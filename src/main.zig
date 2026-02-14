@@ -1,13 +1,13 @@
 const std = @import("std");
 
-const server = @import("server.zig");
+const server = @import("server_piai.zig");
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    std.log.info("Starting ZiggySpiderweb v0.1.0", .{});
+    std.log.info("Starting ZiggySpiderweb v0.2.0 (Pi AI)", .{});
 
     // Parse CLI args
     const args = try std.process.argsAlloc(allocator);
@@ -31,14 +31,22 @@ pub fn main() !void {
             }
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             const help = 
-                "ZiggySpiderweb - Echo Gateway for OpenClaw Protocol\n" ++
+                "ZiggySpiderweb v0.2.0 - Pi AI Gateway for OpenClaw Protocol\n" ++
+                "\n" ++
+                "A WebSocket gateway that proxies OpenClaw protocol messages to Pi AI providers.\n" ++
                 "\n" ++
                 "Usage: spiderweb [options]\n" ++
                 "\n" ++
                 "Options:\n" ++
                 "  --bind <addr>    Bind address (default: 127.0.0.1)\n" ++
                 "  --port <port>    Port number (default: 18790)\n" ++
-                "  --help, -h       Show this help\n";
+                "  --help, -h       Show this help\n" ++
+                "\n" ++
+                "Environment:\n" ++
+                "  OPENAI_API_KEY       OpenAI API key\n" ++
+                "  ANTHROPIC_API_KEY    Anthropic API key\n" ++
+                "  OPENAI_CODEX_API_KEY OpenAI Codex API key (optional)\n"
+            ;
             std.debug.print("{s}", .{help});
             return;
         }
