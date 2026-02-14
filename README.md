@@ -51,15 +51,47 @@ zsc --gateway-test echo ws://127.0.0.1:18790/v1/agents/test/stream
 zsc --gateway-test probe ws://127.0.0.1:18790/v1/agents/test/stream
 ```
 
-## API Key Configuration
+## Configuration
 
-Spiderweb uses Pi AI's key resolution (tries in order):
+Spiderweb uses a JSON config file at `~/.config/spiderweb/config.json`.
 
-| Provider | Environment Variables | Fallback |
-|----------|------------------------|----------|
-| OpenAI | `OPENAI_API_KEY` | - |
-| OpenAI Codex | `OPENAI_CODEX_API_KEY` | `~/.codex/auth.json` (OAuth) → `OPENAI_API_KEY` |
-| Kimi | `KIMI_API_KEY`, `KIMICODE_API_KEY` | `ANTHROPIC_API_KEY` |
+### Quick Config
+
+```bash
+# View current config
+spiderweb-config config
+
+# Set provider and model
+spiderweb-config config set-provider openai gpt-4o
+spiderweb-config config set-provider kimi-coding kimi-k2.5
+spiderweb-config config set-provider openai-codex gpt-5.3-codex
+
+# Set API key (stored in plain text - see security note below)
+spiderweb-config config set-key sk-your-key-here
+
+# Change bind address/port
+spiderweb-config config set-server --bind 0.0.0.0 --port 9000
+
+# Set log level
+spiderweb-config config set-log debug
+```
+
+### API Key Storage
+
+**Priority order:**
+1. **Config file** - Set via `spiderweb-config config set-key`
+2. **Environment variables** - Used as fallback
+
+| Provider | Environment Variable |
+|----------|---------------------|
+| OpenAI | `OPENAI_API_KEY` |
+| OpenAI Codex | `OPENAI_CODEX_API_KEY` → `~/.codex/auth.json` → `OPENAI_API_KEY` |
+| Kimi | `KIMI_API_KEY`, `KIMICODE_API_KEY` |
+
+**Security Note:** Keys stored in the config file are saved in **plain text**. For better security:
+- Use environment variables instead
+- File permissions are set to user-only (0600)
+- Future: Linux keyring integration planned
 
 ## Architecture
 
