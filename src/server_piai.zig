@@ -1,6 +1,7 @@
 const std = @import("std");
 const ziggy_piai = @import("ziggy-piai");
 const Config = @import("config.zig");
+const protocol = @import("protocol.zig");
 
 const ServerState = struct {
     allocator: std.mem.Allocator,
@@ -84,14 +85,11 @@ fn handleConnection(state: *ServerState, conn: std.net.Server.Connection) void {
     };
     defer state.allocator.free(accept_key);
 
-    const response = std.fmt.allocPrint(state.allocator,
-        "HTTP/1.1 101 Switching Protocols\r\n" ++
+    const response = std.fmt.allocPrint(state.allocator, "HTTP/1.1 101 Switching Protocols\r\n" ++
         "Upgrade: websocket\r\n" ++
         "Connection: Upgrade\r\n" ++
         "Sec-WebSocket-Accept: {s}\r\n" ++
-        "\r\n",
-        .{accept_key}
-    ) catch {
+        "\r\n", .{accept_key}) catch {
         std.log.err("Failed to format response", .{});
         return;
     };
@@ -117,10 +115,7 @@ fn handleWebSocketPiAI(state: *ServerState, conn: std.net.Server.Connection, age
     const session_key = try generateSessionKey(state);
     defer state.allocator.free(session_key);
 
-    const ack_msg = try std.fmt.allocPrint(state.allocator,
-        "{{\"type\":\"session.ack\",\"sessionKey\":\"{s}\",\"agentId\":\"{s}\"}}",
-        .{ session_key, agent_id }
-    );
+    const ack_msg = try std.fmt.allocPrint(state.allocator, "{{\"type\":\"session.ack\",\"sessionKey\":\"{s}\",\"agentId\":\"{s}\"}}", .{ session_key, agent_id });
     defer state.allocator.free(ack_msg);
 
     try sendWsFrame(conn.stream, ack_msg, .text);
@@ -128,30 +123,27 @@ fn handleWebSocketPiAI(state: *ServerState, conn: std.net.Server.Connection, age
 
     // Get model from config, fallback to first available
     var model: ?ziggy_piai.types.Model = null;
-    
+
     // Try to find model matching config
     for (state.model_registry.models.items) |m| {
-        // Check if provider matches
         const provider_match = std.mem.eql(u8, m.provider, state.provider_config.name);
-        
-        // If model specified in config, check that too
+
         if (state.provider_config.model) |config_model| {
             if (provider_match and std.mem.eql(u8, m.id, config_model)) {
                 model = m;
                 break;
             }
         } else if (provider_match) {
-            // Use first model for this provider
             model = m;
             break;
         }
     }
-    
+
     // Fallback to first available
     if (model == null and state.model_registry.models.items.len > 0) {
         model = state.model_registry.models.items[0];
     }
-    
+
     if (model == null) {
         std.log.err("No models available in registry", .{});
         return error.NoModels;
@@ -161,15 +153,33 @@ fn handleWebSocketPiAI(state: *ServerState, conn: std.net.Server.Connection, age
 
     // Message loop - accumulate conversation
     var messages: std.array_list.Managed(ziggy_piai.types.Message) = .{ .items = &.{}, .capacity = 0, .allocator = state.allocator };
-    defer messages.deinit();
+    defer {
+        for (messages.items) |message| {
+            state.allocator.free(message.content);
+        }
+        messages.deinit();
+    }
 
     while (true) {
-        const msg = try readWsFrame(conn.stream, &frame_buf);
+        const frame = try readWsFrame(conn.stream, &frame_buf);
+
+        // WebSocket control frames
+        switch (frame.opcode) {
+            0x9 => {
+                // ping -> pong
+                try sendWsControlFrame(conn.stream, 0x0A, frame.payload);
+                continue;
+            },
+            0xA => continue, // pong
+            0x1, 0x2 => {}, // text/binary
+            else => continue,
+        }
+
+        const msg = frame.payload;
         if (msg.len == 0) continue;
 
         std.log.debug("Received: {s}", .{msg});
 
-        // Parse OpenClaw message
         const parsed = std.json.parseFromSlice(std.json.Value, state.allocator, msg, .{}) catch |err| {
             std.log.warn("Failed to parse message: {s}", .{@errorName(err)});
             continue;
@@ -181,115 +191,141 @@ fn handleWebSocketPiAI(state: *ServerState, conn: std.net.Server.Connection, age
         const msg_type = parsed.value.object.get("type") orelse continue;
         if (msg_type != .string) continue;
 
-        if (std.mem.eql(u8, msg_type.string, "session.send")) {
-            // Extract content from session.send
-            const content = blk: {
-                if (parsed.value.object.get("content")) |c| {
-                    if (c == .string) break :blk c.string;
-                }
-                // Try text field as fallback
-                if (parsed.value.object.get("text")) |t| {
-                    if (t == .string) break :blk t.string;
-                }
-                continue;
-            };
+        // App-level heartbeat
+        if (std.mem.eql(u8, msg_type.string, "ping")) {
+            const pong = try protocol.buildPong(state.allocator);
+            defer state.allocator.free(pong);
+            try sendWsFrame(conn.stream, pong, .text);
+            continue;
+        }
 
-            std.log.info("User message: {s}", .{content});
+        const is_chat_send = std.mem.eql(u8, msg_type.string, "chat.send") or std.mem.eql(u8, msg_type.string, "session.send");
+        if (!is_chat_send) continue;
 
-            // Add user message to context
-            try messages.append(.{
-                .role = .user,
-                .content = try state.allocator.dupe(u8, content),
-            });
-
-            // Create context
-            const context = ziggy_piai.types.Context{
-                .messages = messages.items,
-            };
-
-            // Stream response from Pi AI
-            var events = std.array_list.Managed(ziggy_piai.types.AssistantMessageEvent).init(state.allocator);
-            defer events.deinit();
-
-            // Get API key: config > env var
-            const api_key: []const u8 = blk: {
-                // 1. Try config file
-                if (state.provider_config.api_key) |key| {
-                    break :blk try state.allocator.dupe(u8, key);
-                }
-                // 2. Try environment via Pi AI's resolver
-                if (ziggy_piai.env_api_keys.getEnvApiKey(state.allocator, model.?.provider)) |key| {
-                    break :blk key;
-                }
-                // 3. Error
-                std.log.err("No API key found for provider: {s}", .{model.?.provider});
-                const err_msg = "{\"type\":\"error\",\"message\":\"No API key configured\"}";
-                try sendWsFrame(conn.stream, err_msg, .text);
-                continue;
-            };
-            defer state.allocator.free(api_key);
-
-            // Stream from model
-            ziggy_piai.stream.streamByModel(
-                state.allocator,
-                &state.http_client,
-                &state.api_registry,
-                model.?,
-                context,
-                .{ .api_key = api_key },
-                &events,
-            ) catch |err| {
-                std.log.err("Stream error: {s}", .{@errorName(err)});
-                const err_msg = try std.fmt.allocPrint(state.allocator,
-                    "{{\"type\":\"error\",\"message\":\"Stream failed: {s}\"}}",
-                    .{@errorName(err)}
-                );
-                defer state.allocator.free(err_msg);
-                try sendWsFrame(conn.stream, err_msg, .text);
-                continue;
-            };
-
-            // Process events and build response
-            var response_text: std.ArrayList(u8) = .empty;
-            defer response_text.deinit(state.allocator);
-
-            for (events.items) |event| {
-                switch (event) {
-                    .text_delta => |delta| {
-                        try response_text.appendSlice(state.allocator, delta.delta);
-                    },
-                    .done => |done| {
-                        std.log.info("Response complete: {d} tokens", .{done.usage.total_tokens});
-
-                        // Add assistant response to conversation history
-                        try messages.append(.{
-                            .role = .assistant,
-                            .content = try state.allocator.dupe(u8, done.text),
-                        });
-
-                        // Send as OpenClaw message
-                        const response_json = try std.fmt.allocPrint(state.allocator,
-                            "{{\"type\":\"session.receive\",\"content\":\"{s}\"}}",
-                            .{std.mem.replaceOwned(u8, state.allocator, done.text, "\"", "\\\"") catch done.text}
-                        );
-                        defer state.allocator.free(response_json);
-
-                        try sendWsFrame(conn.stream, response_json, .text);
-                    },
-                    .err => |err_msg| {
-                        std.log.err("Pi AI error: {s}", .{err_msg});
-                        const err_json = try std.fmt.allocPrint(state.allocator,
-                            "{{\"type\":\"error\",\"message\":\"{s}\"}}",
-                            .{err_msg}
-                        );
-                        defer state.allocator.free(err_json);
-                        try sendWsFrame(conn.stream, err_json, .text);
-                    },
-                    else => {},
+        const content = blk: {
+            if (parsed.value.object.get("content")) |c| {
+                if (c == .string) break :blk c.string;
+            }
+            if (parsed.value.object.get("text")) |t| {
+                if (t == .string) break :blk t.string;
+            }
+            if (parsed.value.object.get("message")) |m| {
+                if (m == .object) {
+                    if (m.object.get("content")) |mc| {
+                        if (mc == .string) break :blk mc.string;
+                    }
+                    if (m.object.get("text")) |mt| {
+                        if (mt == .string) break :blk mt.string;
+                    }
                 }
             }
+            continue;
+        };
+
+        std.log.info("User message: {s}", .{content});
+
+        try messages.append(.{
+            .role = .user,
+            .content = try state.allocator.dupe(u8, content),
+        });
+
+        const context = ziggy_piai.types.Context{
+            .messages = messages.items,
+        };
+
+        var events = std.array_list.Managed(ziggy_piai.types.AssistantMessageEvent).init(state.allocator);
+        defer events.deinit();
+
+        const api_key: []const u8 = blk: {
+            if (state.provider_config.api_key) |key| {
+                break :blk try state.allocator.dupe(u8, key);
+            }
+            if (ziggy_piai.env_api_keys.getEnvApiKey(state.allocator, model.?.provider)) |key| {
+                break :blk key;
+            }
+            std.log.err("No API key found for provider: {s}", .{model.?.provider});
+            try sendErrorJson(state.allocator, conn.stream, "No API key configured");
+            continue;
+        };
+        defer state.allocator.free(api_key);
+
+        ziggy_piai.stream.streamByModel(
+            state.allocator,
+            &state.http_client,
+            &state.api_registry,
+            model.?,
+            context,
+            .{ .api_key = api_key },
+            &events,
+        ) catch |err| {
+            std.log.err("Stream error: {s}", .{@errorName(err)});
+            const err_msg = try std.fmt.allocPrint(state.allocator, "Stream failed: {s}", .{@errorName(err)});
+            defer state.allocator.free(err_msg);
+            try sendErrorJson(state.allocator, conn.stream, err_msg);
+            continue;
+        };
+
+        var response_text: std.ArrayList(u8) = .empty;
+        defer response_text.deinit(state.allocator);
+
+        var response_sent = false;
+
+        for (events.items) |event| {
+            switch (event) {
+                .text_delta => |delta| {
+                    try response_text.appendSlice(state.allocator, delta.delta);
+                },
+                .done => |done| {
+                    std.log.info("Response complete: {d} tokens", .{done.usage.total_tokens});
+
+                    const final_text = if (done.text.len > 0) done.text else response_text.items;
+                    if (final_text.len == 0) continue;
+
+                    try messages.append(.{
+                        .role = .assistant,
+                        .content = try state.allocator.dupe(u8, final_text),
+                    });
+
+                    try sendSessionReceive(state.allocator, conn.stream, final_text);
+                    response_sent = true;
+                },
+                .err => |err_msg| {
+                    std.log.err("Pi AI error: {s}", .{err_msg});
+                    try sendErrorJson(state.allocator, conn.stream, err_msg);
+                },
+                else => {},
+            }
+        }
+
+        // Fallback if provider emitted deltas but no .done event
+        if (!response_sent and response_text.items.len > 0) {
+            try messages.append(.{
+                .role = .assistant,
+                .content = try state.allocator.dupe(u8, response_text.items),
+            });
+            try sendSessionReceive(state.allocator, conn.stream, response_text.items);
         }
     }
+}
+
+fn sendSessionReceive(allocator: std.mem.Allocator, stream: std.net.Stream, content: []const u8) !void {
+    const escaped = try protocol.jsonEscape(allocator, content);
+    defer allocator.free(escaped);
+
+    const response_json = try std.fmt.allocPrint(allocator, "{{\"type\":\"session.receive\",\"content\":\"{s}\"}}", .{escaped});
+    defer allocator.free(response_json);
+
+    try sendWsFrame(stream, response_json, .text);
+}
+
+fn sendErrorJson(allocator: std.mem.Allocator, stream: std.net.Stream, message: []const u8) !void {
+    const escaped = try protocol.jsonEscape(allocator, message);
+    defer allocator.free(escaped);
+
+    const response_json = try std.fmt.allocPrint(allocator, "{{\"type\":\"error\",\"message\":\"{s}\"}}", .{escaped});
+    defer allocator.free(response_json);
+
+    try sendWsFrame(stream, response_json, .text);
 }
 
 fn parseAgentId(request: []const u8) ?[]const u8 {
@@ -302,7 +338,7 @@ fn parseAgentId(request: []const u8) ?[]const u8 {
 }
 
 fn generateWsAcceptKey(state: *ServerState, request: []const u8) ![]u8 {
-    const key_headers = [_][]const u8{"Sec-WebSocket-Key: ", "sec-websocket-key: "};
+    const key_headers = [_][]const u8{ "Sec-WebSocket-Key: ", "sec-websocket-key: " };
     var key_start: ?usize = null;
     var key_header_len: usize = 0;
 
@@ -334,9 +370,32 @@ fn generateWsAcceptKey(state: *ServerState, request: []const u8) ![]u8 {
     return encoded;
 }
 
-fn readWsFrame(stream: std.net.Stream, buf: []u8) ![]const u8 {
+const WsFrame = struct {
+    opcode: u8,
+    payload: []const u8,
+};
+
+fn readExact(stream: std.net.Stream, buf: []u8) !void {
+    var offset: usize = 0;
+    while (offset < buf.len) {
+        const n = try stream.read(buf[offset..]);
+        if (n == 0) return error.EndOfStream;
+        offset += n;
+    }
+}
+
+fn writeExact(stream: std.net.Stream, buf: []const u8) !void {
+    var offset: usize = 0;
+    while (offset < buf.len) {
+        const n = try stream.write(buf[offset..]);
+        if (n == 0) return error.BrokenPipe;
+        offset += n;
+    }
+}
+
+fn readWsFrame(stream: std.net.Stream, buf: []u8) !WsFrame {
     var header: [2]u8 = undefined;
-    _ = try stream.read(&header);
+    try readExact(stream, &header);
 
     _ = (header[0] & 0x80) != 0; // fin
     const opcode = header[0] & 0x0F;
@@ -345,26 +404,25 @@ fn readWsFrame(stream: std.net.Stream, buf: []u8) ![]const u8 {
 
     if (payload_len == 126) {
         var ext: [2]u8 = undefined;
-        _ = try stream.read(&ext);
+        try readExact(stream, &ext);
         payload_len = std.mem.readInt(u16, &ext, .big);
     } else if (payload_len == 127) {
         var ext: [8]u8 = undefined;
-        _ = try stream.read(&ext);
-        payload_len = std.mem.readInt(u64, &ext, .big);
+        try readExact(stream, &ext);
+        payload_len = @intCast(std.mem.readInt(u64, &ext, .big));
     }
 
     if (opcode == 8) return error.ConnectionClosed;
-    if (opcode == 9) return &[_]u8{};
 
     var mask_key: [4]u8 = undefined;
     if (masked) {
-        _ = try stream.read(&mask_key);
+        try readExact(stream, &mask_key);
     }
 
     if (payload_len > buf.len) return error.BufferTooSmall;
 
     const payload = buf[0..payload_len];
-    _ = try stream.read(payload);
+    try readExact(stream, payload);
 
     if (masked) {
         for (payload, 0..) |*b, i| {
@@ -372,7 +430,15 @@ fn readWsFrame(stream: std.net.Stream, buf: []u8) ![]const u8 {
         }
     }
 
-    return payload;
+    return .{ .opcode = opcode, .payload = payload };
+}
+
+fn sendWsControlFrame(stream: std.net.Stream, opcode: u8, payload: []const u8) !void {
+    if (payload.len > 125) return error.ControlFrameTooLarge;
+
+    var header: [2]u8 = .{ 0x80 | opcode, @intCast(payload.len) };
+    try writeExact(stream, &header);
+    try writeExact(stream, payload);
 }
 
 fn sendWsFrame(stream: std.net.Stream, payload: []const u8, comptime frame_type: enum { text, binary }) !void {
@@ -398,8 +464,8 @@ fn sendWsFrame(stream: std.net.Stream, payload: []const u8, comptime frame_type:
         header_len = 10;
     }
 
-    _ = try stream.write(header[0..header_len]);
-    _ = try stream.write(payload);
+    try writeExact(stream, header[0..header_len]);
+    try writeExact(stream, payload);
 }
 
 fn generateSessionKey(state: *ServerState) ![]u8 {
