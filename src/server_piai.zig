@@ -45,10 +45,17 @@ pub fn run(allocator: std.mem.Allocator, bind_addr: []const u8, port: u16, provi
     std.log.info("Available models: {d}", .{model_registry.models.items.len});
 
     while (true) {
-        const conn = try tcp_server.accept();
+        const conn = tcp_server.accept() catch |err| {
+            std.log.err("Accept failed: {s}", .{@errorName(err)});
+            continue;
+        };
         std.log.info("Connection from {any}", .{conn.address});
 
-        const t = try std.Thread.spawn(.{}, handleConnection, .{ &state, conn });
+        const t = std.Thread.spawn(.{}, handleConnection, .{ &state, conn }) catch |err| {
+            std.log.err("Failed to spawn connection thread: {s}", .{@errorName(err)});
+            conn.stream.close();
+            continue;
+        };
         t.detach();
     }
 }
@@ -104,7 +111,22 @@ fn handleConnection(state: *ServerState, conn: std.net.Server.Connection) void {
 
     // Handle WebSocket frames with Pi AI
     handleWebSocketPiAI(state, conn, agent_id) catch |err| {
-        std.log.err("WebSocket error: {s}", .{@errorName(err)});
+        if (isConnectionClosedError(err)) {
+            std.log.info("WebSocket connection closed: {s}", .{@errorName(err)});
+            return;
+        }
+
+        if (isNetworkError(err)) {
+            std.log.warn("WebSocket network error: {s}", .{@errorName(err)});
+            return;
+        }
+
+        if (isWebSocketFrameError(err)) {
+            std.log.warn("WebSocket frame error: {s}", .{@errorName(err)});
+            return;
+        }
+
+        std.log.err("WebSocket handler error: {s}", .{@errorName(err)});
     };
 }
 
@@ -165,6 +187,11 @@ fn handleWebSocketPiAI(state: *ServerState, conn: std.net.Server.Connection, age
 
         // WebSocket control frames
         switch (frame.opcode) {
+            0x8 => {
+                // close -> mirror close frame and end connection gracefully
+                sendWsControlFrame(conn.stream, 0x08, frame.payload) catch {};
+                return error.ConnectionClosed;
+            },
             0x9 => {
                 // ping -> pong
                 try sendWsControlFrame(conn.stream, 0x0A, frame.payload);
@@ -375,6 +402,34 @@ const WsFrame = struct {
     payload: []const u8,
 };
 
+fn isConnectionClosedError(err: anyerror) bool {
+    const name = @errorName(err);
+    return std.mem.eql(u8, name, "ConnectionClosed") or
+        std.mem.eql(u8, name, "EndOfStream");
+}
+
+fn isNetworkError(err: anyerror) bool {
+    const name = @errorName(err);
+    return std.mem.eql(u8, name, "BrokenPipe") or
+        std.mem.eql(u8, name, "ConnectionResetByPeer") or
+        std.mem.eql(u8, name, "ConnectionTimedOut") or
+        std.mem.eql(u8, name, "SocketNotConnected") or
+        std.mem.eql(u8, name, "NotOpenForReading") or
+        std.mem.eql(u8, name, "NotOpenForWriting") or
+        std.mem.eql(u8, name, "Unexpected");
+}
+
+fn isWebSocketFrameError(err: anyerror) bool {
+    const name = @errorName(err);
+    return std.mem.eql(u8, name, "BufferTooSmall") or
+        std.mem.eql(u8, name, "ControlFrameTooLarge") or
+        std.mem.eql(u8, name, "InvalidOpcode") or
+        std.mem.eql(u8, name, "ClientFrameNotMasked") or
+        std.mem.eql(u8, name, "ReservedBitsNotZero") or
+        std.mem.eql(u8, name, "FragmentedFramesUnsupported") or
+        std.mem.eql(u8, name, "FragmentedControlFrame");
+}
+
 fn readExact(stream: std.net.Stream, buf: []u8) !void {
     var offset: usize = 0;
     while (offset < buf.len) {
@@ -397,8 +452,12 @@ fn readWsFrame(stream: std.net.Stream, buf: []u8) !WsFrame {
     var header: [2]u8 = undefined;
     try readExact(stream, &header);
 
-    _ = (header[0] & 0x80) != 0; // fin
+    const fin = (header[0] & 0x80) != 0;
+    if ((header[0] & 0x70) != 0) return error.ReservedBitsNotZero;
+
     const opcode = header[0] & 0x0F;
+    if (!isValidOpcode(opcode)) return error.InvalidOpcode;
+
     const masked = (header[1] & 0x80) != 0;
     var payload_len: usize = header[1] & 0x7F;
 
@@ -412,25 +471,37 @@ fn readWsFrame(stream: std.net.Stream, buf: []u8) !WsFrame {
         payload_len = @intCast(std.mem.readInt(u64, &ext, .big));
     }
 
-    if (opcode == 8) return error.ConnectionClosed;
+    if (!masked) return error.ClientFrameNotMasked;
+
+    if (isControlOpcode(opcode)) {
+        if (!fin) return error.FragmentedControlFrame;
+        if (payload_len > 125) return error.ControlFrameTooLarge;
+    } else {
+        if (!fin or opcode == 0x0) return error.FragmentedFramesUnsupported;
+    }
 
     var mask_key: [4]u8 = undefined;
-    if (masked) {
-        try readExact(stream, &mask_key);
-    }
+    try readExact(stream, &mask_key);
 
     if (payload_len > buf.len) return error.BufferTooSmall;
 
     const payload = buf[0..payload_len];
     try readExact(stream, payload);
 
-    if (masked) {
-        for (payload, 0..) |*b, i| {
-            b.* ^= mask_key[i % 4];
-        }
+    for (payload, 0..) |*b, i| {
+        b.* ^= mask_key[i % 4];
     }
 
     return .{ .opcode = opcode, .payload = payload };
+}
+
+fn isValidOpcode(opcode: u8) bool {
+    return opcode == 0x0 or opcode == 0x1 or opcode == 0x2 or
+        opcode == 0x8 or opcode == 0x9 or opcode == 0xA;
+}
+
+fn isControlOpcode(opcode: u8) bool {
+    return opcode == 0x8 or opcode == 0x9 or opcode == 0xA;
 }
 
 fn sendWsControlFrame(stream: std.net.Stream, opcode: u8, payload: []const u8) !void {
