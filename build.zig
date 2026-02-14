@@ -26,6 +26,20 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(spiderweb);
 
+    // Config CLI executable
+    const config_mod = b.createModule(.{
+        .root_source_file = b.path("src/config_cli.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const config_cli = b.addExecutable(.{
+        .name = "spiderweb-config",
+        .root_module = config_mod,
+    });
+
+    b.installArtifact(config_cli);
+
     // Run command
     const run_cmd = b.addRunArtifact(spiderweb);
     run_cmd.step.dependOn(b.getInstallStep());

@@ -1,5 +1,6 @@
 const std = @import("std");
 const ziggy_piai = @import("ziggy-piai");
+const Config = @import("config.zig");
 
 const ServerState = struct {
     allocator: std.mem.Allocator,
@@ -7,9 +8,10 @@ const ServerState = struct {
     model_registry: ziggy_piai.models.ModelRegistry,
     api_registry: ziggy_piai.api_registry.ApiRegistry,
     http_client: std.http.Client,
+    provider_config: Config.ProviderConfig,
 };
 
-pub fn run(allocator: std.mem.Allocator, bind_addr: []const u8, port: u16) !void {
+pub fn run(allocator: std.mem.Allocator, bind_addr: []const u8, port: u16, provider_config: Config.ProviderConfig) !void {
     // Initialize Pi AI components
     var model_registry = ziggy_piai.models.ModelRegistry.init(allocator);
     defer model_registry.deinit();
@@ -28,6 +30,7 @@ pub fn run(allocator: std.mem.Allocator, bind_addr: []const u8, port: u16) !void
         .model_registry = model_registry,
         .api_registry = api_registry,
         .http_client = http_client,
+        .provider_config = provider_config,
     };
 
     const addr = try std.net.Address.parseIp(bind_addr, port);
@@ -123,15 +126,38 @@ fn handleWebSocketPiAI(state: *ServerState, conn: std.net.Server.Connection, age
     try sendWsFrame(conn.stream, ack_msg, .text);
     std.log.info("Sent session.ack: {s}", .{ack_msg});
 
-    // Get default model (use first available)
-    const model = if (state.model_registry.models.items.len > 0)
-        state.model_registry.models.items[0]
-    else {
+    // Get model from config, fallback to first available
+    var model: ?ziggy_piai.types.Model = null;
+    
+    // Try to find model matching config
+    for (state.model_registry.models.items) |m| {
+        // Check if provider matches
+        const provider_match = std.mem.eql(u8, m.provider, state.provider_config.name);
+        
+        // If model specified in config, check that too
+        if (state.provider_config.model) |config_model| {
+            if (provider_match and std.mem.eql(u8, m.id, config_model)) {
+                model = m;
+                break;
+            }
+        } else if (provider_match) {
+            // Use first model for this provider
+            model = m;
+            break;
+        }
+    }
+    
+    // Fallback to first available
+    if (model == null and state.model_registry.models.items.len > 0) {
+        model = state.model_registry.models.items[0];
+    }
+    
+    if (model == null) {
         std.log.err("No models available in registry", .{});
         return error.NoModels;
-    };
+    }
 
-    std.log.info("Using model: {s} ({s})", .{ model.name, model.id });
+    std.log.info("Using model: {s} ({s}) from provider: {s}", .{ model.?.name, model.?.id, model.?.provider });
 
     // Message loop - accumulate conversation
     var messages: std.array_list.Managed(ziggy_piai.types.Message) = .{ .items = &.{}, .capacity = 0, .allocator = state.allocator };
@@ -185,9 +211,18 @@ fn handleWebSocketPiAI(state: *ServerState, conn: std.net.Server.Connection, age
             var events = std.array_list.Managed(ziggy_piai.types.AssistantMessageEvent).init(state.allocator);
             defer events.deinit();
 
-            // Get API key from environment
-            const api_key = ziggy_piai.env_api_keys.getEnvApiKey(state.allocator, model.provider) orelse {
-                std.log.err("No API key found for provider: {s}", .{model.provider});
+            // Get API key: config > env var
+            const api_key: []const u8 = blk: {
+                // 1. Try config file
+                if (state.provider_config.api_key) |key| {
+                    break :blk try state.allocator.dupe(u8, key);
+                }
+                // 2. Try environment via Pi AI's resolver
+                if (ziggy_piai.env_api_keys.getEnvApiKey(state.allocator, model.?.provider)) |key| {
+                    break :blk key;
+                }
+                // 3. Error
+                std.log.err("No API key found for provider: {s}", .{model.?.provider});
                 const err_msg = "{\"type\":\"error\",\"message\":\"No API key configured\"}";
                 try sendWsFrame(conn.stream, err_msg, .text);
                 continue;
@@ -199,7 +234,7 @@ fn handleWebSocketPiAI(state: *ServerState, conn: std.net.Server.Connection, age
                 state.allocator,
                 &state.http_client,
                 &state.api_registry,
-                model,
+                model.?,
                 context,
                 .{ .api_key = api_key },
                 &events,
