@@ -8,6 +8,7 @@ const orchestrator = @import("orchestrator.zig");
 const workers = @import("workers.zig");
 const ltm_store = @import("ltm_store.zig");
 const ltm_index = @import("ltm_index.zig");
+const agent_registry = @import("agent_registry.zig");
 const posix = std.posix;
 const builtin = @import("builtin");
 const linux = if (builtin.os.tag == .linux) std.os.linux else struct {
@@ -82,6 +83,7 @@ const ServerState = struct {
     http_client: std.http.Client,
     provider_config: Config.ProviderConfig,
     ltm_store: ?ltm_store.Store,
+    agent_registry: agent_registry.AgentRegistry,
 };
 
 const ConnectionState = enum {
@@ -346,6 +348,10 @@ pub fn run(allocator: std.mem.Allocator, bind_addr: []const u8, port: u16, provi
 
     var persisted_sessions = try loadPersistedSessions(allocator);
 
+    var registry = agent_registry.AgentRegistry.init(allocator, ".");
+    try registry.scan();
+    defer registry.deinit();
+
     var state = ServerState{
         .allocator = allocator,
         .rng = std.Random.DefaultPrng.init(@intCast(std.time.milliTimestamp())),
@@ -354,6 +360,7 @@ pub fn run(allocator: std.mem.Allocator, bind_addr: []const u8, port: u16, provi
         .http_client = http_client,
         .provider_config = provider_config,
         .ltm_store = ltm_storage,
+        .agent_registry = registry,
     };
     defer if (state.ltm_store) |*store| store.close();
 
@@ -823,6 +830,23 @@ fn handleUserMessage(allocator: std.mem.Allocator, state: *ServerState, pool: *s
     const is_chat_send = std.mem.eql(u8, msg_type.string, "chat.send") or std.mem.eql(u8, msg_type.string, "session.send");
     const is_agent_control = std.mem.eql(u8, msg_type.string, "agent.control");
     const is_agent_heartbeat = std.mem.eql(u8, msg_type.string, "agent.heartbeat");
+    const is_agent_list = std.mem.eql(u8, msg_type.string, "agent.list");
+    const is_agent_get = std.mem.eql(u8, msg_type.string, "agent.get");
+
+    if (is_agent_list) {
+        try handleAgentList(allocator, state, conn, request_id);
+        return;
+    }
+
+    if (is_agent_get) {
+        const agent_id = if (parsed.value.object.get("agent_id")) |id|
+            if (id == .string) id.string else null
+        else
+            null;
+        try handleAgentGet(allocator, state, conn, request_id, agent_id);
+        return;
+    }
+
     if (!is_chat_send and !is_agent_control and !is_agent_heartbeat) return;
 
     const control_action = blk: {
@@ -1597,6 +1621,110 @@ fn workerModeLabel(mode: WorkerControlMode) []const u8 {
         .paused => "workers.paused",
         .cancelled => "workers.cancelled",
     };
+}
+
+fn handleAgentList(
+    allocator: std.mem.Allocator,
+    state: *ServerState,
+    conn: *Connection,
+    request_id: []const u8,
+) !void {
+    const agents = state.agent_registry.listAgents();
+
+    var json = std.ArrayListUnmanaged(u8){};
+    defer json.deinit(allocator);
+
+    try json.appendSlice(allocator, "{\"type\":\"agent.list.response\",\"request\":\"");
+    const escaped_request_id = try protocol.jsonEscape(allocator, request_id);
+    defer allocator.free(escaped_request_id);
+    try json.appendSlice(allocator, escaped_request_id);
+    try json.appendSlice(allocator, "\",\"agents\":[");
+
+    for (agents, 0..) |agent, idx| {
+        if (idx > 0) try json.appendSlice(allocator, ",");
+
+        const escaped_id = try protocol.jsonEscape(allocator, agent.id);
+        defer allocator.free(escaped_id);
+        const escaped_name = try protocol.jsonEscape(allocator, agent.name);
+        defer allocator.free(escaped_name);
+        const escaped_desc = try protocol.jsonEscape(allocator, agent.description);
+        defer allocator.free(escaped_desc);
+
+        try json.appendSlice(allocator, "{\"id\":\"");
+        try json.appendSlice(allocator, escaped_id);
+        try json.appendSlice(allocator, "\",\"name\":\"");
+        try json.appendSlice(allocator, escaped_name);
+        try json.appendSlice(allocator, "\",\"description\":\"");
+        try json.appendSlice(allocator, escaped_desc);
+        try json.appendSlice(allocator, "\",\"is_default\":");
+        try json.appendSlice(allocator, if (agent.is_default) "true" else "false");
+        try json.appendSlice(allocator, ",\"identity_loaded\":");
+        try json.appendSlice(allocator, if (agent.identity_loaded) "true" else "false");
+        try json.appendSlice(allocator, "}");
+    }
+
+    try json.appendSlice(allocator, "]}");
+
+    try sendDirect(allocator, conn, json.items);
+}
+
+fn handleAgentGet(
+    allocator: std.mem.Allocator,
+    state: *ServerState,
+    conn: *Connection,
+    request_id: []const u8,
+    agent_id: ?[]const u8,
+) !void {
+    const agent = if (agent_id) |id|
+        state.agent_registry.getAgent(id) orelse state.agent_registry.getDefaultAgent()
+    else
+        state.agent_registry.getDefaultAgent();
+
+    if (agent == null) {
+        try sendErrorJsonDirect(allocator, conn, "No agents available");
+        return;
+    }
+
+    const a = agent.?;
+
+    const escaped_request_id = try protocol.jsonEscape(allocator, request_id);
+    defer allocator.free(escaped_request_id);
+    const escaped_id = try protocol.jsonEscape(allocator, a.id);
+    defer allocator.free(escaped_id);
+    const escaped_name = try protocol.jsonEscape(allocator, a.name);
+    defer allocator.free(escaped_name);
+    const escaped_desc = try protocol.jsonEscape(allocator, a.description);
+    defer allocator.free(escaped_desc);
+
+    const payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"type\":\"agent.info\",\"request\":\"{s}\",\"agent\":{{\"id\":\"{s}\",\"name\":\"{s}\",\"description\":\"{s}\",\"is_default\":{s},\"identity_loaded\":{s}}}}}",
+        .{
+            escaped_request_id,
+            escaped_id,
+            escaped_name,
+            escaped_desc,
+            if (a.is_default) "true" else "false",
+            if (a.identity_loaded) "true" else "false",
+        },
+    );
+    defer allocator.free(payload);
+
+    try sendDirect(allocator, conn, payload);
+}
+
+fn sendErrorJsonDirect(
+    allocator: std.mem.Allocator,
+    conn: *Connection,
+    message: []const u8,
+) !void {
+    const escaped = try protocol.jsonEscape(allocator, message);
+    defer allocator.free(escaped);
+
+    const payload = try std.fmt.allocPrint(allocator, "{{\"type\":\"error\",\"message\":\"{s}\"}}", .{escaped});
+    defer allocator.free(payload);
+
+    try sendDirect(allocator, conn, payload);
 }
 
 fn sendAgentState(
