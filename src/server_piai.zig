@@ -183,7 +183,9 @@ fn handleWebSocketPiAI(state: *ServerState, conn: std.net.Server.Connection, age
     }
 
     while (true) {
+        std.log.debug("handleWebSocketPiAI: waiting for frame...", .{});
         const frame = try readWsFrame(conn.stream, &frame_buf);
+        std.log.debug("handleWebSocketPiAI: received frame opcode={d}, payload_len={d}", .{ frame.opcode, frame.payload.len });
 
         // WebSocket control frames
         switch (frame.opcode) {
@@ -430,13 +432,23 @@ fn isWebSocketFrameError(err: anyerror) bool {
         std.mem.eql(u8, name, "FragmentedControlFrame");
 }
 
-fn readExact(stream: std.net.Stream, buf: []u8) !void {
+fn readExact(stream: std.net.Stream, buf: []u8, comptime context: []const u8) !void {
     var offset: usize = 0;
+    std.log.debug("readExact START: context={s}, buf_len={d}", .{ context, buf.len });
     while (offset < buf.len) {
-        const n = try stream.read(buf[offset..]);
-        if (n == 0) return error.EndOfStream;
+        std.log.debug("readExact LOOP: context={s}, offset={d}, remaining={d}", .{ context, offset, buf.len - offset });
+        const n = stream.read(buf[offset..]) catch |err| {
+            std.log.err("readExact READ ERROR: context={s}, err={s}", .{ context, @errorName(err) });
+            return err;
+        };
+        std.log.debug("readExact READ: context={s}, n={d}", .{ context, n });
+        if (n == 0) {
+            std.log.err("readExact END OF STREAM: context={s}, offset={d}", .{ context, offset });
+            return error.EndOfStream;
+        }
         offset += n;
     }
+    std.log.debug("readExact DONE: context={s}, total_read={d}", .{ context, offset });
 }
 
 fn writeExact(stream: std.net.Stream, buf: []const u8) !void {
@@ -449,8 +461,9 @@ fn writeExact(stream: std.net.Stream, buf: []const u8) !void {
 }
 
 fn readWsFrame(stream: std.net.Stream, buf: []u8) !WsFrame {
+    std.log.debug("readWsFrame: waiting for header (2 bytes)", .{});
     var header: [2]u8 = undefined;
-    try readExact(stream, &header);
+    try readExact(stream, &header, "ws_header");
 
     const fin = (header[0] & 0x80) != 0;
     if ((header[0] & 0x70) != 0) return error.ReservedBitsNotZero;
@@ -462,12 +475,14 @@ fn readWsFrame(stream: std.net.Stream, buf: []u8) !WsFrame {
     var payload_len: usize = header[1] & 0x7F;
 
     if (payload_len == 126) {
+        std.log.debug("readWsFrame: payload_len=126, reading 2-byte ext", .{});
         var ext: [2]u8 = undefined;
-        try readExact(stream, &ext);
+        try readExact(stream, &ext, "ws_ext16");
         payload_len = std.mem.readInt(u16, &ext, .big);
     } else if (payload_len == 127) {
+        std.log.debug("readWsFrame: payload_len=127, reading 8-byte ext", .{});
         var ext: [8]u8 = undefined;
-        try readExact(stream, &ext);
+        try readExact(stream, &ext, "ws_ext64");
         payload_len = @intCast(std.mem.readInt(u64, &ext, .big));
     }
 
@@ -480,13 +495,15 @@ fn readWsFrame(stream: std.net.Stream, buf: []u8) !WsFrame {
         if (!fin or opcode == 0x0) return error.FragmentedFramesUnsupported;
     }
 
+    std.log.debug("readWsFrame: reading mask_key (4 bytes)", .{});
     var mask_key: [4]u8 = undefined;
-    try readExact(stream, &mask_key);
+    try readExact(stream, &mask_key, "ws_mask");
 
     if (payload_len > buf.len) return error.BufferTooSmall;
 
+    std.log.debug("readWsFrame: reading payload ({d} bytes)", .{payload_len});
     const payload = buf[0..payload_len];
-    try readExact(stream, payload);
+    try readExact(stream, payload, "ws_payload");
 
     for (payload, 0..) |*b, i| {
         b.* ^= mask_key[i % 4];
