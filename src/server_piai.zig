@@ -2822,6 +2822,23 @@ fn collectWebSocketPayloads(
     return payloads;
 }
 
+fn buildMaskedTextFrame(
+    allocator: std.mem.Allocator,
+    payload: []const u8,
+    mask_key: [4]u8,
+) ![]u8 {
+    if (payload.len >= 126) return error.InvalidFrame;
+    const frame_len = 2 + 4 + payload.len;
+    var frame = try allocator.alloc(u8, frame_len);
+    frame[0] = 0x81;
+    frame[1] = 0x80 | @as(u8, @truncate(payload.len));
+    @memcpy(frame[2..6], &mask_key);
+    for (payload, 0..) |value, i| {
+        frame[6 + i] = value ^ mask_key[i % 4];
+    }
+    return frame;
+}
+
 fn mockStreamByModel(
     allocator: std.mem.Allocator,
     _: *std.http.Client,
@@ -2844,6 +2861,82 @@ fn mockStreamByModel(
             .usage = .{ .total_tokens = 5 },
         },
     });
+}
+
+test "server_piai: processWebSocket handles masked chat.send and emits session.receive" {
+    const allocator = std.testing.allocator;
+    const original_stream_fn = streamByModelFn;
+    defer { streamByModelFn = original_stream_fn; }
+    streamByModelFn = mockStreamByModel;
+
+    var model_registry = ziggy_piai.models.ModelRegistry.init(allocator);
+    defer model_registry.deinit();
+    try ziggy_piai.models.registerDefaultModels(&model_registry);
+
+    var api_registry = ziggy_piai.api_registry.ApiRegistry.init(allocator);
+    defer api_registry.deinit();
+    try ziggy_piai.providers.register_builtins.registerBuiltInApiProviders(&api_registry);
+
+    var http_client = std.http.Client{ .allocator = allocator };
+    defer http_client.deinit();
+
+    var state = ServerState{
+        .allocator = allocator,
+        .rng = std.Random.DefaultPrng.init(0xBADC0FFEE),
+        .model_registry = model_registry,
+        .api_registry = api_registry,
+        .http_client = http_client,
+        .provider_config = .{
+            .name = "openai",
+            .model = "gpt-4o-mini",
+            .api_key = "mock-api-key",
+            .base_url = "https://example.invalid",
+        },
+        .ltm_store = null,
+    };
+
+    var conn = Connection.init(allocator, 0);
+    conn.state = .websocket;
+    conn.agent_id = try allocator.dupe(u8, "default");
+    try conn.session.setSessionId(allocator, "session-ws-1");
+    defer {
+        conn.read_buf.deinit(allocator);
+        conn.write_buf.deinit(allocator);
+        conn.session.deinit(allocator);
+        allocator.free(conn.agent_id);
+    }
+
+    const inbound = "{\"id\":\"req-ws-001\",\"type\":\"chat.send\",\"content\":\"hello websocket\"}";
+    const frame = try buildMaskedTextFrame(allocator, inbound, .{ 0x12, 0x34, 0x56, 0x78 });
+    defer allocator.free(frame);
+    try conn.read_buf.appendSlice(allocator, frame);
+
+    {
+        var pool: std.Thread.Pool = undefined;
+        try pool.init(.{ .allocator = allocator });
+        defer pool.deinit();
+
+        try processWebSocket(allocator, &state, &pool, &conn);
+    }
+
+    var payloads = try collectWebSocketPayloads(allocator, conn.write_buf.items);
+    defer {
+        for (payloads.items) |payload| allocator.free(payload);
+        payloads.deinit(allocator);
+    }
+
+    var saw_session_receive = false;
+    for (payloads.items) |payload| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
+        defer parsed.deinit();
+        const obj = parsed.value.object;
+        const message_type = obj.get("type") orelse continue;
+        if (!std.mem.eql(u8, message_type.string, "session.receive")) continue;
+        try std.testing.expect(std.mem.eql(u8, obj.get("content").?.string, "mocked model reply"));
+        saw_session_receive = true;
+        break;
+    }
+    try std.testing.expect(saw_session_receive);
 }
 
 test "server_piai: handleUserMessage with chat.send runs mocked stream and emits session.receive" {
