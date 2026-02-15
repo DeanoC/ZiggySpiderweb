@@ -1,0 +1,11 @@
+{
+  "id": "test-agent",
+  "name": "Tool Test Agent",
+  "description": "Agent for testing tool system functionality",
+  "version": "1.0.0",
+  "is_default": false,
+  "capabilities": ["chat", "tools"],
+  "tools": {
+    "enabled": ["file_read", "file_write", "file_list", "search_code", "shell"]
+  }
+}
