@@ -57,7 +57,7 @@
 2. `agent.control` still only supports goal-driven planning and plain text fallback.
 3. Worker behavior is deterministic/stubbed local text logic; it is not yet connected to any long-running tooling or stateful sub-brain side effects.
 4. No dedicated queue/backpressure metrics or persistent worker session state yet (all worker outputs remain ephemeral).
-5. Runtime tests for `/goal`, `agent.control`, and worker progress/status messaging are still missing (unit coverage now includes protocol parsing + outbound payload shape helpers).
+5. Runtime tests for `/goal` messaging are now complemented by mocked `chat.send` and `agent.control` flow coverage; remaining runtime gaps are mainly websocket-level socket integration and broader protocol behavior under load.
 6. End-to-end mocked provider path is now covered for `chat.send` via `handleUserMessage` + mocked `streamByModel`, but runtime socket-level integration with `processWebSocket` remains untested.
 6. Protocol parser tests now cover `agent.plan/progress/status/control` and unsupported incoming protocol types; protocol-level builder/shape tests for `agent.status` payloads and malformed envelope handling remain.
 7. `agent.state` is still a known future extension and intentionally untouched until its contract is defined.

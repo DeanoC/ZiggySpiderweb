@@ -2790,6 +2790,38 @@ fn decodeFirstWebSocketPayload(frame_data: []const u8) ![]const u8 {
     return frame_data[header_len .. header_len + payload_len];
 }
 
+fn collectWebSocketPayloads(
+    allocator: std.mem.Allocator,
+    frame_data: []const u8,
+) !std.ArrayListUnmanaged([]const u8) {
+    var payloads = std.ArrayListUnmanaged([]const u8){};
+    var idx: usize = 0;
+    while (idx < frame_data.len) {
+        if (frame_data.len - idx < 2) return error.InvalidFrame;
+
+        const mask_and_len = frame_data[idx + 1];
+        var payload_len = @as(usize, mask_and_len & 0x7F);
+        var header_len: usize = 2;
+
+        if (payload_len == 126) {
+            if (frame_data.len - idx < 4) return error.InvalidFrame;
+            payload_len = std.mem.readInt(u16, frame_data[idx + 2 .. idx + 4], .big);
+            header_len = 4;
+        } else if (payload_len == 127) {
+            if (frame_data.len - idx < 10) return error.InvalidFrame;
+            payload_len = @intCast(std.mem.readInt(u64, frame_data[idx + 2 .. idx + 10], .big));
+            header_len = 10;
+        }
+
+        const frame_end = idx + header_len + payload_len;
+        if (frame_end > frame_data.len) return error.InvalidFrame;
+
+        try payloads.append(allocator, try allocator.dupe(u8, frame_data[idx + header_len .. frame_end]));
+        idx = frame_end;
+    }
+    return payloads;
+}
+
 fn mockStreamByModel(
     allocator: std.mem.Allocator,
     _: *std.http.Client,
@@ -2871,4 +2903,115 @@ test "server_piai: handleUserMessage with chat.send runs mocked stream and emits
     try std.testing.expect(std.mem.eql(u8, obj.get("type").?.string, "session.receive"));
     try std.testing.expect(std.mem.eql(u8, obj.get("content").?.string, "mocked model reply"));
     try std.testing.expect(obj.get("memoryId").?.integer > 0);
+}
+
+test "server_piai: agent.control goal emits plan and worker events" {
+    const allocator = std.testing.allocator;
+    const original_stream_fn = streamByModelFn;
+    defer { streamByModelFn = original_stream_fn; }
+    streamByModelFn = mockStreamByModel;
+
+    var model_registry = ziggy_piai.models.ModelRegistry.init(allocator);
+    defer model_registry.deinit();
+    try ziggy_piai.models.registerDefaultModels(&model_registry);
+
+    var api_registry = ziggy_piai.api_registry.ApiRegistry.init(allocator);
+    defer api_registry.deinit();
+    try ziggy_piai.providers.register_builtins.registerBuiltInApiProviders(&api_registry);
+
+    var http_client = std.http.Client{ .allocator = allocator };
+    defer http_client.deinit();
+
+    var state = ServerState{
+        .allocator = allocator,
+        .rng = std.Random.DefaultPrng.init(0xBADC0FFEE),
+        .model_registry = model_registry,
+        .api_registry = api_registry,
+        .http_client = http_client,
+        .provider_config = .{
+            .name = "openai",
+            .model = "gpt-4o-mini",
+            .api_key = "mock-api-key",
+            .base_url = "https://example.invalid",
+        },
+        .ltm_store = null,
+    };
+
+    var conn = Connection.init(allocator, 0);
+    try conn.session.setSessionId(allocator, "session-control-1");
+    defer {
+        conn.read_buf.deinit(allocator);
+        conn.write_buf.deinit(allocator);
+        conn.session.deinit(allocator);
+    }
+
+    {
+        var pool: std.Thread.Pool = undefined;
+        try pool.init(.{ .allocator = allocator });
+        defer pool.deinit();
+
+        const inbound = "{\"id\":\"req-002\",\"type\":\"agent.control\",\"goal\":\"Build a small dashboard\"}";
+        try handleUserMessage(allocator, &state, &pool, &conn, inbound);
+    }
+
+    var payloads = try collectWebSocketPayloads(allocator, conn.write_buf.items);
+    defer {
+        for (payloads.items) |payload| allocator.free(payload);
+        payloads.deinit(allocator);
+    }
+
+    var saw_plan = false;
+    var saw_planner_received = false;
+    var saw_worker_status = false;
+    var saw_worker_progress = false;
+    var saw_status = false;
+    var worker_status_count: usize = 0;
+
+    for (payloads.items) |payload| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
+        defer parsed.deinit();
+        const obj = parsed.value.object;
+
+        const message_type = obj.get("type") orelse continue;
+        if (!std.mem.eql(u8, message_type.string, "agent.plan") and
+            !std.mem.eql(u8, message_type.string, "agent.progress") and
+            !std.mem.eql(u8, message_type.string, "agent.status") and
+            !std.mem.eql(u8, message_type.string, "session.receive"))
+        {
+            continue;
+        }
+
+        if (std.mem.eql(u8, message_type.string, "agent.plan")) {
+            saw_plan = true;
+            continue;
+        }
+
+        if (std.mem.eql(u8, message_type.string, "agent.status")) {
+            saw_status = true;
+            worker_status_count += 1;
+            const task_id = obj.get("taskId") orelse unreachable;
+            try std.testing.expect(task_id.integer > 0);
+            continue;
+        }
+
+        if (std.mem.eql(u8, message_type.string, "agent.progress")) {
+            saw_worker_progress = true;
+            const phase = obj.get("phase") orelse continue;
+            if (std.mem.eql(u8, phase.string, "planner")) {
+                const status = obj.get("status") orelse continue;
+                if (std.mem.eql(u8, status.string, "received")) saw_planner_received = true;
+            }
+            if (phase.string.len > 0) {
+                saw_worker_status = true;
+            }
+            continue;
+        }
+    }
+
+    try std.testing.expect(saw_plan);
+    try std.testing.expect(saw_planner_received);
+    try std.testing.expect(saw_worker_status);
+    try std.testing.expect(saw_worker_progress);
+    try std.testing.expect(saw_status);
+    try std.testing.expect(worker_status_count > 0);
 }
