@@ -1,6 +1,30 @@
 const std = @import("std");
 const ToolResult = @import("tool_registry.zig").ToolResult;
 
+/// Escape a string for JSON (handles quotes, backslashes, control chars)
+fn jsonEscape(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
+    var result = std.ArrayList(u8){};
+    errdefer result.deinit(allocator);
+
+    for (input) |c| {
+        switch (c) {
+            '"' => try result.appendSlice(allocator, "\\\""),
+            '\\' => try result.appendSlice(allocator, "\\\\"),
+            '\n' => try result.appendSlice(allocator, "\\n"),
+            '\r' => try result.appendSlice(allocator, "\\r"),
+            '\t' => try result.appendSlice(allocator, "\\t"),
+            // Backspace and form feed
+            0x08 => try result.appendSlice(allocator, "\\b"),
+            0x0C => try result.appendSlice(allocator, "\\f"),
+            // Other control chars
+            0x00...0x07, 0x0E...0x1F => try result.appendSlice(allocator, "\\u0000"),
+            else => try result.append(allocator, c),
+        }
+    }
+
+    return result.toOwnedSlice(allocator);
+}
+
 /// Built-in tool implementations
 pub const BuiltinTools = struct {
     /// Read file contents
@@ -156,11 +180,18 @@ pub const BuiltinTools = struct {
                 else => "other",
             };
 
+            // Escape filename for JSON
+            const escaped_name = jsonEscape(allocator, entry.name) catch {
+                result.deinit(allocator);
+                return .{ .failure = .{ .code = .execution_failed, .message = "Out of memory" } };
+            };
+            defer allocator.free(escaped_name);
+
             result.appendSlice(allocator, "  {\"name\":\"") catch {
                 result.deinit(allocator);
                 return .{ .failure = .{ .code = .execution_failed, .message = "Out of memory" } };
             };
-            result.appendSlice(allocator, entry.name) catch {
+            result.appendSlice(allocator, escaped_name) catch {
                 result.deinit(allocator);
                 return .{ .failure = .{ .code = .execution_failed, .message = "Out of memory" } };
             };
