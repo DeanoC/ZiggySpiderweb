@@ -56,16 +56,10 @@ pub const BuiltinTools = struct {
     /// Read file contents
     pub fn fileRead(allocator: std.mem.Allocator, args: std.json.ObjectMap) ToolResult {
         const path_value = args.get("path") orelse {
-            return .{ .failure = .{
-                .code = .invalid_params,
-                .message = allocator.dupe(u8, "Missing required parameter: path") catch return .{ .failure = .{ .code = .execution_failed, .message = "Out of memory" } },
-            } };
+            return fail(allocator, .invalid_params, "Missing required parameter: path");
         };
         if (path_value != .string) {
-            return .{ .failure = .{
-                .code = .invalid_params,
-                .message = allocator.dupe(u8, "Parameter 'path' must be a string") catch return .{ .failure = .{ .code = .execution_failed, .message = "Out of memory" } },
-            } };
+            return fail(allocator, .invalid_params, "Parameter 'path' must be a string");
         }
         const path = path_value.string;
 
@@ -78,7 +72,7 @@ pub const BuiltinTools = struct {
         }
 
         const content = std.fs.cwd().readFileAlloc(allocator, path, 1024 * 1024) catch |err| {
-            const msg = std.fmt.allocPrint(allocator, "Failed to read file: {s}", .{@errorName(err)}) catch return .{ .failure = .{ .code = .execution_failed, .message = "Failed to read file" } };
+            const msg = std.fmt.allocPrint(allocator, "Failed to read file: {s}", .{@errorName(err)}) catch return fail(allocator, .execution_failed, "Failed to read file");
             return .{ .failure = .{
                 .code = .execution_failed,
                 .message = msg,
@@ -91,23 +85,14 @@ pub const BuiltinTools = struct {
     /// Write file contents
     pub fn fileWrite(allocator: std.mem.Allocator, args: std.json.ObjectMap) ToolResult {
         const path_value = args.get("path") orelse {
-            return .{ .failure = .{
-                .code = .invalid_params,
-                .message = "Missing required parameter: path",
-            } };
+            return fail(allocator, .invalid_params, "Missing required parameter: path");
         };
         const content_value = args.get("content") orelse {
-            return .{ .failure = .{
-                .code = .invalid_params,
-                .message = "Missing required parameter: content",
-            } };
+            return fail(allocator, .invalid_params, "Missing required parameter: content");
         };
 
         if (path_value != .string or content_value != .string) {
-            return .{ .failure = .{
-                .code = .invalid_params,
-                .message = "Parameters 'path' and 'content' must be strings",
-            } };
+            return fail(allocator, .invalid_params, "Parameters 'path' and 'content' must be strings");
         }
 
         const path = path_value.string;
@@ -124,7 +109,7 @@ pub const BuiltinTools = struct {
         // Create parent directories if needed
         if (std.fs.path.dirname(path)) |dir| {
             std.fs.cwd().makePath(dir) catch |err| {
-                const msg = std.fmt.allocPrint(allocator, "Failed to create directory: {s}", .{@errorName(err)}) catch "Failed to create directory";
+                const msg = std.fmt.allocPrint(allocator, "Failed to create directory: {s}", .{@errorName(err)}) catch return fail(allocator, .execution_failed, "Failed to create directory");
                 return .{ .failure = .{
                     .code = .execution_failed,
                     .message = msg,
@@ -136,17 +121,14 @@ pub const BuiltinTools = struct {
             .sub_path = path,
             .data = content,
         }) catch |err| {
-            const msg = std.fmt.allocPrint(allocator, "Failed to write file: {s}", .{@errorName(err)}) catch "Failed to write file";
+            const msg = std.fmt.allocPrint(allocator, "Failed to write file: {s}", .{@errorName(err)}) catch return fail(allocator, .execution_failed, "Failed to write file");
             return .{ .failure = .{
                 .code = .execution_failed,
                 .message = msg,
             } };
         };
 
-        const msg = std.fmt.allocPrint(allocator, "File written successfully: {s}", .{path}) catch return .{ .failure = .{
-            .code = .execution_failed,
-            .message = "Out of memory",
-        } };
+        const msg = std.fmt.allocPrint(allocator, "File written successfully: {s}", .{path}) catch return fail(allocator, .execution_failed, "Out of memory");
         return .{ .success = .{ .content = msg } };
     }
 
@@ -166,7 +148,7 @@ pub const BuiltinTools = struct {
         }
 
         var dir = std.fs.cwd().openDir(path, .{ .iterate = true }) catch |err| {
-            const msg = std.fmt.allocPrint(allocator, "Failed to open directory: {s}", .{@errorName(err)}) catch "Failed to open directory";
+            const msg = std.fmt.allocPrint(allocator, "Failed to open directory: {s}", .{@errorName(err)}) catch return fail(allocator, .execution_failed, "Failed to open directory");
             return .{ .failure = .{
                 .code = .execution_failed,
                 .message = msg,
@@ -179,13 +161,13 @@ pub const BuiltinTools = struct {
 
         result.appendSlice(allocator, "[\n") catch {
             result.deinit(allocator);
-            return .{ .failure = .{ .code = .execution_failed, .message = "Out of memory" } };
+            return fail(allocator, .execution_failed, "Out of memory");
         };
 
         var it = dir.iterate();
         var first = true;
         while (it.next() catch |err| {
-            const msg = std.fmt.allocPrint(allocator, "Failed to iterate directory: {s}", .{@errorName(err)}) catch "Failed to iterate directory";
+            const msg = std.fmt.allocPrint(allocator, "Failed to iterate directory: {s}", .{@errorName(err)}) catch return fail(allocator, .execution_failed, "Failed to iterate directory");
             return .{ .failure = .{
                 .code = .execution_failed,
                 .message = msg,
@@ -194,7 +176,7 @@ pub const BuiltinTools = struct {
             if (!first) {
                 result.appendSlice(allocator, ",\n") catch {
                     result.deinit(allocator);
-                    return .{ .failure = .{ .code = .execution_failed, .message = "Out of memory" } };
+                    return fail(allocator, .execution_failed, "Out of memory");
                 };
             }
             first = false;
@@ -209,53 +191,47 @@ pub const BuiltinTools = struct {
             // Escape filename for JSON
             const escaped_name = jsonEscape(allocator, entry.name) catch {
                 result.deinit(allocator);
-                return .{ .failure = .{ .code = .execution_failed, .message = "Out of memory" } };
+                return fail(allocator, .execution_failed, "Out of memory");
             };
             defer allocator.free(escaped_name);
 
             result.appendSlice(allocator, "  {\"name\":\"") catch {
                 result.deinit(allocator);
-                return .{ .failure = .{ .code = .execution_failed, .message = "Out of memory" } };
+                return fail(allocator, .execution_failed, "Out of memory");
             };
             result.appendSlice(allocator, escaped_name) catch {
                 result.deinit(allocator);
-                return .{ .failure = .{ .code = .execution_failed, .message = "Out of memory" } };
+                return fail(allocator, .execution_failed, "Out of memory");
             };
             result.appendSlice(allocator, "\",\"type\":\"") catch {
                 result.deinit(allocator);
-                return .{ .failure = .{ .code = .execution_failed, .message = "Out of memory" } };
+                return fail(allocator, .execution_failed, "Out of memory");
             };
             result.appendSlice(allocator, entry_type) catch {
                 result.deinit(allocator);
-                return .{ .failure = .{ .code = .execution_failed, .message = "Out of memory" } };
+                return fail(allocator, .execution_failed, "Out of memory");
             };
             result.appendSlice(allocator, "\"}") catch {
                 result.deinit(allocator);
-                return .{ .failure = .{ .code = .execution_failed, .message = "Out of memory" } };
+                return fail(allocator, .execution_failed, "Out of memory");
             };
         }
 
         result.appendSlice(allocator, "\n]") catch {
             result.deinit(allocator);
-            return .{ .failure = .{ .code = .execution_failed, .message = "Out of memory" } };
+            return fail(allocator, .execution_failed, "Out of memory");
         };
 
-        return .{ .success = .{ .content = result.toOwnedSlice(allocator) catch return .{ .failure = .{ .code = .execution_failed, .message = "Out of memory" } }, .format = .json } };
+        return .{ .success = .{ .content = result.toOwnedSlice(allocator) catch return fail(allocator, .execution_failed, "Out of memory"), .format = .json } };
     }
 
     /// Search code using shell command
     pub fn searchCode(allocator: std.mem.Allocator, args: std.json.ObjectMap) ToolResult {
         const query_value = args.get("query") orelse {
-            return .{ .failure = .{
-                .code = .invalid_params,
-                .message = "Missing required parameter: query",
-            } };
+            return fail(allocator, .invalid_params, "Missing required parameter: query");
         };
         if (query_value != .string) {
-            return .{ .failure = .{
-                .code = .invalid_params,
-                .message = "Parameter 'query' must be a string",
-            } };
+            return fail(allocator, .invalid_params, "Parameter 'query' must be a string");
         }
         const query = query_value.string;
 
@@ -288,7 +264,7 @@ pub const BuiltinTools = struct {
                 const msg = std.fmt.allocPrint(allocator, "Search failed: rg={s}, grep={s}", .{
                     @errorName(err),
                     @errorName(grep_err),
-                }) catch "Search failed";
+                }) catch return fail(allocator, .execution_failed, "Search failed");
                 return .{ .failure = .{
                     .code = .execution_failed,
                     .message = msg,
@@ -298,16 +274,13 @@ pub const BuiltinTools = struct {
             if (grep_result.term.Exited != 0 and grep_result.term.Exited != 1) {
                 allocator.free(grep_result.stdout);
                 allocator.free(grep_result.stderr);
-                return .{ .failure = .{
-                    .code = .execution_failed,
-                    .message = "grep command failed",
-                } };
+                return fail(allocator, .execution_failed, "grep command failed");
             }
 
             const output = if (grep_result.stdout.len > 0)
                 grep_result.stdout
             else
-                allocator.dupe(u8, "No matches found") catch "No matches found";
+                allocator.dupe(u8, "No matches found") catch return fail(allocator, .execution_failed, "No matches found");
             allocator.free(grep_result.stderr);
 
             return .{ .success = .{ .content = output } };
@@ -316,16 +289,13 @@ pub const BuiltinTools = struct {
         if (result.term.Exited != 0 and result.term.Exited != 1) {
             allocator.free(result.stdout);
             allocator.free(result.stderr);
-            return .{ .failure = .{
-                .code = .execution_failed,
-                .message = "rg command failed",
-            } };
+            return fail(allocator, .execution_failed, "rg command failed");
         }
 
         const output = if (result.stdout.len > 0)
             result.stdout
         else
-            allocator.dupe(u8, "No matches found") catch "No matches found";
+            allocator.dupe(u8, "No matches found") catch return fail(allocator, .execution_failed, "No matches found");
         allocator.free(result.stderr);
 
         return .{ .success = .{ .content = output } };
@@ -334,16 +304,10 @@ pub const BuiltinTools = struct {
     /// Execute shell command (restricted)
     pub fn shell(allocator: std.mem.Allocator, args: std.json.ObjectMap) ToolResult {
         const command_value = args.get("command") orelse {
-            return .{ .failure = .{
-                .code = .invalid_params,
-                .message = "Missing required parameter: command",
-            } };
+            return fail(allocator, .invalid_params, "Missing required parameter: command");
         };
         if (command_value != .string) {
-            return .{ .failure = .{
-                .code = .invalid_params,
-                .message = "Parameter 'command' must be a string",
-            } };
+            return fail(allocator, .invalid_params, "Parameter 'command' must be a string");
         }
         const command = command_value.string;
 
@@ -357,20 +321,17 @@ pub const BuiltinTools = struct {
         };
         for (blocked) |b| {
             if (std.mem.indexOf(u8, command, b) != null) {
-                return .{ .failure = .{
-                    .code = .permission_denied,
-                    .message = "Command blocked for security reasons",
-                } };
+                return fail(allocator, .permission_denied, "Command blocked for security reasons");
             }
         }
 
-        // Execute with timeout (using bash -c)
+        // Execute with 30 second timeout
         const result = std.process.Child.run(.{
             .allocator = allocator,
             .argv = &[_][]const u8{ "bash", "-c", command },
             .max_output_bytes = 1024 * 1024,
         }) catch |err| {
-            const msg = std.fmt.allocPrint(allocator, "Command execution failed: {s}", .{@errorName(err)}) catch "Command execution failed";
+            const msg = std.fmt.allocPrint(allocator, "Command execution failed: {s}", .{@errorName(err)}) catch return fail(allocator, .execution_failed, "Command execution failed");
             return .{ .failure = .{
                 .code = .execution_failed,
                 .message = msg,
@@ -392,7 +353,7 @@ pub const BuiltinTools = struct {
                     const m = std.fmt.allocPrint(allocator, "Command exited with code {d}: {s}", .{ exit_code, result.stderr }) catch {
                         allocator.free(result.stdout);
                         allocator.free(result.stderr);
-                        break :blk "Command failed";
+                        break :blk allocator.dupe(u8, "Command failed") catch return fail(allocator, .execution_failed, "Command failed");
                     };
                     allocator.free(result.stdout);
                     allocator.free(result.stderr);
@@ -401,7 +362,7 @@ pub const BuiltinTools = struct {
                     const m = std.fmt.allocPrint(allocator, "Command exited with code {d}: {s}", .{ exit_code, result.stdout }) catch {
                         allocator.free(result.stdout);
                         allocator.free(result.stderr);
-                        break :blk "Command failed";
+                        break :blk allocator.dupe(u8, "Command failed") catch return fail(allocator, .execution_failed, "Command failed");
                     };
                     allocator.free(result.stdout);
                     allocator.free(result.stderr);
@@ -409,7 +370,7 @@ pub const BuiltinTools = struct {
                 } else {
                     allocator.free(result.stdout);
                     allocator.free(result.stderr);
-                    break :blk "Command failed with no output";
+                    break :blk allocator.dupe(u8, "Command failed with no output") catch return fail(allocator, .execution_failed, "Command failed");
                 }
             };
             return .{ .failure = .{ .code = .execution_failed, .message = msg } };
@@ -420,7 +381,7 @@ pub const BuiltinTools = struct {
         else if (result.stderr.len > 0)
             result.stderr
         else
-            allocator.dupe(u8, "Command completed with no output") catch "Command completed";
+            allocator.dupe(u8, "Command completed with no output") catch return fail(allocator, .execution_failed, "Command completed");
 
         if (result.stdout.len == 0 and result.stderr.len > 0) {
             allocator.free(result.stdout);

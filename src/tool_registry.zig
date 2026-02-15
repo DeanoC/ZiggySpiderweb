@@ -107,9 +107,10 @@ pub const ToolRegistry = struct {
         args: std.json.ObjectMap,
     ) ToolResult {
         const tool = self.get(name) orelse {
+            const msg = allocator.dupe(u8, "Tool not found") catch return .{ .failure = .{ .code = .execution_failed, .message = "OOM" } };
             return .{ .failure = .{
                 .code = .not_found,
-                .message = "Tool not found",
+                .message = msg,
             } };
         };
         return tool.handler(allocator, args);
