@@ -2692,3 +2692,68 @@ fn generateRandomId(state: *ServerState, len: usize) ![]u8 {
     for (key) |*c| c.* = SESSION_ID_ALPHABET[state.rng.random().int(u8) % SESSION_ID_ALPHABET.len];
     return key;
 }
+
+test "server_piai: sendAgentProgress emits valid outbound agent.progress payload" {
+    const allocator = std.testing.allocator;
+    var write_buf = std.ArrayListUnmanaged(u8){};
+    defer write_buf.deinit(allocator);
+
+    try sendAgentProgress(
+        allocator,
+        &write_buf,
+        "req-123",
+        "session-abc",
+        "planner",
+        "ready",
+        "Plan queued",
+    );
+
+    try std.testing.expect(write_buf.items.len > 2);
+    try std.testing.expectEqual(@as(u8, 0x81), write_buf.items[0]);
+
+    const json_start = std.mem.indexOf(u8, write_buf.items, "{") orelse unreachable;
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, write_buf.items[json_start..], .{});
+    defer parsed.deinit();
+
+    const obj = parsed.value.object;
+    try std.testing.expect(std.mem.eql(u8, obj.get("type").?.string, "agent.progress"));
+    try std.testing.expect(std.mem.eql(u8, obj.get("request").?.string, "req-123"));
+    try std.testing.expect(std.mem.eql(u8, obj.get("sessionKey").?.string, "session-abc"));
+    try std.testing.expect(std.mem.eql(u8, obj.get("phase").?.string, "planner"));
+    try std.testing.expect(std.mem.eql(u8, obj.get("status").?.string, "ready"));
+    try std.testing.expect(std.mem.eql(u8, obj.get("message").?.string, "Plan queued"));
+}
+
+test "server_piai: sendAgentStatus emits valid outbound agent.status payload" {
+    const allocator = std.testing.allocator;
+    var write_buf = std.ArrayListUnmanaged(u8){};
+    defer write_buf.deinit(allocator);
+
+    try sendAgentStatus(
+        allocator,
+        &write_buf,
+        "req-321",
+        "session-xyz",
+        2,
+        "research",
+        "complete",
+        "research: found 3 items",
+    );
+
+    try std.testing.expect(write_buf.items.len > 2);
+    try std.testing.expectEqual(@as(u8, 0x81), write_buf.items[0]);
+
+    const json_start = std.mem.indexOf(u8, write_buf.items, "{") orelse unreachable;
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, write_buf.items[json_start..], .{});
+    defer parsed.deinit();
+
+    const obj = parsed.value.object;
+    try std.testing.expect(std.mem.eql(u8, obj.get("type").?.string, "agent.status"));
+    try std.testing.expect(std.mem.eql(u8, obj.get("request").?.string, "req-321"));
+    try std.testing.expect(std.mem.eql(u8, obj.get("sessionKey").?.string, "session-xyz"));
+    const task_id = obj.get("taskId").?.integer;
+    try std.testing.expectEqual(@as(i64, 2), task_id);
+    try std.testing.expect(std.mem.eql(u8, obj.get("worker").?.string, "research"));
+    try std.testing.expect(std.mem.eql(u8, obj.get("status").?.string, "complete"));
+    try std.testing.expect(std.mem.eql(u8, obj.get("message").?.string, "research: found 3 items"));
+}

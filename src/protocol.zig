@@ -49,6 +49,7 @@ pub fn parseMessageType(json: []const u8) ?MessageType {
     // Simple string search for type field
     if (std.mem.indexOf(u8, json, "\"type\":\"connect\"") != null) return .connect;
     if (std.mem.indexOf(u8, json, "\"type\":\"session.send\"") != null) return .session_send;
+    if (std.mem.indexOf(u8, json, "\"type\":\"chat.send\"") != null) return .session_send;
     if (std.mem.indexOf(u8, json, "\"type\":\"ping\"") != null) return .ping;
     if (std.mem.indexOf(u8, json, "\"type\":\"pong\"") != null) return .pong;
     if (std.mem.indexOf(u8, json, "\"type\":\"disconnect\"") != null) return .disconnect;
@@ -112,6 +113,7 @@ test "protocol: parseMessageType handles core and agent message types" {
     }{
         .{ .json = "{\"type\":\"connect\"}", .expected = .connect },
         .{ .json = "{\"type\":\"session.send\"}", .expected = .session_send },
+        .{ .json = "{\"type\":\"chat.send\"}", .expected = .session_send },
         .{ .json = "{\"type\":\"agent.plan\"}", .expected = .agent_plan },
         .{ .json = "{\"type\":\"agent.progress\"}", .expected = .agent_progress },
         .{ .json = "{\"type\":\"agent.status\"}", .expected = .agent_status },
