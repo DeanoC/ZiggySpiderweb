@@ -39,7 +39,7 @@ const MAX_CONTEXT_BYTES = 16 * 1024;
 const MAX_INBOUND_MESSAGE_BYTES = 4 * 1024;
 const REQUEST_ID_LEN = 16;
 const SESSION_STATE_PATH = ".spiderweb-session-state.json";
-const SESSION_STATE_VERSION = 1;
+const SESSION_STATE_VERSION = 2;
 const LONG_TERM_ARCHIVE_DIR = ".spiderweb-ltm";
 const LTM_INDEX_FILENAME = "archive-index.ndjson";
 const LONG_TERM_ARCHIVE_VERSION = 1;
@@ -50,6 +50,9 @@ const LTM_RETENTION_KEEP_SNAPSHOTS_ENV = "SPIDERWEB_LTM_KEEP_SNAPSHOTS";
 const LTM_RETENTION_KEEP_DAYS_ENV = "SPIDERWEB_LTM_KEEP_DAYS";
 const AGENT_GOAL_PREFIX = "/goal ";
 const WORKER_MAX_PARALLELISM = 2;
+const WORKER_MAX_TASKS_PER_DISPATCH = 4;
+const WORKER_BACKPRESSURE_WARNING_MS: i64 = 30 * 1000;
+const WORKER_RECONNECTION_PROGRESS_ID = "session-restore";
 const MEMORY_MANAGER_SUMMARY_TRIGGER_NUM = 3;
 const MEMORY_MANAGER_SUMMARY_TRIGGER_DEN = 4;
 const MEMORY_MANAGER_SUMMARIES_PER_TICK = 2;
@@ -72,6 +75,13 @@ var streamByModelFn: StreamByModelFn = ziggy_piai.stream.streamByModel;
 const PersistedSession = struct {
     session_id: []u8,
     ram: memory.RamContext,
+    worker_queue_depth: usize,
+    worker_active_tasks: usize,
+    worker_mode: WorkerControlMode,
+    worker_dropped_tasks: usize,
+    worker_last_saturation_ms: i64,
+    worker_backpressure_notified: bool,
+    worker_last_goal: []const u8,
 };
 
 const ServerState = struct {
@@ -107,6 +117,9 @@ const SessionContext = struct {
     worker_active_tasks: usize,
     last_goal: []const u8,
     last_heartbeat_ms: i64,
+    worker_dropped_tasks: usize,
+    worker_last_saturation_ms: i64,
+    worker_backpressure_notified: bool,
 
     fn init(allocator: std.mem.Allocator) SessionContext {
         return .{
@@ -118,6 +131,9 @@ const SessionContext = struct {
             .worker_active_tasks = 0,
             .last_goal = &[_]u8{},
             .last_heartbeat_ms = 0,
+            .worker_dropped_tasks = 0,
+            .worker_last_saturation_ms = 0,
+            .worker_backpressure_notified = false,
         };
     }
 
@@ -138,6 +154,9 @@ const SessionContext = struct {
         self.worker_queue_depth = 0;
         self.worker_active_tasks = 0;
         self.last_heartbeat_ms = 0;
+        self.worker_dropped_tasks = 0;
+        self.worker_last_saturation_ms = 0;
+        self.worker_backpressure_notified = false;
     }
 
     fn setLastGoal(self: *SessionContext, allocator: std.mem.Allocator, goal: []const u8) !void {
@@ -149,6 +168,12 @@ const SessionContext = struct {
         self.worker_mode = mode;
     }
 
+    fn markWorkerSaturation(self: *SessionContext, dropped_tasks: usize) void {
+        self.worker_dropped_tasks = dropped_tasks;
+        self.worker_last_saturation_ms = if (dropped_tasks == 0) 0 else std.time.milliTimestamp();
+        self.worker_backpressure_notified = false;
+    }
+
     fn resetWorkerState(self: *SessionContext, allocator: std.mem.Allocator) void {
         if (self.last_goal.len > 0) allocator.free(self.last_goal);
         self.last_goal = &[_]u8{};
@@ -156,6 +181,9 @@ const SessionContext = struct {
         self.worker_queue_depth = 0;
         self.worker_active_tasks = 0;
         self.last_heartbeat_ms = 0;
+        self.worker_dropped_tasks = 0;
+        self.worker_last_saturation_ms = 0;
+        self.worker_backpressure_notified = false;
     }
 
     fn setIdentityPrompt(self: *SessionContext, allocator: std.mem.Allocator, prompt: []const u8) !void {
@@ -590,8 +618,11 @@ fn processHandshake(
         conn.state = .websocket;
 
         const requested_session_id = parseSessionIdFromRequest(request);
+        var restored_session = false;
         if (requested_session_id) |requested| {
-            restoreSessionFromPersistedWithId(allocator, persisted_sessions, &conn.session, requested) catch |err| {
+            if (restoreSessionFromPersistedWithId(allocator, persisted_sessions, &conn.session, requested)) {
+                restored_session = true;
+            } else |err| {
                 if (err != error.SessionNotFound) {
                     return err;
                 }
@@ -603,8 +634,9 @@ fn processHandshake(
                 }
                 if (restored_from_archive) {
                     std.log.info("Session restored from archive: session={s}", .{requested});
+                    restored_session = true;
                 }
-            };
+            }
         }
 
         if (conn.session.session_id.len == 0) {
@@ -623,6 +655,37 @@ fn processHandshake(
         std.log.info("Session established: fd={any} sessionKey={s}", .{ conn.fd, conn.session.session_id });
 
         try appendWsFrame(allocator, &conn.write_buf, ack_msg, .text);
+
+        if (restored_session) {
+            const has_backlog = conn.session.worker_queue_depth > 0 or conn.session.worker_active_tasks > 0 or conn.session.worker_dropped_tasks > 0;
+            const reconnect_status = if (has_backlog) "backpressure_resumed" else "state_restored";
+            const reconnect_message = if (has_backlog)
+                try std.fmt.allocPrint(
+                    allocator,
+                    "Session restored with backlog: {d} queued, {d} active, {d} dropped tasks from previous run.",
+                    .{
+                        conn.session.worker_queue_depth,
+                        conn.session.worker_active_tasks,
+                        conn.session.worker_dropped_tasks,
+                    },
+                )
+            else
+                try std.fmt.allocPrint(
+                    allocator,
+                    "Session restored from previous process state: {s}",
+                    .{conn.session.last_goal},
+                );
+            defer allocator.free(reconnect_message);
+            try sendAgentProgress(
+                allocator,
+                &conn.write_buf,
+                WORKER_RECONNECTION_PROGRESS_ID,
+                conn.session.session_id,
+                "reconnect",
+                reconnect_status,
+                reconnect_message,
+            );
+        }
     }
 }
 
@@ -982,18 +1045,44 @@ fn handleUserMessage(allocator: std.mem.Allocator, state: *ServerState, pool: *s
 
         is_planned_goal = true;
         const max_workers = if (WORKER_MAX_PARALLELISM == 0) 1 else WORKER_MAX_PARALLELISM;
-        conn.session.worker_queue_depth = if (plan.tasks.items.len > max_workers)
-            (plan.tasks.items.len - max_workers)
+        const accepted_task_count = @min(plan.tasks.items.len, WORKER_MAX_TASKS_PER_DISPATCH);
+        const dropped_task_count = plan.tasks.items.len - accepted_task_count;
+        conn.session.worker_queue_depth = if (accepted_task_count > max_workers)
+            accepted_task_count - max_workers
         else
             0;
-        conn.session.worker_active_tasks = @min(plan.tasks.items.len, max_workers);
+        conn.session.worker_active_tasks = @min(accepted_task_count, max_workers);
+        conn.session.markWorkerSaturation(dropped_task_count);
         try conn.session.setLastGoal(allocator, goal);
         const plan_memory = try orchestrator.formatPlanMemoryText(allocator, &plan);
         defer allocator.free(plan_memory);
+        const executed_tasks = plan.tasks.items[0..accepted_task_count];
 
         try sendAgentProgress(allocator, &conn.write_buf, request_id, conn.session.session_id, "planner", "received", "Planning request received");
         try sendAgentPlan(allocator, &conn.write_buf, request_id, conn.session.session_id, plan.goal, plan.tasks);
         try sendAgentProgress(allocator, &conn.write_buf, request_id, conn.session.session_id, "planner", "ready", plan.response_text);
+        if (dropped_task_count > 0) {
+            const saturation_msg = try std.fmt.allocPrint(
+                allocator,
+                "Worker queue saturation: accepted {d}/{d} plan tasks; {d} dropped",
+                .{ accepted_task_count, plan.tasks.items.len, dropped_task_count },
+            );
+            defer allocator.free(saturation_msg);
+            try sendAgentProgressWithBackpressure(
+                allocator,
+                &conn.write_buf,
+                request_id,
+                conn.session.session_id,
+                "planner",
+                "saturated",
+                saturation_msg,
+                accepted_task_count,
+                plan.tasks.items.len,
+                dropped_task_count,
+                conn.session.worker_queue_depth,
+                conn.session.worker_active_tasks,
+            );
+        }
         try sendAgentProgress(
             allocator,
             &conn.write_buf,
@@ -1041,7 +1130,7 @@ fn handleUserMessage(allocator: std.mem.Allocator, state: *ServerState, pool: *s
 
             workers.executePlanWorkers(
                 allocator,
-                plan.tasks.items,
+                executed_tasks,
                 max_workers,
                 &worker_results,
             ) catch |err| {
@@ -1332,6 +1421,36 @@ fn runHeartbeatCheck(
     const queued_tasks = conn.session.worker_queue_depth;
     if (queued_tasks == 0 and active_tasks == 0) return;
     if (conn.session.last_goal.len == 0) return;
+    const dropped_tasks = conn.session.worker_dropped_tasks;
+
+    if (dropped_tasks > 0 and
+        !conn.session.worker_backpressure_notified and
+        conn.session.worker_last_saturation_ms > 0 and
+        (now - conn.session.worker_last_saturation_ms) >= WORKER_BACKPRESSURE_WARNING_MS)
+    {
+        const alert_message = try std.fmt.allocPrint(
+            allocator,
+            "Backpressure persisted for the last {d}ms; {d} dropped tasks were deferred on prior dispatch.",
+            .{ now - conn.session.worker_last_saturation_ms, dropped_tasks },
+        );
+        defer allocator.free(alert_message);
+        conn.session.worker_backpressure_notified = true;
+        const accepted = queued_tasks + active_tasks;
+        try sendAgentProgressWithBackpressure(
+            allocator,
+            &conn.write_buf,
+            request_id,
+            conn.session.session_id,
+            "planner",
+            "prolonged_saturation",
+            alert_message,
+            accepted,
+            accepted + dropped_tasks,
+            dropped_tasks,
+            queued_tasks,
+            active_tasks,
+        );
+    }
 
     if (conn.session.worker_mode == .cancelled) return;
 
@@ -1591,11 +1710,65 @@ fn sendAgentProgress(
     try appendWsFrame(allocator, write_buf, payload, .text);
 }
 
+fn sendAgentProgressWithBackpressure(
+    allocator: std.mem.Allocator,
+    write_buf: *std.ArrayListUnmanaged(u8),
+    request_id: []const u8,
+    session_id: []const u8,
+    phase: []const u8,
+    status: []const u8,
+    message: []const u8,
+    accepted: usize,
+    total: usize,
+    dropped: usize,
+    queued: usize,
+    active: usize,
+) !void {
+    const escaped_request_id = try protocol.jsonEscape(allocator, request_id);
+    defer allocator.free(escaped_request_id);
+    const escaped_session_id = try protocol.jsonEscape(allocator, session_id);
+    defer allocator.free(escaped_session_id);
+    const escaped_phase = try protocol.jsonEscape(allocator, phase);
+    defer allocator.free(escaped_phase);
+    const escaped_status = try protocol.jsonEscape(allocator, status);
+    defer allocator.free(escaped_status);
+    const escaped_message = try protocol.jsonEscape(allocator, message);
+    defer allocator.free(escaped_message);
+
+    const payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"type\":\"agent.progress\",\"request\":\"{s}\",\"sessionKey\":\"{s}\",\"phase\":\"{s}\",\"status\":\"{s}\",\"message\":\"{s}\",\"accepted\":{d},\"total\":{d},\"dropped\":{d},\"queued\":{d},\"active\":{d}}}",
+        .{
+            escaped_request_id,
+            escaped_session_id,
+            escaped_phase,
+            escaped_status,
+            escaped_message,
+            accepted,
+            total,
+            dropped,
+            queued,
+            active,
+        },
+    );
+    defer allocator.free(payload);
+
+    try appendWsFrame(allocator, write_buf, payload, .text);
+}
+
 fn workerModeLabel(mode: WorkerControlMode) []const u8 {
     return switch (mode) {
         .running => "workers.running",
         .paused => "workers.paused",
         .cancelled => "workers.cancelled",
+    };
+}
+
+fn workerModeName(mode: WorkerControlMode) []const u8 {
+    return switch (mode) {
+        .running => "running",
+        .paused => "paused",
+        .cancelled => "cancelled",
     };
 }
 
@@ -2828,6 +3001,7 @@ fn deinitPersistedSessions(allocator: std.mem.Allocator, sessions: *std.ArrayLis
     for (sessions.items) |*session| {
         session.ram.deinit();
         allocator.free(session.session_id);
+        if (session.worker_last_goal.len > 0) allocator.free(session.worker_last_goal);
     }
     sessions.deinit(allocator);
 }
@@ -2862,6 +3036,17 @@ fn upsertPersistedSession(allocator: std.mem.Allocator, persisted_sessions: *std
     for (persisted_sessions.items) |*persisted| {
         if (std.mem.eql(u8, persisted.session_id, session.session_id)) {
             try copyRamContext(allocator, &session.ram, &persisted.ram);
+            if (persisted.worker_last_goal.len > 0) allocator.free(persisted.worker_last_goal);
+            persisted.worker_queue_depth = session.worker_queue_depth;
+            persisted.worker_active_tasks = session.worker_active_tasks;
+            persisted.worker_mode = session.worker_mode;
+            persisted.worker_dropped_tasks = session.worker_dropped_tasks;
+            persisted.worker_last_saturation_ms = session.worker_last_saturation_ms;
+            persisted.worker_backpressure_notified = session.worker_backpressure_notified;
+            persisted.worker_last_goal = if (session.last_goal.len > 0)
+                try allocator.dupe(u8, session.last_goal)
+            else
+                &[_]u8{};
             return;
         }
     }
@@ -2871,6 +3056,16 @@ fn upsertPersistedSession(allocator: std.mem.Allocator, persisted_sessions: *std
     try persisted_sessions.append(allocator, .{
         .session_id = try allocator.dupe(u8, session.session_id),
         .ram = restored,
+        .worker_queue_depth = session.worker_queue_depth,
+        .worker_active_tasks = session.worker_active_tasks,
+        .worker_mode = session.worker_mode,
+        .worker_dropped_tasks = session.worker_dropped_tasks,
+        .worker_last_saturation_ms = session.worker_last_saturation_ms,
+        .worker_backpressure_notified = session.worker_backpressure_notified,
+        .worker_last_goal = if (session.last_goal.len > 0)
+            try allocator.dupe(u8, session.last_goal)
+        else
+            &[_]u8{},
     });
 }
 
@@ -2918,7 +3113,16 @@ fn savePersistedSessions(
 
         try file.writeAll("{\"session_id\":");
         try writeJsonEscaped(allocator, file, session.session_id);
-        try writeFormatted(allocator, file, ",\"next_id\":{d},\"entries\":[", .{session.ram.next_id});
+        try writeFormatted(allocator, file, ",\"next_id\":{d}", .{session.ram.next_id});
+        try writeFormatted(allocator, file, ",\"workerQueueDepth\":{d}", .{session.worker_queue_depth});
+        try writeFormatted(allocator, file, ",\"workerActiveTasks\":{d}", .{session.worker_active_tasks});
+        try writeFormatted(allocator, file, ",\"workerMode\":\"{s}\"", .{workerModeName(session.worker_mode)});
+        try writeFormatted(allocator, file, ",\"workerDroppedTasks\":{d}", .{session.worker_dropped_tasks});
+        try writeFormatted(allocator, file, ",\"workerLastSaturationMs\":{d}", .{session.worker_last_saturation_ms});
+        try writeFormatted(allocator, file, ",\"workerBackpressureNotified\":{s}", .{if (session.worker_backpressure_notified) "true" else "false"});
+        try file.writeAll(",\"workerLastGoal\":");
+        try writeJsonEscaped(allocator, file, session.worker_last_goal);
+        try file.writeAll(",\"entries\":[");
 
         var first_entry = true;
         for (session.ram.entries.items) |entry| {
@@ -2972,6 +3176,13 @@ fn parseRole(text: []const u8) ?ziggy_piai.types.MessageRole {
 fn parseRamEntryState(text: []const u8) ?memory.RamEntryState {
     if (std.mem.eql(u8, text, "active")) return .active;
     if (std.mem.eql(u8, text, "tombstone")) return .tombstone;
+    return null;
+}
+
+fn parseWorkerMode(text: []const u8) ?WorkerControlMode {
+    if (std.mem.eql(u8, text, "running")) return .running;
+    if (std.mem.eql(u8, text, "paused")) return .paused;
+    if (std.mem.eql(u8, text, "cancelled")) return .cancelled;
     return null;
 }
 
@@ -3044,7 +3255,7 @@ fn loadPersistedSessions(allocator: std.mem.Allocator) !std.ArrayListUnmanaged(P
 
     if (parsed.value != .object) return sessions;
     const version = if (parsed.value.object.get("version")) |v| parsePositiveInteger(v) orelse SESSION_STATE_VERSION else SESSION_STATE_VERSION;
-    if (version != SESSION_STATE_VERSION) return sessions;
+    if (version > SESSION_STATE_VERSION or version == 0) return sessions;
 
     const sessions_value = parsed.value.object.get("sessions") orelse return sessions;
     if (sessions_value != .array) return sessions;
@@ -3113,9 +3324,33 @@ fn loadPersistedSessions(allocator: std.mem.Allocator) !std.ArrayListUnmanaged(P
             }
         }
 
+        const worker_queue_depth = if (session_obj.get("workerQueueDepth")) |value| parsePositiveInteger(value) orelse 0 else 0;
+        const worker_active_tasks = if (session_obj.get("workerActiveTasks")) |value| parsePositiveInteger(value) orelse 0 else 0;
+        const worker_mode = if (session_obj.get("workerMode")) |value|
+            if (value == .string) parseWorkerMode(value.string) orelse .running
+        else
+            .running;
+        const worker_dropped_tasks = if (session_obj.get("workerDroppedTasks")) |value| parsePositiveInteger(value) orelse 0 else 0;
+        const worker_last_saturation_ms = if (session_obj.get("workerLastSaturationMs")) |value|
+            if (value == .integer) value.integer else 0
+        else
+            0;
+        const worker_backpressure_notified = if (session_obj.get("workerBackpressureNotified")) |value|
+            if (value == .bool) value.bool else false
+        else
+            false;
+        const worker_last_goal = if (session_obj.get("workerLastGoal")) |value| if (value == .string) value.string else "" else "";
+
         try sessions.append(allocator, .{
             .session_id = try allocator.dupe(u8, session_id_value.string),
             .ram = context,
+            .worker_queue_depth = worker_queue_depth,
+            .worker_active_tasks = worker_active_tasks,
+            .worker_mode = worker_mode,
+            .worker_dropped_tasks = worker_dropped_tasks,
+            .worker_last_saturation_ms = worker_last_saturation_ms,
+            .worker_backpressure_notified = worker_backpressure_notified,
+            .worker_last_goal = try allocator.dupe(u8, worker_last_goal),
         });
     }
 
@@ -3137,6 +3372,15 @@ fn restoreSessionFromPersistedWithId(
         const recovered = persisted_sessions.orderedRemove(i);
         session.ram = recovered.ram;
         session.session_id = recovered.session_id;
+        session.worker_queue_depth = recovered.worker_queue_depth;
+        session.worker_active_tasks = recovered.worker_active_tasks;
+        session.worker_mode = recovered.worker_mode;
+        session.worker_dropped_tasks = recovered.worker_dropped_tasks;
+        session.worker_last_saturation_ms = recovered.worker_last_saturation_ms;
+        session.worker_backpressure_notified = recovered.worker_backpressure_notified;
+        if (session.last_goal.len > 0) allocator.free(session.last_goal);
+        session.last_goal = recovered.worker_last_goal;
+        recovered.worker_last_goal = &[_]u8{};
         std.log.info("Restored session state: {s}", .{session.session_id});
         return;
     }
@@ -3403,6 +3647,68 @@ test "server_piai: runHeartbeatCheck emits heartbeat progress for running backlo
     try std.testing.expect(std.mem.eql(u8, obj.get("status").?.string, "watching"));
 }
 
+test "server_piai: runHeartbeatCheck emits prolonged saturation progress after warning period" {
+    const allocator = std.testing.allocator;
+
+    var conn = Connection.init(allocator, 0);
+    defer {
+        conn.read_buf.deinit(allocator);
+        conn.write_buf.deinit(allocator);
+        conn.session.deinit(allocator);
+    }
+
+    const now = std.time.milliTimestamp();
+    try conn.session.setSessionId(allocator, "session-heartbeat-saturation-1");
+    try conn.session.setLastGoal(allocator, "replay dropped plan tasks");
+    conn.session.worker_queue_depth = 4;
+    conn.session.worker_active_tasks = 1;
+    conn.session.worker_dropped_tasks = 3;
+    conn.session.worker_last_saturation_ms = now - WORKER_BACKPRESSURE_WARNING_MS - 250;
+    conn.session.last_heartbeat_ms = now - HEARTBEAT_INTERVAL_MS - 10;
+
+    try runHeartbeatCheck(allocator, &conn, "req-heartbeat", false);
+
+    const payloads = try collectWebSocketPayloads(allocator, conn.write_buf.items);
+    defer {
+        for (payloads.items) |payload| allocator.free(payload);
+        payloads.deinit(allocator);
+    }
+
+    var saw_prolonged_saturation = false;
+    var saw_watching = false;
+    for (payloads.items) |payload| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
+        defer parsed.deinit();
+        const obj = parsed.value.object;
+        const message_type = obj.get("type") orelse continue;
+        if (!std.mem.eql(u8, message_type.string, "agent.progress")) continue;
+        const phase = obj.get("phase") orelse continue;
+        if (std.mem.eql(u8, phase.string, "planner")) {
+            const status = obj.get("status") orelse continue;
+            if (std.mem.eql(u8, status.string, "prolonged_saturation")) {
+                saw_prolonged_saturation = true;
+                const accepted = obj.get("accepted").?.integer;
+                const total = obj.get("total").?.integer;
+                const dropped = obj.get("dropped").?.integer;
+                const queued = obj.get("queued").?.integer;
+                const active = obj.get("active").?.integer;
+                try std.testing.expectEqual(@as(i64, 5), accepted);
+                try std.testing.expectEqual(@as(i64, 8), total);
+                try std.testing.expectEqual(@as(i64, 3), dropped);
+                try std.testing.expectEqual(@as(i64, 4), queued);
+                try std.testing.expectEqual(@as(i64, 1), active);
+            }
+            continue;
+        }
+        if (std.mem.eql(u8, phase.string, "heartbeat")) {
+            saw_watching = true;
+        }
+    }
+
+    try std.testing.expect(saw_prolonged_saturation);
+    try std.testing.expect(saw_watching);
+}
+
 test "server_piai: agent.control heartbeat action emits heartbeat progress" {
     const allocator = std.testing.allocator;
 
@@ -3589,6 +3895,182 @@ fn mockStreamByModel(
             .usage = .{ .total_tokens = 5 },
         },
     });
+}
+
+fn mockStreamByModelError(
+    allocator: std.mem.Allocator,
+    _: *std.http.Client,
+    _: *ziggy_piai.api_registry.ApiRegistry,
+    _: ziggy_piai.types.Model,
+    _: ziggy_piai.types.Context,
+    _: ziggy_piai.types.StreamOptions,
+    events: *std.array_list.Managed(ziggy_piai.types.AssistantMessageEvent),
+) !void {
+    _ = allocator;
+    try events.append(.{
+        .err = "mock stream unavailable",
+    });
+}
+
+test "server_piai: handshake restores persisted session context on matching session key" {
+    const allocator = std.testing.allocator;
+
+    var model_registry = ziggy_piai.models.ModelRegistry.init(allocator);
+    defer model_registry.deinit();
+    try ziggy_piai.models.registerDefaultModels(&model_registry);
+
+    var api_registry = ziggy_piai.api_registry.ApiRegistry.init(allocator);
+    defer api_registry.deinit();
+    try ziggy_piai.providers.register_builtins.registerBuiltInApiProviders(&api_registry);
+
+    var http_client = std.http.Client{ .allocator = allocator };
+    defer http_client.deinit();
+
+    var state = ServerState{
+        .allocator = allocator,
+        .rng = std.Random.DefaultPrng.init(0xBADC0FFEE),
+        .model_registry = model_registry,
+        .api_registry = api_registry,
+        .http_client = http_client,
+        .provider_config = .{
+            .name = "openai",
+            .model = "gpt-4o-mini",
+            .api_key = "mock-api-key",
+            .base_url = "https://example.invalid",
+        },
+        .ltm_store = null,
+    };
+
+    var conn = Connection.init(allocator, 0);
+    defer {
+        conn.read_buf.deinit(allocator);
+        conn.write_buf.deinit(allocator);
+        conn.session.deinit(allocator);
+    }
+
+    var restored_ram = memory.RamContext.init(allocator, MAX_CONTEXT_MESSAGES, MAX_CONTEXT_BYTES);
+    _ = try restored_ram.update(.user, "restored content");
+
+    var persisted_sessions = std.ArrayListUnmanaged(PersistedSession){};
+    defer deinitPersistedSessions(allocator, &persisted_sessions);
+    try persisted_sessions.append(allocator, .{
+        .session_id = try allocator.dupe(u8, "restored-session-1"),
+        .ram = restored_ram,
+        .worker_queue_depth = 0,
+        .worker_active_tasks = 0,
+        .worker_mode = .running,
+        .worker_dropped_tasks = 0,
+        .worker_last_saturation_ms = 0,
+        .worker_backpressure_notified = false,
+        .worker_last_goal = &[_]u8{},
+    });
+
+    const handshake = "GET /v1/agents/default/stream?session=restored-session-1 HTTP/1.1\r\n" ++
+        "Host: localhost\r\n" ++
+        "Upgrade: websocket\r\n" ++
+        "Connection: Upgrade\r\n" ++
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" ++
+        "Sec-WebSocket-Version: 13\r\n" ++
+        "\r\n";
+    try conn.read_buf.appendSlice(allocator, handshake);
+
+    try processHandshake(allocator, &state, &persisted_sessions, &conn);
+    try std.testing.expectEqual(ConnectionState.websocket, conn.state);
+    try std.testing.expect(std.mem.eql(u8, conn.session.session_id, "restored-session-1"));
+    try std.testing.expect(persisted_sessions.items.len == 0);
+}
+
+test "server_piai: handshake restores session context from LTM db snapshot" {
+    const allocator = std.testing.allocator;
+
+    var model_registry = ziggy_piai.models.ModelRegistry.init(allocator);
+    defer model_registry.deinit();
+    try ziggy_piai.models.registerDefaultModels(&model_registry);
+
+    var api_registry = ziggy_piai.api_registry.ApiRegistry.init(allocator);
+    defer api_registry.deinit();
+    try ziggy_piai.providers.register_builtins.registerBuiltInApiProviders(&api_registry);
+
+    var http_client = std.http.Client{ .allocator = allocator };
+    defer http_client.deinit();
+
+    const ltm_dir = try std.fmt.allocPrint(allocator, ".tmp-ltm-restore-{d}", .{std.time.milliTimestamp()});
+    defer allocator.free(ltm_dir);
+    std.fs.cwd().makePath(ltm_dir) catch |err| {
+        if (err != error.PathAlreadyExists) return err;
+    };
+
+    var state = ServerState{
+        .allocator = allocator,
+        .rng = std.Random.DefaultPrng.init(0xBADC0FFEE),
+        .model_registry = model_registry,
+        .api_registry = api_registry,
+        .http_client = http_client,
+        .provider_config = .{
+            .name = "openai",
+            .model = "gpt-4o-mini",
+            .api_key = "mock-api-key",
+            .base_url = "https://example.invalid",
+        },
+        .ltm_store = null,
+    };
+    state.ltm_store = try ltm_store.Store.open(allocator, ltm_dir, LTM_DB_FILENAME);
+    defer {
+        if (state.ltm_store) |*store| {
+            store.close();
+        }
+        std.fs.cwd().deleteTree(ltm_dir) catch {};
+    }
+
+    var persisted_conn = Connection.init(allocator, 0);
+    try persisted_conn.session.setSessionId(allocator, "ltm-session-restore-1");
+    defer {
+        persisted_conn.read_buf.deinit(allocator);
+        persisted_conn.write_buf.deinit(allocator);
+        persisted_conn.session.deinit(allocator);
+    }
+
+    _ = try persisted_conn.session.appendMessage(allocator, .user, "restored user message");
+    _ = try persisted_conn.session.appendMessage(allocator, .assistant, "restored assistant message");
+    try std.testing.expect(archiveSessionRamToLongTerm(&state, allocator, &persisted_conn.session, "manual pre-stop snapshot"));
+
+    var conn = Connection.init(allocator, 0);
+    defer {
+        conn.read_buf.deinit(allocator);
+        conn.write_buf.deinit(allocator);
+        conn.session.deinit(allocator);
+    }
+
+    var persisted_sessions = std.ArrayListUnmanaged(PersistedSession){};
+    defer deinitPersistedSessions(allocator, &persisted_sessions);
+
+    const handshake = "GET /v1/agents/default/stream?session=ltm-session-restore-1 HTTP/1.1\r\n" ++
+        "Host: localhost\r\n" ++
+        "Upgrade: websocket\r\n" ++
+        "Connection: Upgrade\r\n" ++
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" ++
+        "Sec-WebSocket-Version: 13\r\n" ++
+        "\r\n";
+    try conn.read_buf.appendSlice(allocator, handshake);
+
+    try processHandshake(allocator, &state, &persisted_sessions, &conn);
+    try std.testing.expectEqual(ConnectionState.websocket, conn.state);
+    try std.testing.expect(std.mem.eql(u8, conn.session.session_id, "ltm-session-restore-1"));
+    try std.testing.expect(conn.session.ram.entries.items.len == 2);
+    try std.testing.expect(conn.session.ram.summaries.items.len == 0);
+
+    var saw_restored_user = false;
+    var saw_restored_assistant = false;
+    for (conn.session.ram.entries.items) |entry| {
+        if (entry.message.role == .user and std.mem.eql(u8, entry.message.content, "restored user message")) {
+            saw_restored_user = true;
+        }
+        if (entry.message.role == .assistant and std.mem.eql(u8, entry.message.content, "restored assistant message")) {
+            saw_restored_assistant = true;
+        }
+    }
+    try std.testing.expect(saw_restored_user);
+    try std.testing.expect(saw_restored_assistant);
 }
 
 test "server_piai: processWebSocket handles masked chat.send and emits session.receive" {
@@ -3826,6 +4308,56 @@ test "server_piai: handleUserMessage with chat.send runs mocked stream and emits
     try std.testing.expect(std.mem.eql(u8, obj.get("type").?.string, "session.receive"));
     try std.testing.expect(std.mem.eql(u8, obj.get("content").?.string, "mocked model reply"));
     try std.testing.expect(obj.get("memoryId").?.integer > 0);
+}
+
+test "server_piai: mocked provider stream error emits error payload" {
+    const allocator = std.testing.allocator;
+    const original_stream_fn = streamByModelFn;
+    defer { streamByModelFn = original_stream_fn; }
+    streamByModelFn = mockStreamByModelError;
+
+    var model_registry = ziggy_piai.models.ModelRegistry.init(allocator);
+    defer model_registry.deinit();
+    try ziggy_piai.models.registerDefaultModels(&model_registry);
+
+    var api_registry = ziggy_piai.api_registry.ApiRegistry.init(allocator);
+    defer api_registry.deinit();
+    try ziggy_piai.providers.register_builtins.registerBuiltInApiProviders(&api_registry);
+
+    var http_client = std.http.Client{ .allocator = allocator };
+    defer http_client.deinit();
+
+    var state = ServerState{
+        .allocator = allocator,
+        .rng = std.Random.DefaultPrng.init(0xBADC0FFEE),
+        .model_registry = model_registry,
+        .api_registry = api_registry,
+        .http_client = http_client,
+        .provider_config = .{
+            .name = "openai",
+            .model = "gpt-4o-mini",
+            .api_key = "mock-api-key",
+            .base_url = "https://example.invalid",
+        },
+        .ltm_store = null,
+    };
+
+    var conn = Connection.init(allocator, 0);
+    try conn.session.setSessionId(allocator, "session-mock-error");
+    defer {
+        conn.read_buf.deinit(allocator);
+        conn.write_buf.deinit(allocator);
+        conn.session.deinit(allocator);
+    }
+
+    try processAiStreaming(allocator, &state, &conn, "req-err-001", false);
+
+    const payload = try decodeFirstWebSocketPayload(conn.write_buf.items);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    try std.testing.expect(std.mem.eql(u8, obj.get("type").?.string, "error"));
+    try std.testing.expect(std.mem.eql(u8, obj.get("message").?.string, "mock stream unavailable"));
 }
 
 test "server_piai: agent.control action state emits agent.state snapshot" {
@@ -4179,4 +4711,261 @@ test "server_piai: agent.control goal emits plan and worker events" {
     try std.testing.expect(saw_worker_progress);
     try std.testing.expect(saw_status);
     try std.testing.expect(worker_status_count > 0);
+}
+
+test "server_piai: plan task admission applies worker dispatch saturation cap" {
+    const allocator = std.testing.allocator;
+    const original_stream_fn = streamByModelFn;
+    defer { streamByModelFn = original_stream_fn; }
+    streamByModelFn = mockStreamByModel;
+
+    var model_registry = ziggy_piai.models.ModelRegistry.init(allocator);
+    defer model_registry.deinit();
+    try ziggy_piai.models.registerDefaultModels(&model_registry);
+
+    var api_registry = ziggy_piai.api_registry.ApiRegistry.init(allocator);
+    defer api_registry.deinit();
+    try ziggy_piai.providers.register_builtins.registerBuiltInApiProviders(&api_registry);
+
+    var http_client = std.http.Client{ .allocator = allocator };
+    defer http_client.deinit();
+
+    var state = ServerState{
+        .allocator = allocator,
+        .rng = std.Random.DefaultPrng.init(0xBADC0FFEE),
+        .model_registry = model_registry,
+        .api_registry = api_registry,
+        .http_client = http_client,
+        .provider_config = .{
+            .name = "openai",
+            .model = "gpt-4o-mini",
+            .api_key = "mock-api-key",
+            .base_url = "https://example.invalid",
+        },
+        .ltm_store = null,
+    };
+
+    var conn = Connection.init(allocator, 0);
+    try conn.session.setSessionId(allocator, "session-control-saturate-1");
+    defer {
+        conn.read_buf.deinit(allocator);
+        conn.write_buf.deinit(allocator);
+        conn.session.deinit(allocator);
+    }
+
+    {
+        var pool: std.Thread.Pool = undefined;
+        try pool.init(.{ .allocator = allocator });
+        defer pool.deinit();
+
+        const inbound = "{\"id\":\"req-030\",\"type\":\"agent.control\",\"goal\":\"a; b; c; d; e\"}";
+        try handleUserMessage(allocator, &state, &pool, &conn, inbound);
+    }
+
+    var payloads = try collectWebSocketPayloads(allocator, conn.write_buf.items);
+    defer {
+        for (payloads.items) |payload| allocator.free(payload);
+        payloads.deinit(allocator);
+    }
+
+    var saw_saturated = false;
+    var worker_status_count: usize = 0;
+    for (payloads.items) |payload| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
+        defer parsed.deinit();
+        const obj = parsed.value.object;
+
+        const message_type = obj.get("type") orelse continue;
+        if (std.mem.eql(u8, message_type.string, "agent.progress")) {
+            const phase = obj.get("phase") orelse continue;
+            if (std.mem.eql(u8, phase.string, "planner")) {
+                const status = obj.get("status") orelse continue;
+                if (std.mem.eql(u8, status.string, "saturated")) {
+                    saw_saturated = true;
+                    const accepted = obj.get("accepted").?.integer;
+                    const total = obj.get("total").?.integer;
+                    const dropped = obj.get("dropped").?.integer;
+                    const queued = obj.get("queued").?.integer;
+                    const active = obj.get("active").?.integer;
+                    try std.testing.expectEqual(@as(i64, 4), accepted);
+                    try std.testing.expectEqual(@as(i64, 5), total);
+                    try std.testing.expectEqual(@as(i64, 1), dropped);
+                    try std.testing.expectEqual(@as(i64, 2), queued);
+                    try std.testing.expectEqual(@as(i64, 2), active);
+                }
+            }
+            continue;
+        }
+
+        if (std.mem.eql(u8, message_type.string, "agent.status")) {
+            worker_status_count += 1;
+            continue;
+        }
+    }
+
+    try std.testing.expect(saw_saturated);
+    try std.testing.expect(worker_status_count > 0);
+    try std.testing.expect(worker_status_count < 5);
+}
+
+test "server_piai: handshake restore emits reconnect progress for restored session state" {
+    const allocator = std.testing.allocator;
+
+    var model_registry = ziggy_piai.models.ModelRegistry.init(allocator);
+    defer model_registry.deinit();
+    try ziggy_piai.models.registerDefaultModels(&model_registry);
+
+    var api_registry = ziggy_piai.api_registry.ApiRegistry.init(allocator);
+    defer api_registry.deinit();
+    try ziggy_piai.providers.register_builtins.registerBuiltInApiProviders(&api_registry);
+
+    var http_client = std.http.Client{ .allocator = allocator };
+    defer http_client.deinit();
+
+    var state = ServerState{
+        .allocator = allocator,
+        .rng = std.Random.DefaultPrng.init(0xBADC0FFEE),
+        .model_registry = model_registry,
+        .api_registry = api_registry,
+        .http_client = http_client,
+        .provider_config = .{
+            .name = "openai",
+            .model = "gpt-4o-mini",
+            .api_key = "mock-api-key",
+            .base_url = "https://example.invalid",
+        },
+        .ltm_store = null,
+    };
+
+    var conn = Connection.init(allocator, 0);
+    defer {
+        conn.read_buf.deinit(allocator);
+        conn.write_buf.deinit(allocator);
+        conn.session.deinit(allocator);
+    }
+
+    var persisted_ram = memory.RamContext.init(allocator, MAX_CONTEXT_MESSAGES, MAX_CONTEXT_BYTES);
+    _ = try persisted_ram.update(.user, "restored content");
+
+    var persisted_sessions = std.ArrayListUnmanaged(PersistedSession){};
+    defer deinitPersistedSessions(allocator, &persisted_sessions);
+    try persisted_sessions.append(allocator, .{
+        .session_id = try allocator.dupe(u8, "restored-session-2"),
+        .ram = persisted_ram,
+        .worker_queue_depth = 0,
+        .worker_active_tasks = 0,
+        .worker_mode = .running,
+        .worker_dropped_tasks = 0,
+        .worker_last_saturation_ms = 0,
+        .worker_backpressure_notified = false,
+        .worker_last_goal = try allocator.dupe(u8, "continue where we left off"),
+    });
+
+    const handshake = "GET /v1/agents/default/stream?session=restored-session-2 HTTP/1.1\r\n" ++
+        "Host: localhost\r\n" ++
+        "Upgrade: websocket\r\n" ++
+        "Connection: Upgrade\r\n" ++
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" ++
+        "Sec-WebSocket-Version: 13\r\n" ++
+        "\r\n";
+    try conn.read_buf.appendSlice(allocator, handshake);
+
+    try processHandshake(allocator, &state, &persisted_sessions, &conn);
+
+    const payloads = try collectWebSocketPayloads(allocator, conn.write_buf.items);
+    defer {
+        for (payloads.items) |payload| allocator.free(payload);
+        payloads.deinit(allocator);
+    }
+
+    try std.testing.expect(payloads.items.len >= 2);
+    const reconnect = payloads.items[1];
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, reconnect, .{});
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    try std.testing.expect(std.mem.eql(u8, obj.get("type").?.string, "agent.progress"));
+    try std.testing.expect(std.mem.eql(u8, obj.get("phase").?.string, "reconnect"));
+    try std.testing.expect(std.mem.eql(u8, obj.get("status").?.string, "state_restored"));
+    const message = obj.get("message") orelse return error.InvalidPayload;
+    try std.testing.expect(std.mem.indexOf(u8, message.string, "continue where we left off") != null);
+}
+
+test "server_piai: handshake restore emits backlog-aware reconnect progress" {
+    const allocator = std.testing.allocator;
+
+    var model_registry = ziggy_piai.models.ModelRegistry.init(allocator);
+    defer model_registry.deinit();
+    try ziggy_piai.models.registerDefaultModels(&model_registry);
+
+    var api_registry = ziggy_piai.api_registry.ApiRegistry.init(allocator);
+    defer api_registry.deinit();
+    try ziggy_piai.providers.register_builtins.registerBuiltInApiProviders(&api_registry);
+
+    var http_client = std.http.Client{ .allocator = allocator };
+    defer http_client.deinit();
+
+    var state = ServerState{
+        .allocator = allocator,
+        .rng = std.Random.DefaultPrng.init(0xBADC0FFEE),
+        .model_registry = model_registry,
+        .api_registry = api_registry,
+        .http_client = http_client,
+        .provider_config = .{
+            .name = "openai",
+            .model = "gpt-4o-mini",
+            .api_key = "mock-api-key",
+            .base_url = "https://example.invalid",
+        },
+        .ltm_store = null,
+    };
+
+    var conn = Connection.init(allocator, 0);
+    defer {
+        conn.read_buf.deinit(allocator);
+        conn.write_buf.deinit(allocator);
+        conn.session.deinit(allocator);
+    }
+
+    var persisted_sessions = std.ArrayListUnmanaged(PersistedSession){};
+    defer deinitPersistedSessions(allocator, &persisted_sessions);
+    try persisted_sessions.append(allocator, .{
+        .session_id = try allocator.dupe(u8, "restored-session-3"),
+        .ram = memory.RamContext.init(allocator, MAX_CONTEXT_MESSAGES, MAX_CONTEXT_BYTES),
+        .worker_queue_depth = 2,
+        .worker_active_tasks = 1,
+        .worker_mode = .running,
+        .worker_dropped_tasks = 3,
+        .worker_last_saturation_ms = std.time.milliTimestamp() - 1,
+        .worker_backpressure_notified = false,
+        .worker_last_goal = try allocator.dupe(u8, "resume backlog"),
+    });
+
+    const handshake = "GET /v1/agents/default/stream?session=restored-session-3 HTTP/1.1\r\n" ++
+        "Host: localhost\r\n" ++
+        "Upgrade: websocket\r\n" ++
+        "Connection: Upgrade\r\n" ++
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" ++
+        "Sec-WebSocket-Version: 13\r\n" ++
+        "\r\n";
+    try conn.read_buf.appendSlice(allocator, handshake);
+
+    try processHandshake(allocator, &state, &persisted_sessions, &conn);
+
+    const payloads = try collectWebSocketPayloads(allocator, conn.write_buf.items);
+    defer {
+        for (payloads.items) |payload| allocator.free(payload);
+        payloads.deinit(allocator);
+    }
+
+    const reconnect = payloads.items[1];
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, reconnect, .{});
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    try std.testing.expect(std.mem.eql(u8, obj.get("type").?.string, "agent.progress"));
+    try std.testing.expect(std.mem.eql(u8, obj.get("phase").?.string, "reconnect"));
+    try std.testing.expect(std.mem.eql(u8, obj.get("status").?.string, "backpressure_resumed"));
+    const message = obj.get("message") orelse return error.InvalidPayload;
+    try std.testing.expect(std.mem.indexOf(u8, message.string, "2 queued") != null);
+    try std.testing.expect(std.mem.indexOf(u8, message.string, "1 active") != null);
+    try std.testing.expect(std.mem.indexOf(u8, message.string, "3 dropped") != null);
 }
