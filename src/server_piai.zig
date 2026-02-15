@@ -2,6 +2,7 @@
 const ziggy_piai = @import("ziggy-piai");
 const Config = @import("config.zig");
 const protocol = @import("protocol.zig");
+const memory = @import("memory.zig");
 const posix = std.posix;
 const builtin = @import("builtin");
 const linux = if (builtin.os.tag == .linux) std.os.linux else struct {
@@ -48,33 +49,23 @@ const ConnectionState = enum {
     closing,
 };
 
-const SessionContext = struct {
-    messages: std.ArrayListUnmanaged(ziggy_piai.types.Message),
-    session_id: []u8,
-    total_message_bytes: usize,
+const SessionError = error{ MessageTooLarge };
 
-    fn init() SessionContext {
+const SessionContext = struct {
+    ram: memory.RamContext,
+    session_id: []u8,
+
+    fn init(allocator: std.mem.Allocator) SessionContext {
         return .{
-            .messages = .{},
+            .ram = memory.RamContext.init(allocator, MAX_CONTEXT_MESSAGES, MAX_CONTEXT_BYTES),
             .session_id = &[_]u8{},
-            .total_message_bytes = 0,
         };
     }
 
     fn deinit(self: *SessionContext, allocator: std.mem.Allocator) void {
-        self.clearMessages(allocator);
-        self.messages.deinit(allocator);
+        self.ram.deinit();
         if (self.session_id.len > 0) allocator.free(self.session_id);
         self.session_id = &[_]u8{};
-        self.total_message_bytes = 0;
-    }
-
-    fn clearMessages(self: *SessionContext, allocator: std.mem.Allocator) void {
-        for (self.messages.items) |msg| {
-            allocator.free(msg.content);
-        }
-        self.messages.clearRetainingCapacity();
-        self.total_message_bytes = 0;
     }
 
     fn setSessionId(self: *SessionContext, allocator: std.mem.Allocator, id: []const u8) !void {
@@ -83,36 +74,18 @@ const SessionContext = struct {
     }
 
     fn appendMessage(self: *SessionContext, allocator: std.mem.Allocator, role: ziggy_piai.types.MessageRole, content: []const u8) !void {
-        try self.messages.append(allocator, .{
-            .role = role,
-            .content = try allocator.dupe(u8, content),
-        });
-        self.total_message_bytes += content.len;
-        try self.trimToLimits(allocator);
+        _ = allocator;
+        _ = try self.ram.update(role, content);
     }
 
     fn appendUserMessage(self: *SessionContext, allocator: std.mem.Allocator, role: ziggy_piai.types.MessageRole, content: []const u8) !void {
         if (content.len > MAX_INBOUND_MESSAGE_BYTES) return error.MessageTooLarge;
-        try self.appendMessage(allocator, role, content);
+        _ = allocator;
+        _ = try self.ram.update(role, content);
     }
 
-    fn contextMessages(self: *SessionContext) []const ziggy_piai.types.Message {
-        return self.messages.items;
-    }
-
-    fn trimToLimits(self: *SessionContext, allocator: std.mem.Allocator) !void {
-        while (self.messages.items.len > MAX_CONTEXT_MESSAGES or
-            self.total_message_bytes > MAX_CONTEXT_BYTES)
-        {
-            if (self.messages.items.len == 0) break;
-            const removed = self.messages.orderedRemove(0);
-            allocator.free(removed.content);
-            if (self.total_message_bytes >= removed.content.len) {
-                self.total_message_bytes -= removed.content.len;
-            } else {
-                self.total_message_bytes = 0;
-            }
-        }
+    fn contextMessages(self: *SessionContext, allocator: std.mem.Allocator) ![]const ziggy_piai.types.Message {
+        return self.ram.load(allocator);
     }
 
 };
@@ -125,14 +98,14 @@ const Connection = struct {
     write_buf: std.ArrayListUnmanaged(u8),
     session: SessionContext,
 
-    fn init(fd: posix.socket_t) Connection {
+    fn init(allocator: std.mem.Allocator, fd: posix.socket_t) Connection {
         return .{
             .fd = fd,
             .state = .handshake,
             .agent_id = &[_]u8{},
             .read_buf = .{},
             .write_buf = .{},
-            .session = SessionContext.init(),
+            .session = SessionContext.init(allocator),
         };
     }
 
@@ -340,7 +313,7 @@ pub fn run(allocator: std.mem.Allocator, bind_addr: []const u8, port: u16, provi
                     }
 
                     const conn = try allocator.create(Connection);
-                    conn.* = Connection.init(conn_fd);
+                    conn.* = Connection.init(allocator, conn_fd);
                     try connections.put(conn_fd, conn);
 
                     try loop.add(conn_fd, linux.EPOLL.IN | linux.EPOLL.OUT | linux.EPOLL.ET);
@@ -550,7 +523,7 @@ fn handleUserMessage(allocator: std.mem.Allocator, state: *ServerState, pool: *s
     };
 
     conn.session.appendUserMessage(allocator, .user, content) catch |err| {
-        if (err == error.MessageTooLarge) {
+        if (err == SessionError.MessageTooLarge) {
             std.log.warn("Dropping oversized user message: session={s} request={s} bytes={d}", .{ conn.session.session_id, request_id, content.len });
             try sendErrorJson(allocator, &conn.write_buf, "Message too large for active context");
             return;
@@ -610,7 +583,9 @@ fn processAiStreaming(allocator: std.mem.Allocator, state: *ServerState, conn: *
         return;
     }
 
-    const context = ziggy_piai.types.Context{ .messages = conn.session.contextMessages() };
+    const context_messages = try conn.session.contextMessages(allocator);
+    defer freeContextMessages(allocator, context_messages);
+    const context = ziggy_piai.types.Context{ .messages = context_messages };
     var events = std.array_list.Managed(ziggy_piai.types.AssistantMessageEvent).init(allocator);
     defer events.deinit();
 
@@ -655,7 +630,7 @@ fn processAiStreaming(allocator: std.mem.Allocator, state: *ServerState, conn: *
                 response_sent = true;
             },
             .err => |err_msg| {
-                std.log.err("Pi AI error: {s}", .{err_msg});
+                std.log.err("Pi AI error: {s} session={s} request={s}", .{ err_msg, conn.session.session_id, request_id });
                 try sendErrorJson(allocator, &conn.write_buf, err_msg);
             },
             else => {},
@@ -666,6 +641,13 @@ fn processAiStreaming(allocator: std.mem.Allocator, state: *ServerState, conn: *
         try conn.session.appendMessage(allocator, .assistant, response_text.items);
         try sendSessionReceive(allocator, &conn.write_buf, request_id, response_text.items);
     }
+}
+
+fn freeContextMessages(allocator: std.mem.Allocator, context_messages: []const ziggy_piai.types.Message) void {
+    for (context_messages) |msg| {
+        allocator.free(msg.content);
+    }
+    allocator.free(context_messages);
 }
 
 fn sendSessionReceive(allocator: std.mem.Allocator, write_buf: *std.ArrayListUnmanaged(u8), request_id: []const u8, content: []const u8) !void {
