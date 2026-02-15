@@ -11,7 +11,7 @@ INSTALL_DIR="${INSTALL_DIR:-/opt/spiderweb}"
 CONFIG_DIR="${CONFIG_DIR:-/etc/spiderweb}"
 SERVICE_NAME="${SERVICE_NAME:-spiderweb}"
 PORT="${PORT:-18790}"
-BIND_ADDR="${BIND_ADDR:-127.0.0.1}"
+BIND_ADDR="${BIND_ADDR:-0.0.0.0}"
 
 # Colors
 RED='\033[0;31m'
