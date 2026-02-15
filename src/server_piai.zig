@@ -317,6 +317,8 @@ const Connection = struct {
     session: SessionContext,
     // Atomic flag to indicate connection is being closed (for thread safety)
     closing: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    // First boot pending flag - set when server is in first-boot mode
+    first_boot_pending: bool = false,
 
     fn init(allocator: std.mem.Allocator, fd: posix.socket_t) Connection {
         return .{
@@ -327,6 +329,7 @@ const Connection = struct {
             .write_buf = .{},
             .session = SessionContext.init(allocator),
             .closing = std.atomic.Value(bool).init(false),
+            .first_boot_pending = false,
         };
     }
 
@@ -762,6 +765,15 @@ fn processHandshake(
 
         try appendWsFrame(allocator, &conn.write_buf, ack_msg, .text);
 
+        // Note: First-boot welcome is sent after client sends first message
+        // This ensures WebSocket handshake is fully complete
+        const is_first_boot = state.agent_registry.isFirstBoot();
+        std.log.info("First boot check: is_first_boot={s} agent_count={d}", .{if (is_first_boot) "true" else "false", state.agent_registry.listAgents().len});
+        if (is_first_boot) {
+            // Store first-boot flag in connection for later
+            conn.first_boot_pending = true;
+        }
+
         if (restored_session) {
             const has_backlog = conn.session.worker_queue_depth > 0 or conn.session.worker_active_tasks > 0 or conn.session.worker_dropped_tasks > 0;
             const reconnect_status = if (has_backlog) "backpressure_resumed" else "state_restored";
@@ -994,6 +1006,8 @@ fn handleUserMessage(allocator: std.mem.Allocator, state: *ServerState, pool: *s
     const is_agent_heartbeat = std.mem.eql(u8, msg_type.string, "agent.heartbeat");
     const is_agent_list = std.mem.eql(u8, msg_type.string, "agent.list");
     const is_agent_get = std.mem.eql(u8, msg_type.string, "agent.get");
+    const is_agent_create = std.mem.eql(u8, msg_type.string, "agent.create");
+    const is_agent_hatch = std.mem.eql(u8, msg_type.string, "agent.hatch");
 
     if (is_agent_list) {
         try handleAgentList(allocator, state, conn, request_id);
@@ -1006,6 +1020,50 @@ fn handleUserMessage(allocator: std.mem.Allocator, state: *ServerState, pool: *s
         else
             null;
         try handleAgentGet(allocator, state, conn, request_id, agent_id);
+        return;
+    }
+
+    if (is_agent_create) {
+        const agent_id = if (parsed.value.object.get("agent_id")) |id|
+            if (id == .string) id.string else null
+        else
+            null;
+        const template = if (parsed.value.object.get("template")) |t|
+            if (t == .string) t.string else null
+        else
+            null;
+        try handleAgentCreate(allocator, state, conn, request_id, agent_id, template);
+        return;
+    }
+
+    if (is_agent_hatch) {
+        const agent_id = if (parsed.value.object.get("agent_id")) |id|
+            if (id == .string) id.string else null
+        else
+            null;
+        try handleAgentHatch(allocator, state, conn, request_id, agent_id);
+        return;
+    }
+
+    // First boot detection
+    const is_first_boot_check = std.mem.eql(u8, msg_type.string, "system.first_boot_check");
+    const is_first_boot_init = std.mem.eql(u8, msg_type.string, "system.first_boot_init");
+
+    if (is_first_boot_check) {
+        try handleFirstBootCheck(allocator, state, conn, request_id);
+        return;
+    }
+
+    if (is_first_boot_init) {
+        const agent_id = if (parsed.value.object.get("agent_id")) |id|
+            if (id == .string) id.string else null
+        else
+            null;
+        const template = if (parsed.value.object.get("template")) |t|
+            if (t == .string) t.string else null
+        else
+            null;
+        try handleFirstBootInit(allocator, state, conn, request_id, agent_id, template);
         return;
     }
 
@@ -1154,6 +1212,35 @@ fn handleUserMessage(allocator: std.mem.Allocator, state: *ServerState, pool: *s
         }
         return;
     };
+
+    // Check for first-boot welcome (send on first message after handshake)
+    if (conn.first_boot_pending and is_chat_send) {
+        conn.first_boot_pending = false;
+        const welcome_msg =
+            "Welcome to ZiggySpiderweb!\n" ++
+            "\n" ++
+            "This appears to be your first time here. Let's create your first agent.\n" ++
+            "\n" ++
+            "What would you like to name your first agent? (e.g., 'assistant', 'ziggy', 'helper')";
+
+        const escaped_welcome = try protocol.jsonEscape(allocator, welcome_msg);
+        defer allocator.free(escaped_welcome);
+
+        const welcome_payload = try std.fmt.allocPrint(
+            allocator,
+            "{{\"type\":\"session.receive\",\"request\":\"first-boot\",\"role\":\"assistant\",\"content\":\"{s}\"}}",
+            .{escaped_welcome},
+        );
+        defer allocator.free(welcome_payload);
+        try sendDirect(allocator, conn, welcome_payload);
+        return;
+    }
+
+    // Check for first-boot state on chat messages (after welcome sent)
+    if (is_chat_send and state.agent_registry.isFirstBoot()) {
+        try handleFirstBootChat(allocator, state, conn, request_id, content);
+        return;
+    }
 
     var plan_goal: ?[]const u8 = null;
     if (is_chat_send and std.mem.startsWith(u8, content, AGENT_GOAL_PREFIX)) {
@@ -1989,6 +2076,8 @@ fn handleAgentList(
         try json.appendSlice(allocator, if (agent.is_default) "true" else "false");
         try json.appendSlice(allocator, ",\"identity_loaded\":");
         try json.appendSlice(allocator, if (agent.identity_loaded) "true" else "false");
+        try json.appendSlice(allocator, ",\"needs_hatching\":");
+        try json.appendSlice(allocator, if (agent.needs_hatching) "true" else "false");
         try json.appendSlice(allocator, "}");
     }
 
@@ -2027,7 +2116,7 @@ fn handleAgentGet(
 
     const payload = try std.fmt.allocPrint(
         allocator,
-        "{{\"type\":\"agent.info\",\"request\":\"{s}\",\"agent\":{{\"id\":\"{s}\",\"name\":\"{s}\",\"description\":\"{s}\",\"is_default\":{s},\"identity_loaded\":{s}}}}}",
+        "{{\"type\":\"agent.info\",\"request\":\"{s}\",\"agent\":{{\"id\":\"{s}\",\"name\":\"{s}\",\"description\":\"{s}\",\"is_default\":{s},\"identity_loaded\":{s},\"needs_hatching\":{s}}}}}",
         .{
             escaped_request_id,
             escaped_id,
@@ -2035,11 +2124,298 @@ fn handleAgentGet(
             escaped_desc,
             if (a.is_default) "true" else "false",
             if (a.identity_loaded) "true" else "false",
+            if (a.needs_hatching) "true" else "false",
         },
     );
     defer allocator.free(payload);
 
     try sendDirect(allocator, conn, payload);
+}
+
+fn handleAgentCreate(
+    allocator: std.mem.Allocator,
+    state: *ServerState,
+    conn: *Connection,
+    request_id: []const u8,
+    agent_id: ?[]const u8,
+    template: ?[]const u8,
+) !void {
+    if (agent_id == null or agent_id.?.len == 0) {
+        try sendErrorJsonDirect(allocator, conn, "agent_id is required");
+        return;
+    }
+
+    // Validate agent_id (alphanumeric, hyphens, underscores only)
+    for (agent_id.?) |c| {
+        if (!std.ascii.isAlphanumeric(c) and c != '-' and c != '_') {
+            try sendErrorJsonDirect(allocator, conn, "agent_id must be alphanumeric, hyphens, or underscores");
+            return;
+        }
+    }
+
+    // Check if agent already exists
+    if (state.agent_registry.getAgent(agent_id.?)) |_| {
+        try sendErrorJsonDirect(allocator, conn, "Agent already exists");
+        return;
+    }
+
+    state.agent_registry.createAgent(agent_id.?, template) catch |err| {
+        const msg = try std.fmt.allocPrint(allocator, "Failed to create agent: {s}", .{@errorName(err)});
+        defer allocator.free(msg);
+        try sendErrorJsonDirect(allocator, conn, msg);
+        return;
+    };
+
+    const escaped_request_id = try protocol.jsonEscape(allocator, request_id);
+    defer allocator.free(escaped_request_id);
+    const escaped_agent_id = try protocol.jsonEscape(allocator, agent_id.?);
+    defer allocator.free(escaped_agent_id);
+
+    const payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"type\":\"agent.created\",\"request\":\"{s}\",\"agent_id\":\"{s}\",\"needs_hatching\":true}}",
+        .{ escaped_request_id, escaped_agent_id },
+    );
+    defer allocator.free(payload);
+
+    try sendDirect(allocator, conn, payload);
+}
+
+fn handleAgentHatch(
+    allocator: std.mem.Allocator,
+    state: *ServerState,
+    conn: *Connection,
+    request_id: []const u8,
+    agent_id: ?[]const u8,
+) !void {
+    if (agent_id == null or agent_id.?.len == 0) {
+        try sendErrorJsonDirect(allocator, conn, "agent_id is required");
+        return;
+    }
+
+    const agent = state.agent_registry.getAgent(agent_id.?);
+    if (agent == null) {
+        try sendErrorJsonDirect(allocator, conn, "Agent not found");
+        return;
+    }
+
+    if (!agent.?.needs_hatching) {
+        try sendErrorJsonDirect(allocator, conn, "Agent does not need hatching");
+        return;
+    }
+
+    state.agent_registry.completeHatching(agent_id.?) catch |err| {
+        const msg = try std.fmt.allocPrint(allocator, "Failed to complete hatching: {s}", .{@errorName(err)});
+        defer allocator.free(msg);
+        try sendErrorJsonDirect(allocator, conn, msg);
+        return;
+    };
+
+    const escaped_request_id = try protocol.jsonEscape(allocator, request_id);
+    defer allocator.free(escaped_request_id);
+    const escaped_agent_id = try protocol.jsonEscape(allocator, agent_id.?);
+    defer allocator.free(escaped_agent_id);
+
+    const payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"type\":\"agent.hatched\",\"request\":\"{s}\",\"agent_id\":\"{s}\",\"success\":true}}",
+        .{ escaped_request_id, escaped_agent_id },
+    );
+    defer allocator.free(payload);
+
+    try sendDirect(allocator, conn, payload);
+}
+
+fn handleFirstBootCheck(
+    allocator: std.mem.Allocator,
+    state: *ServerState,
+    conn: *Connection,
+    request_id: []const u8,
+) !void {
+    const is_first_boot = state.agent_registry.isFirstBoot();
+
+    const escaped_request_id = try protocol.jsonEscape(allocator, request_id);
+    defer allocator.free(escaped_request_id);
+
+    const payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"type\":\"system.first_boot_status\",\"request\":\"{s}\",\"first_boot\":{s}}}",
+        .{ escaped_request_id, if (is_first_boot) "true" else "false" },
+    );
+    defer allocator.free(payload);
+
+    try sendDirect(allocator, conn, payload);
+}
+
+fn handleFirstBootInit(
+    allocator: std.mem.Allocator,
+    state: *ServerState,
+    conn: *Connection,
+    request_id: []const u8,
+    agent_id: ?[]const u8,
+    template: ?[]const u8,
+) !void {
+    if (!state.agent_registry.isFirstBoot()) {
+        try sendErrorJsonDirect(allocator, conn, "Not in first-boot state");
+        return;
+    }
+
+    const actual_agent_id = agent_id orelse "first-agent";
+
+    // Validate agent_id
+    for (actual_agent_id) |c| {
+        if (!std.ascii.isAlphanumeric(c) and c != '-' and c != '_') {
+            try sendErrorJsonDirect(allocator, conn, "agent_id must be alphanumeric, hyphens, or underscores");
+            return;
+        }
+    }
+
+    state.agent_registry.initializeFirstAgent(actual_agent_id, template) catch |err| {
+        const msg = try std.fmt.allocPrint(allocator, "Failed to initialize first agent: {s}", .{@errorName(err)});
+        defer allocator.free(msg);
+        try sendErrorJsonDirect(allocator, conn, msg);
+        return;
+    };
+
+    const escaped_request_id = try protocol.jsonEscape(allocator, request_id);
+    defer allocator.free(escaped_request_id);
+    const escaped_agent_id = try protocol.jsonEscape(allocator, actual_agent_id);
+    defer allocator.free(escaped_agent_id);
+
+    const payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"type\":\"system.first_boot_complete\",\"request\":\"{s}\",\"agent_id\":\"{s}\",\"needs_hatching\":true}}",
+        .{ escaped_request_id, escaped_agent_id },
+    );
+    defer allocator.free(payload);
+
+    try sendDirect(allocator, conn, payload);
+}
+
+fn handleFirstBootChat(
+    allocator: std.mem.Allocator,
+    state: *ServerState,
+    conn: *Connection,
+    request_id: []const u8,
+    content: []const u8,
+) !void {
+    // Simple first-boot flow: server guides user to name their first agent
+    const trimmed = std.mem.trim(u8, content, " \t\r\n");
+
+    if (trimmed.len == 0) {
+        // Initial greeting - ask for agent name
+        const welcome_msg =
+            "Welcome to ZiggySpiderweb! 🕸️\n" ++
+            "\n" ++
+            "This appears to be your first time here. Let's create your first agent.\n" ++
+            "\n" ++
+            "What would you like to name your first agent? (e.g., 'assistant', 'ziggy', 'helper')\n";
+
+        const escaped_request_id = try protocol.jsonEscape(allocator, request_id);
+        defer allocator.free(escaped_request_id);
+        const escaped_msg = try protocol.jsonEscape(allocator, welcome_msg);
+        defer allocator.free(escaped_msg);
+
+        const payload = try std.fmt.allocPrint(
+            allocator,
+            "{{\"type\":\"session.receive\",\"request\":\"{s}\",\"role\":\"assistant\",\"content\":\"{s}\"}}",
+            .{ escaped_request_id, escaped_msg },
+        );
+        defer allocator.free(payload);
+
+        try sendDirect(allocator, conn, payload);
+        return;
+    }
+
+    // User provided a name - create the first agent
+    // Validate the name
+    for (trimmed) |c| {
+        if (!std.ascii.isAlphanumeric(c) and c != '-' and c != '_') {
+            const err_msg = "Agent names can only contain letters, numbers, hyphens, and underscores. Please try again.";
+            const escaped_request_id = try protocol.jsonEscape(allocator, request_id);
+            defer allocator.free(escaped_request_id);
+            const escaped_msg = try protocol.jsonEscape(allocator, err_msg);
+            defer allocator.free(escaped_msg);
+
+            const payload = try std.fmt.allocPrint(
+                allocator,
+                "{{\"type\":\"session.receive\",\"request\":\"{s}\",\"role\":\"assistant\",\"content\":\"{s}\"}}",
+                .{ escaped_request_id, escaped_msg },
+            );
+            defer allocator.free(payload);
+
+            try sendDirect(allocator, conn, payload);
+            return;
+        }
+    }
+
+    // Create the agent
+    state.agent_registry.initializeFirstAgent(trimmed, null) catch |err| {
+        const err_msg = try std.fmt.allocPrint(allocator, "Failed to create agent: {s}. Please try again.", .{@errorName(err)});
+        defer allocator.free(err_msg);
+
+        const escaped_request_id = try protocol.jsonEscape(allocator, request_id);
+        defer allocator.free(escaped_request_id);
+        const escaped_msg = try protocol.jsonEscape(allocator, err_msg);
+        defer allocator.free(escaped_msg);
+
+        const payload = try std.fmt.allocPrint(
+            allocator,
+            "{{\"type\":\"session.receive\",\"request\":\"{s}\",\"role\":\"assistant\",\"content\":\"{s}\"}}",
+            .{ escaped_request_id, escaped_msg },
+        );
+        defer allocator.free(payload);
+
+        try sendDirect(allocator, conn, payload);
+        return;
+    };
+
+    // Read the HATCH.md content to present to the user
+    const hatch_content = state.agent_registry.readHatchFile(trimmed) catch |err| blk: {
+        std.log.warn("Failed to read HATCH.md for first agent: {s}", .{@errorName(err)});
+        break :blk null;
+    };
+    defer if (hatch_content) |hc| allocator.free(hc);
+
+    var msg_buffer = std.ArrayList(u8){};
+    defer msg_buffer.deinit(allocator);
+
+    try msg_buffer.appendSlice(allocator, "Perfect! I've created your first agent: '");
+    try msg_buffer.appendSlice(allocator, trimmed);
+    try msg_buffer.appendSlice(allocator, "'.\n\n");
+
+    if (hatch_content) |hc| {
+        try msg_buffer.appendSlice(allocator, "Now let's hatch your agent. Here's the birth certificate (HATCH.md):\n\n");
+        try msg_buffer.appendSlice(allocator, "---\n");
+        try msg_buffer.appendSlice(allocator, hc);
+        try msg_buffer.appendSlice(allocator, "\n---\n\n");
+        try msg_buffer.appendSlice(allocator, "The agent will read this and create its identity. Once complete, respond with the hatch confirmation.");
+    } else {
+        try msg_buffer.appendSlice(allocator, "Your agent is ready! You can now start chatting.");
+    }
+
+    const escaped_request_id = try protocol.jsonEscape(allocator, request_id);
+    defer allocator.free(escaped_request_id);
+    const escaped_msg = try protocol.jsonEscape(allocator, msg_buffer.items);
+    defer allocator.free(escaped_msg);
+
+    const payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"type\":\"session.receive\",\"request\":\"{s}\",\"role\":\"assistant\",\"content\":\"{s}\",\"agent_id\":\"{s}\",\"needs_hatching\":true}}",
+        .{ escaped_request_id, escaped_msg, trimmed },
+    );
+    defer allocator.free(payload);
+
+    try sendDirect(allocator, conn, payload);
+
+    // Also send agent.hatched message to indicate first boot is done
+    const hatched_payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"type\":\"agent.hatched\",\"request\":\"{s}\",\"agent_id\":\"{s}\",\"first_boot\":true}}",
+        .{ escaped_request_id, trimmed },
+    );
+    defer allocator.free(hatched_payload);
+    try sendDirect(allocator, conn, hatched_payload);
 }
 
 fn sendErrorJsonDirect(

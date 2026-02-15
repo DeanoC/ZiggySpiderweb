@@ -15,6 +15,7 @@ pub const AgentInfo = struct {
     is_default: bool,
     capabilities: std.ArrayListUnmanaged(AgentCapability),
     identity_loaded: bool,
+    needs_hatching: bool,
 
     pub fn deinit(self: *AgentInfo, allocator: std.mem.Allocator) void {
         allocator.free(self.id);
@@ -63,7 +64,8 @@ pub const AgentRegistry = struct {
 
         var agents_dir = std.fs.cwd().openDir(agents_dir_path, .{ .iterate = true }) catch |err| {
             if (err == error.FileNotFound) {
-                // No agents directory - create default agent
+                // No agents directory - we're in first-boot state
+                // Don't create anything yet - wait for client to trigger first boot
                 try self.loadDefaultAgent();
                 return;
             }
@@ -91,6 +93,47 @@ pub const AgentRegistry = struct {
         // If no agents found, create default
         if (self.agents.items.len == 0) {
             try self.loadDefaultAgent();
+        }
+    }
+
+    /// Check if server is in first-boot state (no real agents exist yet)
+    pub fn isFirstBoot(self: *const AgentRegistry) bool {
+        // First boot if only the in-memory default agent exists
+        const len_ok = self.agents.items.len == 1;
+        const id_ok = len_ok and std.mem.eql(u8, self.agents.items[0].id, "default");
+        const identity_ok = len_ok and !self.agents.items[0].identity_loaded;
+        std.log.info("isFirstBoot debug: len={d} len_ok={s} id={s} id_ok={s} identity_loaded={s} identity_ok={s}", .{
+            self.agents.items.len,
+            if (len_ok) "true" else "false",
+            if (len_ok) self.agents.items[0].id else "n/a",
+            if (id_ok) "true" else "false",
+            if (len_ok) @as([]const u8, if (self.agents.items[0].identity_loaded) "true" else "false") else "n/a",
+            if (identity_ok) "true" else "false",
+        });
+        return len_ok and id_ok and identity_ok;
+    }
+
+    /// Initialize first agent on first boot
+    pub fn initializeFirstAgent(self: *AgentRegistry, agent_id: []const u8, template_path: ?[]const u8) !void {
+        // Create the agents directory
+        const agents_dir_path = try std.fs.path.join(self.allocator, &.{ self.base_dir, "agents" });
+        defer self.allocator.free(agents_dir_path);
+
+        try std.fs.cwd().makePath(agents_dir_path);
+
+        // Create the first agent with HATCH.md
+        try self.createAgent(agent_id, template_path);
+
+        // Mark it as default
+        for (self.agents.items) |*a| {
+            if (std.mem.eql(u8, a.id, agent_id)) {
+                // Clear default from all others
+                for (self.agents.items) |*other| {
+                    other.is_default = false;
+                }
+                a.is_default = true;
+                break;
+            }
         }
     }
 
@@ -158,6 +201,9 @@ pub const AgentRegistry = struct {
 
         // Check if identity files exist
         const identity_loaded = self.checkIdentityFiles(agent_path);
+        
+        // Check if HATCH.md exists (needs hatching)
+        const needs_hatching = self.checkHatchFile(agent_path);
 
         return .{
             .id = try self.allocator.dupe(u8, agent_id),
@@ -166,6 +212,7 @@ pub const AgentRegistry = struct {
             .is_default = is_default,
             .capabilities = capabilities,
             .identity_loaded = identity_loaded,
+            .needs_hatching = needs_hatching,
         };
     }
 
@@ -175,6 +222,9 @@ pub const AgentRegistry = struct {
 
         // Check which identity files exist
         const identity_loaded = self.checkIdentityFiles(agent_path);
+        
+        // Check if HATCH.md exists
+        const needs_hatching = self.checkHatchFile(agent_path);
 
         // Infer capabilities from agent_id
         var capabilities = std.ArrayListUnmanaged(AgentCapability){};
@@ -204,6 +254,7 @@ pub const AgentRegistry = struct {
             .is_default = false,
             .capabilities = capabilities,
             .identity_loaded = identity_loaded,
+            .needs_hatching = needs_hatching,
         };
     }
 
@@ -219,6 +270,95 @@ pub const AgentRegistry = struct {
             return true; // Found at least one identity file
         }
         return false;
+    }
+
+    fn checkHatchFile(self: *AgentRegistry, agent_path: []const u8) bool {
+        const hatch_path = std.fs.path.join(self.allocator, &.{ agent_path, "HATCH.md" }) catch return false;
+        defer self.allocator.free(hatch_path);
+
+        std.fs.cwd().access(hatch_path, .{}) catch return false;
+        return true;
+    }
+
+    /// Read HATCH.md content if it exists
+    pub fn readHatchFile(self: *AgentRegistry, agent_id: []const u8) !?[]u8 {
+        const agent_path = try std.fs.path.join(self.allocator, &.{ self.base_dir, "agents", agent_id });
+        defer self.allocator.free(agent_path);
+
+        const hatch_path = try std.fs.path.join(self.allocator, &.{ agent_path, "HATCH.md" });
+        defer self.allocator.free(hatch_path);
+
+        const content = std.fs.cwd().readFileAlloc(self.allocator, hatch_path, 64 * 1024) catch |err| {
+            if (err == error.FileNotFound) return null;
+            return err;
+        };
+        return content;
+    }
+
+    /// Create a new agent with HATCH.md
+    pub fn createAgent(self: *AgentRegistry, agent_id: []const u8, template_path: ?[]const u8) !void {
+        // Create agent directory
+        const agent_path = try std.fs.path.join(self.allocator, &.{ self.base_dir, "agents", agent_id });
+        defer self.allocator.free(agent_path);
+
+        try std.fs.cwd().makePath(agent_path);
+
+        // Determine template source
+        const template_source = if (template_path) |tp|
+            try std.fs.cwd().readFileAlloc(self.allocator, tp, 64 * 1024)
+        else
+            try self.loadDefaultHatchTemplate();
+        defer self.allocator.free(template_source);
+
+        // Write HATCH.md
+        const hatch_path = try std.fs.path.join(self.allocator, &.{ agent_path, "HATCH.md" });
+        defer self.allocator.free(hatch_path);
+
+        try std.fs.cwd().writeFile(.{
+            .sub_path = hatch_path,
+            .data = template_source,
+        });
+
+        // Reload agents to include the new one
+        try self.scan();
+    }
+
+    /// Complete hatching - delete HATCH.md and update agent
+    pub fn completeHatching(self: *AgentRegistry, agent_id: []const u8) !void {
+        const agent_path = try std.fs.path.join(self.allocator, &.{ self.base_dir, "agents", agent_id });
+        defer self.allocator.free(agent_path);
+
+        // Delete HATCH.md
+        const hatch_path = try std.fs.path.join(self.allocator, &.{ agent_path, "HATCH.md" });
+        defer self.allocator.free(hatch_path);
+
+        std.fs.cwd().deleteFile(hatch_path) catch |err| {
+            if (err != error.FileNotFound) return err;
+        };
+
+        // Reload to update agent state
+        try self.scan();
+    }
+
+    fn loadDefaultHatchTemplate(self: *AgentRegistry) ![]u8 {
+        // Try to load from file first
+        const template_path = try std.fs.path.join(self.allocator, &.{ self.base_dir, "agents", "HATCH.template.md" });
+        defer self.allocator.free(template_path);
+
+        return std.fs.cwd().readFileAlloc(self.allocator, template_path, 64 * 1024) catch {
+            // Fallback to embedded minimal template
+            return self.allocator.dupe(u8,
+                "# HATCH.md — New Agent Initialization\n" ++
+                "\n" ++
+                "Welcome, newborn agent. You are hatching in ZiggySpiderweb (ZSS).\n" ++
+                "\n" ++
+                "## Your Task\n" ++
+                "Create your identity by writing SOUL.md, then respond with:\n" ++
+                "{\"type\":\"agent.hatched\",\"name\":\"YourName\",\"files\":[\"SOUL.md\"]}\n" ++
+                "\n" ++
+                "Then delete this HATCH.md. You won't need it again.\n"
+            );
+        };
     }
 
     fn extractNameFromIdentity(self: *AgentRegistry, agent_path: []const u8) !?[]u8 {
@@ -275,6 +415,7 @@ pub const AgentRegistry = struct {
             .is_default = true,
             .capabilities = capabilities,
             .identity_loaded = false,
+            .needs_hatching = false,
         };
 
         try self.agents.append(self.allocator, agent);
