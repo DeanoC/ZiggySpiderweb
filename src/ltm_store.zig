@@ -930,7 +930,8 @@ fn appendUniqueI64(allocator: std.mem.Allocator, ids: *std.ArrayListUnmanaged(i6
         defer _ = sqlite3_finalize(stmt);
 
         const rc = sqlite3_step(stmt);
-        if (rc != SQLITE_ROW) return null;
+        if (rc == SQLITE_DONE) return null;
+        if (rc != SQLITE_ROW) return LtmError.ExecError;
 
         return SessionMetadata{
             .session_id = try self.copyColumnText(stmt, 0),

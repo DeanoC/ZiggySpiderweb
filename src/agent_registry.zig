@@ -208,12 +208,17 @@ pub const AgentRegistry = struct {
     }
 
     fn checkIdentityFiles(self: *AgentRegistry, agent_path: []const u8) bool {
-        // Check for SOUL.md
-        const soul_path = std.fs.path.join(self.allocator, &.{ agent_path, "SOUL.md" }) catch return false;
-        defer self.allocator.free(soul_path);
+        // Check for any supported identity file: SOUL.md, AGENT.md, or IDENTITY.md
+        const identity_files = [_][]const u8{ "SOUL.md", "AGENT.md", "IDENTITY.md" };
 
-        std.fs.cwd().access(soul_path, .{}) catch return false;
-        return true;
+        for (identity_files) |filename| {
+            const path = std.fs.path.join(self.allocator, &.{ agent_path, filename }) catch continue;
+            defer self.allocator.free(path);
+
+            std.fs.cwd().access(path, .{}) catch continue;
+            return true; // Found at least one identity file
+        }
+        return false;
     }
 
     fn extractNameFromIdentity(self: *AgentRegistry, agent_path: []const u8) !?[]u8 {
