@@ -104,3 +104,23 @@ pub fn jsonEscape(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
 
     return result;
 }
+
+test "protocol: parseMessageType handles core and agent message types" {
+    const cases = [_]struct {
+        json: []const u8,
+        expected: ?MessageType,
+    }{
+        .{ .json = "{\"type\":\"connect\"}", .expected = .connect },
+        .{ .json = "{\"type\":\"session.send\"}", .expected = .session_send },
+        .{ .json = "{\"type\":\"agent.plan\"}", .expected = .agent_plan },
+        .{ .json = "{\"type\":\"agent.progress\"}", .expected = .agent_progress },
+        .{ .json = "{\"type\":\"agent.status\"}", .expected = .agent_status },
+        .{ .json = "{\"type\":\"agent.control\"}", .expected = .agent_control },
+        .{ .json = "{\"type\":\"ping\"}", .expected = .ping },
+        .{ .json = "{\"type\":\"memory.query\"}", .expected = null },
+    };
+
+    for (cases) |case| {
+        try std.testing.expectEqual(case.expected, parseMessageType(case.json));
+    }
+}
