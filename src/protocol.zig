@@ -124,3 +124,23 @@ test "protocol: parseMessageType handles core and agent message types" {
         try std.testing.expectEqual(case.expected, parseMessageType(case.json));
     }
 }
+
+test "protocol: parseMessageType ignores unknown and unsupported message types" {
+    const unsupported = [_][]const u8{
+        "{\"type\":\"agent.blocked\"}",
+        "{\"type\":\"session.ack\",\"capabilities\":[]}",
+        "{\"type\":\"memory.query\",\"query\":\"goal\"}",
+        "{\"type\":\"memory.recall\",\"id\":1}",
+        "{\"type\":\"agent.state\",\"phase\":\"running\"}",
+    };
+    for (unsupported) |json| {
+        try std.testing.expectEqual(@as(?MessageType, null), parseMessageType(json));
+    }
+}
+
+test "protocol: jsonEscape escapes common JSON special characters" {
+    const allocator = std.testing.allocator;
+    const encoded = try jsonEscape(allocator, "quote:\" slash:\\ newline:\n tab:\t");
+    defer allocator.free(encoded);
+    try std.testing.expectEqualStrings("quote:\\\" slash:\\\\ newline:\\n tab:\\t", encoded);
+}
