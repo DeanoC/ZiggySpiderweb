@@ -50,6 +50,17 @@ const LTM_RETENTION_KEEP_SNAPSHOTS_ENV = "SPIDERWEB_LTM_KEEP_SNAPSHOTS";
 const LTM_RETENTION_KEEP_DAYS_ENV = "SPIDERWEB_LTM_KEEP_DAYS";
 const AGENT_GOAL_PREFIX = "/goal ";
 const WORKER_MAX_PARALLELISM = 2;
+const StreamByModelFn = *const fn (
+    std.mem.Allocator,
+    *std.http.Client,
+    *ziggy_piai.api_registry.ApiRegistry,
+    ziggy_piai.types.Model,
+    ziggy_piai.types.Context,
+    ziggy_piai.types.StreamOptions,
+    *std.array_list.Managed(ziggy_piai.types.AssistantMessageEvent),
+) anyerror!void;
+
+var streamByModelFn: StreamByModelFn = ziggy_piai.stream.streamByModel;
 
 const PersistedSession = struct {
     session_id: []u8,
@@ -1022,7 +1033,7 @@ fn processAiStreaming(
     };
     defer allocator.free(api_key);
 
-    try ziggy_piai.stream.streamByModel(allocator, &state.http_client, &state.api_registry, model.?, context, .{ .api_key = api_key }, &events);
+    try streamByModelFn(allocator, &state.http_client, &state.api_registry, model.?, context, .{ .api_key = api_key }, &events);
     std.log.info("AI stream started: session={s} request={s}", .{ conn.session.session_id, request_id });
 
     var response_text = std.ArrayListUnmanaged(u8){};
@@ -2756,4 +2767,108 @@ test "server_piai: sendAgentStatus emits valid outbound agent.status payload" {
     try std.testing.expect(std.mem.eql(u8, obj.get("worker").?.string, "research"));
     try std.testing.expect(std.mem.eql(u8, obj.get("status").?.string, "complete"));
     try std.testing.expect(std.mem.eql(u8, obj.get("message").?.string, "research: found 3 items"));
+}
+
+fn decodeFirstWebSocketPayload(frame_data: []const u8) ![]const u8 {
+    if (frame_data.len < 2) return error.InvalidFrame;
+
+    const mask_and_len = frame_data[1];
+    var payload_len = @as(usize, mask_and_len & 0x7F);
+    var header_len: usize = 2;
+
+    if (payload_len == 126) {
+        if (frame_data.len < 4) return error.InvalidFrame;
+        payload_len = std.mem.readInt(u16, frame_data[2..4], .big);
+        header_len = 4;
+    } else if (payload_len == 127) {
+        if (frame_data.len < 10) return error.InvalidFrame;
+        payload_len = @intCast(std.mem.readInt(u64, frame_data[2..10], .big));
+        header_len = 10;
+    }
+
+    if (frame_data.len < header_len + payload_len) return error.InvalidFrame;
+    return frame_data[header_len .. header_len + payload_len];
+}
+
+fn mockStreamByModel(
+    allocator: std.mem.Allocator,
+    _: *std.http.Client,
+    _: *ziggy_piai.api_registry.ApiRegistry,
+    _: ziggy_piai.types.Model,
+    _: ziggy_piai.types.Context,
+    _: ziggy_piai.types.StreamOptions,
+    events: *std.array_list.Managed(ziggy_piai.types.AssistantMessageEvent),
+) !void {
+    _ = allocator;
+    try events.append(.{
+        .text_delta = .{ .content_index = 0, .delta = "mock " },
+    });
+    try events.append(.{
+        .done = .{
+            .text = "mocked model reply",
+            .api = "mock-api",
+            .provider = "openai",
+            .model = "gpt-4o-mini",
+            .usage = .{ .total_tokens = 5 },
+        },
+    });
+}
+
+test "server_piai: handleUserMessage with chat.send runs mocked stream and emits session.receive" {
+    const allocator = std.testing.allocator;
+    const original_stream_fn = streamByModelFn;
+    defer { streamByModelFn = original_stream_fn; }
+    streamByModelFn = mockStreamByModel;
+
+    var model_registry = ziggy_piai.models.ModelRegistry.init(allocator);
+    defer model_registry.deinit();
+    try ziggy_piai.models.registerDefaultModels(&model_registry);
+
+    var api_registry = ziggy_piai.api_registry.ApiRegistry.init(allocator);
+    defer api_registry.deinit();
+    try ziggy_piai.providers.register_builtins.registerBuiltInApiProviders(&api_registry);
+
+    var http_client = std.http.Client{ .allocator = allocator };
+    defer http_client.deinit();
+
+    var state = ServerState{
+        .allocator = allocator,
+        .rng = std.Random.DefaultPrng.init(0xBADC0FFEE),
+        .model_registry = model_registry,
+        .api_registry = api_registry,
+        .http_client = http_client,
+        .provider_config = .{
+            .name = "openai",
+            .model = "gpt-4o-mini",
+            .api_key = "mock-api-key",
+            .base_url = "https://example.invalid",
+        },
+        .ltm_store = null,
+    };
+
+    var conn = Connection.init(allocator, 0);
+    try conn.session.setSessionId(allocator, "session-mock-1");
+    defer {
+        conn.read_buf.deinit(allocator);
+        conn.write_buf.deinit(allocator);
+        conn.session.deinit(allocator);
+    }
+
+    {
+        var pool: std.Thread.Pool = undefined;
+        try pool.init(.{ .allocator = allocator });
+        defer pool.deinit();
+
+        const inbound = "{\"id\":\"req-001\",\"type\":\"chat.send\",\"content\":\"hello from client\"}";
+        try handleUserMessage(allocator, &state, &pool, &conn, inbound);
+    }
+
+    const payload = try decodeFirstWebSocketPayload(conn.write_buf.items);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
+    defer parsed.deinit();
+
+    const obj = parsed.value.object;
+    try std.testing.expect(std.mem.eql(u8, obj.get("type").?.string, "session.receive"));
+    try std.testing.expect(std.mem.eql(u8, obj.get("content").?.string, "mocked model reply"));
+    try std.testing.expect(obj.get("memoryId").?.integer > 0);
 }
