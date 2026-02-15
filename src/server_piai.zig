@@ -37,6 +37,7 @@ const REQUEST_ID_LEN = 16;
 const SESSION_STATE_PATH = ".spiderweb-session-state.json";
 const SESSION_STATE_VERSION = 1;
 const LONG_TERM_ARCHIVE_DIR = ".spiderweb-ltm";
+const LTM_INDEX_FILENAME = "archive-index.ndjson";
 const LONG_TERM_ARCHIVE_VERSION = 1;
 
 const PersistedSession = struct {
@@ -458,6 +459,13 @@ fn processHandshake(
                 if (err != error.SessionNotFound) {
                     return err;
                 }
+                const restored_from_archive = restoreSessionFromLatestArchive(allocator, &conn.session, requested) catch |archive_err| {
+                    std.log.err("Session archive restore failed: {s} session={s}", .{ @errorName(archive_err), requested });
+                    false
+                };
+                if (restored_from_archive) {
+                    std.log.info("Session restored from archive: session={s}", .{requested});
+                }
             };
         }
 
@@ -588,6 +596,29 @@ fn handleUserMessage(allocator: std.mem.Allocator, state: *ServerState, pool: *s
         defer allocator.free(response);
         try appendWsFrame(allocator, &conn.write_buf, response, .text);
         std.log.info("Session reset: session={s} request={s} archived={s} reason={s}", .{ conn.session.session_id, request_id, if (archived) "true" else "false", reason });
+        return;
+    }
+
+    const is_memory_recall = std.mem.eql(u8, msg_type.string, "memory.recall");
+    if (is_memory_recall) {
+        const limit = if (parsed.value.object.get("limit")) |limit_value| parsePositiveInteger(limit_value) orelse 25 else 25;
+        const include_archived = if (parsed.value.object.get("include_archived")) |include| switch (include) {
+            .bool => include.bool,
+            else => true,
+        } else true;
+        const include_full = if (parsed.value.object.get("include_full")) |full| switch (full) {
+            .bool => full.bool,
+            else => false,
+        } else false;
+
+        handleMemoryRecall(allocator, conn, request_id, limit, include_archived, include_full) catch |err| {
+            std.log.err("memory.recall failed: {s} session={s} request={s}", .{
+                @errorName(err),
+                conn.session.session_id,
+                request_id,
+            });
+            try sendErrorJson(allocator, &conn.write_buf, "memory.recall failed");
+        };
         return;
     }
 
@@ -773,6 +804,446 @@ fn sendSessionReceive(
     defer allocator.free(response_json);
 
     try appendWsFrame(allocator, write_buf, response_json, .text);
+}
+
+fn handleMemoryRecall(
+    allocator: std.mem.Allocator,
+    conn: *Connection,
+    request_id: []const u8,
+    requested_limit: u64,
+    include_archived: bool,
+    include_full_from_archive: bool,
+) !void {
+    const limit = if (requested_limit == 0 or requested_limit > 128) 128 else requested_limit;
+    var remaining = @as(usize, limit);
+    var emitted = std.ArrayListUnmanaged(u8){};
+    defer emitted.deinit(allocator);
+
+    try emitted.appendSlice(allocator, "{\"type\":\"memory.recall\",\"request\":\"");
+    const escaped_request_id = try protocol.jsonEscape(allocator, request_id);
+    defer allocator.free(escaped_request_id);
+    try emitted.appendSlice(allocator, escaped_request_id);
+    try emitted.appendSlice(allocator, "\",\"sessionKey\":\"");
+    try emitted.appendSlice(allocator, conn.session.session_id);
+    try emitted.appendSlice(allocator, "\",\"items\":[");
+
+    var first_item = true;
+
+    conn.session.ram.mutex.lock();
+    defer conn.session.ram.mutex.unlock();
+
+    if (conn.session.ram.summaries.items.len > 0) {
+        var idx: usize = conn.session.ram.summaries.items.len;
+        while (idx > 0 and remaining > 0) {
+            idx -= 1;
+            const summary = conn.session.ram.summaries.items[idx];
+            try appendRecallSummaryItem(
+                allocator,
+                &emitted,
+                &first_item,
+                "summary",
+                "ram",
+                summary.id,
+                summary.source_id,
+                summary.text,
+                summary.created_at_ms,
+            );
+            remaining -= 1;
+        }
+    }
+    {
+        var idx: usize = conn.session.ram.entries.items.len;
+        while (idx > 0 and remaining > 0) {
+            idx -= 1;
+            const entry = conn.session.ram.entries.items[idx];
+            if (entry.state != .active) continue;
+            try appendRecallEntryItem(
+                allocator,
+                &emitted,
+                &first_item,
+                "entry",
+                "ram",
+                "active",
+                entry.message.role,
+                entry.id,
+                entry.related_to,
+                entry.message.content,
+            );
+            remaining -= 1;
+        }
+    }
+
+    if (include_archived) {
+        const archive = findLatestArchiveForSession(allocator, conn.session.session_id) catch null;
+        if (archive) |latest| {
+            try appendLatestArchiveToResponse(
+                allocator,
+                &emitted,
+                latest.archive_path,
+                &first_item,
+                &remaining,
+                include_full_from_archive,
+            );
+            allocator.free(latest.archive_path);
+            allocator.free(latest.reason);
+        }
+    }
+
+    try emitted.appendSlice(allocator, "]}");
+    try appendWsFrame(allocator, &conn.write_buf, emitted.items, .text);
+}
+
+const LatestArchiveRef = struct {
+    timestamp_ms: i64,
+    reason: []u8,
+    archive_path: []u8,
+};
+
+fn findLatestArchiveForSession(
+    allocator: std.mem.Allocator,
+    session_id: []const u8,
+) !?LatestArchiveRef {
+    var index_path_buf: [256]u8 = undefined;
+    const index_path = try std.fmt.bufPrint(&index_path_buf, "{s}/{s}", .{ LONG_TERM_ARCHIVE_DIR, LTM_INDEX_FILENAME });
+
+    const file = std.fs.cwd().openFile(index_path, .{ .mode = .read_only }) catch |err| {
+        if (err == error.FileNotFound) return null;
+        return err;
+    };
+    defer file.close();
+
+    const data = try file.readToEndAlloc(allocator, 1024 * 1024);
+    defer allocator.free(data);
+    var best_ts: ?i64 = null;
+    var best_reason: ?[]u8 = null;
+    var best_path: ?[]u8 = null;
+
+    var lines = std.mem.splitSequence(u8, data, "\n");
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch continue;
+        defer parsed.deinit();
+        if (parsed.value != .object) continue;
+
+        const value_session = parsed.value.object.get("session_id") orelse continue;
+        if (value_session != .string) continue;
+        if (!std.mem.eql(u8, value_session.string, session_id)) continue;
+
+        const timestamp = parseCreatedAtMs(parsed.value.object.get("timestamp_ms") orelse continue) orelse continue;
+        const reason = parsed.value.object.get("reason") orelse continue;
+        if (reason != .string) continue;
+        const archive_path_value = parsed.value.object.get("archive_path") orelse continue;
+        if (archive_path_value != .string) continue;
+
+        if (best_ts == null or timestamp > best_ts.?) {
+            if (best_reason) |old| allocator.free(old);
+            if (best_path) |old| allocator.free(old);
+
+            best_reason = try allocator.dupe(u8, reason.string);
+            best_path = try allocator.dupe(u8, archive_path_value.string);
+            best_ts = timestamp;
+        }
+    }
+
+    if (best_ts == null or best_reason == null or best_path == null) {
+        if (best_reason) |best| allocator.free(best);
+        if (best_path) |best| allocator.free(best);
+        return null;
+    }
+
+    return LatestArchiveRef{
+        .timestamp_ms = best_ts.?,
+        .reason = best_reason.?,
+        .archive_path = best_path.?,
+    };
+}
+
+fn appendLatestArchiveToResponse(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    archive_path: []const u8,
+    first_item: *bool,
+    remaining: *usize,
+    include_full_from_archive: bool,
+) !void {
+    const file = std.fs.cwd().openFile(archive_path, .{ .mode = .read_only }) catch return;
+    defer file.close();
+
+    const data = try file.readToEndAlloc(allocator, 1024 * 1024);
+    defer allocator.free(data);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, data, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return;
+
+    if (parsed.value.object.get("summaries")) |summaries| {
+        if (summaries != .array) return;
+        var idx = summaries.array.items.len;
+        while (idx > 0 and remaining.* > 0) {
+            idx -= 1;
+            const summary_value = summaries.array.items[idx];
+            if (summary_value != .object) continue;
+
+            const summary_obj = summary_value.object;
+            const id = parsePositiveInteger(summary_obj.get("id") orelse continue) orelse continue;
+            const source_id = parsePositiveInteger(summary_obj.get("source_id") orelse continue) orelse continue;
+            const text = summary_obj.get("text") orelse continue;
+            if (text != .string) continue;
+            const created_at_ms = if (summary_obj.get("created_at_ms")) |ts| parseCreatedAtMs(ts) else 0;
+
+            try appendRecallSummaryItem(
+                allocator,
+                out,
+                first_item,
+                "summary",
+                "ltm",
+                id,
+                source_id,
+                text.string,
+                created_at_ms,
+            );
+            if (remaining.* > 0) remaining.* -= 1;
+        }
+    }
+
+    if (!include_full_from_archive) return;
+
+    if (parsed.value.object.get("entries")) |entries| {
+        if (entries != .array) return;
+        var idx = entries.array.items.len;
+        while (idx > 0 and remaining.* > 0) {
+            idx -= 1;
+            const entry_value = entries.array.items[idx];
+            if (entry_value != .object) continue;
+
+            const entry_obj = entry_value.object;
+            const entry_id = parsePositiveInteger(entry_obj.get("id") orelse continue) orelse continue;
+            const role = if (entry_obj.get("role")) |value| blk: {
+                if (value != .string) break :blk null;
+                break :blk parseRole(value.string);
+            } else null;
+            if (role == null) continue;
+
+            const state = if (entry_obj.get("state")) |state_value|
+                if (state_value == .string and std.mem.eql(u8, state_value.string, "active")) "active" else "tombstone"
+            else
+                "unknown";
+            const content = if (entry_obj.get("content")) |value| if (value == .string) value.string else continue else continue;
+            const related_to = if (entry_obj.get("related_to")) |value| blk: {
+                if (value == .null) break :blk null;
+                break :blk parsePositiveInteger(value);
+            } else null;
+
+            if (remaining.* == 0) break;
+
+            try appendRecallEntryItem(
+                allocator,
+                out,
+                first_item,
+                "entry",
+                "ltm",
+                state,
+                role.?,
+                entry_id,
+                related_to,
+                content,
+            );
+            if (remaining.* > 0) remaining.* -= 1;
+        }
+    }
+}
+
+fn appendRecallSummaryItem(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    first_item: *bool,
+    kind: []const u8,
+    source: []const u8,
+    summary_id: memory.MemoryID,
+    source_id: memory.MemoryID,
+    text: []const u8,
+    created_at_ms: i64,
+) !void {
+    if (!first_item.*) try out.appendSlice(allocator, ",");
+    first_item.* = false;
+    const escaped_text = try protocol.jsonEscape(allocator, text);
+    defer allocator.free(escaped_text);
+    const entry = try std.fmt.allocPrint(
+        allocator,
+        "{{\"kind\":\"{s}\",\"source\":\"{s}\",\"id\":{d},\"source_id\":{d},\"created_at_ms\":{d},\"text\":\"{s}\"}}",
+        .{ kind, source, summary_id, source_id, created_at_ms, escaped_text },
+    );
+    defer allocator.free(entry);
+    try out.appendSlice(allocator, entry);
+}
+
+fn appendRecallEntryItem(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    first_item: *bool,
+    kind: []const u8,
+    source: []const u8,
+    state: []const u8,
+    role: ziggy_piai.types.MessageRole,
+    id: memory.MemoryID,
+    related_to: ?memory.MemoryID,
+    content: []const u8,
+) !void {
+    if (!first_item.*) try out.appendSlice(allocator, ",");
+    first_item.* = false;
+
+    const escaped_content = try protocol.jsonEscape(allocator, content);
+    defer allocator.free(escaped_content);
+
+    const role_name = switch (role) {
+        .user => "user",
+        .assistant => "assistant",
+        .system => "system",
+        .tool => "tool",
+        .tool_result => "tool_result",
+    };
+
+    const item = if (related_to) |related_id| try std.fmt.allocPrint(
+        allocator,
+        "{{\"kind\":\"{s}\",\"source\":\"{s}\",\"id\":{d},\"role\":\"{s}\",\"state\":\"{s}\",\"related_to\":{d},\"content\":\"{s}\"}}",
+        .{ kind, source, id, role_name, state, related_id, escaped_content },
+    ) else try std.fmt.allocPrint(
+        allocator,
+        "{{\"kind\":\"{s}\",\"source\":\"{s}\",\"id\":{d},\"role\":\"{s}\",\"state\":\"{s}\",\"related_to\":null,\"content\":\"{s}\"}}",
+        .{ kind, source, id, role_name, state, escaped_content },
+    );
+    defer allocator.free(item);
+
+    try out.appendSlice(allocator, item);
+}
+
+fn restoreSessionFromLatestArchive(
+    allocator: std.mem.Allocator,
+    session: *SessionContext,
+    session_id: []const u8,
+) !bool {
+    const latest = try findLatestArchiveForSession(allocator, session_id);
+    const archive = latest orelse return false;
+    defer {
+        allocator.free(archive.archive_path);
+        allocator.free(archive.reason);
+    }
+
+    const file = std.fs.cwd().openFile(archive.archive_path, .{ .mode = .read_only }) catch return false;
+    defer file.close();
+
+    const data = try file.readToEndAlloc(allocator, 1024 * 1024);
+    defer allocator.free(data);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, data, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+
+    session.resetRam(allocator);
+    try session.setSessionId(allocator, session_id);
+
+    const next_id = if (parsed.value.object.get("next_id")) |next_id_value|
+        parsePositiveInteger(next_id_value) orelse 1
+    else
+        1;
+    session.ram.setNextId(next_id);
+
+    if (parsed.value.object.get("summaries")) |summaries| {
+        if (summaries == .array) {
+            for (summaries.array.items) |summary_value| {
+                if (summary_value != .object) continue;
+                const summary_obj = summary_value.object;
+
+                const summary_id = parsePositiveInteger(summary_obj.get("id") orelse continue) orelse continue;
+                const source_id = parsePositiveInteger(summary_obj.get("source_id") orelse continue) orelse continue;
+
+                const summary_text = summary_obj.get("text") orelse continue;
+                if (summary_text != .string) continue;
+
+                const created_at_ms = if (summary_obj.get("created_at_ms")) |ts|
+                    (parseCreatedAtMs(ts) orelse 0)
+                else
+                    0;
+
+                try session.ram.restoreSummary(summary_id, source_id, summary_text.string, created_at_ms);
+            }
+        }
+    }
+
+    const ArchivedEntry = struct {
+        id: memory.MemoryID,
+        role: ziggy_piai.types.MessageRole,
+        related_to: ?memory.MemoryID,
+        content: []const u8,
+    };
+
+    var restored_entries = std.ArrayListUnmanaged(ArchivedEntry){};
+    defer restored_entries.deinit(allocator);
+
+    if (parsed.value.object.get("entries")) |entries| {
+        if (entries == .array) {
+            var idx = entries.array.items.len;
+            var projected_bytes: usize = 0;
+
+            while (idx > 0) {
+                idx -= 1;
+                const entry_value = entries.array.items[idx];
+                if (entry_value != .object) continue;
+
+                const entry_obj = entry_value.object;
+                const state_value = entry_obj.get("state") orelse continue;
+                if (state_value != .string or !std.mem.eql(u8, state_value.string, "active")) continue;
+
+                const entry_id = parsePositiveInteger(entry_obj.get("id") orelse continue) orelse continue;
+                const role = if (entry_obj.get("role")) |role_value| blk: {
+                    if (role_value != .string) break :blk null;
+                    break :blk parseRole(role_value.string);
+                } else null;
+                if (role == null) continue;
+
+                const content = if (entry_value.object.get("content")) |content_value|
+                    if (content_value == .string) content_value.string else continue
+                else
+                    continue;
+                const content_len = content.len;
+
+                const related_to = if (entry_obj.get("related_to")) |related_value| blk: {
+                    if (related_value == .null) break :blk null;
+                    if (related_value != .integer) break :blk null;
+                    break :blk parsePositiveInteger(related_value);
+                } else null;
+
+                if (projected_bytes + content_len > MAX_CONTEXT_BYTES) continue;
+                if (restored_entries.items.len >= MAX_CONTEXT_MESSAGES) continue;
+
+                try restored_entries.append(allocator, .{
+                    .id = entry_id,
+                    .role = role.?,
+                    .related_to = related_to,
+                    .content = content,
+                });
+                projected_bytes += content_len;
+            }
+        }
+    }
+
+    if (restored_entries.items.len > 0) {
+        var reverse_index = restored_entries.items.len;
+        while (reverse_index > 0) {
+            reverse_index -= 1;
+            const restored_entry = restored_entries.items[reverse_index];
+            try session.ram.restoreEntry(
+                restored_entry.id,
+                restored_entry.role,
+                .active,
+                restored_entry.related_to,
+                restored_entry.content,
+            );
+        }
+    }
+
+    if (session.ram.summaries.items.len == 0 and session.ram.entries.items.len == 0) return false;
+    return true;
 }
 
 fn handleSessionReset(

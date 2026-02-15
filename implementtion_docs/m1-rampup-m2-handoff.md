@@ -1,6 +1,6 @@
 # M1 RAM Guide & Handoff for Future AIs
 
-## Current state (as of commit `bf60623`)
+## Current state (post-M1 and early M2)
 
 - RAM model is implemented in `src/memory.zig` and is the active runtime context:
   - Stable `MemoryID` values
@@ -18,6 +18,11 @@
   - `/new` user command
   - optional RAM archive output under `.spiderweb-ltm/<session>-<timestamp>.json`
   - archive includes `version`, `timestamp_ms`, `session_id`, `reason`, `next_id`, `entries`, `summaries`.
+- Optional LTM fallback recovery on client reconnect:
+  - handshake now attempts in-memory session restore first
+  - if not found, it loads the latest archive for that `sessionKey`
+  - restored sessions recover `summaries` plus capped recent active RAM entries
+  - this keeps topic continuity without crashing if RAM snapshot is missing.
 
 ## Useful file map
 
@@ -36,6 +41,7 @@
 1. RAM eviction/summarization should be persisted to long-term memory as structured records, not only active session JSON snapshots.
 2. Concurrency safety for RAM mutations is present, but cross-component locking/queue ownership boundaries are not yet isolated behind a dedicated session store abstraction.
 3. Client-facing control surface is added for reset/new; add tests around message pathing for `session.new` and `/new`.
+4. `memory.recall` returns a compact snapshot payload but currently lacks topic-level filtering and richer schema fields (`memory.query` path is still pending).
 
 ## M2 start plan (next steps)
 
@@ -55,10 +61,20 @@ Recommended execution order:
    - Output: structured `memory.event`/`memory.recall` payloads.
 5. Add startup recovery path:
    - restore recent summarized facts from LTM when session RAM is hot-started.
+   - done: latest archive fallback if persisted session state is unavailable.
 6. Add tests:
    - archive write/read
    - recall precedence (summaries first, full entries by request)
    - fallback behavior if LTM unavailable.
+
+### Current M2 status
+
+- Added `memory.recall` implementation with archive-aware recall (`summaries` first; optionally full entries) in `src/server_piai.zig`.
+- Added startup reconnect fallback to latest LTM archive when a requested session has no in-memory snapshot.
+- Still missing for M2:
+  - first-class SQLite-backed `memory.db` store (plan still defines NDJSON/JSON archives as temporary persistence)
+  - schema/API for recall by topic and memory IDs (`memory.query`)
+  - dedicated migration/retention policy and background summarize->LTM flush path
 
 ## Operational notes
 
