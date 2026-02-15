@@ -8,6 +8,7 @@ const orchestrator = @import("orchestrator.zig");
 const workers = @import("workers.zig");
 const ltm_store = @import("ltm_store.zig");
 const ltm_index = @import("ltm_index.zig");
+const agent_registry = @import("agent_registry.zig");
 const posix = std.posix;
 const builtin = @import("builtin");
 const linux = if (builtin.os.tag == .linux) std.os.linux else struct {
@@ -92,6 +93,7 @@ const ServerState = struct {
     http_client: std.http.Client,
     provider_config: Config.ProviderConfig,
     ltm_store: ?ltm_store.Store,
+    agent_registry: agent_registry.AgentRegistry,
 };
 
 const ConnectionState = enum {
@@ -374,6 +376,10 @@ pub fn run(allocator: std.mem.Allocator, bind_addr: []const u8, port: u16, provi
 
     var persisted_sessions = try loadPersistedSessions(allocator);
 
+    var registry = agent_registry.AgentRegistry.init(allocator, ".");
+    try registry.scan();
+    defer registry.deinit();
+
     var state = ServerState{
         .allocator = allocator,
         .rng = std.Random.DefaultPrng.init(@intCast(std.time.milliTimestamp())),
@@ -382,6 +388,7 @@ pub fn run(allocator: std.mem.Allocator, bind_addr: []const u8, port: u16, provi
         .http_client = http_client,
         .provider_config = provider_config,
         .ltm_store = ltm_storage,
+        .agent_registry = registry,
     };
     defer if (state.ltm_store) |*store| store.close();
 
@@ -886,6 +893,48 @@ fn handleUserMessage(allocator: std.mem.Allocator, state: *ServerState, pool: *s
     const is_chat_send = std.mem.eql(u8, msg_type.string, "chat.send") or std.mem.eql(u8, msg_type.string, "session.send");
     const is_agent_control = std.mem.eql(u8, msg_type.string, "agent.control");
     const is_agent_heartbeat = std.mem.eql(u8, msg_type.string, "agent.heartbeat");
+    const is_agent_list = std.mem.eql(u8, msg_type.string, "agent.list");
+    const is_agent_get = std.mem.eql(u8, msg_type.string, "agent.get");
+
+    if (is_agent_list) {
+        try handleAgentList(allocator, state, conn, request_id);
+        return;
+    }
+
+    if (is_agent_get) {
+        const agent_id = if (parsed.value.object.get("agent_id")) |id|
+            if (id == .string) id.string else null
+        else
+            null;
+        try handleAgentGet(allocator, state, conn, request_id, agent_id);
+        return;
+    }
+
+    const is_session_restore = std.mem.eql(u8, msg_type.string, "session.restore");
+    const is_session_history = std.mem.eql(u8, msg_type.string, "session.history");
+
+    if (is_session_restore) {
+        const agent_id = if (parsed.value.object.get("agent_id")) |id|
+            if (id == .string) id.string else "default"
+        else
+            "default";
+        try handleSessionRestore(allocator, state, conn, request_id, agent_id);
+        return;
+    }
+
+    if (is_session_history) {
+        const agent_id = if (parsed.value.object.get("agent_id")) |id|
+            if (id == .string) id.string else "default"
+        else
+            "default";
+        const limit = if (parsed.value.object.get("limit")) |l|
+            if (l == .integer and l.integer >= 0) @min(l.integer, 20) else 5
+        else
+            5;
+        try handleSessionHistory(allocator, state, conn, request_id, agent_id, @intCast(limit));
+        return;
+    }
+
     if (!is_chat_send and !is_agent_control and !is_agent_heartbeat) return;
 
     const control_action = blk: {
@@ -1243,6 +1292,17 @@ fn handleUserMessage(allocator: std.mem.Allocator, state: *ServerState, pool: *s
         user_msg_id,
         user_content.len,
     });
+
+    // Update session metadata for restore functionality
+    if (state.ltm_store) |*store| {
+        store.updateSessionMetadata(
+            conn.session.session_id,
+            conn.agent_id,
+            @intCast(conn.session.ram.entries.items.len),
+        ) catch |err| {
+            std.log.warn("Failed to update session metadata: {s}", .{@errorName(err)});
+        };
+    }
 
     const args = try allocator.create(AiTaskArgs);
     args.* = .{
@@ -1770,6 +1830,239 @@ fn workerModeName(mode: WorkerControlMode) []const u8 {
         .paused => "paused",
         .cancelled => "cancelled",
     };
+}
+
+fn handleAgentList(
+    allocator: std.mem.Allocator,
+    state: *ServerState,
+    conn: *Connection,
+    request_id: []const u8,
+) !void {
+    const agents = state.agent_registry.listAgents();
+
+    var json = std.ArrayListUnmanaged(u8){};
+    defer json.deinit(allocator);
+
+    try json.appendSlice(allocator, "{\"type\":\"agent.list.response\",\"request\":\"");
+    const escaped_request_id = try protocol.jsonEscape(allocator, request_id);
+    defer allocator.free(escaped_request_id);
+    try json.appendSlice(allocator, escaped_request_id);
+    try json.appendSlice(allocator, "\",\"agents\":[");
+
+    for (agents, 0..) |agent, idx| {
+        if (idx > 0) try json.appendSlice(allocator, ",");
+
+        const escaped_id = try protocol.jsonEscape(allocator, agent.id);
+        defer allocator.free(escaped_id);
+        const escaped_name = try protocol.jsonEscape(allocator, agent.name);
+        defer allocator.free(escaped_name);
+        const escaped_desc = try protocol.jsonEscape(allocator, agent.description);
+        defer allocator.free(escaped_desc);
+
+        try json.appendSlice(allocator, "{\"id\":\"");
+        try json.appendSlice(allocator, escaped_id);
+        try json.appendSlice(allocator, "\",\"name\":\"");
+        try json.appendSlice(allocator, escaped_name);
+        try json.appendSlice(allocator, "\",\"description\":\"");
+        try json.appendSlice(allocator, escaped_desc);
+        try json.appendSlice(allocator, "\",\"is_default\":");
+        try json.appendSlice(allocator, if (agent.is_default) "true" else "false");
+        try json.appendSlice(allocator, ",\"identity_loaded\":");
+        try json.appendSlice(allocator, if (agent.identity_loaded) "true" else "false");
+        try json.appendSlice(allocator, "}");
+    }
+
+    try json.appendSlice(allocator, "]}");
+
+    try sendDirect(allocator, conn, json.items);
+}
+
+fn handleAgentGet(
+    allocator: std.mem.Allocator,
+    state: *ServerState,
+    conn: *Connection,
+    request_id: []const u8,
+    agent_id: ?[]const u8,
+) !void {
+    const agent = if (agent_id) |id|
+        state.agent_registry.getAgent(id) orelse state.agent_registry.getDefaultAgent()
+    else
+        state.agent_registry.getDefaultAgent();
+
+    if (agent == null) {
+        try sendErrorJsonDirect(allocator, conn, "No agents available");
+        return;
+    }
+
+    const a = agent.?;
+
+    const escaped_request_id = try protocol.jsonEscape(allocator, request_id);
+    defer allocator.free(escaped_request_id);
+    const escaped_id = try protocol.jsonEscape(allocator, a.id);
+    defer allocator.free(escaped_id);
+    const escaped_name = try protocol.jsonEscape(allocator, a.name);
+    defer allocator.free(escaped_name);
+    const escaped_desc = try protocol.jsonEscape(allocator, a.description);
+    defer allocator.free(escaped_desc);
+
+    const payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"type\":\"agent.info\",\"request\":\"{s}\",\"agent\":{{\"id\":\"{s}\",\"name\":\"{s}\",\"description\":\"{s}\",\"is_default\":{s},\"identity_loaded\":{s}}}}}",
+        .{
+            escaped_request_id,
+            escaped_id,
+            escaped_name,
+            escaped_desc,
+            if (a.is_default) "true" else "false",
+            if (a.identity_loaded) "true" else "false",
+        },
+    );
+    defer allocator.free(payload);
+
+    try sendDirect(allocator, conn, payload);
+}
+
+fn sendErrorJsonDirect(
+    allocator: std.mem.Allocator,
+    conn: *Connection,
+    message: []const u8,
+) !void {
+    const escaped = try protocol.jsonEscape(allocator, message);
+    defer allocator.free(escaped);
+
+    const payload = try std.fmt.allocPrint(allocator, "{{\"type\":\"error\",\"message\":\"{s}\"}}", .{escaped});
+    defer allocator.free(payload);
+
+    try sendDirect(allocator, conn, payload);
+}
+
+fn handleSessionRestore(
+    allocator: std.mem.Allocator,
+    state: *ServerState,
+    conn: *Connection,
+    request_id: []const u8,
+    agent_id: []const u8,
+) !void {
+    if (state.ltm_store) |*store| {
+        const session = store.getLastActiveSession(agent_id) catch |err| {
+            std.log.err("Failed to get last active session: {s}", .{@errorName(err)});
+            try sendErrorJsonDirect(allocator, conn, "Failed to retrieve session");
+            return;
+        };
+
+        if (session) |s| {
+            defer {
+                var mutable = s;
+                mutable.deinit(allocator);
+            }
+
+            const escaped_request_id = try protocol.jsonEscape(allocator, request_id);
+            defer allocator.free(escaped_request_id);
+            const escaped_session_id = try protocol.jsonEscape(allocator, s.session_id);
+            defer allocator.free(escaped_session_id);
+            const escaped_agent_id = try protocol.jsonEscape(allocator, s.agent_id);
+            defer allocator.free(escaped_agent_id);
+            const escaped_summary = if (s.summary) |sum|
+                try protocol.jsonEscape(allocator, sum)
+            else
+                try allocator.dupe(u8, "");
+            defer if (s.summary != null) allocator.free(escaped_summary);
+
+            const payload = try std.fmt.allocPrint(
+                allocator,
+                "{{\"type\":\"session.restore.response\",\"request\":\"{s}\",\"found\":true,\"session\":{{\"session_key\":\"{s}\",\"agent_id\":\"{s}\",\"last_active_ms\":{d},\"message_count\":{d},\"summary\":\"{s}\"}}}}",
+                .{
+                    escaped_request_id,
+                    escaped_session_id,
+                    escaped_agent_id,
+                    s.last_active_ms,
+                    s.message_count,
+                    escaped_summary,
+                },
+            );
+            defer allocator.free(payload);
+
+            try sendDirect(allocator, conn, payload);
+        } else {
+            const escaped_request_id = try protocol.jsonEscape(allocator, request_id);
+            defer allocator.free(escaped_request_id);
+
+            const payload = try std.fmt.allocPrint(
+                allocator,
+                "{{\"type\":\"session.restore.response\",\"request\":\"{s}\",\"found\":false}}",
+                .{escaped_request_id},
+            );
+            defer allocator.free(payload);
+
+            try sendDirect(allocator, conn, payload);
+        }
+    } else {
+        try sendErrorJsonDirect(allocator, conn, "LTM store not available");
+    }
+}
+
+fn handleSessionHistory(
+    allocator: std.mem.Allocator,
+    state: *ServerState,
+    conn: *Connection,
+    request_id: []const u8,
+    agent_id: []const u8,
+    limit: usize,
+) !void {
+    if (state.ltm_store) |*store| {
+        var sessions = store.listRecentSessions(agent_id, limit) catch |err| {
+            std.log.err("Failed to list recent sessions: {s}", .{@errorName(err)});
+            try sendErrorJsonDirect(allocator, conn, "Failed to retrieve session history");
+            return;
+        };
+        defer {
+            for (sessions.items) |*s| {
+                s.deinit(allocator);
+            }
+            sessions.deinit(allocator);
+        }
+
+        var json = std.ArrayListUnmanaged(u8){};
+        defer json.deinit(allocator);
+
+        try json.appendSlice(allocator, "{\"type\":\"session.history.response\",\"request\":\"");
+        const escaped_request_id = try protocol.jsonEscape(allocator, request_id);
+        defer allocator.free(escaped_request_id);
+        try json.appendSlice(allocator, escaped_request_id);
+        try json.appendSlice(allocator, "\",\"sessions\":[");
+
+        for (sessions.items, 0..) |session, idx| {
+            if (idx > 0) try json.appendSlice(allocator, ",");
+
+            const escaped_session_id = try protocol.jsonEscape(allocator, session.session_id);
+            defer allocator.free(escaped_session_id);
+            const escaped_summary = if (session.summary) |sum|
+                try protocol.jsonEscape(allocator, sum)
+            else
+                try allocator.dupe(u8, "");
+            defer if (session.summary != null) allocator.free(escaped_summary);
+
+            try json.appendSlice(allocator, "{\"session_key\":\"");
+            try json.appendSlice(allocator, escaped_session_id);
+            try json.appendSlice(allocator, "\",\"last_active_ms\":");
+            const last_active = try std.fmt.allocPrint(allocator, "{d}", .{session.last_active_ms});
+            defer allocator.free(last_active);
+            try json.appendSlice(allocator, last_active);
+            try json.appendSlice(allocator, ",\"message_count\":");
+            const msg_count = try std.fmt.allocPrint(allocator, "{d}", .{session.message_count});
+            defer allocator.free(msg_count);
+            try json.appendSlice(allocator, msg_count);
+            try json.appendSlice(allocator, ",\"summary\":\"");
+            try json.appendSlice(allocator, escaped_summary);
+            try json.appendSlice(allocator, "\"}");
+        }
+
+        try json.appendSlice(allocator, "]}");
+
+        try sendDirect(allocator, conn, json.items);
+    } else {
+        try sendErrorJsonDirect(allocator, conn, "LTM store not available");
+    }
 }
 
 fn sendAgentState(
@@ -3327,7 +3620,7 @@ fn loadPersistedSessions(allocator: std.mem.Allocator) !std.ArrayListUnmanaged(P
         const worker_queue_depth = if (session_obj.get("workerQueueDepth")) |value| parsePositiveInteger(value) orelse 0 else 0;
         const worker_active_tasks = if (session_obj.get("workerActiveTasks")) |value| parsePositiveInteger(value) orelse 0 else 0;
         const worker_mode = if (session_obj.get("workerMode")) |value|
-            if (value == .string) parseWorkerMode(value.string) orelse .running
+            (if (value == .string) parseWorkerMode(value.string) orelse .running else .running)
         else
             .running;
         const worker_dropped_tasks = if (session_obj.get("workerDroppedTasks")) |value| parsePositiveInteger(value) orelse 0 else 0;
@@ -3380,7 +3673,6 @@ fn restoreSessionFromPersistedWithId(
         session.worker_backpressure_notified = recovered.worker_backpressure_notified;
         if (session.last_goal.len > 0) allocator.free(session.last_goal);
         session.last_goal = recovered.worker_last_goal;
-        recovered.worker_last_goal = &[_]u8{};
         std.log.info("Restored session state: {s}", .{session.session_id});
         return;
     }
