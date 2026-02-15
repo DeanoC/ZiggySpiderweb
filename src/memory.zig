@@ -22,6 +22,13 @@ pub const RamEntry = struct {
     related_to: ?MemoryID = null,
 };
 
+const PendingMutation = struct {
+    kind: RamMutation,
+    id: MemoryID = 0,
+    role: ziggy_piai.types.MessageRole = .system,
+    content: ?[]const u8 = null,
+};
+
 pub const SummaryEntry = struct {
     id: MemoryID,
     source_id: MemoryID,
@@ -40,6 +47,7 @@ pub const RamContext = struct {
     mutex: std.Thread.Mutex = .{},
     entries: std.ArrayListUnmanaged(RamEntry),
     summaries: std.ArrayListUnmanaged(SummaryEntry),
+    pending_mutations: std.ArrayListUnmanaged(PendingMutation),
     next_id: MemoryID = 1,
     max_messages: usize,
     max_bytes: usize,
@@ -50,6 +58,7 @@ pub const RamContext = struct {
             .allocator = allocator,
             .entries = .{},
             .summaries = .{},
+            .pending_mutations = .{},
             .max_messages = max_messages,
             .max_bytes = max_bytes,
             .total_message_bytes = 0,
@@ -57,8 +66,13 @@ pub const RamContext = struct {
     }
 
     pub fn deinit(self: *RamContext) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
         self.clearMessages();
         self.entries.deinit(self.allocator);
+        self.clearPendingLocked();
+        self.pending_mutations.deinit(self.allocator);
 
         for (self.summaries.items) |summary| {
             self.allocator.free(summary.text);
@@ -75,9 +89,19 @@ pub const RamContext = struct {
         self.next_id = 1;
     }
 
+    fn clearPendingLocked(self: *RamContext) void {
+        for (self.pending_mutations.items) |mutation| {
+            if (mutation.content) |content| {
+                self.allocator.free(content);
+            }
+        }
+        self.pending_mutations.clearRetainingCapacity();
+    }
+
     pub fn load(self: *RamContext, allocator: std.mem.Allocator) ![]const ziggy_piai.types.Message {
         self.mutex.lock();
         defer self.mutex.unlock();
+        try self.flushPendingLocked();
 
         var active_count: usize = 0;
         for (self.entries.items) |entry| {
@@ -107,27 +131,52 @@ pub const RamContext = struct {
         defer self.mutex.unlock();
 
         const id = self.nextMemoryId();
-        try self.entries.append(self.allocator, .{
+        const owned_content = try self.allocator.dupe(u8, content);
+        try self.queueMutationLocked(.{
+            .kind = .update,
             .id = id,
-            .message = .{ .role = role, .content = try self.allocator.dupe(u8, content) },
-            .state = .active,
+            .role = role,
+            .content = owned_content,
         });
-        self.total_message_bytes += content.len;
-
-        try self.applyHardLimitLocked();
+        try self.flushPendingLocked();
         return id;
     }
 
     pub fn evict(self: *RamContext) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
-        try self.evictLocked();
+        try self.queueMutationLocked(.{ .kind = .evict });
+        try self.flushPendingLocked();
     }
 
     pub fn summarize(self: *RamContext) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
-        try self.summarizeLocked();
+        try self.queueMutationLocked(.{ .kind = .summarize });
+        try self.flushPendingLocked();
+    }
+
+    fn queueMutationLocked(self: *RamContext, mutation: PendingMutation) !void {
+        try self.pending_mutations.append(self.allocator, mutation);
+    }
+
+    fn flushPendingLocked(self: *RamContext) !void {
+        while (self.pending_mutations.items.len > 0) {
+            const mutation = self.pending_mutations.orderedRemove(0);
+            switch (mutation.kind) {
+                .load => {},
+                .update => {
+                    const content = mutation.content orelse return;
+                    try self.applyUpdateLocked(mutation.id, mutation.role, content);
+                },
+                .evict => try self.evictLocked(),
+                .summarize => try self.summarizeLocked(),
+            }
+
+            if (mutation.content) |content| {
+                self.allocator.free(content);
+            }
+        }
     }
 
     fn evictLocked(self: *RamContext) !void {
@@ -158,6 +207,17 @@ pub const RamContext = struct {
         const tombstone = try self.buildTombstone(removed.id, "summarized", summary_text);
         try self.entries.append(self.allocator, tombstone);
         self.allocator.free(removed.message.content);
+
+        try self.applyHardLimitLocked();
+    }
+
+    fn applyUpdateLocked(self: *RamContext, id: MemoryID, role: ziggy_piai.types.MessageRole, content: []const u8) !void {
+        try self.entries.append(self.allocator, .{
+            .id = id,
+            .message = .{ .role = role, .content = try self.allocator.dupe(u8, content) },
+            .state = .active,
+        });
+        self.total_message_bytes += content.len;
 
         try self.applyHardLimitLocked();
     }
@@ -205,3 +265,99 @@ pub const RamContext = struct {
         return self.next_id;
     }
 };
+
+test "memory: RAM context assigns stable incremental ids" {
+    const allocator = std.testing.allocator;
+    var ctx = RamContext.init(allocator, 32, 16 * 1024);
+    defer ctx.deinit();
+
+    const user_id = try ctx.update(.user, "hello");
+    const assistant_id = try ctx.update(.assistant, "reply");
+    const final_id = try ctx.update(.user, "again");
+
+    try std.testing.expectEqual(@as(MemoryID, 1), user_id);
+    try std.testing.expectEqual(@as(MemoryID, 2), assistant_id);
+    try std.testing.expectEqual(@as(MemoryID, 3), final_id);
+
+    const snapshot = try ctx.load(allocator);
+    defer {
+        for (snapshot) |msg| allocator.free(msg.content);
+        allocator.free(snapshot);
+    }
+    try std.testing.expectEqual(@as(usize, 3), snapshot.len);
+    try std.testing.expectEqual(ziggy_piai.types.MessageRole.user, snapshot[0].role);
+    try std.testing.expectEqualStrings("hello", snapshot[0].content);
+}
+
+test "memory: summarize mutation creates summary + tombstone links" {
+    const allocator = std.testing.allocator;
+    var ctx = RamContext.init(allocator, 32, 16 * 1024);
+    defer ctx.deinit();
+
+    _ = try ctx.update(.user, "first message");
+    _ = try ctx.update(.assistant, "second message");
+    try ctx.summarize();
+
+    const context = try ctx.load(allocator);
+    defer {
+        for (context) |msg| allocator.free(msg.content);
+        allocator.free(context);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), context.len);
+    try std.testing.expectEqualStrings("second message", context[0].content);
+
+    try std.testing.expectEqual(@as(usize, 1), ctx.summaries.items.len);
+    try std.testing.expectEqual(@as(MemoryID, 1), ctx.summaries.items[0].source_id);
+    try std.testing.expectEqualStrings("[summary:1] first message", ctx.summaries.items[0].text);
+
+    var found_tombstone = false;
+    for (ctx.entries.items) |entry| {
+        if (entry.state == .tombstone and entry.related_to == 1) {
+            found_tombstone = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_tombstone);
+}
+
+test "memory: queued mutations apply in FIFO order" {
+    const allocator = std.testing.allocator;
+    var ctx = RamContext.init(allocator, 16, 16 * 1024);
+    defer ctx.deinit();
+
+    const oldest_id = try ctx.update(.user, "oldest");
+    try std.testing.expectEqual(@as(MemoryID, 1), oldest_id);
+
+    ctx.mutex.lock();
+    defer ctx.mutex.unlock();
+    try ctx.queueMutationLocked(.{
+        .kind = .update,
+        .id = 11,
+        .role = .assistant,
+        .content = try allocator.dupe(u8, "queued assistant"),
+    });
+    try ctx.queueMutationLocked(.{
+        .kind = .update,
+        .id = 12,
+        .role = .assistant,
+        .content = try allocator.dupe(u8, "queued assistant two"),
+    });
+    try ctx.queueMutationLocked(.{ .kind = .evict });
+    try ctx.flushPendingLocked();
+
+    var oldest_evicted = false;
+    for (ctx.entries.items) |entry| {
+        if (entry.state == .tombstone and entry.related_to == oldest_id) {
+            oldest_evicted = true;
+            break;
+        }
+    }
+    try std.testing.expect(oldest_evicted);
+
+    var active_count: usize = 0;
+    for (ctx.entries.items) |entry| {
+        if (entry.state == .active) active_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), active_count);
+}
