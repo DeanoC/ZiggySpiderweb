@@ -6,13 +6,13 @@ pub const BuiltinTools = struct {
     /// Read file contents
     pub fn fileRead(allocator: std.mem.Allocator, args: std.json.ObjectMap) ToolResult {
         const path_value = args.get("path") orelse {
-            return .{ .error = .{
+            return .{ .failure = .{
                 .code = .invalid_params,
                 .message = "Missing required parameter: path",
             } };
         };
         if (path_value != .string) {
-            return .{ .error = .{
+            return .{ .failure = .{
                 .code = .invalid_params,
                 .message = "Parameter 'path' must be a string",
             } };
@@ -21,7 +21,7 @@ pub const BuiltinTools = struct {
 
         // Security: prevent directory traversal
         if (std.mem.indexOf(u8, path, "..") != null) {
-            return .{ .error = .{
+            return .{ .failure = .{
                 .code = .permission_denied,
                 .message = "Path cannot contain '..'",
             } };
@@ -29,7 +29,7 @@ pub const BuiltinTools = struct {
 
         const content = std.fs.cwd().readFileAlloc(allocator, path, 1024 * 1024) catch |err| {
             const msg = std.fmt.allocPrint(allocator, "Failed to read file: {s}", .{@errorName(err)}) catch "Failed to read file";
-            return .{ .error = .{
+            return .{ .failure = .{
                 .code = .execution_failed,
                 .message = msg,
             } };
@@ -41,20 +41,20 @@ pub const BuiltinTools = struct {
     /// Write file contents
     pub fn fileWrite(allocator: std.mem.Allocator, args: std.json.ObjectMap) ToolResult {
         const path_value = args.get("path") orelse {
-            return .{ .error = .{
+            return .{ .failure = .{
                 .code = .invalid_params,
                 .message = "Missing required parameter: path",
             } };
         };
         const content_value = args.get("content") orelse {
-            return .{ .error = .{
+            return .{ .failure = .{
                 .code = .invalid_params,
                 .message = "Missing required parameter: content",
             } };
         };
 
         if (path_value != .string or content_value != .string) {
-            return .{ .error = .{
+            return .{ .failure = .{
                 .code = .invalid_params,
                 .message = "Parameters 'path' and 'content' must be strings",
             } };
@@ -65,7 +65,7 @@ pub const BuiltinTools = struct {
 
         // Security: prevent directory traversal
         if (std.mem.indexOf(u8, path, "..") != null) {
-            return .{ .error = .{
+            return .{ .failure = .{
                 .code = .permission_denied,
                 .message = "Path cannot contain '..'",
             } };
@@ -75,7 +75,7 @@ pub const BuiltinTools = struct {
         if (std.fs.path.dirname(path)) |dir| {
             std.fs.cwd().makePath(dir) catch |err| {
                 const msg = std.fmt.allocPrint(allocator, "Failed to create directory: {s}", .{@errorName(err)}) catch "Failed to create directory";
-                return .{ .error = .{
+                return .{ .failure = .{
                     .code = .execution_failed,
                     .message = msg,
                 } };
@@ -87,13 +87,13 @@ pub const BuiltinTools = struct {
             .data = content,
         }) catch |err| {
             const msg = std.fmt.allocPrint(allocator, "Failed to write file: {s}", .{@errorName(err)}) catch "Failed to write file";
-            return .{ .error = .{
+            return .{ .failure = .{
                 .code = .execution_failed,
                 .message = msg,
             } };
         };
 
-        const msg = std.fmt.allocPrint(allocator, "File written successfully: {s}", .{path}) catch return .{ .error = .{
+        const msg = std.fmt.allocPrint(allocator, "File written successfully: {s}", .{path}) catch return .{ .failure = .{
             .code = .execution_failed,
             .message = "Out of memory",
         } };
@@ -102,18 +102,14 @@ pub const BuiltinTools = struct {
 
     /// List directory contents
     pub fn fileList(allocator: std.mem.Allocator, args: std.json.ObjectMap) ToolResult {
-        const path_value = args.get("path") orelse .{ .string = "." };
-        if (path_value != .string) {
-            return .{ .error = .{
-                .code = .invalid_params,
-                .message = "Parameter 'path' must be a string",
-            } };
-        }
-        const path = path_value.string;
+        const path = if (args.get("path")) |pv|
+            if (pv == .string) pv.string else "."
+        else
+            ".";
 
         // Security: prevent directory traversal
         if (std.mem.indexOf(u8, path, "..") != null) {
-            return .{ .error = .{
+            return .{ .failure = .{
                 .code = .permission_denied,
                 .message = "Path cannot contain '..'",
             } };
@@ -121,7 +117,7 @@ pub const BuiltinTools = struct {
 
         var dir = std.fs.cwd().openDir(path, .{ .iterate = true }) catch |err| {
             const msg = std.fmt.allocPrint(allocator, "Failed to open directory: {s}", .{@errorName(err)}) catch "Failed to open directory";
-            return .{ .error = .{
+            return .{ .failure = .{
                 .code = .execution_failed,
                 .message = msg,
             } };
@@ -129,20 +125,28 @@ pub const BuiltinTools = struct {
         defer dir.close();
 
         var result = std.ArrayListUnmanaged(u8){};
-        defer result.deinit(allocator);
+        errdefer result.deinit(allocator);
 
-        try result.appendSlice(allocator, "[\n");
+        result.appendSlice(allocator, "[\n") catch {
+            result.deinit(allocator);
+            return .{ .failure = .{ .code = .execution_failed, .message = "Out of memory" } };
+        };
 
         var it = dir.iterate();
         var first = true;
         while (it.next() catch |err| {
             const msg = std.fmt.allocPrint(allocator, "Failed to iterate directory: {s}", .{@errorName(err)}) catch "Failed to iterate directory";
-            return .{ .error = .{
+            return .{ .failure = .{
                 .code = .execution_failed,
                 .message = msg,
             } };
         }) |entry| {
-            if (!first) try result.appendSlice(allocator, ",\n");
+            if (!first) {
+                result.appendSlice(allocator, ",\n") catch {
+                    result.deinit(allocator);
+                    return .{ .failure = .{ .code = .execution_failed, .message = "Out of memory" } };
+                };
+            }
             first = false;
 
             const entry_type = switch (entry.kind) {
@@ -152,36 +156,56 @@ pub const BuiltinTools = struct {
                 else => "other",
             };
 
-            try result.appendSlice(allocator, "  {\"name\":\"");
-            try result.appendSlice(allocator, entry.name);
-            try result.appendSlice(allocator, "\",\"type\":\"");
-            try result.appendSlice(allocator, entry_type);
-            try result.appendSlice(allocator, "\"}");
+            result.appendSlice(allocator, "  {\"name\":\"") catch {
+                result.deinit(allocator);
+                return .{ .failure = .{ .code = .execution_failed, .message = "Out of memory" } };
+            };
+            result.appendSlice(allocator, entry.name) catch {
+                result.deinit(allocator);
+                return .{ .failure = .{ .code = .execution_failed, .message = "Out of memory" } };
+            };
+            result.appendSlice(allocator, "\",\"type\":\"") catch {
+                result.deinit(allocator);
+                return .{ .failure = .{ .code = .execution_failed, .message = "Out of memory" } };
+            };
+            result.appendSlice(allocator, entry_type) catch {
+                result.deinit(allocator);
+                return .{ .failure = .{ .code = .execution_failed, .message = "Out of memory" } };
+            };
+            result.appendSlice(allocator, "\"}") catch {
+                result.deinit(allocator);
+                return .{ .failure = .{ .code = .execution_failed, .message = "Out of memory" } };
+            };
         }
 
-        try result.appendSlice(allocator, "\n]");
+        result.appendSlice(allocator, "\n]") catch {
+            result.deinit(allocator);
+            return .{ .failure = .{ .code = .execution_failed, .message = "Out of memory" } };
+        };
 
-        return .{ .success = .{ .content = try result.toOwnedSlice(allocator), .format = .json } };
+        return .{ .success = .{ .content = result.toOwnedSlice(allocator) catch return .{ .failure = .{ .code = .execution_failed, .message = "Out of memory" } }, .format = .json } };
     }
 
     /// Search code using shell command
     pub fn searchCode(allocator: std.mem.Allocator, args: std.json.ObjectMap) ToolResult {
         const query_value = args.get("query") orelse {
-            return .{ .error = .{
+            return .{ .failure = .{
                 .code = .invalid_params,
                 .message = "Missing required parameter: query",
             } };
         };
         if (query_value != .string) {
-            return .{ .error = .{
+            return .{ .failure = .{
                 .code = .invalid_params,
                 .message = "Parameter 'query' must be a string",
             } };
         }
         const query = query_value.string;
 
-        const path_value = args.get("path") orelse .{ .string = "." };
-        const path = if (path_value == .string) path_value.string else ".";
+        const path = if (args.get("path")) |pv|
+            if (pv == .string) pv.string else "."
+        else
+            ".";
 
         // Use ripgrep if available, fallback to grep
         const result = std.process.Child.run(.{
@@ -199,7 +223,7 @@ pub const BuiltinTools = struct {
                     @errorName(err),
                     @errorName(grep_err),
                 }) catch "Search failed";
-                return .{ .error = .{
+                return .{ .failure = .{
                     .code = .execution_failed,
                     .message = msg,
                 } };
@@ -208,7 +232,7 @@ pub const BuiltinTools = struct {
             if (grep_result.term.Exited != 0 and grep_result.term.Exited != 1) {
                 allocator.free(grep_result.stdout);
                 allocator.free(grep_result.stderr);
-                return .{ .error = .{
+                return .{ .failure = .{
                     .code = .execution_failed,
                     .message = "grep command failed",
                 } };
@@ -226,7 +250,7 @@ pub const BuiltinTools = struct {
         if (result.term.Exited != 0 and result.term.Exited != 1) {
             allocator.free(result.stdout);
             allocator.free(result.stderr);
-            return .{ .error = .{
+            return .{ .failure = .{
                 .code = .execution_failed,
                 .message = "rg command failed",
             } };
@@ -244,13 +268,13 @@ pub const BuiltinTools = struct {
     /// Execute shell command (restricted)
     pub fn shell(allocator: std.mem.Allocator, args: std.json.ObjectMap) ToolResult {
         const command_value = args.get("command") orelse {
-            return .{ .error = .{
+            return .{ .failure = .{
                 .code = .invalid_params,
                 .message = "Missing required parameter: command",
             } };
         };
         if (command_value != .string) {
-            return .{ .error = .{
+            return .{ .failure = .{
                 .code = .invalid_params,
                 .message = "Parameter 'command' must be a string",
             } };
@@ -267,7 +291,7 @@ pub const BuiltinTools = struct {
         };
         for (blocked) |b| {
             if (std.mem.indexOf(u8, command, b) != null) {
-                return .{ .error = .{
+                return .{ .failure = .{
                     .code = .permission_denied,
                     .message = "Command blocked for security reasons",
                 } };
@@ -281,7 +305,7 @@ pub const BuiltinTools = struct {
             .max_output_bytes = 1024 * 1024,
         }) catch |err| {
             const msg = std.fmt.allocPrint(allocator, "Command execution failed: {s}", .{@errorName(err)}) catch "Command execution failed";
-            return .{ .error = .{
+            return .{ .failure = .{
                 .code = .execution_failed,
                 .message = msg,
             } };

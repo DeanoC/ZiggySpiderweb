@@ -37,7 +37,7 @@ pub const ToolResult = union(enum) {
         content: []const u8,
         format: ContentFormat = .text,
     },
-    error: struct {
+    failure: struct {
         code: ErrorCode,
         message: []const u8,
     },
@@ -107,7 +107,7 @@ pub const ToolRegistry = struct {
         args: std.json.ObjectMap,
     ) ToolResult {
         const tool = self.get(name) orelse {
-            return .{ .error = .{
+            return .{ .failure = .{
                 .code = .not_found,
                 .message = "Tool not found",
             } };
@@ -195,15 +195,15 @@ test "tool_registry: register and get" {
         },
         .handler = struct {
             fn handle(alloc: std.mem.Allocator, args: std.json.ObjectMap) ToolResult {
-                const msg = args.get("message") orelse return .{ .error = .{
+                const msg = args.get("message") orelse return .{ .failure = .{
                     .code = .invalid_params,
                     .message = "Missing message parameter",
                 } };
-                if (msg != .string) return .{ .error = .{
+                if (msg != .string) return .{ .failure = .{
                     .code = .invalid_params,
                     .message = "Message must be a string",
                 } };
-                const copy = alloc.dupe(u8, msg.string) catch return .{ .error = .{
+                const copy = alloc.dupe(u8, msg.string) catch return .{ .failure = .{
                     .code = .execution_failed,
                     .message = "Out of memory",
                 } };

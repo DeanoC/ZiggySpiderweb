@@ -9,6 +9,8 @@ const workers = @import("workers.zig");
 const ltm_store = @import("ltm_store.zig");
 const ltm_index = @import("ltm_index.zig");
 const agent_registry = @import("agent_registry.zig");
+const tool_registry = @import("tool_registry.zig");
+const tool_executor = @import("tool_executor.zig");
 const posix = std.posix;
 const builtin = @import("builtin");
 const linux = if (builtin.os.tag == .linux) std.os.linux else struct {
@@ -94,7 +96,98 @@ const ServerState = struct {
     provider_config: Config.ProviderConfig,
     ltm_store: ?ltm_store.Store,
     agent_registry: agent_registry.AgentRegistry,
+    tool_registry: tool_registry.ToolRegistry,
 };
+
+/// Register all built-in tools with the registry
+fn registerBuiltinTools(registry: *tool_registry.ToolRegistry) !void {
+    // File read tool
+    try registry.register(.{
+        .name = "file_read",
+        .description = "Read the contents of a file",
+        .params = &[_]tool_registry.ToolParam{
+            .{
+                .name = "path",
+                .param_type = .string,
+                .description = "Path to the file to read",
+                .required = true,
+            },
+        },
+        .handler = tool_executor.BuiltinTools.fileRead,
+    });
+
+    // File write tool
+    try registry.register(.{
+        .name = "file_write",
+        .description = "Write content to a file",
+        .params = &[_]tool_registry.ToolParam{
+            .{
+                .name = "path",
+                .param_type = .string,
+                .description = "Path to the file to write",
+                .required = true,
+            },
+            .{
+                .name = "content",
+                .param_type = .string,
+                .description = "Content to write to the file",
+                .required = true,
+            },
+        },
+        .handler = tool_executor.BuiltinTools.fileWrite,
+    });
+
+    // File list tool
+    try registry.register(.{
+        .name = "file_list",
+        .description = "List files and directories",
+        .params = &[_]tool_registry.ToolParam{
+            .{
+                .name = "path",
+                .param_type = .string,
+                .description = "Directory path to list (defaults to current directory)",
+                .required = false,
+            },
+        },
+        .handler = tool_executor.BuiltinTools.fileList,
+    });
+
+    // Search code tool
+    try registry.register(.{
+        .name = "search_code",
+        .description = "Search for text patterns in code files using ripgrep or grep",
+        .params = &[_]tool_registry.ToolParam{
+            .{
+                .name = "query",
+                .param_type = .string,
+                .description = "Search pattern or text to find",
+                .required = true,
+            },
+            .{
+                .name = "path",
+                .param_type = .string,
+                .description = "Directory or file to search in (defaults to current directory)",
+                .required = false,
+            },
+        },
+        .handler = tool_executor.BuiltinTools.searchCode,
+    });
+
+    // Shell tool
+    try registry.register(.{
+        .name = "shell",
+        .description = "Execute a shell command",
+        .params = &[_]tool_registry.ToolParam{
+            .{
+                .name = "command",
+                .param_type = .string,
+                .description = "Shell command to execute",
+                .required = true,
+            },
+        },
+        .handler = tool_executor.BuiltinTools.shell,
+    });
+}
 
 const ConnectionState = enum {
     handshake,
@@ -380,6 +473,11 @@ pub fn run(allocator: std.mem.Allocator, bind_addr: []const u8, port: u16, provi
     try registry.scan();
     defer registry.deinit();
 
+    // Initialize tool registry with built-in tools
+    var tools = tool_registry.ToolRegistry.init(allocator);
+    defer tools.deinit();
+    try registerBuiltinTools(&tools);
+
     var state = ServerState{
         .allocator = allocator,
         .rng = std.Random.DefaultPrng.init(@intCast(std.time.milliTimestamp())),
@@ -389,6 +487,7 @@ pub fn run(allocator: std.mem.Allocator, bind_addr: []const u8, port: u16, provi
         .provider_config = provider_config,
         .ltm_store = ltm_storage,
         .agent_registry = registry,
+        .tool_registry = tools,
     };
     defer if (state.ltm_store) |*store| store.close();
 
@@ -932,6 +1031,27 @@ fn handleUserMessage(allocator: std.mem.Allocator, state: *ServerState, pool: *s
         else
             5;
         try handleSessionHistory(allocator, state, conn, request_id, agent_id, @intCast(limit));
+        return;
+    }
+
+    const is_tool_list = std.mem.eql(u8, msg_type.string, "tool.list");
+    const is_tool_call = std.mem.eql(u8, msg_type.string, "tool.call");
+
+    if (is_tool_list) {
+        try handleToolList(allocator, state, conn, request_id);
+        return;
+    }
+
+    if (is_tool_call) {
+        const tool_name = if (parsed.value.object.get("tool")) |t|
+            if (t == .string) t.string else null
+        else
+            null;
+        const tool_args = if (parsed.value.object.get("args")) |a|
+            if (a == .object) a.object else null
+        else
+            null;
+        try handleToolCall(allocator, state, conn, request_id, tool_name, tool_args);
         return;
     }
 
@@ -2062,6 +2182,86 @@ fn handleSessionHistory(
         try sendDirect(allocator, conn, json.items);
     } else {
         try sendErrorJsonDirect(allocator, conn, "LTM store not available");
+    }
+}
+
+fn handleToolList(
+    allocator: std.mem.Allocator,
+    state: *ServerState,
+    conn: *Connection,
+    request_id: []const u8,
+) !void {
+    const schemas_json = state.tool_registry.generateSchemasJson(allocator) catch |err| {
+        std.log.err("Failed to generate tool schemas: {s}", .{@errorName(err)});
+        try sendErrorJsonDirect(allocator, conn, "Failed to list tools");
+        return;
+    };
+    defer allocator.free(schemas_json);
+
+    const escaped_request_id = try protocol.jsonEscape(allocator, request_id);
+    defer allocator.free(escaped_request_id);
+
+    const payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"type\":\"tool.list.response\",\"request\":\"{s}\",\"tools\":{s}}}",
+        .{ escaped_request_id, schemas_json },
+    );
+    defer allocator.free(payload);
+
+    try sendDirect(allocator, conn, payload);
+}
+
+fn handleToolCall(
+    allocator: std.mem.Allocator,
+    state: *ServerState,
+    conn: *Connection,
+    request_id: []const u8,
+    tool_name: ?[]const u8,
+    tool_args: ?std.json.ObjectMap,
+) !void {
+    const name = tool_name orelse {
+        try sendErrorJsonDirect(allocator, conn, "Missing tool name");
+        return;
+    };
+
+    const args = tool_args orelse std.json.ObjectMap.init(allocator);
+
+    const result = state.tool_registry.execute(allocator, name, args);
+
+    const escaped_request_id = try protocol.jsonEscape(allocator, request_id);
+    defer allocator.free(escaped_request_id);
+    const escaped_tool_name = try protocol.jsonEscape(allocator, name);
+    defer allocator.free(escaped_tool_name);
+
+    switch (result) {
+        .success => |success| {
+            const escaped_content = try protocol.jsonEscape(allocator, success.content);
+            defer allocator.free(escaped_content);
+
+            const payload = try std.fmt.allocPrint(
+                allocator,
+                "{{\"type\":\"tool.result\",\"request\":\"{s}\",\"tool\":\"{s}\",\"success\":true,\"content\":\"{s}\",\"format\":\"{s}\"}}",
+                .{ escaped_request_id, escaped_tool_name, escaped_content, @tagName(success.format) },
+            );
+            defer allocator.free(payload);
+
+            allocator.free(success.content);
+            try sendDirect(allocator, conn, payload);
+        },
+        .failure => |failure| {
+            const escaped_message = try protocol.jsonEscape(allocator, failure.message);
+            defer allocator.free(escaped_message);
+
+            const payload = try std.fmt.allocPrint(
+                allocator,
+                "{{\"type\":\"tool.error\",\"request\":\"{s}\",\"tool\":\"{s}\",\"success\":false,\"error\":\"{s}\",\"code\":\"{s}\"}}",
+                .{ escaped_request_id, escaped_tool_name, escaped_message, @tagName(failure.code) },
+            );
+            defer allocator.free(payload);
+
+            allocator.free(failure.message);
+            try sendDirect(allocator, conn, payload);
+        },
     }
 }
 
