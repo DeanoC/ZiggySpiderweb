@@ -3,6 +3,9 @@ const ziggy_piai = @import("ziggy-piai");
 const Config = @import("config.zig");
 const protocol = @import("protocol.zig");
 const memory = @import("memory.zig");
+const identity = @import("identity.zig");
+const orchestrator = @import("orchestrator.zig");
+const ltm_store = @import("ltm_store.zig");
 const ltm_index = @import("ltm_index.zig");
 const posix = std.posix;
 const builtin = @import("builtin");
@@ -39,6 +42,12 @@ const SESSION_STATE_VERSION = 1;
 const LONG_TERM_ARCHIVE_DIR = ".spiderweb-ltm";
 const LTM_INDEX_FILENAME = "archive-index.ndjson";
 const LONG_TERM_ARCHIVE_VERSION = 1;
+const LTM_DB_FILENAME = "memory.db";
+const LTM_RETENTION_MAX_SNAPSHOTS_DEFAULT: usize = 24;
+const LTM_RETENTION_MAX_AGE_DAYS_DEFAULT: u64 = 30;
+const LTM_RETENTION_KEEP_SNAPSHOTS_ENV = "SPIDERWEB_LTM_KEEP_SNAPSHOTS";
+const LTM_RETENTION_KEEP_DAYS_ENV = "SPIDERWEB_LTM_KEEP_DAYS";
+const AGENT_GOAL_PREFIX = "/goal ";
 
 const PersistedSession = struct {
     session_id: []u8,
@@ -52,6 +61,7 @@ const ServerState = struct {
     api_registry: ziggy_piai.api_registry.ApiRegistry,
     http_client: std.http.Client,
     provider_config: Config.ProviderConfig,
+    ltm_store: ?ltm_store.Store,
 };
 
 const ConnectionState = enum {
@@ -65,11 +75,13 @@ const SessionError = error{ MessageTooLarge };
 const SessionContext = struct {
     ram: memory.RamContext,
     session_id: []u8,
+    identity_prompt: []u8,
 
     fn init(allocator: std.mem.Allocator) SessionContext {
         return .{
             .ram = memory.RamContext.init(allocator, MAX_CONTEXT_MESSAGES, MAX_CONTEXT_BYTES),
             .session_id = &[_]u8{},
+            .identity_prompt = &[_]u8{},
         };
     }
 
@@ -82,6 +94,13 @@ const SessionContext = struct {
         self.ram.deinit();
         if (self.session_id.len > 0) allocator.free(self.session_id);
         self.session_id = &[_]u8{};
+        if (self.identity_prompt.len > 0) allocator.free(self.identity_prompt);
+        self.identity_prompt = &[_]u8{};
+    }
+
+    fn setIdentityPrompt(self: *SessionContext, allocator: std.mem.Allocator, prompt: []const u8) !void {
+        if (self.identity_prompt.len > 0) allocator.free(self.identity_prompt);
+        self.identity_prompt = try allocator.dupe(u8, prompt);
     }
 
     fn setSessionId(self: *SessionContext, allocator: std.mem.Allocator, id: []const u8) !void {
@@ -256,6 +275,11 @@ pub fn run(allocator: std.mem.Allocator, bind_addr: []const u8, port: u16, provi
     try pool.init(.{ .allocator = allocator, .n_jobs = std.Thread.getCpuCount() catch 4 });
     defer pool.deinit();
 
+    const ltm_storage = ltm_store.Store.open(allocator, LONG_TERM_ARCHIVE_DIR, LTM_DB_FILENAME) catch |err| blk: {
+        std.log.warn("LTM sqlite unavailable, using legacy archive files: {s}", .{@errorName(err)});
+        break :blk null;
+    };
+
     var persisted_sessions = try loadPersistedSessions(allocator);
 
     var state = ServerState{
@@ -265,7 +289,9 @@ pub fn run(allocator: std.mem.Allocator, bind_addr: []const u8, port: u16, provi
         .api_registry = api_registry,
         .http_client = http_client,
         .provider_config = provider_config,
+        .ltm_store = ltm_storage,
     };
+    defer if (state.ltm_store) |*store| store.close();
 
     const addr = try std.net.Address.parseIp(bind_addr, port);
     const sock_flags = posix.SOCK.STREAM | (if (builtin.os.tag == .linux) posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC else 0);
@@ -292,6 +318,31 @@ pub fn run(allocator: std.mem.Allocator, bind_addr: []const u8, port: u16, provi
     defer loop.deinit();
 
     try loop.add(sockfd, linux.EPOLL.IN);
+
+    if (state.ltm_store) |*store| {
+        const legacy_index_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ LONG_TERM_ARCHIVE_DIR, LTM_INDEX_FILENAME });
+        defer allocator.free(legacy_index_path);
+
+        const migrated = store.migrateLegacyArchives(legacy_index_path) catch |err| blk: {
+            std.log.warn("Legacy LTM migration failed: {s}", .{@errorName(err)});
+            break :blk 0;
+        };
+        if (migrated > 0) {
+            std.log.info("Migrated {d} legacy long-term archives into sqlite", .{migrated});
+        }
+
+        const keep_snapshots = parseRetentionKeepLimit(allocator);
+        const max_age_ms = parseRetentionMaxAgeMs(allocator);
+        if (keep_snapshots > 0 or max_age_ms != null) {
+            const pruned = store.pruneSnapshots(max_age_ms, @as(?usize, keep_snapshots)) catch |err| blk: {
+                std.log.warn("LTM retention prune failed: {s}", .{@errorName(err)});
+                break :blk 0;
+            };
+            if (pruned > 0) {
+                std.log.info("Pruned {d} old LTM snapshots", .{pruned});
+            }
+        }
+    }
 
     var connections = std.AutoHashMap(posix.socket_t, *Connection).init(allocator);
     defer {
@@ -438,6 +489,14 @@ fn processHandshake(
 
         const agent_id = parseAgentId(request) orelse "default";
         conn.agent_id = try allocator.dupe(u8, agent_id);
+        const prompt = identity.loadMergedPrompt(allocator, ".", agent_id) catch |err| blk: {
+            std.log.warn("Identity load failed for agent={s}: {s}", .{ agent_id, @errorName(err) });
+            break :blk try allocator.dupe(u8, "You are a helpful AI assistant.");
+        };
+        try conn.session.setIdentityPrompt(allocator, prompt);
+        if (prompt.ptr != conn.session.identity_prompt.ptr) {
+            allocator.free(prompt);
+        }
 
         const accept_key = try generateWsAcceptKey(state, request);
         defer allocator.free(accept_key);
@@ -459,10 +518,12 @@ fn processHandshake(
                 if (err != error.SessionNotFound) {
                     return err;
                 }
-                const restored_from_archive = restoreSessionFromLatestArchive(allocator, &conn.session, requested) catch |archive_err| {
+                var restored_from_archive: bool = false;
+                if (restoreSessionFromLatestArchive(allocator, state, &conn.session, requested)) |archive_restored| {
+                    restored_from_archive = archive_restored;
+                } else |archive_err| {
                     std.log.err("Session archive restore failed: {s} session={s}", .{ @errorName(archive_err), requested });
-                    false
-                };
+                }
                 if (restored_from_archive) {
                     std.log.info("Session restored from archive: session={s}", .{requested});
                 }
@@ -543,6 +604,7 @@ const AiTaskArgs = struct {
     state: *ServerState,
     conn: *Connection,
     request_id: []const u8,
+    is_planned_goal: bool = false,
 };
 
 fn handleUserMessage(allocator: std.mem.Allocator, state: *ServerState, pool: *std.Thread.Pool, conn: *Connection, msg: []const u8) !void {
@@ -582,7 +644,7 @@ fn handleUserMessage(allocator: std.mem.Allocator, state: *ServerState, pool: *s
             break :reason_blk "manual-reset";
         } else "manual-reset";
 
-        const archived = handleSessionReset(allocator, conn, should_archive, reason) catch |err| blk: {
+        const archived = handleSessionReset(state, allocator, conn, should_archive, reason) catch |err| blk: {
             std.log.err("Session reset failed: {s} session={s}", .{ @errorName(err), conn.session.session_id });
             try sendErrorJson(allocator, &conn.write_buf, "session.reset failed");
             break :blk false;
@@ -611,12 +673,12 @@ fn handleUserMessage(allocator: std.mem.Allocator, state: *ServerState, pool: *s
             else => false,
         } else false;
 
-        handleMemoryRecall(allocator, conn, request_id, limit, include_archived, include_full) catch |err| {
-            std.log.err("memory.recall failed: {s} session={s} request={s}", .{
-                @errorName(err),
-                conn.session.session_id,
-                request_id,
-            });
+            handleMemoryRecall(state, allocator, conn, request_id, limit, include_archived, include_full) catch |err| {
+                std.log.err("memory.recall failed: {s} session={s} request={s}", .{
+                    @errorName(err),
+                    conn.session.session_id,
+                    request_id,
+                });
             try sendErrorJson(allocator, &conn.write_buf, "memory.recall failed");
         };
         return;
@@ -661,6 +723,7 @@ fn handleUserMessage(allocator: std.mem.Allocator, state: *ServerState, pool: *s
         }
 
         handleMemoryQuery(
+            state,
             allocator,
             conn,
             request_id,
@@ -681,16 +744,42 @@ fn handleUserMessage(allocator: std.mem.Allocator, state: *ServerState, pool: *s
     }
 
     const is_chat_send = std.mem.eql(u8, msg_type.string, "chat.send") or std.mem.eql(u8, msg_type.string, "session.send");
-    if (!is_chat_send) return;
+    const is_agent_control = std.mem.eql(u8, msg_type.string, "agent.control");
+    if (!is_chat_send and !is_agent_control) return;
 
     const content = blk: {
         if (parsed.value.object.get("content")) |c| if (c == .string) break :blk c.string;
         if (parsed.value.object.get("text")) |t| if (t == .string) break :blk t.string;
+        if (is_agent_control) {
+            if (parsed.value.object.get("goal")) |goal| if (goal == .string) break :blk goal.string;
+        }
         return;
     };
 
-    if (std.mem.eql(u8, content, "/new")) {
-        const archived = handleSessionReset(allocator, conn, true, "slash-new") catch |err| blk: {
+    var plan_goal: ?[]const u8 = null;
+    if (is_chat_send and std.mem.startsWith(u8, content, AGENT_GOAL_PREFIX)) {
+        const trimmed_goal = std.mem.trim(u8, content[AGENT_GOAL_PREFIX.len..], " \t\r\n");
+        if (trimmed_goal.len > 0) {
+            plan_goal = trimmed_goal;
+        } else {
+            std.log.warn("goal command missing content: session={s} request={s}", .{ conn.session.session_id, request_id });
+            try sendErrorJson(allocator, &conn.write_buf, "Goal command requires text after /goal");
+            return;
+        }
+    } else if (is_agent_control) {
+        if (parsed.value.object.get("goal")) |goal| {
+            if (goal == .string) {
+                const trimmed_goal = std.mem.trim(u8, goal.string, " \t\r\n");
+                if (trimmed_goal.len > 0) plan_goal = trimmed_goal;
+            }
+        } else {
+            const trimmed_goal = std.mem.trim(u8, content, " \t\r\n");
+            if (trimmed_goal.len > 0) plan_goal = trimmed_goal;
+        }
+    }
+
+    if (is_chat_send and std.mem.eql(u8, content, "/new")) {
+        const archived = handleSessionReset(state, allocator, conn, true, "slash-new") catch |err| blk: {
             std.log.err("Session reset via /new failed: {s} session={s}", .{ @errorName(err), conn.session.session_id });
             try sendErrorJson(allocator, &conn.write_buf, "session.reset failed");
             break :blk false;
@@ -711,9 +800,40 @@ fn handleUserMessage(allocator: std.mem.Allocator, state: *ServerState, pool: *s
         return;
     }
 
-    const user_msg_id = conn.session.appendUserMessage(allocator, .user, content) catch |err| {
+    var is_planned_goal = false;
+    if (plan_goal) |goal| {
+        var plan = orchestrator.buildPlan(allocator, goal) catch |err| {
+            std.log.err("Failed to build goal plan: {s} session={s} request={s}", .{
+                @errorName(err),
+                conn.session.session_id,
+                request_id,
+            });
+            try sendErrorJson(allocator, &conn.write_buf, "Failed to build Primary Brain plan");
+            return;
+        };
+        defer orchestrator.deinitPlan(allocator, &plan);
+
+        is_planned_goal = true;
+        const plan_memory = try orchestrator.formatPlanMemoryText(allocator, &plan);
+        defer allocator.free(plan_memory);
+
+        try sendAgentProgress(allocator, &conn.write_buf, request_id, conn.session.session_id, "planner", "received", "Planning request received");
+        try sendAgentPlan(allocator, &conn.write_buf, request_id, conn.session.session_id, plan.goal, plan.tasks);
+        try sendAgentProgress(allocator, &conn.write_buf, request_id, conn.session.session_id, "planner", "ready", plan.response_text);
+        _ = try conn.session.appendMessage(allocator, .system, plan_memory);
+    } else if (is_agent_control) {
+        std.log.warn("agent.control requires goal payload: session={s} request={s}", .{ conn.session.session_id, request_id });
+        try sendErrorJson(allocator, &conn.write_buf, "agent.control requires goal field or text");
+        return;
+    }
+
+    const user_content = if (plan_goal) |goal| goal else content;
+    const user_msg_id = conn.session.appendUserMessage(allocator, .user, user_content) catch |err| {
         if (err == SessionError.MessageTooLarge) {
-            std.log.warn("Dropping oversized user message: session={s} request={s} bytes={d}", .{ conn.session.session_id, request_id, content.len });
+            std.log.warn(
+                "Dropping oversized user message: session={s} request={s} bytes={d}",
+                .{ conn.session.session_id, request_id, user_content.len },
+            );
             try sendErrorJson(allocator, &conn.write_buf, "Message too large for active context");
             return;
         }
@@ -724,7 +844,7 @@ fn handleUserMessage(allocator: std.mem.Allocator, state: *ServerState, pool: *s
         conn.session.session_id,
         request_id,
         user_msg_id,
-        content.len,
+        user_content.len,
     });
 
     const args = try allocator.create(AiTaskArgs);
@@ -733,6 +853,7 @@ fn handleUserMessage(allocator: std.mem.Allocator, state: *ServerState, pool: *s
         .state = state,
         .conn = conn,
         .request_id = request_id,
+        .is_planned_goal = is_planned_goal,
     };
 
     pool.spawn(runAiTask, .{args}) catch |err| {
@@ -745,7 +866,7 @@ fn handleUserMessage(allocator: std.mem.Allocator, state: *ServerState, pool: *s
 }
 
 fn runAiTask(args: *AiTaskArgs) void {
-    processAiStreaming(args.allocator, args.state, args.conn, args.request_id) catch |err| {
+    processAiStreaming(args.allocator, args.state, args.conn, args.request_id, args.is_planned_goal) catch |err| {
         std.log.err("AI Task failed: {s} session={s} request={s}", .{
             @errorName(err),
             args.conn.session.session_id,
@@ -756,7 +877,13 @@ fn runAiTask(args: *AiTaskArgs) void {
     args.allocator.destroy(args);
 }
 
-fn processAiStreaming(allocator: std.mem.Allocator, state: *ServerState, conn: *Connection, request_id: []const u8) !void {
+fn processAiStreaming(
+    allocator: std.mem.Allocator,
+    state: *ServerState,
+    conn: *Connection,
+    request_id: []const u8,
+    is_planned_goal: bool,
+) !void {
     var model: ?ziggy_piai.types.Model = null;
     for (state.model_registry.models.items) |m| {
         if (std.mem.eql(u8, m.provider, state.provider_config.name)) {
@@ -772,9 +899,34 @@ fn processAiStreaming(allocator: std.mem.Allocator, state: *ServerState, conn: *
         });
         return;
     }
+    if (is_planned_goal) {
+        try sendAgentProgress(allocator, &conn.write_buf, request_id, conn.session.session_id, "execution", "started", "Primary Brain invoking model");
+    }
 
-    const context_messages = try conn.session.contextMessages(allocator);
-    defer freeContextMessages(allocator, context_messages);
+    const base_messages = try conn.session.contextMessages(allocator);
+    var context_messages = base_messages;
+    var owned_context: ?[]ziggy_piai.types.Message = null;
+    if (conn.session.identity_prompt.len > 0) {
+        const merged = try allocator.alloc(ziggy_piai.types.Message, base_messages.len + 1);
+        merged[0] = .{
+            .role = .system,
+            .content = try allocator.dupe(u8, conn.session.identity_prompt),
+        };
+        if (base_messages.len > 0) {
+            @memcpy(merged[1..], base_messages);
+        }
+        context_messages = merged;
+        owned_context = merged;
+    }
+    defer {
+        if (owned_context) |context| {
+            freeContextMessages(allocator, context);
+            allocator.free(base_messages);
+        } else {
+            freeContextMessages(allocator, base_messages);
+        }
+    }
+
     const context = ziggy_piai.types.Context{ .messages = context_messages };
     var events = std.array_list.Managed(ziggy_piai.types.AssistantMessageEvent).init(allocator);
     defer events.deinit();
@@ -803,6 +955,7 @@ fn processAiStreaming(allocator: std.mem.Allocator, state: *ServerState, conn: *
     defer response_text.deinit(allocator);
 
     var response_sent = false;
+    var execution_completed = false;
     for (events.items) |event| {
         switch (event) {
             .text_delta => |delta| try response_text.appendSlice(allocator, delta.delta),
@@ -818,6 +971,7 @@ fn processAiStreaming(allocator: std.mem.Allocator, state: *ServerState, conn: *
                 const assistant_msg_id = try conn.session.appendMessage(allocator, .assistant, final_text);
                 try sendSessionReceive(allocator, &conn.write_buf, request_id, final_text, assistant_msg_id);
                 response_sent = true;
+                execution_completed = true;
             },
             .err => |err_msg| {
                 std.log.err("Pi AI error: {s} session={s} request={s}", .{ err_msg, conn.session.session_id, request_id });
@@ -830,6 +984,15 @@ fn processAiStreaming(allocator: std.mem.Allocator, state: *ServerState, conn: *
     if (!response_sent and response_text.items.len > 0) {
         const assistant_msg_id = try conn.session.appendMessage(allocator, .assistant, response_text.items);
         try sendSessionReceive(allocator, &conn.write_buf, request_id, response_text.items, assistant_msg_id);
+        execution_completed = true;
+    }
+
+    if (is_planned_goal) {
+        if (execution_completed) {
+            try sendAgentProgress(allocator, &conn.write_buf, request_id, conn.session.session_id, "execution", "complete", "Primary Brain response emitted");
+        } else {
+            try sendAgentProgress(allocator, &conn.write_buf, request_id, conn.session.session_id, "execution", "failed", "Primary Brain produced no assistant output");
+        }
     }
 }
 
@@ -864,9 +1027,84 @@ fn sendSessionReceive(
     try appendWsFrame(allocator, write_buf, response_json, .text);
 }
 
+fn sendAgentProgress(
+    allocator: std.mem.Allocator,
+    write_buf: *std.ArrayListUnmanaged(u8),
+    request_id: []const u8,
+    session_id: []const u8,
+    phase: []const u8,
+    status: []const u8,
+    message: []const u8,
+) !void {
+    const escaped_request_id = try protocol.jsonEscape(allocator, request_id);
+    defer allocator.free(escaped_request_id);
+    const escaped_session_id = try protocol.jsonEscape(allocator, session_id);
+    defer allocator.free(escaped_session_id);
+    const escaped_phase = try protocol.jsonEscape(allocator, phase);
+    defer allocator.free(escaped_phase);
+    const escaped_status = try protocol.jsonEscape(allocator, status);
+    defer allocator.free(escaped_status);
+    const escaped_message = try protocol.jsonEscape(allocator, message);
+    defer allocator.free(escaped_message);
+
+    const payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"type\":\"agent.progress\",\"request\":\"{s}\",\"sessionKey\":\"{s}\",\"phase\":\"{s}\",\"status\":\"{s}\",\"message\":\"{s}\"}}",
+        .{ escaped_request_id, escaped_session_id, escaped_phase, escaped_status, escaped_message },
+    );
+    defer allocator.free(payload);
+
+    try appendWsFrame(allocator, write_buf, payload, .text);
+}
+
+fn sendAgentPlan(
+    allocator: std.mem.Allocator,
+    write_buf: *std.ArrayListUnmanaged(u8),
+    request_id: []const u8,
+    session_id: []const u8,
+    goal: []const u8,
+    tasks: std.ArrayListUnmanaged([]const u8),
+) !void {
+    var payload = std.ArrayListUnmanaged(u8){};
+    defer payload.deinit(allocator);
+
+    const escaped_request_id = try protocol.jsonEscape(allocator, request_id);
+    defer allocator.free(escaped_request_id);
+    const escaped_session_id = try protocol.jsonEscape(allocator, session_id);
+    defer allocator.free(escaped_session_id);
+    const escaped_goal = try protocol.jsonEscape(allocator, goal);
+    defer allocator.free(escaped_goal);
+
+    try payload.appendSlice(allocator, "{\"type\":\"agent.plan\",\"request\":\"");
+    try payload.appendSlice(allocator, escaped_request_id);
+    try payload.appendSlice(allocator, "\",\"sessionKey\":\"");
+    try payload.appendSlice(allocator, escaped_session_id);
+    try payload.appendSlice(allocator, "\",\"goal\":\"");
+    try payload.appendSlice(allocator, escaped_goal);
+    try payload.appendSlice(allocator, "\",\"tasks\":[");
+
+    for (tasks.items, 0..) |task, idx| {
+        if (idx > 0) try payload.appendSlice(allocator, ",");
+        const escaped_task = try protocol.jsonEscape(allocator, task);
+        defer allocator.free(escaped_task);
+
+        const item = try std.fmt.allocPrint(
+            allocator,
+            "{{\"id\":{d},\"title\":\"{s}\",\"status\":\"queued\"}}",
+            .{ idx + 1, escaped_task },
+        );
+        defer allocator.free(item);
+        try payload.appendSlice(allocator, item);
+    }
+
+    try payload.appendSlice(allocator, "]}");
+    try appendWsFrame(allocator, write_buf, payload.items, .text);
+}
+
 const MemoryQueryKind = enum { all, summary, entry };
 
 fn handleMemoryQuery(
+    state: *ServerState,
     allocator: std.mem.Allocator,
     conn: *Connection,
     request_id: []const u8,
@@ -950,20 +1188,43 @@ fn handleMemoryQuery(
     }
 
     if (include_archived) {
-        const archive = findLatestArchiveForSession(allocator, conn.session.session_id) catch null;
-        if (archive) |latest| {
-            try appendLatestArchiveToQueryResponse(
+        var used_store = false;
+        if (state.ltm_store) |*store| {
+            const appended = appendLatestStoreSnapshotToQuery(
                 allocator,
                 &emitted,
-                latest.archive_path,
+                store,
+                conn.session.session_id,
                 &first_item,
                 &remaining,
                 topic,
                 query_ids,
                 kind_filter,
-            );
-            allocator.free(latest.archive_path);
-            allocator.free(latest.reason);
+            ) catch |err| blk: {
+                std.log.warn("LTM store query fallback failed: {s} session={s}", .{ @errorName(err), conn.session.session_id });
+                break :blk false;
+            };
+            if (appended) {
+                used_store = appended;
+            }
+        }
+
+        if (!used_store) {
+            const archive = findLatestArchiveForSessionJson(allocator, conn.session.session_id) catch null;
+            if (archive) |latest| {
+                try appendLatestArchiveToQueryResponse(
+                    allocator,
+                    &emitted,
+                    latest.archive_path,
+                    &first_item,
+                    &remaining,
+                    topic,
+                    query_ids,
+                    kind_filter,
+                );
+                allocator.free(latest.archive_path);
+                allocator.free(latest.reason);
+            }
         }
     }
 
@@ -976,6 +1237,13 @@ fn queryMatchesId(item_id: memory.MemoryID, query_ids: []const memory.MemoryID) 
 
     for (query_ids) |id| {
         if (id == item_id) return true;
+    }
+    return false;
+}
+
+fn containsMemoryId(ids: []const memory.MemoryID, id: memory.MemoryID) bool {
+    for (ids) |candidate| {
+        if (candidate == id) return true;
     }
     return false;
 }
@@ -1019,7 +1287,7 @@ fn appendLatestArchiveToQueryResponse(
                     const source_id = parsePositiveInteger(summary_obj.get("source_id") orelse continue) orelse continue;
                     const text = summary_obj.get("text") orelse continue;
                     if (text != .string) continue;
-                    const created_at_ms = if (summary_obj.get("created_at_ms")) |ts| parseCreatedAtMs(ts) else 0;
+                    const created_at_ms = if (summary_obj.get("created_at_ms")) |ts| (parseCreatedAtMs(ts) orelse 0) else 0;
 
                     if (!queryMatchesId(id, query_ids)) continue;
                     if (!queryMatchesTopic(text.string, topic)) continue;
@@ -1090,6 +1358,7 @@ fn appendLatestArchiveToQueryResponse(
 }
 
 fn handleMemoryRecall(
+    state: *ServerState,
     allocator: std.mem.Allocator,
     conn: *Connection,
     request_id: []const u8,
@@ -1157,23 +1426,192 @@ fn handleMemoryRecall(
     }
 
     if (include_archived) {
-        const archive = findLatestArchiveForSession(allocator, conn.session.session_id) catch null;
-        if (archive) |latest| {
-            try appendLatestArchiveToResponse(
+        var used_store = false;
+        if (state.ltm_store) |*store| {
+            const appended = appendLatestStoreSnapshotToRecall(
                 allocator,
                 &emitted,
-                latest.archive_path,
+                store,
+                conn.session.session_id,
                 &first_item,
                 &remaining,
                 include_full_from_archive,
-            );
-            allocator.free(latest.archive_path);
-            allocator.free(latest.reason);
+            ) catch |err| blk: {
+                std.log.warn("LTM store recall fallback failed: {s} session={s}", .{ @errorName(err), conn.session.session_id });
+                break :blk false;
+            };
+            if (appended) {
+                used_store = appended;
+            }
+        }
+
+        if (!used_store) {
+            const archive = findLatestArchiveForSessionJson(allocator, conn.session.session_id) catch null;
+            if (archive) |latest| {
+                try appendLatestArchiveToResponse(
+                    allocator,
+                    &emitted,
+                    latest.archive_path,
+                    &first_item,
+                    &remaining,
+                    include_full_from_archive,
+                );
+                allocator.free(latest.archive_path);
+                allocator.free(latest.reason);
+            }
         }
     }
 
     try emitted.appendSlice(allocator, "]}");
     try appendWsFrame(allocator, &conn.write_buf, emitted.items, .text);
+}
+
+fn appendLatestStoreSnapshotToRecall(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    store: *ltm_store.Store,
+    session_id: []const u8,
+    first_item: *bool,
+    remaining: *usize,
+    include_full_from_archive: bool,
+) !bool {
+    var snapshots = try store.loadSnapshotsForSession(session_id, null);
+    defer {
+        for (snapshots.items) |*snapshot| snapshot.deinit(allocator);
+        snapshots.deinit(allocator);
+    }
+    if (snapshots.items.len == 0) return false;
+
+    var seen_summary_ids = std.ArrayListUnmanaged(memory.MemoryID){};
+    defer seen_summary_ids.deinit(allocator);
+    var seen_entry_ids = std.ArrayListUnmanaged(memory.MemoryID){};
+    defer seen_entry_ids.deinit(allocator);
+
+    for (snapshots.items) |snapshot| {
+        if (remaining.* == 0) break;
+        for (snapshot.summaries.items) |summary| {
+            if (remaining.* == 0) break;
+            if (containsMemoryId(seen_summary_ids.items, summary.id)) continue;
+            try seen_summary_ids.append(allocator, summary.id);
+
+            try appendRecallSummaryItem(
+                allocator,
+                out,
+                first_item,
+                "summary",
+                "ltm",
+                summary.id,
+                summary.source_id,
+                summary.text,
+                summary.created_at_ms,
+            );
+            remaining.* -= 1;
+        }
+
+        if (!include_full_from_archive or remaining.* == 0) {
+            continue;
+        }
+
+        for (snapshot.entries.items) |entry| {
+            if (remaining.* == 0) break;
+            if (containsMemoryId(seen_entry_ids.items, entry.id)) continue;
+            const role = parseRole(entry.role) orelse continue;
+
+            try seen_entry_ids.append(allocator, entry.id);
+            try appendRecallEntryItem(
+                allocator,
+                out,
+                first_item,
+                "entry",
+                "ltm",
+                entry.state,
+                role,
+                entry.id,
+                entry.related_to,
+                entry.content,
+            );
+            remaining.* -= 1;
+        }
+    }
+
+    return true;
+}
+
+fn appendLatestStoreSnapshotToQuery(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    store: *ltm_store.Store,
+    session_id: []const u8,
+    first_item: *bool,
+    remaining: *usize,
+    topic: ?[]const u8,
+    query_ids: []const memory.MemoryID,
+    kind_filter: MemoryQueryKind,
+) !bool {
+    var snapshots = try store.loadSnapshotsForSession(session_id, null);
+    defer {
+        for (snapshots.items) |*snapshot| snapshot.deinit(allocator);
+        snapshots.deinit(allocator);
+    }
+    if (snapshots.items.len == 0) return false;
+
+    var seen_summary_ids = std.ArrayListUnmanaged(memory.MemoryID){};
+    defer seen_summary_ids.deinit(allocator);
+    var seen_entry_ids = std.ArrayListUnmanaged(memory.MemoryID){};
+    defer seen_entry_ids.deinit(allocator);
+
+    for (snapshots.items) |snapshot| {
+        if (remaining.* == 0) break;
+        if (kind_filter != .entry) {
+            for (snapshot.summaries.items) |summary| {
+                if (remaining.* == 0) break;
+                if (containsMemoryId(seen_summary_ids.items, summary.id)) continue;
+                if (!queryMatchesId(summary.id, query_ids)) continue;
+                if (!queryMatchesTopic(summary.text, topic)) continue;
+
+                try seen_summary_ids.append(allocator, summary.id);
+                try appendRecallSummaryItem(
+                    allocator,
+                    out,
+                    first_item,
+                    "summary",
+                    "ltm",
+                    summary.id,
+                    summary.source_id,
+                    summary.text,
+                    summary.created_at_ms,
+                );
+                remaining.* -= 1;
+            }
+        }
+
+        if (kind_filter != .summary and remaining.* > 0) {
+            for (snapshot.entries.items) |entry| {
+                if (remaining.* == 0) break;
+                if (containsMemoryId(seen_entry_ids.items, entry.id)) continue;
+                if (!queryMatchesId(entry.id, query_ids)) continue;
+                if (!queryMatchesTopic(entry.content, topic)) continue;
+                const role = parseRole(entry.role) orelse continue;
+
+                try seen_entry_ids.append(allocator, entry.id);
+                try appendRecallEntryItem(
+                    allocator,
+                    out,
+                    first_item,
+                    "entry",
+                    "ltm",
+                    entry.state,
+                    role,
+                    entry.id,
+                    entry.related_to,
+                    entry.content,
+                );
+                remaining.* -= 1;
+            }
+        }
+    }
+
+    return true;
 }
 
 const LatestArchiveRef = struct {
@@ -1182,7 +1620,7 @@ const LatestArchiveRef = struct {
     archive_path: []u8,
 };
 
-fn findLatestArchiveForSession(
+fn findLatestArchiveForSessionJson(
     allocator: std.mem.Allocator,
     session_id: []const u8,
 ) !?LatestArchiveRef {
@@ -1272,7 +1710,7 @@ fn appendLatestArchiveToResponse(
             const source_id = parsePositiveInteger(summary_obj.get("source_id") orelse continue) orelse continue;
             const text = summary_obj.get("text") orelse continue;
             if (text != .string) continue;
-            const created_at_ms = if (summary_obj.get("created_at_ms")) |ts| parseCreatedAtMs(ts) else 0;
+            const created_at_ms = if (summary_obj.get("created_at_ms")) |ts| (parseCreatedAtMs(ts) orelse 0) else 0;
 
             try appendRecallSummaryItem(
                 allocator,
@@ -1402,10 +1840,82 @@ fn appendRecallEntryItem(
 
 fn restoreSessionFromLatestArchive(
     allocator: std.mem.Allocator,
+    state: *ServerState,
     session: *SessionContext,
     session_id: []const u8,
 ) !bool {
-    const latest = try findLatestArchiveForSession(allocator, session_id);
+    if (state.ltm_store) |*store| {
+        if (restoreSessionFromLatestDbSnapshot(allocator, store, session, session_id) catch false) {
+            return true;
+        }
+    }
+    return restoreSessionFromLatestArchiveJson(allocator, session, session_id);
+}
+
+fn restoreSessionFromLatestDbSnapshot(
+    allocator: std.mem.Allocator,
+    store: *ltm_store.Store,
+    session: *SessionContext,
+    session_id: []const u8,
+) !bool {
+    var snapshot = try store.loadLatestSnapshot(session_id) orelse return false;
+    defer snapshot.deinit(allocator);
+
+    session.resetRam(allocator);
+    try session.setSessionId(allocator, session_id);
+    session.ram.setNextId(snapshot.snapshot.next_id);
+
+    for (snapshot.summaries.items) |summary| {
+        try session.ram.restoreSummary(summary.id, summary.source_id, summary.text, summary.created_at_ms);
+    }
+
+    var restored_entries = std.ArrayListUnmanaged(struct {
+        id: memory.MemoryID,
+        role: ziggy_piai.types.MessageRole,
+        related_to: ?memory.MemoryID,
+        content: []const u8,
+    }){};
+    defer restored_entries.deinit(allocator);
+
+    var projected_bytes: usize = 0;
+    for (snapshot.entries.items) |entry| {
+        const role = parseRole(entry.role) orelse continue;
+        const state = parseRamEntryState(entry.state) orelse continue;
+        if (state != .active) continue;
+        if (restored_entries.items.len >= MAX_CONTEXT_MESSAGES) continue;
+        if (projected_bytes + entry.content.len > MAX_CONTEXT_BYTES) continue;
+
+        try restored_entries.append(allocator, .{
+            .id = entry.id,
+            .role = role,
+            .content = entry.content,
+            .related_to = entry.related_to,
+        });
+        projected_bytes += entry.content.len;
+    }
+
+    var restore_index = restored_entries.items.len;
+    while (restore_index > 0) {
+        restore_index -= 1;
+        const restored_entry = restored_entries.items[restore_index];
+        try session.ram.restoreEntry(
+            restored_entry.id,
+            restored_entry.role,
+            .active,
+            restored_entry.related_to,
+            restored_entry.content,
+        );
+    }
+
+    return true;
+}
+
+fn restoreSessionFromLatestArchiveJson(
+    allocator: std.mem.Allocator,
+    session: *SessionContext,
+    session_id: []const u8,
+) !bool {
+    const latest = try findLatestArchiveForSessionJson(allocator, session_id);
     const archive = latest orelse return false;
     defer {
         allocator.free(archive.archive_path);
@@ -1530,6 +2040,7 @@ fn restoreSessionFromLatestArchive(
 }
 
 fn handleSessionReset(
+    state: *ServerState,
     allocator: std.mem.Allocator,
     conn: *Connection,
     archive_old_state: bool,
@@ -1538,7 +2049,7 @@ fn handleSessionReset(
     var archived = false;
 
     if (archive_old_state) {
-        archived = archiveSessionRamToLongTerm(allocator, &conn.session, reason) catch false;
+        archived = archiveSessionRamToLongTerm(state, allocator, &conn.session, reason) catch false;
     }
 
     conn.session.resetRam(allocator);
@@ -1546,6 +2057,24 @@ fn handleSessionReset(
 }
 
 fn archiveSessionRamToLongTerm(
+    state: *ServerState,
+    allocator: std.mem.Allocator,
+    session: *SessionContext,
+    reason: []const u8,
+) !bool {
+    if (state.ltm_store) |*store| {
+        if (store.archiveRamSnapshot(session.session_id, reason, &session.ram) catch |err| blk: {
+            std.log.warn("LTM sqlite archive failed, falling back to JSON archive: {s} session={s}", .{ @errorName(err), session.session_id });
+            break :blk false;
+        }) {
+            return true;
+        }
+    }
+
+    return archiveSessionRamToLegacyJson(allocator, session, reason);
+}
+
+fn archiveSessionRamToLegacyJson(
     allocator: std.mem.Allocator,
     session: *SessionContext,
     reason: []const u8,
@@ -1823,6 +2352,45 @@ fn parsePositiveInteger(value: std.json.Value) ?u64 {
 fn parseCreatedAtMs(value: std.json.Value) ?i64 {
     if (value == .integer) return value.integer;
     return null;
+}
+
+fn parseRetentionKeepLimit(allocator: std.mem.Allocator) usize {
+    if (std.process.getEnvVarOwned(allocator, LTM_RETENTION_KEEP_SNAPSHOTS_ENV)) |value| {
+        defer allocator.free(value);
+        const trimmed = std.mem.trim(u8, value, " \t");
+        if (trimmed.len == 0) return LTM_RETENTION_MAX_SNAPSHOTS_DEFAULT;
+        const limit = std.fmt.parseUnsigned(usize, trimmed, 10) catch {
+            return LTM_RETENTION_MAX_SNAPSHOTS_DEFAULT;
+        };
+        if (limit == 0) return 0;
+        return limit;
+    } else |_| {}
+
+    return LTM_RETENTION_MAX_SNAPSHOTS_DEFAULT;
+}
+
+fn parseRetentionMaxAgeMs(allocator: std.mem.Allocator) ?i64 {
+    const days = std.process.getEnvVarOwned(allocator, LTM_RETENTION_KEEP_DAYS_ENV) catch null;
+    defer if (days) |value| allocator.free(value);
+
+    const keep_days = if (days) |value| blk: {
+        const trimmed = std.mem.trim(u8, value, " \t");
+        if (trimmed.len == 0) break :blk LTM_RETENTION_MAX_AGE_DAYS_DEFAULT;
+        break :blk (std.fmt.parseUnsigned(u64, trimmed, 10) catch LTM_RETENTION_MAX_AGE_DAYS_DEFAULT);
+    } else LTM_RETENTION_MAX_AGE_DAYS_DEFAULT;
+
+    if (keep_days == 0) return null;
+
+    return retentionCutoffFromDays(keep_days);
+}
+
+fn retentionCutoffFromDays(days: u64) ?i64 {
+    const now_ms = std.time.milliTimestamp();
+    if (now_ms <= 0) return null;
+    const now_u = @as(u64, @intCast(now_ms));
+    const max_age_ms_u = @as(u128, days) * @as(u128, 86_400_000);
+    if (max_age_ms_u >= now_u) return 0;
+    return @as(i64, @intCast(now_u - max_age_ms_u));
 }
 
 fn loadPersistedSessions(allocator: std.mem.Allocator) !std.ArrayListUnmanaged(PersistedSession) {

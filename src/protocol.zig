@@ -11,6 +11,10 @@ pub const MessageType = enum {
     // Messaging
     session_send,
     session_receive,
+    agent_plan,
+    agent_progress,
+    agent_status,
+    agent_control,
     
     // Heartbeat
     ping,
@@ -48,6 +52,10 @@ pub fn parseMessageType(json: []const u8) ?MessageType {
     if (std.mem.indexOf(u8, json, "\"type\":\"ping\"") != null) return .ping;
     if (std.mem.indexOf(u8, json, "\"type\":\"pong\"") != null) return .pong;
     if (std.mem.indexOf(u8, json, "\"type\":\"disconnect\"") != null) return .disconnect;
+    if (std.mem.indexOf(u8, json, "\"type\":\"agent.plan\"") != null) return .agent_plan;
+    if (std.mem.indexOf(u8, json, "\"type\":\"agent.progress\"") != null) return .agent_progress;
+    if (std.mem.indexOf(u8, json, "\"type\":\"agent.status\"") != null) return .agent_status;
+    if (std.mem.indexOf(u8, json, "\"type\":\"agent.control\"") != null) return .agent_control;
     return null;
 }
 
