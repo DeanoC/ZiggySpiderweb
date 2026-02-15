@@ -63,7 +63,7 @@ const EventLoop = struct {
     fd: posix.fd_t,
 
     fn init() !EventLoop {
-        const fd = try posix.epoll_create1(posix.EPOLL.CLOEXEC);
+        const fd = try posix.epoll_create1(linux.EPOLL.CLOEXEC);
         return .{ .fd = fd };
     }
 
@@ -72,27 +72,27 @@ const EventLoop = struct {
     }
 
     fn add(self: EventLoop, fd: posix.socket_t, events: u32) !void {
-        var ev = posix.linux.epoll_event{
+        var ev = linux.epoll_event{
             .events = events,
             .data = .{ .fd = fd },
         };
-        try posix.epoll_ctl(self.fd, posix.linux.EPOLL.CTL_ADD, fd, &ev);
+        try posix.epoll_ctl(self.fd, linux.EPOLL.CTL_ADD, fd, &ev);
     }
 
     fn remove(self: EventLoop, fd: posix.socket_t) void {
-        posix.epoll_ctl(self.fd, posix.linux.EPOLL.CTL_DEL, fd, null) catch {};
+        posix.epoll_ctl(self.fd, linux.EPOLL.CTL_DEL, fd, null) catch {};
     }
 
     fn wait(self: EventLoop, events_out: []Event) usize {
-        var epoll_events: [64]posix.linux.epoll_event = undefined;
+        var epoll_events: [64]linux.epoll_event = undefined;
         const n = posix.epoll_wait(self.fd, &epoll_events, -1);
         for (epoll_events[0..n], 0..) |ee, i| {
             events_out[i] = .{
                 .fd = ee.data.fd,
-                .read = (ee.events & posix.linux.EPOLL.IN) != 0,
-                .write = (ee.events & posix.linux.EPOLL.OUT) != 0,
-                .err = (ee.events & posix.linux.EPOLL.ERR) != 0,
-                .hup = (ee.events & (posix.linux.EPOLL.HUP | posix.linux.EPOLL.RDHUP)) != 0,
+                .read = (ee.events & linux.EPOLL.IN) != 0,
+                .write = (ee.events & linux.EPOLL.OUT) != 0,
+                .err = (ee.events & linux.EPOLL.ERR) != 0,
+                .hup = (ee.events & (linux.EPOLL.HUP | linux.EPOLL.RDHUP)) != 0,
             };
         }
         return n;
@@ -136,7 +136,7 @@ pub fn run(allocator: std.mem.Allocator, bind_addr: []const u8, port: u16, provi
     var loop = try EventLoop.init();
     defer loop.deinit();
 
-    try loop.add(sockfd, posix.linux.EPOLL.IN);
+    try loop.add(sockfd, linux.EPOLL.IN);
 
     var connections = std.AutoHashMap(posix.socket_t, *Connection).init(allocator);
     defer {
@@ -166,7 +166,7 @@ pub fn run(allocator: std.mem.Allocator, bind_addr: []const u8, port: u16, provi
                     conn.* = Connection.init(allocator, conn_fd);
                     try connections.put(conn_fd, conn);
 
-                    try loop.add(conn_fd, posix.linux.EPOLL.IN | posix.linux.EPOLL.OUT | posix.linux.EPOLL.ET);
+                    try loop.add(conn_fd, linux.EPOLL.IN | linux.EPOLL.OUT | linux.EPOLL.ET);
                     std.log.info("New connection: fd={d}", .{conn_fd});
                 }
             } else {
@@ -273,6 +273,7 @@ fn processHandshake(allocator: std.mem.Allocator, state: *ServerState, conn: *Co
 
 fn processWebSocket(allocator: std.mem.Allocator, state: *ServerState, pool: *std.Thread.Pool, conn: *Connection) !void {
     while (conn.read_buf.items.len >= 2) {
+        std.log.debug("processWebSocket: waiting for header (2 bytes)", .{});
         const header = conn.read_buf.items[0..2];
         const fin = (header[0] & 0x80) != 0;
         const opcode = header[0] & 0x0F;
@@ -282,19 +283,25 @@ fn processWebSocket(allocator: std.mem.Allocator, state: *ServerState, pool: *st
 
         if (payload_len == 126) {
             if (conn.read_buf.items.len < 4) return;
+            std.log.debug("processWebSocket: payload_len=126, reading 2-byte ext", .{});
             payload_len = std.mem.readInt(u16, conn.read_buf.items[2..4], .big);
             header_len = 4;
         } else if (payload_len == 127) {
             if (conn.read_buf.items.len < 10) return;
+            std.log.debug("processWebSocket: payload_len=127, reading 8-byte ext", .{});
             payload_len = @intCast(std.mem.readInt(u64, conn.read_buf.items[2..10], .big));
             header_len = 10;
         }
 
-        if (masked) header_len += 4;
+        if (masked) {
+            std.log.debug("processWebSocket: reading mask_key (4 bytes)", .{});
+            header_len += 4;
+        }
         if (conn.read_buf.items.len < header_len + payload_len) return;
 
+        std.log.debug("processWebSocket: reading payload ({d} bytes)", .{payload_len});
         const frame_data = conn.read_buf.items[0 .. header_len + payload_len];
-        var payload = try allocator.alloc(u8, payload_len);
+        const payload = try allocator.alloc(u8, payload_len);
         defer allocator.free(payload);
         @memcpy(payload, frame_data[header_len..]);
 
@@ -374,7 +381,17 @@ fn processAiStreaming(allocator: std.mem.Allocator, state: *ServerState, conn: *
     var events = std.array_list.Managed(ziggy_piai.types.AssistantMessageEvent).init(allocator);
     defer events.deinit();
 
-    const api_key = ziggy_piai.env_api_keys.getEnvApiKey(allocator, model.?.provider) orelse return;
+    const api_key: []const u8 = blk: {
+        if (state.provider_config.api_key) |key| {
+            break :blk try allocator.dupe(u8, key);
+        }
+        if (ziggy_piai.env_api_keys.getEnvApiKey(allocator, model.?.provider)) |key| {
+            break :blk key;
+        }
+        std.log.err("No API key found for provider: {s}", .{model.?.provider});
+        try sendErrorJson(allocator, &conn.write_buf, "No API key configured");
+        return;
+    };
     defer allocator.free(api_key);
 
     try ziggy_piai.stream.streamByModel(allocator, &state.http_client, &state.api_registry, model.?, context, .{ .api_key = api_key }, &events);
@@ -382,21 +399,54 @@ fn processAiStreaming(allocator: std.mem.Allocator, state: *ServerState, conn: *
     var response_text = std.ArrayList(u8).init(allocator);
     defer response_text.deinit();
 
+    var response_sent = false;
     for (events.items) |event| {
         switch (event) {
             .text_delta => |delta| try response_text.appendSlice(delta.delta),
             .done => |done| {
+                std.log.info("Response complete: {d} tokens", .{done.usage.total_tokens});
                 const final_text = if (done.text.len > 0) done.text else response_text.items;
+                if (final_text.len == 0) continue;
+
                 try conn.messages.append(.{ .role = .assistant, .content = try allocator.dupe(u8, final_text) });
-                const escaped = try protocol.jsonEscape(allocator, final_text);
-                defer allocator.free(escaped);
-                const json = try std.fmt.allocPrint(allocator, "{{\"type\":\"session.receive\",\"content\":\"{s}\"}}", .{escaped});
-                defer allocator.free(json);
-                try appendWsFrame(&conn.write_buf, json, .text);
+                try sendSessionReceive(allocator, &conn.write_buf, final_text);
+                response_sent = true;
+            },
+            .err => |err_msg| {
+                std.log.err("Pi AI error: {s}", .{err_msg});
+                try sendErrorJson(allocator, &conn.write_buf, err_msg);
             },
             else => {},
         }
     }
+
+    if (!response_sent and response_text.items.len > 0) {
+        try conn.messages.append(.{
+            .role = .assistant,
+            .content = try allocator.dupe(u8, response_text.items),
+        });
+        try sendSessionReceive(allocator, &conn.write_buf, response_text.items);
+    }
+}
+
+fn sendSessionReceive(allocator: std.mem.Allocator, write_buf: *std.ArrayList(u8), content: []const u8) !void {
+    const escaped = try protocol.jsonEscape(allocator, content);
+    defer allocator.free(escaped);
+
+    const response_json = try std.fmt.allocPrint(allocator, "{{\"type\":\"session.receive\",\"content\":\"{s}\"}}", .{escaped});
+    defer allocator.free(response_json);
+
+    try appendWsFrame(write_buf, response_json, .text);
+}
+
+fn sendErrorJson(allocator: std.mem.Allocator, write_buf: *std.ArrayList(u8), message: []const u8) !void {
+    const escaped = try protocol.jsonEscape(allocator, message);
+    defer allocator.free(escaped);
+
+    const response_json = try std.fmt.allocPrint(allocator, "{{\"type\":\"error\",\"message\":\"{s}\"}}", .{escaped});
+    defer allocator.free(response_json);
+
+    try appendWsFrame(write_buf, response_json, .text);
 }
 
 fn appendWsFrame(write_buf: *std.ArrayList(u8), payload: []const u8, comptime frame_type: enum { text, binary }) !void {

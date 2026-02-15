@@ -5,7 +5,8 @@
     .minimum_zig_version = "0.13.0",
     .dependencies = .{
         .ziggy_piai = .{
-            .path = "../ziggy-piai-link",
+            .url = "https://github.com/DeanoC/ZiggyPiAi/archive/refs/heads/master.tar.gz",
+            .hash = "1220f3911556f9a6a37ec395b669413e61f27590dc6a5f7fbffb51ad7b13f35e0df3",
         },
     },
     .paths = .{
