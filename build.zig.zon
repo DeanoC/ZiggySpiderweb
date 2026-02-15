@@ -5,14 +5,14 @@
     .minimum_zig_version = "0.13.0",
     .dependencies = .{
         .ziggy_piai = .{
-            .url = "https://github.com/DeanoC/ziggy-piai/archive/refs/heads/main.tar.gz",
-            .hash = "<UPDATE_HASH_AFTER_FIRST_BUILD>",
+            .url = "https://github.com/DeanoC/ZiggyPiAi/archive/refs/heads/master.tar.gz",
+            .hash = "1220f3911556f9a6a37ec395b669413e61f27590dc6a5f7fbffb51ad7b13f35e0df3",
         },
     },
     .paths = .{
-        ."build.zig",
-        ."build.zig.zon",
-        ."src",
-        ."README.md",
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "README.md",
     },
 }

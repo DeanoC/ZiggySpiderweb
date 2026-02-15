@@ -9,7 +9,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    const ziggy_piai_module = ziggy_piai_dep.module("ziggy-piai");
+    const ziggy_piai_module = ziggy_piai_dep.module("ziggypiai");
 
     // Spiderweb executable
     const spiderweb_mod = b.createModule(.{
