@@ -187,7 +187,11 @@ pub const RamContext = struct {
 
     fn evictLocked(self: *RamContext) !void {
         const removed = self.removeOldestActive() orelse return;
-        self.total_message_bytes -= removed.message.content.len;
+        if (self.total_message_bytes >= removed.message.content.len) {
+            self.total_message_bytes -= removed.message.content.len;
+        } else {
+            self.total_message_bytes = 0;
+        }
 
         const tombstone = try self.buildTombstone(removed.id, "evicted", "[evicted context entry]");
         try self.entries.append(self.allocator, tombstone);
@@ -197,7 +201,11 @@ pub const RamContext = struct {
 
     fn summarizeLocked(self: *RamContext) !void {
         const removed = self.removeOldestActive() orelse return;
-        self.total_message_bytes -= removed.message.content.len;
+        if (self.total_message_bytes >= removed.message.content.len) {
+            self.total_message_bytes -= removed.message.content.len;
+        } else {
+            self.total_message_bytes = 0;
+        }
 
         const summary_text = try self.buildSummaryText(removed.id, removed.message.content);
         defer self.allocator.free(summary_text);
@@ -269,7 +277,11 @@ pub const RamContext = struct {
     fn applyHardLimitLocked(self: *RamContext) !void {
         while (self.entries.items.len > self.max_messages or self.total_message_bytes > self.max_bytes) {
             const removed = self.removeOldestActive() orelse return;
-            self.total_message_bytes -= removed.message.content.len;
+            if (self.total_message_bytes >= removed.message.content.len) {
+                self.total_message_bytes -= removed.message.content.len;
+            } else {
+                self.total_message_bytes = 0;
+            }
 
             const tombstone = try self.buildTombstone(removed.id, "evicted", "[evicted context entry]");
             try self.entries.append(self.allocator, tombstone);
