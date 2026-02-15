@@ -163,6 +163,8 @@ pub const RamContext = struct {
     fn flushPendingLocked(self: *RamContext) !void {
         while (self.pending_mutations.items.len > 0) {
             const mutation = self.pending_mutations.orderedRemove(0);
+            errdefer self.clearMutationContent(&mutation);
+
             switch (mutation.kind) {
                 .load => {},
                 .update => {
@@ -173,9 +175,13 @@ pub const RamContext = struct {
                 .summarize => try self.summarizeLocked(),
             }
 
-            if (mutation.content) |content| {
-                self.allocator.free(content);
-            }
+            self.clearMutationContent(&mutation);
+        }
+    }
+
+    fn clearMutationContent(self: *RamContext, mutation: *const PendingMutation) void {
+        if (mutation.content) |content| {
+            self.allocator.free(content);
         }
     }
 

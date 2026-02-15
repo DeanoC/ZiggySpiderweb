@@ -73,15 +73,15 @@ const SessionContext = struct {
         self.session_id = try allocator.dupe(u8, id);
     }
 
-    fn appendMessage(self: *SessionContext, allocator: std.mem.Allocator, role: ziggy_piai.types.MessageRole, content: []const u8) !void {
+    fn appendMessage(self: *SessionContext, allocator: std.mem.Allocator, role: ziggy_piai.types.MessageRole, content: []const u8) !memory.MemoryID {
         _ = allocator;
-        _ = try self.ram.update(role, content);
+        return self.ram.update(role, content);
     }
 
-    fn appendUserMessage(self: *SessionContext, allocator: std.mem.Allocator, role: ziggy_piai.types.MessageRole, content: []const u8) !void {
+    fn appendUserMessage(self: *SessionContext, allocator: std.mem.Allocator, role: ziggy_piai.types.MessageRole, content: []const u8) !memory.MemoryID {
         if (content.len > MAX_INBOUND_MESSAGE_BYTES) return error.MessageTooLarge;
         _ = allocator;
-        _ = try self.ram.update(role, content);
+        return self.ram.update(role, content);
     }
 
     fn contextMessages(self: *SessionContext, allocator: std.mem.Allocator) ![]const ziggy_piai.types.Message {
@@ -522,7 +522,7 @@ fn handleUserMessage(allocator: std.mem.Allocator, state: *ServerState, pool: *s
         return;
     };
 
-    conn.session.appendUserMessage(allocator, .user, content) catch |err| {
+    _ = conn.session.appendUserMessage(allocator, .user, content) catch |err| {
         if (err == SessionError.MessageTooLarge) {
             std.log.warn("Dropping oversized user message: session={s} request={s} bytes={d}", .{ conn.session.session_id, request_id, content.len });
             try sendErrorJson(allocator, &conn.write_buf, "Message too large for active context");
@@ -625,7 +625,7 @@ fn processAiStreaming(allocator: std.mem.Allocator, state: *ServerState, conn: *
                 const final_text = if (done.text.len > 0) done.text else response_text.items;
                 if (final_text.len == 0) continue;
 
-                try conn.session.appendMessage(allocator, .assistant, final_text);
+                _ = try conn.session.appendMessage(allocator, .assistant, final_text);
                 try sendSessionReceive(allocator, &conn.write_buf, request_id, final_text);
                 response_sent = true;
             },
@@ -638,7 +638,7 @@ fn processAiStreaming(allocator: std.mem.Allocator, state: *ServerState, conn: *
     }
 
     if (!response_sent and response_text.items.len > 0) {
-        try conn.session.appendMessage(allocator, .assistant, response_text.items);
+        _ = try conn.session.appendMessage(allocator, .assistant, response_text.items);
         try sendSessionReceive(allocator, &conn.write_buf, request_id, response_text.items);
     }
 }
