@@ -4083,6 +4083,8 @@ test "server_piai: runMemoryManager summarizes overfull RAM and emits memory.eve
             .base_url = "https://example.invalid",
         },
         .ltm_store = null,
+        .agent_registry = undefined,
+        .tool_registry = undefined,
     };
 
     var conn = Connection.init(allocator, 0);
@@ -4228,6 +4230,8 @@ test "server_piai: agent.control heartbeat action emits heartbeat progress" {
             .base_url = "https://example.invalid",
         },
         .ltm_store = null,
+        .agent_registry = undefined,
+        .tool_registry = undefined,
     };
 
     var conn = Connection.init(allocator, 0);
@@ -4431,6 +4435,8 @@ test "server_piai: handshake restores persisted session context on matching sess
             .base_url = "https://example.invalid",
         },
         .ltm_store = null,
+        .agent_registry = undefined,
+        .tool_registry = undefined,
     };
 
     var conn = Connection.init(allocator, 0);
@@ -4505,6 +4511,8 @@ test "server_piai: handshake restores session context from LTM db snapshot" {
             .base_url = "https://example.invalid",
         },
         .ltm_store = null,
+        .agent_registry = undefined,
+        .tool_registry = undefined,
     };
     state.ltm_store = try ltm_store.Store.open(allocator, ltm_dir, LTM_DB_FILENAME);
     defer {
@@ -4595,6 +4603,8 @@ test "server_piai: processWebSocket handles masked chat.send and emits session.r
             .base_url = "https://example.invalid",
         },
         .ltm_store = null,
+        .agent_registry = undefined,
+        .tool_registry = undefined,
     };
 
     var conn = Connection.init(allocator, 0);
@@ -4671,6 +4681,8 @@ test "server_piai: handshake + chat flow emits session.ack then session.receive 
             .base_url = "https://example.invalid",
         },
         .ltm_store = null,
+        .agent_registry = undefined,
+        .tool_registry = undefined,
     };
 
     var conn = Connection.init(allocator, 0);
@@ -4773,6 +4785,8 @@ test "server_piai: handleUserMessage with chat.send runs mocked stream and emits
             .base_url = "https://example.invalid",
         },
         .ltm_store = null,
+        .agent_registry = undefined,
+        .tool_registry = undefined,
     };
 
     var conn = Connection.init(allocator, 0);
@@ -4832,6 +4846,8 @@ test "server_piai: mocked provider stream error emits error payload" {
             .base_url = "https://example.invalid",
         },
         .ltm_store = null,
+        .agent_registry = undefined,
+        .tool_registry = undefined,
     };
 
     var conn = Connection.init(allocator, 0);
@@ -4879,6 +4895,8 @@ test "server_piai: agent.control action state emits agent.state snapshot" {
             .base_url = "https://example.invalid",
         },
         .ltm_store = null,
+        .agent_registry = undefined,
+        .tool_registry = undefined,
     };
 
     var conn = Connection.init(allocator, 0);
@@ -4937,6 +4955,8 @@ test "server_piai: agent.control action pause and resume emit updated worker sta
             .base_url = "https://example.invalid",
         },
         .ltm_store = null,
+        .agent_registry = undefined,
+        .tool_registry = undefined,
     };
 
     var conn = Connection.init(allocator, 0);
@@ -5031,6 +5051,8 @@ test "server_piai: paused worker mode skips plan delegation but emits state snap
             .base_url = "https://example.invalid",
         },
         .ltm_store = null,
+        .agent_registry = undefined,
+        .tool_registry = undefined,
     };
 
     var conn = Connection.init(allocator, 0);
@@ -5124,6 +5146,8 @@ test "server_piai: agent.control goal emits plan and worker events" {
             .base_url = "https://example.invalid",
         },
         .ltm_store = null,
+        .agent_registry = undefined,
+        .tool_registry = undefined,
     };
 
     var conn = Connection.init(allocator, 0);
@@ -5235,6 +5259,8 @@ test "server_piai: plan task admission applies worker dispatch saturation cap" {
             .base_url = "https://example.invalid",
         },
         .ltm_store = null,
+        .agent_registry = undefined,
+        .tool_registry = undefined,
     };
 
     var conn = Connection.init(allocator, 0);
@@ -5327,6 +5353,8 @@ test "server_piai: handshake restore emits reconnect progress for restored sessi
             .base_url = "https://example.invalid",
         },
         .ltm_store = null,
+        .agent_registry = undefined,
+        .tool_registry = undefined,
     };
 
     var conn = Connection.init(allocator, 0);
@@ -5409,6 +5437,8 @@ test "server_piai: handshake restore emits backlog-aware reconnect progress" {
             .base_url = "https://example.invalid",
         },
         .ltm_store = null,
+        .agent_registry = undefined,
+        .tool_registry = undefined,
     };
 
     var conn = Connection.init(allocator, 0);
