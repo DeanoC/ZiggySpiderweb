@@ -47,20 +47,20 @@
   - dispatches `orchestrator` plan tasks through workers
   - emits `agent.progress` updates for worker lifecycle
   - emits additive `agent.status` updates per worker completion
+  - accepts `agent.control` with `action:"state"` and emits `agent.state` snapshots
 - Protocol coverage:
   - `agent.status` added to `MessageType`
   - parse tests include `agent.status` round-trip case
+  - `agent.state` now has parser and tests
 
 ## Known remaining holes
 
-1. `agent.status` is currently outbound only; no inbound control action is implemented yet.
-2. `agent.control` still only supports goal-driven planning and plain text fallback.
-3. Worker behavior is deterministic/stubbed local text logic; it is not yet connected to any long-running tooling or stateful sub-brain side effects.
-4. No dedicated queue/backpressure metrics or persistent worker session state yet (all worker outputs remain ephemeral).
-5. Runtime tests for `/goal` messaging are now complemented by mocked `chat.send` and `agent.control` flow coverage; remaining runtime gaps are mainly websocket-level socket integration and broader protocol behavior under load.
-6. End-to-end mocked provider path is now covered for `chat.send` via `handleUserMessage` + mocked `streamByModel`, but runtime socket-level integration with `processWebSocket` remains untested.
-6. Protocol parser tests now cover `agent.plan/progress/status/control` and unsupported incoming protocol types; protocol-level builder/shape tests for `agent.status` payloads and malformed envelope handling remain.
-7. `agent.state` is still a known future extension and intentionally untouched until its contract is defined.
+1. `agent.control` supports only state snapshot and goal-oriented controls; dedicated control command registry is still missing.
+2. Worker behavior is deterministic/stubbed local text logic; it is not yet connected to any long-running tooling or stateful sub-brain side effects.
+3. No dedicated queue/backpressure metrics or persistent worker session state yet (all worker outputs remain ephemeral).
+4. Runtime tests for websocket load and saturation behavior remain open.
+5. Protocol parser tests are now covering malformed envelopes; protocol-level builder/shape tests for `agent.status` and `agent.state` are still useful follow-ups.
+6. `agent.state` shape is added but the full contract (expected worker/session lifecycle fields and semantics) is still to be finalized.
 
 ## Next milestone recommendations
 

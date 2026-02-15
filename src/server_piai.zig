@@ -760,6 +760,40 @@ fn handleUserMessage(allocator: std.mem.Allocator, state: *ServerState, pool: *s
     const is_agent_control = std.mem.eql(u8, msg_type.string, "agent.control");
     if (!is_chat_send and !is_agent_control) return;
 
+    const control_action = blk: {
+        if (is_agent_control) {
+            if (parsed.value.object.get("action")) |action_value| {
+                if (action_value == .string) break :blk action_value.string;
+            }
+            break :blk null;
+        }
+        break :blk null;
+    };
+
+    if (is_agent_control) {
+        if (control_action) |action| {
+            if (std.mem.eql(u8, action, "state") or std.mem.eql(u8, action, "status")) {
+                try sendAgentState(
+                    allocator,
+                    &conn.write_buf,
+                    request_id_owned,
+                    conn.session.session_id,
+                    "idle",
+                    0,
+                    0,
+                    "",
+                );
+                return;
+            }
+
+            if (!std.mem.eql(u8, action, "goal") and !std.mem.eql(u8, action, "plan")) {
+                std.log.warn("agent.control unsupported action: {s}", .{action});
+                try sendErrorJson(allocator, &conn.write_buf, "agent.control unsupported action");
+                return;
+            }
+        }
+    }
+
     const content = blk: {
         if (parsed.value.object.get("content")) |c| if (c == .string) break :blk c.string;
         if (parsed.value.object.get("text")) |t| if (t == .string) break :blk t.string;
@@ -1136,6 +1170,35 @@ fn sendAgentProgress(
         allocator,
         "{{\"type\":\"agent.progress\",\"request\":\"{s}\",\"sessionKey\":\"{s}\",\"phase\":\"{s}\",\"status\":\"{s}\",\"message\":\"{s}\"}}",
         .{ escaped_request_id, escaped_session_id, escaped_phase, escaped_status, escaped_message },
+    );
+    defer allocator.free(payload);
+
+    try appendWsFrame(allocator, write_buf, payload, .text);
+}
+
+fn sendAgentState(
+    allocator: std.mem.Allocator,
+    write_buf: *std.ArrayListUnmanaged(u8),
+    request_id: []const u8,
+    session_id: []const u8,
+    phase: []const u8,
+    queued_tasks: usize,
+    active_tasks: usize,
+    last_goal: []const u8,
+) !void {
+    const escaped_request_id = try protocol.jsonEscape(allocator, request_id);
+    defer allocator.free(escaped_request_id);
+    const escaped_session_id = try protocol.jsonEscape(allocator, session_id);
+    defer allocator.free(escaped_session_id);
+    const escaped_phase = try protocol.jsonEscape(allocator, phase);
+    defer allocator.free(escaped_phase);
+    const escaped_last_goal = try protocol.jsonEscape(allocator, last_goal);
+    defer allocator.free(escaped_last_goal);
+
+    const payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"type\":\"agent.state\",\"request\":\"{s}\",\"sessionKey\":\"{s}\",\"phase\":\"{s}\",\"queuedTasks\":{d},\"activeTasks\":{d},\"lastGoal\":\"{s}\"}}",
+        .{ escaped_request_id, escaped_session_id, escaped_phase, queued_tasks, active_tasks, escaped_last_goal },
     );
     defer allocator.free(payload);
 
@@ -2996,6 +3059,64 @@ test "server_piai: handleUserMessage with chat.send runs mocked stream and emits
     try std.testing.expect(std.mem.eql(u8, obj.get("type").?.string, "session.receive"));
     try std.testing.expect(std.mem.eql(u8, obj.get("content").?.string, "mocked model reply"));
     try std.testing.expect(obj.get("memoryId").?.integer > 0);
+}
+
+test "server_piai: agent.control action state emits agent.state snapshot" {
+    const allocator = std.testing.allocator;
+
+    var model_registry = ziggy_piai.models.ModelRegistry.init(allocator);
+    defer model_registry.deinit();
+    try ziggy_piai.models.registerDefaultModels(&model_registry);
+
+    var api_registry = ziggy_piai.api_registry.ApiRegistry.init(allocator);
+    defer api_registry.deinit();
+    try ziggy_piai.providers.register_builtins.registerBuiltInApiProviders(&api_registry);
+
+    var http_client = std.http.Client{ .allocator = allocator };
+    defer http_client.deinit();
+
+    var state = ServerState{
+        .allocator = allocator,
+        .rng = std.Random.DefaultPrng.init(0xBADC0FFEE),
+        .model_registry = model_registry,
+        .api_registry = api_registry,
+        .http_client = http_client,
+        .provider_config = .{
+            .name = "openai",
+            .model = "gpt-4o-mini",
+            .api_key = "mock-api-key",
+            .base_url = "https://example.invalid",
+        },
+        .ltm_store = null,
+    };
+
+    var conn = Connection.init(allocator, 0);
+    try conn.session.setSessionId(allocator, "session-control-state-1");
+    defer {
+        conn.read_buf.deinit(allocator);
+        conn.write_buf.deinit(allocator);
+        conn.session.deinit(allocator);
+    }
+
+    {
+        var pool: std.Thread.Pool = undefined;
+        try pool.init(.{ .allocator = allocator });
+        defer pool.deinit();
+
+        const inbound = "{\"id\":\"req-003\",\"type\":\"agent.control\",\"action\":\"state\"}";
+        try handleUserMessage(allocator, &state, &pool, &conn, inbound);
+    }
+
+    const payload = try decodeFirstWebSocketPayload(conn.write_buf.items);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
+    defer parsed.deinit();
+
+    const obj = parsed.value.object;
+    try std.testing.expect(std.mem.eql(u8, obj.get("type").?.string, "agent.state"));
+    try std.testing.expect(std.mem.eql(u8, obj.get("phase").?.string, "idle"));
+    try std.testing.expect(std.mem.eql(u8, obj.get("lastGoal").?.string, ""));
+    try std.testing.expect(obj.get("queuedTasks").?.integer >= 0);
+    try std.testing.expect(obj.get("activeTasks").?.integer >= 0);
 }
 
 test "server_piai: agent.control goal emits plan and worker events" {
