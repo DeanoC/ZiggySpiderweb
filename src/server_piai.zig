@@ -622,6 +622,64 @@ fn handleUserMessage(allocator: std.mem.Allocator, state: *ServerState, pool: *s
         return;
     }
 
+    const is_memory_query = std.mem.eql(u8, msg_type.string, "memory.query");
+    if (is_memory_query) {
+        const limit = if (parsed.value.object.get("limit")) |limit_value| parsePositiveInteger(limit_value) orelse 25 else 25;
+        const include_archived = if (parsed.value.object.get("include_archived")) |include| switch (include) {
+            .bool => include.bool,
+            else => true,
+        } else true;
+        const query_kind = if (parsed.value.object.get("kind")) |value| switch (value) {
+            .string => if (std.mem.eql(u8, value.string, "summary"))
+                MemoryQueryKind.summary
+            else if (std.mem.eql(u8, value.string, "entry"))
+                MemoryQueryKind.entry
+            else
+                MemoryQueryKind.all,
+            else => MemoryQueryKind.all,
+        } else MemoryQueryKind.all;
+
+        const topic = if (parsed.value.object.get("topic")) |topic_value| if (topic_value == .string) topic_value.string else null else null;
+
+        var query_ids = std.ArrayListUnmanaged(memory.MemoryID){};
+        defer query_ids.deinit(allocator);
+
+        if (parsed.value.object.get("memoryId")) |memory_id_value| {
+            if (parsePositiveInteger(memory_id_value)) |id| {
+                try query_ids.append(allocator, id);
+            }
+        }
+
+        if (parsed.value.object.get("memoryIds")) |memory_ids| {
+            if (memory_ids == .array) {
+                for (memory_ids.array.items) |id_value| {
+                    if (parsePositiveInteger(id_value)) |id| {
+                        try query_ids.append(allocator, id);
+                    }
+                }
+            }
+        }
+
+        handleMemoryQuery(
+            allocator,
+            conn,
+            request_id,
+            limit,
+            include_archived,
+            topic,
+            query_ids.items,
+            query_kind,
+        ) catch |err| {
+            std.log.err("memory.query failed: {s} session={s} request={s}", .{
+                @errorName(err),
+                conn.session.session_id,
+                request_id,
+            });
+            try sendErrorJson(allocator, &conn.write_buf, "memory.query failed");
+        };
+        return;
+    }
+
     const is_chat_send = std.mem.eql(u8, msg_type.string, "chat.send") or std.mem.eql(u8, msg_type.string, "session.send");
     if (!is_chat_send) return;
 
@@ -804,6 +862,231 @@ fn sendSessionReceive(
     defer allocator.free(response_json);
 
     try appendWsFrame(allocator, write_buf, response_json, .text);
+}
+
+const MemoryQueryKind = enum { all, summary, entry };
+
+fn handleMemoryQuery(
+    allocator: std.mem.Allocator,
+    conn: *Connection,
+    request_id: []const u8,
+    requested_limit: u64,
+    include_archived: bool,
+    topic: ?[]const u8,
+    query_ids: []const memory.MemoryID,
+    kind_filter: MemoryQueryKind,
+) !void {
+    const limit = if (requested_limit == 0 or requested_limit > 128) 128 else requested_limit;
+    var remaining = @as(usize, limit);
+    var emitted = std.ArrayListUnmanaged(u8){};
+    defer emitted.deinit(allocator);
+
+    const escaped_topic = if (topic) |value| try protocol.jsonEscape(allocator, value) else null;
+    defer if (escaped_topic) |value| allocator.free(value);
+
+    try emitted.appendSlice(allocator, "{\"type\":\"memory.query\",\"request\":\"");
+    const escaped_request_id = try protocol.jsonEscape(allocator, request_id);
+    defer allocator.free(escaped_request_id);
+    try emitted.appendSlice(allocator, escaped_request_id);
+    try emitted.appendSlice(allocator, "\",\"sessionKey\":\"");
+    try emitted.appendSlice(allocator, conn.session.session_id);
+    if (escaped_topic) |topic_value| {
+        try emitted.appendSlice(allocator, "\",\"topic\":\"");
+        try emitted.appendSlice(allocator, topic_value);
+    } else {
+        try emitted.appendSlice(allocator, "\",\"topic\":null");
+    }
+    try emitted.appendSlice(allocator, "\",\"items\":[");
+
+    var first_item = true;
+
+    conn.session.ram.mutex.lock();
+    defer conn.session.ram.mutex.unlock();
+
+    if (kind_filter != .entry) {
+        var idx: usize = conn.session.ram.summaries.items.len;
+        while (idx > 0 and remaining > 0) {
+            idx -= 1;
+            const summary = conn.session.ram.summaries.items[idx];
+            if (!queryMatchesId(summary.id, query_ids)) continue;
+            if (!queryMatchesTopic(summary.text, topic)) continue;
+            try appendRecallSummaryItem(
+                allocator,
+                &emitted,
+                &first_item,
+                "summary",
+                "ram",
+                summary.id,
+                summary.source_id,
+                summary.text,
+                summary.created_at_ms,
+            );
+            if (remaining > 0) remaining -= 1;
+        }
+    }
+
+    if (kind_filter != .summary and remaining > 0) {
+        var idx: usize = conn.session.ram.entries.items.len;
+        while (idx > 0 and remaining > 0) {
+            idx -= 1;
+            const entry = conn.session.ram.entries.items[idx];
+            if (!queryMatchesId(entry.id, query_ids)) continue;
+            if (!queryMatchesTopic(entry.message.content, topic)) continue;
+
+            try appendRecallEntryItem(
+                allocator,
+                &emitted,
+                &first_item,
+                "entry",
+                "ram",
+                if (entry.state == .active) "active" else "tombstone",
+                entry.message.role,
+                entry.id,
+                entry.related_to,
+                entry.message.content,
+            );
+            if (remaining > 0) remaining -= 1;
+        }
+    }
+
+    if (include_archived) {
+        const archive = findLatestArchiveForSession(allocator, conn.session.session_id) catch null;
+        if (archive) |latest| {
+            try appendLatestArchiveToQueryResponse(
+                allocator,
+                &emitted,
+                latest.archive_path,
+                &first_item,
+                &remaining,
+                topic,
+                query_ids,
+                kind_filter,
+            );
+            allocator.free(latest.archive_path);
+            allocator.free(latest.reason);
+        }
+    }
+
+    try emitted.appendSlice(allocator, "]}");
+    try appendWsFrame(allocator, &conn.write_buf, emitted.items, .text);
+}
+
+fn queryMatchesId(item_id: memory.MemoryID, query_ids: []const memory.MemoryID) bool {
+    if (query_ids.len == 0) return true;
+
+    for (query_ids) |id| {
+        if (id == item_id) return true;
+    }
+    return false;
+}
+
+fn queryMatchesTopic(value: []const u8, topic: ?[]const u8) bool {
+    if (topic == null) return true;
+    return std.mem.indexOf(u8, value, topic.?) != null;
+}
+
+fn appendLatestArchiveToQueryResponse(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    archive_path: []const u8,
+    first_item: *bool,
+    remaining: *usize,
+    topic: ?[]const u8,
+    query_ids: []const memory.MemoryID,
+    kind_filter: MemoryQueryKind,
+) !void {
+    const file = std.fs.cwd().openFile(archive_path, .{ .mode = .read_only }) catch return;
+    defer file.close();
+
+    const data = try file.readToEndAlloc(allocator, 1024 * 1024);
+    defer allocator.free(data);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, data, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return;
+
+    if (kind_filter != .entry) {
+        if (parsed.value.object.get("summaries")) |summaries| {
+            if (summaries == .array) {
+                var idx = summaries.array.items.len;
+                while (idx > 0 and remaining.* > 0) {
+                    idx -= 1;
+                    const summary_value = summaries.array.items[idx];
+                    if (summary_value != .object) continue;
+
+                    const summary_obj = summary_value.object;
+                    const id = parsePositiveInteger(summary_obj.get("id") orelse continue) orelse continue;
+                    const source_id = parsePositiveInteger(summary_obj.get("source_id") orelse continue) orelse continue;
+                    const text = summary_obj.get("text") orelse continue;
+                    if (text != .string) continue;
+                    const created_at_ms = if (summary_obj.get("created_at_ms")) |ts| parseCreatedAtMs(ts) else 0;
+
+                    if (!queryMatchesId(id, query_ids)) continue;
+                    if (!queryMatchesTopic(text.string, topic)) continue;
+
+                    try appendRecallSummaryItem(
+                        allocator,
+                        out,
+                        first_item,
+                        "summary",
+                        "ltm",
+                        id,
+                        source_id,
+                        text.string,
+                        created_at_ms,
+                    );
+                    if (remaining.* > 0) remaining.* -= 1;
+                }
+            }
+        }
+    }
+
+    if (kind_filter != .summary and remaining.* > 0) {
+        if (parsed.value.object.get("entries")) |entries| {
+            if (entries == .array) {
+                var idx = entries.array.items.len;
+                while (idx > 0 and remaining.* > 0) {
+                    idx -= 1;
+                    const entry_value = entries.array.items[idx];
+                    if (entry_value != .object) continue;
+
+                    const entry_obj = entry_value.object;
+                    const entry_id = parsePositiveInteger(entry_obj.get("id") orelse continue) orelse continue;
+                    const role = if (entry_obj.get("role")) |value| blk: {
+                        if (value != .string) break :blk null;
+                        break :blk parseRole(value.string);
+                    } else null;
+                    if (role == null) continue;
+
+                    const state = if (entry_obj.get("state")) |state_value|
+                        if (state_value == .string and std.mem.eql(u8, state_value.string, "active")) "active" else "tombstone"
+                    else
+                        "unknown";
+                    const content = if (entry_obj.get("content")) |value| if (value == .string) value.string else continue else continue;
+
+                    if (!queryMatchesId(entry_id, query_ids)) continue;
+                    if (!queryMatchesTopic(content, topic)) continue;
+
+                    try appendRecallEntryItem(
+                        allocator,
+                        out,
+                        first_item,
+                        "entry",
+                        "ltm",
+                        state,
+                        role.?,
+                        entry_id,
+                        if (entry_obj.get("related_to")) |value| blk: {
+                            if (value == .null) break :blk null;
+                            break :blk parsePositiveInteger(value);
+                        } else null,
+                        content,
+                    );
+                    if (remaining.* > 0) remaining.* -= 1;
+                }
+            }
+        }
+    }
 }
 
 fn handleMemoryRecall(

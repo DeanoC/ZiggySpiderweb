@@ -71,9 +71,13 @@ Recommended execution order:
 
 - Added `memory.recall` implementation with archive-aware recall (`summaries` first; optionally full entries) in `src/server_piai.zig`.
 - Added startup reconnect fallback to latest LTM archive when a requested session has no in-memory snapshot.
+- Added `memory.query` websocket request (`memory.query`) supporting:
+  - ID-based filtering via `memoryId` or `memoryIds`
+  - optional `kind` (`summary`/`entry`/`all`)
+  - optional `topic` substring match
+  - optional `include_archived` scanning of latest archive snapshot
 - Still missing for M2:
   - first-class SQLite-backed `memory.db` store (plan still defines NDJSON/JSON archives as temporary persistence)
-  - schema/API for recall by topic and memory IDs (`memory.query`)
   - dedicated migration/retention policy and background summarize->LTM flush path
 
 ## Operational notes
