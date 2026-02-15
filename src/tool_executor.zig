@@ -26,20 +26,29 @@ fn jsonEscape(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
 }
 
 /// Validate path is within workspace (no absolute paths, no ..)
-fn validatePath(path: []const u8) ?[]const u8 {
+/// Returns an owned error message that must be freed by caller
+fn validatePathOwned(allocator: std.mem.Allocator, path: []const u8) ?[]u8 {
     // Reject absolute paths
     if (path.len > 0 and path[0] == '/') {
-        return "Absolute paths are not allowed";
+        return allocator.dupe(u8, "Absolute paths are not allowed") catch return null;
     }
     // Reject paths starting with ~ (home directory)
     if (path.len > 0 and path[0] == '~') {
-        return "Home directory references are not allowed";
+        return allocator.dupe(u8, "Home directory references are not allowed") catch return null;
     }
     // Reject directory traversal
     if (std.mem.indexOf(u8, path, "..") != null) {
-        return "Path cannot contain '..'";
+        return allocator.dupe(u8, "Path cannot contain '..'") catch return null;
     }
     return null;
+}
+
+/// Helper to create a failure result with an allocated message
+fn fail(alloc: std.mem.Allocator, code: ToolResult.ErrorCode, msg: []const u8) ToolResult {
+    return .{ .failure = .{
+        .code = code,
+        .message = alloc.dupe(u8, msg) catch return .{ .failure = .{ .code = .execution_failed, .message = "OOM" } },
+    } };
 }
 
 /// Built-in tool implementations
@@ -49,19 +58,19 @@ pub const BuiltinTools = struct {
         const path_value = args.get("path") orelse {
             return .{ .failure = .{
                 .code = .invalid_params,
-                .message = "Missing required parameter: path",
+                .message = allocator.dupe(u8, "Missing required parameter: path") catch return .{ .failure = .{ .code = .execution_failed, .message = "Out of memory" } },
             } };
         };
         if (path_value != .string) {
             return .{ .failure = .{
                 .code = .invalid_params,
-                .message = "Parameter 'path' must be a string",
+                .message = allocator.dupe(u8, "Parameter 'path' must be a string") catch return .{ .failure = .{ .code = .execution_failed, .message = "Out of memory" } },
             } };
         }
         const path = path_value.string;
 
         // Security: validate path
-        if (validatePath(path)) |err| {
+        if (validatePathOwned(allocator, path)) |err| {
             return .{ .failure = .{
                 .code = .permission_denied,
                 .message = err,
@@ -69,7 +78,7 @@ pub const BuiltinTools = struct {
         }
 
         const content = std.fs.cwd().readFileAlloc(allocator, path, 1024 * 1024) catch |err| {
-            const msg = std.fmt.allocPrint(allocator, "Failed to read file: {s}", .{@errorName(err)}) catch "Failed to read file";
+            const msg = std.fmt.allocPrint(allocator, "Failed to read file: {s}", .{@errorName(err)}) catch return .{ .failure = .{ .code = .execution_failed, .message = "Failed to read file" } };
             return .{ .failure = .{
                 .code = .execution_failed,
                 .message = msg,
@@ -105,7 +114,7 @@ pub const BuiltinTools = struct {
         const content = content_value.string;
 
         // Security: validate path
-        if (validatePath(path)) |err| {
+        if (validatePathOwned(allocator, path)) |err| {
             return .{ .failure = .{
                 .code = .permission_denied,
                 .message = err,
@@ -149,7 +158,7 @@ pub const BuiltinTools = struct {
             ".";
 
         // Security: validate path
-        if (validatePath(path)) |err| {
+        if (validatePathOwned(allocator, path)) |err| {
             return .{ .failure = .{
                 .code = .permission_denied,
                 .message = err,
@@ -256,7 +265,7 @@ pub const BuiltinTools = struct {
             ".";
 
         // Security: validate path
-        if (validatePath(path)) |err| {
+        if (validatePathOwned(allocator, path)) |err| {
             return .{ .failure = .{
                 .code = .permission_denied,
                 .message = err,
@@ -377,21 +386,32 @@ pub const BuiltinTools = struct {
         };
 
         if (exit_code != 0) {
-            const output = if (result.stderr.len > 0)
-                result.stderr
-            else if (result.stdout.len > 0)
-                result.stdout
-            else
-                allocator.dupe(u8, "Command failed with no output") catch "Command failed";
-
-            allocator.free(result.stdout);
-            allocator.free(result.stderr);
-
-            const msg = std.fmt.allocPrint(allocator, "Command exited with code {d}: {s}", .{ exit_code, output }) catch {
-                allocator.free(output);
-                return .{ .failure = .{ .code = .execution_failed, .message = "Command failed" } };
+            // Build error message first, then free buffers
+            const msg = blk: {
+                if (result.stderr.len > 0) {
+                    const m = std.fmt.allocPrint(allocator, "Command exited with code {d}: {s}", .{ exit_code, result.stderr }) catch {
+                        allocator.free(result.stdout);
+                        allocator.free(result.stderr);
+                        break :blk "Command failed";
+                    };
+                    allocator.free(result.stdout);
+                    allocator.free(result.stderr);
+                    break :blk m;
+                } else if (result.stdout.len > 0) {
+                    const m = std.fmt.allocPrint(allocator, "Command exited with code {d}: {s}", .{ exit_code, result.stdout }) catch {
+                        allocator.free(result.stdout);
+                        allocator.free(result.stderr);
+                        break :blk "Command failed";
+                    };
+                    allocator.free(result.stdout);
+                    allocator.free(result.stderr);
+                    break :blk m;
+                } else {
+                    allocator.free(result.stdout);
+                    allocator.free(result.stderr);
+                    break :blk "Command failed with no output";
+                }
             };
-            allocator.free(output);
             return .{ .failure = .{ .code = .execution_failed, .message = msg } };
         }
 

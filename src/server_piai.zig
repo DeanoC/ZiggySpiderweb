@@ -2259,8 +2259,8 @@ fn handleToolCall(
             );
             defer allocator.free(payload);
 
-            // Note: failure.message is owned by the tool and may be a string literal
-            // Do not free it here
+            // Note: failure.message is always owned by the tool and must be freed
+            allocator.free(failure.message);
             try sendDirect(allocator, conn, payload);
         },
     }
