@@ -1173,6 +1173,71 @@ fn handleUserMessage(allocator: std.mem.Allocator, state: *ServerState, pool: *s
     request_id_owned = "";
 }
 
+fn sendDirect(
+    allocator: std.mem.Allocator,
+    conn: *Connection,
+    payload: []const u8,
+) !void {
+    // Write directly to socket, bypassing write_buf
+    // This is used by AI tasks to ensure data is sent immediately
+    var frame_buf = std.ArrayListUnmanaged(u8){};
+    defer frame_buf.deinit(allocator);
+
+    const opcode: u8 = 0x81; // text frame, final
+    var header: [10]u8 = undefined;
+    var header_len: usize = 2;
+
+    header[0] = opcode;
+    if (payload.len < 126) {
+        header[1] = @intCast(payload.len);
+    } else if (payload.len < 65536) {
+        header[1] = 126;
+        std.mem.writeInt(u16, header[2..4], @intCast(payload.len), .big);
+        header_len = 4;
+    } else {
+        header[1] = 127;
+        std.mem.writeInt(u64, header[2..10], payload.len, .big);
+        header_len = 10;
+    }
+
+    try frame_buf.appendSlice(allocator, header[0..header_len]);
+    try frame_buf.appendSlice(allocator, payload);
+
+    // Write directly to socket
+    const n = posix.write(conn.fd, frame_buf.items) catch |err| {
+        std.log.err("Direct write failed: {s}", .{@errorName(err)});
+        return err;
+    };
+
+    if (n < frame_buf.items.len) {
+        std.log.warn("Direct write incomplete: {d}/{d} bytes", .{ n, frame_buf.items.len });
+    }
+}
+
+fn sendSessionReceiveDirect(
+    allocator: std.mem.Allocator,
+    conn: *Connection,
+    request_id: []const u8,
+    content: []const u8,
+    memory_id: memory.MemoryID,
+) !void {
+    _ = request_id;
+    const escaped = try protocol.jsonEscape(allocator, content);
+    defer allocator.free(escaped);
+
+    const memory_id_str = try std.fmt.allocPrint(allocator, "{d}", .{memory_id});
+    defer allocator.free(memory_id_str);
+
+    const response_json = try std.mem.concat(
+        allocator,
+        u8,
+        &.{ "{\"type\":\"session.receive\",\"content\":\"", escaped, "\",\"memoryId\":", memory_id_str, "}" },
+    );
+    defer allocator.free(response_json);
+
+    try sendDirect(allocator, conn, response_json);
+}
+
 fn runAiTask(args: *AiTaskArgs) void {
     processAiStreaming(args.allocator, args.state, args.conn, args.request_id, args.is_planned_goal) catch |err| {
         std.log.err("AI Task failed: {s} session={s} request={s}", .{
@@ -1436,7 +1501,7 @@ fn processAiStreaming(
                 if (final_text.len == 0) continue;
 
                 const assistant_msg_id = try conn.session.appendMessage(allocator, .assistant, final_text);
-                try sendSessionReceive(allocator, &conn.write_buf, request_id, final_text, assistant_msg_id);
+                try sendSessionReceiveDirect(allocator, conn, request_id, final_text, assistant_msg_id);
                 response_sent = true;
                 execution_completed = true;
             },
@@ -1451,7 +1516,7 @@ fn processAiStreaming(
     if (!response_sent and response_text.items.len > 0) {
         if (conn.closing.load(.acquire)) return error.ConnectionClosed;
         const assistant_msg_id = try conn.session.appendMessage(allocator, .assistant, response_text.items);
-        try sendSessionReceive(allocator, &conn.write_buf, request_id, response_text.items, assistant_msg_id);
+        try sendSessionReceiveDirect(allocator, conn, request_id, response_text.items, assistant_msg_id);
         execution_completed = true;
     }
 
