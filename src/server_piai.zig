@@ -55,6 +55,8 @@ const MEMORY_MANAGER_SUMMARY_TRIGGER_DEN = 4;
 const MEMORY_MANAGER_SUMMARIES_PER_TICK = 2;
 const MEMORY_MANAGER_SNAPSHOT_REASON = "memory-manager auto snapshot";
 const HEARTBEAT_INTERVAL_MS: i64 = 30 * 1000;
+const HEARTBEAT_SWEEP_INTERVAL_MS: i64 = 5 * 1000;
+const HEARTBEAT_SWEEP_REQUEST_ID = "heartbeat-sweep";
 const StreamByModelFn = *const fn (
     std.mem.Allocator,
     *std.http.Client,
@@ -244,9 +246,9 @@ const EventLoop = if (builtin.os.tag == .linux) struct {
         posix.epoll_ctl(self.fd, linux.EPOLL.CTL_DEL, fd, null) catch {};
     }
 
-    fn wait(self: *EventLoop, events_out: []Event) usize {
+    fn wait(self: *EventLoop, events_out: []Event, timeout_ms: i32) usize {
         var epoll_events: [64]linux.epoll_event = undefined;
-        const n = posix.epoll_wait(self.fd, &epoll_events, -1);
+        const n = posix.epoll_wait(self.fd, &epoll_events, timeout_ms);
         for (epoll_events[0..n], 0..) |ee, i| {
             events_out[i] = .{
                 .fd = ee.data.fd,
@@ -294,8 +296,8 @@ const EventLoop = if (builtin.os.tag == .linux) struct {
         }
     }
 
-    fn wait(self: *EventLoop, events_out: []Event) usize {
-        const n = posix.poll(self.pollfds.items, -1) catch return 0;
+    fn wait(self: *EventLoop, events_out: []Event, timeout_ms: i32) usize {
+        const n = posix.poll(self.pollfds.items, timeout_ms) catch return 0;
         if (n == 0) return 0;
 
         var count: usize = 0;
@@ -419,8 +421,15 @@ pub fn run(allocator: std.mem.Allocator, bind_addr: []const u8, port: u16, provi
     std.log.info("ZiggySpiderweb v0.4.0 (Abstract EventLoop) listening on {s}:{d}", .{ bind_addr, port });
 
     var events: [64]Event = undefined;
+    var next_heartbeat_check_ms = std.time.milliTimestamp() + HEARTBEAT_SWEEP_INTERVAL_MS;
     while (true) {
-        const n = loop.wait(&events);
+        const now_ms = std.time.milliTimestamp();
+        const wait_ms = if (next_heartbeat_check_ms <= now_ms)
+            0
+        else
+            @as(i32, @intCast(next_heartbeat_check_ms - now_ms));
+
+        const n = loop.wait(&events, wait_ms);
         for (events[0..n]) |ev| {
             if (ev.fd == sockfd) {
                 while (true) {
@@ -492,6 +501,12 @@ pub fn run(allocator: std.mem.Allocator, bind_addr: []const u8, port: u16, provi
                     allocator.destroy(conn);
                 }
             }
+        }
+
+        const after_loop_ms = std.time.milliTimestamp();
+        if (after_loop_ms >= next_heartbeat_check_ms) {
+            runHeartbeatSweep(allocator, &connections);
+            next_heartbeat_check_ms = after_loop_ms + HEARTBEAT_SWEEP_INTERVAL_MS;
         }
     }
 }
@@ -1210,6 +1225,20 @@ fn runMemoryManager(
         summaries_performed,
         message,
     );
+}
+
+fn runHeartbeatSweep(allocator: std.mem.Allocator, connections: *std.AutoHashMap(posix.socket_t, *Connection)) void {
+    var it = connections.valueIterator();
+    while (it.next()) |conn_ptr| {
+        const conn = conn_ptr.*;
+        if (conn.state != .websocket) continue;
+        runHeartbeatCheck(allocator, conn, HEARTBEAT_SWEEP_REQUEST_ID, false) catch |err| {
+            std.log.warn("heartbeat sweep failed: {s} session={s}", .{
+                @errorName(err),
+                conn.session.session_id,
+            });
+        };
+    }
 }
 
 fn runHeartbeatCheck(
@@ -3344,6 +3373,38 @@ test "server_piai: agent.control heartbeat action emits heartbeat progress" {
     try std.testing.expect(std.mem.eql(u8, obj.get("type").?.string, "agent.progress"));
     try std.testing.expect(std.mem.eql(u8, obj.get("phase").?.string, "heartbeat"));
     try std.testing.expect(std.mem.eql(u8, obj.get("status").?.string, "blocked"));
+}
+
+test "server_piai: heartbeat sweep emits heartbeat progress for websocket sessions with backlog" {
+    const allocator = std.testing.allocator;
+
+    var connections = std.AutoHashMap(posix.socket_t, *Connection).init(allocator);
+    defer connections.deinit();
+
+    var conn = Connection.init(allocator, 0);
+    defer {
+        conn.read_buf.deinit(allocator);
+        conn.write_buf.deinit(allocator);
+        conn.session.deinit(allocator);
+    }
+
+    conn.state = .websocket;
+    try conn.session.setSessionId(allocator, "session-heartbeat-sweep-1");
+    try conn.session.setLastGoal(allocator, "periodic progress check");
+    conn.session.worker_queue_depth = 2;
+    conn.session.worker_active_tasks = 1;
+    conn.session.last_heartbeat_ms = std.time.milliTimestamp() - HEARTBEAT_INTERVAL_MS - 10;
+
+    try connections.put(0, &conn);
+    runHeartbeatSweep(allocator, &connections);
+
+    const payload = try decodeFirstWebSocketPayload(conn.write_buf.items);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
+    defer parsed.deinit();
+
+    const obj = parsed.value.object;
+    try std.testing.expect(std.mem.eql(u8, obj.get("type").?.string, "agent.progress"));
+    try std.testing.expect(std.mem.eql(u8, obj.get("phase").?.string, "heartbeat"));
 }
 
 fn decodeFirstWebSocketPayload(frame_data: []const u8) ![]const u8 {
