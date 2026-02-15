@@ -9,6 +9,7 @@
 - **M5 (Worker sub-brains)**: complete for deterministic local worker execution and control-state telemetry.
 - **M6 (Memory manager worker)**: implemented with bounded RAM compacting + snapshot events.
 - **M7 (Heartbeat worker v1)**: implemented with interval-based websocket session sweep + manual heartbeat control action.
+- **M8 (Protocol-flow harness)**: expanded end-to-end mock-backed websocket chat validation.
 
 ## What is implemented
 
@@ -73,6 +74,10 @@
 - Heartbeat progress remains on `agent.progress` phase `heartbeat` with statuses `watching` / `blocked`
 - Added tests validating heartbeat sweep behavior (`runHeartbeatSweep`)
 
+### M8 / Protocol-flow harness (`src/server_piai.zig`)
+- Added test for websocket-style handshake + `chat.send` flow using mocked provider callback.
+- Verifies `session.ack` frame and outbound `session.receive` from mocked stream on the same connection path.
+
 ## Known remaining holes
 
 1. Worker behavior is deterministic/stubbed local text logic; it is not yet connected to any long-running tooling or stateful sub-brain side effects.
@@ -82,6 +87,7 @@
 5. `agent.state` contract is still evolving for future worker lifecycle states (`blocked`, `heartbeat`, etc.).
 6. `memory.event` contract is intentionally minimal and should be expanded for richer memory-manager diagnostics.
 7. Heartbeat suggestions currently stay telemetry-only and do not include explicit escalation or action-recommendation payloads.
+8. M8 harness still missing reconnect restore + error-path assertions for streaming/provider failures.
 
 ## Next milestone recommendations
 
@@ -90,5 +96,5 @@
    - broaden `memory.event` payloads for observability
    - bounded queueing/metrics and saturation behavior
 2. Move M7 to "complete" by expanding heartbeat output with suggestion/action fields and sweep performance telemetry.
-3. Keep `agent.status` semantics stable as additive telemetry while extending `agent.control`, `/goal`, and heartbeat runtime tests.
-4. Start M8 around protocol-first end-to-end harness and real provider flow.
+3. Move M8 to "complete" by covering reconnect restore and streaming failure scenarios in websocket-flow tests.
+4. Keep `agent.status` semantics stable as additive telemetry while extending `agent.control`, `/goal`, and heartbeat runtime tests.
