@@ -27,6 +27,12 @@ const linux = if (builtin.os.tag == .linux) std.os.linux else struct {
     };
 };
 
+const SESSION_ID_ALPHABET = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+const MAX_CONTEXT_MESSAGES = 64;
+const MAX_CONTEXT_BYTES = 16 * 1024;
+const MAX_INBOUND_MESSAGE_BYTES = 4 * 1024;
+const REQUEST_ID_LEN = 16;
+
 const ServerState = struct {
     allocator: std.mem.Allocator,
     rng: std.Random.DefaultPrng,
@@ -42,13 +48,82 @@ const ConnectionState = enum {
     closing,
 };
 
+const SessionContext = struct {
+    messages: std.ArrayListUnmanaged(ziggy_piai.types.Message),
+    session_id: []u8,
+    total_message_bytes: usize,
+
+    fn init() SessionContext {
+        return .{
+            .messages = .{},
+            .session_id = &[_]u8{},
+            .total_message_bytes = 0,
+        };
+    }
+
+    fn deinit(self: *SessionContext, allocator: std.mem.Allocator) void {
+        self.clearMessages(allocator);
+        self.messages.deinit(allocator);
+        if (self.session_id.len > 0) allocator.free(self.session_id);
+        self.session_id = &[_]u8{};
+        self.total_message_bytes = 0;
+    }
+
+    fn clearMessages(self: *SessionContext, allocator: std.mem.Allocator) void {
+        for (self.messages.items) |msg| {
+            allocator.free(msg.content);
+        }
+        self.messages.clearRetainingCapacity();
+        self.total_message_bytes = 0;
+    }
+
+    fn setSessionId(self: *SessionContext, allocator: std.mem.Allocator, id: []const u8) !void {
+        if (self.session_id.len > 0) allocator.free(self.session_id);
+        self.session_id = try allocator.dupe(u8, id);
+    }
+
+    fn appendMessage(self: *SessionContext, allocator: std.mem.Allocator, role: ziggy_piai.types.MessageRole, content: []const u8) !void {
+        try self.messages.append(allocator, .{
+            .role = role,
+            .content = try allocator.dupe(u8, content),
+        });
+        self.total_message_bytes += content.len;
+        try self.trimToLimits(allocator);
+    }
+
+    fn appendUserMessage(self: *SessionContext, allocator: std.mem.Allocator, role: ziggy_piai.types.MessageRole, content: []const u8) !void {
+        if (content.len > MAX_INBOUND_MESSAGE_BYTES) return error.MessageTooLarge;
+        try self.appendMessage(allocator, role, content);
+    }
+
+    fn contextMessages(self: *SessionContext) []const ziggy_piai.types.Message {
+        return self.messages.items;
+    }
+
+    fn trimToLimits(self: *SessionContext, allocator: std.mem.Allocator) !void {
+        while (self.messages.items.len > MAX_CONTEXT_MESSAGES or
+            self.total_message_bytes > MAX_CONTEXT_BYTES)
+        {
+            if (self.messages.items.len == 0) break;
+            const removed = self.messages.orderedRemove(0);
+            allocator.free(removed.content);
+            if (self.total_message_bytes >= removed.content.len) {
+                self.total_message_bytes -= removed.content.len;
+            } else {
+                self.total_message_bytes = 0;
+            }
+        }
+    }
+
+};
+
 const Connection = struct {
     fd: posix.socket_t,
     state: ConnectionState,
     agent_id: []u8,
     read_buf: std.ArrayListUnmanaged(u8),
     write_buf: std.ArrayListUnmanaged(u8),
-    messages: std.ArrayListUnmanaged(ziggy_piai.types.Message),
+    session: SessionContext,
 
     fn init(fd: posix.socket_t) Connection {
         return .{
@@ -57,7 +132,7 @@ const Connection = struct {
             .agent_id = &[_]u8{},
             .read_buf = .{},
             .write_buf = .{},
-            .messages = .{},
+            .session = SessionContext.init(),
         };
     }
 
@@ -65,10 +140,7 @@ const Connection = struct {
         allocator.free(self.agent_id);
         self.read_buf.deinit(allocator);
         self.write_buf.deinit(allocator);
-        for (self.messages.items) |msg| {
-            allocator.free(msg.content);
-        }
-        self.messages.deinit(allocator);
+        self.session.deinit(allocator);
         posix.close(self.fd);
     }
 };
@@ -280,7 +352,11 @@ pub fn run(allocator: std.mem.Allocator, bind_addr: []const u8, port: u16, provi
 
                 if (ev.read) {
                     handleRead(allocator, &state, &pool, conn) catch |err| {
-                        std.log.err("Read error on fd {any}: {s}", .{ conn_fd, @errorName(err) });
+                        std.log.err("Read error on fd {any} session={s}: {s}", .{
+                            conn_fd,
+                            conn.session.session_id,
+                            @errorName(err),
+                        });
                         _ = connections.remove(conn_fd);
                         loop.remove(conn_fd);
                         conn.deinit(allocator);
@@ -291,7 +367,11 @@ pub fn run(allocator: std.mem.Allocator, bind_addr: []const u8, port: u16, provi
 
                 if (ev.write) {
                     handleWrite(allocator, conn) catch |err| {
-                        std.log.err("Write error on fd {any}: {s}", .{ conn_fd, @errorName(err) });
+                        std.log.err("Write error on fd {any} session={s}: {s}", .{
+                            conn_fd,
+                            conn.session.session_id,
+                            @errorName(err),
+                        });
                         _ = connections.remove(conn_fd);
                         loop.remove(conn_fd);
                         conn.deinit(allocator);
@@ -301,7 +381,7 @@ pub fn run(allocator: std.mem.Allocator, bind_addr: []const u8, port: u16, provi
                 }
 
                 if (ev.hup or ev.err) {
-                    std.log.info("Closing connection fd={any}", .{conn_fd});
+                    std.log.info("Closing connection fd={any} session={s}", .{ conn_fd, conn.session.session_id });
                     _ = connections.remove(conn_fd);
                     loop.remove(conn_fd);
                     conn.deinit(allocator);
@@ -369,8 +449,11 @@ fn processHandshake(allocator: std.mem.Allocator, state: *ServerState, conn: *Co
 
         const session_key = try generateSessionKey(state);
         defer allocator.free(session_key);
+        try conn.session.setSessionId(allocator, session_key);
         const ack_msg = try std.fmt.allocPrint(allocator, "{{\"type\":\"session.ack\",\"sessionKey\":\"{s}\",\"agentId\":\"{s}\"}}", .{ session_key, agent_id });
         defer allocator.free(ack_msg);
+
+        std.log.info("Session established: fd={any} sessionKey={s}", .{ conn.fd, session_key });
 
         try appendWsFrame(allocator, &conn.write_buf, ack_msg, .text);
     }
@@ -426,7 +509,12 @@ fn processWebSocket(allocator: std.mem.Allocator, state: *ServerState, pool: *st
     }
 }
 
-const AiTaskArgs = struct { allocator: std.mem.Allocator, state: *ServerState, conn: *Connection };
+const AiTaskArgs = struct {
+    allocator: std.mem.Allocator,
+    state: *ServerState,
+    conn: *Connection,
+    request_id: []const u8,
+};
 
 fn handleUserMessage(allocator: std.mem.Allocator, state: *ServerState, pool: *std.Thread.Pool, conn: *Connection, msg: []const u8) !void {
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, msg, .{}) catch return;
@@ -446,34 +534,66 @@ fn handleUserMessage(allocator: std.mem.Allocator, state: *ServerState, pool: *s
     const is_chat_send = std.mem.eql(u8, msg_type.string, "chat.send") or std.mem.eql(u8, msg_type.string, "session.send");
     if (!is_chat_send) return;
 
+    const request_id = blk: {
+        if (parsed.value.object.get("id")) |id| {
+            if (id == .string) break :blk try allocator.dupe(u8, id.string);
+        }
+        break :blk try generateRequestId(state);
+    };
+    var request_id_owned = request_id;
+    defer if (request_id_owned.len != 0) allocator.free(request_id_owned);
+
     const content = blk: {
         if (parsed.value.object.get("content")) |c| if (c == .string) break :blk c.string;
         if (parsed.value.object.get("text")) |t| if (t == .string) break :blk t.string;
         return;
     };
 
-    try conn.messages.append(allocator, .{
-        .role = .user,
-        .content = try allocator.dupe(u8, content),
+    conn.session.appendUserMessage(allocator, .user, content) catch |err| {
+        if (err == error.MessageTooLarge) {
+            std.log.warn("Dropping oversized user message: session={s} request={s} bytes={d}", .{ conn.session.session_id, request_id, content.len });
+            try sendErrorJson(allocator, &conn.write_buf, "Message too large for active context");
+            return;
+        }
+        return err;
+    };
+
+    std.log.info("Accepted message: session={s} request={s} bytes={d}", .{
+        conn.session.session_id,
+        request_id,
+        content.len,
     });
 
     const args = try allocator.create(AiTaskArgs);
-    args.* = .{ .allocator = allocator, .state = state, .conn = conn };
+    args.* = .{
+        .allocator = allocator,
+        .state = state,
+        .conn = conn,
+        .request_id = request_id,
+    };
 
     pool.spawn(runAiTask, .{args}) catch |err| {
-        std.log.err("Failed to spawn AI task: {s}", .{@errorName(err)});
+        std.log.err("Failed to spawn AI task: {s} session={s} request={s}", .{ @errorName(err), conn.session.session_id, request_id_owned });
         allocator.destroy(args);
+        return;
     };
+    args.request_id = request_id_owned;
+    request_id_owned = "";
 }
 
 fn runAiTask(args: *AiTaskArgs) void {
-    processAiStreaming(args.allocator, args.state, args.conn) catch |err| {
-        std.log.err("AI Task failed: {s}", .{@errorName(err)});
+    processAiStreaming(args.allocator, args.state, args.conn, args.request_id) catch |err| {
+        std.log.err("AI Task failed: {s} session={s} request={s}", .{
+            @errorName(err),
+            args.conn.session.session_id,
+            args.request_id,
+        });
     };
+    args.allocator.free(args.request_id);
     args.allocator.destroy(args);
 }
 
-fn processAiStreaming(allocator: std.mem.Allocator, state: *ServerState, conn: *Connection) !void {
+fn processAiStreaming(allocator: std.mem.Allocator, state: *ServerState, conn: *Connection, request_id: []const u8) !void {
     var model: ?ziggy_piai.types.Model = null;
     for (state.model_registry.models.items) |m| {
         if (std.mem.eql(u8, m.provider, state.provider_config.name)) {
@@ -481,9 +601,16 @@ fn processAiStreaming(allocator: std.mem.Allocator, state: *ServerState, conn: *
             break;
         }
     }
-    if (model == null) return;
+    if (model == null) {
+        std.log.err("No model found for provider: {s} session={s} request={s}", .{
+            state.provider_config.name,
+            conn.session.session_id,
+            request_id,
+        });
+        return;
+    }
 
-    const context = ziggy_piai.types.Context{ .messages = conn.messages.items };
+    const context = ziggy_piai.types.Context{ .messages = conn.session.contextMessages() };
     var events = std.array_list.Managed(ziggy_piai.types.AssistantMessageEvent).init(allocator);
     defer events.deinit();
 
@@ -494,13 +621,18 @@ fn processAiStreaming(allocator: std.mem.Allocator, state: *ServerState, conn: *
         if (ziggy_piai.env_api_keys.getEnvApiKey(allocator, model.?.provider)) |key| {
             break :blk key;
         }
-        std.log.err("No API key found for provider: {s}", .{model.?.provider});
+        std.log.err("No API key found for provider: {s} session={s} request={s}", .{
+            model.?.provider,
+            conn.session.session_id,
+            request_id,
+        });
         try sendErrorJson(allocator, &conn.write_buf, "No API key configured");
         return;
     };
     defer allocator.free(api_key);
 
     try ziggy_piai.stream.streamByModel(allocator, &state.http_client, &state.api_registry, model.?, context, .{ .api_key = api_key }, &events);
+    std.log.info("AI stream started: session={s} request={s}", .{ conn.session.session_id, request_id });
 
     var response_text = std.ArrayListUnmanaged(u8){};
     defer response_text.deinit(allocator);
@@ -510,12 +642,16 @@ fn processAiStreaming(allocator: std.mem.Allocator, state: *ServerState, conn: *
         switch (event) {
             .text_delta => |delta| try response_text.appendSlice(allocator, delta.delta),
             .done => |done| {
-                std.log.info("Response complete: {d} tokens", .{done.usage.total_tokens});
+                std.log.info("Response complete: session={s} request={s} tokens={d}", .{
+                    conn.session.session_id,
+                    request_id,
+                    done.usage.total_tokens,
+                });
                 const final_text = if (done.text.len > 0) done.text else response_text.items;
                 if (final_text.len == 0) continue;
 
-                try conn.messages.append(allocator, .{ .role = .assistant, .content = try allocator.dupe(u8, final_text) });
-                try sendSessionReceive(allocator, &conn.write_buf, final_text);
+                try conn.session.appendMessage(allocator, .assistant, final_text);
+                try sendSessionReceive(allocator, &conn.write_buf, request_id, final_text);
                 response_sent = true;
             },
             .err => |err_msg| {
@@ -527,15 +663,13 @@ fn processAiStreaming(allocator: std.mem.Allocator, state: *ServerState, conn: *
     }
 
     if (!response_sent and response_text.items.len > 0) {
-        try conn.messages.append(allocator, .{
-            .role = .assistant,
-            .content = try allocator.dupe(u8, response_text.items),
-        });
-        try sendSessionReceive(allocator, &conn.write_buf, response_text.items);
+        try conn.session.appendMessage(allocator, .assistant, response_text.items);
+        try sendSessionReceive(allocator, &conn.write_buf, request_id, response_text.items);
     }
 }
 
-fn sendSessionReceive(allocator: std.mem.Allocator, write_buf: *std.ArrayListUnmanaged(u8), content: []const u8) !void {
+fn sendSessionReceive(allocator: std.mem.Allocator, write_buf: *std.ArrayListUnmanaged(u8), request_id: []const u8, content: []const u8) !void {
+    _ = request_id;
     const escaped = try protocol.jsonEscape(allocator, content);
     defer allocator.free(escaped);
 
@@ -613,8 +747,15 @@ fn generateWsAcceptKey(state: *ServerState, request: []const u8) ![]u8 {
 }
 
 fn generateSessionKey(state: *ServerState) ![]u8 {
-    const chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-    var key: [32]u8 = undefined;
-    for (&key) |*c| c.* = chars[state.rng.random().int(u8) % chars.len];
-    return state.allocator.dupe(u8, &key);
+    return generateRandomId(state, 32);
+}
+
+fn generateRequestId(state: *ServerState) ![]u8 {
+    return generateRandomId(state, REQUEST_ID_LEN);
+}
+
+fn generateRandomId(state: *ServerState, len: usize) ![]u8 {
+    const key = try state.allocator.alloc(u8, len);
+    for (key) |*c| c.* = SESSION_ID_ALPHABET[state.rng.random().int(u8) % SESSION_ID_ALPHABET.len];
+    return key;
 }
