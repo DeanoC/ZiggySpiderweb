@@ -562,7 +562,7 @@ fn handleUserMessage(allocator: std.mem.Allocator, state: *ServerState, pool: *s
         return;
     };
 
-    _ = conn.session.appendUserMessage(allocator, .user, content) catch |err| {
+    const user_msg_id = conn.session.appendUserMessage(allocator, .user, content) catch |err| {
         if (err == SessionError.MessageTooLarge) {
             std.log.warn("Dropping oversized user message: session={s} request={s} bytes={d}", .{ conn.session.session_id, request_id, content.len });
             try sendErrorJson(allocator, &conn.write_buf, "Message too large for active context");
@@ -571,9 +571,10 @@ fn handleUserMessage(allocator: std.mem.Allocator, state: *ServerState, pool: *s
         return err;
     };
 
-    std.log.info("Accepted message: session={s} request={s} bytes={d}", .{
+    std.log.info("Accepted message: session={s} request={s} memoryId={d} bytes={d}", .{
         conn.session.session_id,
         request_id,
+        user_msg_id,
         content.len,
     });
 
@@ -665,8 +666,8 @@ fn processAiStreaming(allocator: std.mem.Allocator, state: *ServerState, conn: *
                 const final_text = if (done.text.len > 0) done.text else response_text.items;
                 if (final_text.len == 0) continue;
 
-                _ = try conn.session.appendMessage(allocator, .assistant, final_text);
-                try sendSessionReceive(allocator, &conn.write_buf, request_id, final_text);
+                const assistant_msg_id = try conn.session.appendMessage(allocator, .assistant, final_text);
+                try sendSessionReceive(allocator, &conn.write_buf, request_id, final_text, assistant_msg_id);
                 response_sent = true;
             },
             .err => |err_msg| {
@@ -678,8 +679,8 @@ fn processAiStreaming(allocator: std.mem.Allocator, state: *ServerState, conn: *
     }
 
     if (!response_sent and response_text.items.len > 0) {
-        _ = try conn.session.appendMessage(allocator, .assistant, response_text.items);
-        try sendSessionReceive(allocator, &conn.write_buf, request_id, response_text.items);
+        const assistant_msg_id = try conn.session.appendMessage(allocator, .assistant, response_text.items);
+        try sendSessionReceive(allocator, &conn.write_buf, request_id, response_text.items, assistant_msg_id);
     }
 }
 
@@ -690,12 +691,25 @@ fn freeContextMessages(allocator: std.mem.Allocator, context_messages: []const z
     allocator.free(context_messages);
 }
 
-fn sendSessionReceive(allocator: std.mem.Allocator, write_buf: *std.ArrayListUnmanaged(u8), request_id: []const u8, content: []const u8) !void {
+fn sendSessionReceive(
+    allocator: std.mem.Allocator,
+    write_buf: *std.ArrayListUnmanaged(u8),
+    request_id: []const u8,
+    content: []const u8,
+    memory_id: memory.MemoryID,
+) !void {
     _ = request_id;
     const escaped = try protocol.jsonEscape(allocator, content);
     defer allocator.free(escaped);
 
-    const response_json = try std.fmt.allocPrint(allocator, "{{\"type\":\"session.receive\",\"content\":\"{s}\"}}", .{escaped});
+    const memory_id_str = try std.fmt.allocPrint(allocator, "{d}", .{memory_id});
+    defer allocator.free(memory_id_str);
+
+    const response_json = try std.mem.concat(
+        allocator,
+        u8,
+        &.{ "{\"type\":\"session.receive\",\"content\":\"", escaped, "\",\"memoryId\":", memory_id_str, "}" },
+    );
     defer allocator.free(response_json);
 
     try appendWsFrame(allocator, write_buf, response_json, .text);
