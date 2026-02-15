@@ -11,6 +11,10 @@ pub const MessageType = enum {
     // Messaging
     session_send,
     session_receive,
+    agent_plan,
+    agent_progress,
+    agent_status,
+    agent_control,
     
     // Heartbeat
     ping,
@@ -48,6 +52,10 @@ pub fn parseMessageType(json: []const u8) ?MessageType {
     if (std.mem.indexOf(u8, json, "\"type\":\"ping\"") != null) return .ping;
     if (std.mem.indexOf(u8, json, "\"type\":\"pong\"") != null) return .pong;
     if (std.mem.indexOf(u8, json, "\"type\":\"disconnect\"") != null) return .disconnect;
+    if (std.mem.indexOf(u8, json, "\"type\":\"agent.plan\"") != null) return .agent_plan;
+    if (std.mem.indexOf(u8, json, "\"type\":\"agent.progress\"") != null) return .agent_progress;
+    if (std.mem.indexOf(u8, json, "\"type\":\"agent.status\"") != null) return .agent_status;
+    if (std.mem.indexOf(u8, json, "\"type\":\"agent.control\"") != null) return .agent_control;
     return null;
 }
 
@@ -95,4 +103,44 @@ pub fn jsonEscape(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
     }
 
     return result;
+}
+
+test "protocol: parseMessageType handles core and agent message types" {
+    const cases = [_]struct {
+        json: []const u8,
+        expected: ?MessageType,
+    }{
+        .{ .json = "{\"type\":\"connect\"}", .expected = .connect },
+        .{ .json = "{\"type\":\"session.send\"}", .expected = .session_send },
+        .{ .json = "{\"type\":\"agent.plan\"}", .expected = .agent_plan },
+        .{ .json = "{\"type\":\"agent.progress\"}", .expected = .agent_progress },
+        .{ .json = "{\"type\":\"agent.status\"}", .expected = .agent_status },
+        .{ .json = "{\"type\":\"agent.control\"}", .expected = .agent_control },
+        .{ .json = "{\"type\":\"ping\"}", .expected = .ping },
+        .{ .json = "{\"type\":\"memory.query\"}", .expected = null },
+    };
+
+    for (cases) |case| {
+        try std.testing.expectEqual(case.expected, parseMessageType(case.json));
+    }
+}
+
+test "protocol: parseMessageType ignores unknown and unsupported message types" {
+    const unsupported = [_][]const u8{
+        "{\"type\":\"agent.blocked\"}",
+        "{\"type\":\"session.ack\",\"capabilities\":[]}",
+        "{\"type\":\"memory.query\",\"query\":\"goal\"}",
+        "{\"type\":\"memory.recall\",\"id\":1}",
+        "{\"type\":\"agent.state\",\"phase\":\"running\"}",
+    };
+    for (unsupported) |json| {
+        try std.testing.expectEqual(@as(?MessageType, null), parseMessageType(json));
+    }
+}
+
+test "protocol: jsonEscape escapes common JSON special characters" {
+    const allocator = std.testing.allocator;
+    const encoded = try jsonEscape(allocator, "quote:\" slash:\\ newline:\n tab:\t");
+    defer allocator.free(encoded);
+    try std.testing.expectEqualStrings("quote:\\\" slash:\\\\ newline:\\n tab:\\t", encoded);
 }

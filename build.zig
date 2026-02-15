@@ -24,6 +24,7 @@ pub fn build(b: *std.Build) void {
         .root_module = spiderweb_mod,
     });
     spiderweb.linkLibC();
+    spiderweb.linkSystemLibrary("sqlite3");
 
     b.installArtifact(spiderweb);
 
@@ -65,6 +66,7 @@ pub fn build(b: *std.Build) void {
         .root_module = test_mod,
     });
     spiderweb_tests.linkLibC();
+    spiderweb_tests.linkSystemLibrary("sqlite3");
 
     const run_tests = b.addRunArtifact(spiderweb_tests);
     const test_step = b.step("test", "Run tests");
