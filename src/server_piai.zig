@@ -50,6 +50,11 @@ const LTM_RETENTION_KEEP_SNAPSHOTS_ENV = "SPIDERWEB_LTM_KEEP_SNAPSHOTS";
 const LTM_RETENTION_KEEP_DAYS_ENV = "SPIDERWEB_LTM_KEEP_DAYS";
 const AGENT_GOAL_PREFIX = "/goal ";
 const WORKER_MAX_PARALLELISM = 2;
+const MEMORY_MANAGER_SUMMARY_TRIGGER_NUM = 3;
+const MEMORY_MANAGER_SUMMARY_TRIGGER_DEN = 4;
+const MEMORY_MANAGER_SUMMARIES_PER_TICK = 2;
+const MEMORY_MANAGER_SNAPSHOT_REASON = "memory-manager auto snapshot";
+const HEARTBEAT_INTERVAL_MS: i64 = 30 * 1000;
 const StreamByModelFn = *const fn (
     std.mem.Allocator,
     *std.http.Client,
@@ -83,18 +88,34 @@ const ConnectionState = enum {
     closing,
 };
 
+const WorkerControlMode = enum {
+    running,
+    paused,
+    cancelled,
+};
+
 const SessionError = error{ MessageTooLarge };
 
 const SessionContext = struct {
     ram: memory.RamContext,
     session_id: []u8,
     identity_prompt: []u8,
+    worker_mode: WorkerControlMode,
+    worker_queue_depth: usize,
+    worker_active_tasks: usize,
+    last_goal: []const u8,
+    last_heartbeat_ms: i64,
 
     fn init(allocator: std.mem.Allocator) SessionContext {
         return .{
             .ram = memory.RamContext.init(allocator, MAX_CONTEXT_MESSAGES, MAX_CONTEXT_BYTES),
             .session_id = &[_]u8{},
             .identity_prompt = &[_]u8{},
+            .worker_mode = .running,
+            .worker_queue_depth = 0,
+            .worker_active_tasks = 0,
+            .last_goal = &[_]u8{},
+            .last_heartbeat_ms = 0,
         };
     }
 
@@ -109,6 +130,30 @@ const SessionContext = struct {
         self.session_id = &[_]u8{};
         if (self.identity_prompt.len > 0) allocator.free(self.identity_prompt);
         self.identity_prompt = &[_]u8{};
+        if (self.last_goal.len > 0) allocator.free(self.last_goal);
+        self.last_goal = &[_]u8{};
+        self.worker_mode = .running;
+        self.worker_queue_depth = 0;
+        self.worker_active_tasks = 0;
+        self.last_heartbeat_ms = 0;
+    }
+
+    fn setLastGoal(self: *SessionContext, allocator: std.mem.Allocator, goal: []const u8) !void {
+        if (self.last_goal.len > 0) allocator.free(self.last_goal);
+        self.last_goal = try allocator.dupe(u8, goal);
+    }
+
+    fn setWorkerMode(self: *SessionContext, mode: WorkerControlMode) void {
+        self.worker_mode = mode;
+    }
+
+    fn resetWorkerState(self: *SessionContext, allocator: std.mem.Allocator) void {
+        if (self.last_goal.len > 0) allocator.free(self.last_goal);
+        self.last_goal = &[_]u8{};
+        self.worker_mode = .running;
+        self.worker_queue_depth = 0;
+        self.worker_active_tasks = 0;
+        self.last_heartbeat_ms = 0;
     }
 
     fn setIdentityPrompt(self: *SessionContext, allocator: std.mem.Allocator, prompt: []const u8) !void {
@@ -758,7 +803,8 @@ fn handleUserMessage(allocator: std.mem.Allocator, state: *ServerState, pool: *s
 
     const is_chat_send = std.mem.eql(u8, msg_type.string, "chat.send") or std.mem.eql(u8, msg_type.string, "session.send");
     const is_agent_control = std.mem.eql(u8, msg_type.string, "agent.control");
-    if (!is_chat_send and !is_agent_control) return;
+    const is_agent_heartbeat = std.mem.eql(u8, msg_type.string, "agent.heartbeat");
+    if (!is_chat_send and !is_agent_control and !is_agent_heartbeat) return;
 
     const control_action = blk: {
         if (is_agent_control) {
@@ -776,12 +822,62 @@ fn handleUserMessage(allocator: std.mem.Allocator, state: *ServerState, pool: *s
                 try sendAgentState(
                     allocator,
                     &conn.write_buf,
-                    request_id_owned,
+                    request_id,
                     conn.session.session_id,
-                    "idle",
-                    0,
-                    0,
-                    "",
+                    workerModeLabel(conn.session.worker_mode),
+                    conn.session.worker_queue_depth,
+                    conn.session.worker_active_tasks,
+                    conn.session.last_goal,
+                );
+                return;
+            }
+
+            if (std.mem.eql(u8, action, "heartbeat")) {
+                try runHeartbeatCheck(allocator, conn, request_id, true);
+                return;
+            }
+
+            if (std.mem.eql(u8, action, "pause")) {
+                conn.session.setWorkerMode(.paused);
+                try sendAgentState(
+                    allocator,
+                    &conn.write_buf,
+                    request_id,
+                    conn.session.session_id,
+                    "workers.paused",
+                    conn.session.worker_queue_depth,
+                    conn.session.worker_active_tasks,
+                    conn.session.last_goal,
+                );
+                return;
+            }
+
+            if (std.mem.eql(u8, action, "resume")) {
+                conn.session.setWorkerMode(.running);
+                try sendAgentState(
+                    allocator,
+                    &conn.write_buf,
+                    request_id,
+                    conn.session.session_id,
+                    "workers.running",
+                    conn.session.worker_queue_depth,
+                    conn.session.worker_active_tasks,
+                    conn.session.last_goal,
+                );
+                return;
+            }
+
+            if (std.mem.eql(u8, action, "cancel")) {
+                conn.session.setWorkerMode(.cancelled);
+                try sendAgentState(
+                    allocator,
+                    &conn.write_buf,
+                    request_id,
+                    conn.session.session_id,
+                    "workers.cancelled",
+                    conn.session.worker_queue_depth,
+                    conn.session.worker_active_tasks,
+                    conn.session.last_goal,
                 );
                 return;
             }
@@ -792,6 +888,11 @@ fn handleUserMessage(allocator: std.mem.Allocator, state: *ServerState, pool: *s
                 return;
             }
         }
+    }
+
+    if (is_agent_heartbeat) {
+        try runHeartbeatCheck(allocator, conn, request_id, true);
+        return;
     }
 
     const content = blk: {
@@ -861,6 +962,13 @@ fn handleUserMessage(allocator: std.mem.Allocator, state: *ServerState, pool: *s
         defer orchestrator.deinitPlan(allocator, &plan);
 
         is_planned_goal = true;
+        const max_workers = if (WORKER_MAX_PARALLELISM == 0) 1 else WORKER_MAX_PARALLELISM;
+        conn.session.worker_queue_depth = if (plan.tasks.items.len > max_workers)
+            (plan.tasks.items.len - max_workers)
+        else
+            0;
+        conn.session.worker_active_tasks = @min(plan.tasks.items.len, max_workers);
+        try conn.session.setLastGoal(allocator, goal);
         const plan_memory = try orchestrator.formatPlanMemoryText(allocator, &plan);
         defer allocator.free(plan_memory);
 
@@ -876,68 +984,115 @@ fn handleUserMessage(allocator: std.mem.Allocator, state: *ServerState, pool: *s
             "queued",
             "Delegating plan tasks to local workers",
         );
-
-        var worker_results = std.ArrayListUnmanaged(workers.WorkerResult){};
-        defer worker_results.deinit(allocator);
+        try sendAgentState(
+            allocator,
+            &conn.write_buf,
+            request_id,
+            conn.session.session_id,
+            "workers.dispatching",
+            conn.session.worker_queue_depth,
+            conn.session.worker_active_tasks,
+            conn.session.last_goal,
+        );
 
         var worker_exec_ok = true;
-        workers.executePlanWorkers(allocator, plan.tasks.items, WORKER_MAX_PARALLELISM, &worker_results) catch |err| {
-            std.log.err("Worker execution failed: {s} session={s} request={s}", .{
-                @errorName(err),
-                conn.session.session_id,
-                request_id,
-            });
-            worker_exec_ok = false;
-        };
-        if (!worker_exec_ok) {
+        if (conn.session.worker_mode != .running) {
             try sendAgentProgress(
                 allocator,
                 &conn.write_buf,
                 request_id,
                 conn.session.session_id,
                 "workers",
-                "failed",
-                "Worker delegation failed",
+                "skipped",
+                if (conn.session.worker_mode == .paused) "Workers currently paused" else "Workers cancelled",
+            );
+            try sendAgentState(
+                allocator,
+                &conn.write_buf,
+                request_id,
+                conn.session.session_id,
+                workerModeLabel(conn.session.worker_mode),
+                0,
+                0,
+                conn.session.last_goal,
             );
         } else {
-            for (worker_results.items) |result| {
-                const worker_name = workers.workerTypeLabel(result.worker);
-                const message = try std.fmt.allocPrint(
-                    allocator,
-                    "{s} worker complete for task {d}: {s}",
-                    .{ worker_name, result.task_id, result.detailSlice() },
-                );
-                defer allocator.free(message);
+            var worker_results = std.ArrayListUnmanaged(workers.WorkerResult){};
+            defer worker_results.deinit(allocator);
 
+            workers.executePlanWorkers(
+                allocator,
+                plan.tasks.items,
+                max_workers,
+                &worker_results,
+            ) catch |err| {
+                std.log.err("Worker execution failed: {s} session={s} request={s}", .{
+                    @errorName(err),
+                    conn.session.session_id,
+                    request_id,
+                });
+                worker_exec_ok = false;
+            };
+            if (!worker_exec_ok) {
                 try sendAgentProgress(
                     allocator,
                     &conn.write_buf,
                     request_id,
                     conn.session.session_id,
-                    worker_name,
-                    result.statusSlice(),
-                    message,
+                    "workers",
+                    "failed",
+                    "Worker delegation failed",
                 );
-                try sendAgentStatus(
+            } else {
+                for (worker_results.items) |result| {
+                    const worker_name = workers.workerTypeLabel(result.worker);
+                    const message = try std.fmt.allocPrint(
+                        allocator,
+                        "{s} worker complete for task {d}: {s}",
+                        .{ worker_name, result.task_id, result.detailSlice() },
+                    );
+                    defer allocator.free(message);
+
+                    try sendAgentProgress(
+                        allocator,
+                        &conn.write_buf,
+                        request_id,
+                        conn.session.session_id,
+                        worker_name,
+                        result.statusSlice(),
+                        message,
+                    );
+                    try sendAgentStatus(
+                        allocator,
+                        &conn.write_buf,
+                        request_id,
+                        conn.session.session_id,
+                        result.task_id,
+                        worker_name,
+                        result.statusSlice(),
+                        result.detailSlice(),
+                    );
+                }
+                try sendAgentProgress(
                     allocator,
                     &conn.write_buf,
                     request_id,
                     conn.session.session_id,
-                    result.task_id,
-                    worker_name,
-                    result.statusSlice(),
-                    result.detailSlice(),
+                    "workers",
+                    "ready",
+                    "Worker pre-processing complete",
+                );
+                try sendAgentState(
+                    allocator,
+                    &conn.write_buf,
+                    request_id,
+                    conn.session.session_id,
+                    "workers.ready",
+                    0,
+                    0,
+                    conn.session.last_goal,
                 );
             }
-            try sendAgentProgress(
-                allocator,
-                &conn.write_buf,
-                request_id,
-                conn.session.session_id,
-                "workers",
-                "ready",
-                "Worker pre-processing complete",
-            );
         }
         _ = try conn.session.appendMessage(allocator, .system, plan_memory);
     } else if (is_agent_control) {
@@ -957,6 +1112,21 @@ fn handleUserMessage(allocator: std.mem.Allocator, state: *ServerState, pool: *s
             return;
         }
         return err;
+    };
+
+    runMemoryManager(allocator, state, conn, request_id) catch |err| {
+        std.log.warn("memory manager maintenance failed: {s} session={s} request={s}", .{
+            @errorName(err),
+            conn.session.session_id,
+            request_id,
+        });
+    };
+    runHeartbeatCheck(allocator, conn, request_id, false) catch |err| {
+        std.log.warn("heartbeat check failed: {s} session={s} request={s}", .{
+            @errorName(err),
+            conn.session.session_id,
+            request_id,
+        });
     };
 
     std.log.info("Accepted message: session={s} request={s} memoryId={d} bytes={d}", .{
@@ -994,6 +1164,132 @@ fn runAiTask(args: *AiTaskArgs) void {
     };
     args.allocator.free(args.request_id);
     args.allocator.destroy(args);
+}
+
+fn runMemoryManager(
+    allocator: std.mem.Allocator,
+    state: *ServerState,
+    conn: *Connection,
+    request_id: []const u8,
+) !void {
+    const trigger_count = memoryManagerActiveThreshold(conn.session.ram.max_messages);
+    if (!shouldRunMemoryManagement(&conn.session.ram, trigger_count)) return;
+
+    var summaries_performed: usize = 0;
+    while (summaries_performed < MEMORY_MANAGER_SUMMARIES_PER_TICK and
+        shouldRunMemoryManagement(&conn.session.ram, trigger_count))
+    {
+        try conn.session.ram.summarize();
+        summaries_performed += 1;
+    }
+
+    if (summaries_performed == 0) return;
+
+    var snapshot_taken = false;
+    if (conn.session.session_id.len > 0) {
+        if (state.ltm_store) |*store| {
+            if (store.archiveRamSnapshot(conn.session.session_id, MEMORY_MANAGER_SNAPSHOT_REASON, &conn.session.ram) catch false) {
+                snapshot_taken = true;
+            }
+        }
+    }
+
+    const message = if (snapshot_taken)
+        try std.fmt.allocPrint(allocator, "summarized {d} stale RAM entries and persisted snapshot", .{summaries_performed})
+    else
+        try std.fmt.allocPrint(allocator, "summarized {d} stale RAM entries", .{summaries_performed});
+    defer allocator.free(message);
+
+    try sendMemoryEvent(
+        allocator,
+        &conn.write_buf,
+        request_id,
+        conn.session.session_id,
+        "summarize",
+        if (snapshot_taken) "snapshot" else "summarized",
+        summaries_performed,
+        message,
+    );
+}
+
+fn runHeartbeatCheck(
+    allocator: std.mem.Allocator,
+    conn: *Connection,
+    request_id: []const u8,
+    force: bool,
+) !void {
+    const now = std.time.milliTimestamp();
+    if (!force and conn.session.last_heartbeat_ms != 0) {
+        if ((now - conn.session.last_heartbeat_ms) < HEARTBEAT_INTERVAL_MS) return;
+    }
+
+    if (conn.session.last_heartbeat_ms == 0) {
+        conn.session.last_heartbeat_ms = now;
+        if (!force) return;
+    } else {
+        conn.session.last_heartbeat_ms = now;
+    }
+
+    const active_tasks = conn.session.worker_active_tasks;
+    const queued_tasks = conn.session.worker_queue_depth;
+    if (queued_tasks == 0 and active_tasks == 0) return;
+    if (conn.session.last_goal.len == 0) return;
+
+    if (conn.session.worker_mode == .cancelled) return;
+
+    if (conn.session.worker_mode == .paused) {
+        const status = "blocked";
+        const message = try std.fmt.allocPrint(
+            allocator,
+            "Heartbeat detected {d} queued and {d} active tasks are blocked by pause state.",
+            .{ queued_tasks, active_tasks },
+        );
+        defer allocator.free(message);
+        try sendAgentProgress(
+            allocator,
+            &conn.write_buf,
+            request_id,
+            conn.session.session_id,
+            "heartbeat",
+            status,
+            message,
+        );
+        return;
+    }
+
+    const message = try std.fmt.allocPrint(
+        allocator,
+        "Heartbeat status: {d} queued + {d} active worker tasks remain for the current goal.",
+        .{ queued_tasks, active_tasks },
+    );
+    defer allocator.free(message);
+    try sendAgentProgress(
+        allocator,
+        &conn.write_buf,
+        request_id,
+        conn.session.session_id,
+        "heartbeat",
+        "watching",
+        message,
+    );
+}
+
+fn memoryManagerActiveThreshold(max_messages: usize) usize {
+    if (max_messages == 0) return 1;
+    if (max_messages < MEMORY_MANAGER_SUMMARY_TRIGGER_DEN) return 1;
+    const threshold = (max_messages * MEMORY_MANAGER_SUMMARY_TRIGGER_NUM) / MEMORY_MANAGER_SUMMARY_TRIGGER_DEN;
+    return if (threshold == 0) 1 else threshold;
+}
+
+fn shouldRunMemoryManagement(ram: *const memory.RamContext, trigger_count: usize) bool {
+    if (ram.total_message_bytes > ram.max_bytes) return true;
+
+    var active_count: usize = 0;
+    for (ram.entries.items) |entry| {
+        if (entry.state == .active) active_count += 1;
+    }
+
+    return active_count > trigger_count;
 }
 
 fn processAiStreaming(
@@ -1176,6 +1472,14 @@ fn sendAgentProgress(
     try appendWsFrame(allocator, write_buf, payload, .text);
 }
 
+fn workerModeLabel(mode: WorkerControlMode) []const u8 {
+    return switch (mode) {
+        .running => "workers.running",
+        .paused => "workers.paused",
+        .cancelled => "workers.cancelled",
+    };
+}
+
 fn sendAgentState(
     allocator: std.mem.Allocator,
     write_buf: *std.ArrayListUnmanaged(u8),
@@ -1199,6 +1503,37 @@ fn sendAgentState(
         allocator,
         "{{\"type\":\"agent.state\",\"request\":\"{s}\",\"sessionKey\":\"{s}\",\"phase\":\"{s}\",\"queuedTasks\":{d},\"activeTasks\":{d},\"lastGoal\":\"{s}\"}}",
         .{ escaped_request_id, escaped_session_id, escaped_phase, queued_tasks, active_tasks, escaped_last_goal },
+    );
+    defer allocator.free(payload);
+
+    try appendWsFrame(allocator, write_buf, payload, .text);
+}
+
+fn sendMemoryEvent(
+    allocator: std.mem.Allocator,
+    write_buf: *std.ArrayListUnmanaged(u8),
+    request_id: []const u8,
+    session_id: []const u8,
+    event: []const u8,
+    status: []const u8,
+    count: usize,
+    message: []const u8,
+) !void {
+    const escaped_request_id = try protocol.jsonEscape(allocator, request_id);
+    defer allocator.free(escaped_request_id);
+    const escaped_session_id = try protocol.jsonEscape(allocator, session_id);
+    defer allocator.free(escaped_session_id);
+    const escaped_event = try protocol.jsonEscape(allocator, event);
+    defer allocator.free(escaped_event);
+    const escaped_status = try protocol.jsonEscape(allocator, status);
+    defer allocator.free(escaped_status);
+    const escaped_message = try protocol.jsonEscape(allocator, message);
+    defer allocator.free(escaped_message);
+
+    const payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"type\":\"memory.event\",\"request\":\"{s}\",\"sessionKey\":\"{s}\",\"event\":\"{s}\",\"status\":\"{s}\",\"count\":{d},\"message\":\"{s}\"}}",
+        .{ escaped_request_id, escaped_session_id, escaped_event, escaped_status, count, escaped_message },
     );
     defer allocator.free(payload);
 
@@ -2232,6 +2567,7 @@ fn handleSessionReset(
     }
 
     conn.session.resetRam(allocator);
+    conn.session.resetWorkerState(allocator);
     return archived;
 }
 
@@ -2832,6 +3168,184 @@ test "server_piai: sendAgentStatus emits valid outbound agent.status payload" {
     try std.testing.expect(std.mem.eql(u8, obj.get("message").?.string, "research: found 3 items"));
 }
 
+test "server_piai: sendMemoryEvent emits valid outbound memory.event payload" {
+    const allocator = std.testing.allocator;
+    var write_buf = std.ArrayListUnmanaged(u8){};
+    defer write_buf.deinit(allocator);
+
+    try sendMemoryEvent(
+        allocator,
+        &write_buf,
+        "req-500",
+        "session-memory",
+        "summarize",
+        "summarized",
+        3,
+        "summarized stale RAM entries",
+    );
+
+    try std.testing.expect(write_buf.items.len > 2);
+    try std.testing.expectEqual(@as(u8, 0x81), write_buf.items[0]);
+
+    const json_start = std.mem.indexOf(u8, write_buf.items, "{") orelse unreachable;
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, write_buf.items[json_start..], .{});
+    defer parsed.deinit();
+
+    const obj = parsed.value.object;
+    try std.testing.expect(std.mem.eql(u8, obj.get("type").?.string, "memory.event"));
+    try std.testing.expect(std.mem.eql(u8, obj.get("request").?.string, "req-500"));
+    try std.testing.expect(std.mem.eql(u8, obj.get("sessionKey").?.string, "session-memory"));
+    try std.testing.expect(std.mem.eql(u8, obj.get("event").?.string, "summarize"));
+    try std.testing.expect(std.mem.eql(u8, obj.get("status").?.string, "summarized"));
+    try std.testing.expectEqual(@as(i64, 3), obj.get("count").?.integer);
+    try std.testing.expect(std.mem.eql(u8, obj.get("message").?.string, "summarized stale RAM entries"));
+}
+
+test "server_piai: runMemoryManager summarizes overfull RAM and emits memory.event" {
+    const allocator = std.testing.allocator;
+
+    var model_registry = ziggy_piai.models.ModelRegistry.init(allocator);
+    defer model_registry.deinit();
+    try ziggy_piai.models.registerDefaultModels(&model_registry);
+
+    var api_registry = ziggy_piai.api_registry.ApiRegistry.init(allocator);
+    defer api_registry.deinit();
+    try ziggy_piai.providers.register_builtins.registerBuiltInApiProviders(&api_registry);
+
+    var http_client = std.http.Client{ .allocator = allocator };
+    defer http_client.deinit();
+
+    var state = ServerState{
+        .allocator = allocator,
+        .rng = std.Random.DefaultPrng.init(0xBADC0FFEE),
+        .model_registry = model_registry,
+        .api_registry = api_registry,
+        .http_client = http_client,
+        .provider_config = .{
+            .name = "openai",
+            .model = "gpt-4o-mini",
+            .api_key = "mock-api-key",
+            .base_url = "https://example.invalid",
+        },
+        .ltm_store = null,
+    };
+
+    var conn = Connection.init(allocator, 0);
+    try conn.session.setSessionId(allocator, "session-memory-manager-1");
+    defer {
+        conn.read_buf.deinit(allocator);
+        conn.write_buf.deinit(allocator);
+        conn.session.deinit(allocator);
+    }
+
+    for (0..70) |_| {
+        _ = try conn.session.appendMessage(allocator, .user, "memory-manager input for backpressure smoke test");
+    }
+
+    try runMemoryManager(allocator, &state, &conn, "req-mm");
+
+    const payload = try decodeFirstWebSocketPayload(conn.write_buf.items);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
+    defer parsed.deinit();
+
+    const obj = parsed.value.object;
+    try std.testing.expect(std.mem.eql(u8, obj.get("type").?.string, "memory.event"));
+    try std.testing.expect(std.mem.eql(u8, obj.get("event").?.string, "summarize"));
+    try std.testing.expect(obj.get("count").?.integer > 0);
+    try std.testing.expect(std.mem.eql(u8, obj.get("status").?.string, "summarized"));
+}
+
+test "server_piai: runHeartbeatCheck emits heartbeat progress for running backlog" {
+    const allocator = std.testing.allocator;
+
+    var conn = Connection.init(allocator, 0);
+    defer {
+        conn.read_buf.deinit(allocator);
+        conn.write_buf.deinit(allocator);
+        conn.session.deinit(allocator);
+    }
+
+    try conn.session.setSessionId(allocator, "session-heartbeat-1");
+    try conn.session.setLastGoal(allocator, "summarize findings from logs");
+    conn.session.worker_queue_depth = 2;
+    conn.session.worker_active_tasks = 1;
+    conn.session.last_heartbeat_ms = std.time.milliTimestamp() - HEARTBEAT_INTERVAL_MS - 10;
+    conn.session.setWorkerMode(.running);
+
+    try runHeartbeatCheck(allocator, &conn, "req-heartbeat", false);
+
+    const payload = try decodeFirstWebSocketPayload(conn.write_buf.items);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
+    defer parsed.deinit();
+
+    const obj = parsed.value.object;
+    try std.testing.expect(std.mem.eql(u8, obj.get("type").?.string, "agent.progress"));
+    try std.testing.expect(std.mem.eql(u8, obj.get("phase").?.string, "heartbeat"));
+    try std.testing.expect(std.mem.eql(u8, obj.get("status").?.string, "watching"));
+}
+
+test "server_piai: agent.control heartbeat action emits heartbeat progress" {
+    const allocator = std.testing.allocator;
+
+    var model_registry = ziggy_piai.models.ModelRegistry.init(allocator);
+    defer model_registry.deinit();
+    try ziggy_piai.models.registerDefaultModels(&model_registry);
+
+    var api_registry = ziggy_piai.api_registry.ApiRegistry.init(allocator);
+    defer api_registry.deinit();
+    try ziggy_piai.providers.register_builtins.registerBuiltInApiProviders(&api_registry);
+
+    var http_client = std.http.Client{ .allocator = allocator };
+    defer http_client.deinit();
+
+    var state = ServerState{
+        .allocator = allocator,
+        .rng = std.Random.DefaultPrng.init(0xBADC0FFEE),
+        .model_registry = model_registry,
+        .api_registry = api_registry,
+        .http_client = http_client,
+        .provider_config = .{
+            .name = "openai",
+            .model = "gpt-4o-mini",
+            .api_key = "mock-api-key",
+            .base_url = "https://example.invalid",
+        },
+        .ltm_store = null,
+    };
+
+    var conn = Connection.init(allocator, 0);
+    defer {
+        conn.read_buf.deinit(allocator);
+        conn.write_buf.deinit(allocator);
+        conn.session.deinit(allocator);
+    }
+
+    try conn.session.setSessionId(allocator, "session-heartbeat-control-1");
+    try conn.session.setLastGoal(allocator, "follow up on pending tasks");
+    conn.session.worker_queue_depth = 3;
+    conn.session.worker_active_tasks = 1;
+    conn.session.setWorkerMode(.paused);
+    conn.session.last_heartbeat_ms = 0;
+
+    {
+        var pool: std.Thread.Pool = undefined;
+        try pool.init(.{ .allocator = allocator });
+        defer pool.deinit();
+
+        const inbound = "{\"id\":\"req-hb-002\",\"type\":\"agent.control\",\"action\":\"heartbeat\"}";
+        try handleUserMessage(allocator, &state, &pool, &conn, inbound);
+    }
+
+    const payload = try decodeFirstWebSocketPayload(conn.write_buf.items);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
+    defer parsed.deinit();
+
+    const obj = parsed.value.object;
+    try std.testing.expect(std.mem.eql(u8, obj.get("type").?.string, "agent.progress"));
+    try std.testing.expect(std.mem.eql(u8, obj.get("phase").?.string, "heartbeat"));
+    try std.testing.expect(std.mem.eql(u8, obj.get("status").?.string, "blocked"));
+}
+
 fn decodeFirstWebSocketPayload(frame_data: []const u8) ![]const u8 {
     if (frame_data.len < 2) return error.InvalidFrame;
 
@@ -3113,10 +3627,194 @@ test "server_piai: agent.control action state emits agent.state snapshot" {
 
     const obj = parsed.value.object;
     try std.testing.expect(std.mem.eql(u8, obj.get("type").?.string, "agent.state"));
-    try std.testing.expect(std.mem.eql(u8, obj.get("phase").?.string, "idle"));
+    try std.testing.expect(std.mem.eql(u8, obj.get("phase").?.string, "workers.running"));
     try std.testing.expect(std.mem.eql(u8, obj.get("lastGoal").?.string, ""));
     try std.testing.expect(obj.get("queuedTasks").?.integer >= 0);
     try std.testing.expect(obj.get("activeTasks").?.integer >= 0);
+}
+
+test "server_piai: agent.control action pause and resume emit updated worker state" {
+    const allocator = std.testing.allocator;
+
+    var model_registry = ziggy_piai.models.ModelRegistry.init(allocator);
+    defer model_registry.deinit();
+    try ziggy_piai.models.registerDefaultModels(&model_registry);
+
+    var api_registry = ziggy_piai.api_registry.ApiRegistry.init(allocator);
+    defer api_registry.deinit();
+    try ziggy_piai.providers.register_builtins.registerBuiltInApiProviders(&api_registry);
+
+    var http_client = std.http.Client{ .allocator = allocator };
+    defer http_client.deinit();
+
+    var state = ServerState{
+        .allocator = allocator,
+        .rng = std.Random.DefaultPrng.init(0xBADC0FFEE),
+        .model_registry = model_registry,
+        .api_registry = api_registry,
+        .http_client = http_client,
+        .provider_config = .{
+            .name = "openai",
+            .model = "gpt-4o-mini",
+            .api_key = "mock-api-key",
+            .base_url = "https://example.invalid",
+        },
+        .ltm_store = null,
+    };
+
+    var conn = Connection.init(allocator, 0);
+    try conn.session.setSessionId(allocator, "session-control-pause-1");
+    defer {
+        conn.read_buf.deinit(allocator);
+        conn.write_buf.deinit(allocator);
+        conn.session.deinit(allocator);
+    }
+
+    {
+        var pool: std.Thread.Pool = undefined;
+        try pool.init(.{ .allocator = allocator });
+        defer pool.deinit();
+
+        const inbound = "{\"id\":\"req-010\",\"type\":\"agent.control\",\"action\":\"pause\"}";
+        try handleUserMessage(allocator, &state, &pool, &conn, inbound);
+    }
+    {
+        const payload = try decodeFirstWebSocketPayload(conn.write_buf.items);
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
+        defer parsed.deinit();
+        const obj = parsed.value.object;
+        try std.testing.expect(std.mem.eql(u8, obj.get("type").?.string, "agent.state"));
+        try std.testing.expect(std.mem.eql(u8, obj.get("phase").?.string, "workers.paused"));
+    }
+
+    conn.write_buf.clearRetainingCapacity();
+    {
+        var pool: std.Thread.Pool = undefined;
+        try pool.init(.{ .allocator = allocator });
+        defer pool.deinit();
+
+        const inbound = "{\"id\":\"req-011\",\"type\":\"agent.control\",\"action\":\"resume\"}";
+        try handleUserMessage(allocator, &state, &pool, &conn, inbound);
+    }
+    {
+        const payload = try decodeFirstWebSocketPayload(conn.write_buf.items);
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
+        defer parsed.deinit();
+        const obj = parsed.value.object;
+        try std.testing.expect(std.mem.eql(u8, obj.get("type").?.string, "agent.state"));
+        try std.testing.expect(std.mem.eql(u8, obj.get("phase").?.string, "workers.running"));
+    }
+
+    conn.write_buf.clearRetainingCapacity();
+    {
+        var pool: std.Thread.Pool = undefined;
+        try pool.init(.{ .allocator = allocator });
+        defer pool.deinit();
+
+        const inbound = "{\"id\":\"req-012\",\"type\":\"agent.control\",\"action\":\"cancel\"}";
+        try handleUserMessage(allocator, &state, &pool, &conn, inbound);
+    }
+    {
+        const payload = try decodeFirstWebSocketPayload(conn.write_buf.items);
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
+        defer parsed.deinit();
+        const obj = parsed.value.object;
+        try std.testing.expect(std.mem.eql(u8, obj.get("type").?.string, "agent.state"));
+        try std.testing.expect(std.mem.eql(u8, obj.get("phase").?.string, "workers.cancelled"));
+    }
+}
+
+test "server_piai: paused worker mode skips plan delegation but emits state snapshot with queued work depth" {
+    const allocator = std.testing.allocator;
+    const original_stream_fn = streamByModelFn;
+    defer { streamByModelFn = original_stream_fn; }
+    streamByModelFn = mockStreamByModel;
+
+    var model_registry = ziggy_piai.models.ModelRegistry.init(allocator);
+    defer model_registry.deinit();
+    try ziggy_piai.models.registerDefaultModels(&model_registry);
+
+    var api_registry = ziggy_piai.api_registry.ApiRegistry.init(allocator);
+    defer api_registry.deinit();
+    try ziggy_piai.providers.register_builtins.registerBuiltInApiProviders(&api_registry);
+
+    var http_client = std.http.Client{ .allocator = allocator };
+    defer http_client.deinit();
+
+    var state = ServerState{
+        .allocator = allocator,
+        .rng = std.Random.DefaultPrng.init(0xBADC0FFEE),
+        .model_registry = model_registry,
+        .api_registry = api_registry,
+        .http_client = http_client,
+        .provider_config = .{
+            .name = "openai",
+            .model = "gpt-4o-mini",
+            .api_key = "mock-api-key",
+            .base_url = "https://example.invalid",
+        },
+        .ltm_store = null,
+    };
+
+    var conn = Connection.init(allocator, 0);
+    try conn.session.setSessionId(allocator, "session-control-paused-1");
+    defer {
+        conn.read_buf.deinit(allocator);
+        conn.write_buf.deinit(allocator);
+        conn.session.deinit(allocator);
+    }
+
+    conn.session.setWorkerMode(.paused);
+
+    {
+        var pool: std.Thread.Pool = undefined;
+        try pool.init(.{ .allocator = allocator });
+        defer pool.deinit();
+
+        const inbound =
+            "{\"id\":\"req-020\",\"type\":\"agent.control\",\"goal\":\"Find open PRs and summarize findings and propose next steps\"}";
+        try handleUserMessage(allocator, &state, &pool, &conn, inbound);
+    }
+
+    var payloads = try collectWebSocketPayloads(allocator, conn.write_buf.items);
+    defer {
+        for (payloads.items) |payload| allocator.free(payload);
+        payloads.deinit(allocator);
+    }
+
+    var saw_worker_state = false;
+    var saw_worker_skip = false;
+    var saw_plan = false;
+    var queue_depth: ?i64 = null;
+
+    for (payloads.items) |payload| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
+        defer parsed.deinit();
+        const obj = parsed.value.object;
+
+        const message_type = obj.get("type") orelse continue;
+        if (std.mem.eql(u8, message_type.string, "agent.plan")) {
+            saw_plan = true;
+            continue;
+        }
+        if (std.mem.eql(u8, message_type.string, "agent.progress")) {
+            const status = obj.get("status") orelse continue;
+            if (std.mem.eql(u8, status.string, "skipped")) saw_worker_skip = true;
+            continue;
+        }
+        if (std.mem.eql(u8, message_type.string, "agent.state")) {
+            saw_worker_state = true;
+            try std.testing.expect(std.mem.eql(u8, obj.get("phase").?.string, "workers.paused"));
+            if (obj.get("queuedTasks")) |q| queue_depth = q.integer;
+            continue;
+        }
+    }
+
+    try std.testing.expect(saw_plan);
+    try std.testing.expect(saw_worker_state);
+    try std.testing.expect(saw_worker_skip);
+    try std.testing.expect(queue_depth != null);
+    try std.testing.expect(queue_depth.? > 0);
 }
 
 test "server_piai: agent.control goal emits plan and worker events" {
