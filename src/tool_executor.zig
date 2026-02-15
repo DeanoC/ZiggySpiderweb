@@ -25,30 +25,78 @@ fn jsonEscape(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
     return result.toOwnedSlice(allocator);
 }
 
-/// Validate path is within workspace (no absolute paths, no ..)
-/// Returns an owned error message that must be freed by caller
-fn validatePathOwned(allocator: std.mem.Allocator, path: []const u8) ?[]u8 {
-    // Reject absolute paths
-    if (path.len > 0 and path[0] == '/') {
+const PathMode = enum {
+    read_or_list,
+    write,
+};
+
+fn isWithinWorkspace(workspace: []const u8, target: []const u8) bool {
+    if (std.mem.eql(u8, workspace, target)) return true;
+    if (!std.mem.startsWith(u8, target, workspace)) return false;
+    if (target.len <= workspace.len) return false;
+    return target[workspace.len] == std.fs.path.sep;
+}
+
+/// Validate path resolves inside workspace, including symlink escapes.
+/// Returns an owned error message that must be freed by caller.
+fn validatePathOwned(allocator: std.mem.Allocator, path: []const u8, mode: PathMode) ?[]u8 {
+    if (path.len == 0) {
+        return allocator.dupe(u8, "Path cannot be empty") catch return null;
+    }
+
+    // Reject obvious external references up front.
+    if (std.fs.path.isAbsolute(path)) {
         return allocator.dupe(u8, "Absolute paths are not allowed") catch return null;
     }
-    // Reject paths starting with ~ (home directory)
-    if (path.len > 0 and path[0] == '~') {
+    if (path[0] == '~') {
         return allocator.dupe(u8, "Home directory references are not allowed") catch return null;
     }
-    // Reject directory traversal
-    if (std.mem.indexOf(u8, path, "..") != null) {
-        return allocator.dupe(u8, "Path cannot contain '..'") catch return null;
+
+    const cwd = std.fs.cwd();
+    const workspace_real = cwd.realpathAlloc(allocator, ".") catch |err| {
+        return std.fmt.allocPrint(allocator, "Failed to resolve workspace path: {s}", .{@errorName(err)}) catch return null;
+    };
+    defer allocator.free(workspace_real);
+
+    var candidate = switch (mode) {
+        .read_or_list => path,
+        .write => std.fs.path.dirname(path) orelse ".",
+    };
+
+    // For write paths, walk upward until we find an existing ancestor.
+    while (true) {
+        const resolved = cwd.realpathAlloc(allocator, candidate) catch |err| switch (err) {
+            error.FileNotFound, error.NotDir => {
+                if (std.mem.eql(u8, candidate, ".")) {
+                    return std.fmt.allocPrint(allocator, "Failed to resolve path: {s}", .{@errorName(err)}) catch return null;
+                }
+                candidate = std.fs.path.dirname(candidate) orelse ".";
+                continue;
+            },
+            else => {
+                return std.fmt.allocPrint(allocator, "Failed to resolve path: {s}", .{@errorName(err)}) catch return null;
+            },
+        };
+        defer allocator.free(resolved);
+
+        if (!isWithinWorkspace(workspace_real, resolved)) {
+            return allocator.dupe(u8, "Path resolves outside workspace") catch return null;
+        }
+
+        return null;
     }
-    return null;
 }
+
+/// Static OOM message - must NOT be freed
+pub const OOM_MSG: []const u8 = "Out of memory";
 
 /// Helper to create a failure result with an allocated message
 fn fail(alloc: std.mem.Allocator, code: ToolResult.ErrorCode, msg: []const u8) ToolResult {
-    return .{ .failure = .{
-        .code = code,
-        .message = alloc.dupe(u8, msg) catch return .{ .failure = .{ .code = .execution_failed, .message = "OOM" } },
-    } };
+    const owned_msg = alloc.dupe(u8, msg) catch {
+        // Return static OOM message - caller must check and not free this
+        return .{ .failure = .{ .code = .execution_failed, .message = OOM_MSG } };
+    };
+    return .{ .failure = .{ .code = code, .message = owned_msg } };
 }
 
 /// Built-in tool implementations
@@ -64,7 +112,7 @@ pub const BuiltinTools = struct {
         const path = path_value.string;
 
         // Security: validate path
-        if (validatePathOwned(allocator, path)) |err| {
+        if (validatePathOwned(allocator, path, .read_or_list)) |err| {
             return .{ .failure = .{
                 .code = .permission_denied,
                 .message = err,
@@ -99,7 +147,7 @@ pub const BuiltinTools = struct {
         const content = content_value.string;
 
         // Security: validate path
-        if (validatePathOwned(allocator, path)) |err| {
+        if (validatePathOwned(allocator, path, .write)) |err| {
             return .{ .failure = .{
                 .code = .permission_denied,
                 .message = err,
@@ -140,7 +188,7 @@ pub const BuiltinTools = struct {
             ".";
 
         // Security: validate path
-        if (validatePathOwned(allocator, path)) |err| {
+        if (validatePathOwned(allocator, path, .read_or_list)) |err| {
             return .{ .failure = .{
                 .code = .permission_denied,
                 .message = err,
@@ -241,7 +289,7 @@ pub const BuiltinTools = struct {
             ".";
 
         // Security: validate path
-        if (validatePathOwned(allocator, path)) |err| {
+        if (validatePathOwned(allocator, path, .read_or_list)) |err| {
             return .{ .failure = .{
                 .code = .permission_denied,
                 .message = err,
@@ -301,7 +349,7 @@ pub const BuiltinTools = struct {
         return .{ .success = .{ .content = output } };
     }
 
-    /// Execute shell command (restricted)
+    /// Execute shell command (restricted) with 30 second timeout
     pub fn shell(allocator: std.mem.Allocator, args: std.json.ObjectMap) ToolResult {
         const command_value = args.get("command") orelse {
             return fail(allocator, .invalid_params, "Missing required parameter: command");
@@ -325,10 +373,10 @@ pub const BuiltinTools = struct {
             }
         }
 
-        // Execute with 30 second timeout
+        // Use timeout command to enforce 30 second limit
         const result = std.process.Child.run(.{
             .allocator = allocator,
-            .argv = &[_][]const u8{ "bash", "-c", command },
+            .argv = &[_][]const u8{ "timeout", "30", "bash", "-c", command },
             .max_output_bytes = 1024 * 1024,
         }) catch |err| {
             const msg = std.fmt.allocPrint(allocator, "Command execution failed: {s}", .{@errorName(err)}) catch return fail(allocator, .execution_failed, "Command execution failed");
@@ -338,13 +386,19 @@ pub const BuiltinTools = struct {
             } };
         };
 
-        // Check exit code
+        // Check if timed out (timeout returns 124 on timeout)
         const exit_code: i32 = switch (result.term) {
             .Exited => |code| @intCast(code),
             .Signal => |sig| @intCast(sig),
             .Stopped => |sig| @intCast(sig),
             .Unknown => |code| @intCast(code),
         };
+
+        if (exit_code == 124) {
+            allocator.free(result.stdout);
+            allocator.free(result.stderr);
+            return fail(allocator, .timeout, "Command timed out after 30 seconds");
+        }
 
         if (exit_code != 0) {
             // Build error message first, then free buffers

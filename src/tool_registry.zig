@@ -107,7 +107,7 @@ pub const ToolRegistry = struct {
         args: std.json.ObjectMap,
     ) ToolResult {
         const tool = self.get(name) orelse {
-            const msg = allocator.dupe(u8, "Tool not found") catch return .{ .failure = .{ .code = .execution_failed, .message = "OOM" } };
+            const msg = allocator.dupe(u8, "Tool not found") catch return .{ .failure = .{ .code = .execution_failed, .message = @import("tool_executor.zig").OOM_MSG } };
             return .{ .failure = .{
                 .code = .not_found,
                 .message = msg,

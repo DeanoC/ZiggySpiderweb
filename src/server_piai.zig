@@ -2259,8 +2259,11 @@ fn handleToolCall(
             );
             defer allocator.free(payload);
 
-            // Note: failure.message is always owned by the tool and must be freed
-            allocator.free(failure.message);
+            // Note: failure.message is owned by the tool and must be freed
+            // But don't free the static OOM message
+            if (failure.message.ptr != tool_executor.OOM_MSG.ptr) {
+                allocator.free(failure.message);
+            }
             try sendDirect(allocator, conn, payload);
         },
     }
