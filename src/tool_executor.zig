@@ -25,6 +25,23 @@ fn jsonEscape(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
     return result.toOwnedSlice(allocator);
 }
 
+/// Validate path is within workspace (no absolute paths, no ..)
+fn validatePath(path: []const u8) ?[]const u8 {
+    // Reject absolute paths
+    if (path.len > 0 and path[0] == '/') {
+        return "Absolute paths are not allowed";
+    }
+    // Reject paths starting with ~ (home directory)
+    if (path.len > 0 and path[0] == '~') {
+        return "Home directory references are not allowed";
+    }
+    // Reject directory traversal
+    if (std.mem.indexOf(u8, path, "..") != null) {
+        return "Path cannot contain '..'";
+    }
+    return null;
+}
+
 /// Built-in tool implementations
 pub const BuiltinTools = struct {
     /// Read file contents
@@ -43,11 +60,11 @@ pub const BuiltinTools = struct {
         }
         const path = path_value.string;
 
-        // Security: prevent directory traversal
-        if (std.mem.indexOf(u8, path, "..") != null) {
+        // Security: validate path
+        if (validatePath(path)) |err| {
             return .{ .failure = .{
                 .code = .permission_denied,
-                .message = "Path cannot contain '..'",
+                .message = err,
             } };
         }
 
@@ -87,11 +104,11 @@ pub const BuiltinTools = struct {
         const path = path_value.string;
         const content = content_value.string;
 
-        // Security: prevent directory traversal
-        if (std.mem.indexOf(u8, path, "..") != null) {
+        // Security: validate path
+        if (validatePath(path)) |err| {
             return .{ .failure = .{
                 .code = .permission_denied,
-                .message = "Path cannot contain '..'",
+                .message = err,
             } };
         }
 
@@ -131,11 +148,11 @@ pub const BuiltinTools = struct {
         else
             ".";
 
-        // Security: prevent directory traversal
-        if (std.mem.indexOf(u8, path, "..") != null) {
+        // Security: validate path
+        if (validatePath(path)) |err| {
             return .{ .failure = .{
                 .code = .permission_denied,
-                .message = "Path cannot contain '..'",
+                .message = err,
             } };
         }
 
@@ -238,16 +255,25 @@ pub const BuiltinTools = struct {
         else
             ".";
 
+        // Security: validate path
+        if (validatePath(path)) |err| {
+            return .{ .failure = .{
+                .code = .permission_denied,
+                .message = err,
+            } };
+        }
+
         // Use ripgrep if available, fallback to grep
+        // Use -e for query and -- to prevent flag injection
         const result = std.process.Child.run(.{
             .allocator = allocator,
-            .argv = &[_][]const u8{ "rg", "-n", "-i", "--color=never", query, path },
+            .argv = &[_][]const u8{ "rg", "-n", "-i", "--color=never", "-e", query, "--", path },
             .max_output_bytes = 1024 * 1024,
         }) catch |err| {
-            // Fallback to grep
+            // Fallback to grep with -e and --
             const grep_result = std.process.Child.run(.{
                 .allocator = allocator,
-                .argv = &[_][]const u8{ "grep", "-rn", "-i", "--color=never", query, path },
+                .argv = &[_][]const u8{ "grep", "-rn", "-i", "--color=never", "-e", query, "--", path },
                 .max_output_bytes = 1024 * 1024,
             }) catch |grep_err| {
                 const msg = std.fmt.allocPrint(allocator, "Search failed: rg={s}, grep={s}", .{
@@ -341,6 +367,33 @@ pub const BuiltinTools = struct {
                 .message = msg,
             } };
         };
+
+        // Check exit code
+        const exit_code: i32 = switch (result.term) {
+            .Exited => |code| @intCast(code),
+            .Signal => |sig| @intCast(sig),
+            .Stopped => |sig| @intCast(sig),
+            .Unknown => |code| @intCast(code),
+        };
+
+        if (exit_code != 0) {
+            const output = if (result.stderr.len > 0)
+                result.stderr
+            else if (result.stdout.len > 0)
+                result.stdout
+            else
+                allocator.dupe(u8, "Command failed with no output") catch "Command failed";
+
+            allocator.free(result.stdout);
+            allocator.free(result.stderr);
+
+            const msg = std.fmt.allocPrint(allocator, "Command exited with code {d}: {s}", .{ exit_code, output }) catch {
+                allocator.free(output);
+                return .{ .failure = .{ .code = .execution_failed, .message = "Command failed" } };
+            };
+            allocator.free(output);
+            return .{ .failure = .{ .code = .execution_failed, .message = msg } };
+        }
 
         const output = if (result.stdout.len > 0)
             result.stdout
