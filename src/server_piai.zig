@@ -928,7 +928,7 @@ fn handleUserMessage(allocator: std.mem.Allocator, state: *ServerState, pool: *s
         else
             "default";
         const limit = if (parsed.value.object.get("limit")) |l|
-            if (l == .integer) @min(l.integer, 20) else 5
+            if (l == .integer and l.integer >= 0) @min(l.integer, 20) else 5
         else
             5;
         try handleSessionHistory(allocator, state, conn, request_id, agent_id, @intCast(limit));
@@ -2054,7 +2054,7 @@ fn handleSessionHistory(
             try json.appendSlice(allocator, msg_count);
             try json.appendSlice(allocator, ",\"summary\":\"");
             try json.appendSlice(allocator, escaped_summary);
-            try json.appendSlice(allocator, "}");
+            try json.appendSlice(allocator, "\"}");
         }
 
         try json.appendSlice(allocator, "]}");

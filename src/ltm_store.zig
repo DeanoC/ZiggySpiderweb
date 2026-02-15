@@ -810,6 +810,17 @@ pub const Store = struct {
             "CREATE INDEX IF NOT EXISTS idx_ram_snapshots_session ON ram_snapshots(session_id, timestamp_ms);",
             "CREATE INDEX IF NOT EXISTS idx_summaries_snapshot ON summaries(snapshot_id);",
             "CREATE INDEX IF NOT EXISTS idx_entries_snapshot ON entries(snapshot_id);",
+            "CREATE TABLE IF NOT EXISTS session_metadata("
+            ++ "session_id TEXT PRIMARY KEY,"
+            ++ "agent_id TEXT NOT NULL,"
+            ++ "created_at_ms INTEGER NOT NULL,"
+            ++ "last_active_ms INTEGER NOT NULL,"
+            ++ "message_count INTEGER NOT NULL,"
+            ++ "is_active INTEGER NOT NULL DEFAULT 1,"
+            ++ "summary TEXT"
+            ++ ");",
+            "CREATE INDEX IF NOT EXISTS idx_session_metadata_agent ON session_metadata(agent_id, last_active_ms);",
+            "CREATE INDEX IF NOT EXISTS idx_session_metadata_active ON session_metadata(agent_id, is_active, last_active_ms);",
         };
 
         for (statements) |statement| {
