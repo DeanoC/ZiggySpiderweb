@@ -847,6 +847,31 @@ fn handleUserMessage(allocator: std.mem.Allocator, state: *ServerState, pool: *s
         return;
     }
 
+    const is_session_restore = std.mem.eql(u8, msg_type.string, "session.restore");
+    const is_session_history = std.mem.eql(u8, msg_type.string, "session.history");
+
+    if (is_session_restore) {
+        const agent_id = if (parsed.value.object.get("agent_id")) |id|
+            if (id == .string) id.string else "default"
+        else
+            "default";
+        try handleSessionRestore(allocator, state, conn, request_id, agent_id);
+        return;
+    }
+
+    if (is_session_history) {
+        const agent_id = if (parsed.value.object.get("agent_id")) |id|
+            if (id == .string) id.string else "default"
+        else
+            "default";
+        const limit = if (parsed.value.object.get("limit")) |l|
+            if (l == .integer) @min(l.integer, 20) else 5
+        else
+            5;
+        try handleSessionHistory(allocator, state, conn, request_id, agent_id, @intCast(limit));
+        return;
+    }
+
     if (!is_chat_send and !is_agent_control and !is_agent_heartbeat) return;
 
     const control_action = blk: {
@@ -1178,6 +1203,17 @@ fn handleUserMessage(allocator: std.mem.Allocator, state: *ServerState, pool: *s
         user_msg_id,
         user_content.len,
     });
+
+    // Update session metadata for restore functionality
+    if (state.ltm_store) |*store| {
+        store.updateSessionMetadata(
+            conn.session.session_id,
+            conn.agent_id,
+            @intCast(conn.session.ram.entries.items.len),
+        ) catch |err| {
+            std.log.warn("Failed to update session metadata: {s}", .{@errorName(err)});
+        };
+    }
 
     const args = try allocator.create(AiTaskArgs);
     args.* = .{
@@ -1725,6 +1761,135 @@ fn sendErrorJsonDirect(
     defer allocator.free(payload);
 
     try sendDirect(allocator, conn, payload);
+}
+
+fn handleSessionRestore(
+    allocator: std.mem.Allocator,
+    state: *ServerState,
+    conn: *Connection,
+    request_id: []const u8,
+    agent_id: []const u8,
+) !void {
+    if (state.ltm_store) |*store| {
+        const session = store.getLastActiveSession(agent_id) catch |err| {
+            std.log.err("Failed to get last active session: {s}", .{@errorName(err)});
+            try sendErrorJsonDirect(allocator, conn, "Failed to retrieve session");
+            return;
+        };
+
+        if (session) |s| {
+            defer {
+                var mutable = s;
+                mutable.deinit(allocator);
+            }
+
+            const escaped_request_id = try protocol.jsonEscape(allocator, request_id);
+            defer allocator.free(escaped_request_id);
+            const escaped_session_id = try protocol.jsonEscape(allocator, s.session_id);
+            defer allocator.free(escaped_session_id);
+            const escaped_agent_id = try protocol.jsonEscape(allocator, s.agent_id);
+            defer allocator.free(escaped_agent_id);
+            const escaped_summary = if (s.summary) |sum|
+                try protocol.jsonEscape(allocator, sum)
+            else
+                try allocator.dupe(u8, "");
+            defer if (s.summary != null) allocator.free(escaped_summary);
+
+            const payload = try std.fmt.allocPrint(
+                allocator,
+                "{{\"type\":\"session.restore.response\",\"request\":\"{s}\",\"found\":true,\"session\":{{\"session_key\":\"{s}\",\"agent_id\":\"{s}\",\"last_active_ms\":{d},\"message_count\":{d},\"summary\":\"{s}\"}}}}",
+                .{
+                    escaped_request_id,
+                    escaped_session_id,
+                    escaped_agent_id,
+                    s.last_active_ms,
+                    s.message_count,
+                    escaped_summary,
+                },
+            );
+            defer allocator.free(payload);
+
+            try sendDirect(allocator, conn, payload);
+        } else {
+            const escaped_request_id = try protocol.jsonEscape(allocator, request_id);
+            defer allocator.free(escaped_request_id);
+
+            const payload = try std.fmt.allocPrint(
+                allocator,
+                "{{\"type\":\"session.restore.response\",\"request\":\"{s}\",\"found\":false}}",
+                .{escaped_request_id},
+            );
+            defer allocator.free(payload);
+
+            try sendDirect(allocator, conn, payload);
+        }
+    } else {
+        try sendErrorJsonDirect(allocator, conn, "LTM store not available");
+    }
+}
+
+fn handleSessionHistory(
+    allocator: std.mem.Allocator,
+    state: *ServerState,
+    conn: *Connection,
+    request_id: []const u8,
+    agent_id: []const u8,
+    limit: usize,
+) !void {
+    if (state.ltm_store) |*store| {
+        var sessions = store.listRecentSessions(agent_id, limit) catch |err| {
+            std.log.err("Failed to list recent sessions: {s}", .{@errorName(err)});
+            try sendErrorJsonDirect(allocator, conn, "Failed to retrieve session history");
+            return;
+        };
+        defer {
+            for (sessions.items) |*s| {
+                s.deinit(allocator);
+            }
+            sessions.deinit(allocator);
+        }
+
+        var json = std.ArrayListUnmanaged(u8){};
+        defer json.deinit(allocator);
+
+        try json.appendSlice(allocator, "{\"type\":\"session.history.response\",\"request\":\"");
+        const escaped_request_id = try protocol.jsonEscape(allocator, request_id);
+        defer allocator.free(escaped_request_id);
+        try json.appendSlice(allocator, escaped_request_id);
+        try json.appendSlice(allocator, "\",\"sessions\":[");
+
+        for (sessions.items, 0..) |session, idx| {
+            if (idx > 0) try json.appendSlice(allocator, ",");
+
+            const escaped_session_id = try protocol.jsonEscape(allocator, session.session_id);
+            defer allocator.free(escaped_session_id);
+            const escaped_summary = if (session.summary) |sum|
+                try protocol.jsonEscape(allocator, sum)
+            else
+                try allocator.dupe(u8, "");
+            defer if (session.summary != null) allocator.free(escaped_summary);
+
+            try json.appendSlice(allocator, "{\"session_key\":\"");
+            try json.appendSlice(allocator, escaped_session_id);
+            try json.appendSlice(allocator, "\",\"last_active_ms\":");
+            const last_active = try std.fmt.allocPrint(allocator, "{d}", .{session.last_active_ms});
+            defer allocator.free(last_active);
+            try json.appendSlice(allocator, last_active);
+            try json.appendSlice(allocator, ",\"message_count\":");
+            const msg_count = try std.fmt.allocPrint(allocator, "{d}", .{session.message_count});
+            defer allocator.free(msg_count);
+            try json.appendSlice(allocator, msg_count);
+            try json.appendSlice(allocator, ",\"summary\":\"");
+            try json.appendSlice(allocator, escaped_summary);
+            try json.appendSlice(allocator, "}");
+        }
+
+        try json.appendSlice(allocator, "]}");
+
+        try sendDirect(allocator, conn, json.items);
+    } else {
+        try sendErrorJsonDirect(allocator, conn, "LTM store not available");
+    }
 }
 
 fn sendAgentState(

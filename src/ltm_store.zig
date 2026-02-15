@@ -87,6 +87,22 @@ pub const SnapshotData = struct {
     }
 };
 
+pub const SessionMetadata = struct {
+    session_id: []const u8,
+    agent_id: []const u8,
+    created_at_ms: i64,
+    last_active_ms: i64,
+    message_count: i64,
+    is_active: bool,
+    summary: ?[]const u8,
+
+    pub fn deinit(self: *SessionMetadata, allocator: std.mem.Allocator) void {
+        allocator.free(self.session_id);
+        allocator.free(self.agent_id);
+        if (self.summary) |s| allocator.free(s);
+    }
+};
+
 pub const Store = struct {
     allocator: std.mem.Allocator,
     db: *sqlite3,
@@ -855,6 +871,126 @@ fn appendUniqueI64(allocator: std.mem.Allocator, ids: *std.ArrayListUnmanaged(i6
         }
         try escaped.append(self.allocator, '\'');
         return try escaped.toOwnedSlice(self.allocator);
+    }
+
+
+    // Session metadata functions for agent discovery and restore
+    pub fn updateSessionMetadata(
+        self: *Store,
+        session_id: []const u8,
+        agent_id: []const u8,
+        message_count: i64,
+    ) !void {
+        const now_ms = std.time.milliTimestamp();
+        const session_id_escaped = try self.escapeSqlLiteral(session_id);
+        defer self.allocator.free(session_id_escaped);
+        const agent_id_escaped = try self.escapeSqlLiteral(agent_id);
+        defer self.allocator.free(agent_id_escaped);
+
+        const sql = try std.fmt.allocPrint(
+            self.allocator,
+            "INSERT INTO session_metadata(session_id, agent_id, created_at_ms, last_active_ms, message_count, is_active) " ++
+                "VALUES ({s}, {s}, {d}, {d}, {d}, 1) " ++
+                "ON CONFLICT(session_id) DO UPDATE SET last_active_ms = {d}, message_count = {d};",
+            .{ session_id_escaped, agent_id_escaped, now_ms, now_ms, message_count, now_ms, message_count },
+        );
+        defer self.allocator.free(sql);
+
+        try self.run(sql);
+    }
+
+    pub fn getLastActiveSession(
+        self: *Store,
+        agent_id: []const u8,
+    ) !?SessionMetadata {
+        const agent_id_escaped = try self.escapeSqlLiteral(agent_id);
+        defer self.allocator.free(agent_id_escaped);
+
+        const sql = try std.fmt.allocPrint(
+            self.allocator,
+            "SELECT session_id, agent_id, created_at_ms, last_active_ms, message_count, is_active, summary " ++
+                "FROM session_metadata WHERE agent_id = {s} AND is_active = 1 " ++
+                "ORDER BY last_active_ms DESC LIMIT 1;",
+            .{agent_id_escaped},
+        );
+        defer self.allocator.free(sql);
+
+        const stmt = try self.prepare(sql);
+        defer _ = sqlite3_finalize(stmt);
+
+        const rc = sqlite3_step(stmt);
+        if (rc != SQLITE_ROW) return null;
+
+        return SessionMetadata{
+            .session_id = try self.copyColumnText(stmt, 0),
+            .agent_id = try self.copyColumnText(stmt, 1),
+            .created_at_ms = sqlite3_column_int64(stmt, 2),
+            .last_active_ms = sqlite3_column_int64(stmt, 3),
+            .message_count = sqlite3_column_int64(stmt, 4),
+            .is_active = sqlite3_column_int64(stmt, 5) != 0,
+            .summary = if (sqlite3_column_type(stmt, 6) != SQLITE_NULL)
+                try self.copyColumnText(stmt, 6)
+            else
+                null,
+        };
+    }
+
+    pub fn listRecentSessions(
+        self: *Store,
+        agent_id: []const u8,
+        limit: usize,
+    ) !std.ArrayListUnmanaged(SessionMetadata) {
+        const agent_id_escaped = try self.escapeSqlLiteral(agent_id);
+        defer self.allocator.free(agent_id_escaped);
+
+        const sql = try std.fmt.allocPrint(
+            self.allocator,
+            "SELECT session_id, agent_id, created_at_ms, last_active_ms, message_count, is_active, summary " ++
+                "FROM session_metadata WHERE agent_id = {s} AND is_active = 1 " ++
+                "ORDER BY last_active_ms DESC LIMIT {d};",
+            .{ agent_id_escaped, limit },
+        );
+        defer self.allocator.free(sql);
+
+        const stmt = try self.prepare(sql);
+        defer _ = sqlite3_finalize(stmt);
+
+        var results = std.ArrayListUnmanaged(SessionMetadata){};
+
+        while (true) {
+            const rc = sqlite3_step(stmt);
+            if (rc == SQLITE_DONE) break;
+            if (rc != SQLITE_ROW) return LtmError.ExecError;
+
+            try results.append(self.allocator, .{
+                .session_id = try self.copyColumnText(stmt, 0),
+                .agent_id = try self.copyColumnText(stmt, 1),
+                .created_at_ms = sqlite3_column_int64(stmt, 2),
+                .last_active_ms = sqlite3_column_int64(stmt, 3),
+                .message_count = sqlite3_column_int64(stmt, 4),
+                .is_active = sqlite3_column_int64(stmt, 5) != 0,
+                .summary = if (sqlite3_column_type(stmt, 6) != SQLITE_NULL)
+                    try self.copyColumnText(stmt, 6)
+                else
+                    null,
+            });
+        }
+
+        return results;
+    }
+
+    pub fn setSessionInactive(self: *Store, session_id: []const u8) !void {
+        const session_id_escaped = try self.escapeSqlLiteral(session_id);
+        defer self.allocator.free(session_id_escaped);
+
+        const sql = try std.fmt.allocPrint(
+            self.allocator,
+            "UPDATE session_metadata SET is_active = 0 WHERE session_id = {s};",
+            .{session_id_escaped},
+        );
+        defer self.allocator.free(sql);
+
+        try self.run(sql);
     }
 
     fn raiseError(self: *Store, context: []const u8, rc: i32) !void {
