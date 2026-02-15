@@ -35,6 +35,8 @@ const MAX_INBOUND_MESSAGE_BYTES = 4 * 1024;
 const REQUEST_ID_LEN = 16;
 const SESSION_STATE_PATH = ".spiderweb-session-state.json";
 const SESSION_STATE_VERSION = 1;
+const LONG_TERM_ARCHIVE_DIR = ".spiderweb-ltm";
+const LONG_TERM_ARCHIVE_VERSION = 1;
 
 const PersistedSession = struct {
     session_id: []u8,
@@ -67,6 +69,11 @@ const SessionContext = struct {
             .ram = memory.RamContext.init(allocator, MAX_CONTEXT_MESSAGES, MAX_CONTEXT_BYTES),
             .session_id = &[_]u8{},
         };
+    }
+
+    fn resetRam(self: *SessionContext, allocator: std.mem.Allocator) void {
+        self.ram.deinit();
+        self.ram = memory.RamContext.init(allocator, MAX_CONTEXT_MESSAGES, MAX_CONTEXT_BYTES);
     }
 
     fn deinit(self: *SessionContext, allocator: std.mem.Allocator) void {
@@ -544,9 +551,6 @@ fn handleUserMessage(allocator: std.mem.Allocator, state: *ServerState, pool: *s
         return;
     }
 
-    const is_chat_send = std.mem.eql(u8, msg_type.string, "chat.send") or std.mem.eql(u8, msg_type.string, "session.send");
-    if (!is_chat_send) return;
-
     const request_id = blk: {
         if (parsed.value.object.get("id")) |id| {
             if (id == .string) break :blk try allocator.dupe(u8, id.string);
@@ -556,11 +560,66 @@ fn handleUserMessage(allocator: std.mem.Allocator, state: *ServerState, pool: *s
     var request_id_owned = request_id;
     defer if (request_id_owned.len != 0) allocator.free(request_id_owned);
 
+    const is_session_reset = std.mem.eql(u8, msg_type.string, "session.reset") or std.mem.eql(u8, msg_type.string, "session.new");
+    if (is_session_reset) {
+        const response_type = if (std.mem.eql(u8, msg_type.string, "session.new")) "session.new" else "session.reset";
+        const should_archive = if (parsed.value.object.get("archive")) |archive| switch (archive) {
+            .bool => archive.bool,
+            else => true,
+        } else true;
+
+        const reason = if (parsed.value.object.get("reason")) |reason_value| reason_blk: {
+            if (reason_value == .string) break :reason_blk reason_value.string;
+            break :reason_blk "manual-reset";
+        } else "manual-reset";
+
+        const archived = handleSessionReset(allocator, conn, should_archive, reason) catch |err| blk: {
+            std.log.err("Session reset failed: {s} session={s}", .{ @errorName(err), conn.session.session_id });
+            try sendErrorJson(allocator, &conn.write_buf, "session.reset failed");
+            break :blk false;
+        };
+
+        const response = try std.fmt.allocPrint(
+            allocator,
+            "{{\"type\":\"{s}\",\"request\":\"{s}\",\"sessionKey\":\"{s}\",\"archived\":{s}}}",
+            .{ response_type, request_id, conn.session.session_id, if (archived) "true" else "false" },
+        );
+        defer allocator.free(response);
+        try appendWsFrame(allocator, &conn.write_buf, response, .text);
+        std.log.info("Session reset: session={s} request={s} archived={s} reason={s}", .{ conn.session.session_id, request_id, if (archived) "true" else "false", reason });
+        return;
+    }
+
+    const is_chat_send = std.mem.eql(u8, msg_type.string, "chat.send") or std.mem.eql(u8, msg_type.string, "session.send");
+    if (!is_chat_send) return;
+
     const content = blk: {
         if (parsed.value.object.get("content")) |c| if (c == .string) break :blk c.string;
         if (parsed.value.object.get("text")) |t| if (t == .string) break :blk t.string;
         return;
     };
+
+    if (std.mem.eql(u8, content, "/new")) {
+        const archived = handleSessionReset(allocator, conn, true, "slash-new") catch |err| blk: {
+            std.log.err("Session reset via /new failed: {s} session={s}", .{ @errorName(err), conn.session.session_id });
+            try sendErrorJson(allocator, &conn.write_buf, "session.reset failed");
+            break :blk false;
+        };
+
+        const response = try std.fmt.allocPrint(
+            allocator,
+            "{{\"type\":\"session.new\",\"request\":\"{s}\",\"sessionKey\":\"{s}\",\"archived\":{s}}}",
+            .{ request_id, conn.session.session_id, if (archived) "true" else "false" },
+        );
+        defer allocator.free(response);
+        try appendWsFrame(allocator, &conn.write_buf, response, .text);
+        std.log.info("Session reset via /new: session={s} request={s} archived={s}", .{
+            conn.session.session_id,
+            request_id,
+            if (archived) "true" else "false",
+        });
+        return;
+    }
 
     const user_msg_id = conn.session.appendUserMessage(allocator, .user, content) catch |err| {
         if (err == SessionError.MessageTooLarge) {
@@ -713,6 +772,93 @@ fn sendSessionReceive(
     defer allocator.free(response_json);
 
     try appendWsFrame(allocator, write_buf, response_json, .text);
+}
+
+fn handleSessionReset(
+    allocator: std.mem.Allocator,
+    conn: *Connection,
+    archive_old_state: bool,
+    reason: []const u8,
+) !bool {
+    var archived = false;
+
+    if (archive_old_state) {
+        archived = archiveSessionRamToLongTerm(allocator, &conn.session, reason) catch false;
+    }
+
+    conn.session.resetRam(allocator);
+    return archived;
+}
+
+fn archiveSessionRamToLongTerm(
+    allocator: std.mem.Allocator,
+    session: *SessionContext,
+    reason: []const u8,
+) !bool {
+    if (session.ram.entries.items.len == 0 and session.ram.summaries.items.len == 0) {
+        return false;
+    }
+
+    var ltm_dir = try std.fs.cwd().makeOpenPath(LONG_TERM_ARCHIVE_DIR, .{});
+    defer ltm_dir.close();
+
+    const session_name = if (session.session_id.len > 0) session.session_id else "unbound-session";
+    const timestamp = std.time.milliTimestamp();
+    const filename = try std.fmt.allocPrint(allocator, "{s}-{d}.json", .{ session_name, timestamp });
+    defer allocator.free(filename);
+
+    var file = try ltm_dir.createFile(filename, .{ .truncate = true });
+    defer file.close();
+
+    try writeFormatted(
+        allocator,
+        file,
+        "{{\"version\":{d},\"timestamp_ms\":{d},\"session_id\":",
+        .{ LONG_TERM_ARCHIVE_VERSION, timestamp },
+    );
+    try writeJsonEscaped(allocator, file, session_name);
+    try file.writeAll(",\"reason\":");
+    try writeJsonEscaped(allocator, file, reason);
+    try writeFormatted(allocator, file, ",\"next_id\":{d},\"entries\":[", .{session.ram.next_id});
+
+    for (session.ram.entries.items, 0..) |entry, idx| {
+        if (idx > 0) try file.writeAll(",");
+        const role_name: []const u8 = switch (entry.message.role) {
+            .user => "user",
+            .assistant => "assistant",
+            .system => "system",
+            .tool => "tool",
+            .tool_result => "tool_result",
+        };
+
+        const state_name: []const u8 = if (entry.state == .active) "active" else "tombstone";
+        try writeFormatted(allocator, file, "{{\"id\":{d},\"role\":", .{entry.id});
+        try writeJsonEscaped(allocator, file, role_name);
+        try writeFormatted(allocator, file, ",\"state\":\"{s}\",\"content\":", .{state_name});
+        try writeJsonEscaped(allocator, file, entry.message.content);
+        if (entry.related_to) |related_to| {
+            try writeFormatted(allocator, file, ",\"related_to\":{d}", .{related_to});
+        } else {
+            try file.writeAll(",\"related_to\":null");
+        }
+        try file.writeAll("}");
+    }
+
+    try writeFormatted(allocator, file, "],\"summaries\":[", .{});
+    for (session.ram.summaries.items, 0..) |summary, idx| {
+        if (idx > 0) try file.writeAll(",");
+        try writeFormatted(
+            allocator,
+            file,
+            "{{\"id\":{d},\"source_id\":{d},\"text\":",
+            .{ summary.id, summary.source_id },
+        );
+        try writeJsonEscaped(allocator, file, summary.text);
+        try writeFormatted(allocator, file, ",\"created_at_ms\":{d}}}", .{summary.created_at_ms});
+    }
+
+    try file.writeAll("]}");
+    return true;
 }
 
 fn sendErrorJson(allocator: std.mem.Allocator, write_buf: *std.ArrayListUnmanaged(u8), message: []const u8) !void {
