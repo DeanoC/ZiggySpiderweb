@@ -14,6 +14,9 @@ pub const MessageType = enum {
     agent_plan,
     agent_progress,
     agent_status,
+    agent_heartbeat,
+    agent_state,
+    memory_event,
     agent_control,
     
     // Heartbeat
@@ -49,12 +52,16 @@ pub fn parseMessageType(json: []const u8) ?MessageType {
     // Simple string search for type field
     if (std.mem.indexOf(u8, json, "\"type\":\"connect\"") != null) return .connect;
     if (std.mem.indexOf(u8, json, "\"type\":\"session.send\"") != null) return .session_send;
+    if (std.mem.indexOf(u8, json, "\"type\":\"chat.send\"") != null) return .session_send;
     if (std.mem.indexOf(u8, json, "\"type\":\"ping\"") != null) return .ping;
     if (std.mem.indexOf(u8, json, "\"type\":\"pong\"") != null) return .pong;
     if (std.mem.indexOf(u8, json, "\"type\":\"disconnect\"") != null) return .disconnect;
     if (std.mem.indexOf(u8, json, "\"type\":\"agent.plan\"") != null) return .agent_plan;
     if (std.mem.indexOf(u8, json, "\"type\":\"agent.progress\"") != null) return .agent_progress;
     if (std.mem.indexOf(u8, json, "\"type\":\"agent.status\"") != null) return .agent_status;
+    if (std.mem.indexOf(u8, json, "\"type\":\"agent.heartbeat\"") != null) return .agent_heartbeat;
+    if (std.mem.indexOf(u8, json, "\"type\":\"agent.state\"") != null) return .agent_state;
+    if (std.mem.indexOf(u8, json, "\"type\":\"memory.event\"") != null) return .memory_event;
     if (std.mem.indexOf(u8, json, "\"type\":\"agent.control\"") != null) return .agent_control;
     return null;
 }
@@ -112,9 +119,13 @@ test "protocol: parseMessageType handles core and agent message types" {
     }{
         .{ .json = "{\"type\":\"connect\"}", .expected = .connect },
         .{ .json = "{\"type\":\"session.send\"}", .expected = .session_send },
+        .{ .json = "{\"type\":\"chat.send\"}", .expected = .session_send },
         .{ .json = "{\"type\":\"agent.plan\"}", .expected = .agent_plan },
         .{ .json = "{\"type\":\"agent.progress\"}", .expected = .agent_progress },
         .{ .json = "{\"type\":\"agent.status\"}", .expected = .agent_status },
+        .{ .json = "{\"type\":\"agent.heartbeat\"}", .expected = .agent_heartbeat },
+        .{ .json = "{\"type\":\"agent.state\"}", .expected = .agent_state },
+        .{ .json = "{\"type\":\"memory.event\"}", .expected = .memory_event },
         .{ .json = "{\"type\":\"agent.control\"}", .expected = .agent_control },
         .{ .json = "{\"type\":\"ping\"}", .expected = .ping },
         .{ .json = "{\"type\":\"memory.query\"}", .expected = null },
@@ -131,9 +142,20 @@ test "protocol: parseMessageType ignores unknown and unsupported message types" 
         "{\"type\":\"session.ack\",\"capabilities\":[]}",
         "{\"type\":\"memory.query\",\"query\":\"goal\"}",
         "{\"type\":\"memory.recall\",\"id\":1}",
-        "{\"type\":\"agent.state\",\"phase\":\"running\"}",
     };
     for (unsupported) |json| {
+        try std.testing.expectEqual(@as(?MessageType, null), parseMessageType(json));
+    }
+}
+
+test "protocol: parseMessageType handles malformed envelopes safely" {
+    const malformed = [_][]const u8{
+        "",
+        "{",
+        "{\"type\":\"agent.control\"",
+    };
+
+    for (malformed) |json| {
         try std.testing.expectEqual(@as(?MessageType, null), parseMessageType(json));
     }
 }
