@@ -228,6 +228,44 @@ pub const RamContext = struct {
         try self.applyHardLimitLocked();
     }
 
+    pub fn restoreEntry(
+        self: *RamContext,
+        id: MemoryID,
+        role: ziggy_piai.types.MessageRole,
+        state: RamEntryState,
+        related_to: ?MemoryID,
+        content: []const u8,
+    ) !void {
+        try self.entries.append(self.allocator, .{
+            .id = id,
+            .message = .{ .role = role, .content = try self.allocator.dupe(u8, content) },
+            .state = state,
+            .related_to = related_to,
+        });
+        if (state == .active) {
+            self.total_message_bytes += content.len;
+        }
+    }
+
+    pub fn restoreSummary(
+        self: *RamContext,
+        id: MemoryID,
+        source_id: MemoryID,
+        text: []const u8,
+        created_at_ms: i64,
+    ) !void {
+        try self.summaries.append(self.allocator, .{
+            .id = id,
+            .source_id = source_id,
+            .text = try self.allocator.dupe(u8, text),
+            .created_at_ms = created_at_ms,
+        });
+    }
+
+    pub fn setNextId(self: *RamContext, next_id: MemoryID) void {
+        self.next_id = next_id;
+    }
+
     fn applyHardLimitLocked(self: *RamContext) !void {
         while (self.entries.items.len > self.max_messages or self.total_message_bytes > self.max_bytes) {
             const removed = self.removeOldestActive() orelse return;
