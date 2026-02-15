@@ -5,6 +5,7 @@ const protocol = @import("protocol.zig");
 const memory = @import("memory.zig");
 const identity = @import("identity.zig");
 const orchestrator = @import("orchestrator.zig");
+const workers = @import("workers.zig");
 const ltm_store = @import("ltm_store.zig");
 const ltm_index = @import("ltm_index.zig");
 const posix = std.posix;
@@ -48,6 +49,7 @@ const LTM_RETENTION_MAX_AGE_DAYS_DEFAULT: u64 = 30;
 const LTM_RETENTION_KEEP_SNAPSHOTS_ENV = "SPIDERWEB_LTM_KEEP_SNAPSHOTS";
 const LTM_RETENTION_KEEP_DAYS_ENV = "SPIDERWEB_LTM_KEEP_DAYS";
 const AGENT_GOAL_PREFIX = "/goal ";
+const WORKER_MAX_PARALLELISM = 2;
 
 const PersistedSession = struct {
     session_id: []u8,
@@ -820,6 +822,78 @@ fn handleUserMessage(allocator: std.mem.Allocator, state: *ServerState, pool: *s
         try sendAgentProgress(allocator, &conn.write_buf, request_id, conn.session.session_id, "planner", "received", "Planning request received");
         try sendAgentPlan(allocator, &conn.write_buf, request_id, conn.session.session_id, plan.goal, plan.tasks);
         try sendAgentProgress(allocator, &conn.write_buf, request_id, conn.session.session_id, "planner", "ready", plan.response_text);
+        try sendAgentProgress(
+            allocator,
+            &conn.write_buf,
+            request_id,
+            conn.session.session_id,
+            "workers",
+            "queued",
+            "Delegating plan tasks to local workers",
+        );
+
+        var worker_results = std.ArrayListUnmanaged(workers.WorkerResult){};
+        defer worker_results.deinit(allocator);
+
+        var worker_exec_ok = true;
+        workers.executePlanWorkers(allocator, plan.tasks.items, WORKER_MAX_PARALLELISM, &worker_results) catch |err| {
+            std.log.err("Worker execution failed: {s} session={s} request={s}", .{
+                @errorName(err),
+                conn.session.session_id,
+                request_id,
+            });
+            worker_exec_ok = false;
+        };
+        if (!worker_exec_ok) {
+            try sendAgentProgress(
+                allocator,
+                &conn.write_buf,
+                request_id,
+                conn.session.session_id,
+                "workers",
+                "failed",
+                "Worker delegation failed",
+            );
+        } else {
+            for (worker_results.items) |result| {
+                const worker_name = workers.workerTypeLabel(result.worker);
+                const message = try std.fmt.allocPrint(
+                    allocator,
+                    "{s} worker complete for task {d}: {s}",
+                    .{ worker_name, result.task_id, result.detailSlice() },
+                );
+                defer allocator.free(message);
+
+                try sendAgentProgress(
+                    allocator,
+                    &conn.write_buf,
+                    request_id,
+                    conn.session.session_id,
+                    worker_name,
+                    result.statusSlice(),
+                    message,
+                );
+                try sendAgentStatus(
+                    allocator,
+                    &conn.write_buf,
+                    request_id,
+                    conn.session.session_id,
+                    result.task_id,
+                    worker_name,
+                    result.statusSlice(),
+                    result.detailSlice(),
+                );
+            }
+            try sendAgentProgress(
+                allocator,
+                &conn.write_buf,
+                request_id,
+                conn.session.session_id,
+                "workers",
+                "ready",
+                "Worker pre-processing complete",
+            );
+        }
         _ = try conn.session.appendMessage(allocator, .system, plan_memory);
     } else if (is_agent_control) {
         std.log.warn("agent.control requires goal payload: session={s} request={s}", .{ conn.session.session_id, request_id });
@@ -1051,6 +1125,37 @@ fn sendAgentProgress(
         allocator,
         "{{\"type\":\"agent.progress\",\"request\":\"{s}\",\"sessionKey\":\"{s}\",\"phase\":\"{s}\",\"status\":\"{s}\",\"message\":\"{s}\"}}",
         .{ escaped_request_id, escaped_session_id, escaped_phase, escaped_status, escaped_message },
+    );
+    defer allocator.free(payload);
+
+    try appendWsFrame(allocator, write_buf, payload, .text);
+}
+
+fn sendAgentStatus(
+    allocator: std.mem.Allocator,
+    write_buf: *std.ArrayListUnmanaged(u8),
+    request_id: []const u8,
+    session_id: []const u8,
+    task_id: usize,
+    worker: []const u8,
+    status: []const u8,
+    message: []const u8,
+) !void {
+    const escaped_request_id = try protocol.jsonEscape(allocator, request_id);
+    defer allocator.free(escaped_request_id);
+    const escaped_session_id = try protocol.jsonEscape(allocator, session_id);
+    defer allocator.free(escaped_session_id);
+    const escaped_worker = try protocol.jsonEscape(allocator, worker);
+    defer allocator.free(escaped_worker);
+    const escaped_status = try protocol.jsonEscape(allocator, status);
+    defer allocator.free(escaped_status);
+    const escaped_message = try protocol.jsonEscape(allocator, message);
+    defer allocator.free(escaped_message);
+
+    const payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"type\":\"agent.status\",\"request\":\"{s}\",\"sessionKey\":\"{s}\",\"taskId\":{d},\"worker\":\"{s}\",\"status\":\"{s}\",\"message\":\"{s}\"}}",
+        .{ escaped_request_id, escaped_session_id, task_id, escaped_worker, escaped_status, escaped_message },
     );
     defer allocator.free(payload);
 
