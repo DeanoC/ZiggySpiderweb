@@ -23,6 +23,7 @@ pub fn build(b: *std.Build) void {
         .name = "spiderweb",
         .root_module = spiderweb_mod,
     });
+    spiderweb.linkLibC();
 
     b.installArtifact(spiderweb);
 
@@ -37,6 +38,7 @@ pub fn build(b: *std.Build) void {
         .name = "spiderweb-config",
         .root_module = config_mod,
     });
+    config_cli.linkLibC();
 
     b.installArtifact(config_cli);
 
@@ -62,6 +64,7 @@ pub fn build(b: *std.Build) void {
     const spiderweb_tests = b.addTest(.{
         .root_module = test_mod,
     });
+    spiderweb_tests.linkLibC();
 
     const run_tests = b.addRunArtifact(spiderweb_tests);
     const test_step = b.step("test", "Run tests");

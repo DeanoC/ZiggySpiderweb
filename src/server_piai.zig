@@ -24,29 +24,29 @@ const Connection = struct {
     fd: posix.socket_t,
     state: ConnectionState,
     agent_id: []u8,
-    read_buf: std.ArrayList(u8),
-    write_buf: std.ArrayList(u8),
-    messages: std.ArrayList(ziggy_piai.types.Message),
+    read_buf: std.ArrayListUnmanaged(u8),
+    write_buf: std.ArrayListUnmanaged(u8),
+    messages: std.ArrayListUnmanaged(ziggy_piai.types.Message),
 
-    fn init(allocator: std.mem.Allocator, fd: posix.socket_t) Connection {
+    fn init(fd: posix.socket_t) Connection {
         return .{
             .fd = fd,
             .state = .handshake,
             .agent_id = &[_]u8{},
-            .read_buf = std.ArrayList(u8).init(allocator),
-            .write_buf = std.ArrayList(u8).init(allocator),
-            .messages = std.ArrayList(ziggy_piai.types.Message).init(allocator),
+            .read_buf = .{},
+            .write_buf = .{},
+            .messages = .{},
         };
     }
 
     fn deinit(self: *Connection, allocator: std.mem.Allocator) void {
         allocator.free(self.agent_id);
-        self.read_buf.deinit();
-        self.write_buf.deinit();
+        self.read_buf.deinit(allocator);
+        self.write_buf.deinit(allocator);
         for (self.messages.items) |msg| {
             allocator.free(msg.content);
         }
-        self.messages.deinit();
+        self.messages.deinit(allocator);
         posix.close(self.fd);
     }
 };
@@ -163,7 +163,7 @@ pub fn run(allocator: std.mem.Allocator, bind_addr: []const u8, port: u16, provi
                     };
 
                     const conn = try allocator.create(Connection);
-                    conn.* = Connection.init(allocator, conn_fd);
+                    conn.* = Connection.init(conn_fd);
                     try connections.put(conn_fd, conn);
 
                     try loop.add(conn_fd, linux.EPOLL.IN | linux.EPOLL.OUT | linux.EPOLL.ET);
@@ -185,7 +185,7 @@ pub fn run(allocator: std.mem.Allocator, bind_addr: []const u8, port: u16, provi
                 }
 
                 if (ev.write) {
-                    handleWrite(conn) catch |err| {
+                    handleWrite(allocator, conn) catch |err| {
                         std.log.err("Write error on fd {d}: {s}", .{ conn_fd, @errorName(err) });
                         _ = connections.remove(conn_fd);
                         loop.remove(conn_fd);
@@ -215,7 +215,7 @@ fn handleRead(allocator: std.mem.Allocator, state: *ServerState, pool: *std.Thre
             return err;
         };
         if (n == 0) return error.ConnectionClosed;
-        try conn.read_buf.appendSlice(buf[0..n]);
+        try conn.read_buf.appendSlice(allocator, buf[0..n]);
 
         switch (conn.state) {
             .handshake => try processHandshake(allocator, state, conn),
@@ -225,22 +225,22 @@ fn handleRead(allocator: std.mem.Allocator, state: *ServerState, pool: *std.Thre
     }
 }
 
-fn handleWrite(conn: *Connection) !void {
+fn handleWrite(allocator: std.mem.Allocator, conn: *Connection) !void {
     if (conn.write_buf.items.len == 0) return;
     const n = posix.write(conn.fd, conn.write_buf.items) catch |err| {
         if (err == error.WouldBlock) return;
         return err;
     };
-    conn.write_buf.replaceRange(0, @min(n, conn.write_buf.items.len), &.{}) catch {};
+    conn.write_buf.replaceRange(allocator, 0, @min(n, conn.write_buf.items.len), &.{}) catch {};
 }
 
 fn processHandshake(allocator: std.mem.Allocator, state: *ServerState, conn: *Connection) !void {
     const request = conn.read_buf.items;
-    if (std.mem.find(u8, request, "\r\n\r\n")) |_| {
+    if (std.mem.indexOf(u8, request, "\r\n\r\n")) |_| {
         if (!std.mem.containsAtLeast(u8, request, 1, "Upgrade: websocket") and
             !std.mem.containsAtLeast(u8, request, 1, "upgrade: websocket"))
         {
-            try conn.write_buf.appendSlice("HTTP/1.1 400 Bad Request\r\n\r\n");
+            try conn.write_buf.appendSlice(allocator, "HTTP/1.1 400 Bad Request\r\n\r\n");
             conn.state = .closing;
             return;
         }
@@ -258,7 +258,7 @@ fn processHandshake(allocator: std.mem.Allocator, state: *ServerState, conn: *Co
             "\r\n", .{accept_key});
         defer allocator.free(response);
 
-        try conn.write_buf.appendSlice(response);
+        try conn.write_buf.appendSlice(allocator, response);
         conn.read_buf.clearRetainingCapacity();
         conn.state = .websocket;
 
@@ -267,7 +267,7 @@ fn processHandshake(allocator: std.mem.Allocator, state: *ServerState, conn: *Co
         const ack_msg = try std.fmt.allocPrint(allocator, "{{\"type\":\"session.ack\",\"sessionKey\":\"{s}\",\"agentId\":\"{s}\"}}", .{ session_key, agent_id });
         defer allocator.free(ack_msg);
 
-        try appendWsFrame(&conn.write_buf, ack_msg, .text);
+        try appendWsFrame(allocator, &conn.write_buf, ack_msg, .text);
     }
 }
 
@@ -312,14 +312,16 @@ fn processWebSocket(allocator: std.mem.Allocator, state: *ServerState, pool: *st
 
         switch (opcode) {
             0x8 => { conn.state = .closing; return; },
-            0x9 => try appendWsFrame(&conn.write_buf, payload, .binary),
+            0x9 => try appendWsFrame(allocator, &conn.write_buf, payload, .binary),
             0x1 => try handleUserMessage(allocator, state, pool, conn, payload),
             else => {},
         }
         _ = fin;
-        conn.read_buf.replaceRange(0, header_len + payload_len, &.{}) catch {};
+        conn.read_buf.replaceRange(allocator, 0, header_len + payload_len, &.{}) catch {};
     }
 }
+
+const AiTaskArgs = struct { allocator: std.mem.Allocator, state: *ServerState, conn: *Connection };
 
 fn handleUserMessage(allocator: std.mem.Allocator, state: *ServerState, pool: *std.Thread.Pool, conn: *Connection, msg: []const u8) !void {
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, msg, .{}) catch return;
@@ -332,7 +334,7 @@ fn handleUserMessage(allocator: std.mem.Allocator, state: *ServerState, pool: *s
     if (std.mem.eql(u8, msg_type.string, "ping")) {
         const pong = try protocol.buildPong(allocator);
         defer allocator.free(pong);
-        try appendWsFrame(&conn.write_buf, pong, .text);
+        try appendWsFrame(allocator, &conn.write_buf, pong, .text);
         return;
     }
 
@@ -345,13 +347,12 @@ fn handleUserMessage(allocator: std.mem.Allocator, state: *ServerState, pool: *s
         return;
     };
 
-    try conn.messages.append(.{
+    try conn.messages.append(allocator, .{
         .role = .user,
         .content = try allocator.dupe(u8, content),
     });
 
-    const Args = struct { allocator: std.mem.Allocator, state: *ServerState, conn: *Connection };
-    const args = try allocator.create(Args);
+    const args = try allocator.create(AiTaskArgs);
     args.* = .{ .allocator = allocator, .state = state, .conn = conn };
 
     pool.spawn(runAiTask, .{args}) catch |err| {
@@ -360,7 +361,7 @@ fn handleUserMessage(allocator: std.mem.Allocator, state: *ServerState, pool: *s
     };
 }
 
-fn runAiTask(args: *struct { allocator: std.mem.Allocator, state: *ServerState, conn: *Connection }) void {
+fn runAiTask(args: *AiTaskArgs) void {
     processAiStreaming(args.allocator, args.state, args.conn) catch |err| {
         std.log.err("AI Task failed: {s}", .{@errorName(err)});
     };
@@ -396,19 +397,19 @@ fn processAiStreaming(allocator: std.mem.Allocator, state: *ServerState, conn: *
 
     try ziggy_piai.stream.streamByModel(allocator, &state.http_client, &state.api_registry, model.?, context, .{ .api_key = api_key }, &events);
 
-    var response_text = std.ArrayList(u8).init(allocator);
-    defer response_text.deinit();
+    var response_text = std.ArrayListUnmanaged(u8){};
+    defer response_text.deinit(allocator);
 
     var response_sent = false;
     for (events.items) |event| {
         switch (event) {
-            .text_delta => |delta| try response_text.appendSlice(delta.delta),
+            .text_delta => |delta| try response_text.appendSlice(allocator, delta.delta),
             .done => |done| {
                 std.log.info("Response complete: {d} tokens", .{done.usage.total_tokens});
                 const final_text = if (done.text.len > 0) done.text else response_text.items;
                 if (final_text.len == 0) continue;
 
-                try conn.messages.append(.{ .role = .assistant, .content = try allocator.dupe(u8, final_text) });
+                try conn.messages.append(allocator, .{ .role = .assistant, .content = try allocator.dupe(u8, final_text) });
                 try sendSessionReceive(allocator, &conn.write_buf, final_text);
                 response_sent = true;
             },
@@ -421,7 +422,7 @@ fn processAiStreaming(allocator: std.mem.Allocator, state: *ServerState, conn: *
     }
 
     if (!response_sent and response_text.items.len > 0) {
-        try conn.messages.append(.{
+        try conn.messages.append(allocator, .{
             .role = .assistant,
             .content = try allocator.dupe(u8, response_text.items),
         });
@@ -429,27 +430,27 @@ fn processAiStreaming(allocator: std.mem.Allocator, state: *ServerState, conn: *
     }
 }
 
-fn sendSessionReceive(allocator: std.mem.Allocator, write_buf: *std.ArrayList(u8), content: []const u8) !void {
+fn sendSessionReceive(allocator: std.mem.Allocator, write_buf: *std.ArrayListUnmanaged(u8), content: []const u8) !void {
     const escaped = try protocol.jsonEscape(allocator, content);
     defer allocator.free(escaped);
 
     const response_json = try std.fmt.allocPrint(allocator, "{{\"type\":\"session.receive\",\"content\":\"{s}\"}}", .{escaped});
     defer allocator.free(response_json);
 
-    try appendWsFrame(write_buf, response_json, .text);
+    try appendWsFrame(allocator, write_buf, response_json, .text);
 }
 
-fn sendErrorJson(allocator: std.mem.Allocator, write_buf: *std.ArrayList(u8), message: []const u8) !void {
+fn sendErrorJson(allocator: std.mem.Allocator, write_buf: *std.ArrayListUnmanaged(u8), message: []const u8) !void {
     const escaped = try protocol.jsonEscape(allocator, message);
     defer allocator.free(escaped);
 
     const response_json = try std.fmt.allocPrint(allocator, "{{\"type\":\"error\",\"message\":\"{s}\"}}", .{escaped});
     defer allocator.free(response_json);
 
-    try appendWsFrame(write_buf, response_json, .text);
+    try appendWsFrame(allocator, write_buf, response_json, .text);
 }
 
-fn appendWsFrame(write_buf: *std.ArrayList(u8), payload: []const u8, comptime frame_type: enum { text, binary }) !void {
+fn appendWsFrame(allocator: std.mem.Allocator, write_buf: *std.ArrayListUnmanaged(u8), payload: []const u8, comptime frame_type: enum { text, binary }) !void {
     const opcode: u8 = switch (frame_type) {
         .text => 0x81,
         .binary => 0x82,
@@ -468,8 +469,8 @@ fn appendWsFrame(write_buf: *std.ArrayList(u8), payload: []const u8, comptime fr
         std.mem.writeInt(u64, header[2..10], payload.len, .big);
         header_len = 10;
     }
-    try write_buf.appendSlice(header[0..header_len]);
-    try write_buf.appendSlice(payload);
+    try write_buf.appendSlice(allocator, header[0..header_len]);
+    try write_buf.appendSlice(allocator, payload);
 }
 
 fn parseAgentId(request: []const u8) ?[]const u8 {
