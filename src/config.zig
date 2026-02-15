@@ -86,8 +86,20 @@ pub fn deinit(self: *Config) void {
 }
 
 fn defaultConfigPath(allocator: std.mem.Allocator) ![]const u8 {
+    if (@import("builtin").os.tag == .windows) {
+        const home = std.process.getEnvVarOwned(allocator, "USERPROFILE") catch {
+            const cwd = std.process.getCwdAlloc(allocator) catch return try allocator.dupe(u8, ".spiderweb.json");
+            defer allocator.free(cwd);
+            return try std.fs.path.join(allocator, &.{ cwd, ".spiderweb.json" });
+        };
+        defer allocator.free(home);
+        return try std.fs.path.join(allocator, &.{ home, ".spiderweb.json" });
+    }
+
     const home = std.process.getEnvVarOwned(allocator, "HOME") catch {
-        return allocator.dupe(u8, ".spiderweb.json");
+        const cwd = std.process.getCwdAlloc(allocator) catch return try allocator.dupe(u8, ".spiderweb.json");
+        defer allocator.free(cwd);
+        return try std.fs.path.join(allocator, &.{ cwd, ".spiderweb.json" });
     };
     defer allocator.free(home);
 
@@ -95,7 +107,10 @@ fn defaultConfigPath(allocator: std.mem.Allocator) ![]const u8 {
 }
 
 pub fn load(self: *Config) !void {
-    const file = try std.fs.openFileAbsolute(self.config_path, .{ .mode = .read_only });
+    const file = if (std.fs.path.isAbsolute(self.config_path))
+        try std.fs.openFileAbsolute(self.config_path, .{ .mode = .read_only })
+    else
+        try std.fs.cwd().openFile(self.config_path, .{ .mode = .read_only });
     defer file.close();
 
     const contents = try file.readToEndAlloc(self.allocator, 1024 * 1024);
@@ -169,12 +184,21 @@ pub fn load(self: *Config) !void {
 pub fn save(self: Config) !void {
     // Ensure parent directory exists
     if (std.fs.path.dirname(self.config_path)) |dir| {
-        std.fs.makeDirAbsolute(dir) catch |err| {
-            if (err != error.PathAlreadyExists) return err;
-        };
+        if (std.fs.path.isAbsolute(dir)) {
+            std.fs.makeDirAbsolute(dir) catch |err| {
+                if (err != error.PathAlreadyExists) return err;
+            };
+        } else {
+            std.fs.cwd().makePath(dir) catch |err| {
+                if (err != error.PathAlreadyExists) return err;
+            };
+        }
     }
 
-    const file = try std.fs.createFileAbsolute(self.config_path, .{ .truncate = true });
+    const file = if (std.fs.path.isAbsolute(self.config_path))
+        try std.fs.createFileAbsolute(self.config_path, .{ .truncate = true })
+    else
+        try std.fs.cwd().createFile(self.config_path, .{ .truncate = true });
     defer file.close();
 
     // Write JSON manually for control using a buffer for formatting

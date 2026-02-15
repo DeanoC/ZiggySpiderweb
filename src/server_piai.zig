@@ -3,7 +3,29 @@ const ziggy_piai = @import("ziggy-piai");
 const Config = @import("config.zig");
 const protocol = @import("protocol.zig");
 const posix = std.posix;
-const linux = std.os.linux;
+const builtin = @import("builtin");
+const linux = if (builtin.os.tag == .linux) std.os.linux else struct {
+    pub const epoll_event = extern struct {
+        events: u32,
+        data: extern union {
+            ptr: ?*anyopaque,
+            fd: posix.socket_t,
+            u32: u32,
+            u64: u64,
+        },
+    };
+    pub const EPOLL = struct {
+        pub const IN: u32 = 0x001;
+        pub const OUT: u32 = 0x004;
+        pub const ERR: u32 = 0x008;
+        pub const HUP: u32 = 0x010;
+        pub const RDHUP: u32 = 0x2000;
+        pub const ET: u32 = 1 << 31;
+        pub const CTL_ADD: i32 = 1;
+        pub const CTL_DEL: i32 = 2;
+        pub const CLOEXEC: u32 = 0o2000000;
+    };
+};
 
 const ServerState = struct {
     allocator: std.mem.Allocator,
@@ -59,19 +81,20 @@ const Event = struct {
     hup: bool,
 };
 
-const EventLoop = struct {
+const EventLoop = if (builtin.os.tag == .linux) struct {
     fd: posix.fd_t,
 
-    fn init() !EventLoop {
+    fn init(allocator: std.mem.Allocator) !EventLoop {
+        _ = allocator;
         const fd = try posix.epoll_create1(linux.EPOLL.CLOEXEC);
         return .{ .fd = fd };
     }
 
-    fn deinit(self: EventLoop) void {
+    fn deinit(self: *EventLoop) void {
         posix.close(self.fd);
     }
 
-    fn add(self: EventLoop, fd: posix.socket_t, events: u32) !void {
+    fn add(self: *EventLoop, fd: posix.socket_t, events: u32) !void {
         var ev = linux.epoll_event{
             .events = events,
             .data = .{ .fd = fd },
@@ -79,11 +102,11 @@ const EventLoop = struct {
         try posix.epoll_ctl(self.fd, linux.EPOLL.CTL_ADD, fd, &ev);
     }
 
-    fn remove(self: EventLoop, fd: posix.socket_t) void {
+    fn remove(self: *EventLoop, fd: posix.socket_t) void {
         posix.epoll_ctl(self.fd, linux.EPOLL.CTL_DEL, fd, null) catch {};
     }
 
-    fn wait(self: EventLoop, events_out: []Event) usize {
+    fn wait(self: *EventLoop, events_out: []Event) usize {
         var epoll_events: [64]linux.epoll_event = undefined;
         const n = posix.epoll_wait(self.fd, &epoll_events, -1);
         for (epoll_events[0..n], 0..) |ee, i| {
@@ -96,6 +119,62 @@ const EventLoop = struct {
             };
         }
         return n;
+    }
+} else struct {
+    pollfds: std.ArrayListUnmanaged(posix.pollfd),
+    allocator: std.mem.Allocator,
+
+    fn init(allocator: std.mem.Allocator) !EventLoop {
+        return .{
+            .pollfds = .{},
+            .allocator = allocator,
+        };
+    }
+
+    fn deinit(self: *EventLoop) void {
+        self.pollfds.deinit(self.allocator);
+    }
+
+    fn add(self: *EventLoop, fd: posix.socket_t, events: u32) !void {
+        var poll_events: i16 = 0;
+        if (events & linux.EPOLL.IN != 0) poll_events |= posix.POLL.IN;
+        if (events & linux.EPOLL.OUT != 0) poll_events |= posix.POLL.OUT;
+
+        try self.pollfds.append(self.allocator, .{
+            .fd = fd,
+            .events = poll_events,
+            .revents = 0,
+        });
+    }
+
+    fn remove(self: *EventLoop, fd: posix.socket_t) void {
+        for (self.pollfds.items, 0..) |pfd, i| {
+            if (pfd.fd == fd) {
+                _ = self.pollfds.swapRemove(i);
+                return;
+            }
+        }
+    }
+
+    fn wait(self: *EventLoop, events_out: []Event) usize {
+        const n = posix.poll(self.pollfds.items, -1) catch return 0;
+        if (n == 0) return 0;
+
+        var count: usize = 0;
+        for (self.pollfds.items) |pfd| {
+            if (pfd.revents != 0) {
+                events_out[count] = .{
+                    .fd = pfd.fd,
+                    .read = (pfd.revents & posix.POLL.IN) != 0,
+                    .write = (pfd.revents & posix.POLL.OUT) != 0,
+                    .err = (pfd.revents & (posix.POLL.ERR | posix.POLL.NVAL)) != 0,
+                    .hup = (pfd.revents & posix.POLL.HUP) != 0,
+                };
+                count += 1;
+                if (count == events_out.len) break;
+            }
+        }
+        return count;
     }
 };
 
@@ -126,14 +205,27 @@ pub fn run(allocator: std.mem.Allocator, bind_addr: []const u8, port: u16, provi
     };
 
     const addr = try std.net.Address.parseIp(bind_addr, port);
-    const sockfd = try posix.socket(addr.any.family, posix.SOCK.STREAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC, posix.IPPROTO.TCP);
+    const sock_flags = posix.SOCK.STREAM | (if (builtin.os.tag == .linux) posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC else 0);
+    const sockfd = try posix.socket(addr.any.family, sock_flags, posix.IPPROTO.TCP);
     defer posix.close(sockfd);
+
+    if (builtin.os.tag != .linux) {
+        if (builtin.os.tag == .windows) {
+            var mode: u32 = 1;
+            if (std.os.windows.ws2_32.ioctlsocket(sockfd, std.os.windows.ws2_32.FIONBIO, &mode) != 0) {
+                return error.SystemResources;
+            }
+        } else {
+            const flags = try posix.fcntl(sockfd, posix.F.GETFL, 0);
+            _ = try posix.fcntl(sockfd, posix.F.SETFL, flags | posix.O.NONBLOCK);
+        }
+    }
 
     try posix.setsockopt(sockfd, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
     try posix.bind(sockfd, &addr.any, addr.getOsSockLen());
     try posix.listen(sockfd, 128);
 
-    var loop = try EventLoop.init();
+    var loop = try EventLoop.init(allocator);
     defer loop.deinit();
 
     try loop.add(sockfd, linux.EPOLL.IN);
@@ -156,18 +248,31 @@ pub fn run(allocator: std.mem.Allocator, bind_addr: []const u8, port: u16, provi
         for (events[0..n]) |ev| {
             if (ev.fd == sockfd) {
                 while (true) {
-                    const conn_fd = posix.accept(sockfd, null, null, posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC) catch |err| {
+                    const accept_flags = if (builtin.os.tag == .linux) posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC else 0;
+                    const conn_fd = posix.accept(sockfd, null, null, accept_flags) catch |err| {
                         if (err == error.WouldBlock) break;
                         std.log.err("Accept failed: {s}", .{@errorName(err)});
                         break;
                     };
+
+                    if (builtin.os.tag != .linux) {
+                        if (builtin.os.tag == .windows) {
+                            var mode: u32 = 1;
+                            if (std.os.windows.ws2_32.ioctlsocket(conn_fd, std.os.windows.ws2_32.FIONBIO, &mode) != 0) {
+                                return error.SystemResources;
+                            }
+                        } else {
+                            const flags = try posix.fcntl(conn_fd, posix.F.GETFL, 0);
+                            _ = try posix.fcntl(conn_fd, posix.F.SETFL, flags | posix.O.NONBLOCK);
+                        }
+                    }
 
                     const conn = try allocator.create(Connection);
                     conn.* = Connection.init(conn_fd);
                     try connections.put(conn_fd, conn);
 
                     try loop.add(conn_fd, linux.EPOLL.IN | linux.EPOLL.OUT | linux.EPOLL.ET);
-                    std.log.info("New connection: fd={d}", .{conn_fd});
+                    std.log.info("New connection: fd={any}", .{conn_fd});
                 }
             } else {
                 const conn_fd = ev.fd;
@@ -175,7 +280,7 @@ pub fn run(allocator: std.mem.Allocator, bind_addr: []const u8, port: u16, provi
 
                 if (ev.read) {
                     handleRead(allocator, &state, &pool, conn) catch |err| {
-                        std.log.err("Read error on fd {d}: {s}", .{ conn_fd, @errorName(err) });
+                        std.log.err("Read error on fd {any}: {s}", .{ conn_fd, @errorName(err) });
                         _ = connections.remove(conn_fd);
                         loop.remove(conn_fd);
                         conn.deinit(allocator);
@@ -186,7 +291,7 @@ pub fn run(allocator: std.mem.Allocator, bind_addr: []const u8, port: u16, provi
 
                 if (ev.write) {
                     handleWrite(allocator, conn) catch |err| {
-                        std.log.err("Write error on fd {d}: {s}", .{ conn_fd, @errorName(err) });
+                        std.log.err("Write error on fd {any}: {s}", .{ conn_fd, @errorName(err) });
                         _ = connections.remove(conn_fd);
                         loop.remove(conn_fd);
                         conn.deinit(allocator);
@@ -196,7 +301,7 @@ pub fn run(allocator: std.mem.Allocator, bind_addr: []const u8, port: u16, provi
                 }
 
                 if (ev.hup or ev.err) {
-                    std.log.info("Closing connection fd={d}", .{conn_fd});
+                    std.log.info("Closing connection fd={any}", .{conn_fd});
                     _ = connections.remove(conn_fd);
                     loop.remove(conn_fd);
                     conn.deinit(allocator);
