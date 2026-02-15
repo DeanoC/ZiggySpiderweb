@@ -3,6 +3,7 @@ const ziggy_piai = @import("ziggy-piai");
 const Config = @import("config.zig");
 const protocol = @import("protocol.zig");
 const memory = @import("memory.zig");
+const ltm_index = @import("ltm_index.zig");
 const posix = std.posix;
 const builtin = @import("builtin");
 const linux = if (builtin.os.tag == .linux) std.os.linux else struct {
@@ -806,6 +807,8 @@ fn archiveSessionRamToLongTerm(
     const timestamp = std.time.milliTimestamp();
     const filename = try std.fmt.allocPrint(allocator, "{s}-{d}.json", .{ session_name, timestamp });
     defer allocator.free(filename);
+    const archive_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ LONG_TERM_ARCHIVE_DIR, filename });
+    defer allocator.free(archive_path);
 
     var file = try ltm_dir.createFile(filename, .{ .truncate = true });
     defer file.close();
@@ -858,6 +861,16 @@ fn archiveSessionRamToLongTerm(
     }
 
     try file.writeAll("]}");
+    try ltm_index.appendArchiveIndex(allocator, LONG_TERM_ARCHIVE_DIR, .{
+        .version = ltm_index.LtmIndexVersion,
+        .timestamp_ms = timestamp,
+        .session_id = session_name,
+        .reason = reason,
+        .archive_path = archive_path,
+        .next_id = session.ram.next_id,
+        .entry_count = session.ram.entries.items.len,
+        .summary_count = session.ram.summaries.items.len,
+    });
     return true;
 }
 
