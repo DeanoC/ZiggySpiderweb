@@ -1,4 +1,4 @@
-# M1→M6 Handoff (Runtime Milestones)
+# M1→M10 Handoff (Runtime Milestones)
 
 ## Current milestone status (repository snapshot)
 
@@ -10,6 +10,9 @@
 - **M6 (Memory manager worker)**: implemented with bounded RAM compacting + snapshot events.
 - **M7 (Heartbeat worker v1)**: implemented with interval-based websocket session sweep + manual heartbeat control action.
 - **M8 (Protocol-flow harness)**: expanded end-to-end mock-backed websocket chat validation.
+  - includes reconnect restore from persisted in-memory sessions and long-term snapshot store.
+- **M9 (Queue discipline & saturation)**: added worker admission cap with dropped-task telemetry in plan dispatch.
+- **M10 (Reconnect-aware saturation telemetry)**: implemented resume-aware session persistence and prolonged backpressure signaling.
 
 ## What is implemented
 
@@ -77,24 +80,43 @@
 ### M8 / Protocol-flow harness (`src/server_piai.zig`)
 - Added test for websocket-style handshake + `chat.send` flow using mocked provider callback.
 - Verifies `session.ack` frame and outbound `session.receive` from mocked stream on the same connection path.
+- Added handshake-restoration test verifying persisted session context is recovered by session key.
+- Added handshake reconnect test that restores session context from a long-term snapshot.
+- Added provider-stream error mock test asserting `error` payload is emitted on stream failure.
+
+### M9 / Saturation and backpressure (`src/server_piai.zig`)
+- Added `WORKER_MAX_TASKS_PER_DISPATCH` cap for worker dispatch admission.
+- Added planner saturation progress telemetry when a plan exceeds dispatch cap (`status: "saturated"`).
+- Added test coverage for worker admission cap and reduced dispatched worker status count on saturation.
+
+### M10 / Reconnect-aware saturation (`src/server_piai.zig`)
+- Extended persisted session state (`SESSION_STATE_VERSION=2`) with worker context:
+  - queue depth, active tasks, worker mode
+  - dropped-task count, saturation timestamp
+  - backpressure-notified flag, last goal snapshot
+- Persisted restore path now rehydrates worker backpressure context and last goal:
+  - handshake sends reconnect progress (`phase: "reconnect"`) with `status: "state_restored"` or `"backpressure_resumed"`
+  - zero-backlog sessions restore from in-memory snapshot only; sessions with backlog resume with telemetry.
+- Added long-running saturation path in heartbeat loop:
+  - after `WORKER_BACKPRESSURE_WARNING_MS`, emits `agent.progress` with `phase: "planner"` and `status: "prolonged_saturation"`.
+- Added `sendAgentProgressWithBackpressure(...)` for compact metric payload (`accepted`, `total`, `dropped`, `queued`, `active`).
+- Updated test coverage:
+  - admission saturation event verifies backpressure metrics are included.
+  - handshake reconnect tests verify `reconnect` progress for restored state and backlog resume.
+  - heartbeat prolonged saturation test verifies delayed escalated progress emission.
 
 ## Known remaining holes
 
 1. Worker behavior is deterministic/stubbed local text logic; it is not yet connected to any long-running tooling or stateful sub-brain side effects.
-2. Full queue/backpressure policy (saturation, dropped work, queued deadlines) is still missing.
-3. Runtime tests for websocket load and sustained saturation remain open.
-4. Memory-manager scheduling is still coarse and only runs opportunistically during inbound messages.
-5. `agent.state` contract is still evolving for future worker lifecycle states (`blocked`, `heartbeat`, etc.).
-6. `memory.event` contract is intentionally minimal and should be expanded for richer memory-manager diagnostics.
-7. Heartbeat suggestions currently stay telemetry-only and do not include explicit escalation or action-recommendation payloads.
-8. M8 harness still missing reconnect restore + error-path assertions for streaming/provider failures.
+2. Runtime tests for websocket load and sustained saturation remain open.
+3. Memory-manager scheduling is still coarse and only runs opportunistically during inbound messages.
+4. `memory.event` contract is intentionally minimal and should be expanded for richer memory-manager diagnostics.
+5. Heartbeat suggestions currently stay telemetry-only and do not include explicit escalation or action-recommendation payloads.
+6. Heartbeat failure-mode recommendations are still advisory only (telemetry without explicit suggestion payloads).
 
 ## Next milestone recommendations
 
-1. Move M6 to "complete" by stabilizing snapshot policy and memory-manager scheduling.
-   - tune summary trigger/snapshot policy for stable context retention
-   - broaden `memory.event` payloads for observability
-   - bounded queueing/metrics and saturation behavior
-2. Move M7 to "complete" by expanding heartbeat output with suggestion/action fields and sweep performance telemetry.
-3. Move M8 to "complete" by covering reconnect restore and streaming failure scenarios in websocket-flow tests.
-4. Keep `agent.status` semantics stable as additive telemetry while extending `agent.control`, `/goal`, and heartbeat runtime tests.
+1. Tighten protocol contract for backpressure fields in `agent.progress` payload (`accepted`, `total`, `dropped`, `queued`, `active`) with explicit schema docs.
+2. Add reconnect test coverage for bursty, sustained saturation under mixed pause/cancel modes.
+3. Add explicit operator action to clear worker-saturation state for a "fresh RAM" recovery path while preserving persisted RAM history in LTM.
+4. Expand load/perf coverage for prolonged saturation events under concurrent websocket sessions.
