@@ -134,6 +134,8 @@ const Connection = struct {
     read_buf: std.ArrayListUnmanaged(u8),
     write_buf: std.ArrayListUnmanaged(u8),
     session: SessionContext,
+    // Atomic flag to indicate connection is being closed (for thread safety)
+    closing: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     fn init(allocator: std.mem.Allocator, fd: posix.socket_t) Connection {
         return .{
@@ -143,10 +145,12 @@ const Connection = struct {
             .read_buf = .{},
             .write_buf = .{},
             .session = SessionContext.init(allocator),
+            .closing = std.atomic.Value(bool).init(false),
         };
     }
 
     fn deinit(self: *Connection, allocator: std.mem.Allocator) void {
+        self.closing.store(true, .release);
         allocator.free(self.agent_id);
         self.read_buf.deinit(allocator);
         self.write_buf.deinit(allocator);
@@ -958,6 +962,15 @@ fn processAiStreaming(
     request_id: []const u8,
     is_planned_goal: bool,
 ) !void {
+    // Check if connection is already closing
+    if (conn.closing.load(.acquire)) {
+        std.log.warn("AI Task skipped: connection closing session={s} request={s}", .{
+            conn.session.session_id,
+            request_id,
+        });
+        return error.ConnectionClosed;
+    }
+
     var model: ?ziggy_piai.types.Model = null;
     for (state.model_registry.models.items) |m| {
         if (std.mem.eql(u8, m.provider, state.provider_config.name)) {
@@ -974,6 +987,7 @@ fn processAiStreaming(
         return;
     }
     if (is_planned_goal) {
+        if (conn.closing.load(.acquire)) return error.ConnectionClosed;
         try sendAgentProgress(allocator, &conn.write_buf, request_id, conn.session.session_id, "execution", "started", "Primary Brain invoking model");
     }
 
@@ -1031,6 +1045,15 @@ fn processAiStreaming(
     var response_sent = false;
     var execution_completed = false;
     for (events.items) |event| {
+        // Check if connection closed before processing each event
+        if (conn.closing.load(.acquire)) {
+            std.log.warn("AI Task: connection closed mid-stream session={s} request={s}", .{
+                conn.session.session_id,
+                request_id,
+            });
+            return error.ConnectionClosed;
+        }
+
         switch (event) {
             .text_delta => |delta| try response_text.appendSlice(allocator, delta.delta),
             .done => |done| {
@@ -1056,12 +1079,14 @@ fn processAiStreaming(
     }
 
     if (!response_sent and response_text.items.len > 0) {
+        if (conn.closing.load(.acquire)) return error.ConnectionClosed;
         const assistant_msg_id = try conn.session.appendMessage(allocator, .assistant, response_text.items);
         try sendSessionReceive(allocator, &conn.write_buf, request_id, response_text.items, assistant_msg_id);
         execution_completed = true;
     }
 
     if (is_planned_goal) {
+        if (conn.closing.load(.acquire)) return error.ConnectionClosed;
         if (execution_completed) {
             try sendAgentProgress(allocator, &conn.write_buf, request_id, conn.session.session_id, "execution", "complete", "Primary Brain response emitted");
         } else {
