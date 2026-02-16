@@ -2155,10 +2155,16 @@ fn handleAgentCreate(
         }
     }
 
-    // Check if agent already exists
-    if (state.agent_registry.getAgent(agent_id.?)) |_| {
-        try sendErrorJsonDirect(allocator, conn, "Agent already exists");
-        return;
+    // Check if agent already exists (ignore synthetic placeholder during first-boot)
+    if (state.agent_registry.getAgent(agent_id.?)) |existing| {
+        // Allow creating "default" if it's just the synthetic placeholder (first-boot state)
+        const is_synthetic_placeholder = std.mem.eql(u8, existing.id, "default") and
+            !existing.needs_hatching and
+            !existing.identity_loaded;
+        if (!is_synthetic_placeholder) {
+            try sendErrorJsonDirect(allocator, conn, "Agent already exists");
+            return;
+        }
     }
 
     state.agent_registry.createAgent(agent_id.?, template) catch |err| {

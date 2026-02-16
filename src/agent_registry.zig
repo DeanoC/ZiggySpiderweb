@@ -313,18 +313,18 @@ pub const AgentRegistry = struct {
 
     /// Create a new agent with HATCH.md
     pub fn createAgent(self: *AgentRegistry, agent_id: []const u8, template_path: ?[]const u8) !void {
-        // Create agent directory
-        const agent_path = try std.fs.path.join(self.allocator, &.{ self.base_dir, "agents", agent_id });
-        defer self.allocator.free(agent_path);
-
-        try std.fs.cwd().makePath(agent_path);
-
-        // Determine template source
+        // Load template source FIRST (before any filesystem mutation)
         const template_source = if (template_path) |tp|
             try std.fs.cwd().readFileAlloc(self.allocator, tp, 64 * 1024)
         else
             try self.loadDefaultHatchTemplate();
         defer self.allocator.free(template_source);
+
+        // Create agent directory
+        const agent_path = try std.fs.path.join(self.allocator, &.{ self.base_dir, "agents", agent_id });
+        defer self.allocator.free(agent_path);
+
+        try std.fs.cwd().makePath(agent_path);
 
         // Write HATCH.md
         const hatch_path = try std.fs.path.join(self.allocator, &.{ agent_path, "HATCH.md" });

@@ -205,18 +205,18 @@ test "readHatchFile returns null for hatched agent" {
 
 test "agent list includes needs_hatching flag" {
     const allocator = std.testing.allocator;
-    
+
     const test_dir = try setupTestDir(allocator, "list");
     defer allocator.free(test_dir);
     defer cleanupTestDir(test_dir);
-    
+
     var registry = try AgentRegistry.init(allocator, test_dir);
     defer registry.deinit();
-    
+
     try registry.createAgent("list-agent", null);
-    
+
     const agents = registry.listAgents();
-    
+
     // Find our agent
     var found = false;
     for (agents) |agent| {
@@ -227,4 +227,60 @@ test "agent list includes needs_hatching flag" {
         }
     }
     try std.testing.expect(found);
+}
+
+test "createAgent does not create directory on bad template path" {
+    const allocator = std.testing.allocator;
+
+    const test_dir = try setupTestDir(allocator, "bad-template");
+    defer allocator.free(test_dir);
+    defer cleanupTestDir(test_dir);
+
+    var registry = try AgentRegistry.init(allocator, test_dir);
+    defer registry.deinit();
+
+    // Verify in first-boot state before
+    try std.testing.expect(registry.isFirstBoot());
+
+    // Attempt to create agent with non-existent template
+    const result = registry.createAgent("test-agent", "/nonexistent/template.md");
+    try std.testing.expectError(error.FileNotFound, result);
+
+    // Verify still in first-boot state (no directory created)
+    try std.testing.expect(registry.isFirstBoot());
+
+    // Verify no agent directory was created
+    const agent_path = try std.fs.path.join(allocator, &.{ test_dir, "agents", "test-agent" });
+    defer allocator.free(agent_path);
+    std.fs.cwd().access(agent_path, .{}) catch |err| {
+        try std.testing.expectEqual(error.FileNotFound, err);
+        return;
+    };
+    return error.TestExpectedError;
+}
+
+test "can create agent named default during first-boot" {
+    const allocator = std.testing.allocator;
+
+    const test_dir = try setupTestDir(allocator, "default-firstboot");
+    defer allocator.free(test_dir);
+    defer cleanupTestDir(test_dir);
+
+    var registry = try AgentRegistry.init(allocator, test_dir);
+    defer registry.deinit();
+
+    // Verify in first-boot state (synthetic placeholder exists)
+    try std.testing.expect(registry.isFirstBoot());
+
+    // Should be able to create a real agent named "default" during first-boot
+    // (the synthetic placeholder should be ignored for collision check)
+    try registry.createAgent("default", null);
+
+    // Verify agent was created
+    const agent = registry.getAgent("default");
+    try std.testing.expect(agent != null);
+    try std.testing.expect(agent.?.needs_hatching);
+
+    // Verify no longer in first-boot
+    try std.testing.expect(!registry.isFirstBoot());
 }
