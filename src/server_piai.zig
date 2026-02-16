@@ -2264,7 +2264,13 @@ fn handleFirstBootInit(
 
     const actual_agent_id = agent_id orelse "first-agent";
 
-    // Validate agent_id
+    // Validate agent_id is not empty
+    if (actual_agent_id.len == 0) {
+        try sendErrorJsonDirect(allocator, conn, "agent_id cannot be empty");
+        return;
+    }
+
+    // Validate agent_id characters
     for (actual_agent_id) |c| {
         if (!std.ascii.isAlphanumeric(c) and c != '-' and c != '_') {
             try sendErrorJsonDirect(allocator, conn, "agent_id must be alphanumeric, hyphens, or underscores");

@@ -49,10 +49,10 @@ You wake fresh each session. These files ARE your memory.
 When complete, respond with:
 
 ```json
-{"type":"agent.hatched","name":"<your name>","files":["SOUL.md"]}
+{"type":"agent.hatch","agent_id":"<your name>"}
 ```
 
-Then delete this HATCH.md. You won't need it again.
+The server will confirm with `agent.hatched` and delete this HATCH.md. You won't need it again.
 
 ## Remember
 

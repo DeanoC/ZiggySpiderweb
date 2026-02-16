@@ -348,9 +348,10 @@ pub const AgentRegistry = struct {
                 "\n" ++
                 "## Your Task\n" ++
                 "Create your identity by writing SOUL.md, then respond with:\n" ++
-                "{\"type\":\"agent.hatched\",\"name\":\"YourName\",\"files\":[\"SOUL.md\"]}\n" ++
+                "{\"type\":\"agent.hatch\",\"agent_id\":\"YourName\"}\n" ++
                 "\n" ++
-                "Then delete this HATCH.md. You won't need it again.\n"
+                "The server will confirm with agent.hatched and delete this HATCH.md.\n" ++
+                "You won't need it again.\n"
             );
         };
     }
