@@ -1014,13 +1014,15 @@ fn handleUserMessage(allocator: std.mem.Allocator, state: *ServerState, pool: *s
             "\n" ++
             "What would you like to name your first agent? (e.g., 'assistant', 'ziggy', 'helper')";
 
+        const escaped_request_id = try protocol.jsonEscape(allocator, request_id);
+        defer allocator.free(escaped_request_id);
         const escaped_welcome = try protocol.jsonEscape(allocator, welcome_msg);
         defer allocator.free(escaped_welcome);
 
         const welcome_payload = try std.fmt.allocPrint(
             allocator,
-            "{{\"type\":\"session.receive\",\"request\":\"first-boot\",\"role\":\"assistant\",\"content\":\"{s}\"}}",
-            .{escaped_welcome},
+            "{{\"type\":\"session.receive\",\"request\":\"{s}\",\"role\":\"assistant\",\"content\":\"{s}\"}}",
+            .{escaped_request_id, escaped_welcome},
         );
         defer allocator.free(welcome_payload);
         try sendDirect(allocator, conn, welcome_payload);
@@ -2385,6 +2387,10 @@ fn handleFirstBootChat(
         try sendDirect(allocator, conn, payload);
         return;
     };
+
+    // Update connection context to the newly created agent
+    allocator.free(conn.agent_id);
+    conn.agent_id = try allocator.dupe(u8, trimmed);
 
     // Read the HATCH.md content to present to the user
     const hatch_content = state.agent_registry.readHatchFile(trimmed) catch |err| blk: {
