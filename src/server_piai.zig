@@ -2223,6 +2223,16 @@ fn handleAgentHatch(
         return;
     };
 
+    // Reload identity prompt now that agent has created identity files
+    const new_prompt = identity.loadMergedPrompt(allocator, ".", agent_id.?) catch |err| blk: {
+        std.log.warn("Identity reload failed after hatching for agent={s}: {s}", .{ agent_id.?, @errorName(err) });
+        break :blk try allocator.dupe(u8, "You are a helpful AI assistant.");
+    };
+    try conn.session.setIdentityPrompt(allocator, new_prompt);
+    if (new_prompt.ptr != conn.session.identity_prompt.ptr) {
+        allocator.free(new_prompt);
+    }
+
     const escaped_request_id = try protocol.jsonEscape(allocator, request_id);
     defer allocator.free(escaped_request_id);
     const escaped_agent_id = try protocol.jsonEscape(allocator, agent_id.?);
