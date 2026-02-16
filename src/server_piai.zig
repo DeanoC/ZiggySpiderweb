@@ -2155,13 +2155,15 @@ fn handleAgentCreate(
         }
     }
 
-    // Check if agent already exists (ignore synthetic placeholder during first-boot)
+    // Check if agent already exists (ignore synthetic placeholder only during first-boot)
     if (state.agent_registry.getAgent(agent_id.?)) |existing| {
-        // Allow creating "default" if it's just the synthetic placeholder (first-boot state)
+        // Allow creating "default" only if it's the synthetic placeholder AND we're in first-boot
+        // (i.e., no real agent subdirectories exist yet)
+        const is_first_boot = state.agent_registry.isFirstBoot();
         const is_synthetic_placeholder = std.mem.eql(u8, existing.id, "default") and
             !existing.needs_hatching and
             !existing.identity_loaded;
-        if (!is_synthetic_placeholder) {
+        if (!is_synthetic_placeholder or !is_first_boot) {
             try sendErrorJsonDirect(allocator, conn, "Agent already exists");
             return;
         }

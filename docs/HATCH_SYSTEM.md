@@ -19,12 +19,16 @@ Client sends: {"type":"chat.send","content":"ziggy"}
                  ↓
 Server creates: agents/ziggy/HATCH.md
                  ↓
-Server responds: {"type":"session.receive","content":"Perfect! I've created your first agent..."}
+Server responds: {"type":"session.receive","content":"Perfect! I've created your first agent... (HATCH.md content)", "agent_id":"ziggy", "needs_hatching":true}
                  ↓
-Server sends: {"type":"agent.hatched","agent_id":"ziggy","first_boot":true}
+[Agent reads HATCH.md and creates identity files]
+                 ↓
+Client sends: {"type":"agent.hatch","agent_id":"ziggy"}
+                 ↓
+Server sends: {"type":"agent.hatched","agent_id":"ziggy","success":true}
 ```
 
-The **server drives the first-boot flow** — the client is just a terminal that displays messages and collects user input.
+The **server drives the first-boot flow** — the client is just a terminal that displays messages and collects user input. The agent must still complete the normal hatch flow by sending `agent.hatch`.
 
 ### First Boot Protocol
 
@@ -52,19 +56,19 @@ The **server drives the first-boot flow** — the client is just a terminal that
 {
   "type": "session.receive",
   "role": "assistant",
-  "content": "Perfect! I've created your first agent...",
+  "content": "Perfect! I've created your first agent... (includes HATCH.md content)",
   "agent_id": "my-agent-name",
   "needs_hatching": true
 }
 ```
 
-**Server also sends:**
+**Agent completes hatching:**
 ```json
-{
-  "type": "agent.hatched",
-  "agent_id": "my-agent-name",
-  "first_boot": true
-}
+// Client sends after agent creates identity files
+{"type":"agent.hatch","agent_id":"my-agent-name"}
+
+// Server responds
+{"type":"agent.hatched","agent_id":"my-agent-name","success":true}
 ```
 
 ## Regular Agent Creation Flow
