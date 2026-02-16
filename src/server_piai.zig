@@ -1004,8 +1004,8 @@ fn handleUserMessage(allocator: std.mem.Allocator, state: *ServerState, pool: *s
     const is_chat_send = std.mem.eql(u8, msg_type.string, "chat.send") or std.mem.eql(u8, msg_type.string, "session.send");
 
     // Check for first-boot welcome (send on first CHAT message after handshake)
-    // This must intercept chat messages before normal routing
-    if (conn.first_boot_pending and is_chat_send) {
+    // Must also verify server is still in first-boot state (could have been completed via non-chat path)
+    if (conn.first_boot_pending and is_chat_send and state.agent_registry.isFirstBoot()) {
         conn.first_boot_pending = false;
         const welcome_msg =
             "Welcome to ZiggySpiderweb!\n" ++
@@ -2410,14 +2410,9 @@ fn handleFirstBootChat(
 
     try sendDirect(allocator, conn, payload);
 
-    // Also send agent.hatched message to indicate first boot is done
-    const hatched_payload = try std.fmt.allocPrint(
-        allocator,
-        "{{\"type\":\"agent.hatched\",\"request\":\"{s}\",\"agent_id\":\"{s}\",\"first_boot\":true}}",
-        .{ escaped_request_id, trimmed },
-    );
-    defer allocator.free(hatched_payload);
-    try sendDirect(allocator, conn, hatched_payload);
+    // Note: We do NOT send agent.hatched here - the agent still needs to hatch
+    // Client should send agent.hatch when hatching is complete, then handleAgentHatch
+    // will send the proper agent.hatched response
 }
 
 fn sendErrorJsonDirect(
