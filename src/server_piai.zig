@@ -14,9 +14,12 @@ pub fn run(
     provider_config: Config.ProviderConfig,
     runtime_config: Config.RuntimeConfig,
 ) !void {
-    _ = provider_config;
-
-    const runtime_server = try RuntimeServer.create(allocator, runtime_server_mod.default_agent_id, runtime_config);
+    const runtime_server = try RuntimeServer.createWithProvider(
+        allocator,
+        runtime_server_mod.default_agent_id,
+        runtime_config,
+        provider_config,
+    );
     defer runtime_server.destroy();
 
     const address = try std.net.Address.parseIp(bind_addr, port);
@@ -85,14 +88,21 @@ fn handleWebSocketConnection(
 
         switch (frame.opcode) {
             0x1 => {
-                const response = runtime_server.handleMessage(frame.payload) catch |err| try protocol.buildErrorWithCode(
-                    allocator,
-                    "unknown",
-                    .execution_failed,
-                    @errorName(err),
-                );
-                defer allocator.free(response);
-                try websocket_transport.writeFrame(stream, response, .text);
+                const responses = runtime_server.handleMessageFrames(frame.payload) catch |err| blk: {
+                    const fallback = try protocol.buildErrorWithCode(
+                        allocator,
+                        "unknown",
+                        .execution_failed,
+                        @errorName(err),
+                    );
+                    const wrapped = try allocator.alloc([]u8, 1);
+                    wrapped[0] = fallback;
+                    break :blk wrapped;
+                };
+                defer runtime_server_mod.deinitResponseFrames(allocator, responses);
+                for (responses) |response| {
+                    try websocket_transport.writeFrame(stream, response, .text);
+                }
             },
             0x8 => {
                 try websocket_transport.writeFrame(stream, "", .close);
@@ -279,10 +289,21 @@ test "server_piai: websocket path handles connect/session.send and rejects chat.
     try std.testing.expect(std.mem.indexOf(u8, connect_ack.payload, "\"type\":\"connect.ack\"") != null);
 
     try writeClientTextFrameMasked(&client, "{\"id\":\"req-session\",\"type\":\"session.send\",\"content\":\"hello\"}");
-    var session_reply = try readServerFrame(allocator, &client);
-    defer session_reply.deinit(allocator);
-    try std.testing.expectEqual(@as(u8, 0x1), session_reply.opcode);
-    try std.testing.expect(std.mem.indexOf(u8, session_reply.payload, "\"type\":\"session.receive\"") != null);
+    var saw_session_receive = false;
+    var saw_tool_event = false;
+    var saw_memory_event = false;
+    var frame_count: usize = 0;
+    while (frame_count < 4) : (frame_count += 1) {
+        var session_frame = try readServerFrame(allocator, &client);
+        defer session_frame.deinit(allocator);
+        try std.testing.expectEqual(@as(u8, 0x1), session_frame.opcode);
+        if (std.mem.indexOf(u8, session_frame.payload, "\"type\":\"session.receive\"") != null) saw_session_receive = true;
+        if (std.mem.indexOf(u8, session_frame.payload, "\"type\":\"tool.event\"") != null) saw_tool_event = true;
+        if (std.mem.indexOf(u8, session_frame.payload, "\"type\":\"memory.event\"") != null) saw_memory_event = true;
+    }
+    try std.testing.expect(saw_session_receive);
+    try std.testing.expect(saw_tool_event);
+    try std.testing.expect(saw_memory_event);
 
     try writeClientTextFrameMasked(&client, "{\"id\":\"req-chat\",\"type\":\"chat.send\",\"content\":\"legacy\"}");
     var legacy_reply = try readServerFrame(allocator, &client);
