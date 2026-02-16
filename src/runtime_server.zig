@@ -1,0 +1,596 @@
+const std = @import("std");
+const Config = @import("config.zig");
+const protocol = @import("protocol.zig");
+const agent_runtime = @import("agent_runtime.zig");
+
+pub const default_agent_id = "default";
+const DEFAULT_BRAIN = "primary";
+const INTERNAL_TICK_TIMEOUT_MS: i64 = 5 * 1000;
+
+const RuntimeServerError = error{
+    RuntimeTickTimeout,
+    RuntimeJobTimeout,
+    MissingJobResponse,
+};
+
+const RuntimeOperationClass = enum {
+    chat,
+    control,
+};
+
+const RuntimeQueueJob = struct {
+    msg_type: protocol.MessageType,
+    request_id: []u8,
+    content: ?[]u8,
+    action: ?[]u8,
+
+    result_mutex: std.Thread.Mutex = .{},
+    result_cond: std.Thread.Condition = .{},
+    done: bool = false,
+    cancelled: bool = false,
+    response: ?[]u8 = null,
+};
+
+pub const RuntimeServer = struct {
+    allocator: std.mem.Allocator,
+    runtime: agent_runtime.AgentRuntime,
+
+    runtime_mutex: std.Thread.Mutex = .{},
+    queue_mutex: std.Thread.Mutex = .{},
+    queue_cond: std.Thread.Condition = .{},
+    runtime_queue_max: usize = 128,
+    chat_operation_timeout_ms: u64 = 30_000,
+    control_operation_timeout_ms: u64 = 5_000,
+    runtime_jobs: std.ArrayListUnmanaged(*RuntimeQueueJob) = .{},
+    runtime_workers: []std.Thread,
+    stopping: bool = false,
+
+    pub fn create(allocator: std.mem.Allocator, agent_id: []const u8, runtime_cfg: Config.RuntimeConfig) !*RuntimeServer {
+        const worker_count = if (runtime_cfg.runtime_worker_threads == 0) 1 else runtime_cfg.runtime_worker_threads;
+
+        const self = try allocator.create(RuntimeServer);
+        errdefer allocator.destroy(self);
+
+        self.* = .{
+            .allocator = allocator,
+            .runtime = try agent_runtime.AgentRuntime.initWithPersistence(
+                allocator,
+                agent_id,
+                &[_][]const u8{"delegate"},
+                if (runtime_cfg.ltm_directory.len == 0) null else runtime_cfg.ltm_directory,
+                if (runtime_cfg.ltm_filename.len == 0) null else runtime_cfg.ltm_filename,
+            ),
+            .runtime_queue_max = runtime_cfg.runtime_request_queue_max,
+            .chat_operation_timeout_ms = runtime_cfg.chat_operation_timeout_ms,
+            .control_operation_timeout_ms = runtime_cfg.control_operation_timeout_ms,
+            .runtime_workers = try allocator.alloc(std.Thread, worker_count),
+        };
+        errdefer {
+            self.runtime.deinit();
+            allocator.free(self.runtime_workers);
+        }
+
+        self.runtime.queue_limits = .{
+            .inbound_events = runtime_cfg.inbound_queue_max,
+            .brain_ticks = runtime_cfg.brain_tick_queue_max,
+            .outbound_messages = runtime_cfg.outbound_queue_max,
+            .control_events = runtime_cfg.control_queue_max,
+        };
+
+        var launched: usize = 0;
+        errdefer {
+            self.queue_mutex.lock();
+            self.stopping = true;
+            self.queue_cond.broadcast();
+            self.queue_mutex.unlock();
+
+            var i: usize = 0;
+            while (i < launched) : (i += 1) {
+                self.runtime_workers[i].join();
+            }
+        }
+
+        while (launched < self.runtime_workers.len) : (launched += 1) {
+            self.runtime_workers[launched] = try std.Thread.spawn(.{}, runtimeWorkerMain, .{self});
+        }
+
+        return self;
+    }
+
+    pub fn destroy(self: *RuntimeServer) void {
+        self.queue_mutex.lock();
+        self.stopping = true;
+        self.queue_cond.broadcast();
+        self.queue_mutex.unlock();
+
+        for (self.runtime_workers) |worker| {
+            worker.join();
+        }
+
+        self.queue_mutex.lock();
+        for (self.runtime_jobs.items) |job| {
+            self.destroyJob(job);
+        }
+        self.runtime_jobs.deinit(self.allocator);
+        self.queue_mutex.unlock();
+
+        self.allocator.free(self.runtime_workers);
+        self.runtime.deinit();
+        self.allocator.destroy(self);
+    }
+
+    pub fn handleMessage(self: *RuntimeServer, raw_json: []const u8) ![]u8 {
+        var parsed = protocol.parseMessage(self.allocator, raw_json) catch {
+            return protocol.buildErrorWithCode(self.allocator, "unknown", .invalid_envelope, "invalid request envelope");
+        };
+        defer protocol.deinitParsedMessage(self.allocator, &parsed);
+
+        const request_id = parsed.id orelse "generated";
+
+        switch (parsed.msg_type) {
+            .connect => {
+                return protocol.buildConnectAck(self.allocator, request_id);
+            },
+            .ping => {
+                return protocol.buildPong(self.allocator);
+            },
+            .session_send => {
+                return self.submitRuntimeJobAndAwait(parsed.msg_type, request_id, parsed.content, parsed.action, .chat);
+            },
+            .agent_control => {
+                return self.submitRuntimeJobAndAwait(parsed.msg_type, request_id, parsed.content, parsed.action, .control);
+            },
+            else => {
+                return protocol.buildErrorWithCode(self.allocator, request_id, .unsupported_message_type, "unsupported message type");
+            },
+        }
+    }
+
+    fn submitRuntimeJobAndAwait(
+        self: *RuntimeServer,
+        msg_type: protocol.MessageType,
+        request_id: []const u8,
+        content: ?[]const u8,
+        action: ?[]const u8,
+        operation_class: RuntimeOperationClass,
+    ) ![]u8 {
+        const job = try self.createJob(msg_type, request_id, content, action);
+        errdefer self.destroyJob(job);
+
+        const enqueued = try self.enqueueJob(job);
+        if (!enqueued) {
+            self.destroyJob(job);
+            return protocol.buildErrorWithCode(self.allocator, request_id, .queue_saturated, "runtime request queue saturated");
+        }
+
+        return self.waitForJob(job, operation_class) catch |err| switch (err) {
+            RuntimeServerError.RuntimeJobTimeout => {
+                return protocol.buildErrorWithCode(self.allocator, request_id, .runtime_timeout, "runtime operation timeout");
+            },
+            RuntimeServerError.MissingJobResponse => {
+                self.destroyJob(job);
+                return protocol.buildErrorWithCode(self.allocator, request_id, .execution_failed, "runtime worker did not produce response");
+            },
+            else => {
+                self.destroyJob(job);
+                return protocol.buildErrorWithCode(self.allocator, request_id, .execution_failed, @errorName(err));
+            },
+        };
+    }
+
+    fn enqueueJob(self: *RuntimeServer, job: *RuntimeQueueJob) !bool {
+        self.queue_mutex.lock();
+        defer self.queue_mutex.unlock();
+
+        if (self.stopping) return false;
+        if (self.runtime_jobs.items.len >= self.runtime_queue_max) return false;
+
+        try self.runtime_jobs.append(self.allocator, job);
+        self.queue_cond.signal();
+        return true;
+    }
+
+    fn waitForJob(self: *RuntimeServer, job: *RuntimeQueueJob, operation_class: RuntimeOperationClass) ![]u8 {
+        const timeout_ns = self.operationTimeoutNs(operation_class);
+        const deadline_ns: i128 = std.time.nanoTimestamp() + @as(i128, @intCast(timeout_ns));
+
+        job.result_mutex.lock();
+        defer job.result_mutex.unlock();
+
+        while (!job.done) {
+            const now_ns = std.time.nanoTimestamp();
+            if (now_ns >= deadline_ns) {
+                job.cancelled = true;
+                return RuntimeServerError.RuntimeJobTimeout;
+            }
+
+            const remaining_ns: u64 = @intCast(deadline_ns - now_ns);
+            job.result_cond.timedWait(&job.result_mutex, remaining_ns) catch |err| switch (err) {
+                error.Timeout => continue,
+            };
+        }
+
+        const response = job.response orelse return RuntimeServerError.MissingJobResponse;
+        job.response = null;
+        self.destroyJob(job);
+        return response;
+    }
+
+    fn dequeueJob(self: *RuntimeServer) ?*RuntimeQueueJob {
+        self.queue_mutex.lock();
+        defer self.queue_mutex.unlock();
+
+        while (!self.stopping and self.runtime_jobs.items.len == 0) {
+            self.queue_cond.wait(&self.queue_mutex);
+        }
+
+        if (self.runtime_jobs.items.len == 0) return null;
+        return self.runtime_jobs.orderedRemove(0);
+    }
+
+    fn runtimeWorkerMain(self: *RuntimeServer) void {
+        while (true) {
+            const job = self.dequeueJob() orelse return;
+
+            const response = self.processRuntimeJob(job) catch |err| blk: {
+                break :blk protocol.buildErrorWithCode(self.allocator, job.request_id, .execution_failed, @errorName(err)) catch |build_err| {
+                    std.log.err("runtime worker failed building error response: {s}", .{@errorName(build_err)});
+                    break :blk null;
+                };
+            };
+
+            job.result_mutex.lock();
+            job.done = true;
+            job.response = response;
+            const cancelled = job.cancelled;
+            job.result_cond.signal();
+            job.result_mutex.unlock();
+
+            if (cancelled) {
+                if (response) |owned| self.allocator.free(owned);
+                self.destroyJob(job);
+            }
+        }
+    }
+
+    fn processRuntimeJob(self: *RuntimeServer, job: *RuntimeQueueJob) ![]u8 {
+        self.runtime_mutex.lock();
+        defer self.runtime_mutex.unlock();
+
+        switch (job.msg_type) {
+            .session_send => {
+                const content = job.content orelse {
+                    return protocol.buildErrorWithCode(self.allocator, job.request_id, .missing_content, "session.send requires content");
+                };
+                return self.handleChat(job.request_id, content);
+            },
+            .agent_control => {
+                return self.handleControl(job.request_id, job.action, job.content);
+            },
+            else => {
+                return protocol.buildErrorWithCode(self.allocator, job.request_id, .unsupported_message_type, "unsupported runtime job type");
+            },
+        }
+    }
+
+    fn createJob(
+        self: *RuntimeServer,
+        msg_type: protocol.MessageType,
+        request_id: []const u8,
+        content: ?[]const u8,
+        action: ?[]const u8,
+    ) !*RuntimeQueueJob {
+        const job = try self.allocator.create(RuntimeQueueJob);
+        errdefer self.allocator.destroy(job);
+
+        job.* = .{
+            .msg_type = msg_type,
+            .request_id = try self.allocator.dupe(u8, request_id),
+            .content = if (content) |value| try self.allocator.dupe(u8, value) else null,
+            .action = if (action) |value| try self.allocator.dupe(u8, value) else null,
+        };
+        return job;
+    }
+
+    fn destroyJob(self: *RuntimeServer, job: *RuntimeQueueJob) void {
+        self.allocator.free(job.request_id);
+        if (job.content) |owned| self.allocator.free(owned);
+        if (job.action) |owned| self.allocator.free(owned);
+        if (job.response) |owned| self.allocator.free(owned);
+        self.allocator.destroy(job);
+    }
+
+    fn handleChat(self: *RuntimeServer, request_id: []const u8, content: []const u8) ![]u8 {
+        self.runtime.enqueueUserEvent(content) catch |err| {
+            return self.buildRuntimeErrorResponse(request_id, err);
+        };
+
+        const escaped_content = try protocol.jsonEscape(self.allocator, content);
+        defer self.allocator.free(escaped_content);
+        const talk_args = try std.fmt.allocPrint(self.allocator, "{{\"message\":\"{s}\"}}", .{escaped_content});
+        defer self.allocator.free(talk_args);
+        self.runtime.queueToolUse(DEFAULT_BRAIN, "talk.user", talk_args) catch |err| {
+            return self.buildRuntimeErrorResponse(request_id, err);
+        };
+
+        self.runPendingTicks() catch |err| {
+            return self.buildRuntimeErrorResponse(request_id, err);
+        };
+
+        const outbound = try self.runtime.drainOutbound(self.allocator);
+        defer agent_runtime.deinitOutbound(self.allocator, outbound);
+
+        const message = if (outbound.len > 0) outbound[0] else "ok";
+        return protocol.buildSessionReceive(self.allocator, request_id, message);
+    }
+
+    fn handleControl(
+        self: *RuntimeServer,
+        request_id: []const u8,
+        action: ?[]const u8,
+        content: ?[]const u8,
+    ) ![]u8 {
+        const control_action = action orelse "state";
+
+        if (std.mem.eql(u8, control_action, "state") or std.mem.eql(u8, control_action, "status")) {
+            return protocol.buildAgentState(self.allocator, request_id, @tagName(self.runtime.state), self.runtime.checkpoint);
+        }
+
+        if (std.mem.eql(u8, control_action, "pause")) {
+            self.runtime.setState(.paused) catch |err| return self.buildRuntimeErrorResponse(request_id, err);
+            return protocol.buildAgentState(self.allocator, request_id, "paused", self.runtime.checkpoint);
+        }
+
+        if (std.mem.eql(u8, control_action, "resume")) {
+            self.runtime.setState(.running) catch |err| return self.buildRuntimeErrorResponse(request_id, err);
+            return protocol.buildAgentState(self.allocator, request_id, "running", self.runtime.checkpoint);
+        }
+
+        if (std.mem.eql(u8, control_action, "cancel")) {
+            self.runtime.setState(.cancelled) catch |err| return self.buildRuntimeErrorResponse(request_id, err);
+            return protocol.buildAgentState(self.allocator, request_id, "cancelled", self.runtime.checkpoint);
+        }
+
+        if (std.mem.eql(u8, control_action, "goal") or std.mem.eql(u8, control_action, "plan")) {
+            const goal = content orelse return protocol.buildErrorWithCode(self.allocator, request_id, .missing_content, "agent.control goal requires content");
+            return self.handleChat(request_id, goal);
+        }
+
+        return protocol.buildErrorWithCode(self.allocator, request_id, .unsupported_message_type, "unsupported agent.control action");
+    }
+
+    fn runPendingTicks(self: *RuntimeServer) !void {
+        const started_ms = std.time.milliTimestamp();
+
+        while (true) {
+            if (std.time.milliTimestamp() - started_ms > INTERNAL_TICK_TIMEOUT_MS) {
+                return RuntimeServerError.RuntimeTickTimeout;
+            }
+
+            const tick_opt = try self.runtime.tickNext();
+            if (tick_opt == null) break;
+
+            var tick = tick_opt.?;
+            defer tick.deinit(self.allocator);
+
+            for (tick.tool_results) |result| {
+                const event = try protocol.buildToolEvent(self.allocator, "runtime", result.payload_json);
+                defer self.allocator.free(event);
+
+                if (self.runtime.outbound_messages.items.len >= self.runtime.queue_limits.outbound_messages) {
+                    return agent_runtime.RuntimeError.QueueSaturated;
+                }
+                try self.runtime.outbound_messages.append(self.allocator, try self.allocator.dupe(u8, event));
+            }
+
+            const memory_event = try protocol.buildMemoryEvent(self.allocator, "runtime", tick.observe_json);
+            defer self.allocator.free(memory_event);
+            if (self.runtime.outbound_messages.items.len >= self.runtime.queue_limits.outbound_messages) {
+                return agent_runtime.RuntimeError.QueueSaturated;
+            }
+            try self.runtime.outbound_messages.append(self.allocator, try self.allocator.dupe(u8, memory_event));
+        }
+    }
+
+    pub fn buildRuntimeErrorResponse(self: *RuntimeServer, request_id: []const u8, err: anyerror) ![]u8 {
+        return switch (err) {
+            agent_runtime.RuntimeError.QueueSaturated => protocol.buildErrorWithCode(self.allocator, request_id, .queue_saturated, "runtime queue saturated"),
+            agent_runtime.RuntimeError.RuntimePaused => protocol.buildErrorWithCode(self.allocator, request_id, .runtime_paused, "runtime is paused"),
+            agent_runtime.RuntimeError.RuntimeCancelled => protocol.buildErrorWithCode(self.allocator, request_id, .runtime_cancelled, "runtime is cancelled"),
+            RuntimeServerError.RuntimeTickTimeout => protocol.buildErrorWithCode(self.allocator, request_id, .runtime_timeout, "runtime tick timeout"),
+            RuntimeServerError.RuntimeJobTimeout => protocol.buildErrorWithCode(self.allocator, request_id, .runtime_timeout, "runtime operation timeout"),
+            else => protocol.buildErrorWithCode(self.allocator, request_id, .execution_failed, @errorName(err)),
+        };
+    }
+
+    fn operationTimeoutNs(self: *const RuntimeServer, operation_class: RuntimeOperationClass) u64 {
+        const timeout_ms = switch (operation_class) {
+            .chat => self.chat_operation_timeout_ms,
+            .control => self.control_operation_timeout_ms,
+        };
+        return timeout_ms * std.time.ns_per_ms;
+    }
+};
+
+const AsyncRequestCtx = struct {
+    allocator: std.mem.Allocator,
+    server: *RuntimeServer,
+    request_json: []const u8,
+    response: ?[]u8 = null,
+    err_name: ?[]u8 = null,
+
+    fn deinit(self: *AsyncRequestCtx) void {
+        if (self.response) |payload| self.allocator.free(payload);
+        if (self.err_name) |err| self.allocator.free(err);
+    }
+};
+
+fn runRequestInThread(ctx: *AsyncRequestCtx) void {
+    ctx.response = ctx.server.handleMessage(ctx.request_json) catch |err| {
+        ctx.err_name = std.fmt.allocPrint(ctx.allocator, "{s}", .{@errorName(err)}) catch null;
+        return;
+    };
+}
+
+test "runtime_server: session.send dispatches through runtime and emits session.receive" {
+    const allocator = std.testing.allocator;
+    const server = try RuntimeServer.create(allocator, "agent-test", .{ .ltm_directory = "", .ltm_filename = "" });
+    defer server.destroy();
+
+    const response = try server.handleMessage("{\"id\":\"req-1\",\"type\":\"session.send\",\"content\":\"hello runtime\"}");
+    defer allocator.free(response);
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "\"type\":\"session.receive\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "hello runtime") != null);
+}
+
+test "runtime_server: agent.control pause/resume state" {
+    const allocator = std.testing.allocator;
+    const server = try RuntimeServer.create(allocator, "agent-test", .{ .ltm_directory = "", .ltm_filename = "" });
+    defer server.destroy();
+
+    const pause = try server.handleMessage("{\"id\":\"req-2\",\"type\":\"agent.control\",\"action\":\"pause\"}");
+    defer allocator.free(pause);
+    try std.testing.expect(std.mem.indexOf(u8, pause, "paused") != null);
+
+    const state = try server.handleMessage("{\"id\":\"req-3\",\"type\":\"agent.control\",\"action\":\"state\"}");
+    defer allocator.free(state);
+    try std.testing.expect(std.mem.indexOf(u8, state, "paused") != null);
+
+    const resume_resp = try server.handleMessage("{\"id\":\"req-4\",\"type\":\"agent.control\",\"action\":\"resume\"}");
+    defer allocator.free(resume_resp);
+    try std.testing.expect(std.mem.indexOf(u8, resume_resp, "running") != null);
+}
+
+test "runtime_server: paused runtime returns coded runtime_paused error" {
+    const allocator = std.testing.allocator;
+    const server = try RuntimeServer.create(allocator, "agent-test", .{ .ltm_directory = "", .ltm_filename = "" });
+    defer server.destroy();
+
+    const pause = try server.handleMessage("{\"id\":\"req-10\",\"type\":\"agent.control\",\"action\":\"pause\"}");
+    defer allocator.free(pause);
+
+    const blocked = try server.handleMessage("{\"id\":\"req-11\",\"type\":\"session.send\",\"content\":\"hello\"}");
+    defer allocator.free(blocked);
+
+    try std.testing.expect(std.mem.indexOf(u8, blocked, "\"code\":\"runtime_paused\"") != null);
+}
+
+test "runtime_server: queue saturation returns coded queue_saturated error" {
+    const allocator = std.testing.allocator;
+    const server = try RuntimeServer.create(allocator, "agent-test", .{
+        .inbound_queue_max = 512,
+        .brain_tick_queue_max = 1,
+        .outbound_queue_max = 1,
+        .control_queue_max = 1,
+        .runtime_request_queue_max = 0,
+        .ltm_directory = "",
+        .ltm_filename = "",
+    });
+    defer server.destroy();
+
+    const blocked = try server.handleMessage("{\"id\":\"req-20\",\"type\":\"session.send\",\"content\":\"hello\"}");
+    defer allocator.free(blocked);
+
+    try std.testing.expect(std.mem.indexOf(u8, blocked, "\"code\":\"queue_saturated\"") != null);
+}
+
+test "runtime_server: operation timeout policy prefers longer chat timeout" {
+    const allocator = std.testing.allocator;
+    const server = try RuntimeServer.create(allocator, "agent-test", .{ .ltm_directory = "", .ltm_filename = "" });
+    defer server.destroy();
+    try std.testing.expect(server.operationTimeoutNs(.chat) > server.operationTimeoutNs(.control));
+}
+
+test "runtime_server: queued control request times out with runtime_timeout code" {
+    const allocator = std.testing.allocator;
+    const server = try RuntimeServer.create(allocator, "agent-test", .{
+        .control_operation_timeout_ms = 10,
+        .ltm_directory = "",
+        .ltm_filename = "",
+    });
+    defer server.destroy();
+
+    server.runtime_mutex.lock();
+    var runtime_locked = true;
+    defer if (runtime_locked) server.runtime_mutex.unlock();
+
+    var ctx = AsyncRequestCtx{
+        .allocator = allocator,
+        .server = server,
+        .request_json = "{\"id\":\"req-timeout\",\"type\":\"agent.control\",\"action\":\"state\"}",
+    };
+    defer ctx.deinit();
+
+    const thread = try std.Thread.spawn(.{}, runRequestInThread, .{&ctx});
+    std.Thread.sleep(50 * std.time.ns_per_ms);
+    server.runtime_mutex.unlock();
+    runtime_locked = false;
+    thread.join();
+
+    try std.testing.expect(ctx.err_name == null);
+    try std.testing.expect(ctx.response != null);
+    try std.testing.expect(std.mem.indexOf(u8, ctx.response.?, "\"code\":\"runtime_timeout\"") != null);
+}
+
+test "runtime_server: concurrent queue pressure yields deterministic queue_saturated" {
+    const allocator = std.testing.allocator;
+    const server = try RuntimeServer.create(allocator, "agent-test", .{
+        .runtime_worker_threads = 1,
+        .runtime_request_queue_max = 1,
+        .ltm_directory = "",
+        .ltm_filename = "",
+    });
+    defer server.destroy();
+
+    server.runtime_mutex.lock();
+    var runtime_locked = true;
+    defer if (runtime_locked) server.runtime_mutex.unlock();
+
+    var ctx1 = AsyncRequestCtx{
+        .allocator = allocator,
+        .server = server,
+        .request_json = "{\"id\":\"req-q1\",\"type\":\"session.send\",\"content\":\"one\"}",
+    };
+    defer ctx1.deinit();
+    var ctx2 = AsyncRequestCtx{
+        .allocator = allocator,
+        .server = server,
+        .request_json = "{\"id\":\"req-q2\",\"type\":\"session.send\",\"content\":\"two\"}",
+    };
+    defer ctx2.deinit();
+    var ctx3 = AsyncRequestCtx{
+        .allocator = allocator,
+        .server = server,
+        .request_json = "{\"id\":\"req-q3\",\"type\":\"session.send\",\"content\":\"three\"}",
+    };
+    defer ctx3.deinit();
+
+    const t1 = try std.Thread.spawn(.{}, runRequestInThread, .{&ctx1});
+    std.Thread.sleep(1 * std.time.ns_per_ms);
+    const t2 = try std.Thread.spawn(.{}, runRequestInThread, .{&ctx2});
+    std.Thread.sleep(1 * std.time.ns_per_ms);
+    const t3 = try std.Thread.spawn(.{}, runRequestInThread, .{&ctx3});
+
+    std.Thread.sleep(10 * std.time.ns_per_ms);
+    server.runtime_mutex.unlock();
+    runtime_locked = false;
+
+    t1.join();
+    t2.join();
+    t3.join();
+
+    try std.testing.expect(ctx1.err_name == null);
+    try std.testing.expect(ctx2.err_name == null);
+    try std.testing.expect(ctx3.err_name == null);
+    try std.testing.expect(ctx1.response != null);
+    try std.testing.expect(ctx2.response != null);
+    try std.testing.expect(ctx3.response != null);
+
+    const responses = [_][]const u8{ ctx1.response.?, ctx2.response.?, ctx3.response.? };
+    var saturated_count: usize = 0;
+    for (responses) |payload| {
+        if (std.mem.indexOf(u8, payload, "\"code\":\"queue_saturated\"") != null) saturated_count += 1;
+    }
+    try std.testing.expect(saturated_count >= 1);
+}

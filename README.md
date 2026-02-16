@@ -76,6 +76,20 @@ spiderweb-config config set-server --bind 0.0.0.0 --port 9000
 spiderweb-config config set-log debug
 ```
 
+### Runtime Queue/Timeout Keys
+
+Runtime execution now uses a bounded request queue plus fixed runtime workers.
+
+`runtime` keys in `~/.config/spiderweb/config.json`:
+- `runtime_worker_threads`
+- `runtime_request_queue_max`
+- `chat_operation_timeout_ms`
+- `control_operation_timeout_ms`
+
+Notes:
+- Older inflight-style runtime gating keys are no longer used.
+- Protocol input should use `session.send`; legacy `chat.send` is rejected.
+
 ### API Key Storage
 
 **Priority order:**

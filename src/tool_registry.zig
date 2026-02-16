@@ -1,6 +1,10 @@
 const std = @import("std");
 
-/// Tool parameter type
+pub const ToolDomain = enum {
+    world,
+    brain,
+};
+
 pub const ToolParamType = enum {
     string,
     integer,
@@ -9,64 +13,41 @@ pub const ToolParamType = enum {
     object,
 };
 
-/// Tool parameter definition
 pub const ToolParam = struct {
     name: []const u8,
     param_type: ToolParamType,
     description: []const u8,
     required: bool = true,
-    default_value: ?[]const u8 = null,
 };
 
-/// Tool definition
-pub const Tool = struct {
+pub const ToolSchema = struct {
     name: []const u8,
     description: []const u8,
+    domain: ToolDomain,
     params: []const ToolParam,
-    handler: ToolHandler,
-
-    pub const ToolHandler = *const fn (
-        allocator: std.mem.Allocator,
-        args: std.json.ObjectMap,
-    ) ToolResult;
 };
 
-/// Tool execution result
 pub const ToolResult = union(enum) {
-    success: struct {
-        content: []const u8,
-        format: ContentFormat = .text,
-    },
-    failure: struct {
-        code: ErrorCode,
-        message: []const u8,
-    },
-
-    pub const ContentFormat = enum {
-        text,
-        json,
-        markdown,
-    };
-
-    pub const ErrorCode = enum {
-        invalid_params,
-        not_found,
-        execution_failed,
-        permission_denied,
-        timeout,
-    };
+    success: []const u8,
+    failure: []const u8,
 };
 
-/// Tool registry - manages available tools
+pub const ToolHandler = *const fn (
+    allocator: std.mem.Allocator,
+    args: std.json.ObjectMap,
+) ToolResult;
+
+pub const RegisteredTool = struct {
+    schema: ToolSchema,
+    handler: ?ToolHandler,
+};
+
 pub const ToolRegistry = struct {
     allocator: std.mem.Allocator,
-    tools: std.StringHashMapUnmanaged(Tool),
+    tools: std.StringHashMapUnmanaged(RegisteredTool) = .{},
 
     pub fn init(allocator: std.mem.Allocator) ToolRegistry {
-        return .{
-            .allocator = allocator,
-            .tools = .{},
-        };
+        return .{ .allocator = allocator };
     }
 
     pub fn deinit(self: *ToolRegistry) void {
@@ -77,99 +58,127 @@ pub const ToolRegistry = struct {
         self.tools.deinit(self.allocator);
     }
 
-    /// Register a tool
-    pub fn register(self: *ToolRegistry, tool: Tool) !void {
-        const name_copy = try self.allocator.dupe(u8, tool.name);
-        try self.tools.put(self.allocator, name_copy, tool);
+    pub fn registerWorldTool(
+        self: *ToolRegistry,
+        name: []const u8,
+        description: []const u8,
+        params: []const ToolParam,
+        handler: ToolHandler,
+    ) !void {
+        try self.registerInternal(.{
+            .schema = .{
+                .name = name,
+                .description = description,
+                .domain = .world,
+                .params = params,
+            },
+            .handler = handler,
+        });
     }
 
-    /// Get a tool by name
-    pub fn get(self: *const ToolRegistry, name: []const u8) ?Tool {
+    pub fn registerBrainToolSchema(
+        self: *ToolRegistry,
+        name: []const u8,
+        description: []const u8,
+        params: []const ToolParam,
+    ) !void {
+        try self.registerInternal(.{
+            .schema = .{
+                .name = name,
+                .description = description,
+                .domain = .brain,
+                .params = params,
+            },
+            .handler = null,
+        });
+    }
+
+    pub fn get(self: *const ToolRegistry, name: []const u8) ?RegisteredTool {
         return self.tools.get(name);
     }
 
-    /// List all registered tools
-    pub fn list(self: *const ToolRegistry, allocator: std.mem.Allocator) ![]Tool {
-        var result = try allocator.alloc(Tool, self.tools.count());
-        var it = self.tools.iterator();
-        var i: usize = 0;
-        while (it.next()) |entry| : (i += 1) {
-            result[i] = entry.value_ptr.*;
-        }
-        return result;
-    }
-
-    /// Execute a tool by name with arguments
-    pub fn execute(
+    pub fn executeWorld(
         self: *const ToolRegistry,
         allocator: std.mem.Allocator,
         name: []const u8,
         args: std.json.ObjectMap,
     ) ToolResult {
         const tool = self.get(name) orelse {
-            const msg = allocator.dupe(u8, "Tool not found") catch return .{ .failure = .{ .code = .execution_failed, .message = @import("tool_executor.zig").OOM_MSG } };
-            return .{ .failure = .{
-                .code = .not_found,
-                .message = msg,
-            } };
+            const msg = allocator.dupe(u8, "tool_not_found") catch return .{ .failure = "oom" };
+            return .{ .failure = msg };
         };
-        return tool.handler(allocator, args);
+
+        if (tool.schema.domain != .world or tool.handler == null) {
+            const msg = allocator.dupe(u8, "tool_not_executable") catch return .{ .failure = "oom" };
+            return .{ .failure = msg };
+        }
+
+        return tool.handler.?(allocator, args);
     }
 
-    /// Generate JSON schema for all tools (for LLM)
     pub fn generateSchemasJson(
         self: *const ToolRegistry,
         allocator: std.mem.Allocator,
+        domain_filter: ?ToolDomain,
     ) ![]u8 {
-        var json = std.ArrayListUnmanaged(u8){};
-        defer json.deinit(allocator);
+        var out = std.ArrayListUnmanaged(u8){};
+        defer out.deinit(allocator);
 
-        try json.appendSlice(allocator, "[");
-
+        try out.append(allocator, '[');
         var it = self.tools.iterator();
         var first = true;
         while (it.next()) |entry| {
-            if (!first) try json.appendSlice(allocator, ",");
+            const tool = entry.value_ptr.*;
+            if (domain_filter) |filter| {
+                if (tool.schema.domain != filter) continue;
+            }
+
+            if (!first) try out.append(allocator, ',');
             first = false;
 
-            const tool = entry.value_ptr.*;
-            try json.appendSlice(allocator, "{\"name\":\"");
-            try json.appendSlice(allocator, tool.name);
-            try json.appendSlice(allocator, "\",\"description\":\"");
-            try json.appendSlice(allocator, tool.description);
-            try json.appendSlice(allocator, "\",\"parameters\":{");
-            try json.appendSlice(allocator, "\"type\":\"object\",\"properties\":{");
+            try out.appendSlice(allocator, "{\"name\":\"");
+            try appendEscaped(allocator, &out, tool.schema.name);
+            try out.appendSlice(allocator, "\",\"description\":\"");
+            try appendEscaped(allocator, &out, tool.schema.description);
+            try out.appendSlice(allocator, "\",\"domain\":\"");
+            try out.appendSlice(allocator, @tagName(tool.schema.domain));
+            try out.appendSlice(allocator, "\",\"parameters\":{\"type\":\"object\",\"properties\":{");
 
-            for (tool.params, 0..) |param, i| {
-                if (i > 0) try json.appendSlice(allocator, ",");
-                try json.appendSlice(allocator, "\"");
-                try json.appendSlice(allocator, param.name);
-                try json.appendSlice(allocator, "\":{\"type\":\"");
-                try json.appendSlice(allocator, paramTypeToString(param.param_type));
-                try json.appendSlice(allocator, "\",\"description\":\"");
-                try json.appendSlice(allocator, param.description);
-                try json.appendSlice(allocator, "\"}");
+            for (tool.schema.params, 0..) |param, index| {
+                if (index > 0) try out.append(allocator, ',');
+                try out.append(allocator, '"');
+                try appendEscaped(allocator, &out, param.name);
+                try out.appendSlice(allocator, "\":{\"type\":\"");
+                try out.appendSlice(allocator, paramTypeString(param.param_type));
+                try out.appendSlice(allocator, "\",\"description\":\"");
+                try appendEscaped(allocator, &out, param.description);
+                try out.appendSlice(allocator, "\"}");
             }
 
-            try json.appendSlice(allocator, "},\"required\":[");
-            var req_first = true;
-            for (tool.params) |param| {
+            try out.appendSlice(allocator, "},\"required\":[");
+            var required_first = true;
+            for (tool.schema.params) |param| {
                 if (!param.required) continue;
-                if (!req_first) try json.appendSlice(allocator, ",");
-                req_first = false;
-                try json.appendSlice(allocator, "\"");
-                try json.appendSlice(allocator, param.name);
-                try json.appendSlice(allocator, "\"");
+                if (!required_first) try out.append(allocator, ',');
+                required_first = false;
+                try out.append(allocator, '"');
+                try appendEscaped(allocator, &out, param.name);
+                try out.append(allocator, '"');
             }
-            try json.appendSlice(allocator, "]}}");
+            try out.appendSlice(allocator, "]}}");
         }
 
-        try json.appendSlice(allocator, "]");
-        return json.toOwnedSlice(allocator);
+        try out.append(allocator, ']');
+        return out.toOwnedSlice(allocator);
+    }
+
+    fn registerInternal(self: *ToolRegistry, tool: RegisteredTool) !void {
+        const name = try self.allocator.dupe(u8, tool.schema.name);
+        try self.tools.put(self.allocator, name, tool);
     }
 };
 
-fn paramTypeToString(param_type: ToolParamType) []const u8 {
+fn paramTypeString(param_type: ToolParamType) []const u8 {
     return switch (param_type) {
         .string => "string",
         .integer => "integer",
@@ -179,42 +188,36 @@ fn paramTypeToString(param_type: ToolParamType) []const u8 {
     };
 }
 
-test "tool_registry: register and get" {
+fn appendEscaped(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), value: []const u8) !void {
+    for (value) |char| {
+        switch (char) {
+            '\\' => try out.appendSlice(allocator, "\\\\"),
+            '"' => try out.appendSlice(allocator, "\\\""),
+            '\n' => try out.appendSlice(allocator, "\\n"),
+            '\r' => try out.appendSlice(allocator, "\\r"),
+            '\t' => try out.appendSlice(allocator, "\\t"),
+            else => try out.append(allocator, char),
+        }
+    }
+}
+
+test "tool_registry: registers brain schema and emits required fields" {
     const allocator = std.testing.allocator;
     var registry = ToolRegistry.init(allocator);
     defer registry.deinit();
 
-    const test_tool = Tool{
-        .name = "test_echo",
-        .description = "Echoes input back",
-        .params = &[_]ToolParam{
-            .{
-                .name = "message",
-                .param_type = .string,
-                .description = "Message to echo",
-            },
+    try registry.registerBrainToolSchema(
+        "memory.mutate",
+        "Mutate memory by mem_id",
+        &[_]ToolParam{
+            .{ .name = "mem_id", .param_type = .string, .description = "Canonical mem id", .required = true },
+            .{ .name = "content", .param_type = .object, .description = "Replacement content", .required = true },
         },
-        .handler = struct {
-            fn handle(alloc: std.mem.Allocator, args: std.json.ObjectMap) ToolResult {
-                const msg = args.get("message") orelse return .{ .failure = .{
-                    .code = .invalid_params,
-                    .message = "Missing message parameter",
-                } };
-                if (msg != .string) return .{ .failure = .{
-                    .code = .invalid_params,
-                    .message = "Message must be a string",
-                } };
-                const copy = alloc.dupe(u8, msg.string) catch return .{ .failure = .{
-                    .code = .execution_failed,
-                    .message = "Out of memory",
-                } };
-                return .{ .success = .{ .content = copy } };
-            }
-        }.handle,
-    };
+    );
 
-    try registry.register(test_tool);
+    const json = try registry.generateSchemasJson(allocator, .brain);
+    defer allocator.free(json);
 
-    const retrieved = registry.get("test_echo").?;
-    try std.testing.expectEqualStrings("test_echo", retrieved.name);
+    try std.testing.expect(std.mem.indexOf(u8, json, "memory.mutate") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"required\":[\"mem_id\",\"content\"]") != null);
 }
