@@ -99,10 +99,12 @@ pub const AgentRegistry = struct {
     /// Check if server is in first-boot state (no real agents exist yet)
     pub fn isFirstBoot(self: *const AgentRegistry) bool {
         // First boot if only the in-memory default agent exists
+        // Distinguish synthetic placeholder (needs_hatching=false) from real agent named "default" (needs_hatching=true)
         const len_ok = self.agents.items.len == 1;
         const id_ok = len_ok and std.mem.eql(u8, self.agents.items[0].id, "default");
         const identity_ok = len_ok and !self.agents.items[0].identity_loaded;
-        return len_ok and id_ok and identity_ok;
+        const is_placeholder = len_ok and !self.agents.items[0].needs_hatching;
+        return len_ok and id_ok and identity_ok and is_placeholder;
     }
 
     /// Initialize first agent on first boot

@@ -43,6 +43,28 @@ test "isFirstBoot returns false after creating first agent" {
     try std.testing.expect(!registry.isFirstBoot());
 }
 
+test "isFirstBoot returns false for real agent named default" {
+    const allocator = std.testing.allocator;
+    
+    const test_dir = try setupTestDir(allocator, "default-agent");
+    defer allocator.free(test_dir);
+    defer cleanupTestDir(test_dir);
+    
+    var registry = try AgentRegistry.init(allocator, test_dir);
+    defer registry.deinit();
+    
+    // Create a real agent named "default" (should have HATCH.md, so needs_hatching=true)
+    try registry.createAgent("default", null);
+    
+    // Should NOT be in first-boot state because this is a real agent with HATCH.md
+    try std.testing.expect(!registry.isFirstBoot());
+    
+    // Verify the agent has needs_hatching=true (distinguishes from placeholder)
+    const agent = registry.getAgent("default");
+    try std.testing.expect(agent != null);
+    try std.testing.expect(agent.?.needs_hatching);
+}
+
 test "createAgent creates HATCH.md file" {
     const allocator = std.testing.allocator;
     
