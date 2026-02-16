@@ -99,26 +99,34 @@ pub const AgentRegistry = struct {
     /// Check if server is in first-boot state (no real agents exist yet)
     pub fn isFirstBoot(self: *const AgentRegistry) bool {
         // First boot if only the in-memory default agent exists
-        // Distinguish synthetic placeholder from real agent by checking if agents directory exists
+        // Distinguish synthetic placeholder from real agent by checking if agents/ has any subdirectories
         const len_ok = self.agents.items.len == 1;
         const id_ok = len_ok and std.mem.eql(u8, self.agents.items[0].id, "default");
         const identity_ok = len_ok and !self.agents.items[0].identity_loaded;
         const needs_hatching_ok = len_ok and !self.agents.items[0].needs_hatching;
-        
-        // The key check: synthetic placeholder has no agents directory on disk
-        // Real agents (even hatched ones with no identity files) have a directory
+
+        // The key check: synthetic placeholder has no agent subdirectories in agents/
+        // Real agents have at least one subdirectory (even if hatched with no identity files yet)
         const agents_dir_path = std.fs.path.join(self.allocator, &.{ self.base_dir, "agents" }) catch return false;
         defer self.allocator.free(agents_dir_path);
-        
-        var agents_dir_exists = true;
-        std.fs.cwd().openDir(agents_dir_path, .{ .iterate = true }) catch |err| {
-            if (err == error.FileNotFound) {
-                agents_dir_exists = false;
+
+        var has_agent_subdirs = false;
+        if (std.fs.cwd().openDir(agents_dir_path, .{ .iterate = true })) |*agents_dir| {
+            defer agents_dir.close(); // P1 fix: close the handle
+            var it = agents_dir.iterate();
+            while (it.next() catch null) |entry| {
+                if (entry.kind == .directory) {
+                    has_agent_subdirs = true;
+                    break;
+                }
             }
-        };
-        
-        // First boot = only synthetic placeholder in memory, no agents directory on disk
-        return len_ok and id_ok and identity_ok and needs_hatching_ok and !agents_dir_exists;
+        } else |_| {
+            // Directory doesn't exist = definitely first boot
+            has_agent_subdirs = false;
+        }
+
+        // First boot = only synthetic placeholder in memory, no agent subdirectories
+        return len_ok and id_ok and identity_ok and needs_hatching_ok and !has_agent_subdirs;
     }
 
     /// Initialize first agent on first boot
