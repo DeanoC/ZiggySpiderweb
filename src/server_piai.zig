@@ -2406,47 +2406,26 @@ fn handleFirstBootChat(
     allocator.free(conn.agent_id);
     conn.agent_id = try allocator.dupe(u8, trimmed);
 
-    // Read the HATCH.md content to present to the user
-    const hatch_content = state.agent_registry.readHatchFile(trimmed) catch |err| blk: {
-        std.log.warn("Failed to read HATCH.md for first agent: {s}", .{@errorName(err)});
-        break :blk null;
-    };
-    defer if (hatch_content) |hc| allocator.free(hc);
-
-    var msg_buffer = std.ArrayList(u8){};
-    defer msg_buffer.deinit(allocator);
-
-    try msg_buffer.appendSlice(allocator, "Perfect! I've created your first agent: '");
-    try msg_buffer.appendSlice(allocator, trimmed);
-    try msg_buffer.appendSlice(allocator, "'.\n\n");
-
-    if (hatch_content) |hc| {
-        try msg_buffer.appendSlice(allocator, "Now let's hatch your agent. Here's the birth certificate (HATCH.md):\n\n");
-        try msg_buffer.appendSlice(allocator, "---\n");
-        try msg_buffer.appendSlice(allocator, hc);
-        try msg_buffer.appendSlice(allocator, "\n---\n\n");
-        try msg_buffer.appendSlice(allocator, "The agent will read this and create its identity. Once complete, respond with the hatch confirmation.");
-    } else {
-        try msg_buffer.appendSlice(allocator, "Your agent is ready! You can now start chatting.");
-    }
+    // Note: We do NOT send HATCH.md content to the client here.
+    // HATCH.md is a birth certificate meant for the AGENT to read when it connects,
+    // not content to be displayed to the human user.
+    // The agent will read HATCH.md from its directory via readHatchFile().
 
     const escaped_request_id = try protocol.jsonEscape(allocator, request_id);
     defer allocator.free(escaped_request_id);
-    const escaped_msg = try protocol.jsonEscape(allocator, msg_buffer.items);
-    defer allocator.free(escaped_msg);
+    const escaped_agent_id = try protocol.jsonEscape(allocator, trimmed);
+    defer allocator.free(escaped_agent_id);
 
     const payload = try std.fmt.allocPrint(
         allocator,
-        "{{\"type\":\"session.receive\",\"request\":\"{s}\",\"role\":\"assistant\",\"content\":\"{s}\",\"agent_id\":\"{s}\",\"needs_hatching\":true}}",
-        .{ escaped_request_id, escaped_msg, trimmed },
+        "{{\"type\":\"agent.created\",\"request\":\"{s}\",\"agent_id\":\"{s}\",\"needs_hatching\":true}}",
+        .{ escaped_request_id, escaped_agent_id },
     );
     defer allocator.free(payload);
 
     try sendDirect(allocator, conn, payload);
 
-    // Note: We do NOT send agent.hatched here - the agent still needs to hatch
-    // Client should send agent.hatch when hatching is complete, then handleAgentHatch
-    // will send the proper agent.hatched response
+    std.log.info("First agent created via chat: agent_id={s}", .{trimmed});
 }
 
 fn sendErrorJsonDirect(
