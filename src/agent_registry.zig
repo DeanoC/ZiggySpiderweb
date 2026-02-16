@@ -111,18 +111,22 @@ pub const AgentRegistry = struct {
         defer self.allocator.free(agents_dir_path);
 
         var has_agent_subdirs = false;
-        if (std.fs.cwd().openDir(agents_dir_path, .{ .iterate = true })) |*agents_dir| {
-            defer agents_dir.close(); // P1 fix: close the handle
-            var it = agents_dir.iterate();
+        var agents_dir = std.fs.cwd().openDir(agents_dir_path, .{ .iterate = true }) catch |err| blk: {
+            if (err == error.FileNotFound) {
+                // Directory doesn't exist = definitely first boot
+                break :blk null;
+            }
+            return false;
+        };
+        if (agents_dir) |*dir| {
+            defer dir.close(); // P1 fix: close the handle
+            var it = dir.iterate();
             while (it.next() catch null) |entry| {
                 if (entry.kind == .directory) {
                     has_agent_subdirs = true;
                     break;
                 }
             }
-        } else |_| {
-            // Directory doesn't exist = definitely first boot
-            has_agent_subdirs = false;
         }
 
         // First boot = only synthetic placeholder in memory, no agent subdirectories
