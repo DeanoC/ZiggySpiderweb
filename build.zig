@@ -71,4 +71,22 @@ pub fn build(b: *std.Build) void {
     const run_tests = b.addRunArtifact(spiderweb_tests);
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_tests.step);
+
+    // Hatch system tests
+    const hatch_test_mod = b.createModule(.{
+        .root_source_file = b.path("tests/hatch_system_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    hatch_test_mod.addImport("ziggy-piai", ziggy_piai_module);
+
+    const hatch_tests = b.addTest(.{
+        .root_module = hatch_test_mod,
+    });
+    hatch_tests.linkLibC();
+    hatch_tests.linkSystemLibrary("sqlite3");
+
+    const run_hatch_tests = b.addRunArtifact(hatch_tests);
+    const hatch_test_step = b.step("test-hatch", "Run hatch system tests");
+    hatch_test_step.dependOn(&run_hatch_tests.step);
 }

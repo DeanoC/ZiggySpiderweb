@@ -102,14 +102,6 @@ pub const AgentRegistry = struct {
         const len_ok = self.agents.items.len == 1;
         const id_ok = len_ok and std.mem.eql(u8, self.agents.items[0].id, "default");
         const identity_ok = len_ok and !self.agents.items[0].identity_loaded;
-        std.log.info("isFirstBoot debug: len={d} len_ok={s} id={s} id_ok={s} identity_loaded={s} identity_ok={s}", .{
-            self.agents.items.len,
-            if (len_ok) "true" else "false",
-            if (len_ok) self.agents.items[0].id else "n/a",
-            if (id_ok) "true" else "false",
-            if (len_ok) @as([]const u8, if (self.agents.items[0].identity_loaded) "true" else "false") else "n/a",
-            if (identity_ok) "true" else "false",
-        });
         return len_ok and id_ok and identity_ok;
     }
 

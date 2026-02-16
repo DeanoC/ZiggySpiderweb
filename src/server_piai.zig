@@ -889,6 +889,30 @@ fn handleUserMessage(allocator: std.mem.Allocator, state: *ServerState, pool: *s
     var request_id_owned = request_id;
     defer if (request_id_owned.len != 0) allocator.free(request_id_owned);
 
+    // Check for first-boot welcome (send on ANY first message after handshake)
+    // This must come before other handlers to intercept all message types
+    if (conn.first_boot_pending) {
+        conn.first_boot_pending = false;
+        const welcome_msg =
+            "Welcome to ZiggySpiderweb!\n" ++
+            "\n" ++
+            "This appears to be your first time here. Let's create your first agent.\n" ++
+            "\n" ++
+            "What would you like to name your first agent? (e.g., 'assistant', 'ziggy', 'helper')";
+
+        const escaped_welcome = try protocol.jsonEscape(allocator, welcome_msg);
+        defer allocator.free(escaped_welcome);
+
+        const welcome_payload = try std.fmt.allocPrint(
+            allocator,
+            "{{\"type\":\"session.receive\",\"request\":\"first-boot\",\"role\":\"assistant\",\"content\":\"{s}\"}}",
+            .{escaped_welcome},
+        );
+        defer allocator.free(welcome_payload);
+        try sendDirect(allocator, conn, welcome_payload);
+        return;
+    }
+
     const is_session_reset = std.mem.eql(u8, msg_type.string, "session.reset") or std.mem.eql(u8, msg_type.string, "session.new");
     if (is_session_reset) {
         const response_type = if (std.mem.eql(u8, msg_type.string, "session.new")) "session.new" else "session.reset";
@@ -1213,30 +1237,7 @@ fn handleUserMessage(allocator: std.mem.Allocator, state: *ServerState, pool: *s
         return;
     };
 
-    // Check for first-boot welcome (send on first message after handshake)
-    if (conn.first_boot_pending and is_chat_send) {
-        conn.first_boot_pending = false;
-        const welcome_msg =
-            "Welcome to ZiggySpiderweb!\n" ++
-            "\n" ++
-            "This appears to be your first time here. Let's create your first agent.\n" ++
-            "\n" ++
-            "What would you like to name your first agent? (e.g., 'assistant', 'ziggy', 'helper')";
-
-        const escaped_welcome = try protocol.jsonEscape(allocator, welcome_msg);
-        defer allocator.free(escaped_welcome);
-
-        const welcome_payload = try std.fmt.allocPrint(
-            allocator,
-            "{{\"type\":\"session.receive\",\"request\":\"first-boot\",\"role\":\"assistant\",\"content\":\"{s}\"}}",
-            .{escaped_welcome},
-        );
-        defer allocator.free(welcome_payload);
-        try sendDirect(allocator, conn, welcome_payload);
-        return;
-    }
-
-    // Check for first-boot state on chat messages (after welcome sent)
+    // Check for first-boot chat handling (after welcome was sent)
     if (is_chat_send and state.agent_registry.isFirstBoot()) {
         try handleFirstBootChat(allocator, state, conn, request_id, content);
         return;
