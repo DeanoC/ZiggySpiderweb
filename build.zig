@@ -87,6 +87,8 @@ pub fn build(b: *std.Build) void {
     hatch_tests.linkSystemLibrary("sqlite3");
 
     const run_hatch_tests = b.addRunArtifact(hatch_tests);
+    test_step.dependOn(&run_hatch_tests.step);
+
     const hatch_test_step = b.step("test-hatch", "Run hatch system tests");
     hatch_test_step.dependOn(&run_hatch_tests.step);
 }

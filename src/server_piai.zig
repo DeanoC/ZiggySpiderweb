@@ -2305,6 +2305,10 @@ fn handleFirstBootInit(
         return;
     };
 
+    // Update connection context to the newly created agent
+    allocator.free(conn.agent_id);
+    conn.agent_id = try allocator.dupe(u8, actual_agent_id);
+
     const escaped_request_id = try protocol.jsonEscape(allocator, request_id);
     defer allocator.free(escaped_request_id);
     const escaped_agent_id = try protocol.jsonEscape(allocator, actual_agent_id);
