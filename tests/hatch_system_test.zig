@@ -65,6 +65,30 @@ test "isFirstBoot returns false for real agent named default" {
     try std.testing.expect(agent.?.needs_hatching);
 }
 
+test "isFirstBoot returns false after hatching even without identity files" {
+    const allocator = std.testing.allocator;
+    
+    const test_dir = try setupTestDir(allocator, "hatched-no-identity");
+    defer allocator.free(test_dir);
+    defer cleanupTestDir(test_dir);
+    
+    var registry = try AgentRegistry.init(allocator, test_dir);
+    defer registry.deinit();
+    
+    // Create and hatch a real agent named "default"
+    try registry.createAgent("default", null);
+    try registry.completeHatching("default");
+    
+    // Even though no identity files exist, the agents directory exists on disk
+    // so this should NOT be first-boot state
+    try std.testing.expect(!registry.isFirstBoot());
+    
+    // Verify the agent exists and no longer needs hatching
+    const agent = registry.getAgent("default");
+    try std.testing.expect(agent != null);
+    try std.testing.expect(!agent.?.needs_hatching);
+}
+
 test "createAgent creates HATCH.md file" {
     const allocator = std.testing.allocator;
     
