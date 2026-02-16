@@ -20,6 +20,9 @@ spiderweb
 .DS_Store
 Thumbs.db
 
+# Local runtime state
+.spiderweb-ltm/
+
 # Test artifacts
 *.log
 /tmp/
