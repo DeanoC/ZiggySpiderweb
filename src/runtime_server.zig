@@ -420,10 +420,10 @@ pub const RuntimeServer = struct {
                         "session.send requires content",
                     ));
                 };
-                return self.handleChat(job.request_id, content);
+                return self.handleChat(job, job.request_id, content);
             },
             .agent_control => {
-                return self.handleControl(job.request_id, job.action, job.content);
+                return self.handleControl(job, job.request_id, job.action, job.content);
             },
             else => {
                 return self.wrapSingleFrame(try protocol.buildErrorWithCode(
@@ -469,12 +469,16 @@ pub const RuntimeServer = struct {
         self.allocator.destroy(job);
     }
 
-    fn handleChat(self: *RuntimeServer, request_id: []const u8, content: []const u8) ![][]u8 {
+    fn handleChat(self: *RuntimeServer, job: *RuntimeQueueJob, request_id: []const u8, content: []const u8) ![][]u8 {
+        if (self.isJobCancelled(job)) return RuntimeServerError.RuntimeJobCancelled;
+
         const assistant_text = if (self.provider_runtime != null)
             self.completeWithProvider(content) catch |err| return self.wrapRuntimeErrorResponse(request_id, err)
         else
             try self.allocator.dupe(u8, content);
         defer self.allocator.free(assistant_text);
+
+        if (self.isJobCancelled(job)) return RuntimeServerError.RuntimeJobCancelled;
 
         self.runtime.enqueueUserEvent(content) catch |err| {
             return self.wrapRuntimeErrorResponse(request_id, err);
@@ -489,8 +493,9 @@ pub const RuntimeServer = struct {
             return self.wrapRuntimeErrorResponse(request_id, err);
         };
 
-        const runtime_events = self.runPendingTicks(request_id) catch |err| {
+        const runtime_events = self.runPendingTicks(job, request_id) catch |err| {
             self.clearRuntimeOutboundLocked();
+            if (err == RuntimeServerError.RuntimeJobCancelled) return err;
             return self.wrapRuntimeErrorResponse(request_id, err);
         };
         defer deinitResponseFrames(self.allocator, runtime_events);
@@ -526,6 +531,7 @@ pub const RuntimeServer = struct {
 
     fn handleControl(
         self: *RuntimeServer,
+        job: *RuntimeQueueJob,
         request_id: []const u8,
         action: ?[]const u8,
         content: ?[]const u8,
@@ -558,7 +564,7 @@ pub const RuntimeServer = struct {
                 .missing_content,
                 "agent.control goal requires content",
             ));
-            return self.handleChat(request_id, goal);
+            return self.handleChat(job, request_id, goal);
         }
 
         return self.wrapSingleFrame(try protocol.buildErrorWithCode(
@@ -569,7 +575,7 @@ pub const RuntimeServer = struct {
         ));
     }
 
-    fn runPendingTicks(self: *RuntimeServer, request_id: []const u8) ![][]u8 {
+    fn runPendingTicks(self: *RuntimeServer, job: *RuntimeQueueJob, request_id: []const u8) ![][]u8 {
         const started_ms = std.time.milliTimestamp();
         var runtime_events = std.ArrayListUnmanaged([]u8){};
         errdefer {
@@ -578,6 +584,8 @@ pub const RuntimeServer = struct {
         }
 
         while (true) {
+            if (self.isJobCancelled(job)) return RuntimeServerError.RuntimeJobCancelled;
+
             if (std.time.milliTimestamp() - started_ms > INTERNAL_TICK_TIMEOUT_MS) {
                 return RuntimeServerError.RuntimeTickTimeout;
             }
@@ -797,6 +805,29 @@ fn mockProviderStreamByModelError(
     return error.MockProviderUnavailable;
 }
 
+fn mockProviderStreamByModelSlow(
+    allocator: std.mem.Allocator,
+    _: *std.http.Client,
+    _: *ziggy_piai.api_registry.ApiRegistry,
+    _: ziggy_piai.types.Model,
+    _: ziggy_piai.types.Context,
+    _: ziggy_piai.types.StreamOptions,
+    events: *std.array_list.Managed(ziggy_piai.types.AssistantMessageEvent),
+) anyerror!void {
+    std.Thread.sleep(50 * std.time.ns_per_ms);
+    try events.append(.{ .done = .{
+        .text = try allocator.dupe(u8, "slow provider response"),
+        .thinking = try allocator.dupe(u8, ""),
+        .tool_calls = &.{},
+        .api = "chat",
+        .provider = "openai",
+        .model = "gpt-4o-mini",
+        .usage = .{},
+        .stop_reason = .stop,
+        .error_message = null,
+    } });
+}
+
 test "runtime_server: session.send dispatches through runtime and emits session.receive" {
     const allocator = std.testing.allocator;
     const server = try RuntimeServer.create(allocator, "agent-test", .{ .ltm_directory = "", .ltm_filename = "" });
@@ -897,6 +928,39 @@ test "runtime_server: provider failure does not leak queued user/tick events" {
         try std.testing.expectEqual(@as(usize, 0), server.runtime.tick_queue.items.len);
         try std.testing.expectEqual(@as(usize, 0), server.runtime.bus.pendingCount());
     }
+}
+
+test "runtime_server: timed out provider session.send does not mutate runtime state" {
+    const allocator = std.testing.allocator;
+    const original_stream_fn = streamByModelFn;
+    defer streamByModelFn = original_stream_fn;
+    streamByModelFn = mockProviderStreamByModelSlow;
+
+    const server = try RuntimeServer.createWithProvider(allocator, "agent-test", .{
+        .chat_operation_timeout_ms = 10,
+        .ltm_directory = "",
+        .ltm_filename = "",
+    }, .{
+        .name = "openai",
+        .model = "gpt-4o-mini",
+        .api_key = "test-key",
+    });
+    defer server.destroy();
+
+    const response = try server.handleMessage("{\"id\":\"req-provider-timeout\",\"type\":\"session.send\",\"content\":\"hello provider\"}");
+    defer allocator.free(response);
+    try std.testing.expect(std.mem.indexOf(u8, response, "\"code\":\"runtime_timeout\"") != null);
+
+    std.Thread.sleep(80 * std.time.ns_per_ms);
+
+    server.runtime_mutex.lock();
+    defer server.runtime_mutex.unlock();
+    try std.testing.expectEqual(@as(u64, 0), server.runtime.checkpoint);
+    try std.testing.expectEqual(@as(usize, 0), server.runtime.bus.pendingCount());
+    try std.testing.expectEqual(@as(usize, 0), server.runtime.tick_queue.items.len);
+    try std.testing.expectEqual(@as(usize, 0), server.runtime.outbound_messages.items.len);
+    const primary = server.runtime.brains.getPtr("primary").?;
+    try std.testing.expectEqual(@as(usize, 0), primary.pending_tool_uses.items.len);
 }
 
 test "runtime_server: talk enqueue failure rolls back queued user work" {
