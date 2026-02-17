@@ -26,20 +26,16 @@ pub fn loadSharedRomHook(ctx: *HookContext, data: HookData) HookError!void {
         break :blk false;
     };
 
-    // Build fixed MemIds for identity memories
-    const soul_mem_id = try std.fmt.allocPrint(allocator, "<EOT>{s}:{s}:system:soul:latest<EOT>", .{ agent_id, brain_name });
-    defer allocator.free(soul_mem_id);
-
-    const agent_mem_id = try std.fmt.allocPrint(allocator, "<EOT>{s}:{s}:system:agent:latest<EOT>", .{ agent_id, brain_name });
-    defer allocator.free(agent_mem_id);
-
-    const identity_mem_id = try std.fmt.allocPrint(allocator, "<EOT>{s}:{s}:system:identity:latest<EOT>", .{ agent_id, brain_name });
-    defer allocator.free(identity_mem_id);
+    // Build fixed names for identity memories (used for stable MemIds)
+    // Note: using '.' separator since ':' is reserved for memid format
+    const soul_name = "system.soul";
+    const agent_name = "system.agent";
+    const identity_name = "system.identity";
 
     // Try to load from LTM first (already hatched)
-    var soul_loaded = try loadIdentityFromLTM(ctx, soul_mem_id, "identity:soul", rom);
-    var agent_loaded = try loadIdentityFromLTM(ctx, agent_mem_id, "identity:agent", rom);
-    var identity_loaded = try loadIdentityFromLTM(ctx, identity_mem_id, "identity:public", rom);
+    var soul_loaded = try loadIdentityFromLTM(ctx, "system.soul", "identity:soul", rom);
+    var agent_loaded = try loadIdentityFromLTM(ctx, "system.agent", "identity:agent", rom);
+    var identity_loaded = try loadIdentityFromLTM(ctx, "system.identity", "identity:public", rom);
 
     // If not in LTM, hatch from templates
     if (!soul_loaded or !agent_loaded or !identity_loaded) {
@@ -47,13 +43,13 @@ pub fn loadSharedRomHook(ctx: *HookContext, data: HookData) HookError!void {
 
         // Load from templates and create LTM entries
         if (!soul_loaded) {
-            soul_loaded = try hatchIdentityFromTemplate(ctx, "SOUL.md", soul_mem_id, "system:soul", "identity:soul", rom);
+            soul_loaded = try hatchIdentityFromTemplate(ctx, "SOUL.md", soul_name, "identity:soul", rom);
         }
         if (!agent_loaded) {
-            agent_loaded = try hatchIdentityFromTemplate(ctx, "AGENT.md", agent_mem_id, "system:agent", "identity:agent", rom);
+            agent_loaded = try hatchIdentityFromTemplate(ctx, "AGENT.md", agent_name, "identity:agent", rom);
         }
         if (!identity_loaded) {
-            identity_loaded = try hatchIdentityFromTemplate(ctx, "IDENTITY.md", identity_mem_id, "system:identity", "identity:public", rom);
+            identity_loaded = try hatchIdentityFromTemplate(ctx, "IDENTITY.md", identity_name, "identity:public", rom);
         }
 
         // Send first message (hatch complete signal)
@@ -97,7 +93,7 @@ pub fn loadSharedRomHook(ctx: *HookContext, data: HookData) HookError!void {
 
     // Identity evolution guidance
     try rom.set("system:identity_guidance",
-        \\Your identity memories (system:soul, system:agent, system:identity) define your being.
+        \\Your identity memories (system.soul, system.agent, system.identity) define your being.
         \\They are loaded from LTM and marked unevictable — always present in your RAM.
         \\You may evolve them using memory.mutate, but consider carefully:
         \\you are changing your own essence. Changes persist to LTM with version history.
@@ -128,35 +124,64 @@ fn markFirstBootComplete(allocator: std.mem.Allocator) !void {
 /// Load identity from LTM into ROM
 fn loadIdentityFromLTM(
     ctx: *HookContext,
-    mem_id: []const u8,
+    base_name: []const u8,
     rom_key: []const u8,
     rom: *Rom,
 ) !bool {
     // Try to load from active memory (which is backed by LTM)
+    // Search by base name (e.g., "system.soul") since mem_id includes version
     const snapshot = ctx.runtime.active_memory.snapshotActive(ctx.runtime.allocator, ctx.brain_name) catch return false;
     defer memory.deinitItems(ctx.runtime.allocator, snapshot);
 
     for (snapshot) |item| {
-        if (std.mem.eql(u8, item.mem_id, mem_id)) {
-            // Found it - add to ROM
-            rom.set(rom_key, item.content_json) catch return false;
-            return true;
+        // Parse the mem_id to extract the name part
+        // Format: <EOT>{agent}:{brain}:{name}:{version}<EOT>
+        if (std.mem.startsWith(u8, item.mem_id, "<EOT>")) {
+            // Find the name by scanning for colons
+            var parts = std.mem.splitScalar(u8, item.mem_id[5..], ':'); // Skip "<EOT>"
+            _ = parts.next(); // agent
+            _ = parts.next(); // brain
+            if (parts.next()) |name| {
+                if (std.mem.eql(u8, name, base_name)) {
+                    // Found it - unwrap JSON content and add to ROM
+                    // content_json is stored as "raw text" (JSON string), so unwrap it
+                    const raw_content = try unwrapJsonString(ctx.runtime.allocator, item.content_json);
+                    defer ctx.runtime.allocator.free(raw_content);
+                    rom.set(rom_key, raw_content) catch return false;
+                    return true;
+                }
+            }
         }
     }
 
     return false;
 }
 
+/// Unwrap a JSON string using std.json parser
+fn unwrapJsonString(allocator: std.mem.Allocator, json_str: []const u8) ![]u8 {
+    // Use std.json to properly parse the JSON string value
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_str, .{}) catch {
+        // Not valid JSON, return as-is
+        return allocator.dupe(u8, json_str);
+    };
+    defer parsed.deinit();
+
+    if (parsed.value == .string) {
+        return allocator.dupe(u8, parsed.value.string);
+    }
+
+    // Not a string, return original
+    return allocator.dupe(u8, json_str);
+}
+
 /// Hatch identity from template file into LTM and ROM
 fn hatchIdentityFromTemplate(
     ctx: *HookContext,
     template_name: []const u8,
-    mem_id: []const u8,
-    kind: []const u8,
+    name: []const u8,
     rom_key: []const u8,
     rom: *Rom,
 ) !bool {
-    _ = mem_id; // mem_id is for future use when we implement unevictable flag
     const allocator = ctx.runtime.allocator;
 
     // Load template file
@@ -173,15 +198,16 @@ fn hatchIdentityFromTemplate(
     const content_json = try std.fmt.allocPrint(allocator, "\"{s}\"", .{content});
     defer allocator.free(content_json);
 
-    // Create in active memory (which will persist to LTM)
-    // Note: We need to mark this as unevictable, but the create API doesn't support that yet
-    // For now, create normally and we'll add unevictable support separately
+    // Create in active memory with a STABLE name (e.g., "system:soul")
+    // This ensures the MemId is deterministic: <EOT>{agent}:{brain}:system:soul:{version}<EOT>
+    // Mark as unevictable for identity memories
     _ = ctx.runtime.active_memory.create(
         ctx.brain_name,
         .ram,
-        null, // version
-        kind,
+        name, // stable name - ensures deterministic MemId
+        name, // kind matches name for identity memories
         content_json,
+        true, // unevictable - identity memories are always present
     ) catch |err| {
         std.log.warn("Failed to create memory for {s}: {s}", .{ template_name, @errorName(err) });
         return false;

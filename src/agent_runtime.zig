@@ -271,7 +271,7 @@ pub const AgentRuntime = struct {
         );
         defer self.allocator.free(payload);
 
-        var created = try self.active_memory.create(brain_name, .ram, null, "message", payload);
+        var created = try self.active_memory.create(brain_name, .ram, null, "message", payload, false);
         created.deinit(self.allocator);
     }
 
@@ -401,7 +401,7 @@ pub const AgentRuntime = struct {
 
         // Store results as artifacts
         for (results) |result| {
-            var artifact = try self.active_memory.create(brain_name, .ram, null, "tool_result", result.payload_json);
+            var artifact = try self.active_memory.create(brain_name, .ram, null, "tool_result", result.payload_json, false);
             artifact.deinit(self.allocator);
         }
 
