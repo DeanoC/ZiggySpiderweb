@@ -19,6 +19,14 @@ pub fn build(b: *std.Build) void {
     });
     spiderweb_mod.addImport("ziggy-piai", ziggy_piai_module);
 
+    // Add agent_config module for flat config loading
+    const agent_config_mod = b.createModule(.{
+        .root_source_file = b.path("src/agent_config.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    spiderweb_mod.addImport("agent_config", agent_config_mod);
+
     const spiderweb = b.addExecutable(.{
         .name = "spiderweb",
         .root_module = spiderweb_mod,
@@ -62,6 +70,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     test_mod.addImport("ziggy-piai", ziggy_piai_module);
+    test_mod.addImport("agent_config", agent_config_mod);
 
     const spiderweb_tests = b.addTest(.{
         .root_module = test_mod,
