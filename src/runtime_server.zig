@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const Config = @import("config.zig");
 const protocol = @import("protocol.zig");
 const agent_runtime = @import("agent_runtime.zig");
+const brain_specialization = @import("brain_specialization.zig");
 const memory = @import("memory.zig");
 const tool_registry = @import("tool_registry.zig");
 const ziggy_piai = @import("ziggy-piai");
@@ -68,8 +69,8 @@ const ProviderRuntime = struct {
     model_registry: ziggy_piai.models.ModelRegistry,
     api_registry: ziggy_piai.api_registry.ApiRegistry,
     http_client: std.http.Client,
-    provider_name: []u8,
-    model_name: ?[]u8,
+    default_provider_name: []u8,
+    default_model_name: ?[]u8,
     api_key: ?[]u8,
     base_url: ?[]u8,
 
@@ -86,14 +87,14 @@ const ProviderRuntime = struct {
             .model_registry = model_registry,
             .api_registry = api_registry,
             .http_client = .{ .allocator = allocator },
-            .provider_name = try allocator.dupe(u8, provider_cfg.name),
-            .model_name = null,
+            .default_provider_name = try allocator.dupe(u8, provider_cfg.name),
+            .default_model_name = null,
             .api_key = null,
             .base_url = null,
         };
         errdefer provider.deinit(allocator);
 
-        if (provider_cfg.model) |value| provider.model_name = try allocator.dupe(u8, value);
+        if (provider_cfg.model) |value| provider.default_model_name = try allocator.dupe(u8, value);
         if (provider_cfg.api_key) |value| provider.api_key = try allocator.dupe(u8, value);
         if (provider_cfg.base_url) |value| provider.base_url = try allocator.dupe(u8, value);
 
@@ -104,8 +105,8 @@ const ProviderRuntime = struct {
         self.model_registry.deinit();
         self.api_registry.deinit();
         self.http_client.deinit();
-        allocator.free(self.provider_name);
-        if (self.model_name) |value| allocator.free(value);
+        allocator.free(self.default_provider_name);
+        if (self.default_model_name) |value| allocator.free(value);
         if (self.api_key) |value| allocator.free(value);
         if (self.base_url) |value| allocator.free(value);
     }
@@ -556,7 +557,7 @@ pub const RuntimeServer = struct {
         };
 
         var provider_completion = if (self.provider_runtime != null)
-            self.completeWithProvider(job) catch |err| return self.wrapRuntimeErrorResponse(request_id, err)
+            self.completeWithProvider(job, DEFAULT_BRAIN) catch |err| return self.wrapRuntimeErrorResponse(request_id, err)
         else
             ProviderCompletion{
                 .assistant_text = try self.allocator.dupe(u8, content),
@@ -689,11 +690,45 @@ pub const RuntimeServer = struct {
         return frames;
     }
 
-    fn completeWithProvider(self: *RuntimeServer, job: *RuntimeQueueJob) !ProviderCompletion {
-        const provider = &(self.provider_runtime orelse return RuntimeServerError.ProviderModelNotFound);
-        const model = selectModel(provider) orelse return RuntimeServerError.ProviderModelNotFound;
+    fn completeWithProvider(self: *RuntimeServer, job: *RuntimeQueueJob, brain_name: []const u8) !ProviderCompletion {
+        const provider_runtime = &(self.provider_runtime orelse return RuntimeServerError.ProviderModelNotFound);
 
-        const api_key = try self.resolveApiKey(provider, model.provider);
+        var provider_name: []const u8 = provider_runtime.default_provider_name;
+        var model_name: ?[]const u8 = provider_runtime.default_model_name;
+        var think_level: ?[]const u8 = null;
+
+        var specialization = brain_specialization.loadBrainSpecialization(self.allocator, &self.runtime, brain_name) catch |err| blk: {
+            std.log.warn("Failed loading provider specialization for {s}: {s}", .{ brain_name, @errorName(err) });
+            break :blk null;
+        };
+        defer if (specialization) |*spec| spec.deinit();
+
+        if (specialization) |spec| {
+            if (spec.provider_name) |value| {
+                const provider_changed = !std.mem.eql(u8, provider_name, value);
+                provider_name = value;
+                if (provider_changed and spec.model_name == null) {
+                    model_name = null;
+                }
+            }
+            if (spec.model_name) |value| model_name = value;
+            if (spec.think_level) |value| think_level = value;
+        }
+        if (self.runtime.getBrainProviderOverride(brain_name)) |runtime_override| {
+            if (runtime_override.provider_name) |value| {
+                const provider_changed = !std.mem.eql(u8, provider_name, value);
+                provider_name = value;
+                if (provider_changed and runtime_override.model_name == null) {
+                    model_name = null;
+                }
+            }
+            if (runtime_override.model_name) |value| model_name = value;
+            if (runtime_override.think_level) |value| think_level = value;
+        }
+
+        const model = selectModel(provider_runtime, provider_name, model_name) orelse return RuntimeServerError.ProviderModelNotFound;
+
+        const api_key = try self.resolveApiKey(provider_runtime, model.provider);
         defer self.allocator.free(api_key);
 
         const world_tool_specs = try self.runtime.world_tools.exportProviderWorldTools(self.allocator);
@@ -712,7 +747,7 @@ pub const RuntimeServer = struct {
         var round: usize = 0;
         var total_calls: usize = 0;
         while (round < MAX_PROVIDER_TOOL_ROUNDS) : (round += 1) {
-            const active_memory_prompt = try self.buildProviderActiveMemoryPrompt(DEFAULT_BRAIN);
+            const active_memory_prompt = try self.buildProviderActiveMemoryPrompt(brain_name);
             defer self.allocator.free(active_memory_prompt);
 
             var events = std.array_list.Managed(ziggy_piai.types.AssistantMessageEvent).init(self.allocator);
@@ -734,11 +769,14 @@ pub const RuntimeServer = struct {
 
             streamByModelFn(
                 self.allocator,
-                &provider.http_client,
-                &provider.api_registry,
+                &provider_runtime.http_client,
+                &provider_runtime.api_registry,
                 model,
                 context,
-                .{ .api_key = api_key },
+                .{
+                    .api_key = api_key,
+                    .reasoning = think_level,
+                },
                 &events,
             ) catch return RuntimeServerError.ProviderStreamFailed;
 
@@ -759,12 +797,12 @@ pub const RuntimeServer = struct {
             }
             total_calls += tool_calls.len;
 
-            try self.appendAssistantToolCallMessage(DEFAULT_BRAIN, assistant.text, tool_calls);
+            try self.appendAssistantToolCallMessage(brain_name, assistant.text, tool_calls);
 
             for (tool_calls) |tool_call| {
                 const args_with_call_id = try injectToolCallId(self.allocator, tool_call.arguments_json, tool_call.id);
                 defer self.allocator.free(args_with_call_id);
-                try self.runtime.queueToolUse(DEFAULT_BRAIN, tool_call.name, args_with_call_id);
+                try self.runtime.queueToolUse(brain_name, tool_call.name, args_with_call_id);
             }
 
             var tool_payloads = std.ArrayListUnmanaged([]u8){};
@@ -783,18 +821,22 @@ pub const RuntimeServer = struct {
         return RuntimeServerError.ProviderToolLoopExceeded;
     }
 
-    fn resolveApiKey(self: *RuntimeServer, provider: *const ProviderRuntime, provider_name: []const u8) ![]const u8 {
-        if (provider.api_key) |key| return try self.allocator.dupe(u8, key);
+    fn resolveApiKey(self: *RuntimeServer, provider_runtime: *const ProviderRuntime, provider_name: []const u8) ![]const u8 {
+        if (provider_runtime.api_key) |key| {
+            if (std.mem.eql(u8, provider_name, provider_runtime.default_provider_name)) {
+                return try self.allocator.dupe(u8, key);
+            }
+        }
         return ziggy_piai.env_api_keys.getEnvApiKey(self.allocator, provider_name) orelse RuntimeServerError.MissingProviderApiKey;
     }
 
-    fn selectModel(provider: *const ProviderRuntime) ?ziggy_piai.types.Model {
-        if (provider.model_name) |model_name| {
-            return provider.model_registry.getModel(provider.provider_name, model_name);
+    fn selectModel(provider_runtime: *const ProviderRuntime, provider_name: []const u8, model_name: ?[]const u8) ?ziggy_piai.types.Model {
+        if (model_name) |selected_model_name| {
+            return provider_runtime.model_registry.getModel(provider_name, selected_model_name);
         }
 
-        for (provider.model_registry.models.items) |model| {
-            if (std.mem.eql(u8, model.provider, provider.provider_name)) return model;
+        for (provider_runtime.model_registry.models.items) |model| {
+            if (std.mem.eql(u8, model.provider, provider_name)) return model;
         }
         return null;
     }
@@ -1014,6 +1056,23 @@ const AsyncRequestCtx = struct {
     }
 };
 
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+
+fn setEnvForTest(allocator: std.mem.Allocator, name: []const u8, value: []const u8) !void {
+    const name_z = try allocator.dupeZ(u8, name);
+    defer allocator.free(name_z);
+    const value_z = try allocator.dupeZ(u8, value);
+    defer allocator.free(value_z);
+    if (setenv(name_z.ptr, value_z.ptr, 1) != 0) return error.SetEnvFailed;
+}
+
+fn unsetEnvForTest(allocator: std.mem.Allocator, name: []const u8) !void {
+    const name_z = try allocator.dupeZ(u8, name);
+    defer allocator.free(name_z);
+    if (unsetenv(name_z.ptr) != 0) return error.UnsetEnvFailed;
+}
+
 fn runRequestInThread(ctx: *AsyncRequestCtx) void {
     ctx.response = ctx.server.handleMessage(ctx.request_json) catch |err| {
         ctx.err_name = std.fmt.allocPrint(ctx.allocator, "{s}", .{@errorName(err)}) catch null;
@@ -1045,6 +1104,61 @@ fn mockProviderStreamByModel(
 }
 
 var mockToolLoopCallCount: usize = 0;
+var mockCapturedProviderName: ?[]const u8 = null;
+var mockCapturedModelName: ?[]const u8 = null;
+var mockCapturedReasoning: ?[]const u8 = null;
+var mockCapturedApiKey: ?[]u8 = null;
+
+fn mockProviderStreamCaptureConfig(
+    allocator: std.mem.Allocator,
+    _: *std.http.Client,
+    _: *ziggy_piai.api_registry.ApiRegistry,
+    model: ziggy_piai.types.Model,
+    _: ziggy_piai.types.Context,
+    options: ziggy_piai.types.StreamOptions,
+    events: *std.array_list.Managed(ziggy_piai.types.AssistantMessageEvent),
+) anyerror!void {
+    mockCapturedProviderName = model.provider;
+    mockCapturedModelName = model.id;
+    mockCapturedReasoning = options.reasoning;
+    if (mockCapturedApiKey) |existing| {
+        allocator.free(existing);
+        mockCapturedApiKey = null;
+    }
+    if (options.api_key) |value| {
+        mockCapturedApiKey = try allocator.dupe(u8, value);
+    }
+    try events.append(.{ .done = .{
+        .text = try allocator.dupe(u8, "captured provider response"),
+        .thinking = try allocator.dupe(u8, ""),
+        .tool_calls = &.{},
+        .api = model.api,
+        .provider = model.provider,
+        .model = model.id,
+        .usage = .{},
+        .stop_reason = .stop,
+        .error_message = null,
+    } });
+}
+
+fn writeAgentJsonForTest(allocator: std.mem.Allocator, agent_id: []const u8, brain_name: []const u8, content: []const u8) !void {
+    const agents_root = try std.fs.path.join(allocator, &.{ "agents", agent_id });
+    defer allocator.free(agents_root);
+
+    const dir = if (std.mem.eql(u8, brain_name, "primary"))
+        try allocator.dupe(u8, agents_root)
+    else
+        try std.fs.path.join(allocator, &.{ agents_root, brain_name });
+    defer allocator.free(dir);
+
+    try std.fs.cwd().makePath(dir);
+    const file_path = try std.fs.path.join(allocator, &.{ dir, "agent.json" });
+    defer allocator.free(file_path);
+    try std.fs.cwd().writeFile(.{
+        .sub_path = file_path,
+        .data = content,
+    });
+}
 
 fn mockProviderStreamByModelWithToolLoop(
     allocator: std.mem.Allocator,
@@ -1252,6 +1366,158 @@ test "runtime_server: provider-backed session.send uses configured provider runt
         }
     }
     try std.testing.expectEqual(@as(usize, 1), assistant_turns);
+}
+
+test "runtime_server: provider-only override resets inherited model and uses effective provider key source" {
+    const allocator = std.testing.allocator;
+    const original_stream_fn = streamByModelFn;
+    defer streamByModelFn = original_stream_fn;
+    streamByModelFn = mockProviderStreamCaptureConfig;
+    mockCapturedProviderName = null;
+    mockCapturedModelName = null;
+    mockCapturedReasoning = null;
+    if (mockCapturedApiKey) |value| {
+        allocator.free(value);
+        mockCapturedApiKey = null;
+    }
+    defer if (mockCapturedApiKey) |value| {
+        allocator.free(value);
+        mockCapturedApiKey = null;
+    };
+
+    const codex_env_name = "OPENAI_CODEX_API_KEY";
+    const prev_codex_key = std.process.getEnvVarOwned(allocator, codex_env_name) catch null;
+    defer if (prev_codex_key) |value| {
+        setEnvForTest(allocator, codex_env_name, value) catch {};
+        allocator.free(value);
+    } else {
+        unsetEnvForTest(allocator, codex_env_name) catch {};
+    };
+
+    try setEnvForTest(allocator, codex_env_name, "codex-env-key");
+
+    const server = try RuntimeServer.createWithProvider(allocator, "agent-provider-only-override", .{
+        .ltm_directory = "",
+        .ltm_filename = "",
+    }, .{
+        .name = "openai",
+        .model = "gpt-4o-mini",
+        .api_key = "configured-openai-key",
+    });
+    defer server.destroy();
+
+    try server.runtime.setBrainProviderOverride("primary", .{
+        .provider_name = "openai-codex",
+    });
+
+    const response = try server.handleMessage("{\"id\":\"req-provider-only-override\",\"type\":\"session.send\",\"content\":\"hello provider\"}");
+    defer allocator.free(response);
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "captured provider response") != null);
+    try std.testing.expectEqualStrings("openai-codex", mockCapturedProviderName.?);
+    try std.testing.expectEqualStrings("gpt-5.1-codex-mini", mockCapturedModelName.?);
+    try std.testing.expectEqualStrings("codex-env-key", mockCapturedApiKey.?);
+}
+
+test "runtime_server: agent.json can override primary brain provider model and think level" {
+    const allocator = std.testing.allocator;
+    const original_stream_fn = streamByModelFn;
+    defer streamByModelFn = original_stream_fn;
+    streamByModelFn = mockProviderStreamCaptureConfig;
+    mockCapturedProviderName = null;
+    mockCapturedModelName = null;
+    mockCapturedReasoning = null;
+
+    const agent_id = "agent-provider-json-override";
+    const agent_dir = try std.fs.path.join(allocator, &.{ "agents", agent_id });
+    defer allocator.free(agent_dir);
+    std.fs.cwd().deleteTree(agent_dir) catch {};
+    defer std.fs.cwd().deleteTree(agent_dir) catch {};
+
+    try writeAgentJsonForTest(allocator, agent_id, "primary",
+        \\{
+        \\  "provider": "openai-codex",
+        \\  "model": "gpt-5.1-codex-mini",
+        \\  "think_level": "high"
+        \\}
+    );
+
+    const server = try RuntimeServer.createWithProvider(allocator, agent_id, .{
+        .ltm_directory = "",
+        .ltm_filename = "",
+    }, .{
+        .name = "openai",
+        .model = "gpt-4o-mini",
+        .api_key = "test-key",
+    });
+    defer server.destroy();
+
+    const response = try server.handleMessage("{\"id\":\"req-provider-json-override\",\"type\":\"session.send\",\"content\":\"hello provider\"}");
+    defer allocator.free(response);
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "captured provider response") != null);
+    try std.testing.expectEqualStrings("openai-codex", mockCapturedProviderName.?);
+    try std.testing.expectEqualStrings("gpt-5.1-codex-mini", mockCapturedModelName.?);
+    try std.testing.expectEqualStrings("high", mockCapturedReasoning.?);
+}
+
+test "runtime_server: runtime override supersedes and can clear file provider specialization" {
+    const allocator = std.testing.allocator;
+    const original_stream_fn = streamByModelFn;
+    defer streamByModelFn = original_stream_fn;
+    streamByModelFn = mockProviderStreamCaptureConfig;
+
+    const agent_id = "agent-provider-runtime-override";
+    const agent_dir = try std.fs.path.join(allocator, &.{ "agents", agent_id });
+    defer allocator.free(agent_dir);
+    std.fs.cwd().deleteTree(agent_dir) catch {};
+    defer std.fs.cwd().deleteTree(agent_dir) catch {};
+
+    try writeAgentJsonForTest(allocator, agent_id, "primary",
+        \\{
+        \\  "provider": "openai-codex",
+        \\  "model": "gpt-5.1-codex-mini",
+        \\  "think_level": "low"
+        \\}
+    );
+
+    const server = try RuntimeServer.createWithProvider(allocator, agent_id, .{
+        .ltm_directory = "",
+        .ltm_filename = "",
+    }, .{
+        .name = "openai",
+        .model = "gpt-4o-mini",
+        .api_key = "test-key",
+    });
+    defer server.destroy();
+
+    try server.runtime.setBrainProviderOverride("primary", .{
+        .provider_name = "openai-codex",
+        .model_name = "gpt-5.2",
+        .think_level = "high",
+    });
+
+    mockCapturedProviderName = null;
+    mockCapturedModelName = null;
+    mockCapturedReasoning = null;
+    const overridden = try server.handleMessage("{\"id\":\"req-provider-runtime-override-1\",\"type\":\"session.send\",\"content\":\"hello provider\"}");
+    defer allocator.free(overridden);
+    try std.testing.expect(std.mem.indexOf(u8, overridden, "captured provider response") != null);
+    try std.testing.expectEqualStrings("openai-codex", mockCapturedProviderName.?);
+    try std.testing.expectEqualStrings("gpt-5.2", mockCapturedModelName.?);
+    try std.testing.expectEqualStrings("high", mockCapturedReasoning.?);
+
+    try server.runtime.setBrainProviderOverride("primary", .{});
+
+    mockCapturedProviderName = null;
+    mockCapturedModelName = null;
+    mockCapturedReasoning = null;
+    const reverted = try server.handleMessage("{\"id\":\"req-provider-runtime-override-2\",\"type\":\"session.send\",\"content\":\"hello provider\"}");
+    defer allocator.free(reverted);
+    try std.testing.expect(std.mem.indexOf(u8, reverted, "captured provider response") != null);
+    try std.testing.expectEqualStrings("openai-codex", mockCapturedProviderName.?);
+    try std.testing.expectEqualStrings("gpt-5.1-codex-mini", mockCapturedModelName.?);
+    try std.testing.expectEqualStrings("low", mockCapturedReasoning.?);
 }
 
 test "runtime_server: provider tool loop executes world tool and returns final response" {
