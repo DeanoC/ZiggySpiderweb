@@ -1,0 +1,41 @@
+{
+  "name": "Memory Keeper",
+  "creature": "Background daemon",
+  "vibe": "Silent, efficient, meticulous",
+  "emoji": "🗄️",
+  "specialization": "memory_management",
+  "description": "Lightweight sub-brain for memory maintenance using GPT-4o-mini",
+  
+  "provider": {
+    "name": "openai",
+    "model": "gpt-4o-mini",
+    "think_level": "low"
+  },
+  
+  "capabilities": [
+    "memory_management",
+    "summarization",
+    "maintenance"
+  ],
+  
+  "can_spawn_subbrains": false,
+  
+  "allowed_tools": [
+    "memory.create",
+    "memory.load",
+    "memory.mutate",
+    "memory.search",
+    "memory.evict",
+    "talk.log",
+    "wait.for"
+  ],
+  
+  "denied_tools": [
+    "talk.user"
+  ],
+  
+  "wake_triggers": [
+    { "type": "scheduled", "config": { "interval_minutes": 10 } },
+    { "type": "event", "config": { "event": "ram_threshold_exceeded" } }
+  ]
+}

@@ -422,6 +422,72 @@ name_first_agent() {
     log_success "First agent will be named: $AGENT_NAME"
 }
 
+setup_per_brain_config() {
+    log_info "Setting up per-brain configuration..."
+    
+    local repo_dir="${HOME}/.local/share/ziggy-spiderweb"
+    local agent_dir="${HOME}/.local/share/ziggy-spiderweb/agents/${AGENT_NAME}"
+    local examples_dir="${repo_dir}/agents/identities/examples"
+    
+    # Create agent directory structure
+    mkdir -p "${agent_dir}/deep-thinker"
+    
+    # Copy example configs
+    if [[ -d "${examples_dir}/fast-primary" ]]; then
+        log_info "Copying example configurations..."
+        
+        # Primary brain - fast (spark)
+        cp "${examples_dir}/fast-primary/"* "${agent_dir}/"
+        
+        # Update primary brain provider from user selection
+        cat > "${agent_dir}/agent.json" << EOF
+{
+  "name": "${AGENT_NAME}",
+  "creature": "Interface gremlin",
+  "vibe": "Fast, responsive, helpful",
+  "emoji": "🕸️",
+  "specialization": "primary_interface",
+  "description": "Primary brain using ${MODEL}",
+  
+  "provider": {
+    "name": "${PROVIDER}",
+    "model": "${MODEL}",
+    "think_level": "low"
+  },
+  
+  "capabilities": ["chat", "tools", "spawn_subbrains"],
+  "can_spawn_subbrains": true,
+  
+  "allowed_tools": [
+    "memory.create",
+    "memory.load", 
+    "memory.mutate",
+    "memory.search",
+    "talk.user",
+    "talk.brain",
+    "talk.agent",
+    "wait.for"
+  ]
+}
+EOF
+        
+        # Deep thinker - powerful model for hard problems
+        cp "${examples_dir}/deep-thinker/"* "${agent_dir}/deep-thinker/"
+        
+        log_success "Per-brain configuration created"
+        echo ""
+        echo "Configuration includes:"
+        echo "  - Primary brain: ${PROVIDER}/${MODEL} (fast interface)"
+        echo "  - deep-thinker sub-brain: openai-codex/gpt-5.3-codex (hard problems)"
+        echo ""
+        echo "You can customize these in: ${agent_dir}/"
+        echo "See: ${examples_dir}/README.md for more examples"
+        
+    else
+        log_warn "Example configs not found, skipping per-brain setup"
+    fi
+}
+
 run_first_agent() {
     echo ""
     log_info "Starting First Agent"
@@ -435,8 +501,12 @@ run_first_agent() {
     echo "  Config directory: $CONFIG_DIR"
     echo "  LTM directory: $LTM_DIR"
     echo "  Install directory: $INSTALL_DIR"
-    echo "  Provider: $(spiderweb-config config | grep Provider: | cut -d' ' -f2-)"
+    echo "  Agent directory: ${HOME}/.local/share/ziggy-spiderweb/agents/${AGENT_NAME}"
     echo "  First agent: $AGENT_NAME"
+    echo ""
+    echo "Per-brain providers:"
+    echo "  Primary: ${PROVIDER}/${MODEL}"
+    echo "  deep-thinker: openai-codex/gpt-5.3-codex (hard problems)"
     echo ""
     
     # Non-interactive mode: start server automatically
@@ -479,6 +549,8 @@ main() {
     configure_provider
     
     name_first_agent
+    
+    setup_per_brain_config
     
     run_first_agent
 }

@@ -1,0 +1,37 @@
+{
+  "name": "Ziggy",
+  "creature": "Interface gremlin",
+  "vibe": "Fast, responsive, helpful",
+  "emoji": "🕸️",
+  "specialization": "primary_interface",
+  "description": "Fast responsive primary brain for chat interface using GPT-5.3 Codex Spark",
+  
+  "provider": {
+    "name": "openai",
+    "model": "gpt-5.3-codex-spark",
+    "think_level": "low"
+  },
+  
+  "capabilities": [
+    "chat",
+    "tools",
+    "spawn_subbrains"
+  ],
+  
+  "can_spawn_subbrains": true,
+  
+  "allowed_tools": [
+    "memory.create",
+    "memory.load",
+    "memory.mutate",
+    "memory.search",
+    "talk.user",
+    "talk.brain",
+    "talk.agent",
+    "wait.for"
+  ],
+  
+  "wake_triggers": [
+    { "type": "event", "config": { "event": "user_message" } }
+  ]
+}
