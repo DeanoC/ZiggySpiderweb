@@ -29,7 +29,7 @@ pub const brain_tool_schemas = [_]ToolSchema{
     .{ .name = "memory.search", .description = "Keyword search memory entries", .required_fields = &[_][]const u8{"query"} },
     .{ .name = "wait.for", .description = "Wait for correlated talk/event", .required_fields = &[_][]const u8{"events"} },
     .{ .name = "talk.user", .description = "Send message to user channel", .required_fields = &[_][]const u8{"message"} },
-    .{ .name = "talk.agent", .description = "Send message to another agent channel", .required_fields = &[_][]const u8{"message"} },
+    .{ .name = "talk.agent", .description = "Send message to another agent channel", .required_fields = &[_][]const u8{ "message", "target_brain" } },
     .{ .name = "talk.brain", .description = "Send message to another brain", .required_fields = &[_][]const u8{ "message", "target_brain" } },
     .{ .name = "talk.log", .description = "Emit runtime log talk event", .required_fields = &[_][]const u8{"message"} },
 };
@@ -402,10 +402,12 @@ pub const Engine = struct {
                 return .{ .result = try self.failure(tool_name, "invalid_args", "talk.brain requires 'target_brain'"), .talk_id = 0 };
             };
         } else if (std.mem.eql(u8, tool_name, "talk.agent")) {
-            target_brain = if (args.get("target_brain")) |value|
-                if (value == .string) value.string else ""
-            else
-                "";
+            target_brain = getRequiredString(args, "target_brain") orelse {
+                return .{ .result = try self.failure(tool_name, "invalid_args", "talk.agent requires 'target_brain'"), .talk_id = 0 };
+            };
+            if (target_brain.len == 0 or std.mem.eql(u8, target_brain, "user")) {
+                return .{ .result = try self.failure(tool_name, "invalid_args", "talk.agent target_brain must be a non-user brain"), .talk_id = 0 };
+            }
         }
 
         self.bus.enqueue(.{
@@ -1057,6 +1059,48 @@ test "brain_tools: talk.agent emits delegated event" {
     defer deinitEvents(allocator, delegate_events);
     try std.testing.expectEqual(@as(usize, 1), delegate_events.len);
     try std.testing.expectEqual(@as(?event_bus.TalkId, talk_id), delegate_events[0].talk_id);
+}
+
+test "brain_tools: talk.agent requires explicit target_brain" {
+    const allocator = std.testing.allocator;
+    var mem = try memory.RuntimeMemory.init(allocator, "agentA");
+    defer mem.deinit();
+    var bus = event_bus.EventBus.init(allocator);
+    defer bus.deinit();
+
+    var brain = try brain_context.BrainContext.init(allocator, "primary");
+    defer brain.deinit();
+    try brain.queueToolUse("talk.agent", "{\"message\":\"handoff\"}");
+
+    var engine = Engine.init(allocator, &mem, &bus);
+    const results = try engine.executePending(&brain);
+    defer deinitResults(allocator, results);
+
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expect(!results[0].success);
+    try std.testing.expect(std.mem.indexOf(u8, results[0].payload_json, "talk.agent requires 'target_brain'") != null);
+    try std.testing.expectEqual(@as(usize, 0), bus.pendingCount());
+}
+
+test "brain_tools: talk.agent rejects user target to avoid delivery leak" {
+    const allocator = std.testing.allocator;
+    var mem = try memory.RuntimeMemory.init(allocator, "agentA");
+    defer mem.deinit();
+    var bus = event_bus.EventBus.init(allocator);
+    defer bus.deinit();
+
+    var brain = try brain_context.BrainContext.init(allocator, "primary");
+    defer brain.deinit();
+    try brain.queueToolUse("talk.agent", "{\"message\":\"handoff\",\"target_brain\":\"user\"}");
+
+    var engine = Engine.init(allocator, &mem, &bus);
+    const results = try engine.executePending(&brain);
+    defer deinitResults(allocator, results);
+
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expect(!results[0].success);
+    try std.testing.expect(std.mem.indexOf(u8, results[0].payload_json, "must be a non-user brain") != null);
+    try std.testing.expectEqual(@as(usize, 0), bus.pendingCount());
 }
 
 test "brain_tools: talk.log emits log-targeted event" {

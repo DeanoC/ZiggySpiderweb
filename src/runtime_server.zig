@@ -337,12 +337,19 @@ pub const RuntimeServer = struct {
         const deadline_ns: i128 = std.time.nanoTimestamp() + @as(i128, @intCast(timeout_ns));
 
         job.result_mutex.lock();
-        defer job.result_mutex.unlock();
 
         while (!job.done) {
             const now_ns = std.time.nanoTimestamp();
             if (now_ns >= deadline_ns) {
                 job.cancelled = true;
+                const removed_from_queue = self.cancelQueuedJob(job);
+                if (removed_from_queue) {
+                    job.done = true;
+                }
+                job.result_mutex.unlock();
+                if (removed_from_queue) {
+                    self.destroyJob(job);
+                }
                 return RuntimeServerError.RuntimeJobTimeout;
             }
 
@@ -352,10 +359,28 @@ pub const RuntimeServer = struct {
             };
         }
 
-        const response = job.response orelse return RuntimeServerError.MissingJobResponse;
+        const response = job.response orelse {
+            job.result_mutex.unlock();
+            return RuntimeServerError.MissingJobResponse;
+        };
         job.response = null;
+        job.result_mutex.unlock();
         self.destroyJob(job);
         return response;
+    }
+
+    fn cancelQueuedJob(self: *RuntimeServer, job: *RuntimeQueueJob) bool {
+        self.queue_mutex.lock();
+        defer self.queue_mutex.unlock();
+
+        var idx: usize = 0;
+        while (idx < self.runtime_jobs.items.len) : (idx += 1) {
+            if (self.runtime_jobs.items[idx] == job) {
+                _ = self.runtime_jobs.orderedRemove(idx);
+                return true;
+            }
+        }
+        return false;
     }
 
     fn dequeueJob(self: *RuntimeServer) ?*RuntimeQueueJob {
@@ -1262,4 +1287,58 @@ test "runtime_server: concurrent queue pressure yields deterministic queue_satur
         if (std.mem.indexOf(u8, payload, "\"code\":\"queue_saturated\"") != null) saturated_count += 1;
     }
     try std.testing.expect(saturated_count >= 1);
+}
+
+test "runtime_server: timed-out queued jobs are removed from queue accounting" {
+    const allocator = std.testing.allocator;
+    const server = try RuntimeServer.create(allocator, "agent-test", .{
+        .runtime_worker_threads = 1,
+        .runtime_request_queue_max = 1,
+        .control_operation_timeout_ms = 15,
+        .ltm_directory = "",
+        .ltm_filename = "",
+    });
+    defer server.destroy();
+
+    server.runtime_mutex.lock();
+    var runtime_locked = true;
+    defer if (runtime_locked) server.runtime_mutex.unlock();
+
+    var ctx1 = AsyncRequestCtx{
+        .allocator = allocator,
+        .server = server,
+        .request_json = "{\"id\":\"req-hol-1\",\"type\":\"agent.control\",\"action\":\"state\"}",
+    };
+    defer ctx1.deinit();
+
+    const t1 = try std.Thread.spawn(.{}, runRequestInThread, .{&ctx1});
+    defer t1.join();
+
+    var saw_nonzero_queue = false;
+    var spins: usize = 0;
+    while (spins < 200) : (spins += 1) {
+        server.queue_mutex.lock();
+        const queued = server.runtime_jobs.items.len;
+        server.queue_mutex.unlock();
+        if (queued > 0) saw_nonzero_queue = true;
+        if (saw_nonzero_queue and queued == 0) break;
+        std.Thread.sleep(1 * std.time.ns_per_ms);
+    }
+
+    const second = try server.handleMessage("{\"id\":\"req-hol-2\",\"type\":\"agent.control\",\"action\":\"state\"}");
+    defer allocator.free(second);
+    try std.testing.expect(std.mem.indexOf(u8, second, "\"code\":\"runtime_timeout\"") != null);
+
+    const third = try server.handleMessage("{\"id\":\"req-hol-3\",\"type\":\"agent.control\",\"action\":\"state\"}");
+    defer allocator.free(third);
+    try std.testing.expect(std.mem.indexOf(u8, third, "\"code\":\"runtime_timeout\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, third, "\"code\":\"queue_saturated\"") == null);
+
+    server.runtime_mutex.unlock();
+    runtime_locked = false;
+    std.Thread.sleep(40 * std.time.ns_per_ms);
+
+    try std.testing.expect(ctx1.err_name == null);
+    try std.testing.expect(ctx1.response != null);
+    try std.testing.expect(std.mem.indexOf(u8, ctx1.response.?, "\"code\":\"runtime_timeout\"") != null);
 }

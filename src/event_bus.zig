@@ -117,6 +117,18 @@ pub const EventBus = struct {
         return self.events.items.len;
     }
 
+    pub fn hasPendingForBrain(self: *EventBus, brain: []const u8) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        for (self.events.items) |event| {
+            const is_broadcast = event.target_brain.len == 0;
+            const is_target = std.mem.eql(u8, event.target_brain, brain);
+            if (is_broadcast or is_target) return true;
+        }
+        return false;
+    }
+
     pub fn removeLatestMatching(
         self: *EventBus,
         event_type: EventType,
@@ -250,4 +262,30 @@ test "event_bus: removeLatestMatching removes newest matching event only" {
     try std.testing.expectEqual(@as(usize, 2), bus.pendingCount());
     try std.testing.expect(try bus.removeLatestMatching(.user, "user", "primary", "hello"));
     try std.testing.expectEqual(@as(usize, 1), bus.pendingCount());
+}
+
+test "event_bus: hasPendingForBrain reflects targeted and broadcast events" {
+    const allocator = std.testing.allocator;
+    var bus = EventBus.init(allocator);
+    defer bus.deinit();
+
+    try std.testing.expect(!bus.hasPendingForBrain("primary"));
+
+    try bus.enqueue(.{
+        .event_type = .talk,
+        .source_brain = "primary",
+        .target_brain = "delegate",
+        .payload = "sync",
+    });
+    try std.testing.expect(!bus.hasPendingForBrain("primary"));
+    try std.testing.expect(bus.hasPendingForBrain("delegate"));
+
+    try bus.enqueue(.{
+        .event_type = .hook,
+        .source_brain = "system",
+        .target_brain = "",
+        .payload = "broadcast",
+    });
+    try std.testing.expect(bus.hasPendingForBrain("primary"));
+    try std.testing.expect(bus.hasPendingForBrain("delegate"));
 }

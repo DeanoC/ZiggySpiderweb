@@ -233,6 +233,8 @@ pub const AgentRuntime = struct {
             artifact.deinit(self.allocator);
         }
 
+        try self.enqueueTicksForPendingBrainEvents();
+
         const user_events = try self.bus.dequeueForBrain(self.allocator, "user");
         defer {
             for (user_events) |*event| event.deinit(self.allocator);
@@ -270,6 +272,23 @@ pub const AgentRuntime = struct {
             return RuntimeError.QueueSaturated;
         }
         try self.tick_queue.append(self.allocator, try self.allocator.dupe(u8, brain_name));
+    }
+
+    fn enqueueTicksForPendingBrainEvents(self: *AgentRuntime) !void {
+        var it = self.brains.iterator();
+        while (it.next()) |entry| {
+            const target_brain = entry.key_ptr.*;
+            if (!self.bus.hasPendingForBrain(target_brain)) continue;
+            if (self.hasQueuedTick(target_brain)) continue;
+            try self.enqueueTick(target_brain);
+        }
+    }
+
+    fn hasQueuedTick(self: *const AgentRuntime, brain_name: []const u8) bool {
+        for (self.tick_queue.items) |queued_name| {
+            if (std.mem.eql(u8, queued_name, brain_name)) return true;
+        }
+        return false;
     }
 
     fn removeLatestTick(self: *AgentRuntime, brain_name: []const u8) bool {
@@ -411,6 +430,24 @@ test "agent_runtime: talk.brain plus wait.for correlates across brains" {
     try std.testing.expectEqual(@as(usize, 1), resolve_tick.tool_results.len);
     try std.testing.expect(resolve_tick.tool_results[0].success);
     try std.testing.expect(std.mem.indexOf(u8, resolve_tick.tool_results[0].payload_json, "\"waiting\":false") != null);
+}
+
+test "agent_runtime: talk.brain schedules target brain tick for runtime loop" {
+    const allocator = std.testing.allocator;
+    var runtime = try AgentRuntime.init(allocator, "agentA", &[_][]const u8{"research"});
+    defer runtime.deinit();
+
+    try runtime.queueToolUse("primary", "talk.brain", "{\"message\":\"sync\",\"target_brain\":\"research\"}");
+
+    var first_tick = (try runtime.tickNext()).?;
+    defer first_tick.deinit(allocator);
+    try std.testing.expectEqualStrings("primary", first_tick.brain);
+    try std.testing.expectEqual(@as(usize, 1), first_tick.tool_results.len);
+    try std.testing.expect(first_tick.tool_results[0].success);
+
+    var second_tick = (try runtime.tickNext()).?;
+    defer second_tick.deinit(allocator);
+    try std.testing.expectEqualStrings("research", second_tick.brain);
 }
 
 test "agent_runtime: memory lifecycle create mutate evict load historical" {
