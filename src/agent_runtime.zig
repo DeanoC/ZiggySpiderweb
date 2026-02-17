@@ -6,6 +6,9 @@ const brain_tools = @import("brain_tools.zig");
 const event_bus = @import("event_bus.zig");
 const tool_registry = @import("tool_registry.zig");
 const tool_executor = @import("tool_executor.zig");
+const hook_registry = @import("hook_registry.zig");
+const system_hooks = @import("system_hooks.zig");
+const brain_specialization = @import("brain_specialization.zig");
 
 pub const RuntimeError = error{
     BrainNotFound,
@@ -55,6 +58,7 @@ pub const AgentRuntime = struct {
     state: RuntimeState = .running,
     queue_limits: QueueLimits = .{},
     checkpoint: u64 = 0,
+    hooks: hook_registry.HookRegistry,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -90,10 +94,17 @@ pub const AgentRuntime = struct {
             .active_memory = try memory.RuntimeMemory.initWithStore(allocator, agent_id, owned_store),
             .bus = event_bus.EventBus.init(allocator),
             .world_tools = tool_registry.ToolRegistry.init(allocator),
+            .hooks = hook_registry.HookRegistry.init(allocator),
         };
         errdefer runtime.deinit();
 
         try tool_executor.BuiltinTools.registerAll(&runtime.world_tools);
+
+        // Register system hooks
+        try system_hooks.registerSystemHooks(&runtime.hooks);
+
+        // Register brain specialization hook (at priority 0)
+        try brain_specialization.registerBrainSpecialization(&runtime.hooks, "primary");
 
         try runtime.addBrain("primary");
         for (sub_brains) |brain_name| {
@@ -121,6 +132,7 @@ pub const AgentRuntime = struct {
         for (self.control_events.items) |event| self.allocator.free(event);
         self.control_events.deinit(self.allocator);
 
+        self.hooks.deinit();
         self.bus.deinit();
         self.world_tools.deinit();
         self.active_memory.deinit();
@@ -209,6 +221,18 @@ pub const AgentRuntime = struct {
 
         const brain = self.brains.getPtr(brain_name) orelse return RuntimeError.BrainNotFound;
 
+        // Setup hook context
+        self.checkpoint += 1;
+        var ctx = hook_registry.HookContext.init(self, brain_name, self.checkpoint);
+        defer ctx.deinit(self.allocator);
+
+        // === PRE_OBSERVE ===
+        var rom = hook_registry.Rom.init(self.allocator);
+        defer rom.deinit();
+
+        try self.hooks.execute(.pre_observe, &ctx, .{ .pre_observe = &rom });
+
+        // Collect inbox events
         brain.clearInbox();
         const inbound = try self.bus.dequeueForBrain(self.allocator, brain_name);
         defer {
@@ -227,18 +251,55 @@ pub const AgentRuntime = struct {
             });
         }
 
+        // === OBSERVE ===
         const snapshot = try self.active_memory.snapshotActive(self.allocator, brain_name);
         defer memory.deinitItems(self.allocator, snapshot);
-        const observe_json = try memory.toActiveMemoryJson(self.allocator, brain_name, snapshot);
 
+        // Build observe_json including both active memory and ROM
+        const observe_json = try buildObserveJson(self.allocator, brain_name, snapshot, &rom);
+        // Note: observe_json is owned by TickResult and freed in TickResult.deinit()
+
+        // === POST_OBSERVE ===
+        var observe_result = hook_registry.ObserveResult{
+            .rom = &rom,
+            .inbox_count = brain.inbox.items.len,
+        };
+        try self.hooks.execute(.post_observe, &ctx, .{ .post_observe = &observe_result });
+
+        // === PRE_MUTATE ===
+        var pending_tools = hook_registry.PendingTools.init();
+        defer pending_tools.deinit(self.allocator);
+
+        // Convert brain's pending tool uses to hook format
+        for (brain.pending_tool_uses.items) |tool_use| {
+            try pending_tools.add(self.allocator, tool_use.name, tool_use.args_json);
+        }
+        try self.hooks.execute(.pre_mutate, &ctx, .{ .pre_mutate = &pending_tools });
+
+        // Sync back to brain (hooks may have modified/removed tools)
+        brain.clearPendingTools();
+        for (pending_tools.tools.items) |tool| {
+            try brain.queueToolUse(tool.name, tool.args_json);
+        }
+
+        // === MUTATE ===
         var engine = brain_tools.Engine.initWithWorldTools(self.allocator, &self.active_memory, &self.bus, &self.world_tools);
         const results = try engine.executePending(brain);
         errdefer brain_tools.deinitResults(self.allocator, results);
 
+        // === POST_MUTATE ===
+        var tool_results = hook_registry.ToolResults{ .results = results };
+        try self.hooks.execute(.post_mutate, &ctx, .{ .post_mutate = &tool_results });
+
+        // Store results as artifacts
         for (results) |result| {
             var artifact = try self.active_memory.create(brain_name, .ram, null, "tool_result", result.payload_json);
             artifact.deinit(self.allocator);
         }
+
+        // === PRE_RESULTS ===
+        var results_data = hook_registry.ResultsData{ .tool_results = &tool_results };
+        try self.hooks.execute(.pre_results, &ctx, .{ .pre_results = &results_data });
 
         try self.enqueueTicksForPendingBrainEvents();
 
@@ -255,7 +316,13 @@ pub const AgentRuntime = struct {
             try self.outbound_messages.append(self.allocator, try self.allocator.dupe(u8, event.payload));
         }
 
-        self.checkpoint += 1;
+        // === POST_RESULTS ===
+        var checkpoint_data = hook_registry.CheckpointData{
+            .tick = self.checkpoint,
+            .artifacts_count = results.len,
+        };
+        try self.hooks.execute(.post_results, &ctx, .{ .post_results = &checkpoint_data });
+
         return .{
             .brain = try self.allocator.dupe(u8, brain_name),
             .observe_json = observe_json,
@@ -308,6 +375,102 @@ pub const AgentRuntime = struct {
             return true;
         }
         return false;
+    }
+
+    /// Build observe JSON combining active memory and ROM
+    fn buildObserveJson(
+        allocator: std.mem.Allocator,
+        brain_name: []const u8,
+        snapshot: []const memory.ActiveMemoryItem,
+        rom: *const hook_registry.Rom,
+    ) ![]u8 {
+        // Start with active memory JSON
+        var result = std.ArrayListUnmanaged(u8){};
+        defer result.deinit(allocator);
+
+        const writer = result.writer(allocator);
+
+        // Build JSON manually to include both memory and ROM
+        try writer.writeAll("{");
+
+        // Active memory
+        try writer.writeAll("\"brain\":");
+        try writeJsonString(writer, brain_name);
+        try writer.writeByte(',');
+        try writer.writeAll("\"active_memory\":");
+
+        // Serialize snapshot
+        try writer.writeByte('[');
+        for (snapshot, 0..) |item, i| {
+            if (i > 0) try writer.writeByte(',');
+            try writer.writeByte('{');
+            // Use JSON escaping for all string fields
+            try writer.writeAll("\"mem_id\":");
+            try writeJsonString(writer, item.mem_id);
+            try writer.writeByte(',');
+            try writer.print("\"tier\":\"{s}\",", .{@tagName(item.tier)});
+            try writer.writeAll("\"kind\":");
+            try writeJsonString(writer, item.kind);
+            try writer.writeByte(',');
+            try writer.print("\"mutable\":{},", .{item.mutable});
+            try writer.writeAll("\"content\":");
+            // Validate content_json is valid JSON, otherwise wrap as string
+            if (isValidJson(item.content_json)) {
+                try writer.writeAll(item.content_json);
+            } else {
+                try writeJsonString(writer, item.content_json);
+            }
+            try writer.writeByte('}');
+        }
+        try writer.writeByte(']');
+
+        // ROM entries
+        try writer.writeAll(",\"rom\":");
+        try writer.writeByte('{');
+
+        var first = true;
+        var rom_it = rom.entries.iterator();
+        while (rom_it.next()) |entry| {
+            if (!first) try writer.writeByte(',');
+            first = false;
+            // Proper JSON string encoding for key and value
+            try writeJsonString(writer, entry.key_ptr.*);
+            try writer.writeByte(':');
+            try writeJsonString(writer, entry.value_ptr.value);
+        }
+        try writer.writeByte('}');
+
+        try writer.writeByte('}');
+
+        return result.toOwnedSlice(allocator);
+    }
+
+    /// Check if a string is valid JSON
+    fn isValidJson(str: []const u8) bool {
+        // Try to parse as JSON - if it succeeds, it's valid
+        const parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, str, .{}) catch return false;
+        parsed.deinit();
+        return true;
+    }
+
+    /// Write a string as a JSON string value with proper escaping
+    fn writeJsonString(writer: anytype, str: []const u8) !void {
+        try writer.writeByte('"');
+        for (str) |c| {
+            switch (c) {
+                '"' => try writer.writeAll("\\\""),
+                '\\' => try writer.writeAll("\\\\"),
+                '\n' => try writer.writeAll("\\n"),
+                '\r' => try writer.writeAll("\\r"),
+                '\t' => try writer.writeAll("\\t"),
+                '\x08' => try writer.writeAll("\\b"),
+                '\x0C' => try writer.writeAll("\\f"),
+                // Other control characters must be escaped as \u00XX
+                0x00...0x07, 0x0B, 0x0E...0x1F => try writer.print("\\u00{X:0>2}", .{c}),
+                else => try writer.writeByte(c),
+            }
+        }
+        try writer.writeByte('"');
     }
 };
 
