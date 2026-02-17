@@ -1,61 +1,53 @@
-# Tool System Implementation Plan
-
-GitHub Issue #3: Add tool registry and calling mechanism
+# Tool System (Current Implementation)
 
 ## Overview
-Implement a complete tool system allowing agents to call tools like file_read, search, shell, etc.
+The world tool system is implemented as a provider-driven tool-calling loop.
 
-## Architecture
+There is no standalone websocket `tool.list` / `tool.call` protocol in this implementation.
+Tools are exposed to the model during `session.send`, and model-emitted tool calls are executed inside runtime.
 
-### 1. Tool Registry (`src/tool_registry.zig`)
-- Register tools with JSON schemas
-- Tool metadata: name, description, parameters, handler function
-- Dynamic tool discovery
+## Runtime Flow
 
-### 2. Tool Schema (`src/tool_schema.zig`)
-- JSON Schema generation for tools
-- Parameter validation
-- Type conversion
+1. Client sends `session.send`.
+2. Runtime builds provider context with world tool schemas.
+3. Provider may emit tool calls.
+4. Runtime executes tool calls through the world tool registry.
+5. Tool results are fed back to provider as `tool_result` messages.
+6. Loop repeats until provider returns final assistant text.
+7. Runtime emits:
+   - `session.receive`
+   - `tool.event`
+   - `memory.event`
 
-### 3. Tool Execution (`src/tool_executor.zig`)
-- Execute tool calls
-- Handle results/errors
-- Security sandboxing (where applicable)
+## Implemented World Tools
 
-### 4. Protocol Integration (`src/server_piai.zig`)
-- `tool.list` → `tool.list.response`
-- `tool.call` → `tool.result` / `tool.error`
-- Stream tool results for long-running operations
+- `file.read`
+- `file.write`
+- `file.list`
+- `search.code`
+- `shell.exec`
 
-## Tools to Implement (Phase 1)
+## Core Modules
 
-### File Operations
-- `file_read` - Read file contents
-- `file_write` - Write/modify files
-- `file_list` - List directory contents
+- `src/tool_registry.zig`: world/brain tool schemas, registration, provider schema export, execution dispatch.
+- `src/tool_executor.zig`: implementations for the five world tools.
+- `src/agent_runtime.zig`: runtime-owned world tool registry and registration.
+- `src/brain_tools.zig`: dispatches unknown tool names to world tool registry.
+- `src/runtime_server.zig`: provider tool-call roundtrip loop and event emission.
 
-### Search
-- `search_code` - Search codebase (grep/ripgrep)
-- `search_memory` - Query LTM store
+## Limits and Safeguards
 
-### System
-- `shell` - Execute shell commands (with restrictions)
-- `exec` - Run background tasks
+- Max provider tool rounds per request: `8`
+- Max total tool calls per request: `32`
+- `shell.exec` timeout is bounded and output is capped
+- Queue saturation/runtime pause/cancel semantics continue to apply
 
-### Memory
-- `memory_query` - Query long-term memory
-- `memory_store` - Store to long-term memory
+## Testing
 
-## Implementation Steps
-
-1. Define tool types and interfaces
-2. Create tool registry
-3. Implement core tools
-4. Add protocol handlers
-5. Write tests
-6. Document API
-
-## Security Considerations
-- Shell commands restricted to workspace
-- File access within project boundaries
-- Rate limiting on expensive operations
+- Unit tests:
+  - world tool handlers in `src/tool_executor.zig`
+  - runtime/provider tool loop in `src/runtime_server.zig`
+- Full suite:
+  - `zig build test`
+- Build verification:
+  - `zig build`

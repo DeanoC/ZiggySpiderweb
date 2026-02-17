@@ -4,6 +4,8 @@ const memory = @import("memory.zig");
 const brain_context = @import("brain_context.zig");
 const brain_tools = @import("brain_tools.zig");
 const event_bus = @import("event_bus.zig");
+const tool_registry = @import("tool_registry.zig");
+const tool_executor = @import("tool_executor.zig");
 
 pub const RuntimeError = error{
     BrainNotFound,
@@ -45,6 +47,7 @@ pub const AgentRuntime = struct {
     ltm_store: ?*ltm_store.VersionedMemStore = null,
     active_memory: memory.RuntimeMemory,
     bus: event_bus.EventBus,
+    world_tools: tool_registry.ToolRegistry,
     brains: std.StringHashMapUnmanaged(brain_context.BrainContext) = .{},
     tick_queue: std.ArrayListUnmanaged([]u8) = .{},
     outbound_messages: std.ArrayListUnmanaged([]u8) = .{},
@@ -86,8 +89,11 @@ pub const AgentRuntime = struct {
             .ltm_store = owned_store,
             .active_memory = try memory.RuntimeMemory.initWithStore(allocator, agent_id, owned_store),
             .bus = event_bus.EventBus.init(allocator),
+            .world_tools = tool_registry.ToolRegistry.init(allocator),
         };
         errdefer runtime.deinit();
+
+        try tool_executor.BuiltinTools.registerAll(&runtime.world_tools);
 
         try runtime.addBrain("primary");
         for (sub_brains) |brain_name| {
@@ -116,6 +122,7 @@ pub const AgentRuntime = struct {
         self.control_events.deinit(self.allocator);
 
         self.bus.deinit();
+        self.world_tools.deinit();
         self.active_memory.deinit();
         if (self.ltm_store) |store| {
             store.close();
@@ -224,7 +231,7 @@ pub const AgentRuntime = struct {
         defer memory.deinitItems(self.allocator, snapshot);
         const observe_json = try memory.toActiveMemoryJson(self.allocator, brain_name, snapshot);
 
-        var engine = brain_tools.Engine.init(self.allocator, &self.active_memory, &self.bus);
+        var engine = brain_tools.Engine.initWithWorldTools(self.allocator, &self.active_memory, &self.bus, &self.world_tools);
         const results = try engine.executePending(brain);
         errdefer brain_tools.deinitResults(self.allocator, results);
 
