@@ -229,7 +229,7 @@ pub const AgentRuntime = struct {
         // === PRE_OBSERVE ===
         var rom = hook_registry.Rom.init(self.allocator);
         defer rom.deinit();
-        
+
         try self.hooks.execute(.pre_observe, &ctx, .{ .pre_observe = &rom });
 
         // Collect inbox events
@@ -254,7 +254,10 @@ pub const AgentRuntime = struct {
         // === OBSERVE ===
         const snapshot = try self.active_memory.snapshotActive(self.allocator, brain_name);
         defer memory.deinitItems(self.allocator, snapshot);
-        const observe_json = try memory.toActiveMemoryJson(self.allocator, brain_name, snapshot);
+
+        // Build observe_json including both active memory and ROM
+        const observe_json = try buildObserveJson(self.allocator, brain_name, snapshot, &rom);
+        // Note: observe_json is owned by TickResult and freed in TickResult.deinit()
 
         // === POST_OBSERVE ===
         var observe_result = hook_registry.ObserveResult{
@@ -372,6 +375,68 @@ pub const AgentRuntime = struct {
             return true;
         }
         return false;
+    }
+
+    /// Build observe JSON combining active memory and ROM
+    fn buildObserveJson(
+        allocator: std.mem.Allocator,
+        brain_name: []const u8,
+        snapshot: []const memory.ActiveMemoryItem,
+        rom: *const hook_registry.Rom,
+    ) ![]u8 {
+        // Start with active memory JSON
+        var result = std.ArrayListUnmanaged(u8){};
+        defer result.deinit(allocator);
+
+        const writer = result.writer(allocator);
+
+        // Build JSON manually to include both memory and ROM
+        try writer.writeAll("{");
+
+        // Active memory
+        try writer.print("\"brain\":\"{s}\",", .{brain_name});
+        try writer.writeAll("\"active_memory\":");
+
+        // Serialize snapshot
+        try writer.writeByte('[');
+        for (snapshot, 0..) |item, i| {
+            if (i > 0) try writer.writeByte(',');
+            try writer.writeByte('{');
+            try writer.print("\"mem_id\":\"{s}\",", .{item.mem_id});
+            try writer.print("\"tier\":\"{s}\",", .{@tagName(item.tier)});
+            try writer.print("\"kind\":\"{s}\",", .{item.kind});
+            try writer.print("\"mutable\":{},", .{item.mutable});
+            try writer.print("\"content\":", .{});
+            try writer.writeAll(item.content_json);
+            try writer.writeByte('}');
+        }
+        try writer.writeByte(']');
+
+        // ROM entries
+        try writer.writeAll(",\"rom\":");
+        try writer.writeByte('{');
+
+        var first = true;
+        var rom_it = rom.entries.iterator();
+        while (rom_it.next()) |entry| {
+            if (!first) try writer.writeByte(',');
+            first = false;
+            // Simple JSON string encoding (assumes keys/values are safe)
+            try writer.writeByte('"');
+            try writer.writeAll(entry.key_ptr.*);
+            try writer.writeAll("\":\"");
+            // Escape quotes in value if needed
+            for (entry.value_ptr.value) |c| {
+                if (c == '"' or c == '\\') try writer.writeByte('\\');
+                try writer.writeByte(c);
+            }
+            try writer.writeByte('"');
+        }
+        try writer.writeByte('}');
+
+        try writer.writeByte('}');
+
+        return result.toOwnedSlice(allocator);
     }
 };
 
