@@ -448,6 +448,12 @@ fn loadAgentJsonFile(
     runtime: *AgentRuntime,
     brain_name: []const u8,
 ) !?[]u8 {
+    // Security: Validate agent_id doesn't contain path traversal
+    if (!isValidAgentId(runtime.agent_id)) {
+        std.log.err("Invalid agent_id contains path traversal: {s}", .{runtime.agent_id});
+        return error.InvalidAgentId;
+    }
+    
     // Construct path: agents/{agent_id}/{brain_name}/agent.json
     // For primary brain, use agent root: agents/{agent_id}/agent.json
     const base_dir = try std.fs.path.join(allocator, &.{ "agents", runtime.agent_id });
@@ -466,6 +472,27 @@ fn loadAgentJsonFile(
         if (err == error.FileNotFound) return null;
         return err;
     };
+}
+
+/// Validate agent_id doesn't contain path traversal characters
+fn isValidAgentId(agent_id: []const u8) bool {
+    // Reject empty IDs
+    if (agent_id.len == 0) return false;
+    
+    // Reject absolute paths
+    if (agent_id[0] == '/') return false;
+    
+    // Reject path traversal sequences
+    // Check for ".." as a complete path component
+    var it = std.mem.splitScalar(u8, agent_id, '/');
+    while (it.next()) |component| {
+        if (std.mem.eql(u8, component, "..")) return false;
+    }
+    
+    // Reject null bytes
+    if (std.mem.indexOfScalar(u8, agent_id, 0) != null) return false;
+    
+    return true;
 }
 
 /// Register brain specialization hook for a specific brain

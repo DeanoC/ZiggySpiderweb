@@ -156,6 +156,12 @@ fn loadIdentityFile(
     brain_name: []const u8,
     filename: []const u8,
 ) !?[]u8 {
+    // Security: Validate agent_id doesn't contain path traversal
+    if (!isValidAgentId(runtime.agent_id)) {
+        std.log.err("Invalid agent_id contains path traversal: {s}", .{runtime.agent_id});
+        return error.InvalidAgentId;
+    }
+    
     // Construct path: agents/{agent_id}/{brain_name}/{filename}
     // For primary brain, use agent root: agents/{agent_id}/{filename}
     const base_dir = try std.fs.path.join(allocator, &.{ "agents", runtime.agent_id });
@@ -170,10 +176,50 @@ fn loadIdentityFile(
     const path = try std.fs.path.join(allocator, &.{ brain_dir, filename });
     defer allocator.free(path);
     
+    // Additional safety: resolve path and verify it's within agents/
+    const resolved = std.fs.cwd().realpathAlloc(allocator, path) catch |err| {
+        // If path doesn't exist, that's fine - return null
+        if (err == error.FileNotFound) return null;
+        return err;
+    };
+    defer allocator.free(resolved);
+    
+    // Verify resolved path starts with agents/
+    const cwd = try std.process.getCwdAlloc(allocator);
+    defer allocator.free(cwd);
+    const expected_prefix = try std.fs.path.join(allocator, &.{ cwd, "agents" });
+    defer allocator.free(expected_prefix);
+    
+    if (!std.mem.startsWith(u8, resolved, expected_prefix)) {
+        std.log.err("Path escapes agents directory: {s}", .{resolved});
+        return error.PathTraversal;
+    }
+    
     return std.fs.cwd().readFileAlloc(allocator, path, 1024 * 1024) catch |err| {
         if (err == error.FileNotFound) return null;
         return err;
     };
+}
+
+/// Validate agent_id doesn't contain path traversal characters
+fn isValidAgentId(agent_id: []const u8) bool {
+    // Reject empty IDs
+    if (agent_id.len == 0) return false;
+    
+    // Reject absolute paths
+    if (agent_id[0] == '/') return false;
+    
+    // Reject path traversal sequences
+    // Check for ".." as a complete path component
+    var it = std.mem.splitScalar(u8, agent_id, '/');
+    while (it.next()) |component| {
+        if (std.mem.eql(u8, component, "..")) return false;
+    }
+    
+    // Reject null bytes
+    if (std.mem.indexOfScalar(u8, agent_id, 0) != null) return false;
+    
+    return true;
 }
 
 fn loadAgentJson(
