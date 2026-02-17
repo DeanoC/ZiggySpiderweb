@@ -1,72 +1,41 @@
 # Tool System Tests
 
-## Quick Start
+## Current Status
 
-1. **Start the Spiderweb server** with tool support:
-   ```bash
-   cd /safe/Safe/openclaw-config/workspace/ziggy-spiderweb-worktrees/tool-system
-   zig build
-   ./zig-out/bin/spiderweb
-   ```
+The active tool architecture is provider-driven.
 
-2. **Run the test suite**:
-   ```bash
-   zig run tests/tools/test_runner.zig -- --host 127.0.0.1 --port 18790
-   ```
+- Tools are surfaced to the AI provider during `session.send`.
+- The provider emits tool calls.
+- Runtime executes tools and returns tool results back to provider.
+- Clients observe results via `tool.event` and `memory.event` frames.
 
-## Test Scenarios
+Standalone websocket messages like `tool.list` and `tool.call` are not part of the current runtime protocol path.
 
-The test runner validates:
+## What Is Covered
 
-1. **Tool Discovery** - Server returns all 5 tools with schemas
-2. **File Read** - Can read files from the filesystem
-3. **File List** - Can list directory contents
-4. **Search Code** - Can search codebase with ripgrep/grep
-5. **Shell** - Can execute shell commands
+1. Unit-level world tool behavior in `src/tool_executor.zig`:
+   - `file.read`
+   - `file.write`
+   - `file.list`
+   - `search.code`
+   - `shell.exec`
+2. Runtime/provider integration in `src/runtime_server.zig`:
+   - provider emits tool call
+   - runtime executes it
+   - provider returns final response
 
-## Manual Testing with AI
+## How To Run
 
-For end-to-end testing with a real AI provider:
-
-1. Copy the test agent:
-   ```bash
-   cp -r agents/test-agent /path/to/spiderweb/agents/
-   ```
-
-2. Connect as test-agent:
-   ```
-   ws://localhost:18790/new?agent=test-agent
-   ```
-
-3. Send test messages:
-   - "Read the README.md file"
-   - "List the files in src directory"
-   - "Search for TODO in the codebase"
-   - "Run echo Hello World"
-
-4. Verify AI calls tools and responds with actual results
-
-## Adding New Tests
-
-Add test methods to `ToolTestRunner` in `test_runner.zig`:
-
-```zig
-fn testMyNewTool(self: *ToolTestRunner) !TestResult {
-    std.log.info("Test: My New Tool", .{});
-    
-    // Send tool.call
-    try self.client.sendJson("...");
-    
-    // Receive response
-    const response = try self.client.receiveFrame(self.allocator);
-    
-    // Validate
-    // ...
-    
-    return .passed;
-}
+```bash
+zig build test
 ```
 
-## Test Data
+Optional full build verification:
 
-Create test files in `tests/test-data/` for file operations tests.
+```bash
+zig build
+```
+
+## Notes
+
+The older `tests/tools/test_runner*.zig` files were designed around direct `tool.list` / `tool.call` protocol experimentation and are not the source of truth for the current provider-driven implementation.

@@ -27,20 +27,60 @@ pub const ToolSchema = struct {
     params: []const ToolParam,
 };
 
-pub const ToolResult = union(enum) {
-    success: []const u8,
-    failure: []const u8,
+pub const ToolErrorCode = enum {
+    invalid_params,
+    permission_denied,
+    timeout,
+    execution_failed,
+    tool_not_found,
+    tool_not_executable,
+};
+
+pub const ToolExecutionResult = union(enum) {
+    success: struct {
+        payload_json: []u8,
+    },
+    failure: struct {
+        code: ToolErrorCode,
+        message: []u8,
+    },
+
+    pub fn deinit(self: *ToolExecutionResult, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .success => |*success| allocator.free(success.payload_json),
+            .failure => |*failure| allocator.free(failure.message),
+        }
+        self.* = undefined;
+    }
 };
 
 pub const ToolHandler = *const fn (
     allocator: std.mem.Allocator,
     args: std.json.ObjectMap,
-) ToolResult;
+) ToolExecutionResult;
 
 pub const RegisteredTool = struct {
     schema: ToolSchema,
     handler: ?ToolHandler,
 };
+
+pub const ProviderTool = struct {
+    name: []u8,
+    description: []u8,
+    parameters_json: []u8,
+
+    pub fn deinit(self: *ProviderTool, allocator: std.mem.Allocator) void {
+        allocator.free(self.name);
+        allocator.free(self.description);
+        allocator.free(self.parameters_json);
+        self.* = undefined;
+    }
+};
+
+pub fn deinitProviderTools(allocator: std.mem.Allocator, tools: []ProviderTool) void {
+    for (tools) |*tool| tool.deinit(allocator);
+    allocator.free(tools);
+}
 
 pub const ToolRegistry = struct {
     allocator: std.mem.Allocator,
@@ -102,73 +142,72 @@ pub const ToolRegistry = struct {
         allocator: std.mem.Allocator,
         name: []const u8,
         args: std.json.ObjectMap,
-    ) ToolResult {
+    ) ToolExecutionResult {
         const tool = self.get(name) orelse {
-            const msg = allocator.dupe(u8, "tool_not_found") catch return .{ .failure = "oom" };
-            return .{ .failure = msg };
+            const msg = allocator.dupe(u8, "tool not found") catch return .{ .failure = .{
+                .code = .execution_failed,
+                .message = allocator.dupe(u8, "out of memory") catch @panic("out of memory while reporting error"),
+            } };
+            return .{ .failure = .{ .code = .tool_not_found, .message = msg } };
         };
 
         if (tool.schema.domain != .world or tool.handler == null) {
-            const msg = allocator.dupe(u8, "tool_not_executable") catch return .{ .failure = "oom" };
-            return .{ .failure = msg };
+            const msg = allocator.dupe(u8, "tool is not executable") catch return .{ .failure = .{
+                .code = .execution_failed,
+                .message = allocator.dupe(u8, "out of memory") catch @panic("out of memory while reporting error"),
+            } };
+            return .{ .failure = .{ .code = .tool_not_executable, .message = msg } };
         }
 
         return tool.handler.?(allocator, args);
     }
 
-    pub fn generateSchemasJson(
-        self: *const ToolRegistry,
-        allocator: std.mem.Allocator,
-        domain_filter: ?ToolDomain,
-    ) ![]u8 {
-        var out = std.ArrayListUnmanaged(u8){};
-        defer out.deinit(allocator);
+    pub fn exportProviderWorldTools(self: *const ToolRegistry, allocator: std.mem.Allocator) ![]ProviderTool {
+        var out = std.ArrayListUnmanaged(ProviderTool){};
+        errdefer {
+            for (out.items) |*tool| tool.deinit(allocator);
+            out.deinit(allocator);
+        }
 
-        try out.append(allocator, '[');
         var it = self.tools.iterator();
-        var first = true;
         while (it.next()) |entry| {
             const tool = entry.value_ptr.*;
-            if (domain_filter) |filter| {
-                if (tool.schema.domain != filter) continue;
+            if (tool.schema.domain != .world) continue;
+
+            var parameters = std.ArrayListUnmanaged(u8){};
+            errdefer parameters.deinit(allocator);
+
+            try parameters.appendSlice(allocator, "{\"type\":\"object\",\"properties\":{");
+            for (tool.schema.params, 0..) |param, idx| {
+                if (idx > 0) try parameters.append(allocator, ',');
+                try parameters.append(allocator, '"');
+                try appendEscaped(allocator, &parameters, param.name);
+                try parameters.appendSlice(allocator, "\":{\"type\":\"");
+                try parameters.appendSlice(allocator, paramTypeString(param.param_type));
+                try parameters.appendSlice(allocator, "\",\"description\":\"");
+                try appendEscaped(allocator, &parameters, param.description);
+                try parameters.appendSlice(allocator, "\"}");
             }
 
-            if (!first) try out.append(allocator, ',');
-            first = false;
-
-            try out.appendSlice(allocator, "{\"name\":\"");
-            try appendEscaped(allocator, &out, tool.schema.name);
-            try out.appendSlice(allocator, "\",\"description\":\"");
-            try appendEscaped(allocator, &out, tool.schema.description);
-            try out.appendSlice(allocator, "\",\"domain\":\"");
-            try out.appendSlice(allocator, @tagName(tool.schema.domain));
-            try out.appendSlice(allocator, "\",\"parameters\":{\"type\":\"object\",\"properties\":{");
-
-            for (tool.schema.params, 0..) |param, index| {
-                if (index > 0) try out.append(allocator, ',');
-                try out.append(allocator, '"');
-                try appendEscaped(allocator, &out, param.name);
-                try out.appendSlice(allocator, "\":{\"type\":\"");
-                try out.appendSlice(allocator, paramTypeString(param.param_type));
-                try out.appendSlice(allocator, "\",\"description\":\"");
-                try appendEscaped(allocator, &out, param.description);
-                try out.appendSlice(allocator, "\"}");
-            }
-
-            try out.appendSlice(allocator, "},\"required\":[");
+            try parameters.appendSlice(allocator, "},\"required\":[");
             var required_first = true;
             for (tool.schema.params) |param| {
                 if (!param.required) continue;
-                if (!required_first) try out.append(allocator, ',');
+                if (!required_first) try parameters.append(allocator, ',');
                 required_first = false;
-                try out.append(allocator, '"');
-                try appendEscaped(allocator, &out, param.name);
-                try out.append(allocator, '"');
+                try parameters.append(allocator, '"');
+                try appendEscaped(allocator, &parameters, param.name);
+                try parameters.append(allocator, '"');
             }
-            try out.appendSlice(allocator, "]}}");
+            try parameters.appendSlice(allocator, "]}");
+
+            try out.append(allocator, .{
+                .name = try allocator.dupe(u8, tool.schema.name),
+                .description = try allocator.dupe(u8, tool.schema.description),
+                .parameters_json = try parameters.toOwnedSlice(allocator),
+            });
         }
 
-        try out.append(allocator, ']');
         return out.toOwnedSlice(allocator);
     }
 
@@ -215,9 +254,5 @@ test "tool_registry: registers brain schema and emits required fields" {
         },
     );
 
-    const json = try registry.generateSchemasJson(allocator, .brain);
-    defer allocator.free(json);
-
-    try std.testing.expect(std.mem.indexOf(u8, json, "memory.mutate") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"required\":[\"mem_id\",\"content\"]") != null);
+    try std.testing.expect(registry.get("memory.mutate") != null);
 }

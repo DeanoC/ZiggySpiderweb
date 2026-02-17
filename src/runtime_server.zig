@@ -2,11 +2,14 @@ const std = @import("std");
 const Config = @import("config.zig");
 const protocol = @import("protocol.zig");
 const agent_runtime = @import("agent_runtime.zig");
+const tool_registry = @import("tool_registry.zig");
 const ziggy_piai = @import("ziggy-piai");
 
 pub const default_agent_id = "default";
 const DEFAULT_BRAIN = "primary";
 const INTERNAL_TICK_TIMEOUT_MS: i64 = 5 * 1000;
+const MAX_PROVIDER_TOOL_ROUNDS: usize = 8;
+const MAX_PROVIDER_TOOL_CALLS_PER_TURN: usize = 32;
 
 const RuntimeServerError = error{
     RuntimeTickTimeout,
@@ -16,6 +19,7 @@ const RuntimeServerError = error{
     ProviderModelNotFound,
     MissingProviderApiKey,
     ProviderStreamFailed,
+    ProviderToolLoopExceeded,
 };
 
 const RuntimeOperationClass = enum {
@@ -34,6 +38,17 @@ const RuntimeQueueJob = struct {
     done: bool = false,
     cancelled: bool = false,
     response: ?[][]u8 = null,
+};
+
+const ProviderCompletion = struct {
+    assistant_text: []u8,
+    runtime_events: [][]u8,
+
+    fn deinit(self: *ProviderCompletion, allocator: std.mem.Allocator) void {
+        allocator.free(self.assistant_text);
+        deinitResponseFrames(allocator, self.runtime_events);
+        self.* = undefined;
+    }
 };
 
 const StreamByModelFn = *const fn (
@@ -504,11 +519,14 @@ pub const RuntimeServer = struct {
     fn handleChat(self: *RuntimeServer, job: *RuntimeQueueJob, request_id: []const u8, content: []const u8) ![][]u8 {
         if (self.isJobCancelled(job)) return RuntimeServerError.RuntimeJobCancelled;
 
-        const assistant_text = if (self.provider_runtime != null)
-            self.completeWithProvider(content) catch |err| return self.wrapRuntimeErrorResponse(request_id, err)
+        var provider_completion = if (self.provider_runtime != null)
+            self.completeWithProvider(job, request_id, content) catch |err| return self.wrapRuntimeErrorResponse(request_id, err)
         else
-            try self.allocator.dupe(u8, content);
-        defer self.allocator.free(assistant_text);
+            ProviderCompletion{
+                .assistant_text = try self.allocator.dupe(u8, content),
+                .runtime_events = try self.allocator.alloc([]u8, 0),
+            };
+        defer provider_completion.deinit(self.allocator);
 
         if (self.isJobCancelled(job)) return RuntimeServerError.RuntimeJobCancelled;
 
@@ -516,7 +534,7 @@ pub const RuntimeServer = struct {
             return self.wrapRuntimeErrorResponse(request_id, err);
         };
 
-        const escaped_content = try protocol.jsonEscape(self.allocator, assistant_text);
+        const escaped_content = try protocol.jsonEscape(self.allocator, provider_completion.assistant_text);
         defer self.allocator.free(escaped_content);
         const talk_args = try std.fmt.allocPrint(self.allocator, "{{\"message\":\"{s}\"}}", .{escaped_content});
         defer self.allocator.free(talk_args);
@@ -525,12 +543,12 @@ pub const RuntimeServer = struct {
             return self.wrapRuntimeErrorResponse(request_id, err);
         };
 
-        const runtime_events = self.runPendingTicks(job, request_id) catch |err| {
+        const talk_runtime_events = self.runPendingTicks(job, request_id, null) catch |err| {
             self.clearRuntimeOutboundLocked();
             if (err == RuntimeServerError.RuntimeJobCancelled) return err;
             return self.wrapRuntimeErrorResponse(request_id, err);
         };
-        defer deinitResponseFrames(self.allocator, runtime_events);
+        defer deinitResponseFrames(self.allocator, talk_runtime_events);
 
         const outbound = try self.runtime.drainOutbound(self.allocator);
         defer agent_runtime.deinitOutbound(self.allocator, outbound);
@@ -549,7 +567,11 @@ pub const RuntimeServer = struct {
             }
         }
 
-        for (runtime_events) |event_payload| {
+        for (provider_completion.runtime_events) |event_payload| {
+            try responses.append(self.allocator, try self.allocator.dupe(u8, event_payload));
+        }
+
+        for (talk_runtime_events) |event_payload| {
             try responses.append(self.allocator, try self.allocator.dupe(u8, event_payload));
         }
 
@@ -607,7 +629,12 @@ pub const RuntimeServer = struct {
         ));
     }
 
-    fn runPendingTicks(self: *RuntimeServer, job: *RuntimeQueueJob, request_id: []const u8) ![][]u8 {
+    fn runPendingTicks(
+        self: *RuntimeServer,
+        job: *RuntimeQueueJob,
+        request_id: []const u8,
+        tool_payloads: ?*std.ArrayListUnmanaged([]u8),
+    ) ![][]u8 {
         const started_ms = std.time.milliTimestamp();
         var runtime_events = std.ArrayListUnmanaged([]u8){};
         errdefer {
@@ -634,6 +661,9 @@ pub const RuntimeServer = struct {
                     return agent_runtime.RuntimeError.QueueSaturated;
                 }
                 try runtime_events.append(self.allocator, event);
+                if (tool_payloads) |payloads| {
+                    try payloads.append(self.allocator, try self.allocator.dupe(u8, result.payload_json));
+                }
             }
 
             const memory_event = try protocol.buildMemoryEvent(self.allocator, request_id, tick.observe_json);
@@ -656,6 +686,7 @@ pub const RuntimeServer = struct {
             RuntimeServerError.ProviderModelNotFound => protocol.buildErrorWithCode(self.allocator, request_id, .execution_failed, "provider model not found"),
             RuntimeServerError.MissingProviderApiKey => protocol.buildErrorWithCode(self.allocator, request_id, .execution_failed, "missing provider API key"),
             RuntimeServerError.ProviderStreamFailed => protocol.buildErrorWithCode(self.allocator, request_id, .execution_failed, "provider stream failed"),
+            RuntimeServerError.ProviderToolLoopExceeded => protocol.buildErrorWithCode(self.allocator, request_id, .execution_failed, "provider tool loop exceeded limits"),
             else => protocol.buildErrorWithCode(self.allocator, request_id, .execution_failed, @errorName(err)),
         };
     }
@@ -670,37 +701,148 @@ pub const RuntimeServer = struct {
         return frames;
     }
 
-    fn completeWithProvider(self: *RuntimeServer, content: []const u8) ![]u8 {
+    fn completeWithProvider(self: *RuntimeServer, job: *RuntimeQueueJob, request_id: []const u8, content: []const u8) !ProviderCompletion {
         const provider = &(self.provider_runtime orelse return RuntimeServerError.ProviderModelNotFound);
         const model = selectModel(provider) orelse return RuntimeServerError.ProviderModelNotFound;
 
         const api_key = try self.resolveApiKey(provider, model.provider);
         defer self.allocator.free(api_key);
 
-        const user_content = try self.allocator.dupe(u8, content);
-        defer self.allocator.free(user_content);
-        const messages = try self.allocator.alloc(ziggy_piai.types.Message, 1);
-        defer self.allocator.free(messages);
-        messages[0] = .{ .role = .user, .content = user_content };
+        const world_tool_specs = try self.runtime.world_tools.exportProviderWorldTools(self.allocator);
+        defer tool_registry.deinitProviderTools(self.allocator, world_tool_specs);
 
-        const context = ziggy_piai.types.Context{ .messages = messages };
-        var events = std.array_list.Managed(ziggy_piai.types.AssistantMessageEvent).init(self.allocator);
-        defer {
-            deinitAssistantEvents(self.allocator, &events);
-            events.deinit();
+        const provider_tools = try self.allocator.alloc(ziggy_piai.types.Tool, world_tool_specs.len);
+        defer self.allocator.free(provider_tools);
+        for (world_tool_specs, 0..) |spec, idx| {
+            provider_tools[idx] = .{
+                .name = spec.name,
+                .description = spec.description,
+                .parameters_json = spec.parameters_json,
+            };
         }
 
-        streamByModelFn(
-            self.allocator,
-            &provider.http_client,
-            &provider.api_registry,
-            model,
-            context,
-            .{ .api_key = api_key },
-            &events,
-        ) catch return RuntimeServerError.ProviderStreamFailed;
+        var conversation = std.ArrayListUnmanaged(ziggy_piai.types.Message){};
+        defer {
+            deinitProviderMessages(self.allocator, conversation.items);
+            conversation.deinit(self.allocator);
+        }
 
-        return extractAssistantText(self.allocator, events.items);
+        try conversation.append(self.allocator, .{
+            .role = .user,
+            .content = try self.allocator.dupe(u8, content),
+        });
+
+        var runtime_events = std.ArrayListUnmanaged([]u8){};
+        errdefer {
+            for (runtime_events.items) |payload| self.allocator.free(payload);
+            runtime_events.deinit(self.allocator);
+        }
+
+        var round: usize = 0;
+        var total_calls: usize = 0;
+        while (round < MAX_PROVIDER_TOOL_ROUNDS) : (round += 1) {
+            var events = std.array_list.Managed(ziggy_piai.types.AssistantMessageEvent).init(self.allocator);
+            defer {
+                deinitAssistantEvents(self.allocator, &events);
+                events.deinit();
+            }
+
+            const context = ziggy_piai.types.Context{
+                .messages = conversation.items,
+                .tools = provider_tools,
+            };
+
+            streamByModelFn(
+                self.allocator,
+                &provider.http_client,
+                &provider.api_registry,
+                model,
+                context,
+                .{ .api_key = api_key },
+                &events,
+            ) catch return RuntimeServerError.ProviderStreamFailed;
+
+            var assistant = try extractAssistantMessage(self.allocator, events.items);
+            errdefer deinitOwnedAssistantMessage(self.allocator, &assistant);
+
+            try conversation.append(self.allocator, .{
+                .role = .assistant,
+                .content = assistant.text,
+                .tool_calls = assistant.tool_calls,
+            });
+
+            // Ownership moved into conversation.
+            assistant.text = "";
+            assistant.thinking = "";
+            assistant.tool_calls = &.{};
+
+            const tool_calls = conversation.items[conversation.items.len - 1].tool_calls orelse &.{};
+            if (tool_calls.len == 0) {
+                return .{
+                    .assistant_text = try self.allocator.dupe(u8, conversation.items[conversation.items.len - 1].content),
+                    .runtime_events = try runtime_events.toOwnedSlice(self.allocator),
+                };
+            }
+
+            if (total_calls + tool_calls.len > MAX_PROVIDER_TOOL_CALLS_PER_TURN) {
+                return RuntimeServerError.ProviderToolLoopExceeded;
+            }
+            total_calls += tool_calls.len;
+
+            for (tool_calls) |tool_call| {
+                const args_with_call_id = try injectToolCallId(self.allocator, tool_call.arguments_json, tool_call.id);
+                defer self.allocator.free(args_with_call_id);
+                try self.runtime.queueToolUse(DEFAULT_BRAIN, tool_call.name, args_with_call_id);
+            }
+
+            var tool_payloads = std.ArrayListUnmanaged([]u8){};
+            defer {
+                for (tool_payloads.items) |payload| self.allocator.free(payload);
+                tool_payloads.deinit(self.allocator);
+            }
+
+            const round_events = self.runPendingTicks(job, request_id, &tool_payloads) catch |err| {
+                if (err == RuntimeServerError.RuntimeJobCancelled) return err;
+                return err;
+            };
+            defer deinitResponseFrames(self.allocator, round_events);
+            for (round_events) |payload| {
+                try runtime_events.append(self.allocator, try self.allocator.dupe(u8, payload));
+            }
+
+            var by_call_id = std.StringHashMap(usize).init(self.allocator);
+            defer {
+                var id_it = by_call_id.iterator();
+                while (id_it.next()) |entry| self.allocator.free(entry.key_ptr.*);
+                by_call_id.deinit();
+            }
+            for (tool_payloads.items, 0..) |payload, idx| {
+                const payload_call_id = extractToolCallIdFromPayload(self.allocator, payload) catch null;
+                if (payload_call_id) |call_id| {
+                    if (by_call_id.get(call_id) == null) {
+                        try by_call_id.put(call_id, idx);
+                    } else {
+                        self.allocator.free(call_id);
+                    }
+                }
+            }
+
+            for (tool_calls) |tool_call| {
+                const result_payload = if (by_call_id.get(tool_call.id)) |payload_index|
+                    tool_payloads.items[payload_index]
+                else
+                    "{\"error\":{\"code\":\"execution_failed\",\"message\":\"missing tool result\"}}";
+
+                try conversation.append(self.allocator, .{
+                    .role = .tool_result,
+                    .content = try self.allocator.dupe(u8, result_payload),
+                    .tool_call_id = try self.allocator.dupe(u8, tool_call.id),
+                    .tool_name = try self.allocator.dupe(u8, tool_call.name),
+                });
+            }
+        }
+
+        return RuntimeServerError.ProviderToolLoopExceeded;
     }
 
     fn resolveApiKey(self: *RuntimeServer, provider: *const ProviderRuntime, provider_name: []const u8) ![]const u8 {
@@ -733,22 +875,130 @@ fn isChatLikeControlAction(action: ?[]const u8) bool {
     return std.mem.eql(u8, control_action, "goal") or std.mem.eql(u8, control_action, "plan");
 }
 
-fn extractAssistantText(allocator: std.mem.Allocator, events: []const ziggy_piai.types.AssistantMessageEvent) ![]u8 {
-    var text = std.ArrayListUnmanaged(u8){};
-    defer text.deinit(allocator);
+fn injectToolCallId(allocator: std.mem.Allocator, args_json: []const u8, call_id: []const u8) ![]u8 {
+    const trimmed = std.mem.trim(u8, args_json, " \t\r\n");
+    if (trimmed.len < 2 or trimmed[0] != '{' or trimmed[trimmed.len - 1] != '}') {
+        return error.InvalidToolArgs;
+    }
+
+    const escaped_call_id = try protocol.jsonEscape(allocator, call_id);
+    defer allocator.free(escaped_call_id);
+
+    const inner = std.mem.trim(u8, trimmed[1 .. trimmed.len - 1], " \t\r\n");
+    if (inner.len == 0) {
+        return std.fmt.allocPrint(allocator, "{{\"_tool_call_id\":\"{s}\"}}", .{escaped_call_id});
+    }
+    return std.fmt.allocPrint(
+        allocator,
+        "{{\"_tool_call_id\":\"{s}\",{s}}}",
+        .{ escaped_call_id, inner },
+    );
+}
+
+fn extractToolCallIdFromPayload(allocator: std.mem.Allocator, payload: []const u8) !?[]u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, payload, .{}) catch return null;
+    defer parsed.deinit();
+
+    if (parsed.value != .object) return null;
+    const value = parsed.value.object.get("tool_call_id") orelse return null;
+    if (value != .string) return null;
+    const duplicated = try allocator.dupe(u8, value.string);
+    return duplicated;
+}
+
+fn extractAssistantMessage(
+    allocator: std.mem.Allocator,
+    events: []const ziggy_piai.types.AssistantMessageEvent,
+) !ziggy_piai.types.AssistantMessage {
+    var text_acc = std.ArrayListUnmanaged(u8){};
+    defer text_acc.deinit(allocator);
 
     for (events) |event| {
         switch (event) {
-            .text_delta => |delta| try text.appendSlice(allocator, delta.delta),
+            .text_delta => |delta| try text_acc.appendSlice(allocator, delta.delta),
             .done => |done| {
-                if (done.text.len > 0) return allocator.dupe(u8, done.text);
+                const copied_tool_calls = try cloneToolCalls(allocator, done.tool_calls);
+                const owned_text = if (done.text.len > 0)
+                    try allocator.dupe(u8, done.text)
+                else
+                    try text_acc.toOwnedSlice(allocator);
+                return .{
+                    .text = owned_text,
+                    .thinking = try allocator.dupe(u8, ""),
+                    .tool_calls = copied_tool_calls,
+                    .api = "",
+                    .provider = "",
+                    .model = "",
+                    .usage = done.usage,
+                    .stop_reason = done.stop_reason,
+                    .error_message = null,
+                };
             },
             .err => return RuntimeServerError.ProviderStreamFailed,
             else => {},
         }
     }
 
-    return text.toOwnedSlice(allocator);
+    return .{
+        .text = try text_acc.toOwnedSlice(allocator),
+        .thinking = try allocator.dupe(u8, ""),
+        .tool_calls = &.{},
+        .api = "",
+        .provider = "",
+        .model = "",
+        .usage = .{},
+        .stop_reason = .stop,
+        .error_message = null,
+    };
+}
+
+fn cloneToolCalls(allocator: std.mem.Allocator, source: []const ziggy_piai.types.ToolCall) ![]const ziggy_piai.types.ToolCall {
+    if (source.len == 0) return &.{};
+    const cloned = try allocator.alloc(ziggy_piai.types.ToolCall, source.len);
+    errdefer allocator.free(cloned);
+
+    for (source, 0..) |tool_call, idx| {
+        cloned[idx] = .{
+            .id = try allocator.dupe(u8, tool_call.id),
+            .name = try allocator.dupe(u8, tool_call.name),
+            .arguments_json = try allocator.dupe(u8, tool_call.arguments_json),
+        };
+    }
+    return cloned;
+}
+
+fn deinitOwnedAssistantMessage(allocator: std.mem.Allocator, msg: *ziggy_piai.types.AssistantMessage) void {
+    if (msg.text.len > 0) allocator.free(msg.text);
+    if (msg.thinking.len > 0) allocator.free(msg.thinking);
+    if (msg.error_message) |value| allocator.free(value);
+    if (msg.tool_calls.len > 0) {
+        for (msg.tool_calls) |tool_call| {
+            allocator.free(tool_call.id);
+            allocator.free(tool_call.name);
+            allocator.free(tool_call.arguments_json);
+        }
+        allocator.free(msg.tool_calls);
+    }
+    msg.* = undefined;
+}
+
+fn deinitProviderMessages(allocator: std.mem.Allocator, messages: []ziggy_piai.types.Message) void {
+    for (messages) |*message| {
+        if (message.content.len > 0) allocator.free(message.content);
+        if (message.tool_calls) |tool_calls| {
+            if (tool_calls.len > 0) {
+                for (tool_calls) |tool_call| {
+                    allocator.free(tool_call.id);
+                    allocator.free(tool_call.name);
+                    allocator.free(tool_call.arguments_json);
+                }
+                allocator.free(tool_calls);
+            }
+        }
+        if (message.tool_call_id) |tool_call_id| allocator.free(tool_call_id);
+        if (message.tool_name) |tool_name| allocator.free(tool_name);
+        if (message.content_blocks) |blocks| allocator.free(blocks);
+    }
 }
 
 fn deinitAssistantMessage(allocator: std.mem.Allocator, msg: *ziggy_piai.types.AssistantMessage) void {
@@ -819,6 +1069,54 @@ fn mockProviderStreamByModel(
     try std.testing.expect(std.mem.eql(u8, model.provider, "openai"));
     try events.append(.{ .done = .{
         .text = try allocator.dupe(u8, "mock provider response"),
+        .thinking = try allocator.dupe(u8, ""),
+        .tool_calls = &.{},
+        .api = model.api,
+        .provider = model.provider,
+        .model = model.id,
+        .usage = .{},
+        .stop_reason = .stop,
+        .error_message = null,
+    } });
+}
+
+var mockToolLoopCallCount: usize = 0;
+
+fn mockProviderStreamByModelWithToolLoop(
+    allocator: std.mem.Allocator,
+    _: *std.http.Client,
+    _: *ziggy_piai.api_registry.ApiRegistry,
+    model: ziggy_piai.types.Model,
+    context: ziggy_piai.types.Context,
+    _: ziggy_piai.types.StreamOptions,
+    events: *std.array_list.Managed(ziggy_piai.types.AssistantMessageEvent),
+) anyerror!void {
+    try std.testing.expect(context.tools != null);
+    if (mockToolLoopCallCount == 0) {
+        mockToolLoopCallCount += 1;
+        const tool_calls = try allocator.alloc(ziggy_piai.types.ToolCall, 1);
+        tool_calls[0] = .{
+            .id = try allocator.dupe(u8, "call-1"),
+            .name = try allocator.dupe(u8, "file.list"),
+            .arguments_json = try allocator.dupe(u8, "{\"path\":\"src\"}"),
+        };
+        try events.append(.{ .done = .{
+            .text = try allocator.dupe(u8, ""),
+            .thinking = try allocator.dupe(u8, ""),
+            .tool_calls = tool_calls,
+            .api = model.api,
+            .provider = model.provider,
+            .model = model.id,
+            .usage = .{},
+            .stop_reason = .tool_use,
+            .error_message = null,
+        } });
+        return;
+    }
+
+    try std.testing.expect(context.messages.len >= 3);
+    try events.append(.{ .done = .{
+        .text = try allocator.dupe(u8, "tool loop complete"),
         .thinking = try allocator.dupe(u8, ""),
         .tool_calls = &.{},
         .api = model.api,
@@ -935,6 +1233,37 @@ test "runtime_server: provider-backed session.send uses configured provider runt
     }
 
     try std.testing.expect(found_provider_text);
+}
+
+test "runtime_server: provider tool loop executes world tool and returns final response" {
+    const allocator = std.testing.allocator;
+    const original_stream_fn = streamByModelFn;
+    defer streamByModelFn = original_stream_fn;
+    streamByModelFn = mockProviderStreamByModelWithToolLoop;
+    mockToolLoopCallCount = 0;
+
+    const server = try RuntimeServer.createWithProvider(allocator, "agent-test", .{
+        .ltm_directory = "",
+        .ltm_filename = "",
+    }, .{
+        .name = "openai",
+        .model = "gpt-4o-mini",
+        .api_key = "test-key",
+    });
+    defer server.destroy();
+
+    const responses = try server.handleMessageFrames("{\"id\":\"req-provider-tools\",\"type\":\"session.send\",\"content\":\"use tools\"}");
+    defer deinitResponseFrames(allocator, responses);
+
+    var saw_final = false;
+    var saw_tool_event = false;
+    for (responses) |payload| {
+        if (std.mem.indexOf(u8, payload, "tool loop complete") != null) saw_final = true;
+        if (std.mem.indexOf(u8, payload, "\"type\":\"tool.event\"") != null) saw_tool_event = true;
+    }
+
+    try std.testing.expect(saw_final);
+    try std.testing.expect(saw_tool_event);
 }
 
 test "runtime_server: provider failure does not leak queued user/tick events" {

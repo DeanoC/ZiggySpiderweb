@@ -90,6 +90,23 @@ Notes:
 - Older inflight-style runtime gating keys are no longer used.
 - Protocol input should use `session.send`; legacy `chat.send` is rejected.
 
+### World Tools (Provider-Driven)
+
+World tools are executed through provider tool-calling during `session.send`.
+
+- Runtime supplies tool schemas to the configured provider.
+- Provider emits tool calls.
+- Runtime executes tools and feeds results back to provider.
+- Clients receive `tool.event` and `memory.event` frames as part of the normal response stream.
+
+Implemented tool names:
+
+- `file.read`
+- `file.write`
+- `file.list`
+- `search.code`
+- `shell.exec`
+
 ### API Key Storage
 
 **Priority order:**
