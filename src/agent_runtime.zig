@@ -266,7 +266,7 @@ pub const AgentRuntime = struct {
         // === PRE_MUTATE ===
         var pending_tools = hook_registry.PendingTools.init();
         defer pending_tools.deinit(self.allocator);
-        
+
         // Convert brain's pending tool uses to hook format
         for (brain.pending_tool_uses.items) |tool_use| {
             try pending_tools.add(self.allocator, tool_use.name, tool_use.args_json);

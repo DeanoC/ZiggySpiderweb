@@ -271,14 +271,14 @@ fn loadAgentJsonFile(
     brain_name: []const u8,
 ) !?[]u8 {
     // Construct path: agents/{agent_id}/{brain_name}/agent.json
-    // For primary brain, use agent root
-    const agent_dir = try std.fs.path.join(allocator, &.{ runtime.agent_id, "agents" });
-    defer allocator.free(agent_dir);
+    // For primary brain, use agent root: agents/{agent_id}/agent.json
+    const base_dir = try std.fs.path.join(allocator, &.{ "agents", runtime.agent_id });
+    defer allocator.free(base_dir);
     
     const brain_dir = if (std.mem.eql(u8, brain_name, "primary"))
-        try allocator.dupe(u8, agent_dir)
+        try allocator.dupe(u8, base_dir)
     else
-        try std.fs.path.join(allocator, &.{ agent_dir, brain_name });
+        try std.fs.path.join(allocator, &.{ base_dir, brain_name });
     defer allocator.free(brain_dir);
     
     const path = try std.fs.path.join(allocator, &.{ brain_dir, "agent.json" });

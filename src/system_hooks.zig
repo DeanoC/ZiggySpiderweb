@@ -5,6 +5,7 @@ const HookData = hook_registry.HookData;
 const HookError = hook_registry.HookError;
 const Rom = hook_registry.Rom;
 const AgentRuntime = @import("agent_runtime.zig").AgentRuntime;
+const brain_tools = @import("brain_tools.zig");
 
 /// Load shared/base ROM from identity files
 pub fn loadSharedRomHook(ctx: *HookContext, data: HookData) HookError!void {
@@ -48,7 +49,7 @@ pub fn loadSharedRomHook(ctx: *HookContext, data: HookData) HookError!void {
         try rom.set("identity:public", content);
     }
     
-    // Load agent.json for capabilities
+    // Load agent.json (raw config for reference)
     const agent_json = loadAgentJson(allocator, ctx.runtime, ctx.brain_name) catch |err| {
         std.log.warn("Failed to load agent.json for {s}: {s}", .{ ctx.brain_name, @errorName(err) });
         return;
@@ -56,8 +57,13 @@ pub fn loadSharedRomHook(ctx: *HookContext, data: HookData) HookError!void {
     defer if (agent_json) |c| allocator.free(c);
     
     if (agent_json) |content| {
-        try rom.set("system:capabilities", content);
+        try rom.set("system:agent_config", content);
     }
+    
+    // Load available tool schemas (for brain specialization to filter)
+    const tool_schemas = try getToolSchemas(allocator);
+    defer allocator.free(tool_schemas);
+    try rom.set("system:capabilities", tool_schemas);
     
     // System constants
     try rom.set("system:agent_id", ctx.runtime.agent_id);
@@ -151,24 +157,23 @@ fn loadIdentityFile(
     filename: []const u8,
 ) !?[]u8 {
     // Construct path: agents/{agent_id}/{brain_name}/{filename}
-    // For primary brain, use agent root; for sub-brains, use sub-directory
-    const path = try std.fs.path.join(allocator, &.{
-        runtime.agent_id,
-        if (std.mem.eql(u8, brain_name, "primary")) "" else brain_name,
-        filename,
-    });
+    // For primary brain, use agent root: agents/{agent_id}/{filename}
+    const base_dir = try std.fs.path.join(allocator, &.{ "agents", runtime.agent_id });
+    defer allocator.free(base_dir);
+    
+    const brain_dir = if (std.mem.eql(u8, brain_name, "primary"))
+        try allocator.dupe(u8, base_dir)
+    else
+        try std.fs.path.join(allocator, &.{ base_dir, brain_name });
+    defer allocator.free(brain_dir);
+    
+    const path = try std.fs.path.join(allocator, &.{ brain_dir, filename });
     defer allocator.free(path);
     
-    // Clean up double slashes
-    const clean_path = try std.fs.path.resolve(allocator, &.{path});
-    defer allocator.free(clean_path);
-    
-    const content = std.fs.cwd().readFileAlloc(allocator, clean_path, 1024 * 1024) catch |err| {
+    return std.fs.cwd().readFileAlloc(allocator, path, 1024 * 1024) catch |err| {
         if (err == error.FileNotFound) return null;
         return err;
     };
-    
-    return content;
 }
 
 fn loadAgentJson(
@@ -239,4 +244,35 @@ pub fn createBrainSpecializationHook(
             // Apply brain-specific ROM overlays
         }
     }.callback;
+}
+
+/// Serialize tool schemas to JSON for ROM
+fn getToolSchemas(allocator: std.mem.Allocator) ![]u8 {
+    var json = std.ArrayListUnmanaged(u8){};
+    defer json.deinit(allocator);
+    
+    const writer = json.writer(allocator);
+    
+    try writer.writeByte('[');
+    for (brain_tools.brain_tool_schemas, 0..) |schema, i| {
+        if (i > 0) try writer.writeByte(',');
+        try writer.writeByte('{');
+        
+        // name
+        try writer.print("\"name\":\"{s}\"," , .{schema.name});
+        // description  
+        try writer.print("\"description\":\"{s}\"," , .{schema.description});
+        // required_fields
+        try writer.writeAll("\"required_fields\":[");
+        for (schema.required_fields, 0..) |field, j| {
+            if (j > 0) try writer.writeByte(',');
+            try writer.print("\"{s}\"", .{field});
+        }
+        try writer.writeAll("]");
+        
+        try writer.writeByte('}');
+    }
+    try writer.writeByte(']');
+    
+    return json.toOwnedSlice(allocator);
 }
