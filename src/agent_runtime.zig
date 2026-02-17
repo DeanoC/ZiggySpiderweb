@@ -6,6 +6,9 @@ const brain_tools = @import("brain_tools.zig");
 const event_bus = @import("event_bus.zig");
 const tool_registry = @import("tool_registry.zig");
 const tool_executor = @import("tool_executor.zig");
+const hook_registry = @import("hook_registry.zig");
+const system_hooks = @import("system_hooks.zig");
+const brain_specialization = @import("brain_specialization.zig");
 
 pub const RuntimeError = error{
     BrainNotFound,
@@ -55,6 +58,7 @@ pub const AgentRuntime = struct {
     state: RuntimeState = .running,
     queue_limits: QueueLimits = .{},
     checkpoint: u64 = 0,
+    hooks: hook_registry.HookRegistry,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -90,10 +94,17 @@ pub const AgentRuntime = struct {
             .active_memory = try memory.RuntimeMemory.initWithStore(allocator, agent_id, owned_store),
             .bus = event_bus.EventBus.init(allocator),
             .world_tools = tool_registry.ToolRegistry.init(allocator),
+            .hooks = hook_registry.HookRegistry.init(allocator),
         };
         errdefer runtime.deinit();
 
         try tool_executor.BuiltinTools.registerAll(&runtime.world_tools);
+
+        // Register system hooks
+        try system_hooks.registerSystemHooks(&runtime.hooks);
+
+        // Register brain specialization hook (at priority 0)
+        try brain_specialization.registerBrainSpecialization(&runtime.hooks, "primary");
 
         try runtime.addBrain("primary");
         for (sub_brains) |brain_name| {
@@ -121,6 +132,7 @@ pub const AgentRuntime = struct {
         for (self.control_events.items) |event| self.allocator.free(event);
         self.control_events.deinit(self.allocator);
 
+        self.hooks.deinit();
         self.bus.deinit();
         self.world_tools.deinit();
         self.active_memory.deinit();
@@ -209,6 +221,18 @@ pub const AgentRuntime = struct {
 
         const brain = self.brains.getPtr(brain_name) orelse return RuntimeError.BrainNotFound;
 
+        // Setup hook context
+        self.checkpoint += 1;
+        var ctx = hook_registry.HookContext.init(self, brain_name, self.checkpoint);
+        defer ctx.deinit(self.allocator);
+
+        // === PRE_OBSERVE ===
+        var rom = hook_registry.Rom.init(self.allocator);
+        defer rom.deinit();
+        
+        try self.hooks.execute(.pre_observe, &ctx, .{ .pre_observe = &rom });
+
+        // Collect inbox events
         brain.clearInbox();
         const inbound = try self.bus.dequeueForBrain(self.allocator, brain_name);
         defer {
@@ -227,18 +251,52 @@ pub const AgentRuntime = struct {
             });
         }
 
+        // === OBSERVE ===
         const snapshot = try self.active_memory.snapshotActive(self.allocator, brain_name);
         defer memory.deinitItems(self.allocator, snapshot);
         const observe_json = try memory.toActiveMemoryJson(self.allocator, brain_name, snapshot);
 
+        // === POST_OBSERVE ===
+        var observe_result = hook_registry.ObserveResult{
+            .rom = &rom,
+            .inbox_count = brain.inbox.items.len,
+        };
+        try self.hooks.execute(.post_observe, &ctx, .{ .post_observe = &observe_result });
+
+        // === PRE_MUTATE ===
+        var pending_tools = hook_registry.PendingTools.init();
+        defer pending_tools.deinit(self.allocator);
+        
+        // Convert brain's pending tool uses to hook format
+        for (brain.pending_tool_uses.items) |tool_use| {
+            try pending_tools.add(self.allocator, tool_use.name, tool_use.args_json);
+        }
+        try self.hooks.execute(.pre_mutate, &ctx, .{ .pre_mutate = &pending_tools });
+
+        // Sync back to brain (hooks may have modified/removed tools)
+        brain.clearPendingTools();
+        for (pending_tools.tools.items) |tool| {
+            try brain.queueToolUse(tool.name, tool.args_json);
+        }
+
+        // === MUTATE ===
         var engine = brain_tools.Engine.initWithWorldTools(self.allocator, &self.active_memory, &self.bus, &self.world_tools);
         const results = try engine.executePending(brain);
         errdefer brain_tools.deinitResults(self.allocator, results);
 
+        // === POST_MUTATE ===
+        var tool_results = hook_registry.ToolResults{ .results = results };
+        try self.hooks.execute(.post_mutate, &ctx, .{ .post_mutate = &tool_results });
+
+        // Store results as artifacts
         for (results) |result| {
             var artifact = try self.active_memory.create(brain_name, .ram, null, "tool_result", result.payload_json);
             artifact.deinit(self.allocator);
         }
+
+        // === PRE_RESULTS ===
+        var results_data = hook_registry.ResultsData{ .tool_results = &tool_results };
+        try self.hooks.execute(.pre_results, &ctx, .{ .pre_results = &results_data });
 
         try self.enqueueTicksForPendingBrainEvents();
 
@@ -255,7 +313,13 @@ pub const AgentRuntime = struct {
             try self.outbound_messages.append(self.allocator, try self.allocator.dupe(u8, event.payload));
         }
 
-        self.checkpoint += 1;
+        // === POST_RESULTS ===
+        var checkpoint_data = hook_registry.CheckpointData{
+            .tick = self.checkpoint,
+            .artifacts_count = results.len,
+        };
+        try self.hooks.execute(.post_results, &ctx, .{ .post_results = &checkpoint_data });
+
         return .{
             .brain = try self.allocator.dupe(u8, brain_name),
             .observe_json = observe_json,

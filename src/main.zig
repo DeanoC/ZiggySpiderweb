@@ -7,7 +7,10 @@ comptime {
     _ = @import("agent_runtime.zig");
     _ = @import("brain_context.zig");
     _ = @import("brain_tools.zig");
+    _ = @import("brain_specialization.zig");
     _ = @import("event_bus.zig");
+    _ = @import("hook_registry.zig");
+    _ = @import("system_hooks.zig");
     _ = @import("ltm_store.zig");
     _ = @import("memory.zig");
     _ = @import("memid.zig");
