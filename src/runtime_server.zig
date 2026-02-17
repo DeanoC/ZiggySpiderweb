@@ -893,7 +893,7 @@ pub const RuntimeServer = struct {
         const content_json = try payload.toOwnedSlice(self.allocator);
         defer self.allocator.free(content_json);
 
-        var created = try self.runtime.active_memory.create(brain_name, .ram, null, "message", content_json);
+        var created = try self.runtime.active_memory.create(brain_name, .ram, null, "message", content_json, false);
         created.deinit(self.allocator);
     }
 

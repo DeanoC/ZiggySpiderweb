@@ -26,7 +26,7 @@ pub const brain_tool_schemas = [_]ToolSchema{
     .{ .name = "memory.load", .description = "Load memory by mem_id and optional version", .required_fields = &[_][]const u8{"mem_id"} },
     .{ .name = "memory.evict", .description = "Evict mutable memory by mem_id", .required_fields = &[_][]const u8{"mem_id"} },
     .{ .name = "memory.mutate", .description = "Mutate mutable memory by mem_id", .required_fields = &[_][]const u8{ "mem_id", "content" } },
-    .{ .name = "memory.create", .description = "Create RAM/ROM memory entry", .required_fields = &[_][]const u8{ "kind", "content" } },
+    .{ .name = "memory.create", .description = "Create RAM/ROM memory entry. Optional 'unevictable': true to prevent eviction.", .required_fields = &[_][]const u8{ "kind", "content" } },
     .{ .name = "memory.search", .description = "Keyword search memory entries", .required_fields = &[_][]const u8{"query"} },
     .{ .name = "wait.for", .description = "Wait for correlated talk/event", .required_fields = &[_][]const u8{"events"} },
     .{ .name = "talk.user", .description = "Send message to user channel", .required_fields = &[_][]const u8{"message"} },
@@ -327,15 +327,21 @@ pub const Engine = struct {
         else
             null;
 
-        var created = self.runtime_memory.create(brain.brain_name, tier, name, kind, content) catch |err| {
+        // Parse optional unevictable flag (defaults to false)
+        const unevictable = if (args.get("unevictable")) |value| blk: {
+            if (value == .bool) break :blk value.bool;
+            return self.failure(tool_name, "invalid_args", "memory.create unevictable must be a boolean");
+        } else false;
+
+        var created = self.runtime_memory.create(brain.brain_name, tier, name, kind, content, unevictable) catch |err| {
             return self.failure(tool_name, "execution_failed", @errorName(err));
         };
         defer created.deinit(self.allocator);
 
         const payload = try std.fmt.allocPrint(
             self.allocator,
-            "{{\"mem_id\":\"{s}\",\"version\":{d},\"tier\":\"{s}\"}}",
-            .{ created.mem_id, created.version orelse 0, if (created.tier == .ram) "ram" else "rom" },
+            "{{\"mem_id\":\"{s}\",\"version\":{d},\"tier\":\"{s}\",\"unevictable\":{}}}",
+            .{ created.mem_id, created.version orelse 0, if (created.tier == .ram) "ram" else "rom", created.unevictable },
         );
         return self.success(tool_name, payload);
     }
@@ -984,7 +990,7 @@ test "brain_tools: memory.load escapes kind in JSON payload" {
     var bus = event_bus.EventBus.init(allocator);
     defer bus.deinit();
 
-    var created = try mem.create("primary", .ram, "escaped_kind", "note \"x\" \\ slash\nline", "{\"text\":\"v\"}");
+    var created = try mem.create("primary", .ram, "escaped_kind", "note \"x\" \\ slash\nline", "{\"text\":\"v\"}", false);
     defer created.deinit(allocator);
 
     var brain = try brain_context.BrainContext.init(allocator, "primary");
@@ -1013,7 +1019,7 @@ test "brain_tools: memory.mutate success bumps version" {
     var bus = event_bus.EventBus.init(allocator);
     defer bus.deinit();
 
-    var created = try mem.create("primary", .ram, "mutable", "note", "{\"text\":\"v1\"}");
+    var created = try mem.create("primary", .ram, "mutable", "note", "{\"text\":\"v1\"}", false);
     defer created.deinit(allocator);
 
     var brain = try brain_context.BrainContext.init(allocator, "primary");
@@ -1039,7 +1045,7 @@ test "brain_tools: memory.evict success and missing mem_id failure" {
     var bus = event_bus.EventBus.init(allocator);
     defer bus.deinit();
 
-    var created = try mem.create("primary", .ram, "evictable", "note", "{\"text\":\"bye\"}");
+    var created = try mem.create("primary", .ram, "evictable", "note", "{\"text\":\"bye\"}", false);
     defer created.deinit(allocator);
 
     var brain = try brain_context.BrainContext.init(allocator, "primary");
@@ -1068,9 +1074,9 @@ test "brain_tools: memory.search returns matching mem_id set" {
     var bus = event_bus.EventBus.init(allocator);
     defer bus.deinit();
 
-    var compile_item = try mem.create("primary", .ram, "compile_task", "note", "{\"text\":\"compile fix\"}");
+    var compile_item = try mem.create("primary", .ram, "compile_task", "note", "{\"text\":\"compile fix\"}", false);
     defer compile_item.deinit(allocator);
-    var docs_item = try mem.create("primary", .ram, "docs_task", "note", "{\"text\":\"docs update\"}");
+    var docs_item = try mem.create("primary", .ram, "docs_task", "note", "{\"text\":\"docs update\"}", false);
     defer docs_item.deinit(allocator);
 
     var brain = try brain_context.BrainContext.init(allocator, "primary");

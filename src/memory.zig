@@ -197,6 +197,7 @@ pub const RuntimeMemory = struct {
         name: ?[]const u8,
         kind: []const u8,
         content_json: []const u8,
+        unevictable: bool,
     ) !ActiveMemoryItem {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -220,7 +221,7 @@ pub const RuntimeMemory = struct {
             .version = version,
             .kind = try self.allocator.dupe(u8, kind),
             .mutable = tier == .ram,
-            .unevictable = false,
+            .unevictable = unevictable,
             .created_at_ms = std.time.milliTimestamp(),
             .content_json = try self.allocator.dupe(u8, content_json),
         };
@@ -293,6 +294,7 @@ pub const RuntimeMemory = struct {
         const current_ref = try self.resolveMutableRefLocked(raw_mem_id);
         const current_item = current_ref.item.*;
         if (!current_item.mutable or current_item.tier != .ram) return MemoryError.ImmutableTier;
+        if (current_item.unevictable) return MemoryError.ImmutableTier; // Cannot evict unevictable memories
 
         try self.persistHistoryLocked(&current_item);
         const evicted = try current_item.clone(self.allocator);
@@ -772,9 +774,9 @@ test "memory: create emits canonical mem ids with unique names" {
     var mem = try RuntimeMemory.init(allocator, "agentA");
     defer mem.deinit();
 
-    var first = try mem.create("primary", .ram, "task_plan", "message", "{\"text\":\"first\"}");
+    var first = try mem.create("primary", .ram, "task_plan", "message", "{\"text\":\"first\"}", false);
     defer first.deinit(allocator);
-    var second = try mem.create("primary", .ram, "task_plan", "message", "{\"text\":\"second\"}");
+    var second = try mem.create("primary", .ram, "task_plan", "message", "{\"text\":\"second\"}", false);
     defer second.deinit(allocator);
 
     _ = try memid.MemId.parse(first.mem_id);
@@ -789,11 +791,11 @@ test "memory: create rejects non-canonical preferred names" {
 
     try std.testing.expectError(
         MemoryError.InvalidMemId,
-        mem.create("primary", .ram, "bad:name", "note", "{\"text\":\"x\"}"),
+        mem.create("primary", .ram, "bad:name", "note", "{\"text\":\"x\"}", false),
     );
     try std.testing.expectError(
         MemoryError.InvalidMemId,
-        mem.create("primary", .ram, "has space", "note", "{\"text\":\"x\"}"),
+        mem.create("primary", .ram, "has space", "note", "{\"text\":\"x\"}", false),
     );
 
     const snapshot = try mem.snapshotActive(allocator, "primary");
@@ -806,7 +808,7 @@ test "memory: mutate creates new version and load supports historical version" {
     var mem = try RuntimeMemory.init(allocator, "agentA");
     defer mem.deinit();
 
-    var created = try mem.create("primary", .ram, "notes", "note", "{\"text\":\"v1\"}");
+    var created = try mem.create("primary", .ram, "notes", "note", "{\"text\":\"v1\"}", false);
     defer created.deinit(allocator);
 
     var mutated = try mem.mutate(created.mem_id, "{\"text\":\"v2\"}");
@@ -834,7 +836,7 @@ test "memory: mutate does not change active state when persistence fails" {
     var mem = try RuntimeMemory.init(allocator, "agentA");
     defer mem.deinit();
 
-    var created = try mem.create("primary", .ram, "persist_notes", "note", "{\"text\":\"v1\"}");
+    var created = try mem.create("primary", .ram, "persist_notes", "note", "{\"text\":\"v1\"}", false);
     defer created.deinit(allocator);
     const created_id_copy = try allocator.dupe(u8, created.mem_id);
     defer allocator.free(created_id_copy);
@@ -865,7 +867,7 @@ test "memory: create does not change active state when persistence fails" {
 
     try std.testing.expectError(
         MemoryError.PersistenceFailed,
-        mem.create("primary", .ram, "persist_create", "note", "{\"text\":\"v1\"}"),
+        mem.create("primary", .ram, "persist_create", "note", "{\"text\":\"v1\"}", false),
     );
 
     const snapshot = try mem.snapshotActive(allocator, "primary");
@@ -878,7 +880,7 @@ test "memory: evict does not remove active state when persistence fails" {
     var mem = try RuntimeMemory.init(allocator, "agentA");
     defer mem.deinit();
 
-    var created = try mem.create("primary", .ram, "persist_evict", "note", "{\"text\":\"v1\"}");
+    var created = try mem.create("primary", .ram, "persist_evict", "note", "{\"text\":\"v1\"}", false);
     defer created.deinit(allocator);
     const created_id_copy = try allocator.dupe(u8, created.mem_id);
     defer allocator.free(created_id_copy);
@@ -902,9 +904,9 @@ test "memory: active memory JSON always includes mem_id" {
     var mem = try RuntimeMemory.init(allocator, "agentA");
     defer mem.deinit();
 
-    var ram_item = try mem.create("primary", .ram, "task", "message", "{\"role\":\"assistant\",\"text\":\"hi\"}");
+    var ram_item = try mem.create("primary", .ram, "task", "message", "{\"role\":\"assistant\",\"text\":\"hi\"}", false);
     defer ram_item.deinit(allocator);
-    var rom_item = try mem.create("primary", .rom, "system_clock", "state", "{\"now\":\"2026-02-16T12:00:00Z\"}");
+    var rom_item = try mem.create("primary", .rom, "system_clock", "state", "{\"now\":\"2026-02-16T12:00:00Z\"}", false);
     defer rom_item.deinit(allocator);
 
     const snapshot = try mem.snapshotActive(allocator, "primary");
@@ -922,7 +924,7 @@ test "memory: ROM mutation and eviction are rejected deterministically" {
     var mem = try RuntimeMemory.init(allocator, "agentA");
     defer mem.deinit();
 
-    var rom_item = try mem.create("primary", .rom, "policy", "state", "{\"text\":\"immutable\"}");
+    var rom_item = try mem.create("primary", .rom, "policy", "state", "{\"text\":\"immutable\"}", false);
     defer rom_item.deinit(allocator);
 
     try std.testing.expectError(MemoryError.ImmutableTier, mem.mutate(rom_item.mem_id, "{\"text\":\"nope\"}"));
@@ -943,7 +945,7 @@ test "memory: persisted store supports reload across runtime restarts" {
         var first_runtime = try RuntimeMemory.initWithStore(allocator, "agentA", &store);
         defer first_runtime.deinit();
 
-        var created = try first_runtime.create("primary", .ram, "notes", "note", "{\"text\":\"v1\"}");
+        var created = try first_runtime.create("primary", .ram, "notes", "note", "{\"text\":\"v1\"}", false);
         defer created.deinit(allocator);
         var mutated = try first_runtime.mutate(created.mem_id, "{\"text\":\"v2\"}");
         defer mutated.deinit(allocator);
@@ -979,7 +981,7 @@ test "memory: create allocates next version from persisted history" {
         var first_runtime = try RuntimeMemory.initWithStore(allocator, "agentA", &store);
         defer first_runtime.deinit();
 
-        var created = try first_runtime.create("primary", .ram, "memo", "note", "{\"text\":\"v1\"}");
+        var created = try first_runtime.create("primary", .ram, "memo", "note", "{\"text\":\"v1\"}", false);
         defer created.deinit(allocator);
         break :alias_blk try (try memid.MemId.parse(created.mem_id)).withVersion(null).format(allocator);
     };
@@ -988,7 +990,7 @@ test "memory: create allocates next version from persisted history" {
     var second_runtime = try RuntimeMemory.initWithStore(allocator, "agentA", &store);
     defer second_runtime.deinit();
 
-    var created_again = try second_runtime.create("primary", .ram, "memo", "note", "{\"text\":\"v2\"}");
+    var created_again = try second_runtime.create("primary", .ram, "memo", "note", "{\"text\":\"v2\"}", false);
     defer created_again.deinit(allocator);
     try std.testing.expectEqual(@as(?u64, 2), created_again.version);
 
