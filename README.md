@@ -19,6 +19,25 @@ ZiggySpiderweb is an OpenClaw-compatible WebSocket gateway that:
 
 ## Quick Start
 
+### Automated Install (Recommended for Debian/Ubuntu)
+
+The fastest way to get started on Linux:
+
+```bash
+# One-line install - downloads, builds, configures, and runs
+curl -fsSL https://raw.githubusercontent.com/DeanoC/ZiggySpiderweb/main/install.sh | bash
+```
+
+This script will:
+1. Check and install dependencies (Zig, secret-tool, jq, etc.)
+2. Clone and build ZiggySpiderweb
+3. Prompt for AI provider and API key
+4. Configure secure credential storage
+5. Name your first agent
+6. Start the server
+
+### Manual Install
+
 ```bash
 # Clone and build
 git clone https://github.com/DeanoC/ZiggySpiderweb.git
