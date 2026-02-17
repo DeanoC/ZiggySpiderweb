@@ -1,6 +1,7 @@
 const std = @import("std");
 const Config = @import("config.zig");
 const connection_dispatcher = @import("connection_dispatcher.zig");
+const memory = @import("memory.zig");
 const protocol = @import("protocol.zig");
 const runtime_server_mod = @import("runtime_server.zig");
 const websocket_transport = @import("websocket_transport.zig");
@@ -423,21 +424,12 @@ test "server_piai: websocket path handles connect/session.send and rejects chat.
     try std.testing.expect(std.mem.indexOf(u8, connect_ack.payload, "\"type\":\"connect.ack\"") != null);
 
     try writeClientTextFrameMasked(&client, "{\"id\":\"req-session\",\"type\":\"session.send\",\"content\":\"hello\"}");
-    var saw_session_receive = false;
-    var saw_tool_event = false;
-    var saw_memory_event = false;
-    var frame_count: usize = 0;
-    while (frame_count < 4) : (frame_count += 1) {
-        var session_frame = try readServerFrame(allocator, &client);
-        defer session_frame.deinit(allocator);
-        try std.testing.expectEqual(@as(u8, 0x1), session_frame.opcode);
-        if (std.mem.indexOf(u8, session_frame.payload, "\"type\":\"session.receive\"") != null) saw_session_receive = true;
-        if (std.mem.indexOf(u8, session_frame.payload, "\"type\":\"tool.event\"") != null) saw_tool_event = true;
-        if (std.mem.indexOf(u8, session_frame.payload, "\"type\":\"memory.event\"") != null) saw_memory_event = true;
-    }
-    try std.testing.expect(saw_session_receive);
-    try std.testing.expect(saw_tool_event);
-    try std.testing.expect(saw_memory_event);
+    var session_frame = try readServerFrame(allocator, &client);
+    defer session_frame.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0x1), session_frame.opcode);
+    try std.testing.expect(std.mem.indexOf(u8, session_frame.payload, "\"type\":\"session.receive\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, session_frame.payload, "\"type\":\"tool.event\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, session_frame.payload, "\"type\":\"memory.event\"") == null);
 
     try writeClientTextFrameMasked(&client, "{\"id\":\"req-chat\",\"type\":\"chat.send\",\"content\":\"legacy\"}");
     var legacy_reply = try readServerFrame(allocator, &client);
@@ -484,11 +476,11 @@ test "server_piai: route path agent id isolates runtime state across connections
         defer connect_ack.deinit(allocator);
         try std.testing.expect(std.mem.indexOf(u8, connect_ack.payload, "\"type\":\"connect.ack\"") != null);
 
-        try writeClientTextFrameMasked(&client, "{\"id\":\"a-pause\",\"type\":\"agent.control\",\"action\":\"pause\"}");
-        var pause_frame = try readServerFrame(allocator, &client);
-        defer pause_frame.deinit(allocator);
-        try std.testing.expect(std.mem.indexOf(u8, pause_frame.payload, "\"type\":\"agent.state\"") != null);
-        try std.testing.expect(std.mem.indexOf(u8, pause_frame.payload, "\"state\":\"paused\"") != null);
+        try writeClientTextFrameMasked(&client, "{\"id\":\"a-msg\",\"type\":\"session.send\",\"content\":\"alpha hello\"}");
+        var alpha_reply = try readServerFrame(allocator, &client);
+        defer alpha_reply.deinit(allocator);
+        try std.testing.expect(std.mem.indexOf(u8, alpha_reply.payload, "\"type\":\"session.receive\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, alpha_reply.payload, "alpha hello") != null);
 
         try websocket_transport.writeFrame(&client, "", .close);
         var close_reply = try readServerFrame(allocator, &client);
@@ -509,11 +501,11 @@ test "server_piai: route path agent id isolates runtime state across connections
         defer connect_ack.deinit(allocator);
         try std.testing.expect(std.mem.indexOf(u8, connect_ack.payload, "\"type\":\"connect.ack\"") != null);
 
-        try writeClientTextFrameMasked(&client, "{\"id\":\"b-state\",\"type\":\"agent.control\",\"action\":\"state\"}");
-        var state_frame = try readServerFrame(allocator, &client);
-        defer state_frame.deinit(allocator);
-        try std.testing.expect(std.mem.indexOf(u8, state_frame.payload, "\"type\":\"agent.state\"") != null);
-        try std.testing.expect(std.mem.indexOf(u8, state_frame.payload, "\"state\":\"running\"") != null);
+        try writeClientTextFrameMasked(&client, "{\"id\":\"b-msg\",\"type\":\"session.send\",\"content\":\"beta hello\"}");
+        var beta_reply = try readServerFrame(allocator, &client);
+        defer beta_reply.deinit(allocator);
+        try std.testing.expect(std.mem.indexOf(u8, beta_reply.payload, "\"type\":\"session.receive\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, beta_reply.payload, "beta hello") != null);
 
         try websocket_transport.writeFrame(&client, "", .close);
         var close_reply = try readServerFrame(allocator, &client);
@@ -521,25 +513,23 @@ test "server_piai: route path agent id isolates runtime state across connections
         try std.testing.expectEqual(@as(u8, 0x8), close_reply.opcode);
     }
 
-    {
-        const server_thread = try std.Thread.spawn(.{}, runSingleWsConnection, .{&server_ctx});
-        defer server_thread.join();
+    const alpha_runtime = try runtime_registry.getOrCreate("alpha");
+    const beta_runtime = try runtime_registry.getOrCreate("beta");
 
-        var client = try std.net.tcpConnectToAddress(listener.listen_address);
-        defer client.close();
-        try performClientHandshake(allocator, &client, "/v1/agents/alpha/stream");
+    const alpha_snapshot = try alpha_runtime.runtime.active_memory.snapshotActive(allocator, "primary");
+    defer memory.deinitItems(allocator, alpha_snapshot);
+    const alpha_json = try memory.toActiveMemoryJson(allocator, "primary", alpha_snapshot);
+    defer allocator.free(alpha_json);
 
-        try writeClientTextFrameMasked(&client, "{\"id\":\"a-state\",\"type\":\"agent.control\",\"action\":\"state\"}");
-        var state_frame = try readServerFrame(allocator, &client);
-        defer state_frame.deinit(allocator);
-        try std.testing.expect(std.mem.indexOf(u8, state_frame.payload, "\"type\":\"agent.state\"") != null);
-        try std.testing.expect(std.mem.indexOf(u8, state_frame.payload, "\"state\":\"paused\"") != null);
+    const beta_snapshot = try beta_runtime.runtime.active_memory.snapshotActive(allocator, "primary");
+    defer memory.deinitItems(allocator, beta_snapshot);
+    const beta_json = try memory.toActiveMemoryJson(allocator, "primary", beta_snapshot);
+    defer allocator.free(beta_json);
 
-        try websocket_transport.writeFrame(&client, "", .close);
-        var close_reply = try readServerFrame(allocator, &client);
-        defer close_reply.deinit(allocator);
-        try std.testing.expectEqual(@as(u8, 0x8), close_reply.opcode);
-    }
+    try std.testing.expect(std.mem.indexOf(u8, alpha_json, "alpha hello") != null);
+    try std.testing.expect(std.mem.indexOf(u8, alpha_json, "beta hello") == null);
+    try std.testing.expect(std.mem.indexOf(u8, beta_json, "beta hello") != null);
+    try std.testing.expect(std.mem.indexOf(u8, beta_json, "alpha hello") == null);
 
     try std.testing.expect(server_ctx.err_name == null);
 }

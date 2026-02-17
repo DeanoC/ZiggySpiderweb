@@ -167,6 +167,23 @@ pub const AgentRuntime = struct {
         try self.control_events.append(self.allocator, event);
     }
 
+    pub fn appendMessageMemory(self: *AgentRuntime, brain_name: []const u8, role: []const u8, content: []const u8) !void {
+        const escaped_role = try jsonEscapeAlloc(self.allocator, role);
+        defer self.allocator.free(escaped_role);
+        const escaped_content = try jsonEscapeAlloc(self.allocator, content);
+        defer self.allocator.free(escaped_content);
+
+        const payload = try std.fmt.allocPrint(
+            self.allocator,
+            "{{\"role\":\"{s}\",\"content\":\"{s}\"}}",
+            .{ escaped_role, escaped_content },
+        );
+        defer self.allocator.free(payload);
+
+        var created = try self.active_memory.create(brain_name, .ram, null, "message", payload);
+        created.deinit(self.allocator);
+    }
+
     pub fn enqueueUserEvent(self: *AgentRuntime, content: []const u8) !void {
         if (self.state == .cancelled) return RuntimeError.RuntimeCancelled;
         if (self.state == .paused) return RuntimeError.RuntimePaused;
@@ -673,4 +690,56 @@ test "agent_runtime: memory lifecycle create mutate evict load historical" {
     defer load_tick.deinit(allocator);
     try std.testing.expect(load_tick.tool_results[0].success);
     try std.testing.expect(std.mem.indexOf(u8, load_tick.tool_results[0].payload_json, "\"v1\"") != null);
+}
+
+test "agent_runtime: appendMessageMemory escapes JSON control characters" {
+    const allocator = std.testing.allocator;
+    var runtime = try AgentRuntime.init(allocator, "agent-test", &[_][]const u8{});
+    defer runtime.deinit();
+
+    const control_text = "a\x08b\x0cc\x01d";
+    try runtime.appendMessageMemory("primary", "user", control_text);
+
+    const snapshot = try runtime.active_memory.snapshotActive(allocator, "primary");
+    defer memory.deinitItems(allocator, snapshot);
+    const json = try memory.toActiveMemoryJson(allocator, "primary", snapshot);
+    defer allocator.free(json);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+    defer parsed.deinit();
+
+    const active = parsed.value.object.get("active_memory").?.object;
+    const items = active.get("items").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), items.len);
+    const payload = items[0].object.get("content").?.object;
+    try std.testing.expectEqualStrings("user", payload.get("role").?.string);
+    try std.testing.expectEqualStrings(control_text, payload.get("content").?.string);
+}
+
+fn jsonEscapeAlloc(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8){};
+    defer out.deinit(allocator);
+    const hex = "0123456789abcdef";
+
+    for (raw) |char| {
+        switch (char) {
+            '\\' => try out.appendSlice(allocator, "\\\\"),
+            '"' => try out.appendSlice(allocator, "\\\""),
+            '\n' => try out.appendSlice(allocator, "\\n"),
+            '\r' => try out.appendSlice(allocator, "\\r"),
+            '\t' => try out.appendSlice(allocator, "\\t"),
+            '\x08' => try out.appendSlice(allocator, "\\b"),
+            '\x0c' => try out.appendSlice(allocator, "\\f"),
+            else => {
+                if (char < 0x20) {
+                    try out.appendSlice(allocator, "\\u00");
+                    try out.append(allocator, hex[@as(usize, (char >> 4) & 0x0f)]);
+                    try out.append(allocator, hex[@as(usize, char & 0x0f)]);
+                } else {
+                    try out.append(allocator, char);
+                }
+            },
+        }
+    }
+    return out.toOwnedSlice(allocator);
 }
