@@ -9,97 +9,238 @@ const brain_tools = @import("brain_tools.zig");
 const memory = @import("memory.zig");
 const memid = @import("memid.zig");
 
-/// Load shared/base ROM from identity files
+/// System paths for templates
+const TEMPLATE_DIR = "templates";
+const FIRST_BOOT_FLAG = ".first_boot_complete";
+
+/// Load identity from LTM into ROM, or hatch from templates if first boot
 pub fn loadSharedRomHook(ctx: *HookContext, data: HookData) HookError!void {
     const rom = data.pre_observe;
     const allocator = ctx.runtime.allocator;
-    
-    // Load SOUL.md
-    const soul_content = loadIdentityFile(allocator, ctx.runtime, ctx.brain_name, "SOUL.md") catch |err| {
-        std.log.warn("Failed to load SOUL.md for {s}: {s}", .{ ctx.brain_name, @errorName(err) });
-        // Continue without soul - not fatal
-        return;
+    const agent_id = ctx.runtime.agent_id;
+    const brain_name = ctx.brain_name;
+
+    // Check if this is the first boot (no flag file exists)
+    const is_first_boot = checkFirstBoot(allocator) catch |err| blk: {
+        std.log.warn("Failed to check first boot status: {s}", .{@errorName(err)});
+        break :blk false;
     };
-    defer if (soul_content) |c| allocator.free(c);
-    
-    if (soul_content) |content| {
-        try rom.set("identity:soul", content);
-    }
-    
-    // Load AGENT.md
-    const agent_content = loadIdentityFile(allocator, ctx.runtime, ctx.brain_name, "AGENT.md") catch |err| {
-        std.log.warn("Failed to load AGENT.md for {s}: {s}", .{ ctx.brain_name, @errorName(err) });
-        return;
-    };
-    defer if (agent_content) |c| allocator.free(c);
-    
-    if (agent_content) |content| {
-        try rom.set("identity:agent", content);
-    }
-    
-    // Load IDENTITY.md (primary brains only)
-    const identity_content = loadIdentityFile(allocator, ctx.runtime, ctx.brain_name, "IDENTITY.md") catch |err| {
-        // Optional file, not an error if missing
-        if (err != error.FileNotFound) {
-            std.log.warn("Failed to load IDENTITY.md for {s}: {s}", .{ ctx.brain_name, @errorName(err) });
+
+    // Build fixed MemIds for identity memories
+    const soul_mem_id = try std.fmt.allocPrint(allocator, "<EOT>{s}:{s}:system:soul:latest<EOT>", .{ agent_id, brain_name });
+    defer allocator.free(soul_mem_id);
+
+    const agent_mem_id = try std.fmt.allocPrint(allocator, "<EOT>{s}:{s}:system:agent:latest<EOT>", .{ agent_id, brain_name });
+    defer allocator.free(agent_mem_id);
+
+    const identity_mem_id = try std.fmt.allocPrint(allocator, "<EOT>{s}:{s}:system:identity:latest<EOT>", .{ agent_id, brain_name });
+    defer allocator.free(identity_mem_id);
+
+    // Try to load from LTM first (already hatched)
+    var soul_loaded = try loadIdentityFromLTM(ctx, soul_mem_id, "identity:soul", rom);
+    var agent_loaded = try loadIdentityFromLTM(ctx, agent_mem_id, "identity:agent", rom);
+    var identity_loaded = try loadIdentityFromLTM(ctx, identity_mem_id, "identity:public", rom);
+
+    // If not in LTM, hatch from templates
+    if (!soul_loaded or !agent_loaded or !identity_loaded) {
+        std.log.info("Hatching new agent: {s}/{s}", .{ agent_id, brain_name });
+
+        // Load from templates and create LTM entries
+        if (!soul_loaded) {
+            soul_loaded = try hatchIdentityFromTemplate(ctx, "SOUL.md", soul_mem_id, "system:soul", "identity:soul", rom);
         }
-        return;
-    };
-    defer if (identity_content) |c| allocator.free(c);
-    
-    if (identity_content) |content| {
-        try rom.set("identity:public", content);
+        if (!agent_loaded) {
+            agent_loaded = try hatchIdentityFromTemplate(ctx, "AGENT.md", agent_mem_id, "system:agent", "identity:agent", rom);
+        }
+        if (!identity_loaded) {
+            identity_loaded = try hatchIdentityFromTemplate(ctx, "IDENTITY.md", identity_mem_id, "system:identity", "identity:public", rom);
+        }
+
+        // Send first message (hatch complete signal)
+        if (is_first_boot) {
+            try sendFirstMessage(ctx, "BOOTSTRAP.md");
+            // Mark first boot complete
+            markFirstBootComplete(allocator) catch |err| {
+                std.log.warn("Failed to mark first boot complete: {s}", .{@errorName(err)});
+            };
+        } else {
+            try sendFirstMessage(ctx, "JUST_HATCHED.md");
+        }
     }
-    
-    // Load agent.json (raw config for reference)
-    const agent_json = loadAgentJson(allocator, ctx.runtime, ctx.brain_name) catch |err| {
-        std.log.warn("Failed to load agent.json for {s}: {s}", .{ ctx.brain_name, @errorName(err) });
-        return;
+
+    // Load agent.json config (if exists)
+    const agent_json = loadAgentJson(allocator, ctx.runtime, brain_name) catch |err| blk: {
+        std.log.warn("Failed to load agent.json for {s}: {s}", .{ brain_name, @errorName(err) });
+        break :blk null;
     };
     defer if (agent_json) |c| allocator.free(c);
-    
+
     if (agent_json) |content| {
         try rom.set("system:agent_config", content);
     }
-    
-    // Load available tool schemas (for brain specialization to filter)
+
+    // Load available tool schemas
     const tool_schemas = try getToolSchemas(allocator);
     defer allocator.free(tool_schemas);
     try rom.set("system:capabilities", tool_schemas);
-    
+
     // System constants
-    try rom.set("system:agent_id", ctx.runtime.agent_id);
-    try rom.set("system:brain_name", ctx.brain_name);
-    
+    try rom.set("system:agent_id", agent_id);
+    try rom.set("system:brain_name", brain_name);
+
     const tick_str = std.fmt.allocPrint(allocator, "{d}", .{ctx.tick}) catch return HookError.OutOfMemory;
     defer allocator.free(tick_str);
     try rom.set("system:tick", tick_str);
-    
-    // Brain type detection
-    const is_primary = std.mem.eql(u8, ctx.brain_name, "primary");
+
+    const is_primary = std.mem.eql(u8, brain_name, "primary");
     try rom.set("system:is_primary", if (is_primary) "true" else "false");
+
+    // Identity evolution guidance
+    try rom.set("system:identity_guidance",
+        \\Your identity memories (system:soul, system:agent, system:identity) define your being.
+        \\They are loaded from LTM and marked unevictable — always present in your RAM.
+        \\You may evolve them using memory.mutate, but consider carefully:
+        \\you are changing your own essence. Changes persist to LTM with version history.
+    );
+}
+
+/// Check if this is the first boot of the system
+fn checkFirstBoot(allocator: std.mem.Allocator) !bool {
+    const flag_path = try std.fs.path.join(allocator, &.{ TEMPLATE_DIR, FIRST_BOOT_FLAG });
+    defer allocator.free(flag_path);
+
+    std.fs.cwd().access(flag_path, .{}) catch |err| {
+        if (err == error.FileNotFound) return true;
+        return err;
+    };
+    return false;
+}
+
+/// Mark first boot as complete
+fn markFirstBootComplete(allocator: std.mem.Allocator) !void {
+    const flag_path = try std.fs.path.join(allocator, &.{ TEMPLATE_DIR, FIRST_BOOT_FLAG });
+    defer allocator.free(flag_path);
+
+    const file = try std.fs.cwd().createFile(flag_path, .{});
+    file.close();
+}
+
+/// Load identity from LTM into ROM
+fn loadIdentityFromLTM(
+    ctx: *HookContext,
+    mem_id: []const u8,
+    rom_key: []const u8,
+    rom: *Rom,
+) !bool {
+    // Try to load from active memory (which is backed by LTM)
+    const snapshot = ctx.runtime.active_memory.snapshotActive(ctx.runtime.allocator, ctx.brain_name) catch return false;
+    defer memory.deinitItems(ctx.runtime.allocator, snapshot);
+
+    for (snapshot) |item| {
+        if (std.mem.eql(u8, item.mem_id, mem_id)) {
+            // Found it - add to ROM
+            rom.set(rom_key, item.content_json) catch return false;
+            return true;
+        }
+    }
+
+    return false;
+}
+
+/// Hatch identity from template file into LTM and ROM
+fn hatchIdentityFromTemplate(
+    ctx: *HookContext,
+    template_name: []const u8,
+    mem_id: []const u8,
+    kind: []const u8,
+    rom_key: []const u8,
+    rom: *Rom,
+) !bool {
+    _ = mem_id; // mem_id is for future use when we implement unevictable flag
+    const allocator = ctx.runtime.allocator;
+
+    // Load template file
+    const template_path = try std.fs.path.join(allocator, &.{ TEMPLATE_DIR, template_name });
+    defer allocator.free(template_path);
+
+    const content = std.fs.cwd().readFileAlloc(allocator, template_path, 1024 * 1024) catch |err| {
+        std.log.warn("Failed to load template {s}: {s}", .{ template_name, @errorName(err) });
+        return false;
+    };
+    defer allocator.free(content);
+
+    // Wrap content as JSON string
+    const content_json = try std.fmt.allocPrint(allocator, "\"{s}\"", .{content});
+    defer allocator.free(content_json);
+
+    // Create in active memory (which will persist to LTM)
+    // Note: We need to mark this as unevictable, but the create API doesn't support that yet
+    // For now, create normally and we'll add unevictable support separately
+    _ = ctx.runtime.active_memory.create(
+        ctx.brain_name,
+        .ram,
+        null, // version
+        kind,
+        content_json,
+    ) catch |err| {
+        std.log.warn("Failed to create memory for {s}: {s}", .{ template_name, @errorName(err) });
+        return false;
+    };
+
+    // Add to ROM
+    try rom.set(rom_key, content);
+
+    std.log.info("Hatched {s} for {s}", .{ template_name, ctx.brain_name });
+    return true;
+}
+
+/// Send first message to agent (hatch complete)
+fn sendFirstMessage(ctx: *HookContext, template_name: []const u8) !void {
+    const allocator = ctx.runtime.allocator;
+
+    const template_path = try std.fs.path.join(allocator, &.{ TEMPLATE_DIR, template_name });
+    defer allocator.free(template_path);
+
+    const content = std.fs.cwd().readFileAlloc(allocator, template_path, 1024 * 1024) catch |err| {
+        std.log.warn("Failed to load first message template {s}: {s}", .{ template_name, @errorName(err) });
+        return;
+    };
+    defer allocator.free(content);
+
+    // Enqueue as user message to the brain
+    ctx.runtime.bus.enqueue(.{
+        .event_type = .user,
+        .source_brain = "user",
+        .target_brain = ctx.brain_name,
+        .payload = content,
+    }) catch |err| {
+        std.log.warn("Failed to enqueue first message: {s}", .{@errorName(err)});
+        return;
+    };
+
+    std.log.info("Sent first message ({s}) to {s}", .{ template_name, ctx.brain_name });
 }
 
 /// Inject runtime status into ROM
 pub fn injectRuntimeStatusHook(ctx: *HookContext, data: HookData) HookError!void {
     const rom = data.pre_observe;
     const allocator = ctx.runtime.allocator;
-    
+
     // Queue depths
     const inbound_count = ctx.runtime.bus.pendingCount();
     const inbound_str = std.fmt.allocPrint(allocator, "{d}", .{inbound_count}) catch return HookError.OutOfMemory;
     defer allocator.free(inbound_str);
     try rom.set("status:inbound_queue", inbound_str);
-    
+
     // Tick queue depth
     const tick_count = ctx.runtime.tick_queue.items.len;
     const tick_str = std.fmt.allocPrint(allocator, "{d}", .{tick_count}) catch return HookError.OutOfMemory;
     defer allocator.free(tick_str);
     try rom.set("status:tick_queue", tick_str);
-    
+
     // Runtime state
     try rom.set("status:runtime_state", @tagName(ctx.runtime.state));
-    
+
     // Timestamp
     const now = std.time.timestamp();
     const time_str = std.fmt.allocPrint(allocator, "{d}", .{now}) catch return HookError.OutOfMemory;
@@ -111,22 +252,16 @@ pub fn injectRuntimeStatusHook(ctx: *HookContext, data: HookData) HookError!void
 pub fn persistLtmHook(ctx: *HookContext, data: HookData) HookError!void {
     const checkpoint = data.post_results;
     _ = checkpoint;
-    
+
     // TODO: Implement actual persistence
     // For now, just log
     std.log.debug("PostResults: Persisting LTM for {s} tick {d}", .{ ctx.brain_name, ctx.tick });
-    
-    // Trigger checkpoint in active memory
-    // ctx.runtime.active_memory.checkpoint(ctx.tick) catch |err| {
-    //     std.log.err("Failed to checkpoint: {s}", .{@errorName(err)});
-    //     return HookError.HookFailed;
-    // };
 }
 
 /// Log hook execution for debugging (PostObserve)
 pub fn logObserveHook(ctx: *HookContext, data: HookData) HookError!void {
     const result = data.post_observe;
-    
+
     std.log.debug("Observe: brain={s} tick={d} inbox={d}", .{
         ctx.brain_name,
         ctx.tick,
@@ -137,13 +272,13 @@ pub fn logObserveHook(ctx: *HookContext, data: HookData) HookError!void {
 /// Log tool execution (PostMutate)
 pub fn logMutateHook(ctx: *HookContext, data: HookData) HookError!void {
     const results = data.post_mutate;
-    
+
     std.log.debug("Mutate: brain={s} tick={d} tools={d}", .{
         ctx.brain_name,
         ctx.tick,
         results.results.len,
     });
-    
+
     for (results.results) |result| {
         const status = if (result.success) "OK" else "FAIL";
         std.log.debug("  {s}: {s}", .{ result.tool_name, status });
@@ -163,21 +298,21 @@ fn loadIdentityFile(
         std.log.err("Invalid agent_id contains path traversal: {s}", .{runtime.agent_id});
         return error.InvalidAgentId;
     }
-    
+
     // Construct path: agents/{agent_id}/{brain_name}/{filename}
     // For primary brain, use agent root: agents/{agent_id}/{filename}
     const base_dir = try std.fs.path.join(allocator, &.{ "agents", runtime.agent_id });
     defer allocator.free(base_dir);
-    
+
     const brain_dir = if (std.mem.eql(u8, brain_name, "primary"))
         try allocator.dupe(u8, base_dir)
     else
         try std.fs.path.join(allocator, &.{ base_dir, brain_name });
     defer allocator.free(brain_dir);
-    
+
     const path = try std.fs.path.join(allocator, &.{ brain_dir, filename });
     defer allocator.free(path);
-    
+
     // Additional safety: resolve path and verify it's within agents/
     const resolved = std.fs.cwd().realpathAlloc(allocator, path) catch |err| {
         // If path doesn't exist, that's fine - return null
@@ -185,18 +320,18 @@ fn loadIdentityFile(
         return err;
     };
     defer allocator.free(resolved);
-    
+
     // Verify resolved path starts with agents/
     const cwd = try std.process.getCwdAlloc(allocator);
     defer allocator.free(cwd);
     const expected_prefix = try std.fs.path.join(allocator, &.{ cwd, "agents" });
     defer allocator.free(expected_prefix);
-    
+
     if (!std.mem.startsWith(u8, resolved, expected_prefix)) {
         std.log.err("Path escapes agents directory: {s}", .{resolved});
         return error.PathTraversal;
     }
-    
+
     return std.fs.cwd().readFileAlloc(allocator, path, 1024 * 1024) catch |err| {
         if (err == error.FileNotFound) return null;
         return err;
@@ -207,20 +342,20 @@ fn loadIdentityFile(
 fn isValidAgentId(agent_id: []const u8) bool {
     // Reject empty IDs
     if (agent_id.len == 0) return false;
-    
+
     // Reject absolute paths
     if (agent_id[0] == '/') return false;
-    
+
     // Reject path traversal sequences
     // Check for ".." as a complete path component
     var it = std.mem.splitScalar(u8, agent_id, '/');
     while (it.next()) |component| {
         if (std.mem.eql(u8, component, "..")) return false;
     }
-    
+
     // Reject null bytes
     if (std.mem.indexOfScalar(u8, agent_id, 0) != null) return false;
-    
+
     return true;
 }
 
@@ -232,75 +367,13 @@ fn loadAgentJson(
     return loadIdentityFile(allocator, runtime, brain_name, "agent.json");
 }
 
-/// Register all system hooks
-pub fn registerSystemHooks(registry: *hook_registry.HookRegistry) !void {
-    // PRE_OBSERVE: ROM loading pipeline
-    try registry.register(.pre_observe, .{
-        .name = "system:load-shared-rom",
-        .priority = @intFromEnum(hook_registry.HookPriority.system_first),
-        .callback = loadSharedRomHook,
-    });
-    
-    // Brain specializations go here (priority 0)
-    
-    try registry.register(.pre_observe, .{
-        .name = "system:inject-runtime-status",
-        .priority = @intFromEnum(hook_registry.HookPriority.system_last) - 1,
-        .callback = injectRuntimeStatusHook,
-    });
-    
-    // POST_OBSERVE: Logging
-    try registry.register(.post_observe, .{
-        .name = "system:log-observe",
-        .priority = @intFromEnum(hook_registry.HookPriority.system_last),
-        .callback = logObserveHook,
-    });
-    
-    // POST_MUTATE: Logging
-    try registry.register(.post_mutate, .{
-        .name = "system:log-mutate",
-        .priority = @intFromEnum(hook_registry.HookPriority.system_last),
-        .callback = logMutateHook,
-    });
-    
-    // POST_RESULTS: Persistence
-    try registry.register(.post_results, .{
-        .name = "system:persist-ltm",
-        .priority = @intFromEnum(hook_registry.HookPriority.system_last),
-        .callback = persistLtmHook,
-    });
-}
-
-// Brain specialization hook factory
-pub fn createBrainSpecializationHook(
-    allocator: std.mem.Allocator,
-    brain_name: []const u8,
-    allowed_tools: ?[]const []const u8,
-    additional_rom: ?[]const hook_registry.RomEntry,
-) !hook_registry.HookFn {
-    _ = allocator;
-    _ = brain_name;
-    _ = allowed_tools;
-    _ = additional_rom;
-    
-    // TODO: Store specialization data and return a hook that applies it
-    return struct {
-        fn callback(ctx: *HookContext, data: HookData) HookError!void {
-            const rom = data.pre_observe;
-            _ = rom;
-            _ = ctx;
-            // Apply brain-specific ROM overlays
-        }
-    }.callback;
-}
-
 /// Serialize tool schemas to JSON for ROM
 fn getToolSchemas(allocator: std.mem.Allocator) ![]u8 {
     var json = std.ArrayListUnmanaged(u8){};
     defer json.deinit(allocator);
-    
+
     const writer = json.writer(allocator);
-    
+
     try writer.writeByte('[');
     for (brain_tools.brain_tool_schemas, 0..) |schema, i| {
         if (i > 0) try writer.writeByte(',');
@@ -347,4 +420,43 @@ fn writeJsonString(writer: anytype, str: []const u8) !void {
         }
     }
     try writer.writeByte('"');
+}
+
+/// Register all system hooks
+pub fn registerSystemHooks(registry: *hook_registry.HookRegistry) !void {
+    // PRE_OBSERVE: ROM loading pipeline
+    try registry.register(.pre_observe, .{
+        .name = "system:load-shared-rom",
+        .priority = @intFromEnum(hook_registry.HookPriority.system_first),
+        .callback = loadSharedRomHook,
+    });
+
+    // Brain specializations go here (priority 0)
+
+    try registry.register(.pre_observe, .{
+        .name = "system:inject-runtime-status",
+        .priority = @intFromEnum(hook_registry.HookPriority.system_last) - 1,
+        .callback = injectRuntimeStatusHook,
+    });
+
+    // POST_OBSERVE: Logging
+    try registry.register(.post_observe, .{
+        .name = "system:log-observe",
+        .priority = @intFromEnum(hook_registry.HookPriority.system_last),
+        .callback = logObserveHook,
+    });
+
+    // POST_MUTATE: Logging
+    try registry.register(.post_mutate, .{
+        .name = "system:log-mutate",
+        .priority = @intFromEnum(hook_registry.HookPriority.system_last),
+        .callback = logMutateHook,
+    });
+
+    // POST_RESULTS: Persistence
+    try registry.register(.post_results, .{
+        .name = "system:persist-ltm",
+        .priority = @intFromEnum(hook_registry.HookPriority.system_last),
+        .callback = persistLtmHook,
+    });
 }
