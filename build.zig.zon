@@ -6,7 +6,7 @@
     .dependencies = .{
         .ziggy_piai = .{
             .url = "https://github.com/DeanoC/ZiggyPiAi/archive/refs/heads/master.tar.gz",
-            .hash = "1220f3911556f9a6a37ec395b669413e61f27590dc6a5f7fbffb51ad7b13f35e0df3",
+            .hash = "1220aec7f4828ab23d3a36b7b32dd3b278e94ca1fd05d012df3d8cd8016b0356bedc",
         },
     },
     .paths = .{

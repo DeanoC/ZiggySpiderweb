@@ -13,9 +13,13 @@ ZiggySpiderweb is an OpenClaw-compatible WebSocket gateway that:
 - Streams responses back through OpenClaw protocol
 
 **Supported Providers:**
-- OpenAI (GPT-4o, GPT-4o-mini)
+- OpenAI (GPT-4o, GPT-4.1, GPT-5.3-codex-spark)
 - OpenAI Codex (GPT-5.1, GPT-5.2, GPT-5.3 variants)
 - Kimi Coding (K2, K2.5 series)
+
+**Authentication:**
+- API keys: Stored securely via Linux secret-tool or environment variables
+- OAuth: Automatic Codex token refresh from `~/.codex/auth.json` (if you've authenticated with `codex` CLI)
 
 ## Quick Start
 
@@ -133,6 +137,47 @@ Implemented tool names:
 **Security Note:** `spiderweb-config config set-key` does not write plaintext keys to config.
 On Linux, secure storage uses the desktop keyring via `secret-tool`.
 If no secure backend is available, configure provider keys via environment variables.
+
+### Environment Variables
+
+Spiderweb supports multiple ways to provide API keys via environment variables:
+
+**OpenAI:**
+- `OPENAI_API_KEY` - Standard API key
+
+**OpenAI Codex:**
+- `OPENAI_CODEX_API_KEY` - Dedicated Codex API key
+- `OPENAI_API_KEY` - Falls back to standard OpenAI key
+- **OAuth:** Automatically reads `~/.codex/auth.json` if you've authenticated via the `codex` CLI
+
+**OpenAI Codex Spark:**
+- `OPENAI_CODEX_SPARK_API_KEY` - Dedicated Spark API key
+- `OPENAI_CODEX_API_KEY` - Falls back to Codex key
+- `OPENAI_API_KEY` - Falls back to standard OpenAI key
+- **OAuth:** Automatically reads `~/.codex/auth.json`
+
+**Kimi Coding:**
+- `KIMICODE_API_KEY` - Preferred
+- `KIMI_API_KEY` - Alternative
+- `ANTHROPIC_API_KEY` - Falls back to Anthropic key
+
+**Anthropic (if using directly):**
+- `ANTHROPIC_API_KEY`
+
+**Azure OpenAI:**
+- `AZURE_OPENAI_API_KEY`
+
+### OAuth Token Refresh
+
+When using OpenAI Codex providers, Spiderweb automatically:
+1. Reads tokens from `~/.codex/auth.json` (created by the `codex` CLI)
+2. Refreshes expired tokens using the refresh token
+3. Writes updated tokens back to `~/.codex/auth.json`
+
+This allows seamless Codex usage without manual API key management if you've already authenticated with:
+```bash
+codex auth login
+```
 
 ## Architecture
 
