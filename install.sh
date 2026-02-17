@@ -2,6 +2,13 @@
 # ZiggySpiderweb First Install Script
 # Debian/Ubuntu only for now
 # Usage: curl -fsSL https://raw.githubusercontent.com/DeanoC/ZiggySpiderweb/main/install.sh | bash
+#
+# Non-interactive mode (for CI/testing):
+#   SPIDERWEB_PROVIDER=openai \
+#   SPIDERWEB_MODEL=gpt-4o-mini \
+#   SPIDERWEB_API_KEY=sk-xxx \
+#   SPIDERWEB_AGENT_NAME=ziggy \
+#   ./install.sh --non-interactive
 
 set -euo pipefail
 
@@ -15,6 +22,18 @@ SPIDERWEB_VERSION="0.2.0"
 INSTALL_DIR="${HOME}/.local/bin"
 CONFIG_DIR="${HOME}/.config/spiderweb"
 LTM_DIR=".spiderweb-ltm"
+
+# Non-interactive mode detection
+NON_INTERACTIVE=false
+if [[ "${1:-}" == "--non-interactive" ]] || [[ -n "${SPIDERWEB_NON_INTERACTIVE:-}" ]]; then
+    NON_INTERACTIVE=true
+fi
+
+# Environment overrides
+PROVIDER="${SPIDERWEB_PROVIDER:-}"
+MODEL="${SPIDERWEB_MODEL:-}"
+API_KEY="${SPIDERWEB_API_KEY:-}"
+AGENT_NAME="${SPIDERWEB_AGENT_NAME:-ziggy}"
 
 log_info() {
     echo -e "${BLUE}[INFO]${NC} $1"
@@ -121,11 +140,15 @@ check_dependencies() {
 install_dependencies() {
     log_info "Installing dependencies..."
     
-    echo ""
-    read -rp "Install missing dependencies? This requires sudo. [Y/n]: " confirm
-    if [[ ! "$confirm" =~ ^[Yy]$ ]] && [[ -n "$confirm" ]]; then
-        log_error "Cannot continue without dependencies."
-        exit 1
+    if [[ "$NON_INTERACTIVE" == "true" ]]; then
+        log_info "Non-interactive mode: auto-installing dependencies"
+    else
+        echo ""
+        read -rp "Install missing dependencies? This requires sudo. [Y/n]: " confirm
+        if [[ ! "$confirm" =~ ^[Yy]$ ]] && [[ -n "$confirm" ]]; then
+            log_error "Cannot continue without dependencies."
+            exit 1
+        fi
     fi
     
     log_info "Updating package list..."
@@ -228,6 +251,23 @@ clone_and_build() {
 
 configure_provider() {
     log_info "Configuring AI Provider"
+    
+    # Non-interactive mode: use environment variables
+    if [[ "$NON_INTERACTIVE" == "true" ]]; then
+        if [[ -z "$PROVIDER" ]] || [[ -z "$MODEL" ]]; then
+            log_error "Non-interactive mode requires SPIDERWEB_PROVIDER and SPIDERWEB_MODEL environment variables"
+            exit 1
+        fi
+        log_info "Non-interactive mode: Using provider=$PROVIDER, model=$MODEL"
+        
+        # API key check
+        if [[ -z "$API_KEY" ]]; then
+            log_warn "No SPIDERWEB_API_KEY provided - you will need to configure this manually"
+        fi
+        return 0
+    fi
+    
+    # Interactive mode
     echo ""
     echo "Supported providers:"
     echo "  1) openai (GPT-4o, GPT-4.1, GPT-5.3-codex-spark)"
@@ -293,6 +333,13 @@ configure_provider() {
     
     log_info "Selected model: $model"
     
+
+    MODEL="$model"
+
+    # API Key (skip prompts in non-interactive mode)
+    if [[ "$NON_INTERACTIVE" == "true" ]]; then
+        return 0
+    fi
     # API Key
     echo ""
     log_info "API Key Setup"
@@ -344,6 +391,12 @@ configure_provider() {
 }
 
 name_first_agent() {
+    # Non-interactive mode: use environment variable
+    if [[ "$NON_INTERACTIVE" == "true" ]]; then
+        log_info "Non-interactive mode: Agent name = $AGENT_NAME"
+        return 0
+    fi
+    
     echo ""
     log_info "Name Your First Agent"
     echo ""
@@ -365,8 +418,8 @@ name_first_agent() {
         break
     done
     
-    FIRST_AGENT="$agent_name"
-    log_success "First agent will be named: $FIRST_AGENT"
+    AGENT_NAME="$agent_name"
+    log_success "First agent will be named: $AGENT_NAME"
 }
 
 run_first_agent() {
@@ -383,8 +436,17 @@ run_first_agent() {
     echo "  LTM directory: $LTM_DIR"
     echo "  Install directory: $INSTALL_DIR"
     echo "  Provider: $(spiderweb-config config | grep Provider: | cut -d' ' -f2-)"
-    echo "  First agent: $FIRST_AGENT"
+    echo "  First agent: $AGENT_NAME"
     echo ""
+    
+    # Non-interactive mode: start server automatically
+    if [[ "$NON_INTERACTIVE" == "true" ]]; then
+        log_info "Non-interactive mode: Starting server..."
+        echo ""
+        echo "The server will run on http://127.0.0.1:18790"
+        echo ""
+        exec spiderweb
+    fi
     
     read -rp "Start the server now? [Y/n]: " confirm
     if [[ ! "$confirm" =~ ^[Nn]$ ]] || [[ -z "$confirm" ]]; then
@@ -399,7 +461,7 @@ run_first_agent() {
     else
         echo ""
         log_info "You can start the server later with: spiderweb"
-        log_info "Or test with: zsc --gateway-test ping ws://127.0.0.1:18790/v1/agents/$FIRST_AGENT/stream"
+        log_info "Or test with: zsc --gateway-test ping ws://127.0.0.1:18790/v1/agents/$AGENT_NAME/stream"
     fi
 }
 

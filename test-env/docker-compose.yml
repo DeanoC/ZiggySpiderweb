@@ -1,0 +1,70 @@
+version: '3.8'
+
+services:
+  spiderweb-test:
+    build:
+      context: ..
+      dockerfile: test-env/Dockerfile
+    container_name: spiderweb-test
+    hostname: spiderweb-test
+    
+    # Keep container running for interactive use
+    stdin_open: true
+    tty: true
+    
+    # Port forwarding for testing
+    ports:
+      - "18790:18790"
+    
+    # Volume mounts for development (optional)
+    volumes:
+      # Mount local source for development testing
+      - ../:/home/spiderweb/ziggy-spiderweb-src:ro
+      # Named volume for LTM persistence (optional - remove for true wipe)
+      - spiderweb-ltm:/home/spiderweb/.spiderweb-ltm
+    
+    # Environment variables for automated testing
+    environment:
+      - TERM=xterm-256color
+      - SPIDERWEB_TEST_MODE=1
+    
+    # Resource limits (adjust as needed)
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+        reservations:
+          memory: 512M
+    
+    # Network configuration
+    networks:
+      - spiderweb-test-net
+    
+    # Health check
+    healthcheck:
+      test: ["CMD", "bash", "-c", "echo 'Spiderweb test container healthy'"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Optional: PostgreSQL for testing (if needed in future)
+  # postgres:
+  #   image: postgres:15-alpine
+  #   environment:
+  #     POSTGRES_USER: spiderweb
+  #     POSTGRES_PASSWORD: test
+  #     POSTGRES_DB: spiderweb_test
+  #   volumes:
+  #     - postgres-data:/var/lib/postgresql/data
+  #   networks:
+  #     - spiderweb-test-net
+
+volumes:
+  spiderweb-ltm:
+    driver: local
+  # postgres-data:
+  #   driver: local
+
+networks:
+  spiderweb-test-net:
+    driver: bridge
