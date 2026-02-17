@@ -513,8 +513,17 @@ pub const Engine = struct {
             else
                 "";
 
-            const explicit_talk_id = getOptionalTalkId(event_obj, "talk_id") catch return error.InvalidWait;
-            const talk_id = explicit_talk_id orelse default_talk_id;
+            var talk_id = default_talk_id;
+            if (event_obj.get("talk_id")) |talk_value| {
+                if (talk_value == .null) {
+                    talk_id = null;
+                } else {
+                    if (talk_value != .integer or talk_value.integer < 0 or talk_value.integer > std.math.maxInt(event_bus.TalkId)) {
+                        return error.InvalidWait;
+                    }
+                    talk_id = if (talk_value.integer == 0) null else @intCast(talk_value.integer);
+                }
+            }
 
             try specs.append(self.allocator, .{
                 .event_type = parsed_event_type,
@@ -704,16 +713,6 @@ fn getRequiredString(args: std.json.ObjectMap, field: []const u8) ?[]const u8 {
     const value = args.get(field) orelse return null;
     if (value != .string) return null;
     return value.string;
-}
-
-fn getOptionalTalkId(args: std.json.ObjectMap, field: []const u8) !?event_bus.TalkId {
-    const value = args.get(field) orelse return null;
-    if (value == .null) return null;
-    if (value != .integer or value.integer < 0 or value.integer > std.math.maxInt(event_bus.TalkId)) {
-        return error.InvalidType;
-    }
-    if (value.integer == 0) return null;
-    return @intCast(value.integer);
 }
 
 fn getOptionalU64(args: std.json.ObjectMap, field: []const u8) !?u64 {
@@ -1156,4 +1155,42 @@ test "brain_tools: wait.for honors explicit talk_id correlation" {
     try std.testing.expect(std.mem.indexOf(u8, resolved[0].payload_json, "\"waiting\":false") != null);
     try std.testing.expect(!brain.hasPendingWait());
     try std.testing.expectEqual(@as(usize, 1), brain.inbox.items.len);
+}
+
+test "brain_tools: wait.for talk_id zero disables default talk correlation" {
+    const allocator = std.testing.allocator;
+    var mem = try memory.RuntimeMemory.init(allocator, "agentA");
+    defer mem.deinit();
+    var bus = event_bus.EventBus.init(allocator);
+    defer bus.deinit();
+
+    var brain = try brain_context.BrainContext.init(allocator, "primary");
+    defer brain.deinit();
+    brain.next_talk_id = 41;
+
+    try brain.queueToolUse("talk.user", "{\"message\":\"first\"}");
+    try brain.queueToolUse("talk.brain", "{\"message\":\"second\",\"target_brain\":\"delegate\"}");
+    try brain.queueToolUse("wait.for", "{\"events\":[{\"event_type\":\"agent\",\"parameter\":\"delegate\",\"talk_id\":0}]}");
+
+    var engine = Engine.init(allocator, &mem, &bus);
+    const first_results = try engine.executePending(&brain);
+    defer deinitResults(allocator, first_results);
+    try std.testing.expectEqual(@as(usize, 3), first_results.len);
+    try std.testing.expect(std.mem.indexOf(u8, first_results[2].payload_json, "\"waiting\":true") != null);
+    try std.testing.expect(brain.hasPendingWait());
+
+    try brain.pushInbox(.{
+        .event_type = .agent,
+        .source_brain = try allocator.dupe(u8, "delegate"),
+        .target_brain = try allocator.dupe(u8, "primary"),
+        .talk_id = 41,
+        .payload = try allocator.dupe(u8, "from old talk"),
+        .created_at_ms = std.time.milliTimestamp(),
+    });
+
+    const resolved = try engine.executePending(&brain);
+    defer deinitResults(allocator, resolved);
+    try std.testing.expectEqual(@as(usize, 1), resolved.len);
+    try std.testing.expect(std.mem.indexOf(u8, resolved[0].payload_json, "\"waiting\":false") != null);
+    try std.testing.expect(!brain.hasPendingWait());
 }

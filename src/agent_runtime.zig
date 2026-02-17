@@ -134,8 +134,13 @@ pub const AgentRuntime = struct {
     }
 
     pub fn setState(self: *AgentRuntime, next_state: RuntimeState) !void {
-        if (self.control_events.items.len >= self.queue_limits.control_events) {
+        if (self.queue_limits.control_events == 0) {
             return RuntimeError.QueueSaturated;
+        }
+
+        while (self.control_events.items.len + 1 > self.queue_limits.control_events) {
+            const removed = self.control_events.orderedRemove(0);
+            self.allocator.free(removed);
         }
 
         self.state = next_state;
@@ -328,6 +333,20 @@ test "agent_runtime: enqueueUserEvent rejects paused/cancelled without queuing w
     try std.testing.expectError(RuntimeError.RuntimeCancelled, runtime.enqueueUserEvent("hello"));
     try std.testing.expectEqual(@as(usize, 0), runtime.tick_queue.items.len);
     try std.testing.expectEqual(@as(usize, 0), runtime.bus.pendingCount());
+}
+
+test "agent_runtime: setState evicts stale control events instead of saturating" {
+    const allocator = std.testing.allocator;
+    var runtime = try AgentRuntime.init(allocator, "agentA", &[_][]const u8{});
+    defer runtime.deinit();
+
+    runtime.queue_limits.control_events = 1;
+    try runtime.setState(.paused);
+    try runtime.setState(.running);
+    try runtime.setState(.cancelled);
+
+    try std.testing.expectEqual(@as(usize, 1), runtime.control_events.items.len);
+    try std.testing.expect(std.mem.eql(u8, runtime.control_events.items[0], "state:cancelled"));
 }
 
 test "agent_runtime: queueToolUse rollback clears partially queued tool when tick enqueue fails" {

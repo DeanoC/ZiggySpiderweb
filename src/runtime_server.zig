@@ -489,7 +489,7 @@ pub const RuntimeServer = struct {
             return self.wrapRuntimeErrorResponse(request_id, err);
         };
 
-        const runtime_events = self.runPendingTicks() catch |err| {
+        const runtime_events = self.runPendingTicks(request_id) catch |err| {
             self.clearRuntimeOutboundLocked();
             return self.wrapRuntimeErrorResponse(request_id, err);
         };
@@ -569,7 +569,7 @@ pub const RuntimeServer = struct {
         ));
     }
 
-    fn runPendingTicks(self: *RuntimeServer) ![][]u8 {
+    fn runPendingTicks(self: *RuntimeServer, request_id: []const u8) ![][]u8 {
         const started_ms = std.time.milliTimestamp();
         var runtime_events = std.ArrayListUnmanaged([]u8){};
         errdefer {
@@ -589,14 +589,14 @@ pub const RuntimeServer = struct {
             defer tick.deinit(self.allocator);
 
             for (tick.tool_results) |result| {
-                const event = try protocol.buildToolEvent(self.allocator, "runtime", result.payload_json);
+                const event = try protocol.buildToolEvent(self.allocator, request_id, result.payload_json);
                 if (runtime_events.items.len + self.runtime.outbound_messages.items.len >= self.runtime.queue_limits.outbound_messages) {
                     return agent_runtime.RuntimeError.QueueSaturated;
                 }
                 try runtime_events.append(self.allocator, event);
             }
 
-            const memory_event = try protocol.buildMemoryEvent(self.allocator, "runtime", tick.observe_json);
+            const memory_event = try protocol.buildMemoryEvent(self.allocator, request_id, tick.observe_json);
             if (runtime_events.items.len + self.runtime.outbound_messages.items.len >= self.runtime.queue_limits.outbound_messages) {
                 return agent_runtime.RuntimeError.QueueSaturated;
             }
@@ -824,8 +824,14 @@ test "runtime_server: session.send returns all outbound runtime frames" {
     var memory_event_count: usize = 0;
     for (responses) |payload| {
         if (std.mem.indexOf(u8, payload, "\"type\":\"session.receive\"") != null) session_receive_count += 1;
-        if (std.mem.indexOf(u8, payload, "\"type\":\"tool.event\"") != null) tool_event_count += 1;
-        if (std.mem.indexOf(u8, payload, "\"type\":\"memory.event\"") != null) memory_event_count += 1;
+        if (std.mem.indexOf(u8, payload, "\"type\":\"tool.event\"") != null) {
+            tool_event_count += 1;
+            try std.testing.expect(std.mem.indexOf(u8, payload, "\"request\":\"req-frames\"") != null);
+        }
+        if (std.mem.indexOf(u8, payload, "\"type\":\"memory.event\"") != null) {
+            memory_event_count += 1;
+            try std.testing.expect(std.mem.indexOf(u8, payload, "\"request\":\"req-frames\"") != null);
+        }
     }
 
     try std.testing.expect(session_receive_count >= 1);
@@ -964,6 +970,27 @@ test "runtime_server: paused runtime returns coded runtime_paused error" {
     defer allocator.free(blocked);
 
     try std.testing.expect(std.mem.indexOf(u8, blocked, "\"code\":\"runtime_paused\"") != null);
+}
+
+test "runtime_server: repeated control transitions do not saturate control queue" {
+    const allocator = std.testing.allocator;
+    const server = try RuntimeServer.create(allocator, "agent-test", .{
+        .control_queue_max = 1,
+        .ltm_directory = "",
+        .ltm_filename = "",
+    });
+    defer server.destroy();
+
+    var step: usize = 0;
+    while (step < 8) : (step += 1) {
+        const pause = try server.handleMessage("{\"id\":\"req-pause\",\"type\":\"agent.control\",\"action\":\"pause\"}");
+        defer allocator.free(pause);
+        try std.testing.expect(std.mem.indexOf(u8, pause, "\"code\":\"queue_saturated\"") == null);
+
+        const resume_resp = try server.handleMessage("{\"id\":\"req-resume\",\"type\":\"agent.control\",\"action\":\"resume\"}");
+        defer allocator.free(resume_resp);
+        try std.testing.expect(std.mem.indexOf(u8, resume_resp, "\"code\":\"queue_saturated\"") == null);
+    }
 }
 
 test "runtime_server: queue saturation returns coded queue_saturated error" {
