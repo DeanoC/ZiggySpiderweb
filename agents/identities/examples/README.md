@@ -1,10 +1,17 @@
 # Example Agent Configurations
 
-This directory contains example agent configurations showing how to use per-brain provider/model settings.
+This directory contains example `agent.json` configurations showing how to use per-brain provider/model settings.
+
+## Architecture Overview
+
+With the hatch system, identity is separated from configuration:
+
+- **`templates/`** — Identity files (SOUL.md, AGENT.md, IDENTITY.md) hatched into LTM
+- **`agents/{agent_id}/`** — Per-brain configuration (agent.json only)
 
 ## Examples
 
-### 1. Fast Primary (`fast-primary/`)
+### 1. Fast Primary (`fast-primary/agent.json`)
 
 Uses `gpt-5.3-codex-spark` for fast, responsive chat interface.
 
@@ -16,7 +23,7 @@ Uses `gpt-5.3-codex-spark` for fast, responsive chat interface.
 
 **Use case:** Primary chat interface that feels snappy and responsive.
 
-### 2. Deep Thinker (`deep-thinker/`)
+### 2. Deep Thinker (`deep-thinker/agent.json`)
 
 Uses full `gpt-5.3-codex` for complex problem solving.
 
@@ -28,7 +35,7 @@ Uses full `gpt-5.3-codex` for complex problem solving.
 
 **Use case:** Spawned by primary brain for hard coding tasks, architecture decisions, debugging.
 
-### 3. Memory Keeper (`memory-keeper/`)
+### 3. Memory Keeper (`memory-keeper/agent.json`)
 
 Uses `gpt-4o-mini` for lightweight background memory maintenance.
 
@@ -46,18 +53,16 @@ Uses `gpt-4o-mini` for lightweight background memory maintenance.
 ### Setting up your first agent:
 
 ```bash
-# 1. Create your agent directory
+# 1. Create your agent directory structure
 mkdir -p agents/ziggy/deep-thinker
-mkdir -p agents/ziggy/memory-keeper
 
-# 2. Copy example configs
-cp agents/identities/examples/fast-primary/* agents/ziggy/
-cp agents/identities/examples/deep-thinker/* agents/ziggy/deep-thinker/
-cp agents/identities/examples/memory-keeper/* agents/ziggy/memory-keeper/
+# 2. Copy example agent.json configs
+# (Identity comes from templates/, only config goes in agents/)
+cp agents/identities/examples/fast-primary/agent.json agents/ziggy/
+cp agents/identities/examples/deep-thinker/agent.json agents/ziggy/deep-thinker/
 
-# 3. Customize as needed
+# 3. Customize agent.json as needed
 vim agents/ziggy/agent.json
-vim agents/ziggy/SOUL.md
 vim agents/ziggy/deep-thinker/agent.json
 ```
 
@@ -66,22 +71,17 @@ vim agents/ziggy/deep-thinker/agent.json
 ```
 agents/
 └── ziggy/                    # Agent ID
-    ├── SOUL.md               # Core identity (hatched into LTM)
-    ├── AGENT.md              # How you work (hatched into LTM)
-    ├── IDENTITY.md           # Public persona (hatched into LTM)
-    ├── agent.json            # Primary brain config
+    └── agent.json            # Primary brain config (provider, model, tools)
     │
-    ├── deep-thinker/         # Sub-brain directory
-    │   ├── SOUL.md
-    │   ├── AGENT.md
-    │   ├── IDENTITY.md
-    │   └── agent.json        # Sub-brain config with different model
-    │
-    └── memory-keeper/        # Another sub-brain
-        ├── SOUL.md
-        ├── AGENT.md
-        ├── IDENTITY.md
-        └── agent.json
+    └── deep-thinker/         # Sub-brain directory
+        └── agent.json        # Sub-brain config (different provider/model)
+
+templates/
+├── SOUL.md                   # Identity hatched into LTM for all agents
+├── AGENT.md                  # How you work (hatched into LTM)
+├── IDENTITY.md               # Public persona (hatched into LTM)
+├── JUST_HATCHED.md           # Welcome message for new agents
+└── BOOTSTRAP.md              # Welcome message for first agent
 ```
 
 ### agent.json fields:
@@ -127,9 +127,19 @@ agents/
 
 When a brain processes a message:
 
-1. **Runtime loads** the default provider config (from spiderweb config)
-2. **Checks** `agent.json` for brain-specific overrides
-3. **Applies** per-brain provider/model/think settings
-4. **Streams** to the appropriate AI provider
+1. **Hatch** — On first boot, identity files from `templates/` are loaded into LTM
+2. **Runtime loads** the default provider config (from spiderweb config)
+3. **Checks** `agent.json` for brain-specific overrides
+4. **Applies** per-brain provider/model/think settings
+5. **Streams** to the appropriate AI provider
 
-This lets you use fast/cheap models for simple work and powerful models for hard problems, all in the same agent.
+This lets you use fast/cheap models for simple work and powerful models for hard problems, all in the same agent, while sharing a common identity from templates/.
+
+## Customizing Identity
+
+To customize identity for all agents, edit files in `templates/`:
+- `templates/SOUL.md` — Core values and personality
+- `templates/AGENT.md` — How the agent works
+- `templates/IDENTITY.md` — Public persona
+
+These are hatched into LTM and become the agent's persistent identity.

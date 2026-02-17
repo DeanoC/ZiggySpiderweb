@@ -432,14 +432,13 @@ setup_per_brain_config() {
     # Create agent directory structure
     mkdir -p "${agent_dir}/deep-thinker"
     
-    # Copy example configs
+    # Copy example agent.json configs
+    # Note: Identity files (SOUL.md, AGENT.md, IDENTITY.md) are hatched from templates/
+    # Only per-brain configuration (agent.json) goes in agents/
     if [[ -d "${examples_dir}/fast-primary" ]]; then
         log_info "Copying example configurations..."
         
-        # Primary brain - fast (spark)
-        cp "${examples_dir}/fast-primary/"* "${agent_dir}/"
-        
-        # Update primary brain provider from user selection
+        # Primary brain config with user's selected provider/model
         cat > "${agent_dir}/agent.json" << EOF
 {
   "name": "${AGENT_NAME}",
@@ -471,16 +470,19 @@ setup_per_brain_config() {
 }
 EOF
         
-        # Deep thinker - powerful model for hard problems
-        cp "${examples_dir}/deep-thinker/"* "${agent_dir}/deep-thinker/"
+        # Deep thinker sub-brain config (uses full Codex)
+        if [[ -f "${examples_dir}/deep-thinker/agent.json" ]]; then
+            cp "${examples_dir}/deep-thinker/agent.json" "${agent_dir}/deep-thinker/"
+        fi
         
         log_success "Per-brain configuration created"
         echo ""
-        echo "Configuration includes:"
-        echo "  - Primary brain: ${PROVIDER}/${MODEL} (fast interface)"
-        echo "  - deep-thinker sub-brain: openai-codex/gpt-5.3-codex (hard problems)"
+        echo "Configuration:"
+        echo "  - Identity files: templates/ (hatched into LTM)"
+        echo "  - Primary brain: ${PROVIDER}/${MODEL}"
+        echo "  - deep-thinker: openai-codex/gpt-5.3-codex"
         echo ""
-        echo "You can customize these in: ${agent_dir}/"
+        echo "Config directory: ${agent_dir}/"
         echo "See: ${examples_dir}/README.md for more examples"
         
     else
