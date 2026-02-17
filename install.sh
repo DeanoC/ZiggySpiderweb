@@ -546,6 +546,7 @@ run_first_agent() {
     mkdir -p "$LTM_DIR"
     
     # Determine sub-brain values for summary (same logic as setup_per_brain_config)
+    local sub_template="coder"
     local sub_provider
     local sub_model
     case "$PROVIDER" in
@@ -560,12 +561,13 @@ run_first_agent() {
     echo "  Config directory: $CONFIG_DIR"
     echo "  LTM directory: $LTM_DIR"
     echo "  Install directory: $INSTALL_DIR"
-    echo "  Agent directory: ${HOME}/.local/share/ziggy-spiderweb/agents/${AGENT_NAME}"
+    echo "  Agent config: ${HOME}/.local/share/ziggy-spiderweb/agents/${AGENT_NAME}_config.json"
     echo "  First agent: $AGENT_NAME"
     echo ""
     echo "Per-brain providers:"
     echo "  Primary: ${PROVIDER}/${MODEL}"
-    echo "  deep-thinker: ${sub_provider}/${sub_model} (hard problems)"
+    echo "  coder: ${sub_template} template + ${sub_provider}/${sub_model}"
+    echo "  memory-keeper: memory-keeper template + openai/gpt-4o-mini"
     echo ""
     
     # Non-interactive mode: start server automatically
