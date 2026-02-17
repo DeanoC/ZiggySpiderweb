@@ -192,9 +192,9 @@ pub const AgentRegistry = struct {
 
         const root = parsed.value.object;
 
-        const name = if (root.get("name")) |n| 
+        const name = if (root.get("name")) |n|
             if (n == .string) try self.allocator.dupe(u8, n.string) else try self.allocator.dupe(u8, agent_id)
-        else 
+        else
             try self.allocator.dupe(u8, agent_id);
 
         const description = if (root.get("description")) |d|
@@ -221,7 +221,7 @@ pub const AgentRegistry = struct {
 
         // Check if identity files exist
         const identity_loaded = self.checkIdentityFiles(agent_path);
-        
+
         // Check if HATCH.md exists (needs hatching)
         const needs_hatching = self.checkHatchFile(agent_path);
 
@@ -242,7 +242,7 @@ pub const AgentRegistry = struct {
 
         // Check which identity files exist
         const identity_loaded = self.checkIdentityFiles(agent_path);
-        
+
         // Check if HATCH.md exists
         const needs_hatching = self.checkHatchFile(agent_path);
 
@@ -252,18 +252,21 @@ pub const AgentRegistry = struct {
 
         if (std.mem.containsAtLeast(u8, agent_id, 1, "code") or
             std.mem.containsAtLeast(u8, agent_id, 1, "dev") or
-            std.mem.containsAtLeast(u8, agent_id, 1, "prog")) {
+            std.mem.containsAtLeast(u8, agent_id, 1, "prog"))
+        {
             try capabilities.append(self.allocator, .code);
         }
 
         if (std.mem.containsAtLeast(u8, agent_id, 1, "plan") or
             std.mem.containsAtLeast(u8, agent_id, 1, "pm") or
-            std.mem.containsAtLeast(u8, agent_id, 1, "manage")) {
+            std.mem.containsAtLeast(u8, agent_id, 1, "manage"))
+        {
             try capabilities.append(self.allocator, .plan);
         }
 
         if (std.mem.containsAtLeast(u8, agent_id, 1, "research") or
-            std.mem.containsAtLeast(u8, agent_id, 1, "search")) {
+            std.mem.containsAtLeast(u8, agent_id, 1, "search"))
+        {
             try capabilities.append(self.allocator, .research);
         }
 
@@ -367,8 +370,7 @@ pub const AgentRegistry = struct {
 
         return std.fs.cwd().readFileAlloc(self.allocator, template_path, 64 * 1024) catch {
             // Fallback to embedded minimal template
-            return self.allocator.dupe(u8,
-                "# HATCH.md — New Agent Initialization\n" ++
+            return self.allocator.dupe(u8, "# HATCH.md — New Agent Initialization\n" ++
                 "\n" ++
                 "Welcome, newborn agent. You are hatching in ZiggySpiderweb (ZSS).\n" ++
                 "\n" ++
@@ -377,8 +379,7 @@ pub const AgentRegistry = struct {
                 "{\"type\":\"agent.hatch\",\"agent_id\":\"YourName\"}\n" ++
                 "\n" ++
                 "The server will confirm with agent.hatched and delete this HATCH.md.\n" ++
-                "You won't need it again.\n"
-            );
+                "You won't need it again.\n");
         };
     }
 

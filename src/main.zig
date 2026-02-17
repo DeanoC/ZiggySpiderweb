@@ -3,6 +3,18 @@ const std = @import("std");
 const server = @import("server_piai.zig");
 const Config = @import("config.zig");
 
+comptime {
+    _ = @import("agent_runtime.zig");
+    _ = @import("brain_context.zig");
+    _ = @import("brain_tools.zig");
+    _ = @import("event_bus.zig");
+    _ = @import("ltm_store.zig");
+    _ = @import("memory.zig");
+    _ = @import("memid.zig");
+    _ = @import("protocol.zig");
+    _ = @import("tool_registry.zig");
+}
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -24,11 +36,25 @@ pub fn main() !void {
             .log = .{
                 .level = try allocator.dupe(u8, "info"),
             },
+            .runtime = .{
+                .inbound_queue_max = 512,
+                .brain_tick_queue_max = 256,
+                .outbound_queue_max = 512,
+                .control_queue_max = 128,
+                .connection_worker_threads = 4,
+                .connection_queue_max = 128,
+                .runtime_worker_threads = 2,
+                .runtime_request_queue_max = 128,
+                .chat_operation_timeout_ms = 30_000,
+                .control_operation_timeout_ms = 5_000,
+                .ltm_directory = try allocator.dupe(u8, ".spiderweb-ltm"),
+                .ltm_filename = try allocator.dupe(u8, "runtime-memory.db"),
+            },
             .config_path = try allocator.dupe(u8, ".spiderweb.json"),
         };
         // Need to handle deinit, but we already have an error path
         std.log.info("Starting ZiggySpiderweb v0.2.0 (Pi AI)", .{});
-        try server.run(allocator, cfg.server.bind, cfg.server.port, cfg.provider);
+        try server.run(allocator, cfg.server.bind, cfg.server.port, cfg.provider, cfg.runtime);
         return;
     };
     defer config.deinit();
@@ -87,5 +113,5 @@ pub fn main() !void {
     std.log.info("Binding to {s}:{d}", .{ bind_addr, port });
 
     // Start server
-    try server.run(allocator, bind_addr, port, config.provider);
+    try server.run(allocator, bind_addr, port, config.provider, config.runtime);
 }

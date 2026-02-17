@@ -74,4 +74,3 @@ fn jsonEscape(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
 
     return output.toOwnedSlice(allocator);
 }
-

@@ -1,168 +1,34 @@
-const std = @import("std");
+const types = @import("protocol_types.zig");
+const request = @import("protocol_request.zig");
+const response = @import("protocol_response.zig");
 
-// OpenClaw protocol message types
-pub const MessageType = enum {
-    // Connection lifecycle
-    connect,
-    connect_ack,
-    session_ack,
-    disconnect,
-    
-    // Messaging
-    session_send,
-    session_receive,
-    agent_plan,
-    agent_progress,
-    agent_status,
-    agent_heartbeat,
-    agent_state,
-    memory_event,
-    agent_control,
-    
-    // Heartbeat
-    ping,
-    pong,
-    
-    // Errors
-    err,
-};
+pub const MessageType = types.MessageType;
+pub const ErrorCode = types.ErrorCode;
+pub const ParsedMessage = types.ParsedMessage;
 
-// Connect payload from client
-pub const ConnectPayload = struct {
-    agentId: []const u8,
-    auth: ?AuthPayload = null,
-    sessionKey: ?[]const u8 = null,
-};
+pub const parseMessageType = request.parseMessageType;
+pub const parseMessage = request.parseMessage;
+pub const deinitParsedMessage = types.deinitParsedMessage;
 
-pub const AuthPayload = struct {
-    deviceKey: []const u8,
-    deviceAuth: []const u8,
-};
+pub const buildConnectAck = response.buildConnectAck;
+pub const buildSessionReceive = response.buildSessionReceive;
+pub const buildAgentProgress = response.buildAgentProgress;
+pub const buildAgentState = response.buildAgentState;
+pub const buildMemoryEvent = response.buildMemoryEvent;
+pub const buildToolEvent = response.buildToolEvent;
+pub const buildPong = response.buildPong;
+pub const buildError = response.buildError;
+pub const buildErrorWithCode = response.buildErrorWithCode;
+pub const jsonEscape = response.jsonEscape;
 
-// Session message envelope
-pub const SessionMessage = struct {
-    id: []const u8,
-    content: []const u8,
-    role: []const u8 = "user",
-    timestamp: ?i64 = null,
-};
+test "protocol facade: request + response modules are wired" {
+    const allocator = @import("std").testing.allocator;
 
-// Parse JSON message type
-pub fn parseMessageType(json: []const u8) ?MessageType {
-    // Simple string search for type field
-    if (std.mem.indexOf(u8, json, "\"type\":\"connect\"") != null) return .connect;
-    if (std.mem.indexOf(u8, json, "\"type\":\"session.send\"") != null) return .session_send;
-    if (std.mem.indexOf(u8, json, "\"type\":\"chat.send\"") != null) return .session_send;
-    if (std.mem.indexOf(u8, json, "\"type\":\"ping\"") != null) return .ping;
-    if (std.mem.indexOf(u8, json, "\"type\":\"pong\"") != null) return .pong;
-    if (std.mem.indexOf(u8, json, "\"type\":\"disconnect\"") != null) return .disconnect;
-    if (std.mem.indexOf(u8, json, "\"type\":\"agent.plan\"") != null) return .agent_plan;
-    if (std.mem.indexOf(u8, json, "\"type\":\"agent.progress\"") != null) return .agent_progress;
-    if (std.mem.indexOf(u8, json, "\"type\":\"agent.status\"") != null) return .agent_status;
-    if (std.mem.indexOf(u8, json, "\"type\":\"agent.heartbeat\"") != null) return .agent_heartbeat;
-    if (std.mem.indexOf(u8, json, "\"type\":\"agent.state\"") != null) return .agent_state;
-    if (std.mem.indexOf(u8, json, "\"type\":\"memory.event\"") != null) return .memory_event;
-    if (std.mem.indexOf(u8, json, "\"type\":\"agent.control\"") != null) return .agent_control;
-    return null;
-}
+    var parsed = try parseMessage(allocator, "{\"id\":\"abc\",\"type\":\"session.send\",\"content\":\"hi\"}");
+    defer deinitParsedMessage(allocator, &parsed);
+    try @import("std").testing.expectEqual(MessageType.session_send, parsed.msg_type);
 
-// Build session.receive response
-pub fn buildSessionReceive(allocator: std.mem.Allocator, request_id: []const u8, content: []const u8) ![]u8 {
-    return std.fmt.allocPrint(allocator,
-        "{{\"type\":\"session.receive\",\"id\":\"{s}\",\"content\":\"{s}\",\"timestamp\":{d}}}",
-        .{ request_id, content, std.time.milliTimestamp() }
-    );
-}
-
-// Build pong response
-pub fn buildPong(allocator: std.mem.Allocator) ![]u8 {
-    return std.fmt.allocPrint(allocator,
-        "{{\"type\":\"pong\",\"timestamp\":{d}}}",
-        .{std.time.milliTimestamp()}
-    );
-}
-
-// Simple JSON escape (for echo content)
-pub fn jsonEscape(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
-    // Count extra space needed
-    var extra: usize = 0;
-    for (input) |c| {
-        switch (c) {
-            '"', '\\', 0x08, 0x0C, '\n', '\r', '\t' => extra += 1,
-            else => {},
-        }
-    }
-
-    const result = try allocator.alloc(u8, input.len + extra);
-    var i: usize = 0;
-    for (input) |c| {
-        switch (c) {
-            '"' => { result[i] = '\\'; i += 1; result[i] = '"'; },
-            '\\' => { result[i] = '\\'; i += 1; result[i] = '\\'; },
-            0x08 => { result[i] = '\\'; i += 1; result[i] = 'b'; },
-            0x0C => { result[i] = '\\'; i += 1; result[i] = 'f'; },
-            '\n' => { result[i] = '\\'; i += 1; result[i] = 'n'; },
-            '\r' => { result[i] = '\\'; i += 1; result[i] = 'r'; },
-            '\t' => { result[i] = '\\'; i += 1; result[i] = 't'; },
-            else => result[i] = c,
-        }
-        i += 1;
-    }
-
-    return result;
-}
-
-test "protocol: parseMessageType handles core and agent message types" {
-    const cases = [_]struct {
-        json: []const u8,
-        expected: ?MessageType,
-    }{
-        .{ .json = "{\"type\":\"connect\"}", .expected = .connect },
-        .{ .json = "{\"type\":\"session.send\"}", .expected = .session_send },
-        .{ .json = "{\"type\":\"chat.send\"}", .expected = .session_send },
-        .{ .json = "{\"type\":\"agent.plan\"}", .expected = .agent_plan },
-        .{ .json = "{\"type\":\"agent.progress\"}", .expected = .agent_progress },
-        .{ .json = "{\"type\":\"agent.status\"}", .expected = .agent_status },
-        .{ .json = "{\"type\":\"agent.heartbeat\"}", .expected = .agent_heartbeat },
-        .{ .json = "{\"type\":\"agent.state\"}", .expected = .agent_state },
-        .{ .json = "{\"type\":\"memory.event\"}", .expected = .memory_event },
-        .{ .json = "{\"type\":\"agent.control\"}", .expected = .agent_control },
-        .{ .json = "{\"type\":\"ping\"}", .expected = .ping },
-        .{ .json = "{\"type\":\"memory.query\"}", .expected = null },
-    };
-
-    for (cases) |case| {
-        try std.testing.expectEqual(case.expected, parseMessageType(case.json));
-    }
-}
-
-test "protocol: parseMessageType ignores unknown and unsupported message types" {
-    const unsupported = [_][]const u8{
-        "{\"type\":\"agent.blocked\"}",
-        "{\"type\":\"session.ack\",\"capabilities\":[]}",
-        "{\"type\":\"memory.query\",\"query\":\"goal\"}",
-        "{\"type\":\"memory.recall\",\"id\":1}",
-    };
-    for (unsupported) |json| {
-        try std.testing.expectEqual(@as(?MessageType, null), parseMessageType(json));
-    }
-}
-
-test "protocol: parseMessageType handles malformed envelopes safely" {
-    const malformed = [_][]const u8{
-        "",
-        "{",
-        "{\"type\":\"agent.control\"",
-    };
-
-    for (malformed) |json| {
-        try std.testing.expectEqual(@as(?MessageType, null), parseMessageType(json));
-    }
-}
-
-test "protocol: jsonEscape escapes common JSON special characters" {
-    const allocator = std.testing.allocator;
-    const encoded = try jsonEscape(allocator, "quote:\" slash:\\ newline:\n tab:\t");
-    defer allocator.free(encoded);
-    try std.testing.expectEqualStrings("quote:\\\" slash:\\\\ newline:\\n tab:\\t", encoded);
+    const err_payload = try buildErrorWithCode(allocator, "abc", .queue_saturated, "busy");
+    defer allocator.free(err_payload);
+    try @import("std").testing.expect(@import("std").mem.indexOf(u8, err_payload, "queue_saturated") != null);
 }

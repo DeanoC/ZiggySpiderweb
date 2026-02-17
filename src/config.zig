@@ -18,10 +18,26 @@ pub const LogConfig = struct {
     level: []const u8 = "info",
 };
 
+pub const RuntimeConfig = struct {
+    inbound_queue_max: usize = 512,
+    brain_tick_queue_max: usize = 256,
+    outbound_queue_max: usize = 512,
+    control_queue_max: usize = 128,
+    connection_worker_threads: usize = 4,
+    connection_queue_max: usize = 128,
+    runtime_worker_threads: usize = 2,
+    runtime_request_queue_max: usize = 128,
+    chat_operation_timeout_ms: u64 = 30_000,
+    control_operation_timeout_ms: u64 = 5_000,
+    ltm_directory: []const u8 = ".spiderweb-ltm",
+    ltm_filename: []const u8 = "runtime-memory.db",
+};
+
 allocator: std.mem.Allocator,
 server: ServerConfig,
 provider: ProviderConfig,
 log: LogConfig,
+runtime: RuntimeConfig,
 config_path: []const u8,
 
 const default_config =
@@ -36,9 +52,23 @@ const default_config =
     \\  },
     \\  "log": {
     \\    "level": "info"
+    \\  },
+    \\  "runtime": {
+    \\    "inbound_queue_max": 512,
+    \\    "brain_tick_queue_max": 256,
+    \\    "outbound_queue_max": 512,
+    \\    "control_queue_max": 128,
+    \\    "connection_worker_threads": 4,
+    \\    "connection_queue_max": 128,
+    \\    "runtime_worker_threads": 2,
+    \\    "runtime_request_queue_max": 128,
+    \\    "chat_operation_timeout_ms": 30000,
+    \\    "control_operation_timeout_ms": 5000,
+    \\    "ltm_directory": ".spiderweb-ltm",
+    \\    "ltm_filename": "runtime-memory.db"
     \\  }
     \\}
-    ;
+;
 
 pub fn init(allocator: std.mem.Allocator, config_path: ?[]const u8) !Config {
     const path = config_path orelse try defaultConfigPath(allocator);
@@ -57,6 +87,20 @@ pub fn init(allocator: std.mem.Allocator, config_path: ?[]const u8) !Config {
         },
         .log = .{
             .level = try allocator.dupe(u8, "info"),
+        },
+        .runtime = .{
+            .inbound_queue_max = 512,
+            .brain_tick_queue_max = 256,
+            .outbound_queue_max = 512,
+            .control_queue_max = 128,
+            .connection_worker_threads = 4,
+            .connection_queue_max = 128,
+            .runtime_worker_threads = 2,
+            .runtime_request_queue_max = 128,
+            .chat_operation_timeout_ms = 30_000,
+            .control_operation_timeout_ms = 5_000,
+            .ltm_directory = try allocator.dupe(u8, ".spiderweb-ltm"),
+            .ltm_filename = try allocator.dupe(u8, "runtime-memory.db"),
         },
         .config_path = path,
     };
@@ -83,6 +127,8 @@ pub fn deinit(self: *Config) void {
     if (self.provider.api_key) |k| self.allocator.free(k);
     if (self.provider.base_url) |b| self.allocator.free(b);
     self.allocator.free(self.log.level);
+    self.allocator.free(self.runtime.ltm_directory);
+    self.allocator.free(self.runtime.ltm_filename);
 }
 
 fn defaultConfigPath(allocator: std.mem.Allocator) ![]const u8 {
@@ -180,6 +226,73 @@ pub fn load(self: *Config) !void {
             }
         }
     }
+
+    if (root.object.get("runtime")) |runtime_val| {
+        if (runtime_val == .object) {
+            if (runtime_val.object.get("inbound_queue_max")) |value| {
+                if (value == .integer and value.integer > 0) {
+                    self.runtime.inbound_queue_max = @intCast(value.integer);
+                }
+            }
+            if (runtime_val.object.get("brain_tick_queue_max")) |value| {
+                if (value == .integer and value.integer > 0) {
+                    self.runtime.brain_tick_queue_max = @intCast(value.integer);
+                }
+            }
+            if (runtime_val.object.get("outbound_queue_max")) |value| {
+                if (value == .integer and value.integer > 0) {
+                    self.runtime.outbound_queue_max = @intCast(value.integer);
+                }
+            }
+            if (runtime_val.object.get("control_queue_max")) |value| {
+                if (value == .integer and value.integer > 0) {
+                    self.runtime.control_queue_max = @intCast(value.integer);
+                }
+            }
+            if (runtime_val.object.get("connection_worker_threads")) |value| {
+                if (value == .integer and value.integer >= 0) {
+                    self.runtime.connection_worker_threads = @intCast(value.integer);
+                }
+            }
+            if (runtime_val.object.get("connection_queue_max")) |value| {
+                if (value == .integer and value.integer >= 0) {
+                    self.runtime.connection_queue_max = @intCast(value.integer);
+                }
+            }
+            if (runtime_val.object.get("runtime_worker_threads")) |value| {
+                if (value == .integer and value.integer >= 0) {
+                    self.runtime.runtime_worker_threads = @intCast(value.integer);
+                }
+            }
+            if (runtime_val.object.get("runtime_request_queue_max")) |value| {
+                if (value == .integer and value.integer >= 0) {
+                    self.runtime.runtime_request_queue_max = @intCast(value.integer);
+                }
+            }
+            if (runtime_val.object.get("chat_operation_timeout_ms")) |value| {
+                if (value == .integer and value.integer > 0) {
+                    self.runtime.chat_operation_timeout_ms = @intCast(value.integer);
+                }
+            }
+            if (runtime_val.object.get("control_operation_timeout_ms")) |value| {
+                if (value == .integer and value.integer > 0) {
+                    self.runtime.control_operation_timeout_ms = @intCast(value.integer);
+                }
+            }
+            if (runtime_val.object.get("ltm_directory")) |value| {
+                if (value == .string) {
+                    self.allocator.free(self.runtime.ltm_directory);
+                    self.runtime.ltm_directory = try self.allocator.dupe(u8, value.string);
+                }
+            }
+            if (runtime_val.object.get("ltm_filename")) |value| {
+                if (value == .string) {
+                    self.allocator.free(self.runtime.ltm_filename);
+                    self.runtime.ltm_filename = try self.allocator.dupe(u8, value.string);
+                }
+            }
+        }
+    }
 }
 pub fn save(self: Config) !void {
     // Ensure parent directory exists
@@ -236,6 +349,33 @@ pub fn save(self: Config) !void {
     try file.writeAll("  \"log\": {\n");
     const log_line = try std.fmt.bufPrint(&buf, "    \"level\": \"{s}\"\n", .{self.log.level});
     try file.writeAll(log_line);
+    try file.writeAll("  },\n");
+
+    try file.writeAll("  \"runtime\": {\n");
+    const inbound_line = try std.fmt.bufPrint(&buf, "    \"inbound_queue_max\": {d},\n", .{self.runtime.inbound_queue_max});
+    try file.writeAll(inbound_line);
+    const tick_line = try std.fmt.bufPrint(&buf, "    \"brain_tick_queue_max\": {d},\n", .{self.runtime.brain_tick_queue_max});
+    try file.writeAll(tick_line);
+    const outbound_line = try std.fmt.bufPrint(&buf, "    \"outbound_queue_max\": {d},\n", .{self.runtime.outbound_queue_max});
+    try file.writeAll(outbound_line);
+    const control_line = try std.fmt.bufPrint(&buf, "    \"control_queue_max\": {d},\n", .{self.runtime.control_queue_max});
+    try file.writeAll(control_line);
+    const worker_threads_line = try std.fmt.bufPrint(&buf, "    \"connection_worker_threads\": {d},\n", .{self.runtime.connection_worker_threads});
+    try file.writeAll(worker_threads_line);
+    const connection_queue_line = try std.fmt.bufPrint(&buf, "    \"connection_queue_max\": {d},\n", .{self.runtime.connection_queue_max});
+    try file.writeAll(connection_queue_line);
+    const runtime_workers_line = try std.fmt.bufPrint(&buf, "    \"runtime_worker_threads\": {d},\n", .{self.runtime.runtime_worker_threads});
+    try file.writeAll(runtime_workers_line);
+    const runtime_queue_line = try std.fmt.bufPrint(&buf, "    \"runtime_request_queue_max\": {d},\n", .{self.runtime.runtime_request_queue_max});
+    try file.writeAll(runtime_queue_line);
+    const chat_timeout_line = try std.fmt.bufPrint(&buf, "    \"chat_operation_timeout_ms\": {d},\n", .{self.runtime.chat_operation_timeout_ms});
+    try file.writeAll(chat_timeout_line);
+    const control_timeout_line = try std.fmt.bufPrint(&buf, "    \"control_operation_timeout_ms\": {d},\n", .{self.runtime.control_operation_timeout_ms});
+    try file.writeAll(control_timeout_line);
+    const ltm_dir_line = try std.fmt.bufPrint(&buf, "    \"ltm_directory\": \"{s}\",\n", .{self.runtime.ltm_directory});
+    try file.writeAll(ltm_dir_line);
+    const ltm_file_line = try std.fmt.bufPrint(&buf, "    \"ltm_filename\": \"{s}\"\n", .{self.runtime.ltm_filename});
+    try file.writeAll(ltm_file_line);
     try file.writeAll("  }\n");
 
     try file.writeAll("}\n");
@@ -298,4 +438,11 @@ test "Config defaults" {
     try std.testing.expectEqualStrings("gpt-4o-mini", config.provider.model.?);
     try std.testing.expectEqualStrings("127.0.0.1", config.server.bind);
     try std.testing.expectEqual(@as(u16, 18790), config.server.port);
+    try std.testing.expectEqual(@as(usize, 512), config.runtime.inbound_queue_max);
+    try std.testing.expectEqual(@as(usize, 4), config.runtime.connection_worker_threads);
+    try std.testing.expectEqual(@as(usize, 2), config.runtime.runtime_worker_threads);
+    try std.testing.expectEqual(@as(usize, 128), config.runtime.runtime_request_queue_max);
+    try std.testing.expectEqual(@as(u64, 30_000), config.runtime.chat_operation_timeout_ms);
+    try std.testing.expectEqual(@as(u64, 5_000), config.runtime.control_operation_timeout_ms);
+    try std.testing.expectEqualStrings(".spiderweb-ltm", config.runtime.ltm_directory);
 }
