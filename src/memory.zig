@@ -21,6 +21,7 @@ pub const ActiveMemoryItem = struct {
     version: ?u64,
     kind: []u8,
     mutable: bool,
+    unevictable: bool,  // Always keep in RAM (identity/core memories)
     created_at_ms: i64,
     content_json: []u8,
 
@@ -31,6 +32,7 @@ pub const ActiveMemoryItem = struct {
             .version = self.version,
             .kind = try allocator.dupe(u8, self.kind),
             .mutable = self.mutable,
+            .unevictable = self.unevictable,
             .created_at_ms = self.created_at_ms,
             .content_json = try allocator.dupe(u8, self.content_json),
         };
@@ -218,6 +220,7 @@ pub const RuntimeMemory = struct {
             .version = version,
             .kind = try self.allocator.dupe(u8, kind),
             .mutable = tier == .ram,
+            .unevictable = false,
             .created_at_ms = std.time.milliTimestamp(),
             .content_json = try self.allocator.dupe(u8, content_json),
         };
@@ -256,6 +259,7 @@ pub const RuntimeMemory = struct {
             .version = next_version,
             .kind = try self.allocator.dupe(u8, current_item.kind),
             .mutable = true,
+            .unevictable = current_item.unevictable,  // Preserve unevictable status
             .created_at_ms = std.time.milliTimestamp(),
             .content_json = try self.allocator.dupe(u8, content_json),
         };
@@ -552,6 +556,7 @@ pub const RuntimeMemory = struct {
             .version = record.version,
             .kind = try self.allocator.dupe(u8, record.kind),
             .mutable = true,
+            .unevictable = false,
             .created_at_ms = record.created_at_ms,
             .content_json = try self.allocator.dupe(u8, record.content_json),
         };

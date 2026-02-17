@@ -6,6 +6,8 @@ const HookError = hook_registry.HookError;
 const Rom = hook_registry.Rom;
 const AgentRuntime = @import("agent_runtime.zig").AgentRuntime;
 const brain_tools = @import("brain_tools.zig");
+const memory = @import("memory.zig");
+const memid = @import("memid.zig");
 
 /// Load shared/base ROM from identity files
 pub fn loadSharedRomHook(ctx: *HookContext, data: HookData) HookError!void {
