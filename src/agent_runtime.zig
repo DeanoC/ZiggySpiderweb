@@ -402,9 +402,14 @@ pub const AgentRuntime = struct {
         for (snapshot, 0..) |item, i| {
             if (i > 0) try writer.writeByte(',');
             try writer.writeByte('{');
-            try writer.print("\"mem_id\":\"{s}\",", .{item.mem_id});
+            // Use JSON escaping for all string fields
+            try writer.writeAll("\"mem_id\":");
+            try writeJsonString(writer, item.mem_id);
+            try writer.writeByte(',');
             try writer.print("\"tier\":\"{s}\",", .{@tagName(item.tier)});
-            try writer.print("\"kind\":\"{s}\",", .{item.kind});
+            try writer.writeAll("\"kind\":");
+            try writeJsonString(writer, item.kind);
+            try writer.writeByte(',');
             try writer.print("\"mutable\":{},", .{item.mutable});
             try writer.print("\"content\":", .{});
             try writer.writeAll(item.content_json);
