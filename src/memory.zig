@@ -446,7 +446,11 @@ pub const RuntimeMemory = struct {
 
     fn uniqueNameLocked(self: *RuntimeMemory, store: *BrainStore, brain: []const u8, preferred: ?[]const u8) ![]u8 {
         const base_name = if (preferred) |name|
-            if (std.mem.trim(u8, name, " \t\r\n").len > 0) try self.allocator.dupe(u8, std.mem.trim(u8, name, " \t\r\n")) else try self.autoNameLocked()
+            if (std.mem.trim(u8, name, " \t\r\n").len > 0) blk: {
+                const trimmed = std.mem.trim(u8, name, " \t\r\n");
+                if (!isCanonicalMemName(trimmed)) return MemoryError.InvalidMemId;
+                break :blk try self.allocator.dupe(u8, trimmed);
+            } else try self.autoNameLocked()
         else
             try self.autoNameLocked();
 
@@ -477,6 +481,15 @@ pub const RuntimeMemory = struct {
         if (hasNameInIterator(ram_it, brain, name)) return true;
         const rom_it = store.rom_items.iterator();
         return hasNameInIterator(rom_it, brain, name);
+    }
+
+    fn isCanonicalMemName(name: []const u8) bool {
+        if (name.len == 0) return false;
+        for (name) |char| {
+            const ok = std.ascii.isAlphanumeric(char) or char == '_' or char == '-' or char == '.';
+            if (!ok) return false;
+        }
+        return true;
     }
 
     fn persistHistoryLocked(self: *RuntimeMemory, item: *const ActiveMemoryItem) !void {
@@ -762,6 +775,25 @@ test "memory: create emits canonical mem ids with unique names" {
     _ = try memid.MemId.parse(first.mem_id);
     _ = try memid.MemId.parse(second.mem_id);
     try std.testing.expect(!std.mem.eql(u8, first.mem_id, second.mem_id));
+}
+
+test "memory: create rejects non-canonical preferred names" {
+    const allocator = std.testing.allocator;
+    var mem = try RuntimeMemory.init(allocator, "agentA");
+    defer mem.deinit();
+
+    try std.testing.expectError(
+        MemoryError.InvalidMemId,
+        mem.create("primary", .ram, "bad:name", "note", "{\"text\":\"x\"}"),
+    );
+    try std.testing.expectError(
+        MemoryError.InvalidMemId,
+        mem.create("primary", .ram, "has space", "note", "{\"text\":\"x\"}"),
+    );
+
+    const snapshot = try mem.snapshotActive(allocator, "primary");
+    defer deinitItems(allocator, snapshot);
+    try std.testing.expectEqual(@as(usize, 0), snapshot.len);
 }
 
 test "memory: mutate creates new version and load supports historical version" {

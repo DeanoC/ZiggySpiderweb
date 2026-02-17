@@ -289,18 +289,23 @@ pub const Engine = struct {
         const rendered_content = try renderJsonValue(self.allocator, loaded.content_json);
         defer self.allocator.free(rendered_content);
 
-        const payload = try std.fmt.allocPrint(
-            self.allocator,
-            "{{\"mem_id\":\"{s}\",\"version\":{d},\"kind\":\"{s}\",\"tier\":\"{s}\",\"content\":{s}}}",
-            .{
-                loaded.mem_id,
-                loaded.version orelse 0,
-                loaded.kind,
-                if (loaded.tier == .ram) "ram" else "rom",
-                rendered_content,
-            },
-        );
-        return self.success(tool_name, payload);
+        var payload = std.ArrayListUnmanaged(u8){};
+        defer payload.deinit(self.allocator);
+
+        try payload.appendSlice(self.allocator, "{\"mem_id\":\"");
+        try appendJsonEscaped(self.allocator, &payload, loaded.mem_id);
+        try payload.appendSlice(self.allocator, "\",\"version\":");
+        try payload.writer(self.allocator).print("{d}", .{loaded.version orelse 0});
+        try payload.appendSlice(self.allocator, ",\"kind\":\"");
+        try appendJsonEscaped(self.allocator, &payload, loaded.kind);
+        try payload.appendSlice(self.allocator, "\",\"tier\":\"");
+        try payload.appendSlice(self.allocator, if (loaded.tier == .ram) "ram" else "rom");
+        try payload.appendSlice(self.allocator, "\",\"content\":");
+        try payload.appendSlice(self.allocator, rendered_content);
+        try payload.appendSlice(self.allocator, "}");
+
+        const payload_json = try payload.toOwnedSlice(self.allocator);
+        return self.success(tool_name, payload_json);
     }
 
     fn execMemoryMutate(self: *Engine, tool_name: []const u8, args: std.json.ObjectMap) !ToolResult {
@@ -903,6 +908,35 @@ test "brain_tools: memory.create then memory.load succeeds" {
     try std.testing.expect(load_results[0].success);
     try std.testing.expect(std.mem.indexOf(u8, load_results[0].payload_json, created_mem_id) != null);
     try std.testing.expect(std.mem.indexOf(u8, load_results[0].payload_json, "draft content") != null);
+}
+
+test "brain_tools: memory.load escapes kind in JSON payload" {
+    const allocator = std.testing.allocator;
+    var mem = try memory.RuntimeMemory.init(allocator, "agentA");
+    defer mem.deinit();
+    var bus = event_bus.EventBus.init(allocator);
+    defer bus.deinit();
+
+    var created = try mem.create("primary", .ram, "escaped_kind", "note \"x\" \\ slash\nline", "{\"text\":\"v\"}");
+    defer created.deinit(allocator);
+
+    var brain = try brain_context.BrainContext.init(allocator, "primary");
+    defer brain.deinit();
+
+    const load_args = try std.fmt.allocPrint(allocator, "{{\"mem_id\":\"{s}\"}}", .{created.mem_id});
+    defer allocator.free(load_args);
+    try brain.queueToolUse("memory.load", load_args);
+
+    var engine = Engine.init(allocator, &mem, &bus);
+    const load_results = try engine.executePending(&brain);
+    defer deinitResults(allocator, load_results);
+
+    try std.testing.expectEqual(@as(usize, 1), load_results.len);
+    try std.testing.expect(load_results[0].success);
+
+    const loaded_kind = try testExtractStringField(allocator, load_results[0].payload_json, "kind");
+    defer allocator.free(loaded_kind);
+    try std.testing.expectEqualStrings("note \"x\" \\ slash\nline", loaded_kind);
 }
 
 test "brain_tools: memory.mutate success bumps version" {
