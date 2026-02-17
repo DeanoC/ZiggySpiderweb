@@ -16,3 +16,16 @@ A memory eviction returns the MemId of the eviction which the agent may choose t
 ## Time
 To the agent time does not pass between each loop (without us providing an external clock in its context).
 This means that from a synchronisation point of view, each loop iteration provides a perfect point to update disks etc.
+
+## State Machine
+The agent loop runs a state machine, with hooks at every step. Each hook may have multiple subscribers.
+This allows the system to perform actions before and after each state in an iteration.
+
+States:
+- Observe
+- Mutate
+- Results
+
+PreObserve is a key step as it allows each hook to mutate the ROM (e.g. feeding real time data in to the ROM)
+PostResults is the where a disk/reconcilation step can occur.
+Using various hooks allows single step debugging, data validation and agent level logging.
