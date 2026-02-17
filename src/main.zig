@@ -102,7 +102,8 @@ pub fn main() !void {
                 "Configuration:\n" ++
                 "  spiderweb-config config              Show current config\n" ++
                 "  spiderweb-config config set-provider <name> [model]\n" ++
-                "  spiderweb-config config set-key <api-key>\n" ++
+                "  spiderweb-config config set-key <api-key> [provider]\n" ++
+                "  spiderweb-config config clear-key [provider]\n" ++
                 "\n" ++
                 "Environment (used as fallback for API keys):\n" ++
                 "  OPENAI_API_KEY       OpenAI API key\n" ++

@@ -1,11 +1,12 @@
 const std = @import("std");
+const credential_store = @import("credential_store.zig");
 
 const Config = @This();
 
 pub const ProviderConfig = struct {
     name: []const u8,
     model: ?[]const u8 = null,
-    api_key: ?[]const u8 = null, // Only used if keyring not available
+    api_key: ?[]const u8 = null, // Legacy plaintext key support (read-only compatibility).
     base_url: ?[]const u8 = null,
 };
 
@@ -335,10 +336,6 @@ pub fn save(self: Config) !void {
         const model_line = try std.fmt.bufPrint(&buf, ",\n    \"model\": \"{s}\"", .{m});
         try file.writeAll(model_line);
     }
-    if (self.provider.api_key) |k| {
-        const key_line = try std.fmt.bufPrint(&buf, ",\n    \"api_key\": \"{s}\"", .{k});
-        try file.writeAll(key_line);
-    }
     if (self.provider.base_url) |b| {
         const url_line = try std.fmt.bufPrint(&buf, ",\n    \"base_url\": \"{s}\"", .{b});
         try file.writeAll(url_line);
@@ -411,7 +408,12 @@ pub fn setLogLevel(self: *Config, level: []const u8) !void {
 }
 
 pub fn getApiKey(self: Config, allocator: std.mem.Allocator) !?[]const u8 {
-    // Priority: 1) Config file, 2) Environment variable
+    // Priority: 1) Secure credential store, 2) legacy config key, 3) environment variable
+    const store = credential_store.CredentialStore.init(allocator);
+    if (store.getProviderApiKey(self.provider.name)) |key| {
+        return key;
+    }
+
     if (self.provider.api_key) |key| {
         return try allocator.dupe(u8, key);
     }
@@ -445,4 +447,29 @@ test "Config defaults" {
     try std.testing.expectEqual(@as(u64, 30_000), config.runtime.chat_operation_timeout_ms);
     try std.testing.expectEqual(@as(u64, 5_000), config.runtime.control_operation_timeout_ms);
     try std.testing.expectEqualStrings(".spiderweb-ltm", config.runtime.ltm_directory);
+}
+
+test "Config save omits legacy provider.api_key field" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cwd = try std.process.getCwdAlloc(allocator);
+    defer allocator.free(cwd);
+    const config_path = try std.fs.path.join(allocator, &.{ cwd, ".zig-cache", "tmp", tmp.sub_path, "config.json" });
+    defer allocator.free(config_path);
+
+    var config = try Config.init(allocator, config_path);
+    defer config.deinit();
+
+    if (config.provider.api_key) |old| allocator.free(old);
+    config.provider.api_key = try allocator.dupe(u8, "legacy-key");
+    try config.save();
+
+    const raw = try std.fs.openFileAbsolute(config_path, .{ .mode = .read_only });
+    defer raw.close();
+    const contents = try raw.readToEndAlloc(allocator, 128 * 1024);
+    defer allocator.free(contents);
+
+    try std.testing.expect(std.mem.indexOf(u8, contents, "\"api_key\"") == null);
 }

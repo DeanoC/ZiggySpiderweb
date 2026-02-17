@@ -1,5 +1,6 @@
 const std = @import("std");
 const Config = @import("config.zig");
+const credential_store = @import("credential_store.zig");
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -30,16 +31,26 @@ fn handleConfigCommand(allocator: std.mem.Allocator, args: []const []const u8) !
         // Show current config
         var config = try Config.init(allocator, null);
         defer config.deinit();
+        const store = credential_store.CredentialStore.init(allocator);
+
+        var key_source: []const u8 = "env";
+        if (store.getProviderApiKey(config.provider.name)) |key| {
+            allocator.free(key);
+            key_source = "secure-store";
+        } else if (config.provider.api_key != null) {
+            key_source = "legacy-config";
+        }
 
         const stdout_file = std.fs.File.stdout();
         var buf: [1024]u8 = undefined;
-        const msg = try std.fmt.bufPrint(&buf, "Config: {s}\n  Bind: {s}:{d}\n  Provider: {s}/{s}\n  API Key: {s}\n  Log: {s}\n", .{
+        const msg = try std.fmt.bufPrint(&buf, "Config: {s}\n  Bind: {s}:{d}\n  Provider: {s}/{s}\n  API Key Source: {s}\n  Secure Backend: {s}\n  Log: {s}\n", .{
             config.config_path,
             config.server.bind,
             config.server.port,
             config.provider.name,
             config.provider.model orelse "(default)",
-            if (config.provider.api_key) |_| "(set)" else "(from env)",
+            key_source,
+            store.backendName(),
             config.log.level,
         });
         try stdout_file.writeAll(msg);
@@ -89,24 +100,44 @@ fn handleConfigCommand(allocator: std.mem.Allocator, args: []const []const u8) !
         std.log.info("Updated server config", .{});
     } else if (std.mem.eql(u8, subcommand, "set-key")) {
         if (args.len < 2) {
-            std.log.err("Usage: config set-key <api-key>", .{});
+            std.log.err("Usage: config set-key <api-key> [provider]", .{});
             return error.InvalidArguments;
         }
 
         var config = try Config.init(allocator, null);
         defer config.deinit();
+        const provider_name = if (args.len >= 3) args[2] else config.provider.name;
 
-        // Free old key if exists
-        if (config.provider.api_key) |k| {
-            allocator.free(k);
+        const store = credential_store.CredentialStore.init(allocator);
+        if (!store.supportsSecureStorage()) {
+            std.log.err("No secure credential backend available (expected `secret-tool` on Linux)", .{});
+            std.log.info("Use provider-specific environment variables until secure storage is available.", .{});
+            return error.SecureStoreUnavailable;
         }
 
-        // Set new key
-        config.provider.api_key = try allocator.dupe(u8, args[1]);
-        try config.save();
+        try store.setProviderApiKey(provider_name, args[1]);
 
-        std.log.info("API key saved to config (NOTE: stored in plain text)", .{});
-        std.log.info("Consider using environment variables or keyring for better security", .{});
+        // Purge legacy plaintext key from config if present.
+        if (config.provider.api_key) |legacy| {
+            allocator.free(legacy);
+            config.provider.api_key = null;
+            try config.save();
+        }
+
+        std.log.info("API key stored in secure backend '{s}' for provider '{s}'", .{ store.backendName(), provider_name });
+    } else if (std.mem.eql(u8, subcommand, "clear-key")) {
+        var config = try Config.init(allocator, null);
+        defer config.deinit();
+        const provider_name = if (args.len >= 2) args[1] else config.provider.name;
+
+        const store = credential_store.CredentialStore.init(allocator);
+        if (!store.supportsSecureStorage()) {
+            std.log.err("No secure credential backend available (expected `secret-tool` on Linux)", .{});
+            return error.SecureStoreUnavailable;
+        }
+
+        try store.clearProviderApiKey(provider_name);
+        std.log.info("Cleared secure API key for provider '{s}'", .{provider_name});
     } else if (std.mem.eql(u8, subcommand, "set-log")) {
         if (args.len < 2) {
             std.log.err("Usage: config set-log <level>", .{});
@@ -128,7 +159,7 @@ fn handleConfigCommand(allocator: std.mem.Allocator, args: []const []const u8) !
         try stdout_file.writeAll(msg);
     } else {
         std.log.err("Unknown config command: {s}", .{subcommand});
-        std.log.info("Available: set-provider, set-server, set-key, set-log, path", .{});
+        std.log.info("Available: set-provider, set-server, set-key, clear-key, set-log, path", .{});
         return error.UnknownCommand;
     }
 }
@@ -142,14 +173,16 @@ fn printUsage() !void {
         \\  spiderweb-config config path         Show config file path
         \\  spiderweb-config config set-provider <name> [model]
         \\  spiderweb-config config set-server --bind <addr> --port <port>
-        \\  spiderweb-config config set-key <api-key>
+        \\  spiderweb-config config set-key <api-key> [provider]
+        \\  spiderweb-config config clear-key [provider]
         \\  spiderweb-config config set-log <debug|info|warn|error>
         \\
         \\Examples:
         \\  spiderweb-config config set-provider openai gpt-4o
         \\  spiderweb-config config set-provider kimi-coding kimi-k2.5
         \\  spiderweb-config config set-server --bind 0.0.0.0 --port 9000
-        \\  spiderweb-config config set-key sk-...
+        \\  spiderweb-config config set-key sk-... openai
+        \\  spiderweb-config config clear-key openai
         \\
     ;
     const stdout_file = std.fs.File.stdout();

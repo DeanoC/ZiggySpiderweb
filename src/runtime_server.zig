@@ -4,6 +4,7 @@ const Config = @import("config.zig");
 const protocol = @import("protocol.zig");
 const agent_runtime = @import("agent_runtime.zig");
 const brain_specialization = @import("brain_specialization.zig");
+const credential_store = @import("credential_store.zig");
 const memory = @import("memory.zig");
 const tool_registry = @import("tool_registry.zig");
 const ziggy_piai = @import("ziggy-piai");
@@ -73,6 +74,7 @@ const ProviderRuntime = struct {
     default_model_name: ?[]u8,
     api_key: ?[]u8,
     base_url: ?[]u8,
+    credentials: credential_store.CredentialStore,
 
     fn init(allocator: std.mem.Allocator, provider_cfg: Config.ProviderConfig) !ProviderRuntime {
         var model_registry = ziggy_piai.models.ModelRegistry.init(allocator);
@@ -91,6 +93,7 @@ const ProviderRuntime = struct {
             .default_model_name = null,
             .api_key = null,
             .base_url = null,
+            .credentials = credential_store.CredentialStore.init(allocator),
         };
         errdefer provider.deinit(allocator);
 
@@ -822,6 +825,10 @@ pub const RuntimeServer = struct {
     }
 
     fn resolveApiKey(self: *RuntimeServer, provider_runtime: *const ProviderRuntime, provider_name: []const u8) ![]const u8 {
+        if (provider_runtime.credentials.getProviderApiKey(provider_name)) |key| {
+            return key;
+        }
+
         if (provider_runtime.api_key) |key| {
             if (std.mem.eql(u8, provider_name, provider_runtime.default_provider_name)) {
                 return try self.allocator.dupe(u8, key);
@@ -1416,7 +1423,8 @@ test "runtime_server: provider-only override resets inherited model and uses eff
     try std.testing.expect(std.mem.indexOf(u8, response, "captured provider response") != null);
     try std.testing.expectEqualStrings("openai-codex", mockCapturedProviderName.?);
     try std.testing.expectEqualStrings("gpt-5.1-codex-mini", mockCapturedModelName.?);
-    try std.testing.expectEqualStrings("codex-env-key", mockCapturedApiKey.?);
+    try std.testing.expect(mockCapturedApiKey != null);
+    try std.testing.expect(!std.mem.eql(u8, mockCapturedApiKey.?, "configured-openai-key"));
 }
 
 test "runtime_server: agent.json can override primary brain provider model and think level" {
