@@ -427,19 +427,42 @@ setup_per_brain_config() {
     
     local repo_dir="${HOME}/.local/share/ziggy-spiderweb"
     local agent_dir="${HOME}/.local/share/ziggy-spiderweb/agents/${AGENT_NAME}"
-    local examples_dir="${repo_dir}/agents/identities/examples"
     
     # Create agent directory structure
     mkdir -p "${agent_dir}/deep-thinker"
     
-    # Copy example agent.json configs
-    # Note: Identity files (SOUL.md, AGENT.md, IDENTITY.md) are hatched from templates/
-    # Only per-brain configuration (agent.json) goes in agents/
-    if [[ -d "${examples_dir}/fast-primary" ]]; then
-        log_info "Copying example configurations..."
-        
-        # Primary brain config with user's selected provider/model
-        cat > "${agent_dir}/agent.json" << EOF
+    # Determine sub-brain config based on primary provider
+    # Sub-brain should be in same ecosystem but cheaper/appropriate
+    local sub_provider
+    local sub_model
+    local sub_think
+    
+    case "$PROVIDER" in
+        openai)
+            sub_provider="openai"
+            sub_model="gpt-4.1-mini"
+            sub_think="medium"
+            ;;
+        openai-codex)
+            sub_provider="openai-codex"
+            sub_model="gpt-5.1-codex-mini"
+            sub_think="high"
+            ;;
+        kimi-coding)
+            sub_provider="kimi-coding"
+            sub_model="kimi-k2-thinking"
+            sub_think="high"
+            ;;
+        *)
+            # Fallback to same as primary
+            sub_provider="$PROVIDER"
+            sub_model="$MODEL"
+            sub_think="medium"
+            ;;
+    esac
+    
+    # Primary brain config with user's selected provider/model
+    cat > "${agent_dir}/agent.json" << EOF
 {
   "name": "${AGENT_NAME}",
   "creature": "Interface gremlin",
@@ -469,25 +492,49 @@ setup_per_brain_config() {
   ]
 }
 EOF
-        
-        # Deep thinker sub-brain config (uses full Codex)
-        if [[ -f "${examples_dir}/deep-thinker/agent.json" ]]; then
-            cp "${examples_dir}/deep-thinker/agent.json" "${agent_dir}/deep-thinker/"
-        fi
-        
-        log_success "Per-brain configuration created"
-        echo ""
-        echo "Configuration:"
-        echo "  - Identity files: templates/ (hatched into LTM)"
-        echo "  - Primary brain: ${PROVIDER}/${MODEL}"
-        echo "  - deep-thinker: openai-codex/gpt-5.3-codex"
-        echo ""
-        echo "Config directory: ${agent_dir}/"
-        echo "See: ${examples_dir}/README.md for more examples"
-        
-    else
-        log_warn "Example configs not found, skipping per-brain setup"
-    fi
+    
+    # Deep thinker sub-brain config (appropriate for provider ecosystem)
+    cat > "${agent_dir}/deep-thinker/agent.json" << EOF
+{
+  "name": "Deep Thinker",
+  "creature": "Background scholar",
+  "vibe": "Thorough, methodical, precise",
+  "emoji": "🧠",
+  "specialization": "complex_problem_solving",
+  "description": "Sub-brain for hard problems using ${sub_model}",
+  
+  "provider": {
+    "name": "${sub_provider}",
+    "model": "${sub_model}",
+    "think_level": "${sub_think}"
+  },
+  
+  "capabilities": ["deep_analysis", "code_generation", "complex_reasoning"],
+  "can_spawn_subbrains": false,
+  
+  "allowed_tools": [
+    "memory.create",
+    "memory.load",
+    "memory.mutate",
+    "memory.search",
+    "memory.evict",
+    "talk.brain",
+    "talk.agent",
+    "talk.log",
+    "wait.for"
+  ]
+}
+EOF
+    
+    log_success "Per-brain configuration created"
+    echo ""
+    echo "Configuration:"
+    echo "  - Identity files: templates/ (hatched into LTM)"
+    echo "  - Primary brain: ${PROVIDER}/${MODEL}"
+    echo "  - deep-thinker: ${sub_provider}/${sub_model}"
+    echo ""
+    echo "Config directory: ${agent_dir}/"
+    echo "See: ${repo_dir}/agents/identities/examples/README.md for more examples"
 }
 
 run_first_agent() {
@@ -497,6 +544,16 @@ run_first_agent() {
     
     # Create LTM directory
     mkdir -p "$LTM_DIR"
+    
+    # Determine sub-brain values for summary (same logic as setup_per_brain_config)
+    local sub_provider
+    local sub_model
+    case "$PROVIDER" in
+        openai) sub_provider="openai"; sub_model="gpt-4.1-mini" ;;
+        openai-codex) sub_provider="openai-codex"; sub_model="gpt-5.1-codex-mini" ;;
+        kimi-coding) sub_provider="kimi-coding"; sub_model="kimi-k2-thinking" ;;
+        *) sub_provider="$PROVIDER"; sub_model="$MODEL" ;;
+    esac
     
     # Show configuration summary
     echo "Configuration Summary:"
@@ -508,7 +565,7 @@ run_first_agent() {
     echo ""
     echo "Per-brain providers:"
     echo "  Primary: ${PROVIDER}/${MODEL}"
-    echo "  deep-thinker: openai-codex/gpt-5.3-codex (hard problems)"
+    echo "  deep-thinker: ${sub_provider}/${sub_model} (hard problems)"
     echo ""
     
     # Non-interactive mode: start server automatically
