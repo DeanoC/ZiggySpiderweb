@@ -704,12 +704,24 @@ pub const RuntimeServer = struct {
         defer if (specialization) |*spec| spec.deinit();
 
         if (specialization) |spec| {
-            if (spec.provider_name) |value| provider_name = value;
+            if (spec.provider_name) |value| {
+                const provider_changed = !std.mem.eql(u8, provider_name, value);
+                provider_name = value;
+                if (provider_changed and spec.model_name == null) {
+                    model_name = null;
+                }
+            }
             if (spec.model_name) |value| model_name = value;
             if (spec.think_level) |value| think_level = value;
         }
         if (self.runtime.getBrainProviderOverride(brain_name)) |runtime_override| {
-            if (runtime_override.provider_name) |value| provider_name = value;
+            if (runtime_override.provider_name) |value| {
+                const provider_changed = !std.mem.eql(u8, provider_name, value);
+                provider_name = value;
+                if (provider_changed and runtime_override.model_name == null) {
+                    model_name = null;
+                }
+            }
             if (runtime_override.model_name) |value| model_name = value;
             if (runtime_override.think_level) |value| think_level = value;
         }
@@ -810,7 +822,11 @@ pub const RuntimeServer = struct {
     }
 
     fn resolveApiKey(self: *RuntimeServer, provider_runtime: *const ProviderRuntime, provider_name: []const u8) ![]const u8 {
-        if (provider_runtime.api_key) |key| return try self.allocator.dupe(u8, key);
+        if (provider_runtime.api_key) |key| {
+            if (std.mem.eql(u8, provider_name, provider_runtime.default_provider_name)) {
+                return try self.allocator.dupe(u8, key);
+            }
+        }
         return ziggy_piai.env_api_keys.getEnvApiKey(self.allocator, provider_name) orelse RuntimeServerError.MissingProviderApiKey;
     }
 
@@ -1040,6 +1056,23 @@ const AsyncRequestCtx = struct {
     }
 };
 
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+
+fn setEnvForTest(allocator: std.mem.Allocator, name: []const u8, value: []const u8) !void {
+    const name_z = try allocator.dupeZ(u8, name);
+    defer allocator.free(name_z);
+    const value_z = try allocator.dupeZ(u8, value);
+    defer allocator.free(value_z);
+    if (setenv(name_z.ptr, value_z.ptr, 1) != 0) return error.SetEnvFailed;
+}
+
+fn unsetEnvForTest(allocator: std.mem.Allocator, name: []const u8) !void {
+    const name_z = try allocator.dupeZ(u8, name);
+    defer allocator.free(name_z);
+    if (unsetenv(name_z.ptr) != 0) return error.UnsetEnvFailed;
+}
+
 fn runRequestInThread(ctx: *AsyncRequestCtx) void {
     ctx.response = ctx.server.handleMessage(ctx.request_json) catch |err| {
         ctx.err_name = std.fmt.allocPrint(ctx.allocator, "{s}", .{@errorName(err)}) catch null;
@@ -1074,6 +1107,7 @@ var mockToolLoopCallCount: usize = 0;
 var mockCapturedProviderName: ?[]const u8 = null;
 var mockCapturedModelName: ?[]const u8 = null;
 var mockCapturedReasoning: ?[]const u8 = null;
+var mockCapturedApiKey: ?[]u8 = null;
 
 fn mockProviderStreamCaptureConfig(
     allocator: std.mem.Allocator,
@@ -1087,6 +1121,13 @@ fn mockProviderStreamCaptureConfig(
     mockCapturedProviderName = model.provider;
     mockCapturedModelName = model.id;
     mockCapturedReasoning = options.reasoning;
+    if (mockCapturedApiKey) |existing| {
+        allocator.free(existing);
+        mockCapturedApiKey = null;
+    }
+    if (options.api_key) |value| {
+        mockCapturedApiKey = try allocator.dupe(u8, value);
+    }
     try events.append(.{ .done = .{
         .text = try allocator.dupe(u8, "captured provider response"),
         .thinking = try allocator.dupe(u8, ""),
@@ -1325,6 +1366,57 @@ test "runtime_server: provider-backed session.send uses configured provider runt
         }
     }
     try std.testing.expectEqual(@as(usize, 1), assistant_turns);
+}
+
+test "runtime_server: provider-only override resets inherited model and uses effective provider key source" {
+    const allocator = std.testing.allocator;
+    const original_stream_fn = streamByModelFn;
+    defer streamByModelFn = original_stream_fn;
+    streamByModelFn = mockProviderStreamCaptureConfig;
+    mockCapturedProviderName = null;
+    mockCapturedModelName = null;
+    mockCapturedReasoning = null;
+    if (mockCapturedApiKey) |value| {
+        allocator.free(value);
+        mockCapturedApiKey = null;
+    }
+    defer if (mockCapturedApiKey) |value| {
+        allocator.free(value);
+        mockCapturedApiKey = null;
+    };
+
+    const codex_env_name = "OPENAI_CODEX_API_KEY";
+    const prev_codex_key = std.process.getEnvVarOwned(allocator, codex_env_name) catch null;
+    defer if (prev_codex_key) |value| {
+        setEnvForTest(allocator, codex_env_name, value) catch {};
+        allocator.free(value);
+    } else {
+        unsetEnvForTest(allocator, codex_env_name) catch {};
+    };
+
+    try setEnvForTest(allocator, codex_env_name, "codex-env-key");
+
+    const server = try RuntimeServer.createWithProvider(allocator, "agent-provider-only-override", .{
+        .ltm_directory = "",
+        .ltm_filename = "",
+    }, .{
+        .name = "openai",
+        .model = "gpt-4o-mini",
+        .api_key = "configured-openai-key",
+    });
+    defer server.destroy();
+
+    try server.runtime.setBrainProviderOverride("primary", .{
+        .provider_name = "openai-codex",
+    });
+
+    const response = try server.handleMessage("{\"id\":\"req-provider-only-override\",\"type\":\"session.send\",\"content\":\"hello provider\"}");
+    defer allocator.free(response);
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "captured provider response") != null);
+    try std.testing.expectEqualStrings("openai-codex", mockCapturedProviderName.?);
+    try std.testing.expectEqualStrings("gpt-5.1-codex-mini", mockCapturedModelName.?);
+    try std.testing.expectEqualStrings("codex-env-key", mockCapturedApiKey.?);
 }
 
 test "runtime_server: agent.json can override primary brain provider model and think level" {
