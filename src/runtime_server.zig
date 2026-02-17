@@ -711,16 +711,18 @@ pub const RuntimeServer = struct {
             var assistant = try extractAssistantMessage(self.allocator, events.items);
             errdefer deinitOwnedAssistantMessage(self.allocator, &assistant);
 
-            self.runtime.appendMessageMemory(DEFAULT_BRAIN, "assistant", assistant.text) catch |err| {
-                return err;
-            };
-
             const tool_calls = assistant.tool_calls;
             if (tool_calls.len == 0) {
                 const final_text = try self.allocator.dupe(u8, assistant.text);
                 deinitOwnedAssistantMessage(self.allocator, &assistant);
                 return .{
                     .assistant_text = final_text,
+                };
+            }
+
+            if (assistant.text.len > 0) {
+                self.runtime.appendMessageMemory(DEFAULT_BRAIN, "assistant", assistant.text) catch |err| {
+                    return err;
                 };
             }
 
@@ -1115,6 +1117,28 @@ test "runtime_server: provider-backed session.send uses configured provider runt
     }
 
     try std.testing.expect(found_provider_text);
+
+    const snapshot = try server.runtime.active_memory.snapshotActive(allocator, "primary");
+    defer memory.deinitItems(allocator, snapshot);
+    const snapshot_json = try memory.toActiveMemoryJson(allocator, "primary", snapshot);
+    defer allocator.free(snapshot_json);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, snapshot_json, .{});
+    defer parsed.deinit();
+
+    const items = parsed.value.object.get("active_memory").?.object.get("items").?.array.items;
+    var assistant_turns: usize = 0;
+    for (items) |item| {
+        if (item.object.get("kind").?.string.len == 0) continue;
+        if (!std.mem.eql(u8, item.object.get("kind").?.string, "message")) continue;
+        const content_obj = item.object.get("content").?.object;
+        const role = content_obj.get("role").?.string;
+        const text = content_obj.get("content").?.string;
+        if (std.mem.eql(u8, role, "assistant") and std.mem.eql(u8, text, "mock provider response")) {
+            assistant_turns += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), assistant_turns);
 }
 
 test "runtime_server: provider tool loop executes world tool and returns final response" {

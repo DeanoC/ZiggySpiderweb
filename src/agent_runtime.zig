@@ -529,9 +529,34 @@ test "agent_runtime: memory lifecycle create mutate evict load historical" {
     try std.testing.expect(std.mem.indexOf(u8, load_tick.tool_results[0].payload_json, "\"v1\"") != null);
 }
 
+test "agent_runtime: appendMessageMemory escapes JSON control characters" {
+    const allocator = std.testing.allocator;
+    var runtime = try AgentRuntime.init(allocator, "agent-test", &[_][]const u8{});
+    defer runtime.deinit();
+
+    const control_text = "a\x08b\x0cc\x01d";
+    try runtime.appendMessageMemory("primary", "user", control_text);
+
+    const snapshot = try runtime.active_memory.snapshotActive(allocator, "primary");
+    defer memory.deinitItems(allocator, snapshot);
+    const json = try memory.toActiveMemoryJson(allocator, "primary", snapshot);
+    defer allocator.free(json);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+    defer parsed.deinit();
+
+    const active = parsed.value.object.get("active_memory").?.object;
+    const items = active.get("items").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), items.len);
+    const payload = items[0].object.get("content").?.object;
+    try std.testing.expectEqualStrings("user", payload.get("role").?.string);
+    try std.testing.expectEqualStrings(control_text, payload.get("content").?.string);
+}
+
 fn jsonEscapeAlloc(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
     var out = std.ArrayListUnmanaged(u8){};
     defer out.deinit(allocator);
+    const hex = "0123456789abcdef";
 
     for (raw) |char| {
         switch (char) {
@@ -540,7 +565,17 @@ fn jsonEscapeAlloc(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
             '\n' => try out.appendSlice(allocator, "\\n"),
             '\r' => try out.appendSlice(allocator, "\\r"),
             '\t' => try out.appendSlice(allocator, "\\t"),
-            else => try out.append(allocator, char),
+            '\x08' => try out.appendSlice(allocator, "\\b"),
+            '\x0c' => try out.appendSlice(allocator, "\\f"),
+            else => {
+                if (char < 0x20) {
+                    try out.appendSlice(allocator, "\\u00");
+                    try out.append(allocator, hex[@as(usize, (char >> 4) & 0x0f)]);
+                    try out.append(allocator, hex[@as(usize, char & 0x0f)]);
+                } else {
+                    try out.append(allocator, char);
+                }
+            },
         }
     }
     return out.toOwnedSlice(allocator);
