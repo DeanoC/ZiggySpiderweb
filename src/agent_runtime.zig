@@ -155,6 +155,23 @@ pub const AgentRuntime = struct {
         try self.control_events.append(self.allocator, event);
     }
 
+    pub fn appendMessageMemory(self: *AgentRuntime, brain_name: []const u8, role: []const u8, content: []const u8) !void {
+        const escaped_role = try jsonEscapeAlloc(self.allocator, role);
+        defer self.allocator.free(escaped_role);
+        const escaped_content = try jsonEscapeAlloc(self.allocator, content);
+        defer self.allocator.free(escaped_content);
+
+        const payload = try std.fmt.allocPrint(
+            self.allocator,
+            "{{\"role\":\"{s}\",\"content\":\"{s}\"}}",
+            .{ escaped_role, escaped_content },
+        );
+        defer self.allocator.free(payload);
+
+        var created = try self.active_memory.create(brain_name, .ram, null, "message", payload);
+        created.deinit(self.allocator);
+    }
+
     pub fn enqueueUserEvent(self: *AgentRuntime, content: []const u8) !void {
         if (self.state == .cancelled) return RuntimeError.RuntimeCancelled;
         if (self.state == .paused) return RuntimeError.RuntimePaused;
@@ -510,4 +527,21 @@ test "agent_runtime: memory lifecycle create mutate evict load historical" {
     defer load_tick.deinit(allocator);
     try std.testing.expect(load_tick.tool_results[0].success);
     try std.testing.expect(std.mem.indexOf(u8, load_tick.tool_results[0].payload_json, "\"v1\"") != null);
+}
+
+fn jsonEscapeAlloc(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8){};
+    defer out.deinit(allocator);
+
+    for (raw) |char| {
+        switch (char) {
+            '\\' => try out.appendSlice(allocator, "\\\\"),
+            '"' => try out.appendSlice(allocator, "\\\""),
+            '\n' => try out.appendSlice(allocator, "\\n"),
+            '\r' => try out.appendSlice(allocator, "\\r"),
+            '\t' => try out.appendSlice(allocator, "\\t"),
+            else => try out.append(allocator, char),
+        }
+    }
+    return out.toOwnedSlice(allocator);
 }
