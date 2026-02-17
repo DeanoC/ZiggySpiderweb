@@ -418,12 +418,14 @@ pub const Engine = struct {
             return .{ .result = try self.failure(tool_name, "execution_failed", @errorName(err)), .talk_id = 0 };
         };
 
-        const payload = try std.fmt.allocPrint(
-            self.allocator,
-            "{{\"talk_id\":{d},\"message\":\"{s}\"}}",
-            .{ talk_id, message },
-        );
-        return .{ .result = try self.success(tool_name, payload), .talk_id = talk_id };
+        var payload = std.ArrayListUnmanaged(u8){};
+        defer payload.deinit(self.allocator);
+        try payload.appendSlice(self.allocator, "{\"talk_id\":");
+        try payload.writer(self.allocator).print("{d}", .{talk_id});
+        try payload.appendSlice(self.allocator, ",\"message\":\"");
+        try appendJsonEscaped(self.allocator, &payload, message);
+        try payload.appendSlice(self.allocator, "\"}");
+        return .{ .result = try self.success(tool_name, try payload.toOwnedSlice(self.allocator)), .talk_id = talk_id };
     }
 
     fn execWaitFor(
@@ -1008,6 +1010,29 @@ test "brain_tools: talk.user emits user-targeted event" {
     try std.testing.expectEqual(@as(usize, 1), user_events.len);
     try std.testing.expectEqual(event_bus.EventType.talk, user_events[0].event_type);
     try std.testing.expectEqual(@as(?event_bus.TalkId, talk_id), user_events[0].talk_id);
+}
+
+test "brain_tools: talk payload preserves JSON validity for escaped content" {
+    const allocator = std.testing.allocator;
+    var mem = try memory.RuntimeMemory.init(allocator, "agentA");
+    defer mem.deinit();
+    var bus = event_bus.EventBus.init(allocator);
+    defer bus.deinit();
+
+    var brain = try brain_context.BrainContext.init(allocator, "primary");
+    defer brain.deinit();
+    try brain.queueToolUse("talk.user", "{\"message\":\"quote \\\"line\\\"\\\\path\\nnext\"}");
+
+    var engine = Engine.init(allocator, &mem, &bus);
+    const results = try engine.executePending(&brain);
+    defer deinitResults(allocator, results);
+
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expect(results[0].success);
+
+    const payload_message = try testExtractStringField(allocator, results[0].payload_json, "message");
+    defer allocator.free(payload_message);
+    try std.testing.expectEqualStrings("quote \"line\"\\path\nnext", payload_message);
 }
 
 test "brain_tools: talk.agent emits delegated event" {

@@ -450,15 +450,15 @@ pub const RuntimeServer = struct {
     }
 
     fn handleChat(self: *RuntimeServer, request_id: []const u8, content: []const u8) ![][]u8 {
-        self.runtime.enqueueUserEvent(content) catch |err| {
-            return self.wrapRuntimeErrorResponse(request_id, err);
-        };
-
         const assistant_text = if (self.provider_runtime != null)
             self.completeWithProvider(content) catch |err| return self.wrapRuntimeErrorResponse(request_id, err)
         else
             try self.allocator.dupe(u8, content);
         defer self.allocator.free(assistant_text);
+
+        self.runtime.enqueueUserEvent(content) catch |err| {
+            return self.wrapRuntimeErrorResponse(request_id, err);
+        };
 
         const escaped_content = try protocol.jsonEscape(self.allocator, assistant_text);
         defer self.allocator.free(escaped_content);
@@ -758,6 +758,18 @@ fn mockProviderStreamByModel(
     } });
 }
 
+fn mockProviderStreamByModelError(
+    _: std.mem.Allocator,
+    _: *std.http.Client,
+    _: *ziggy_piai.api_registry.ApiRegistry,
+    _: ziggy_piai.types.Model,
+    _: ziggy_piai.types.Context,
+    _: ziggy_piai.types.StreamOptions,
+    _: *std.array_list.Managed(ziggy_piai.types.AssistantMessageEvent),
+) anyerror!void {
+    return error.MockProviderUnavailable;
+}
+
 test "runtime_server: session.send dispatches through runtime and emits session.receive" {
     const allocator = std.testing.allocator;
     const server = try RuntimeServer.create(allocator, "agent-test", .{ .ltm_directory = "", .ltm_filename = "" });
@@ -822,6 +834,36 @@ test "runtime_server: provider-backed session.send uses configured provider runt
     }
 
     try std.testing.expect(found_provider_text);
+}
+
+test "runtime_server: provider failure does not leak queued user/tick events" {
+    const allocator = std.testing.allocator;
+    const original_stream_fn = streamByModelFn;
+    defer streamByModelFn = original_stream_fn;
+    streamByModelFn = mockProviderStreamByModelError;
+
+    const server = try RuntimeServer.createWithProvider(allocator, "agent-test", .{
+        .inbound_queue_max = 1,
+        .brain_tick_queue_max = 1,
+        .ltm_directory = "",
+        .ltm_filename = "",
+    }, .{
+        .name = "openai",
+        .model = "gpt-4o-mini",
+        .api_key = "test-key",
+    });
+    defer server.destroy();
+
+    var attempt: usize = 0;
+    while (attempt < 3) : (attempt += 1) {
+        const response = try server.handleMessage("{\"id\":\"req-provider-fail\",\"type\":\"session.send\",\"content\":\"hello provider\"}");
+        defer allocator.free(response);
+
+        try std.testing.expect(std.mem.indexOf(u8, response, "\"code\":\"execution_failed\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, response, "\"code\":\"queue_saturated\"") == null);
+        try std.testing.expectEqual(@as(usize, 0), server.runtime.tick_queue.items.len);
+        try std.testing.expectEqual(@as(usize, 0), server.runtime.bus.pendingCount());
+    }
 }
 
 test "runtime_server: agent.control pause/resume state" {
