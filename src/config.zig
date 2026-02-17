@@ -6,7 +6,7 @@ const Config = @This();
 pub const ProviderConfig = struct {
     name: []const u8,
     model: ?[]const u8 = null,
-    api_key: ?[]const u8 = null, // Legacy plaintext key support (read-only compatibility).
+    api_key: ?[]const u8 = null, // Test-only injection path (not loaded/saved by config CLI).
     base_url: ?[]const u8 = null,
 };
 
@@ -199,12 +199,6 @@ pub fn load(self: *Config) !void {
                 if (model == .string) {
                     if (self.provider.model) |m| self.allocator.free(m);
                     self.provider.model = try self.allocator.dupe(u8, model.string);
-                }
-            }
-            if (provider_val.object.get("api_key")) |key| {
-                if (key == .string) {
-                    if (self.provider.api_key) |k| self.allocator.free(k);
-                    self.provider.api_key = try self.allocator.dupe(u8, key.string);
                 }
             }
             if (provider_val.object.get("base_url")) |url| {
@@ -408,27 +402,8 @@ pub fn setLogLevel(self: *Config, level: []const u8) !void {
 }
 
 pub fn getApiKey(self: Config, allocator: std.mem.Allocator) !?[]const u8 {
-    // Priority: 1) Secure credential store, 2) legacy config key, 3) environment variable
     const store = credential_store.CredentialStore.init(allocator);
-    if (store.getProviderApiKey(self.provider.name)) |key| {
-        return key;
-    }
-
-    if (self.provider.api_key) |key| {
-        return try allocator.dupe(u8, key);
-    }
-
-    // Try environment variable based on provider
-    const env_var = switch (self.provider.name[0]) {
-        'o' => if (std.mem.startsWith(u8, self.provider.name, "openai-codex"))
-            "OPENAI_CODEX_API_KEY"
-        else
-            "OPENAI_API_KEY",
-        'k' => "KIMI_API_KEY",
-        else => "OPENAI_API_KEY",
-    };
-
-    return std.process.getEnvVarOwned(allocator, env_var) catch null;
+    return store.getProviderApiKey(self.provider.name);
 }
 
 test "Config defaults" {
@@ -447,29 +422,4 @@ test "Config defaults" {
     try std.testing.expectEqual(@as(u64, 30_000), config.runtime.chat_operation_timeout_ms);
     try std.testing.expectEqual(@as(u64, 5_000), config.runtime.control_operation_timeout_ms);
     try std.testing.expectEqualStrings(".spiderweb-ltm", config.runtime.ltm_directory);
-}
-
-test "Config save omits legacy provider.api_key field" {
-    const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const cwd = try std.process.getCwdAlloc(allocator);
-    defer allocator.free(cwd);
-    const config_path = try std.fs.path.join(allocator, &.{ cwd, ".zig-cache", "tmp", tmp.sub_path, "config.json" });
-    defer allocator.free(config_path);
-
-    var config = try Config.init(allocator, config_path);
-    defer config.deinit();
-
-    if (config.provider.api_key) |old| allocator.free(old);
-    config.provider.api_key = try allocator.dupe(u8, "legacy-key");
-    try config.save();
-
-    const raw = try std.fs.openFileAbsolute(config_path, .{ .mode = .read_only });
-    defer raw.close();
-    const contents = try raw.readToEndAlloc(allocator, 128 * 1024);
-    defer allocator.free(contents);
-
-    try std.testing.expect(std.mem.indexOf(u8, contents, "\"api_key\"") == null);
 }

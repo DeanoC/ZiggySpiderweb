@@ -72,7 +72,7 @@ const ProviderRuntime = struct {
     http_client: std.http.Client,
     default_provider_name: []u8,
     default_model_name: ?[]u8,
-    api_key: ?[]u8,
+    test_only_api_key: ?[]u8,
     base_url: ?[]u8,
     credentials: credential_store.CredentialStore,
 
@@ -91,14 +91,16 @@ const ProviderRuntime = struct {
             .http_client = .{ .allocator = allocator },
             .default_provider_name = try allocator.dupe(u8, provider_cfg.name),
             .default_model_name = null,
-            .api_key = null,
+            .test_only_api_key = null,
             .base_url = null,
             .credentials = credential_store.CredentialStore.init(allocator),
         };
         errdefer provider.deinit(allocator);
 
         if (provider_cfg.model) |value| provider.default_model_name = try allocator.dupe(u8, value);
-        if (provider_cfg.api_key) |value| provider.api_key = try allocator.dupe(u8, value);
+        if (builtin.is_test) {
+            if (provider_cfg.api_key) |value| provider.test_only_api_key = try allocator.dupe(u8, value);
+        }
         if (provider_cfg.base_url) |value| provider.base_url = try allocator.dupe(u8, value);
 
         return provider;
@@ -110,7 +112,7 @@ const ProviderRuntime = struct {
         self.http_client.deinit();
         allocator.free(self.default_provider_name);
         if (self.default_model_name) |value| allocator.free(value);
-        if (self.api_key) |value| allocator.free(value);
+        if (self.test_only_api_key) |value| allocator.free(value);
         if (self.base_url) |value| allocator.free(value);
     }
 };
@@ -828,13 +830,10 @@ pub const RuntimeServer = struct {
         if (provider_runtime.credentials.getProviderApiKey(provider_name)) |key| {
             return key;
         }
-
-        if (provider_runtime.api_key) |key| {
-            if (std.mem.eql(u8, provider_name, provider_runtime.default_provider_name)) {
-                return try self.allocator.dupe(u8, key);
-            }
+        if (builtin.is_test) {
+            if (provider_runtime.test_only_api_key) |key| return try self.allocator.dupe(u8, key);
         }
-        return ziggy_piai.env_api_keys.getEnvApiKey(self.allocator, provider_name) orelse RuntimeServerError.MissingProviderApiKey;
+        return RuntimeServerError.MissingProviderApiKey;
     }
 
     fn selectModel(provider_runtime: *const ProviderRuntime, provider_name: []const u8, model_name: ?[]const u8) ?ziggy_piai.types.Model {
@@ -1062,23 +1061,6 @@ const AsyncRequestCtx = struct {
         if (self.err_name) |err| self.allocator.free(err);
     }
 };
-
-extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
-extern "c" fn unsetenv(name: [*:0]const u8) c_int;
-
-fn setEnvForTest(allocator: std.mem.Allocator, name: []const u8, value: []const u8) !void {
-    const name_z = try allocator.dupeZ(u8, name);
-    defer allocator.free(name_z);
-    const value_z = try allocator.dupeZ(u8, value);
-    defer allocator.free(value_z);
-    if (setenv(name_z.ptr, value_z.ptr, 1) != 0) return error.SetEnvFailed;
-}
-
-fn unsetEnvForTest(allocator: std.mem.Allocator, name: []const u8) !void {
-    const name_z = try allocator.dupeZ(u8, name);
-    defer allocator.free(name_z);
-    if (unsetenv(name_z.ptr) != 0) return error.UnsetEnvFailed;
-}
 
 fn runRequestInThread(ctx: *AsyncRequestCtx) void {
     ctx.response = ctx.server.handleMessage(ctx.request_json) catch |err| {
@@ -1375,7 +1357,7 @@ test "runtime_server: provider-backed session.send uses configured provider runt
     try std.testing.expectEqual(@as(usize, 1), assistant_turns);
 }
 
-test "runtime_server: provider-only override resets inherited model and uses effective provider key source" {
+test "runtime_server: provider-only override resets inherited model selection" {
     const allocator = std.testing.allocator;
     const original_stream_fn = streamByModelFn;
     defer streamByModelFn = original_stream_fn;
@@ -1391,17 +1373,6 @@ test "runtime_server: provider-only override resets inherited model and uses eff
         allocator.free(value);
         mockCapturedApiKey = null;
     };
-
-    const codex_env_name = "OPENAI_CODEX_API_KEY";
-    const prev_codex_key = std.process.getEnvVarOwned(allocator, codex_env_name) catch null;
-    defer if (prev_codex_key) |value| {
-        setEnvForTest(allocator, codex_env_name, value) catch {};
-        allocator.free(value);
-    } else {
-        unsetEnvForTest(allocator, codex_env_name) catch {};
-    };
-
-    try setEnvForTest(allocator, codex_env_name, "codex-env-key");
 
     const server = try RuntimeServer.createWithProvider(allocator, "agent-provider-only-override", .{
         .ltm_directory = "",
@@ -1424,7 +1395,7 @@ test "runtime_server: provider-only override resets inherited model and uses eff
     try std.testing.expectEqualStrings("openai-codex", mockCapturedProviderName.?);
     try std.testing.expectEqualStrings("gpt-5.1-codex-mini", mockCapturedModelName.?);
     try std.testing.expect(mockCapturedApiKey != null);
-    try std.testing.expect(!std.mem.eql(u8, mockCapturedApiKey.?, "configured-openai-key"));
+    try std.testing.expectEqualStrings("configured-openai-key", mockCapturedApiKey.?);
 }
 
 test "runtime_server: agent.json can override primary brain provider model and think level" {

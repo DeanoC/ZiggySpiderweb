@@ -25,11 +25,8 @@ git clone https://github.com/DeanoC/ZiggySpiderweb.git
 cd ZiggySpiderweb
 zig build
 
-# Set your API key (choose one)
-export OPENAI_API_KEY="sk-..."
-# OR
-export KIMI_API_KEY="your-kimi-key"
-# OR use existing Codex OAuth: ~/.codex/auth.json
+# Store provider key in secure credential backend (Linux: secret-tool)
+./zig-out/bin/spiderweb-config config set-key sk-... openai
 
 # Run on default port 18790
 ./zig-out/bin/spiderweb
@@ -112,18 +109,10 @@ Implemented tool names:
 
 **Priority order:**
 1. **Secure credential store** - Set via `spiderweb-config config set-key ...`
-2. **Environment variables** - Used as fallback
-3. **Legacy config file key** - Read-only compatibility for old installs
 
-| Provider | Environment Variable |
-|----------|---------------------|
-| OpenAI | `OPENAI_API_KEY` |
-| OpenAI Codex | `OPENAI_CODEX_API_KEY` → `~/.codex/auth.json` → `OPENAI_API_KEY` |
-| Kimi | `KIMI_API_KEY`, `KIMICODE_API_KEY` |
-
-**Security Note:** `spiderweb-config config set-key` no longer writes plaintext keys to config.
+**Security Note:** `spiderweb-config config set-key` does not write plaintext keys to config.
 On Linux, secure storage uses the desktop keyring via `secret-tool`.
-If no secure backend is available, use environment variables.
+If no secure backend is available, the server will not use provider keys.
 
 ## Architecture
 
