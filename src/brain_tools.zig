@@ -251,12 +251,48 @@ pub const Engine = struct {
 
     fn execWorldTool(self: *Engine, tool_name: []const u8, args: std.json.ObjectMap) !ToolResult {
         const world_tools = self.world_tools orelse return self.failure(tool_name, "unsupported_tool", "Unsupported brain tool");
+        const tool_call_id = if (args.get("_tool_call_id")) |value|
+            if (value == .string) value.string else null
+        else
+            null;
         var outcome = world_tools.executeWorld(self.allocator, tool_name, args);
         defer outcome.deinit(self.allocator);
 
         return switch (outcome) {
-            .success => |ok| self.success(tool_name, try self.allocator.dupe(u8, ok.payload_json)),
-            .failure => |failure_info| self.failure(tool_name, @tagName(failure_info.code), failure_info.message),
+            .success => |ok| {
+                if (tool_call_id) |call_id| {
+                    var wrapped_buf = std.ArrayListUnmanaged(u8){};
+                    defer wrapped_buf.deinit(self.allocator);
+                    try wrapped_buf.appendSlice(self.allocator, "{\"tool_call_id\":\"");
+                    try appendJsonEscaped(self.allocator, &wrapped_buf, call_id);
+                    try wrapped_buf.appendSlice(self.allocator, "\",\"result\":");
+                    try wrapped_buf.appendSlice(self.allocator, ok.payload_json);
+                    try wrapped_buf.append(self.allocator, '}');
+                    const wrapped = try wrapped_buf.toOwnedSlice(self.allocator);
+                    return self.success(tool_name, wrapped);
+                }
+                return self.success(tool_name, try self.allocator.dupe(u8, ok.payload_json));
+            },
+            .failure => |failure_info| {
+                if (tool_call_id) |call_id| {
+                    var wrapped_buf = std.ArrayListUnmanaged(u8){};
+                    defer wrapped_buf.deinit(self.allocator);
+                    try wrapped_buf.appendSlice(self.allocator, "{\"tool_call_id\":\"");
+                    try appendJsonEscaped(self.allocator, &wrapped_buf, call_id);
+                    try wrapped_buf.appendSlice(self.allocator, "\",\"error\":{\"code\":\"");
+                    try appendJsonEscaped(self.allocator, &wrapped_buf, @tagName(failure_info.code));
+                    try wrapped_buf.appendSlice(self.allocator, "\",\"message\":\"");
+                    try appendJsonEscaped(self.allocator, &wrapped_buf, failure_info.message);
+                    try wrapped_buf.appendSlice(self.allocator, "\"}}");
+                    const wrapped = try wrapped_buf.toOwnedSlice(self.allocator);
+                    return .{
+                        .tool_name = try self.allocator.dupe(u8, tool_name),
+                        .success = false,
+                        .payload_json = wrapped,
+                    };
+                }
+                return self.failure(tool_name, @tagName(failure_info.code), failure_info.message);
+            },
         };
     }
 

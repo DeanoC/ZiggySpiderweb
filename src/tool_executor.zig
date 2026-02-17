@@ -4,6 +4,11 @@ const registry_mod = @import("tool_registry.zig");
 pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 1024 * 1024;
 pub const DEFAULT_MAX_FILE_READ_BYTES: usize = 1024 * 1024;
 
+const PathMode = enum {
+    read_or_list,
+    write,
+};
+
 fn fail(allocator: std.mem.Allocator, code: registry_mod.ToolErrorCode, msg: []const u8) registry_mod.ToolExecutionResult {
     const owned = allocator.dupe(u8, msg) catch return .{ .failure = .{
         .code = .execution_failed,
@@ -34,6 +39,51 @@ fn optionalString(args: std.json.ObjectMap, name: []const u8) ?[]const u8 {
     const value = args.get(name) orelse return null;
     if (value != .string) return null;
     return value.string;
+}
+
+fn isWithinWorkspace(workspace: []const u8, target: []const u8) bool {
+    if (std.mem.eql(u8, workspace, target)) return true;
+    if (!std.mem.startsWith(u8, target, workspace)) return false;
+    if (target.len <= workspace.len) return false;
+    return target[workspace.len] == std.fs.path.sep;
+}
+
+fn validatePathOwned(allocator: std.mem.Allocator, path: []const u8, mode: PathMode) ?[]u8 {
+    if (path.len == 0) return allocator.dupe(u8, "path cannot be empty") catch null;
+    if (std.fs.path.isAbsolute(path)) return allocator.dupe(u8, "absolute paths are not allowed") catch null;
+    if (path[0] == '~') return allocator.dupe(u8, "home directory references are not allowed") catch null;
+
+    const cwd = std.fs.cwd();
+    const workspace_real = cwd.realpathAlloc(allocator, ".") catch |err| {
+        return std.fmt.allocPrint(allocator, "failed to resolve workspace path: {s}", .{@errorName(err)}) catch null;
+    };
+    defer allocator.free(workspace_real);
+
+    var candidate = switch (mode) {
+        .read_or_list => path,
+        .write => std.fs.path.dirname(path) orelse ".",
+    };
+
+    while (true) {
+        const resolved = cwd.realpathAlloc(allocator, candidate) catch |err| switch (err) {
+            error.FileNotFound, error.NotDir => {
+                if (std.mem.eql(u8, candidate, ".")) {
+                    return std.fmt.allocPrint(allocator, "failed to resolve path: {s}", .{@errorName(err)}) catch null;
+                }
+                candidate = std.fs.path.dirname(candidate) orelse ".";
+                continue;
+            },
+            else => {
+                return std.fmt.allocPrint(allocator, "failed to resolve path: {s}", .{@errorName(err)}) catch null;
+            },
+        };
+        defer allocator.free(resolved);
+
+        if (!isWithinWorkspace(workspace_real, resolved)) {
+            return allocator.dupe(u8, "path resolves outside workspace") catch null;
+        }
+        return null;
+    }
 }
 
 fn appendJsonEscaped(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), value: []const u8) !void {
@@ -126,6 +176,9 @@ pub const BuiltinTools = struct {
 
     pub fn fileRead(allocator: std.mem.Allocator, args: std.json.ObjectMap) registry_mod.ToolExecutionResult {
         const path = requiredString(args, "path") orelse return fail(allocator, .invalid_params, "missing required parameter: path");
+        if (validatePathOwned(allocator, path, .read_or_list)) |msg| {
+            return .{ .failure = .{ .code = .permission_denied, .message = msg } };
+        }
 
         const max_bytes = parseUsize(args, "max_bytes", DEFAULT_MAX_FILE_READ_BYTES) catch {
             return fail(allocator, .invalid_params, "max_bytes must be a non-negative integer");
@@ -154,6 +207,9 @@ pub const BuiltinTools = struct {
     pub fn fileWrite(allocator: std.mem.Allocator, args: std.json.ObjectMap) registry_mod.ToolExecutionResult {
         const path = requiredString(args, "path") orelse return fail(allocator, .invalid_params, "missing required parameter: path");
         const content = requiredString(args, "content") orelse return fail(allocator, .invalid_params, "missing required parameter: content");
+        if (validatePathOwned(allocator, path, .write)) |msg| {
+            return .{ .failure = .{ .code = .permission_denied, .message = msg } };
+        }
 
         const append = parseBool(args, "append", false) catch return fail(allocator, .invalid_params, "append must be boolean");
         const create_parents = parseBool(args, "create_parents", true) catch return fail(allocator, .invalid_params, "create_parents must be boolean");
@@ -173,17 +229,24 @@ pub const BuiltinTools = struct {
             std.fs.cwd().writeFile(.{ .sub_path = path, .data = content }) catch |err| return fail(allocator, .execution_failed, @errorName(err));
         }
 
-        const payload = std.fmt.allocPrint(
-            allocator,
-            "{{\"path\":\"{s}\",\"bytes_written\":{d},\"append\":{s}}}",
-            .{ path, content.len, if (append) "true" else "false" },
-        ) catch return fail(allocator, .execution_failed, "out of memory");
+        var payload = std.ArrayListUnmanaged(u8){};
+        errdefer payload.deinit(allocator);
+        payload.appendSlice(allocator, "{\"path\":\"") catch return fail(allocator, .execution_failed, "out of memory");
+        appendJsonEscaped(allocator, &payload, path) catch return fail(allocator, .execution_failed, "out of memory");
+        payload.appendSlice(allocator, "\",\"bytes_written\":") catch return fail(allocator, .execution_failed, "out of memory");
+        payload.writer(allocator).print("{d}", .{content.len}) catch return fail(allocator, .execution_failed, "out of memory");
+        payload.appendSlice(allocator, ",\"append\":") catch return fail(allocator, .execution_failed, "out of memory");
+        payload.appendSlice(allocator, if (append) "true" else "false") catch return fail(allocator, .execution_failed, "out of memory");
+        payload.append(allocator, '}') catch return fail(allocator, .execution_failed, "out of memory");
 
-        return .{ .success = .{ .payload_json = payload } };
+        return .{ .success = .{ .payload_json = payload.toOwnedSlice(allocator) catch return fail(allocator, .execution_failed, "out of memory") } };
     }
 
     pub fn fileList(allocator: std.mem.Allocator, args: std.json.ObjectMap) registry_mod.ToolExecutionResult {
         const path = optionalString(args, "path") orelse ".";
+        if (validatePathOwned(allocator, path, .read_or_list)) |msg| {
+            return .{ .failure = .{ .code = .permission_denied, .message = msg } };
+        }
         const recursive = parseBool(args, "recursive", false) catch return fail(allocator, .invalid_params, "recursive must be boolean");
         const max_entries = parseUsize(args, "max_entries", 500) catch return fail(allocator, .invalid_params, "max_entries must be integer");
         const effective_max = @min(max_entries, 5000);
@@ -197,6 +260,7 @@ pub const BuiltinTools = struct {
 
         var first = true;
         var count: usize = 0;
+        var truncated = false;
 
         if (recursive) {
             var dir = std.fs.cwd().openDir(path, .{ .iterate = true }) catch |err| return fail(allocator, .execution_failed, @errorName(err));
@@ -206,7 +270,10 @@ pub const BuiltinTools = struct {
             defer walker.deinit();
 
             while (walker.next() catch |err| return fail(allocator, .execution_failed, @errorName(err))) |entry| {
-                if (count >= effective_max) break;
+                if (count >= effective_max) {
+                    truncated = true;
+                    break;
+                }
                 if (!first) payload.append(allocator, ',') catch return fail(allocator, .execution_failed, "out of memory");
                 first = false;
                 count += 1;
@@ -230,7 +297,10 @@ pub const BuiltinTools = struct {
 
             var it = dir.iterate();
             while (it.next() catch |err| return fail(allocator, .execution_failed, @errorName(err))) |entry| {
-                if (count >= effective_max) break;
+                if (count >= effective_max) {
+                    truncated = true;
+                    break;
+                }
                 if (!first) payload.append(allocator, ',') catch return fail(allocator, .execution_failed, "out of memory");
                 first = false;
                 count += 1;
@@ -251,7 +321,7 @@ pub const BuiltinTools = struct {
         }
 
         payload.appendSlice(allocator, "],\"truncated\":") catch return fail(allocator, .execution_failed, "out of memory");
-        payload.appendSlice(allocator, if (count >= effective_max) "true" else "false") catch return fail(allocator, .execution_failed, "out of memory");
+        payload.appendSlice(allocator, if (truncated) "true" else "false") catch return fail(allocator, .execution_failed, "out of memory");
         payload.append(allocator, '}') catch return fail(allocator, .execution_failed, "out of memory");
 
         return .{ .success = .{ .payload_json = payload.toOwnedSlice(allocator) catch return fail(allocator, .execution_failed, "out of memory") } };

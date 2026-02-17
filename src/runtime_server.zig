@@ -790,7 +790,9 @@ pub const RuntimeServer = struct {
             total_calls += tool_calls.len;
 
             for (tool_calls) |tool_call| {
-                try self.runtime.queueToolUse(DEFAULT_BRAIN, tool_call.name, tool_call.arguments_json);
+                const args_with_call_id = try injectToolCallId(self.allocator, tool_call.arguments_json, tool_call.id);
+                defer self.allocator.free(args_with_call_id);
+                try self.runtime.queueToolUse(DEFAULT_BRAIN, tool_call.name, args_with_call_id);
             }
 
             var tool_payloads = std.ArrayListUnmanaged([]u8){};
@@ -808,9 +810,26 @@ pub const RuntimeServer = struct {
                 try runtime_events.append(self.allocator, try self.allocator.dupe(u8, payload));
             }
 
-            for (tool_calls, 0..) |tool_call, idx| {
-                const result_payload = if (idx < tool_payloads.items.len)
-                    tool_payloads.items[idx]
+            var by_call_id = std.StringHashMap(usize).init(self.allocator);
+            defer {
+                var id_it = by_call_id.iterator();
+                while (id_it.next()) |entry| self.allocator.free(entry.key_ptr.*);
+                by_call_id.deinit();
+            }
+            for (tool_payloads.items, 0..) |payload, idx| {
+                const payload_call_id = extractToolCallIdFromPayload(self.allocator, payload) catch null;
+                if (payload_call_id) |call_id| {
+                    if (by_call_id.get(call_id) == null) {
+                        try by_call_id.put(call_id, idx);
+                    } else {
+                        self.allocator.free(call_id);
+                    }
+                }
+            }
+
+            for (tool_calls) |tool_call| {
+                const result_payload = if (by_call_id.get(tool_call.id)) |payload_index|
+                    tool_payloads.items[payload_index]
                 else
                     "{\"error\":{\"code\":\"execution_failed\",\"message\":\"missing tool result\"}}";
 
@@ -854,6 +873,37 @@ pub const RuntimeServer = struct {
 fn isChatLikeControlAction(action: ?[]const u8) bool {
     const control_action = action orelse "state";
     return std.mem.eql(u8, control_action, "goal") or std.mem.eql(u8, control_action, "plan");
+}
+
+fn injectToolCallId(allocator: std.mem.Allocator, args_json: []const u8, call_id: []const u8) ![]u8 {
+    const trimmed = std.mem.trim(u8, args_json, " \t\r\n");
+    if (trimmed.len < 2 or trimmed[0] != '{' or trimmed[trimmed.len - 1] != '}') {
+        return error.InvalidToolArgs;
+    }
+
+    const escaped_call_id = try protocol.jsonEscape(allocator, call_id);
+    defer allocator.free(escaped_call_id);
+
+    const inner = std.mem.trim(u8, trimmed[1 .. trimmed.len - 1], " \t\r\n");
+    if (inner.len == 0) {
+        return std.fmt.allocPrint(allocator, "{{\"_tool_call_id\":\"{s}\"}}", .{escaped_call_id});
+    }
+    return std.fmt.allocPrint(
+        allocator,
+        "{{\"_tool_call_id\":\"{s}\",{s}}}",
+        .{ escaped_call_id, inner },
+    );
+}
+
+fn extractToolCallIdFromPayload(allocator: std.mem.Allocator, payload: []const u8) !?[]u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, payload, .{}) catch return null;
+    defer parsed.deinit();
+
+    if (parsed.value != .object) return null;
+    const value = parsed.value.object.get("tool_call_id") orelse return null;
+    if (value != .string) return null;
+    const duplicated = try allocator.dupe(u8, value.string);
+    return duplicated;
 }
 
 fn extractAssistantMessage(
