@@ -1,22 +1,133 @@
-﻿# Hatching a new agent
+# Hatching a New Agent
 
-When a new agent is created, it hatches with certain memories and requirements.
+## Overview
 
-The first agent in the web is special and requires hatching as part of the Spiderweb installation.
+Hatching is the process of creating and initializing a new agent in the ZiggySpiderweb ecosystem. This document describes the architecture and lifecycle of agent creation.
+
+## Architecture
+
+### Templates vs Agent Instances
+
+**Templates (Filesystem)**
+- System template files: `SOUL.md`, `AGENT.md`, `IDENTITY.md`, `JUST_HATCHED.md`, `BOOTSTRAP.md`
+- Stored in the filesystem as read-only blueprints
+- Only the **first agent** has privilege to modify these templates
+- Regular agents cannot access or modify templates
+
+**Agent Instances (LTM - Long-Term Memory)**
+- Each agent has its own isolated LTM database
+- Agent identity and state are stored in LTM, not files
+- No filesystem access for agent self-modification after hatching
+- All agent state changes go through `memory.*` tools with versioning
+
+### Memory Model
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  Agent Instance Memory                                  │
+├─────────────────────────────────────────────────────────┤
+│  Active Memory (RAM)  │  Long-Term Memory (LTM)         │
+│  ───────────────────  │  ─────────────────────────────  │
+│  Working cache        │  Persistent storage             │
+│  Evictable            │  Versioned history              │
+│  Loaded from LTM      │  Source of truth                │
+└─────────────────────────────────────────────────────────┘
+```
+
+**Key Principle**: Active memory is a cache of LTM. The agent sees active memory in its context window, but all mutations persist to LTM with full version history.
 
 ## Agent Creation
-Every agent is bootstrapped with a copy of some identity files, which become its initial memory.
 
-The first agent is provided a system startup script, where it will ask the user preferences (including its name) on the initial configuration.
+### First Agent (System Bootstrap)
 
-Other agents can be created either by the user from ZiggyStarSpider directly or via an existing agent as part of a chat. Creating agents is a high-cost operation, so only the first agent or the user have this capability.
+1. **Templates loaded** from filesystem into first agent's LTM
+2. **Identity memories created** with fixed MemIds:
+   - `<EOT>agent:primary:system:soul:latest<EOT>`
+   - `<EOT>agent:primary:system:agent:latest<EOT>`
+   - `<EOT>agent:primary:system:identity:latest<EOT>`
+3. **Marked unevictable** in active memory (always present)
+4. **First message**: `BOOTSTRAP.md` content sent as user message
+   - Contains system-wide configuration questions
+   - Larger than `JUST_HATCHED.md` due to privilege scope
+5. **Agent begins responding** to bootstrap questions
 
-## Agent Hatching
-A template SOUL.md, AGENT.md and IDENTITY.md are loaded into the new agents memory and are marked unevictable from active memory.
-The templates are system files, and only the first agent has permission to change them.
+### Subsequent Agents
 
-Once these are loaded, the agent will be spun up and sent its first message.
-This first message will be either template JUST_HATCHED.md or if the first agent a BOOTSTRAP.md is used instead.
+1. **Templates copied** from system templates to new agent's LTM
+2. **Identity memories created** with same fixed MemId pattern
+3. **Marked unevictable** in active memory
+4. **First message**: `JUST_HATCHED.md` content sent as user message
+   - Contains welcome and initial guidance
+   - Simpler than `BOOTSTRAP.md` (no system-wide config)
+5. **Agent begins responding** to creator
 
-## Agent Life
-With the hatching complete and the first message sent, the agent will be ready to function within the Spiderweb ecosystem.
+## Identity Evolution
+
+Agents can evolve their identity over time:
+
+```
+Agent wants to change its values:
+  ↓
+Uses memory.mutate on identity MemId
+  ↓
+Change persisted to LTM with new version
+  ↓
+Active memory updated (still unevictable)
+  ↓
+Version history preserved for rollback
+```
+
+**Important**: The agent is modifying its own being. The ROM guidance reminds:
+> "These memories define you. You may evolve them using memory.mutate, but consider carefully — you are changing your own essence."
+
+## Hatch Completion
+
+Unlike the previous design, there is **no explicit hatch signal**. Hatch is complete when:
+
+1. Identity files loaded into LTM
+2. Identity memories marked unevictable in RAM
+3. First message (JUST_HATCHED.md or BOOTSTRAP.md) delivered
+4. **Agent begins chatting**
+
+The transition from "hatching" to "operational" is seamless.
+
+## Privilege Model
+
+| Capability | First Agent | Regular Agent | User |
+|------------|-------------|---------------|------|
+| Modify system templates | ✅ | ❌ | ❌ |
+| Create new agents | ✅ | ❌ | ✅ |
+| Edit own identity | ✅ | ✅ | N/A |
+| Access other agent LTM | ❌ | ❌ | ✅ (admin) |
+
+## File Structure
+
+```
+system/                        # System templates (read-only for regular agents)
+├── SOUL.md                    # Default personality template
+├── AGENT.md                   # Default operational rules template
+├── IDENTITY.md                # Default public identity template
+├── JUST_HATCHED.md            # First message for new agents
+└── BOOTSTRAP.md               # First message for first agent
+
+agents/                        # Agent directories (no state files)
+├── <agent_id>/                # Empty or minimal metadata
+└── ...
+```
+
+## Benefits of LTM-Only Architecture
+
+1. **Versioning**: All identity changes have history
+2. **Rollback**: Can restore previous identity versions
+3. **Backup**: LTM can be backed up independently
+4. **Isolation**: Each agent's memory is completely separate
+5. **Enforcement**: Agent cannot bypass versioning via filesystem
+6. **Scalability**: LTM designed for many agents, filesystem not required
+
+## TODO
+
+- [ ] Create `JUST_HATCHED.md` template
+- [ ] Create `BOOTSTRAP.md` template
+- [ ] Implement hatch-to-LTM loading in `system_hooks.zig`
+- [ ] Add unevictable flag handling for identity memories
+- [ ] Document MemId format for identity memories
