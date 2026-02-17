@@ -44,6 +44,35 @@ pub const TickResult = struct {
     }
 };
 
+pub const BrainProviderOverride = struct {
+    provider_name: ?[]u8 = null,
+    model_name: ?[]u8 = null,
+    think_level: ?[]u8 = null,
+
+    pub fn isEmpty(self: BrainProviderOverride) bool {
+        return self.provider_name == null and self.model_name == null and self.think_level == null;
+    }
+
+    pub fn deinit(self: *BrainProviderOverride, allocator: std.mem.Allocator) void {
+        if (self.provider_name) |value| allocator.free(value);
+        if (self.model_name) |value| allocator.free(value);
+        if (self.think_level) |value| allocator.free(value);
+        self.* = .{};
+    }
+};
+
+pub const BrainProviderOverrideInput = struct {
+    provider_name: ?[]const u8 = null,
+    model_name: ?[]const u8 = null,
+    think_level: ?[]const u8 = null,
+};
+
+pub const BrainProviderOverrideView = struct {
+    provider_name: ?[]const u8 = null,
+    model_name: ?[]const u8 = null,
+    think_level: ?[]const u8 = null,
+};
+
 pub const AgentRuntime = struct {
     allocator: std.mem.Allocator,
     agent_id: []u8,
@@ -52,6 +81,7 @@ pub const AgentRuntime = struct {
     bus: event_bus.EventBus,
     world_tools: tool_registry.ToolRegistry,
     brains: std.StringHashMapUnmanaged(brain_context.BrainContext) = .{},
+    brain_provider_overrides: std.StringHashMapUnmanaged(BrainProviderOverride) = .{},
     tick_queue: std.ArrayListUnmanaged([]u8) = .{},
     outbound_messages: std.ArrayListUnmanaged([]u8) = .{},
     control_events: std.ArrayListUnmanaged([]u8) = .{},
@@ -123,6 +153,13 @@ pub const AgentRuntime = struct {
         }
         self.brains.deinit(self.allocator);
 
+        var provider_it = self.brain_provider_overrides.iterator();
+        while (provider_it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            entry.value_ptr.deinit(self.allocator);
+        }
+        self.brain_provider_overrides.deinit(self.allocator);
+
         for (self.tick_queue.items) |name| self.allocator.free(name);
         self.tick_queue.deinit(self.allocator);
 
@@ -150,6 +187,60 @@ pub const AgentRuntime = struct {
         const owned_name = try self.allocator.dupe(u8, brain_name);
         const context = try brain_context.BrainContext.init(self.allocator, brain_name);
         try self.brains.put(self.allocator, owned_name, context);
+    }
+
+    pub fn addBrainWithProviderOverride(
+        self: *AgentRuntime,
+        brain_name: []const u8,
+        override: BrainProviderOverrideInput,
+    ) !void {
+        try self.addBrain(brain_name);
+        try self.setBrainProviderOverride(brain_name, override);
+    }
+
+    pub fn setBrainProviderOverride(
+        self: *AgentRuntime,
+        brain_name: []const u8,
+        override: BrainProviderOverrideInput,
+    ) !void {
+        if (!self.brains.contains(brain_name)) return RuntimeError.BrainNotFound;
+
+        var owned = BrainProviderOverride{
+            .provider_name = if (override.provider_name) |value| try self.allocator.dupe(u8, value) else null,
+            .model_name = if (override.model_name) |value| try self.allocator.dupe(u8, value) else null,
+            .think_level = if (override.think_level) |value| try self.allocator.dupe(u8, value) else null,
+        };
+        errdefer owned.deinit(self.allocator);
+
+        if (owned.isEmpty()) {
+            self.clearBrainProviderOverride(brain_name);
+            return;
+        }
+
+        if (self.brain_provider_overrides.getPtr(brain_name)) |existing| {
+            existing.deinit(self.allocator);
+            existing.* = owned;
+            return;
+        }
+
+        const owned_name = try self.allocator.dupe(u8, brain_name);
+        try self.brain_provider_overrides.put(self.allocator, owned_name, owned);
+    }
+
+    pub fn clearBrainProviderOverride(self: *AgentRuntime, brain_name: []const u8) void {
+        const removed = self.brain_provider_overrides.fetchRemove(brain_name) orelse return;
+        self.allocator.free(removed.key);
+        var value = removed.value;
+        value.deinit(self.allocator);
+    }
+
+    pub fn getBrainProviderOverride(self: *const AgentRuntime, brain_name: []const u8) ?BrainProviderOverrideView {
+        const value = self.brain_provider_overrides.get(brain_name) orelse return null;
+        return .{
+            .provider_name = value.provider_name,
+            .model_name = value.model_name,
+            .think_level = value.think_level,
+        };
     }
 
     pub fn setState(self: *AgentRuntime, next_state: RuntimeState) !void {
@@ -513,6 +604,52 @@ test "agent_runtime: create primary + sub brain and execute one tick" {
 
     try std.testing.expectEqual(@as(u64, 1), result.checkpoint);
     try std.testing.expect(std.mem.indexOf(u8, result.observe_json, "\"active_memory\"") != null);
+}
+
+test "agent_runtime: brain provider overrides are mutable and clearable" {
+    const allocator = std.testing.allocator;
+    var runtime = try AgentRuntime.init(allocator, "agentA", &[_][]const u8{"research"});
+    defer runtime.deinit();
+
+    try runtime.setBrainProviderOverride("research", .{
+        .provider_name = "openai-codex",
+        .model_name = "gpt-5.1-codex-mini",
+        .think_level = "high",
+    });
+
+    const first = runtime.getBrainProviderOverride("research").?;
+    try std.testing.expectEqualStrings("openai-codex", first.provider_name.?);
+    try std.testing.expectEqualStrings("gpt-5.1-codex-mini", first.model_name.?);
+    try std.testing.expectEqualStrings("high", first.think_level.?);
+
+    try runtime.setBrainProviderOverride("research", .{
+        .model_name = "gpt-5.2",
+    });
+    const second = runtime.getBrainProviderOverride("research").?;
+    try std.testing.expect(second.provider_name == null);
+    try std.testing.expectEqualStrings("gpt-5.2", second.model_name.?);
+    try std.testing.expect(second.think_level == null);
+
+    try runtime.setBrainProviderOverride("research", .{});
+    try std.testing.expect(runtime.getBrainProviderOverride("research") == null);
+}
+
+test "agent_runtime: addBrainWithProviderOverride applies spawn-time model settings" {
+    const allocator = std.testing.allocator;
+    var runtime = try AgentRuntime.init(allocator, "agentA", &[_][]const u8{});
+    defer runtime.deinit();
+
+    try runtime.addBrainWithProviderOverride("delegate", .{
+        .provider_name = "openai",
+        .model_name = "gpt-4.1-mini",
+        .think_level = "medium",
+    });
+
+    try std.testing.expect(runtime.brains.contains("delegate"));
+    const override = runtime.getBrainProviderOverride("delegate").?;
+    try std.testing.expectEqualStrings("openai", override.provider_name.?);
+    try std.testing.expectEqualStrings("gpt-4.1-mini", override.model_name.?);
+    try std.testing.expectEqualStrings("medium", override.think_level.?);
 }
 
 test "agent_runtime: queue saturation returns explicit overload" {

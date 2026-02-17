@@ -14,6 +14,9 @@ pub const BrainSpecialization = struct {
     denied_tools: ?std.ArrayListUnmanaged([]const u8),
     role: ?[]const u8,
     can_spawn_subbrains: bool,
+    provider_name: ?[]const u8,
+    model_name: ?[]const u8,
+    think_level: ?[]const u8,
     additional_rom: std.ArrayListUnmanaged(hook_registry.RomEntry),
 
     pub fn init(allocator: std.mem.Allocator, brain_name: []const u8) BrainSpecialization {
@@ -24,6 +27,9 @@ pub const BrainSpecialization = struct {
             .denied_tools = null,
             .role = null,
             .can_spawn_subbrains = false,
+            .provider_name = null,
+            .model_name = null,
+            .think_level = null,
             .additional_rom = .{},
         };
     }
@@ -43,6 +49,15 @@ pub const BrainSpecialization = struct {
         }
         if (self.role) |role| {
             self.allocator.free(role);
+        }
+        if (self.provider_name) |value| {
+            self.allocator.free(value);
+        }
+        if (self.model_name) |value| {
+            self.allocator.free(value);
+        }
+        if (self.think_level) |value| {
+            self.allocator.free(value);
         }
         for (self.additional_rom.items) |*entry| {
             self.allocator.free(entry.key);
@@ -89,13 +104,13 @@ pub fn loadBrainSpecialization(
     // Parse JSON
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, content.?, .{});
     defer parsed.deinit();
-    
+
     // Validate root is an object
     if (parsed.value != .object) {
         std.log.warn("agent.json for {s} is not a JSON object", .{brain_name});
         return null;
     }
-    
+
     const root = parsed.value.object;
 
     // Parse allowed_tools
@@ -135,6 +150,55 @@ pub fn loadBrainSpecialization(
     if (root.get("can_spawn_subbrains")) |spawn_json| {
         if (spawn_json == .bool) {
             spec.can_spawn_subbrains = spawn_json.bool;
+        }
+    }
+
+    // Parse provider/model/think settings (top-level or provider object)
+    if (root.get("provider")) |provider_json| {
+        switch (provider_json) {
+            .string => {
+                spec.provider_name = try allocator.dupe(u8, provider_json.string);
+            },
+            .object => {
+                if (provider_json.object.get("name")) |name_json| {
+                    if (name_json == .string) {
+                        spec.provider_name = try allocator.dupe(u8, name_json.string);
+                    }
+                }
+                if (provider_json.object.get("model")) |model_json| {
+                    if (model_json == .string) {
+                        spec.model_name = try allocator.dupe(u8, model_json.string);
+                    }
+                }
+                if (provider_json.object.get("think_level")) |think_json| {
+                    if (think_json == .string) {
+                        spec.think_level = try allocator.dupe(u8, think_json.string);
+                    }
+                }
+            },
+            else => {},
+        }
+    }
+    if (root.get("model")) |model_json| {
+        if (model_json == .string) {
+            if (spec.model_name) |existing| allocator.free(existing);
+            spec.model_name = try allocator.dupe(u8, model_json.string);
+        }
+    }
+    if (root.get("think_level")) |think_json| {
+        if (think_json == .string) {
+            if (spec.think_level) |existing| allocator.free(existing);
+            spec.think_level = try allocator.dupe(u8, think_json.string);
+        }
+    } else if (root.get("thinking_level")) |think_json| {
+        if (think_json == .string) {
+            if (spec.think_level) |existing| allocator.free(existing);
+            spec.think_level = try allocator.dupe(u8, think_json.string);
+        }
+    } else if (root.get("reasoning")) |think_json| {
+        if (think_json == .string) {
+            if (spec.think_level) |existing| allocator.free(existing);
+            spec.think_level = try allocator.dupe(u8, think_json.string);
         }
     }
 
@@ -182,9 +246,25 @@ pub fn applyBrainSpecializationHook(ctx: *HookContext, data: HookData) HookError
     }
 
     // Add can_spawn_subbrains flag
-    rom.set("system:can_spawn_subbrains",
-        if (spec.?.can_spawn_subbrains) "true" else "false"
-    ) catch return HookError.OutOfMemory;
+    rom.set("system:can_spawn_subbrains", if (spec.?.can_spawn_subbrains) "true" else "false") catch return HookError.OutOfMemory;
+
+    var effective_provider = spec.?.provider_name;
+    var effective_model = spec.?.model_name;
+    var effective_think_level = spec.?.think_level;
+    if (ctx.runtime.getBrainProviderOverride(ctx.brain_name)) |runtime_override| {
+        if (runtime_override.provider_name) |value| effective_provider = value;
+        if (runtime_override.model_name) |value| effective_model = value;
+        if (runtime_override.think_level) |value| effective_think_level = value;
+    }
+    if (effective_provider) |value| {
+        rom.set("system:provider", value) catch return HookError.OutOfMemory;
+    }
+    if (effective_model) |value| {
+        rom.set("system:model", value) catch return HookError.OutOfMemory;
+    }
+    if (effective_think_level) |value| {
+        rom.set("system:think_level", value) catch return HookError.OutOfMemory;
+    }
 
     // Filter available tools
     const capabilities_json = rom.get("system:capabilities") orelse return;
@@ -453,7 +533,7 @@ fn loadAgentJsonFile(
         std.log.err("Invalid agent_id contains path traversal: {s}", .{runtime.agent_id});
         return error.InvalidAgentId;
     }
-    
+
     // Construct path: agents/{agent_id}/{brain_name}/agent.json
     // For primary brain, use agent root: agents/{agent_id}/agent.json
     const base_dir = try std.fs.path.join(allocator, &.{ "agents", runtime.agent_id });
@@ -478,20 +558,20 @@ fn loadAgentJsonFile(
 fn isValidAgentId(agent_id: []const u8) bool {
     // Reject empty IDs
     if (agent_id.len == 0) return false;
-    
+
     // Reject absolute paths
     if (agent_id[0] == '/') return false;
-    
+
     // Reject path traversal sequences
     // Check for ".." as a complete path component
     var it = std.mem.splitScalar(u8, agent_id, '/');
     while (it.next()) |component| {
         if (std.mem.eql(u8, component, "..")) return false;
     }
-    
+
     // Reject null bytes
     if (std.mem.indexOfScalar(u8, agent_id, 0) != null) return false;
-    
+
     return true;
 }
 
