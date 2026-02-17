@@ -30,13 +30,31 @@ pub const Frame = struct {
     }
 };
 
+pub const HandshakeInfo = struct {
+    path: []u8,
+
+    pub fn deinit(self: *HandshakeInfo, allocator: std.mem.Allocator) void {
+        allocator.free(self.path);
+        self.* = undefined;
+    }
+};
+
 pub fn performHandshake(allocator: std.mem.Allocator, stream: *std.net.Stream) !void {
+    var info = try performHandshakeWithInfo(allocator, stream);
+    defer info.deinit(allocator);
+}
+
+pub fn performHandshakeWithInfo(allocator: std.mem.Allocator, stream: *std.net.Stream) !HandshakeInfo {
     const request = try readHttpRequest(allocator, stream, default_max_http_request_bytes);
     defer allocator.free(request);
 
     const has_upgrade = std.mem.indexOf(u8, request, "Upgrade: websocket") != null or
         std.mem.indexOf(u8, request, "upgrade: websocket") != null;
     if (!has_upgrade) return Error.InvalidHandshake;
+
+    const request_path = extractRequestPath(request) orelse return Error.InvalidHandshake;
+    const owned_path = try allocator.dupe(u8, request_path);
+    errdefer allocator.free(owned_path);
 
     const ws_key = extractWebSocketKey(request) orelse return Error.NoWebSocketKey;
     const accept_key = try computeWebSocketAcceptKey(allocator, ws_key);
@@ -53,6 +71,7 @@ pub fn performHandshake(allocator: std.mem.Allocator, stream: *std.net.Stream) !
     defer allocator.free(response);
 
     try stream.writeAll(response);
+    return .{ .path = owned_path };
 }
 
 pub fn readFrame(allocator: std.mem.Allocator, stream: *std.net.Stream, max_payload_bytes: usize) !Frame {
@@ -162,6 +181,17 @@ fn extractWebSocketKey(request: []const u8) ?[]const u8 {
     return null;
 }
 
+fn extractRequestPath(request: []const u8) ?[]const u8 {
+    const line_end = std.mem.indexOf(u8, request, "\r\n") orelse return null;
+    const line = request[0..line_end];
+    if (!std.mem.startsWith(u8, line, "GET ")) return null;
+
+    const path_start = 4;
+    const path_end = std.mem.indexOfPos(u8, line, path_start, " ") orelse return null;
+    if (path_end <= path_start) return null;
+    return line[path_start..path_end];
+}
+
 fn computeWebSocketAcceptKey(allocator: std.mem.Allocator, client_key: []const u8) ![]u8 {
     const combined = try std.fmt.allocPrint(allocator, "{s}{s}", .{ client_key, WEBSOCKET_MAGIC });
     defer allocator.free(combined);
@@ -189,4 +219,14 @@ test "websocket_transport: compute accept key from RFC sample" {
     const accept = try computeWebSocketAcceptKey(allocator, key);
     defer allocator.free(accept);
     try std.testing.expectEqualStrings("s3pPLMBiTxaQ9kYGzzhZRbK+xOo=", accept);
+}
+
+test "websocket_transport: extract request path from handshake line" {
+    const request =
+        "GET /v1/agents/alpha/stream HTTP/1.1\r\n" ++
+        "Host: localhost\r\n" ++
+        "\r\n";
+
+    const path = extractRequestPath(request) orelse return error.TestExpectedPath;
+    try std.testing.expectEqualStrings("/v1/agents/alpha/stream", path);
 }

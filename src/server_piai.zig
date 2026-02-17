@@ -7,6 +7,66 @@ const websocket_transport = @import("websocket_transport.zig");
 
 pub const RuntimeServer = runtime_server_mod.RuntimeServer;
 
+const AgentRuntimeRegistry = struct {
+    allocator: std.mem.Allocator,
+    runtime_config: Config.RuntimeConfig,
+    provider_config: ?Config.ProviderConfig,
+    mutex: std.Thread.Mutex = .{},
+    by_agent: std.StringHashMapUnmanaged(*RuntimeServer) = .{},
+
+    fn init(
+        allocator: std.mem.Allocator,
+        runtime_config: Config.RuntimeConfig,
+        provider_config: ?Config.ProviderConfig,
+    ) AgentRuntimeRegistry {
+        return .{
+            .allocator = allocator,
+            .runtime_config = runtime_config,
+            .provider_config = provider_config,
+        };
+    }
+
+    fn deinit(self: *AgentRuntimeRegistry) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        var it = self.by_agent.iterator();
+        while (it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            entry.value_ptr.*.destroy();
+        }
+        self.by_agent.deinit(self.allocator);
+    }
+
+    fn getOrCreate(self: *AgentRuntimeRegistry, agent_id: []const u8) !*RuntimeServer {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        if (self.by_agent.get(agent_id)) |existing| return existing;
+
+        const owned_agent = try self.allocator.dupe(u8, agent_id);
+        errdefer self.allocator.free(owned_agent);
+
+        const runtime_server = if (self.provider_config) |provider_cfg|
+            try RuntimeServer.createWithProvider(
+                self.allocator,
+                owned_agent,
+                self.runtime_config,
+                provider_cfg,
+            )
+        else
+            try RuntimeServer.create(
+                self.allocator,
+                owned_agent,
+                self.runtime_config,
+            );
+        errdefer runtime_server.destroy();
+
+        try self.by_agent.put(self.allocator, owned_agent, runtime_server);
+        return runtime_server;
+    }
+};
+
 pub fn run(
     allocator: std.mem.Allocator,
     bind_addr: []const u8,
@@ -14,13 +74,10 @@ pub fn run(
     provider_config: Config.ProviderConfig,
     runtime_config: Config.RuntimeConfig,
 ) !void {
-    const runtime_server = try RuntimeServer.createWithProvider(
-        allocator,
-        runtime_server_mod.default_agent_id,
-        runtime_config,
-        provider_config,
-    );
-    defer runtime_server.destroy();
+    var runtime_registry = AgentRuntimeRegistry.init(allocator, runtime_config, provider_config);
+    defer runtime_registry.deinit();
+
+    _ = try runtime_registry.getOrCreate(runtime_server_mod.default_agent_id);
 
     const address = try std.net.Address.parseIp(bind_addr, port);
     var tcp_server = try address.listen(.{ .reuse_address = true });
@@ -31,7 +88,7 @@ pub fn run(
         runtime_config.connection_worker_threads,
         runtime_config.connection_queue_max,
         workerHandleConnection,
-        runtime_server,
+        &runtime_registry,
     );
     defer dispatcher.destroy();
 
@@ -64,16 +121,20 @@ fn workerHandleConnection(
     stream: *std.net.Stream,
     ctx: ?*anyopaque,
 ) !void {
-    const runtime_server: *RuntimeServer = @ptrCast(@alignCast(ctx orelse return error.InvalidContext));
-    try handleWebSocketConnection(allocator, runtime_server, stream);
+    const runtime_registry: *AgentRuntimeRegistry = @ptrCast(@alignCast(ctx orelse return error.InvalidContext));
+    try handleWebSocketConnection(allocator, runtime_registry, stream);
 }
 
 fn handleWebSocketConnection(
     allocator: std.mem.Allocator,
-    runtime_server: *RuntimeServer,
+    runtime_registry: *AgentRuntimeRegistry,
     stream: *std.net.Stream,
 ) !void {
-    try websocket_transport.performHandshake(allocator, stream);
+    var handshake = try websocket_transport.performHandshakeWithInfo(allocator, stream);
+    defer handshake.deinit(allocator);
+
+    const agent_id = parseAgentIdFromStreamPath(handshake.path) orelse runtime_server_mod.default_agent_id;
+    const runtime_server = try runtime_registry.getOrCreate(agent_id);
 
     while (true) {
         var frame = websocket_transport.readFrame(
@@ -117,6 +178,23 @@ fn handleWebSocketConnection(
     }
 }
 
+fn parseAgentIdFromStreamPath(path: []const u8) ?[]const u8 {
+    const prefix = "/v1/agents/";
+    const stream_suffix = "/stream";
+    if (!std.mem.startsWith(u8, path, prefix)) return null;
+
+    const after_prefix = path[prefix.len..];
+    const suffix_at = std.mem.indexOf(u8, after_prefix, stream_suffix) orelse return null;
+    if (suffix_at == 0) return null;
+
+    const agent_id = after_prefix[0..suffix_at];
+    if (std.mem.indexOfScalar(u8, agent_id, '/') != null) return null;
+
+    const trailing = after_prefix[suffix_at + stream_suffix.len ..];
+    if (trailing.len != 0 and !std.mem.startsWith(u8, trailing, "?")) return null;
+    return agent_id;
+}
+
 fn sendServiceUnavailable(stream: *std.net.Stream) !void {
     const payload =
         "HTTP/1.1 503 Service Unavailable\r\n" ++
@@ -128,7 +206,7 @@ fn sendServiceUnavailable(stream: *std.net.Stream) !void {
 
 const WsTestServerCtx = struct {
     allocator: std.mem.Allocator,
-    runtime_server: *RuntimeServer,
+    runtime_registry: *AgentRuntimeRegistry,
     listener: *std.net.Server,
     err_name: ?[]u8 = null,
 
@@ -144,7 +222,7 @@ fn runSingleWsConnection(ctx: *WsTestServerCtx) void {
     };
     defer connection.stream.close();
 
-    handleWebSocketConnection(ctx.allocator, ctx.runtime_server, &connection.stream) catch |err| {
+    handleWebSocketConnection(ctx.allocator, ctx.runtime_registry, &connection.stream) catch |err| {
         ctx.err_name = std.fmt.allocPrint(ctx.allocator, "{s}", .{@errorName(err)}) catch null;
     };
 }
@@ -244,20 +322,40 @@ fn readExactFromStream(stream: *std.net.Stream, out: []u8) !void {
     }
 }
 
+fn performClientHandshake(allocator: std.mem.Allocator, client: *std.net.Stream, path: []const u8) !void {
+    const handshake = try std.fmt.allocPrint(
+        allocator,
+        "GET {s} HTTP/1.1\r\n" ++
+            "Host: localhost\r\n" ++
+            "Upgrade: websocket\r\n" ++
+            "Connection: Upgrade\r\n" ++
+            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" ++
+            "Sec-WebSocket-Version: 13\r\n" ++
+            "\r\n",
+        .{path},
+    );
+    defer allocator.free(handshake);
+    try client.writeAll(handshake);
+
+    const handshake_response = try readHttpHeadersAlloc(allocator, client, 16 * 1024);
+    defer allocator.free(handshake_response);
+    try std.testing.expect(std.mem.indexOf(u8, handshake_response, "101 Switching Protocols") != null);
+}
+
 test "server_piai: websocket path handles connect/session.send and rejects chat.send" {
     const allocator = std.testing.allocator;
-    const runtime_server = try RuntimeServer.create(allocator, runtime_server_mod.default_agent_id, .{
+    var runtime_registry = AgentRuntimeRegistry.init(allocator, .{
         .ltm_directory = "",
         .ltm_filename = "",
-    });
-    defer runtime_server.destroy();
+    }, null);
+    defer runtime_registry.deinit();
 
     var listener = try (try std.net.Address.parseIp("127.0.0.1", 0)).listen(.{ .reuse_address = true });
     defer listener.deinit();
 
     var server_ctx = WsTestServerCtx{
         .allocator = allocator,
-        .runtime_server = runtime_server,
+        .runtime_registry = &runtime_registry,
         .listener = &listener,
     };
     defer server_ctx.deinit();
@@ -268,19 +366,7 @@ test "server_piai: websocket path handles connect/session.send and rejects chat.
     var client = try std.net.tcpConnectToAddress(listener.listen_address);
     defer client.close();
 
-    const handshake =
-        "GET /v1/agents/default/stream HTTP/1.1\r\n" ++
-        "Host: localhost\r\n" ++
-        "Upgrade: websocket\r\n" ++
-        "Connection: Upgrade\r\n" ++
-        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" ++
-        "Sec-WebSocket-Version: 13\r\n" ++
-        "\r\n";
-    try client.writeAll(handshake);
-
-    const handshake_response = try readHttpHeadersAlloc(allocator, &client, 16 * 1024);
-    defer allocator.free(handshake_response);
-    try std.testing.expect(std.mem.indexOf(u8, handshake_response, "101 Switching Protocols") != null);
+    try performClientHandshake(allocator, &client, "/v1/agents/default/stream");
 
     try writeClientTextFrameMasked(&client, "{\"id\":\"req-connect\",\"type\":\"connect\"}");
     var connect_ack = try readServerFrame(allocator, &client);
@@ -317,4 +403,103 @@ test "server_piai: websocket path handles connect/session.send and rejects chat.
     try std.testing.expectEqual(@as(u8, 0x8), close_reply.opcode);
 
     try std.testing.expect(server_ctx.err_name == null);
+}
+
+test "server_piai: route path agent id isolates runtime state across connections" {
+    const allocator = std.testing.allocator;
+    var runtime_registry = AgentRuntimeRegistry.init(allocator, .{
+        .ltm_directory = "",
+        .ltm_filename = "",
+    }, null);
+    defer runtime_registry.deinit();
+
+    var listener = try (try std.net.Address.parseIp("127.0.0.1", 0)).listen(.{ .reuse_address = true });
+    defer listener.deinit();
+
+    var server_ctx = WsTestServerCtx{
+        .allocator = allocator,
+        .runtime_registry = &runtime_registry,
+        .listener = &listener,
+    };
+    defer server_ctx.deinit();
+
+    {
+        const server_thread = try std.Thread.spawn(.{}, runSingleWsConnection, .{&server_ctx});
+        defer server_thread.join();
+
+        var client = try std.net.tcpConnectToAddress(listener.listen_address);
+        defer client.close();
+        try performClientHandshake(allocator, &client, "/v1/agents/alpha/stream");
+
+        try writeClientTextFrameMasked(&client, "{\"id\":\"a-connect\",\"type\":\"connect\"}");
+        var connect_ack = try readServerFrame(allocator, &client);
+        defer connect_ack.deinit(allocator);
+        try std.testing.expect(std.mem.indexOf(u8, connect_ack.payload, "\"type\":\"connect.ack\"") != null);
+
+        try writeClientTextFrameMasked(&client, "{\"id\":\"a-pause\",\"type\":\"agent.control\",\"action\":\"pause\"}");
+        var pause_frame = try readServerFrame(allocator, &client);
+        defer pause_frame.deinit(allocator);
+        try std.testing.expect(std.mem.indexOf(u8, pause_frame.payload, "\"type\":\"agent.state\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, pause_frame.payload, "\"state\":\"paused\"") != null);
+
+        try websocket_transport.writeFrame(&client, "", .close);
+        var close_reply = try readServerFrame(allocator, &client);
+        defer close_reply.deinit(allocator);
+        try std.testing.expectEqual(@as(u8, 0x8), close_reply.opcode);
+    }
+
+    {
+        const server_thread = try std.Thread.spawn(.{}, runSingleWsConnection, .{&server_ctx});
+        defer server_thread.join();
+
+        var client = try std.net.tcpConnectToAddress(listener.listen_address);
+        defer client.close();
+        try performClientHandshake(allocator, &client, "/v1/agents/beta/stream");
+
+        try writeClientTextFrameMasked(&client, "{\"id\":\"b-connect\",\"type\":\"connect\"}");
+        var connect_ack = try readServerFrame(allocator, &client);
+        defer connect_ack.deinit(allocator);
+        try std.testing.expect(std.mem.indexOf(u8, connect_ack.payload, "\"type\":\"connect.ack\"") != null);
+
+        try writeClientTextFrameMasked(&client, "{\"id\":\"b-state\",\"type\":\"agent.control\",\"action\":\"state\"}");
+        var state_frame = try readServerFrame(allocator, &client);
+        defer state_frame.deinit(allocator);
+        try std.testing.expect(std.mem.indexOf(u8, state_frame.payload, "\"type\":\"agent.state\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, state_frame.payload, "\"state\":\"running\"") != null);
+
+        try websocket_transport.writeFrame(&client, "", .close);
+        var close_reply = try readServerFrame(allocator, &client);
+        defer close_reply.deinit(allocator);
+        try std.testing.expectEqual(@as(u8, 0x8), close_reply.opcode);
+    }
+
+    {
+        const server_thread = try std.Thread.spawn(.{}, runSingleWsConnection, .{&server_ctx});
+        defer server_thread.join();
+
+        var client = try std.net.tcpConnectToAddress(listener.listen_address);
+        defer client.close();
+        try performClientHandshake(allocator, &client, "/v1/agents/alpha/stream");
+
+        try writeClientTextFrameMasked(&client, "{\"id\":\"a-state\",\"type\":\"agent.control\",\"action\":\"state\"}");
+        var state_frame = try readServerFrame(allocator, &client);
+        defer state_frame.deinit(allocator);
+        try std.testing.expect(std.mem.indexOf(u8, state_frame.payload, "\"type\":\"agent.state\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, state_frame.payload, "\"state\":\"paused\"") != null);
+
+        try websocket_transport.writeFrame(&client, "", .close);
+        var close_reply = try readServerFrame(allocator, &client);
+        defer close_reply.deinit(allocator);
+        try std.testing.expectEqual(@as(u8, 0x8), close_reply.opcode);
+    }
+
+    try std.testing.expect(server_ctx.err_name == null);
+}
+
+test "server_piai: parse route path extracts agent id" {
+    const path = parseAgentIdFromStreamPath("/v1/agents/alpha/stream") orelse return error.TestExpectedAgent;
+    try std.testing.expectEqualStrings("alpha", path);
+    try std.testing.expect(parseAgentIdFromStreamPath("/v1/agents/alpha/stream?x=1") != null);
+    try std.testing.expect(parseAgentIdFromStreamPath("/v1/agents//stream") == null);
+    try std.testing.expect(parseAgentIdFromStreamPath("/v1/agents/alpha/not-stream") == null);
 }

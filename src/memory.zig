@@ -203,18 +203,19 @@ pub const RuntimeMemory = struct {
         const base_name = try self.uniqueNameLocked(store, brain, name);
         defer self.allocator.free(base_name);
 
-        const parsed = memid.MemId{
+        const base_mem_id = memid.MemId{
             .agent = self.agent_id,
             .brain = brain,
             .name = base_name,
-            .version = 1,
+            .version = null,
         };
-        const mem_id = try parsed.format(self.allocator);
+        const version = try self.nextVersionForBaseLocked(base_mem_id);
+        const mem_id = try base_mem_id.withVersion(version).format(self.allocator);
 
         var item = ActiveMemoryItem{
             .mem_id = mem_id,
             .tier = tier,
-            .version = 1,
+            .version = version,
             .kind = try self.allocator.dupe(u8, kind),
             .mutable = tier == .ram,
             .created_at_ms = std.time.milliTimestamp(),
@@ -409,6 +410,30 @@ pub const RuntimeMemory = struct {
         }
 
         return out.toOwnedSlice(allocator);
+    }
+
+    fn nextVersionForBaseLocked(self: *RuntimeMemory, base_mem_id: memid.MemId) !u64 {
+        const base_id = try base_mem_id.formatBase(self.allocator);
+        defer self.allocator.free(base_id);
+
+        var next_version: u64 = 1;
+        if (self.history_by_base.getPtr(base_id)) |history| {
+            if (history.latest()) |latest| {
+                if (latest.version) |version| {
+                    if (version >= next_version) next_version = version + 1;
+                }
+            }
+        }
+
+        if (self.persisted_store) |store| {
+            if (store.load(self.allocator, base_id, null) catch return MemoryError.PersistenceFailed) |loaded_record| {
+                var record = loaded_record;
+                defer record.deinit(self.allocator);
+                if (record.version >= next_version) next_version = record.version + 1;
+            }
+        }
+
+        return next_version;
     }
 
     fn ensureBrainLocked(self: *RuntimeMemory, brain: []const u8) !*BrainStore {
@@ -901,4 +926,37 @@ test "memory: persisted store supports reload across runtime restarts" {
     var v1 = try second_runtime.load(latest_alias, 1);
     defer v1.deinit(allocator);
     try std.testing.expectEqualStrings("{\"text\":\"v1\"}", v1.content_json);
+}
+
+test "memory: create allocates next version from persisted history" {
+    const allocator = std.testing.allocator;
+    const dir = try std.fmt.allocPrint(allocator, ".tmp-memory-create-version-{d}", .{std.time.nanoTimestamp()});
+    defer allocator.free(dir);
+    defer std.fs.cwd().deleteTree(dir) catch {};
+
+    try std.fs.cwd().makePath(dir);
+    var store = try ltm_store.VersionedMemStore.open(allocator, dir, "runtime-memory.db");
+    defer store.close();
+
+    const alias = alias_blk: {
+        var first_runtime = try RuntimeMemory.initWithStore(allocator, "agentA", &store);
+        defer first_runtime.deinit();
+
+        var created = try first_runtime.create("primary", .ram, "memo", "note", "{\"text\":\"v1\"}");
+        defer created.deinit(allocator);
+        break :alias_blk try (try memid.MemId.parse(created.mem_id)).withVersion(null).format(allocator);
+    };
+    defer allocator.free(alias);
+
+    var second_runtime = try RuntimeMemory.initWithStore(allocator, "agentA", &store);
+    defer second_runtime.deinit();
+
+    var created_again = try second_runtime.create("primary", .ram, "memo", "note", "{\"text\":\"v2\"}");
+    defer created_again.deinit(allocator);
+    try std.testing.expectEqual(@as(?u64, 2), created_again.version);
+
+    var latest = try second_runtime.load(alias, null);
+    defer latest.deinit(allocator);
+    try std.testing.expectEqual(@as(?u64, 2), latest.version);
+    try std.testing.expectEqualStrings("{\"text\":\"v2\"}", latest.content_json);
 }
