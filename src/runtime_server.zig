@@ -248,7 +248,14 @@ pub const RuntimeServer = struct {
                 return self.submitRuntimeJobAndAwait(parsed.msg_type, request_id, parsed.content, parsed.action, .chat);
             },
             .agent_control => {
-                return self.submitRuntimeJobAndAwait(parsed.msg_type, request_id, parsed.content, parsed.action, .control);
+                const operation_class: RuntimeOperationClass = if (isChatLikeControlAction(parsed.action)) .chat else .control;
+                return self.submitRuntimeJobAndAwait(
+                    parsed.msg_type,
+                    request_id,
+                    parsed.content,
+                    parsed.action,
+                    operation_class,
+                );
             },
             else => {
                 return self.wrapSingleFrame(try protocol.buildErrorWithCode(
@@ -696,6 +703,11 @@ pub const RuntimeServer = struct {
     }
 };
 
+fn isChatLikeControlAction(action: ?[]const u8) bool {
+    const control_action = action orelse "state";
+    return std.mem.eql(u8, control_action, "goal") or std.mem.eql(u8, control_action, "plan");
+}
+
 fn extractAssistantText(allocator: std.mem.Allocator, events: []const ziggy_piai.types.AssistantMessageEvent) ![]u8 {
     var text = std.ArrayListUnmanaged(u8){};
     defer text.deinit(allocator);
@@ -1112,6 +1124,46 @@ test "runtime_server: queued control request times out with runtime_timeout code
     try std.testing.expect(ctx.err_name == null);
     try std.testing.expect(ctx.response != null);
     try std.testing.expect(std.mem.indexOf(u8, ctx.response.?, "\"code\":\"runtime_timeout\"") != null);
+}
+
+test "runtime_server: agent.control goal/plan use chat timeout class" {
+    const allocator = std.testing.allocator;
+    const server = try RuntimeServer.create(allocator, "agent-test", .{
+        .chat_operation_timeout_ms = 120,
+        .control_operation_timeout_ms = 10,
+        .ltm_directory = "",
+        .ltm_filename = "",
+    });
+    defer server.destroy();
+
+    const requests = [_][]const u8{
+        "{\"id\":\"req-goal-timeout-class\",\"type\":\"agent.control\",\"action\":\"goal\",\"content\":\"hello\"}",
+        "{\"id\":\"req-plan-timeout-class\",\"type\":\"agent.control\",\"action\":\"plan\",\"content\":\"hello\"}",
+    };
+
+    for (requests) |request_json| {
+        server.runtime_mutex.lock();
+        var runtime_locked = true;
+        defer if (runtime_locked) server.runtime_mutex.unlock();
+
+        var ctx = AsyncRequestCtx{
+            .allocator = allocator,
+            .server = server,
+            .request_json = request_json,
+        };
+        defer ctx.deinit();
+
+        const thread = try std.Thread.spawn(.{}, runRequestInThread, .{&ctx});
+        std.Thread.sleep(40 * std.time.ns_per_ms);
+        server.runtime_mutex.unlock();
+        runtime_locked = false;
+        thread.join();
+
+        try std.testing.expect(ctx.err_name == null);
+        try std.testing.expect(ctx.response != null);
+        try std.testing.expect(std.mem.indexOf(u8, ctx.response.?, "\"code\":\"runtime_timeout\"") == null);
+        try std.testing.expect(std.mem.indexOf(u8, ctx.response.?, "\"type\":\"session.receive\"") != null);
+    }
 }
 
 test "runtime_server: timed out queued control action does not execute later" {

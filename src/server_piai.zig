@@ -7,10 +7,14 @@ const websocket_transport = @import("websocket_transport.zig");
 
 pub const RuntimeServer = runtime_server_mod.RuntimeServer;
 
+const default_max_agent_runtimes: usize = 64;
+const max_agent_id_len: usize = 64;
+
 const AgentRuntimeRegistry = struct {
     allocator: std.mem.Allocator,
     runtime_config: Config.RuntimeConfig,
     provider_config: ?Config.ProviderConfig,
+    max_runtimes: usize,
     mutex: std.Thread.Mutex = .{},
     by_agent: std.StringHashMapUnmanaged(*RuntimeServer) = .{},
 
@@ -19,10 +23,20 @@ const AgentRuntimeRegistry = struct {
         runtime_config: Config.RuntimeConfig,
         provider_config: ?Config.ProviderConfig,
     ) AgentRuntimeRegistry {
+        return initWithLimits(allocator, runtime_config, provider_config, default_max_agent_runtimes);
+    }
+
+    fn initWithLimits(
+        allocator: std.mem.Allocator,
+        runtime_config: Config.RuntimeConfig,
+        provider_config: ?Config.ProviderConfig,
+        max_runtimes: usize,
+    ) AgentRuntimeRegistry {
         return .{
             .allocator = allocator,
             .runtime_config = runtime_config,
             .provider_config = provider_config,
+            .max_runtimes = if (max_runtimes == 0) 1 else max_runtimes,
         };
     }
 
@@ -43,6 +57,8 @@ const AgentRuntimeRegistry = struct {
         defer self.mutex.unlock();
 
         if (self.by_agent.get(agent_id)) |existing| return existing;
+        if (!isValidAgentId(agent_id)) return error.InvalidAgentId;
+        if (self.by_agent.count() >= self.max_runtimes) return error.RuntimeLimitReached;
 
         const owned_agent = try self.allocator.dupe(u8, agent_id);
         errdefer self.allocator.free(owned_agent);
@@ -64,6 +80,16 @@ const AgentRuntimeRegistry = struct {
 
         try self.by_agent.put(self.allocator, owned_agent, runtime_server);
         return runtime_server;
+    }
+
+    fn isValidAgentId(agent_id: []const u8) bool {
+        if (agent_id.len == 0 or agent_id.len > max_agent_id_len) return false;
+        for (agent_id) |char| {
+            if (std.ascii.isAlphanumeric(char)) continue;
+            if (char == '_' or char == '-' or char == '.') continue;
+            return false;
+        }
+        return true;
     }
 };
 
@@ -134,7 +160,17 @@ fn handleWebSocketConnection(
     defer handshake.deinit(allocator);
 
     const agent_id = parseAgentIdFromStreamPath(handshake.path) orelse runtime_server_mod.default_agent_id;
-    const runtime_server = try runtime_registry.getOrCreate(agent_id);
+    const runtime_server = runtime_registry.getOrCreate(agent_id) catch |err| switch (err) {
+        error.InvalidAgentId => {
+            try sendWebSocketErrorAndClose(allocator, stream, .invalid_envelope, "invalid agent id");
+            return;
+        },
+        error.RuntimeLimitReached => {
+            try sendWebSocketErrorAndClose(allocator, stream, .queue_saturated, "agent runtime limit reached");
+            return;
+        },
+        else => return err,
+    };
 
     while (true) {
         var frame = websocket_transport.readFrame(
@@ -176,6 +212,18 @@ fn handleWebSocketConnection(
             else => {},
         }
     }
+}
+
+fn sendWebSocketErrorAndClose(
+    allocator: std.mem.Allocator,
+    stream: *std.net.Stream,
+    code: protocol.ErrorCode,
+    message: []const u8,
+) !void {
+    const payload = try protocol.buildErrorWithCode(allocator, "unknown", code, message);
+    defer allocator.free(payload);
+    try websocket_transport.writeFrame(stream, payload, .text);
+    try websocket_transport.writeFrame(stream, "", .close);
 }
 
 fn parseAgentIdFromStreamPath(path: []const u8) ?[]const u8 {
@@ -496,10 +544,74 @@ test "server_piai: route path agent id isolates runtime state across connections
     try std.testing.expect(server_ctx.err_name == null);
 }
 
+test "server_piai: runtime creation is capped to avoid unbounded per-agent growth" {
+    const allocator = std.testing.allocator;
+    var runtime_registry = AgentRuntimeRegistry.initWithLimits(
+        allocator,
+        .{ .ltm_directory = "", .ltm_filename = "" },
+        null,
+        1,
+    );
+    defer runtime_registry.deinit();
+
+    var listener = try (try std.net.Address.parseIp("127.0.0.1", 0)).listen(.{ .reuse_address = true });
+    defer listener.deinit();
+
+    var server_ctx = WsTestServerCtx{
+        .allocator = allocator,
+        .runtime_registry = &runtime_registry,
+        .listener = &listener,
+    };
+    defer server_ctx.deinit();
+
+    {
+        const server_thread = try std.Thread.spawn(.{}, runSingleWsConnection, .{&server_ctx});
+        defer server_thread.join();
+
+        var client = try std.net.tcpConnectToAddress(listener.listen_address);
+        defer client.close();
+        try performClientHandshake(allocator, &client, "/v1/agents/alpha/stream");
+
+        try writeClientTextFrameMasked(&client, "{\"id\":\"alpha-connect\",\"type\":\"connect\"}");
+        var connect_ack = try readServerFrame(allocator, &client);
+        defer connect_ack.deinit(allocator);
+        try std.testing.expect(std.mem.indexOf(u8, connect_ack.payload, "\"type\":\"connect.ack\"") != null);
+
+        try websocket_transport.writeFrame(&client, "", .close);
+        var close_reply = try readServerFrame(allocator, &client);
+        defer close_reply.deinit(allocator);
+        try std.testing.expectEqual(@as(u8, 0x8), close_reply.opcode);
+    }
+
+    {
+        const server_thread = try std.Thread.spawn(.{}, runSingleWsConnection, .{&server_ctx});
+        defer server_thread.join();
+
+        var client = try std.net.tcpConnectToAddress(listener.listen_address);
+        defer client.close();
+        try performClientHandshake(allocator, &client, "/v1/agents/beta/stream");
+
+        var limit_error = try readServerFrame(allocator, &client);
+        defer limit_error.deinit(allocator);
+        try std.testing.expect(std.mem.indexOf(u8, limit_error.payload, "\"code\":\"queue_saturated\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, limit_error.payload, "agent runtime limit reached") != null);
+
+        var close_reply = try readServerFrame(allocator, &client);
+        defer close_reply.deinit(allocator);
+        try std.testing.expectEqual(@as(u8, 0x8), close_reply.opcode);
+    }
+
+    try std.testing.expect(server_ctx.err_name == null);
+}
+
 test "server_piai: parse route path extracts agent id" {
     const path = parseAgentIdFromStreamPath("/v1/agents/alpha/stream") orelse return error.TestExpectedAgent;
     try std.testing.expectEqualStrings("alpha", path);
     try std.testing.expect(parseAgentIdFromStreamPath("/v1/agents/alpha/stream?x=1") != null);
     try std.testing.expect(parseAgentIdFromStreamPath("/v1/agents//stream") == null);
     try std.testing.expect(parseAgentIdFromStreamPath("/v1/agents/alpha/not-stream") == null);
+    try std.testing.expect(AgentRuntimeRegistry.isValidAgentId("alpha-1"));
+    try std.testing.expect(AgentRuntimeRegistry.isValidAgentId("agent_2"));
+    try std.testing.expect(!AgentRuntimeRegistry.isValidAgentId("agent:bad"));
+    try std.testing.expect(!AgentRuntimeRegistry.isValidAgentId(""));
 }
