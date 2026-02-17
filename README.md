@@ -25,11 +25,8 @@ git clone https://github.com/DeanoC/ZiggySpiderweb.git
 cd ZiggySpiderweb
 zig build
 
-# Set your API key (choose one)
-export OPENAI_API_KEY="sk-..."
-# OR
-export KIMI_API_KEY="your-kimi-key"
-# OR use existing Codex OAuth: ~/.codex/auth.json
+# Store provider key in secure credential backend (Linux: secret-tool)
+./zig-out/bin/spiderweb-config config set-key sk-... openai
 
 # Run on default port 18790
 ./zig-out/bin/spiderweb
@@ -66,8 +63,9 @@ spiderweb-config config set-provider openai gpt-4o
 spiderweb-config config set-provider kimi-coding kimi-k2.5
 spiderweb-config config set-provider openai-codex gpt-5.3-codex
 
-# Set API key (stored in plain text - see security note below)
-spiderweb-config config set-key sk-your-key-here
+# Store API key in secure credential backend (Linux: `secret-tool`)
+spiderweb-config config set-key sk-your-key-here openai
+spiderweb-config config clear-key openai
 
 # Change bind address/port
 spiderweb-config config set-server --bind 0.0.0.0 --port 9000
@@ -110,19 +108,12 @@ Implemented tool names:
 ### API Key Storage
 
 **Priority order:**
-1. **Config file** - Set via `spiderweb-config config set-key`
-2. **Environment variables** - Used as fallback
+1. **Secure credential store** - Set via `spiderweb-config config set-key ...`
+2. **Environment variable fallback** - Provider-specific env keys (for example `OPENAI_API_KEY`)
 
-| Provider | Environment Variable |
-|----------|---------------------|
-| OpenAI | `OPENAI_API_KEY` |
-| OpenAI Codex | `OPENAI_CODEX_API_KEY` → `~/.codex/auth.json` → `OPENAI_API_KEY` |
-| Kimi | `KIMI_API_KEY`, `KIMICODE_API_KEY` |
-
-**Security Note:** Keys stored in the config file are saved in **plain text**. For better security:
-- Use environment variables instead
-- File permissions are set to user-only (0600)
-- Future: Linux keyring integration planned
+**Security Note:** `spiderweb-config config set-key` does not write plaintext keys to config.
+On Linux, secure storage uses the desktop keyring via `secret-tool`.
+If no secure backend is available, configure provider keys via environment variables.
 
 ## Architecture
 

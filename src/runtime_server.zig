@@ -4,6 +4,7 @@ const Config = @import("config.zig");
 const protocol = @import("protocol.zig");
 const agent_runtime = @import("agent_runtime.zig");
 const brain_specialization = @import("brain_specialization.zig");
+const credential_store = @import("credential_store.zig");
 const memory = @import("memory.zig");
 const tool_registry = @import("tool_registry.zig");
 const ziggy_piai = @import("ziggy-piai");
@@ -65,14 +66,18 @@ const StreamByModelFn = *const fn (
 
 var streamByModelFn: StreamByModelFn = ziggy_piai.stream.streamByModel;
 
+const GetEnvApiKeyFn = *const fn (std.mem.Allocator, []const u8) ?[]const u8;
+var getEnvApiKeyFn: GetEnvApiKeyFn = ziggy_piai.env_api_keys.getEnvApiKey;
+
 const ProviderRuntime = struct {
     model_registry: ziggy_piai.models.ModelRegistry,
     api_registry: ziggy_piai.api_registry.ApiRegistry,
     http_client: std.http.Client,
     default_provider_name: []u8,
     default_model_name: ?[]u8,
-    api_key: ?[]u8,
+    test_only_api_key: ?[]u8,
     base_url: ?[]u8,
+    credentials: credential_store.CredentialStore,
 
     fn init(allocator: std.mem.Allocator, provider_cfg: Config.ProviderConfig) !ProviderRuntime {
         var model_registry = ziggy_piai.models.ModelRegistry.init(allocator);
@@ -89,13 +94,16 @@ const ProviderRuntime = struct {
             .http_client = .{ .allocator = allocator },
             .default_provider_name = try allocator.dupe(u8, provider_cfg.name),
             .default_model_name = null,
-            .api_key = null,
+            .test_only_api_key = null,
             .base_url = null,
+            .credentials = credential_store.CredentialStore.init(allocator),
         };
         errdefer provider.deinit(allocator);
 
         if (provider_cfg.model) |value| provider.default_model_name = try allocator.dupe(u8, value);
-        if (provider_cfg.api_key) |value| provider.api_key = try allocator.dupe(u8, value);
+        if (builtin.is_test) {
+            if (provider_cfg.api_key) |value| provider.test_only_api_key = try allocator.dupe(u8, value);
+        }
         if (provider_cfg.base_url) |value| provider.base_url = try allocator.dupe(u8, value);
 
         return provider;
@@ -107,7 +115,7 @@ const ProviderRuntime = struct {
         self.http_client.deinit();
         allocator.free(self.default_provider_name);
         if (self.default_model_name) |value| allocator.free(value);
-        if (self.api_key) |value| allocator.free(value);
+        if (self.test_only_api_key) |value| allocator.free(value);
         if (self.base_url) |value| allocator.free(value);
     }
 };
@@ -822,12 +830,16 @@ pub const RuntimeServer = struct {
     }
 
     fn resolveApiKey(self: *RuntimeServer, provider_runtime: *const ProviderRuntime, provider_name: []const u8) ![]const u8 {
-        if (provider_runtime.api_key) |key| {
-            if (std.mem.eql(u8, provider_name, provider_runtime.default_provider_name)) {
-                return try self.allocator.dupe(u8, key);
-            }
+        if (provider_runtime.credentials.getProviderApiKey(provider_name)) |key| {
+            return key;
         }
-        return ziggy_piai.env_api_keys.getEnvApiKey(self.allocator, provider_name) orelse RuntimeServerError.MissingProviderApiKey;
+        if (builtin.is_test) {
+            if (provider_runtime.test_only_api_key) |key| return try self.allocator.dupe(u8, key);
+        }
+        if (getEnvApiKeyFn(self.allocator, provider_name)) |key| {
+            return key;
+        }
+        return RuntimeServerError.MissingProviderApiKey;
     }
 
     fn selectModel(provider_runtime: *const ProviderRuntime, provider_name: []const u8, model_name: ?[]const u8) ?ziggy_piai.types.Model {
@@ -1056,23 +1068,6 @@ const AsyncRequestCtx = struct {
     }
 };
 
-extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
-extern "c" fn unsetenv(name: [*:0]const u8) c_int;
-
-fn setEnvForTest(allocator: std.mem.Allocator, name: []const u8, value: []const u8) !void {
-    const name_z = try allocator.dupeZ(u8, name);
-    defer allocator.free(name_z);
-    const value_z = try allocator.dupeZ(u8, value);
-    defer allocator.free(value_z);
-    if (setenv(name_z.ptr, value_z.ptr, 1) != 0) return error.SetEnvFailed;
-}
-
-fn unsetEnvForTest(allocator: std.mem.Allocator, name: []const u8) !void {
-    const name_z = try allocator.dupeZ(u8, name);
-    defer allocator.free(name_z);
-    if (unsetenv(name_z.ptr) != 0) return error.UnsetEnvFailed;
-}
-
 fn runRequestInThread(ctx: *AsyncRequestCtx) void {
     ctx.response = ctx.server.handleMessage(ctx.request_json) catch |err| {
         ctx.err_name = std.fmt.allocPrint(ctx.allocator, "{s}", .{@errorName(err)}) catch null;
@@ -1139,6 +1134,11 @@ fn mockProviderStreamCaptureConfig(
         .stop_reason = .stop,
         .error_message = null,
     } });
+}
+
+fn mockGetEnvApiKeyForOpenAi(allocator: std.mem.Allocator, provider: []const u8) ?[]const u8 {
+    if (!std.mem.eql(u8, provider, "openai")) return null;
+    return allocator.dupe(u8, "env-openai-key") catch null;
 }
 
 fn writeAgentJsonForTest(allocator: std.mem.Allocator, agent_id: []const u8, brain_name: []const u8, content: []const u8) !void {
@@ -1368,7 +1368,7 @@ test "runtime_server: provider-backed session.send uses configured provider runt
     try std.testing.expectEqual(@as(usize, 1), assistant_turns);
 }
 
-test "runtime_server: provider-only override resets inherited model and uses effective provider key source" {
+test "runtime_server: provider-only override resets inherited model selection" {
     const allocator = std.testing.allocator;
     const original_stream_fn = streamByModelFn;
     defer streamByModelFn = original_stream_fn;
@@ -1384,17 +1384,6 @@ test "runtime_server: provider-only override resets inherited model and uses eff
         allocator.free(value);
         mockCapturedApiKey = null;
     };
-
-    const codex_env_name = "OPENAI_CODEX_API_KEY";
-    const prev_codex_key = std.process.getEnvVarOwned(allocator, codex_env_name) catch null;
-    defer if (prev_codex_key) |value| {
-        setEnvForTest(allocator, codex_env_name, value) catch {};
-        allocator.free(value);
-    } else {
-        unsetEnvForTest(allocator, codex_env_name) catch {};
-    };
-
-    try setEnvForTest(allocator, codex_env_name, "codex-env-key");
 
     const server = try RuntimeServer.createWithProvider(allocator, "agent-provider-only-override", .{
         .ltm_directory = "",
@@ -1416,7 +1405,51 @@ test "runtime_server: provider-only override resets inherited model and uses eff
     try std.testing.expect(std.mem.indexOf(u8, response, "captured provider response") != null);
     try std.testing.expectEqualStrings("openai-codex", mockCapturedProviderName.?);
     try std.testing.expectEqualStrings("gpt-5.1-codex-mini", mockCapturedModelName.?);
-    try std.testing.expectEqualStrings("codex-env-key", mockCapturedApiKey.?);
+    try std.testing.expect(mockCapturedApiKey != null);
+    try std.testing.expectEqualStrings("configured-openai-key", mockCapturedApiKey.?);
+}
+
+test "runtime_server: provider runtime falls back to env API key on secure-store miss" {
+    const allocator = std.testing.allocator;
+    const original_stream_fn = streamByModelFn;
+    defer streamByModelFn = original_stream_fn;
+    streamByModelFn = mockProviderStreamCaptureConfig;
+
+    const original_env_key_fn = getEnvApiKeyFn;
+    defer getEnvApiKeyFn = original_env_key_fn;
+    getEnvApiKeyFn = mockGetEnvApiKeyForOpenAi;
+
+    mockCapturedProviderName = null;
+    mockCapturedModelName = null;
+    mockCapturedReasoning = null;
+    if (mockCapturedApiKey) |value| {
+        allocator.free(value);
+        mockCapturedApiKey = null;
+    }
+    defer if (mockCapturedApiKey) |value| {
+        allocator.free(value);
+        mockCapturedApiKey = null;
+    };
+
+    const server = try RuntimeServer.createWithProvider(allocator, "agent-env-fallback", .{
+        .ltm_directory = "",
+        .ltm_filename = "",
+    }, .{
+        .name = "openai",
+        .model = "gpt-4o-mini",
+    });
+    defer server.destroy();
+
+    // Make lookup deterministic for the test regardless of host keyring contents.
+    server.provider_runtime.?.credentials.backend = .none;
+
+    const response = try server.handleMessage("{\"id\":\"req-provider-env-fallback\",\"type\":\"session.send\",\"content\":\"hello provider\"}");
+    defer allocator.free(response);
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "captured provider response") != null);
+    try std.testing.expectEqualStrings("openai", mockCapturedProviderName.?);
+    try std.testing.expect(mockCapturedApiKey != null);
+    try std.testing.expectEqualStrings("env-openai-key", mockCapturedApiKey.?);
 }
 
 test "runtime_server: agent.json can override primary brain provider model and think level" {

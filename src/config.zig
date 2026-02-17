@@ -1,11 +1,12 @@
 const std = @import("std");
+const credential_store = @import("credential_store.zig");
 
 const Config = @This();
 
 pub const ProviderConfig = struct {
     name: []const u8,
     model: ?[]const u8 = null,
-    api_key: ?[]const u8 = null, // Only used if keyring not available
+    api_key: ?[]const u8 = null, // Test-only injection path (not loaded/saved by config CLI).
     base_url: ?[]const u8 = null,
 };
 
@@ -200,12 +201,6 @@ pub fn load(self: *Config) !void {
                     self.provider.model = try self.allocator.dupe(u8, model.string);
                 }
             }
-            if (provider_val.object.get("api_key")) |key| {
-                if (key == .string) {
-                    if (self.provider.api_key) |k| self.allocator.free(k);
-                    self.provider.api_key = try self.allocator.dupe(u8, key.string);
-                }
-            }
             if (provider_val.object.get("base_url")) |url| {
                 if (url == .string) {
                     if (self.provider.base_url) |b| self.allocator.free(b);
@@ -335,10 +330,6 @@ pub fn save(self: Config) !void {
         const model_line = try std.fmt.bufPrint(&buf, ",\n    \"model\": \"{s}\"", .{m});
         try file.writeAll(model_line);
     }
-    if (self.provider.api_key) |k| {
-        const key_line = try std.fmt.bufPrint(&buf, ",\n    \"api_key\": \"{s}\"", .{k});
-        try file.writeAll(key_line);
-    }
     if (self.provider.base_url) |b| {
         const url_line = try std.fmt.bufPrint(&buf, ",\n    \"base_url\": \"{s}\"", .{b});
         try file.writeAll(url_line);
@@ -411,22 +402,8 @@ pub fn setLogLevel(self: *Config, level: []const u8) !void {
 }
 
 pub fn getApiKey(self: Config, allocator: std.mem.Allocator) !?[]const u8 {
-    // Priority: 1) Config file, 2) Environment variable
-    if (self.provider.api_key) |key| {
-        return try allocator.dupe(u8, key);
-    }
-
-    // Try environment variable based on provider
-    const env_var = switch (self.provider.name[0]) {
-        'o' => if (std.mem.startsWith(u8, self.provider.name, "openai-codex"))
-            "OPENAI_CODEX_API_KEY"
-        else
-            "OPENAI_API_KEY",
-        'k' => "KIMI_API_KEY",
-        else => "OPENAI_API_KEY",
-    };
-
-    return std.process.getEnvVarOwned(allocator, env_var) catch null;
+    const store = credential_store.CredentialStore.init(allocator);
+    return store.getProviderApiKey(self.provider.name);
 }
 
 test "Config defaults" {

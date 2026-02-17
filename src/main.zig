@@ -33,7 +33,6 @@ pub fn main() !void {
             .provider = .{
                 .name = try allocator.dupe(u8, "openai"),
                 .model = try allocator.dupe(u8, "gpt-4o-mini"),
-                .api_key = null,
                 .base_url = null,
             },
             .log = .{
@@ -102,12 +101,10 @@ pub fn main() !void {
                 "Configuration:\n" ++
                 "  spiderweb-config config              Show current config\n" ++
                 "  spiderweb-config config set-provider <name> [model]\n" ++
-                "  spiderweb-config config set-key <api-key>\n" ++
+                "  spiderweb-config config set-key <api-key> [provider]\n" ++
+                "  spiderweb-config config clear-key [provider]\n" ++
                 "\n" ++
-                "Environment (used as fallback for API keys):\n" ++
-                "  OPENAI_API_KEY       OpenAI API key\n" ++
-                "  ANTHROPIC_API_KEY    Anthropic API key\n" ++
-                "  OPENAI_CODEX_API_KEY OpenAI Codex API key (optional)\n";
+                "API key resolution order: secure credential backend (Linux: secret-tool), then provider env vars.\n";
             std.debug.print("{s}", .{help});
             return;
         }
