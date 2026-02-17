@@ -115,6 +115,11 @@ pub fn main() !void {
 
     std.log.info("Binding to {s}:{d}", .{ bind_addr, port });
 
+    if (config.runtime.ltm_directory.len == 0 or config.runtime.ltm_filename.len == 0) {
+        std.log.err("Invalid runtime config: LTM store is required (`runtime.ltm_directory` and `runtime.ltm_filename` must be set)", .{});
+        return error.MissingLtmStoreConfig;
+    }
+
     // Start server
     try server.run(allocator, bind_addr, port, config.provider, config.runtime);
 }

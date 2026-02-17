@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const Config = @import("config.zig");
 const protocol = @import("protocol.zig");
 const agent_runtime = @import("agent_runtime.zig");
@@ -21,6 +22,7 @@ const RuntimeServerError = error{
     MissingProviderApiKey,
     ProviderStreamFailed,
     ProviderToolLoopExceeded,
+    MissingLtmStoreConfig,
 };
 
 const RuntimeOperationClass = enum {
@@ -128,6 +130,7 @@ pub const RuntimeServer = struct {
     runtime_jobs: std.ArrayListUnmanaged(*RuntimeQueueJob) = .{},
     runtime_workers: []std.Thread,
     stopping: bool = false,
+    test_ltm_directory: ?[]u8 = null,
 
     pub fn create(allocator: std.mem.Allocator, agent_id: []const u8, runtime_cfg: Config.RuntimeConfig) !*RuntimeServer {
         return createInternal(allocator, agent_id, runtime_cfg, null);
@@ -153,6 +156,25 @@ pub const RuntimeServer = struct {
         const self = try allocator.create(RuntimeServer);
         errdefer allocator.destroy(self);
 
+        var effective_ltm_directory = runtime_cfg.ltm_directory;
+        var effective_ltm_filename = runtime_cfg.ltm_filename;
+        var test_ltm_directory: ?[]u8 = null;
+        errdefer if (test_ltm_directory) |dir| allocator.free(dir);
+
+        if (effective_ltm_directory.len == 0) {
+            if (!builtin.is_test) return RuntimeServerError.MissingLtmStoreConfig;
+            test_ltm_directory = try std.fmt.allocPrint(
+                allocator,
+                ".tmp-runtime-ltm-{s}-{d}",
+                .{ agent_id, std.time.nanoTimestamp() },
+            );
+            effective_ltm_directory = test_ltm_directory.?;
+        }
+        if (effective_ltm_filename.len == 0) {
+            if (!builtin.is_test) return RuntimeServerError.MissingLtmStoreConfig;
+            effective_ltm_filename = "runtime-memory.db";
+        }
+
         var provider_runtime: ?ProviderRuntime = null;
         if (provider_cfg) |cfg| {
             provider_runtime = try ProviderRuntime.init(allocator, cfg);
@@ -165,18 +187,24 @@ pub const RuntimeServer = struct {
                 allocator,
                 agent_id,
                 &[_][]const u8{"delegate"},
-                if (runtime_cfg.ltm_directory.len == 0) null else runtime_cfg.ltm_directory,
-                if (runtime_cfg.ltm_filename.len == 0) null else runtime_cfg.ltm_filename,
+                effective_ltm_directory,
+                effective_ltm_filename,
             ),
             .runtime_queue_max = runtime_cfg.runtime_request_queue_max,
             .chat_operation_timeout_ms = runtime_cfg.chat_operation_timeout_ms,
             .control_operation_timeout_ms = runtime_cfg.control_operation_timeout_ms,
             .runtime_workers = try allocator.alloc(std.Thread, worker_count),
             .provider_runtime = provider_runtime,
+            .test_ltm_directory = test_ltm_directory,
         };
         errdefer {
             self.runtime.deinit();
             allocator.free(self.runtime_workers);
+            if (self.test_ltm_directory) |dir| {
+                std.fs.cwd().deleteTree(dir) catch {};
+                allocator.free(dir);
+                self.test_ltm_directory = null;
+            }
         }
 
         self.runtime.queue_limits = .{
@@ -226,6 +254,11 @@ pub const RuntimeServer = struct {
         self.allocator.free(self.runtime_workers);
         if (self.provider_runtime) |*provider| provider.deinit(self.allocator);
         self.runtime.deinit();
+        if (self.test_ltm_directory) |dir| {
+            std.fs.cwd().deleteTree(dir) catch {};
+            self.allocator.free(dir);
+            self.test_ltm_directory = null;
+        }
         self.allocator.destroy(self);
     }
 
@@ -1138,6 +1171,15 @@ test "runtime_server: session.send dispatches through runtime and emits session.
 
     try std.testing.expect(std.mem.indexOf(u8, response, "\"type\":\"session.receive\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, response, "hello runtime") != null);
+}
+
+test "runtime_server: empty ltm config in tests provisions sqlite-backed runtime" {
+    const allocator = std.testing.allocator;
+    const server = try RuntimeServer.create(allocator, "agent-test", .{ .ltm_directory = "", .ltm_filename = "" });
+    defer server.destroy();
+
+    try std.testing.expect(server.runtime.ltm_store != null);
+    try std.testing.expect(server.test_ltm_directory != null);
 }
 
 test "runtime_server: session.send returns all outbound runtime frames" {
