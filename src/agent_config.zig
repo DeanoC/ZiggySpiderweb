@@ -63,7 +63,7 @@ pub const BrainConfig = struct {
     pub fn init(allocator: std.mem.Allocator) BrainConfig {
         return .{
             .allocator = allocator,
-            .provider = ProviderConfig{},
+            .provider = ProviderConfig.empty,
             .can_spawn_subbrains = false,
             .allowed_tools = null,
             .denied_tools = null,
@@ -196,7 +196,7 @@ pub const SubBrainTemplate = struct {
             .name = null,
             .specialization = null,
             .description = null,
-            .default_provider = ProviderConfig{},
+            .default_provider = ProviderConfig.empty,
             .capabilities = null,
             .rom_entries = null,
             .allowed_tools = null,
@@ -250,7 +250,7 @@ pub fn loadAgentConfig(
     };
     defer allocator.free(content);
     
-    return parseAgentConfig(allocator, content);
+    return try parseAgentConfig(allocator, content);
 }
 
 /// Parse agent config JSON
@@ -288,7 +288,7 @@ fn parseAgentConfig(allocator: std.mem.Allocator, json_content: []const u8) !Age
                 const brain_name = try allocator.dupe(u8, entry.key_ptr.*);
                 errdefer allocator.free(brain_name);
                 
-                const sub_config = try parseSubBrainConfig(allocator, entry.value_ptr.*);
+                var sub_config = try parseSubBrainConfig(allocator, entry.value_ptr.*);
                 errdefer sub_config.deinit(allocator);
                 
                 try config.sub_brains.put(allocator, brain_name, sub_config);
@@ -434,7 +434,7 @@ pub fn loadSubBrainTemplate(
     };
     defer allocator.free(content);
     
-    return parseSubBrainTemplate(allocator, content);
+    return try parseSubBrainTemplate(allocator, content);
 }
 
 /// Parse sub-brain template JSON
@@ -630,7 +630,7 @@ pub fn mergeWithTemplate(
             // Check if key already exists and replace
             var found = false;
             if (merged.rom_overrides) |*existing| {
-                for (existing.items, 0..) |*existing_rom, idx| {
+                for (existing.items) |*existing_rom| {
                     if (std.mem.eql(u8, existing_rom.key, rom.key)) {
                         allocator.free(existing_rom.value);
                         existing_rom.value = try allocator.dupe(u8, rom.value);
