@@ -421,22 +421,36 @@ pub const AgentRuntime = struct {
         while (rom_it.next()) |entry| {
             if (!first) try writer.writeByte(',');
             first = false;
-            // Simple JSON string encoding (assumes keys/values are safe)
-            try writer.writeByte('"');
-            try writer.writeAll(entry.key_ptr.*);
-            try writer.writeAll("\":\"");
-            // Escape quotes in value if needed
-            for (entry.value_ptr.value) |c| {
-                if (c == '"' or c == '\\') try writer.writeByte('\\');
-                try writer.writeByte(c);
-            }
-            try writer.writeByte('"');
+            // Proper JSON string encoding for key and value
+            try writeJsonString(writer, entry.key_ptr.*);
+            try writer.writeByte(':');
+            try writeJsonString(writer, entry.value_ptr.value);
         }
         try writer.writeByte('}');
 
         try writer.writeByte('}');
 
         return result.toOwnedSlice(allocator);
+    }
+
+    /// Write a string as a JSON string value with proper escaping
+    fn writeJsonString(writer: anytype, str: []const u8) !void {
+        try writer.writeByte('"');
+        for (str) |c| {
+            switch (c) {
+                '"' => try writer.writeAll("\\\""),
+                '\\' => try writer.writeAll("\\\\"),
+                '\n' => try writer.writeAll("\\n"),
+                '\r' => try writer.writeAll("\\r"),
+                '\t' => try writer.writeAll("\\t"),
+                '\x08' => try writer.writeAll("\\b"),
+                '\x0C' => try writer.writeAll("\\f"),
+                // Other control characters must be escaped as \u00XX
+                0x00...0x07, 0x0B, 0x0E...0x1F => try writer.print("\\u00{X:0>2}", .{c}),
+                else => try writer.writeByte(c),
+            }
+        }
+        try writer.writeByte('"');
     }
 };
 

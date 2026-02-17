@@ -314,6 +314,9 @@ pub const HookRegistry = struct {
     pub fn execute(self: *HookRegistry, phase: HookPhase, ctx: *HookContext, data: HookData) !void {
         const list = self.listForPhase(phase);
 
+        // Update context phase before invoking callbacks
+        ctx.phase = phase;
+
         for (list.items) |hook| {
             hook.callback(ctx, data) catch |err| {
                 std.log.err("Hook '{s}' failed in {s}: {s}", .{
