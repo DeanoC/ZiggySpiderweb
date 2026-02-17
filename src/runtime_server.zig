@@ -11,6 +11,7 @@ const INTERNAL_TICK_TIMEOUT_MS: i64 = 5 * 1000;
 const RuntimeServerError = error{
     RuntimeTickTimeout,
     RuntimeJobTimeout,
+    RuntimeJobCancelled,
     MissingJobResponse,
     ProviderModelNotFound,
     MissingProviderApiKey,
@@ -366,7 +367,18 @@ pub const RuntimeServer = struct {
         while (true) {
             const job = self.dequeueJob() orelse return;
 
+            if (self.isJobCancelled(job)) {
+                job.result_mutex.lock();
+                job.done = true;
+                job.result_cond.signal();
+                job.result_mutex.unlock();
+                self.destroyJob(job);
+                continue;
+            }
+
             const response = self.processRuntimeJob(job) catch |err| blk: {
+                if (err == RuntimeServerError.RuntimeJobCancelled) break :blk null;
+
                 const payload = protocol.buildErrorWithCode(self.allocator, job.request_id, .execution_failed, @errorName(err)) catch |build_err| {
                     std.log.err("runtime worker failed building error response: {s}", .{@errorName(build_err)});
                     break :blk null;
@@ -396,6 +408,8 @@ pub const RuntimeServer = struct {
         self.runtime_mutex.lock();
         defer self.runtime_mutex.unlock();
 
+        if (self.isJobCancelled(job)) return RuntimeServerError.RuntimeJobCancelled;
+
         switch (job.msg_type) {
             .session_send => {
                 const content = job.content orelse {
@@ -420,6 +434,12 @@ pub const RuntimeServer = struct {
                 ));
             },
         }
+    }
+
+    fn isJobCancelled(_: *RuntimeServer, job: *RuntimeQueueJob) bool {
+        job.result_mutex.lock();
+        defer job.result_mutex.unlock();
+        return job.cancelled;
     }
 
     fn createJob(
@@ -1001,6 +1021,42 @@ test "runtime_server: queued control request times out with runtime_timeout code
     try std.testing.expect(ctx.err_name == null);
     try std.testing.expect(ctx.response != null);
     try std.testing.expect(std.mem.indexOf(u8, ctx.response.?, "\"code\":\"runtime_timeout\"") != null);
+}
+
+test "runtime_server: timed out queued control action does not execute later" {
+    const allocator = std.testing.allocator;
+    const server = try RuntimeServer.create(allocator, "agent-test", .{
+        .control_operation_timeout_ms = 10,
+        .ltm_directory = "",
+        .ltm_filename = "",
+    });
+    defer server.destroy();
+
+    server.runtime_mutex.lock();
+    var runtime_locked = true;
+    defer if (runtime_locked) server.runtime_mutex.unlock();
+
+    var ctx = AsyncRequestCtx{
+        .allocator = allocator,
+        .server = server,
+        .request_json = "{\"id\":\"req-timeout-cancel\",\"type\":\"agent.control\",\"action\":\"cancel\"}",
+    };
+    defer ctx.deinit();
+
+    const thread = try std.Thread.spawn(.{}, runRequestInThread, .{&ctx});
+    std.Thread.sleep(50 * std.time.ns_per_ms);
+    server.runtime_mutex.unlock();
+    runtime_locked = false;
+    thread.join();
+
+    try std.testing.expect(ctx.err_name == null);
+    try std.testing.expect(ctx.response != null);
+    try std.testing.expect(std.mem.indexOf(u8, ctx.response.?, "\"code\":\"runtime_timeout\"") != null);
+
+    server.runtime_mutex.lock();
+    defer server.runtime_mutex.unlock();
+    try std.testing.expectEqual(agent_runtime.RuntimeState.running, server.runtime.state);
+    try std.testing.expectEqual(@as(usize, 0), server.runtime.control_events.items.len);
 }
 
 test "runtime_server: concurrent queue pressure yields deterministic queue_saturated" {

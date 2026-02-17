@@ -144,6 +144,9 @@ pub const AgentRuntime = struct {
     }
 
     pub fn enqueueUserEvent(self: *AgentRuntime, content: []const u8) !void {
+        if (self.state == .cancelled) return RuntimeError.RuntimeCancelled;
+        if (self.state == .paused) return RuntimeError.RuntimePaused;
+
         if (self.bus.pendingCount() >= self.queue_limits.inbound_events) {
             return RuntimeError.QueueSaturated;
         }
@@ -309,6 +312,22 @@ test "agent_runtime: queue saturation returns explicit overload" {
     runtime.queue_limits.brain_ticks = 1;
     try runtime.enqueueUserEvent("hello");
     try std.testing.expectError(RuntimeError.QueueSaturated, runtime.enqueueUserEvent("again"));
+}
+
+test "agent_runtime: enqueueUserEvent rejects paused/cancelled without queuing work" {
+    const allocator = std.testing.allocator;
+    var runtime = try AgentRuntime.init(allocator, "agentA", &[_][]const u8{});
+    defer runtime.deinit();
+
+    runtime.state = .paused;
+    try std.testing.expectError(RuntimeError.RuntimePaused, runtime.enqueueUserEvent("hello"));
+    try std.testing.expectEqual(@as(usize, 0), runtime.tick_queue.items.len);
+    try std.testing.expectEqual(@as(usize, 0), runtime.bus.pendingCount());
+
+    runtime.state = .cancelled;
+    try std.testing.expectError(RuntimeError.RuntimeCancelled, runtime.enqueueUserEvent("hello"));
+    try std.testing.expectEqual(@as(usize, 0), runtime.tick_queue.items.len);
+    try std.testing.expectEqual(@as(usize, 0), runtime.bus.pendingCount());
 }
 
 test "agent_runtime: queueToolUse rollback clears partially queued tool when tick enqueue fails" {
