@@ -34,6 +34,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    config_mod.addImport("ziggy-piai", ziggy_piai_module);
 
     const config_cli = b.addExecutable(.{
         .name = "spiderweb-config",

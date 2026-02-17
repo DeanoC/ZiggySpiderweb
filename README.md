@@ -109,10 +109,11 @@ Implemented tool names:
 
 **Priority order:**
 1. **Secure credential store** - Set via `spiderweb-config config set-key ...`
+2. **Environment variable fallback** - Provider-specific env keys (for example `OPENAI_API_KEY`)
 
 **Security Note:** `spiderweb-config config set-key` does not write plaintext keys to config.
 On Linux, secure storage uses the desktop keyring via `secret-tool`.
-If no secure backend is available, the server will not use provider keys.
+If no secure backend is available, configure provider keys via environment variables.
 
 ## Architecture
 

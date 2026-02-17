@@ -1,6 +1,7 @@
 const std = @import("std");
 const Config = @import("config.zig");
 const credential_store = @import("credential_store.zig");
+const ziggy_piai = @import("ziggy-piai");
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -37,6 +38,9 @@ fn handleConfigCommand(allocator: std.mem.Allocator, args: []const []const u8) !
         if (store.getProviderApiKey(config.provider.name)) |key| {
             allocator.free(key);
             key_source = "secure-store";
+        } else if (ziggy_piai.env_api_keys.getEnvApiKey(allocator, config.provider.name)) |key| {
+            allocator.free(key);
+            key_source = "environment";
         }
 
         const stdout_file = std.fs.File.stdout();

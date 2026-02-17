@@ -104,7 +104,7 @@ pub fn main() !void {
                 "  spiderweb-config config set-key <api-key> [provider]\n" ++
                 "  spiderweb-config config clear-key [provider]\n" ++
                 "\n" ++
-                "API keys must be stored via secure credential backend (Linux: secret-tool).\n";
+                "API key resolution order: secure credential backend (Linux: secret-tool), then provider env vars.\n";
             std.debug.print("{s}", .{help});
             return;
         }
