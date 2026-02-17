@@ -117,6 +117,34 @@ pub const EventBus = struct {
         return self.events.items.len;
     }
 
+    pub fn removeLatestMatching(
+        self: *EventBus,
+        event_type: EventType,
+        source_brain: []const u8,
+        target_brain: []const u8,
+        payload: []const u8,
+    ) !bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        var idx = self.events.items.len;
+        while (idx > 0) {
+            idx -= 1;
+            const event = self.events.items[idx];
+            if (event.event_type != event_type) continue;
+            if (!std.mem.eql(u8, event.source_brain, source_brain)) continue;
+            if (!std.mem.eql(u8, event.target_brain, target_brain)) continue;
+            if (!std.mem.eql(u8, event.payload, payload)) continue;
+
+            var removed = self.events.orderedRemove(idx);
+            removed.deinit(self.allocator);
+            try self.rebuildTalkIndexLocked();
+            return true;
+        }
+
+        return false;
+    }
+
     pub fn clear(self: *EventBus) void {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -199,4 +227,27 @@ test "event_bus: talk id index clears on consume" {
 
     try std.testing.expectEqual(@as(usize, 1), events.len);
     try std.testing.expect(!bus.hasTalkId(42));
+}
+
+test "event_bus: removeLatestMatching removes newest matching event only" {
+    const allocator = std.testing.allocator;
+    var bus = EventBus.init(allocator);
+    defer bus.deinit();
+
+    try bus.enqueue(.{
+        .event_type = .user,
+        .source_brain = "user",
+        .target_brain = "primary",
+        .payload = "hello",
+    });
+    try bus.enqueue(.{
+        .event_type = .user,
+        .source_brain = "user",
+        .target_brain = "primary",
+        .payload = "hello",
+    });
+
+    try std.testing.expectEqual(@as(usize, 2), bus.pendingCount());
+    try std.testing.expect(try bus.removeLatestMatching(.user, "user", "primary", "hello"));
+    try std.testing.expectEqual(@as(usize, 1), bus.pendingCount());
 }

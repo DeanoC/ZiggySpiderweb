@@ -81,10 +81,25 @@ pub const BrainContext = struct {
     }
 
     pub fn consumeInboxIndices(self: *BrainContext, matched_indices: []const usize) void {
-        var i: usize = matched_indices.len;
-        while (i > 0) {
-            i -= 1;
-            const index = matched_indices[i];
+        if (matched_indices.len == 0) return;
+
+        const sorted = self.allocator.alloc(usize, matched_indices.len) catch return;
+        defer self.allocator.free(sorted);
+        @memcpy(sorted, matched_indices);
+
+        std.sort.pdq(
+            usize,
+            sorted,
+            {},
+            struct {
+                fn lessThan(_: void, lhs: usize, rhs: usize) bool {
+                    return lhs > rhs;
+                }
+            }.lessThan,
+        );
+
+        for (sorted) |index| {
+            if (index >= self.inbox.items.len) continue;
             var event = self.inbox.orderedRemove(index);
             event.deinit(self.allocator);
         }
@@ -127,4 +142,30 @@ test "brain_context: talk id is monotonic and skips zero" {
 
     try std.testing.expectEqual(std.math.maxInt(event_bus.TalkId), first);
     try std.testing.expectEqual(@as(event_bus.TalkId, 1), second);
+}
+
+test "brain_context: consumeInboxIndices handles unsorted indices safely" {
+    const allocator = std.testing.allocator;
+    var context = try BrainContext.init(allocator, "primary");
+    defer context.deinit();
+
+    try context.pushInbox(.{
+        .event_type = .user,
+        .source_brain = try allocator.dupe(u8, "user"),
+        .target_brain = try allocator.dupe(u8, "primary"),
+        .talk_id = null,
+        .payload = try allocator.dupe(u8, "a"),
+        .created_at_ms = 1,
+    });
+    try context.pushInbox(.{
+        .event_type = .user,
+        .source_brain = try allocator.dupe(u8, "user"),
+        .target_brain = try allocator.dupe(u8, "primary"),
+        .talk_id = null,
+        .payload = try allocator.dupe(u8, "b"),
+        .created_at_ms = 2,
+    });
+
+    context.consumeInboxIndices(&[_]usize{ 1, 0 });
+    try std.testing.expectEqual(@as(usize, 0), context.inbox.items.len);
 }

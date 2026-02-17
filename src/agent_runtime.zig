@@ -164,7 +164,18 @@ pub const AgentRuntime = struct {
     pub fn queueToolUse(self: *AgentRuntime, brain_name: []const u8, tool_name: []const u8, args_json: []const u8) !void {
         const brain = self.brains.getPtr(brain_name) orelse return RuntimeError.BrainNotFound;
         try brain.queueToolUse(tool_name, args_json);
+        errdefer {
+            if (brain.pending_tool_uses.pop()) |rolled_back_value| {
+                var rolled_back = rolled_back_value;
+                rolled_back.deinit(self.allocator);
+            }
+        }
         try self.enqueueTick(brain_name);
+    }
+
+    pub fn rollbackQueuedUserPrimaryWork(self: *AgentRuntime, content: []const u8) void {
+        _ = self.bus.removeLatestMatching(.user, "user", "primary", content) catch {};
+        _ = self.removeLatestTick("primary");
     }
 
     pub fn tickNext(self: *AgentRuntime) !?TickResult {
@@ -252,6 +263,18 @@ pub const AgentRuntime = struct {
         }
         try self.tick_queue.append(self.allocator, try self.allocator.dupe(u8, brain_name));
     }
+
+    fn removeLatestTick(self: *AgentRuntime, brain_name: []const u8) bool {
+        var idx = self.tick_queue.items.len;
+        while (idx > 0) {
+            idx -= 1;
+            if (!std.mem.eql(u8, self.tick_queue.items[idx], brain_name)) continue;
+            const removed = self.tick_queue.orderedRemove(idx);
+            self.allocator.free(removed);
+            return true;
+        }
+        return false;
+    }
 };
 
 pub fn deinitOutbound(allocator: std.mem.Allocator, messages: [][]u8) void {
@@ -286,6 +309,32 @@ test "agent_runtime: queue saturation returns explicit overload" {
     runtime.queue_limits.brain_ticks = 1;
     try runtime.enqueueUserEvent("hello");
     try std.testing.expectError(RuntimeError.QueueSaturated, runtime.enqueueUserEvent("again"));
+}
+
+test "agent_runtime: queueToolUse rollback clears partially queued tool when tick enqueue fails" {
+    const allocator = std.testing.allocator;
+    var runtime = try AgentRuntime.init(allocator, "agentA", &[_][]const u8{});
+    defer runtime.deinit();
+
+    runtime.queue_limits.brain_ticks = 0;
+    try std.testing.expectError(RuntimeError.QueueSaturated, runtime.queueToolUse("primary", "talk.user", "{\"message\":\"x\"}"));
+
+    const primary = runtime.brains.getPtr("primary").?;
+    try std.testing.expectEqual(@as(usize, 0), primary.pending_tool_uses.items.len);
+}
+
+test "agent_runtime: rollbackQueuedUserPrimaryWork removes pending user event and tick" {
+    const allocator = std.testing.allocator;
+    var runtime = try AgentRuntime.init(allocator, "agentA", &[_][]const u8{});
+    defer runtime.deinit();
+
+    try runtime.enqueueUserEvent("hello");
+    try std.testing.expectEqual(@as(usize, 1), runtime.tick_queue.items.len);
+    try std.testing.expectEqual(@as(usize, 1), runtime.bus.pendingCount());
+
+    runtime.rollbackQueuedUserPrimaryWork("hello");
+    try std.testing.expectEqual(@as(usize, 0), runtime.tick_queue.items.len);
+    try std.testing.expectEqual(@as(usize, 0), runtime.bus.pendingCount());
 }
 
 test "agent_runtime: talk.brain plus wait.for correlates across brains" {

@@ -465,6 +465,7 @@ pub const RuntimeServer = struct {
         const talk_args = try std.fmt.allocPrint(self.allocator, "{{\"message\":\"{s}\"}}", .{escaped_content});
         defer self.allocator.free(talk_args);
         self.runtime.queueToolUse(DEFAULT_BRAIN, "talk.user", talk_args) catch |err| {
+            self.runtime.rollbackQueuedUserPrimaryWork(content);
             return self.wrapRuntimeErrorResponse(request_id, err);
         };
 
@@ -863,6 +864,28 @@ test "runtime_server: provider failure does not leak queued user/tick events" {
         try std.testing.expect(std.mem.indexOf(u8, response, "\"code\":\"queue_saturated\"") == null);
         try std.testing.expectEqual(@as(usize, 0), server.runtime.tick_queue.items.len);
         try std.testing.expectEqual(@as(usize, 0), server.runtime.bus.pendingCount());
+    }
+}
+
+test "runtime_server: talk enqueue failure rolls back queued user work" {
+    const allocator = std.testing.allocator;
+    const server = try RuntimeServer.create(allocator, "agent-test", .{
+        .brain_tick_queue_max = 1,
+        .ltm_directory = "",
+        .ltm_filename = "",
+    });
+    defer server.destroy();
+
+    var attempt: usize = 0;
+    while (attempt < 3) : (attempt += 1) {
+        const response = try server.handleMessage("{\"id\":\"req-talk-sat\",\"type\":\"session.send\",\"content\":\"hello\"}");
+        defer allocator.free(response);
+
+        try std.testing.expect(std.mem.indexOf(u8, response, "\"code\":\"queue_saturated\"") != null);
+        try std.testing.expectEqual(@as(usize, 0), server.runtime.tick_queue.items.len);
+        try std.testing.expectEqual(@as(usize, 0), server.runtime.bus.pendingCount());
+        const primary = server.runtime.brains.getPtr("primary").?;
+        try std.testing.expectEqual(@as(usize, 0), primary.pending_tool_uses.items.len);
     }
 }
 
