@@ -9,8 +9,8 @@ At each iteration of the loop,
 Tools can be a mix of Brain Tools and World Tools, allowing an agent to change its own state and the world.
 This allows it to learn and adapt to the environment and manage its own memory.
 
-Tool results are themselves memories, which in many cases the agent will evict 
-and store in LTM. This allows the agent to learn from its own experiences and solves the tombstone problem on eviction.
+Tool results are themselves memories, which in many cases the agent will evict and store in LTM. 
+This allows the agent to learn from its own experiences and solves the tombstone problem on eviction.
 A memory eviction returns the MemId of the eviction which the agent may choose to mutate into its own index if important.
 
 ## Time
