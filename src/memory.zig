@@ -220,12 +220,20 @@ pub const RuntimeMemory = struct {
             .created_at_ms = std.time.milliTimestamp(),
             .content_json = try self.allocator.dupe(u8, content_json),
         };
+        var inserted_into_map = false;
+        errdefer if (!inserted_into_map) item.deinit(self.allocator);
+
+        try self.persistHistoryLocked(&item);
 
         const target = store.mapForTier(tier);
         try target.put(self.allocator, item.mem_id, item);
+        inserted_into_map = true;
+        errdefer if (target.fetchRemove(item.mem_id)) |removed_entry| {
+            var removed = removed_entry.value;
+            removed.deinit(self.allocator);
+        };
         try store.appendOrder(self.allocator, item.mem_id);
-
-        try self.persistHistoryLocked(&item);
+        errdefer store.removeOrder(item.mem_id);
         return item.clone(self.allocator);
     }
 
@@ -281,11 +289,11 @@ pub const RuntimeMemory = struct {
         const current_item = current_ref.item.*;
         if (!current_item.mutable or current_item.tier != .ram) return MemoryError.ImmutableTier;
 
-        current_ref.store.removeOrder(current_item.mem_id);
-        _ = current_ref.store.ram_items.remove(current_item.mem_id);
-
         try self.persistHistoryLocked(&current_item);
         const evicted = try current_item.clone(self.allocator);
+
+        current_ref.store.removeOrder(current_item.mem_id);
+        _ = current_ref.store.ram_items.remove(current_item.mem_id);
 
         var owned = current_item;
         owned.deinit(self.allocator);
@@ -780,6 +788,49 @@ test "memory: mutate does not change active state when persistence fails" {
     var latest = try mem.load(latest_alias, null);
     defer latest.deinit(allocator);
 
+    try std.testing.expectEqual(@as(?u64, 1), latest.version);
+    try std.testing.expectEqualStrings("{\"text\":\"v1\"}", latest.content_json);
+}
+
+test "memory: create does not change active state when persistence fails" {
+    const allocator = std.testing.allocator;
+    var mem = try RuntimeMemory.init(allocator, "agentA");
+    defer mem.deinit();
+
+    const original_hook = persist_history_hook;
+    defer persist_history_hook = original_hook;
+    persist_history_hook = failPersistHistoryForTest;
+
+    try std.testing.expectError(
+        MemoryError.PersistenceFailed,
+        mem.create("primary", .ram, "persist_create", "note", "{\"text\":\"v1\"}"),
+    );
+
+    const snapshot = try mem.snapshotActive(allocator, "primary");
+    defer deinitItems(allocator, snapshot);
+    try std.testing.expectEqual(@as(usize, 0), snapshot.len);
+}
+
+test "memory: evict does not remove active state when persistence fails" {
+    const allocator = std.testing.allocator;
+    var mem = try RuntimeMemory.init(allocator, "agentA");
+    defer mem.deinit();
+
+    var created = try mem.create("primary", .ram, "persist_evict", "note", "{\"text\":\"v1\"}");
+    defer created.deinit(allocator);
+    const created_id_copy = try allocator.dupe(u8, created.mem_id);
+    defer allocator.free(created_id_copy);
+
+    const original_hook = persist_history_hook;
+    defer persist_history_hook = original_hook;
+    persist_history_hook = failPersistHistoryForTest;
+
+    try std.testing.expectError(MemoryError.PersistenceFailed, mem.evict(created_id_copy));
+
+    const latest_alias = try (try memid.MemId.parse(created_id_copy)).withVersion(null).format(allocator);
+    defer allocator.free(latest_alias);
+    var latest = try mem.load(latest_alias, null);
+    defer latest.deinit(allocator);
     try std.testing.expectEqual(@as(?u64, 1), latest.version);
     try std.testing.expectEqualStrings("{\"text\":\"v1\"}", latest.content_json);
 }
