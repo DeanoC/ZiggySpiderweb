@@ -257,22 +257,46 @@ fn getToolSchemas(allocator: std.mem.Allocator) ![]u8 {
     for (brain_tools.brain_tool_schemas, 0..) |schema, i| {
         if (i > 0) try writer.writeByte(',');
         try writer.writeByte('{');
-        
+
         // name
-        try writer.print("\"name\":\"{s}\"," , .{schema.name});
-        // description  
-        try writer.print("\"description\":\"{s}\"," , .{schema.description});
+        try writer.writeAll("\"name\":");
+        try writeJsonString(writer, schema.name);
+        try writer.writeByte(',');
+        // description
+        try writer.writeAll("\"description\":");
+        try writeJsonString(writer, schema.description);
+        try writer.writeByte(',');
         // required_fields
         try writer.writeAll("\"required_fields\":[");
         for (schema.required_fields, 0..) |field, j| {
             if (j > 0) try writer.writeByte(',');
-            try writer.print("\"{s}\"", .{field});
+            try writeJsonString(writer, field);
         }
         try writer.writeAll("]");
-        
+
         try writer.writeByte('}');
     }
     try writer.writeByte(']');
-    
+
     return json.toOwnedSlice(allocator);
+}
+
+/// Write a string as a JSON string value with proper escaping
+fn writeJsonString(writer: anytype, str: []const u8) !void {
+    try writer.writeByte('"');
+    for (str) |c| {
+        switch (c) {
+            '"' => try writer.writeAll("\\\""),
+            '\\' => try writer.writeAll("\\\\"),
+            '\n' => try writer.writeAll("\\n"),
+            '\r' => try writer.writeAll("\\r"),
+            '\t' => try writer.writeAll("\\t"),
+            '\x08' => try writer.writeAll("\\b"),
+            '\x0C' => try writer.writeAll("\\f"),
+            // Other control characters must be escaped as \u00XX
+            0x00...0x07, 0x0B, 0x0E...0x1F => try writer.print("\\u00{X:0>2}", .{c}),
+            else => try writer.writeByte(c),
+        }
+    }
+    try writer.writeByte('"');
 }

@@ -367,46 +367,71 @@ fn filterToolsForBrain(
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, capabilities_json, .{});
     defer parsed.deinit();
 
-    // If it's an array of tools, filter it
+    // If it's not an array, return as-is
     if (parsed.value != .array) {
-        // Not an array, return as-is
         return allocator.dupe(u8, capabilities_json);
     }
 
-    // Build filtered list of tool names
-    var allowed_tools = std.ArrayListUnmanaged([]const u8){};
-    defer {
-        for (allowed_tools.items) |tool| {
-            allocator.free(tool);
-        }
-        allowed_tools.deinit(allocator);
-    }
+    // Build filtered list of tool schema objects (not just names)
+    var filtered_tools = std.ArrayListUnmanaged(std.json.Value){};
+    defer filtered_tools.deinit(allocator);
 
     for (parsed.value.array.items) |tool| {
         const tool_name = getToolName(tool) orelse continue;
 
         if (spec.isToolAllowed(tool_name)) {
-            const owned = try allocator.dupe(u8, tool_name);
-            try allowed_tools.append(allocator, owned);
+            // Clone the full tool schema object
+            try filtered_tools.append(allocator, tool);
         }
     }
 
-    // Build simple JSON array of allowed tool names
+    // Build result JSON with full schema objects
     var result_json = std.ArrayListUnmanaged(u8){};
     defer result_json.deinit(allocator);
 
     const writer = result_json.writer(allocator);
     try writer.writeByte('[');
-    for (allowed_tools.items, 0..) |tool_name, i| {
+    for (filtered_tools.items, 0..) |tool, i| {
         if (i > 0) try writer.writeByte(',');
-        // Manual JSON string encoding (simple version - assumes no special chars)
-        try writer.writeByte('"');
-        try writer.writeAll(tool_name);
-        try writer.writeByte('"');
+        // Serialize the full tool schema object
+        try writeJsonValue(writer, tool);
     }
     try writer.writeByte(']');
 
     return result_json.toOwnedSlice(allocator);
+}
+
+/// Write a JSON value to the writer
+fn writeJsonValue(writer: anytype, value: std.json.Value) !void {
+    switch (value) {
+        .null => try writer.writeAll("null"),
+        .bool => |b| try writer.print("{}", .{b}),
+        .integer => |n| try writer.print("{d}", .{n}),
+        .float => |n| try writer.print("{e}", .{n}),
+        .string => |s| try writeJsonString(writer, s),
+        .array => |arr| {
+            try writer.writeByte('[');
+            for (arr.items, 0..) |item, i| {
+                if (i > 0) try writer.writeByte(',');
+                try writeJsonValue(writer, item);
+            }
+            try writer.writeByte(']');
+        },
+        .object => |obj| {
+            try writer.writeByte('{');
+            var first = true;
+            var it = obj.iterator();
+            while (it.next()) |entry| {
+                if (!first) try writer.writeByte(',');
+                first = false;
+                try writeJsonString(writer, entry.key_ptr.*);
+                try writer.writeByte(':');
+                try writeJsonValue(writer, entry.value_ptr.*);
+            }
+            try writer.writeByte('}');
+        },
+        .number_string => |s| try writer.writeAll(s),
+    }
 }
 
 /// Extract tool name from tool schema JSON

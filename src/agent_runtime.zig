@@ -394,7 +394,9 @@ pub const AgentRuntime = struct {
         try writer.writeAll("{");
 
         // Active memory
-        try writer.print("\"brain\":\"{s}\",", .{brain_name});
+        try writer.writeAll("\"brain\":");
+        try writeJsonString(writer, brain_name);
+        try writer.writeByte(',');
         try writer.writeAll("\"active_memory\":");
 
         // Serialize snapshot
@@ -411,8 +413,13 @@ pub const AgentRuntime = struct {
             try writeJsonString(writer, item.kind);
             try writer.writeByte(',');
             try writer.print("\"mutable\":{},", .{item.mutable});
-            try writer.print("\"content\":", .{});
-            try writer.writeAll(item.content_json);
+            try writer.writeAll("\"content\":");
+            // Validate content_json is valid JSON, otherwise wrap as string
+            if (isValidJson(item.content_json)) {
+                try writer.writeAll(item.content_json);
+            } else {
+                try writeJsonString(writer, item.content_json);
+            }
             try writer.writeByte('}');
         }
         try writer.writeByte(']');
@@ -436,6 +443,14 @@ pub const AgentRuntime = struct {
         try writer.writeByte('}');
 
         return result.toOwnedSlice(allocator);
+    }
+
+    /// Check if a string is valid JSON
+    fn isValidJson(str: []const u8) bool {
+        // Try to parse as JSON - if it succeeds, it's valid
+        const parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, str, .{}) catch return false;
+        parsed.deinit();
+        return true;
     }
 
     /// Write a string as a JSON string value with proper escaping
