@@ -117,8 +117,10 @@ fn handleConfigCommand(allocator: std.mem.Allocator, args: []const []const u8) !
         }
 
         try store.setProviderApiKey(provider_name, args[1]);
+        // Re-save config to scrub any legacy plaintext provider.api_key fields.
+        try config.save();
 
-        std.log.info("API key stored in secure backend '{s}' for provider '{s}'", .{ store.backendName(), provider_name });
+        std.log.info("API key stored in secure backend '{s}' for provider '{s}' and rewrote config", .{ store.backendName(), provider_name });
     } else if (std.mem.eql(u8, subcommand, "clear-key")) {
         var config = try Config.init(allocator, null);
         defer config.deinit();
