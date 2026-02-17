@@ -137,6 +137,12 @@ fn handleConfigCommand(allocator: std.mem.Allocator, args: []const []const u8) !
         }
 
         try store.clearProviderApiKey(provider_name);
+        // Also clear legacy plaintext key fallback for matching provider.
+        if (std.mem.eql(u8, provider_name, config.provider.name) and config.provider.api_key != null) {
+            allocator.free(config.provider.api_key.?);
+            config.provider.api_key = null;
+            try config.save();
+        }
         std.log.info("Cleared secure API key for provider '{s}'", .{provider_name});
     } else if (std.mem.eql(u8, subcommand, "set-log")) {
         if (args.len < 2) {
