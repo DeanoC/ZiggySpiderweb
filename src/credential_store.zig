@@ -71,17 +71,14 @@ fn detectBackend(allocator: std.mem.Allocator) Backend {
 }
 
 fn commandExists(allocator: std.mem.Allocator, command: []const u8) bool {
-    const result = std.process.Child.run(.{
-        .allocator = allocator,
-        .argv = &[_][]const u8{ command, "--help" },
-        .max_output_bytes = 256,
-    }) catch return false;
-    defer allocator.free(result.stdout);
-    defer allocator.free(result.stderr);
-    return switch (result.term) {
-        .Exited => true,
-        else => false,
-    };
+    var child = std.process.Child.init(&[_][]const u8{ command, "--help" }, allocator);
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Ignore;
+    child.stderr_behavior = .Ignore;
+
+    child.spawn() catch return false;
+    _ = child.wait() catch return false;
+    return true;
 }
 
 fn isValidProvider(provider_name: []const u8) bool {
