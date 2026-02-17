@@ -532,10 +532,6 @@ pub const RuntimeServer = struct {
 
         if (self.isJobCancelled(job)) return RuntimeServerError.RuntimeJobCancelled;
 
-        self.runtime.appendMessageMemory(DEFAULT_BRAIN, "assistant", provider_completion.assistant_text) catch |err| {
-            return self.wrapRuntimeErrorResponse(request_id, err);
-        };
-
         const escaped_content = try protocol.jsonEscape(self.allocator, provider_completion.assistant_text);
         defer self.allocator.free(escaped_content);
         const talk_args = try std.fmt.allocPrint(self.allocator, "{{\"message\":\"{s}\"}}", .{escaped_content});
@@ -547,6 +543,11 @@ pub const RuntimeServer = struct {
         self.runPendingTicks(job, null) catch |err| {
             self.clearRuntimeOutboundLocked();
             if (err == RuntimeServerError.RuntimeJobCancelled) return err;
+            return self.wrapRuntimeErrorResponse(request_id, err);
+        };
+
+        self.runtime.appendMessageMemory(DEFAULT_BRAIN, "assistant", provider_completion.assistant_text) catch |err| {
+            self.clearRuntimeOutboundLocked();
             return self.wrapRuntimeErrorResponse(request_id, err);
         };
 
@@ -720,12 +721,12 @@ pub const RuntimeServer = struct {
                 };
             }
 
-            try self.appendAssistantToolCallMessage(DEFAULT_BRAIN, assistant.text, tool_calls);
-
             if (total_calls + tool_calls.len > MAX_PROVIDER_TOOL_CALLS_PER_TURN) {
                 return RuntimeServerError.ProviderToolLoopExceeded;
             }
             total_calls += tool_calls.len;
+
+            try self.appendAssistantToolCallMessage(DEFAULT_BRAIN, assistant.text, tool_calls);
 
             for (tool_calls) |tool_call| {
                 const args_with_call_id = try injectToolCallId(self.allocator, tool_call.arguments_json, tool_call.id);
@@ -1060,6 +1061,38 @@ fn mockProviderStreamByModelWithToolLoop(
     } });
 }
 
+fn mockProviderStreamByModelTooManyToolCalls(
+    allocator: std.mem.Allocator,
+    _: *std.http.Client,
+    _: *ziggy_piai.api_registry.ApiRegistry,
+    model: ziggy_piai.types.Model,
+    _: ziggy_piai.types.Context,
+    _: ziggy_piai.types.StreamOptions,
+    events: *std.array_list.Managed(ziggy_piai.types.AssistantMessageEvent),
+) anyerror!void {
+    const tool_count = MAX_PROVIDER_TOOL_CALLS_PER_TURN + 1;
+    const tool_calls = try allocator.alloc(ziggy_piai.types.ToolCall, tool_count);
+    for (tool_calls, 0..) |*tool_call, idx| {
+        tool_call.* = .{
+            .id = try std.fmt.allocPrint(allocator, "call-{d}", .{idx}),
+            .name = try allocator.dupe(u8, "file.list"),
+            .arguments_json = try allocator.dupe(u8, "{\"path\":\"src\"}"),
+        };
+    }
+
+    try events.append(.{ .done = .{
+        .text = try allocator.dupe(u8, ""),
+        .thinking = try allocator.dupe(u8, ""),
+        .tool_calls = tool_calls,
+        .api = model.api,
+        .provider = model.provider,
+        .model = model.id,
+        .usage = .{},
+        .stop_reason = .tool_use,
+        .error_message = null,
+    } });
+}
+
 fn mockProviderStreamByModelError(
     _: std.mem.Allocator,
     _: *std.http.Client,
@@ -1216,6 +1249,39 @@ test "runtime_server: provider tool loop executes world tool and returns final r
     try std.testing.expect(std.mem.indexOf(u8, snapshot_json, "\"name\":\"file.list\"") != null);
 }
 
+test "runtime_server: provider tool-call cap does not persist unexecuted tool-call metadata" {
+    const allocator = std.testing.allocator;
+    const original_stream_fn = streamByModelFn;
+    defer streamByModelFn = original_stream_fn;
+    streamByModelFn = mockProviderStreamByModelTooManyToolCalls;
+
+    const server = try RuntimeServer.createWithProvider(allocator, "agent-test", .{
+        .ltm_directory = "",
+        .ltm_filename = "",
+    }, .{
+        .name = "openai",
+        .model = "gpt-4o-mini",
+        .api_key = "test-key",
+    });
+    defer server.destroy();
+
+    const response = try server.handleMessage("{\"id\":\"req-provider-too-many-tools\",\"type\":\"session.send\",\"content\":\"use many tools\"}");
+    defer allocator.free(response);
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "\"code\":\"execution_failed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "provider tool loop exceeded limits") != null);
+
+    const snapshot = try server.runtime.active_memory.snapshotActive(allocator, "primary");
+    defer memory.deinitItems(allocator, snapshot);
+    const snapshot_json = try memory.toActiveMemoryJson(allocator, "primary", snapshot);
+    defer allocator.free(snapshot_json);
+
+    try std.testing.expect(std.mem.indexOf(u8, snapshot_json, "\"role\":\"user\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot_json, "use many tools") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot_json, "\"tool_calls\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot_json, "\"role\":\"assistant\"") == null);
+}
+
 test "runtime_server: provider failure does not leak queued user/tick events" {
     const allocator = std.testing.allocator;
     const original_stream_fn = streamByModelFn;
@@ -1313,6 +1379,13 @@ test "runtime_server: talk enqueue failure does not leave pending runtime work" 
         const primary = server.runtime.brains.getPtr("primary").?;
         try std.testing.expectEqual(@as(usize, 0), primary.pending_tool_uses.items.len);
     }
+
+    const snapshot = try server.runtime.active_memory.snapshotActive(allocator, "primary");
+    defer memory.deinitItems(allocator, snapshot);
+    const snapshot_json = try memory.toActiveMemoryJson(allocator, "primary", snapshot);
+    defer allocator.free(snapshot_json);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot_json, "\"role\":\"user\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot_json, "\"role\":\"assistant\"") == null);
 }
 
 test "runtime_server: runPendingTicks failure clears stale outbound queue" {
