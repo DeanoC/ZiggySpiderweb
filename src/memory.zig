@@ -81,6 +81,9 @@ const MemoryHistory = struct {
     }
 };
 
+const PersistHistoryHookFn = *const fn (self: *RuntimeMemory, item: *const ActiveMemoryItem) MemoryError!void;
+var persist_history_hook: ?PersistHistoryHookFn = null;
+
 const BrainStore = struct {
     ram_items: std.StringHashMapUnmanaged(ActiveMemoryItem) = .{},
     rom_items: std.StringHashMapUnmanaged(ActiveMemoryItem) = .{},
@@ -247,16 +250,25 @@ pub const RuntimeMemory = struct {
             .created_at_ms = std.time.milliTimestamp(),
             .content_json = try self.allocator.dupe(u8, content_json),
         };
+        var inserted_into_map = false;
+        errdefer if (!inserted_into_map) next_item.deinit(self.allocator);
+
+        try self.persistHistoryLocked(&next_item);
+
+        try current_ref.store.ram_items.put(self.allocator, next_item.mem_id, next_item);
+        inserted_into_map = true;
+        errdefer if (current_ref.store.ram_items.fetchRemove(next_item.mem_id)) |removed_entry| {
+            var removed = removed_entry.value;
+            removed.deinit(self.allocator);
+        };
+        try current_ref.store.appendOrder(self.allocator, next_item.mem_id);
+        errdefer current_ref.store.removeOrder(next_item.mem_id);
 
         current_ref.store.removeOrder(current_item.mem_id);
         _ = current_ref.store.ram_items.remove(current_item.mem_id);
 
         var old = current_item;
         old.deinit(self.allocator);
-
-        try current_ref.store.ram_items.put(self.allocator, next_item.mem_id, next_item);
-        try current_ref.store.appendOrder(self.allocator, next_item.mem_id);
-        try self.persistHistoryLocked(&next_item);
 
         return next_item.clone(self.allocator);
     }
@@ -435,6 +447,10 @@ pub const RuntimeMemory = struct {
     }
 
     fn persistHistoryLocked(self: *RuntimeMemory, item: *const ActiveMemoryItem) !void {
+        if (persist_history_hook) |hook| {
+            return hook(self, item);
+        }
+
         const parsed = memid.MemId.parse(item.mem_id) catch return MemoryError.InvalidMemId;
         const base_id = try parsed.formatBase(self.allocator);
         defer self.allocator.free(base_id);
@@ -737,6 +753,35 @@ test "memory: mutate creates new version and load supports historical version" {
     var v1 = try mem.load(latest_id, 1);
     defer v1.deinit(allocator);
     try std.testing.expectEqualStrings("{\"text\":\"v1\"}", v1.content_json);
+}
+
+fn failPersistHistoryForTest(_: *RuntimeMemory, _: *const ActiveMemoryItem) MemoryError!void {
+    return MemoryError.PersistenceFailed;
+}
+
+test "memory: mutate does not change active state when persistence fails" {
+    const allocator = std.testing.allocator;
+    var mem = try RuntimeMemory.init(allocator, "agentA");
+    defer mem.deinit();
+
+    var created = try mem.create("primary", .ram, "persist_notes", "note", "{\"text\":\"v1\"}");
+    defer created.deinit(allocator);
+    const created_id_copy = try allocator.dupe(u8, created.mem_id);
+    defer allocator.free(created_id_copy);
+
+    const original_hook = persist_history_hook;
+    defer persist_history_hook = original_hook;
+    persist_history_hook = failPersistHistoryForTest;
+
+    try std.testing.expectError(MemoryError.PersistenceFailed, mem.mutate(created_id_copy, "{\"text\":\"v2\"}"));
+
+    const latest_alias = try (try memid.MemId.parse(created_id_copy)).withVersion(null).format(allocator);
+    defer allocator.free(latest_alias);
+    var latest = try mem.load(latest_alias, null);
+    defer latest.deinit(allocator);
+
+    try std.testing.expectEqual(@as(?u64, 1), latest.version);
+    try std.testing.expectEqualStrings("{\"text\":\"v1\"}", latest.content_json);
 }
 
 test "memory: active memory JSON always includes mem_id" {

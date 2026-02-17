@@ -470,6 +470,7 @@ pub const RuntimeServer = struct {
         };
 
         const runtime_events = self.runPendingTicks() catch |err| {
+            self.clearRuntimeOutboundLocked();
             return self.wrapRuntimeErrorResponse(request_id, err);
         };
         defer deinitResponseFrames(self.allocator, runtime_events);
@@ -496,6 +497,11 @@ pub const RuntimeServer = struct {
         }
 
         return responses.toOwnedSlice(self.allocator);
+    }
+
+    fn clearRuntimeOutboundLocked(self: *RuntimeServer) void {
+        for (self.runtime.outbound_messages.items) |message| self.allocator.free(message);
+        self.runtime.outbound_messages.clearRetainingCapacity();
     }
 
     fn handleControl(
@@ -886,6 +892,25 @@ test "runtime_server: talk enqueue failure rolls back queued user work" {
         try std.testing.expectEqual(@as(usize, 0), server.runtime.bus.pendingCount());
         const primary = server.runtime.brains.getPtr("primary").?;
         try std.testing.expectEqual(@as(usize, 0), primary.pending_tool_uses.items.len);
+    }
+}
+
+test "runtime_server: runPendingTicks failure clears stale outbound queue" {
+    const allocator = std.testing.allocator;
+    const server = try RuntimeServer.create(allocator, "agent-test", .{
+        .outbound_queue_max = 2,
+        .ltm_directory = "",
+        .ltm_filename = "",
+    });
+    defer server.destroy();
+
+    var attempt: usize = 0;
+    while (attempt < 3) : (attempt += 1) {
+        const response = try server.handleMessage("{\"id\":\"req-tick-fail\",\"type\":\"session.send\",\"content\":\"hello\"}");
+        defer allocator.free(response);
+
+        try std.testing.expect(std.mem.indexOf(u8, response, "\"code\":\"queue_saturated\"") != null);
+        try std.testing.expectEqual(@as(usize, 0), server.runtime.outbound_messages.items.len);
     }
 }
 

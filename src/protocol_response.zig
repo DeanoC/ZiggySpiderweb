@@ -110,14 +110,25 @@ pub fn jsonEscape(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
     var out = std.ArrayListUnmanaged(u8){};
     defer out.deinit(allocator);
 
+    const hex = "0123456789abcdef";
     for (input) |char| {
         switch (char) {
             '\\' => try out.appendSlice(allocator, "\\\\"),
             '"' => try out.appendSlice(allocator, "\\\""),
+            '\x08' => try out.appendSlice(allocator, "\\b"),
+            '\x0C' => try out.appendSlice(allocator, "\\f"),
             '\n' => try out.appendSlice(allocator, "\\n"),
             '\r' => try out.appendSlice(allocator, "\\r"),
             '\t' => try out.appendSlice(allocator, "\\t"),
-            else => try out.append(allocator, char),
+            else => {
+                if (char < 0x20) {
+                    try out.appendSlice(allocator, "\\u00");
+                    try out.append(allocator, hex[(char >> 4) & 0x0F]);
+                    try out.append(allocator, hex[char & 0x0F]);
+                } else {
+                    try out.append(allocator, char);
+                }
+            },
         }
     }
 
@@ -130,4 +141,19 @@ test "protocol_response: buildErrorWithCode includes deterministic error code" {
     defer allocator.free(payload);
 
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"code\":\"queue_saturated\"") != null);
+}
+
+test "protocol_response: jsonEscape handles all control characters" {
+    const allocator = std.testing.allocator;
+    const input = [_]u8{ 'a', 0x01, '\x08', '\x0C', '\n', '\r', '\t', 'z' };
+    const escaped = try jsonEscape(allocator, &input);
+    defer allocator.free(escaped);
+
+    try std.testing.expect(std.mem.indexOf(u8, escaped, "\\u0001") != null);
+    try std.testing.expect(std.mem.indexOf(u8, escaped, "\\b") != null);
+    try std.testing.expect(std.mem.indexOf(u8, escaped, "\\f") != null);
+    try std.testing.expect(std.mem.indexOf(u8, escaped, "\\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, escaped, "\\r") != null);
+    try std.testing.expect(std.mem.indexOf(u8, escaped, "\\t") != null);
+    try std.testing.expect(std.mem.indexOfScalar(u8, escaped, 0x01) == null);
 }
