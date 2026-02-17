@@ -720,11 +720,7 @@ pub const RuntimeServer = struct {
                 };
             }
 
-            if (assistant.text.len > 0) {
-                self.runtime.appendMessageMemory(DEFAULT_BRAIN, "assistant", assistant.text) catch |err| {
-                    return err;
-                };
-            }
+            try self.appendAssistantToolCallMessage(DEFAULT_BRAIN, assistant.text, tool_calls);
 
             if (total_calls + tool_calls.len > MAX_PROVIDER_TOOL_CALLS_PER_TURN) {
                 return RuntimeServerError.ProviderToolLoopExceeded;
@@ -781,6 +777,48 @@ pub const RuntimeServer = struct {
             "<active_memory_state>\n{s}</active_memory_state>\nUse only this state as conversation context.",
             .{state_json},
         );
+    }
+
+    fn appendAssistantToolCallMessage(
+        self: *RuntimeServer,
+        brain_name: []const u8,
+        content: []const u8,
+        tool_calls: []const ziggy_piai.types.ToolCall,
+    ) !void {
+        var payload = std.ArrayListUnmanaged(u8){};
+        defer payload.deinit(self.allocator);
+
+        try payload.appendSlice(self.allocator, "{\"role\":\"assistant\",\"content\":\"");
+        const escaped_content = try protocol.jsonEscape(self.allocator, content);
+        defer self.allocator.free(escaped_content);
+        try payload.appendSlice(self.allocator, escaped_content);
+        try payload.appendSlice(self.allocator, "\",\"tool_calls\":[");
+
+        for (tool_calls, 0..) |tool_call, idx| {
+            if (idx > 0) try payload.append(self.allocator, ',');
+
+            const escaped_id = try protocol.jsonEscape(self.allocator, tool_call.id);
+            defer self.allocator.free(escaped_id);
+            const escaped_name = try protocol.jsonEscape(self.allocator, tool_call.name);
+            defer self.allocator.free(escaped_name);
+            const escaped_args = try protocol.jsonEscape(self.allocator, tool_call.arguments_json);
+            defer self.allocator.free(escaped_args);
+
+            try payload.appendSlice(self.allocator, "{\"id\":\"");
+            try payload.appendSlice(self.allocator, escaped_id);
+            try payload.appendSlice(self.allocator, "\",\"name\":\"");
+            try payload.appendSlice(self.allocator, escaped_name);
+            try payload.appendSlice(self.allocator, "\",\"arguments_json\":\"");
+            try payload.appendSlice(self.allocator, escaped_args);
+            try payload.appendSlice(self.allocator, "\"}");
+        }
+
+        try payload.appendSlice(self.allocator, "]}");
+        const content_json = try payload.toOwnedSlice(self.allocator);
+        defer self.allocator.free(content_json);
+
+        var created = try self.runtime.active_memory.create(brain_name, .ram, null, "message", content_json);
+        created.deinit(self.allocator);
     }
 
     fn operationTimeoutNs(self: *const RuntimeServer, operation_class: RuntimeOperationClass) u64 {
@@ -1173,6 +1211,9 @@ test "runtime_server: provider tool loop executes world tool and returns final r
 
     try std.testing.expect(saw_final);
     try std.testing.expect(std.mem.indexOf(u8, snapshot_json, "\"kind\":\"tool_result\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot_json, "\"tool_calls\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot_json, "\"id\":\"call-1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot_json, "\"name\":\"file.list\"") != null);
 }
 
 test "runtime_server: provider failure does not leak queued user/tick events" {
