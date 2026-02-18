@@ -92,6 +92,15 @@ const AgentRuntimeRegistry = struct {
         }
         return true;
     }
+
+    fn getFirstAgentId(self: *AgentRuntimeRegistry) ?[]const u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        
+        var it = self.by_agent.keyIterator();
+        const first = it.next() orelse return null;
+        return first.*;
+    }
 };
 
 pub fn run(
@@ -160,7 +169,7 @@ fn handleWebSocketConnection(
     var handshake = try websocket_transport.performHandshakeWithInfo(allocator, stream);
     defer handshake.deinit(allocator);
 
-    const agent_id = parseAgentIdFromStreamPath(handshake.path) orelse runtime_server_mod.default_agent_id;
+    const agent_id = parseAgentIdFromStreamPath(handshake.path) orelse runtime_registry.getFirstAgentId() orelse runtime_server_mod.default_agent_id;
     const runtime_server = runtime_registry.getOrCreate(agent_id) catch |err| switch (err) {
         error.InvalidAgentId => {
             try sendWebSocketErrorAndClose(allocator, stream, .invalid_envelope, "invalid agent id");
