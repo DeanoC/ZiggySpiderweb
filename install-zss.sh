@@ -55,6 +55,8 @@ fi
 if [[ -d "$ZSS_REPO" ]]; then
     log_info "Updating ZiggyStarSpider..."
     cd "$ZSS_REPO"
+    # Stash any local changes to avoid merge conflicts
+    git stash -q 2>/dev/null || true
     git pull -q
 else
     log_info "Cloning ZiggyStarSpider (this may take a minute)..."
