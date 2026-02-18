@@ -166,7 +166,22 @@ fi
 # Ask about systemd service
 INSTALL_SYSTEMD=false
 SYSTEMD_SCOPE="user"
-if [[ -t 0 ]]; then
+
+# Check for existing systemd services
+SYSTEMD_EXISTS=false
+EXISTING_SCOPE=""
+if [[ -f /etc/systemd/system/spiderweb.service ]]; then
+    SYSTEMD_EXISTS=true
+    EXISTING_SCOPE="system"
+elif [[ -f "$HOME/.config/systemd/user/spiderweb.service" ]]; then
+    SYSTEMD_EXISTS=true
+    EXISTING_SCOPE="user"
+fi
+
+if [[ "$SYSTEMD_EXISTS" == "true" ]]; then
+    log_info "Systemd service already exists ($EXISTING_SCOPE scope)"
+    INSTALL_SYSTEMD=false
+elif [[ -t 0 ]]; then
     echo ""
     read -rp "Install systemd service? [Y/n]: " systemd_confirm
     if [[ ! "$systemd_confirm" =~ ^[Nn]$ ]] || [[ -z "$systemd_confirm" ]]; then
@@ -199,14 +214,14 @@ WantedBy=default.target"
     if [[ "$SYSTEMD_SCOPE" == "system" ]]; then
         echo "$SERVICE_FILE" | sudo tee /etc/systemd/system/spiderweb.service > /dev/null
         sudo systemctl daemon-reload
-        log_success "System service installed"
-        echo "  Enable with: sudo systemctl enable --now spiderweb"
+        sudo systemctl enable --now spiderweb
+        log_success "System service installed and started"
     else
         mkdir -p "$HOME/.config/systemd/user"
         echo "$SERVICE_FILE" > "$HOME/.config/systemd/user/spiderweb.service"
         systemctl --user daemon-reload
-        log_success "User service installed"
-        echo "  Enable with: systemctl --user enable --now spiderweb"
+        systemctl --user enable --now spiderweb
+        log_success "User service installed and started"
     fi
 fi
 
@@ -245,25 +260,17 @@ fi
 echo ""
 
 if [[ "$INSTALL_SYSTEMD" == "true" ]]; then
-    echo "Systemd service installed ($SYSTEMD_SCOPE scope)"
-    if [[ "$SYSTEMD_SCOPE" == "system" ]]; then
-        echo "  Start: sudo systemctl start spiderweb"
-        echo "  Status: sudo systemctl status spiderweb"
-    else
-        echo "  Start: systemctl --user start spiderweb"
-        echo "  Status: systemctl --user status spiderweb"
-    fi
+    echo "Systemd service installed and started ($SYSTEMD_SCOPE scope)"
+elif [[ "$SYSTEMD_EXISTS" == "true" ]]; then
+    echo "Systemd service already exists ($EXISTING_SCOPE scope)"
 else
     echo "To install systemd service later:"
     echo "  spiderweb-config config install-service"
-    echo "  systemctl --user enable --now spiderweb"
 fi
 
 echo ""
 if [[ "$INSTALL_ZSS" == "true" ]]; then
-    echo "Connect to your agent:"
-    echo "  zss connect"
-    echo "  or: zss connect --url ws://127.0.0.1:18790/v1/agents/<agent-name>/stream"
+    echo "Connect to your agent: zss connect"
 else
     echo "To connect to your agent, install ZiggyStarSpider:"
     echo "  https://github.com/DeanoC/ZiggyStarSpider"
