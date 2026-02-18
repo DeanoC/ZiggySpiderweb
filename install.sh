@@ -227,8 +227,31 @@ fi
 if [[ "$INSTALL_SYSTEMD" == "true" ]]; then
     log_info "Installing systemd service..."
     
+    # Get current user for system service
+    CURRENT_USER=$(whoami)
+    
     # Create service file content
-    SERVICE_FILE="[Unit]
+    if [[ "$SYSTEMD_SCOPE" == "system" ]]; then
+        SERVICE_FILE="[Unit]
+Description=ZiggySpiderweb AI Agent Gateway
+After=network.target
+
+[Service]
+Type=simple
+User=$CURRENT_USER
+ExecStart=$INSTALL_DIR/spiderweb
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target"
+        
+        echo "$SERVICE_FILE" | sudo tee /etc/systemd/system/spiderweb.service > /dev/null
+        sudo systemctl daemon-reload
+        sudo systemctl enable --now spiderweb
+        log_success "System service installed and started"
+    else
+        SERVICE_FILE="[Unit]
 Description=ZiggySpiderweb AI Agent Gateway
 After=network.target
 
@@ -240,13 +263,7 @@ RestartSec=5
 
 [Install]
 WantedBy=default.target"
-    
-    if [[ "$SYSTEMD_SCOPE" == "system" ]]; then
-        echo "$SERVICE_FILE" | sudo tee /etc/systemd/system/spiderweb.service > /dev/null
-        sudo systemctl daemon-reload
-        sudo systemctl enable --now spiderweb
-        log_success "System service installed and started"
-    else
+        
         mkdir -p "$HOME/.config/systemd/user"
         echo "$SERVICE_FILE" > "$HOME/.config/systemd/user/spiderweb.service"
         systemctl --user daemon-reload
@@ -347,7 +364,7 @@ if [[ "$INSTALL_ZSS" == "true" ]]; then
     echo "  Local:  zss connect"
     # Only show remote URL if remote access is enabled
     if [[ -t 0 ]] && [[ "$BIND_ADDRESS" == "0.0.0.0" ]]; then
-        echo "  Remote: zss connect --url ws://<host-ip>:${CURRENT_PORT}/v1/agents/<agent>/stream"
+        echo "  Remote: zss connect --url ws://<host-ip>:${CURRENT_PORT}"
     fi
 else
     echo "To connect to your agent, install ZiggyStarSpider:"
