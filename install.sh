@@ -117,6 +117,14 @@ zig build -Doptimize=ReleaseSafe
 
 log_info "Installing binaries..."
 mkdir -p "$INSTALL_DIR"
+
+# Stop any running spiderweb to allow binary replacement
+if pgrep spiderweb > /dev/null 2>&1; then
+    log_info "Stopping running spiderweb..."
+    pkill spiderweb || true
+    sleep 1
+fi
+
 cp zig-out/bin/spiderweb "$INSTALL_DIR/"
 cp zig-out/bin/spiderweb-config "$INSTALL_DIR/"
 
