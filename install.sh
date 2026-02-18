@@ -201,12 +201,12 @@ echo "  spiderweb-config config install-service"
 echo "  systemctl --user enable --now spiderweb"
 echo ""
 if [[ "$INSTALL_ZSS" == "true" ]]; then
-    echo "Test your agent:"
-    echo "  zss --gateway-test ping ws://127.0.0.1:18790/v1/agents/<agent-name>/stream"
+    echo "Connect to your agent:"
+    echo "  zss connect --url ws://127.0.0.1:18790/v1/agents/<agent-name>/stream"
 else
     echo "To connect to your agent, install ZiggyStarSpider:"
     echo "  https://github.com/DeanoC/ZiggyStarSpider"
     echo ""
-    echo "Then test with:"
-    echo "  zss --gateway-test ping ws://127.0.0.1:18790/v1/agents/<agent-name>/stream"
+    echo "Then connect with:"
+    echo "  zss connect --url ws://127.0.0.1:18790/v1/agents/<agent-name>/stream"
 fi
