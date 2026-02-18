@@ -15,6 +15,7 @@ const AgentRuntimeRegistry = struct {
     allocator: std.mem.Allocator,
     runtime_config: Config.RuntimeConfig,
     provider_config: ?Config.ProviderConfig,
+    default_agent_id: []const u8,
     max_runtimes: usize,
     mutex: std.Thread.Mutex = .{},
     by_agent: std.StringHashMapUnmanaged(*RuntimeServer) = .{},
@@ -37,6 +38,7 @@ const AgentRuntimeRegistry = struct {
             .allocator = allocator,
             .runtime_config = runtime_config,
             .provider_config = provider_config,
+            .default_agent_id = if (runtime_config.default_agent_id.len == 0) runtime_server_mod.default_agent_id else runtime_config.default_agent_id,
             .max_runtimes = if (max_runtimes == 0) 1 else max_runtimes,
         };
     }
@@ -96,7 +98,7 @@ const AgentRuntimeRegistry = struct {
     fn getFirstAgentId(self: *AgentRuntimeRegistry) ?[]const u8 {
         self.mutex.lock();
         defer self.mutex.unlock();
-        
+
         var it = self.by_agent.keyIterator();
         const first = it.next() orelse return null;
         return first.*;
@@ -113,7 +115,7 @@ pub fn run(
     var runtime_registry = AgentRuntimeRegistry.init(allocator, runtime_config, provider_config);
     defer runtime_registry.deinit();
 
-    _ = try runtime_registry.getOrCreate(runtime_server_mod.default_agent_id);
+    _ = try runtime_registry.getOrCreate(runtime_registry.default_agent_id);
 
     const address = try std.net.Address.parseIp(bind_addr, port);
     var tcp_server = try address.listen(.{ .reuse_address = true });
@@ -130,7 +132,7 @@ pub fn run(
 
     std.log.info(
         "Runtime websocket server listening at ws://{s}:{d}/v1/agents/{s}/stream",
-        .{ bind_addr, port, runtime_server_mod.default_agent_id },
+        .{ bind_addr, port, runtime_registry.default_agent_id },
     );
 
     while (true) {
@@ -169,7 +171,7 @@ fn handleWebSocketConnection(
     var handshake = try websocket_transport.performHandshakeWithInfo(allocator, stream);
     defer handshake.deinit(allocator);
 
-    const agent_id = parseAgentIdFromStreamPath(handshake.path) orelse runtime_registry.getFirstAgentId() orelse runtime_server_mod.default_agent_id;
+    const agent_id = parseAgentIdFromStreamPath(handshake.path) orelse runtime_registry.getFirstAgentId() orelse runtime_registry.default_agent_id;
     const runtime_server = runtime_registry.getOrCreate(agent_id) catch |err| switch (err) {
         error.InvalidAgentId => {
             try sendWebSocketErrorAndClose(allocator, stream, .invalid_envelope, "invalid agent id");
@@ -195,6 +197,43 @@ fn handleWebSocketConnection(
 
         switch (frame.opcode) {
             0x1 => {
+                if (protocol.parseMessageType(frame.payload) == .connect) {
+                    var parsed_connect = protocol.parseMessage(allocator, frame.payload) catch {
+                        const invalid = try protocol.buildErrorWithCode(
+                            allocator,
+                            "unknown",
+                            .invalid_envelope,
+                            "invalid request envelope",
+                        );
+                        defer allocator.free(invalid);
+                        try websocket_transport.writeFrame(stream, invalid, .text);
+                        continue;
+                    };
+                    defer protocol.deinitParsedMessage(allocator, &parsed_connect);
+
+                    const request_id = parsed_connect.id orelse "generated";
+                    const connect_ack = try protocol.buildConnectAck(allocator, request_id);
+                    defer allocator.free(connect_ack);
+                    try websocket_transport.writeFrame(stream, connect_ack, .text);
+
+                    const bootstrap_responses = runtime_server.handleConnectBootstrapFrames(request_id) catch |err| blk: {
+                        const fallback = try protocol.buildErrorWithCode(
+                            allocator,
+                            request_id,
+                            .execution_failed,
+                            @errorName(err),
+                        );
+                        const wrapped = try allocator.alloc([]u8, 1);
+                        wrapped[0] = fallback;
+                        break :blk wrapped;
+                    };
+                    defer runtime_server_mod.deinitResponseFrames(allocator, bootstrap_responses);
+                    for (bootstrap_responses) |response| {
+                        try websocket_transport.writeFrame(stream, response, .text);
+                    }
+                    continue;
+                }
+
                 const responses = runtime_server.handleMessageFrames(frame.payload) catch |err| blk: {
                     const fallback = try protocol.buildErrorWithCode(
                         allocator,
@@ -431,6 +470,9 @@ test "server_piai: websocket path handles connect/session.send and rejects chat.
     defer connect_ack.deinit(allocator);
     try std.testing.expectEqual(@as(u8, 0x1), connect_ack.opcode);
     try std.testing.expect(std.mem.indexOf(u8, connect_ack.payload, "\"type\":\"connect.ack\"") != null);
+    var bootstrap_frame = try readServerFrame(allocator, &client);
+    defer bootstrap_frame.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, bootstrap_frame.payload, "\"type\":\"session.receive\"") != null);
 
     try writeClientTextFrameMasked(&client, "{\"id\":\"req-session\",\"type\":\"session.send\",\"content\":\"hello\"}");
     var session_frame = try readServerFrame(allocator, &client);
@@ -484,6 +526,9 @@ test "server_piai: route path agent id isolates runtime state across connections
         var connect_ack = try readServerFrame(allocator, &client);
         defer connect_ack.deinit(allocator);
         try std.testing.expect(std.mem.indexOf(u8, connect_ack.payload, "\"type\":\"connect.ack\"") != null);
+        var bootstrap_frame = try readServerFrame(allocator, &client);
+        defer bootstrap_frame.deinit(allocator);
+        try std.testing.expect(std.mem.indexOf(u8, bootstrap_frame.payload, "\"type\":\"session.receive\"") != null);
 
         try writeClientTextFrameMasked(&client, "{\"id\":\"a-msg\",\"type\":\"session.send\",\"content\":\"alpha hello\"}");
         var alpha_reply = try readServerFrame(allocator, &client);
@@ -509,6 +554,9 @@ test "server_piai: route path agent id isolates runtime state across connections
         var connect_ack = try readServerFrame(allocator, &client);
         defer connect_ack.deinit(allocator);
         try std.testing.expect(std.mem.indexOf(u8, connect_ack.payload, "\"type\":\"connect.ack\"") != null);
+        var bootstrap_frame = try readServerFrame(allocator, &client);
+        defer bootstrap_frame.deinit(allocator);
+        try std.testing.expect(std.mem.indexOf(u8, bootstrap_frame.payload, "\"type\":\"session.receive\"") != null);
 
         try writeClientTextFrameMasked(&client, "{\"id\":\"b-msg\",\"type\":\"session.send\",\"content\":\"beta hello\"}");
         var beta_reply = try readServerFrame(allocator, &client);
@@ -575,6 +623,9 @@ test "server_piai: runtime creation is capped to avoid unbounded per-agent growt
         var connect_ack = try readServerFrame(allocator, &client);
         defer connect_ack.deinit(allocator);
         try std.testing.expect(std.mem.indexOf(u8, connect_ack.payload, "\"type\":\"connect.ack\"") != null);
+        var bootstrap_frame = try readServerFrame(allocator, &client);
+        defer bootstrap_frame.deinit(allocator);
+        try std.testing.expect(std.mem.indexOf(u8, bootstrap_frame.payload, "\"type\":\"session.receive\"") != null);
 
         try websocket_transport.writeFrame(&client, "", .close);
         var close_reply = try readServerFrame(allocator, &client);

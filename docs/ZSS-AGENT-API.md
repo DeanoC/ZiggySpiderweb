@@ -8,6 +8,17 @@ This document describes the protocol messages for agent discovery and session re
 
 ## Agent Discovery
 
+## Connect Behavior
+
+On websocket `connect`, the server replies with:
+
+1. `connect.ack`
+2. Optional `session.receive` bootstrap message for first-time agent initialization
+
+Clients should always handle multiple frames after a single `connect` request.
+
+---
+
 ### List Available Agents
 
 **Request:**

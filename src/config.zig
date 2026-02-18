@@ -30,6 +30,7 @@ pub const RuntimeConfig = struct {
     runtime_request_queue_max: usize = 128,
     chat_operation_timeout_ms: u64 = 30_000,
     control_operation_timeout_ms: u64 = 5_000,
+    default_agent_id: []const u8 = "default",
     ltm_directory: []const u8 = ".spiderweb-ltm",
     ltm_filename: []const u8 = "runtime-memory.db",
 };
@@ -65,6 +66,7 @@ const default_config =
     \\    "runtime_request_queue_max": 128,
     \\    "chat_operation_timeout_ms": 30000,
     \\    "control_operation_timeout_ms": 5000,
+    \\    "default_agent_id": "default",
     \\    "ltm_directory": ".spiderweb-ltm",
     \\    "ltm_filename": "runtime-memory.db"
     \\  }
@@ -100,6 +102,7 @@ pub fn init(allocator: std.mem.Allocator, config_path: ?[]const u8) !Config {
             .runtime_request_queue_max = 128,
             .chat_operation_timeout_ms = 30_000,
             .control_operation_timeout_ms = 5_000,
+            .default_agent_id = try allocator.dupe(u8, "default"),
             .ltm_directory = try allocator.dupe(u8, ".spiderweb-ltm"),
             .ltm_filename = try allocator.dupe(u8, "runtime-memory.db"),
         },
@@ -128,6 +131,7 @@ pub fn deinit(self: *Config) void {
     if (self.provider.api_key) |k| self.allocator.free(k);
     if (self.provider.base_url) |b| self.allocator.free(b);
     self.allocator.free(self.log.level);
+    self.allocator.free(self.runtime.default_agent_id);
     self.allocator.free(self.runtime.ltm_directory);
     self.allocator.free(self.runtime.ltm_filename);
 }
@@ -274,6 +278,12 @@ pub fn load(self: *Config) !void {
                     self.runtime.control_operation_timeout_ms = @intCast(value.integer);
                 }
             }
+            if (runtime_val.object.get("default_agent_id")) |value| {
+                if (value == .string and value.string.len > 0) {
+                    self.allocator.free(self.runtime.default_agent_id);
+                    self.runtime.default_agent_id = try self.allocator.dupe(u8, value.string);
+                }
+            }
             if (runtime_val.object.get("ltm_directory")) |value| {
                 if (value == .string) {
                     self.allocator.free(self.runtime.ltm_directory);
@@ -363,6 +373,8 @@ pub fn save(self: Config) !void {
     try file.writeAll(chat_timeout_line);
     const control_timeout_line = try std.fmt.bufPrint(&buf, "    \"control_operation_timeout_ms\": {d},\n", .{self.runtime.control_operation_timeout_ms});
     try file.writeAll(control_timeout_line);
+    const default_agent_line = try std.fmt.bufPrint(&buf, "    \"default_agent_id\": \"{s}\",\n", .{self.runtime.default_agent_id});
+    try file.writeAll(default_agent_line);
     const ltm_dir_line = try std.fmt.bufPrint(&buf, "    \"ltm_directory\": \"{s}\",\n", .{self.runtime.ltm_directory});
     try file.writeAll(ltm_dir_line);
     const ltm_file_line = try std.fmt.bufPrint(&buf, "    \"ltm_filename\": \"{s}\"\n", .{self.runtime.ltm_filename});
@@ -401,6 +413,12 @@ pub fn setLogLevel(self: *Config, level: []const u8) !void {
     try self.save();
 }
 
+pub fn setDefaultAgentId(self: *Config, agent_id: []const u8) !void {
+    self.allocator.free(self.runtime.default_agent_id);
+    self.runtime.default_agent_id = try self.allocator.dupe(u8, agent_id);
+    try self.save();
+}
+
 pub fn getApiKey(self: Config, allocator: std.mem.Allocator) !?[]const u8 {
     const store = credential_store.CredentialStore.init(allocator);
     return store.getProviderApiKey(self.provider.name);
@@ -421,5 +439,6 @@ test "Config defaults" {
     try std.testing.expectEqual(@as(usize, 128), config.runtime.runtime_request_queue_max);
     try std.testing.expectEqual(@as(u64, 30_000), config.runtime.chat_operation_timeout_ms);
     try std.testing.expectEqual(@as(u64, 5_000), config.runtime.control_operation_timeout_ms);
+    try std.testing.expectEqualStrings("default", config.runtime.default_agent_id);
     try std.testing.expectEqualStrings(".spiderweb-ltm", config.runtime.ltm_directory);
 }

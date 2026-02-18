@@ -48,12 +48,13 @@ fn handleConfigCommand(allocator: std.mem.Allocator, args: []const []const u8) !
 
         const stdout_file = std.fs.File.stdout();
         var buf: [1024]u8 = undefined;
-        const msg = try std.fmt.bufPrint(&buf, "Config: {s}\n  Bind: {s}:{d}\n  Provider: {s}/{s}\n  API Key Source: {s}\n  Secure Backend: {s}\n  Log: {s}\n", .{
+        const msg = try std.fmt.bufPrint(&buf, "Config: {s}\n  Bind: {s}:{d}\n  Provider: {s}/{s}\n  Default Agent: {s}\n  API Key Source: {s}\n  Secure Backend: {s}\n  Log: {s}\n", .{
             config.config_path,
             config.server.bind,
             config.server.port,
             config.provider.name,
             config.provider.model orelse "(default)",
+            config.runtime.default_agent_id,
             key_source,
             store.backendName(),
             config.log.level,

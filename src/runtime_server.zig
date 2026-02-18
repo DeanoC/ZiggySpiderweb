@@ -6,6 +6,8 @@ const agent_runtime = @import("agent_runtime.zig");
 const brain_specialization = @import("brain_specialization.zig");
 const credential_store = @import("credential_store.zig");
 const memory = @import("memory.zig");
+const memid = @import("memid.zig");
+const system_hooks = @import("system_hooks.zig");
 const tool_registry = @import("tool_registry.zig");
 const ziggy_piai = @import("ziggy-piai");
 
@@ -14,6 +16,8 @@ const DEFAULT_BRAIN = "primary";
 const INTERNAL_TICK_TIMEOUT_MS: i64 = 5 * 1000;
 const MAX_PROVIDER_TOOL_ROUNDS: usize = 8;
 const MAX_PROVIDER_TOOL_CALLS_PER_TURN: usize = 32;
+const BOOTSTRAP_COMPLETE_MEM_NAME = "system.bootstrap.complete";
+const BOOTSTRAP_COMPLETE_MEM_KIND = "bootstrap.status";
 
 const RuntimeServerError = error{
     RuntimeTickTimeout,
@@ -52,6 +56,16 @@ const ProviderCompletion = struct {
         allocator.free(self.assistant_text);
         self.* = undefined;
     }
+};
+
+const ProviderToolNameMapEntry = struct {
+    provider_name: []u8,
+    runtime_name: []const u8,
+};
+
+const BootstrapPrompt = struct {
+    template_name: []const u8,
+    content: []u8,
 };
 
 const StreamByModelFn = *const fn (
@@ -129,6 +143,7 @@ pub const RuntimeServer = struct {
     allocator: std.mem.Allocator,
     runtime: agent_runtime.AgentRuntime,
     provider_runtime: ?ProviderRuntime = null,
+    default_agent_id: []u8,
 
     runtime_mutex: std.Thread.Mutex = .{},
     queue_mutex: std.Thread.Mutex = .{},
@@ -204,11 +219,13 @@ pub const RuntimeServer = struct {
             .control_operation_timeout_ms = runtime_cfg.control_operation_timeout_ms,
             .runtime_workers = try allocator.alloc(std.Thread, worker_count),
             .provider_runtime = provider_runtime,
+            .default_agent_id = try allocator.dupe(u8, if (runtime_cfg.default_agent_id.len == 0) default_agent_id else runtime_cfg.default_agent_id),
             .test_ltm_directory = test_ltm_directory,
         };
         errdefer {
             self.runtime.deinit();
             allocator.free(self.runtime_workers);
+            allocator.free(self.default_agent_id);
             if (self.test_ltm_directory) |dir| {
                 std.fs.cwd().deleteTree(dir) catch {};
                 allocator.free(dir);
@@ -261,6 +278,7 @@ pub const RuntimeServer = struct {
         self.queue_mutex.unlock();
 
         self.allocator.free(self.runtime_workers);
+        self.allocator.free(self.default_agent_id);
         if (self.provider_runtime) |*provider| provider.deinit(self.allocator);
         self.runtime.deinit();
         if (self.test_ltm_directory) |dir| {
@@ -322,6 +340,10 @@ pub const RuntimeServer = struct {
                 ));
             },
         }
+    }
+
+    pub fn handleConnectBootstrapFrames(self: *RuntimeServer, request_id: []const u8) ![][]u8 {
+        return self.submitRuntimeJobAndAwait(.connect, request_id, null, null, .chat);
     }
 
     fn submitRuntimeJobAndAwait(
@@ -499,6 +521,9 @@ pub const RuntimeServer = struct {
         if (self.isJobCancelled(job)) return RuntimeServerError.RuntimeJobCancelled;
 
         switch (job.msg_type) {
+            .connect => {
+                return self.handleConnect(job, job.request_id);
+            },
             .session_send => {
                 const content = job.content orelse {
                     return self.wrapSingleFrame(try protocol.buildErrorWithCode(
@@ -557,8 +582,119 @@ pub const RuntimeServer = struct {
         self.allocator.destroy(job);
     }
 
+    fn handleConnect(self: *RuntimeServer, job: *RuntimeQueueJob, request_id: []const u8) ![][]u8 {
+        var responses = std.ArrayListUnmanaged([]u8){};
+        errdefer {
+            for (responses.items) |payload| self.allocator.free(payload);
+            responses.deinit(self.allocator);
+        }
+
+        const bootstrap_prompt = try self.resolveBootstrapPrompt(DEFAULT_BRAIN);
+        if (bootstrap_prompt) |prompt| {
+            defer self.allocator.free(prompt.content);
+
+            const bootstrap_frames = try self.handleChat(job, request_id, prompt.content);
+            defer deinitResponseFrames(self.allocator, bootstrap_frames);
+            for (bootstrap_frames) |frame| {
+                try responses.append(self.allocator, try self.allocator.dupe(u8, frame));
+            }
+            var bootstrap_delivered = false;
+            for (bootstrap_frames) |frame| {
+                if (std.mem.indexOf(u8, frame, "\"type\":\"session.receive\"") != null) {
+                    bootstrap_delivered = true;
+                    break;
+                }
+            }
+            if (bootstrap_delivered) {
+                self.markBootstrapComplete(DEFAULT_BRAIN, prompt.template_name) catch |err| {
+                    std.log.warn("Failed to mark bootstrap complete for {s}: {s}", .{ self.runtime.agent_id, @errorName(err) });
+                };
+            }
+        }
+
+        return responses.toOwnedSlice(self.allocator);
+    }
+
+    fn resolveBootstrapPrompt(self: *RuntimeServer, brain_name: []const u8) !?BootstrapPrompt {
+        system_hooks.ensureIdentityMemories(&self.runtime, brain_name) catch |err| {
+            std.log.warn("Failed to ensure identity memories for {s}: {s}", .{ self.runtime.agent_id, @errorName(err) });
+            return null;
+        };
+        if (try self.hasBootstrapCompleted(brain_name)) return null;
+
+        const template_name = if (std.mem.eql(u8, self.runtime.agent_id, self.default_agent_id))
+            "BOOTSTRAP.md"
+        else
+            "JUST_HATCHED.md";
+        const content = system_hooks.readTemplate(self.allocator, template_name) catch |err| {
+            std.log.warn("Failed to load bootstrap template {s}: {s}", .{ template_name, @errorName(err) });
+            return null;
+        };
+        return .{
+            .template_name = template_name,
+            .content = content,
+        };
+    }
+
+    fn hasBootstrapCompleted(self: *RuntimeServer, brain_name: []const u8) !bool {
+        var item = (try self.loadMemoryByName(brain_name, BOOTSTRAP_COMPLETE_MEM_NAME)) orelse return false;
+        item.deinit(self.allocator);
+        return true;
+    }
+
+    fn markBootstrapComplete(self: *RuntimeServer, brain_name: []const u8, template_name: []const u8) !void {
+        const escaped_template = try protocol.jsonEscape(self.allocator, template_name);
+        defer self.allocator.free(escaped_template);
+
+        const payload = try std.fmt.allocPrint(
+            self.allocator,
+            "{{\"complete\":true,\"template\":\"{s}\",\"completed_at_ms\":{d}}}",
+            .{ escaped_template, std.time.milliTimestamp() },
+        );
+        defer self.allocator.free(payload);
+
+        if (try self.loadMemoryByName(brain_name, BOOTSTRAP_COMPLETE_MEM_NAME)) |existing_item| {
+            var item = existing_item;
+            defer item.deinit(self.allocator);
+            var mutated = try self.runtime.active_memory.mutate(item.mem_id, payload);
+            mutated.deinit(self.allocator);
+            return;
+        }
+
+        var created = try self.runtime.active_memory.create(
+            brain_name,
+            .ram,
+            BOOTSTRAP_COMPLETE_MEM_NAME,
+            BOOTSTRAP_COMPLETE_MEM_KIND,
+            payload,
+            true,
+        );
+        created.deinit(self.allocator);
+    }
+
+    fn loadMemoryByName(self: *RuntimeServer, brain_name: []const u8, name: []const u8) !?memory.ActiveMemoryItem {
+        const mem_id = try self.buildLatestMemId(brain_name, name);
+        defer self.allocator.free(mem_id);
+
+        return self.runtime.active_memory.load(mem_id, null) catch |err| switch (err) {
+            memory.MemoryError.NotFound => null,
+            else => err,
+        };
+    }
+
+    fn buildLatestMemId(self: *RuntimeServer, brain_name: []const u8, name: []const u8) ![]u8 {
+        return std.fmt.allocPrint(
+            self.allocator,
+            "{s}{s}:{s}:{s}:latest{s}",
+            .{ memid.EOT_MARKER, self.runtime.agent_id, brain_name, name, memid.EOT_MARKER },
+        );
+    }
+
     fn handleChat(self: *RuntimeServer, job: *RuntimeQueueJob, request_id: []const u8, content: []const u8) ![][]u8 {
         if (self.isJobCancelled(job)) return RuntimeServerError.RuntimeJobCancelled;
+        system_hooks.ensureIdentityMemories(&self.runtime, DEFAULT_BRAIN) catch |err| {
+            std.log.warn("Failed to ensure identity memories for {s}: {s}", .{ self.runtime.agent_id, @errorName(err) });
+        };
 
         self.runtime.appendMessageMemory(DEFAULT_BRAIN, "user", content) catch |err| {
             return self.wrapRuntimeErrorResponse(request_id, err);
@@ -744,13 +880,33 @@ pub const RuntimeServer = struct {
 
         const provider_tools = try self.allocator.alloc(ziggy_piai.types.Tool, world_tool_specs.len);
         defer self.allocator.free(provider_tools);
+        const provider_tool_name_map = try self.allocator.alloc(ProviderToolNameMapEntry, world_tool_specs.len);
+        var provider_tool_name_count: usize = 0;
+        defer {
+            for (provider_tool_name_map[0..provider_tool_name_count]) |entry| self.allocator.free(entry.provider_name);
+            self.allocator.free(provider_tool_name_map);
+        }
         for (world_tool_specs, 0..) |spec, idx| {
+            const provider_tool_name = try sanitizeProviderToolName(
+                self.allocator,
+                spec.name,
+                idx,
+                provider_tool_name_map[0..idx],
+            );
+            provider_tool_name_map[idx] = .{
+                .provider_name = provider_tool_name,
+                .runtime_name = spec.name,
+            };
+            provider_tool_name_count += 1;
             provider_tools[idx] = .{
-                .name = spec.name,
+                .name = provider_tool_name,
                 .description = spec.description,
                 .parameters_json = spec.parameters_json,
             };
         }
+
+        const provider_instructions = try self.buildProviderInstructions(brain_name);
+        defer self.allocator.free(provider_instructions);
 
         var round: usize = 0;
         var total_calls: usize = 0;
@@ -771,6 +927,7 @@ pub const RuntimeServer = struct {
                 },
             };
             const context = ziggy_piai.types.Context{
+                .system_prompt = provider_instructions,
                 .messages = &messages,
                 .tools = provider_tools,
             };
@@ -808,9 +965,10 @@ pub const RuntimeServer = struct {
             try self.appendAssistantToolCallMessage(brain_name, assistant.text, tool_calls);
 
             for (tool_calls) |tool_call| {
+                const runtime_tool_name = resolveRuntimeToolName(tool_call.name, provider_tool_name_map);
                 const args_with_call_id = try injectToolCallId(self.allocator, tool_call.arguments_json, tool_call.id);
                 defer self.allocator.free(args_with_call_id);
-                try self.runtime.queueToolUse(brain_name, tool_call.name, args_with_call_id);
+                try self.runtime.queueToolUse(brain_name, runtime_tool_name, args_with_call_id);
             }
 
             var tool_payloads = std.ArrayListUnmanaged([]u8){};
@@ -827,6 +985,62 @@ pub const RuntimeServer = struct {
         }
 
         return RuntimeServerError.ProviderToolLoopExceeded;
+    }
+
+    fn buildProviderInstructions(self: *RuntimeServer, brain_name: []const u8) ![]u8 {
+        return std.fmt.allocPrint(
+            self.allocator,
+            "You are {s}, the {s} brain in the ZiggySpiderweb runtime. Follow your identity memories and respond helpfully and directly.",
+            .{ self.runtime.agent_id, brain_name },
+        );
+    }
+
+    fn resolveRuntimeToolName(provider_name: []const u8, mapping: []const ProviderToolNameMapEntry) []const u8 {
+        for (mapping) |entry| {
+            if (std.mem.eql(u8, entry.provider_name, provider_name)) return entry.runtime_name;
+        }
+        return provider_name;
+    }
+
+    fn sanitizeProviderToolName(
+        allocator: std.mem.Allocator,
+        runtime_name: []const u8,
+        index: usize,
+        existing: []const ProviderToolNameMapEntry,
+    ) ![]u8 {
+        var out = std.ArrayListUnmanaged(u8){};
+        defer out.deinit(allocator);
+
+        for (runtime_name) |ch| {
+            const allowed = std.ascii.isAlphanumeric(ch) or ch == '_' or ch == '-';
+            try out.append(allocator, if (allowed) ch else '_');
+        }
+        if (out.items.len == 0) {
+            return std.fmt.allocPrint(allocator, "tool_{d}", .{index});
+        }
+
+        const base = try out.toOwnedSlice(allocator);
+        errdefer allocator.free(base);
+        if (!toolNameExists(existing, base)) {
+            return base;
+        }
+
+        var suffix: usize = 2;
+        while (true) : (suffix += 1) {
+            const candidate = try std.fmt.allocPrint(allocator, "{s}_{d}", .{ base, suffix });
+            if (!toolNameExists(existing, candidate)) {
+                allocator.free(base);
+                return candidate;
+            }
+            allocator.free(candidate);
+        }
+    }
+
+    fn toolNameExists(existing: []const ProviderToolNameMapEntry, candidate: []const u8) bool {
+        for (existing) |entry| {
+            if (std.mem.eql(u8, entry.provider_name, candidate)) return true;
+        }
+        return false;
     }
 
     fn resolveApiKey(self: *RuntimeServer, provider_runtime: *const ProviderRuntime, provider_name: []const u8) ![]const u8 {
@@ -1314,6 +1528,32 @@ test "runtime_server: session.send returns all outbound runtime frames" {
     }
 
     try std.testing.expectEqual(@as(usize, 1), session_receive_count);
+}
+
+test "runtime_server: connect returns ack while bootstrap runs separately once" {
+    const allocator = std.testing.allocator;
+    const server = try RuntimeServer.create(allocator, "agent-first", .{
+        .ltm_directory = "",
+        .ltm_filename = "",
+        .default_agent_id = "agent-first",
+    });
+    defer server.destroy();
+
+    const first_connect = try server.handleMessageFrames("{\"id\":\"req-connect-1\",\"type\":\"connect\"}");
+    defer deinitResponseFrames(allocator, first_connect);
+
+    try std.testing.expectEqual(@as(usize, 1), first_connect.len);
+    try std.testing.expect(std.mem.indexOf(u8, first_connect[0], "\"type\":\"connect.ack\"") != null);
+
+    const first_bootstrap = try server.handleConnectBootstrapFrames("req-connect-1");
+    defer deinitResponseFrames(allocator, first_bootstrap);
+    try std.testing.expectEqual(@as(usize, 1), first_bootstrap.len);
+    try std.testing.expect(std.mem.indexOf(u8, first_bootstrap[0], "\"type\":\"session.receive\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first_bootstrap[0], "System Bootstrap") != null);
+
+    const second_bootstrap = try server.handleConnectBootstrapFrames("req-connect-2");
+    defer deinitResponseFrames(allocator, second_bootstrap);
+    try std.testing.expectEqual(@as(usize, 0), second_bootstrap.len);
 }
 
 test "runtime_server: provider-backed session.send uses configured provider runtime" {
