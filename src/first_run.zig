@@ -85,7 +85,9 @@ pub fn runFirstRun(allocator: std.mem.Allocator, args: []const []const u8) !void
     try std.fs.File.stdout().writeAll("  Config: ~/.config/spiderweb/config.json\n");
     try std.fs.File.stdout().writeAll("\nNext steps:\n");
     try std.fs.File.stdout().writeAll("  Start server:    spiderweb\n");
-    try print("  Test agent:      zsc --gateway-test ping ws://127.0.0.1:18790/v1/agents/{s}/stream\n", .{agent_name});
+    try std.fs.File.stdout().writeAll("  Test agent:      zss --gateway-test ping ws://127.0.0.1:18790/v1/agents/{s}/stream\n");
+    try std.fs.File.stdout().writeAll("\nInstall systemd service:\n");
+    try std.fs.File.stdout().writeAll("  spiderweb-config config install-service\n");
     
     if (!non_interactive) {
         try std.fs.File.stdout().writeAll("\nStart the server now? [Y/n]: ");

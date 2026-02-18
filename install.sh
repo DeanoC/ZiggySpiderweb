@@ -1,6 +1,6 @@
 #!/bin/bash
 # ZiggySpiderweb Install Script
-# 
+#
 # RECOMMENDED (interactive):
 #   curl -fsSL https://raw.githubusercontent.com/DeanoC/ZiggySpiderweb/main/install.sh -o /tmp/install.sh
 #   bash /tmp/install.sh
@@ -151,3 +151,21 @@ if [[ -n "${SPIDERWEB_NON_INTERACTIVE:-}" ]]; then
 else
     spiderweb-config first-run
 fi
+
+# Post-install summary
+echo ""
+log_success "Installation complete!"
+echo ""
+echo "Binaries installed to:"
+echo "  $INSTALL_DIR/spiderweb"
+echo "  $INSTALL_DIR/spiderweb-config"
+echo ""
+echo "To install systemd service:"
+echo "  spiderweb-config config install-service"
+echo "  systemctl --user enable --now spiderweb"
+echo ""
+echo "To connect to your agent, install ZiggyStarSpider:"
+echo "  https://github.com/DeanoC/ZiggyStarSpider"
+echo ""
+echo "Then test with:"
+echo "  zss --gateway-test ping ws://127.0.0.1:18790/v1/agents/<agent-name>/stream"

@@ -158,11 +158,55 @@ fn handleConfigCommand(allocator: std.mem.Allocator, args: []const []const u8) !
         var buf: [256]u8 = undefined;
         const msg = try std.fmt.bufPrint(&buf, "{s}\n", .{config.config_path});
         try stdout_file.writeAll(msg);
+    } else if (std.mem.eql(u8, subcommand, "install-service")) {
+        try installSystemdService(allocator);
     } else {
         std.log.err("Unknown config command: {s}", .{subcommand});
-        std.log.info("Available: set-provider, set-server, set-key, clear-key, set-log, path", .{});
+        std.log.info("Available: set-provider, set-server, set-key, clear-key, set-log, path, install-service", .{});
         return error.UnknownCommand;
     }
+}
+
+fn installSystemdService(allocator: std.mem.Allocator) !void {
+    const home = std.process.getEnvVarOwned(allocator, "HOME") catch {
+        std.log.err("Could not get HOME directory", .{});
+        return error.MissingHome;
+    };
+    defer allocator.free(home);
+
+    const service_dir = try std.fs.path.join(allocator, &.{ home, ".config", "systemd", "user" });
+    defer allocator.free(service_dir);
+
+    try std.fs.cwd().makePath(service_dir);
+
+    const service_path = try std.fs.path.join(allocator, &.{ service_dir, "spiderweb.service" });
+    defer allocator.free(service_path);
+
+    const service_content =
+        \\[Unit]
+        \\Description=ZiggySpiderweb AI Agent Gateway
+        \\After=network.target
+        \\
+        \\[Service]
+        \\Type=simple
+        \\ExecStart={s}/.local/bin/spiderweb
+        \\Restart=on-failure
+        \\RestartSec=5
+        \\
+        \\[Install]
+        \\WantedBy=default.target
+        \\
+    ;
+
+    var buf: [1024]u8 = undefined;
+    const content = try std.fmt.bufPrint(&buf, service_content, .{home});
+
+    const file = try std.fs.cwd().createFile(service_path, .{});
+    defer file.close();
+    try file.writeAll(content);
+
+    std.log.info("Systemd service installed to {s}", .{service_path});
+    std.log.info("Enable with: systemctl --user enable --now spiderweb", .{});
 }
 
 fn printUsage() !void {
@@ -178,6 +222,7 @@ fn printUsage() !void {
         \\  spiderweb-config config set-key <api-key> [provider]
         \\  spiderweb-config config clear-key [provider]
         \\  spiderweb-config config set-log <debug|info|warn|error>
+        \\  spiderweb-config config install-service     Install systemd service
         \\
         \\Examples:
         \\  spiderweb-config first-run
