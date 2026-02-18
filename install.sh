@@ -179,7 +179,7 @@ if [[ "$INSTALL_ZSS" == "true" ]]; then
     fi
     
     log_info "Building ZiggyStarSpider CLI..."
-    zig build -Doptimize=ReleaseSafe -Dtarget=native
+    zig build cli -Doptimize=ReleaseSafe -Dtarget=native
     
     log_info "Building ZiggyStarSpider TUI..."
     zig build tui -Doptimize=ReleaseSafe -Dtarget=native
@@ -187,6 +187,8 @@ if [[ "$INSTALL_ZSS" == "true" ]]; then
     log_info "Installing zss binaries..."
     cp zig-out/bin/zss "$INSTALL_DIR/" 2>/dev/null || true
     cp zig-out/bin/zss-tui "$INSTALL_DIR/" 2>/dev/null || true
+    
+    log_success "ZiggyStarSpider installed!"
     
     log_success "ZiggyStarSpider installed!"
 fi
