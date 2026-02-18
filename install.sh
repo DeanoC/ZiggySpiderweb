@@ -58,12 +58,39 @@ AGENT_NAME="${SPIDERWEB_AGENT_NAME:-ziggy}"
 
 # Read from terminal even when piped
 read_tty() {
+    local prompt=""
+    local args=()
+    
+    # Parse args to extract -p prompt
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -p)
+                prompt="$2"
+                shift 2
+                ;;
+            -rp|-Pr)
+                # Handle combined flags
+                args+=("$1")
+                shift
+                ;;
+            *)
+                args+=("$1")
+                shift
+                ;;
+        esac
+    done
+    
+    # Output prompt to stderr so it's visible when piped
+    if [[ -n "$prompt" ]]; then
+        echo -n "$prompt" >&2
+    fi
+    
     if [[ -t 0 ]]; then
         # stdin is a terminal, use it normally
-        read "$@"
+        read "${args[@]}"
     else
         # stdin is a pipe, read from terminal device
-        read "$@" < /dev/tty
+        read "${args[@]}" < /dev/tty
     fi
 }
 
