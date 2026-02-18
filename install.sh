@@ -268,11 +268,12 @@ clone_and_build() {
     cp zig-out/bin/spiderweb-config "$INSTALL_DIR/"
     
     log_success "ZiggySpiderweb built and installed"
+    
+    echo ""
+    echo "═══════════════════════════════════════════════════════════════"
 }
 
 configure_provider() {
-    log_info "DEBUG: Entering configure_provider"
-    
     log_info "Configuring AI Provider"
     
     # Non-interactive mode: use environment variables
@@ -442,8 +443,6 @@ configure_provider() {
 }
 
 name_first_agent() {
-    log_info "DEBUG: Entering name_first_agent"
-    
     # Non-interactive mode: use environment variable
     if [[ "$NON_INTERACTIVE" == "true" ]]; then
         log_info "Non-interactive mode: Agent name = $AGENT_NAME"
