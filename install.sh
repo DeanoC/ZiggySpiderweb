@@ -262,11 +262,9 @@ fi
 echo ""
 if [[ "$INSTALL_ZSS" == "true" ]]; then
     echo "Connect to your agent:"
-    echo "  zss connect --url ws://127.0.0.1:18790/v1/agents/<agent-name>/stream"
+    echo "  zss connect"
+    echo "  or: zss connect --url ws://127.0.0.1:18790/v1/agents/<agent-name>/stream"
 else
     echo "To connect to your agent, install ZiggyStarSpider:"
     echo "  https://github.com/DeanoC/ZiggyStarSpider"
-    echo ""
-    echo "Then connect with:"
-    echo "  zss connect --url ws://127.0.0.1:18790/v1/agents/<agent-name>/stream"
 fi
