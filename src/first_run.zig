@@ -90,11 +90,61 @@ pub fn runFirstRun(allocator: std.mem.Allocator, args: []const []const u8) !void
     try std.fs.File.stdout().writeAll("  spiderweb-config config install-service\n");
     
     if (!non_interactive) {
-        try std.fs.File.stdout().writeAll("\nStart the server now? [Y/n]: ");
-        var buf: [8]u8 = undefined;
-        const n = try std.fs.File.stdin().read(buf[0..]);
-        if (n == 0 or (buf[0] != 'n' and buf[0] != 'N')) {
-            try std.fs.File.stdout().writeAll("\nStarting ZiggySpiderweb...\n");
+        // Check if spiderweb is already running (via systemd or manual)
+        const is_running = blk: {
+            // Try to check if process exists (exact match)
+            const result = std.process.Child.run(.{
+                .allocator = allocator,
+                .argv = &.{"pgrep", "-x", "spiderweb"},
+            }) catch break :blk false;
+            defer allocator.free(result.stdout);
+            defer allocator.free(result.stderr);
+            break :blk result.term == .Exited and result.term.Exited == 0;
+        };
+        
+        if (!is_running) {
+            try std.fs.File.stdout().writeAll("\nStart the server now? [Y/n]: ");
+            var buf: [8]u8 = undefined;
+            const n = try std.fs.File.stdin().read(buf[0..]);
+            if (n == 0 or (buf[0] != 'n' and buf[0] != 'N')) {
+                try std.fs.File.stdout().writeAll("\nStarting ZiggySpiderweb...\n");
+                
+                // Check if systemd user service exists
+                const systemd_user_exists = blk: {
+                    const home = std.process.getEnvVarOwned(allocator, "HOME") catch break :blk false;
+                    defer allocator.free(home);
+                    const path = std.fs.path.join(allocator, &.{ home, ".config/systemd/user/spiderweb.service" }) catch break :blk false;
+                    defer allocator.free(path);
+                    std.fs.accessAbsolute(path, .{}) catch break :blk false;
+                    break :blk true;
+                };
+                
+                // Check if systemd system service exists  
+                const systemd_system_exists = blk: {
+                    std.fs.accessAbsolute("/etc/systemd/system/spiderweb.service", .{}) catch break :blk false;
+                    break :blk true;
+                };
+                
+                if (systemd_user_exists) {
+                    // Use systemd user service
+                    var child = std.process.Child.init(&.{ "systemctl", "--user", "start", "spiderweb" }, allocator);
+                    _ = child.spawn() catch {};
+                } else if (systemd_system_exists) {
+                    // Use systemd system service
+                    var child = std.process.Child.init(&.{ "sudo", "systemctl", "start", "spiderweb" }, allocator);
+                    _ = child.spawn() catch {};
+                } else {
+                    // Start directly
+                    var child = std.process.Child.init(&.{ "spiderweb" }, allocator);
+                    child.stdin_behavior = .Ignore;
+                    child.stdout_behavior = .Ignore;
+                    child.stderr_behavior = .Ignore;
+                    _ = child.spawn() catch {};
+                }
+                std.Thread.sleep(1 * std.time.ns_per_s);
+            }
+        } else {
+            try std.fs.File.stdout().writeAll("\nSpiderweb is already running.\n");
         }
     }
 }
