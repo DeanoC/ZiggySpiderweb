@@ -56,6 +56,17 @@ MODEL="${SPIDERWEB_MODEL:-}"
 API_KEY="${SPIDERWEB_API_KEY:-}"
 AGENT_NAME="${SPIDERWEB_AGENT_NAME:-ziggy}"
 
+# Read from terminal even when piped
+read_tty() {
+    if [[ -t 0 ]]; then
+        # stdin is a terminal, use it normally
+        read "$@"
+    else
+        # stdin is a pipe, read from terminal device
+        read "$@" < /dev/tty
+    fi
+}
+
 log_info() {
     echo -e "${BLUE}[INFO]${NC} $1"
 }
@@ -165,7 +176,7 @@ install_dependencies() {
         log_info "Non-interactive mode: auto-installing dependencies"
     else
         echo ""
-        read -rp "Install missing dependencies? This requires sudo. [Y/n]: " confirm
+        read_tty -rp "Install missing dependencies? This requires sudo. [Y/n]: " confirm
         if [[ ! "$confirm" =~ ^[Yy]$ ]] && [[ -n "$confirm" ]]; then
             log_error "Cannot continue without dependencies."
             exit 1
@@ -243,7 +254,7 @@ clone_and_build() {
     
     if [[ -d "$repo_dir" ]]; then
         log_warn "Existing installation found at ${repo_dir}"
-        read -rp "Remove and re-clone? [y/N]: " confirm
+        read_tty -rp "Remove and re-clone? [y/N]: " confirm
         if [[ "$confirm" =~ ^[Yy]$ ]]; then
             rm -rf "$repo_dir"
         else
@@ -305,7 +316,7 @@ configure_provider() {
     
     local provider_choice
     while true; do
-        read -rp "Select [1-4]: " provider_choice
+        read_tty -rp "Select [1-4]: " provider_choice
         case "$provider_choice" in
             1) PROVIDER="openai"; break ;;
             2) PROVIDER="openai-codex"; break ;;
@@ -317,7 +328,7 @@ configure_provider() {
                 echo "Available providers:"
                 echo "  openai, openai-codex, openai-codex-spark, kimi-coding, anthropic, azure-openai"
                 echo ""
-                read -rp "Enter provider name: " PROVIDER
+                read_tty -rp "Enter provider name: " PROVIDER
                 if [[ -z "$PROVIDER" ]]; then
                     log_error "Provider name required"
                     continue
@@ -338,7 +349,7 @@ configure_provider() {
             echo "Available models:"
             echo "  1) gpt-4o-mini (fast, cheap)"
             echo "  2) gpt-4.1-mini (reasoning, large context)"
-            read -rp "Select model [1-2]: " model_choice
+            read_tty -rp "Select model [1-2]: " model_choice
             case "$model_choice" in
                 1) model="gpt-4o-mini" ;;
                 2) model="gpt-4.1-mini" ;;
@@ -351,7 +362,7 @@ configure_provider() {
             echo "  2) gpt-5.1 (powerful)"
             echo "  3) gpt-5.3-codex (latest)"
             echo "  4) gpt-5.3-codex-spark (fast)"
-            read -rp "Select model [1-4]: " model_choice
+            read_tty -rp "Select model [1-4]: " model_choice
             case "$model_choice" in
                 1) model="gpt-5.1-codex-mini" ;;
                 2) model="gpt-5.1" ;;
@@ -364,7 +375,7 @@ configure_provider() {
             echo "Available models:"
             echo "  1) k2p5 (Kimi K2.5)"
             echo "  2) kimi-k2.5"
-            read -rp "Select model [1-2]: " model_choice
+            read_tty -rp "Select model [1-2]: " model_choice
             case "$model_choice" in
                 1) model="k2p5" ;;
                 2) model="kimi-k2.5" ;;
@@ -375,7 +386,7 @@ configure_provider() {
             echo ""
             log_info "Enter model name for $PROVIDER"
             echo ""
-            read -rp "Model name: " model
+            read_tty -rp "Model name: " model
             if [[ -z "$model" ]]; then
                 log_error "Model name required"
                 model="gpt-4o-mini"
@@ -400,7 +411,7 @@ configure_provider() {
     
     local api_key
     while true; do
-        read -rsp "Enter API key for $PROVIDER: " api_key
+        read_tty -rsp "Enter API key for $PROVIDER: " api_key
         echo ""
         if [[ -z "$api_key" ]]; then
             log_error "API key cannot be empty"
@@ -408,7 +419,7 @@ configure_provider() {
         fi
         
         # Confirm
-        read -rsp "Confirm API key: " api_key_confirm
+        read_tty -rsp "Confirm API key: " api_key_confirm
         echo ""
         if [[ "$api_key" != "$api_key_confirm" ]]; then
             log_error "API keys do not match"
@@ -458,7 +469,7 @@ name_first_agent() {
     
     local agent_name
     while true; do
-        read -rp "Agent name [default: ziggy]: " agent_name
+        read_tty -rp "Agent name [default: ziggy]: " agent_name
         agent_name="${agent_name:-ziggy}"
         
         # Validate name (alphanumeric, dash, underscore only)
@@ -631,7 +642,7 @@ run_first_agent() {
         exec spiderweb
     fi
     
-    read -rp "Start the server now? [Y/n]: " confirm
+    read_tty -rp "Start the server now? [Y/n]: " confirm
     if [[ ! "$confirm" =~ ^[Nn]$ ]] || [[ -z "$confirm" ]]; then
         log_info "Starting ZiggySpiderweb server..."
         echo ""
