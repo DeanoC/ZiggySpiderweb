@@ -130,6 +130,39 @@ cp zig-out/bin/spiderweb-config "$INSTALL_DIR/"
 
 log_success "Build complete!"
 
+# Ask about installing ZiggyStarSpider client
+INSTALL_ZSS=false
+if [[ -t 0 ]]; then
+    echo ""
+    read -rp "Also install ZiggyStarSpider client (zss)? [Y/n]: " zss_confirm
+    if [[ ! "$zss_confirm" =~ ^[Nn]$ ]] || [[ -z "$zss_confirm" ]]; then
+        INSTALL_ZSS=true
+    fi
+fi
+
+if [[ "$INSTALL_ZSS" == "true" ]]; then
+    ZSS_REPO="${HOME}/.local/share/ziggy-starspider"
+    
+    if [[ -d "$ZSS_REPO" ]]; then
+        log_info "ZiggyStarSpider already exists, updating..."
+        cd "$ZSS_REPO"
+        git pull -q
+    else
+        log_info "Cloning ZiggyStarSpider..."
+        mkdir -p "$(dirname "$ZSS_REPO")"
+        git clone -q https://github.com/DeanoC/ZiggyStarSpider.git "$ZSS_REPO"
+        cd "$ZSS_REPO"
+    fi
+    
+    log_info "Building ZiggyStarSpider..."
+    zig build -Doptimize=ReleaseSafe
+    
+    log_info "Installing zss binary..."
+    cp zig-out/bin/zss "$INSTALL_DIR/"
+    
+    log_success "ZiggyStarSpider installed!"
+fi
+
 # Run first-run wizard
 echo ""
 log_info "Starting first-time setup..."
@@ -159,13 +192,21 @@ echo ""
 echo "Binaries installed to:"
 echo "  $INSTALL_DIR/spiderweb"
 echo "  $INSTALL_DIR/spiderweb-config"
+if [[ "$INSTALL_ZSS" == "true" ]]; then
+    echo "  $INSTALL_DIR/zss"
+fi
 echo ""
 echo "To install systemd service:"
 echo "  spiderweb-config config install-service"
 echo "  systemctl --user enable --now spiderweb"
 echo ""
-echo "To connect to your agent, install ZiggyStarSpider:"
-echo "  https://github.com/DeanoC/ZiggyStarSpider"
-echo ""
-echo "Then test with:"
-echo "  zss --gateway-test ping ws://127.0.0.1:18790/v1/agents/<agent-name>/stream"
+if [[ "$INSTALL_ZSS" == "true" ]]; then
+    echo "Test your agent:"
+    echo "  zss --gateway-test ping ws://127.0.0.1:18790/v1/agents/<agent-name>/stream"
+else
+    echo "To connect to your agent, install ZiggyStarSpider:"
+    echo "  https://github.com/DeanoC/ZiggyStarSpider"
+    echo ""
+    echo "Then test with:"
+    echo "  zss --gateway-test ping ws://127.0.0.1:18790/v1/agents/<agent-name>/stream"
+fi
