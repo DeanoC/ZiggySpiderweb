@@ -90,6 +90,30 @@ fi
 REPO_DIR="${HOME}/.local/share/ziggy-spiderweb"
 INSTALL_DIR="${HOME}/.local/bin"
 
+# Check if spiderweb is running and offer to stop it first
+SPIDERWEB_RUNNING=false
+if pgrep spiderweb > /dev/null 2>&1; then
+    SPIDERWEB_RUNNING=true
+    if [[ -t 0 ]]; then
+        echo ""
+        read -rp "Spiderweb is currently running. Stop it to allow update? [Y/n]: " stop_confirm
+        if [[ ! "$stop_confirm" =~ ^[Nn]$ ]] || [[ -z "$stop_confirm" ]]; then
+            log_info "Stopping spiderweb..."
+            # Try graceful stop first
+            if systemctl --user is-active spiderweb >/dev/null 2>&1; then
+                systemctl --user stop spiderweb || true
+            elif sudo systemctl is-active spiderweb >/dev/null 2>&1; then
+                sudo systemctl stop spiderweb || true
+            fi
+            # Kill any remaining processes
+            pkill spiderweb 2>/dev/null || sudo pkill spiderweb 2>/dev/null || true
+            sleep 2
+            pkill -9 spiderweb 2>/dev/null || sudo pkill -9 spiderweb 2>/dev/null || true
+            sleep 1
+        fi
+    fi
+fi
+
 if [[ -d "$REPO_DIR" ]]; then
     if [[ -t 0 ]]; then
         # Interactive - ask user
@@ -118,20 +142,7 @@ zig build -Doptimize=ReleaseSafe
 log_info "Installing binaries..."
 mkdir -p "$INSTALL_DIR"
 
-# Stop any running spiderweb to allow binary replacement
-if pgrep spiderweb > /dev/null 2>&1; then
-    log_info "Stopping running spiderweb..."
-    # Try user kill first, then sudo if needed
-    pkill spiderweb 2>/dev/null || sudo pkill spiderweb 2>/dev/null || true
-    sleep 2
-    # Force kill if still running
-    if pgrep spiderweb > /dev/null 2>&1; then
-        pkill -9 spiderweb 2>/dev/null || sudo pkill -9 spiderweb 2>/dev/null || true
-        sleep 1
-    fi
-fi
-
-# If still can't copy, try with sudo
+# Copy binaries (spiderweb should be stopped by now)
 if ! cp zig-out/bin/spiderweb "$INSTALL_DIR/" 2>/dev/null; then
     log_info "Need elevated permissions to update binary..."
     sudo cp zig-out/bin/spiderweb "$INSTALL_DIR/"
