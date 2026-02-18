@@ -275,18 +275,9 @@ log_info "Starting first-time setup..."
 echo ""
 
 if [[ -n "${SPIDERWEB_NON_INTERACTIVE:-}" ]]; then
-    # Non-interactive mode
-    FIRST_RUN_ARGS="--non-interactive"
-    if [[ -n "${SPIDERWEB_PROVIDER:-}" ]]; then
-        FIRST_RUN_ARGS="$FIRST_RUN_ARGS --provider ${SPIDERWEB_PROVIDER}"
-    fi
-    if [[ -n "${SPIDERWEB_MODEL:-}" ]]; then
-        FIRST_RUN_ARGS="$FIRST_RUN_ARGS --model ${SPIDERWEB_MODEL}"
-    fi
-    if [[ -n "${SPIDERWEB_AGENT:-}" ]]; then
-        FIRST_RUN_ARGS="$FIRST_RUN_ARGS --agent ${SPIDERWEB_AGENT}"
-    fi
-    spiderweb-config first-run $FIRST_RUN_ARGS
+    # Non-interactive mode - skip first-run, user should run manually
+    log_info "Skipping interactive first-time setup (non-interactive mode)"
+    log_info "Run 'spiderweb-config first-run' manually to configure your agent"
 else
     spiderweb-config first-run
 fi
