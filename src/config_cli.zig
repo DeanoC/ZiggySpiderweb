@@ -2,6 +2,7 @@ const std = @import("std");
 const Config = @import("config.zig");
 const credential_store = @import("credential_store.zig");
 const ziggy_piai = @import("ziggy-piai");
+const first_run = @import("first_run.zig");
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -20,6 +21,8 @@ pub fn main() !void {
 
     if (std.mem.eql(u8, command, "config")) {
         try handleConfigCommand(allocator, args[2..]);
+    } else if (std.mem.eql(u8, command, "first-run")) {
+        try first_run.runFirstRun(allocator, args[2..]);
     } else {
         std.log.err("Unknown command: {s}", .{command});
         try printUsage();
@@ -167,6 +170,7 @@ fn printUsage() !void {
         \\ZiggySpiderweb Configuration Tool
         \\
         \\Usage:
+        \\  spiderweb-config first-run [--non-interactive] [--provider <name>] [--model <model>] [--agent <name>]
         \\  spiderweb-config config              Show current config
         \\  spiderweb-config config path         Show config file path
         \\  spiderweb-config config set-provider <name> [model]
@@ -176,6 +180,8 @@ fn printUsage() !void {
         \\  spiderweb-config config set-log <debug|info|warn|error>
         \\
         \\Examples:
+        \\  spiderweb-config first-run
+        \\  spiderweb-config first-run --non-interactive --provider openai-codex --agent ziggy
         \\  spiderweb-config config set-provider openai gpt-4o
         \\  spiderweb-config config set-provider kimi-coding kimi-k2.5
         \\  spiderweb-config config set-server --bind 0.0.0.0 --port 9000
