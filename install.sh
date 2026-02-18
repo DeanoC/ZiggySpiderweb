@@ -187,6 +187,7 @@ if [[ "$INSTALL_ZSS" == "true" ]]; then
     log_info "Installing zss binaries..."
     cp zig-out/bin/zss "$INSTALL_DIR/" 2>/dev/null || true
     cp zig-out/bin/zss-tui "$INSTALL_DIR/" 2>/dev/null || true
+    # Note: zss-gui is built but not installed (headless server)
     
     log_success "ZiggyStarSpider installed!"
 fi
