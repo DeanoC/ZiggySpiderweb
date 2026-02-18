@@ -295,8 +295,8 @@ configure_provider() {
     log_info "Select your AI provider"
     echo ""
     echo "Quick setup (recommended):"
-    echo "  1) OpenAI        - GPT-4o, GPT-4.1, GPT-5.3-codex-spark"
-    echo "  2) OpenAI Codex  - GPT-5.1, GPT-5.2, GPT-5.3 Codex (reasoning models)"
+    echo "  1) OpenAI        - GPT-4o, GPT-4.1"
+    echo "  2) OpenAI Codex  - GPT-5.1, GPT-5.2, GPT-5.3, GPT-5.3-codex-spark"
     echo "  3) Kimi Coding   - Kimi K2, K2.5 (Moonshot AI)"
     echo ""
     echo "  4) Manual setup  - Configure provider manually"
@@ -337,12 +337,10 @@ configure_provider() {
             echo "Available models:"
             echo "  1) gpt-4o-mini (fast, cheap)"
             echo "  2) gpt-4.1-mini (reasoning, large context)"
-            echo "  3) gpt-5.3-codex-spark (fast codex)"
-            read -rp "Select model [1-3]: " model_choice
+            read -rp "Select model [1-2]: " model_choice
             case "$model_choice" in
                 1) model="gpt-4o-mini" ;;
                 2) model="gpt-4.1-mini" ;;
-                3) model="gpt-5.3-codex-spark" ;;
                 *) model="gpt-4o-mini" ;;
             esac
             ;;
@@ -351,11 +349,13 @@ configure_provider() {
             echo "  1) gpt-5.1-codex-mini (balanced)"
             echo "  2) gpt-5.1 (powerful)"
             echo "  3) gpt-5.3-codex (latest)"
-            read -rp "Select model [1-3]: " model_choice
+            echo "  4) gpt-5.3-codex-spark (fast)"
+            read -rp "Select model [1-4]: " model_choice
             case "$model_choice" in
                 1) model="gpt-5.1-codex-mini" ;;
                 2) model="gpt-5.1" ;;
                 3) model="gpt-5.3-codex" ;;
+                4) model="gpt-5.3-codex-spark" ;;
                 *) model="gpt-5.1-codex-mini" ;;
             esac
             ;;
