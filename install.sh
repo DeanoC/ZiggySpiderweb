@@ -178,13 +178,15 @@ if [[ "$INSTALL_ZSS" == "true" ]]; then
         cd "$ZSS_REPO"
     fi
     
-    log_info "Building ZiggyStarSpider (native only)..."
+    log_info "Building ZiggyStarSpider CLI..."
     zig build -Doptimize=ReleaseSafe -Dtarget=native
     
-    log_info "Installing zss binary..."
+    log_info "Building ZiggyStarSpider TUI..."
+    zig build tui -Doptimize=ReleaseSafe -Dtarget=native
+    
+    log_info "Installing zss binaries..."
     cp zig-out/bin/zss "$INSTALL_DIR/" 2>/dev/null || true
-    # Don't install GUI on headless servers
-    # cp zig-out/bin/zss-gui "$INSTALL_DIR/" 2>/dev/null || true
+    cp zig-out/bin/zss-tui "$INSTALL_DIR/" 2>/dev/null || true
     
     log_success "ZiggyStarSpider installed!"
 fi
@@ -282,6 +284,7 @@ echo "  $INSTALL_DIR/spiderweb"
 echo "  $INSTALL_DIR/spiderweb-config"
 if [[ "$INSTALL_ZSS" == "true" ]]; then
     echo "  $INSTALL_DIR/zss"
+    echo "  $INSTALL_DIR/zss-tui"
 fi
 echo ""
 
@@ -296,7 +299,9 @@ fi
 
 echo ""
 if [[ "$INSTALL_ZSS" == "true" ]]; then
-    echo "Connect to your agent: zss connect"
+    echo "Connect to your agent:"
+    echo "  zss-tui     (interactive TUI)"
+    echo "  zss connect (simple CLI)"
 else
     echo "To connect to your agent, install ZiggyStarSpider:"
     echo "  https://github.com/DeanoC/ZiggyStarSpider"
