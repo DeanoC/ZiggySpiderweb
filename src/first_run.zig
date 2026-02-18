@@ -110,7 +110,10 @@ fn selectProviderInteractive(allocator: std.mem.Allocator) !struct { []const u8,
         try std.fs.File.stdout().writeAll("\\nSelect [1-4]: ");
         var buf: [16]u8 = undefined;
         const n = try std.fs.File.stdin().read(buf[0..]);
-        if (n == 0) continue;
+        if (n == 0) {
+            // EOF - probably piped without input, use default
+            return .{ "openai", "gpt-4o-mini" };
+        }
         
         const choice = std.mem.trim(u8, buf[0..n], " \\r\\n");
         
