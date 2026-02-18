@@ -121,12 +121,25 @@ mkdir -p "$INSTALL_DIR"
 # Stop any running spiderweb to allow binary replacement
 if pgrep spiderweb > /dev/null 2>&1; then
     log_info "Stopping running spiderweb..."
-    pkill spiderweb || true
-    sleep 1
+    # Try user kill first, then sudo if needed
+    pkill spiderweb 2>/dev/null || sudo pkill spiderweb 2>/dev/null || true
+    sleep 2
+    # Force kill if still running
+    if pgrep spiderweb > /dev/null 2>&1; then
+        pkill -9 spiderweb 2>/dev/null || sudo pkill -9 spiderweb 2>/dev/null || true
+        sleep 1
+    fi
 fi
 
-cp zig-out/bin/spiderweb "$INSTALL_DIR/"
-cp zig-out/bin/spiderweb-config "$INSTALL_DIR/"
+# If still can't copy, try with sudo
+if ! cp zig-out/bin/spiderweb "$INSTALL_DIR/" 2>/dev/null; then
+    log_info "Need elevated permissions to update binary..."
+    sudo cp zig-out/bin/spiderweb "$INSTALL_DIR/"
+    sudo cp zig-out/bin/spiderweb-config "$INSTALL_DIR/"
+else
+    cp zig-out/bin/spiderweb "$INSTALL_DIR/"
+    cp zig-out/bin/spiderweb-config "$INSTALL_DIR/"
+fi
 
 log_success "Build complete!"
 
