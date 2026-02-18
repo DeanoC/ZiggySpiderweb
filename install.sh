@@ -12,6 +12,27 @@
 
 set -euo pipefail
 
+# Error handler - show friendly message on failure
+cleanup_on_error() {
+    local exit_code=$?
+    local line_no=$1
+    if [[ $exit_code -ne 0 ]]; then
+        echo ""
+        echo -e "${RED}[ERROR]${NC} Installation failed at line $line_no (exit code: $exit_code)"
+        echo ""
+        echo "Common causes:"
+        echo "  • sudo password not entered or incorrect"
+        echo "  • Network issue downloading packages"
+        echo "  • Missing write permissions"
+        echo ""
+        echo "Try running with --non-interactive or install dependencies manually:"
+        echo "  sudo apt-get install curl jq git libsecret-tools sqlite3 build-essential"
+        echo ""
+    fi
+    exit $exit_code
+}
+trap 'cleanup_on_error $LINENO' ERR
+
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -62,7 +83,7 @@ print_banner() {
 ║                                                               ║
 ║   🕸️  ZiggySpiderweb - First Time Setup                      ║
 ║                                                               ║
-║   OpenClaw Protocol Gateway for Pi AI Providers              ║
+║   Pi AI Agent Gateway                                         ║
 ║                                                               ║
 ╚═══════════════════════════════════════════════════════════════╝
 EOF

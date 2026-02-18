@@ -3,14 +3,14 @@
 [![Zig](https://img.shields.io/badge/Zig-0.15.0-orange.svg)](https://ziglang.org)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-An **OpenClaw protocol gateway** that proxies requests to Pi AI providers (OpenAI, Codex, Kimi). Built in Zig, Linux-only.
+An **AI agent gateway** that connects agents to Pi AI providers (OpenAI, Codex, Kimi). Built in Zig, Linux-only.
 
 ## What is it?
 
-ZiggySpiderweb is an OpenClaw-compatible WebSocket gateway that:
-- Accepts OpenClaw protocol connections from any compatible client
-- Proxies messages to AI providers via Pi AI abstraction
-- Streams responses back through OpenClaw protocol
+ZiggySpiderweb is a WebSocket gateway that runs AI agents with:
+- Direct agent connections via WebSocket
+- Message routing to AI providers via Pi AI abstraction
+- Streaming responses with tool execution support
 
 **Supported Providers:**
 - OpenAI (GPT-4o, GPT-4.1, GPT-5.3-codex-spark)
