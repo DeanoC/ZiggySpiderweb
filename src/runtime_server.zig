@@ -313,7 +313,7 @@ pub const RuntimeServer = struct {
 
         switch (parsed.msg_type) {
             .connect => {
-                return self.submitRuntimeJobAndAwait(parsed.msg_type, request_id, parsed.content, parsed.action, .chat);
+                return self.wrapSingleFrame(try protocol.buildConnectAck(self.allocator, request_id));
             },
             .ping => {
                 return self.wrapSingleFrame(try protocol.buildPong(self.allocator));
@@ -340,6 +340,10 @@ pub const RuntimeServer = struct {
                 ));
             },
         }
+    }
+
+    pub fn handleConnectBootstrapFrames(self: *RuntimeServer, request_id: []const u8) ![][]u8 {
+        return self.submitRuntimeJobAndAwait(.connect, request_id, null, null, .chat);
     }
 
     fn submitRuntimeJobAndAwait(
@@ -584,8 +588,6 @@ pub const RuntimeServer = struct {
             for (responses.items) |payload| self.allocator.free(payload);
             responses.deinit(self.allocator);
         }
-
-        try responses.append(self.allocator, try protocol.buildConnectAck(self.allocator, request_id));
 
         const bootstrap_prompt = try self.resolveBootstrapPrompt(DEFAULT_BRAIN);
         if (bootstrap_prompt) |prompt| {
@@ -1528,7 +1530,7 @@ test "runtime_server: session.send returns all outbound runtime frames" {
     try std.testing.expectEqual(@as(usize, 1), session_receive_count);
 }
 
-test "runtime_server: connect emits bootstrap once then only connect.ack" {
+test "runtime_server: connect returns ack while bootstrap runs separately once" {
     const allocator = std.testing.allocator;
     const server = try RuntimeServer.create(allocator, "agent-first", .{
         .ltm_directory = "",
@@ -1540,16 +1542,18 @@ test "runtime_server: connect emits bootstrap once then only connect.ack" {
     const first_connect = try server.handleMessageFrames("{\"id\":\"req-connect-1\",\"type\":\"connect\"}");
     defer deinitResponseFrames(allocator, first_connect);
 
-    try std.testing.expectEqual(@as(usize, 2), first_connect.len);
+    try std.testing.expectEqual(@as(usize, 1), first_connect.len);
     try std.testing.expect(std.mem.indexOf(u8, first_connect[0], "\"type\":\"connect.ack\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, first_connect[1], "\"type\":\"session.receive\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, first_connect[1], "System Bootstrap") != null);
 
-    const second_connect = try server.handleMessageFrames("{\"id\":\"req-connect-2\",\"type\":\"connect\"}");
-    defer deinitResponseFrames(allocator, second_connect);
+    const first_bootstrap = try server.handleConnectBootstrapFrames("req-connect-1");
+    defer deinitResponseFrames(allocator, first_bootstrap);
+    try std.testing.expectEqual(@as(usize, 1), first_bootstrap.len);
+    try std.testing.expect(std.mem.indexOf(u8, first_bootstrap[0], "\"type\":\"session.receive\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first_bootstrap[0], "System Bootstrap") != null);
 
-    try std.testing.expectEqual(@as(usize, 1), second_connect.len);
-    try std.testing.expect(std.mem.indexOf(u8, second_connect[0], "\"type\":\"connect.ack\"") != null);
+    const second_bootstrap = try server.handleConnectBootstrapFrames("req-connect-2");
+    defer deinitResponseFrames(allocator, second_bootstrap);
+    try std.testing.expectEqual(@as(usize, 0), second_bootstrap.len);
 }
 
 test "runtime_server: provider-backed session.send uses configured provider runtime" {

@@ -197,6 +197,43 @@ fn handleWebSocketConnection(
 
         switch (frame.opcode) {
             0x1 => {
+                if (protocol.parseMessageType(frame.payload) == .connect) {
+                    var parsed_connect = protocol.parseMessage(allocator, frame.payload) catch {
+                        const invalid = try protocol.buildErrorWithCode(
+                            allocator,
+                            "unknown",
+                            .invalid_envelope,
+                            "invalid request envelope",
+                        );
+                        defer allocator.free(invalid);
+                        try websocket_transport.writeFrame(stream, invalid, .text);
+                        continue;
+                    };
+                    defer protocol.deinitParsedMessage(allocator, &parsed_connect);
+
+                    const request_id = parsed_connect.id orelse "generated";
+                    const connect_ack = try protocol.buildConnectAck(allocator, request_id);
+                    defer allocator.free(connect_ack);
+                    try websocket_transport.writeFrame(stream, connect_ack, .text);
+
+                    const bootstrap_responses = runtime_server.handleConnectBootstrapFrames(request_id) catch |err| blk: {
+                        const fallback = try protocol.buildErrorWithCode(
+                            allocator,
+                            request_id,
+                            .execution_failed,
+                            @errorName(err),
+                        );
+                        const wrapped = try allocator.alloc([]u8, 1);
+                        wrapped[0] = fallback;
+                        break :blk wrapped;
+                    };
+                    defer runtime_server_mod.deinitResponseFrames(allocator, bootstrap_responses);
+                    for (bootstrap_responses) |response| {
+                        try websocket_transport.writeFrame(stream, response, .text);
+                    }
+                    continue;
+                }
+
                 const responses = runtime_server.handleMessageFrames(frame.payload) catch |err| blk: {
                     const fallback = try protocol.buildErrorWithCode(
                         allocator,
