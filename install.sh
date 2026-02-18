@@ -163,6 +163,53 @@ if [[ "$INSTALL_ZSS" == "true" ]]; then
     log_success "ZiggyStarSpider installed!"
 fi
 
+# Ask about systemd service
+INSTALL_SYSTEMD=false
+SYSTEMD_SCOPE="user"
+if [[ -t 0 ]]; then
+    echo ""
+    read -rp "Install systemd service? [Y/n]: " systemd_confirm
+    if [[ ! "$systemd_confirm" =~ ^[Nn]$ ]] || [[ -z "$systemd_confirm" ]]; then
+        INSTALL_SYSTEMD=true
+        echo ""
+        read -rp "User or system service? [user/system]: " scope_choice
+        if [[ "$scope_choice" =~ ^[Ss]ystem$ ]]; then
+            SYSTEMD_SCOPE="system"
+        fi
+    fi
+fi
+
+if [[ "$INSTALL_SYSTEMD" == "true" ]]; then
+    log_info "Installing systemd service..."
+    
+    # Create service file content
+    SERVICE_FILE="[Unit]
+Description=ZiggySpiderweb AI Agent Gateway
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=$INSTALL_DIR/spiderweb
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target"
+    
+    if [[ "$SYSTEMD_SCOPE" == "system" ]]; then
+        echo "$SERVICE_FILE" | sudo tee /etc/systemd/system/spiderweb.service > /dev/null
+        sudo systemctl daemon-reload
+        log_success "System service installed"
+        echo "  Enable with: sudo systemctl enable --now spiderweb"
+    else
+        mkdir -p "$HOME/.config/systemd/user"
+        echo "$SERVICE_FILE" > "$HOME/.config/systemd/user/spiderweb.service"
+        systemctl --user daemon-reload
+        log_success "User service installed"
+        echo "  Enable with: systemctl --user enable --now spiderweb"
+    fi
+fi
+
 # Run first-run wizard
 echo ""
 log_info "Starting first-time setup..."
@@ -196,9 +243,22 @@ if [[ "$INSTALL_ZSS" == "true" ]]; then
     echo "  $INSTALL_DIR/zss"
 fi
 echo ""
-echo "To install systemd service:"
-echo "  spiderweb-config config install-service"
-echo "  systemctl --user enable --now spiderweb"
+
+if [[ "$INSTALL_SYSTEMD" == "true" ]]; then
+    echo "Systemd service installed ($SYSTEMD_SCOPE scope)"
+    if [[ "$SYSTEMD_SCOPE" == "system" ]]; then
+        echo "  Start: sudo systemctl start spiderweb"
+        echo "  Status: sudo systemctl status spiderweb"
+    else
+        echo "  Start: systemctl --user start spiderweb"
+        echo "  Status: systemctl --user status spiderweb"
+    fi
+else
+    echo "To install systemd service later:"
+    echo "  spiderweb-config config install-service"
+    echo "  systemctl --user enable --now spiderweb"
+fi
+
 echo ""
 if [[ "$INSTALL_ZSS" == "true" ]]; then
     echo "Connect to your agent:"
