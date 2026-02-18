@@ -145,7 +145,23 @@ fn ensureMemoryFromTemplate(
     const allocator = runtime.allocator;
     var existing = try loadMemoryByName(runtime, brain_name, name);
     if (existing) |*item| {
-        item.deinit(allocator);
+        defer item.deinit(allocator);
+        if (try isMemoryActive(runtime, brain_name, name)) {
+            return true;
+        }
+
+        var recreated = runtime.active_memory.create(
+            brain_name,
+            .ram,
+            name,
+            item.kind,
+            item.content_json,
+            true,
+        ) catch |err| {
+            std.log.warn("Failed to rehydrate memory {s} for {s}/{s}: {s}", .{ name, runtime.agent_id, brain_name, @errorName(err) });
+            return false;
+        };
+        defer recreated.deinit(allocator);
         return true;
     }
 
@@ -176,6 +192,17 @@ fn ensureMemoryFromTemplate(
 
     std.log.info("Hatched {s} for {s}/{s}", .{ template_name, runtime.agent_id, brain_name });
     return true;
+}
+
+fn isMemoryActive(runtime: *AgentRuntime, brain_name: []const u8, name: []const u8) !bool {
+    const snapshot = try runtime.active_memory.snapshotActive(runtime.allocator, brain_name);
+    defer memory.deinitItems(runtime.allocator, snapshot);
+
+    for (snapshot) |item| {
+        const parsed = memid.MemId.parse(item.mem_id) catch continue;
+        if (std.mem.eql(u8, parsed.name, name)) return true;
+    }
+    return false;
 }
 
 fn loadMemoryByName(runtime: *AgentRuntime, brain_name: []const u8, name: []const u8) !?memory.ActiveMemoryItem {
@@ -435,4 +462,42 @@ pub fn registerSystemHooks(registry: *hook_registry.HookRegistry) !void {
         .priority = @intFromEnum(hook_registry.HookPriority.system_last),
         .callback = persistLtmHook,
     });
+}
+
+test "system_hooks: ensureIdentityMemories rehydrates persisted identity into active memory" {
+    const allocator = std.testing.allocator;
+    const ltm_dir = try std.fmt.allocPrint(allocator, ".tmp-system-hooks-ltm-{d}", .{std.time.nanoTimestamp()});
+    defer allocator.free(ltm_dir);
+    defer std.fs.cwd().deleteTree(ltm_dir) catch {};
+
+    {
+        var runtime = try AgentRuntime.initWithPersistence(allocator, "agent-system-hooks", &.{}, ltm_dir, "runtime-memory.db");
+        defer runtime.deinit();
+
+        try ensureIdentityMemories(&runtime, "primary");
+    }
+
+    var restarted = try AgentRuntime.initWithPersistence(allocator, "agent-system-hooks", &.{}, ltm_dir, "runtime-memory.db");
+    defer restarted.deinit();
+
+    const before = try restarted.active_memory.snapshotActive(allocator, "primary");
+    defer memory.deinitItems(allocator, before);
+    try std.testing.expectEqual(@as(usize, 0), before.len);
+
+    try ensureIdentityMemories(&restarted, "primary");
+
+    const after = try restarted.active_memory.snapshotActive(allocator, "primary");
+    defer memory.deinitItems(allocator, after);
+
+    try std.testing.expect(containsNamedMemory(after, SOUL_MEM_NAME));
+    try std.testing.expect(containsNamedMemory(after, AGENT_MEM_NAME));
+    try std.testing.expect(containsNamedMemory(after, IDENTITY_MEM_NAME));
+}
+
+fn containsNamedMemory(items: []const memory.ActiveMemoryItem, name: []const u8) bool {
+    for (items) |item| {
+        const parsed = memid.MemId.parse(item.mem_id) catch continue;
+        if (std.mem.eql(u8, parsed.name, name)) return true;
+    }
+    return false;
 }
