@@ -255,6 +255,20 @@ WantedBy=default.target"
     fi
 fi
 
+# Ask about remote access
+BIND_ADDRESS="127.0.0.1"
+CURRENT_PORT="18790"
+if [[ -t 0 ]]; then
+    echo ""
+    read -rp "Allow remote connections (Tailscale/VPN)? [y/N]: " remote_confirm
+    if [[ "$remote_confirm" =~ ^[Yy]$ ]]; then
+        BIND_ADDRESS="0.0.0.0"
+        log_info "Server will bind to all interfaces (0.0.0.0)"
+    else
+        log_info "Server will bind to localhost only (127.0.0.1)"
+    fi
+fi
+
 # Run first-run wizard
 echo ""
 log_info "Starting first-time setup..."
@@ -275,6 +289,41 @@ if [[ -n "${SPIDERWEB_NON_INTERACTIVE:-}" ]]; then
     spiderweb-config first-run $FIRST_RUN_ARGS
 else
     spiderweb-config first-run
+fi
+
+# Only configure bind address in interactive mode (when we asked the user)
+if [[ -t 0 ]]; then
+    log_info "Configuring bind address (${BIND_ADDRESS})..."
+    
+    # Get current port from config - spiderweb-config outputs "Bind: <host>:<port>"
+    # Extract port from format like "Bind: 127.0.0.1:18790"
+    DETECTED_PORT=$(spiderweb-config config 2>/dev/null | grep -oP 'Bind: [^:]+:\K\d+' || echo "18790")
+    if [[ -n "$DETECTED_PORT" ]]; then
+        CURRENT_PORT="$DETECTED_PORT"
+    fi
+    
+    spiderweb-config config set-server --bind "$BIND_ADDRESS" --port "$CURRENT_PORT"
+    
+    # Restart service if running to apply new bind address
+    if [[ "$INSTALL_SYSTEMD" == "true" ]] || [[ "$SYSTEMD_EXISTS" == "true" ]]; then
+        if systemctl --user is-active spiderweb >/dev/null 2>&1 || sudo systemctl is-active spiderweb >/dev/null 2>&1; then
+            log_info "Restarting service with new bind address..."
+            if [[ "$SYSTEMD_SCOPE" == "system" ]] || [[ "$EXISTING_SCOPE" == "system" ]]; then
+                sudo systemctl restart spiderweb 2>/dev/null || true
+            else
+                systemctl --user restart spiderweb 2>/dev/null || true
+            fi
+        fi
+    else
+        # No systemd - check if spiderweb is running directly and restart it
+        if pgrep -x spiderweb > /dev/null 2>&1; then
+            log_info "Restarting spiderweb with new bind address..."
+            pkill -x spiderweb 2>/dev/null || true
+            sleep 1
+            # spiderweb-config first-run will have started it, or user can start manually
+            spiderweb &
+        fi
+    fi
 fi
 
 # Post-install summary
@@ -302,8 +351,11 @@ fi
 echo ""
 if [[ "$INSTALL_ZSS" == "true" ]]; then
     echo "Connect to your agent:"
-    echo "  zss-tui     (interactive TUI)"
-    echo "  zss connect (simple CLI)"
+    echo "  Local:  zss connect"
+    # Only show remote URL if remote access is enabled
+    if [[ -t 0 ]] && [[ "$BIND_ADDRESS" == "0.0.0.0" ]]; then
+        echo "  Remote: zss connect --url ws://<host-ip>:${CURRENT_PORT}/v1/agents/<agent>/stream"
+    fi
 else
     echo "To connect to your agent, install ZiggyStarSpider:"
     echo "  https://github.com/DeanoC/ZiggyStarSpider"
