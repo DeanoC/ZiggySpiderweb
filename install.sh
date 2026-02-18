@@ -279,6 +279,8 @@ if [[ -n "${SPIDERWEB_NON_INTERACTIVE:-}" ]]; then
     log_info "Skipping interactive first-time setup (non-interactive mode)"
     log_info "Run 'spiderweb-config first-run' manually to configure your agent"
 else
+    # Clear any leftover input before running first-run
+    while IFS= read -r -t 0.1 dummy 2>/dev/null; do : ; done
     spiderweb-config first-run
 fi
 
