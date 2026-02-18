@@ -49,6 +49,7 @@ pub fn main() !void {
                 .runtime_request_queue_max = 128,
                 .chat_operation_timeout_ms = 30_000,
                 .control_operation_timeout_ms = 5_000,
+                .default_agent_id = try allocator.dupe(u8, "default"),
                 .ltm_directory = try allocator.dupe(u8, ".spiderweb-ltm"),
                 .ltm_filename = try allocator.dupe(u8, "runtime-memory.db"),
             },
@@ -64,6 +65,7 @@ pub fn main() !void {
     std.log.info("Starting ZiggySpiderweb v0.2.0 (Pi AI)", .{});
     std.log.info("Config: {s}", .{config.config_path});
     std.log.info("Provider: {s}/{s}", .{ config.provider.name, config.provider.model orelse "default" });
+    std.log.info("Default agent route: {s}", .{config.runtime.default_agent_id});
 
     // Override with CLI args if provided
     var port = config.server.port;

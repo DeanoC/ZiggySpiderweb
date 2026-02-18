@@ -8,10 +8,14 @@ const AgentRuntime = @import("agent_runtime.zig").AgentRuntime;
 const brain_tools = @import("brain_tools.zig");
 const memory = @import("memory.zig");
 const memid = @import("memid.zig");
+const protocol = @import("protocol.zig");
 
 /// System paths for templates
 const TEMPLATE_DIR = "templates";
-const FIRST_BOOT_FLAG = ".first_boot_complete";
+
+pub const SOUL_MEM_NAME = "system.soul";
+pub const AGENT_MEM_NAME = "system.agent";
+pub const IDENTITY_MEM_NAME = "system.identity";
 
 /// Load identity from LTM into ROM, or hatch from templates if first boot
 pub fn loadSharedRomHook(ctx: *HookContext, data: HookData) HookError!void {
@@ -20,49 +24,35 @@ pub fn loadSharedRomHook(ctx: *HookContext, data: HookData) HookError!void {
     const agent_id = ctx.runtime.agent_id;
     const brain_name = ctx.brain_name;
 
-    // Check if this is the first boot (no flag file exists)
-    const is_first_boot = checkFirstBoot(allocator) catch |err| blk: {
-        std.log.warn("Failed to check first boot status: {s}", .{@errorName(err)});
-        break :blk false;
+    ensureIdentityMemories(ctx.runtime, brain_name) catch |err| switch (err) {
+        error.OutOfMemory => return HookError.OutOfMemory,
+        else => {
+            std.log.warn("Failed to ensure identity memories for {s}/{s}: {s}", .{ agent_id, brain_name, @errorName(err) });
+            return HookError.HookFailed;
+        },
     };
 
-    // Build fixed names for identity memories (used for stable MemIds)
-    // Note: using '.' separator since ':' is reserved for memid format
-    const soul_name = "system.soul";
-    const agent_name = "system.agent";
-    const identity_name = "system.identity";
-
-    // Try to load from LTM first (already hatched)
-    var soul_loaded = try loadIdentityFromLTM(ctx, "system.soul", "identity:soul", rom);
-    var agent_loaded = try loadIdentityFromLTM(ctx, "system.agent", "identity:agent", rom);
-    var identity_loaded = try loadIdentityFromLTM(ctx, "system.identity", "identity:public", rom);
-
-    // If not in LTM, hatch from templates
-    if (!soul_loaded or !agent_loaded or !identity_loaded) {
-        std.log.info("Hatching new agent: {s}/{s}", .{ agent_id, brain_name });
-
-        // Load from templates and create LTM entries
-        if (!soul_loaded) {
-            soul_loaded = try hatchIdentityFromTemplate(ctx, "SOUL.md", soul_name, "identity:soul", rom);
-        }
-        if (!agent_loaded) {
-            agent_loaded = try hatchIdentityFromTemplate(ctx, "AGENT.md", agent_name, "identity:agent", rom);
-        }
-        if (!identity_loaded) {
-            identity_loaded = try hatchIdentityFromTemplate(ctx, "IDENTITY.md", identity_name, "identity:public", rom);
-        }
-
-        // Send first message (hatch complete signal)
-        if (is_first_boot) {
-            try sendFirstMessage(ctx, "BOOTSTRAP.md");
-            // Mark first boot complete
-            markFirstBootComplete(allocator) catch |err| {
-                std.log.warn("Failed to mark first boot complete: {s}", .{@errorName(err)});
-            };
-        } else {
-            try sendFirstMessage(ctx, "JUST_HATCHED.md");
-        }
-    }
+    _ = loadIdentityFromLTM(ctx, SOUL_MEM_NAME, "identity:soul", rom) catch |err| switch (err) {
+        error.OutOfMemory => return HookError.OutOfMemory,
+        else => {
+            std.log.warn("Failed loading identity memory {s} for {s}/{s}: {s}", .{ SOUL_MEM_NAME, agent_id, brain_name, @errorName(err) });
+            return HookError.HookFailed;
+        },
+    };
+    _ = loadIdentityFromLTM(ctx, AGENT_MEM_NAME, "identity:agent", rom) catch |err| switch (err) {
+        error.OutOfMemory => return HookError.OutOfMemory,
+        else => {
+            std.log.warn("Failed loading identity memory {s} for {s}/{s}: {s}", .{ AGENT_MEM_NAME, agent_id, brain_name, @errorName(err) });
+            return HookError.HookFailed;
+        },
+    };
+    _ = loadIdentityFromLTM(ctx, IDENTITY_MEM_NAME, "identity:public", rom) catch |err| switch (err) {
+        error.OutOfMemory => return HookError.OutOfMemory,
+        else => {
+            std.log.warn("Failed loading identity memory {s} for {s}/{s}: {s}", .{ IDENTITY_MEM_NAME, agent_id, brain_name, @errorName(err) });
+            return HookError.HookFailed;
+        },
+    };
 
     // Load agent.json config (if exists)
     const agent_json = loadAgentJson(allocator, ctx.runtime, brain_name) catch |err| blk: {
@@ -100,27 +90,6 @@ pub fn loadSharedRomHook(ctx: *HookContext, data: HookData) HookError!void {
     );
 }
 
-/// Check if this is the first boot of the system
-fn checkFirstBoot(allocator: std.mem.Allocator) !bool {
-    const flag_path = try std.fs.path.join(allocator, &.{ TEMPLATE_DIR, FIRST_BOOT_FLAG });
-    defer allocator.free(flag_path);
-
-    std.fs.cwd().access(flag_path, .{}) catch |err| {
-        if (err == error.FileNotFound) return true;
-        return err;
-    };
-    return false;
-}
-
-/// Mark first boot as complete
-fn markFirstBootComplete(allocator: std.mem.Allocator) !void {
-    const flag_path = try std.fs.path.join(allocator, &.{ TEMPLATE_DIR, FIRST_BOOT_FLAG });
-    defer allocator.free(flag_path);
-
-    const file = try std.fs.cwd().createFile(flag_path, .{});
-    file.close();
-}
-
 /// Load identity from LTM into ROM
 fn loadIdentityFromLTM(
     ctx: *HookContext,
@@ -128,33 +97,13 @@ fn loadIdentityFromLTM(
     rom_key: []const u8,
     rom: *Rom,
 ) !bool {
-    // Try to load from active memory (which is backed by LTM)
-    // Search by base name (e.g., "system.soul") since mem_id includes version
-    const snapshot = ctx.runtime.active_memory.snapshotActive(ctx.runtime.allocator, ctx.brain_name) catch return false;
-    defer memory.deinitItems(ctx.runtime.allocator, snapshot);
+    var loaded = (try loadMemoryByName(ctx.runtime, ctx.brain_name, base_name)) orelse return false;
+    defer loaded.deinit(ctx.runtime.allocator);
 
-    for (snapshot) |item| {
-        // Parse the mem_id to extract the name part
-        // Format: <EOT>{agent}:{brain}:{name}:{version}<EOT>
-        if (std.mem.startsWith(u8, item.mem_id, "<EOT>")) {
-            // Find the name by scanning for colons
-            var parts = std.mem.splitScalar(u8, item.mem_id[5..], ':'); // Skip "<EOT>"
-            _ = parts.next(); // agent
-            _ = parts.next(); // brain
-            if (parts.next()) |name| {
-                if (std.mem.eql(u8, name, base_name)) {
-                    // Found it - unwrap JSON content and add to ROM
-                    // content_json is stored as "raw text" (JSON string), so unwrap it
-                    const raw_content = try unwrapJsonString(ctx.runtime.allocator, item.content_json);
-                    defer ctx.runtime.allocator.free(raw_content);
-                    rom.set(rom_key, raw_content) catch return false;
-                    return true;
-                }
-            }
-        }
-    }
-
-    return false;
+    const raw_content = try unwrapJsonString(ctx.runtime.allocator, loaded.content_json);
+    defer ctx.runtime.allocator.free(raw_content);
+    rom.set(rom_key, raw_content) catch return false;
+    return true;
 }
 
 /// Unwrap a JSON string using std.json parser
@@ -174,77 +123,78 @@ fn unwrapJsonString(allocator: std.mem.Allocator, json_str: []const u8) ![]u8 {
     return allocator.dupe(u8, json_str);
 }
 
-/// Hatch identity from template file into LTM and ROM
-fn hatchIdentityFromTemplate(
-    ctx: *HookContext,
-    template_name: []const u8,
-    name: []const u8,
-    rom_key: []const u8,
-    rom: *Rom,
-) !bool {
-    const allocator = ctx.runtime.allocator;
+/// Ensure the identity memories exist for a brain, hatching from templates if needed.
+pub fn ensureIdentityMemories(runtime: *AgentRuntime, brain_name: []const u8) !void {
+    _ = try ensureMemoryFromTemplate(runtime, brain_name, "SOUL.md", SOUL_MEM_NAME);
+    _ = try ensureMemoryFromTemplate(runtime, brain_name, "AGENT.md", AGENT_MEM_NAME);
+    _ = try ensureMemoryFromTemplate(runtime, brain_name, "IDENTITY.md", IDENTITY_MEM_NAME);
+}
 
-    // Load template file
+pub fn readTemplate(allocator: std.mem.Allocator, template_name: []const u8) ![]u8 {
     const template_path = try std.fs.path.join(allocator, &.{ TEMPLATE_DIR, template_name });
     defer allocator.free(template_path);
+    return std.fs.cwd().readFileAlloc(allocator, template_path, 1024 * 1024);
+}
 
-    const content = std.fs.cwd().readFileAlloc(allocator, template_path, 1024 * 1024) catch |err| {
+fn ensureMemoryFromTemplate(
+    runtime: *AgentRuntime,
+    brain_name: []const u8,
+    template_name: []const u8,
+    name: []const u8,
+) !bool {
+    const allocator = runtime.allocator;
+    var existing = try loadMemoryByName(runtime, brain_name, name);
+    if (existing) |*item| {
+        item.deinit(allocator);
+        return true;
+    }
+
+    const content = readTemplate(allocator, template_name) catch |err| {
         std.log.warn("Failed to load template {s}: {s}", .{ template_name, @errorName(err) });
         return false;
     };
     defer allocator.free(content);
 
-    // Wrap content as JSON string
-    const content_json = try std.fmt.allocPrint(allocator, "\"{s}\"", .{content});
+    const escaped_content = try protocol.jsonEscape(allocator, content);
+    defer allocator.free(escaped_content);
+
+    const content_json = try std.fmt.allocPrint(allocator, "\"{s}\"", .{escaped_content});
     defer allocator.free(content_json);
 
-    // Create in active memory with a STABLE name (e.g., "system:soul")
-    // This ensures the MemId is deterministic: <EOT>{agent}:{brain}:system:soul:{version}<EOT>
-    // Mark as unevictable for identity memories
-    _ = ctx.runtime.active_memory.create(
-        ctx.brain_name,
+    var created = runtime.active_memory.create(
+        brain_name,
         .ram,
-        name, // stable name - ensures deterministic MemId
-        name, // kind matches name for identity memories
+        name,
+        name,
         content_json,
-        true, // unevictable - identity memories are always present
+        true,
     ) catch |err| {
         std.log.warn("Failed to create memory for {s}: {s}", .{ template_name, @errorName(err) });
         return false;
     };
+    defer created.deinit(allocator);
 
-    // Add to ROM
-    try rom.set(rom_key, content);
-
-    std.log.info("Hatched {s} for {s}", .{ template_name, ctx.brain_name });
+    std.log.info("Hatched {s} for {s}/{s}", .{ template_name, runtime.agent_id, brain_name });
     return true;
 }
 
-/// Send first message to agent (hatch complete)
-fn sendFirstMessage(ctx: *HookContext, template_name: []const u8) !void {
-    const allocator = ctx.runtime.allocator;
+fn loadMemoryByName(runtime: *AgentRuntime, brain_name: []const u8, name: []const u8) !?memory.ActiveMemoryItem {
+    const allocator = runtime.allocator;
+    const mem_id = try buildLatestMemId(allocator, runtime.agent_id, brain_name, name);
+    defer allocator.free(mem_id);
 
-    const template_path = try std.fs.path.join(allocator, &.{ TEMPLATE_DIR, template_name });
-    defer allocator.free(template_path);
-
-    const content = std.fs.cwd().readFileAlloc(allocator, template_path, 1024 * 1024) catch |err| {
-        std.log.warn("Failed to load first message template {s}: {s}", .{ template_name, @errorName(err) });
-        return;
+    return runtime.active_memory.load(mem_id, null) catch |err| switch (err) {
+        memory.MemoryError.NotFound => null,
+        else => err,
     };
-    defer allocator.free(content);
+}
 
-    // Enqueue as user message to the brain
-    ctx.runtime.bus.enqueue(.{
-        .event_type = .user,
-        .source_brain = "user",
-        .target_brain = ctx.brain_name,
-        .payload = content,
-    }) catch |err| {
-        std.log.warn("Failed to enqueue first message: {s}", .{@errorName(err)});
-        return;
-    };
-
-    std.log.info("Sent first message ({s}) to {s}", .{ template_name, ctx.brain_name });
+fn buildLatestMemId(allocator: std.mem.Allocator, agent_id: []const u8, brain_name: []const u8, name: []const u8) ![]u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "{s}{s}:{s}:{s}:latest{s}",
+        .{ memid.EOT_MARKER, agent_id, brain_name, name, memid.EOT_MARKER },
+    );
 }
 
 /// Inject runtime status into ROM

@@ -106,6 +106,7 @@ Runtime execution now uses a bounded request queue plus fixed runtime workers.
 - `runtime_request_queue_max`
 - `chat_operation_timeout_ms`
 - `control_operation_timeout_ms`
+- `default_agent_id`
 
 Notes:
 - Older inflight-style runtime gating keys are no longer used.
@@ -188,7 +189,9 @@ OpenClaw Client (ZSC, OpenClaw, etc.)
 ┌─────────────────┐
 │  HTTP Upgrade   │  ← GET /v1/agents/{agentId}/stream
 ├─────────────────┤
-│  Session ACK    │  ← {"type":"session.ack",...}
+│  Session ACK    │  ← {"type":"connect.ack",...}
+├─────────────────┤
+│ Optional Bootstrap│ ← {"type":"session.receive",...} on first connect
 ├─────────────────┤
 │  OpenClaw Parse │  ← {"type":"session.send",...}
 ├─────────────────┤
