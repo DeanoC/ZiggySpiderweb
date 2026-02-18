@@ -271,6 +271,8 @@ clone_and_build() {
 }
 
 configure_provider() {
+    log_info "DEBUG: Entering configure_provider"
+    
     log_info "Configuring AI Provider"
     
     # Non-interactive mode: use environment variables
@@ -290,20 +292,38 @@ configure_provider() {
     
     # Interactive mode
     echo ""
-    echo "Supported providers:"
-    echo "  1) openai (GPT-4o, GPT-4.1, GPT-5.3-codex-spark)"
-    echo "  2) openai-codex (GPT-5.1, GPT-5.2, GPT-5.3 Codex)"
-    echo "  3) kimi-coding (Kimi K2, K2.5)"
+    log_info "Select your AI provider"
+    echo ""
+    echo "Quick setup (recommended):"
+    echo "  1) OpenAI        - GPT-4o, GPT-4.1, GPT-5.3-codex-spark"
+    echo "  2) OpenAI Codex  - GPT-5.1, GPT-5.2, GPT-5.3 Codex (reasoning models)"
+    echo "  3) Kimi Coding   - Kimi K2, K2.5 (Moonshot AI)"
+    echo ""
+    echo "  4) Manual setup  - Configure provider manually"
     echo ""
     
     local provider_choice
     while true; do
-        read -rp "Select provider [1-3]: " provider_choice
+        read -rp "Select [1-4]: " provider_choice
         case "$provider_choice" in
             1) PROVIDER="openai"; break ;;
             2) PROVIDER="openai-codex"; break ;;
             3) PROVIDER="kimi-coding"; break ;;
-            *) log_error "Invalid choice. Please enter 1, 2, or 3." ;;
+            4) 
+                echo ""
+                log_info "Manual provider setup"
+                echo ""
+                echo "Available providers:"
+                echo "  openai, openai-codex, openai-codex-spark, kimi-coding, anthropic, azure-openai"
+                echo ""
+                read -rp "Enter provider name: " PROVIDER
+                if [[ -z "$PROVIDER" ]]; then
+                    log_error "Provider name required"
+                    continue
+                fi
+                break
+                ;;
+            *) log_error "Invalid choice. Please enter 1, 2, 3, or 4." ;;
         esac
     done
     
@@ -349,6 +369,16 @@ configure_provider() {
                 2) model="kimi-k2.5" ;;
                 *) model="k2p5" ;;
             esac
+            ;;
+        *)
+            echo ""
+            log_info "Enter model name for $PROVIDER"
+            echo ""
+            read -rp "Model name: " model
+            if [[ -z "$model" ]]; then
+                log_error "Model name required"
+                model="gpt-4o-mini"
+            fi
             ;;
     esac
     
@@ -412,6 +442,8 @@ configure_provider() {
 }
 
 name_first_agent() {
+    log_info "DEBUG: Entering name_first_agent"
+    
     # Non-interactive mode: use environment variable
     if [[ "$NON_INTERACTIVE" == "true" ]]; then
         log_info "Non-interactive mode: Agent name = $AGENT_NAME"
@@ -635,6 +667,8 @@ main() {
     setup_per_brain_config
     
     run_first_agent
+    
+    log_success "Installation complete!"
 }
 
 # Run main function
