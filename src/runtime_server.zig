@@ -879,8 +879,9 @@ pub const RuntimeServer = struct {
         const provider_tools = try self.allocator.alloc(ziggy_piai.types.Tool, world_tool_specs.len);
         defer self.allocator.free(provider_tools);
         const provider_tool_name_map = try self.allocator.alloc(ProviderToolNameMapEntry, world_tool_specs.len);
+        var provider_tool_name_count: usize = 0;
         defer {
-            for (provider_tool_name_map) |entry| self.allocator.free(entry.provider_name);
+            for (provider_tool_name_map[0..provider_tool_name_count]) |entry| self.allocator.free(entry.provider_name);
             self.allocator.free(provider_tool_name_map);
         }
         for (world_tool_specs, 0..) |spec, idx| {
@@ -894,6 +895,7 @@ pub const RuntimeServer = struct {
                 .provider_name = provider_tool_name,
                 .runtime_name = spec.name,
             };
+            provider_tool_name_count += 1;
             provider_tools[idx] = .{
                 .name = provider_tool_name,
                 .description = spec.description,

@@ -2,6 +2,7 @@ const std = @import("std");
 const Config = @import("config.zig");
 const credential_store = @import("credential_store.zig");
 const ziggy_piai = @import("ziggy-piai");
+const max_agent_id_len: usize = 64;
 
 fn print(comptime fmt: []const u8, args: anytype) !void {
     var buf: [4096]u8 = undefined;
@@ -66,7 +67,13 @@ pub fn runFirstRun(allocator: std.mem.Allocator, args: []const []const u8) !void
         agent_name_param orelse "ziggy"
     else
         try createAgentInteractive(agent_name_param);
-    const agent_name = try normalizeAgentId(allocator, chosen_agent_name);
+    const agent_name = normalizeAgentId(allocator, chosen_agent_name) catch |err| switch (err) {
+        error.AgentIdTooLong => {
+            std.log.err("Agent id must be at most {d} characters after normalization", .{max_agent_id_len});
+            return error.InvalidArguments;
+        },
+        else => return err,
+    };
     defer allocator.free(agent_name);
 
     // Step 4: Save configuration
@@ -322,6 +329,7 @@ fn normalizeAgentId(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
         out.deinit(allocator);
         return allocator.dupe(u8, "ziggy");
     }
+    if (out.items.len > max_agent_id_len) return error.AgentIdTooLong;
 
     return out.toOwnedSlice(allocator);
 }
