@@ -19,7 +19,7 @@ test "isFirstBoot returns true when only default agent exists" {
     defer allocator.free(test_dir);
     defer cleanupTestDir(test_dir);
     
-    var registry = try AgentRegistry.init(allocator, test_dir);
+    var registry = AgentRegistry.init(allocator, test_dir, "agents", "templates");
     defer registry.deinit();
     
     // Fresh registry should be in first-boot state
@@ -33,7 +33,7 @@ test "isFirstBoot returns false after creating first agent" {
     defer allocator.free(test_dir);
     defer cleanupTestDir(test_dir);
     
-    var registry = try AgentRegistry.init(allocator, test_dir);
+    var registry = AgentRegistry.init(allocator, test_dir, "agents", "templates");
     defer registry.deinit();
     
     // Create first agent
@@ -50,7 +50,7 @@ test "isFirstBoot returns false for real agent named default" {
     defer allocator.free(test_dir);
     defer cleanupTestDir(test_dir);
     
-    var registry = try AgentRegistry.init(allocator, test_dir);
+    var registry = AgentRegistry.init(allocator, test_dir, "agents", "templates");
     defer registry.deinit();
     
     // Create a real agent named "default" (should have HATCH.md, so needs_hatching=true)
@@ -72,7 +72,7 @@ test "isFirstBoot returns false after hatching even without identity files" {
     defer allocator.free(test_dir);
     defer cleanupTestDir(test_dir);
 
-    var registry = try AgentRegistry.init(allocator, test_dir);
+    var registry = AgentRegistry.init(allocator, test_dir, "agents", "templates");
     defer registry.deinit();
 
     // Create and hatch a real agent named "default"
@@ -100,7 +100,7 @@ test "createAgent creates HATCH.md file" {
     defer allocator.free(test_dir);
     defer cleanupTestDir(test_dir);
     
-    var registry = try AgentRegistry.init(allocator, test_dir);
+    var registry = AgentRegistry.init(allocator, test_dir, "agents", "templates");
     defer registry.deinit();
     
     try registry.createAgent("new-agent", null);
@@ -123,7 +123,7 @@ test "agent has needs_hatching flag when HATCH.md exists" {
     defer allocator.free(test_dir);
     defer cleanupTestDir(test_dir);
     
-    var registry = try AgentRegistry.init(allocator, test_dir);
+    var registry = AgentRegistry.init(allocator, test_dir, "agents", "templates");
     defer registry.deinit();
     
     try registry.createAgent("hatch-agent", null);
@@ -140,7 +140,7 @@ test "completeHatching removes HATCH.md and clears flag" {
     defer allocator.free(test_dir);
     defer cleanupTestDir(test_dir);
     
-    var registry = try AgentRegistry.init(allocator, test_dir);
+    var registry = AgentRegistry.init(allocator, test_dir, "agents", "templates");
     defer registry.deinit();
     
     try registry.createAgent("complete-agent", null);
@@ -174,7 +174,7 @@ test "readHatchFile returns HATCH.md content" {
     defer allocator.free(test_dir);
     defer cleanupTestDir(test_dir);
     
-    var registry = try AgentRegistry.init(allocator, test_dir);
+    var registry = AgentRegistry.init(allocator, test_dir, "agents", "templates");
     defer registry.deinit();
     
     try registry.createAgent("read-agent", null);
@@ -193,7 +193,7 @@ test "readHatchFile returns null for hatched agent" {
     defer allocator.free(test_dir);
     defer cleanupTestDir(test_dir);
     
-    var registry = try AgentRegistry.init(allocator, test_dir);
+    var registry = AgentRegistry.init(allocator, test_dir, "agents", "templates");
     defer registry.deinit();
     
     try registry.createAgent("hatched-agent", null);
@@ -210,7 +210,7 @@ test "agent list includes needs_hatching flag" {
     defer allocator.free(test_dir);
     defer cleanupTestDir(test_dir);
 
-    var registry = try AgentRegistry.init(allocator, test_dir);
+    var registry = AgentRegistry.init(allocator, test_dir, "agents", "templates");
     defer registry.deinit();
 
     try registry.createAgent("list-agent", null);
@@ -236,7 +236,7 @@ test "createAgent does not create directory on bad template path" {
     defer allocator.free(test_dir);
     defer cleanupTestDir(test_dir);
 
-    var registry = try AgentRegistry.init(allocator, test_dir);
+    var registry = AgentRegistry.init(allocator, test_dir, "agents", "templates");
     defer registry.deinit();
 
     // Verify in first-boot state before
@@ -266,7 +266,7 @@ test "can create agent named default during first-boot" {
     defer allocator.free(test_dir);
     defer cleanupTestDir(test_dir);
 
-    var registry = try AgentRegistry.init(allocator, test_dir);
+    var registry = AgentRegistry.init(allocator, test_dir, "agents", "templates");
     defer registry.deinit();
 
     // Verify in first-boot state (synthetic placeholder exists)

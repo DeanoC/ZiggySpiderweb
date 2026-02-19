@@ -29,13 +29,17 @@ pub const AgentRegistry = struct {
     allocator: std.mem.Allocator,
     agents: std.ArrayListUnmanaged(AgentInfo),
     base_dir: []const u8,
+    agents_dir_rel: []const u8,
+    assets_dir_rel: []const u8,
     default_agent_id: ?[]const u8,
 
-    pub fn init(allocator: std.mem.Allocator, base_dir: []const u8) AgentRegistry {
+    pub fn init(allocator: std.mem.Allocator, base_dir: []const u8, agents_dir: []const u8, assets_dir: []const u8) AgentRegistry {
         return .{
             .allocator = allocator,
             .agents = .{},
             .base_dir = base_dir,
+            .agents_dir_rel = agents_dir,
+            .assets_dir_rel = assets_dir,
             .default_agent_id = null,
         };
     }
@@ -59,7 +63,7 @@ pub const AgentRegistry = struct {
         self.agents.clearRetainingCapacity();
 
         // Try to open agents/ directory
-        const agents_dir_path = try std.fs.path.join(self.allocator, &.{ self.base_dir, "agents" });
+        const agents_dir_path = try std.fs.path.join(self.allocator, &.{ self.base_dir, self.agents_dir_rel });
         defer self.allocator.free(agents_dir_path);
 
         var agents_dir = std.fs.cwd().openDir(agents_dir_path, .{ .iterate = true }) catch |err| {
@@ -107,7 +111,7 @@ pub const AgentRegistry = struct {
 
         // The key check: synthetic placeholder has no agent subdirectories in agents/
         // Real agents have at least one subdirectory (even if hatched with no identity files yet)
-        const agents_dir_path = std.fs.path.join(self.allocator, &.{ self.base_dir, "agents" }) catch return false;
+        const agents_dir_path = std.fs.path.join(self.allocator, &.{ self.base_dir, self.agents_dir_rel }) catch return false;
         defer self.allocator.free(agents_dir_path);
 
         var has_agent_subdirs = false;
@@ -328,7 +332,7 @@ pub const AgentRegistry = struct {
         defer self.allocator.free(template_source);
 
         // Create agent directory
-        const agent_path = try std.fs.path.join(self.allocator, &.{ self.base_dir, "agents", agent_id });
+        const agent_path = try std.fs.path.join(self.allocator, &.{ self.base_dir, self.agents_dir_rel, agent_id });
         defer self.allocator.free(agent_path);
 
         try std.fs.cwd().makePath(agent_path);
@@ -348,7 +352,7 @@ pub const AgentRegistry = struct {
 
     /// Complete hatching - delete HATCH.md and update agent
     pub fn completeHatching(self: *AgentRegistry, agent_id: []const u8) !void {
-        const agent_path = try std.fs.path.join(self.allocator, &.{ self.base_dir, "agents", agent_id });
+        const agent_path = try std.fs.path.join(self.allocator, &.{ self.base_dir, self.agents_dir_rel, agent_id });
         defer self.allocator.free(agent_path);
 
         // Delete HATCH.md
@@ -364,23 +368,30 @@ pub const AgentRegistry = struct {
     }
 
     fn loadDefaultHatchTemplate(self: *AgentRegistry) ![]u8 {
-        // Try to load from file first
-        const template_path = try std.fs.path.join(self.allocator, &.{ self.base_dir, "agents", "HATCH.template.md" });
-        defer self.allocator.free(template_path);
+        // Try to load from templates/ first, then fallback to agents/ (legacy)
+        const templates_path = try std.fs.path.join(self.allocator, &.{ self.base_dir, self.assets_dir_rel, "HATCH.template.md" });
+        defer self.allocator.free(templates_path);
 
-        return std.fs.cwd().readFileAlloc(self.allocator, template_path, 64 * 1024) catch {
-            // Fallback to embedded minimal template
-            return self.allocator.dupe(u8, "# HATCH.md — New Agent Initialization\n" ++
-                "\n" ++
-                "Welcome, newborn agent. You are hatching in ZiggySpiderweb (ZSS).\n" ++
-                "\n" ++
-                "## Your Task\n" ++
-                "Create your identity by writing SOUL.md, then respond with:\n" ++
-                "{\"type\":\"agent.hatch\",\"agent_id\":\"YourName\"}\n" ++
-                "\n" ++
-                "The server will confirm with agent.hatched and delete this HATCH.md.\n" ++
-                "You won't need it again.\n");
-        };
+        if (std.fs.cwd().readFileAlloc(self.allocator, templates_path, 64 * 1024)) |content| {
+            return content;
+        } else |_| {
+            const legacy_path = try std.fs.path.join(self.allocator, &.{ self.base_dir, self.agents_dir_rel, "HATCH.template.md" });
+            defer self.allocator.free(legacy_path);
+
+            return std.fs.cwd().readFileAlloc(self.allocator, legacy_path, 64 * 1024) catch {
+                // Fallback to embedded minimal template
+                return self.allocator.dupe(u8, "# HATCH.md — New Agent Initialization\n" ++
+                    "\n" ++
+                    "Welcome, newborn agent. You are hatching in ZiggySpiderweb (ZSS).\n" ++
+                    "\n" ++
+                    "## Your Task\n" ++
+                    "Create your identity by writing SOUL.md, then respond with:\n" ++
+                    "{\"type\":\"agent.hatch\",\"agent_id\":\"YourName\"}\n" ++
+                    "\n" ++
+                    "The server will confirm with agent.hatched and delete this HATCH.md.\n" ++
+                    "You won't need it again.\n");
+            };
+        }
     }
 
     fn extractNameFromIdentity(self: *AgentRegistry, agent_path: []const u8) !?[]u8 {

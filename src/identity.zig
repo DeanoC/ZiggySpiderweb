@@ -52,7 +52,8 @@ fn loadLayerContent(
     agent_id: []const u8,
     filename: []const u8,
 ) !?[]u8 {
-    const candidate1 = try std.fs.path.join(allocator, &.{ base_dir, "agents", agent_id, filename });
+    const agents_dir = "agents"; // Default if not in runtime
+    const candidate1 = try std.fs.path.join(allocator, &.{ base_dir, agents_dir, agent_id, filename });
     defer allocator.free(candidate1);
     if (try readFileIfExists(allocator, candidate1)) |content| return content;
 

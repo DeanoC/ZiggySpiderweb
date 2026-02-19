@@ -214,6 +214,7 @@ pub const RuntimeServer = struct {
                 &[_][]const u8{"delegate"},
                 effective_ltm_directory,
                 effective_ltm_filename,
+                runtime_cfg,
             ),
             .runtime_queue_max = runtime_cfg.runtime_request_queue_max,
             .chat_operation_timeout_ms = runtime_cfg.chat_operation_timeout_ms,

@@ -9,6 +9,7 @@ const tool_executor = @import("tool_executor.zig");
 const hook_registry = @import("hook_registry.zig");
 const system_hooks = @import("system_hooks.zig");
 const brain_specialization = @import("brain_specialization.zig");
+const Config = @import("config.zig");
 
 pub const RuntimeError = error{
     BrainNotFound,
@@ -89,13 +90,15 @@ pub const AgentRuntime = struct {
     queue_limits: QueueLimits = .{},
     checkpoint: u64 = 0,
     hooks: hook_registry.HookRegistry,
+    runtime_config: Config.RuntimeConfig,
 
     pub fn init(
         allocator: std.mem.Allocator,
         agent_id: []const u8,
         sub_brains: []const []const u8,
+        runtime_config: Config.RuntimeConfig,
     ) !AgentRuntime {
-        return initWithPersistence(allocator, agent_id, sub_brains, null, null);
+        return initWithPersistence(allocator, agent_id, sub_brains, null, null, runtime_config);
     }
 
     pub fn initWithPersistence(
@@ -104,6 +107,7 @@ pub const AgentRuntime = struct {
         sub_brains: []const []const u8,
         ltm_directory: ?[]const u8,
         ltm_filename: ?[]const u8,
+        runtime_config: Config.RuntimeConfig,
     ) !AgentRuntime {
         var owned_store: ?*ltm_store.VersionedMemStore = null;
         if (ltm_directory) |directory| {
@@ -125,6 +129,7 @@ pub const AgentRuntime = struct {
             .bus = event_bus.EventBus.init(allocator),
             .world_tools = tool_registry.ToolRegistry.init(allocator),
             .hooks = hook_registry.HookRegistry.init(allocator),
+            .runtime_config = try runtime_config.clone(allocator),
         };
         errdefer runtime.deinit();
 
@@ -173,6 +178,7 @@ pub const AgentRuntime = struct {
         self.bus.deinit();
         self.world_tools.deinit();
         self.active_memory.deinit();
+        self.runtime_config.deinit(self.allocator);
         if (self.ltm_store) |store| {
             store.close();
             self.allocator.destroy(store);
@@ -589,7 +595,8 @@ pub fn deinitOutbound(allocator: std.mem.Allocator, messages: [][]u8) void {
 
 test "agent_runtime: create primary + sub brain and execute one tick" {
     const allocator = std.testing.allocator;
-    var runtime = try AgentRuntime.init(allocator, "agentA", &[_][]const u8{"research"});
+    const cfg = Config.RuntimeConfig{};
+    var runtime = try AgentRuntime.init(allocator, "agentA", &[_][]const u8{"research"}, cfg);
     defer runtime.deinit();
 
     try std.testing.expect(runtime.brains.contains("primary"));
@@ -608,7 +615,8 @@ test "agent_runtime: create primary + sub brain and execute one tick" {
 
 test "agent_runtime: brain provider overrides are mutable and clearable" {
     const allocator = std.testing.allocator;
-    var runtime = try AgentRuntime.init(allocator, "agentA", &[_][]const u8{"research"});
+    const cfg = Config.RuntimeConfig{};
+    var runtime = try AgentRuntime.init(allocator, "agentA", &[_][]const u8{"research"}, cfg);
     defer runtime.deinit();
 
     try runtime.setBrainProviderOverride("research", .{
@@ -636,7 +644,8 @@ test "agent_runtime: brain provider overrides are mutable and clearable" {
 
 test "agent_runtime: addBrainWithProviderOverride applies spawn-time model settings" {
     const allocator = std.testing.allocator;
-    var runtime = try AgentRuntime.init(allocator, "agentA", &[_][]const u8{});
+    const cfg = Config.RuntimeConfig{};
+    var runtime = try AgentRuntime.init(allocator, "agentA", &[_][]const u8{}, cfg);
     defer runtime.deinit();
 
     try runtime.addBrainWithProviderOverride("delegate", .{
@@ -654,7 +663,8 @@ test "agent_runtime: addBrainWithProviderOverride applies spawn-time model setti
 
 test "agent_runtime: queue saturation returns explicit overload" {
     const allocator = std.testing.allocator;
-    var runtime = try AgentRuntime.init(allocator, "agentA", &[_][]const u8{});
+    const cfg = Config.RuntimeConfig{};
+    var runtime = try AgentRuntime.init(allocator, "agentA", &[_][]const u8{}, cfg);
     defer runtime.deinit();
 
     runtime.queue_limits.brain_ticks = 1;
@@ -664,7 +674,8 @@ test "agent_runtime: queue saturation returns explicit overload" {
 
 test "agent_runtime: enqueueUserEvent rejects paused/cancelled without queuing work" {
     const allocator = std.testing.allocator;
-    var runtime = try AgentRuntime.init(allocator, "agentA", &[_][]const u8{});
+    const cfg = Config.RuntimeConfig{};
+    var runtime = try AgentRuntime.init(allocator, "agentA", &[_][]const u8{}, cfg);
     defer runtime.deinit();
 
     runtime.state = .paused;
@@ -680,7 +691,8 @@ test "agent_runtime: enqueueUserEvent rejects paused/cancelled without queuing w
 
 test "agent_runtime: setState evicts stale control events instead of saturating" {
     const allocator = std.testing.allocator;
-    var runtime = try AgentRuntime.init(allocator, "agentA", &[_][]const u8{});
+    const cfg = Config.RuntimeConfig{};
+    var runtime = try AgentRuntime.init(allocator, "agentA", &[_][]const u8{}, cfg);
     defer runtime.deinit();
 
     runtime.queue_limits.control_events = 1;
@@ -694,7 +706,8 @@ test "agent_runtime: setState evicts stale control events instead of saturating"
 
 test "agent_runtime: queueToolUse rollback clears partially queued tool when tick enqueue fails" {
     const allocator = std.testing.allocator;
-    var runtime = try AgentRuntime.init(allocator, "agentA", &[_][]const u8{});
+    const cfg = Config.RuntimeConfig{};
+    var runtime = try AgentRuntime.init(allocator, "agentA", &[_][]const u8{}, cfg);
     defer runtime.deinit();
 
     runtime.queue_limits.brain_ticks = 0;
@@ -706,7 +719,8 @@ test "agent_runtime: queueToolUse rollback clears partially queued tool when tic
 
 test "agent_runtime: rollbackQueuedUserPrimaryWork removes pending user event and tick" {
     const allocator = std.testing.allocator;
-    var runtime = try AgentRuntime.init(allocator, "agentA", &[_][]const u8{});
+    const cfg = Config.RuntimeConfig{};
+    var runtime = try AgentRuntime.init(allocator, "agentA", &[_][]const u8{}, cfg);
     defer runtime.deinit();
 
     try runtime.enqueueUserEvent("hello");
@@ -720,7 +734,8 @@ test "agent_runtime: rollbackQueuedUserPrimaryWork removes pending user event an
 
 test "agent_runtime: talk.brain plus wait.for correlates across brains" {
     const allocator = std.testing.allocator;
-    var runtime = try AgentRuntime.init(allocator, "agentA", &[_][]const u8{"research"});
+    const cfg = Config.RuntimeConfig{};
+    var runtime = try AgentRuntime.init(allocator, "agentA", &[_][]const u8{"research"}, cfg);
     defer runtime.deinit();
 
     try runtime.queueToolUse("primary", "talk.brain", "{\"message\":\"sync\",\"target_brain\":\"research\"}");
@@ -758,7 +773,8 @@ test "agent_runtime: talk.brain plus wait.for correlates across brains" {
 
 test "agent_runtime: talk.brain schedules target brain tick for runtime loop" {
     const allocator = std.testing.allocator;
-    var runtime = try AgentRuntime.init(allocator, "agentA", &[_][]const u8{"research"});
+    const cfg = Config.RuntimeConfig{};
+    var runtime = try AgentRuntime.init(allocator, "agentA", &[_][]const u8{"research"}, cfg);
     defer runtime.deinit();
 
     try runtime.queueToolUse("primary", "talk.brain", "{\"message\":\"sync\",\"target_brain\":\"research\"}");
@@ -776,12 +792,13 @@ test "agent_runtime: talk.brain schedules target brain tick for runtime loop" {
 
 test "agent_runtime: memory lifecycle create mutate evict load historical" {
     const allocator = std.testing.allocator;
+    const cfg = Config.RuntimeConfig{};
     const dir = try std.fmt.allocPrint(allocator, ".tmp-runtime-lifecycle-{d}", .{std.time.nanoTimestamp()});
     defer allocator.free(dir);
     defer std.fs.cwd().deleteTree(dir) catch {};
 
     try std.fs.cwd().makePath(dir);
-    var runtime = try AgentRuntime.initWithPersistence(allocator, "agentA", &[_][]const u8{}, dir, "runtime.db");
+    var runtime = try AgentRuntime.initWithPersistence(allocator, "agentA", &[_][]const u8{}, dir, "runtime.db", cfg);
     defer runtime.deinit();
 
     try runtime.queueToolUse("primary", "memory.create", "{\"name\":\"memo\",\"kind\":\"note\",\"content\":{\"text\":\"v1\"}}");
@@ -831,7 +848,8 @@ test "agent_runtime: memory lifecycle create mutate evict load historical" {
 
 test "agent_runtime: appendMessageMemory escapes JSON control characters" {
     const allocator = std.testing.allocator;
-    var runtime = try AgentRuntime.init(allocator, "agent-test", &[_][]const u8{});
+    const cfg = Config.RuntimeConfig{};
+    var runtime = try AgentRuntime.init(allocator, "agent-test", &[_][]const u8{}, cfg);
     defer runtime.deinit();
 
     const control_text = "a\x08b\x0cc\x01d";
