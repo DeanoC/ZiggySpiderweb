@@ -75,15 +75,17 @@ pub fn parseMessage(allocator: std.mem.Allocator, raw_json: []const u8) !types.P
     else
         null;
 
-    const action = if (obj.get("action")) |value|
-        if (value == .string) value.string else null
-    else if (payload_obj) |payload|
-        if (payload.get("action")) |value|
-            if (value == .string) value.string else null
-        else
-            null
-    else
-        null;
+    const action = blk: {
+        if (obj.get("action")) |value| {
+            if (value == .string) break :blk value.string;
+        }
+        if (payload_obj) |payload| {
+            if (payload.get("action")) |value| {
+                if (value == .string) break :blk value.string;
+            }
+        }
+        break :blk null;
+    };
 
     return .{
         .msg_type = msg_type,
@@ -134,5 +136,18 @@ test "protocol_request: parseMessage supports payload wrapped action and request
 
     try std.testing.expectEqual(types.MessageType.agent_control, parsed.msg_type);
     try std.testing.expectEqualStrings("r3", parsed.id.?);
+    try std.testing.expectEqualStrings("debug.subscribe", parsed.action.?);
+}
+
+test "protocol_request: parseMessage falls back to payload action when top-level action is not string" {
+    const allocator = std.testing.allocator;
+    var parsed = try parseMessage(
+        allocator,
+        "{\"type\":\"agent.control\",\"action\":null,\"payload\":{\"request_id\":\"r4\",\"action\":\"debug.subscribe\"}}",
+    );
+    defer types.deinitParsedMessage(allocator, &parsed);
+
+    try std.testing.expectEqual(types.MessageType.agent_control, parsed.msg_type);
+    try std.testing.expectEqualStrings("r4", parsed.id.?);
     try std.testing.expectEqualStrings("debug.subscribe", parsed.action.?);
 }

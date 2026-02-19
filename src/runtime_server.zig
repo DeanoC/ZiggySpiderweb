@@ -1204,6 +1204,23 @@ pub const RuntimeServer = struct {
         return @min(capped_delay + jitter, PROVIDER_RETRY_MAX_DELAY_MS);
     }
 
+    fn waitProviderRetryBackoff(self: *RuntimeServer, job: *RuntimeQueueJob, delay_ms: u64) bool {
+        if (delay_ms == 0) return self.isJobCancelled(job);
+
+        // Release runtime lock while idling to avoid stalling unrelated queued jobs.
+        self.runtime_mutex.unlock();
+        defer self.runtime_mutex.lock();
+
+        var remaining_ms = delay_ms;
+        while (remaining_ms > 0) {
+            const slice_ms: u64 = @min(remaining_ms, 100);
+            std.Thread.sleep(slice_ms * std.time.ns_per_ms);
+            if (self.isJobCancelled(job)) return true;
+            remaining_ms -= slice_ms;
+        }
+        return self.isJobCancelled(job);
+    }
+
     fn modelEquals(a: ziggy_piai.types.Model, b: ziggy_piai.types.Model) bool {
         return std.mem.eql(u8, a.provider, b.provider) and std.mem.eql(u8, a.id, b.id);
     }
@@ -1396,7 +1413,7 @@ pub const RuntimeServer = struct {
                             try self.appendDebugFrame(&debug_frames, job.request_id, "provider.retry", retry_payload_json);
                         }
                         resetProviderEvents(self.allocator, &events);
-                        std.Thread.sleep(delay_ms * std.time.ns_per_ms);
+                        if (self.waitProviderRetryBackoff(job, delay_ms)) return RuntimeServerError.RuntimeJobCancelled;
                         attempt_idx += 1;
                         continue :provider_attempt_loop;
                     }
@@ -1471,7 +1488,7 @@ pub const RuntimeServer = struct {
                             try self.appendDebugFrame(&debug_frames, job.request_id, "provider.retry", retry_payload_json);
                         }
                         resetProviderEvents(self.allocator, &events);
-                        std.Thread.sleep(delay_ms * std.time.ns_per_ms);
+                        if (self.waitProviderRetryBackoff(job, delay_ms)) return RuntimeServerError.RuntimeJobCancelled;
                         attempt_idx += 1;
                         continue :provider_attempt_loop;
                     }
