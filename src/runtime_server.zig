@@ -1163,7 +1163,8 @@ pub const RuntimeServer = struct {
             return .{ .runtime_error = RuntimeServerError.ProviderUnavailable, .retryable = true };
         }
 
-        return .{ .runtime_error = RuntimeServerError.ProviderStreamFailed, .retryable = false };
+        // Unknown provider failures are treated as transient so we retry before surfacing.
+        return .{ .runtime_error = RuntimeServerError.ProviderUnavailable, .retryable = true };
     }
 
     fn findProviderStreamMessage(events: []const ziggy_piai.types.AssistantMessageEvent) ?[]const u8 {
@@ -1429,6 +1430,24 @@ pub const RuntimeServer = struct {
                         }
                     }
 
+                    if (job.emit_debug) {
+                        const escaped_provider = try protocol.jsonEscape(self.allocator, selected_model.provider);
+                        defer self.allocator.free(escaped_provider);
+                        const escaped_model = try protocol.jsonEscape(self.allocator, selected_model.id);
+                        defer self.allocator.free(escaped_model);
+                        const escaped_error = try protocol.jsonEscape(self.allocator, stream_error_name);
+                        defer self.allocator.free(escaped_error);
+                        const escaped_mapped = try protocol.jsonEscape(self.allocator, @errorName(failure.runtime_error));
+                        defer self.allocator.free(escaped_mapped);
+                        const error_payload_json = try std.fmt.allocPrint(
+                            self.allocator,
+                            "{{\"provider\":\"{s}\",\"model\":\"{s}\",\"error\":\"{s}\",\"mapped_error\":\"{s}\"}}",
+                            .{ escaped_provider, escaped_model, escaped_error, escaped_mapped },
+                        );
+                        defer self.allocator.free(error_payload_json);
+                        try self.appendDebugFrame(&debug_frames, job.request_id, "provider.error", error_payload_json);
+                    }
+
                     return failure.runtime_error;
                 };
 
@@ -1484,6 +1503,24 @@ pub const RuntimeServer = struct {
                             attempt_idx = 0;
                             continue :provider_attempt_loop;
                         }
+                    }
+
+                    if (job.emit_debug) {
+                        const escaped_provider = try protocol.jsonEscape(self.allocator, selected_model.provider);
+                        defer self.allocator.free(escaped_provider);
+                        const escaped_model = try protocol.jsonEscape(self.allocator, selected_model.id);
+                        defer self.allocator.free(escaped_model);
+                        const escaped_error = try protocol.jsonEscape(self.allocator, provider_error_message);
+                        defer self.allocator.free(escaped_error);
+                        const escaped_mapped = try protocol.jsonEscape(self.allocator, @errorName(failure.runtime_error));
+                        defer self.allocator.free(escaped_mapped);
+                        const error_payload_json = try std.fmt.allocPrint(
+                            self.allocator,
+                            "{{\"provider\":\"{s}\",\"model\":\"{s}\",\"error\":\"{s}\",\"mapped_error\":\"{s}\"}}",
+                            .{ escaped_provider, escaped_model, escaped_error, escaped_mapped },
+                        );
+                        defer self.allocator.free(error_payload_json);
+                        try self.appendDebugFrame(&debug_frames, job.request_id, "provider.error", error_payload_json);
                     }
 
                     return failure.runtime_error;
