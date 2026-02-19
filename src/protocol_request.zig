@@ -43,19 +43,23 @@ pub fn parseMessage(allocator: std.mem.Allocator, raw_json: []const u8) !types.P
     else
         types.MessageType.unknown;
 
-    const id = if (obj.get("id")) |value|
-        if (value == .string) value.string else null
-    else if (obj.get("request_id")) |value|
-        if (value == .string) value.string else null
-    else if (payload_obj) |payload|
-        if (payload.get("id")) |value|
-            if (value == .string) value.string else null
-        else if (payload.get("request_id")) |value|
-            if (value == .string) value.string else null
-        else
-            null
-    else
-        null;
+    const id = blk: {
+        if (obj.get("id")) |value| {
+            if (value == .string) break :blk value.string;
+        }
+        if (obj.get("request_id")) |value| {
+            if (value == .string) break :blk value.string;
+        }
+        if (payload_obj) |payload| {
+            if (payload.get("id")) |value| {
+                if (value == .string) break :blk value.string;
+            }
+            if (payload.get("request_id")) |value| {
+                if (value == .string) break :blk value.string;
+            }
+        }
+        break :blk null;
+    };
 
     const content = if (obj.get("content")) |value|
         if (value == .string) value.string else null
@@ -149,5 +153,18 @@ test "protocol_request: parseMessage falls back to payload action when top-level
 
     try std.testing.expectEqual(types.MessageType.agent_control, parsed.msg_type);
     try std.testing.expectEqualStrings("r4", parsed.id.?);
+    try std.testing.expectEqualStrings("debug.subscribe", parsed.action.?);
+}
+
+test "protocol_request: parseMessage falls back to payload request id when top-level request id is not string" {
+    const allocator = std.testing.allocator;
+    var parsed = try parseMessage(
+        allocator,
+        "{\"type\":\"agent.control\",\"request_id\":null,\"payload\":{\"request_id\":\"r5\",\"action\":\"debug.subscribe\"}}",
+    );
+    defer types.deinitParsedMessage(allocator, &parsed);
+
+    try std.testing.expectEqual(types.MessageType.agent_control, parsed.msg_type);
+    try std.testing.expectEqualStrings("r5", parsed.id.?);
     try std.testing.expectEqualStrings("debug.subscribe", parsed.action.?);
 }
