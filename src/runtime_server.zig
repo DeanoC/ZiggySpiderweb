@@ -629,7 +629,7 @@ pub const RuntimeServer = struct {
             "BOOTSTRAP.md"
         else
             "JUST_HATCHED.md";
-        const content = system_hooks.readTemplate(self.allocator, template_name) catch |err| {
+        const content = system_hooks.readTemplate(self.allocator, &self.runtime, template_name) catch |err| {
             std.log.warn("Failed to load bootstrap template {s}: {s}", .{ template_name, @errorName(err) });
             return null;
         };
@@ -1146,6 +1146,7 @@ pub const RuntimeServer = struct {
         options: ziggy_piai.types.StreamOptions,
     ) void {
         if (!self.log_provider_requests) return;
+        const tools = context.tools orelse &.{};
 
         std.log.debug(
             "provider request begin provider={s} model={s} brain={s} messages={d} tools={d} reasoning={s}",
@@ -1154,11 +1155,11 @@ pub const RuntimeServer = struct {
                 model.id,
                 brain_name,
                 context.messages.len,
-                context.tools.len,
+                tools.len,
                 options.reasoning orelse "default",
             },
         );
-        std.log.debug("provider request system_prompt={s}", .{context.system_prompt});
+        std.log.debug("provider request system_prompt={s}", .{context.system_prompt orelse ""});
 
         for (context.messages, 0..) |message, idx| {
             std.log.debug(
@@ -1167,7 +1168,7 @@ pub const RuntimeServer = struct {
             );
         }
 
-        for (context.tools, 0..) |tool, idx| {
+        for (tools, 0..) |tool, idx| {
             std.log.debug(
                 "provider request tool[{d}] name={s} description={s} parameters_json={s}",
                 .{ idx, tool.name, tool.description, tool.parameters_json },

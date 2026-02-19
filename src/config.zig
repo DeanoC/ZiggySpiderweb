@@ -347,9 +347,14 @@ pub fn save(self: Config) !void {
     // Ensure parent directory exists
     if (std.fs.path.dirname(self.config_path)) |dir| {
         if (std.fs.path.isAbsolute(dir)) {
-            std.fs.makeDirAbsolute(dir) catch |err| {
-                if (err != error.PathAlreadyExists) return err;
-            };
+            var root_dir = try std.fs.openDirAbsolute("/", .{});
+            defer root_dir.close();
+            const rel_dir = std.mem.trimLeft(u8, dir, "/");
+            if (rel_dir.len > 0) {
+                root_dir.makePath(rel_dir) catch |err| {
+                    if (err != error.PathAlreadyExists) return err;
+                };
+            }
         } else {
             std.fs.cwd().makePath(dir) catch |err| {
                 if (err != error.PathAlreadyExists) return err;
@@ -474,7 +479,12 @@ pub fn getApiKey(self: Config, allocator: std.mem.Allocator) !?[]const u8 {
 
 test "Config defaults" {
     const allocator = std.testing.allocator;
-    var config = try Config.init(allocator, null);
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const cfg_path = try std.fs.path.join(allocator, &.{ tmp_dir.sub_path[0..], "config.json" });
+
+    var config = try Config.init(allocator, cfg_path);
     defer config.deinit();
 
     try std.testing.expectEqualStrings("openai", config.provider.name);
