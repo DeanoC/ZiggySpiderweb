@@ -144,6 +144,7 @@ pub const RuntimeServer = struct {
     runtime: agent_runtime.AgentRuntime,
     provider_runtime: ?ProviderRuntime = null,
     default_agent_id: []u8,
+    log_provider_requests: bool = false,
 
     runtime_mutex: std.Thread.Mutex = .{},
     queue_mutex: std.Thread.Mutex = .{},
@@ -220,6 +221,7 @@ pub const RuntimeServer = struct {
             .runtime_workers = try allocator.alloc(std.Thread, worker_count),
             .provider_runtime = provider_runtime,
             .default_agent_id = try allocator.dupe(u8, if (runtime_cfg.default_agent_id.len == 0) default_agent_id else runtime_cfg.default_agent_id),
+            .log_provider_requests = shouldLogProviderRequests(),
             .test_ltm_directory = test_ltm_directory,
         };
         errdefer {
@@ -931,6 +933,10 @@ pub const RuntimeServer = struct {
                 .messages = &messages,
                 .tools = provider_tools,
             };
+            self.logProviderRequestDebug(brain_name, model, context, .{
+                .api_key = api_key,
+                .reasoning = think_level,
+            });
 
             streamByModelFn(
                 self.allocator,
@@ -1130,11 +1136,64 @@ pub const RuntimeServer = struct {
         };
         return timeout_ms * std.time.ns_per_ms;
     }
+
+    fn logProviderRequestDebug(
+        self: *const RuntimeServer,
+        brain_name: []const u8,
+        model: ziggy_piai.types.Model,
+        context: ziggy_piai.types.Context,
+        options: ziggy_piai.types.StreamOptions,
+    ) void {
+        if (!self.log_provider_requests) return;
+
+        std.log.debug(
+            "provider request begin provider={s} model={s} brain={s} messages={d} tools={d} reasoning={s}",
+            .{
+                model.provider,
+                model.id,
+                brain_name,
+                context.messages.len,
+                context.tools.len,
+                options.reasoning orelse "default",
+            },
+        );
+        std.log.debug("provider request system_prompt={s}", .{context.system_prompt});
+
+        for (context.messages, 0..) |message, idx| {
+            std.log.debug(
+                "provider request message[{d}] role={s} content={s}",
+                .{ idx, @tagName(message.role), message.content },
+            );
+        }
+
+        for (context.tools, 0..) |tool, idx| {
+            std.log.debug(
+                "provider request tool[{d}] name={s} description={s} parameters_json={s}",
+                .{ idx, tool.name, tool.description, tool.parameters_json },
+            );
+        }
+
+        std.log.debug("provider request end", .{});
+    }
 };
 
 fn isChatLikeControlAction(action: ?[]const u8) bool {
     const control_action = action orelse "state";
     return std.mem.eql(u8, control_action, "goal") or std.mem.eql(u8, control_action, "plan");
+}
+
+fn shouldLogProviderRequests() bool {
+    const env_value = std.process.getEnvVarOwned(std.heap.page_allocator, "SPIDERWEB_LOG_PROVIDER_REQUEST") catch return false;
+    defer std.heap.page_allocator.free(env_value);
+    return parseTruthyEnvFlag(env_value);
+}
+
+fn parseTruthyEnvFlag(raw: []const u8) bool {
+    if (std.ascii.eqlIgnoreCase(raw, "1")) return true;
+    if (std.ascii.eqlIgnoreCase(raw, "true")) return true;
+    if (std.ascii.eqlIgnoreCase(raw, "yes")) return true;
+    if (std.ascii.eqlIgnoreCase(raw, "on")) return true;
+    return false;
 }
 
 fn injectToolCallId(allocator: std.mem.Allocator, args_json: []const u8, call_id: []const u8) ![]u8 {
@@ -1287,6 +1346,21 @@ fn runRequestInThread(ctx: *AsyncRequestCtx) void {
         ctx.err_name = std.fmt.allocPrint(ctx.allocator, "{s}", .{@errorName(err)}) catch null;
         return;
     };
+}
+
+test "runtime_server: parseTruthyEnvFlag accepts common truthy values" {
+    try std.testing.expect(parseTruthyEnvFlag("1"));
+    try std.testing.expect(parseTruthyEnvFlag("true"));
+    try std.testing.expect(parseTruthyEnvFlag("TRUE"));
+    try std.testing.expect(parseTruthyEnvFlag("yes"));
+    try std.testing.expect(parseTruthyEnvFlag("on"));
+}
+
+test "runtime_server: parseTruthyEnvFlag rejects falsey values" {
+    try std.testing.expect(!parseTruthyEnvFlag(""));
+    try std.testing.expect(!parseTruthyEnvFlag("0"));
+    try std.testing.expect(!parseTruthyEnvFlag("false"));
+    try std.testing.expect(!parseTruthyEnvFlag("off"));
 }
 
 fn mockProviderStreamByModel(
