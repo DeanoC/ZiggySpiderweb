@@ -16,6 +16,7 @@ pub const buildAgentProgress = response.buildAgentProgress;
 pub const buildAgentState = response.buildAgentState;
 pub const buildMemoryEvent = response.buildMemoryEvent;
 pub const buildToolEvent = response.buildToolEvent;
+pub const buildDebugEvent = response.buildDebugEvent;
 pub const buildPong = response.buildPong;
 pub const buildError = response.buildError;
 pub const buildErrorWithCode = response.buildErrorWithCode;
