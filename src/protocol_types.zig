@@ -24,6 +24,11 @@ pub const ErrorCode = enum {
     runtime_paused,
     runtime_cancelled,
     runtime_timeout,
+    provider_rate_limited,
+    provider_auth_failed,
+    provider_request_invalid,
+    provider_timeout,
+    provider_unavailable,
     execution_failed,
 };
 

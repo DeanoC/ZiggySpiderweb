@@ -33,16 +33,33 @@ pub fn parseMessage(allocator: std.mem.Allocator, raw_json: []const u8) !types.P
 
     if (parsed.value != .object) return error.InvalidEnvelope;
     const obj = parsed.value.object;
+    const payload_obj = if (obj.get("payload")) |value|
+        if (value == .object) value.object else null
+    else
+        null;
 
     const msg_type = if (obj.get("type")) |value|
         if (value == .string) parseMessageTypeString(value.string) else types.MessageType.unknown
     else
         types.MessageType.unknown;
 
-    const id = if (obj.get("id")) |value|
-        if (value == .string) value.string else null
-    else
-        null;
+    const id = blk: {
+        if (obj.get("id")) |value| {
+            if (value == .string) break :blk value.string;
+        }
+        if (obj.get("request_id")) |value| {
+            if (value == .string) break :blk value.string;
+        }
+        if (payload_obj) |payload| {
+            if (payload.get("id")) |value| {
+                if (value == .string) break :blk value.string;
+            }
+            if (payload.get("request_id")) |value| {
+                if (value == .string) break :blk value.string;
+            }
+        }
+        break :blk null;
+    };
 
     const content = if (obj.get("content")) |value|
         if (value == .string) value.string else null
@@ -50,13 +67,29 @@ pub fn parseMessage(allocator: std.mem.Allocator, raw_json: []const u8) !types.P
         if (value == .string) value.string else null
     else if (obj.get("goal")) |value|
         if (value == .string) value.string else null
+    else if (payload_obj) |payload|
+        if (payload.get("content")) |value|
+            if (value == .string) value.string else null
+        else if (payload.get("text")) |value|
+            if (value == .string) value.string else null
+        else if (payload.get("goal")) |value|
+            if (value == .string) value.string else null
+        else
+            null
     else
         null;
 
-    const action = if (obj.get("action")) |value|
-        if (value == .string) value.string else null
-    else
-        null;
+    const action = blk: {
+        if (obj.get("action")) |value| {
+            if (value == .string) break :blk value.string;
+        }
+        if (payload_obj) |payload| {
+            if (payload.get("action")) |value| {
+                if (value == .string) break :blk value.string;
+            }
+        }
+        break :blk null;
+    };
 
     return .{
         .msg_type = msg_type,
@@ -95,4 +128,43 @@ test "protocol_request: parseMessage ignores embedded type fragments in content"
 
     try std.testing.expectEqual(types.MessageType.agent_control, parsed.msg_type);
     try std.testing.expectEqualStrings("state", parsed.action.?);
+}
+
+test "protocol_request: parseMessage supports payload wrapped action and request id" {
+    const allocator = std.testing.allocator;
+    var parsed = try parseMessage(
+        allocator,
+        "{\"type\":\"agent.control\",\"payload\":{\"request_id\":\"r3\",\"action\":\"debug.subscribe\"}}",
+    );
+    defer types.deinitParsedMessage(allocator, &parsed);
+
+    try std.testing.expectEqual(types.MessageType.agent_control, parsed.msg_type);
+    try std.testing.expectEqualStrings("r3", parsed.id.?);
+    try std.testing.expectEqualStrings("debug.subscribe", parsed.action.?);
+}
+
+test "protocol_request: parseMessage falls back to payload action when top-level action is not string" {
+    const allocator = std.testing.allocator;
+    var parsed = try parseMessage(
+        allocator,
+        "{\"type\":\"agent.control\",\"action\":null,\"payload\":{\"request_id\":\"r4\",\"action\":\"debug.subscribe\"}}",
+    );
+    defer types.deinitParsedMessage(allocator, &parsed);
+
+    try std.testing.expectEqual(types.MessageType.agent_control, parsed.msg_type);
+    try std.testing.expectEqualStrings("r4", parsed.id.?);
+    try std.testing.expectEqualStrings("debug.subscribe", parsed.action.?);
+}
+
+test "protocol_request: parseMessage falls back to payload request id when top-level request id is not string" {
+    const allocator = std.testing.allocator;
+    var parsed = try parseMessage(
+        allocator,
+        "{\"type\":\"agent.control\",\"request_id\":null,\"payload\":{\"request_id\":\"r5\",\"action\":\"debug.subscribe\"}}",
+    );
+    defer types.deinitParsedMessage(allocator, &parsed);
+
+    try std.testing.expectEqual(types.MessageType.agent_control, parsed.msg_type);
+    try std.testing.expectEqualStrings("r5", parsed.id.?);
+    try std.testing.expectEqualStrings("debug.subscribe", parsed.action.?);
 }

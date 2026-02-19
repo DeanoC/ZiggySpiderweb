@@ -191,6 +191,7 @@ fn installSystemdService(allocator: std.mem.Allocator) !void {
         \\[Service]
         \\Type=simple
         \\ExecStart={s}/.local/bin/spiderweb
+        \\WorkingDirectory={s}
         \\Restart=on-failure
         \\RestartSec=5
         \\
@@ -200,7 +201,7 @@ fn installSystemdService(allocator: std.mem.Allocator) !void {
     ;
 
     var buf: [1024]u8 = undefined;
-    const content = try std.fmt.bufPrint(&buf, service_content, .{home});
+    const content = try std.fmt.bufPrint(&buf, service_content, .{ home, home });
 
     const file = try std.fs.cwd().createFile(service_path, .{});
     defer file.close();

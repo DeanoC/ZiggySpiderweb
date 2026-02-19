@@ -140,6 +140,10 @@ install_config() {
   },
   "log": {
     "level": "info"
+  },
+  "runtime": {
+    "ltm_directory": "/var/lib/spiderweb/.spiderweb-ltm",
+    "ltm_filename": "runtime-memory.db"
   }
 }
 EOF

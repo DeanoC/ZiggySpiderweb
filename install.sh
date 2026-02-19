@@ -240,6 +240,7 @@ After=network.target
 Type=simple
 User=$CURRENT_USER
 ExecStart=$INSTALL_DIR/spiderweb
+WorkingDirectory=%h
 Restart=on-failure
 RestartSec=5
 
@@ -258,6 +259,7 @@ After=network.target
 [Service]
 Type=simple
 ExecStart=$INSTALL_DIR/spiderweb
+WorkingDirectory=%h
 Restart=on-failure
 RestartSec=5
 
