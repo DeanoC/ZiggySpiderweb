@@ -17,7 +17,7 @@ This repository is a Zig project with source in `src/` and documentation in `REA
 - `zig build run -- --port 18790 --bind 127.0.0.1` — runs the server from the build system.
 - `zig build run -- --help` — prints runtime usage.
 - `zig fmt src/*.zig` — formats Zig source using the standard formatter.
-- Before committing any changes, run `zig build` to validate the workspace compiles.
+- If source code changes, you must run `zig build` and `zig build test` and confirm both pass before pushing to any remote.
 
 ## Coding Style & Naming Conventions
 - Follow Zig style used in existing files: 4-space indentation, UTF-8 plain text.
