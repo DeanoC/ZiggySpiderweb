@@ -16,6 +16,10 @@ const DEFAULT_BRAIN = "primary";
 const INTERNAL_TICK_TIMEOUT_MS: i64 = 5 * 1000;
 const MAX_PROVIDER_TOOL_ROUNDS: usize = 8;
 const MAX_PROVIDER_TOOL_CALLS_PER_TURN: usize = 32;
+const PROVIDER_STREAM_MAX_ATTEMPTS: usize = if (builtin.is_test) 2 else 3;
+const PROVIDER_RETRY_BASE_DELAY_MS: u64 = if (builtin.is_test) 1 else 250;
+const PROVIDER_RETRY_MAX_DELAY_MS: u64 = if (builtin.is_test) 8 else 4000;
+const PROVIDER_RETRY_JITTER_MS: u64 = if (builtin.is_test) 1 else 200;
 const BOOTSTRAP_COMPLETE_MEM_NAME = "system.bootstrap.complete";
 const BOOTSTRAP_COMPLETE_MEM_KIND = "bootstrap.status";
 
@@ -27,6 +31,11 @@ const RuntimeServerError = error{
     ProviderModelNotFound,
     MissingProviderApiKey,
     ProviderStreamFailed,
+    ProviderRateLimited,
+    ProviderAuthFailed,
+    ProviderRequestInvalid,
+    ProviderTimeout,
+    ProviderUnavailable,
     ProviderToolLoopExceeded,
     MissingLtmStoreConfig,
 };
@@ -842,6 +851,11 @@ pub const RuntimeServer = struct {
             RuntimeServerError.RuntimeJobTimeout => protocol.buildErrorWithCode(self.allocator, request_id, .runtime_timeout, "runtime operation timeout"),
             RuntimeServerError.ProviderModelNotFound => protocol.buildErrorWithCode(self.allocator, request_id, .execution_failed, "provider model not found"),
             RuntimeServerError.MissingProviderApiKey => protocol.buildErrorWithCode(self.allocator, request_id, .execution_failed, "missing provider API key"),
+            RuntimeServerError.ProviderRateLimited => protocol.buildErrorWithCode(self.allocator, request_id, .provider_rate_limited, "provider rate limited"),
+            RuntimeServerError.ProviderAuthFailed => protocol.buildErrorWithCode(self.allocator, request_id, .provider_auth_failed, "provider authentication failed"),
+            RuntimeServerError.ProviderRequestInvalid => protocol.buildErrorWithCode(self.allocator, request_id, .provider_request_invalid, "provider request invalid"),
+            RuntimeServerError.ProviderTimeout => protocol.buildErrorWithCode(self.allocator, request_id, .provider_timeout, "provider request timed out"),
+            RuntimeServerError.ProviderUnavailable => protocol.buildErrorWithCode(self.allocator, request_id, .provider_unavailable, "provider temporarily unavailable"),
             RuntimeServerError.ProviderStreamFailed => protocol.buildErrorWithCode(self.allocator, request_id, .execution_failed, "provider stream failed"),
             RuntimeServerError.ProviderToolLoopExceeded => protocol.buildErrorWithCode(self.allocator, request_id, .execution_failed, "provider tool loop exceeded limits"),
             else => protocol.buildErrorWithCode(self.allocator, request_id, .execution_failed, @errorName(err)),
@@ -1049,6 +1063,176 @@ pub const RuntimeServer = struct {
         );
     }
 
+    const ProviderFailure = struct {
+        runtime_error: RuntimeServerError,
+        retryable: bool,
+        retry_after_ms: ?u64 = null,
+    };
+
+    fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+        return std.ascii.indexOfIgnoreCase(haystack, needle) != null;
+    }
+
+    fn containsAnyIgnoreCase(haystack: []const u8, needles: []const []const u8) bool {
+        for (needles) |needle| {
+            if (containsIgnoreCase(haystack, needle)) return true;
+        }
+        return false;
+    }
+
+    fn parseFirstUnsigned(input: []const u8) ?u64 {
+        var start: ?usize = null;
+        for (input, 0..) |ch, idx| {
+            if (ch >= '0' and ch <= '9') {
+                start = idx;
+                break;
+            }
+        }
+        const first = start orelse return null;
+
+        var value: u64 = 0;
+        var saw_digit = false;
+        var i = first;
+        while (i < input.len) : (i += 1) {
+            const ch = input[i];
+            if (ch < '0' or ch > '9') break;
+            saw_digit = true;
+            const digit: u64 = @intCast(ch - '0');
+            if (value > (std.math.maxInt(u64) - digit) / 10) return null;
+            value = (value * 10) + digit;
+        }
+        if (!saw_digit) return null;
+        return value;
+    }
+
+    fn parseRetryAfterMs(provider_error_message: []const u8) ?u64 {
+        const markers = [_][]const u8{
+            "retry-after:",
+            "retry after",
+            "try again in",
+        };
+        for (markers) |marker| {
+            const marker_idx = std.ascii.indexOfIgnoreCase(provider_error_message, marker) orelse continue;
+            const tail = provider_error_message[marker_idx + marker.len ..];
+            const amount = parseFirstUnsigned(tail) orelse continue;
+            const window_len: usize = if (tail.len < 40) tail.len else 40;
+            const window = tail[0..window_len];
+
+            if (containsIgnoreCase(window, "ms")) return amount;
+            if (containsAnyIgnoreCase(window, &.{ "min", "minute" })) {
+                return std.math.mul(u64, amount, 60_000) catch PROVIDER_RETRY_MAX_DELAY_MS;
+            }
+            return std.math.mul(u64, amount, 1_000) catch PROVIDER_RETRY_MAX_DELAY_MS;
+        }
+        return null;
+    }
+
+    fn classifyProviderFailure(stream_error_name: ?[]const u8, provider_error_message: ?[]const u8) ProviderFailure {
+        const err_name = stream_error_name orelse "";
+        const message = provider_error_message orelse "";
+
+        if (containsAnyIgnoreCase(message, &.{ "429", "rate limit", "too many requests", "usage limit", "quota exceeded" })) {
+            return .{
+                .runtime_error = RuntimeServerError.ProviderRateLimited,
+                .retryable = true,
+                .retry_after_ms = parseRetryAfterMs(message),
+            };
+        }
+
+        if (containsAnyIgnoreCase(message, &.{ "401", "403", "unauthorized", "forbidden", "invalid api key", "invalid_api_key", "invalid token", "token expired", "insufficient permission", "permission denied" }) or
+            containsAnyIgnoreCase(err_name, &.{ "Unauthorized", "Forbidden", "Auth", "InvalidApiKey" }))
+        {
+            return .{ .runtime_error = RuntimeServerError.ProviderAuthFailed, .retryable = false };
+        }
+
+        if (containsAnyIgnoreCase(message, &.{ "400", "404", "422", "bad request", "invalid request", "model not found", "unsupported model", "unknown model", "unrecognized request argument" }) or
+            containsAnyIgnoreCase(err_name, &.{ "BadRequest", "InvalidRequest", "ModelNotFound", "ProviderNotRegistered" }))
+        {
+            return .{ .runtime_error = RuntimeServerError.ProviderRequestInvalid, .retryable = false };
+        }
+
+        if (containsAnyIgnoreCase(message, &.{ "timeout", "timed out", "deadline exceeded", "request timeout" }) or
+            containsAnyIgnoreCase(err_name, &.{ "Timeout", "TimedOut" }))
+        {
+            return .{ .runtime_error = RuntimeServerError.ProviderTimeout, .retryable = true };
+        }
+
+        if (containsAnyIgnoreCase(message, &.{ "500", "502", "503", "504", "service unavailable", "temporarily unavailable", "connection reset", "connection refused", "broken pipe", "end of stream", "network error", "connection closed", "econnreset" }) or
+            containsAnyIgnoreCase(err_name, &.{ "ConnectionResetByPeer", "ConnectionRefused", "ConnectionClosed", "NetworkUnreachable", "HostUnreachable", "BrokenPipe", "EndOfStream", "MockProviderUnavailable", "Tls" }))
+        {
+            return .{ .runtime_error = RuntimeServerError.ProviderUnavailable, .retryable = true };
+        }
+
+        return .{ .runtime_error = RuntimeServerError.ProviderStreamFailed, .retryable = false };
+    }
+
+    fn findProviderStreamMessage(events: []const ziggy_piai.types.AssistantMessageEvent) ?[]const u8 {
+        for (events) |event| {
+            switch (event) {
+                .err => |message| return message,
+                .done => |done| {
+                    if (done.stop_reason == .err and done.error_message != null) return done.error_message.?;
+                },
+                else => {},
+            }
+        }
+        return null;
+    }
+
+    fn resetProviderEvents(allocator: std.mem.Allocator, events: *std.array_list.Managed(ziggy_piai.types.AssistantMessageEvent)) void {
+        deinitAssistantEvents(allocator, events);
+        events.items.len = 0;
+    }
+
+    fn computeProviderRetryDelayMs(request_id: []const u8, attempt_idx: usize, retry_after_ms: ?u64) u64 {
+        if (retry_after_ms) |value| return @min(value, PROVIDER_RETRY_MAX_DELAY_MS);
+
+        const shift: u6 = @intCast(@min(attempt_idx, @as(usize, 10)));
+        const exp_factor: u64 = @as(u64, 1) << shift;
+        const exp_delay = std.math.mul(u64, PROVIDER_RETRY_BASE_DELAY_MS, exp_factor) catch PROVIDER_RETRY_MAX_DELAY_MS;
+        const capped_delay = @min(exp_delay, PROVIDER_RETRY_MAX_DELAY_MS);
+
+        if (PROVIDER_RETRY_JITTER_MS == 0) return capped_delay;
+
+        var attempt_u64: u64 = @intCast(attempt_idx);
+        var hasher = std.hash.Wyhash.init(0);
+        hasher.update(request_id);
+        hasher.update(std.mem.asBytes(&attempt_u64));
+        const hash = hasher.final();
+        const jitter: u64 = hash % (PROVIDER_RETRY_JITTER_MS + 1);
+        return @min(capped_delay + jitter, PROVIDER_RETRY_MAX_DELAY_MS);
+    }
+
+    fn modelEquals(a: ziggy_piai.types.Model, b: ziggy_piai.types.Model) bool {
+        return std.mem.eql(u8, a.provider, b.provider) and std.mem.eql(u8, a.id, b.id);
+    }
+
+    fn selectFallbackModelWithApiKey(
+        self: *RuntimeServer,
+        provider_runtime: *const ProviderRuntime,
+        current_model: ziggy_piai.types.Model,
+    ) !?ziggy_piai.types.Model {
+        if (selectModel(provider_runtime, provider_runtime.default_provider_name, provider_runtime.default_model_name)) |default_model| {
+            if (!modelEquals(default_model, current_model)) {
+                if (self.resolveApiKey(provider_runtime, default_model.provider)) |key| {
+                    self.allocator.free(key);
+                    return default_model;
+                } else |_| {}
+            }
+        }
+
+        for (provider_runtime.model_registry.models.items) |candidate| {
+            if (!std.mem.eql(u8, candidate.provider, current_model.provider)) continue;
+            if (std.mem.eql(u8, candidate.id, current_model.id)) continue;
+            if (self.resolveApiKey(provider_runtime, candidate.provider)) |key| {
+                self.allocator.free(key);
+                return candidate;
+            } else |_| {}
+        }
+
+        return null;
+    }
+
     fn completeWithProvider(self: *RuntimeServer, job: *RuntimeQueueJob, brain_name: []const u8) !ProviderCompletion {
         const provider_runtime = &(self.provider_runtime orelse return RuntimeServerError.ProviderModelNotFound);
         var debug_frames = std.ArrayListUnmanaged([]u8){};
@@ -1090,10 +1274,7 @@ pub const RuntimeServer = struct {
             if (runtime_override.think_level) |value| think_level = value;
         }
 
-        const model = selectModel(provider_runtime, provider_name, model_name) orelse return RuntimeServerError.ProviderModelNotFound;
-
-        const api_key = try self.resolveApiKey(provider_runtime, model.provider);
-        defer self.allocator.free(api_key);
+        const primary_model = selectModel(provider_runtime, provider_name, model_name) orelse return RuntimeServerError.ProviderModelNotFound;
 
         const world_tool_specs = try self.runtime.world_tools.exportProviderWorldTools(self.allocator);
         defer tool_registry.deinitProviderTools(self.allocator, world_tool_specs);
@@ -1151,42 +1332,165 @@ pub const RuntimeServer = struct {
                 .messages = &messages,
                 .tools = provider_tools,
             };
-            self.logProviderRequestDebug(brain_name, model, context, .{
-                .api_key = api_key,
-                .reasoning = think_level,
-            });
-            if (job.emit_debug) {
-                const request_payload_json = try self.buildProviderRequestDebugPayload(
-                    brain_name,
-                    model,
+            var selected_model = primary_model;
+            var used_fallback = false;
+            var attempt_idx: usize = 0;
+            provider_attempt_loop: while (true) {
+                const api_key = try self.resolveApiKey(provider_runtime, selected_model.provider);
+                defer self.allocator.free(api_key);
+
+                self.logProviderRequestDebug(brain_name, selected_model, context, .{
+                    .api_key = api_key,
+                    .reasoning = think_level,
+                });
+                if (job.emit_debug) {
+                    const request_payload_json = try self.buildProviderRequestDebugPayload(
+                        brain_name,
+                        selected_model,
+                        context,
+                        .{
+                            .api_key = api_key,
+                            .reasoning = think_level,
+                        },
+                        round,
+                    );
+                    defer self.allocator.free(request_payload_json);
+                    try self.appendDebugFrame(
+                        &debug_frames,
+                        job.request_id,
+                        "provider.request",
+                        request_payload_json,
+                    );
+                }
+
+                streamByModelFn(
+                    self.allocator,
+                    &provider_runtime.http_client,
+                    &provider_runtime.api_registry,
+                    selected_model,
                     context,
                     .{
                         .api_key = api_key,
                         .reasoning = think_level,
                     },
-                    round,
-                );
-                defer self.allocator.free(request_payload_json);
-                try self.appendDebugFrame(
-                    &debug_frames,
-                    job.request_id,
-                    "provider.request",
-                    request_payload_json,
-                );
-            }
+                    &events,
+                ) catch |stream_err| {
+                    const stream_error_name = @errorName(stream_err);
+                    const failure = classifyProviderFailure(stream_error_name, null);
+                    if (failure.retryable and attempt_idx + 1 < PROVIDER_STREAM_MAX_ATTEMPTS) {
+                        const delay_ms = computeProviderRetryDelayMs(job.request_id, attempt_idx, failure.retry_after_ms);
+                        if (job.emit_debug) {
+                            const escaped_provider = try protocol.jsonEscape(self.allocator, selected_model.provider);
+                            defer self.allocator.free(escaped_provider);
+                            const escaped_model = try protocol.jsonEscape(self.allocator, selected_model.id);
+                            defer self.allocator.free(escaped_model);
+                            const escaped_error = try protocol.jsonEscape(self.allocator, stream_error_name);
+                            defer self.allocator.free(escaped_error);
+                            const retry_payload_json = try std.fmt.allocPrint(
+                                self.allocator,
+                                "{{\"provider\":\"{s}\",\"model\":\"{s}\",\"attempt\":{d},\"delay_ms\":{d},\"error\":\"{s}\"}}",
+                                .{ escaped_provider, escaped_model, attempt_idx + 1, delay_ms, escaped_error },
+                            );
+                            defer self.allocator.free(retry_payload_json);
+                            try self.appendDebugFrame(&debug_frames, job.request_id, "provider.retry", retry_payload_json);
+                        }
+                        resetProviderEvents(self.allocator, &events);
+                        std.Thread.sleep(delay_ms * std.time.ns_per_ms);
+                        attempt_idx += 1;
+                        continue :provider_attempt_loop;
+                    }
 
-            streamByModelFn(
-                self.allocator,
-                &provider_runtime.http_client,
-                &provider_runtime.api_registry,
-                model,
-                context,
-                .{
-                    .api_key = api_key,
-                    .reasoning = think_level,
-                },
-                &events,
-            ) catch return RuntimeServerError.ProviderStreamFailed;
+                    if (failure.retryable and !used_fallback) {
+                        if (try self.selectFallbackModelWithApiKey(provider_runtime, selected_model)) |fallback_model| {
+                            if (job.emit_debug) {
+                                const escaped_from_provider = try protocol.jsonEscape(self.allocator, selected_model.provider);
+                                defer self.allocator.free(escaped_from_provider);
+                                const escaped_from_model = try protocol.jsonEscape(self.allocator, selected_model.id);
+                                defer self.allocator.free(escaped_from_model);
+                                const escaped_to_provider = try protocol.jsonEscape(self.allocator, fallback_model.provider);
+                                defer self.allocator.free(escaped_to_provider);
+                                const escaped_to_model = try protocol.jsonEscape(self.allocator, fallback_model.id);
+                                defer self.allocator.free(escaped_to_model);
+                                const escaped_error = try protocol.jsonEscape(self.allocator, stream_error_name);
+                                defer self.allocator.free(escaped_error);
+                                const fallback_payload_json = try std.fmt.allocPrint(
+                                    self.allocator,
+                                    "{{\"from_provider\":\"{s}\",\"from_model\":\"{s}\",\"to_provider\":\"{s}\",\"to_model\":\"{s}\",\"error\":\"{s}\"}}",
+                                    .{ escaped_from_provider, escaped_from_model, escaped_to_provider, escaped_to_model, escaped_error },
+                                );
+                                defer self.allocator.free(fallback_payload_json);
+                                try self.appendDebugFrame(&debug_frames, job.request_id, "provider.fallback", fallback_payload_json);
+                            }
+                            resetProviderEvents(self.allocator, &events);
+                            selected_model = fallback_model;
+                            used_fallback = true;
+                            attempt_idx = 0;
+                            continue :provider_attempt_loop;
+                        }
+                    }
+
+                    return failure.runtime_error;
+                };
+
+                if (findProviderStreamMessage(events.items)) |provider_error_message| {
+                    const failure = classifyProviderFailure(null, provider_error_message);
+                    if (failure.retryable and attempt_idx + 1 < PROVIDER_STREAM_MAX_ATTEMPTS) {
+                        const delay_ms = computeProviderRetryDelayMs(job.request_id, attempt_idx, failure.retry_after_ms);
+                        if (job.emit_debug) {
+                            const escaped_provider = try protocol.jsonEscape(self.allocator, selected_model.provider);
+                            defer self.allocator.free(escaped_provider);
+                            const escaped_model = try protocol.jsonEscape(self.allocator, selected_model.id);
+                            defer self.allocator.free(escaped_model);
+                            const escaped_error = try protocol.jsonEscape(self.allocator, provider_error_message);
+                            defer self.allocator.free(escaped_error);
+                            const retry_payload_json = try std.fmt.allocPrint(
+                                self.allocator,
+                                "{{\"provider\":\"{s}\",\"model\":\"{s}\",\"attempt\":{d},\"delay_ms\":{d},\"error\":\"{s}\"}}",
+                                .{ escaped_provider, escaped_model, attempt_idx + 1, delay_ms, escaped_error },
+                            );
+                            defer self.allocator.free(retry_payload_json);
+                            try self.appendDebugFrame(&debug_frames, job.request_id, "provider.retry", retry_payload_json);
+                        }
+                        resetProviderEvents(self.allocator, &events);
+                        std.Thread.sleep(delay_ms * std.time.ns_per_ms);
+                        attempt_idx += 1;
+                        continue :provider_attempt_loop;
+                    }
+
+                    if (failure.retryable and !used_fallback) {
+                        if (try self.selectFallbackModelWithApiKey(provider_runtime, selected_model)) |fallback_model| {
+                            if (job.emit_debug) {
+                                const escaped_from_provider = try protocol.jsonEscape(self.allocator, selected_model.provider);
+                                defer self.allocator.free(escaped_from_provider);
+                                const escaped_from_model = try protocol.jsonEscape(self.allocator, selected_model.id);
+                                defer self.allocator.free(escaped_from_model);
+                                const escaped_to_provider = try protocol.jsonEscape(self.allocator, fallback_model.provider);
+                                defer self.allocator.free(escaped_to_provider);
+                                const escaped_to_model = try protocol.jsonEscape(self.allocator, fallback_model.id);
+                                defer self.allocator.free(escaped_to_model);
+                                const escaped_error = try protocol.jsonEscape(self.allocator, provider_error_message);
+                                defer self.allocator.free(escaped_error);
+                                const fallback_payload_json = try std.fmt.allocPrint(
+                                    self.allocator,
+                                    "{{\"from_provider\":\"{s}\",\"from_model\":\"{s}\",\"to_provider\":\"{s}\",\"to_model\":\"{s}\",\"error\":\"{s}\"}}",
+                                    .{ escaped_from_provider, escaped_from_model, escaped_to_provider, escaped_to_model, escaped_error },
+                                );
+                                defer self.allocator.free(fallback_payload_json);
+                                try self.appendDebugFrame(&debug_frames, job.request_id, "provider.fallback", fallback_payload_json);
+                            }
+                            resetProviderEvents(self.allocator, &events);
+                            selected_model = fallback_model;
+                            used_fallback = true;
+                            attempt_idx = 0;
+                            continue :provider_attempt_loop;
+                        }
+                    }
+
+                    return failure.runtime_error;
+                }
+
+                break;
+            }
 
             var assistant = try extractAssistantMessage(self.allocator, events.items);
             errdefer deinitOwnedAssistantMessage(self.allocator, &assistant);
@@ -1770,6 +2074,8 @@ fn mockProviderStreamByModel(
 
 var mockToolLoopCallCount: usize = 0;
 var mockSensitiveToolLoopCallCount: usize = 0;
+var mockRateLimitCallCount: usize = 0;
+var mockAuthFailureCallCount: usize = 0;
 var mockCapturedProviderName: ?[]const u8 = null;
 var mockCapturedModelName: ?[]const u8 = null;
 var mockCapturedReasoning: ?[]const u8 = null;
@@ -1965,6 +2271,32 @@ fn mockProviderStreamByModelError(
     _: *std.array_list.Managed(ziggy_piai.types.AssistantMessageEvent),
 ) anyerror!void {
     return error.MockProviderUnavailable;
+}
+
+fn mockProviderStreamByModelRateLimited(
+    allocator: std.mem.Allocator,
+    _: *std.http.Client,
+    _: *ziggy_piai.api_registry.ApiRegistry,
+    _: ziggy_piai.types.Model,
+    _: ziggy_piai.types.Context,
+    _: ziggy_piai.types.StreamOptions,
+    events: *std.array_list.Managed(ziggy_piai.types.AssistantMessageEvent),
+) anyerror!void {
+    mockRateLimitCallCount += 1;
+    try events.append(.{ .err = try allocator.dupe(u8, "Request failed with status 429. Retry-After: 1") });
+}
+
+fn mockProviderStreamByModelAuthFailed(
+    allocator: std.mem.Allocator,
+    _: *std.http.Client,
+    _: *ziggy_piai.api_registry.ApiRegistry,
+    _: ziggy_piai.types.Model,
+    _: ziggy_piai.types.Context,
+    _: ziggy_piai.types.StreamOptions,
+    events: *std.array_list.Managed(ziggy_piai.types.AssistantMessageEvent),
+) anyerror!void {
+    mockAuthFailureCallCount += 1;
+    try events.append(.{ .err = try allocator.dupe(u8, "Request failed with status 401 unauthorized") });
 }
 
 fn mockProviderStreamByModelSlow(
@@ -2472,7 +2804,7 @@ test "runtime_server: provider failure does not leak queued user/tick events" {
         const response = try server.handleMessage("{\"id\":\"req-provider-fail\",\"type\":\"session.send\",\"content\":\"hello provider\"}");
         defer allocator.free(response);
 
-        try std.testing.expect(std.mem.indexOf(u8, response, "\"code\":\"execution_failed\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, response, "\"code\":\"provider_unavailable\"") != null);
         try std.testing.expect(std.mem.indexOf(u8, response, "\"code\":\"queue_saturated\"") == null);
         try std.testing.expectEqual(@as(usize, 0), server.runtime.tick_queue.items.len);
         try std.testing.expectEqual(@as(usize, 0), server.runtime.bus.pendingCount());
@@ -2484,6 +2816,54 @@ test "runtime_server: provider failure does not leak queued user/tick events" {
     defer allocator.free(snapshot_json);
     try std.testing.expect(std.mem.indexOf(u8, snapshot_json, "\"role\":\"user\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot_json, "hello provider") != null);
+}
+
+test "runtime_server: provider rate-limit failures return provider_rate_limited code" {
+    const allocator = std.testing.allocator;
+    const original_stream_fn = streamByModelFn;
+    defer streamByModelFn = original_stream_fn;
+    streamByModelFn = mockProviderStreamByModelRateLimited;
+    mockRateLimitCallCount = 0;
+
+    const server = try RuntimeServer.createWithProvider(allocator, "agent-test", .{
+        .ltm_directory = "",
+        .ltm_filename = "",
+    }, .{
+        .name = "openai",
+        .model = "gpt-4o-mini",
+        .api_key = "test-key",
+    });
+    defer server.destroy();
+
+    const response = try server.handleMessage("{\"id\":\"req-provider-rate-limit\",\"type\":\"session.send\",\"content\":\"hello provider\"}");
+    defer allocator.free(response);
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "\"code\":\"provider_rate_limited\"") != null);
+    try std.testing.expect(mockRateLimitCallCount >= PROVIDER_STREAM_MAX_ATTEMPTS);
+}
+
+test "runtime_server: provider auth failures are not retried and return provider_auth_failed" {
+    const allocator = std.testing.allocator;
+    const original_stream_fn = streamByModelFn;
+    defer streamByModelFn = original_stream_fn;
+    streamByModelFn = mockProviderStreamByModelAuthFailed;
+    mockAuthFailureCallCount = 0;
+
+    const server = try RuntimeServer.createWithProvider(allocator, "agent-test", .{
+        .ltm_directory = "",
+        .ltm_filename = "",
+    }, .{
+        .name = "openai",
+        .model = "gpt-4o-mini",
+        .api_key = "test-key",
+    });
+    defer server.destroy();
+
+    const response = try server.handleMessage("{\"id\":\"req-provider-auth\",\"type\":\"session.send\",\"content\":\"hello provider\"}");
+    defer allocator.free(response);
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "\"code\":\"provider_auth_failed\"") != null);
+    try std.testing.expectEqual(@as(usize, 1), mockAuthFailureCallCount);
 }
 
 test "runtime_server: timed out provider session.send does not enqueue runtime work after cancellation" {
