@@ -78,6 +78,22 @@ pub fn buildToolEvent(
     );
 }
 
+pub fn buildDebugEvent(
+    allocator: std.mem.Allocator,
+    request_id: []const u8,
+    category: []const u8,
+    payload_json: []const u8,
+) ![]u8 {
+    const escaped_category = try jsonEscape(allocator, category);
+    defer allocator.free(escaped_category);
+
+    return std.fmt.allocPrint(
+        allocator,
+        "{{\"type\":\"debug.event\",\"request\":\"{s}\",\"category\":\"{s}\",\"payload\":{s},\"timestamp\":{d}}}",
+        .{ request_id, escaped_category, payload_json, std.time.milliTimestamp() },
+    );
+}
+
 pub fn buildPong(allocator: std.mem.Allocator) ![]u8 {
     return std.fmt.allocPrint(
         allocator,
@@ -141,6 +157,16 @@ test "protocol_response: buildErrorWithCode includes deterministic error code" {
     defer allocator.free(payload);
 
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"code\":\"queue_saturated\"") != null);
+}
+
+test "protocol_response: buildDebugEvent includes category and payload" {
+    const allocator = std.testing.allocator;
+    const payload = try buildDebugEvent(allocator, "req-d", "provider.request", "{\"x\":1}");
+    defer allocator.free(payload);
+
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"type\":\"debug.event\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"category\":\"provider.request\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"payload\":{\"x\":1}") != null);
 }
 
 test "protocol_response: jsonEscape handles all control characters" {

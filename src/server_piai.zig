@@ -183,6 +183,7 @@ fn handleWebSocketConnection(
         },
         else => return err,
     };
+    var debug_stream_enabled = false;
 
     while (true) {
         var frame = websocket_transport.readFrame(
@@ -197,7 +198,8 @@ fn handleWebSocketConnection(
 
         switch (frame.opcode) {
             0x1 => {
-                if (protocol.parseMessageType(frame.payload) == .connect) {
+                const msg_type = protocol.parseMessageType(frame.payload);
+                if (msg_type == .connect) {
                     var parsed_connect = protocol.parseMessage(allocator, frame.payload) catch {
                         const invalid = try protocol.buildErrorWithCode(
                             allocator,
@@ -234,7 +236,41 @@ fn handleWebSocketConnection(
                     continue;
                 }
 
-                const responses = runtime_server.handleMessageFrames(frame.payload) catch |err| blk: {
+                if (msg_type == .agent_control) {
+                    var parsed_control = protocol.parseMessage(allocator, frame.payload) catch {
+                        const invalid = try protocol.buildErrorWithCode(
+                            allocator,
+                            "unknown",
+                            .invalid_envelope,
+                            "invalid request envelope",
+                        );
+                        defer allocator.free(invalid);
+                        try websocket_transport.writeFrame(stream, invalid, .text);
+                        continue;
+                    };
+                    defer protocol.deinitParsedMessage(allocator, &parsed_control);
+
+                    const action = parsed_control.action orelse "";
+                    if (std.mem.eql(u8, action, "debug.subscribe") or std.mem.eql(u8, action, "debug.unsubscribe")) {
+                        debug_stream_enabled = std.mem.eql(u8, action, "debug.subscribe");
+                        const request_id = parsed_control.id orelse "generated";
+                        const payload_json = if (debug_stream_enabled)
+                            "{\"enabled\":true}"
+                        else
+                            "{\"enabled\":false}";
+                        const ack = try protocol.buildDebugEvent(
+                            allocator,
+                            request_id,
+                            "control.subscription",
+                            payload_json,
+                        );
+                        defer allocator.free(ack);
+                        try websocket_transport.writeFrame(stream, ack, .text);
+                        continue;
+                    }
+                }
+
+                const responses = runtime_server.handleMessageFramesWithDebug(frame.payload, debug_stream_enabled) catch |err| blk: {
                     const fallback = try protocol.buildErrorWithCode(
                         allocator,
                         "unknown",
@@ -481,6 +517,20 @@ test "server_piai: websocket path handles connect/session.send and rejects chat.
     try std.testing.expect(std.mem.indexOf(u8, session_frame.payload, "\"type\":\"session.receive\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, session_frame.payload, "\"type\":\"tool.event\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, session_frame.payload, "\"type\":\"memory.event\"") == null);
+
+    try writeClientTextFrameMasked(&client, "{\"id\":\"req-debug-sub\",\"type\":\"agent.control\",\"action\":\"debug.subscribe\"}");
+    var debug_sub = try readServerFrame(allocator, &client);
+    defer debug_sub.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, debug_sub.payload, "\"type\":\"debug.event\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, debug_sub.payload, "\"category\":\"control.subscription\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, debug_sub.payload, "\"enabled\":true") != null);
+
+    try writeClientTextFrameMasked(&client, "{\"id\":\"req-debug-unsub\",\"type\":\"agent.control\",\"action\":\"debug.unsubscribe\"}");
+    var debug_unsub = try readServerFrame(allocator, &client);
+    defer debug_unsub.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, debug_unsub.payload, "\"type\":\"debug.event\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, debug_unsub.payload, "\"category\":\"control.subscription\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, debug_unsub.payload, "\"enabled\":false") != null);
 
     try writeClientTextFrameMasked(&client, "{\"id\":\"req-chat\",\"type\":\"chat.send\",\"content\":\"legacy\"}");
     var legacy_reply = try readServerFrame(allocator, &client);

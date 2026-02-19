@@ -41,6 +41,7 @@ const RuntimeQueueJob = struct {
     request_id: []u8,
     content: ?[]u8,
     action: ?[]u8,
+    emit_debug: bool = false,
 
     result_mutex: std.Thread.Mutex = .{},
     result_cond: std.Thread.Condition = .{},
@@ -51,9 +52,11 @@ const RuntimeQueueJob = struct {
 
 const ProviderCompletion = struct {
     assistant_text: []u8,
+    debug_frames: ?[][]u8 = null,
 
     fn deinit(self: *ProviderCompletion, allocator: std.mem.Allocator) void {
         allocator.free(self.assistant_text);
+        if (self.debug_frames) |frames| deinitResponseFrames(allocator, frames);
         self.* = undefined;
     }
 };
@@ -306,6 +309,14 @@ pub const RuntimeServer = struct {
     }
 
     pub fn handleMessageFrames(self: *RuntimeServer, raw_json: []const u8) ![][]u8 {
+        return self.handleMessageFramesWithDebug(raw_json, false);
+    }
+
+    pub fn handleMessageFramesWithDebug(
+        self: *RuntimeServer,
+        raw_json: []const u8,
+        emit_debug: bool,
+    ) ![][]u8 {
         var parsed = protocol.parseMessage(self.allocator, raw_json) catch {
             const payload = try protocol.buildErrorWithCode(self.allocator, "unknown", .invalid_envelope, "invalid request envelope");
             return self.wrapSingleFrame(payload);
@@ -322,7 +333,7 @@ pub const RuntimeServer = struct {
                 return self.wrapSingleFrame(try protocol.buildPong(self.allocator));
             },
             .session_send => {
-                return self.submitRuntimeJobAndAwait(parsed.msg_type, request_id, parsed.content, parsed.action, .chat);
+                return self.submitRuntimeJobAndAwait(parsed.msg_type, request_id, parsed.content, parsed.action, .chat, emit_debug);
             },
             .agent_control => {
                 const operation_class: RuntimeOperationClass = if (isChatLikeControlAction(parsed.action)) .chat else .control;
@@ -332,6 +343,7 @@ pub const RuntimeServer = struct {
                     parsed.content,
                     parsed.action,
                     operation_class,
+                    emit_debug,
                 );
             },
             else => {
@@ -346,7 +358,7 @@ pub const RuntimeServer = struct {
     }
 
     pub fn handleConnectBootstrapFrames(self: *RuntimeServer, request_id: []const u8) ![][]u8 {
-        return self.submitRuntimeJobAndAwait(.connect, request_id, null, null, .chat);
+        return self.submitRuntimeJobAndAwait(.connect, request_id, null, null, .chat, false);
     }
 
     fn submitRuntimeJobAndAwait(
@@ -356,8 +368,9 @@ pub const RuntimeServer = struct {
         content: ?[]const u8,
         action: ?[]const u8,
         operation_class: RuntimeOperationClass,
+        emit_debug: bool,
     ) ![][]u8 {
-        const job = try self.createJob(msg_type, request_id, content, action);
+        const job = try self.createJob(msg_type, request_id, content, action, emit_debug);
         errdefer self.destroyJob(job);
 
         const enqueued = try self.enqueueJob(job);
@@ -564,6 +577,7 @@ pub const RuntimeServer = struct {
         request_id: []const u8,
         content: ?[]const u8,
         action: ?[]const u8,
+        emit_debug: bool,
     ) !*RuntimeQueueJob {
         const job = try self.allocator.create(RuntimeQueueJob);
         errdefer self.allocator.destroy(job);
@@ -573,6 +587,7 @@ pub const RuntimeServer = struct {
             .request_id = try self.allocator.dupe(u8, request_id),
             .content = if (content) |value| try self.allocator.dupe(u8, value) else null,
             .action = if (action) |value| try self.allocator.dupe(u8, value) else null,
+            .emit_debug = emit_debug,
         };
         return job;
     }
@@ -700,11 +715,11 @@ pub const RuntimeServer = struct {
         };
 
         self.runtime.appendMessageMemory(DEFAULT_BRAIN, "user", content) catch |err| {
-            return self.wrapRuntimeErrorResponse(request_id, err);
+            return self.wrapRuntimeErrorResponse(request_id, err, job.emit_debug);
         };
 
         var provider_completion = if (self.provider_runtime != null)
-            self.completeWithProvider(job, DEFAULT_BRAIN) catch |err| return self.wrapRuntimeErrorResponse(request_id, err)
+            self.completeWithProvider(job, DEFAULT_BRAIN) catch |err| return self.wrapRuntimeErrorResponse(request_id, err, job.emit_debug)
         else
             ProviderCompletion{
                 .assistant_text = try self.allocator.dupe(u8, content),
@@ -718,18 +733,18 @@ pub const RuntimeServer = struct {
         const talk_args = try std.fmt.allocPrint(self.allocator, "{{\"message\":\"{s}\"}}", .{escaped_content});
         defer self.allocator.free(talk_args);
         self.runtime.queueToolUse(DEFAULT_BRAIN, "talk.user", talk_args) catch |err| {
-            return self.wrapRuntimeErrorResponse(request_id, err);
+            return self.wrapRuntimeErrorResponse(request_id, err, job.emit_debug);
         };
 
         self.runPendingTicks(job, null) catch |err| {
             self.clearRuntimeOutboundLocked();
             if (err == RuntimeServerError.RuntimeJobCancelled) return err;
-            return self.wrapRuntimeErrorResponse(request_id, err);
+            return self.wrapRuntimeErrorResponse(request_id, err, job.emit_debug);
         };
 
         self.runtime.appendMessageMemory(DEFAULT_BRAIN, "assistant", provider_completion.assistant_text) catch |err| {
             self.clearRuntimeOutboundLocked();
-            return self.wrapRuntimeErrorResponse(request_id, err);
+            return self.wrapRuntimeErrorResponse(request_id, err, job.emit_debug);
         };
 
         const outbound = try self.runtime.drainOutbound(self.allocator);
@@ -739,6 +754,12 @@ pub const RuntimeServer = struct {
         errdefer {
             for (responses.items) |payload| self.allocator.free(payload);
             responses.deinit(self.allocator);
+        }
+
+        if (provider_completion.debug_frames) |debug_frames| {
+            for (debug_frames) |payload| {
+                try responses.append(self.allocator, try self.allocator.dupe(u8, payload));
+            }
         }
 
         if (outbound.len == 0) {
@@ -827,8 +848,38 @@ pub const RuntimeServer = struct {
         };
     }
 
-    fn wrapRuntimeErrorResponse(self: *RuntimeServer, request_id: []const u8, err: anyerror) ![][]u8 {
-        return self.wrapSingleFrame(try self.buildRuntimeErrorResponse(request_id, err));
+    fn wrapRuntimeErrorResponse(
+        self: *RuntimeServer,
+        request_id: []const u8,
+        err: anyerror,
+        emit_debug: bool,
+    ) ![][]u8 {
+        if (!emit_debug) return self.wrapSingleFrame(try self.buildRuntimeErrorResponse(request_id, err));
+
+        var responses = std.ArrayListUnmanaged([]u8){};
+        errdefer {
+            for (responses.items) |payload| self.allocator.free(payload);
+            responses.deinit(self.allocator);
+        }
+
+        const error_name = @errorName(err);
+        const escaped_error = try protocol.jsonEscape(self.allocator, error_name);
+        defer self.allocator.free(escaped_error);
+        const debug_payload_json = try std.fmt.allocPrint(
+            self.allocator,
+            "{{\"error\":\"{s}\"}}",
+            .{escaped_error},
+        );
+        defer self.allocator.free(debug_payload_json);
+
+        try self.appendDebugFrame(
+            &responses,
+            request_id,
+            "runtime.error",
+            debug_payload_json,
+        );
+        try responses.append(self.allocator, try self.buildRuntimeErrorResponse(request_id, err));
+        return responses.toOwnedSlice(self.allocator);
     }
 
     fn wrapSingleFrame(self: *RuntimeServer, payload: []u8) ![][]u8 {
@@ -837,8 +888,174 @@ pub const RuntimeServer = struct {
         return frames;
     }
 
+    fn appendDebugFrame(
+        self: *RuntimeServer,
+        frames: *std.ArrayListUnmanaged([]u8),
+        request_id: []const u8,
+        category: []const u8,
+        payload_json: []const u8,
+    ) !void {
+        const redacted_payload = try redactDebugPayload(self.allocator, payload_json);
+        defer self.allocator.free(redacted_payload);
+
+        const payload = try protocol.buildDebugEvent(
+            self.allocator,
+            request_id,
+            category,
+            redacted_payload,
+        );
+        try frames.append(self.allocator, payload);
+    }
+
+    fn buildProviderRequestDebugPayload(
+        self: *RuntimeServer,
+        brain_name: []const u8,
+        model: ziggy_piai.types.Model,
+        context: ziggy_piai.types.Context,
+        options: ziggy_piai.types.StreamOptions,
+        round: usize,
+    ) ![]u8 {
+        var out = std.ArrayListUnmanaged(u8){};
+        errdefer out.deinit(self.allocator);
+
+        const escaped_brain = try protocol.jsonEscape(self.allocator, brain_name);
+        defer self.allocator.free(escaped_brain);
+        const escaped_provider = try protocol.jsonEscape(self.allocator, model.provider);
+        defer self.allocator.free(escaped_provider);
+        const escaped_model = try protocol.jsonEscape(self.allocator, model.id);
+        defer self.allocator.free(escaped_model);
+        const escaped_system_prompt = try protocol.jsonEscape(self.allocator, context.system_prompt orelse "");
+        defer self.allocator.free(escaped_system_prompt);
+
+        try out.appendSlice(self.allocator, "{\"brain\":\"");
+        try out.appendSlice(self.allocator, escaped_brain);
+        try out.appendSlice(self.allocator, "\",\"provider\":\"");
+        try out.appendSlice(self.allocator, escaped_provider);
+        try out.appendSlice(self.allocator, "\",\"model\":\"");
+        try out.appendSlice(self.allocator, escaped_model);
+        try out.appendSlice(self.allocator, "\",\"round\":");
+        try out.writer(self.allocator).print("{d}", .{round + 1});
+        try out.appendSlice(self.allocator, ",\"system_prompt\":\"");
+        try out.appendSlice(self.allocator, escaped_system_prompt);
+        try out.appendSlice(self.allocator, "\",\"messages\":[");
+
+        for (context.messages, 0..) |message, idx| {
+            if (idx > 0) try out.append(self.allocator, ',');
+            const escaped_content = try protocol.jsonEscape(self.allocator, message.content);
+            defer self.allocator.free(escaped_content);
+            try out.appendSlice(self.allocator, "{\"role\":\"");
+            try out.appendSlice(self.allocator, @tagName(message.role));
+            try out.appendSlice(self.allocator, "\",\"content\":\"");
+            try out.appendSlice(self.allocator, escaped_content);
+            try out.appendSlice(self.allocator, "\"}");
+        }
+
+        try out.appendSlice(self.allocator, "],\"tools\":[");
+        const tools = context.tools orelse &.{};
+        for (tools, 0..) |tool, idx| {
+            if (idx > 0) try out.append(self.allocator, ',');
+            const escaped_name = try protocol.jsonEscape(self.allocator, tool.name);
+            defer self.allocator.free(escaped_name);
+            const escaped_desc = try protocol.jsonEscape(self.allocator, tool.description);
+            defer self.allocator.free(escaped_desc);
+            const escaped_params = try protocol.jsonEscape(self.allocator, tool.parameters_json);
+            defer self.allocator.free(escaped_params);
+            try out.appendSlice(self.allocator, "{\"name\":\"");
+            try out.appendSlice(self.allocator, escaped_name);
+            try out.appendSlice(self.allocator, "\",\"description\":\"");
+            try out.appendSlice(self.allocator, escaped_desc);
+            try out.appendSlice(self.allocator, "\",\"parameters_json\":\"");
+            try out.appendSlice(self.allocator, escaped_params);
+            try out.appendSlice(self.allocator, "\"}");
+        }
+
+        const escaped_reasoning = try protocol.jsonEscape(self.allocator, options.reasoning orelse "");
+        defer self.allocator.free(escaped_reasoning);
+        const escaped_api_key = try protocol.jsonEscape(self.allocator, options.api_key orelse "");
+        defer self.allocator.free(escaped_api_key);
+        try out.appendSlice(self.allocator, "],\"options\":{\"reasoning\":\"");
+        try out.appendSlice(self.allocator, escaped_reasoning);
+        try out.appendSlice(self.allocator, "\",\"api_key\":\"");
+        try out.appendSlice(self.allocator, escaped_api_key);
+        try out.appendSlice(self.allocator, "\"}}");
+
+        return out.toOwnedSlice(self.allocator);
+    }
+
+    fn buildProviderResponseDebugPayload(
+        self: *RuntimeServer,
+        assistant: ziggy_piai.types.AssistantMessage,
+        round: usize,
+    ) ![]u8 {
+        var out = std.ArrayListUnmanaged(u8){};
+        errdefer out.deinit(self.allocator);
+
+        const escaped_text = try protocol.jsonEscape(self.allocator, assistant.text);
+        defer self.allocator.free(escaped_text);
+        const stop_reason = @tagName(assistant.stop_reason);
+        const escaped_stop = try protocol.jsonEscape(self.allocator, stop_reason);
+        defer self.allocator.free(escaped_stop);
+
+        try out.appendSlice(self.allocator, "{\"round\":");
+        try out.writer(self.allocator).print("{d}", .{round + 1});
+        try out.appendSlice(self.allocator, ",\"stop_reason\":\"");
+        try out.appendSlice(self.allocator, escaped_stop);
+        try out.appendSlice(self.allocator, "\",\"text\":\"");
+        try out.appendSlice(self.allocator, escaped_text);
+        try out.appendSlice(self.allocator, "\",\"tool_calls\":[");
+
+        for (assistant.tool_calls, 0..) |tool_call, idx| {
+            if (idx > 0) try out.append(self.allocator, ',');
+            const escaped_id = try protocol.jsonEscape(self.allocator, tool_call.id);
+            defer self.allocator.free(escaped_id);
+            const escaped_name = try protocol.jsonEscape(self.allocator, tool_call.name);
+            defer self.allocator.free(escaped_name);
+            const escaped_args = try protocol.jsonEscape(self.allocator, tool_call.arguments_json);
+            defer self.allocator.free(escaped_args);
+
+            try out.appendSlice(self.allocator, "{\"id\":\"");
+            try out.appendSlice(self.allocator, escaped_id);
+            try out.appendSlice(self.allocator, "\",\"name\":\"");
+            try out.appendSlice(self.allocator, escaped_name);
+            try out.appendSlice(self.allocator, "\",\"arguments_json\":\"");
+            try out.appendSlice(self.allocator, escaped_args);
+            try out.appendSlice(self.allocator, "\"}");
+        }
+
+        try out.appendSlice(self.allocator, "]}");
+        return out.toOwnedSlice(self.allocator);
+    }
+
+    fn buildProviderToolCallDebugPayload(
+        self: *RuntimeServer,
+        tool_call: ziggy_piai.types.ToolCall,
+        runtime_tool_name: []const u8,
+        args_with_call_id: []const u8,
+        round: usize,
+    ) ![]u8 {
+        const escaped_provider_name = try protocol.jsonEscape(self.allocator, tool_call.name);
+        defer self.allocator.free(escaped_provider_name);
+        const escaped_runtime_name = try protocol.jsonEscape(self.allocator, runtime_tool_name);
+        defer self.allocator.free(escaped_runtime_name);
+        const escaped_call_id = try protocol.jsonEscape(self.allocator, tool_call.id);
+        defer self.allocator.free(escaped_call_id);
+        const escaped_args = try protocol.jsonEscape(self.allocator, args_with_call_id);
+        defer self.allocator.free(escaped_args);
+
+        return std.fmt.allocPrint(
+            self.allocator,
+            "{{\"round\":{d},\"call_id\":\"{s}\",\"provider_tool_name\":\"{s}\",\"runtime_tool_name\":\"{s}\",\"arguments_json\":\"{s}\"}}",
+            .{ round + 1, escaped_call_id, escaped_provider_name, escaped_runtime_name, escaped_args },
+        );
+    }
+
     fn completeWithProvider(self: *RuntimeServer, job: *RuntimeQueueJob, brain_name: []const u8) !ProviderCompletion {
         const provider_runtime = &(self.provider_runtime orelse return RuntimeServerError.ProviderModelNotFound);
+        var debug_frames = std.ArrayListUnmanaged([]u8){};
+        errdefer {
+            for (debug_frames.items) |payload| self.allocator.free(payload);
+            debug_frames.deinit(self.allocator);
+        }
 
         var provider_name: []const u8 = provider_runtime.default_provider_name;
         var model_name: ?[]const u8 = provider_runtime.default_model_name;
@@ -938,6 +1155,25 @@ pub const RuntimeServer = struct {
                 .api_key = api_key,
                 .reasoning = think_level,
             });
+            if (job.emit_debug) {
+                const request_payload_json = try self.buildProviderRequestDebugPayload(
+                    brain_name,
+                    model,
+                    context,
+                    .{
+                        .api_key = api_key,
+                        .reasoning = think_level,
+                    },
+                    round,
+                );
+                defer self.allocator.free(request_payload_json);
+                try self.appendDebugFrame(
+                    &debug_frames,
+                    job.request_id,
+                    "provider.request",
+                    request_payload_json,
+                );
+            }
 
             streamByModelFn(
                 self.allocator,
@@ -954,13 +1190,30 @@ pub const RuntimeServer = struct {
 
             var assistant = try extractAssistantMessage(self.allocator, events.items);
             errdefer deinitOwnedAssistantMessage(self.allocator, &assistant);
+            if (job.emit_debug) {
+                const response_payload_json = try self.buildProviderResponseDebugPayload(assistant, round);
+                defer self.allocator.free(response_payload_json);
+                try self.appendDebugFrame(
+                    &debug_frames,
+                    job.request_id,
+                    "provider.response",
+                    response_payload_json,
+                );
+            }
 
             const tool_calls = assistant.tool_calls;
             if (tool_calls.len == 0) {
                 const final_text = try self.allocator.dupe(u8, assistant.text);
                 deinitOwnedAssistantMessage(self.allocator, &assistant);
+                var owned_debug_frames: ?[][]u8 = null;
+                if (debug_frames.items.len > 0) {
+                    owned_debug_frames = try debug_frames.toOwnedSlice(self.allocator);
+                } else {
+                    debug_frames.deinit(self.allocator);
+                }
                 return .{
                     .assistant_text = final_text,
+                    .debug_frames = owned_debug_frames,
                 };
             }
 
@@ -975,6 +1228,21 @@ pub const RuntimeServer = struct {
                 const runtime_tool_name = resolveRuntimeToolName(tool_call.name, provider_tool_name_map);
                 const args_with_call_id = try injectToolCallId(self.allocator, tool_call.arguments_json, tool_call.id);
                 defer self.allocator.free(args_with_call_id);
+                if (job.emit_debug) {
+                    const tool_call_payload_json = try self.buildProviderToolCallDebugPayload(
+                        tool_call,
+                        runtime_tool_name,
+                        args_with_call_id,
+                        round,
+                    );
+                    defer self.allocator.free(tool_call_payload_json);
+                    try self.appendDebugFrame(
+                        &debug_frames,
+                        job.request_id,
+                        "provider.tool_call",
+                        tool_call_payload_json,
+                    );
+                }
                 try self.runtime.queueToolUse(brain_name, runtime_tool_name, args_with_call_id);
             }
 
@@ -1198,6 +1466,64 @@ fn parseTruthyEnvFlag(raw: []const u8) bool {
     return false;
 }
 
+fn redactDebugPayload(allocator: std.mem.Allocator, payload_json: []const u8) ![]u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, payload_json, .{}) catch {
+        return allocator.dupe(u8, payload_json);
+    };
+    defer parsed.deinit();
+
+    redactSensitiveJsonValue(&parsed.value);
+    return std.json.Stringify.valueAlloc(allocator, parsed.value, .{});
+}
+
+fn redactSensitiveJsonValue(value: *std.json.Value) void {
+    switch (value.*) {
+        .object => |*obj| {
+            var it = obj.iterator();
+            while (it.next()) |entry| {
+                if (isSensitiveJsonKey(entry.key_ptr.*)) {
+                    entry.value_ptr.* = .{ .string = "[redacted]" };
+                } else {
+                    redactSensitiveJsonValue(entry.value_ptr);
+                }
+            }
+        },
+        .array => |*arr| {
+            for (arr.items) |*child| {
+                redactSensitiveJsonValue(child);
+            }
+        },
+        else => {},
+    }
+}
+
+fn isSensitiveJsonKey(key: []const u8) bool {
+    if (key.len == 0) return false;
+
+    var lower_buf: [128]u8 = undefined;
+    const copy_len = @min(key.len, lower_buf.len);
+    for (key[0..copy_len], 0..) |ch, idx| {
+        lower_buf[idx] = std.ascii.toLower(ch);
+    }
+    const lower = lower_buf[0..copy_len];
+
+    if (std.mem.eql(u8, lower, "api_key")) return true;
+    if (std.mem.eql(u8, lower, "apikey")) return true;
+    if (std.mem.eql(u8, lower, "authorization")) return true;
+    if (std.mem.eql(u8, lower, "auth_token")) return true;
+    if (std.mem.eql(u8, lower, "token")) return true;
+    if (std.mem.eql(u8, lower, "secret")) return true;
+    if (std.mem.eql(u8, lower, "password")) return true;
+    if (std.mem.endsWith(u8, lower, "_token")) return true;
+    if (std.mem.endsWith(u8, lower, "-token")) return true;
+    if (std.mem.endsWith(u8, lower, "_secret")) return true;
+    if (std.mem.endsWith(u8, lower, "-secret")) return true;
+    if (std.mem.endsWith(u8, lower, "_api_key")) return true;
+    if (std.mem.endsWith(u8, lower, "-api-key")) return true;
+
+    return false;
+}
+
 fn injectToolCallId(allocator: std.mem.Allocator, args_json: []const u8, call_id: []const u8) ![]u8 {
     const trimmed = std.mem.trim(u8, args_json, " \t\r\n");
     if (trimmed.len < 2 or trimmed[0] != '{' or trimmed[trimmed.len - 1] != '}') {
@@ -1363,6 +1689,30 @@ test "runtime_server: parseTruthyEnvFlag rejects falsey values" {
     try std.testing.expect(!parseTruthyEnvFlag("0"));
     try std.testing.expect(!parseTruthyEnvFlag("false"));
     try std.testing.expect(!parseTruthyEnvFlag("off"));
+}
+
+test "runtime_server: redactDebugPayload masks secret fields only" {
+    const allocator = std.testing.allocator;
+    const payload =
+        \\{
+        \\  "api_key":"abc123",
+        \\  "authorization":"Bearer value",
+        \\  "auth_token":"token-value",
+        \\  "session_id":"visible",
+        \\  "nested":{"github_token":"gh_abc","safe":"ok"},
+        \\  "items":[{"secret":"x"},{"name":"visible"}]
+        \\}
+    ;
+    const redacted = try redactDebugPayload(allocator, payload);
+    defer allocator.free(redacted);
+
+    try std.testing.expect(std.mem.indexOf(u8, redacted, "\"api_key\":\"[redacted]\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, redacted, "\"authorization\":\"[redacted]\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, redacted, "\"auth_token\":\"[redacted]\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, redacted, "\"github_token\":\"[redacted]\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, redacted, "\"secret\":\"[redacted]\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, redacted, "\"session_id\":\"visible\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, redacted, "\"safe\":\"ok\"") != null);
 }
 
 fn mockProviderStreamByModel(
@@ -1682,6 +2032,55 @@ test "runtime_server: provider-backed session.send uses configured provider runt
         }
     }
     try std.testing.expectEqual(@as(usize, 1), assistant_turns);
+}
+
+test "runtime_server: provider-backed session.send emits debug.event frames when enabled" {
+    const allocator = std.testing.allocator;
+    const original_stream_fn = streamByModelFn;
+    defer streamByModelFn = original_stream_fn;
+    streamByModelFn = mockProviderStreamByModel;
+
+    const server = try RuntimeServer.createWithProvider(allocator, "agent-debug", .{
+        .ltm_directory = "",
+        .ltm_filename = "",
+    }, .{
+        .name = "openai",
+        .model = "gpt-4o-mini",
+        .api_key = "test-key",
+    });
+    defer server.destroy();
+
+    const without_debug = try server.handleMessageFrames("{\"id\":\"req-debug-off\",\"type\":\"session.send\",\"content\":\"hello\"}");
+    defer deinitResponseFrames(allocator, without_debug);
+    for (without_debug) |payload| {
+        try std.testing.expect(std.mem.indexOf(u8, payload, "\"type\":\"debug.event\"") == null);
+    }
+
+    const with_debug = try server.handleMessageFramesWithDebug(
+        "{\"id\":\"req-debug-on\",\"type\":\"session.send\",\"content\":\"hello\"}",
+        true,
+    );
+    defer deinitResponseFrames(allocator, with_debug);
+
+    var saw_provider_request = false;
+    var saw_provider_response = false;
+    var saw_session_receive = false;
+    for (with_debug) |payload| {
+        if (std.mem.indexOf(u8, payload, "\"category\":\"provider.request\"") != null) {
+            saw_provider_request = true;
+            try std.testing.expect(std.mem.indexOf(u8, payload, "\"api_key\":\"[redacted]\"") != null);
+        }
+        if (std.mem.indexOf(u8, payload, "\"category\":\"provider.response\"") != null) {
+            saw_provider_response = true;
+        }
+        if (std.mem.indexOf(u8, payload, "\"type\":\"session.receive\"") != null) {
+            saw_session_receive = true;
+        }
+    }
+
+    try std.testing.expect(saw_provider_request);
+    try std.testing.expect(saw_provider_response);
+    try std.testing.expect(saw_session_receive);
 }
 
 test "runtime_server: provider-only override resets inherited model selection" {
