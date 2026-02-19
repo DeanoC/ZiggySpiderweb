@@ -33,6 +33,36 @@ pub const RuntimeConfig = struct {
     default_agent_id: []const u8 = "default",
     ltm_directory: []const u8 = ".spiderweb-ltm",
     ltm_filename: []const u8 = "runtime-memory.db",
+    assets_dir: []const u8 = "templates",
+    agents_dir: []const u8 = "agents",
+
+    pub fn clone(self: RuntimeConfig, allocator: std.mem.Allocator) !RuntimeConfig {
+        return .{
+            .inbound_queue_max = self.inbound_queue_max,
+            .brain_tick_queue_max = self.brain_tick_queue_max,
+            .outbound_queue_max = self.outbound_queue_max,
+            .control_queue_max = self.control_queue_max,
+            .connection_worker_threads = self.connection_worker_threads,
+            .connection_queue_max = self.connection_queue_max,
+            .runtime_worker_threads = self.runtime_worker_threads,
+            .runtime_request_queue_max = self.runtime_request_queue_max,
+            .chat_operation_timeout_ms = self.chat_operation_timeout_ms,
+            .control_operation_timeout_ms = self.control_operation_timeout_ms,
+            .default_agent_id = try allocator.dupe(u8, self.default_agent_id),
+            .ltm_directory = try allocator.dupe(u8, self.ltm_directory),
+            .ltm_filename = try allocator.dupe(u8, self.ltm_filename),
+            .assets_dir = try allocator.dupe(u8, self.assets_dir),
+            .agents_dir = try allocator.dupe(u8, self.agents_dir),
+        };
+    }
+
+    pub fn deinit(self: *RuntimeConfig, allocator: std.mem.Allocator) void {
+        allocator.free(self.default_agent_id);
+        allocator.free(self.ltm_directory);
+        allocator.free(self.ltm_filename);
+        allocator.free(self.assets_dir);
+        allocator.free(self.agents_dir);
+    }
 };
 
 allocator: std.mem.Allocator,
@@ -68,7 +98,9 @@ const default_config =
     \\    "control_operation_timeout_ms": 5000,
     \\    "default_agent_id": "default",
     \\    "ltm_directory": ".spiderweb-ltm",
-    \\    "ltm_filename": "runtime-memory.db"
+    \\    "ltm_filename": "runtime-memory.db",
+    \\    "assets_dir": "templates",
+    \\    "agents_dir": "agents"
     \\  }
     \\}
 ;
@@ -105,6 +137,8 @@ pub fn init(allocator: std.mem.Allocator, config_path: ?[]const u8) !Config {
             .default_agent_id = try allocator.dupe(u8, "default"),
             .ltm_directory = try allocator.dupe(u8, ".spiderweb-ltm"),
             .ltm_filename = try allocator.dupe(u8, "runtime-memory.db"),
+            .assets_dir = try allocator.dupe(u8, "templates"),
+            .agents_dir = try allocator.dupe(u8, "agents"),
         },
         .config_path = path,
     };
@@ -131,9 +165,7 @@ pub fn deinit(self: *Config) void {
     if (self.provider.api_key) |k| self.allocator.free(k);
     if (self.provider.base_url) |b| self.allocator.free(b);
     self.allocator.free(self.log.level);
-    self.allocator.free(self.runtime.default_agent_id);
-    self.allocator.free(self.runtime.ltm_directory);
-    self.allocator.free(self.runtime.ltm_filename);
+    self.runtime.deinit(self.allocator);
 }
 
 fn defaultConfigPath(allocator: std.mem.Allocator) ![]const u8 {
@@ -226,78 +258,90 @@ pub fn load(self: *Config) !void {
         }
     }
 
-    if (root.object.get("runtime")) |runtime_val| {
-        if (runtime_val == .object) {
-            if (runtime_val.object.get("inbound_queue_max")) |value| {
-                if (value == .integer and value.integer > 0) {
-                    self.runtime.inbound_queue_max = @intCast(value.integer);
+            if (root.object.get("runtime")) |runtime_val| {
+                if (runtime_val == .object) {
+                    if (runtime_val.object.get("inbound_queue_max")) |value| {
+                        if (value == .integer and value.integer > 0) {
+                            self.runtime.inbound_queue_max = @intCast(value.integer);
+                        }
+                    }
+                    if (runtime_val.object.get("brain_tick_queue_max")) |value| {
+                        if (value == .integer and value.integer > 0) {
+                            self.runtime.brain_tick_queue_max = @intCast(value.integer);
+                        }
+                    }
+                    if (runtime_val.object.get("outbound_queue_max")) |value| {
+                        if (value == .integer and value.integer > 0) {
+                            self.runtime.outbound_queue_max = @intCast(value.integer);
+                        }
+                    }
+                    if (runtime_val.object.get("control_queue_max")) |value| {
+                        if (value == .integer and value.integer > 0) {
+                            self.runtime.control_queue_max = @intCast(value.integer);
+                        }
+                    }
+                    if (runtime_val.object.get("connection_worker_threads")) |value| {
+                        if (value == .integer and value.integer >= 0) {
+                            self.runtime.connection_worker_threads = @intCast(value.integer);
+                        }
+                    }
+                    if (runtime_val.object.get("connection_queue_max")) |value| {
+                        if (value == .integer and value.integer >= 0) {
+                            self.runtime.connection_queue_max = @intCast(value.integer);
+                        }
+                    }
+                    if (runtime_val.object.get("runtime_worker_threads")) |value| {
+                        if (value == .integer and value.integer >= 0) {
+                            self.runtime.runtime_worker_threads = @intCast(value.integer);
+                        }
+                    }
+                    if (runtime_val.object.get("runtime_request_queue_max")) |value| {
+                        if (value == .integer and value.integer >= 0) {
+                            self.runtime.runtime_request_queue_max = @intCast(value.integer);
+                        }
+                    }
+                    if (runtime_val.object.get("chat_operation_timeout_ms")) |value| {
+                        if (value == .integer and value.integer > 0) {
+                            self.runtime.chat_operation_timeout_ms = @intCast(value.integer);
+                        }
+                    }
+                    if (runtime_val.object.get("control_operation_timeout_ms")) |value| {
+                        if (value == .integer and value.integer > 0) {
+                            self.runtime.control_operation_timeout_ms = @intCast(value.integer);
+                        }
+                    }
+                    if (runtime_val.object.get("default_agent_id")) |value| {
+                        if (value == .string and value.string.len > 0) {
+                            self.allocator.free(self.runtime.default_agent_id);
+                            self.runtime.default_agent_id = try self.allocator.dupe(u8, value.string);
+                        }
+                    }
+                    if (runtime_val.object.get("ltm_directory")) |value| {
+                        if (value == .string) {
+                            self.allocator.free(self.runtime.ltm_directory);
+                            self.runtime.ltm_directory = try self.allocator.dupe(u8, value.string);
+                        }
+                    }
+                    if (runtime_val.object.get("ltm_filename")) |value| {
+                        if (value == .string) {
+                            self.allocator.free(self.runtime.ltm_filename);
+                            self.runtime.ltm_filename = try self.allocator.dupe(u8, value.string);
+                        }
+                    }
+                    if (runtime_val.object.get("assets_dir")) |value| {
+                        if (value == .string) {
+                            self.allocator.free(self.runtime.assets_dir);
+                            self.runtime.assets_dir = try self.allocator.dupe(u8, value.string);
+                        }
+                    }
+                    if (runtime_val.object.get("agents_dir")) |value| {
+                        if (value == .string) {
+                            self.allocator.free(self.runtime.agents_dir);
+                            self.runtime.agents_dir = try self.allocator.dupe(u8, value.string);
+                        }
+                    }
                 }
             }
-            if (runtime_val.object.get("brain_tick_queue_max")) |value| {
-                if (value == .integer and value.integer > 0) {
-                    self.runtime.brain_tick_queue_max = @intCast(value.integer);
-                }
-            }
-            if (runtime_val.object.get("outbound_queue_max")) |value| {
-                if (value == .integer and value.integer > 0) {
-                    self.runtime.outbound_queue_max = @intCast(value.integer);
-                }
-            }
-            if (runtime_val.object.get("control_queue_max")) |value| {
-                if (value == .integer and value.integer > 0) {
-                    self.runtime.control_queue_max = @intCast(value.integer);
-                }
-            }
-            if (runtime_val.object.get("connection_worker_threads")) |value| {
-                if (value == .integer and value.integer >= 0) {
-                    self.runtime.connection_worker_threads = @intCast(value.integer);
-                }
-            }
-            if (runtime_val.object.get("connection_queue_max")) |value| {
-                if (value == .integer and value.integer >= 0) {
-                    self.runtime.connection_queue_max = @intCast(value.integer);
-                }
-            }
-            if (runtime_val.object.get("runtime_worker_threads")) |value| {
-                if (value == .integer and value.integer >= 0) {
-                    self.runtime.runtime_worker_threads = @intCast(value.integer);
-                }
-            }
-            if (runtime_val.object.get("runtime_request_queue_max")) |value| {
-                if (value == .integer and value.integer >= 0) {
-                    self.runtime.runtime_request_queue_max = @intCast(value.integer);
-                }
-            }
-            if (runtime_val.object.get("chat_operation_timeout_ms")) |value| {
-                if (value == .integer and value.integer > 0) {
-                    self.runtime.chat_operation_timeout_ms = @intCast(value.integer);
-                }
-            }
-            if (runtime_val.object.get("control_operation_timeout_ms")) |value| {
-                if (value == .integer and value.integer > 0) {
-                    self.runtime.control_operation_timeout_ms = @intCast(value.integer);
-                }
-            }
-            if (runtime_val.object.get("default_agent_id")) |value| {
-                if (value == .string and value.string.len > 0) {
-                    self.allocator.free(self.runtime.default_agent_id);
-                    self.runtime.default_agent_id = try self.allocator.dupe(u8, value.string);
-                }
-            }
-            if (runtime_val.object.get("ltm_directory")) |value| {
-                if (value == .string) {
-                    self.allocator.free(self.runtime.ltm_directory);
-                    self.runtime.ltm_directory = try self.allocator.dupe(u8, value.string);
-                }
-            }
-            if (runtime_val.object.get("ltm_filename")) |value| {
-                if (value == .string) {
-                    self.allocator.free(self.runtime.ltm_filename);
-                    self.runtime.ltm_filename = try self.allocator.dupe(u8, value.string);
-                }
-            }
-        }
-    }
 }
 pub fn save(self: Config) !void {
     // Ensure parent directory exists
@@ -377,8 +421,12 @@ pub fn save(self: Config) !void {
     try file.writeAll(default_agent_line);
     const ltm_dir_line = try std.fmt.bufPrint(&buf, "    \"ltm_directory\": \"{s}\",\n", .{self.runtime.ltm_directory});
     try file.writeAll(ltm_dir_line);
-    const ltm_file_line = try std.fmt.bufPrint(&buf, "    \"ltm_filename\": \"{s}\"\n", .{self.runtime.ltm_filename});
+    const ltm_file_line = try std.fmt.bufPrint(&buf, "    \"ltm_filename\": \"{s}\",\n", .{self.runtime.ltm_filename});
     try file.writeAll(ltm_file_line);
+    const assets_dir_line = try std.fmt.bufPrint(&buf, "    \"assets_dir\": \"{s}\",\n", .{self.runtime.assets_dir});
+    try file.writeAll(assets_dir_line);
+    const agents_dir_line = try std.fmt.bufPrint(&buf, "    \"agents_dir\": \"{s}\"\n", .{self.runtime.agents_dir});
+    try file.writeAll(agents_dir_line);
     try file.writeAll("  }\n");
 
     try file.writeAll("}\n");
@@ -426,7 +474,7 @@ pub fn getApiKey(self: Config, allocator: std.mem.Allocator) !?[]const u8 {
 
 test "Config defaults" {
     const allocator = std.testing.allocator;
-    const config = try Config.init(allocator, null);
+    var config = try Config.init(allocator, null);
     defer config.deinit();
 
     try std.testing.expectEqualStrings("openai", config.provider.name);

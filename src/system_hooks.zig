@@ -9,9 +9,9 @@ const brain_tools = @import("brain_tools.zig");
 const memory = @import("memory.zig");
 const memid = @import("memid.zig");
 const protocol = @import("protocol.zig");
+const Config = @import("config.zig");
 
 /// System paths for templates
-const TEMPLATE_DIR = "templates";
 
 pub const SOUL_MEM_NAME = "system.soul";
 pub const AGENT_MEM_NAME = "system.agent";
@@ -130,8 +130,8 @@ pub fn ensureIdentityMemories(runtime: *AgentRuntime, brain_name: []const u8) !v
     _ = try ensureMemoryFromTemplate(runtime, brain_name, "IDENTITY.md", IDENTITY_MEM_NAME);
 }
 
-pub fn readTemplate(allocator: std.mem.Allocator, template_name: []const u8) ![]u8 {
-    const template_path = try std.fs.path.join(allocator, &.{ TEMPLATE_DIR, template_name });
+pub fn readTemplate(allocator: std.mem.Allocator, runtime: *AgentRuntime, template_name: []const u8) ![]u8 {
+    const template_path = try std.fs.path.join(allocator, &.{ runtime.runtime_config.assets_dir, template_name });
     defer allocator.free(template_path);
     return std.fs.cwd().readFileAlloc(allocator, template_path, 1024 * 1024);
 }
@@ -165,7 +165,7 @@ fn ensureMemoryFromTemplate(
         return true;
     }
 
-    const content = readTemplate(allocator, template_name) catch |err| {
+    const content = readTemplate(allocator, runtime, template_name) catch |err| {
         std.log.warn("Failed to load template {s}: {s}", .{ template_name, @errorName(err) });
         return false;
     };
@@ -304,7 +304,8 @@ fn loadIdentityFile(
 
     // Construct path: agents/{agent_id}/{brain_name}/{filename}
     // For primary brain, use agent root: agents/{agent_id}/{filename}
-    const base_dir = try std.fs.path.join(allocator, &.{ "agents", runtime.agent_id });
+    const agents_dir = runtime.runtime_config.agents_dir;
+    const base_dir = try std.fs.path.join(allocator, &.{ agents_dir, runtime.agent_id });
     defer allocator.free(base_dir);
 
     const brain_dir = if (std.mem.eql(u8, brain_name, "primary"))
@@ -327,7 +328,7 @@ fn loadIdentityFile(
     // Verify resolved path starts with agents/
     const cwd = try std.process.getCwdAlloc(allocator);
     defer allocator.free(cwd);
-    const expected_prefix = try std.fs.path.join(allocator, &.{ cwd, "agents" });
+    const expected_prefix = try std.fs.path.join(allocator, &.{ cwd, agents_dir });
     defer allocator.free(expected_prefix);
 
     if (!std.mem.startsWith(u8, resolved, expected_prefix)) {
@@ -469,15 +470,16 @@ test "system_hooks: ensureIdentityMemories rehydrates persisted identity into ac
     const ltm_dir = try std.fmt.allocPrint(allocator, ".tmp-system-hooks-ltm-{d}", .{std.time.nanoTimestamp()});
     defer allocator.free(ltm_dir);
     defer std.fs.cwd().deleteTree(ltm_dir) catch {};
+    const cfg = Config.RuntimeConfig{};
 
     {
-        var runtime = try AgentRuntime.initWithPersistence(allocator, "agent-system-hooks", &.{}, ltm_dir, "runtime-memory.db");
+        var runtime = try AgentRuntime.initWithPersistence(allocator, "agent-system-hooks", &.{}, ltm_dir, "runtime-memory.db", cfg);
         defer runtime.deinit();
 
         try ensureIdentityMemories(&runtime, "primary");
     }
 
-    var restarted = try AgentRuntime.initWithPersistence(allocator, "agent-system-hooks", &.{}, ltm_dir, "runtime-memory.db");
+    var restarted = try AgentRuntime.initWithPersistence(allocator, "agent-system-hooks", &.{}, ltm_dir, "runtime-memory.db", cfg);
     defer restarted.deinit();
 
     const before = try restarted.active_memory.snapshotActive(allocator, "primary");
