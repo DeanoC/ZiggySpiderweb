@@ -1010,16 +1010,16 @@ pub const RuntimeServer = struct {
             defer self.allocator.free(escaped_id);
             const escaped_name = try protocol.jsonEscape(self.allocator, tool_call.name);
             defer self.allocator.free(escaped_name);
-            const escaped_args = try protocol.jsonEscape(self.allocator, tool_call.arguments_json);
-            defer self.allocator.free(escaped_args);
+            const normalized_args = try normalizeJsonValueForDebug(self.allocator, tool_call.arguments_json);
+            defer self.allocator.free(normalized_args);
 
             try out.appendSlice(self.allocator, "{\"id\":\"");
             try out.appendSlice(self.allocator, escaped_id);
             try out.appendSlice(self.allocator, "\",\"name\":\"");
             try out.appendSlice(self.allocator, escaped_name);
-            try out.appendSlice(self.allocator, "\",\"arguments_json\":\"");
-            try out.appendSlice(self.allocator, escaped_args);
-            try out.appendSlice(self.allocator, "\"}");
+            try out.appendSlice(self.allocator, "\",\"arguments\":");
+            try out.appendSlice(self.allocator, normalized_args);
+            try out.appendSlice(self.allocator, "}");
         }
 
         try out.appendSlice(self.allocator, "]}");
@@ -1039,13 +1039,13 @@ pub const RuntimeServer = struct {
         defer self.allocator.free(escaped_runtime_name);
         const escaped_call_id = try protocol.jsonEscape(self.allocator, tool_call.id);
         defer self.allocator.free(escaped_call_id);
-        const escaped_args = try protocol.jsonEscape(self.allocator, args_with_call_id);
-        defer self.allocator.free(escaped_args);
+        const normalized_args = try normalizeJsonValueForDebug(self.allocator, args_with_call_id);
+        defer self.allocator.free(normalized_args);
 
         return std.fmt.allocPrint(
             self.allocator,
-            "{{\"round\":{d},\"call_id\":\"{s}\",\"provider_tool_name\":\"{s}\",\"runtime_tool_name\":\"{s}\",\"arguments_json\":\"{s}\"}}",
-            .{ round + 1, escaped_call_id, escaped_provider_name, escaped_runtime_name, escaped_args },
+            "{{\"round\":{d},\"call_id\":\"{s}\",\"provider_tool_name\":\"{s}\",\"runtime_tool_name\":\"{s}\",\"arguments\":{s}}}",
+            .{ round + 1, escaped_call_id, escaped_provider_name, escaped_runtime_name, normalized_args },
         );
     }
 
@@ -1500,28 +1500,37 @@ fn redactSensitiveJsonValue(value: *std.json.Value) void {
 fn isSensitiveJsonKey(key: []const u8) bool {
     if (key.len == 0) return false;
 
-    var lower_buf: [128]u8 = undefined;
-    const copy_len = @min(key.len, lower_buf.len);
-    for (key[0..copy_len], 0..) |ch, idx| {
-        lower_buf[idx] = std.ascii.toLower(ch);
-    }
-    const lower = lower_buf[0..copy_len];
-
-    if (std.mem.eql(u8, lower, "api_key")) return true;
-    if (std.mem.eql(u8, lower, "apikey")) return true;
-    if (std.mem.eql(u8, lower, "authorization")) return true;
-    if (std.mem.eql(u8, lower, "auth_token")) return true;
-    if (std.mem.eql(u8, lower, "token")) return true;
-    if (std.mem.eql(u8, lower, "secret")) return true;
-    if (std.mem.eql(u8, lower, "password")) return true;
-    if (std.mem.endsWith(u8, lower, "_token")) return true;
-    if (std.mem.endsWith(u8, lower, "-token")) return true;
-    if (std.mem.endsWith(u8, lower, "_secret")) return true;
-    if (std.mem.endsWith(u8, lower, "-secret")) return true;
-    if (std.mem.endsWith(u8, lower, "_api_key")) return true;
-    if (std.mem.endsWith(u8, lower, "-api-key")) return true;
+    if (std.ascii.eqlIgnoreCase(key, "api_key")) return true;
+    if (std.ascii.eqlIgnoreCase(key, "apikey")) return true;
+    if (std.ascii.eqlIgnoreCase(key, "authorization")) return true;
+    if (std.ascii.eqlIgnoreCase(key, "auth_token")) return true;
+    if (std.ascii.eqlIgnoreCase(key, "token")) return true;
+    if (std.ascii.eqlIgnoreCase(key, "secret")) return true;
+    if (std.ascii.eqlIgnoreCase(key, "password")) return true;
+    if (endsWithAsciiIgnoreCase(key, "_token")) return true;
+    if (endsWithAsciiIgnoreCase(key, "-token")) return true;
+    if (endsWithAsciiIgnoreCase(key, "_secret")) return true;
+    if (endsWithAsciiIgnoreCase(key, "-secret")) return true;
+    if (endsWithAsciiIgnoreCase(key, "_api_key")) return true;
+    if (endsWithAsciiIgnoreCase(key, "-api-key")) return true;
 
     return false;
+}
+
+fn endsWithAsciiIgnoreCase(haystack: []const u8, suffix: []const u8) bool {
+    if (suffix.len > haystack.len) return false;
+    return std.ascii.eqlIgnoreCase(haystack[haystack.len - suffix.len ..], suffix);
+}
+
+fn normalizeJsonValueForDebug(allocator: std.mem.Allocator, raw_json: []const u8) ![]u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw_json, .{}) catch {
+        const escaped = try protocol.jsonEscape(allocator, raw_json);
+        defer allocator.free(escaped);
+        return std.fmt.allocPrint(allocator, "\"{s}\"", .{escaped});
+    };
+    defer parsed.deinit();
+
+    return std.json.Stringify.valueAlloc(allocator, parsed.value, .{});
 }
 
 fn injectToolCallId(allocator: std.mem.Allocator, args_json: []const u8, call_id: []const u8) ![]u8 {
@@ -1715,6 +1724,27 @@ test "runtime_server: redactDebugPayload masks secret fields only" {
     try std.testing.expect(std.mem.indexOf(u8, redacted, "\"safe\":\"ok\"") != null);
 }
 
+test "runtime_server: redactDebugPayload masks sensitive suffixes on long keys" {
+    const allocator = std.testing.allocator;
+    const long_prefix = try allocator.alloc(u8, 140);
+    defer allocator.free(long_prefix);
+    @memset(long_prefix, 'a');
+
+    const payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"{s}_token\":\"secret-value\",\"safe\":\"ok\"}}",
+        .{long_prefix},
+    );
+    defer allocator.free(payload);
+
+    const redacted = try redactDebugPayload(allocator, payload);
+    defer allocator.free(redacted);
+
+    try std.testing.expect(std.mem.indexOf(u8, redacted, "\"secret-value\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, redacted, "\"[redacted]\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, redacted, "\"safe\":\"ok\"") != null);
+}
+
 fn mockProviderStreamByModel(
     allocator: std.mem.Allocator,
     _: *std.http.Client,
@@ -1739,6 +1769,7 @@ fn mockProviderStreamByModel(
 }
 
 var mockToolLoopCallCount: usize = 0;
+var mockSensitiveToolLoopCallCount: usize = 0;
 var mockCapturedProviderName: ?[]const u8 = null;
 var mockCapturedModelName: ?[]const u8 = null;
 var mockCapturedReasoning: ?[]const u8 = null;
@@ -1837,6 +1868,50 @@ fn mockProviderStreamByModelWithToolLoop(
     try std.testing.expect(std.mem.indexOf(u8, context.messages[0].content, "\"tool_result\"") != null);
     try events.append(.{ .done = .{
         .text = try allocator.dupe(u8, "tool loop complete"),
+        .thinking = try allocator.dupe(u8, ""),
+        .tool_calls = &.{},
+        .api = model.api,
+        .provider = model.provider,
+        .model = model.id,
+        .usage = .{},
+        .stop_reason = .stop,
+        .error_message = null,
+    } });
+}
+
+fn mockProviderStreamByModelWithSensitiveToolLoop(
+    allocator: std.mem.Allocator,
+    _: *std.http.Client,
+    _: *ziggy_piai.api_registry.ApiRegistry,
+    model: ziggy_piai.types.Model,
+    _: ziggy_piai.types.Context,
+    _: ziggy_piai.types.StreamOptions,
+    events: *std.array_list.Managed(ziggy_piai.types.AssistantMessageEvent),
+) anyerror!void {
+    if (mockSensitiveToolLoopCallCount == 0) {
+        mockSensitiveToolLoopCallCount += 1;
+        const tool_calls = try allocator.alloc(ziggy_piai.types.ToolCall, 1);
+        tool_calls[0] = .{
+            .id = try allocator.dupe(u8, "call-sensitive-1"),
+            .name = try allocator.dupe(u8, "file.list"),
+            .arguments_json = try allocator.dupe(u8, "{\"path\":\"src\",\"api_key\":\"sensitive-key\"}"),
+        };
+        try events.append(.{ .done = .{
+            .text = try allocator.dupe(u8, ""),
+            .thinking = try allocator.dupe(u8, ""),
+            .tool_calls = tool_calls,
+            .api = model.api,
+            .provider = model.provider,
+            .model = model.id,
+            .usage = .{},
+            .stop_reason = .tool_use,
+            .error_message = null,
+        } });
+        return;
+    }
+
+    try events.append(.{ .done = .{
+        .text = try allocator.dupe(u8, "sensitive tool loop complete"),
         .thinking = try allocator.dupe(u8, ""),
         .tool_calls = &.{},
         .api = model.api,
@@ -2081,6 +2156,42 @@ test "runtime_server: provider-backed session.send emits debug.event frames when
     try std.testing.expect(saw_provider_request);
     try std.testing.expect(saw_provider_response);
     try std.testing.expect(saw_session_receive);
+}
+
+test "runtime_server: debug provider.tool_call frames redact nested tool arguments" {
+    const allocator = std.testing.allocator;
+    const original_stream_fn = streamByModelFn;
+    defer streamByModelFn = original_stream_fn;
+    streamByModelFn = mockProviderStreamByModelWithSensitiveToolLoop;
+    mockSensitiveToolLoopCallCount = 0;
+
+    const server = try RuntimeServer.createWithProvider(allocator, "agent-debug-sensitive", .{
+        .ltm_directory = "",
+        .ltm_filename = "",
+    }, .{
+        .name = "openai",
+        .model = "gpt-4o-mini",
+        .api_key = "test-key",
+    });
+    defer server.destroy();
+
+    const responses = try server.handleMessageFramesWithDebug(
+        "{\"id\":\"req-debug-sensitive\",\"type\":\"session.send\",\"content\":\"use tool\"}",
+        true,
+    );
+    defer deinitResponseFrames(allocator, responses);
+
+    var saw_tool_call_debug = false;
+    for (responses) |payload| {
+        if (std.mem.indexOf(u8, payload, "\"category\":\"provider.tool_call\"") != null) {
+            saw_tool_call_debug = true;
+            try std.testing.expect(std.mem.indexOf(u8, payload, "\"arguments\":") != null);
+            try std.testing.expect(std.mem.indexOf(u8, payload, "\"api_key\":\"[redacted]\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, payload, "sensitive-key") == null);
+        }
+    }
+
+    try std.testing.expect(saw_tool_call_debug);
 }
 
 test "runtime_server: provider-only override resets inherited model selection" {
