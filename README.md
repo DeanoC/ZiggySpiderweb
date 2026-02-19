@@ -214,6 +214,10 @@ OpenClaw Client (ZSC, OpenClaw, etc.)
 | Multi-provider | ✅ (16 models) |
 | TLS | ❌ (localhost only) |
 
+## Ops Runbook
+
+- First agent bootstrap: `docs/FIRST_AGENT_BOOTSTRAP_RUNBOOK.md`
+
 ## Development
 
 ```bash
