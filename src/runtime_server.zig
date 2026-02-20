@@ -1358,6 +1358,10 @@ pub const RuntimeServer = struct {
         var round: usize = 0;
         var total_calls: usize = 0;
         while (round < MAX_PROVIDER_TOOL_ROUNDS) : (round += 1) {
+            self.runtime.refreshCorePrompt(brain_name) catch |err| {
+                std.log.warn("Failed to refresh core prompt memories for {s}: {s}", .{ brain_name, @errorName(err) });
+            };
+
             const active_memory_prompt = try self.buildProviderActiveMemoryPrompt(brain_name);
             defer self.allocator.free(active_memory_prompt);
 
@@ -1664,10 +1668,6 @@ pub const RuntimeServer = struct {
         context_window: u32,
         tool_context_token_estimate: usize,
     ) ![]u8 {
-        self.runtime.refreshCorePrompt(brain_name) catch |err| {
-            std.log.warn("Failed to refresh core prompt memories for {s}: {s}", .{ brain_name, @errorName(err) });
-        };
-
         const core_prompt = try self.buildCoreSystemPrompt(brain_name);
         defer self.allocator.free(core_prompt);
 
@@ -2474,6 +2474,31 @@ fn mockProviderStreamByModel(
     } });
 }
 
+fn mockProviderStreamAssertsFreshActiveSnapshot(
+    allocator: std.mem.Allocator,
+    _: *std.http.Client,
+    _: *ziggy_piai.api_registry.ApiRegistry,
+    model: ziggy_piai.types.Model,
+    context: ziggy_piai.types.Context,
+    _: ziggy_piai.types.StreamOptions,
+    events: *std.array_list.Managed(ziggy_piai.types.AssistantMessageEvent),
+) anyerror!void {
+    try std.testing.expectEqual(@as(usize, 1), context.messages.len);
+    try std.testing.expect(std.mem.indexOf(u8, context.messages[0].content, "core.stale_provider_entry") == null);
+
+    try events.append(.{ .done = .{
+        .text = try allocator.dupe(u8, "fresh snapshot response"),
+        .thinking = try allocator.dupe(u8, ""),
+        .tool_calls = &.{},
+        .api = model.api,
+        .provider = model.provider,
+        .model = model.id,
+        .usage = .{},
+        .stop_reason = .stop,
+        .error_message = null,
+    } });
+}
+
 var mockToolLoopCallCount: usize = 0;
 var mockSensitiveToolLoopCallCount: usize = 0;
 var mockRateLimitCallCount: usize = 0;
@@ -2935,6 +2960,38 @@ test "runtime_server: provider-backed session.send uses configured provider runt
         }
     }
     try std.testing.expectEqual(@as(usize, 1), assistant_turns);
+}
+
+test "runtime_server: provider request snapshot is refreshed before send" {
+    const allocator = std.testing.allocator;
+    const original_stream_fn = streamByModelFn;
+    defer streamByModelFn = original_stream_fn;
+    streamByModelFn = mockProviderStreamAssertsFreshActiveSnapshot;
+
+    const server = try RuntimeServer.createWithProvider(allocator, "agent-test", .{
+        .ltm_directory = "",
+        .ltm_filename = "",
+    }, .{
+        .name = "openai",
+        .model = "gpt-4o-mini",
+        .api_key = "test-key",
+    });
+    defer server.destroy();
+
+    var stale = try server.runtime.active_memory.createActiveNoHistory(
+        "primary",
+        "core.stale_provider_entry",
+        "core.system_prompt",
+        "\"stale\"",
+        true,
+        true,
+    );
+    defer stale.deinit(allocator);
+
+    const response = try server.handleMessage("{\"id\":\"req-provider-fresh-snapshot\",\"type\":\"session.send\",\"content\":\"hello provider\"}");
+    defer allocator.free(response);
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "fresh snapshot response") != null);
 }
 
 test "runtime_server: provider-backed session.send emits debug.event frames when enabled" {

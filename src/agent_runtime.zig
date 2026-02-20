@@ -543,14 +543,14 @@ pub const AgentRuntime = struct {
             if (findActiveByName(active_snapshot, core_name)) |item| {
                 if (std.mem.eql(u8, item.content_json, content_json) and !item.mutable) continue;
 
-                var removed = self.active_memory.removeActive(item.mem_id) catch |err| switch (err) {
+                var removed = self.active_memory.removeActiveNoHistory(item.mem_id) catch |err| switch (err) {
                     memory.MemoryError.NotFound => null,
                     else => return err,
                 };
                 if (removed) |*removed_item| removed_item.deinit(self.allocator);
             }
 
-            var created = try self.active_memory.create(
+            var created = try self.active_memory.createActiveNoHistory(
                 brain_name,
                 core_name,
                 core_kind,
@@ -566,7 +566,7 @@ pub const AgentRuntime = struct {
             const parsed = memid.MemId.parse(item.mem_id) catch continue;
             if (expected_core_names.contains(parsed.name)) continue;
 
-            var removed = self.active_memory.removeActive(item.mem_id) catch |err| switch (err) {
+            var removed = self.active_memory.removeActiveNoHistory(item.mem_id) catch |err| switch (err) {
                 memory.MemoryError.NotFound => continue,
                 else => return err,
             };

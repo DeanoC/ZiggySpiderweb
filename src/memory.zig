@@ -180,6 +180,36 @@ pub const RuntimeMemory = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
+        return self.createLocked(brain, name, kind, content_json, write_protected, unevictable, true);
+    }
+
+    /// Create an active memory entry without recording version history.
+    /// Intended for runtime-managed transient mirrors that can be regenerated.
+    pub fn createActiveNoHistory(
+        self: *RuntimeMemory,
+        brain: []const u8,
+        name: ?[]const u8,
+        kind: []const u8,
+        content_json: []const u8,
+        write_protected: bool,
+        unevictable: bool,
+    ) !ActiveMemoryItem {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        return self.createLocked(brain, name, kind, content_json, write_protected, unevictable, false);
+    }
+
+    fn createLocked(
+        self: *RuntimeMemory,
+        brain: []const u8,
+        name: ?[]const u8,
+        kind: []const u8,
+        content_json: []const u8,
+        write_protected: bool,
+        unevictable: bool,
+        persist_history: bool,
+    ) !ActiveMemoryItem {
         const store = try self.ensureBrainLocked(brain);
         const base_name = try self.uniqueNameLocked(store, brain, name);
         defer self.allocator.free(base_name);
@@ -205,7 +235,7 @@ pub const RuntimeMemory = struct {
         var inserted_into_map = false;
         errdefer if (!inserted_into_map) item.deinit(self.allocator);
 
-        try self.persistHistoryLocked(&item);
+        if (persist_history) try self.persistHistoryLocked(&item);
 
         try store.ram_items.put(self.allocator, item.mem_id, item);
         inserted_into_map = true;
@@ -287,10 +317,23 @@ pub const RuntimeMemory = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
+        return self.removeActiveLocked(raw_mem_id, true);
+    }
+
+    /// Remove an active memory entry without enforcing memory flags and without recording history.
+    /// Intended for runtime-managed transient mirrors that can be regenerated.
+    pub fn removeActiveNoHistory(self: *RuntimeMemory, raw_mem_id: []const u8) !ActiveMemoryItem {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        return self.removeActiveLocked(raw_mem_id, false);
+    }
+
+    fn removeActiveLocked(self: *RuntimeMemory, raw_mem_id: []const u8, persist_history: bool) !ActiveMemoryItem {
         const current_ref = try self.resolveMutableRefLocked(raw_mem_id);
         const current_item = current_ref.item.*;
 
-        try self.persistHistoryLocked(&current_item);
+        if (persist_history) try self.persistHistoryLocked(&current_item);
         const removed = try current_item.clone(self.allocator);
 
         current_ref.store.removeOrder(current_item.mem_id);
@@ -1025,6 +1068,24 @@ test "memory: removeActive bypasses unevictable guard for runtime-managed cleanu
     const snapshot = try mem.snapshotActive(allocator, "primary");
     defer deinitItems(allocator, snapshot);
     try std.testing.expectEqual(@as(usize, 0), snapshot.len);
+}
+
+test "memory: createActiveNoHistory and removeActiveNoHistory avoid version persistence" {
+    const allocator = std.testing.allocator;
+    var mem = try RuntimeMemory.init(allocator, "agentA");
+    defer mem.deinit();
+
+    var transient = try mem.createActiveNoHistory("primary", "core.transient", "core.system_prompt", "\"t1\"", true, true);
+    defer transient.deinit(allocator);
+
+    var removed = try mem.removeActiveNoHistory(transient.mem_id);
+    defer removed.deinit(allocator);
+
+    const snapshot = try mem.snapshotActive(allocator, "primary");
+    defer deinitItems(allocator, snapshot);
+    try std.testing.expectEqual(@as(usize, 0), snapshot.len);
+
+    try std.testing.expectError(MemoryError.NotFound, mem.load(transient.mem_id, null));
 }
 
 test "memory: persisted store supports reload across runtime restarts" {
