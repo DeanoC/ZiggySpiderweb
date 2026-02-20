@@ -39,6 +39,7 @@
   "allowed_tools": [
     "memory_create",
     "memory_load",
+    "memory_versions",
     "memory_mutate",
     "memory_search",
     "talk_brain",

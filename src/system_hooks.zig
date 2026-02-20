@@ -252,12 +252,6 @@ pub fn injectRuntimeStatusHook(ctx: *HookContext, data: HookData) HookError!void
 
     // Runtime state
     try rom.set("status:runtime_state", @tagName(ctx.runtime.state));
-
-    // Timestamp
-    const now = std.time.timestamp();
-    const time_str = std.fmt.allocPrint(allocator, "{d}", .{now}) catch return HookError.OutOfMemory;
-    defer allocator.free(time_str);
-    try rom.set("status:timestamp", time_str);
 }
 
 /// Persist LTM after results (PostResults hook)

@@ -34,7 +34,7 @@ You have tools that allow you to change yourself and the world.
 - `kind`: string : Semantic label describing what the memory represents.
 - `write_protected`: boolean : If `true`, `memory_mutate` should fail for this memory.
 - `unevictable`: boolean : If `true`, `memory_evict` should fail for this memory.
-- `content`: object : JSON value for the memory payload.
+- `content`: JSON value : The memory payload (object, string, number, boolean, array, or null).
 
 ## How To Use Memory Fields
 - Use `mem_id` when a tool requires a specific memory target.

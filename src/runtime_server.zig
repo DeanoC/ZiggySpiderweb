@@ -2805,6 +2805,7 @@ test "runtime_server: provider tool schemas include optional args and flexible c
     defer tool_registry.deinitProviderTools(allocator, specs);
 
     var saw_memory_load = false;
+    var saw_memory_versions = false;
     var saw_memory_search = false;
     var saw_memory_create = false;
     var saw_memory_mutate = false;
@@ -2813,6 +2814,9 @@ test "runtime_server: provider tool schemas include optional args and flexible c
         if (std.mem.eql(u8, spec.name, "memory_load")) {
             saw_memory_load = true;
             try std.testing.expect(std.mem.indexOf(u8, spec.parameters_json, "\"version\":{\"type\":\"integer\"}") != null);
+        } else if (std.mem.eql(u8, spec.name, "memory_versions")) {
+            saw_memory_versions = true;
+            try std.testing.expect(std.mem.indexOf(u8, spec.parameters_json, "\"limit\":{\"type\":\"integer\"}") != null);
         } else if (std.mem.eql(u8, spec.name, "memory_search")) {
             saw_memory_search = true;
             try std.testing.expect(std.mem.indexOf(u8, spec.parameters_json, "\"limit\":{\"type\":\"integer\"}") != null);
@@ -2829,6 +2833,7 @@ test "runtime_server: provider tool schemas include optional args and flexible c
     }
 
     try std.testing.expect(saw_memory_load);
+    try std.testing.expect(saw_memory_versions);
     try std.testing.expect(saw_memory_search);
     try std.testing.expect(saw_memory_create);
     try std.testing.expect(saw_memory_mutate);

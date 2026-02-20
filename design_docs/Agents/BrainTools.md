@@ -8,15 +8,23 @@ They are mostly presented as a group name then action in that group. i.e. `wait_
 
 ## memory - group for memory tools
 
-`memory_load`: takes a MemId and loads it from LTM to active memory
+`memory_load`: loads a memory by `mem_id` (latest by default, or a specific version).
 
 Arguments 
-- MemId – the MemId to load from LTM
-- Offset – the offset into the MemId to load from
-- Length – the length of the MemId to load (0 for all up to a fixed maximum)
+- `mem_id` (string) – canonical mem id
+- `version` (int, optional) – load a specific version
 
 Returns 
-- return Success<Actual length loaded> or Failure 
+- Memory payload and metadata, or Failure
+
+`memory_versions`: lists known versions of a memory in descending order.
+
+Arguments
+- `mem_id` (string) – canonical mem id (`:latest` alias supported)
+- `limit` (int, optional) – max rows to return
+
+Returns
+- list of versions with mem_id, version, kind, flags, and created_at_ms
 
 `memory_evict`: takes a MemId and evicts it from active memory
 

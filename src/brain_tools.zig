@@ -1,5 +1,6 @@
 const std = @import("std");
 const memory = @import("memory.zig");
+const memid = @import("memid.zig");
 const brain_context = @import("brain_context.zig");
 const event_bus = @import("event_bus.zig");
 const tool_registry = @import("tool_registry.zig");
@@ -25,6 +26,7 @@ pub const ToolSchema = struct {
 
 pub const brain_tool_schemas = [_]ToolSchema{
     .{ .name = "memory_load", .description = "Load memory by mem_id and optional version", .required_fields = &[_][]const u8{"mem_id"}, .optional_fields = &[_][]const u8{"version"} },
+    .{ .name = "memory_versions", .description = "List available versions for a memory", .required_fields = &[_][]const u8{"mem_id"}, .optional_fields = &[_][]const u8{"limit"} },
     .{ .name = "memory_evict", .description = "Evict memory by mem_id unless it is marked unevictable", .required_fields = &[_][]const u8{"mem_id"} },
     .{ .name = "memory_mutate", .description = "Mutate memory by mem_id unless it is write_protected", .required_fields = &[_][]const u8{ "mem_id", "content" } },
     .{ .name = "memory_create", .description = "Create memory entry. Optional flags: write_protected, unevictable.", .required_fields = &[_][]const u8{ "kind", "content" }, .optional_fields = &[_][]const u8{ "name", "write_protected", "unevictable" } },
@@ -222,6 +224,9 @@ pub const Engine = struct {
         if (std.mem.eql(u8, tool_use.name, "memory_load")) {
             return .{ .result = try self.execMemoryLoad(tool_use.name, args) };
         }
+        if (std.mem.eql(u8, tool_use.name, "memory_versions")) {
+            return .{ .result = try self.execMemoryVersions(tool_use.name, args) };
+        }
         if (std.mem.eql(u8, tool_use.name, "memory_mutate")) {
             return .{ .result = try self.execMemoryMutate(tool_use.name, args) };
         }
@@ -399,6 +404,47 @@ pub const Engine = struct {
             .{ mutated.mem_id, mutated.version orelse 0 },
         );
         return self.success(tool_name, payload);
+    }
+
+    fn execMemoryVersions(self: *Engine, tool_name: []const u8, args: std.json.ObjectMap) !ToolResult {
+        const mem_id = getRequiredString(args, "mem_id") orelse {
+            return self.failure(tool_name, "invalid_args", "memory_versions requires 'mem_id'");
+        };
+        const limit = getOptionalUsize(args, "limit") catch {
+            return self.failure(tool_name, "invalid_args", "memory_versions limit must be a non-negative integer");
+        } orelse 25;
+
+        const versions = self.runtime_memory.listVersions(self.allocator, mem_id, limit) catch |err| {
+            return self.failure(tool_name, "execution_failed", @errorName(err));
+        };
+        defer memory.deinitItems(self.allocator, versions);
+
+        var payload = std.ArrayListUnmanaged(u8){};
+        defer payload.deinit(self.allocator);
+
+        try payload.appendSlice(self.allocator, "{\"mem_id\":\"");
+        try appendJsonEscaped(self.allocator, &payload, mem_id);
+        try payload.appendSlice(self.allocator, "\",\"versions\":[");
+        for (versions, 0..) |item, index| {
+            if (index > 0) try payload.append(self.allocator, ',');
+
+            try payload.appendSlice(self.allocator, "{\"mem_id\":\"");
+            try appendJsonEscaped(self.allocator, &payload, item.mem_id);
+            try payload.appendSlice(self.allocator, "\",\"version\":");
+            try payload.writer(self.allocator).print("{d}", .{item.version orelse 0});
+            try payload.appendSlice(self.allocator, ",\"kind\":\"");
+            try appendJsonEscaped(self.allocator, &payload, item.kind);
+            try payload.appendSlice(self.allocator, "\",\"write_protected\":");
+            try payload.appendSlice(self.allocator, if (item.mutable) "false" else "true");
+            try payload.appendSlice(self.allocator, ",\"unevictable\":");
+            try payload.appendSlice(self.allocator, if (item.unevictable) "true" else "false");
+            try payload.appendSlice(self.allocator, ",\"created_at_ms\":");
+            try payload.writer(self.allocator).print("{d}", .{item.created_at_ms});
+            try payload.append(self.allocator, '}');
+        }
+        try payload.appendSlice(self.allocator, "]}");
+
+        return self.success(tool_name, try payload.toOwnedSlice(self.allocator));
     }
 
     fn execMemoryEvict(self: *Engine, tool_name: []const u8, args: std.json.ObjectMap) !ToolResult {
@@ -978,6 +1024,38 @@ test "brain_tools: memory_create then memory_load succeeds" {
     try std.testing.expect(load_results[0].success);
     try std.testing.expect(std.mem.indexOf(u8, load_results[0].payload_json, created_mem_id) != null);
     try std.testing.expect(std.mem.indexOf(u8, load_results[0].payload_json, "draft content") != null);
+}
+
+test "brain_tools: memory_versions returns latest-first history" {
+    const allocator = std.testing.allocator;
+    var mem = try memory.RuntimeMemory.init(allocator, "agentA");
+    defer mem.deinit();
+    var bus = event_bus.EventBus.init(allocator);
+    defer bus.deinit();
+
+    var brain = try brain_context.BrainContext.init(allocator, "primary");
+    defer brain.deinit();
+
+    var created = try mem.create("primary", "history_case", "note", "{\"text\":\"v1\"}", false, false);
+    defer created.deinit(allocator);
+    var second = try mem.mutate(created.mem_id, "{\"text\":\"v2\"}");
+    defer second.deinit(allocator);
+
+    const latest_alias = try (try memid.MemId.parse(created.mem_id)).withVersion(null).format(allocator);
+    defer allocator.free(latest_alias);
+
+    const args = try std.fmt.allocPrint(allocator, "{{\"mem_id\":\"{s}\",\"limit\":2}}", .{latest_alias});
+    defer allocator.free(args);
+    try brain.queueToolUse("memory_versions", args);
+
+    var engine = Engine.init(allocator, &mem, &bus);
+    const results = try engine.executePending(&brain);
+    defer deinitResults(allocator, results);
+
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expect(results[0].success);
+    try std.testing.expect(std.mem.indexOf(u8, results[0].payload_json, "\"version\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, results[0].payload_json, "\"version\":1") != null);
 }
 
 test "brain_tools: memory_load escapes kind in JSON payload" {

@@ -372,6 +372,68 @@ pub const RuntimeMemory = struct {
         return out.toOwnedSlice(allocator);
     }
 
+    pub fn listVersions(
+        self: *RuntimeMemory,
+        allocator: std.mem.Allocator,
+        raw_mem_id: []const u8,
+        limit: usize,
+    ) ![]ActiveMemoryItem {
+        if (limit == 0) return allocator.alloc(ActiveMemoryItem, 0);
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const parsed = memid.MemId.parse(raw_mem_id) catch return MemoryError.InvalidMemId;
+        const base_id = try parsed.formatBase(self.allocator);
+        defer self.allocator.free(base_id);
+
+        var out = std.ArrayListUnmanaged(ActiveMemoryItem){};
+        errdefer {
+            for (out.items) |*item| item.deinit(allocator);
+            out.deinit(allocator);
+        }
+
+        if (self.brains.getPtr(parsed.brain)) |store| {
+            var ram_it = store.ram_items.iterator();
+            while (ram_it.next()) |entry| {
+                const current = entry.value_ptr;
+                const current_parsed = memid.MemId.parse(current.mem_id) catch continue;
+                if (!sameBase(&parsed, &current_parsed)) continue;
+                try appendVersionIfMissing(allocator, &out, current);
+            }
+        }
+
+        if (self.history_by_base.getPtr(base_id)) |history| {
+            for (history.versions.items) |*item| {
+                try appendVersionIfMissing(allocator, &out, item);
+            }
+        }
+
+        if (self.persisted_store) |store| {
+            const persisted_rows = store.listVersions(self.allocator, base_id, limit) catch return MemoryError.PersistenceFailed;
+            defer ltm_store.deinitRecords(self.allocator, persisted_rows);
+
+            for (persisted_rows) |*record| {
+                var item = try self.itemFromPersistedRecord(parsed.brain, record);
+                errdefer item.deinit(allocator);
+                if (containsVersion(out.items, item.version)) {
+                    item.deinit(allocator);
+                    continue;
+                }
+                try out.append(allocator, item);
+            }
+        }
+
+        std.mem.sort(ActiveMemoryItem, out.items, {}, lessThanVersionDesc);
+
+        if (out.items.len > limit) {
+            for (out.items[limit..]) |*item| item.deinit(allocator);
+            out.shrinkRetainingCapacity(limit);
+        }
+
+        return out.toOwnedSlice(allocator);
+    }
+
     pub fn snapshotActive(self: *RuntimeMemory, allocator: std.mem.Allocator, brain: []const u8) ![]ActiveMemoryItem {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -635,6 +697,28 @@ fn hasNameInIterator(it: std.StringHashMapUnmanaged(ActiveMemoryItem).Iterator, 
 
 fn sameBase(a: *const memid.MemId, b: *const memid.MemId) bool {
     return std.mem.eql(u8, a.agent, b.agent) and std.mem.eql(u8, a.brain, b.brain) and std.mem.eql(u8, a.name, b.name);
+}
+
+fn appendVersionIfMissing(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(ActiveMemoryItem),
+    item: *const ActiveMemoryItem,
+) !void {
+    if (containsVersion(out.items, item.version)) return;
+    try out.append(allocator, try item.clone(allocator));
+}
+
+fn containsVersion(items: []const ActiveMemoryItem, target: ?u64) bool {
+    for (items) |item| {
+        if (item.version == target) return true;
+    }
+    return false;
+}
+
+fn lessThanVersionDesc(_: void, lhs: ActiveMemoryItem, rhs: ActiveMemoryItem) bool {
+    const lhs_version = lhs.version orelse 0;
+    const rhs_version = rhs.version orelse 0;
+    return lhs_version > rhs_version;
 }
 
 fn matchesKeyword(item: *const ActiveMemoryItem, keyword_lower: []const u8) bool {
@@ -973,6 +1057,31 @@ test "memory: create allocates next version from persisted history" {
     defer latest.deinit(allocator);
     try std.testing.expectEqual(@as(?u64, 2), latest.version);
     try std.testing.expectEqualStrings("{\"text\":\"v2\"}", latest.content_json);
+}
+
+test "memory: listVersions returns latest-first history for a mem_id" {
+    const allocator = std.testing.allocator;
+    var mem = try RuntimeMemory.init(allocator, "agentA");
+    defer mem.deinit();
+
+    var created = try mem.create("primary", "timeline", "note", "{\"text\":\"v1\"}", false, false);
+    defer created.deinit(allocator);
+    var v2 = try mem.mutate(created.mem_id, "{\"text\":\"v2\"}");
+    defer v2.deinit(allocator);
+    var v3 = try mem.mutate(v2.mem_id, "{\"text\":\"v3\"}");
+    defer v3.deinit(allocator);
+
+    const latest_alias = try (try memid.MemId.parse(created.mem_id)).withVersion(null).format(allocator);
+    defer allocator.free(latest_alias);
+
+    const versions = try mem.listVersions(allocator, latest_alias, 2);
+    defer deinitItems(allocator, versions);
+
+    try std.testing.expectEqual(@as(usize, 2), versions.len);
+    try std.testing.expectEqual(@as(?u64, 3), versions[0].version);
+    try std.testing.expectEqualStrings("{\"text\":\"v3\"}", versions[0].content_json);
+    try std.testing.expectEqual(@as(?u64, 2), versions[1].version);
+    try std.testing.expectEqualStrings("{\"text\":\"v2\"}", versions[1].content_json);
 }
 
 test "memory: auto-generated base names continue across runtime restart" {

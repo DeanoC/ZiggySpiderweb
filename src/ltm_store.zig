@@ -249,6 +249,49 @@ pub const VersionedMemStore = struct {
         return out.toOwnedSlice(allocator);
     }
 
+    pub fn listVersions(
+        self: *VersionedMemStore,
+        allocator: std.mem.Allocator,
+        base_id: []const u8,
+        limit: usize,
+    ) ![]VersionedRecord {
+        const base_id_escaped = try self.escapeSqlLiteral(base_id);
+        defer self.allocator.free(base_id_escaped);
+
+        const sql = try std.fmt.allocPrint(
+            self.allocator,
+            "SELECT base_id, version, kind, content_json, created_at_ms FROM mem_versions " ++
+                "WHERE base_id = {s} ORDER BY version DESC LIMIT {d};",
+            .{ base_id_escaped, limit },
+        );
+        defer self.allocator.free(sql);
+
+        const stmt = try self.prepare(sql);
+        defer _ = sqlite3_finalize(stmt);
+
+        var out = std.ArrayListUnmanaged(VersionedRecord){};
+        errdefer {
+            for (out.items) |*record| record.deinit(allocator);
+            out.deinit(allocator);
+        }
+
+        while (true) {
+            const rc = sqlite3_step(stmt);
+            if (rc == SQLITE_DONE) break;
+            if (rc != SQLITE_ROW) return LtmError.ExecError;
+
+            try out.append(allocator, .{
+                .base_id = try self.copyColumnText(allocator, stmt, 0),
+                .version = try self.columnToU64(stmt, 1),
+                .kind = try self.copyColumnText(allocator, stmt, 2),
+                .content_json = try self.copyColumnText(allocator, stmt, 3),
+                .created_at_ms = sqlite3_column_int64(stmt, 4),
+            });
+        }
+
+        return out.toOwnedSlice(allocator);
+    }
+
     fn initSchema(self: *VersionedMemStore) !void {
         const schema_sql =
             "CREATE TABLE IF NOT EXISTS mem_versions (" ++
@@ -427,6 +470,31 @@ test "ltm_store: persistVersion is idempotent for same base/version" {
     var latest = (try store.load(allocator, "agent:primary:artifact", null)).?;
     defer latest.deinit(allocator);
     try std.testing.expectEqual(@as(u64, 3), latest.version);
+}
+
+test "ltm_store: listVersions returns latest-first rows for a base id" {
+    const allocator = std.testing.allocator;
+    const dir = try std.fmt.allocPrint(allocator, ".tmp-vltm-list-versions-{d}", .{std.time.nanoTimestamp()});
+    defer allocator.free(dir);
+    defer std.fs.cwd().deleteTree(dir) catch {};
+
+    try std.fs.cwd().makePath(dir);
+    var store = try VersionedMemStore.open(allocator, dir, "runtime-memory.db");
+    defer store.close();
+
+    try store.persistVersionAt("agent:primary:notes", 1, "note", "{\"text\":\"v1\"}", 11);
+    try store.persistVersionAt("agent:primary:notes", 2, "note", "{\"text\":\"v2\"}", 12);
+    try store.persistVersionAt("agent:primary:notes", 3, "note", "{\"text\":\"v3\"}", 13);
+    try store.persistVersionAt("agent:primary:other", 1, "note", "{\"text\":\"skip\"}", 14);
+
+    const rows = try store.listVersions(allocator, "agent:primary:notes", 2);
+    defer deinitRecords(allocator, rows);
+
+    try std.testing.expectEqual(@as(usize, 2), rows.len);
+    try std.testing.expectEqual(@as(u64, 3), rows[0].version);
+    try std.testing.expectEqualStrings("{\"text\":\"v3\"}", rows[0].content_json);
+    try std.testing.expectEqual(@as(u64, 2), rows[1].version);
+    try std.testing.expectEqualStrings("{\"text\":\"v2\"}", rows[1].content_json);
 }
 
 test "ltm_store: highestAutoMemIndex only counts canonical auto names for agent and brain" {
