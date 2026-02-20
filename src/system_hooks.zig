@@ -406,6 +406,13 @@ fn getToolSchemas(allocator: std.mem.Allocator) ![]u8 {
             if (j > 0) try writer.writeByte(',');
             try writeJsonString(writer, field);
         }
+        try writer.writeAll("],");
+        // optional_fields
+        try writer.writeAll("\"optional_fields\":[");
+        for (schema.optional_fields, 0..) |field, j| {
+            if (j > 0) try writer.writeByte(',');
+            try writeJsonString(writer, field);
+        }
         try writer.writeAll("]");
 
         try writer.writeByte('}');

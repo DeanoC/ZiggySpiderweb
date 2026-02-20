@@ -1790,7 +1790,11 @@ pub const RuntimeServer = struct {
         }
 
         for (brain_tools.brain_tool_schemas) |schema| {
-            const parameters_json = try buildBrainToolParametersJson(allocator, schema.required_fields);
+            const parameters_json = try buildBrainToolParametersJson(
+                allocator,
+                schema.required_fields,
+                schema.optional_fields,
+            );
             errdefer allocator.free(parameters_json);
 
             try out.append(allocator, .{
@@ -1806,17 +1810,30 @@ pub const RuntimeServer = struct {
     fn buildBrainToolParametersJson(
         allocator: std.mem.Allocator,
         required_fields: []const []const u8,
+        optional_fields: []const []const u8,
     ) ![]u8 {
         var out = std.ArrayListUnmanaged(u8){};
         defer out.deinit(allocator);
 
         try out.appendSlice(allocator, "{\"type\":\"object\",\"properties\":{");
+        var has_property = false;
         for (required_fields, 0..) |field, idx| {
-            if (idx > 0) try out.append(allocator, ',');
+            _ = idx;
+            if (has_property) try out.append(allocator, ',');
             try out.appendSlice(allocator, "\"");
             try appendJsonEscaped(allocator, &out, field);
             try out.appendSlice(allocator, "\":");
             try appendBrainToolFieldSchemaJson(allocator, &out, field);
+            has_property = true;
+        }
+        for (optional_fields) |field| {
+            if (containsField(required_fields, field)) continue;
+            if (has_property) try out.append(allocator, ',');
+            try out.appendSlice(allocator, "\"");
+            try appendJsonEscaped(allocator, &out, field);
+            try out.appendSlice(allocator, "\":");
+            try appendBrainToolFieldSchemaJson(allocator, &out, field);
+            has_property = true;
         }
         try out.appendSlice(allocator, "},\"required\":[");
         for (required_fields, 0..) |field, idx| {
@@ -1828,6 +1845,13 @@ pub const RuntimeServer = struct {
         try out.appendSlice(allocator, "]}");
 
         return out.toOwnedSlice(allocator);
+    }
+
+    fn containsField(fields: []const []const u8, candidate: []const u8) bool {
+        for (fields) |field| {
+            if (std.mem.eql(u8, field, candidate)) return true;
+        }
+        return false;
     }
 
     fn brainToolFieldType(field: []const u8) []const u8 {
@@ -1852,6 +1876,12 @@ pub const RuntimeServer = struct {
         out: *std.ArrayListUnmanaged(u8),
         field: []const u8,
     ) !void {
+        if (std.mem.eql(u8, field, "content")) {
+            // content accepts any JSON value in memory_create/memory_mutate.
+            try out.appendSlice(allocator, "{}");
+            return;
+        }
+
         if (std.mem.eql(u8, field, "events")) {
             try out.appendSlice(allocator, "{\"type\":\"array\",\"items\":{\"type\":\"object\"}}");
             return;
@@ -2767,6 +2797,41 @@ test "runtime_server: wait_for tool schema includes events items" {
     }
 
     return error.TestUnexpectedResult;
+}
+
+test "runtime_server: provider tool schemas include optional args and flexible content" {
+    const allocator = std.testing.allocator;
+    const specs = try RuntimeServer.buildProviderBrainTools(allocator);
+    defer tool_registry.deinitProviderTools(allocator, specs);
+
+    var saw_memory_load = false;
+    var saw_memory_search = false;
+    var saw_memory_create = false;
+    var saw_memory_mutate = false;
+
+    for (specs) |spec| {
+        if (std.mem.eql(u8, spec.name, "memory_load")) {
+            saw_memory_load = true;
+            try std.testing.expect(std.mem.indexOf(u8, spec.parameters_json, "\"version\":{\"type\":\"integer\"}") != null);
+        } else if (std.mem.eql(u8, spec.name, "memory_search")) {
+            saw_memory_search = true;
+            try std.testing.expect(std.mem.indexOf(u8, spec.parameters_json, "\"limit\":{\"type\":\"integer\"}") != null);
+        } else if (std.mem.eql(u8, spec.name, "memory_create")) {
+            saw_memory_create = true;
+            try std.testing.expect(std.mem.indexOf(u8, spec.parameters_json, "\"name\":{\"type\":\"string\"}") != null);
+            try std.testing.expect(std.mem.indexOf(u8, spec.parameters_json, "\"write_protected\":{\"type\":\"boolean\"}") != null);
+            try std.testing.expect(std.mem.indexOf(u8, spec.parameters_json, "\"unevictable\":{\"type\":\"boolean\"}") != null);
+            try std.testing.expect(std.mem.indexOf(u8, spec.parameters_json, "\"content\":{}") != null);
+        } else if (std.mem.eql(u8, spec.name, "memory_mutate")) {
+            saw_memory_mutate = true;
+            try std.testing.expect(std.mem.indexOf(u8, spec.parameters_json, "\"content\":{}") != null);
+        }
+    }
+
+    try std.testing.expect(saw_memory_load);
+    try std.testing.expect(saw_memory_search);
+    try std.testing.expect(saw_memory_create);
+    try std.testing.expect(saw_memory_mutate);
 }
 
 test "runtime_server: session.send returns all outbound runtime frames" {

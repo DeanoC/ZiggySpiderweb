@@ -20,14 +20,15 @@ pub const ToolSchema = struct {
     name: []const u8,
     description: []const u8,
     required_fields: []const []const u8,
+    optional_fields: []const []const u8 = &.{},
 };
 
 pub const brain_tool_schemas = [_]ToolSchema{
-    .{ .name = "memory_load", .description = "Load memory by mem_id and optional version", .required_fields = &[_][]const u8{"mem_id"} },
+    .{ .name = "memory_load", .description = "Load memory by mem_id and optional version", .required_fields = &[_][]const u8{"mem_id"}, .optional_fields = &[_][]const u8{"version"} },
     .{ .name = "memory_evict", .description = "Evict memory by mem_id unless it is marked unevictable", .required_fields = &[_][]const u8{"mem_id"} },
     .{ .name = "memory_mutate", .description = "Mutate memory by mem_id unless it is write_protected", .required_fields = &[_][]const u8{ "mem_id", "content" } },
-    .{ .name = "memory_create", .description = "Create memory entry. Optional flags: write_protected, unevictable.", .required_fields = &[_][]const u8{ "kind", "content" } },
-    .{ .name = "memory_search", .description = "Keyword search memory entries", .required_fields = &[_][]const u8{"query"} },
+    .{ .name = "memory_create", .description = "Create memory entry. Optional flags: write_protected, unevictable.", .required_fields = &[_][]const u8{ "kind", "content" }, .optional_fields = &[_][]const u8{ "name", "write_protected", "unevictable" } },
+    .{ .name = "memory_search", .description = "Keyword search memory entries", .required_fields = &[_][]const u8{"query"}, .optional_fields = &[_][]const u8{"limit"} },
     .{ .name = "wait_for", .description = "Wait for correlated talk/event", .required_fields = &[_][]const u8{"events"} },
     .{ .name = "talk_user", .description = "Send message to user channel", .required_fields = &[_][]const u8{"message"} },
     .{ .name = "talk_agent", .description = "Send message to another agent channel", .required_fields = &[_][]const u8{ "message", "target_brain" } },
