@@ -123,11 +123,11 @@ World tools are executed through provider tool-calling during `session.send`.
 
 Implemented tool names:
 
-- `file.read`
-- `file.write`
-- `file.list`
-- `search.code`
-- `shell.exec`
+- `file_read`
+- `file_write`
+- `file_list`
+- `search_code`
+- `shell_exec`
 
 ### API Key Storage
 

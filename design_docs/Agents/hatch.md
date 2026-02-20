@@ -9,7 +9,7 @@ Hatching is the process of creating and initializing a new agent in the ZiggySpi
 ### Templates vs Agent Instances
 
 **Templates (Filesystem)**
-- System template files: `SOUL.md`, `AGENT.md`, `IDENTITY.md`, `JUST_HATCHED.md`, `BOOTSTRAP.md`
+- System template files: `CORE.md`, `SOUL.md`, `AGENT.md`, `IDENTITY.md`, `JUST_HATCHED.md`, `BOOTSTRAP.md`
 - Stored in the filesystem as read-only blueprints
 - Only the **first agent** has privilege to modify these templates
 - Regular agents cannot access or modify templates
@@ -18,7 +18,7 @@ Hatching is the process of creating and initializing a new agent in the ZiggySpi
 - Each agent has its own isolated LTM database
 - Agent identity and state are stored in LTM, not files
 - No filesystem access for agent self-modification after hatching
-- All agent state changes go through `memory.*` tools with versioning
+- All agent state changes go through `memory_*` tools with versioning
 
 ### Memory Model
 
@@ -26,7 +26,7 @@ Hatching is the process of creating and initializing a new agent in the ZiggySpi
 ┌─────────────────────────────────────────────────────────┐
 │  Agent Instance Memory                                  │
 ├─────────────────────────────────────────────────────────┤
-│  Active Memory (RAM)  │  Long-Term Memory (LTM)         │
+│  Active Memory        │  Long-Term Memory (LTM)         │
 │  ───────────────────  │  ─────────────────────────────  │
 │  Working cache        │  Persistent storage             │
 │  Evictable            │  Versioned history              │
@@ -42,9 +42,10 @@ Hatching is the process of creating and initializing a new agent in the ZiggySpi
 
 1. **Templates loaded** from filesystem into first agent's LTM
 2. **Identity memories created** with fixed MemIds:
-   - `<EOT>agent:primary:system:soul:latest<EOT>`
-   - `<EOT>agent:primary:system:agent:latest<EOT>`
-   - `<EOT>agent:primary:system:identity:latest<EOT>`
+   - `<EOT>agent:primary:system.core:latest<EOT>` (base core instructions)
+   - `<EOT>agent:primary:system.soul:latest<EOT>`
+   - `<EOT>agent:primary:system.agent:latest<EOT>`
+   - `<EOT>agent:primary:system.identity:latest<EOT>`
 3. **Marked unevictable** in active memory (always present)
 4. **First message**: `BOOTSTRAP.md` content sent as user message
    - Contains system-wide configuration questions
@@ -54,7 +55,7 @@ Hatching is the process of creating and initializing a new agent in the ZiggySpi
 ### Subsequent Agents
 
 1. **Templates copied** from system templates to new agent's LTM
-2. **Identity memories created** with same fixed MemId pattern
+2. **Core + identity memories created** with same fixed MemId pattern
 3. **Marked unevictable** in active memory
 4. **First message**: `JUST_HATCHED.md` content sent as user message
    - Contains welcome and initial guidance
@@ -68,7 +69,7 @@ Agents can evolve their identity over time:
 ```
 Agent wants to change its values:
   ↓
-Uses memory.mutate on identity MemId
+Uses `memory_mutate` on identity MemId
   ↓
 Change persisted to LTM with new version
   ↓
@@ -77,15 +78,15 @@ Active memory updated (still unevictable)
 Version history preserved for rollback
 ```
 
-**Important**: The agent is modifying its own being. The ROM guidance reminds:
-> "These memories define you. You may evolve them using memory.mutate, but consider carefully — you are changing your own essence."
+**Important**: The agent is modifying its own being. Core system-prompt guidance reminds:
+> "These memories define you. You may evolve them using memory_mutate, but consider carefully — you are changing your own essence."
 
 ## Hatch Completion
 
 Unlike the previous design, there is **no explicit hatch signal**. Hatch is complete when:
 
 1. Identity files loaded into LTM
-2. Identity memories marked unevictable in RAM
+2. Identity memories marked unevictable in active memory
 3. First message (JUST_HATCHED.md or BOOTSTRAP.md) delivered
 4. **Agent begins chatting**
 
@@ -104,6 +105,7 @@ The transition from "hatching" to "operational" is seamless.
 
 ```
 system/                        # System templates (read-only for regular agents)
+├── CORE.md                    # Base core instructions (loaded first)
 ├── SOUL.md                    # Default personality template
 ├── AGENT.md                   # Default operational rules template
 ├── IDENTITY.md                # Default public identity template

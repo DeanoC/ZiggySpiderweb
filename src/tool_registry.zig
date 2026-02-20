@@ -246,7 +246,7 @@ test "tool_registry: registers brain schema and emits required fields" {
     defer registry.deinit();
 
     try registry.registerBrainToolSchema(
-        "memory.mutate",
+        "memory_mutate",
         "Mutate memory by mem_id",
         &[_]ToolParam{
             .{ .name = "mem_id", .param_type = .string, .description = "Canonical mem id", .required = true },
@@ -254,5 +254,5 @@ test "tool_registry: registers brain schema and emits required fields" {
         },
     );
 
-    try std.testing.expect(registry.get("memory.mutate") != null);
+    try std.testing.expect(registry.get("memory_mutate") != null);
 }

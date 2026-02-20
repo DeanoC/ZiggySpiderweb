@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const Config = @import("config.zig");
 const protocol = @import("protocol.zig");
 const agent_runtime = @import("agent_runtime.zig");
+const brain_tools = @import("brain_tools.zig");
 const brain_specialization = @import("brain_specialization.zig");
 const credential_store = @import("credential_store.zig");
 const memory = @import("memory.zig");
@@ -22,6 +23,8 @@ const PROVIDER_RETRY_MAX_DELAY_MS: u64 = if (builtin.is_test) 8 else 4000;
 const PROVIDER_RETRY_JITTER_MS: u64 = if (builtin.is_test) 1 else 200;
 const BOOTSTRAP_COMPLETE_MEM_NAME = "system.bootstrap.complete";
 const BOOTSTRAP_COMPLETE_MEM_KIND = "bootstrap.status";
+const BASE_CORE_PROMPT_KIND = "core.base_prompt";
+const BASE_CORE_PROMPT_NAME = "core.system.base_instructions";
 
 const RuntimeServerError = error{
     RuntimeTickTimeout,
@@ -690,10 +693,10 @@ pub const RuntimeServer = struct {
 
         var created = try self.runtime.active_memory.create(
             brain_name,
-            .ram,
             BOOTSTRAP_COMPLETE_MEM_NAME,
             BOOTSTRAP_COMPLETE_MEM_KIND,
             payload,
+            false,
             true,
         );
         created.deinit(self.allocator);
@@ -741,7 +744,7 @@ pub const RuntimeServer = struct {
         defer self.allocator.free(escaped_content);
         const talk_args = try std.fmt.allocPrint(self.allocator, "{{\"message\":\"{s}\"}}", .{escaped_content});
         defer self.allocator.free(talk_args);
-        self.runtime.queueToolUse(DEFAULT_BRAIN, "talk.user", talk_args) catch |err| {
+        self.runtime.queueToolUse(DEFAULT_BRAIN, "talk_user", talk_args) catch |err| {
             return self.wrapRuntimeErrorResponse(request_id, err, job.emit_debug);
         };
 
@@ -1145,7 +1148,7 @@ pub const RuntimeServer = struct {
             return .{ .runtime_error = RuntimeServerError.ProviderAuthFailed, .retryable = false };
         }
 
-        if (containsAnyIgnoreCase(message, &.{ "400", "404", "422", "bad request", "invalid request", "model not found", "unsupported model", "unknown model", "unrecognized request argument" }) or
+        if (containsAnyIgnoreCase(message, &.{ "400", "404", "422", "bad request", "invalid request", "invalid schema", "schema missing", "model not found", "unsupported model", "unknown model", "unrecognized request argument" }) or
             containsAnyIgnoreCase(err_name, &.{ "BadRequest", "InvalidRequest", "ModelNotFound", "ProviderNotRegistered" }))
         {
             return .{ .runtime_error = RuntimeServerError.ProviderRequestInvalid, .retryable = false };
@@ -1294,38 +1297,63 @@ pub const RuntimeServer = struct {
 
         const primary_model = selectModel(provider_runtime, provider_name, model_name) orelse return RuntimeServerError.ProviderModelNotFound;
 
+        const brain_tool_specs = try buildProviderBrainTools(self.allocator);
+        defer tool_registry.deinitProviderTools(self.allocator, brain_tool_specs);
         const world_tool_specs = try self.runtime.world_tools.exportProviderWorldTools(self.allocator);
         defer tool_registry.deinitProviderTools(self.allocator, world_tool_specs);
 
-        const provider_tools = try self.allocator.alloc(ziggy_piai.types.Tool, world_tool_specs.len);
+        const total_tool_count = brain_tool_specs.len + world_tool_specs.len;
+        const provider_tools = try self.allocator.alloc(ziggy_piai.types.Tool, total_tool_count);
         defer self.allocator.free(provider_tools);
-        const provider_tool_name_map = try self.allocator.alloc(ProviderToolNameMapEntry, world_tool_specs.len);
+        const provider_tool_name_map = try self.allocator.alloc(ProviderToolNameMapEntry, total_tool_count);
         var provider_tool_name_count: usize = 0;
         defer {
             for (provider_tool_name_map[0..provider_tool_name_count]) |entry| self.allocator.free(entry.provider_name);
             self.allocator.free(provider_tool_name_map);
         }
-        for (world_tool_specs, 0..) |spec, idx| {
+
+        var provider_idx: usize = 0;
+        for (brain_tool_specs) |spec| {
             const provider_tool_name = try sanitizeProviderToolName(
                 self.allocator,
                 spec.name,
-                idx,
-                provider_tool_name_map[0..idx],
+                provider_idx,
+                provider_tool_name_map[0..provider_idx],
             );
-            provider_tool_name_map[idx] = .{
+            provider_tool_name_map[provider_idx] = .{
                 .provider_name = provider_tool_name,
                 .runtime_name = spec.name,
             };
             provider_tool_name_count += 1;
-            provider_tools[idx] = .{
+            provider_tools[provider_idx] = .{
                 .name = provider_tool_name,
                 .description = spec.description,
                 .parameters_json = spec.parameters_json,
             };
+            provider_idx += 1;
         }
 
-        const provider_instructions = try self.buildProviderInstructions(brain_name);
-        defer self.allocator.free(provider_instructions);
+        for (world_tool_specs) |spec| {
+            const provider_tool_name = try sanitizeProviderToolName(
+                self.allocator,
+                spec.name,
+                provider_idx,
+                provider_tool_name_map[0..provider_idx],
+            );
+            provider_tool_name_map[provider_idx] = .{
+                .provider_name = provider_tool_name,
+                .runtime_name = spec.name,
+            };
+            provider_tool_name_count += 1;
+            provider_tools[provider_idx] = .{
+                .name = provider_tool_name,
+                .description = spec.description,
+                .parameters_json = spec.parameters_json,
+            };
+            provider_idx += 1;
+        }
+
+        const tool_context_token_estimate = estimateProviderToolContextTokens(provider_tools);
 
         var round: usize = 0;
         var total_calls: usize = 0;
@@ -1345,15 +1373,24 @@ pub const RuntimeServer = struct {
                     .content = active_memory_prompt,
                 },
             };
-            const context = ziggy_piai.types.Context{
-                .system_prompt = provider_instructions,
-                .messages = &messages,
-                .tools = provider_tools,
-            };
             var selected_model = primary_model;
             var used_fallback = false;
             var attempt_idx: usize = 0;
             provider_attempt_loop: while (true) {
+                const provider_instructions = try self.buildProviderInstructions(
+                    brain_name,
+                    active_memory_prompt,
+                    selected_model.context_window,
+                    tool_context_token_estimate,
+                );
+                defer self.allocator.free(provider_instructions);
+
+                const context = ziggy_piai.types.Context{
+                    .system_prompt = provider_instructions,
+                    .messages = &messages,
+                    .tools = provider_tools,
+                };
+
                 const api_key = try self.resolveApiKey(provider_runtime, selected_model.provider);
                 defer self.allocator.free(api_key);
 
@@ -1620,12 +1657,293 @@ pub const RuntimeServer = struct {
         return RuntimeServerError.ProviderToolLoopExceeded;
     }
 
-    fn buildProviderInstructions(self: *RuntimeServer, brain_name: []const u8) ![]u8 {
+    fn buildProviderInstructions(
+        self: *RuntimeServer,
+        brain_name: []const u8,
+        active_memory_prompt: []const u8,
+        context_window: u32,
+        tool_context_token_estimate: usize,
+    ) ![]u8 {
+        self.runtime.refreshCorePrompt(brain_name) catch |err| {
+            std.log.warn("Failed to refresh core prompt memories for {s}: {s}", .{ brain_name, @errorName(err) });
+        };
+
+        const core_prompt = try self.buildCoreSystemPrompt(brain_name);
+        defer self.allocator.free(core_prompt);
+
+        const dynamic_board = try self.buildDynamicCoreInfoBoard(
+            brain_name,
+            core_prompt,
+            active_memory_prompt,
+            context_window,
+            tool_context_token_estimate,
+        );
+        defer self.allocator.free(dynamic_board);
+
+        var core_prompt_with_board = std.ArrayListUnmanaged(u8){};
+        defer core_prompt_with_board.deinit(self.allocator);
+        if (core_prompt.len > 0) {
+            try core_prompt_with_board.appendSlice(self.allocator, core_prompt);
+            if (core_prompt[core_prompt.len - 1] != '\n') try core_prompt_with_board.appendSlice(self.allocator, "\n");
+            try core_prompt_with_board.appendSlice(self.allocator, "\n");
+        }
+        try core_prompt_with_board.appendSlice(self.allocator, dynamic_board);
+        if (dynamic_board.len == 0 or dynamic_board[dynamic_board.len - 1] != '\n') {
+            try core_prompt_with_board.appendSlice(self.allocator, "\n");
+        }
+
+        return core_prompt_with_board.toOwnedSlice(self.allocator);
+    }
+
+    fn buildDynamicCoreInfoBoard(
+        self: *RuntimeServer,
+        brain_name: []const u8,
+        core_prompt: []const u8,
+        active_memory_prompt: []const u8,
+        context_window: u32,
+        tool_context_token_estimate: usize,
+    ) ![]u8 {
+        const context_limit = @as(usize, context_window);
+        const unix_time = std.time.timestamp();
+        const timestamp_utc = try formatUtcTimestamp(self.allocator, unix_time);
+        defer self.allocator.free(timestamp_utc);
+
+        // Two-pass estimate so the board includes itself in the approximation.
+        const base_estimate = estimateTokenCount(core_prompt) + estimateTokenCount(active_memory_prompt) + tool_context_token_estimate;
+        const preview_board = try std.fmt.allocPrint(
+            self.allocator,
+            \\## Dynamic Info Board
+            \\- agent_name: {s}
+            \\- brain_name: {s}
+            \\- approximate_context_used: {d}/{d}
+            \\- date_time_utc: {s}
+            \\- unix_time: {d}
+            \\
+        ,
+            .{ self.runtime.agent_id, brain_name, base_estimate, context_limit, timestamp_utc, unix_time },
+        );
+        defer self.allocator.free(preview_board);
+
+        const final_estimate = estimateTokenCount(core_prompt) +
+            estimateTokenCount(active_memory_prompt) +
+            tool_context_token_estimate +
+            estimateTokenCount(preview_board);
+
         return std.fmt.allocPrint(
             self.allocator,
-            "You are {s}, the {s} brain in the ZiggySpiderweb runtime. Follow your identity memories and respond helpfully and directly.",
-            .{ self.runtime.agent_id, brain_name },
+            \\## Dynamic Info Board
+            \\- agent_name: {s}
+            \\- brain_name: {s}
+            \\- approximate_context_used: {d}/{d}
+            \\- date_time_utc: {s}
+            \\- unix_time: {d}
+            \\
+        ,
+            .{ self.runtime.agent_id, brain_name, final_estimate, context_limit, timestamp_utc, unix_time },
         );
+    }
+
+    fn estimateProviderToolContextTokens(tools: []const ziggy_piai.types.Tool) usize {
+        var total_bytes: usize = 0;
+        for (tools) |tool| {
+            total_bytes += tool.name.len + tool.description.len + tool.parameters_json.len + 24;
+        }
+        return estimateTokenCountFromBytes(total_bytes);
+    }
+
+    fn estimateTokenCount(text: []const u8) usize {
+        return estimateTokenCountFromBytes(text.len);
+    }
+
+    fn estimateTokenCountFromBytes(bytes: usize) usize {
+        if (bytes == 0) return 0;
+        return (bytes + 3) / 4;
+    }
+
+    fn formatUtcTimestamp(allocator: std.mem.Allocator, unix_time: i64) ![]u8 {
+        const unix_seconds: u64 = if (unix_time < 0) 0 else @as(u64, @intCast(unix_time));
+        const epoch_seconds = std.time.epoch.EpochSeconds{ .secs = unix_seconds };
+        const epoch_day = epoch_seconds.getEpochDay();
+        const day_seconds = epoch_seconds.getDaySeconds();
+        const year_day = epoch_day.calculateYearDay();
+        const month_day = year_day.calculateMonthDay();
+
+        return std.fmt.allocPrint(
+            allocator,
+            "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2} UTC",
+            .{
+                year_day.year,
+                month_day.month.numeric(),
+                month_day.day_index + 1,
+                day_seconds.getHoursIntoDay(),
+                day_seconds.getMinutesIntoHour(),
+                day_seconds.getSecondsIntoMinute(),
+            },
+        );
+    }
+
+    fn buildProviderBrainTools(allocator: std.mem.Allocator) ![]tool_registry.ProviderTool {
+        var out = std.ArrayListUnmanaged(tool_registry.ProviderTool){};
+        errdefer {
+            for (out.items) |*tool| tool.deinit(allocator);
+            out.deinit(allocator);
+        }
+
+        for (brain_tools.brain_tool_schemas) |schema| {
+            const parameters_json = try buildBrainToolParametersJson(allocator, schema.required_fields);
+            errdefer allocator.free(parameters_json);
+
+            try out.append(allocator, .{
+                .name = try allocator.dupe(u8, schema.name),
+                .description = try allocator.dupe(u8, schema.description),
+                .parameters_json = parameters_json,
+            });
+        }
+
+        return out.toOwnedSlice(allocator);
+    }
+
+    fn buildBrainToolParametersJson(
+        allocator: std.mem.Allocator,
+        required_fields: []const []const u8,
+    ) ![]u8 {
+        var out = std.ArrayListUnmanaged(u8){};
+        defer out.deinit(allocator);
+
+        try out.appendSlice(allocator, "{\"type\":\"object\",\"properties\":{");
+        for (required_fields, 0..) |field, idx| {
+            if (idx > 0) try out.append(allocator, ',');
+            try out.appendSlice(allocator, "\"");
+            try appendJsonEscaped(allocator, &out, field);
+            try out.appendSlice(allocator, "\":");
+            try appendBrainToolFieldSchemaJson(allocator, &out, field);
+        }
+        try out.appendSlice(allocator, "},\"required\":[");
+        for (required_fields, 0..) |field, idx| {
+            if (idx > 0) try out.append(allocator, ',');
+            try out.appendSlice(allocator, "\"");
+            try appendJsonEscaped(allocator, &out, field);
+            try out.appendSlice(allocator, "\"");
+        }
+        try out.appendSlice(allocator, "]}");
+
+        return out.toOwnedSlice(allocator);
+    }
+
+    fn brainToolFieldType(field: []const u8) []const u8 {
+        if (std.mem.eql(u8, field, "mem_id")) return "string";
+        if (std.mem.eql(u8, field, "name")) return "string";
+        if (std.mem.eql(u8, field, "kind")) return "string";
+        if (std.mem.eql(u8, field, "query")) return "string";
+        if (std.mem.eql(u8, field, "message")) return "string";
+        if (std.mem.eql(u8, field, "target_brain")) return "string";
+        if (std.mem.eql(u8, field, "version")) return "integer";
+        if (std.mem.eql(u8, field, "limit")) return "integer";
+        if (std.mem.eql(u8, field, "talk_id")) return "integer";
+        if (std.mem.eql(u8, field, "content")) return "object";
+        if (std.mem.eql(u8, field, "events")) return "array";
+        if (std.mem.eql(u8, field, "write_protected")) return "boolean";
+        if (std.mem.eql(u8, field, "unevictable")) return "boolean";
+        return "string";
+    }
+
+    fn appendBrainToolFieldSchemaJson(
+        allocator: std.mem.Allocator,
+        out: *std.ArrayListUnmanaged(u8),
+        field: []const u8,
+    ) !void {
+        if (std.mem.eql(u8, field, "events")) {
+            try out.appendSlice(allocator, "{\"type\":\"array\",\"items\":{\"type\":\"object\"}}");
+            return;
+        }
+
+        try out.appendSlice(allocator, "{\"type\":\"");
+        try out.appendSlice(allocator, brainToolFieldType(field));
+        try out.appendSlice(allocator, "\"}");
+    }
+
+    fn appendJsonEscaped(
+        allocator: std.mem.Allocator,
+        out: *std.ArrayListUnmanaged(u8),
+        raw: []const u8,
+    ) !void {
+        for (raw) |char| {
+            switch (char) {
+                '\\' => try out.appendSlice(allocator, "\\\\"),
+                '"' => try out.appendSlice(allocator, "\\\""),
+                '\n' => try out.appendSlice(allocator, "\\n"),
+                '\r' => try out.appendSlice(allocator, "\\r"),
+                '\t' => try out.appendSlice(allocator, "\\t"),
+                else => try out.append(allocator, char),
+            }
+        }
+    }
+
+    fn buildCoreSystemPrompt(self: *RuntimeServer, brain_name: []const u8) ![]u8 {
+        const snapshot = try self.runtime.active_memory.snapshotActive(self.allocator, brain_name);
+        defer memory.deinitItems(self.allocator, snapshot);
+
+        var out = std.ArrayListUnmanaged(u8){};
+        errdefer out.deinit(self.allocator);
+
+        // Always render the base core instructions first, as plain markdown.
+        for (snapshot) |item| {
+            if (!isCorePromptMemory(item)) continue;
+            if (!isBaseCorePromptMemory(item)) continue;
+            try self.appendCorePromptEntry(&out, item, false);
+        }
+
+        for (snapshot) |item| {
+            if (!isCorePromptMemory(item)) continue;
+            if (isBaseCorePromptMemory(item)) continue;
+            try self.appendCorePromptEntry(&out, item, true);
+        }
+
+        return out.toOwnedSlice(self.allocator);
+    }
+
+    fn appendCorePromptEntry(
+        self: *RuntimeServer,
+        out: *std.ArrayListUnmanaged(u8),
+        item: memory.ActiveMemoryItem,
+        include_mem_id: bool,
+    ) !void {
+        const text = decodeMemoryText(self.allocator, item.content_json) catch item.content_json;
+        const owns_text = text.ptr != item.content_json.ptr;
+        defer if (owns_text) self.allocator.free(text);
+
+        if (include_mem_id) {
+            try out.appendSlice(self.allocator, "[");
+            try out.appendSlice(self.allocator, item.mem_id);
+            try out.appendSlice(self.allocator, "] ");
+        }
+
+        try out.appendSlice(self.allocator, text);
+        if (text.len == 0 or text[text.len - 1] != '\n') {
+            try out.appendSlice(self.allocator, "\n");
+        }
+    }
+
+    fn isCorePromptMemory(item: memory.ActiveMemoryItem) bool {
+        return std.mem.eql(u8, item.kind, "core.system_prompt") or std.mem.eql(u8, item.kind, BASE_CORE_PROMPT_KIND);
+    }
+
+    fn isBaseCorePromptMemory(item: memory.ActiveMemoryItem) bool {
+        if (std.mem.eql(u8, item.kind, BASE_CORE_PROMPT_KIND)) return true;
+        const parsed = memid.MemId.parse(item.mem_id) catch return false;
+        return std.mem.eql(u8, parsed.name, BASE_CORE_PROMPT_NAME);
+    }
+
+    fn decodeMemoryText(allocator: std.mem.Allocator, content_json: []const u8) ![]u8 {
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, content_json, .{}) catch {
+            return allocator.dupe(u8, content_json);
+        };
+        defer parsed.deinit();
+
+        if (parsed.value == .string) {
+            return allocator.dupe(u8, parsed.value.string);
+        }
+        return allocator.dupe(u8, content_json);
     }
 
     fn resolveRuntimeToolName(provider_name: []const u8, mapping: []const ProviderToolNameMapEntry) []const u8 {
@@ -1752,7 +2070,7 @@ pub const RuntimeServer = struct {
         const content_json = try payload.toOwnedSlice(self.allocator);
         defer self.allocator.free(content_json);
 
-        var created = try self.runtime.active_memory.create(brain_name, .ram, null, "message", content_json, false);
+        var created = try self.runtime.active_memory.create(brain_name, null, "message", content_json, false, false);
         created.deinit(self.allocator);
     }
 
@@ -2206,7 +2524,7 @@ fn mockProviderStreamByModelWithToolLoop(
         const tool_calls = try allocator.alloc(ziggy_piai.types.ToolCall, 1);
         tool_calls[0] = .{
             .id = try allocator.dupe(u8, "call-1"),
-            .name = try allocator.dupe(u8, "file.list"),
+            .name = try allocator.dupe(u8, "file_list"),
             .arguments_json = try allocator.dupe(u8, "{\"path\":\"src\"}"),
         };
         try events.append(.{ .done = .{
@@ -2253,7 +2571,7 @@ fn mockProviderStreamByModelWithSensitiveToolLoop(
         const tool_calls = try allocator.alloc(ziggy_piai.types.ToolCall, 1);
         tool_calls[0] = .{
             .id = try allocator.dupe(u8, "call-sensitive-1"),
-            .name = try allocator.dupe(u8, "file.list"),
+            .name = try allocator.dupe(u8, "file_list"),
             .arguments_json = try allocator.dupe(u8, "{\"path\":\"src\",\"api_key\":\"sensitive-key\"}"),
         };
         try events.append(.{ .done = .{
@@ -2297,7 +2615,7 @@ fn mockProviderStreamByModelTooManyToolCalls(
     for (tool_calls, 0..) |*tool_call, idx| {
         tool_call.* = .{
             .id = try std.fmt.allocPrint(allocator, "call-{d}", .{idx}),
-            .name = try allocator.dupe(u8, "file.list"),
+            .name = try allocator.dupe(u8, "file_list"),
             .arguments_json = try allocator.dupe(u8, "{\"path\":\"src\"}"),
         };
     }
@@ -2395,6 +2713,60 @@ test "runtime_server: empty ltm config in tests provisions sqlite-backed runtime
 
     try std.testing.expect(server.runtime.ltm_store != null);
     try std.testing.expect(server.test_ltm_directory != null);
+}
+
+test "runtime_server: base core prompt renders first without mem_id prefix" {
+    const allocator = std.testing.allocator;
+    const server = try RuntimeServer.create(allocator, "agent-test", .{ .ltm_directory = "", .ltm_filename = "" });
+    defer server.destroy();
+
+    try server.runtime.refreshCorePrompt("primary");
+    const prompt = try server.buildCoreSystemPrompt("primary");
+    defer allocator.free(prompt);
+
+    const base_idx = std.mem.indexOf(u8, prompt, "# CORE.md - Base Runtime Instructions") orelse return error.TestUnexpectedResult;
+    const soul_idx = std.mem.indexOf(u8, prompt, "SOUL.md") orelse return error.TestUnexpectedResult;
+
+    try std.testing.expect(base_idx < soul_idx);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "core.system.base_instructions") == null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "[") != null);
+}
+
+test "runtime_server: provider instructions include dynamic info board without persisting it" {
+    const allocator = std.testing.allocator;
+    const server = try RuntimeServer.create(allocator, "agent-test", .{ .ltm_directory = "", .ltm_filename = "" });
+    defer server.destroy();
+
+    const active_memory_prompt = "<active_memory_state>{}</active_memory_state>";
+    const instructions = try server.buildProviderInstructions("primary", active_memory_prompt, 128_000, 0);
+    defer allocator.free(instructions);
+
+    const board_idx = std.mem.indexOf(u8, instructions, "## Dynamic Info Board") orelse return error.TestUnexpectedResult;
+    const soul_idx = std.mem.indexOf(u8, instructions, "SOUL.md") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(board_idx > soul_idx);
+    try std.testing.expect(std.mem.indexOf(u8, instructions, "approximate_context_used: ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, instructions, "date_time_utc: ") != null);
+
+    const snapshot = try server.runtime.active_memory.snapshotActive(allocator, "primary");
+    defer memory.deinitItems(allocator, snapshot);
+
+    for (snapshot) |item| {
+        try std.testing.expect(std.mem.indexOf(u8, item.content_json, "Dynamic Info Board") == null);
+    }
+}
+
+test "runtime_server: wait_for tool schema includes events items" {
+    const allocator = std.testing.allocator;
+    const specs = try RuntimeServer.buildProviderBrainTools(allocator);
+    defer tool_registry.deinitProviderTools(allocator, specs);
+
+    for (specs) |spec| {
+        if (!std.mem.eql(u8, spec.name, "wait_for")) continue;
+        try std.testing.expect(std.mem.indexOf(u8, spec.parameters_json, "\"events\":{\"type\":\"array\",\"items\":{\"type\":\"object\"}}") != null);
+        return;
+    }
+
+    return error.TestUnexpectedResult;
 }
 
 test "runtime_server: session.send returns all outbound runtime frames" {
@@ -2799,7 +3171,7 @@ test "runtime_server: provider tool loop executes world tool and returns final r
     try std.testing.expect(std.mem.indexOf(u8, snapshot_json, "\"kind\":\"tool_result\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot_json, "\"tool_calls\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot_json, "\"id\":\"call-1\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, snapshot_json, "\"name\":\"file.list\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot_json, "\"name\":\"file_list\"") != null);
 }
 
 test "runtime_server: provider tool-call cap does not persist unexecuted tool-call metadata" {

@@ -21,11 +21,11 @@ Tools are exposed to the model during `session.send`, and model-emitted tool cal
 
 ## Implemented World Tools
 
-- `file.read`
-- `file.write`
-- `file.list`
-- `search.code`
-- `shell.exec`
+- `file_read`
+- `file_write`
+- `file_list`
+- `search_code`
+- `shell_exec`
 
 ## Core Modules
 
@@ -39,7 +39,7 @@ Tools are exposed to the model during `session.send`, and model-emitted tool cal
 
 - Max provider tool rounds per request: `8`
 - Max total tool calls per request: `32`
-- `shell.exec` timeout is bounded and output is capped
+- `shell_exec` timeout is bounded and output is capped
 - Queue saturation/runtime pause/cancel semantics continue to apply
 
 ## Testing

@@ -122,7 +122,7 @@ fn shellQuoteSingle(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
 pub const BuiltinTools = struct {
     pub fn registerAll(registry: *registry_mod.ToolRegistry) !void {
         try registry.registerWorldTool(
-            "file.read",
+            "file_read",
             "Read file contents",
             &[_]registry_mod.ToolParam{
                 .{ .name = "path", .param_type = .string, .description = "Path to file", .required = true },
@@ -131,7 +131,7 @@ pub const BuiltinTools = struct {
             fileRead,
         );
         try registry.registerWorldTool(
-            "file.write",
+            "file_write",
             "Write file contents",
             &[_]registry_mod.ToolParam{
                 .{ .name = "path", .param_type = .string, .description = "Path to file", .required = true },
@@ -142,7 +142,7 @@ pub const BuiltinTools = struct {
             fileWrite,
         );
         try registry.registerWorldTool(
-            "file.list",
+            "file_list",
             "List directory contents",
             &[_]registry_mod.ToolParam{
                 .{ .name = "path", .param_type = .string, .description = "Directory path", .required = false },
@@ -152,7 +152,7 @@ pub const BuiltinTools = struct {
             fileList,
         );
         try registry.registerWorldTool(
-            "search.code",
+            "search_code",
             "Search code using ripgrep",
             &[_]registry_mod.ToolParam{
                 .{ .name = "query", .param_type = .string, .description = "Search query", .required = true },
@@ -163,7 +163,7 @@ pub const BuiltinTools = struct {
             searchCode,
         );
         try registry.registerWorldTool(
-            "shell.exec",
+            "shell_exec",
             "Execute a shell command",
             &[_]registry_mod.ToolParam{
                 .{ .name = "command", .param_type = .string, .description = "Command line to execute", .required = true },
@@ -505,7 +505,7 @@ fn testFileWriteReadImpl(allocator: std.mem.Allocator, _: []const u8) !void {
     try std.testing.expect(std.mem.indexOf(u8, read_result.success.payload_json, "\"content\":\"hello\"") != null);
 }
 
-test "tool_executor: file.write then file.read roundtrip" {
+test "tool_executor: file_write then file_read roundtrip" {
     try inTempCwd(std.testing.allocator, testFileWriteReadImpl);
 }
 
@@ -524,7 +524,7 @@ fn testFileListImpl(allocator: std.mem.Allocator, _: []const u8) !void {
     try std.testing.expect(std.mem.indexOf(u8, list_result.success.payload_json, "\"truncated\":true") != null);
 }
 
-test "tool_executor: file.list honors max_entries truncation" {
+test "tool_executor: file_list honors max_entries truncation" {
     try inTempCwd(std.testing.allocator, testFileListImpl);
 }
 
@@ -542,7 +542,7 @@ fn testSearchCodeImpl(allocator: std.mem.Allocator, _: []const u8) !void {
     try std.testing.expect(std.mem.indexOf(u8, search_result.success.payload_json, "needle") != null);
 }
 
-test "tool_executor: search.code returns matching lines" {
+test "tool_executor: search_code returns matching lines" {
     try inTempCwd(std.testing.allocator, testSearchCodeImpl);
 }
 
@@ -560,7 +560,7 @@ fn testShellCwdImpl(allocator: std.mem.Allocator, _: []const u8) !void {
     try std.testing.expect(std.mem.indexOf(u8, shell_result.success.payload_json, "workdir/sub") != null);
 }
 
-test "tool_executor: shell.exec supports cwd" {
+test "tool_executor: shell_exec supports cwd" {
     try inTempCwd(std.testing.allocator, testShellCwdImpl);
 }
 
@@ -575,6 +575,6 @@ fn testShellTimeoutImpl(allocator: std.mem.Allocator, _: []const u8) !void {
     try std.testing.expectEqual(registry_mod.ToolErrorCode.timeout, timeout_result.failure.code);
 }
 
-test "tool_executor: shell.exec returns timeout" {
+test "tool_executor: shell_exec returns timeout" {
     try inTempCwd(std.testing.allocator, testShellTimeoutImpl);
 }

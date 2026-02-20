@@ -2,11 +2,6 @@ const std = @import("std");
 const ltm_store = @import("ltm_store.zig");
 const memid = @import("memid.zig");
 
-pub const MemoryTier = enum {
-    ram,
-    rom,
-};
-
 pub const MemoryError = error{
     InvalidMemId,
     NotFound,
@@ -17,18 +12,16 @@ pub const MemoryError = error{
 
 pub const ActiveMemoryItem = struct {
     mem_id: []u8,
-    tier: MemoryTier,
     version: ?u64,
     kind: []u8,
     mutable: bool,
-    unevictable: bool,  // Always keep in RAM (identity/core memories)
+    unevictable: bool, // Non-evictable memory flag
     created_at_ms: i64,
     content_json: []u8,
 
     pub fn clone(self: *const ActiveMemoryItem, allocator: std.mem.Allocator) !ActiveMemoryItem {
         return .{
             .mem_id = try allocator.dupe(u8, self.mem_id),
-            .tier = self.tier,
             .version = self.version,
             .kind = try allocator.dupe(u8, self.kind),
             .mutable = self.mutable,
@@ -88,7 +81,6 @@ var persist_history_hook: ?PersistHistoryHookFn = null;
 
 const BrainStore = struct {
     ram_items: std.StringHashMapUnmanaged(ActiveMemoryItem) = .{},
-    rom_items: std.StringHashMapUnmanaged(ActiveMemoryItem) = .{},
     ordered_ids: std.ArrayListUnmanaged([]const u8) = .{},
 
     fn deinit(self: *BrainStore, allocator: std.mem.Allocator) void {
@@ -98,21 +90,7 @@ const BrainStore = struct {
             item.deinit(allocator);
         }
         self.ram_items.deinit(allocator);
-
-        var rom_it = self.rom_items.iterator();
-        while (rom_it.next()) |entry| {
-            var item = entry.value_ptr.*;
-            item.deinit(allocator);
-        }
-        self.rom_items.deinit(allocator);
         self.ordered_ids.deinit(allocator);
-    }
-
-    fn mapForTier(self: *BrainStore, tier: MemoryTier) *std.StringHashMapUnmanaged(ActiveMemoryItem) {
-        return switch (tier) {
-            .ram => &self.ram_items,
-            .rom => &self.rom_items,
-        };
     }
 
     fn appendOrder(self: *BrainStore, allocator: std.mem.Allocator, mem_id: []const u8) !void {
@@ -193,10 +171,10 @@ pub const RuntimeMemory = struct {
     pub fn create(
         self: *RuntimeMemory,
         brain: []const u8,
-        tier: MemoryTier,
         name: ?[]const u8,
         kind: []const u8,
         content_json: []const u8,
+        write_protected: bool,
         unevictable: bool,
     ) !ActiveMemoryItem {
         self.mutex.lock();
@@ -217,10 +195,9 @@ pub const RuntimeMemory = struct {
 
         var item = ActiveMemoryItem{
             .mem_id = mem_id,
-            .tier = tier,
             .version = version,
             .kind = try self.allocator.dupe(u8, kind),
-            .mutable = tier == .ram,
+            .mutable = !write_protected,
             .unevictable = unevictable,
             .created_at_ms = std.time.milliTimestamp(),
             .content_json = try self.allocator.dupe(u8, content_json),
@@ -230,10 +207,9 @@ pub const RuntimeMemory = struct {
 
         try self.persistHistoryLocked(&item);
 
-        const target = store.mapForTier(tier);
-        try target.put(self.allocator, item.mem_id, item);
+        try store.ram_items.put(self.allocator, item.mem_id, item);
         inserted_into_map = true;
-        errdefer if (target.fetchRemove(item.mem_id)) |removed_entry| {
+        errdefer if (store.ram_items.fetchRemove(item.mem_id)) |removed_entry| {
             var removed = removed_entry.value;
             removed.deinit(self.allocator);
         };
@@ -248,7 +224,7 @@ pub const RuntimeMemory = struct {
 
         const current_ref = try self.resolveMutableRefLocked(raw_mem_id);
         const current_item = current_ref.item.*;
-        if (!current_item.mutable or current_item.tier != .ram) return MemoryError.ImmutableTier;
+        if (!current_item.mutable) return MemoryError.ImmutableTier;
 
         const parsed = memid.MemId.parse(current_item.mem_id) catch return MemoryError.InvalidMemId;
         const next_version = (current_item.version orelse 0) + 1;
@@ -256,11 +232,10 @@ pub const RuntimeMemory = struct {
 
         var next_item = ActiveMemoryItem{
             .mem_id = next_id,
-            .tier = .ram,
             .version = next_version,
             .kind = try self.allocator.dupe(u8, current_item.kind),
-            .mutable = true,
-            .unevictable = current_item.unevictable,  // Preserve unevictable status
+            .mutable = current_item.mutable,
+            .unevictable = current_item.unevictable, // Preserve unevictable status
             .created_at_ms = std.time.milliTimestamp(),
             .content_json = try self.allocator.dupe(u8, content_json),
         };
@@ -293,7 +268,6 @@ pub const RuntimeMemory = struct {
 
         const current_ref = try self.resolveMutableRefLocked(raw_mem_id);
         const current_item = current_ref.item.*;
-        if (!current_item.mutable or current_item.tier != .ram) return MemoryError.ImmutableTier;
         if (current_item.unevictable) return MemoryError.ImmutableTier; // Cannot evict unevictable memories
 
         try self.persistHistoryLocked(&current_item);
@@ -388,7 +362,7 @@ pub const RuntimeMemory = struct {
         for (store.ordered_ids.items) |mem_id_ref| {
             if (added >= limit) break;
 
-            const item = store.ram_items.getPtr(mem_id_ref) orelse store.rom_items.getPtr(mem_id_ref) orelse continue;
+            const item = store.ram_items.getPtr(mem_id_ref) orelse continue;
             if (!matchesKeyword(item, search_term)) continue;
 
             try out.append(allocator, try item.clone(allocator));
@@ -411,7 +385,7 @@ pub const RuntimeMemory = struct {
         }
 
         for (store.ordered_ids.items) |mem_id_ref| {
-            const item = store.ram_items.getPtr(mem_id_ref) orelse store.rom_items.getPtr(mem_id_ref) orelse continue;
+            const item = store.ram_items.getPtr(mem_id_ref) orelse continue;
             try out.append(allocator, try item.clone(allocator));
         }
 
@@ -456,9 +430,14 @@ pub const RuntimeMemory = struct {
                 const trimmed = std.mem.trim(u8, name, " \t\r\n");
                 if (!isCanonicalMemName(trimmed)) return MemoryError.InvalidMemId;
                 break :blk try self.allocator.dupe(u8, trimmed);
-            } else try self.autoNameLocked()
-        else
-            try self.autoNameLocked();
+            } else blk: {
+                try self.syncAutoNameWithStoreLocked(brain);
+                break :blk try self.autoNameLocked();
+            }
+        else blk: {
+            try self.syncAutoNameWithStoreLocked(brain);
+            break :blk try self.autoNameLocked();
+        };
 
         var candidate = base_name;
         var suffix: u64 = 2;
@@ -481,12 +460,18 @@ pub const RuntimeMemory = struct {
         return std.fmt.allocPrint(self.allocator, "mem_{d}", .{self.next_auto_name});
     }
 
+    fn syncAutoNameWithStoreLocked(self: *RuntimeMemory, brain: []const u8) !void {
+        const store = self.persisted_store orelse return;
+        const highest_index = store.highestAutoMemIndex(self.agent_id, brain) catch return MemoryError.PersistenceFailed;
+        if (highest_index == std.math.maxInt(u64)) return MemoryError.PersistenceFailed;
+        const next_index = highest_index + 1;
+        if (next_index > self.next_auto_name) self.next_auto_name = next_index;
+    }
+
     fn baseNameExistsLocked(self: *RuntimeMemory, store: *BrainStore, brain: []const u8, name: []const u8) bool {
         _ = self;
         const ram_it = store.ram_items.iterator();
-        if (hasNameInIterator(ram_it, brain, name)) return true;
-        const rom_it = store.rom_items.iterator();
-        return hasNameInIterator(rom_it, brain, name);
+        return hasNameInIterator(ram_it, brain, name);
     }
 
     fn isCanonicalMemName(name: []const u8) bool {
@@ -554,7 +539,6 @@ pub const RuntimeMemory = struct {
 
         return .{
             .mem_id = mem_id,
-            .tier = .ram,
             .version = record.version,
             .kind = try self.allocator.dupe(u8, record.kind),
             .mutable = true,
@@ -571,7 +555,6 @@ pub const RuntimeMemory = struct {
     ) !?*const ActiveMemoryItem {
         const store = self.brains.getPtr(brain) orelse return null;
         if (store.ram_items.getPtr(concrete_mem_id)) |item| return item;
-        if (store.rom_items.getPtr(concrete_mem_id)) |item| return item;
         return null;
     }
 
@@ -583,18 +566,6 @@ pub const RuntimeMemory = struct {
 
         var ram_it = store.ram_items.iterator();
         while (ram_it.next()) |entry| {
-            const current = entry.value_ptr;
-            const current_parsed = memid.MemId.parse(current.mem_id) catch continue;
-            if (!sameBase(parsed, &current_parsed)) continue;
-            const version = current.version orelse 0;
-            if (latest == null or version >= latest_version) {
-                latest = current;
-                latest_version = version;
-            }
-        }
-
-        var rom_it = store.rom_items.iterator();
-        while (rom_it.next()) |entry| {
             const current = entry.value_ptr;
             const current_parsed = memid.MemId.parse(current.mem_id) catch continue;
             if (!sameBase(parsed, &current_parsed)) continue;
@@ -622,9 +593,6 @@ pub const RuntimeMemory = struct {
             defer self.allocator.free(concrete);
 
             if (store.ram_items.getPtr(concrete)) |item| {
-                return .{ .store = store, .item = item };
-            }
-            if (store.rom_items.getPtr(concrete)) |item| {
                 return .{ .store = store, .item = item };
             }
             return MemoryError.NotFound;
@@ -706,11 +674,6 @@ pub fn toActiveMemoryJson(allocator: std.mem.Allocator, brain: []const u8, items
 
         try out.appendSlice(allocator, "{\"mem_id\":\"");
         try appendJsonEscaped(allocator, &out, item.mem_id);
-        try out.appendSlice(allocator, "\",\"tier\":\"");
-        try out.appendSlice(allocator, switch (item.tier) {
-            .ram => "ram",
-            .rom => "rom",
-        });
         try out.appendSlice(allocator, "\",\"version\":");
         if (item.version) |version| {
             var version_buf: [32]u8 = undefined;
@@ -722,8 +685,10 @@ pub fn toActiveMemoryJson(allocator: std.mem.Allocator, brain: []const u8, items
 
         try out.appendSlice(allocator, ",\"kind\":\"");
         try appendJsonEscaped(allocator, &out, item.kind);
-        try out.appendSlice(allocator, "\",\"mutable\":");
-        try out.appendSlice(allocator, if (item.mutable) "true" else "false");
+        try out.appendSlice(allocator, "\",\"write_protected\":");
+        try out.appendSlice(allocator, if (item.mutable) "false" else "true");
+        try out.appendSlice(allocator, ",\"unevictable\":");
+        try out.appendSlice(allocator, if (item.unevictable) "true" else "false");
 
         var time_buf: [32]u8 = undefined;
         const time_text = try std.fmt.bufPrint(&time_buf, "{d}", .{item.created_at_ms});
@@ -774,9 +739,9 @@ test "memory: create emits canonical mem ids with unique names" {
     var mem = try RuntimeMemory.init(allocator, "agentA");
     defer mem.deinit();
 
-    var first = try mem.create("primary", .ram, "task_plan", "message", "{\"text\":\"first\"}", false);
+    var first = try mem.create("primary", "task_plan", "message", "{\"text\":\"first\"}", false, false);
     defer first.deinit(allocator);
-    var second = try mem.create("primary", .ram, "task_plan", "message", "{\"text\":\"second\"}", false);
+    var second = try mem.create("primary", "task_plan", "message", "{\"text\":\"second\"}", false, false);
     defer second.deinit(allocator);
 
     _ = try memid.MemId.parse(first.mem_id);
@@ -791,11 +756,11 @@ test "memory: create rejects non-canonical preferred names" {
 
     try std.testing.expectError(
         MemoryError.InvalidMemId,
-        mem.create("primary", .ram, "bad:name", "note", "{\"text\":\"x\"}", false),
+        mem.create("primary", "bad:name", "note", "{\"text\":\"x\"}", false, false),
     );
     try std.testing.expectError(
         MemoryError.InvalidMemId,
-        mem.create("primary", .ram, "has space", "note", "{\"text\":\"x\"}", false),
+        mem.create("primary", "has space", "note", "{\"text\":\"x\"}", false, false),
     );
 
     const snapshot = try mem.snapshotActive(allocator, "primary");
@@ -808,7 +773,7 @@ test "memory: mutate creates new version and load supports historical version" {
     var mem = try RuntimeMemory.init(allocator, "agentA");
     defer mem.deinit();
 
-    var created = try mem.create("primary", .ram, "notes", "note", "{\"text\":\"v1\"}", false);
+    var created = try mem.create("primary", "notes", "note", "{\"text\":\"v1\"}", false, false);
     defer created.deinit(allocator);
 
     var mutated = try mem.mutate(created.mem_id, "{\"text\":\"v2\"}");
@@ -836,7 +801,7 @@ test "memory: mutate does not change active state when persistence fails" {
     var mem = try RuntimeMemory.init(allocator, "agentA");
     defer mem.deinit();
 
-    var created = try mem.create("primary", .ram, "persist_notes", "note", "{\"text\":\"v1\"}", false);
+    var created = try mem.create("primary", "persist_notes", "note", "{\"text\":\"v1\"}", false, false);
     defer created.deinit(allocator);
     const created_id_copy = try allocator.dupe(u8, created.mem_id);
     defer allocator.free(created_id_copy);
@@ -867,7 +832,7 @@ test "memory: create does not change active state when persistence fails" {
 
     try std.testing.expectError(
         MemoryError.PersistenceFailed,
-        mem.create("primary", .ram, "persist_create", "note", "{\"text\":\"v1\"}", false),
+        mem.create("primary", "persist_create", "note", "{\"text\":\"v1\"}", false, false),
     );
 
     const snapshot = try mem.snapshotActive(allocator, "primary");
@@ -880,7 +845,7 @@ test "memory: evict does not remove active state when persistence fails" {
     var mem = try RuntimeMemory.init(allocator, "agentA");
     defer mem.deinit();
 
-    var created = try mem.create("primary", .ram, "persist_evict", "note", "{\"text\":\"v1\"}", false);
+    var created = try mem.create("primary", "persist_evict", "note", "{\"text\":\"v1\"}", false, false);
     defer created.deinit(allocator);
     const created_id_copy = try allocator.dupe(u8, created.mem_id);
     defer allocator.free(created_id_copy);
@@ -904,10 +869,10 @@ test "memory: active memory JSON always includes mem_id" {
     var mem = try RuntimeMemory.init(allocator, "agentA");
     defer mem.deinit();
 
-    var ram_item = try mem.create("primary", .ram, "task", "message", "{\"role\":\"assistant\",\"text\":\"hi\"}", false);
+    var ram_item = try mem.create("primary", "task", "message", "{\"role\":\"assistant\",\"text\":\"hi\"}", false, false);
     defer ram_item.deinit(allocator);
-    var rom_item = try mem.create("primary", .rom, "system_clock", "state", "{\"now\":\"2026-02-16T12:00:00Z\"}", false);
-    defer rom_item.deinit(allocator);
+    var core_item = try mem.create("primary", "system_clock", "state", "{\"now\":\"2026-02-16T12:00:00Z\"}", true, false);
+    defer core_item.deinit(allocator);
 
     const snapshot = try mem.snapshotActive(allocator, "primary");
     defer deinitItems(allocator, snapshot);
@@ -916,19 +881,29 @@ test "memory: active memory JSON always includes mem_id" {
     defer allocator.free(json);
 
     try std.testing.expect(std.mem.indexOf(u8, json, "\"mem_id\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"tier\":\"rom\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"write_protected\":true") != null);
 }
 
-test "memory: ROM mutation and eviction are rejected deterministically" {
+test "memory: write-protected memory rejects mutation deterministically" {
     const allocator = std.testing.allocator;
     var mem = try RuntimeMemory.init(allocator, "agentA");
     defer mem.deinit();
 
-    var rom_item = try mem.create("primary", .rom, "policy", "state", "{\"text\":\"immutable\"}", false);
-    defer rom_item.deinit(allocator);
+    var protected_item = try mem.create("primary", "policy", "state", "{\"text\":\"immutable\"}", true, false);
+    defer protected_item.deinit(allocator);
 
-    try std.testing.expectError(MemoryError.ImmutableTier, mem.mutate(rom_item.mem_id, "{\"text\":\"nope\"}"));
-    try std.testing.expectError(MemoryError.ImmutableTier, mem.evict(rom_item.mem_id));
+    try std.testing.expectError(MemoryError.ImmutableTier, mem.mutate(protected_item.mem_id, "{\"text\":\"nope\"}"));
+}
+
+test "memory: unevictable memory rejects eviction deterministically" {
+    const allocator = std.testing.allocator;
+    var mem = try RuntimeMemory.init(allocator, "agentA");
+    defer mem.deinit();
+
+    var fixed_item = try mem.create("primary", "policy", "state", "{\"text\":\"fixed\"}", false, true);
+    defer fixed_item.deinit(allocator);
+
+    try std.testing.expectError(MemoryError.ImmutableTier, mem.evict(fixed_item.mem_id));
 }
 
 test "memory: persisted store supports reload across runtime restarts" {
@@ -945,7 +920,7 @@ test "memory: persisted store supports reload across runtime restarts" {
         var first_runtime = try RuntimeMemory.initWithStore(allocator, "agentA", &store);
         defer first_runtime.deinit();
 
-        var created = try first_runtime.create("primary", .ram, "notes", "note", "{\"text\":\"v1\"}", false);
+        var created = try first_runtime.create("primary", "notes", "note", "{\"text\":\"v1\"}", false, false);
         defer created.deinit(allocator);
         var mutated = try first_runtime.mutate(created.mem_id, "{\"text\":\"v2\"}");
         defer mutated.deinit(allocator);
@@ -981,7 +956,7 @@ test "memory: create allocates next version from persisted history" {
         var first_runtime = try RuntimeMemory.initWithStore(allocator, "agentA", &store);
         defer first_runtime.deinit();
 
-        var created = try first_runtime.create("primary", .ram, "memo", "note", "{\"text\":\"v1\"}", false);
+        var created = try first_runtime.create("primary", "memo", "note", "{\"text\":\"v1\"}", false, false);
         defer created.deinit(allocator);
         break :alias_blk try (try memid.MemId.parse(created.mem_id)).withVersion(null).format(allocator);
     };
@@ -990,7 +965,7 @@ test "memory: create allocates next version from persisted history" {
     var second_runtime = try RuntimeMemory.initWithStore(allocator, "agentA", &store);
     defer second_runtime.deinit();
 
-    var created_again = try second_runtime.create("primary", .ram, "memo", "note", "{\"text\":\"v2\"}", false);
+    var created_again = try second_runtime.create("primary", "memo", "note", "{\"text\":\"v2\"}", false, false);
     defer created_again.deinit(allocator);
     try std.testing.expectEqual(@as(?u64, 2), created_again.version);
 
@@ -998,4 +973,40 @@ test "memory: create allocates next version from persisted history" {
     defer latest.deinit(allocator);
     try std.testing.expectEqual(@as(?u64, 2), latest.version);
     try std.testing.expectEqualStrings("{\"text\":\"v2\"}", latest.content_json);
+}
+
+test "memory: auto-generated base names continue across runtime restart" {
+    const allocator = std.testing.allocator;
+    const dir = try std.fmt.allocPrint(allocator, ".tmp-memory-auto-name-restart-{d}", .{std.time.nanoTimestamp()});
+    defer allocator.free(dir);
+    defer std.fs.cwd().deleteTree(dir) catch {};
+
+    try std.fs.cwd().makePath(dir);
+    var store = try ltm_store.VersionedMemStore.open(allocator, dir, "runtime-memory.db");
+    defer store.close();
+
+    {
+        var first_runtime = try RuntimeMemory.initWithStore(allocator, "agentA", &store);
+        defer first_runtime.deinit();
+
+        var first = try first_runtime.create("primary", null, "note", "{\"text\":\"first\"}", false, false);
+        defer first.deinit(allocator);
+        var second = try first_runtime.create("primary", null, "note", "{\"text\":\"second\"}", false, false);
+        defer second.deinit(allocator);
+
+        const first_parsed = try memid.MemId.parse(first.mem_id);
+        const second_parsed = try memid.MemId.parse(second.mem_id);
+        try std.testing.expectEqualStrings("mem_1", first_parsed.name);
+        try std.testing.expectEqualStrings("mem_2", second_parsed.name);
+    }
+
+    var second_runtime = try RuntimeMemory.initWithStore(allocator, "agentA", &store);
+    defer second_runtime.deinit();
+
+    var third = try second_runtime.create("primary", null, "note", "{\"text\":\"third\"}", false, false);
+    defer third.deinit(allocator);
+
+    const third_parsed = try memid.MemId.parse(third.mem_id);
+    try std.testing.expectEqualStrings("mem_3", third_parsed.name);
+    try std.testing.expectEqual(@as(?u64, 1), third_parsed.version);
 }
