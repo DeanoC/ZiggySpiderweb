@@ -170,6 +170,39 @@ pub const VersionedMemStore = struct {
         };
     }
 
+    pub fn highestAutoMemIndex(self: *VersionedMemStore, agent: []const u8, brain: []const u8) !u64 {
+        const auto_prefix = try std.fmt.allocPrint(self.allocator, "{s}:{s}:mem_", .{ agent, brain });
+        defer self.allocator.free(auto_prefix);
+        const like_pattern = try std.fmt.allocPrint(self.allocator, "{s}%", .{auto_prefix});
+        defer self.allocator.free(like_pattern);
+        const pattern_escaped = try self.escapeSqlLiteral(like_pattern);
+        defer self.allocator.free(pattern_escaped);
+
+        const sql = try std.fmt.allocPrint(
+            self.allocator,
+            "SELECT DISTINCT base_id FROM mem_versions WHERE base_id LIKE {s};",
+            .{pattern_escaped},
+        );
+        defer self.allocator.free(sql);
+
+        const stmt = try self.prepare(sql);
+        defer _ = sqlite3_finalize(stmt);
+
+        var highest: u64 = 0;
+        while (true) {
+            const rc = sqlite3_step(stmt);
+            if (rc == SQLITE_DONE) break;
+            if (rc != SQLITE_ROW) return LtmError.ExecError;
+
+            const base_id_text = sqlite3_column_text(stmt, 0) orelse return LtmError.InvalidData;
+            const base_id = std.mem.span(base_id_text);
+            const auto_index = parseAutoMemIndex(base_id, auto_prefix) orelse continue;
+            if (auto_index > highest) highest = auto_index;
+        }
+
+        return highest;
+    }
+
     pub fn search(
         self: *VersionedMemStore,
         allocator: std.mem.Allocator,
@@ -187,6 +220,49 @@ pub const VersionedMemStore = struct {
                 "WHERE content_json LIKE {s} OR kind LIKE {s} OR base_id LIKE {s} " ++
                 "ORDER BY created_at_ms DESC LIMIT {d};",
             .{ keyword_escaped, keyword_escaped, keyword_escaped, limit },
+        );
+        defer self.allocator.free(sql);
+
+        const stmt = try self.prepare(sql);
+        defer _ = sqlite3_finalize(stmt);
+
+        var out = std.ArrayListUnmanaged(VersionedRecord){};
+        errdefer {
+            for (out.items) |*record| record.deinit(allocator);
+            out.deinit(allocator);
+        }
+
+        while (true) {
+            const rc = sqlite3_step(stmt);
+            if (rc == SQLITE_DONE) break;
+            if (rc != SQLITE_ROW) return LtmError.ExecError;
+
+            try out.append(allocator, .{
+                .base_id = try self.copyColumnText(allocator, stmt, 0),
+                .version = try self.columnToU64(stmt, 1),
+                .kind = try self.copyColumnText(allocator, stmt, 2),
+                .content_json = try self.copyColumnText(allocator, stmt, 3),
+                .created_at_ms = sqlite3_column_int64(stmt, 4),
+            });
+        }
+
+        return out.toOwnedSlice(allocator);
+    }
+
+    pub fn listVersions(
+        self: *VersionedMemStore,
+        allocator: std.mem.Allocator,
+        base_id: []const u8,
+        limit: usize,
+    ) ![]VersionedRecord {
+        const base_id_escaped = try self.escapeSqlLiteral(base_id);
+        defer self.allocator.free(base_id_escaped);
+
+        const sql = try std.fmt.allocPrint(
+            self.allocator,
+            "SELECT base_id, version, kind, content_json, created_at_ms FROM mem_versions " ++
+                "WHERE base_id = {s} ORDER BY version DESC LIMIT {d};",
+            .{ base_id_escaped, limit },
         );
         defer self.allocator.free(sql);
 
@@ -302,6 +378,13 @@ pub const VersionedMemStore = struct {
         return allocator.dupe(u8, std.mem.span(ptr));
     }
 
+    fn parseAutoMemIndex(base_id: []const u8, auto_prefix: []const u8) ?u64 {
+        if (!std.mem.startsWith(u8, base_id, auto_prefix)) return null;
+        const suffix = base_id[auto_prefix.len..];
+        if (suffix.len == 0) return null;
+        return std.fmt.parseUnsigned(u64, suffix, 10) catch null;
+    }
+
     fn columnToU64(self: *VersionedMemStore, stmt: *sqlite3_stmt, column: i32) !u64 {
         _ = self;
         if (sqlite3_column_type(stmt, column) == SQLITE_NULL) return LtmError.InvalidData;
@@ -387,4 +470,53 @@ test "ltm_store: persistVersion is idempotent for same base/version" {
     var latest = (try store.load(allocator, "agent:primary:artifact", null)).?;
     defer latest.deinit(allocator);
     try std.testing.expectEqual(@as(u64, 3), latest.version);
+}
+
+test "ltm_store: listVersions returns latest-first rows for a base id" {
+    const allocator = std.testing.allocator;
+    const dir = try std.fmt.allocPrint(allocator, ".tmp-vltm-list-versions-{d}", .{std.time.nanoTimestamp()});
+    defer allocator.free(dir);
+    defer std.fs.cwd().deleteTree(dir) catch {};
+
+    try std.fs.cwd().makePath(dir);
+    var store = try VersionedMemStore.open(allocator, dir, "runtime-memory.db");
+    defer store.close();
+
+    try store.persistVersionAt("agent:primary:notes", 1, "note", "{\"text\":\"v1\"}", 11);
+    try store.persistVersionAt("agent:primary:notes", 2, "note", "{\"text\":\"v2\"}", 12);
+    try store.persistVersionAt("agent:primary:notes", 3, "note", "{\"text\":\"v3\"}", 13);
+    try store.persistVersionAt("agent:primary:other", 1, "note", "{\"text\":\"skip\"}", 14);
+
+    const rows = try store.listVersions(allocator, "agent:primary:notes", 2);
+    defer deinitRecords(allocator, rows);
+
+    try std.testing.expectEqual(@as(usize, 2), rows.len);
+    try std.testing.expectEqual(@as(u64, 3), rows[0].version);
+    try std.testing.expectEqualStrings("{\"text\":\"v3\"}", rows[0].content_json);
+    try std.testing.expectEqual(@as(u64, 2), rows[1].version);
+    try std.testing.expectEqualStrings("{\"text\":\"v2\"}", rows[1].content_json);
+}
+
+test "ltm_store: highestAutoMemIndex only counts canonical auto names for agent and brain" {
+    const allocator = std.testing.allocator;
+    const dir = try std.fmt.allocPrint(allocator, ".tmp-vltm-auto-index-{d}", .{std.time.nanoTimestamp()});
+    defer allocator.free(dir);
+    defer std.fs.cwd().deleteTree(dir) catch {};
+
+    try std.fs.cwd().makePath(dir);
+    var store = try VersionedMemStore.open(allocator, dir, "runtime-memory.db");
+    defer store.close();
+
+    try store.persistVersionAt("agentA:primary:mem_1", 1, "note", "{\"text\":\"v1\"}", 1);
+    try store.persistVersionAt("agentA:primary:mem_10", 2, "note", "{\"text\":\"v2\"}", 2);
+    try store.persistVersionAt("agentA:primary:mem_10", 3, "note", "{\"text\":\"v3\"}", 3);
+    try store.persistVersionAt("agentA:primary:mem_2_extra", 1, "note", "{\"text\":\"ignore\"}", 4);
+    try store.persistVersionAt("agentA:secondary:mem_99", 1, "note", "{\"text\":\"ignore\"}", 5);
+    try store.persistVersionAt("agentB:primary:mem_77", 1, "note", "{\"text\":\"ignore\"}", 6);
+
+    const highest = try store.highestAutoMemIndex("agentA", "primary");
+    try std.testing.expectEqual(@as(u64, 10), highest);
+
+    const none = try store.highestAutoMemIndex("agentA", "tertiary");
+    try std.testing.expectEqual(@as(u64, 0), none);
 }

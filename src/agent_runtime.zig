@@ -1,6 +1,7 @@
 const std = @import("std");
 const ltm_store = @import("ltm_store.zig");
 const memory = @import("memory.zig");
+const memid = @import("memid.zig");
 const brain_context = @import("brain_context.zig");
 const brain_tools = @import("brain_tools.zig");
 const event_bus = @import("event_bus.zig");
@@ -277,7 +278,7 @@ pub const AgentRuntime = struct {
         );
         defer self.allocator.free(payload);
 
-        var created = try self.active_memory.create(brain_name, .ram, null, "message", payload, false);
+        var created = try self.active_memory.create(brain_name, null, "message", payload, false, false);
         created.deinit(self.allocator);
     }
 
@@ -314,6 +315,19 @@ pub const AgentRuntime = struct {
         try self.enqueueTick(brain_name);
     }
 
+    pub fn refreshCorePrompt(self: *AgentRuntime, brain_name: []const u8) !void {
+        if (!self.brains.contains(brain_name)) return RuntimeError.BrainNotFound;
+
+        var ctx = hook_registry.HookContext.init(self, brain_name, self.checkpoint);
+        defer ctx.deinit(self.allocator);
+
+        var core = hook_registry.CorePrompt.init(self.allocator);
+        defer core.deinit();
+
+        try self.hooks.execute(.pre_observe, &ctx, .{ .pre_observe = &core });
+        try self.syncCorePromptMemories(brain_name, &core);
+    }
+
     pub fn rollbackQueuedUserPrimaryWork(self: *AgentRuntime, content: []const u8) void {
         _ = self.bus.removeLatestMatching(.user, "user", "primary", content) catch {};
         _ = self.removeLatestTick("primary");
@@ -345,6 +359,7 @@ pub const AgentRuntime = struct {
         defer rom.deinit();
 
         try self.hooks.execute(.pre_observe, &ctx, .{ .pre_observe = &rom });
+        try self.syncCorePromptMemories(brain_name, &rom);
 
         // Collect inbox events
         brain.clearInbox();
@@ -369,13 +384,13 @@ pub const AgentRuntime = struct {
         const snapshot = try self.active_memory.snapshotActive(self.allocator, brain_name);
         defer memory.deinitItems(self.allocator, snapshot);
 
-        // Build observe_json including both active memory and ROM
-        const observe_json = try buildObserveJson(self.allocator, brain_name, snapshot, &rom);
+        // Build observe_json from active memory snapshot
+        const observe_json = try buildObserveJson(self.allocator, brain_name, snapshot);
         // Note: observe_json is owned by TickResult and freed in TickResult.deinit()
 
         // === POST_OBSERVE ===
         var observe_result = hook_registry.ObserveResult{
-            .rom = &rom,
+            .core = &rom,
             .inbox_count = brain.inbox.items.len,
         };
         try self.hooks.execute(.post_observe, &ctx, .{ .post_observe = &observe_result });
@@ -407,7 +422,7 @@ pub const AgentRuntime = struct {
 
         // Store results as artifacts
         for (results) |result| {
-            var artifact = try self.active_memory.create(brain_name, .ram, null, "tool_result", result.payload_json, false);
+            var artifact = try self.active_memory.create(brain_name, null, "tool_result", result.payload_json, false, false);
             artifact.deinit(self.allocator);
         }
 
@@ -491,12 +506,121 @@ pub const AgentRuntime = struct {
         return false;
     }
 
-    /// Build observe JSON combining active memory and ROM
+    fn syncCorePromptMemories(
+        self: *AgentRuntime,
+        brain_name: []const u8,
+        rom: *const hook_registry.Rom,
+    ) !void {
+        const active_snapshot = try self.active_memory.snapshotActive(self.allocator, brain_name);
+        defer memory.deinitItems(self.allocator, active_snapshot);
+
+        var expected_core_names = std.StringHashMapUnmanaged(void){};
+        defer {
+            var expected_it = expected_core_names.iterator();
+            while (expected_it.next()) |entry| {
+                self.allocator.free(entry.key_ptr.*);
+            }
+            expected_core_names.deinit(self.allocator);
+        }
+
+        var it = rom.entries.iterator();
+        while (it.next()) |entry| {
+            const core_kind = coreMemoryKindFromKey(entry.key_ptr.*);
+            const core_name = try coreMemoryNameFromKey(self.allocator, entry.key_ptr.*);
+            defer self.allocator.free(core_name);
+
+            if (!expected_core_names.contains(core_name)) {
+                const owned_core_name = try self.allocator.dupe(u8, core_name);
+                errdefer self.allocator.free(owned_core_name);
+                try expected_core_names.put(self.allocator, owned_core_name, {});
+            }
+
+            const escaped_content = try jsonEscapeAlloc(self.allocator, entry.value_ptr.value);
+            defer self.allocator.free(escaped_content);
+            const content_json = try std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped_content});
+            defer self.allocator.free(content_json);
+
+            if (findActiveByName(active_snapshot, core_name)) |item| {
+                if (std.mem.eql(u8, item.content_json, content_json) and !item.mutable) continue;
+
+                var removed = self.active_memory.removeActiveNoHistory(item.mem_id) catch |err| switch (err) {
+                    memory.MemoryError.NotFound => null,
+                    else => return err,
+                };
+                if (removed) |*removed_item| removed_item.deinit(self.allocator);
+            }
+
+            var created = try self.active_memory.createActiveNoHistory(
+                brain_name,
+                core_name,
+                core_kind,
+                content_json,
+                true,
+                true,
+            );
+            created.deinit(self.allocator);
+        }
+
+        for (active_snapshot) |item| {
+            if (!isManagedCorePromptMemory(item)) continue;
+            const parsed = memid.MemId.parse(item.mem_id) catch continue;
+            if (expected_core_names.contains(parsed.name)) continue;
+
+            var removed = self.active_memory.removeActiveNoHistory(item.mem_id) catch |err| switch (err) {
+                memory.MemoryError.NotFound => continue,
+                else => return err,
+            };
+            removed.deinit(self.allocator);
+        }
+    }
+
+    fn coreMemoryNameFromKey(allocator: std.mem.Allocator, key: []const u8) ![]u8 {
+        var out = std.ArrayListUnmanaged(u8){};
+        defer out.deinit(allocator);
+
+        try out.appendSlice(allocator, "core.");
+        for (key) |char| {
+            if (std.ascii.isAlphanumeric(char) or char == '_' or char == '-' or char == '.') {
+                try out.append(allocator, char);
+                continue;
+            }
+            if (char == ':') {
+                try out.append(allocator, '.');
+                continue;
+            }
+            try out.append(allocator, '_');
+        }
+
+        return out.toOwnedSlice(allocator);
+    }
+
+    fn coreMemoryKindFromKey(key: []const u8) []const u8 {
+        if (std.mem.eql(u8, key, system_hooks.BASE_CORE_ROM_KEY)) return "core.base_prompt";
+        return "core.system_prompt";
+    }
+
+    fn isManagedCorePromptMemory(item: memory.ActiveMemoryItem) bool {
+        if (!std.mem.eql(u8, item.kind, "core.system_prompt") and !std.mem.eql(u8, item.kind, "core.base_prompt")) {
+            return false;
+        }
+
+        const parsed = memid.MemId.parse(item.mem_id) catch return false;
+        return std.mem.startsWith(u8, parsed.name, "core.");
+    }
+
+    fn findActiveByName(snapshot: []const memory.ActiveMemoryItem, name: []const u8) ?memory.ActiveMemoryItem {
+        for (snapshot) |item| {
+            const parsed = memid.MemId.parse(item.mem_id) catch continue;
+            if (std.mem.eql(u8, parsed.name, name)) return item;
+        }
+        return null;
+    }
+
+    /// Build observe JSON from active memory only
     fn buildObserveJson(
         allocator: std.mem.Allocator,
         brain_name: []const u8,
         snapshot: []const memory.ActiveMemoryItem,
-        rom: *const hook_registry.Rom,
     ) ![]u8 {
         // Start with active memory JSON
         var result = std.ArrayListUnmanaged(u8){};
@@ -504,7 +628,7 @@ pub const AgentRuntime = struct {
 
         const writer = result.writer(allocator);
 
-        // Build JSON manually to include both memory and ROM
+        // Build JSON manually so content can be embedded as JSON
         try writer.writeAll("{");
 
         // Active memory
@@ -522,11 +646,11 @@ pub const AgentRuntime = struct {
             try writer.writeAll("\"mem_id\":");
             try writeJsonString(writer, item.mem_id);
             try writer.writeByte(',');
-            try writer.print("\"tier\":\"{s}\",", .{@tagName(item.tier)});
+            try writer.print("\"write_protected\":{},", .{!item.mutable});
             try writer.writeAll("\"kind\":");
             try writeJsonString(writer, item.kind);
             try writer.writeByte(',');
-            try writer.print("\"mutable\":{},", .{item.mutable});
+            try writer.print("\"unevictable\":{},", .{item.unevictable});
             try writer.writeAll("\"content\":");
             // Validate content_json is valid JSON, otherwise wrap as string
             if (isValidJson(item.content_json)) {
@@ -537,22 +661,6 @@ pub const AgentRuntime = struct {
             try writer.writeByte('}');
         }
         try writer.writeByte(']');
-
-        // ROM entries
-        try writer.writeAll(",\"rom\":");
-        try writer.writeByte('{');
-
-        var first = true;
-        var rom_it = rom.entries.iterator();
-        while (rom_it.next()) |entry| {
-            if (!first) try writer.writeByte(',');
-            first = false;
-            // Proper JSON string encoding for key and value
-            try writeJsonString(writer, entry.key_ptr.*);
-            try writer.writeByte(':');
-            try writeJsonString(writer, entry.value_ptr.value);
-        }
-        try writer.writeByte('}');
 
         try writer.writeByte('}');
 
@@ -593,6 +701,14 @@ pub fn deinitOutbound(allocator: std.mem.Allocator, messages: [][]u8) void {
     allocator.free(messages);
 }
 
+fn hasNamedMemory(items: []const memory.ActiveMemoryItem, name: []const u8) bool {
+    for (items) |item| {
+        const parsed = memid.MemId.parse(item.mem_id) catch continue;
+        if (std.mem.eql(u8, parsed.name, name)) return true;
+    }
+    return false;
+}
+
 test "agent_runtime: create primary + sub brain and execute one tick" {
     const allocator = std.testing.allocator;
     const cfg = Config.RuntimeConfig{};
@@ -602,7 +718,7 @@ test "agent_runtime: create primary + sub brain and execute one tick" {
     try std.testing.expect(runtime.brains.contains("primary"));
     try std.testing.expect(runtime.brains.contains("research"));
 
-    try runtime.queueToolUse("primary", "memory.create", "{\"kind\":\"message\",\"content\":{\"text\":\"hello\"}}");
+    try runtime.queueToolUse("primary", "memory_create", "{\"kind\":\"message\",\"content\":{\"text\":\"hello\"}}");
     const result = (try runtime.tickNext()).?;
     defer {
         var mutable = result;
@@ -672,6 +788,48 @@ test "agent_runtime: queue saturation returns explicit overload" {
     try std.testing.expectError(RuntimeError.QueueSaturated, runtime.enqueueUserEvent("again"));
 }
 
+test "agent_runtime: refreshCorePrompt prunes stale managed core memory entries" {
+    const allocator = std.testing.allocator;
+    const cfg = Config.RuntimeConfig{};
+    var runtime = try AgentRuntime.init(allocator, "agentA", &[_][]const u8{}, cfg);
+    defer runtime.deinit();
+
+    var stale = try runtime.active_memory.create("primary", "core.stale_entry", "core.system_prompt", "\"stale\"", false, true);
+    defer stale.deinit(allocator);
+
+    const before = try runtime.active_memory.snapshotActive(allocator, "primary");
+    defer memory.deinitItems(allocator, before);
+    try std.testing.expect(hasNamedMemory(before, "core.stale_entry"));
+
+    try runtime.refreshCorePrompt("primary");
+
+    const after = try runtime.active_memory.snapshotActive(allocator, "primary");
+    defer memory.deinitItems(allocator, after);
+    try std.testing.expect(!hasNamedMemory(after, "core.stale_entry"));
+}
+
+test "agent_runtime: refreshCorePrompt writes managed core memories as write-protected" {
+    const allocator = std.testing.allocator;
+    const cfg = Config.RuntimeConfig{};
+    var runtime = try AgentRuntime.init(allocator, "agentA", &[_][]const u8{}, cfg);
+    defer runtime.deinit();
+
+    try runtime.refreshCorePrompt("primary");
+
+    const snapshot = try runtime.active_memory.snapshotActive(allocator, "primary");
+    defer memory.deinitItems(allocator, snapshot);
+
+    var found_managed_core = false;
+    for (snapshot) |item| {
+        if (!AgentRuntime.isManagedCorePromptMemory(item)) continue;
+        found_managed_core = true;
+        try std.testing.expect(!item.mutable);
+        try std.testing.expect(item.unevictable);
+    }
+
+    try std.testing.expect(found_managed_core);
+}
+
 test "agent_runtime: enqueueUserEvent rejects paused/cancelled without queuing work" {
     const allocator = std.testing.allocator;
     const cfg = Config.RuntimeConfig{};
@@ -711,7 +869,7 @@ test "agent_runtime: queueToolUse rollback clears partially queued tool when tic
     defer runtime.deinit();
 
     runtime.queue_limits.brain_ticks = 0;
-    try std.testing.expectError(RuntimeError.QueueSaturated, runtime.queueToolUse("primary", "talk.user", "{\"message\":\"x\"}"));
+    try std.testing.expectError(RuntimeError.QueueSaturated, runtime.queueToolUse("primary", "talk_user", "{\"message\":\"x\"}"));
 
     const primary = runtime.brains.getPtr("primary").?;
     try std.testing.expectEqual(@as(usize, 0), primary.pending_tool_uses.items.len);
@@ -732,14 +890,14 @@ test "agent_runtime: rollbackQueuedUserPrimaryWork removes pending user event an
     try std.testing.expectEqual(@as(usize, 0), runtime.bus.pendingCount());
 }
 
-test "agent_runtime: talk.brain plus wait.for correlates across brains" {
+test "agent_runtime: talk_brain plus wait_for correlates across brains" {
     const allocator = std.testing.allocator;
     const cfg = Config.RuntimeConfig{};
     var runtime = try AgentRuntime.init(allocator, "agentA", &[_][]const u8{"research"}, cfg);
     defer runtime.deinit();
 
-    try runtime.queueToolUse("primary", "talk.brain", "{\"message\":\"sync\",\"target_brain\":\"research\"}");
-    try runtime.queueToolUse("primary", "wait.for", "{\"events\":[{\"event_type\":\"agent\",\"parameter\":\"research\"}]}");
+    try runtime.queueToolUse("primary", "talk_brain", "{\"message\":\"sync\",\"target_brain\":\"research\"}");
+    try runtime.queueToolUse("primary", "wait_for", "{\"events\":[{\"event_type\":\"agent\",\"parameter\":\"research\"}]}");
 
     var primary_tick = (try runtime.tickNext()).?;
     defer primary_tick.deinit(allocator);
@@ -771,13 +929,13 @@ test "agent_runtime: talk.brain plus wait.for correlates across brains" {
     try std.testing.expect(std.mem.indexOf(u8, resolve_tick.tool_results[0].payload_json, "\"waiting\":false") != null);
 }
 
-test "agent_runtime: talk.brain schedules target brain tick for runtime loop" {
+test "agent_runtime: talk_brain schedules target brain tick for runtime loop" {
     const allocator = std.testing.allocator;
     const cfg = Config.RuntimeConfig{};
     var runtime = try AgentRuntime.init(allocator, "agentA", &[_][]const u8{"research"}, cfg);
     defer runtime.deinit();
 
-    try runtime.queueToolUse("primary", "talk.brain", "{\"message\":\"sync\",\"target_brain\":\"research\"}");
+    try runtime.queueToolUse("primary", "talk_brain", "{\"message\":\"sync\",\"target_brain\":\"research\"}");
 
     var first_tick = (try runtime.tickNext()).?;
     defer first_tick.deinit(allocator);
@@ -801,7 +959,7 @@ test "agent_runtime: memory lifecycle create mutate evict load historical" {
     var runtime = try AgentRuntime.initWithPersistence(allocator, "agentA", &[_][]const u8{}, dir, "runtime.db", cfg);
     defer runtime.deinit();
 
-    try runtime.queueToolUse("primary", "memory.create", "{\"name\":\"memo\",\"kind\":\"note\",\"content\":{\"text\":\"v1\"}}");
+    try runtime.queueToolUse("primary", "memory_create", "{\"name\":\"memo\",\"kind\":\"note\",\"content\":{\"text\":\"v1\"}}");
     var create_tick = (try runtime.tickNext()).?;
     defer create_tick.deinit(allocator);
     try std.testing.expectEqual(@as(usize, 1), create_tick.tool_results.len);
@@ -815,7 +973,7 @@ test "agent_runtime: memory lifecycle create mutate evict load historical" {
 
     const mutate_args = try std.fmt.allocPrint(allocator, "{{\"mem_id\":\"{s}\",\"content\":{{\"text\":\"v2\"}}}}", .{created_id_copy});
     defer allocator.free(mutate_args);
-    try runtime.queueToolUse("primary", "memory.mutate", mutate_args);
+    try runtime.queueToolUse("primary", "memory_mutate", mutate_args);
     var mutate_tick = (try runtime.tickNext()).?;
     defer mutate_tick.deinit(allocator);
     try std.testing.expect(mutate_tick.tool_results[0].success);
@@ -828,7 +986,7 @@ test "agent_runtime: memory lifecycle create mutate evict load historical" {
 
     const evict_args = try std.fmt.allocPrint(allocator, "{{\"mem_id\":\"{s}\"}}", .{mutated_id_copy});
     defer allocator.free(evict_args);
-    try runtime.queueToolUse("primary", "memory.evict", evict_args);
+    try runtime.queueToolUse("primary", "memory_evict", evict_args);
     var evict_tick = (try runtime.tickNext()).?;
     defer evict_tick.deinit(allocator);
     try std.testing.expect(evict_tick.tool_results[0].success);
@@ -839,7 +997,7 @@ test "agent_runtime: memory lifecycle create mutate evict load historical" {
 
     const load_args = try std.fmt.allocPrint(allocator, "{{\"mem_id\":\"{s}\",\"version\":1}}", .{latest_alias});
     defer allocator.free(load_args);
-    try runtime.queueToolUse("primary", "memory.load", load_args);
+    try runtime.queueToolUse("primary", "memory_load", load_args);
     var load_tick = (try runtime.tickNext()).?;
     defer load_tick.deinit(allocator);
     try std.testing.expect(load_tick.tool_results[0].success);

@@ -32,11 +32,12 @@
   ],
   
   "allowed_tools": [
-    "memory.create",
-    "memory.load",
-    "memory.search",
-    "talk.brain",
-    "talk.agent",
+    "memory_create",
+    "memory_load",
+    "memory_versions",
+    "memory_search",
+    "talk_brain",
+    "talk_agent",
     "file_read",
     "file_write",
     "file_list"

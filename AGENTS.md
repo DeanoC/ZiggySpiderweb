@@ -44,3 +44,7 @@ This repository is a Zig project with source in `src/` and documentation in `REA
 - The process runs as a Linux-targeted websocket gateway and expects OpenClaw-compatible clients.
 - Core flow: `OpenClaw connect → websocket handshake → chat message parsing → provider stream proxy → OpenClaw frames`.
 - Keep protocol paths and message types stable (`/v1/agents/{agentId}/stream`) to preserve client compatibility.
+
+## Compatibility Policy
+- Until `1.0.0`, backward compatibility is **not** guaranteed.
+- During this initial development phase, breaking changes to runtime behavior, memory schema, protocol payloads, and internal tool contracts are allowed.

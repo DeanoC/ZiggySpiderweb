@@ -18,7 +18,7 @@ pub const HookError = error{
 };
 
 pub const HookPriority = enum(i16) {
-    /// System-first hooks (ROM loading, validation)
+    /// System-first hooks (core prompt loading, validation)
     system_first = -1000,
 
     /// Default priority for brain specializations
@@ -28,26 +28,29 @@ pub const HookPriority = enum(i16) {
     system_last = 1000,
 };
 
-/// ROM entry for PreObserve hook pipeline
-pub const RomEntry = struct {
+/// Core prompt entry for PreObserve hook pipeline
+pub const CoreEntry = struct {
     key: []const u8,
     value: []const u8,
     mutable: bool = true,
 };
 
-/// Simple ROM structure for PreObserve pipeline
-pub const Rom = struct {
-    allocator: std.mem.Allocator,
-    entries: std.StringHashMapUnmanaged(RomEntry),
+/// Backward-compatible alias for older naming.
+pub const RomEntry = CoreEntry;
 
-    pub fn init(allocator: std.mem.Allocator) Rom {
+/// Simple core prompt structure for PreObserve pipeline
+pub const CorePrompt = struct {
+    allocator: std.mem.Allocator,
+    entries: std.StringHashMapUnmanaged(CoreEntry),
+
+    pub fn init(allocator: std.mem.Allocator) CorePrompt {
         return .{
             .allocator = allocator,
             .entries = .{},
         };
     }
 
-    pub fn deinit(self: *Rom) void {
+    pub fn deinit(self: *CorePrompt) void {
         var it = self.entries.iterator();
         while (it.next()) |entry| {
             self.allocator.free(entry.key_ptr.*);
@@ -56,8 +59,8 @@ pub const Rom = struct {
         self.entries.deinit(self.allocator);
     }
 
-    /// Set a key-value pair in ROM (always mutable during PreObserve)
-    pub fn set(self: *Rom, key: []const u8, value: []const u8) !void {
+    /// Set a key-value pair in core prompt memory (always mutable during PreObserve)
+    pub fn set(self: *CorePrompt, key: []const u8, value: []const u8) !void {
         // Check if entry exists
         if (self.entries.getEntry(key)) |existing| {
             // Update existing entry - free old value, keep key
@@ -82,19 +85,19 @@ pub const Rom = struct {
         });
     }
 
-    /// Get a value from ROM
-    pub fn get(self: *const Rom, key: []const u8) ?[]const u8 {
+    /// Get a value from core prompt memory
+    pub fn get(self: *const CorePrompt, key: []const u8) ?[]const u8 {
         const entry = self.entries.get(key) orelse return null;
         return entry.value;
     }
 
     /// Check if key exists
-    pub fn has(self: *const Rom, key: []const u8) bool {
+    pub fn has(self: *const CorePrompt, key: []const u8) bool {
         return self.entries.contains(key);
     }
 
     /// Get all keys (for debugging)
-    pub fn keys(self: *const Rom, allocator: std.mem.Allocator) ![][]const u8 {
+    pub fn keys(self: *const CorePrompt, allocator: std.mem.Allocator) ![][]const u8 {
         var result = std.ArrayList([]const u8).init(allocator);
         errdefer result.deinit();
 
@@ -107,9 +110,12 @@ pub const Rom = struct {
     }
 };
 
+/// Backward-compatible alias for older naming.
+pub const Rom = CorePrompt;
+
 /// Data passed to hooks varies by phase
 pub const HookData = union(HookPhase) {
-    pre_observe: *Rom,
+    pre_observe: *CorePrompt,
     post_observe: *ObserveResult,
     pre_mutate: *PendingTools,
     post_mutate: *ToolResults,
@@ -190,7 +196,7 @@ pub const HookContext = struct {
 
 /// Result of Observe phase
 pub const ObserveResult = struct {
-    rom: *const Rom,
+    core: *const CorePrompt,
     inbox_count: usize,
     // TODO: Add more observe data as needed
 };

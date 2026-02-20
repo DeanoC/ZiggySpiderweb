@@ -3,7 +3,7 @@ Each agent has a loop per brain (primary or sub-brain), this is something like t
 At each iteration of the loop, 
 - the brain will examine its active memory (Observe)
 - select which tools to use to affect itself or the world (Mutate)
-- load the results of the tools into RAM (Results)
+- load the results of the tools into active memory (Results)
 - repeat
 
 Tools can be a mix of Brain Tools and World Tools, allowing an agent to change its own state and the world.
@@ -26,6 +26,7 @@ States:
 - Mutate
 - Results
 
-PreObserve is a key step as it allows each hook to mutate the ROM (e.g. feeding real time data in to the ROM)
+PreObserve is a key step as it allows each hook to update core system-prompt memory (e.g. feeding real-time data into core memory).
+`CORE.md` base instructions are loaded first, then other core memories are layered on top.
 PostResults is the where a disk/reconcilation step can occur.
 Using various hooks allows single step debugging, data validation and agent level logging.

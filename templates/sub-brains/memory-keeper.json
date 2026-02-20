@@ -31,17 +31,18 @@
   ],
   
   "allowed_tools": [
-    "memory.create",
-    "memory.load",
-    "memory.mutate",
-    "memory.search",
-    "memory.evict",
-    "talk.log"
+    "memory_create",
+    "memory_load",
+    "memory_versions",
+    "memory_mutate",
+    "memory_search",
+    "memory_evict",
+    "talk_log"
   ],
   
   "denied_tools": [
-    "talk.user",
-    "talk.brain"
+    "talk_user",
+    "talk_brain"
   ],
   
   "can_spawn_subbrains": false

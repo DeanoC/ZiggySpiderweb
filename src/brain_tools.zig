@@ -1,5 +1,6 @@
 const std = @import("std");
 const memory = @import("memory.zig");
+const memid = @import("memid.zig");
 const brain_context = @import("brain_context.zig");
 const event_bus = @import("event_bus.zig");
 const tool_registry = @import("tool_registry.zig");
@@ -20,19 +21,21 @@ pub const ToolSchema = struct {
     name: []const u8,
     description: []const u8,
     required_fields: []const []const u8,
+    optional_fields: []const []const u8 = &.{},
 };
 
 pub const brain_tool_schemas = [_]ToolSchema{
-    .{ .name = "memory.load", .description = "Load memory by mem_id and optional version", .required_fields = &[_][]const u8{"mem_id"} },
-    .{ .name = "memory.evict", .description = "Evict mutable memory by mem_id", .required_fields = &[_][]const u8{"mem_id"} },
-    .{ .name = "memory.mutate", .description = "Mutate mutable memory by mem_id", .required_fields = &[_][]const u8{ "mem_id", "content" } },
-    .{ .name = "memory.create", .description = "Create RAM/ROM memory entry. Optional 'unevictable': true to prevent eviction.", .required_fields = &[_][]const u8{ "kind", "content" } },
-    .{ .name = "memory.search", .description = "Keyword search memory entries", .required_fields = &[_][]const u8{"query"} },
-    .{ .name = "wait.for", .description = "Wait for correlated talk/event", .required_fields = &[_][]const u8{"events"} },
-    .{ .name = "talk.user", .description = "Send message to user channel", .required_fields = &[_][]const u8{"message"} },
-    .{ .name = "talk.agent", .description = "Send message to another agent channel", .required_fields = &[_][]const u8{ "message", "target_brain" } },
-    .{ .name = "talk.brain", .description = "Send message to another brain", .required_fields = &[_][]const u8{ "message", "target_brain" } },
-    .{ .name = "talk.log", .description = "Emit runtime log talk event", .required_fields = &[_][]const u8{"message"} },
+    .{ .name = "memory_load", .description = "Load memory by mem_id and optional version", .required_fields = &[_][]const u8{"mem_id"}, .optional_fields = &[_][]const u8{"version"} },
+    .{ .name = "memory_versions", .description = "List available versions for a memory", .required_fields = &[_][]const u8{"mem_id"}, .optional_fields = &[_][]const u8{"limit"} },
+    .{ .name = "memory_evict", .description = "Evict memory by mem_id unless it is marked unevictable", .required_fields = &[_][]const u8{"mem_id"} },
+    .{ .name = "memory_mutate", .description = "Mutate memory by mem_id unless it is write_protected", .required_fields = &[_][]const u8{ "mem_id", "content" } },
+    .{ .name = "memory_create", .description = "Create memory entry. Optional flags: write_protected, unevictable.", .required_fields = &[_][]const u8{ "kind", "content" }, .optional_fields = &[_][]const u8{ "name", "write_protected", "unevictable" } },
+    .{ .name = "memory_search", .description = "Keyword search memory entries", .required_fields = &[_][]const u8{"query"}, .optional_fields = &[_][]const u8{"limit"} },
+    .{ .name = "wait_for", .description = "Wait for correlated talk/event", .required_fields = &[_][]const u8{"events"} },
+    .{ .name = "talk_user", .description = "Send message to user channel", .required_fields = &[_][]const u8{"message"} },
+    .{ .name = "talk_agent", .description = "Send message to another agent channel", .required_fields = &[_][]const u8{ "message", "target_brain" } },
+    .{ .name = "talk_brain", .description = "Send message to another brain", .required_fields = &[_][]const u8{ "message", "target_brain" } },
+    .{ .name = "talk_log", .description = "Emit runtime log talk event", .required_fields = &[_][]const u8{"message"} },
 };
 
 const WaitEventSpec = struct {
@@ -171,18 +174,18 @@ pub const Engine = struct {
 
         var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, pending_wait_json, .{}) catch {
             brain.clearPendingWait();
-            return .{ .resolved = try self.failure("wait.for", "invalid_state", "pending wait state is invalid") };
+            return .{ .resolved = try self.failure("wait_for", "invalid_state", "pending wait state is invalid") };
         };
         defer parsed.deinit();
 
         if (parsed.value != .object) {
             brain.clearPendingWait();
-            return .{ .resolved = try self.failure("wait.for", "invalid_state", "pending wait state must be an object") };
+            return .{ .resolved = try self.failure("wait_for", "invalid_state", "pending wait state must be an object") };
         }
 
         const specs = self.parseWaitSpecs(parsed.value.object, null) catch {
             brain.clearPendingWait();
-            return .{ .resolved = try self.failure("wait.for", "invalid_state", "pending wait events are invalid") };
+            return .{ .resolved = try self.failure("wait_for", "invalid_state", "pending wait events are invalid") };
         };
         defer deinitWaitSpecs(self.allocator, specs);
 
@@ -196,7 +199,7 @@ pub const Engine = struct {
         const payload = try buildWaitPayload(self.allocator, brain, specs, &evaluation, false);
         brain.consumeInboxIndices(evaluation.matched_indices);
         brain.clearPendingWait();
-        return .{ .resolved = try self.success("wait.for", payload) };
+        return .{ .resolved = try self.success("wait_for", payload) };
     }
 
     fn executeOne(
@@ -215,28 +218,31 @@ pub const Engine = struct {
         }
         const args = parsed.value.object;
 
-        if (std.mem.eql(u8, tool_use.name, "memory.create")) {
+        if (std.mem.eql(u8, tool_use.name, "memory_create")) {
             return .{ .result = try self.execMemoryCreate(tool_use.name, brain, args) };
         }
-        if (std.mem.eql(u8, tool_use.name, "memory.load")) {
+        if (std.mem.eql(u8, tool_use.name, "memory_load")) {
             return .{ .result = try self.execMemoryLoad(tool_use.name, args) };
         }
-        if (std.mem.eql(u8, tool_use.name, "memory.mutate")) {
+        if (std.mem.eql(u8, tool_use.name, "memory_versions")) {
+            return .{ .result = try self.execMemoryVersions(tool_use.name, args) };
+        }
+        if (std.mem.eql(u8, tool_use.name, "memory_mutate")) {
             return .{ .result = try self.execMemoryMutate(tool_use.name, args) };
         }
-        if (std.mem.eql(u8, tool_use.name, "memory.evict")) {
+        if (std.mem.eql(u8, tool_use.name, "memory_evict")) {
             return .{ .result = try self.execMemoryEvict(tool_use.name, args) };
         }
-        if (std.mem.eql(u8, tool_use.name, "memory.search")) {
+        if (std.mem.eql(u8, tool_use.name, "memory_search")) {
             return .{ .result = try self.execMemorySearch(tool_use.name, brain, args) };
         }
-        if (std.mem.eql(u8, tool_use.name, "wait.for")) {
+        if (std.mem.eql(u8, tool_use.name, "wait_for")) {
             return self.execWaitFor(tool_use.name, brain, args, talk_ids_in_batch);
         }
-        if (std.mem.eql(u8, tool_use.name, "talk.user") or
-            std.mem.eql(u8, tool_use.name, "talk.agent") or
-            std.mem.eql(u8, tool_use.name, "talk.brain") or
-            std.mem.eql(u8, tool_use.name, "talk.log"))
+        if (std.mem.eql(u8, tool_use.name, "talk_user") or
+            std.mem.eql(u8, tool_use.name, "talk_agent") or
+            std.mem.eql(u8, tool_use.name, "talk_brain") or
+            std.mem.eql(u8, tool_use.name, "talk_log"))
         {
             const talk = try self.execTalk(tool_use.name, brain, args);
             return .{ .result = talk.result, .talk_id = talk.talk_id };
@@ -303,55 +309,49 @@ pub const Engine = struct {
         args: std.json.ObjectMap,
     ) !ToolResult {
         const kind = getRequiredString(args, "kind") orelse {
-            return self.failure(tool_name, "invalid_args", "memory.create requires 'kind'");
+            return self.failure(tool_name, "invalid_args", "memory_create requires 'kind'");
         };
         const content_value = args.get("content") orelse {
-            return self.failure(tool_name, "invalid_args", "memory.create requires 'content'");
+            return self.failure(tool_name, "invalid_args", "memory_create requires 'content'");
         };
         const content = try jsonValueToOwnedSlice(self.allocator, content_value);
         defer self.allocator.free(content);
-
-        const tier = if (args.get("tier")) |value| blk: {
-            if (value != .string) {
-                return self.failure(tool_name, "invalid_args", "memory.create tier must be 'ram' or 'rom'");
-            }
-            if (std.mem.eql(u8, value.string, "rom")) break :blk memory.MemoryTier.rom;
-            if (!std.mem.eql(u8, value.string, "ram")) {
-                return self.failure(tool_name, "invalid_args", "memory.create tier must be 'ram' or 'rom'");
-            }
-            break :blk memory.MemoryTier.ram;
-        } else memory.MemoryTier.ram;
 
         const name = if (args.get("name")) |value|
             if (value == .string) value.string else null
         else
             null;
 
+        const write_protected = if (args.get("write_protected")) |value| blk: {
+            if (value == .bool) break :blk value.bool;
+            return self.failure(tool_name, "invalid_args", "memory_create write_protected must be a boolean");
+        } else false;
+
         // Parse optional unevictable flag (defaults to false)
         const unevictable = if (args.get("unevictable")) |value| blk: {
             if (value == .bool) break :blk value.bool;
-            return self.failure(tool_name, "invalid_args", "memory.create unevictable must be a boolean");
+            return self.failure(tool_name, "invalid_args", "memory_create unevictable must be a boolean");
         } else false;
 
-        var created = self.runtime_memory.create(brain.brain_name, tier, name, kind, content, unevictable) catch |err| {
+        var created = self.runtime_memory.create(brain.brain_name, name, kind, content, write_protected, unevictable) catch |err| {
             return self.failure(tool_name, "execution_failed", @errorName(err));
         };
         defer created.deinit(self.allocator);
 
         const payload = try std.fmt.allocPrint(
             self.allocator,
-            "{{\"mem_id\":\"{s}\",\"version\":{d},\"tier\":\"{s}\",\"unevictable\":{}}}",
-            .{ created.mem_id, created.version orelse 0, if (created.tier == .ram) "ram" else "rom", created.unevictable },
+            "{{\"mem_id\":\"{s}\",\"version\":{d},\"write_protected\":{},\"unevictable\":{}}}",
+            .{ created.mem_id, created.version orelse 0, !created.mutable, created.unevictable },
         );
         return self.success(tool_name, payload);
     }
 
     fn execMemoryLoad(self: *Engine, tool_name: []const u8, args: std.json.ObjectMap) !ToolResult {
         const mem_id = getRequiredString(args, "mem_id") orelse {
-            return self.failure(tool_name, "invalid_args", "memory.load requires 'mem_id'");
+            return self.failure(tool_name, "invalid_args", "memory_load requires 'mem_id'");
         };
         const version = getOptionalU64(args, "version") catch {
-            return self.failure(tool_name, "invalid_args", "memory.load version must be a non-negative integer");
+            return self.failure(tool_name, "invalid_args", "memory_load version must be a non-negative integer");
         };
 
         var loaded = self.runtime_memory.load(mem_id, version) catch |err| {
@@ -371,9 +371,11 @@ pub const Engine = struct {
         try payload.writer(self.allocator).print("{d}", .{loaded.version orelse 0});
         try payload.appendSlice(self.allocator, ",\"kind\":\"");
         try appendJsonEscaped(self.allocator, &payload, loaded.kind);
-        try payload.appendSlice(self.allocator, "\",\"tier\":\"");
-        try payload.appendSlice(self.allocator, if (loaded.tier == .ram) "ram" else "rom");
-        try payload.appendSlice(self.allocator, "\",\"content\":");
+        try payload.appendSlice(self.allocator, "\",\"write_protected\":");
+        try payload.appendSlice(self.allocator, if (loaded.mutable) "false" else "true");
+        try payload.appendSlice(self.allocator, ",\"unevictable\":");
+        try payload.appendSlice(self.allocator, if (loaded.unevictable) "true" else "false");
+        try payload.appendSlice(self.allocator, ",\"content\":");
         try payload.appendSlice(self.allocator, rendered_content);
         try payload.appendSlice(self.allocator, "}");
 
@@ -383,10 +385,10 @@ pub const Engine = struct {
 
     fn execMemoryMutate(self: *Engine, tool_name: []const u8, args: std.json.ObjectMap) !ToolResult {
         const mem_id = getRequiredString(args, "mem_id") orelse {
-            return self.failure(tool_name, "invalid_args", "memory.mutate requires 'mem_id'");
+            return self.failure(tool_name, "invalid_args", "memory_mutate requires 'mem_id'");
         };
         const content_value = args.get("content") orelse {
-            return self.failure(tool_name, "invalid_args", "memory.mutate requires 'content'");
+            return self.failure(tool_name, "invalid_args", "memory_mutate requires 'content'");
         };
         const content = try jsonValueToOwnedSlice(self.allocator, content_value);
         defer self.allocator.free(content);
@@ -404,9 +406,50 @@ pub const Engine = struct {
         return self.success(tool_name, payload);
     }
 
+    fn execMemoryVersions(self: *Engine, tool_name: []const u8, args: std.json.ObjectMap) !ToolResult {
+        const mem_id = getRequiredString(args, "mem_id") orelse {
+            return self.failure(tool_name, "invalid_args", "memory_versions requires 'mem_id'");
+        };
+        const limit = getOptionalUsize(args, "limit") catch {
+            return self.failure(tool_name, "invalid_args", "memory_versions limit must be a non-negative integer");
+        } orelse 25;
+
+        const versions = self.runtime_memory.listVersions(self.allocator, mem_id, limit) catch |err| {
+            return self.failure(tool_name, "execution_failed", @errorName(err));
+        };
+        defer memory.deinitItems(self.allocator, versions);
+
+        var payload = std.ArrayListUnmanaged(u8){};
+        defer payload.deinit(self.allocator);
+
+        try payload.appendSlice(self.allocator, "{\"mem_id\":\"");
+        try appendJsonEscaped(self.allocator, &payload, mem_id);
+        try payload.appendSlice(self.allocator, "\",\"versions\":[");
+        for (versions, 0..) |item, index| {
+            if (index > 0) try payload.append(self.allocator, ',');
+
+            try payload.appendSlice(self.allocator, "{\"mem_id\":\"");
+            try appendJsonEscaped(self.allocator, &payload, item.mem_id);
+            try payload.appendSlice(self.allocator, "\",\"version\":");
+            try payload.writer(self.allocator).print("{d}", .{item.version orelse 0});
+            try payload.appendSlice(self.allocator, ",\"kind\":\"");
+            try appendJsonEscaped(self.allocator, &payload, item.kind);
+            try payload.appendSlice(self.allocator, "\",\"write_protected\":");
+            try payload.appendSlice(self.allocator, if (item.mutable) "false" else "true");
+            try payload.appendSlice(self.allocator, ",\"unevictable\":");
+            try payload.appendSlice(self.allocator, if (item.unevictable) "true" else "false");
+            try payload.appendSlice(self.allocator, ",\"created_at_ms\":");
+            try payload.writer(self.allocator).print("{d}", .{item.created_at_ms});
+            try payload.append(self.allocator, '}');
+        }
+        try payload.appendSlice(self.allocator, "]}");
+
+        return self.success(tool_name, try payload.toOwnedSlice(self.allocator));
+    }
+
     fn execMemoryEvict(self: *Engine, tool_name: []const u8, args: std.json.ObjectMap) !ToolResult {
         const mem_id = getRequiredString(args, "mem_id") orelse {
-            return self.failure(tool_name, "invalid_args", "memory.evict requires 'mem_id'");
+            return self.failure(tool_name, "invalid_args", "memory_evict requires 'mem_id'");
         };
 
         var evicted = self.runtime_memory.evict(mem_id) catch |err| {
@@ -429,10 +472,10 @@ pub const Engine = struct {
         args: std.json.ObjectMap,
     ) !ToolResult {
         const query = getRequiredString(args, "query") orelse {
-            return self.failure(tool_name, "invalid_args", "memory.search requires 'query'");
+            return self.failure(tool_name, "invalid_args", "memory_search requires 'query'");
         };
         const limit = getOptionalUsize(args, "limit") catch {
-            return self.failure(tool_name, "invalid_args", "memory.search limit must be a non-negative integer");
+            return self.failure(tool_name, "invalid_args", "memory_search limit must be a non-negative integer");
         } orelse 25;
 
         const found = self.runtime_memory.search(self.allocator, brain.brain_name, query, limit) catch |err| {
@@ -448,8 +491,8 @@ pub const Engine = struct {
             if (index > 0) try payload.append(self.allocator, ',');
             const row = try std.fmt.allocPrint(
                 self.allocator,
-                "{{\"mem_id\":\"{s}\",\"version\":{d},\"kind\":\"{s}\",\"tier\":\"{s}\"}}",
-                .{ item.mem_id, item.version orelse 0, item.kind, if (item.tier == .ram) "ram" else "rom" },
+                "{{\"mem_id\":\"{s}\",\"version\":{d},\"kind\":\"{s}\",\"write_protected\":{},\"unevictable\":{}}}",
+                .{ item.mem_id, item.version orelse 0, item.kind, !item.mutable, item.unevictable },
             );
             defer self.allocator.free(row);
             try payload.appendSlice(self.allocator, row);
@@ -466,25 +509,25 @@ pub const Engine = struct {
         args: std.json.ObjectMap,
     ) !TalkOutcome {
         const message = getRequiredString(args, "message") orelse {
-            return .{ .result = try self.failure(tool_name, "invalid_args", "talk.* requires 'message'"), .talk_id = 0 };
+            return .{ .result = try self.failure(tool_name, "invalid_args", "talk_* requires 'message'"), .talk_id = 0 };
         };
 
         const talk_id = brain.nextTalkId();
         var target_brain: []const u8 = "";
-        if (std.mem.eql(u8, tool_name, "talk.user")) {
+        if (std.mem.eql(u8, tool_name, "talk_user")) {
             target_brain = "user";
-        } else if (std.mem.eql(u8, tool_name, "talk.log")) {
+        } else if (std.mem.eql(u8, tool_name, "talk_log")) {
             target_brain = "log";
-        } else if (std.mem.eql(u8, tool_name, "talk.brain")) {
+        } else if (std.mem.eql(u8, tool_name, "talk_brain")) {
             target_brain = getRequiredString(args, "target_brain") orelse {
-                return .{ .result = try self.failure(tool_name, "invalid_args", "talk.brain requires 'target_brain'"), .talk_id = 0 };
+                return .{ .result = try self.failure(tool_name, "invalid_args", "talk_brain requires 'target_brain'"), .talk_id = 0 };
             };
-        } else if (std.mem.eql(u8, tool_name, "talk.agent")) {
+        } else if (std.mem.eql(u8, tool_name, "talk_agent")) {
             target_brain = getRequiredString(args, "target_brain") orelse {
-                return .{ .result = try self.failure(tool_name, "invalid_args", "talk.agent requires 'target_brain'"), .talk_id = 0 };
+                return .{ .result = try self.failure(tool_name, "invalid_args", "talk_agent requires 'target_brain'"), .talk_id = 0 };
             };
             if (target_brain.len == 0 or std.mem.eql(u8, target_brain, "user")) {
-                return .{ .result = try self.failure(tool_name, "invalid_args", "talk.agent target_brain must be a non-user brain"), .talk_id = 0 };
+                return .{ .result = try self.failure(tool_name, "invalid_args", "talk_agent target_brain must be a non-user brain"), .talk_id = 0 };
             }
         }
 
@@ -516,12 +559,12 @@ pub const Engine = struct {
         talk_ids_in_batch: []const event_bus.TalkId,
     ) !ExecuteOutcome {
         if (talk_ids_in_batch.len == 0) {
-            return .{ .result = try self.failure(tool_name, "invalid_sequence", "wait.for requires at least one prior talk.* in the same tool-use list") };
+            return .{ .result = try self.failure(tool_name, "invalid_sequence", "wait_for requires at least one prior talk_* in the same tool-use list") };
         }
 
         const default_talk_id = talk_ids_in_batch[talk_ids_in_batch.len - 1];
         const specs = self.parseWaitSpecs(args, default_talk_id) catch {
-            return .{ .result = try self.failure(tool_name, "invalid_args", "wait.for requires non-empty 'events' with valid event_type/parameter/talk_id fields") };
+            return .{ .result = try self.failure(tool_name, "invalid_args", "wait_for requires non-empty 'events' with valid event_type/parameter/talk_id fields") };
         };
         defer deinitWaitSpecs(self.allocator, specs);
 
@@ -864,7 +907,7 @@ fn deinitEvents(allocator: std.mem.Allocator, events: []event_bus.Event) void {
     allocator.free(events);
 }
 
-test "brain_tools: wait.for fails without prior talk" {
+test "brain_tools: wait_for fails without prior talk" {
     const allocator = std.testing.allocator;
     var mem = try memory.RuntimeMemory.init(allocator, "agentA");
     defer mem.deinit();
@@ -874,7 +917,7 @@ test "brain_tools: wait.for fails without prior talk" {
     var brain = try brain_context.BrainContext.init(allocator, "primary");
     defer brain.deinit();
 
-    try brain.queueToolUse("wait.for", "{\"events\":[{\"event_type\":\"agent\",\"parameter\":\"primary\"}]}");
+    try brain.queueToolUse("wait_for", "{\"events\":[{\"event_type\":\"agent\",\"parameter\":\"primary\"}]}");
 
     var engine = Engine.init(allocator, &mem, &bus);
     const results = try engine.executePending(&brain);
@@ -885,7 +928,7 @@ test "brain_tools: wait.for fails without prior talk" {
     try std.testing.expect(std.mem.indexOf(u8, results[0].payload_json, "invalid_sequence") != null);
 }
 
-test "brain_tools: talk then wait.for blocks until correlated event arrives" {
+test "brain_tools: talk then wait_for blocks until correlated event arrives" {
     const allocator = std.testing.allocator;
     var mem = try memory.RuntimeMemory.init(allocator, "agentA");
     defer mem.deinit();
@@ -895,8 +938,8 @@ test "brain_tools: talk then wait.for blocks until correlated event arrives" {
     var brain = try brain_context.BrainContext.init(allocator, "primary");
     defer brain.deinit();
 
-    try brain.queueToolUse("talk.brain", "{\"message\":\"hello\",\"target_brain\":\"delegate\"}");
-    try brain.queueToolUse("wait.for", "{\"events\":[{\"event_type\":\"agent\",\"parameter\":\"delegate\"}]}");
+    try brain.queueToolUse("talk_brain", "{\"message\":\"hello\",\"target_brain\":\"delegate\"}");
+    try brain.queueToolUse("wait_for", "{\"events\":[{\"event_type\":\"agent\",\"parameter\":\"delegate\"}]}");
 
     var engine = Engine.init(allocator, &mem, &bus);
     const first_results = try engine.executePending(&brain);
@@ -927,7 +970,7 @@ test "brain_tools: talk then wait.for blocks until correlated event arrives" {
     try std.testing.expectEqual(@as(usize, 0), brain.inbox.items.len);
 }
 
-test "brain_tools: memory.mutate requires mem_id" {
+test "brain_tools: memory_mutate requires mem_id" {
     const allocator = std.testing.allocator;
     var mem = try memory.RuntimeMemory.init(allocator, "agentA");
     defer mem.deinit();
@@ -937,7 +980,7 @@ test "brain_tools: memory.mutate requires mem_id" {
     var brain = try brain_context.BrainContext.init(allocator, "primary");
     defer brain.deinit();
 
-    try brain.queueToolUse("memory.mutate", "{\"content\":\"{}\"}");
+    try brain.queueToolUse("memory_mutate", "{\"content\":\"{}\"}");
 
     var engine = Engine.init(allocator, &mem, &bus);
     const results = try engine.executePending(&brain);
@@ -948,7 +991,7 @@ test "brain_tools: memory.mutate requires mem_id" {
     try std.testing.expect(std.mem.indexOf(u8, results[0].payload_json, "requires 'mem_id'") != null);
 }
 
-test "brain_tools: memory.create then memory.load succeeds" {
+test "brain_tools: memory_create then memory_load succeeds" {
     const allocator = std.testing.allocator;
     var mem = try memory.RuntimeMemory.init(allocator, "agentA");
     defer mem.deinit();
@@ -958,7 +1001,7 @@ test "brain_tools: memory.create then memory.load succeeds" {
     var brain = try brain_context.BrainContext.init(allocator, "primary");
     defer brain.deinit();
 
-    try brain.queueToolUse("memory.create", "{\"name\":\"draft\",\"kind\":\"note\",\"content\":{\"text\":\"draft content\"}}");
+    try brain.queueToolUse("memory_create", "{\"name\":\"draft\",\"kind\":\"note\",\"content\":{\"text\":\"draft content\"}}");
 
     var engine = Engine.init(allocator, &mem, &bus);
     const create_results = try engine.executePending(&brain);
@@ -972,7 +1015,7 @@ test "brain_tools: memory.create then memory.load succeeds" {
 
     const load_args = try std.fmt.allocPrint(allocator, "{{\"mem_id\":\"{s}\"}}", .{created_mem_id});
     defer allocator.free(load_args);
-    try brain.queueToolUse("memory.load", load_args);
+    try brain.queueToolUse("memory_load", load_args);
 
     const load_results = try engine.executePending(&brain);
     defer deinitResults(allocator, load_results);
@@ -983,14 +1026,46 @@ test "brain_tools: memory.create then memory.load succeeds" {
     try std.testing.expect(std.mem.indexOf(u8, load_results[0].payload_json, "draft content") != null);
 }
 
-test "brain_tools: memory.load escapes kind in JSON payload" {
+test "brain_tools: memory_versions returns latest-first history" {
     const allocator = std.testing.allocator;
     var mem = try memory.RuntimeMemory.init(allocator, "agentA");
     defer mem.deinit();
     var bus = event_bus.EventBus.init(allocator);
     defer bus.deinit();
 
-    var created = try mem.create("primary", .ram, "escaped_kind", "note \"x\" \\ slash\nline", "{\"text\":\"v\"}", false);
+    var brain = try brain_context.BrainContext.init(allocator, "primary");
+    defer brain.deinit();
+
+    var created = try mem.create("primary", "history_case", "note", "{\"text\":\"v1\"}", false, false);
+    defer created.deinit(allocator);
+    var second = try mem.mutate(created.mem_id, "{\"text\":\"v2\"}");
+    defer second.deinit(allocator);
+
+    const latest_alias = try (try memid.MemId.parse(created.mem_id)).withVersion(null).format(allocator);
+    defer allocator.free(latest_alias);
+
+    const args = try std.fmt.allocPrint(allocator, "{{\"mem_id\":\"{s}\",\"limit\":2}}", .{latest_alias});
+    defer allocator.free(args);
+    try brain.queueToolUse("memory_versions", args);
+
+    var engine = Engine.init(allocator, &mem, &bus);
+    const results = try engine.executePending(&brain);
+    defer deinitResults(allocator, results);
+
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expect(results[0].success);
+    try std.testing.expect(std.mem.indexOf(u8, results[0].payload_json, "\"version\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, results[0].payload_json, "\"version\":1") != null);
+}
+
+test "brain_tools: memory_load escapes kind in JSON payload" {
+    const allocator = std.testing.allocator;
+    var mem = try memory.RuntimeMemory.init(allocator, "agentA");
+    defer mem.deinit();
+    var bus = event_bus.EventBus.init(allocator);
+    defer bus.deinit();
+
+    var created = try mem.create("primary", "escaped_kind", "note \"x\" \\ slash\nline", "{\"text\":\"v\"}", false, false);
     defer created.deinit(allocator);
 
     var brain = try brain_context.BrainContext.init(allocator, "primary");
@@ -998,7 +1073,7 @@ test "brain_tools: memory.load escapes kind in JSON payload" {
 
     const load_args = try std.fmt.allocPrint(allocator, "{{\"mem_id\":\"{s}\"}}", .{created.mem_id});
     defer allocator.free(load_args);
-    try brain.queueToolUse("memory.load", load_args);
+    try brain.queueToolUse("memory_load", load_args);
 
     var engine = Engine.init(allocator, &mem, &bus);
     const load_results = try engine.executePending(&brain);
@@ -1012,14 +1087,14 @@ test "brain_tools: memory.load escapes kind in JSON payload" {
     try std.testing.expectEqualStrings("note \"x\" \\ slash\nline", loaded_kind);
 }
 
-test "brain_tools: memory.mutate success bumps version" {
+test "brain_tools: memory_mutate success bumps version" {
     const allocator = std.testing.allocator;
     var mem = try memory.RuntimeMemory.init(allocator, "agentA");
     defer mem.deinit();
     var bus = event_bus.EventBus.init(allocator);
     defer bus.deinit();
 
-    var created = try mem.create("primary", .ram, "mutable", "note", "{\"text\":\"v1\"}", false);
+    var created = try mem.create("primary", "mutable", "note", "{\"text\":\"v1\"}", false, false);
     defer created.deinit(allocator);
 
     var brain = try brain_context.BrainContext.init(allocator, "primary");
@@ -1027,7 +1102,7 @@ test "brain_tools: memory.mutate success bumps version" {
 
     const mutate_args = try std.fmt.allocPrint(allocator, "{{\"mem_id\":\"{s}\",\"content\":{{\"text\":\"v2\"}}}}", .{created.mem_id});
     defer allocator.free(mutate_args);
-    try brain.queueToolUse("memory.mutate", mutate_args);
+    try brain.queueToolUse("memory_mutate", mutate_args);
 
     var engine = Engine.init(allocator, &mem, &bus);
     const results = try engine.executePending(&brain);
@@ -1038,14 +1113,14 @@ test "brain_tools: memory.mutate success bumps version" {
     try std.testing.expect(std.mem.indexOf(u8, results[0].payload_json, "\"version\":2") != null);
 }
 
-test "brain_tools: memory.evict success and missing mem_id failure" {
+test "brain_tools: memory_evict success and missing mem_id failure" {
     const allocator = std.testing.allocator;
     var mem = try memory.RuntimeMemory.init(allocator, "agentA");
     defer mem.deinit();
     var bus = event_bus.EventBus.init(allocator);
     defer bus.deinit();
 
-    var created = try mem.create("primary", .ram, "evictable", "note", "{\"text\":\"bye\"}", false);
+    var created = try mem.create("primary", "evictable", "note", "{\"text\":\"bye\"}", false, false);
     defer created.deinit(allocator);
 
     var brain = try brain_context.BrainContext.init(allocator, "primary");
@@ -1053,8 +1128,8 @@ test "brain_tools: memory.evict success and missing mem_id failure" {
 
     const evict_args = try std.fmt.allocPrint(allocator, "{{\"mem_id\":\"{s}\"}}", .{created.mem_id});
     defer allocator.free(evict_args);
-    try brain.queueToolUse("memory.evict", evict_args);
-    try brain.queueToolUse("memory.evict", "{}");
+    try brain.queueToolUse("memory_evict", evict_args);
+    try brain.queueToolUse("memory_evict", "{}");
 
     var engine = Engine.init(allocator, &mem, &bus);
     const results = try engine.executePending(&brain);
@@ -1067,22 +1142,22 @@ test "brain_tools: memory.evict success and missing mem_id failure" {
     try std.testing.expect(std.mem.indexOf(u8, results[1].payload_json, "requires 'mem_id'") != null);
 }
 
-test "brain_tools: memory.search returns matching mem_id set" {
+test "brain_tools: memory_search returns matching mem_id set" {
     const allocator = std.testing.allocator;
     var mem = try memory.RuntimeMemory.init(allocator, "agentA");
     defer mem.deinit();
     var bus = event_bus.EventBus.init(allocator);
     defer bus.deinit();
 
-    var compile_item = try mem.create("primary", .ram, "compile_task", "note", "{\"text\":\"compile fix\"}", false);
+    var compile_item = try mem.create("primary", "compile_task", "note", "{\"text\":\"compile fix\"}", false, false);
     defer compile_item.deinit(allocator);
-    var docs_item = try mem.create("primary", .ram, "docs_task", "note", "{\"text\":\"docs update\"}", false);
+    var docs_item = try mem.create("primary", "docs_task", "note", "{\"text\":\"docs update\"}", false, false);
     defer docs_item.deinit(allocator);
 
     var brain = try brain_context.BrainContext.init(allocator, "primary");
     defer brain.deinit();
 
-    try brain.queueToolUse("memory.search", "{\"query\":\"compile\",\"limit\":10}");
+    try brain.queueToolUse("memory_search", "{\"query\":\"compile\",\"limit\":10}");
 
     var engine = Engine.init(allocator, &mem, &bus);
     const results = try engine.executePending(&brain);
@@ -1094,7 +1169,7 @@ test "brain_tools: memory.search returns matching mem_id set" {
     try std.testing.expect(std.mem.indexOf(u8, results[0].payload_json, docs_item.mem_id) == null);
 }
 
-test "brain_tools: talk.user emits user-targeted event" {
+test "brain_tools: talk_user emits user-targeted event" {
     const allocator = std.testing.allocator;
     var mem = try memory.RuntimeMemory.init(allocator, "agentA");
     defer mem.deinit();
@@ -1103,7 +1178,7 @@ test "brain_tools: talk.user emits user-targeted event" {
 
     var brain = try brain_context.BrainContext.init(allocator, "primary");
     defer brain.deinit();
-    try brain.queueToolUse("talk.user", "{\"message\":\"hello user\"}");
+    try brain.queueToolUse("talk_user", "{\"message\":\"hello user\"}");
 
     var engine = Engine.init(allocator, &mem, &bus);
     const results = try engine.executePending(&brain);
@@ -1129,7 +1204,7 @@ test "brain_tools: talk payload preserves JSON validity for escaped content" {
 
     var brain = try brain_context.BrainContext.init(allocator, "primary");
     defer brain.deinit();
-    try brain.queueToolUse("talk.user", "{\"message\":\"quote \\\"line\\\"\\\\path\\nnext\"}");
+    try brain.queueToolUse("talk_user", "{\"message\":\"quote \\\"line\\\"\\\\path\\nnext\"}");
 
     var engine = Engine.init(allocator, &mem, &bus);
     const results = try engine.executePending(&brain);
@@ -1143,7 +1218,7 @@ test "brain_tools: talk payload preserves JSON validity for escaped content" {
     try std.testing.expectEqualStrings("quote \"line\"\\path\nnext", payload_message);
 }
 
-test "brain_tools: talk.agent emits delegated event" {
+test "brain_tools: talk_agent emits delegated event" {
     const allocator = std.testing.allocator;
     var mem = try memory.RuntimeMemory.init(allocator, "agentA");
     defer mem.deinit();
@@ -1152,7 +1227,7 @@ test "brain_tools: talk.agent emits delegated event" {
 
     var brain = try brain_context.BrainContext.init(allocator, "primary");
     defer brain.deinit();
-    try brain.queueToolUse("talk.agent", "{\"message\":\"handoff\",\"target_brain\":\"delegate\"}");
+    try brain.queueToolUse("talk_agent", "{\"message\":\"handoff\",\"target_brain\":\"delegate\"}");
 
     var engine = Engine.init(allocator, &mem, &bus);
     const results = try engine.executePending(&brain);
@@ -1168,7 +1243,7 @@ test "brain_tools: talk.agent emits delegated event" {
     try std.testing.expectEqual(@as(?event_bus.TalkId, talk_id), delegate_events[0].talk_id);
 }
 
-test "brain_tools: talk.agent requires explicit target_brain" {
+test "brain_tools: talk_agent requires explicit target_brain" {
     const allocator = std.testing.allocator;
     var mem = try memory.RuntimeMemory.init(allocator, "agentA");
     defer mem.deinit();
@@ -1177,7 +1252,7 @@ test "brain_tools: talk.agent requires explicit target_brain" {
 
     var brain = try brain_context.BrainContext.init(allocator, "primary");
     defer brain.deinit();
-    try brain.queueToolUse("talk.agent", "{\"message\":\"handoff\"}");
+    try brain.queueToolUse("talk_agent", "{\"message\":\"handoff\"}");
 
     var engine = Engine.init(allocator, &mem, &bus);
     const results = try engine.executePending(&brain);
@@ -1185,11 +1260,11 @@ test "brain_tools: talk.agent requires explicit target_brain" {
 
     try std.testing.expectEqual(@as(usize, 1), results.len);
     try std.testing.expect(!results[0].success);
-    try std.testing.expect(std.mem.indexOf(u8, results[0].payload_json, "talk.agent requires 'target_brain'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, results[0].payload_json, "talk_agent requires 'target_brain'") != null);
     try std.testing.expectEqual(@as(usize, 0), bus.pendingCount());
 }
 
-test "brain_tools: talk.agent rejects user target to avoid delivery leak" {
+test "brain_tools: talk_agent rejects user target to avoid delivery leak" {
     const allocator = std.testing.allocator;
     var mem = try memory.RuntimeMemory.init(allocator, "agentA");
     defer mem.deinit();
@@ -1198,7 +1273,7 @@ test "brain_tools: talk.agent rejects user target to avoid delivery leak" {
 
     var brain = try brain_context.BrainContext.init(allocator, "primary");
     defer brain.deinit();
-    try brain.queueToolUse("talk.agent", "{\"message\":\"handoff\",\"target_brain\":\"user\"}");
+    try brain.queueToolUse("talk_agent", "{\"message\":\"handoff\",\"target_brain\":\"user\"}");
 
     var engine = Engine.init(allocator, &mem, &bus);
     const results = try engine.executePending(&brain);
@@ -1210,7 +1285,7 @@ test "brain_tools: talk.agent rejects user target to avoid delivery leak" {
     try std.testing.expectEqual(@as(usize, 0), bus.pendingCount());
 }
 
-test "brain_tools: talk.log emits log-targeted event" {
+test "brain_tools: talk_log emits log-targeted event" {
     const allocator = std.testing.allocator;
     var mem = try memory.RuntimeMemory.init(allocator, "agentA");
     defer mem.deinit();
@@ -1219,7 +1294,7 @@ test "brain_tools: talk.log emits log-targeted event" {
 
     var brain = try brain_context.BrainContext.init(allocator, "primary");
     defer brain.deinit();
-    try brain.queueToolUse("talk.log", "{\"message\":\"log line\"}");
+    try brain.queueToolUse("talk_log", "{\"message\":\"log line\"}");
 
     var engine = Engine.init(allocator, &mem, &bus);
     const results = try engine.executePending(&brain);
@@ -1235,7 +1310,7 @@ test "brain_tools: talk.log emits log-targeted event" {
     try std.testing.expectEqual(@as(?event_bus.TalkId, talk_id), log_events[0].talk_id);
 }
 
-test "brain_tools: talk.brain requires target_brain" {
+test "brain_tools: talk_brain requires target_brain" {
     const allocator = std.testing.allocator;
     var mem = try memory.RuntimeMemory.init(allocator, "agentA");
     defer mem.deinit();
@@ -1244,7 +1319,7 @@ test "brain_tools: talk.brain requires target_brain" {
 
     var brain = try brain_context.BrainContext.init(allocator, "primary");
     defer brain.deinit();
-    try brain.queueToolUse("talk.brain", "{\"message\":\"missing target\"}");
+    try brain.queueToolUse("talk_brain", "{\"message\":\"missing target\"}");
 
     var engine = Engine.init(allocator, &mem, &bus);
     const results = try engine.executePending(&brain);
@@ -1252,10 +1327,10 @@ test "brain_tools: talk.brain requires target_brain" {
 
     try std.testing.expectEqual(@as(usize, 1), results.len);
     try std.testing.expect(!results[0].success);
-    try std.testing.expect(std.mem.indexOf(u8, results[0].payload_json, "talk.brain requires 'target_brain'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, results[0].payload_json, "talk_brain requires 'target_brain'") != null);
 }
 
-test "brain_tools: wait.for honors explicit talk_id correlation" {
+test "brain_tools: wait_for honors explicit talk_id correlation" {
     const allocator = std.testing.allocator;
     var mem = try memory.RuntimeMemory.init(allocator, "agentA");
     defer mem.deinit();
@@ -1266,9 +1341,9 @@ test "brain_tools: wait.for honors explicit talk_id correlation" {
     defer brain.deinit();
     brain.next_talk_id = 41;
 
-    try brain.queueToolUse("talk.user", "{\"message\":\"first\"}");
-    try brain.queueToolUse("talk.brain", "{\"message\":\"second\",\"target_brain\":\"delegate\"}");
-    try brain.queueToolUse("wait.for", "{\"events\":[{\"event_type\":\"agent\",\"parameter\":\"delegate\",\"talk_id\":42}]}");
+    try brain.queueToolUse("talk_user", "{\"message\":\"first\"}");
+    try brain.queueToolUse("talk_brain", "{\"message\":\"second\",\"target_brain\":\"delegate\"}");
+    try brain.queueToolUse("wait_for", "{\"events\":[{\"event_type\":\"agent\",\"parameter\":\"delegate\",\"talk_id\":42}]}");
 
     var engine = Engine.init(allocator, &mem, &bus);
     const first_results = try engine.executePending(&brain);
@@ -1308,7 +1383,7 @@ test "brain_tools: wait.for honors explicit talk_id correlation" {
     try std.testing.expectEqual(@as(usize, 1), brain.inbox.items.len);
 }
 
-test "brain_tools: wait.for talk_id zero disables default talk correlation" {
+test "brain_tools: wait_for talk_id zero disables default talk correlation" {
     const allocator = std.testing.allocator;
     var mem = try memory.RuntimeMemory.init(allocator, "agentA");
     defer mem.deinit();
@@ -1319,9 +1394,9 @@ test "brain_tools: wait.for talk_id zero disables default talk correlation" {
     defer brain.deinit();
     brain.next_talk_id = 41;
 
-    try brain.queueToolUse("talk.user", "{\"message\":\"first\"}");
-    try brain.queueToolUse("talk.brain", "{\"message\":\"second\",\"target_brain\":\"delegate\"}");
-    try brain.queueToolUse("wait.for", "{\"events\":[{\"event_type\":\"agent\",\"parameter\":\"delegate\",\"talk_id\":0}]}");
+    try brain.queueToolUse("talk_user", "{\"message\":\"first\"}");
+    try brain.queueToolUse("talk_brain", "{\"message\":\"second\",\"target_brain\":\"delegate\"}");
+    try brain.queueToolUse("wait_for", "{\"events\":[{\"event_type\":\"agent\",\"parameter\":\"delegate\",\"talk_id\":0}]}");
 
     var engine = Engine.init(allocator, &mem, &bus);
     const first_results = try engine.executePending(&brain);

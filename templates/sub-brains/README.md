@@ -57,7 +57,7 @@ ROM entries:
     {"key": "system:xxx", "value": "Guidance text"}
   ],
   "allowed_tools": ["tool.*"],
-  "denied_tools": ["talk.user"],
+  "denied_tools": ["talk_user"],
   "can_spawn_subbrains": false
 }
 ```
@@ -100,7 +100,7 @@ If no template specified, define everything inline:
     "custom-brain": {
       "provider": { "name": "openai", "model": "gpt-4o" },
       "capabilities": ["chat"],
-      "allowed_tools": ["talk.user"]
+      "allowed_tools": ["talk_user"]
     }
   }
 }

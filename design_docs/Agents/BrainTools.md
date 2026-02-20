@@ -4,29 +4,37 @@ This allows the brain to wait for outside stimuli and control its limited active
 
 Brain Tools are presented to the agent in the same way as other tools. From an action point of view, all tool use is the same.
 
-They are mostly presented as a group name then action in that group. i.e. `wait.for`
+They are mostly presented as a group name then action in that group. i.e. `wait_for`
 
 ## memory - group for memory tools
 
-`memory.load`: takes a MemId and loads it from LTM to RAM
+`memory_load`: loads a memory by `mem_id` (latest by default, or a specific version).
 
 Arguments 
-- MemId – the MemId to load from LTM
-- Offset – the offset into the MemId to load from
-- Length – the length of the MemId to load (0 for all up to a fixed maximum)
+- `mem_id` (string) – canonical mem id
+- `version` (int, optional) – load a specific version
 
 Returns 
-- return Success<Actual length loaded> or Failure 
+- Memory payload and metadata, or Failure
 
-`memory.evict`: takes a MemId and evicts from
+`memory_versions`: lists known versions of a memory in descending order.
+
+Arguments
+- `mem_id` (string) – canonical mem id (`:latest` alias supported)
+- `limit` (int, optional) – max rows to return
+
+Returns
+- list of versions with mem_id, version, kind, flags, and created_at_ms
+
+`memory_evict`: takes a MemId and evicts it from active memory
 
 Arguments 
-- MemId – the MemId to evict from RAM to LTM
+- MemId – the MemId to evict from active memory
 
 Returns 
 - Success or Failure
 
-`memory.mutate`: modifies a MemId in RAM to the specified value. 
+`memory_mutate`: modifies a MemId in active memory to the specified value. 
 
 Arguments 
 - MemId – the MemId to modify 
@@ -35,7 +43,7 @@ Arguments
 Returns 
 - Success or Failure, MemId if successful.
 
-`memory.create`: creates a new MemId with the specified value.
+`memory_create`: creates a new MemId with the specified value.
 
 Arguments 
 - name – the name portion that will be used to create the MemId 
@@ -44,7 +52,7 @@ Arguments
 Returns 
 - Success or Failure, MemId if successful.
 
-`memory.search`: return MemIds and short summaries of matching MemIds.
+`memory_search`: return MemIds and short summaries of matching MemIds.
 
 Arguments 
 - `query` (string)
@@ -55,11 +63,11 @@ Returns
 - A list of `MemId`s with short snippets/summaries.
 
 ## wait - group for wait tools
-Waits must have a previous talk.* in the same tool use list
-Waits can specify the TalkId returned by a talk.* this can be used to distinguish similar events
+Waits must have a previous `talk_*` in the same tool use list
+Waits can specify the TalkId returned by a `talk_*`; this can be used to distinguish similar events
 The event is cleared once the wait returns it.
 
-`wait.for`: waits for a specified events to occur.
+`wait_for`: waits for a specified events to occur.
 
 struct Event {
     EventType EventType;
@@ -80,11 +88,11 @@ Returns
 
 ## talk - group for talk tools
 Talk sends a message to the destination, the do not wait or stop the Agent loop.
-All waits must issue a talk.* before they wait for tracking.
+All waits must issue a `talk_*` before they wait for tracking.
 
 They all return a TalkId, which is monotonically increasing and may loop after some time. 0 is never returned.
 
-`talk.user`: speaks a message to the user 
+`talk_user`: speaks a message to the user 
 
 Arguments 
 - User currently must be ""
@@ -93,7 +101,7 @@ Arguments
 Returns -
 - TalkId – semi-unique identifier of this talk message
 
-`talk.agent`: speaks a message to the agent
+`talk_agent`: speaks a message to the agent
 Arguments 
 - Agent – the name of the agent to speak to
 - Message – the message to say
@@ -101,7 +109,7 @@ Arguments
 Returns -
 - TalkId – semi-unique identifier of this talk message
 
-`talk.brain`: speaks a message to a brain Brains can only talk to other brains in the same Agent
+`talk_brain`: speaks a message to a brain Brains can only talk to other brains in the same Agent
 Arguments 
 - subbrain – name (`primary` to talk to the Agents primary brain)
 - Message – the message to say
@@ -109,7 +117,7 @@ Arguments
 Returns -
 - TalkId – semi-unique identifier of this talk message
 
-`talk.log`: speaks a message to the log
+`talk_log`: speaks a message to the log
 
 Arguments 
 - Severity – the log severity

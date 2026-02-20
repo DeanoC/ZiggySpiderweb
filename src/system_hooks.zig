@@ -12,12 +12,13 @@ const protocol = @import("protocol.zig");
 const Config = @import("config.zig");
 
 /// System paths for templates
-
 pub const SOUL_MEM_NAME = "system.soul";
 pub const AGENT_MEM_NAME = "system.agent";
 pub const IDENTITY_MEM_NAME = "system.identity";
+pub const BASE_CORE_MEM_NAME = "system.core";
+pub const BASE_CORE_ROM_KEY = "system:base_instructions";
 
-/// Load identity from LTM into ROM, or hatch from templates if first boot
+/// Load identity from LTM into core prompt memory map, or hatch from templates if first boot
 pub fn loadSharedRomHook(ctx: *HookContext, data: HookData) HookError!void {
     const rom = data.pre_observe;
     const allocator = ctx.runtime.allocator;
@@ -32,6 +33,13 @@ pub fn loadSharedRomHook(ctx: *HookContext, data: HookData) HookError!void {
         },
     };
 
+    _ = loadIdentityFromLTM(ctx, BASE_CORE_MEM_NAME, BASE_CORE_ROM_KEY, rom) catch |err| switch (err) {
+        error.OutOfMemory => return HookError.OutOfMemory,
+        else => {
+            std.log.warn("Failed loading base core memory {s} for {s}/{s}: {s}", .{ BASE_CORE_MEM_NAME, agent_id, brain_name, @errorName(err) });
+            return HookError.HookFailed;
+        },
+    };
     _ = loadIdentityFromLTM(ctx, SOUL_MEM_NAME, "identity:soul", rom) catch |err| switch (err) {
         error.OutOfMemory => return HookError.OutOfMemory,
         else => {
@@ -84,13 +92,13 @@ pub fn loadSharedRomHook(ctx: *HookContext, data: HookData) HookError!void {
     // Identity evolution guidance
     try rom.set("system:identity_guidance",
         \\Your identity memories (system.soul, system.agent, system.identity) define your being.
-        \\They are loaded from LTM and marked unevictable — always present in your RAM.
-        \\You may evolve them using memory.mutate, but consider carefully:
+        \\They are loaded from LTM and marked unevictable — always present in your active memory.
+        \\You may evolve them using memory_mutate, but consider carefully:
         \\you are changing your own essence. Changes persist to LTM with version history.
     );
 }
 
-/// Load identity from LTM into ROM
+/// Load identity from LTM into core prompt memory map
 fn loadIdentityFromLTM(
     ctx: *HookContext,
     base_name: []const u8,
@@ -125,6 +133,7 @@ fn unwrapJsonString(allocator: std.mem.Allocator, json_str: []const u8) ![]u8 {
 
 /// Ensure the identity memories exist for a brain, hatching from templates if needed.
 pub fn ensureIdentityMemories(runtime: *AgentRuntime, brain_name: []const u8) !void {
+    _ = try ensureMemoryFromTemplate(runtime, brain_name, "CORE.md", BASE_CORE_MEM_NAME);
     _ = try ensureMemoryFromTemplate(runtime, brain_name, "SOUL.md", SOUL_MEM_NAME);
     _ = try ensureMemoryFromTemplate(runtime, brain_name, "AGENT.md", AGENT_MEM_NAME);
     _ = try ensureMemoryFromTemplate(runtime, brain_name, "IDENTITY.md", IDENTITY_MEM_NAME);
@@ -152,10 +161,10 @@ fn ensureMemoryFromTemplate(
 
         var recreated = runtime.active_memory.create(
             brain_name,
-            .ram,
             name,
             item.kind,
             item.content_json,
+            false,
             true,
         ) catch |err| {
             std.log.warn("Failed to rehydrate memory {s} for {s}/{s}: {s}", .{ name, runtime.agent_id, brain_name, @errorName(err) });
@@ -179,10 +188,10 @@ fn ensureMemoryFromTemplate(
 
     var created = runtime.active_memory.create(
         brain_name,
-        .ram,
         name,
         name,
         content_json,
+        false,
         true,
     ) catch |err| {
         std.log.warn("Failed to create memory for {s}: {s}", .{ template_name, @errorName(err) });
@@ -224,7 +233,7 @@ fn buildLatestMemId(allocator: std.mem.Allocator, agent_id: []const u8, brain_na
     );
 }
 
-/// Inject runtime status into ROM
+/// Inject runtime status into core prompt memory map
 pub fn injectRuntimeStatusHook(ctx: *HookContext, data: HookData) HookError!void {
     const rom = data.pre_observe;
     const allocator = ctx.runtime.allocator;
@@ -243,12 +252,6 @@ pub fn injectRuntimeStatusHook(ctx: *HookContext, data: HookData) HookError!void
 
     // Runtime state
     try rom.set("status:runtime_state", @tagName(ctx.runtime.state));
-
-    // Timestamp
-    const now = std.time.timestamp();
-    const time_str = std.fmt.allocPrint(allocator, "{d}", .{now}) catch return HookError.OutOfMemory;
-    defer allocator.free(time_str);
-    try rom.set("status:timestamp", time_str);
 }
 
 /// Persist LTM after results (PostResults hook)
@@ -371,7 +374,7 @@ fn loadAgentJson(
     return loadIdentityFile(allocator, runtime, brain_name, "agent.json");
 }
 
-/// Serialize tool schemas to JSON for ROM
+/// Serialize tool schemas to JSON for core prompt memory map
 fn getToolSchemas(allocator: std.mem.Allocator) ![]u8 {
     var json = std.ArrayListUnmanaged(u8){};
     defer json.deinit(allocator);
@@ -394,6 +397,13 @@ fn getToolSchemas(allocator: std.mem.Allocator) ![]u8 {
         // required_fields
         try writer.writeAll("\"required_fields\":[");
         for (schema.required_fields, 0..) |field, j| {
+            if (j > 0) try writer.writeByte(',');
+            try writeJsonString(writer, field);
+        }
+        try writer.writeAll("],");
+        // optional_fields
+        try writer.writeAll("\"optional_fields\":[");
+        for (schema.optional_fields, 0..) |field, j| {
             if (j > 0) try writer.writeByte(',');
             try writeJsonString(writer, field);
         }
@@ -428,9 +438,9 @@ fn writeJsonString(writer: anytype, str: []const u8) !void {
 
 /// Register all system hooks
 pub fn registerSystemHooks(registry: *hook_registry.HookRegistry) !void {
-    // PRE_OBSERVE: ROM loading pipeline
+    // PRE_OBSERVE: core prompt loading pipeline
     try registry.register(.pre_observe, .{
-        .name = "system:load-shared-rom",
+        .name = "system:load-shared-core",
         .priority = @intFromEnum(hook_registry.HookPriority.system_first),
         .callback = loadSharedRomHook,
     });
@@ -491,6 +501,7 @@ test "system_hooks: ensureIdentityMemories rehydrates persisted identity into ac
     const after = try restarted.active_memory.snapshotActive(allocator, "primary");
     defer memory.deinitItems(allocator, after);
 
+    try std.testing.expect(containsNamedMemory(after, BASE_CORE_MEM_NAME));
     try std.testing.expect(containsNamedMemory(after, SOUL_MEM_NAME));
     try std.testing.expect(containsNamedMemory(after, AGENT_MEM_NAME));
     try std.testing.expect(containsNamedMemory(after, IDENTITY_MEM_NAME));
