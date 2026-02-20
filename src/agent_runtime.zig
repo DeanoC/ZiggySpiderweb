@@ -541,24 +541,13 @@ pub const AgentRuntime = struct {
             defer self.allocator.free(content_json);
 
             if (findActiveByName(active_snapshot, core_name)) |item| {
-                if (std.mem.eql(u8, item.content_json, content_json)) continue;
+                if (std.mem.eql(u8, item.content_json, content_json) and !item.mutable) continue;
 
-                var updated = self.active_memory.mutate(item.mem_id, content_json) catch |err| switch (err) {
-                    memory.MemoryError.NotFound => blk: {
-                        const recreated = try self.active_memory.create(
-                            brain_name,
-                            core_name,
-                            core_kind,
-                            content_json,
-                            false,
-                            true,
-                        );
-                        break :blk recreated;
-                    },
+                var removed = self.active_memory.removeActive(item.mem_id) catch |err| switch (err) {
+                    memory.MemoryError.NotFound => null,
                     else => return err,
                 };
-                updated.deinit(self.allocator);
-                continue;
+                if (removed) |*removed_item| removed_item.deinit(self.allocator);
             }
 
             var created = try self.active_memory.create(
@@ -566,7 +555,7 @@ pub const AgentRuntime = struct {
                 core_name,
                 core_kind,
                 content_json,
-                false,
+                true,
                 true,
             );
             created.deinit(self.allocator);
@@ -817,6 +806,28 @@ test "agent_runtime: refreshCorePrompt prunes stale managed core memory entries"
     const after = try runtime.active_memory.snapshotActive(allocator, "primary");
     defer memory.deinitItems(allocator, after);
     try std.testing.expect(!hasNamedMemory(after, "core.stale_entry"));
+}
+
+test "agent_runtime: refreshCorePrompt writes managed core memories as write-protected" {
+    const allocator = std.testing.allocator;
+    const cfg = Config.RuntimeConfig{};
+    var runtime = try AgentRuntime.init(allocator, "agentA", &[_][]const u8{}, cfg);
+    defer runtime.deinit();
+
+    try runtime.refreshCorePrompt("primary");
+
+    const snapshot = try runtime.active_memory.snapshotActive(allocator, "primary");
+    defer memory.deinitItems(allocator, snapshot);
+
+    var found_managed_core = false;
+    for (snapshot) |item| {
+        if (!AgentRuntime.isManagedCorePromptMemory(item)) continue;
+        found_managed_core = true;
+        try std.testing.expect(!item.mutable);
+        try std.testing.expect(item.unevictable);
+    }
+
+    try std.testing.expect(found_managed_core);
 }
 
 test "agent_runtime: enqueueUserEvent rejects paused/cancelled without queuing work" {
