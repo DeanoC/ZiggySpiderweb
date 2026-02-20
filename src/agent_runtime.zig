@@ -514,11 +514,26 @@ pub const AgentRuntime = struct {
         const active_snapshot = try self.active_memory.snapshotActive(self.allocator, brain_name);
         defer memory.deinitItems(self.allocator, active_snapshot);
 
+        var expected_core_names = std.StringHashMapUnmanaged(void){};
+        defer {
+            var expected_it = expected_core_names.iterator();
+            while (expected_it.next()) |entry| {
+                self.allocator.free(entry.key_ptr.*);
+            }
+            expected_core_names.deinit(self.allocator);
+        }
+
         var it = rom.entries.iterator();
         while (it.next()) |entry| {
             const core_kind = coreMemoryKindFromKey(entry.key_ptr.*);
             const core_name = try coreMemoryNameFromKey(self.allocator, entry.key_ptr.*);
             defer self.allocator.free(core_name);
+
+            if (!expected_core_names.contains(core_name)) {
+                const owned_core_name = try self.allocator.dupe(u8, core_name);
+                errdefer self.allocator.free(owned_core_name);
+                try expected_core_names.put(self.allocator, owned_core_name, {});
+            }
 
             const escaped_content = try jsonEscapeAlloc(self.allocator, entry.value_ptr.value);
             defer self.allocator.free(escaped_content);
@@ -556,6 +571,18 @@ pub const AgentRuntime = struct {
             );
             created.deinit(self.allocator);
         }
+
+        for (active_snapshot) |item| {
+            if (!isManagedCorePromptMemory(item)) continue;
+            const parsed = memid.MemId.parse(item.mem_id) catch continue;
+            if (expected_core_names.contains(parsed.name)) continue;
+
+            var removed = self.active_memory.removeActive(item.mem_id) catch |err| switch (err) {
+                memory.MemoryError.NotFound => continue,
+                else => return err,
+            };
+            removed.deinit(self.allocator);
+        }
     }
 
     fn coreMemoryNameFromKey(allocator: std.mem.Allocator, key: []const u8) ![]u8 {
@@ -581,6 +608,15 @@ pub const AgentRuntime = struct {
     fn coreMemoryKindFromKey(key: []const u8) []const u8 {
         if (std.mem.eql(u8, key, system_hooks.BASE_CORE_ROM_KEY)) return "core.base_prompt";
         return "core.system_prompt";
+    }
+
+    fn isManagedCorePromptMemory(item: memory.ActiveMemoryItem) bool {
+        if (!std.mem.eql(u8, item.kind, "core.system_prompt") and !std.mem.eql(u8, item.kind, "core.base_prompt")) {
+            return false;
+        }
+
+        const parsed = memid.MemId.parse(item.mem_id) catch return false;
+        return std.mem.startsWith(u8, parsed.name, "core.");
     }
 
     fn findActiveByName(snapshot: []const memory.ActiveMemoryItem, name: []const u8) ?memory.ActiveMemoryItem {
@@ -676,6 +712,14 @@ pub fn deinitOutbound(allocator: std.mem.Allocator, messages: [][]u8) void {
     allocator.free(messages);
 }
 
+fn hasNamedMemory(items: []const memory.ActiveMemoryItem, name: []const u8) bool {
+    for (items) |item| {
+        const parsed = memid.MemId.parse(item.mem_id) catch continue;
+        if (std.mem.eql(u8, parsed.name, name)) return true;
+    }
+    return false;
+}
+
 test "agent_runtime: create primary + sub brain and execute one tick" {
     const allocator = std.testing.allocator;
     const cfg = Config.RuntimeConfig{};
@@ -753,6 +797,26 @@ test "agent_runtime: queue saturation returns explicit overload" {
     runtime.queue_limits.brain_ticks = 1;
     try runtime.enqueueUserEvent("hello");
     try std.testing.expectError(RuntimeError.QueueSaturated, runtime.enqueueUserEvent("again"));
+}
+
+test "agent_runtime: refreshCorePrompt prunes stale managed core memory entries" {
+    const allocator = std.testing.allocator;
+    const cfg = Config.RuntimeConfig{};
+    var runtime = try AgentRuntime.init(allocator, "agentA", &[_][]const u8{}, cfg);
+    defer runtime.deinit();
+
+    var stale = try runtime.active_memory.create("primary", "core.stale_entry", "core.system_prompt", "\"stale\"", false, true);
+    defer stale.deinit(allocator);
+
+    const before = try runtime.active_memory.snapshotActive(allocator, "primary");
+    defer memory.deinitItems(allocator, before);
+    try std.testing.expect(hasNamedMemory(before, "core.stale_entry"));
+
+    try runtime.refreshCorePrompt("primary");
+
+    const after = try runtime.active_memory.snapshotActive(allocator, "primary");
+    defer memory.deinitItems(allocator, after);
+    try std.testing.expect(!hasNamedMemory(after, "core.stale_entry"));
 }
 
 test "agent_runtime: enqueueUserEvent rejects paused/cancelled without queuing work" {

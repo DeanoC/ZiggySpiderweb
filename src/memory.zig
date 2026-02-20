@@ -281,6 +281,26 @@ pub const RuntimeMemory = struct {
         return evicted;
     }
 
+    /// Remove an active memory entry without enforcing memory flags.
+    /// Intended for runtime-managed sync paths (e.g. pruning stale core entries).
+    pub fn removeActive(self: *RuntimeMemory, raw_mem_id: []const u8) !ActiveMemoryItem {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const current_ref = try self.resolveMutableRefLocked(raw_mem_id);
+        const current_item = current_ref.item.*;
+
+        try self.persistHistoryLocked(&current_item);
+        const removed = try current_item.clone(self.allocator);
+
+        current_ref.store.removeOrder(current_item.mem_id);
+        _ = current_ref.store.ram_items.remove(current_item.mem_id);
+
+        var owned = current_item;
+        owned.deinit(self.allocator);
+        return removed;
+    }
+
     pub fn load(self: *RuntimeMemory, raw_mem_id: []const u8, version: ?u64) !ActiveMemoryItem {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -988,6 +1008,23 @@ test "memory: unevictable memory rejects eviction deterministically" {
     defer fixed_item.deinit(allocator);
 
     try std.testing.expectError(MemoryError.ImmutableTier, mem.evict(fixed_item.mem_id));
+}
+
+test "memory: removeActive bypasses unevictable guard for runtime-managed cleanup" {
+    const allocator = std.testing.allocator;
+    var mem = try RuntimeMemory.init(allocator, "agentA");
+    defer mem.deinit();
+
+    var fixed_item = try mem.create("primary", "runtime_managed", "core.system_prompt", "\"stale\"", false, true);
+    defer fixed_item.deinit(allocator);
+
+    var removed = try mem.removeActive(fixed_item.mem_id);
+    defer removed.deinit(allocator);
+    try std.testing.expectEqualStrings(fixed_item.mem_id, removed.mem_id);
+
+    const snapshot = try mem.snapshotActive(allocator, "primary");
+    defer deinitItems(allocator, snapshot);
+    try std.testing.expectEqual(@as(usize, 0), snapshot.len);
 }
 
 test "memory: persisted store supports reload across runtime restarts" {
