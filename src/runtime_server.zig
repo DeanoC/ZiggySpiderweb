@@ -284,6 +284,7 @@ pub const RuntimeServer = struct {
             .{
                 .max_run_steps = runtime_cfg.max_run_steps,
                 .checkpoint_interval_steps = runtime_cfg.run_checkpoint_interval_steps,
+                .run_auto_resume_on_boot = runtime_cfg.run_auto_resume_on_boot,
             },
         );
         var runs_owned_by_self = false;

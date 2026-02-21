@@ -30,6 +30,7 @@ pub const RunEngineError = error{
 pub const RunEngineConfig = struct {
     max_run_steps: usize = 1024,
     checkpoint_interval_steps: usize = 1,
+    run_auto_resume_on_boot: bool = false,
 };
 
 pub const RunSnapshot = struct {
@@ -130,6 +131,7 @@ pub const RunEngine = struct {
             .config = .{
                 .max_run_steps = if (config.max_run_steps == 0) 1024 else config.max_run_steps,
                 .checkpoint_interval_steps = if (config.checkpoint_interval_steps == 0) 1 else config.checkpoint_interval_steps,
+                .run_auto_resume_on_boot = config.run_auto_resume_on_boot,
             },
             .store = run_store.RunStore.init(allocator, persisted_store),
         };
@@ -468,7 +470,9 @@ pub const RunEngine = struct {
             };
             errdefer run.deinit(self.allocator);
 
-            if (run.state == .running) run.state = .paused;
+            if (run.state == .running and !self.config.run_auto_resume_on_boot) {
+                run.state = .paused;
+            }
 
             const recover_event_limit: usize = @intCast(std.math.maxInt(i64));
             const persisted_events = try self.store.listEvents(self.allocator, run_id, recover_event_limit);
@@ -681,4 +685,90 @@ test "run_engine: recovery loads more than 1024 persisted runs" {
     const snapshots = try restored.list(allocator);
     defer deinitSnapshots(allocator, snapshots);
     try std.testing.expectEqual(@as(usize, 1100), snapshots.len);
+}
+
+test "run_engine: recovery pauses running runs when auto resume is disabled" {
+    const allocator = std.testing.allocator;
+
+    const dir = try std.fmt.allocPrint(allocator, ".tmp-run-engine-recover-paused-{d}", .{std.time.nanoTimestamp()});
+    defer allocator.free(dir);
+    defer std.fs.cwd().deleteTree(dir) catch {};
+    try std.fs.cwd().makePath(dir);
+
+    var captured_run_id: []u8 = undefined;
+    {
+        var mem_store = try ltm_store.VersionedMemStore.open(allocator, dir, "run.db");
+        defer mem_store.close();
+
+        var first = try RunEngine.init(allocator, &mem_store, .{
+            .max_run_steps = 16,
+            .checkpoint_interval_steps = 1,
+            .run_auto_resume_on_boot = false,
+        });
+        defer first.deinit();
+
+        var started = try first.start("inflight input");
+        defer started.deinit(allocator);
+        captured_run_id = try allocator.dupe(u8, started.run_id);
+
+        var step = try first.beginStep(started.run_id, null);
+        defer step.deinit(allocator);
+    }
+    defer allocator.free(captured_run_id);
+
+    var mem_store = try ltm_store.VersionedMemStore.open(allocator, dir, "run.db");
+    defer mem_store.close();
+    var restored = try RunEngine.init(allocator, &mem_store, .{
+        .max_run_steps = 16,
+        .checkpoint_interval_steps = 1,
+        .run_auto_resume_on_boot = false,
+    });
+    defer restored.deinit();
+
+    var snapshot = try restored.get(captured_run_id);
+    defer snapshot.deinit(allocator);
+    try std.testing.expectEqual(RunState.paused, snapshot.state);
+}
+
+test "run_engine: recovery keeps running runs when auto resume is enabled" {
+    const allocator = std.testing.allocator;
+
+    const dir = try std.fmt.allocPrint(allocator, ".tmp-run-engine-recover-running-{d}", .{std.time.nanoTimestamp()});
+    defer allocator.free(dir);
+    defer std.fs.cwd().deleteTree(dir) catch {};
+    try std.fs.cwd().makePath(dir);
+
+    var captured_run_id: []u8 = undefined;
+    {
+        var mem_store = try ltm_store.VersionedMemStore.open(allocator, dir, "run.db");
+        defer mem_store.close();
+
+        var first = try RunEngine.init(allocator, &mem_store, .{
+            .max_run_steps = 16,
+            .checkpoint_interval_steps = 1,
+            .run_auto_resume_on_boot = false,
+        });
+        defer first.deinit();
+
+        var started = try first.start("inflight input");
+        defer started.deinit(allocator);
+        captured_run_id = try allocator.dupe(u8, started.run_id);
+
+        var step = try first.beginStep(started.run_id, null);
+        defer step.deinit(allocator);
+    }
+    defer allocator.free(captured_run_id);
+
+    var mem_store = try ltm_store.VersionedMemStore.open(allocator, dir, "run.db");
+    defer mem_store.close();
+    var restored = try RunEngine.init(allocator, &mem_store, .{
+        .max_run_steps = 16,
+        .checkpoint_interval_steps = 1,
+        .run_auto_resume_on_boot = true,
+    });
+    defer restored.deinit();
+
+    var snapshot = try restored.get(captured_run_id);
+    defer snapshot.deinit(allocator);
+    try std.testing.expectEqual(RunState.running, snapshot.state);
 }
