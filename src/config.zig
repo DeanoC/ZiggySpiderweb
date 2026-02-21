@@ -28,7 +28,7 @@ pub const RuntimeConfig = struct {
     connection_queue_max: usize = 128,
     runtime_worker_threads: usize = 2,
     runtime_request_queue_max: usize = 128,
-    chat_operation_timeout_ms: u64 = 30_000,
+    chat_operation_timeout_ms: u64 = 120_000,
     control_operation_timeout_ms: u64 = 5_000,
     default_agent_id: []const u8 = "default",
     ltm_directory: []const u8 = ".spiderweb-ltm",
@@ -94,7 +94,7 @@ const default_config =
     \\    "connection_queue_max": 128,
     \\    "runtime_worker_threads": 2,
     \\    "runtime_request_queue_max": 128,
-    \\    "chat_operation_timeout_ms": 30000,
+    \\    "chat_operation_timeout_ms": 120000,
     \\    "control_operation_timeout_ms": 5000,
     \\    "default_agent_id": "default",
     \\    "ltm_directory": ".spiderweb-ltm",
@@ -132,7 +132,7 @@ pub fn init(allocator: std.mem.Allocator, config_path: ?[]const u8) !Config {
             .connection_queue_max = 128,
             .runtime_worker_threads = 2,
             .runtime_request_queue_max = 128,
-            .chat_operation_timeout_ms = 30_000,
+            .chat_operation_timeout_ms = 120_000,
             .control_operation_timeout_ms = 5_000,
             .default_agent_id = try allocator.dupe(u8, "default"),
             .ltm_directory = try allocator.dupe(u8, ".spiderweb-ltm"),
@@ -495,7 +495,7 @@ test "Config defaults" {
     try std.testing.expectEqual(@as(usize, 4), config.runtime.connection_worker_threads);
     try std.testing.expectEqual(@as(usize, 2), config.runtime.runtime_worker_threads);
     try std.testing.expectEqual(@as(usize, 128), config.runtime.runtime_request_queue_max);
-    try std.testing.expectEqual(@as(u64, 30_000), config.runtime.chat_operation_timeout_ms);
+    try std.testing.expectEqual(@as(u64, 120_000), config.runtime.chat_operation_timeout_ms);
     try std.testing.expectEqual(@as(u64, 5_000), config.runtime.control_operation_timeout_ms);
     try std.testing.expectEqualStrings("default", config.runtime.default_agent_id);
     try std.testing.expectEqualStrings(".spiderweb-ltm", config.runtime.ltm_directory);

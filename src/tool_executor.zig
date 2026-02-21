@@ -185,10 +185,20 @@ pub const BuiltinTools = struct {
         };
         const effective_max = @min(max_bytes, 8 * 1024 * 1024);
 
-        const content = std.fs.cwd().readFileAlloc(allocator, path, effective_max) catch |err| {
+        var file = std.fs.cwd().openFile(path, .{}) catch |err| {
             return fail(allocator, .execution_failed, @errorName(err));
         };
-        defer allocator.free(content);
+        defer file.close();
+
+        const file_size = file.getEndPos() catch 0;
+
+        const content_buffer = allocator.alloc(u8, effective_max) catch return fail(allocator, .execution_failed, "out of memory");
+        defer allocator.free(content_buffer);
+        const content_len = file.readAll(content_buffer) catch |err| {
+            return fail(allocator, .execution_failed, @errorName(err));
+        };
+        const content = content_buffer[0..content_len];
+        const truncated = file_size > content_len;
 
         var payload = std.ArrayListUnmanaged(u8){};
         errdefer payload.deinit(allocator);
@@ -197,6 +207,8 @@ pub const BuiltinTools = struct {
         appendJsonEscaped(allocator, &payload, path) catch return fail(allocator, .execution_failed, "out of memory");
         payload.appendSlice(allocator, "\",\"bytes\":") catch return fail(allocator, .execution_failed, "out of memory");
         payload.writer(allocator).print("{d}", .{content.len}) catch return fail(allocator, .execution_failed, "out of memory");
+        payload.appendSlice(allocator, ",\"truncated\":") catch return fail(allocator, .execution_failed, "out of memory");
+        payload.appendSlice(allocator, if (truncated) "true" else "false") catch return fail(allocator, .execution_failed, "out of memory");
         payload.appendSlice(allocator, ",\"content\":\"") catch return fail(allocator, .execution_failed, "out of memory");
         appendJsonEscaped(allocator, &payload, content) catch return fail(allocator, .execution_failed, "out of memory");
         payload.appendSlice(allocator, "\"}") catch return fail(allocator, .execution_failed, "out of memory");
@@ -507,6 +519,25 @@ fn testFileWriteReadImpl(allocator: std.mem.Allocator, _: []const u8) !void {
 
 test "tool_executor: file_write then file_read roundtrip" {
     try inTempCwd(std.testing.allocator, testFileWriteReadImpl);
+}
+
+fn testFileReadMaxBytesImpl(allocator: std.mem.Allocator, _: []const u8) !void {
+    try std.fs.cwd().writeFile(.{ .sub_path = "big.txt", .data = "abcdefghij" });
+
+    var read_parsed = try std.json.parseFromSlice(std.json.Value, allocator, "{\"path\":\"big.txt\",\"max_bytes\":4}", .{});
+    defer read_parsed.deinit();
+
+    var read_result = BuiltinTools.fileRead(allocator, read_parsed.value.object);
+    defer read_result.deinit(allocator);
+
+    try std.testing.expect(read_result == .success);
+    try std.testing.expect(std.mem.indexOf(u8, read_result.success.payload_json, "\"bytes\":4") != null);
+    try std.testing.expect(std.mem.indexOf(u8, read_result.success.payload_json, "\"truncated\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, read_result.success.payload_json, "\"content\":\"abcd\"") != null);
+}
+
+test "tool_executor: file_read max_bytes returns partial content" {
+    try inTempCwd(std.testing.allocator, testFileReadMaxBytesImpl);
 }
 
 fn testFileListImpl(allocator: std.mem.Allocator, _: []const u8) !void {

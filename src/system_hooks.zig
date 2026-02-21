@@ -5,7 +5,6 @@ const HookData = hook_registry.HookData;
 const HookError = hook_registry.HookError;
 const Rom = hook_registry.Rom;
 const AgentRuntime = @import("agent_runtime.zig").AgentRuntime;
-const brain_tools = @import("brain_tools.zig");
 const memory = @import("memory.zig");
 const memid = @import("memid.zig");
 const protocol = @import("protocol.zig");
@@ -73,11 +72,6 @@ pub fn loadSharedRomHook(ctx: *HookContext, data: HookData) HookError!void {
         try rom.set("system:agent_config", content);
     }
 
-    // Load available tool schemas
-    const tool_schemas = try getToolSchemas(allocator);
-    defer allocator.free(tool_schemas);
-    try rom.set("system:capabilities", tool_schemas);
-
     // System constants
     try rom.set("system:agent_id", agent_id);
     try rom.set("system:brain_name", brain_name);
@@ -89,13 +83,6 @@ pub fn loadSharedRomHook(ctx: *HookContext, data: HookData) HookError!void {
     const is_primary = std.mem.eql(u8, brain_name, "primary");
     try rom.set("system:is_primary", if (is_primary) "true" else "false");
 
-    // Identity evolution guidance
-    try rom.set("system:identity_guidance",
-        \\Your identity memories (system.soul, system.agent, system.identity) define your being.
-        \\They are loaded from LTM and marked unevictable — always present in your active memory.
-        \\You may evolve them using memory_mutate, but consider carefully:
-        \\you are changing your own essence. Changes persist to LTM with version history.
-    );
 }
 
 /// Load identity from LTM into core prompt memory map
@@ -155,15 +142,50 @@ fn ensureMemoryFromTemplate(
     var existing = try loadMemoryByName(runtime, brain_name, name);
     if (existing) |*item| {
         defer item.deinit(allocator);
+
+        // CORE.md is authoritative and write-protected by policy:
+        // always synchronize LTM content with the current template file.
+        if (std.mem.eql(u8, name, BASE_CORE_MEM_NAME)) {
+            const content = readTemplate(allocator, runtime, template_name) catch |err| {
+                std.log.warn("Failed to load template {s}: {s}", .{ template_name, @errorName(err) });
+                return true;
+            };
+            defer allocator.free(content);
+
+            const escaped_content = try protocol.jsonEscape(allocator, content);
+            defer allocator.free(escaped_content);
+            const template_content_json = try std.fmt.allocPrint(allocator, "\"{s}\"", .{escaped_content});
+            defer allocator.free(template_content_json);
+
+            if (!std.mem.eql(u8, item.content_json, template_content_json)) {
+                var updated = runtime.active_memory.create(
+                    brain_name,
+                    name,
+                    item.kind,
+                    template_content_json,
+                    false,
+                    true,
+                ) catch |err| {
+                    std.log.warn("Failed to sync {s} from {s}: {s}", .{ name, template_name, @errorName(err) });
+                    return false;
+                };
+                updated.deinit(allocator);
+                std.log.info("Synced {s} from {s} for {s}/{s}", .{ name, template_name, runtime.agent_id, brain_name });
+            }
+        }
+
         if (try isMemoryActive(runtime, brain_name, name)) {
             return true;
         }
 
+        // Rehydrate from latest persisted version.
+        var latest = (try loadMemoryByName(runtime, brain_name, name)) orelse return true;
+        defer latest.deinit(allocator);
         var recreated = runtime.active_memory.create(
             brain_name,
             name,
-            item.kind,
-            item.content_json,
+            latest.kind,
+            latest.content_json,
             false,
             true,
         ) catch |err| {
@@ -372,68 +394,6 @@ fn loadAgentJson(
     brain_name: []const u8,
 ) !?[]u8 {
     return loadIdentityFile(allocator, runtime, brain_name, "agent.json");
-}
-
-/// Serialize tool schemas to JSON for core prompt memory map
-fn getToolSchemas(allocator: std.mem.Allocator) ![]u8 {
-    var json = std.ArrayListUnmanaged(u8){};
-    defer json.deinit(allocator);
-
-    const writer = json.writer(allocator);
-
-    try writer.writeByte('[');
-    for (brain_tools.brain_tool_schemas, 0..) |schema, i| {
-        if (i > 0) try writer.writeByte(',');
-        try writer.writeByte('{');
-
-        // name
-        try writer.writeAll("\"name\":");
-        try writeJsonString(writer, schema.name);
-        try writer.writeByte(',');
-        // description
-        try writer.writeAll("\"description\":");
-        try writeJsonString(writer, schema.description);
-        try writer.writeByte(',');
-        // required_fields
-        try writer.writeAll("\"required_fields\":[");
-        for (schema.required_fields, 0..) |field, j| {
-            if (j > 0) try writer.writeByte(',');
-            try writeJsonString(writer, field);
-        }
-        try writer.writeAll("],");
-        // optional_fields
-        try writer.writeAll("\"optional_fields\":[");
-        for (schema.optional_fields, 0..) |field, j| {
-            if (j > 0) try writer.writeByte(',');
-            try writeJsonString(writer, field);
-        }
-        try writer.writeAll("]");
-
-        try writer.writeByte('}');
-    }
-    try writer.writeByte(']');
-
-    return json.toOwnedSlice(allocator);
-}
-
-/// Write a string as a JSON string value with proper escaping
-fn writeJsonString(writer: anytype, str: []const u8) !void {
-    try writer.writeByte('"');
-    for (str) |c| {
-        switch (c) {
-            '"' => try writer.writeAll("\\\""),
-            '\\' => try writer.writeAll("\\\\"),
-            '\n' => try writer.writeAll("\\n"),
-            '\r' => try writer.writeAll("\\r"),
-            '\t' => try writer.writeAll("\\t"),
-            '\x08' => try writer.writeAll("\\b"),
-            '\x0C' => try writer.writeAll("\\f"),
-            // Other control characters must be escaped as \u00XX
-            0x00...0x07, 0x0B, 0x0E...0x1F => try writer.print("\\u00{X:0>2}", .{c}),
-            else => try writer.writeByte(c),
-        }
-    }
-    try writer.writeByte('"');
 }
 
 /// Register all system hooks

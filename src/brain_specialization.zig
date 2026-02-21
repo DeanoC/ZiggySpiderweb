@@ -403,17 +403,15 @@ pub fn applyBrainSpecializationHook(ctx: *HookContext, data: HookData) HookError
         rom.set("system:think_level", value) catch return HookError.OutOfMemory;
     }
 
-    // Filter available tools
-    const capabilities_json = rom.get("system:capabilities") orelse return;
-
-    // Parse capabilities, filter, and rebuild
-    const filtered = filterToolsForBrain(allocator, capabilities_json, &spec.?) catch |err| {
-        std.log.warn("Failed to filter tools for {s}: {s}", .{ ctx.brain_name, @errorName(err) });
-        return;
-    };
-    defer allocator.free(filtered);
-
-    rom.set("system:capabilities", filtered) catch return HookError.OutOfMemory;
+    // Filter available tools in ROM capabilities when present.
+    if (rom.get("system:capabilities")) |capabilities_json| {
+        const filtered = filterToolsForBrain(allocator, capabilities_json, &spec.?) catch |err| {
+            std.log.warn("Failed to filter tools for {s}: {s}", .{ ctx.brain_name, @errorName(err) });
+            return;
+        };
+        defer allocator.free(filtered);
+        rom.set("system:capabilities", filtered) catch return HookError.OutOfMemory;
+    }
 
     // Add additional ROM entries
     for (spec.?.additional_rom.items) |entry| {

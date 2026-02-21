@@ -175,6 +175,14 @@ fn installSystemdService(allocator: std.mem.Allocator) !void {
     };
     defer allocator.free(home);
 
+    const repo_dir = try std.fs.path.join(allocator, &.{ home, ".local", "share", "ziggy-spiderweb" });
+    defer allocator.free(repo_dir);
+
+    const working_dir = blk: {
+        std.fs.accessAbsolute(repo_dir, .{}) catch break :blk home;
+        break :blk repo_dir;
+    };
+
     const service_dir = try std.fs.path.join(allocator, &.{ home, ".config", "systemd", "user" });
     defer allocator.free(service_dir);
 
@@ -201,7 +209,7 @@ fn installSystemdService(allocator: std.mem.Allocator) !void {
     ;
 
     var buf: [1024]u8 = undefined;
-    const content = try std.fmt.bufPrint(&buf, service_content, .{ home, home });
+    const content = try std.fmt.bufPrint(&buf, service_content, .{ home, working_dir });
 
     const file = try std.fs.cwd().createFile(service_path, .{});
     defer file.close();

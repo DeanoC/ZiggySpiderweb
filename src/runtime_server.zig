@@ -17,6 +17,8 @@ const DEFAULT_BRAIN = "primary";
 const INTERNAL_TICK_TIMEOUT_MS: i64 = 5 * 1000;
 const MAX_PROVIDER_TOOL_ROUNDS: usize = 8;
 const MAX_PROVIDER_TOOL_CALLS_PER_TURN: usize = 32;
+const MAX_PROVIDER_FOLLOWUP_ROUNDS: usize = 3;
+const USE_EXPLICIT_JSON_TOOL_CALLS: bool = false;
 const PROVIDER_STREAM_MAX_ATTEMPTS: usize = if (builtin.is_test) 2 else 3;
 const PROVIDER_RETRY_BASE_DELAY_MS: u64 = if (builtin.is_test) 1 else 250;
 const PROVIDER_RETRY_MAX_DELAY_MS: u64 = if (builtin.is_test) 8 else 4000;
@@ -25,6 +27,8 @@ const BOOTSTRAP_COMPLETE_MEM_NAME = "system.bootstrap.complete";
 const BOOTSTRAP_COMPLETE_MEM_KIND = "bootstrap.status";
 const BASE_CORE_PROMPT_KIND = "core.base_prompt";
 const BASE_CORE_PROMPT_NAME = "core.system.base_instructions";
+const CORE_CAPABILITIES_PROMPT_NAME = "core.system.capabilities";
+const CORE_IDENTITY_GUIDANCE_PROMPT_NAME = "core.system.identity_guidance";
 
 const RuntimeServerError = error{
     RuntimeTickTimeout,
@@ -54,6 +58,7 @@ const RuntimeQueueJob = struct {
     content: ?[]u8,
     action: ?[]u8,
     emit_debug: bool = false,
+    provider_error_debug_payload: ?[]u8 = null,
 
     result_mutex: std.Thread.Mutex = .{},
     result_cond: std.Thread.Condition = .{},
@@ -64,6 +69,7 @@ const RuntimeQueueJob = struct {
 
 const ProviderCompletion = struct {
     assistant_text: []u8,
+    wait_for_user: bool = false,
     debug_frames: ?[][]u8 = null,
 
     fn deinit(self: *ProviderCompletion, allocator: std.mem.Allocator) void {
@@ -76,6 +82,36 @@ const ProviderCompletion = struct {
 const ProviderToolNameMapEntry = struct {
     provider_name: []u8,
     runtime_name: []const u8,
+};
+
+const ProviderLoopAction = enum {
+    task_complete,
+    followup_needed,
+    wait_for_user,
+};
+
+const ProviderLoopDirective = struct {
+    action: ProviderLoopAction,
+    message: ?[]u8 = null,
+    reason: []const u8 = "",
+
+    fn deinit(self: *ProviderLoopDirective, allocator: std.mem.Allocator) void {
+        if (self.message) |value| allocator.free(value);
+        self.* = undefined;
+    }
+};
+
+const StructuredToolCall = struct {
+    id: []u8,
+    name: []u8,
+    arguments_json: []u8,
+
+    fn deinit(self: *StructuredToolCall, allocator: std.mem.Allocator) void {
+        allocator.free(self.id);
+        allocator.free(self.name);
+        allocator.free(self.arguments_json);
+        self.* = undefined;
+    }
 };
 
 const BootstrapPrompt = struct {
@@ -165,7 +201,7 @@ pub const RuntimeServer = struct {
     queue_mutex: std.Thread.Mutex = .{},
     queue_cond: std.Thread.Condition = .{},
     runtime_queue_max: usize = 128,
-    chat_operation_timeout_ms: u64 = 30_000,
+    chat_operation_timeout_ms: u64 = 120_000,
     control_operation_timeout_ms: u64 = 5_000,
     runtime_jobs: std.ArrayListUnmanaged(*RuntimeQueueJob) = .{},
     runtime_workers: []std.Thread,
@@ -329,7 +365,7 @@ pub const RuntimeServer = struct {
         raw_json: []const u8,
         emit_debug: bool,
     ) ![][]u8 {
-        var parsed = protocol.parseMessage(self.allocator, raw_json) catch {
+        var parsed = parseIncomingMessage(self.allocator, raw_json) catch {
             const payload = try protocol.buildErrorWithCode(self.allocator, "unknown", .invalid_envelope, "invalid request envelope");
             return self.wrapSingleFrame(payload);
         };
@@ -367,6 +403,24 @@ pub const RuntimeServer = struct {
                 ));
             },
         }
+    }
+
+    fn parseIncomingMessage(allocator: std.mem.Allocator, raw_json: []const u8) !protocol.ParsedMessage {
+        return protocol.parseMessage(allocator, raw_json) catch |err| {
+            // Be lenient for raw text clients: treat non-JSON-looking payloads as `session.send`.
+            const trimmed = std.mem.trim(u8, raw_json, " \t\r\n");
+            if (trimmed.len == 0) return err;
+
+            const first = trimmed[0];
+            if (first == '{' or first == '[' or first == '"') return err;
+
+            return .{
+                .msg_type = .session_send,
+                .id = null,
+                .content = try allocator.dupe(u8, trimmed),
+                .action = null,
+            };
+        };
     }
 
     pub fn handleConnectBootstrapFrames(self: *RuntimeServer, request_id: []const u8) ![][]u8 {
@@ -536,7 +590,6 @@ pub const RuntimeServer = struct {
             job.result_mutex.unlock();
 
             if (cancelled) {
-                if (response) |frames| deinitResponseFrames(self.allocator, frames);
                 self.destroyJob(job);
             }
         }
@@ -608,6 +661,7 @@ pub const RuntimeServer = struct {
         self.allocator.free(job.request_id);
         if (job.content) |owned| self.allocator.free(owned);
         if (job.action) |owned| self.allocator.free(owned);
+        if (job.provider_error_debug_payload) |payload| self.allocator.free(payload);
         if (job.response) |frames| deinitResponseFrames(self.allocator, frames);
         self.allocator.destroy(job);
     }
@@ -656,6 +710,7 @@ pub const RuntimeServer = struct {
             "BOOTSTRAP.md"
         else
             "JUST_HATCHED.md";
+        std.log.info("Using bootstrap template {s} for {s}/{s}", .{ template_name, self.runtime.agent_id, brain_name });
         const content = system_hooks.readTemplate(self.allocator, &self.runtime, template_name) catch |err| {
             std.log.warn("Failed to load bootstrap template {s}: {s}", .{ template_name, @errorName(err) });
             return null;
@@ -731,7 +786,7 @@ pub const RuntimeServer = struct {
         };
 
         var provider_completion = if (self.provider_runtime != null)
-            self.completeWithProvider(job, DEFAULT_BRAIN) catch |err| return self.wrapRuntimeErrorResponse(request_id, err, job.emit_debug)
+            self.completeWithProvider(job, DEFAULT_BRAIN) catch |err| return self.wrapRuntimeErrorResponseWithProviderDebug(job, request_id, err, job.emit_debug)
         else
             ProviderCompletion{
                 .assistant_text = try self.allocator.dupe(u8, content),
@@ -740,24 +795,28 @@ pub const RuntimeServer = struct {
 
         if (self.isJobCancelled(job)) return RuntimeServerError.RuntimeJobCancelled;
 
-        const escaped_content = try protocol.jsonEscape(self.allocator, provider_completion.assistant_text);
-        defer self.allocator.free(escaped_content);
-        const talk_args = try std.fmt.allocPrint(self.allocator, "{{\"message\":\"{s}\"}}", .{escaped_content});
-        defer self.allocator.free(talk_args);
-        self.runtime.queueToolUse(DEFAULT_BRAIN, "talk_user", talk_args) catch |err| {
-            return self.wrapRuntimeErrorResponse(request_id, err, job.emit_debug);
-        };
+        if (!provider_completion.wait_for_user) {
+            const escaped_content = try protocol.jsonEscape(self.allocator, provider_completion.assistant_text);
+            defer self.allocator.free(escaped_content);
+            const talk_args = try std.fmt.allocPrint(self.allocator, "{{\"message\":\"{s}\"}}", .{escaped_content});
+            defer self.allocator.free(talk_args);
+            self.runtime.queueToolUse(DEFAULT_BRAIN, "talk_user", talk_args) catch |err| {
+                return self.wrapRuntimeErrorResponse(request_id, err, job.emit_debug);
+            };
 
-        self.runPendingTicks(job, null) catch |err| {
-            self.clearRuntimeOutboundLocked();
-            if (err == RuntimeServerError.RuntimeJobCancelled) return err;
-            return self.wrapRuntimeErrorResponse(request_id, err, job.emit_debug);
-        };
+            self.runPendingTicks(job, null) catch |err| {
+                self.clearRuntimeOutboundLocked();
+                if (err == RuntimeServerError.RuntimeJobCancelled) return err;
+                return self.wrapRuntimeErrorResponse(request_id, err, job.emit_debug);
+            };
+        }
 
-        self.runtime.appendMessageMemory(DEFAULT_BRAIN, "assistant", provider_completion.assistant_text) catch |err| {
-            self.clearRuntimeOutboundLocked();
-            return self.wrapRuntimeErrorResponse(request_id, err, job.emit_debug);
-        };
+        if (provider_completion.assistant_text.len > 0) {
+            self.runtime.appendMessageMemory(DEFAULT_BRAIN, "assistant", provider_completion.assistant_text) catch |err| {
+                self.clearRuntimeOutboundLocked();
+                return self.wrapRuntimeErrorResponse(request_id, err, job.emit_debug);
+            };
+        }
 
         const outbound = try self.runtime.drainOutbound(self.allocator);
         defer agent_runtime.deinitOutbound(self.allocator, outbound);
@@ -775,7 +834,11 @@ pub const RuntimeServer = struct {
         }
 
         if (outbound.len == 0) {
-            try responses.append(self.allocator, try protocol.buildSessionReceive(self.allocator, request_id, "ok"));
+            const fallback_text = if (provider_completion.assistant_text.len > 0)
+                provider_completion.assistant_text
+            else
+                "ok";
+            try responses.append(self.allocator, try protocol.buildSessionReceive(self.allocator, request_id, fallback_text));
         } else {
             for (outbound) |message| {
                 try responses.append(self.allocator, try protocol.buildSessionReceive(self.allocator, request_id, message));
@@ -897,6 +960,62 @@ pub const RuntimeServer = struct {
         );
         try responses.append(self.allocator, try self.buildRuntimeErrorResponse(request_id, err));
         return responses.toOwnedSlice(self.allocator);
+    }
+
+    fn wrapRuntimeErrorResponseWithProviderDebug(
+        self: *RuntimeServer,
+        job: *RuntimeQueueJob,
+        request_id: []const u8,
+        err: anyerror,
+        emit_debug: bool,
+    ) ![][]u8 {
+        const provider_error_payload = job.provider_error_debug_payload;
+        job.provider_error_debug_payload = null;
+
+        if (!emit_debug) {
+            if (provider_error_payload) |payload| self.allocator.free(payload);
+            return self.wrapSingleFrame(try self.buildRuntimeErrorResponse(request_id, err));
+        }
+
+        var responses = std.ArrayListUnmanaged([]u8){};
+        errdefer {
+            for (responses.items) |payload| self.allocator.free(payload);
+            responses.deinit(self.allocator);
+        }
+
+        if (provider_error_payload) |payload| {
+            defer self.allocator.free(payload);
+            try self.appendDebugFrame(
+                &responses,
+                request_id,
+                "provider.error",
+                payload,
+            );
+        }
+
+        const error_name = @errorName(err);
+        const escaped_error = try protocol.jsonEscape(self.allocator, error_name);
+        defer self.allocator.free(escaped_error);
+        const debug_payload_json = try std.fmt.allocPrint(
+            self.allocator,
+            "{{\"error\":\"{s}\"}}",
+            .{escaped_error},
+        );
+        defer self.allocator.free(debug_payload_json);
+
+        try self.appendDebugFrame(
+            &responses,
+            request_id,
+            "runtime.error",
+            debug_payload_json,
+        );
+        try responses.append(self.allocator, try self.buildRuntimeErrorResponse(request_id, err));
+        return responses.toOwnedSlice(self.allocator);
+    }
+
+    fn setProviderErrorDebugPayload(self: *RuntimeServer, job: *RuntimeQueueJob, payload_json: []const u8) !void {
+        if (job.provider_error_debug_payload) |existing| self.allocator.free(existing);
+        job.provider_error_debug_payload = try self.allocator.dupe(u8, payload_json);
     }
 
     fn wrapSingleFrame(self: *RuntimeServer, payload: []u8) ![][]u8 {
@@ -1066,6 +1185,32 @@ pub const RuntimeServer = struct {
         );
     }
 
+    fn buildProviderErrorDebugPayload(
+        self: *RuntimeServer,
+        model: ziggy_piai.types.Model,
+        error_text: []const u8,
+        mapped_error: RuntimeServerError,
+        retryable: bool,
+        source: []const u8,
+    ) ![]u8 {
+        const escaped_provider = try protocol.jsonEscape(self.allocator, model.provider);
+        defer self.allocator.free(escaped_provider);
+        const escaped_model = try protocol.jsonEscape(self.allocator, model.id);
+        defer self.allocator.free(escaped_model);
+        const escaped_error = try protocol.jsonEscape(self.allocator, error_text);
+        defer self.allocator.free(escaped_error);
+        const escaped_mapped = try protocol.jsonEscape(self.allocator, @errorName(mapped_error));
+        defer self.allocator.free(escaped_mapped);
+        const escaped_source = try protocol.jsonEscape(self.allocator, source);
+        defer self.allocator.free(escaped_source);
+
+        return std.fmt.allocPrint(
+            self.allocator,
+            "{{\"provider\":\"{s}\",\"model\":\"{s}\",\"error\":\"{s}\",\"mapped_error\":\"{s}\",\"retryable\":{},\"source\":\"{s}\"}}",
+            .{ escaped_provider, escaped_model, escaped_error, escaped_mapped, retryable, escaped_source },
+        );
+    }
+
     const ProviderFailure = struct {
         runtime_error: RuntimeServerError,
         retryable: bool,
@@ -1134,6 +1279,10 @@ pub const RuntimeServer = struct {
         const err_name = stream_error_name orelse "";
         const message = provider_error_message orelse "";
 
+        if (containsAnyIgnoreCase(err_name, &.{ "MissingApiKey", "MissingProviderApiKey" })) {
+            return .{ .runtime_error = RuntimeServerError.MissingProviderApiKey, .retryable = false };
+        }
+
         if (containsAnyIgnoreCase(message, &.{ "429", "rate limit", "too many requests", "usage limit", "quota exceeded" })) {
             return .{
                 .runtime_error = RuntimeServerError.ProviderRateLimited,
@@ -1143,13 +1292,13 @@ pub const RuntimeServer = struct {
         }
 
         if (containsAnyIgnoreCase(message, &.{ "401", "403", "unauthorized", "forbidden", "invalid api key", "invalid_api_key", "invalid token", "token expired", "insufficient permission", "permission denied" }) or
-            containsAnyIgnoreCase(err_name, &.{ "Unauthorized", "Forbidden", "Auth", "InvalidApiKey" }))
+            containsAnyIgnoreCase(err_name, &.{ "Unauthorized", "Forbidden", "Auth", "InvalidApiKey", "InvalidCodexApiKey", "TokenExchangeFailed" }))
         {
             return .{ .runtime_error = RuntimeServerError.ProviderAuthFailed, .retryable = false };
         }
 
-        if (containsAnyIgnoreCase(message, &.{ "400", "404", "422", "bad request", "invalid request", "invalid schema", "schema missing", "model not found", "unsupported model", "unknown model", "unrecognized request argument" }) or
-            containsAnyIgnoreCase(err_name, &.{ "BadRequest", "InvalidRequest", "ModelNotFound", "ProviderNotRegistered" }))
+        if (containsAnyIgnoreCase(message, &.{ "400", "404", "422", "bad request", "invalid request", "invalid schema", "schema missing", "model not found", "unsupported model", "unknown model", "unrecognized request argument", "invalid request envelope" }) or
+            containsAnyIgnoreCase(err_name, &.{ "BadRequest", "InvalidRequest", "ModelNotFound", "ProviderNotRegistered", "ProviderNotSupported" }))
         {
             return .{ .runtime_error = RuntimeServerError.ProviderRequestInvalid, .retryable = false };
         }
@@ -1166,8 +1315,17 @@ pub const RuntimeServer = struct {
             return .{ .runtime_error = RuntimeServerError.ProviderUnavailable, .retryable = true };
         }
 
-        // Unknown provider failures are treated as transient so we retry before surfacing.
-        return .{ .runtime_error = RuntimeServerError.ProviderUnavailable, .retryable = true };
+        if (containsAnyIgnoreCase(err_name, &.{ "CompleteErrorUnavailable" })) {
+            return .{ .runtime_error = RuntimeServerError.ProviderStreamFailed, .retryable = true };
+        }
+
+        if (containsAnyIgnoreCase(message, &.{ "invalid json", "malformed json", "json parse", "decode error", "invalid response format", "invalid sse" }) or
+            containsAnyIgnoreCase(err_name, &.{ "InvalidResponse", "InvalidJson", "InvalidCharacter", "UnexpectedToken", "Malformed", "ParseError", "DecodeError", "Unicode", "NotUtf8" }))
+        {
+            return .{ .runtime_error = RuntimeServerError.ProviderStreamFailed, .retryable = false };
+        }
+
+        return .{ .runtime_error = RuntimeServerError.ProviderStreamFailed, .retryable = false };
     }
 
     fn findProviderStreamMessage(events: []const ziggy_piai.types.AssistantMessageEvent) ?[]const u8 {
@@ -1353,16 +1511,33 @@ pub const RuntimeServer = struct {
             provider_idx += 1;
         }
 
-        const tool_context_token_estimate = estimateProviderToolContextTokens(provider_tools);
+        const tool_context_token_estimate = if (USE_EXPLICIT_JSON_TOOL_CALLS)
+            0
+        else
+            estimateProviderToolContextTokens(provider_tools);
 
         var round: usize = 0;
         var total_calls: usize = 0;
+        var followup_requested = false;
+        var followup_rounds: usize = 0;
+        var pending_tool_failure_followup = false;
         while (round < MAX_PROVIDER_TOOL_ROUNDS) : (round += 1) {
             self.runtime.refreshCorePrompt(brain_name) catch |err| {
                 std.log.warn("Failed to refresh core prompt memories for {s}: {s}", .{ brain_name, @errorName(err) });
             };
 
-            const active_memory_prompt = try self.buildProviderActiveMemoryPrompt(brain_name);
+            const base_active_memory_prompt = try self.buildProviderActiveMemoryPrompt(brain_name);
+            defer self.allocator.free(base_active_memory_prompt);
+            const include_followup_hint = followup_requested;
+            followup_requested = false;
+            const active_memory_prompt = if (include_followup_hint)
+                try std.fmt.allocPrint(
+                    self.allocator,
+                    "{s}\n\n<loop_hint>\nPrevious output requested followup_needed.\nContinue reasoning and emit exactly one of: tool_calls, wait_for marker, or task_complete marker.\nDo not emit narrative status text without one of those markers; plain text without a marker is protocol-invalid and will be ignored.\n</loop_hint>",
+                    .{base_active_memory_prompt},
+                )
+            else
+                try self.allocator.dupe(u8, base_active_memory_prompt);
             defer self.allocator.free(active_memory_prompt);
 
             var events = std.array_list.Managed(ziggy_piai.types.AssistantMessageEvent).init(self.allocator);
@@ -1371,12 +1546,6 @@ pub const RuntimeServer = struct {
                 events.deinit();
             }
 
-            const messages = [_]ziggy_piai.types.Message{
-                .{
-                    .role = .user,
-                    .content = active_memory_prompt,
-                },
-            };
             var selected_model = primary_model;
             var used_fallback = false;
             var attempt_idx: usize = 0;
@@ -1388,11 +1557,23 @@ pub const RuntimeServer = struct {
                     tool_context_token_estimate,
                 );
                 defer self.allocator.free(provider_instructions);
+                const provider_instructions_safe = try self.normalizeProviderUtf8(provider_instructions);
+                defer self.allocator.free(provider_instructions_safe);
 
+                const active_memory_prompt_safe = try self.normalizeProviderUtf8(active_memory_prompt);
+                defer self.allocator.free(active_memory_prompt_safe);
+                const messages = [_]ziggy_piai.types.Message{
+                    .{
+                        .role = .user,
+                        .content = active_memory_prompt_safe,
+                    },
+                };
+
+                const no_tools = [_]ziggy_piai.types.Tool{};
                 const context = ziggy_piai.types.Context{
-                    .system_prompt = provider_instructions,
+                    .system_prompt = provider_instructions_safe,
                     .messages = &messages,
-                    .tools = provider_tools,
+                    .tools = if (USE_EXPLICIT_JSON_TOOL_CALLS) no_tools[0..] else provider_tools,
                 };
 
                 const api_key = try self.resolveApiKey(provider_runtime, selected_model.provider);
@@ -1489,21 +1670,26 @@ pub const RuntimeServer = struct {
                     }
 
                     if (job.emit_debug) {
-                        const escaped_provider = try protocol.jsonEscape(self.allocator, selected_model.provider);
-                        defer self.allocator.free(escaped_provider);
-                        const escaped_model = try protocol.jsonEscape(self.allocator, selected_model.id);
-                        defer self.allocator.free(escaped_model);
-                        const escaped_error = try protocol.jsonEscape(self.allocator, stream_error_name);
-                        defer self.allocator.free(escaped_error);
-                        const escaped_mapped = try protocol.jsonEscape(self.allocator, @errorName(failure.runtime_error));
-                        defer self.allocator.free(escaped_mapped);
-                        const error_payload_json = try std.fmt.allocPrint(
-                            self.allocator,
-                            "{{\"provider\":\"{s}\",\"model\":\"{s}\",\"error\":\"{s}\",\"mapped_error\":\"{s}\"}}",
-                            .{ escaped_provider, escaped_model, escaped_error, escaped_mapped },
+                        const error_payload_json = try self.buildProviderErrorDebugPayload(
+                            selected_model,
+                            stream_error_name,
+                            failure.runtime_error,
+                            failure.retryable,
+                            "stream_error",
                         );
                         defer self.allocator.free(error_payload_json);
+                        try self.setProviderErrorDebugPayload(job, error_payload_json);
                         try self.appendDebugFrame(&debug_frames, job.request_id, "provider.error", error_payload_json);
+                    } else {
+                        const error_payload_json = try self.buildProviderErrorDebugPayload(
+                            selected_model,
+                            stream_error_name,
+                            failure.runtime_error,
+                            failure.retryable,
+                            "stream_error",
+                        );
+                        defer self.allocator.free(error_payload_json);
+                        try self.setProviderErrorDebugPayload(job, error_payload_json);
                     }
 
                     return failure.runtime_error;
@@ -1564,21 +1750,26 @@ pub const RuntimeServer = struct {
                     }
 
                     if (job.emit_debug) {
-                        const escaped_provider = try protocol.jsonEscape(self.allocator, selected_model.provider);
-                        defer self.allocator.free(escaped_provider);
-                        const escaped_model = try protocol.jsonEscape(self.allocator, selected_model.id);
-                        defer self.allocator.free(escaped_model);
-                        const escaped_error = try protocol.jsonEscape(self.allocator, provider_error_message);
-                        defer self.allocator.free(escaped_error);
-                        const escaped_mapped = try protocol.jsonEscape(self.allocator, @errorName(failure.runtime_error));
-                        defer self.allocator.free(escaped_mapped);
-                        const error_payload_json = try std.fmt.allocPrint(
-                            self.allocator,
-                            "{{\"provider\":\"{s}\",\"model\":\"{s}\",\"error\":\"{s}\",\"mapped_error\":\"{s}\"}}",
-                            .{ escaped_provider, escaped_model, escaped_error, escaped_mapped },
+                        const error_payload_json = try self.buildProviderErrorDebugPayload(
+                            selected_model,
+                            provider_error_message,
+                            failure.runtime_error,
+                            failure.retryable,
+                            "provider_event",
                         );
                         defer self.allocator.free(error_payload_json);
+                        try self.setProviderErrorDebugPayload(job, error_payload_json);
                         try self.appendDebugFrame(&debug_frames, job.request_id, "provider.error", error_payload_json);
+                    } else {
+                        const error_payload_json = try self.buildProviderErrorDebugPayload(
+                            selected_model,
+                            provider_error_message,
+                            failure.runtime_error,
+                            failure.retryable,
+                            "provider_event",
+                        );
+                        defer self.allocator.free(error_payload_json);
+                        try self.setProviderErrorDebugPayload(job, error_payload_json);
                     }
 
                     return failure.runtime_error;
@@ -1602,22 +1793,263 @@ pub const RuntimeServer = struct {
 
             const tool_calls = assistant.tool_calls;
             if (tool_calls.len == 0) {
-                const final_text = try self.allocator.dupe(u8, assistant.text);
-                deinitOwnedAssistantMessage(self.allocator, &assistant);
-                var owned_debug_frames: ?[][]u8 = null;
-                if (debug_frames.items.len > 0) {
-                    owned_debug_frames = try debug_frames.toOwnedSlice(self.allocator);
-                } else {
-                    debug_frames.deinit(self.allocator);
+                const structured_tool_calls = try self.parseStructuredToolCalls(assistant.text, round);
+                defer {
+                    for (structured_tool_calls) |*call| call.deinit(self.allocator);
+                    if (structured_tool_calls.len > 0) self.allocator.free(structured_tool_calls);
                 }
-                return .{
-                    .assistant_text = final_text,
-                    .debug_frames = owned_debug_frames,
-                };
+                if (structured_tool_calls.len > 0) {
+                    if (structured_tool_calls.len > 1) {
+                        if (job.emit_debug) {
+                            const payload = try std.fmt.allocPrint(
+                                self.allocator,
+                                "{{\"round\":{d},\"reason\":\"multiple_tool_calls_not_allowed\",\"incoming_calls\":{d}}}",
+                                .{ round, structured_tool_calls.len },
+                            );
+                            defer self.allocator.free(payload);
+                            try self.appendDebugFrame(&debug_frames, job.request_id, "provider.tool_call_rejected", payload);
+                        }
+
+                        try self.appendAssistantStructuredToolCallMessage(brain_name, assistant.text, structured_tool_calls);
+                        try self.appendToolProtocolErrorResult(
+                            brain_name,
+                            "invalid_tool_batch",
+                            "Emit exactly one tool call per act step. Do not batch tool calls.",
+                            structured_tool_calls.len,
+                        );
+                        pending_tool_failure_followup = true;
+                        followup_rounds += 1;
+                        if (followup_rounds > MAX_PROVIDER_FOLLOWUP_ROUNDS) {
+                            deinitOwnedAssistantMessage(self.allocator, &assistant);
+                            return RuntimeServerError.ProviderToolLoopExceeded;
+                        }
+                        followup_requested = true;
+                        deinitOwnedAssistantMessage(self.allocator, &assistant);
+                        continue;
+                    }
+
+                    if (total_calls + structured_tool_calls.len > MAX_PROVIDER_TOOL_CALLS_PER_TURN) {
+                        if (job.emit_debug) {
+                            const payload = try std.fmt.allocPrint(
+                                self.allocator,
+                                "{{\"reason\":\"tool_call_cap\",\"round\":{d},\"total_calls\":{d},\"incoming_calls\":{d},\"cap\":{d}}}",
+                                .{ round, total_calls, structured_tool_calls.len, MAX_PROVIDER_TOOL_CALLS_PER_TURN },
+                            );
+                            defer self.allocator.free(payload);
+                            try self.appendDebugFrame(&debug_frames, job.request_id, "provider.loop_exit", payload);
+                        }
+                        deinitOwnedAssistantMessage(self.allocator, &assistant);
+                        return self.finalizeProviderCompletion(&debug_frames, "", true);
+                    }
+                    total_calls += structured_tool_calls.len;
+                    try self.appendAssistantStructuredToolCallMessage(brain_name, assistant.text, structured_tool_calls);
+
+                    for (structured_tool_calls) |tool_call| {
+                        const args_with_call_id = try injectToolCallId(self.allocator, tool_call.arguments_json, tool_call.id);
+                        defer self.allocator.free(args_with_call_id);
+                        if (job.emit_debug) {
+                            const tool_call_payload_json = try self.buildProviderStructuredToolCallDebugPayload(
+                                tool_call,
+                                tool_call.name,
+                                args_with_call_id,
+                                round,
+                            );
+                            defer self.allocator.free(tool_call_payload_json);
+                            try self.appendDebugFrame(
+                                &debug_frames,
+                                job.request_id,
+                                "provider.tool_call",
+                                tool_call_payload_json,
+                            );
+                        }
+                        try self.runtime.queueToolUse(brain_name, tool_call.name, args_with_call_id);
+                    }
+
+                    var structured_tool_payloads = std.ArrayListUnmanaged([]u8){};
+                    defer {
+                        for (structured_tool_payloads.items) |payload| self.allocator.free(payload);
+                        structured_tool_payloads.deinit(self.allocator);
+                    }
+
+                    self.runPendingTicks(job, &structured_tool_payloads) catch |err| {
+                        if (err == RuntimeServerError.RuntimeJobCancelled) return err;
+                        return err;
+                    };
+                    if (job.emit_debug) {
+                        try self.appendToolResultDebugFrames(
+                            &debug_frames,
+                            job.request_id,
+                            round,
+                            structured_tool_payloads.items,
+                        );
+                    }
+                    pending_tool_failure_followup = self.toolPayloadBatchHasError(structured_tool_payloads.items);
+                    deinitOwnedAssistantMessage(self.allocator, &assistant);
+                    continue;
+                }
+
+                var directive = try self.parseProviderLoopDirective(assistant.text);
+                defer directive.deinit(self.allocator);
+
+                const implicit_wait_fallback =
+                    directive.action == .wait_for_user and
+                    directive.message == null and
+                    isImplicitWaitFallbackReason(directive.reason);
+
+                if (implicit_wait_fallback and total_calls == 0 and !pending_tool_failure_followup) {
+                    const fallback_text = std.mem.trim(u8, assistant.text, " \t\r\n");
+                    if (fallback_text.len > 0) {
+                        const completion = try self.finalizeProviderCompletion(&debug_frames, fallback_text, false);
+                        pending_tool_failure_followup = false;
+                        deinitOwnedAssistantMessage(self.allocator, &assistant);
+                        return completion;
+                    }
+                }
+
+                if (implicit_wait_fallback and total_calls > 0) {
+                    followup_rounds += 1;
+                    if (job.emit_debug) {
+                        const escaped_reason = try protocol.jsonEscape(self.allocator, directive.reason);
+                        defer self.allocator.free(escaped_reason);
+                        const payload = try std.fmt.allocPrint(
+                            self.allocator,
+                            "{{\"round\":{d},\"reason\":\"post_tool_implicit_wait\",\"directive_reason\":\"{s}\",\"followup_rounds\":{d},\"total_calls\":{d}}}",
+                            .{ round, escaped_reason, followup_rounds, total_calls },
+                        );
+                        defer self.allocator.free(payload);
+                        try self.appendDebugFrame(&debug_frames, job.request_id, "provider.followup", payload);
+                    }
+
+                    if (followup_rounds > MAX_PROVIDER_FOLLOWUP_ROUNDS) {
+                        const exhausted_text = std.mem.trim(u8, assistant.text, " \t\r\n");
+                        if (exhausted_text.len > 0) {
+                            const completion = try self.finalizeProviderCompletion(&debug_frames, exhausted_text, false);
+                            deinitOwnedAssistantMessage(self.allocator, &assistant);
+                            return completion;
+                        }
+                        deinitOwnedAssistantMessage(self.allocator, &assistant);
+                        return RuntimeServerError.ProviderToolLoopExceeded;
+                    }
+
+                    followup_requested = true;
+                    deinitOwnedAssistantMessage(self.allocator, &assistant);
+                    continue;
+                }
+
+                if (pending_tool_failure_followup and directive.action == .wait_for_user) {
+                    followup_rounds += 1;
+                    if (job.emit_debug) {
+                        const escaped_reason = try protocol.jsonEscape(self.allocator, directive.reason);
+                        defer self.allocator.free(escaped_reason);
+                        const payload = try std.fmt.allocPrint(
+                            self.allocator,
+                            "{{\"round\":{d},\"reason\":\"post_tool_error_wait_blocked\",\"directive_reason\":\"{s}\",\"followup_rounds\":{d},\"total_calls\":{d}}}",
+                            .{ round, escaped_reason, followup_rounds, total_calls },
+                        );
+                        defer self.allocator.free(payload);
+                        try self.appendDebugFrame(&debug_frames, job.request_id, "provider.followup", payload);
+                    }
+
+                    if (followup_rounds > MAX_PROVIDER_FOLLOWUP_ROUNDS) {
+                        const exhausted_text = std.mem.trim(u8, assistant.text, " \t\r\n");
+                        if (exhausted_text.len > 0) {
+                            const completion = try self.finalizeProviderCompletion(&debug_frames, exhausted_text, false);
+                            deinitOwnedAssistantMessage(self.allocator, &assistant);
+                            return completion;
+                        }
+                        deinitOwnedAssistantMessage(self.allocator, &assistant);
+                        return RuntimeServerError.ProviderToolLoopExceeded;
+                    }
+
+                    followup_requested = true;
+                    deinitOwnedAssistantMessage(self.allocator, &assistant);
+                    continue;
+                }
+
+                if (directive.action == .followup_needed) {
+                    followup_rounds += 1;
+                    if (job.emit_debug) {
+                        const escaped_reason = try protocol.jsonEscape(self.allocator, directive.reason);
+                        defer self.allocator.free(escaped_reason);
+                        const payload = try std.fmt.allocPrint(
+                            self.allocator,
+                            "{{\"round\":{d},\"reason\":\"{s}\",\"followup_rounds\":{d}}}",
+                            .{ round, escaped_reason, followup_rounds },
+                        );
+                        defer self.allocator.free(payload);
+                        try self.appendDebugFrame(&debug_frames, job.request_id, "provider.followup", payload);
+                    }
+
+                    if (followup_rounds > MAX_PROVIDER_FOLLOWUP_ROUNDS) {
+                        const exhausted_text = std.mem.trim(u8, assistant.text, " \t\r\n");
+                        if (exhausted_text.len > 0) {
+                            const completion = try self.finalizeProviderCompletion(&debug_frames, exhausted_text, false);
+                            deinitOwnedAssistantMessage(self.allocator, &assistant);
+                            return completion;
+                        }
+                        deinitOwnedAssistantMessage(self.allocator, &assistant);
+                        return RuntimeServerError.ProviderToolLoopExceeded;
+                    }
+
+                    followup_requested = true;
+                    deinitOwnedAssistantMessage(self.allocator, &assistant);
+                    continue;
+                }
+
+                if (directive.action == .task_complete) {
+                    const completion_text = directive.message orelse assistant.text;
+                    const completion = try self.finalizeProviderCompletion(&debug_frames, completion_text, false);
+                    pending_tool_failure_followup = false;
+                    deinitOwnedAssistantMessage(self.allocator, &assistant);
+                    return completion;
+                }
+
+                pending_tool_failure_followup = false;
+                deinitOwnedAssistantMessage(self.allocator, &assistant);
+                return self.finalizeProviderCompletion(&debug_frames, "", true);
+            }
+
+            if (tool_calls.len > 1) {
+                if (job.emit_debug) {
+                    const payload = try std.fmt.allocPrint(
+                        self.allocator,
+                        "{{\"round\":{d},\"reason\":\"multiple_tool_calls_not_allowed\",\"incoming_calls\":{d}}}",
+                        .{ round, tool_calls.len },
+                    );
+                    defer self.allocator.free(payload);
+                    try self.appendDebugFrame(&debug_frames, job.request_id, "provider.tool_call_rejected", payload);
+                }
+
+                try self.appendAssistantToolCallMessage(brain_name, assistant.text, tool_calls);
+                try self.appendToolProtocolErrorResult(
+                    brain_name,
+                    "invalid_tool_batch",
+                    "Emit exactly one tool call per act step. Do not batch tool calls.",
+                    tool_calls.len,
+                );
+                pending_tool_failure_followup = true;
+                followup_rounds += 1;
+                if (followup_rounds > MAX_PROVIDER_FOLLOWUP_ROUNDS) {
+                    deinitOwnedAssistantMessage(self.allocator, &assistant);
+                    return RuntimeServerError.ProviderToolLoopExceeded;
+                }
+                followup_requested = true;
+                deinitOwnedAssistantMessage(self.allocator, &assistant);
+                continue;
             }
 
             if (total_calls + tool_calls.len > MAX_PROVIDER_TOOL_CALLS_PER_TURN) {
-                return RuntimeServerError.ProviderToolLoopExceeded;
+                if (job.emit_debug) {
+                    const payload = try std.fmt.allocPrint(
+                        self.allocator,
+                        "{{\"reason\":\"tool_call_cap\",\"round\":{d},\"total_calls\":{d},\"incoming_calls\":{d},\"cap\":{d}}}",
+                        .{ round, total_calls, tool_calls.len, MAX_PROVIDER_TOOL_CALLS_PER_TURN },
+                    );
+                    defer self.allocator.free(payload);
+                    try self.appendDebugFrame(&debug_frames, job.request_id, "provider.loop_exit", payload);
+                }
+                deinitOwnedAssistantMessage(self.allocator, &assistant);
+                return self.finalizeProviderCompletion(&debug_frames, "", true);
             }
             total_calls += tool_calls.len;
 
@@ -1655,10 +2087,28 @@ pub const RuntimeServer = struct {
                 if (err == RuntimeServerError.RuntimeJobCancelled) return err;
                 return err;
             };
+            if (job.emit_debug) {
+                try self.appendToolResultDebugFrames(
+                    &debug_frames,
+                    job.request_id,
+                    round,
+                    tool_payloads.items,
+                );
+            }
+            pending_tool_failure_followup = self.toolPayloadBatchHasError(tool_payloads.items);
             deinitOwnedAssistantMessage(self.allocator, &assistant);
         }
 
-        return RuntimeServerError.ProviderToolLoopExceeded;
+        if (job.emit_debug) {
+            const payload = try std.fmt.allocPrint(
+                self.allocator,
+                "{{\"reason\":\"round_cap\",\"rounds\":{d},\"max_rounds\":{d}}}",
+                .{ round, MAX_PROVIDER_TOOL_ROUNDS },
+            );
+            defer self.allocator.free(payload);
+            try self.appendDebugFrame(&debug_frames, job.request_id, "provider.loop_exit", payload);
+        }
+        return self.finalizeProviderCompletion(&debug_frames, "", true);
     }
 
     fn buildProviderInstructions(
@@ -1741,6 +2191,48 @@ pub const RuntimeServer = struct {
         ,
             .{ self.runtime.agent_id, brain_name, final_estimate, context_limit, timestamp_utc, unix_time },
         );
+    }
+
+    fn normalizeProviderUtf8(self: *RuntimeServer, input: []const u8) ![]u8 {
+        if (std.unicode.Utf8View.init(input)) |_| {
+            return self.allocator.dupe(u8, input);
+        } else |_| {}
+
+        const replacement = "\xEF\xBF\xBD";
+        var out = std.ArrayListUnmanaged(u8){};
+        errdefer out.deinit(self.allocator);
+
+        var i: usize = 0;
+        while (i < input.len) {
+            const byte = input[i];
+            if (byte < 0x80) {
+                try out.append(self.allocator, byte);
+                i += 1;
+                continue;
+            }
+
+            const seq_len = std.unicode.utf8ByteSequenceLength(byte) catch {
+                try out.appendSlice(self.allocator, replacement);
+                i += 1;
+                continue;
+            };
+            const needed: usize = @intCast(seq_len);
+            if (i + needed > input.len) {
+                try out.appendSlice(self.allocator, replacement);
+                break;
+            }
+
+            const candidate = input[i .. i + needed];
+            if (std.unicode.Utf8View.init(candidate)) |_| {
+                try out.appendSlice(self.allocator, candidate);
+                i += needed;
+            } else |_| {
+                try out.appendSlice(self.allocator, replacement);
+                i += 1;
+            }
+        }
+
+        return out.toOwnedSlice(self.allocator);
     }
 
     fn estimateProviderToolContextTokens(tools: []const ziggy_piai.types.Tool) usize {
@@ -1919,12 +2411,14 @@ pub const RuntimeServer = struct {
         // Always render the base core instructions first, as plain markdown.
         for (snapshot) |item| {
             if (!isCorePromptMemory(item)) continue;
+            if (shouldExcludeCorePromptItem(item)) continue;
             if (!isBaseCorePromptMemory(item)) continue;
             try self.appendCorePromptEntry(&out, item, false);
         }
 
         for (snapshot) |item| {
             if (!isCorePromptMemory(item)) continue;
+            if (shouldExcludeCorePromptItem(item)) continue;
             if (isBaseCorePromptMemory(item)) continue;
             try self.appendCorePromptEntry(&out, item, true);
         }
@@ -1962,6 +2456,12 @@ pub const RuntimeServer = struct {
         if (std.mem.eql(u8, item.kind, BASE_CORE_PROMPT_KIND)) return true;
         const parsed = memid.MemId.parse(item.mem_id) catch return false;
         return std.mem.eql(u8, parsed.name, BASE_CORE_PROMPT_NAME);
+    }
+
+    fn shouldExcludeCorePromptItem(item: memory.ActiveMemoryItem) bool {
+        const parsed = memid.MemId.parse(item.mem_id) catch return false;
+        return std.mem.eql(u8, parsed.name, CORE_CAPABILITIES_PROMPT_NAME) or
+            std.mem.eql(u8, parsed.name, CORE_IDENTITY_GUIDANCE_PROMPT_NAME);
     }
 
     fn decodeMemoryText(allocator: std.mem.Allocator, content_json: []const u8) ![]u8 {
@@ -2052,14 +2552,263 @@ pub const RuntimeServer = struct {
         const snapshot = try self.runtime.active_memory.snapshotActive(self.allocator, brain_name);
         defer memory.deinitItems(self.allocator, snapshot);
 
-        const state_json = try memory.toActiveMemoryJson(self.allocator, brain_name, snapshot);
-        defer self.allocator.free(state_json);
+        var non_core_snapshot = std.ArrayListUnmanaged(memory.ActiveMemoryItem){};
+        defer non_core_snapshot.deinit(self.allocator);
+        for (snapshot) |item| {
+            if (!shouldIncludeProviderActiveMemoryItem(item)) continue;
+            try non_core_snapshot.append(self.allocator, item);
+        }
 
-        return std.fmt.allocPrint(
+        const state_json = try memory.toActiveMemoryJson(self.allocator, brain_name, non_core_snapshot.items);
+        defer self.allocator.free(state_json);
+        return self.allocator.dupe(u8, state_json);
+    }
+
+    fn shouldIncludeProviderActiveMemoryItem(item: memory.ActiveMemoryItem) bool {
+        if (isCorePromptMemory(item)) return false;
+        if (std.mem.startsWith(u8, item.kind, "core.")) return false;
+        if (std.mem.startsWith(u8, item.kind, "system.")) return false;
+
+        const parsed = memid.MemId.parse(item.mem_id) catch return false;
+        if (std.mem.startsWith(u8, parsed.name, "core.")) return false;
+        if (std.mem.startsWith(u8, parsed.name, "system.")) return false;
+        return true;
+    }
+
+    fn parseProviderLoopDirective(self: *RuntimeServer, raw_text: []const u8) !ProviderLoopDirective {
+        const trimmed = std.mem.trim(u8, raw_text, " \t\r\n");
+        if (trimmed.len == 0) {
+            return .{ .action = .wait_for_user, .reason = "empty_response" };
+        }
+
+        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, trimmed, .{}) catch {
+            return .{
+                .action = parseProviderLoopMarkers(trimmed),
+                .reason = "marker_fallback",
+            };
+        };
+        defer parsed.deinit();
+
+        if (parsed.value != .object) {
+            return .{
+                .action = parseProviderLoopMarkers(trimmed),
+                .reason = "non_object_fallback",
+            };
+        }
+
+        const obj = parsed.value.object;
+        const action_text = if (obj.get("action")) |value|
+            if (value == .string) value.string else ""
+        else
+            "";
+
+        const wait_for_marked = jsonObjectBool(obj, "wait_for") orelse false or
+            std.ascii.eqlIgnoreCase(action_text, "wait_for");
+        const followup_marked = jsonObjectBool(obj, "followup_needed") orelse false or
+            std.ascii.eqlIgnoreCase(action_text, "followup_needed") or
+            std.ascii.eqlIgnoreCase(action_text, "continue_reasoning") or
+            std.ascii.eqlIgnoreCase(action_text, "continue");
+        const task_complete_marked = jsonObjectBool(obj, "task_complete") orelse false or
+            std.ascii.eqlIgnoreCase(action_text, "task_complete") or
+            std.ascii.eqlIgnoreCase(action_text, "done");
+
+        const message = if (obj.get("message")) |value| blk: {
+            if (value == .string and value.string.len > 0) {
+                break :blk try self.allocator.dupe(u8, value.string);
+            }
+            break :blk null;
+        } else null;
+
+        if (wait_for_marked) {
+            return .{ .action = .wait_for_user, .message = message, .reason = "wait_for_marker" };
+        }
+        if (followup_marked) {
+            return .{ .action = .followup_needed, .message = message, .reason = "followup_marker" };
+        }
+        if (task_complete_marked) {
+            return .{ .action = .task_complete, .message = message, .reason = "task_complete_marker" };
+        }
+        if (message != null) {
+            return .{ .action = .task_complete, .message = message, .reason = "message_field" };
+        }
+
+        return .{ .action = .wait_for_user, .reason = "json_without_markers" };
+    }
+
+    fn parseStructuredToolCalls(
+        self: *RuntimeServer,
+        raw_text: []const u8,
+        round: usize,
+    ) ![]StructuredToolCall {
+        const trimmed = std.mem.trim(u8, raw_text, " \t\r\n");
+        if (trimmed.len == 0) return &.{};
+
+        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, trimmed, .{}) catch {
+            return &.{};
+        };
+        defer parsed.deinit();
+
+        if (parsed.value != .object) return &.{};
+        const obj = parsed.value.object;
+        const tool_calls_value = obj.get("tool_calls") orelse return &.{};
+        if (tool_calls_value != .array) return &.{};
+        if (tool_calls_value.array.items.len == 0) return &.{};
+
+        var out = std.ArrayListUnmanaged(StructuredToolCall){};
+        errdefer {
+            for (out.items) |*call| call.deinit(self.allocator);
+            out.deinit(self.allocator);
+        }
+
+        for (tool_calls_value.array.items, 0..) |entry, idx| {
+            if (entry != .object) continue;
+            const call_obj = entry.object;
+            const name_value = call_obj.get("name") orelse continue;
+            if (name_value != .string or name_value.string.len == 0) continue;
+
+            const id = if (call_obj.get("id")) |id_value| blk: {
+                if (id_value == .string and id_value.string.len > 0) {
+                    break :blk try self.allocator.dupe(u8, id_value.string);
+                }
+                break :blk try std.fmt.allocPrint(self.allocator, "json-call-{d}-{d}", .{ round + 1, idx + 1 });
+            } else try std.fmt.allocPrint(self.allocator, "json-call-{d}-{d}", .{ round + 1, idx + 1 });
+            errdefer self.allocator.free(id);
+
+            const arguments_json = if (call_obj.get("arguments")) |args_value|
+                try jsonValueToOwnedSlice(self.allocator, args_value)
+            else if (call_obj.get("args")) |args_value|
+                try jsonValueToOwnedSlice(self.allocator, args_value)
+            else
+                try self.allocator.dupe(u8, "{}");
+            errdefer self.allocator.free(arguments_json);
+
+            const name = try self.allocator.dupe(u8, name_value.string);
+            errdefer self.allocator.free(name);
+
+            try out.append(self.allocator, .{
+                .id = id,
+                .name = name,
+                .arguments_json = arguments_json,
+            });
+        }
+
+        if (out.items.len == 0) {
+            out.deinit(self.allocator);
+            return &.{};
+        }
+
+        return out.toOwnedSlice(self.allocator);
+    }
+
+    fn finalizeProviderCompletion(
+        self: *RuntimeServer,
+        debug_frames: *std.ArrayListUnmanaged([]u8),
+        assistant_text: []const u8,
+        wait_for_user: bool,
+    ) !ProviderCompletion {
+        const final_text = try self.allocator.dupe(u8, assistant_text);
+        var owned_debug_frames: ?[][]u8 = null;
+        if (debug_frames.items.len > 0) {
+            owned_debug_frames = try debug_frames.toOwnedSlice(self.allocator);
+        } else {
+            debug_frames.deinit(self.allocator);
+        }
+        return .{
+            .assistant_text = final_text,
+            .wait_for_user = wait_for_user,
+            .debug_frames = owned_debug_frames,
+        };
+    }
+
+    fn jsonObjectBool(obj: std.json.ObjectMap, field: []const u8) ?bool {
+        const value = obj.get(field) orelse return null;
+        if (value != .bool) return null;
+        return value.bool;
+    }
+
+    fn parseProviderLoopMarkers(text: []const u8) ProviderLoopAction {
+        if (containsCaseInsensitive(text, "followup_needed")) return .followup_needed;
+        if (containsCaseInsensitive(text, "continue_reasoning")) return .followup_needed;
+        if (containsCaseInsensitive(text, "task_complete")) return .task_complete;
+        if (containsCaseInsensitive(text, "wait_for")) return .wait_for_user;
+        // Default fallback: no explicit tool/wait marker means wait for user.
+        return .wait_for_user;
+    }
+
+    fn isImplicitWaitFallbackReason(reason: []const u8) bool {
+        return std.mem.eql(u8, reason, "marker_fallback") or
+            std.mem.eql(u8, reason, "non_object_fallback") or
+            std.mem.eql(u8, reason, "json_without_markers");
+    }
+
+    fn toolPayloadBatchHasError(self: *RuntimeServer, payloads: []const []const u8) bool {
+        for (payloads) |payload| {
+            if (self.toolPayloadHasError(payload)) return true;
+        }
+        return false;
+    }
+
+    fn toolPayloadHasError(self: *RuntimeServer, payload: []const u8) bool {
+        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, payload, .{}) catch {
+            return std.mem.indexOf(u8, payload, "\"error\"") != null;
+        };
+        defer parsed.deinit();
+        if (parsed.value != .object) return false;
+        return parsed.value.object.get("error") != null;
+    }
+
+    fn appendToolProtocolErrorResult(
+        self: *RuntimeServer,
+        brain_name: []const u8,
+        code: []const u8,
+        message: []const u8,
+        incoming_calls: usize,
+    ) !void {
+        const escaped_code = try protocol.jsonEscape(self.allocator, code);
+        defer self.allocator.free(escaped_code);
+        const escaped_message = try protocol.jsonEscape(self.allocator, message);
+        defer self.allocator.free(escaped_message);
+        const payload_json = try std.fmt.allocPrint(
             self.allocator,
-            "<active_memory_state>\n{s}</active_memory_state>\nUse only this state as conversation context.",
-            .{state_json},
+            "{{\"error\":{{\"code\":\"{s}\",\"message\":\"{s}\"}},\"incoming_calls\":{d},\"constraint\":\"single_tool_call_per_round\"}}",
+            .{ escaped_code, escaped_message, incoming_calls },
         );
+        defer self.allocator.free(payload_json);
+        var created = try self.runtime.active_memory.create(brain_name, null, "tool_result", payload_json, false, false);
+        created.deinit(self.allocator);
+    }
+
+    fn appendToolResultDebugFrames(
+        self: *RuntimeServer,
+        debug_frames: *std.ArrayListUnmanaged([]u8),
+        request_id: []const u8,
+        round: usize,
+        payloads: []const []const u8,
+    ) !void {
+        for (payloads, 0..) |payload, idx| {
+            const normalized_payload = try normalizeJsonValueForDebug(self.allocator, payload);
+            defer self.allocator.free(normalized_payload);
+            const payload_json = try std.fmt.allocPrint(
+                self.allocator,
+                "{{\"round\":{d},\"result_index\":{d},\"has_error\":{},\"result\":{s}}}",
+                .{ round + 1, idx, self.toolPayloadHasError(payload), normalized_payload },
+            );
+            defer self.allocator.free(payload_json);
+            try self.appendDebugFrame(debug_frames, request_id, "runtime.tool_result", payload_json);
+        }
+    }
+
+    fn containsCaseInsensitive(haystack: []const u8, needle: []const u8) bool {
+        if (needle.len == 0 or haystack.len < needle.len) return false;
+        var start: usize = 0;
+        while (start + needle.len <= haystack.len) : (start += 1) {
+            if (std.ascii.eqlIgnoreCase(haystack[start .. start + needle.len], needle)) return true;
+        }
+        return false;
+    }
+
+    fn jsonValueToOwnedSlice(allocator: std.mem.Allocator, value: std.json.Value) ![]u8 {
+        return std.fmt.allocPrint(allocator, "{f}", .{std.json.fmt(value, .{})});
     }
 
     fn appendAssistantToolCallMessage(
@@ -2102,6 +2851,70 @@ pub const RuntimeServer = struct {
 
         var created = try self.runtime.active_memory.create(brain_name, null, "message", content_json, false, false);
         created.deinit(self.allocator);
+    }
+
+    fn appendAssistantStructuredToolCallMessage(
+        self: *RuntimeServer,
+        brain_name: []const u8,
+        content: []const u8,
+        tool_calls: []const StructuredToolCall,
+    ) !void {
+        var payload = std.ArrayListUnmanaged(u8){};
+        defer payload.deinit(self.allocator);
+
+        try payload.appendSlice(self.allocator, "{\"role\":\"assistant\",\"content\":\"");
+        const escaped_content = try protocol.jsonEscape(self.allocator, content);
+        defer self.allocator.free(escaped_content);
+        try payload.appendSlice(self.allocator, escaped_content);
+        try payload.appendSlice(self.allocator, "\",\"tool_calls\":[");
+
+        for (tool_calls, 0..) |tool_call, idx| {
+            if (idx > 0) try payload.append(self.allocator, ',');
+
+            const escaped_id = try protocol.jsonEscape(self.allocator, tool_call.id);
+            defer self.allocator.free(escaped_id);
+            const escaped_name = try protocol.jsonEscape(self.allocator, tool_call.name);
+            defer self.allocator.free(escaped_name);
+            const escaped_args = try protocol.jsonEscape(self.allocator, tool_call.arguments_json);
+            defer self.allocator.free(escaped_args);
+
+            try payload.appendSlice(self.allocator, "{\"id\":\"");
+            try payload.appendSlice(self.allocator, escaped_id);
+            try payload.appendSlice(self.allocator, "\",\"name\":\"");
+            try payload.appendSlice(self.allocator, escaped_name);
+            try payload.appendSlice(self.allocator, "\",\"arguments_json\":\"");
+            try payload.appendSlice(self.allocator, escaped_args);
+            try payload.appendSlice(self.allocator, "\"}");
+        }
+
+        try payload.appendSlice(self.allocator, "]}");
+        const content_json = try payload.toOwnedSlice(self.allocator);
+        defer self.allocator.free(content_json);
+
+        var created = try self.runtime.active_memory.create(brain_name, null, "message", content_json, false, false);
+        created.deinit(self.allocator);
+    }
+
+    fn buildProviderStructuredToolCallDebugPayload(
+        self: *RuntimeServer,
+        tool_call: StructuredToolCall,
+        runtime_tool_name: []const u8,
+        args_with_call_id: []const u8,
+        round: usize,
+    ) ![]u8 {
+        const escaped_id = try protocol.jsonEscape(self.allocator, tool_call.id);
+        defer self.allocator.free(escaped_id);
+        const escaped_provider_name = try protocol.jsonEscape(self.allocator, tool_call.name);
+        defer self.allocator.free(escaped_provider_name);
+        const escaped_runtime_name = try protocol.jsonEscape(self.allocator, runtime_tool_name);
+        defer self.allocator.free(escaped_runtime_name);
+        const escaped_args = try protocol.jsonEscape(self.allocator, args_with_call_id);
+        defer self.allocator.free(escaped_args);
+        return std.fmt.allocPrint(
+            self.allocator,
+            "{{\"round\":{d},\"tool_call\":{{\"id\":\"{s}\",\"provider_name\":\"{s}\",\"runtime_name\":\"{s}\",\"arguments\":\"{s}\"}}}}",
+            .{ round, escaped_id, escaped_provider_name, escaped_runtime_name, escaped_args },
+        );
     }
 
     fn operationTimeoutNs(self: *const RuntimeServer, operation_class: RuntimeOperationClass) u64 {
@@ -2347,25 +3160,76 @@ fn deinitAssistantMessage(allocator: std.mem.Allocator, msg: *ziggy_piai.types.A
     if (msg.tool_calls.len > 0) allocator.free(msg.tool_calls);
 }
 
+fn markFreedPtr(
+    allocator: std.mem.Allocator,
+    freed_ptrs: *std.AutoHashMapUnmanaged(usize, void),
+    addr: usize,
+) bool {
+    if (freed_ptrs.contains(addr)) return false;
+    freed_ptrs.put(allocator, addr, {}) catch return false;
+    return true;
+}
+
+fn freeBytesOnce(
+    allocator: std.mem.Allocator,
+    freed_ptrs: *std.AutoHashMapUnmanaged(usize, void),
+    bytes: []const u8,
+) void {
+    if (bytes.len == 0) return;
+    const addr = @intFromPtr(bytes.ptr);
+    if (!markFreedPtr(allocator, freed_ptrs, addr)) return;
+    allocator.free(bytes);
+}
+
+fn freeToolCallsOnce(
+    allocator: std.mem.Allocator,
+    freed_ptrs: *std.AutoHashMapUnmanaged(usize, void),
+    tool_calls: []const ziggy_piai.types.ToolCall,
+) void {
+    if (tool_calls.len == 0) return;
+    const addr = @intFromPtr(tool_calls.ptr);
+    if (!markFreedPtr(allocator, freed_ptrs, addr)) return;
+    allocator.free(tool_calls);
+}
+
+fn deinitAssistantMessageDedup(
+    allocator: std.mem.Allocator,
+    msg: *ziggy_piai.types.AssistantMessage,
+    freed_ptrs: *std.AutoHashMapUnmanaged(usize, void),
+) void {
+    freeBytesOnce(allocator, freed_ptrs, msg.text);
+    freeBytesOnce(allocator, freed_ptrs, msg.thinking);
+    if (msg.error_message) |value| freeBytesOnce(allocator, freed_ptrs, value);
+    for (msg.tool_calls) |tool_call| {
+        freeBytesOnce(allocator, freed_ptrs, tool_call.id);
+        freeBytesOnce(allocator, freed_ptrs, tool_call.name);
+        freeBytesOnce(allocator, freed_ptrs, tool_call.arguments_json);
+    }
+    freeToolCallsOnce(allocator, freed_ptrs, msg.tool_calls);
+}
+
 fn deinitAssistantEvents(
     allocator: std.mem.Allocator,
     events: *std.array_list.Managed(ziggy_piai.types.AssistantMessageEvent),
 ) void {
+    var freed_ptrs = std.AutoHashMapUnmanaged(usize, void){};
+    defer freed_ptrs.deinit(allocator);
+
     for (events.items) |*event| {
         switch (event.*) {
-            .start => |*msg| deinitAssistantMessage(allocator, msg),
-            .done => |*msg| deinitAssistantMessage(allocator, msg),
-            .text_delta => |*delta| allocator.free(delta.delta),
-            .text_end => |*end| allocator.free(end.content),
-            .thinking_delta => |*delta| allocator.free(delta.delta),
-            .thinking_end => |*end| allocator.free(end.content),
-            .toolcall_delta => |*delta| allocator.free(delta.delta),
+            .start => |*msg| deinitAssistantMessageDedup(allocator, msg, &freed_ptrs),
+            .done => |*msg| deinitAssistantMessageDedup(allocator, msg, &freed_ptrs),
+            .text_delta => |*delta| freeBytesOnce(allocator, &freed_ptrs, delta.delta),
+            .text_end => |*end| freeBytesOnce(allocator, &freed_ptrs, end.content),
+            .thinking_delta => |*delta| freeBytesOnce(allocator, &freed_ptrs, delta.delta),
+            .thinking_end => |*end| freeBytesOnce(allocator, &freed_ptrs, end.content),
+            .toolcall_delta => |*delta| freeBytesOnce(allocator, &freed_ptrs, delta.delta),
             .toolcall_end => |*end| {
-                allocator.free(end.tool_call.id);
-                allocator.free(end.tool_call.name);
-                allocator.free(end.tool_call.arguments_json);
+                freeBytesOnce(allocator, &freed_ptrs, end.tool_call.id);
+                freeBytesOnce(allocator, &freed_ptrs, end.tool_call.name);
+                freeBytesOnce(allocator, &freed_ptrs, end.tool_call.arguments_json);
             },
-            .err => |value| allocator.free(value),
+            .err => |value| freeBytesOnce(allocator, &freed_ptrs, value),
             else => {},
         }
     }
@@ -2397,6 +3261,49 @@ test "runtime_server: parseTruthyEnvFlag accepts common truthy values" {
     try std.testing.expect(parseTruthyEnvFlag("TRUE"));
     try std.testing.expect(parseTruthyEnvFlag("yes"));
     try std.testing.expect(parseTruthyEnvFlag("on"));
+}
+
+test "runtime_server: deinitAssistantEvents deduplicates shared tool-call buffers" {
+    const allocator = std.testing.allocator;
+
+    var events = std.array_list.Managed(ziggy_piai.types.AssistantMessageEvent).init(allocator);
+    defer events.deinit();
+
+    const shared_id = try allocator.dupe(u8, "call-shared");
+    const shared_name = try allocator.dupe(u8, "file_list");
+    const shared_args = try allocator.dupe(u8, "{\"path\":\".\"}");
+
+    const tool_calls = try allocator.alloc(ziggy_piai.types.ToolCall, 1);
+    tool_calls[0] = .{
+        .id = shared_id,
+        .name = shared_name,
+        .arguments_json = shared_args,
+    };
+
+    try events.append(.{
+        .toolcall_end = .{
+            .tool_call = .{
+                .id = shared_id,
+                .name = shared_name,
+                .arguments_json = shared_args,
+            },
+        },
+    });
+    try events.append(.{
+        .done = .{
+            .text = try allocator.dupe(u8, ""),
+            .thinking = try allocator.dupe(u8, ""),
+            .tool_calls = tool_calls,
+            .api = "responses",
+            .provider = "openai-codex",
+            .model = "gpt-5.3-codex",
+            .usage = .{},
+            .stop_reason = .tool_use,
+            .error_message = null,
+        },
+    });
+
+    deinitAssistantEvents(allocator, &events);
 }
 
 test "runtime_server: parseTruthyEnvFlag rejects falsey values" {
@@ -2451,6 +3358,16 @@ test "runtime_server: redactDebugPayload masks sensitive suffixes on long keys" 
     try std.testing.expect(std.mem.indexOf(u8, redacted, "\"safe\":\"ok\"") != null);
 }
 
+fn buildTaskCompleteOutput(allocator: std.mem.Allocator, message: []const u8) ![]u8 {
+    const escaped_message = try protocol.jsonEscape(allocator, message);
+    defer allocator.free(escaped_message);
+    return std.fmt.allocPrint(
+        allocator,
+        "{{\"task_complete\":true,\"message\":\"{s}\"}}",
+        .{escaped_message},
+    );
+}
+
 fn mockProviderStreamByModel(
     allocator: std.mem.Allocator,
     _: *std.http.Client,
@@ -2461,8 +3378,9 @@ fn mockProviderStreamByModel(
     events: *std.array_list.Managed(ziggy_piai.types.AssistantMessageEvent),
 ) anyerror!void {
     try std.testing.expect(std.mem.eql(u8, model.provider, "openai"));
+    const output = try buildTaskCompleteOutput(allocator, "mock provider response");
     try events.append(.{ .done = .{
-        .text = try allocator.dupe(u8, "mock provider response"),
+        .text = output,
         .thinking = try allocator.dupe(u8, ""),
         .tool_calls = &.{},
         .api = model.api,
@@ -2486,8 +3404,9 @@ fn mockProviderStreamAssertsFreshActiveSnapshot(
     try std.testing.expectEqual(@as(usize, 1), context.messages.len);
     try std.testing.expect(std.mem.indexOf(u8, context.messages[0].content, "core.stale_provider_entry") == null);
 
+    const output = try buildTaskCompleteOutput(allocator, "fresh snapshot response");
     try events.append(.{ .done = .{
-        .text = try allocator.dupe(u8, "fresh snapshot response"),
+        .text = output,
         .thinking = try allocator.dupe(u8, ""),
         .tool_calls = &.{},
         .api = model.api,
@@ -2501,6 +3420,11 @@ fn mockProviderStreamAssertsFreshActiveSnapshot(
 
 var mockToolLoopCallCount: usize = 0;
 var mockSensitiveToolLoopCallCount: usize = 0;
+var mockJsonToolEnvelopeCallCount: usize = 0;
+var mockJsonToolEnvelopeImplicitWaitCallCount: usize = 0;
+var mockJsonToolEnvelopeErrorWaitCallCount: usize = 0;
+var mockJsonToolEnvelopeMultiToolBatchCount: usize = 0;
+var mockJsonToolEnvelopeMultiToolBatchPlainTextCount: usize = 0;
 var mockRateLimitCallCount: usize = 0;
 var mockAuthFailureCallCount: usize = 0;
 var mockCapturedProviderName: ?[]const u8 = null;
@@ -2527,8 +3451,9 @@ fn mockProviderStreamCaptureConfig(
     if (options.api_key) |value| {
         mockCapturedApiKey = try allocator.dupe(u8, value);
     }
+    const output = try buildTaskCompleteOutput(allocator, "captured provider response");
     try events.append(.{ .done = .{
-        .text = try allocator.dupe(u8, "captured provider response"),
+        .text = output,
         .thinking = try allocator.dupe(u8, ""),
         .tool_calls = &.{},
         .api = model.api,
@@ -2599,8 +3524,285 @@ fn mockProviderStreamByModelWithToolLoop(
     try std.testing.expectEqual(@as(usize, 1), context.messages.len);
     try std.testing.expect(std.mem.indexOf(u8, context.messages[0].content, "\"active_memory\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, context.messages[0].content, "\"tool_result\"") != null);
+    const output = try buildTaskCompleteOutput(allocator, "tool loop complete");
     try events.append(.{ .done = .{
-        .text = try allocator.dupe(u8, "tool loop complete"),
+        .text = output,
+        .thinking = try allocator.dupe(u8, ""),
+        .tool_calls = &.{},
+        .api = model.api,
+        .provider = model.provider,
+        .model = model.id,
+        .usage = .{},
+        .stop_reason = .stop,
+        .error_message = null,
+    } });
+}
+
+fn mockProviderStreamByModelWithJsonToolEnvelope(
+    allocator: std.mem.Allocator,
+    _: *std.http.Client,
+    _: *ziggy_piai.api_registry.ApiRegistry,
+    model: ziggy_piai.types.Model,
+    context: ziggy_piai.types.Context,
+    _: ziggy_piai.types.StreamOptions,
+    events: *std.array_list.Managed(ziggy_piai.types.AssistantMessageEvent),
+) anyerror!void {
+    if (mockJsonToolEnvelopeCallCount == 0) {
+        mockJsonToolEnvelopeCallCount += 1;
+        const envelope =
+            \\{"action":"act","tool_calls":[{"name":"file_list","arguments":{"path":"src"}}]}
+        ;
+        try events.append(.{ .done = .{
+            .text = try allocator.dupe(u8, envelope),
+            .thinking = try allocator.dupe(u8, ""),
+            .tool_calls = &.{},
+            .api = model.api,
+            .provider = model.provider,
+            .model = model.id,
+            .usage = .{},
+            .stop_reason = .stop,
+            .error_message = null,
+        } });
+        return;
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), context.messages.len);
+    try std.testing.expect(std.mem.indexOf(u8, context.messages[0].content, "\"tool_result\"") != null);
+    const output = try buildTaskCompleteOutput(allocator, "json tool loop complete");
+    try events.append(.{ .done = .{
+        .text = output,
+        .thinking = try allocator.dupe(u8, ""),
+        .tool_calls = &.{},
+        .api = model.api,
+        .provider = model.provider,
+        .model = model.id,
+        .usage = .{},
+        .stop_reason = .stop,
+        .error_message = null,
+    } });
+}
+
+fn mockProviderStreamByModelWithJsonToolEnvelopeImplicitWait(
+    allocator: std.mem.Allocator,
+    _: *std.http.Client,
+    _: *ziggy_piai.api_registry.ApiRegistry,
+    model: ziggy_piai.types.Model,
+    context: ziggy_piai.types.Context,
+    _: ziggy_piai.types.StreamOptions,
+    events: *std.array_list.Managed(ziggy_piai.types.AssistantMessageEvent),
+) anyerror!void {
+    if (mockJsonToolEnvelopeImplicitWaitCallCount == 0) {
+        mockJsonToolEnvelopeImplicitWaitCallCount += 1;
+        const envelope =
+            \\{"action":"act","tool_calls":[{"name":"file_list","arguments":{"path":"src"}}]}
+        ;
+        try events.append(.{ .done = .{
+            .text = try allocator.dupe(u8, envelope),
+            .thinking = try allocator.dupe(u8, ""),
+            .tool_calls = &.{},
+            .api = model.api,
+            .provider = model.provider,
+            .model = model.id,
+            .usage = .{},
+            .stop_reason = .stop,
+            .error_message = null,
+        } });
+        return;
+    }
+
+    if (mockJsonToolEnvelopeImplicitWaitCallCount == 1) {
+        mockJsonToolEnvelopeImplicitWaitCallCount += 1;
+        try std.testing.expectEqual(@as(usize, 1), context.messages.len);
+        try std.testing.expect(std.mem.indexOf(u8, context.messages[0].content, "\"tool_result\"") != null);
+        try events.append(.{ .done = .{
+            .text = try allocator.dupe(u8, "ok"),
+            .thinking = try allocator.dupe(u8, ""),
+            .tool_calls = &.{},
+            .api = model.api,
+            .provider = model.provider,
+            .model = model.id,
+            .usage = .{},
+            .stop_reason = .stop,
+            .error_message = null,
+        } });
+        return;
+    }
+
+    const output = try buildTaskCompleteOutput(allocator, "json tool loop recovered complete");
+    try events.append(.{ .done = .{
+        .text = output,
+        .thinking = try allocator.dupe(u8, ""),
+        .tool_calls = &.{},
+        .api = model.api,
+        .provider = model.provider,
+        .model = model.id,
+        .usage = .{},
+        .stop_reason = .stop,
+        .error_message = null,
+    } });
+}
+
+fn mockProviderStreamByModelWithJsonToolEnvelopeErrorThenWait(
+    allocator: std.mem.Allocator,
+    _: *std.http.Client,
+    _: *ziggy_piai.api_registry.ApiRegistry,
+    model: ziggy_piai.types.Model,
+    context: ziggy_piai.types.Context,
+    _: ziggy_piai.types.StreamOptions,
+    events: *std.array_list.Managed(ziggy_piai.types.AssistantMessageEvent),
+) anyerror!void {
+    if (mockJsonToolEnvelopeErrorWaitCallCount == 0) {
+        mockJsonToolEnvelopeErrorWaitCallCount += 1;
+        const envelope =
+            \\{"action":"act","tool_calls":[{"name":"file_read","arguments":{"path":"missing.txt","max_bytes":32}}]}
+        ;
+        try events.append(.{ .done = .{
+            .text = try allocator.dupe(u8, envelope),
+            .thinking = try allocator.dupe(u8, ""),
+            .tool_calls = &.{},
+            .api = model.api,
+            .provider = model.provider,
+            .model = model.id,
+            .usage = .{},
+            .stop_reason = .stop,
+            .error_message = null,
+        } });
+        return;
+    }
+
+    if (mockJsonToolEnvelopeErrorWaitCallCount == 1) {
+        mockJsonToolEnvelopeErrorWaitCallCount += 1;
+        try std.testing.expectEqual(@as(usize, 1), context.messages.len);
+        try std.testing.expect(std.mem.indexOf(u8, context.messages[0].content, "\"tool_result\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, context.messages[0].content, "\"error\"") != null);
+        const wait_json = "{\"action\":\"wait_for\"}";
+        try events.append(.{ .done = .{
+            .text = try allocator.dupe(u8, wait_json),
+            .thinking = try allocator.dupe(u8, ""),
+            .tool_calls = &.{},
+            .api = model.api,
+            .provider = model.provider,
+            .model = model.id,
+            .usage = .{},
+            .stop_reason = .stop,
+            .error_message = null,
+        } });
+        return;
+    }
+
+    const output = try buildTaskCompleteOutput(allocator, "reported tool failure");
+    try events.append(.{ .done = .{
+        .text = output,
+        .thinking = try allocator.dupe(u8, ""),
+        .tool_calls = &.{},
+        .api = model.api,
+        .provider = model.provider,
+        .model = model.id,
+        .usage = .{},
+        .stop_reason = .stop,
+        .error_message = null,
+    } });
+}
+
+fn mockProviderStreamByModelWithJsonMultiToolBatch(
+    allocator: std.mem.Allocator,
+    _: *std.http.Client,
+    _: *ziggy_piai.api_registry.ApiRegistry,
+    model: ziggy_piai.types.Model,
+    context: ziggy_piai.types.Context,
+    _: ziggy_piai.types.StreamOptions,
+    events: *std.array_list.Managed(ziggy_piai.types.AssistantMessageEvent),
+) anyerror!void {
+    if (mockJsonToolEnvelopeMultiToolBatchCount == 0) {
+        mockJsonToolEnvelopeMultiToolBatchCount += 1;
+        const envelope =
+            \\{"action":"act","tool_calls":[{"name":"file_list","arguments":{"path":".","max_entries":50}},{"name":"talk_user","arguments":{"message":"planning message"}}]}
+        ;
+        try events.append(.{ .done = .{
+            .text = try allocator.dupe(u8, envelope),
+            .thinking = try allocator.dupe(u8, ""),
+            .tool_calls = &.{},
+            .api = model.api,
+            .provider = model.provider,
+            .model = model.id,
+            .usage = .{},
+            .stop_reason = .stop,
+            .error_message = null,
+        } });
+        return;
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), context.messages.len);
+    try std.testing.expect(std.mem.indexOf(u8, context.messages[0].content, "\"invalid_tool_batch\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, context.messages[0].content, "planning message") != null);
+    try std.testing.expect(std.mem.indexOf(u8, context.messages[0].content, "\"file_list\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, context.messages[0].content, "\"talk_user\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, context.messages[0].content, "\"entries\"") == null);
+
+    const output = try buildTaskCompleteOutput(allocator, "multi-tool batch rejected and corrected");
+    try events.append(.{ .done = .{
+        .text = output,
+        .thinking = try allocator.dupe(u8, ""),
+        .tool_calls = &.{},
+        .api = model.api,
+        .provider = model.provider,
+        .model = model.id,
+        .usage = .{},
+        .stop_reason = .stop,
+        .error_message = null,
+    } });
+}
+
+fn mockProviderStreamByModelWithJsonMultiToolBatchThenPlainText(
+    allocator: std.mem.Allocator,
+    _: *std.http.Client,
+    _: *ziggy_piai.api_registry.ApiRegistry,
+    model: ziggy_piai.types.Model,
+    context: ziggy_piai.types.Context,
+    _: ziggy_piai.types.StreamOptions,
+    events: *std.array_list.Managed(ziggy_piai.types.AssistantMessageEvent),
+) anyerror!void {
+    if (mockJsonToolEnvelopeMultiToolBatchPlainTextCount == 0) {
+        mockJsonToolEnvelopeMultiToolBatchPlainTextCount += 1;
+        const envelope =
+            \\{"action":"act","tool_calls":[{"name":"file_list","arguments":{"path":".","max_entries":50}},{"name":"file_read","arguments":{"path":"CORE.md","max_bytes":200}}]}
+        ;
+        try events.append(.{ .done = .{
+            .text = try allocator.dupe(u8, envelope),
+            .thinking = try allocator.dupe(u8, ""),
+            .tool_calls = &.{},
+            .api = model.api,
+            .provider = model.provider,
+            .model = model.id,
+            .usage = .{},
+            .stop_reason = .stop,
+            .error_message = null,
+        } });
+        return;
+    }
+
+    if (mockJsonToolEnvelopeMultiToolBatchPlainTextCount == 1) {
+        mockJsonToolEnvelopeMultiToolBatchPlainTextCount += 1;
+        try std.testing.expectEqual(@as(usize, 1), context.messages.len);
+        try std.testing.expect(std.mem.indexOf(u8, context.messages[0].content, "\"invalid_tool_batch\"") != null);
+        try events.append(.{ .done = .{
+            .text = try allocator.dupe(u8, "Got it — I need to do this one tool at a time."),
+            .thinking = try allocator.dupe(u8, ""),
+            .tool_calls = &.{},
+            .api = model.api,
+            .provider = model.provider,
+            .model = model.id,
+            .usage = .{},
+            .stop_reason = .stop,
+            .error_message = null,
+        } });
+        return;
+    }
+
+    mockJsonToolEnvelopeMultiToolBatchPlainTextCount += 1;
+    const output = try buildTaskCompleteOutput(allocator, "recovered after plain-text fallback");
+    try events.append(.{ .done = .{
+        .text = output,
         .thinking = try allocator.dupe(u8, ""),
         .tool_calls = &.{},
         .api = model.api,
@@ -2643,8 +3845,9 @@ fn mockProviderStreamByModelWithSensitiveToolLoop(
         return;
     }
 
+    const output = try buildTaskCompleteOutput(allocator, "sensitive tool loop complete");
     try events.append(.{ .done = .{
-        .text = try allocator.dupe(u8, "sensitive tool loop complete"),
+        .text = output,
         .thinking = try allocator.dupe(u8, ""),
         .tool_calls = &.{},
         .api = model.api,
@@ -2700,6 +3903,18 @@ fn mockProviderStreamByModelError(
     return error.MockProviderUnavailable;
 }
 
+fn mockProviderStreamByModelStreamFailure(
+    _: std.mem.Allocator,
+    _: *std.http.Client,
+    _: *ziggy_piai.api_registry.ApiRegistry,
+    _: ziggy_piai.types.Model,
+    _: ziggy_piai.types.Context,
+    _: ziggy_piai.types.StreamOptions,
+    _: *std.array_list.Managed(ziggy_piai.types.AssistantMessageEvent),
+) anyerror!void {
+    return error.CompleteErrorUnavailable;
+}
+
 fn mockProviderStreamByModelRateLimited(
     allocator: std.mem.Allocator,
     _: *std.http.Client,
@@ -2736,13 +3951,58 @@ fn mockProviderStreamByModelSlow(
     events: *std.array_list.Managed(ziggy_piai.types.AssistantMessageEvent),
 ) anyerror!void {
     std.Thread.sleep(50 * std.time.ns_per_ms);
+    const output = try buildTaskCompleteOutput(allocator, "slow provider response");
     try events.append(.{ .done = .{
-        .text = try allocator.dupe(u8, "slow provider response"),
+        .text = output,
         .thinking = try allocator.dupe(u8, ""),
         .tool_calls = &.{},
         .api = "chat",
         .provider = "openai",
         .model = "gpt-4o-mini",
+        .usage = .{},
+        .stop_reason = .stop,
+        .error_message = null,
+    } });
+}
+
+fn mockProviderStreamByModelPlainTextNoMarkers(
+    allocator: std.mem.Allocator,
+    _: *std.http.Client,
+    _: *ziggy_piai.api_registry.ApiRegistry,
+    model: ziggy_piai.types.Model,
+    _: ziggy_piai.types.Context,
+    _: ziggy_piai.types.StreamOptions,
+    events: *std.array_list.Managed(ziggy_piai.types.AssistantMessageEvent),
+) anyerror!void {
+    try events.append(.{ .done = .{
+        .text = try allocator.dupe(u8, "plain text without task markers"),
+        .thinking = try allocator.dupe(u8, ""),
+        .tool_calls = &.{},
+        .api = model.api,
+        .provider = model.provider,
+        .model = model.id,
+        .usage = .{},
+        .stop_reason = .stop,
+        .error_message = null,
+    } });
+}
+
+fn mockProviderStreamByModelPlainTextUnicode(
+    allocator: std.mem.Allocator,
+    _: *std.http.Client,
+    _: *ziggy_piai.api_registry.ApiRegistry,
+    model: ziggy_piai.types.Model,
+    _: ziggy_piai.types.Context,
+    _: ziggy_piai.types.StreamOptions,
+    events: *std.array_list.Managed(ziggy_piai.types.AssistantMessageEvent),
+) anyerror!void {
+    try events.append(.{ .done = .{
+        .text = try allocator.dupe(u8, "Hello! 👋"),
+        .thinking = try allocator.dupe(u8, ""),
+        .tool_calls = &.{},
+        .api = model.api,
+        .provider = model.provider,
+        .model = model.id,
         .usage = .{},
         .stop_reason = .stop,
         .error_message = null,
@@ -2755,6 +4015,18 @@ test "runtime_server: session.send dispatches through runtime and emits session.
     defer server.destroy();
 
     const response = try server.handleMessage("{\"id\":\"req-1\",\"type\":\"session.send\",\"content\":\"hello runtime\"}");
+    defer allocator.free(response);
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "\"type\":\"session.receive\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "hello runtime") != null);
+}
+
+test "runtime_server: raw text payload is treated as session.send" {
+    const allocator = std.testing.allocator;
+    const server = try RuntimeServer.create(allocator, "agent-test", .{ .ltm_directory = "", .ltm_filename = "" });
+    defer server.destroy();
+
+    const response = try server.handleMessage("hello runtime");
     defer allocator.free(response);
 
     try std.testing.expect(std.mem.indexOf(u8, response, "\"type\":\"session.receive\"") != null);
@@ -2779,12 +4051,76 @@ test "runtime_server: base core prompt renders first without mem_id prefix" {
     const prompt = try server.buildCoreSystemPrompt("primary");
     defer allocator.free(prompt);
 
-    const base_idx = std.mem.indexOf(u8, prompt, "# CORE.md - Base Runtime Instructions") orelse return error.TestUnexpectedResult;
+    const base_idx = std.mem.indexOf(u8, prompt, "# CORE.md - Runtime Contract (Authoritative)") orelse return error.TestUnexpectedResult;
     const soul_idx = std.mem.indexOf(u8, prompt, "SOUL.md") orelse return error.TestUnexpectedResult;
 
     try std.testing.expect(base_idx < soul_idx);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "core.system.base_instructions") == null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "core.system.capabilities") == null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "core.system.identity_guidance") == null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "[") != null);
+}
+
+test "runtime_server: legacy transient core prompt entries are excluded from system prompt" {
+    const allocator = std.testing.allocator;
+    const server = try RuntimeServer.create(allocator, "agent-test", .{ .ltm_directory = "", .ltm_filename = "" });
+    defer server.destroy();
+
+    var legacy_capabilities = try server.runtime.active_memory.create(
+        "primary",
+        "core.system.capabilities",
+        "core.system_prompt",
+        "\"legacy capabilities\"",
+        true,
+        true,
+    );
+    defer legacy_capabilities.deinit(allocator);
+
+    var legacy_guidance = try server.runtime.active_memory.create(
+        "primary",
+        "core.system.identity_guidance",
+        "core.system_prompt",
+        "\"legacy guidance\"",
+        true,
+        true,
+    );
+    defer legacy_guidance.deinit(allocator);
+
+    const prompt = try server.buildCoreSystemPrompt("primary");
+    defer allocator.free(prompt);
+
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "legacy capabilities") == null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "legacy guidance") == null);
+}
+
+test "runtime_server: provider active memory prompt excludes core memory entries" {
+    const allocator = std.testing.allocator;
+    const server = try RuntimeServer.create(allocator, "agent-test", .{ .ltm_directory = "", .ltm_filename = "" });
+    defer server.destroy();
+
+    try server.runtime.refreshCorePrompt("primary");
+    var user_message = try server.runtime.active_memory.create(
+        "primary",
+        "message.user",
+        "message",
+        "{\"role\":\"user\",\"content\":\"hello runtime\"}",
+        false,
+        false,
+    );
+    defer user_message.deinit(allocator);
+
+    const prompt = try server.buildProviderActiveMemoryPrompt("primary");
+    defer allocator.free(prompt);
+
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "\"kind\":\"message\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "hello runtime") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "\"kind\":\"core.system_prompt\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "\"kind\":\"core.base_prompt\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "core.system.agent_id") == null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "system.core") == null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "system.soul") == null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "<active_memory_state>") == null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Use only this state as conversation context.") == null);
 }
 
 test "runtime_server: provider instructions include dynamic info board without persisting it" {
@@ -2962,6 +4298,61 @@ test "runtime_server: provider-backed session.send uses configured provider runt
     try std.testing.expectEqual(@as(usize, 1), assistant_turns);
 }
 
+test "runtime_server: provider plain text without markers is surfaced to user" {
+    const allocator = std.testing.allocator;
+    const original_stream_fn = streamByModelFn;
+    defer streamByModelFn = original_stream_fn;
+    streamByModelFn = mockProviderStreamByModelPlainTextNoMarkers;
+
+    const server = try RuntimeServer.createWithProvider(allocator, "agent-test", .{
+        .ltm_directory = "",
+        .ltm_filename = "",
+    }, .{
+        .name = "openai",
+        .model = "gpt-4o-mini",
+        .api_key = "test-key",
+    });
+    defer server.destroy();
+
+    const response = try server.handleMessage("{\"id\":\"req-provider-fallback\",\"type\":\"session.send\",\"content\":\"hello provider\"}");
+    defer allocator.free(response);
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "\"type\":\"session.receive\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "\"content\":\"ok\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "plain text without task markers") != null);
+
+    const snapshot = try server.runtime.active_memory.snapshotActive(allocator, "primary");
+    defer memory.deinitItems(allocator, snapshot);
+    const snapshot_json = try memory.toActiveMemoryJson(allocator, "primary", snapshot);
+    defer allocator.free(snapshot_json);
+
+    try std.testing.expect(std.mem.indexOf(u8, snapshot_json, "plain text without task markers") != null);
+}
+
+test "runtime_server: provider unicode plain text is surfaced instead of fallback ok" {
+    const allocator = std.testing.allocator;
+    const original_stream_fn = streamByModelFn;
+    defer streamByModelFn = original_stream_fn;
+    streamByModelFn = mockProviderStreamByModelPlainTextUnicode;
+
+    const server = try RuntimeServer.createWithProvider(allocator, "agent-test", .{
+        .ltm_directory = "",
+        .ltm_filename = "",
+    }, .{
+        .name = "openai",
+        .model = "gpt-4o-mini",
+        .api_key = "test-key",
+    });
+    defer server.destroy();
+
+    const response = try server.handleMessage("{\"id\":\"req-provider-unicode\",\"type\":\"session.send\",\"content\":\"hello\"}");
+    defer allocator.free(response);
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "\"type\":\"session.receive\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "\"content\":\"ok\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "Hello! 👋") != null);
+}
+
 test "runtime_server: provider request snapshot is refreshed before send" {
     const allocator = std.testing.allocator;
     const original_stream_fn = streamByModelFn;
@@ -3077,6 +4468,40 @@ test "runtime_server: debug provider.tool_call frames redact nested tool argumen
     }
 
     try std.testing.expect(saw_tool_call_debug);
+}
+
+test "runtime_server: debug stream includes runtime.tool_result frames for executed tools" {
+    const allocator = std.testing.allocator;
+    const original_stream_fn = streamByModelFn;
+    defer streamByModelFn = original_stream_fn;
+    streamByModelFn = mockProviderStreamByModelWithJsonToolEnvelope;
+    mockJsonToolEnvelopeCallCount = 0;
+
+    const server = try RuntimeServer.createWithProvider(allocator, "agent-debug-tool-results", .{
+        .ltm_directory = "",
+        .ltm_filename = "",
+    }, .{
+        .name = "openai",
+        .model = "gpt-4o-mini",
+        .api_key = "test-key",
+    });
+    defer server.destroy();
+
+    const responses = try server.handleMessageFramesWithDebug(
+        "{\"id\":\"req-debug-tool-results\",\"type\":\"session.send\",\"content\":\"use tool\"}",
+        true,
+    );
+    defer deinitResponseFrames(allocator, responses);
+
+    var saw_tool_result_debug = false;
+    for (responses) |payload| {
+        if (std.mem.indexOf(u8, payload, "\"category\":\"runtime.tool_result\"") != null) {
+            saw_tool_result_debug = true;
+            try std.testing.expect(std.mem.indexOf(u8, payload, "\"has_error\":false") != null);
+        }
+    }
+
+    try std.testing.expect(saw_tool_result_debug);
 }
 
 test "runtime_server: provider-only override resets inherited model selection" {
@@ -3301,6 +4726,174 @@ test "runtime_server: provider tool loop executes world tool and returns final r
     try std.testing.expect(std.mem.indexOf(u8, snapshot_json, "\"name\":\"file_list\"") != null);
 }
 
+test "runtime_server: explicit json tool_calls envelope executes world tool and returns final response" {
+    const allocator = std.testing.allocator;
+    const original_stream_fn = streamByModelFn;
+    defer streamByModelFn = original_stream_fn;
+    streamByModelFn = mockProviderStreamByModelWithJsonToolEnvelope;
+    mockJsonToolEnvelopeCallCount = 0;
+
+    const server = try RuntimeServer.createWithProvider(allocator, "agent-test", .{
+        .ltm_directory = "",
+        .ltm_filename = "",
+    }, .{
+        .name = "openai",
+        .model = "gpt-4o-mini",
+        .api_key = "test-key",
+    });
+    defer server.destroy();
+
+    const responses = try server.handleMessageFrames("{\"id\":\"req-provider-json-tools\",\"type\":\"session.send\",\"content\":\"use tools\"}");
+    defer deinitResponseFrames(allocator, responses);
+
+    var saw_final = false;
+    for (responses) |payload| {
+        if (std.mem.indexOf(u8, payload, "json tool loop complete") != null) saw_final = true;
+    }
+
+    const snapshot = try server.runtime.active_memory.snapshotActive(allocator, "primary");
+    defer memory.deinitItems(allocator, snapshot);
+    const snapshot_json = try memory.toActiveMemoryJson(allocator, "primary", snapshot);
+    defer allocator.free(snapshot_json);
+
+    try std.testing.expect(saw_final);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot_json, "\"kind\":\"tool_result\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot_json, "\"tool_calls\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot_json, "\"name\":\"file_list\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot_json, "json-call-") != null);
+}
+
+test "runtime_server: post-tool implicit wait fallback triggers followup round" {
+    const allocator = std.testing.allocator;
+    const original_stream_fn = streamByModelFn;
+    defer streamByModelFn = original_stream_fn;
+    streamByModelFn = mockProviderStreamByModelWithJsonToolEnvelopeImplicitWait;
+    mockJsonToolEnvelopeImplicitWaitCallCount = 0;
+
+    const server = try RuntimeServer.createWithProvider(allocator, "agent-test", .{
+        .ltm_directory = "",
+        .ltm_filename = "",
+    }, .{
+        .name = "openai",
+        .model = "gpt-4o-mini",
+        .api_key = "test-key",
+    });
+    defer server.destroy();
+
+    const responses = try server.handleMessageFrames("{\"id\":\"req-provider-json-tools-followup\",\"type\":\"session.send\",\"content\":\"use tools\"}");
+    defer deinitResponseFrames(allocator, responses);
+
+    var saw_final = false;
+    var saw_generic_ok = false;
+    for (responses) |payload| {
+        if (std.mem.indexOf(u8, payload, "json tool loop recovered complete") != null) saw_final = true;
+        if (std.mem.indexOf(u8, payload, "\"content\":\"ok\"") != null) saw_generic_ok = true;
+    }
+
+    try std.testing.expect(saw_final);
+    try std.testing.expect(!saw_generic_ok);
+    try std.testing.expectEqual(@as(usize, 3), mockJsonToolEnvelopeImplicitWaitCallCount);
+}
+
+test "runtime_server: wait_for after tool failure triggers followup instead of stopping" {
+    const allocator = std.testing.allocator;
+    const original_stream_fn = streamByModelFn;
+    defer streamByModelFn = original_stream_fn;
+    streamByModelFn = mockProviderStreamByModelWithJsonToolEnvelopeErrorThenWait;
+    mockJsonToolEnvelopeErrorWaitCallCount = 0;
+
+    const server = try RuntimeServer.createWithProvider(allocator, "agent-test", .{
+        .ltm_directory = "",
+        .ltm_filename = "",
+    }, .{
+        .name = "openai",
+        .model = "gpt-4o-mini",
+        .api_key = "test-key",
+    });
+    defer server.destroy();
+
+    const responses = try server.handleMessageFrames("{\"id\":\"req-provider-json-tools-error-wait\",\"type\":\"session.send\",\"content\":\"use tools\"}");
+    defer deinitResponseFrames(allocator, responses);
+
+    var saw_final = false;
+    var saw_generic_ok = false;
+    for (responses) |payload| {
+        if (std.mem.indexOf(u8, payload, "reported tool failure") != null) saw_final = true;
+        if (std.mem.indexOf(u8, payload, "\"content\":\"ok\"") != null) saw_generic_ok = true;
+    }
+
+    try std.testing.expect(saw_final);
+    try std.testing.expect(!saw_generic_ok);
+    try std.testing.expectEqual(@as(usize, 3), mockJsonToolEnvelopeErrorWaitCallCount);
+}
+
+test "runtime_server: multiple structured tool calls are rejected with protocol error" {
+    const allocator = std.testing.allocator;
+    const original_stream_fn = streamByModelFn;
+    defer streamByModelFn = original_stream_fn;
+    streamByModelFn = mockProviderStreamByModelWithJsonMultiToolBatch;
+    mockJsonToolEnvelopeMultiToolBatchCount = 0;
+
+    const server = try RuntimeServer.createWithProvider(allocator, "agent-test", .{
+        .ltm_directory = "",
+        .ltm_filename = "",
+    }, .{
+        .name = "openai",
+        .model = "gpt-4o-mini",
+        .api_key = "test-key",
+    });
+    defer server.destroy();
+
+    const responses = try server.handleMessageFramesWithDebug(
+        "{\"id\":\"req-provider-json-multi-batch\",\"type\":\"session.send\",\"content\":\"use tools\"}",
+        true,
+    );
+    defer deinitResponseFrames(allocator, responses);
+
+    var saw_final = false;
+    var saw_rejected_debug = false;
+    var saw_tool_call_debug = false;
+    for (responses) |payload| {
+        if (std.mem.indexOf(u8, payload, "multi-tool batch rejected and corrected") != null) saw_final = true;
+        if (std.mem.indexOf(u8, payload, "\"category\":\"provider.tool_call_rejected\"") != null) saw_rejected_debug = true;
+        if (std.mem.indexOf(u8, payload, "\"category\":\"provider.tool_call\"") != null) saw_tool_call_debug = true;
+    }
+
+    const snapshot = try server.runtime.active_memory.snapshotActive(allocator, "primary");
+    defer memory.deinitItems(allocator, snapshot);
+    const snapshot_json = try memory.toActiveMemoryJson(allocator, "primary", snapshot);
+    defer allocator.free(snapshot_json);
+
+    try std.testing.expect(saw_final);
+    try std.testing.expect(saw_rejected_debug);
+    try std.testing.expect(!saw_tool_call_debug);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot_json, "\"invalid_tool_batch\"") != null);
+}
+
+test "runtime_server: multi-tool rejection does not exit on plain-text fallback while pending tool failure" {
+    const allocator = std.testing.allocator;
+    const original_stream_fn = streamByModelFn;
+    defer streamByModelFn = original_stream_fn;
+    streamByModelFn = mockProviderStreamByModelWithJsonMultiToolBatchThenPlainText;
+    mockJsonToolEnvelopeMultiToolBatchPlainTextCount = 0;
+
+    const server = try RuntimeServer.createWithProvider(allocator, "agent-test", .{
+        .ltm_directory = "",
+        .ltm_filename = "",
+    }, .{
+        .name = "openai",
+        .model = "gpt-4o-mini",
+        .api_key = "test-key",
+    });
+    defer server.destroy();
+
+    const response = try server.handleMessage("{\"id\":\"req-provider-json-multi-batch-plain\",\"type\":\"session.send\",\"content\":\"use tools\"}");
+    defer allocator.free(response);
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "recovered after plain-text fallback") != null);
+    try std.testing.expectEqual(@as(usize, 3), mockJsonToolEnvelopeMultiToolBatchPlainTextCount);
+}
+
 test "runtime_server: provider tool-call cap does not persist unexecuted tool-call metadata" {
     const allocator = std.testing.allocator;
     const original_stream_fn = streamByModelFn;
@@ -3320,8 +4913,8 @@ test "runtime_server: provider tool-call cap does not persist unexecuted tool-ca
     const response = try server.handleMessage("{\"id\":\"req-provider-too-many-tools\",\"type\":\"session.send\",\"content\":\"use many tools\"}");
     defer allocator.free(response);
 
-    try std.testing.expect(std.mem.indexOf(u8, response, "\"code\":\"execution_failed\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, response, "provider tool loop exceeded limits") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "\"type\":\"session.receive\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "\"content\":\"ok\"") != null);
 
     const snapshot = try server.runtime.active_memory.snapshotActive(allocator, "primary");
     defer memory.deinitItems(allocator, snapshot);
@@ -3369,6 +4962,54 @@ test "runtime_server: provider failure does not leak queued user/tick events" {
     defer allocator.free(snapshot_json);
     try std.testing.expect(std.mem.indexOf(u8, snapshot_json, "\"role\":\"user\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot_json, "hello provider") != null);
+}
+
+test "runtime_server: provider stream failures surface mapped debug details" {
+    const allocator = std.testing.allocator;
+    const original_stream_fn = streamByModelFn;
+    defer streamByModelFn = original_stream_fn;
+    streamByModelFn = mockProviderStreamByModelStreamFailure;
+
+    const server = try RuntimeServer.createWithProvider(allocator, "agent-test", .{
+        .ltm_directory = "",
+        .ltm_filename = "",
+    }, .{
+        .name = "openai",
+        .model = "gpt-4o-mini",
+        .api_key = "test-key",
+    });
+    defer server.destroy();
+
+    const responses = try server.handleMessageFramesWithDebug(
+        "{\"id\":\"req-provider-stream-failure\",\"type\":\"session.send\",\"content\":\"hello provider\"}",
+        true,
+    );
+    defer deinitResponseFrames(allocator, responses);
+
+    var saw_provider_error_debug = false;
+    var saw_runtime_error_debug = false;
+    var saw_error_frame = false;
+    for (responses) |payload| {
+        if (std.mem.indexOf(u8, payload, "\"category\":\"provider.error\"") != null) {
+            saw_provider_error_debug = true;
+            try std.testing.expect(std.mem.indexOf(u8, payload, "\"error\":\"CompleteErrorUnavailable\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, payload, "\"mapped_error\":\"ProviderStreamFailed\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, payload, "\"source\":\"stream_error\"") != null);
+        }
+        if (std.mem.indexOf(u8, payload, "\"category\":\"runtime.error\"") != null) {
+            saw_runtime_error_debug = true;
+            try std.testing.expect(std.mem.indexOf(u8, payload, "\"error\":\"ProviderStreamFailed\"") != null);
+        }
+        if (std.mem.indexOf(u8, payload, "\"type\":\"error\"") != null) {
+            saw_error_frame = true;
+            try std.testing.expect(std.mem.indexOf(u8, payload, "\"code\":\"execution_failed\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, payload, "provider stream failed") != null);
+        }
+    }
+
+    try std.testing.expect(saw_provider_error_debug);
+    try std.testing.expect(saw_runtime_error_debug);
+    try std.testing.expect(saw_error_frame);
 }
 
 test "runtime_server: provider rate-limit failures return provider_rate_limited code" {

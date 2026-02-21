@@ -63,6 +63,14 @@ sudo ./scripts/uninstall.sh
 
 This removes everything but backs up config to `/root/spiderweb-config-backup-*/`.
 
+## Full Reset (Double Confirm)
+
+```bash
+./scripts/full-reset.sh
+```
+
+This performs a full local + system cleanup for fresh-install testing and requires two separate confirmations before any cleanup starts.
+
 ## Environment Variables
 
 | Variable | Default | Description |

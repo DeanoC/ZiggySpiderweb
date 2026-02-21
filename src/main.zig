@@ -47,7 +47,7 @@ pub fn main() !void {
                 .connection_queue_max = 128,
                 .runtime_worker_threads = 2,
                 .runtime_request_queue_max = 128,
-                .chat_operation_timeout_ms = 30_000,
+                .chat_operation_timeout_ms = 120_000,
                 .control_operation_timeout_ms = 5_000,
                 .default_agent_id = try allocator.dupe(u8, "default"),
                 .ltm_directory = try allocator.dupe(u8, ".spiderweb-ltm"),
