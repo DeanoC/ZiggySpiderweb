@@ -137,7 +137,7 @@ stop_services_and_processes() {
 
     run_root systemctl stop "$SERVICE_NAME" 2>/dev/null || true
     run_root systemctl disable "$SERVICE_NAME" 2>/dev/null || true
-    run_root systemctl daemon-reload
+    run_root systemctl daemon-reload 2>/dev/null || true
     run_root systemctl reset-failed 2>/dev/null || true
 }
 
