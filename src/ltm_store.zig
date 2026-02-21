@@ -340,6 +340,20 @@ pub const VersionedMemStore = struct {
         return out.toOwnedSlice(allocator);
     }
 
+    pub fn deleteBaseId(self: *VersionedMemStore, base_id: []const u8) !void {
+        const base_id_escaped = try self.escapeSqlLiteral(base_id);
+        defer self.allocator.free(base_id_escaped);
+
+        const sql = try std.fmt.allocPrint(
+            self.allocator,
+            "DELETE FROM mem_versions WHERE base_id = {s};",
+            .{base_id_escaped},
+        );
+        defer self.allocator.free(sql);
+
+        try self.run(sql);
+    }
+
     fn initSchema(self: *VersionedMemStore) !void {
         const schema_sql =
             "CREATE TABLE IF NOT EXISTS mem_versions (" ++
@@ -569,6 +583,29 @@ test "ltm_store: listDistinctBaseIds groups by base id and sorts by newest updat
     try std.testing.expectEqual(@as(usize, 2), ids.len);
     try std.testing.expectEqualStrings("run:run-1:meta", ids[0]);
     try std.testing.expectEqualStrings("run:run-2:meta", ids[1]);
+}
+
+test "ltm_store: deleteBaseId removes all versions for base id" {
+    const allocator = std.testing.allocator;
+    const dir = try std.fmt.allocPrint(allocator, ".tmp-vltm-delete-base-{d}", .{std.time.nanoTimestamp()});
+    defer allocator.free(dir);
+    defer std.fs.cwd().deleteTree(dir) catch {};
+
+    try std.fs.cwd().makePath(dir);
+    var store = try VersionedMemStore.open(allocator, dir, "runtime-memory.db");
+    defer store.close();
+
+    try store.persistVersionAt("run:run-1:meta", 1, "run.meta", "{\"state\":\"created\"}", 10);
+    try store.persistVersionAt("run:run-1:meta", 2, "run.meta", "{\"state\":\"running\"}", 20);
+
+    const before = try store.listVersions(allocator, "run:run-1:meta", 10);
+    defer deinitRecords(allocator, before);
+    try std.testing.expectEqual(@as(usize, 2), before.len);
+
+    try store.deleteBaseId("run:run-1:meta");
+
+    const after = try store.load(allocator, "run:run-1:meta", null);
+    try std.testing.expect(after == null);
 }
 
 test "ltm_store: highestAutoMemIndex only counts canonical auto names for agent and brain" {

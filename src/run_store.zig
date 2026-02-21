@@ -125,6 +125,25 @@ pub const RunStore = struct {
         return 1;
     }
 
+    pub fn purgeRun(self: *RunStore, run_id: []const u8) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        var meta_base_buf: [512]u8 = undefined;
+        const meta_base_id = try std.fmt.bufPrint(&meta_base_buf, "run:{s}:meta", .{run_id});
+        var events_base_buf: [512]u8 = undefined;
+        const events_base_id = try std.fmt.bufPrint(&events_base_buf, "run:{s}:events", .{run_id});
+
+        if (self.mem_store) |store| {
+            try store.deleteBaseId(meta_base_id);
+            try store.deleteBaseId(events_base_id);
+        } else {
+            if (self.ephemeral_event_seq.fetchRemove(events_base_id)) |entry| {
+                self.allocator.free(entry.key);
+            }
+        }
+    }
+
     pub fn loadMeta(self: *RunStore, allocator: std.mem.Allocator, run_id: []const u8) !?RunMeta {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -484,6 +503,45 @@ test "run_store: loadMeta accepts records without pending_inputs" {
     defer loaded.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 0), loaded.pending_inputs.len);
+}
+
+test "run_store: purgeRun removes persisted metadata and events" {
+    const allocator = std.testing.allocator;
+
+    const dir = try std.fmt.allocPrint(allocator, ".tmp-run-store-purge-{d}", .{std.time.nanoTimestamp()});
+    defer allocator.free(dir);
+    defer std.fs.cwd().deleteTree(dir) catch {};
+    try std.fs.cwd().makePath(dir);
+
+    var mem_store = try ltm_store.VersionedMemStore.open(allocator, dir, "run.db");
+    defer mem_store.close();
+
+    var store = RunStore.init(allocator, &mem_store);
+    defer store.deinit();
+
+    try store.persistMeta(.{
+        .run_id = "run-purge",
+        .state = "created",
+        .step_count = 0,
+        .checkpoint_seq = 0,
+        .created_at_ms = 1,
+        .updated_at_ms = 1,
+    });
+    _ = try store.appendEvent(.{
+        .run_id = "run-purge",
+        .event_type = "run.started",
+        .payload_json = "{}",
+        .created_at_ms = 1,
+    });
+
+    try store.purgeRun("run-purge");
+
+    const meta = try store.loadMeta(allocator, "run-purge");
+    try std.testing.expect(meta == null);
+
+    const events = try store.listEvents(allocator, "run-purge", 10);
+    defer deinitEvents(allocator, events);
+    try std.testing.expectEqual(@as(usize, 0), events.len);
 }
 
 test "run_store: listRunIds returns distinct runs even with heavy metadata churn" {

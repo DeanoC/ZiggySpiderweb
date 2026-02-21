@@ -1407,7 +1407,7 @@ pub const RuntimeServer = struct {
         self.runs.recordPhase(run_id, .integrate, "{}") catch |err| return self.wrapRuntimeErrorResponse(request_id, err, job.emit_debug);
         self.runs.recordPhase(run_id, .checkpoint, "{}") catch |err| return self.wrapRuntimeErrorResponse(request_id, err, job.emit_debug);
 
-        var completed = self.runs.completeStep(run_id, completion_output, wait_for_user) catch |err| {
+        var completed = self.runs.completeStep(run_id, completion_output, wait_for_user, chat_meta.task_complete) catch |err| {
             return self.wrapRuntimeErrorResponse(request_id, err, job.emit_debug);
         };
         defer completed.deinit(self.allocator);

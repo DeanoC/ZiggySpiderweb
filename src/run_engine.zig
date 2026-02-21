@@ -191,6 +191,7 @@ pub const RunEngine = struct {
 
         var start_committed = false;
         errdefer if (!start_committed) {
+            self.store.purgeRun(run_id) catch {};
             if (self.runs.fetchRemove(run_id)) |entry| {
                 self.allocator.free(entry.key);
                 var removed_run = entry.value;
@@ -200,9 +201,8 @@ pub const RunEngine = struct {
 
         try self.persistMetaForRunLocked(self.runs.getPtr(run_id).?);
         _ = try self.appendEventLocked(run_id, "run.started", "{}", now);
-        start_committed = true;
-
         const snapshot = try self.runs.getPtr(run_id).?.cloneSnapshot(self.allocator);
+        start_committed = true;
         return snapshot;
     }
 
@@ -335,7 +335,13 @@ pub const RunEngine = struct {
         _ = try self.appendEventLocked(run_id, event_type, payload_json, run.updated_at_ms);
     }
 
-    pub fn completeStep(self: *RunEngine, run_id: []const u8, output: []const u8, wait_for_user: bool) !RunSnapshot {
+    pub fn completeStep(
+        self: *RunEngine,
+        run_id: []const u8,
+        output: []const u8,
+        wait_for_user: bool,
+        task_complete: bool,
+    ) !RunSnapshot {
         self.mutex.lock();
         defer self.mutex.unlock();
 
@@ -349,7 +355,7 @@ pub const RunEngine = struct {
         const should_checkpoint = @mod(run.step_count, self.config.checkpoint_interval_steps) == 0;
         if (should_checkpoint) run.checkpoint_seq += 1;
 
-        if (!wait_for_user and containsCaseInsensitive(output, "task_complete")) {
+        if (task_complete) {
             run.state = .completed;
         } else if (wait_for_user) {
             run.state = .waiting_for_user;
@@ -627,15 +633,6 @@ fn parseState(raw: []const u8) RunState {
     return .failed;
 }
 
-fn containsCaseInsensitive(haystack: []const u8, needle: []const u8) bool {
-    if (needle.len == 0 or haystack.len < needle.len) return false;
-    var start: usize = 0;
-    while (start + needle.len <= haystack.len) : (start += 1) {
-        if (std.ascii.eqlIgnoreCase(haystack[start .. start + needle.len], needle)) return true;
-    }
-    return false;
-}
-
 fn escapeJson(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
     var out = std.ArrayListUnmanaged(u8){};
     defer out.deinit(allocator);
@@ -680,7 +677,7 @@ test "run_engine: start, step and lifecycle transitions" {
     try engine.recordPhase(started.run_id, .observe, "{}");
     try engine.recordPhase(started.run_id, .act, "{}");
 
-    var done = try engine.completeStep(started.run_id, "waiting", true);
+    var done = try engine.completeStep(started.run_id, "waiting", true, false);
     defer done.deinit(allocator);
     try std.testing.expectEqual(RunState.waiting_for_user, done.state);
 
@@ -699,6 +696,110 @@ test "run_engine: start, step and lifecycle transitions" {
     const events = try engine.listEvents(allocator, started.run_id, 32);
     defer deinitEvents(allocator, events);
     try std.testing.expect(events.len >= 5);
+}
+
+test "run_engine: completion state uses explicit completion signal" {
+    const allocator = std.testing.allocator;
+
+    var engine = try RunEngine.init(allocator, null, .{
+        .max_run_steps = 16,
+        .checkpoint_interval_steps = 1,
+    });
+    defer engine.deinit();
+
+    var started = try engine.start("run completion");
+    defer started.deinit(allocator);
+
+    var step = try engine.beginStep(started.run_id, null);
+    defer step.deinit(allocator);
+
+    var running = try engine.completeStep(started.run_id, "cannot task_complete yet", false, false);
+    defer running.deinit(allocator);
+    try std.testing.expectEqual(RunState.running, running.state);
+
+    var resumed_step = try engine.beginStep(started.run_id, "final answer");
+    defer resumed_step.deinit(allocator);
+    var completed = try engine.completeStep(started.run_id, "done", false, true);
+    defer completed.deinit(allocator);
+    try std.testing.expectEqual(RunState.completed, completed.state);
+}
+
+test "run_engine: start rollback removes persisted run artifacts on failure" {
+    const allocator = std.testing.allocator;
+
+    const baseline_alloc_index = blk: {
+        const dir = try std.fmt.allocPrint(allocator, ".tmp-run-engine-start-rollback-baseline-{d}", .{std.time.nanoTimestamp()});
+        defer allocator.free(dir);
+        defer std.fs.cwd().deleteTree(dir) catch {};
+        try std.fs.cwd().makePath(dir);
+
+        var baseline_state = std.testing.FailingAllocator.init(allocator, .{});
+        const baseline_allocator = baseline_state.allocator();
+
+        var mem_store = try ltm_store.VersionedMemStore.open(allocator, dir, "run.db");
+        defer mem_store.close();
+
+        var engine = try RunEngine.init(baseline_allocator, &mem_store, .{
+            .max_run_steps = 16,
+            .checkpoint_interval_steps = 1,
+        });
+        defer engine.deinit();
+
+        var started = try engine.start("rollback test");
+        defer started.deinit(baseline_allocator);
+        break :blk baseline_state.alloc_index;
+    };
+
+    const start_index = if (baseline_alloc_index > 64) baseline_alloc_index - 64 else 0;
+    var offset: usize = 0;
+    var saw_oom_cleanup = false;
+    while (offset < 160) : (offset += 1) {
+        const dir = try std.fmt.allocPrint(allocator, ".tmp-run-engine-start-rollback-{d}-{d}", .{ std.time.nanoTimestamp(), offset });
+        defer allocator.free(dir);
+        defer std.fs.cwd().deleteTree(dir) catch {};
+        try std.fs.cwd().makePath(dir);
+
+        var failing_state = std.testing.FailingAllocator.init(allocator, .{ .fail_index = start_index + offset });
+        const failing_allocator = failing_state.allocator();
+
+        var mem_store = try ltm_store.VersionedMemStore.open(allocator, dir, "run.db");
+        defer mem_store.close();
+
+        var engine = try RunEngine.init(failing_allocator, &mem_store, .{
+            .max_run_steps = 16,
+            .checkpoint_interval_steps = 1,
+        });
+        defer engine.deinit();
+
+        const started = engine.start("rollback test");
+        if (started) |snapshot| {
+            var owned_snapshot = snapshot;
+            owned_snapshot.deinit(failing_allocator);
+            continue;
+        } else |err| switch (err) {
+            error.OutOfMemory => {
+                const meta_ids = try mem_store.listDistinctBaseIds(allocator, "run.meta", "run:%:meta", 10, 0);
+                defer {
+                    for (meta_ids) |id| allocator.free(id);
+                    allocator.free(meta_ids);
+                }
+                try std.testing.expectEqual(@as(usize, 0), meta_ids.len);
+
+                const event_ids = try mem_store.listDistinctBaseIds(allocator, "run.event", "run:%:events", 10, 0);
+                defer {
+                    for (event_ids) |id| allocator.free(id);
+                    allocator.free(event_ids);
+                }
+                try std.testing.expectEqual(@as(usize, 0), event_ids.len);
+
+                saw_oom_cleanup = true;
+                break;
+            },
+            else => return err,
+        }
+    }
+
+    try std.testing.expect(saw_oom_cleanup);
 }
 
 test "run_engine: recovery restores persisted run events" {
@@ -727,7 +828,7 @@ test "run_engine: recovery restores persisted run events" {
         var step = try first.beginStep(started.run_id, null);
         defer step.deinit(allocator);
         try first.recordPhase(started.run_id, .observe, "{}");
-        var completed = try first.completeStep(started.run_id, "waiting", true);
+        var completed = try first.completeStep(started.run_id, "waiting", true, false);
         defer completed.deinit(allocator);
     }
     defer allocator.free(captured_run_id);
@@ -947,7 +1048,7 @@ test "run_engine: listEvents returns out-of-memory without invalid deinit on par
 
     var step = try engine.beginStep(started.run_id, null);
     defer step.deinit(allocator);
-    var completed = try engine.completeStep(started.run_id, "done", true);
+    var completed = try engine.completeStep(started.run_id, "done", true, false);
     defer completed.deinit(allocator);
 
     var failing_state = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 2 });
