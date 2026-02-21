@@ -82,7 +82,6 @@ pub fn loadSharedRomHook(ctx: *HookContext, data: HookData) HookError!void {
 
     const is_primary = std.mem.eql(u8, brain_name, "primary");
     try rom.set("system:is_primary", if (is_primary) "true" else "false");
-
 }
 
 /// Load identity from LTM into core prompt memory map
@@ -158,14 +157,7 @@ fn ensureMemoryFromTemplate(
             defer allocator.free(template_content_json);
 
             if (!std.mem.eql(u8, item.content_json, template_content_json)) {
-                var updated = runtime.active_memory.create(
-                    brain_name,
-                    name,
-                    item.kind,
-                    template_content_json,
-                    false,
-                    true,
-                ) catch |err| {
+                var updated = runtime.active_memory.mutate(item.mem_id, template_content_json) catch |err| {
                     std.log.warn("Failed to sync {s} from {s}: {s}", .{ name, template_name, @errorName(err) });
                     return false;
                 };
@@ -467,10 +459,92 @@ test "system_hooks: ensureIdentityMemories rehydrates persisted identity into ac
     try std.testing.expect(containsNamedMemory(after, IDENTITY_MEM_NAME));
 }
 
+test "system_hooks: ensureIdentityMemories mutates CORE memory on template sync" {
+    const allocator = std.testing.allocator;
+    const nonce = std.time.nanoTimestamp();
+    const ltm_dir = try std.fmt.allocPrint(allocator, ".tmp-system-hooks-ltm-sync-{d}", .{nonce});
+    defer allocator.free(ltm_dir);
+    defer std.fs.cwd().deleteTree(ltm_dir) catch {};
+    const assets_dir = try std.fmt.allocPrint(allocator, ".tmp-system-hooks-assets-sync-{d}", .{nonce});
+    defer allocator.free(assets_dir);
+    defer std.fs.cwd().deleteTree(assets_dir) catch {};
+
+    try std.fs.cwd().makePath(assets_dir);
+
+    const core_v1 =
+        \\# CORE.md
+        \\base-v1
+    ;
+    const core_v2 =
+        \\# CORE.md
+        \\base-v2
+    ;
+    const identity_template =
+        \\# identity
+        \\v1
+    ;
+
+    const core_path = try std.fs.path.join(allocator, &.{ assets_dir, "CORE.md" });
+    defer allocator.free(core_path);
+    try std.fs.cwd().writeFile(.{
+        .sub_path = core_path,
+        .data = core_v1,
+    });
+
+    inline for (.{ "SOUL.md", "AGENT.md", "IDENTITY.md" }) |filename| {
+        const path = try std.fs.path.join(allocator, &.{ assets_dir, filename });
+        defer allocator.free(path);
+        try std.fs.cwd().writeFile(.{
+            .sub_path = path,
+            .data = identity_template,
+        });
+    }
+
+    var cfg = Config.RuntimeConfig{};
+    cfg.assets_dir = assets_dir;
+
+    var runtime = try AgentRuntime.initWithPersistence(allocator, "agent-system-hooks-sync", &.{}, ltm_dir, "runtime-memory.db", cfg);
+    defer runtime.deinit();
+
+    try ensureIdentityMemories(&runtime, "primary");
+
+    try std.fs.cwd().writeFile(.{
+        .sub_path = core_path,
+        .data = core_v2,
+    });
+
+    try ensureIdentityMemories(&runtime, "primary");
+
+    const after = try runtime.active_memory.snapshotActive(allocator, "primary");
+    defer memory.deinitItems(allocator, after);
+
+    try std.testing.expectEqual(@as(usize, 1), countNamedMemoryPrefix(after, BASE_CORE_MEM_NAME));
+
+    const synced_opt = try loadMemoryByName(&runtime, "primary", BASE_CORE_MEM_NAME);
+    try std.testing.expect(synced_opt != null);
+    var synced = synced_opt.?;
+    defer synced.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), synced.version orelse 0);
+
+    const content = try unwrapJsonString(allocator, synced.content_json);
+    defer allocator.free(content);
+    try std.testing.expect(std.mem.eql(u8, content, core_v2));
+}
+
 fn containsNamedMemory(items: []const memory.ActiveMemoryItem, name: []const u8) bool {
     for (items) |item| {
         const parsed = memid.MemId.parse(item.mem_id) catch continue;
         if (std.mem.eql(u8, parsed.name, name)) return true;
     }
     return false;
+}
+
+fn countNamedMemoryPrefix(items: []const memory.ActiveMemoryItem, prefix: []const u8) usize {
+    var count: usize = 0;
+    for (items) |item| {
+        const parsed = memid.MemId.parse(item.mem_id) catch continue;
+        if (std.mem.startsWith(u8, parsed.name, prefix)) count += 1;
+    }
+    return count;
 }
