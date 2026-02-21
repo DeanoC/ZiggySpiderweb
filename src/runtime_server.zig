@@ -1356,13 +1356,13 @@ pub const RuntimeServer = struct {
             else
                 "";
             if (std.mem.eql(u8, msg_type, "session.receive")) {
-                if (assistant_content == null) {
-                    const content = if (parsed.value.object.get("content")) |value|
-                        if (value == .string) value.string else ""
-                    else
-                        "";
-                    assistant_content = try allocator.dupe(u8, content);
-                }
+                const content = if (parsed.value.object.get("content")) |value|
+                    if (value == .string) value.string else ""
+                else
+                    "";
+                const latest = try allocator.dupe(u8, content);
+                if (assistant_content) |previous| allocator.free(previous);
+                assistant_content = latest;
                 continue;
             }
 
@@ -4902,6 +4902,26 @@ test "runtime_server: run resume without input keeps paused state" {
     const status_rsp = try server.handleMessage(status_req);
     defer allocator.free(status_rsp);
     try std.testing.expect(std.mem.indexOf(u8, status_rsp, "\"state\":\"paused\"") != null);
+}
+
+test "runtime_server: extractRunStepFrameResult uses final session.receive content" {
+    const allocator = std.testing.allocator;
+
+    var frames = std.ArrayListUnmanaged([]u8){};
+    defer {
+        for (frames.items) |payload| allocator.free(payload);
+        frames.deinit(allocator);
+    }
+
+    try frames.append(allocator, try allocator.dupe(u8, "{\"type\":\"session.receive\",\"content\":\"intermediate\"}"));
+    try frames.append(allocator, try allocator.dupe(u8, "{\"type\":\"agent.run.event\",\"event_type\":\"assistant.output\"}"));
+    try frames.append(allocator, try allocator.dupe(u8, "{\"type\":\"session.receive\",\"content\":\"final\"}"));
+
+    var extracted = try RuntimeServer.extractRunStepFrameResult(allocator, frames.items);
+    defer extracted.deinit(allocator);
+
+    try std.testing.expectEqualStrings("final", extracted.assistant_content);
+    try std.testing.expect(extracted.error_message == null);
 }
 
 test "runtime_server: empty ltm config in tests provisions sqlite-backed runtime" {

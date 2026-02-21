@@ -247,13 +247,35 @@ pub const RunEngine = struct {
 
         if (run.pending_inputs.items.len == 0) return RunEngineError.NoPendingInput;
 
-        const input = run.pending_inputs.orderedRemove(0);
+        const input = run.pending_inputs.items[0];
+        const work_run_id = try self.allocator.dupe(u8, run_id);
+        errdefer self.allocator.free(work_run_id);
+        const work_input = try self.allocator.dupe(u8, input);
+        errdefer self.allocator.free(work_input);
+        const next_last_input = try self.allocator.dupe(u8, input);
         const was_paused = run.state == .paused;
-        if (run.last_input) |value| self.allocator.free(value);
-        run.last_input = try self.allocator.dupe(u8, input);
+        const previous_state = run.state;
+        const previous_step_count = run.step_count;
+        const previous_updated_at_ms = run.updated_at_ms;
+        const previous_last_input = run.last_input;
+        const previous_event_count = run.events.items.len;
+        run.last_input = next_last_input;
         run.step_count += 1;
         run.state = .running;
         run.updated_at_ms = std.time.milliTimestamp();
+        var committed = false;
+        errdefer if (!committed) {
+            run.state = previous_state;
+            run.step_count = previous_step_count;
+            run.updated_at_ms = previous_updated_at_ms;
+            if (run.last_input) |value| self.allocator.free(value);
+            run.last_input = previous_last_input;
+
+            while (run.events.items.len > previous_event_count) {
+                var event = run.events.pop().?;
+                event.deinit(self.allocator);
+            }
+        };
 
         if (was_paused) {
             _ = try self.appendEventLocked(run_id, "run.resumed", "{}", run.updated_at_ms);
@@ -263,11 +285,16 @@ pub const RunEngine = struct {
         defer self.allocator.free(payload);
         _ = try self.appendEventLocked(run_id, "run.step_started", payload, run.updated_at_ms);
         try self.persistMetaForRunLocked(run);
+        const consumed_input = run.pending_inputs.orderedRemove(0);
+        self.allocator.free(consumed_input);
+        committed = true;
+
+        if (previous_last_input) |value| self.allocator.free(value);
 
         return .{
-            .run_id = try self.allocator.dupe(u8, run_id),
+            .run_id = work_run_id,
             .step_count = run.step_count,
-            .input = input,
+            .input = work_input,
         };
     }
 
@@ -829,4 +856,62 @@ test "run_engine: listEvents returns out-of-memory without invalid deinit on par
     const failing_allocator = failing_state.allocator();
 
     try std.testing.expectError(error.OutOfMemory, engine.listEvents(failing_allocator, started.run_id, 2));
+}
+
+test "run_engine: beginStep keeps queued input when step start fails" {
+    const allocator = std.testing.allocator;
+
+    const baseline_alloc_index = blk: {
+        var baseline_state = std.testing.FailingAllocator.init(allocator, .{});
+        const baseline_allocator = baseline_state.allocator();
+
+        var baseline_engine = try RunEngine.init(baseline_allocator, null, .{
+            .max_run_steps = 16,
+            .checkpoint_interval_steps = 1,
+        });
+        defer baseline_engine.deinit();
+
+        var baseline_started = try baseline_engine.start("queued input");
+        defer baseline_started.deinit(baseline_allocator);
+        break :blk baseline_state.alloc_index;
+    };
+
+    var saw_begin_step_oom = false;
+    var offset: usize = 0;
+    while (offset < 64) : (offset += 1) {
+        var failing_state = std.testing.FailingAllocator.init(allocator, .{ .fail_index = baseline_alloc_index + offset });
+        const failing_allocator = failing_state.allocator();
+
+        var engine = try RunEngine.init(failing_allocator, null, .{
+            .max_run_steps = 16,
+            .checkpoint_interval_steps = 1,
+        });
+        defer engine.deinit();
+
+        var started = try engine.start("queued input");
+        defer started.deinit(failing_allocator);
+
+        const begin = engine.beginStep(started.run_id, null);
+        if (begin) |work| {
+            var owned_work = work;
+            owned_work.deinit(failing_allocator);
+            continue;
+        } else |err| switch (err) {
+            error.OutOfMemory => {
+                saw_begin_step_oom = true;
+
+                engine.mutex.lock();
+                defer engine.mutex.unlock();
+                const run = engine.runs.getPtr(started.run_id).?;
+                try std.testing.expectEqual(@as(usize, 1), run.pending_inputs.items.len);
+                try std.testing.expectEqual(@as(u64, 0), run.step_count);
+                try std.testing.expectEqual(RunState.created, run.state);
+                try std.testing.expect(run.last_input == null);
+                break;
+            },
+            else => return err,
+        }
+    }
+
+    try std.testing.expect(saw_begin_step_oom);
 }
