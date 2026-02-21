@@ -164,6 +164,7 @@ pub const RunEngine = struct {
             "run-{d}-{d}",
             .{ now, self.next_run_counter },
         );
+        defer self.allocator.free(run_id);
         self.next_run_counter += 1;
 
         var run = RunRecord{
@@ -174,21 +175,34 @@ pub const RunEngine = struct {
             .created_at_ms = now,
             .updated_at_ms = now,
         };
-        errdefer run.deinit(self.allocator);
+        var run_owned_by_map = false;
+        errdefer if (!run_owned_by_map) run.deinit(self.allocator);
 
         if (initial_input) |value| {
             try run.pending_inputs.append(self.allocator, try self.allocator.dupe(u8, value));
         }
 
         const owned_key = try self.allocator.dupe(u8, run_id);
-        errdefer self.allocator.free(owned_key);
+        var key_owned_by_map = false;
+        errdefer if (!key_owned_by_map) self.allocator.free(owned_key);
         try self.runs.put(self.allocator, owned_key, run);
+        run_owned_by_map = true;
+        key_owned_by_map = true;
+
+        var start_committed = false;
+        errdefer if (!start_committed) {
+            if (self.runs.fetchRemove(run_id)) |entry| {
+                self.allocator.free(entry.key);
+                var removed_run = entry.value;
+                removed_run.deinit(self.allocator);
+            }
+        };
 
         try self.persistMetaForRunLocked(self.runs.getPtr(run_id).?);
         _ = try self.appendEventLocked(run_id, "run.started", "{}", now);
+        start_committed = true;
 
         const snapshot = try self.runs.getPtr(run_id).?.cloneSnapshot(self.allocator);
-        self.allocator.free(run_id);
         return snapshot;
     }
 

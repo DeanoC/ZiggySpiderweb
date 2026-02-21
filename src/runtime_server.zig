@@ -1224,6 +1224,7 @@ pub const RuntimeServer = struct {
 
         var chat_meta = RunStepMeta{};
         const chat_frames = self.handleChat(job, request_id, work.input, &chat_meta) catch |err| {
+            if (err == RuntimeServerError.RuntimeJobCancelled) return err;
             _ = self.runs.failStep(run_id, @errorName(err)) catch {};
             return err;
         };
@@ -4922,6 +4923,31 @@ test "runtime_server: extractRunStepFrameResult uses final session.receive conte
 
     try std.testing.expectEqualStrings("final", extracted.assistant_content);
     try std.testing.expect(extracted.error_message == null);
+}
+
+test "runtime_server: cancelled run step does not mark run failed" {
+    const allocator = std.testing.allocator;
+    const server = try RuntimeServer.create(allocator, "agent-run-cancel", .{ .ltm_directory = "", .ltm_filename = "" });
+    defer server.destroy();
+
+    var started = try server.runs.start("cancel flow");
+    defer started.deinit(allocator);
+
+    const job = try server.createJob(.agent_run_step, "req-run-cancelled", null, null, false);
+    defer server.destroyJob(job);
+
+    job.result_mutex.lock();
+    job.cancelled = true;
+    job.result_mutex.unlock();
+
+    try std.testing.expectError(
+        RuntimeServerError.RuntimeJobCancelled,
+        server.runSingleStep(job, "req-run-cancelled", started.run_id, null, false, false),
+    );
+
+    var snapshot = try server.runs.get(started.run_id);
+    defer snapshot.deinit(allocator);
+    try std.testing.expectEqual(run_engine.RunState.running, snapshot.state);
 }
 
 test "runtime_server: empty ltm config in tests provisions sqlite-backed runtime" {
