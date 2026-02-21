@@ -329,6 +329,7 @@ fn readLineTrimmedAlloc(allocator: std.mem.Allocator, max_len: usize) !?[]u8 {
         return try allocator.dupe(u8, "");
     }
     const dup = try allocator.dupe(u8, trimmed);
+    out.deinit(allocator);
     return dup;
 }
 
