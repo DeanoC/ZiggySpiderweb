@@ -558,11 +558,7 @@ pub const Engine = struct {
         args: std.json.ObjectMap,
         talk_ids_in_batch: []const event_bus.TalkId,
     ) !ExecuteOutcome {
-        if (talk_ids_in_batch.len == 0) {
-            return .{ .result = try self.failure(tool_name, "invalid_sequence", "wait_for requires at least one prior talk_* in the same tool-use list") };
-        }
-
-        const default_talk_id = talk_ids_in_batch[talk_ids_in_batch.len - 1];
+        const default_talk_id: ?event_bus.TalkId = if (talk_ids_in_batch.len == 0) null else talk_ids_in_batch[talk_ids_in_batch.len - 1];
         const specs = self.parseWaitSpecs(args, default_talk_id) catch {
             return .{ .result = try self.failure(tool_name, "invalid_args", "wait_for requires non-empty 'events' with valid event_type/parameter/talk_id fields") };
         };
@@ -907,7 +903,7 @@ fn deinitEvents(allocator: std.mem.Allocator, events: []event_bus.Event) void {
     allocator.free(events);
 }
 
-test "brain_tools: wait_for fails without prior talk" {
+test "brain_tools: wait_for without prior talk enters waiting state" {
     const allocator = std.testing.allocator;
     var mem = try memory.RuntimeMemory.init(allocator, "agentA");
     defer mem.deinit();
@@ -924,8 +920,9 @@ test "brain_tools: wait_for fails without prior talk" {
     defer deinitResults(allocator, results);
 
     try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expect(!results[0].success);
-    try std.testing.expect(std.mem.indexOf(u8, results[0].payload_json, "invalid_sequence") != null);
+    try std.testing.expect(results[0].success);
+    try std.testing.expect(std.mem.indexOf(u8, results[0].payload_json, "\"waiting\":true") != null);
+    try std.testing.expect(brain.hasPendingWait());
 }
 
 test "brain_tools: talk then wait_for blocks until correlated event arrives" {

@@ -16,9 +16,20 @@ pub fn parseMessageType(raw_json: []const u8) types.MessageType {
 fn parseMessageTypeString(raw_type: []const u8) types.MessageType {
     if (std.mem.eql(u8, raw_type, "connect")) return .connect;
     if (std.mem.eql(u8, raw_type, "session.send")) return .session_send;
+    if (std.mem.eql(u8, raw_type, "agent.run.start")) return .agent_run_start;
+    if (std.mem.eql(u8, raw_type, "agent.run.step")) return .agent_run_step;
+    if (std.mem.eql(u8, raw_type, "agent.run.resume")) return .agent_run_resume;
+    if (std.mem.eql(u8, raw_type, "agent.run.pause")) return .agent_run_pause;
+    if (std.mem.eql(u8, raw_type, "agent.run.cancel")) return .agent_run_cancel;
+    if (std.mem.eql(u8, raw_type, "agent.run.status")) return .agent_run_status;
+    if (std.mem.eql(u8, raw_type, "agent.run.events")) return .agent_run_events;
+    if (std.mem.eql(u8, raw_type, "agent.run.list")) return .agent_run_list;
     if (std.mem.eql(u8, raw_type, "agent.control")) return .agent_control;
     if (std.mem.eql(u8, raw_type, "agent.progress")) return .agent_progress;
     if (std.mem.eql(u8, raw_type, "agent.state")) return .agent_state;
+    if (std.mem.eql(u8, raw_type, "agent.run.ack")) return .agent_run_ack;
+    if (std.mem.eql(u8, raw_type, "agent.run.state")) return .agent_run_state;
+    if (std.mem.eql(u8, raw_type, "agent.run.event")) return .agent_run_event;
     if (std.mem.eql(u8, raw_type, "memory.event")) return .memory_event;
     if (std.mem.eql(u8, raw_type, "tool.event")) return .tool_event;
     if (std.mem.eql(u8, raw_type, "ping")) return .ping;
@@ -83,8 +94,14 @@ pub fn parseMessage(allocator: std.mem.Allocator, raw_json: []const u8) !types.P
         if (obj.get("action")) |value| {
             if (value == .string) break :blk value.string;
         }
+        if (obj.get("run_id")) |value| {
+            if (value == .string) break :blk value.string;
+        }
         if (payload_obj) |payload| {
             if (payload.get("action")) |value| {
+                if (value == .string) break :blk value.string;
+            }
+            if (payload.get("run_id")) |value| {
                 if (value == .string) break :blk value.string;
             }
         }
@@ -103,6 +120,8 @@ test "protocol_request: parseMessageType recognizes runtime-native message model
     try std.testing.expectEqual(types.MessageType.connect, parseMessageType("{\"type\":\"connect\"}"));
     try std.testing.expectEqual(types.MessageType.session_send, parseMessageType("{\"type\":\"session.send\"}"));
     try std.testing.expectEqual(types.MessageType.session_send, parseMessageType("{\"type\": \"session.send\"}"));
+    try std.testing.expectEqual(types.MessageType.agent_run_start, parseMessageType("{\"type\":\"agent.run.start\"}"));
+    try std.testing.expectEqual(types.MessageType.agent_run_status, parseMessageType("{\"type\":\"agent.run.status\"}"));
     try std.testing.expectEqual(types.MessageType.agent_control, parseMessageType("{\"type\":\"agent.control\"}"));
     try std.testing.expectEqual(types.MessageType.unknown, parseMessageType("{\"type\":\"chat.send\"}"));
     try std.testing.expectEqual(types.MessageType.unknown, parseMessageType("{\"type\":\"mystery\"}"));
@@ -167,4 +186,17 @@ test "protocol_request: parseMessage falls back to payload request id when top-l
     try std.testing.expectEqual(types.MessageType.agent_control, parsed.msg_type);
     try std.testing.expectEqualStrings("r5", parsed.id.?);
     try std.testing.expectEqualStrings("debug.subscribe", parsed.action.?);
+}
+
+test "protocol_request: parseMessage maps run_id to action for run messages" {
+    const allocator = std.testing.allocator;
+    var parsed = try parseMessage(
+        allocator,
+        "{\"id\":\"r6\",\"type\":\"agent.run.step\",\"run_id\":\"run-123\",\"content\":\"continue\"}",
+    );
+    defer types.deinitParsedMessage(allocator, &parsed);
+
+    try std.testing.expectEqual(types.MessageType.agent_run_step, parsed.msg_type);
+    try std.testing.expectEqualStrings("run-123", parsed.action.?);
+    try std.testing.expectEqualStrings("continue", parsed.content.?);
 }

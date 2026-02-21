@@ -249,6 +249,54 @@ pub const VersionedMemStore = struct {
         return out.toOwnedSlice(allocator);
     }
 
+    pub fn listDistinctBaseIds(
+        self: *VersionedMemStore,
+        allocator: std.mem.Allocator,
+        kind: []const u8,
+        like_pattern: ?[]const u8,
+        limit: usize,
+        offset: usize,
+    ) ![][]u8 {
+        const kind_escaped = try self.escapeSqlLiteral(kind);
+        defer self.allocator.free(kind_escaped);
+
+        const sql = if (like_pattern) |pattern| blk: {
+            const pattern_escaped = try self.escapeSqlLiteral(pattern);
+            defer self.allocator.free(pattern_escaped);
+            break :blk try std.fmt.allocPrint(
+                self.allocator,
+                "SELECT base_id FROM mem_versions WHERE kind = {s} AND base_id LIKE {s} " ++
+                    "GROUP BY base_id ORDER BY MAX(created_at_ms) DESC LIMIT {d} OFFSET {d};",
+                .{ kind_escaped, pattern_escaped, limit, offset },
+            );
+        } else try std.fmt.allocPrint(
+            self.allocator,
+            "SELECT base_id FROM mem_versions WHERE kind = {s} " ++
+                "GROUP BY base_id ORDER BY MAX(created_at_ms) DESC LIMIT {d} OFFSET {d};",
+            .{ kind_escaped, limit, offset },
+        );
+        defer self.allocator.free(sql);
+
+        const stmt = try self.prepare(sql);
+        defer _ = sqlite3_finalize(stmt);
+
+        var out = std.ArrayListUnmanaged([]u8){};
+        errdefer {
+            for (out.items) |base_id| allocator.free(base_id);
+            out.deinit(allocator);
+        }
+
+        while (true) {
+            const rc = sqlite3_step(stmt);
+            if (rc == SQLITE_DONE) break;
+            if (rc != SQLITE_ROW) return LtmError.ExecError;
+
+            try out.append(allocator, try self.copyColumnText(allocator, stmt, 0));
+        }
+
+        return out.toOwnedSlice(allocator);
+    }
+
     pub fn listVersions(
         self: *VersionedMemStore,
         allocator: std.mem.Allocator,
@@ -290,6 +338,20 @@ pub const VersionedMemStore = struct {
         }
 
         return out.toOwnedSlice(allocator);
+    }
+
+    pub fn deleteBaseId(self: *VersionedMemStore, base_id: []const u8) !void {
+        const base_id_escaped = try self.escapeSqlLiteral(base_id);
+        defer self.allocator.free(base_id_escaped);
+
+        const sql = try std.fmt.allocPrint(
+            self.allocator,
+            "DELETE FROM mem_versions WHERE base_id = {s};",
+            .{base_id_escaped},
+        );
+        defer self.allocator.free(sql);
+
+        try self.run(sql);
     }
 
     fn initSchema(self: *VersionedMemStore) !void {
@@ -495,6 +557,55 @@ test "ltm_store: listVersions returns latest-first rows for a base id" {
     try std.testing.expectEqualStrings("{\"text\":\"v3\"}", rows[0].content_json);
     try std.testing.expectEqual(@as(u64, 2), rows[1].version);
     try std.testing.expectEqualStrings("{\"text\":\"v2\"}", rows[1].content_json);
+}
+
+test "ltm_store: listDistinctBaseIds groups by base id and sorts by newest update" {
+    const allocator = std.testing.allocator;
+    const dir = try std.fmt.allocPrint(allocator, ".tmp-vltm-list-distinct-{d}", .{std.time.nanoTimestamp()});
+    defer allocator.free(dir);
+    defer std.fs.cwd().deleteTree(dir) catch {};
+
+    try std.fs.cwd().makePath(dir);
+    var store = try VersionedMemStore.open(allocator, dir, "runtime-memory.db");
+    defer store.close();
+
+    try store.persistVersionAt("run:run-1:meta", 1, "run.meta", "{\"state\":\"created\"}", 10);
+    try store.persistVersionAt("run:run-1:meta", 2, "run.meta", "{\"state\":\"running\"}", 30);
+    try store.persistVersionAt("run:run-2:meta", 1, "run.meta", "{\"state\":\"created\"}", 20);
+    try store.persistVersionAt("agent:primary:notes", 1, "note", "{\"text\":\"skip\"}", 40);
+
+    const ids = try store.listDistinctBaseIds(allocator, "run.meta", "run:%:meta", 10, 0);
+    defer {
+        for (ids) |base_id| allocator.free(base_id);
+        allocator.free(ids);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), ids.len);
+    try std.testing.expectEqualStrings("run:run-1:meta", ids[0]);
+    try std.testing.expectEqualStrings("run:run-2:meta", ids[1]);
+}
+
+test "ltm_store: deleteBaseId removes all versions for base id" {
+    const allocator = std.testing.allocator;
+    const dir = try std.fmt.allocPrint(allocator, ".tmp-vltm-delete-base-{d}", .{std.time.nanoTimestamp()});
+    defer allocator.free(dir);
+    defer std.fs.cwd().deleteTree(dir) catch {};
+
+    try std.fs.cwd().makePath(dir);
+    var store = try VersionedMemStore.open(allocator, dir, "runtime-memory.db");
+    defer store.close();
+
+    try store.persistVersionAt("run:run-1:meta", 1, "run.meta", "{\"state\":\"created\"}", 10);
+    try store.persistVersionAt("run:run-1:meta", 2, "run.meta", "{\"state\":\"running\"}", 20);
+
+    const before = try store.listVersions(allocator, "run:run-1:meta", 10);
+    defer deinitRecords(allocator, before);
+    try std.testing.expectEqual(@as(usize, 2), before.len);
+
+    try store.deleteBaseId("run:run-1:meta");
+
+    const after = try store.load(allocator, "run:run-1:meta", null);
+    try std.testing.expect(after == null);
 }
 
 test "ltm_store: highestAutoMemIndex only counts canonical auto names for agent and brain" {

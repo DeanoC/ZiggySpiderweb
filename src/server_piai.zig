@@ -10,6 +10,302 @@ pub const RuntimeServer = runtime_server_mod.RuntimeServer;
 
 const default_max_agent_runtimes: usize = 64;
 const max_agent_id_len: usize = 64;
+const debug_stream_log_filename = "debug-stream.ndjson";
+const debug_stream_archive_prefix = "debug-stream-";
+const debug_stream_archive_suffix = ".ndjson";
+const debug_stream_archive_suffix_gz = ".ndjson.gz";
+const debug_stream_rotate_max_bytes: u64 = 8 * 1024 * 1024;
+const debug_stream_archive_keep: usize = 8;
+
+const DebugStreamFileSink = struct {
+    allocator: std.mem.Allocator,
+    path: ?[]u8 = null,
+    gzip_available: bool = false,
+    mutex: std.Thread.Mutex = .{},
+
+    fn init(allocator: std.mem.Allocator, runtime_config: Config.RuntimeConfig) DebugStreamFileSink {
+        var sink = DebugStreamFileSink{ .allocator = allocator };
+        if (runtime_config.ltm_directory.len == 0) return sink;
+
+        const path = sink.initPath(runtime_config.ltm_directory) catch |err| {
+            std.log.warn("Debug stream file logging disabled: {s}", .{@errorName(err)});
+            return sink;
+        };
+        sink.path = path;
+        sink.gzip_available = commandExists(allocator, "gzip");
+        if (!sink.gzip_available) {
+            std.log.warn("gzip not found; debug stream archives will be uncompressed", .{});
+        }
+
+        sink.touch() catch |err| {
+            std.log.warn("Debug stream file logging disabled for {s}: {s}", .{ path, @errorName(err) });
+            allocator.free(path);
+            sink.path = null;
+        };
+        return sink;
+    }
+
+    fn deinit(self: *DebugStreamFileSink) void {
+        if (self.path) |path| self.allocator.free(path);
+    }
+
+    fn append(self: *DebugStreamFileSink, agent_id: []const u8, frame_payload: []const u8) void {
+        const path = self.path orelse return;
+        if (std.mem.indexOf(u8, frame_payload, "\"type\":\"debug.event\"") == null) return;
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        self.appendLocked(path, agent_id, frame_payload) catch |err| {
+            std.log.warn("Failed to append debug event to {s}: {s}", .{ path, @errorName(err) });
+        };
+    }
+
+    fn initPath(self: *DebugStreamFileSink, ltm_directory: []const u8) ![]u8 {
+        try ensureDirectoryExists(ltm_directory);
+        return std.fs.path.join(self.allocator, &.{ ltm_directory, debug_stream_log_filename });
+    }
+
+    fn touch(self: *DebugStreamFileSink) !void {
+        const path = self.path orelse return;
+        var file = try openOrCreateAppendFile(path);
+        defer file.close();
+        try file.seekFromEnd(0);
+    }
+
+    fn appendLocked(self: *DebugStreamFileSink, path: []const u8, agent_id: []const u8, frame_payload: []const u8) !void {
+        var file = try openOrCreateAppendFile(path);
+        defer file.close();
+        try file.seekFromEnd(0);
+        const line = try std.fmt.allocPrint(
+            self.allocator,
+            "{d}\t{s}\t{s}\n",
+            .{ std.time.milliTimestamp(), agent_id, frame_payload },
+        );
+        defer self.allocator.free(line);
+        try file.writeAll(line);
+        try self.maybeRotateLocked(path);
+    }
+
+    fn maybeRotateLocked(self: *DebugStreamFileSink, path: []const u8) !void {
+        const size = fileSize(path) catch |err| switch (err) {
+            error.FileNotFound => return,
+            else => return err,
+        };
+        if (size <= debug_stream_rotate_max_bytes) return;
+
+        const archive_path = try self.allocateArchivePath(path);
+        defer self.allocator.free(archive_path);
+
+        renamePath(path, archive_path) catch |err| switch (err) {
+            error.FileNotFound => return,
+            else => return err,
+        };
+
+        if (self.gzip_available) {
+            self.compressArchive(archive_path) catch |err| {
+                std.log.warn("Failed to gzip debug archive {s}: {s}", .{ archive_path, @errorName(err) });
+            };
+        }
+
+        self.pruneArchives(path) catch |err| {
+            std.log.warn("Failed pruning debug archives for {s}: {s}", .{ path, @errorName(err) });
+        };
+        self.touch() catch |err| {
+            std.log.warn("Failed to recreate debug stream log {s}: {s}", .{ path, @errorName(err) });
+        };
+    }
+
+    fn allocateArchivePath(self: *DebugStreamFileSink, path: []const u8) ![]u8 {
+        const now_ms_signed = std.time.milliTimestamp();
+        const now_ms: u64 = if (now_ms_signed < 0) 0 else @intCast(now_ms_signed);
+        const parent = std.fs.path.dirname(path) orelse ".";
+
+        var attempt: usize = 0;
+        while (attempt < 256) : (attempt += 1) {
+            const name = if (attempt == 0)
+                try std.fmt.allocPrint(self.allocator, "{s}{d}{s}", .{
+                    debug_stream_archive_prefix,
+                    now_ms,
+                    debug_stream_archive_suffix,
+                })
+            else
+                try std.fmt.allocPrint(self.allocator, "{s}{d}-{d}{s}", .{
+                    debug_stream_archive_prefix,
+                    now_ms,
+                    attempt,
+                    debug_stream_archive_suffix,
+                });
+            defer self.allocator.free(name);
+
+            const candidate = try std.fs.path.join(self.allocator, &.{ parent, name });
+            if (!pathExists(candidate)) return candidate;
+            self.allocator.free(candidate);
+        }
+        return error.PathAlreadyExists;
+    }
+
+    fn compressArchive(self: *DebugStreamFileSink, archive_path: []const u8) !void {
+        const result = try std.process.Child.run(.{
+            .allocator = self.allocator,
+            .argv = &.{ "gzip", "-f", archive_path },
+            .max_output_bytes = 16 * 1024,
+        });
+        defer self.allocator.free(result.stdout);
+        defer self.allocator.free(result.stderr);
+
+        switch (result.term) {
+            .Exited => |code| if (code != 0) return error.ProcessFailed,
+            else => return error.ProcessFailed,
+        }
+    }
+
+    fn pruneArchives(self: *DebugStreamFileSink, path: []const u8) !void {
+        if (debug_stream_archive_keep == 0) return;
+        const parent = std.fs.path.dirname(path) orelse ".";
+        var dir = if (std.fs.path.isAbsolute(parent))
+            try std.fs.openDirAbsolute(parent, .{ .iterate = true })
+        else
+            try std.fs.cwd().openDir(parent, .{ .iterate = true });
+        defer dir.close();
+
+        var candidates = std.ArrayListUnmanaged(ArchiveCandidate){};
+        defer {
+            for (candidates.items) |entry| self.allocator.free(entry.name);
+            candidates.deinit(self.allocator);
+        }
+
+        var it = dir.iterate();
+        while (try it.next()) |entry| {
+            if (entry.kind != .file) continue;
+            const ts = parseArchiveTimestamp(entry.name) orelse continue;
+            try candidates.append(self.allocator, .{
+                .name = try self.allocator.dupe(u8, entry.name),
+                .timestamp_ms = ts,
+            });
+        }
+
+        while (candidates.items.len > debug_stream_archive_keep) {
+            var oldest_idx: usize = 0;
+            var oldest_ts = candidates.items[0].timestamp_ms;
+            var i: usize = 1;
+            while (i < candidates.items.len) : (i += 1) {
+                if (candidates.items[i].timestamp_ms < oldest_ts) {
+                    oldest_ts = candidates.items[i].timestamp_ms;
+                    oldest_idx = i;
+                }
+            }
+
+            const oldest = candidates.orderedRemove(oldest_idx);
+            dir.deleteFile(oldest.name) catch |err| {
+                std.log.warn("Failed deleting old debug archive {s}: {s}", .{ oldest.name, @errorName(err) });
+            };
+            self.allocator.free(oldest.name);
+        }
+    }
+};
+
+const ArchiveCandidate = struct {
+    name: []u8,
+    timestamp_ms: u64,
+};
+
+fn parseArchiveTimestamp(name: []const u8) ?u64 {
+    if (!std.mem.startsWith(u8, name, debug_stream_archive_prefix)) return null;
+    var tail = name[debug_stream_archive_prefix.len..];
+
+    if (std.mem.endsWith(u8, tail, debug_stream_archive_suffix_gz)) {
+        tail = tail[0 .. tail.len - debug_stream_archive_suffix_gz.len];
+    } else if (std.mem.endsWith(u8, tail, debug_stream_archive_suffix)) {
+        tail = tail[0 .. tail.len - debug_stream_archive_suffix.len];
+    } else {
+        return null;
+    }
+    if (tail.len == 0) return null;
+
+    const dash_idx = std.mem.indexOfScalar(u8, tail, '-');
+    const numeric = if (dash_idx) |idx| tail[0..idx] else tail;
+    if (numeric.len == 0) return null;
+    return std.fmt.parseUnsigned(u64, numeric, 10) catch null;
+}
+
+fn commandExists(allocator: std.mem.Allocator, command: []const u8) bool {
+    var child = std.process.Child.init(&[_][]const u8{ command, "--help" }, allocator);
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Ignore;
+    child.stderr_behavior = .Ignore;
+
+    child.spawn() catch return false;
+    _ = child.wait() catch return false;
+    return true;
+}
+
+fn ensureDirectoryExists(dir_path: []const u8) !void {
+    if (dir_path.len == 0) return error.InvalidPath;
+
+    if (std.fs.path.isAbsolute(dir_path)) {
+        var root_dir = try std.fs.openDirAbsolute("/", .{});
+        defer root_dir.close();
+        const rel_dir = std.mem.trimLeft(u8, dir_path, "/");
+        if (rel_dir.len == 0) return;
+        root_dir.makePath(rel_dir) catch |err| {
+            if (err != error.PathAlreadyExists) return err;
+        };
+        return;
+    }
+
+    std.fs.cwd().makePath(dir_path) catch |err| {
+        if (err != error.PathAlreadyExists) return err;
+    };
+}
+
+fn openFileReadWrite(path: []const u8) !std.fs.File {
+    if (std.fs.path.isAbsolute(path)) {
+        return std.fs.openFileAbsolute(path, .{ .mode = .read_write });
+    }
+    return std.fs.cwd().openFile(path, .{ .mode = .read_write });
+}
+
+fn createFileNoTruncate(path: []const u8) !std.fs.File {
+    if (std.fs.path.isAbsolute(path)) {
+        return std.fs.createFileAbsolute(path, .{ .read = true, .truncate = false });
+    }
+    return std.fs.cwd().createFile(path, .{ .read = true, .truncate = false });
+}
+
+fn openOrCreateAppendFile(path: []const u8) !std.fs.File {
+    return openFileReadWrite(path) catch |err| switch (err) {
+        error.FileNotFound => createFileNoTruncate(path),
+        else => err,
+    };
+}
+
+fn fileSize(path: []const u8) !u64 {
+    const file = if (std.fs.path.isAbsolute(path))
+        try std.fs.openFileAbsolute(path, .{ .mode = .read_only })
+    else
+        try std.fs.cwd().openFile(path, .{ .mode = .read_only });
+    defer file.close();
+    const stat = try file.stat();
+    return stat.size;
+}
+
+fn renamePath(old_path: []const u8, new_path: []const u8) !void {
+    if (std.fs.path.isAbsolute(old_path) and std.fs.path.isAbsolute(new_path)) {
+        try std.fs.renameAbsolute(old_path, new_path);
+        return;
+    }
+    try std.fs.cwd().rename(old_path, new_path);
+}
+
+fn pathExists(path: []const u8) bool {
+    if (std.fs.path.isAbsolute(path)) {
+        std.fs.accessAbsolute(path, .{}) catch return false;
+        return true;
+    }
+    std.fs.cwd().access(path, .{}) catch return false;
+    return true;
+}
 
 const AgentRuntimeRegistry = struct {
     allocator: std.mem.Allocator,
@@ -17,6 +313,7 @@ const AgentRuntimeRegistry = struct {
     provider_config: ?Config.ProviderConfig,
     default_agent_id: []const u8,
     max_runtimes: usize,
+    debug_stream_sink: DebugStreamFileSink,
     mutex: std.Thread.Mutex = .{},
     by_agent: std.StringHashMapUnmanaged(*RuntimeServer) = .{},
 
@@ -48,6 +345,7 @@ const AgentRuntimeRegistry = struct {
                 .{ configured_default, effective_default },
             );
         }
+        const debug_stream_sink = DebugStreamFileSink.init(allocator, runtime_config);
 
         return .{
             .allocator = allocator,
@@ -55,6 +353,7 @@ const AgentRuntimeRegistry = struct {
             .provider_config = provider_config,
             .default_agent_id = effective_default,
             .max_runtimes = if (max_runtimes == 0) 1 else max_runtimes,
+            .debug_stream_sink = debug_stream_sink,
         };
     }
 
@@ -68,6 +367,7 @@ const AgentRuntimeRegistry = struct {
             entry.value_ptr.*.destroy();
         }
         self.by_agent.deinit(self.allocator);
+        self.debug_stream_sink.deinit();
     }
 
     fn getOrCreate(self: *AgentRuntimeRegistry, agent_id: []const u8) !*RuntimeServer {
@@ -118,6 +418,10 @@ const AgentRuntimeRegistry = struct {
         var it = self.by_agent.keyIterator();
         const first = it.next() orelse return null;
         return first.*;
+    }
+
+    fn maybeLogDebugFrame(self: *AgentRuntimeRegistry, agent_id: []const u8, payload: []const u8) void {
+        self.debug_stream_sink.append(agent_id, payload);
     }
 };
 
@@ -248,6 +552,7 @@ fn handleWebSocketConnection(
                     defer runtime_server_mod.deinitResponseFrames(allocator, bootstrap_responses);
                     for (bootstrap_responses) |response| {
                         try websocket_transport.writeFrame(stream, response, .text);
+                        runtime_registry.maybeLogDebugFrame(agent_id, response);
                     }
                     continue;
                 }
@@ -282,6 +587,7 @@ fn handleWebSocketConnection(
                         );
                         defer allocator.free(ack);
                         try websocket_transport.writeFrame(stream, ack, .text);
+                        runtime_registry.maybeLogDebugFrame(agent_id, ack);
                         continue;
                     }
                 }
@@ -300,6 +606,7 @@ fn handleWebSocketConnection(
                 defer runtime_server_mod.deinitResponseFrames(allocator, responses);
                 for (responses) |response| {
                     try websocket_transport.writeFrame(stream, response, .text);
+                    runtime_registry.maybeLogDebugFrame(agent_id, response);
                 }
             },
             0x8 => {
@@ -740,4 +1047,12 @@ test "server_piai: invalid configured default agent falls back to built-in defau
 
     const registry = AgentRuntimeRegistry.initWithLimits(allocator, cfg, null, 8);
     try std.testing.expectEqualStrings(runtime_server_mod.default_agent_id, registry.default_agent_id);
+}
+
+test "server_piai: parseArchiveTimestamp accepts rotated debug archive names" {
+    try std.testing.expectEqual(@as(?u64, 1771674073992), parseArchiveTimestamp("debug-stream-1771674073992.ndjson"));
+    try std.testing.expectEqual(@as(?u64, 1771674073992), parseArchiveTimestamp("debug-stream-1771674073992.ndjson.gz"));
+    try std.testing.expectEqual(@as(?u64, 1771674073992), parseArchiveTimestamp("debug-stream-1771674073992-1.ndjson"));
+    try std.testing.expectEqual(@as(?u64, null), parseArchiveTimestamp("debug-stream.ndjson"));
+    try std.testing.expectEqual(@as(?u64, null), parseArchiveTimestamp("debug-stream-abc.ndjson"));
 }

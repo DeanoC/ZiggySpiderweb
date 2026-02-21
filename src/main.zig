@@ -13,8 +13,12 @@ comptime {
     _ = @import("system_hooks.zig");
     _ = @import("ltm_store.zig");
     _ = @import("memory.zig");
+    _ = @import("memory_schema.zig");
     _ = @import("memid.zig");
+    _ = @import("prompt_compiler.zig");
     _ = @import("protocol.zig");
+    _ = @import("run_engine.zig");
+    _ = @import("run_store.zig");
     _ = @import("tool_registry.zig");
 }
 
