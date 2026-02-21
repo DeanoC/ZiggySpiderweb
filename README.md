@@ -106,11 +106,45 @@ Runtime execution now uses a bounded request queue plus fixed runtime workers.
 - `runtime_request_queue_max`
 - `chat_operation_timeout_ms`
 - `control_operation_timeout_ms`
+- `run_checkpoint_interval_steps`
+- `run_auto_resume_on_boot`
+- `tool_retry_max_attempts`
+- `tool_lease_timeout_ms`
+- `max_inflight_tool_calls_per_run`
+- `max_run_steps`
 - `default_agent_id`
 
 Notes:
 - Older inflight-style runtime gating keys are no longer used.
 - Protocol input should use `session.send`; legacy `chat.send` is rejected.
+
+### Debug Stream Log Files
+
+When debug streaming is enabled (`debug.subscribe`), server-side copies of `debug.event` frames are appended to:
+
+- `<runtime.ltm_directory>/debug-stream.ndjson`
+
+Retention behavior:
+
+- Rotates at ~8 MiB per live file.
+- Rotated files are archived as `debug-stream-<timestamp>.ndjson`.
+- If `gzip` is available on the host, rotated archives are compressed to `.ndjson.gz`.
+- Keeps the newest 8 archives and prunes older files.
+
+### Agent Run API
+
+Spiderweb now supports a run-oriented control path:
+
+- `agent.run.start`
+- `agent.run.step`
+- `agent.run.resume`
+- `agent.run.pause`
+- `agent.run.cancel`
+- `agent.run.status`
+- `agent.run.events`
+- `agent.run.list`
+
+`session.send` remains supported and acts as a compatibility shim for chat-style turns.
 
 ### World Tools (Provider-Driven)
 

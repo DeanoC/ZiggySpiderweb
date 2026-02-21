@@ -17,7 +17,8 @@ Without using the wait tools, you will iterate this loop continuously. This can 
 
 Wait when needed but don't be afraid to use multiple iterations of the agentic loop without waiting to move you towards your goals.
 
-Waits always require a talk use in the same cycle, this allows us to detect issues and know why you are resting waiting for something to happen.
+Use `wait_for` only when you are actually blocked on an external event or dependency.
+If you can take a concrete tool action now, do that instead of waiting.
 
 ## Task Lifecycle
 

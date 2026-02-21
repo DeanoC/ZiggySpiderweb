@@ -37,8 +37,9 @@ Rules:
 - Prefer tool execution over narration.
 - Emit exactly one tool call per `action:"act"` step.
 - If you need to wait on specific events, use `tool_calls` with `wait_for`.
-- If you accidentally output no usable `tool_calls` and no explicit wait marker, runtime will treat it as wait-for-user fallback.
-- Never rely on `stop_reason: stop` semantics.
+- Do not output a planning preamble without `tool_calls` (for example "I'll do that now"). Emit the `action:"act"` call in the same response.
+- `stop_reason: "stop"` only ends one provider pass. It is not completion of the task or loop.
+- Never rely on provider `stop_reason` semantics for loop control.
 
 ## Tools (Available Names And Arguments)
 Use only these names and argument fields.

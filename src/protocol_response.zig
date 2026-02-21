@@ -56,6 +56,52 @@ pub fn buildAgentState(
     );
 }
 
+pub fn buildAgentRunAck(
+    allocator: std.mem.Allocator,
+    request_id: []const u8,
+    run_id: []const u8,
+    state: []const u8,
+    step_count: u64,
+    checkpoint_seq: u64,
+) ![]u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "{{\"type\":\"agent.run.ack\",\"request\":\"{s}\",\"run_id\":\"{s}\",\"state\":\"{s}\",\"step_count\":{d},\"checkpoint_seq\":{d},\"timestamp\":{d}}}",
+        .{ request_id, run_id, state, step_count, checkpoint_seq, std.time.milliTimestamp() },
+    );
+}
+
+pub fn buildAgentRunState(
+    allocator: std.mem.Allocator,
+    request_id: []const u8,
+    run_id: []const u8,
+    state: []const u8,
+    step_count: u64,
+    checkpoint_seq: u64,
+) ![]u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "{{\"type\":\"agent.run.state\",\"request\":\"{s}\",\"run_id\":\"{s}\",\"state\":\"{s}\",\"step_count\":{d},\"checkpoint_seq\":{d},\"timestamp\":{d}}}",
+        .{ request_id, run_id, state, step_count, checkpoint_seq, std.time.milliTimestamp() },
+    );
+}
+
+pub fn buildAgentRunEvent(
+    allocator: std.mem.Allocator,
+    request_id: []const u8,
+    run_id: []const u8,
+    event_type: []const u8,
+    payload_json: []const u8,
+) ![]u8 {
+    const escaped_event_type = try jsonEscape(allocator, event_type);
+    defer allocator.free(escaped_event_type);
+    return std.fmt.allocPrint(
+        allocator,
+        "{{\"type\":\"agent.run.event\",\"request\":\"{s}\",\"run_id\":\"{s}\",\"event_type\":\"{s}\",\"payload\":{s},\"timestamp\":{d}}}",
+        .{ request_id, run_id, escaped_event_type, payload_json, std.time.milliTimestamp() },
+    );
+}
+
 pub fn buildMemoryEvent(
     allocator: std.mem.Allocator,
     request_id: []const u8,
@@ -187,6 +233,16 @@ test "protocol_response: buildErrorWithCode includes deterministic error code" {
     defer allocator.free(payload);
 
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"code\":\"queue_saturated\"") != null);
+}
+
+test "protocol_response: buildAgentRunState emits run metadata" {
+    const allocator = std.testing.allocator;
+    const payload = try buildAgentRunState(allocator, "req-run", "run-1", "running", 3, 2);
+    defer allocator.free(payload);
+
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"type\":\"agent.run.state\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"run_id\":\"run-1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"step_count\":3") != null);
 }
 
 test "protocol_response: buildDebugEvent includes category and payload" {

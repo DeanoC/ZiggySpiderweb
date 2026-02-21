@@ -6,8 +6,11 @@ const agent_runtime = @import("agent_runtime.zig");
 const brain_tools = @import("brain_tools.zig");
 const brain_specialization = @import("brain_specialization.zig");
 const credential_store = @import("credential_store.zig");
+const memory_schema = @import("memory_schema.zig");
 const memory = @import("memory.zig");
 const memid = @import("memid.zig");
+const prompt_compiler = @import("prompt_compiler.zig");
+const run_engine = @import("run_engine.zig");
 const system_hooks = @import("system_hooks.zig");
 const tool_registry = @import("tool_registry.zig");
 const ziggy_piai = @import("ziggy-piai");
@@ -193,6 +196,7 @@ pub fn deinitResponseFrames(allocator: std.mem.Allocator, frames: [][]u8) void {
 pub const RuntimeServer = struct {
     allocator: std.mem.Allocator,
     runtime: agent_runtime.AgentRuntime,
+    runs: run_engine.RunEngine,
     provider_runtime: ?ProviderRuntime = null,
     default_agent_id: []u8,
     log_provider_requests: bool = false,
@@ -257,16 +261,30 @@ pub const RuntimeServer = struct {
         }
         errdefer if (provider_runtime) |*provider| provider.deinit(allocator);
 
+        var runtime = try agent_runtime.AgentRuntime.initWithPersistence(
+            allocator,
+            agent_id,
+            &[_][]const u8{"delegate"},
+            effective_ltm_directory,
+            effective_ltm_filename,
+            runtime_cfg,
+        );
+        errdefer runtime.deinit();
+
+        var runs = try run_engine.RunEngine.init(
+            allocator,
+            runtime.ltm_store,
+            .{
+                .max_run_steps = runtime_cfg.max_run_steps,
+                .checkpoint_interval_steps = runtime_cfg.run_checkpoint_interval_steps,
+            },
+        );
+        errdefer runs.deinit();
+
         self.* = .{
             .allocator = allocator,
-            .runtime = try agent_runtime.AgentRuntime.initWithPersistence(
-                allocator,
-                agent_id,
-                &[_][]const u8{"delegate"},
-                effective_ltm_directory,
-                effective_ltm_filename,
-                runtime_cfg,
-            ),
+            .runtime = runtime,
+            .runs = runs,
             .runtime_queue_max = runtime_cfg.runtime_request_queue_max,
             .chat_operation_timeout_ms = runtime_cfg.chat_operation_timeout_ms,
             .control_operation_timeout_ms = runtime_cfg.control_operation_timeout_ms,
@@ -277,6 +295,7 @@ pub const RuntimeServer = struct {
             .test_ltm_directory = test_ltm_directory,
         };
         errdefer {
+            self.runs.deinit();
             self.runtime.deinit();
             allocator.free(self.runtime_workers);
             allocator.free(self.default_agent_id);
@@ -334,6 +353,7 @@ pub const RuntimeServer = struct {
         self.allocator.free(self.runtime_workers);
         self.allocator.free(self.default_agent_id);
         if (self.provider_runtime) |*provider| provider.deinit(self.allocator);
+        self.runs.deinit();
         self.runtime.deinit();
         if (self.test_ltm_directory) |dir| {
             std.fs.cwd().deleteTree(dir) catch {};
@@ -382,6 +402,12 @@ pub const RuntimeServer = struct {
             },
             .session_send => {
                 return self.submitRuntimeJobAndAwait(parsed.msg_type, request_id, parsed.content, parsed.action, .chat, emit_debug);
+            },
+            .agent_run_start, .agent_run_step, .agent_run_resume => {
+                return self.submitRuntimeJobAndAwait(parsed.msg_type, request_id, parsed.content, parsed.action, .chat, emit_debug);
+            },
+            .agent_run_pause, .agent_run_cancel, .agent_run_status, .agent_run_events, .agent_run_list => {
+                return self.submitRuntimeJobAndAwait(parsed.msg_type, request_id, parsed.content, parsed.action, .control, emit_debug);
             },
             .agent_control => {
                 const operation_class: RuntimeOperationClass = if (isChatLikeControlAction(parsed.action)) .chat else .control;
@@ -616,6 +642,86 @@ pub const RuntimeServer = struct {
                 };
                 return self.handleChat(job, job.request_id, content);
             },
+            .agent_run_start => {
+                const content = job.content orelse {
+                    return self.wrapSingleFrame(try protocol.buildErrorWithCode(
+                        self.allocator,
+                        job.request_id,
+                        .missing_content,
+                        "agent.run.start requires content",
+                    ));
+                };
+                return self.handleRunStart(job, job.request_id, content);
+            },
+            .agent_run_step => {
+                const run_id = job.action orelse {
+                    return self.wrapSingleFrame(try protocol.buildErrorWithCode(
+                        self.allocator,
+                        job.request_id,
+                        .missing_content,
+                        "agent.run.step requires action run_id",
+                    ));
+                };
+                return self.handleRunStep(job, job.request_id, run_id, job.content);
+            },
+            .agent_run_resume => {
+                const run_id = job.action orelse {
+                    return self.wrapSingleFrame(try protocol.buildErrorWithCode(
+                        self.allocator,
+                        job.request_id,
+                        .missing_content,
+                        "agent.run.resume requires action run_id",
+                    ));
+                };
+                return self.handleRunResume(job, job.request_id, run_id, job.content);
+            },
+            .agent_run_pause => {
+                const run_id = job.action orelse {
+                    return self.wrapSingleFrame(try protocol.buildErrorWithCode(
+                        self.allocator,
+                        job.request_id,
+                        .missing_content,
+                        "agent.run.pause requires action run_id",
+                    ));
+                };
+                return self.handleRunPause(job.request_id, run_id);
+            },
+            .agent_run_cancel => {
+                const run_id = job.action orelse {
+                    return self.wrapSingleFrame(try protocol.buildErrorWithCode(
+                        self.allocator,
+                        job.request_id,
+                        .missing_content,
+                        "agent.run.cancel requires action run_id",
+                    ));
+                };
+                return self.handleRunCancel(job.request_id, run_id);
+            },
+            .agent_run_status => {
+                const run_id = job.action orelse {
+                    return self.wrapSingleFrame(try protocol.buildErrorWithCode(
+                        self.allocator,
+                        job.request_id,
+                        .missing_content,
+                        "agent.run.status requires action run_id",
+                    ));
+                };
+                return self.handleRunStatus(job.request_id, run_id);
+            },
+            .agent_run_events => {
+                const run_id = job.action orelse {
+                    return self.wrapSingleFrame(try protocol.buildErrorWithCode(
+                        self.allocator,
+                        job.request_id,
+                        .missing_content,
+                        "agent.run.events requires action run_id",
+                    ));
+                };
+                return self.handleRunEvents(job.request_id, run_id, job.content);
+            },
+            .agent_run_list => {
+                return self.handleRunList(job.request_id);
+            },
             .agent_control => {
                 return self.handleControl(job, job.request_id, job.action, job.content);
             },
@@ -780,6 +886,12 @@ pub const RuntimeServer = struct {
         system_hooks.ensureIdentityMemories(&self.runtime, DEFAULT_BRAIN) catch |err| {
             std.log.warn("Failed to ensure identity memories for {s}: {s}", .{ self.runtime.agent_id, @errorName(err) });
         };
+        memory_schema.ensureRuntimeInstructionMemories(&self.runtime, DEFAULT_BRAIN) catch |err| {
+            std.log.warn("Failed to ensure runtime instruction memories for {s}: {s}", .{ self.runtime.agent_id, @errorName(err) });
+        };
+        memory_schema.setActiveGoal(&self.runtime, DEFAULT_BRAIN, content) catch |err| {
+            std.log.warn("Failed to update active goal memory for {s}: {s}", .{ self.runtime.agent_id, @errorName(err) });
+        };
 
         self.runtime.appendMessageMemory(DEFAULT_BRAIN, "user", content) catch |err| {
             return self.wrapRuntimeErrorResponse(request_id, err, job.emit_debug);
@@ -878,6 +990,254 @@ pub const RuntimeServer = struct {
             .unsupported_message_type,
             "unsupported agent.control action in chat-only mode",
         ));
+    }
+
+    fn handleRunStart(
+        self: *RuntimeServer,
+        job: *RuntimeQueueJob,
+        request_id: []const u8,
+        content: []const u8,
+    ) ![][]u8 {
+        var started = self.runs.start(content) catch |err| {
+            return self.wrapRuntimeErrorResponse(request_id, err, job.emit_debug);
+        };
+        defer started.deinit(self.allocator);
+        return self.runSingleStep(job, request_id, started.run_id, null, true);
+    }
+
+    fn handleRunStep(
+        self: *RuntimeServer,
+        job: *RuntimeQueueJob,
+        request_id: []const u8,
+        run_id: []const u8,
+        content: ?[]const u8,
+    ) ![][]u8 {
+        return self.runSingleStep(job, request_id, run_id, content, false);
+    }
+
+    fn handleRunResume(
+        self: *RuntimeServer,
+        job: *RuntimeQueueJob,
+        request_id: []const u8,
+        run_id: []const u8,
+        content: ?[]const u8,
+    ) ![][]u8 {
+        _ = self.runs.resumeRun(run_id) catch |err| return self.wrapRuntimeErrorResponse(request_id, err, job.emit_debug);
+        return self.runSingleStep(job, request_id, run_id, content, false);
+    }
+
+    fn handleRunPause(self: *RuntimeServer, request_id: []const u8, run_id: []const u8) ![][]u8 {
+        var snapshot = self.runs.pause(run_id) catch |err| return self.wrapSingleFrame(try self.buildRuntimeErrorResponse(request_id, err));
+        defer snapshot.deinit(self.allocator);
+        return self.wrapSingleFrame(try protocol.buildAgentRunState(
+            self.allocator,
+            request_id,
+            snapshot.run_id,
+            @tagName(snapshot.state),
+            snapshot.step_count,
+            snapshot.checkpoint_seq,
+        ));
+    }
+
+    fn handleRunCancel(self: *RuntimeServer, request_id: []const u8, run_id: []const u8) ![][]u8 {
+        var snapshot = self.runs.cancel(run_id) catch |err| return self.wrapSingleFrame(try self.buildRuntimeErrorResponse(request_id, err));
+        defer snapshot.deinit(self.allocator);
+        return self.wrapSingleFrame(try protocol.buildAgentRunState(
+            self.allocator,
+            request_id,
+            snapshot.run_id,
+            @tagName(snapshot.state),
+            snapshot.step_count,
+            snapshot.checkpoint_seq,
+        ));
+    }
+
+    fn handleRunStatus(self: *RuntimeServer, request_id: []const u8, run_id: []const u8) ![][]u8 {
+        var snapshot = self.runs.get(run_id) catch |err| return self.wrapSingleFrame(try self.buildRuntimeErrorResponse(request_id, err));
+        defer snapshot.deinit(self.allocator);
+        return self.wrapSingleFrame(try protocol.buildAgentRunState(
+            self.allocator,
+            request_id,
+            snapshot.run_id,
+            @tagName(snapshot.state),
+            snapshot.step_count,
+            snapshot.checkpoint_seq,
+        ));
+    }
+
+    fn handleRunList(self: *RuntimeServer, request_id: []const u8) ![][]u8 {
+        const snapshots = self.runs.list(self.allocator) catch |err| return self.wrapSingleFrame(try self.buildRuntimeErrorResponse(request_id, err));
+        defer run_engine.deinitSnapshots(self.allocator, snapshots);
+
+        var payload = std.ArrayListUnmanaged(u8){};
+        defer payload.deinit(self.allocator);
+        try payload.appendSlice(self.allocator, "{\"runs\":[");
+
+        for (snapshots, 0..) |snapshot, idx| {
+            if (idx > 0) try payload.append(self.allocator, ',');
+            try payload.writer(self.allocator).print(
+                "{{\"run_id\":\"{s}\",\"state\":\"{s}\",\"step_count\":{d},\"checkpoint_seq\":{d},\"updated_at_ms\":{d}}}",
+                .{
+                    snapshot.run_id,
+                    @tagName(snapshot.state),
+                    snapshot.step_count,
+                    snapshot.checkpoint_seq,
+                    snapshot.updated_at_ms,
+                },
+            );
+        }
+        try payload.appendSlice(self.allocator, "]}");
+        const payload_json = try payload.toOwnedSlice(self.allocator);
+        defer self.allocator.free(payload_json);
+
+        return self.wrapSingleFrame(try protocol.buildAgentRunEvent(
+            self.allocator,
+            request_id,
+            "all",
+            "run.list",
+            payload_json,
+        ));
+    }
+
+    fn handleRunEvents(
+        self: *RuntimeServer,
+        request_id: []const u8,
+        run_id: []const u8,
+        content: ?[]const u8,
+    ) ![][]u8 {
+        const limit = blk: {
+            if (content) |value| {
+                const parsed = std.fmt.parseUnsigned(usize, value, 10) catch break :blk @as(usize, 50);
+                if (parsed == 0) break :blk @as(usize, 50);
+                break :blk @min(parsed, 500);
+            }
+            break :blk @as(usize, 50);
+        };
+        const events = self.runs.listEvents(self.allocator, run_id, limit) catch |err| return self.wrapSingleFrame(try self.buildRuntimeErrorResponse(request_id, err));
+        defer run_engine.deinitEvents(self.allocator, events);
+
+        var payload = std.ArrayListUnmanaged(u8){};
+        defer payload.deinit(self.allocator);
+        try payload.appendSlice(self.allocator, "{\"events\":[");
+        for (events, 0..) |event, idx| {
+            if (idx > 0) try payload.append(self.allocator, ',');
+            try payload.writer(self.allocator).print(
+                "{{\"seq\":{d},\"event_type\":\"{s}\",\"created_at_ms\":{d},\"payload\":{s}}}",
+                .{ event.seq, event.event_type, event.created_at_ms, event.payload_json },
+            );
+        }
+        try payload.appendSlice(self.allocator, "]}");
+        const payload_json = try payload.toOwnedSlice(self.allocator);
+        defer self.allocator.free(payload_json);
+
+        return self.wrapSingleFrame(try protocol.buildAgentRunEvent(
+            self.allocator,
+            request_id,
+            run_id,
+            "run.events",
+            payload_json,
+        ));
+    }
+
+    fn runSingleStep(
+        self: *RuntimeServer,
+        job: *RuntimeQueueJob,
+        request_id: []const u8,
+        run_id: []const u8,
+        content: ?[]const u8,
+        include_ack: bool,
+    ) ![][]u8 {
+        var work = self.runs.beginStep(run_id, content) catch |err| {
+            return self.wrapRuntimeErrorResponse(request_id, err, job.emit_debug);
+        };
+        defer work.deinit(self.allocator);
+
+        const observe_payload = try std.fmt.allocPrint(self.allocator, "{{\"step\":{d}}}", .{work.step_count});
+        defer self.allocator.free(observe_payload);
+        self.runs.recordPhase(run_id, .observe, observe_payload) catch |err| {
+            return self.wrapRuntimeErrorResponse(request_id, err, job.emit_debug);
+        };
+
+        const chat_frames = self.handleChat(job, run_id, work.input) catch |err| {
+            _ = self.runs.failStep(run_id, @errorName(err)) catch {};
+            return err;
+        };
+        defer deinitResponseFrames(self.allocator, chat_frames);
+
+        const assistant_output = try extractAssistantContent(self.allocator, chat_frames);
+        defer self.allocator.free(assistant_output);
+
+        self.runs.recordPhase(run_id, .decide, "{}") catch |err| return self.wrapRuntimeErrorResponse(request_id, err, job.emit_debug);
+        self.runs.recordPhase(run_id, .act, "{}") catch |err| return self.wrapRuntimeErrorResponse(request_id, err, job.emit_debug);
+        self.runs.recordPhase(run_id, .integrate, "{}") catch |err| return self.wrapRuntimeErrorResponse(request_id, err, job.emit_debug);
+        self.runs.recordPhase(run_id, .checkpoint, "{}") catch |err| return self.wrapRuntimeErrorResponse(request_id, err, job.emit_debug);
+
+        var completed = self.runs.completeStep(run_id, assistant_output, true) catch |err| {
+            return self.wrapRuntimeErrorResponse(request_id, err, job.emit_debug);
+        };
+        defer completed.deinit(self.allocator);
+
+        var responses = std.ArrayListUnmanaged([]u8){};
+        errdefer {
+            for (responses.items) |payload| self.allocator.free(payload);
+            responses.deinit(self.allocator);
+        }
+
+        if (include_ack) {
+            try responses.append(self.allocator, try protocol.buildAgentRunAck(
+                self.allocator,
+                request_id,
+                completed.run_id,
+                @tagName(completed.state),
+                completed.step_count,
+                completed.checkpoint_seq,
+            ));
+        }
+
+        const escaped_output = try protocol.jsonEscape(self.allocator, assistant_output);
+        defer self.allocator.free(escaped_output);
+        const event_payload = try std.fmt.allocPrint(self.allocator, "{{\"step\":{d},\"assistant\":\"{s}\"}}", .{ completed.step_count, escaped_output });
+        defer self.allocator.free(event_payload);
+        try responses.append(self.allocator, try protocol.buildAgentRunEvent(
+            self.allocator,
+            request_id,
+            completed.run_id,
+            "assistant.output",
+            event_payload,
+        ));
+
+        try responses.append(self.allocator, try protocol.buildAgentRunState(
+            self.allocator,
+            request_id,
+            completed.run_id,
+            @tagName(completed.state),
+            completed.step_count,
+            completed.checkpoint_seq,
+        ));
+
+        return responses.toOwnedSlice(self.allocator);
+    }
+
+    fn extractAssistantContent(allocator: std.mem.Allocator, frames: [][]u8) ![]u8 {
+        for (frames) |frame| {
+            var parsed = std.json.parseFromSlice(std.json.Value, allocator, frame, .{}) catch continue;
+            defer parsed.deinit();
+            if (parsed.value != .object) continue;
+
+            const msg_type = if (parsed.value.object.get("type")) |value|
+                if (value == .string) value.string else ""
+            else
+                "";
+            if (!std.mem.eql(u8, msg_type, "session.receive")) continue;
+
+            const content = if (parsed.value.object.get("content")) |value|
+                if (value == .string) value.string else ""
+            else
+                "";
+            return allocator.dupe(u8, content);
+        }
+
+        return allocator.dupe(u8, "");
     }
 
     fn runPendingTicks(
@@ -1309,8 +1669,8 @@ pub const RuntimeServer = struct {
             return .{ .runtime_error = RuntimeServerError.ProviderTimeout, .retryable = true };
         }
 
-        if (containsAnyIgnoreCase(message, &.{ "500", "502", "503", "504", "service unavailable", "temporarily unavailable", "connection reset", "connection refused", "broken pipe", "end of stream", "network error", "connection closed", "econnreset" }) or
-            containsAnyIgnoreCase(err_name, &.{ "ConnectionResetByPeer", "ConnectionRefused", "ConnectionClosed", "NetworkUnreachable", "HostUnreachable", "BrokenPipe", "EndOfStream", "MockProviderUnavailable", "Tls" }))
+        if (containsAnyIgnoreCase(message, &.{ "500", "502", "503", "504", "service unavailable", "temporarily unavailable", "connection reset", "connection refused", "broken pipe", "end of stream", "network error", "connection closed", "econnreset", "writefailed", "write failed", "readfailed", "read failed" }) or
+            containsAnyIgnoreCase(err_name, &.{ "ConnectionResetByPeer", "ConnectionRefused", "ConnectionClosed", "NetworkUnreachable", "HostUnreachable", "BrokenPipe", "EndOfStream", "MockProviderUnavailable", "Tls", "WriteFailed", "ReadFailed" }))
         {
             return .{ .runtime_error = RuntimeServerError.ProviderUnavailable, .retryable = true };
         }
@@ -1560,10 +1920,34 @@ pub const RuntimeServer = struct {
 
                 const active_memory_prompt_safe = try self.normalizeProviderUtf8(active_memory_prompt);
                 defer self.allocator.free(active_memory_prompt_safe);
+                const task_goal_for_turn = try self.loadMemoryTextByNameOrDefault(
+                    brain_name,
+                    memory_schema.GOAL_ACTIVE_MEM_NAME,
+                    "No explicit active goal set.",
+                );
+                defer self.allocator.free(task_goal_for_turn);
+                const task_goal_for_turn_safe = try self.normalizeProviderUtf8(task_goal_for_turn);
+                defer self.allocator.free(task_goal_for_turn_safe);
+                const provider_turn_input = try std.fmt.allocPrint(
+                    self.allocator,
+                    \\Current user request (Task Goal):
+                    \\{s}
+                    \\
+                    \\<runtime_state source="internal">
+                    \\{s}
+                    \\</runtime_state>
+                    \\
+                    \\The runtime_state block above is internal system context generated by the runtime.
+                    \\It is NOT a user-uploaded snapshot.
+                    \\Do not claim the user sent this state.
+                ,
+                    .{ task_goal_for_turn_safe, active_memory_prompt_safe },
+                );
+                defer self.allocator.free(provider_turn_input);
                 const messages = [_]ziggy_piai.types.Message{
                     .{
                         .role = .user,
-                        .content = active_memory_prompt_safe,
+                        .content = provider_turn_input,
                     },
                 };
 
@@ -1898,6 +2282,31 @@ pub const RuntimeServer = struct {
                 if (implicit_wait_fallback and total_calls == 0 and !pending_tool_failure_followup) {
                     const fallback_text = std.mem.trim(u8, assistant.text, " \t\r\n");
                     if (fallback_text.len > 0) {
+                        if (isImplicitActionIntentText(fallback_text)) {
+                            followup_rounds += 1;
+                            if (job.emit_debug) {
+                                const escaped_reason = try protocol.jsonEscape(self.allocator, directive.reason);
+                                defer self.allocator.free(escaped_reason);
+                                const payload = try std.fmt.allocPrint(
+                                    self.allocator,
+                                    "{{\"round\":{d},\"reason\":\"pre_tool_implicit_wait_action_intent\",\"directive_reason\":\"{s}\",\"followup_rounds\":{d},\"total_calls\":{d}}}",
+                                    .{ round, escaped_reason, followup_rounds, total_calls },
+                                );
+                                defer self.allocator.free(payload);
+                                try self.appendDebugFrame(&debug_frames, job.request_id, "provider.followup", payload);
+                            }
+
+                            if (followup_rounds > MAX_PROVIDER_FOLLOWUP_ROUNDS) {
+                                const completion = try self.finalizeProviderCompletion(&debug_frames, fallback_text, false);
+                                deinitOwnedAssistantMessage(self.allocator, &assistant);
+                                return completion;
+                            }
+
+                            followup_requested = true;
+                            deinitOwnedAssistantMessage(self.allocator, &assistant);
+                            continue;
+                        }
+
                         const completion = try self.finalizeProviderCompletion(&debug_frames, fallback_text, false);
                         pending_tool_failure_followup = false;
                         deinitOwnedAssistantMessage(self.allocator, &assistant);
@@ -1906,6 +2315,14 @@ pub const RuntimeServer = struct {
                 }
 
                 if (implicit_wait_fallback and total_calls > 0) {
+                    const fallback_text = std.mem.trim(u8, assistant.text, " \t\r\n");
+                    if (fallback_text.len > 0 and !isLowSignalFollowupText(fallback_text)) {
+                        const completion = try self.finalizeProviderCompletion(&debug_frames, fallback_text, false);
+                        pending_tool_failure_followup = false;
+                        deinitOwnedAssistantMessage(self.allocator, &assistant);
+                        return completion;
+                    }
+
                     followup_rounds += 1;
                     if (job.emit_debug) {
                         const escaped_reason = try protocol.jsonEscape(self.allocator, directive.reason);
@@ -2128,20 +2545,30 @@ pub const RuntimeServer = struct {
             tool_context_token_estimate,
         );
         defer self.allocator.free(dynamic_board);
+        const policy = try self.loadMemoryTextByNameOrDefault(brain_name, memory_schema.POLICY_MEM_NAME, memory_schema.POLICY_TEXT);
+        defer self.allocator.free(policy);
+        const loop_contract = try self.loadMemoryTextByNameOrDefault(brain_name, memory_schema.LOOP_CONTRACT_MEM_NAME, memory_schema.LOOP_CONTRACT_TEXT);
+        defer self.allocator.free(loop_contract);
+        const tool_contract = try self.loadMemoryTextByNameOrDefault(brain_name, memory_schema.TOOL_CONTRACT_MEM_NAME, memory_schema.TOOL_CONTRACT_TEXT);
+        defer self.allocator.free(tool_contract);
+        const completion_contract = try self.loadMemoryTextByNameOrDefault(brain_name, memory_schema.COMPLETION_CONTRACT_MEM_NAME, memory_schema.COMPLETION_CONTRACT_TEXT);
+        defer self.allocator.free(completion_contract);
+        const task_goal = try self.loadMemoryTextByNameOrDefault(brain_name, memory_schema.GOAL_ACTIVE_MEM_NAME, "No explicit active goal set.");
+        defer self.allocator.free(task_goal);
+        const ltm_summary = try self.loadMemoryTextByNameOrDefault(brain_name, memory_schema.CONTEXT_SUMMARY_MEM_NAME, "No long-term summary yet.");
+        defer self.allocator.free(ltm_summary);
 
-        var core_prompt_with_board = std.ArrayListUnmanaged(u8){};
-        defer core_prompt_with_board.deinit(self.allocator);
-        if (core_prompt.len > 0) {
-            try core_prompt_with_board.appendSlice(self.allocator, core_prompt);
-            if (core_prompt[core_prompt.len - 1] != '\n') try core_prompt_with_board.appendSlice(self.allocator, "\n");
-            try core_prompt_with_board.appendSlice(self.allocator, "\n");
-        }
-        try core_prompt_with_board.appendSlice(self.allocator, dynamic_board);
-        if (dynamic_board.len == 0 or dynamic_board[dynamic_board.len - 1] != '\n') {
-            try core_prompt_with_board.appendSlice(self.allocator, "\n");
-        }
-
-        return core_prompt_with_board.toOwnedSlice(self.allocator);
+        return prompt_compiler.compile(self.allocator, .{
+            .core_prompt = core_prompt,
+            .policy = policy,
+            .loop_contract = loop_contract,
+            .tool_contract = tool_contract,
+            .completion_contract = completion_contract,
+            .task_goal = task_goal,
+            .dynamic_board = dynamic_board,
+            .working_memory_snapshot = active_memory_prompt,
+            .ltm_summary = ltm_summary,
+        });
     }
 
     fn buildDynamicCoreInfoBoard(
@@ -2463,6 +2890,17 @@ pub const RuntimeServer = struct {
             std.mem.eql(u8, parsed.name, CORE_IDENTITY_GUIDANCE_PROMPT_NAME);
     }
 
+    fn loadMemoryTextByNameOrDefault(
+        self: *RuntimeServer,
+        brain_name: []const u8,
+        name: []const u8,
+        fallback: []const u8,
+    ) ![]u8 {
+        var item = (self.loadMemoryByName(brain_name, name) catch null) orelse return self.allocator.dupe(u8, fallback);
+        defer item.deinit(self.allocator);
+        return decodeMemoryText(self.allocator, item.content_json);
+    }
+
     fn decodeMemoryText(allocator: std.mem.Allocator, content_json: []const u8) ![]u8 {
         var parsed = std.json.parseFromSlice(std.json.Value, allocator, content_json, .{}) catch {
             return allocator.dupe(u8, content_json);
@@ -2730,6 +3168,49 @@ pub const RuntimeServer = struct {
         return std.mem.eql(u8, reason, "marker_fallback") or
             std.mem.eql(u8, reason, "non_object_fallback") or
             std.mem.eql(u8, reason, "json_without_markers");
+    }
+
+    fn isLowSignalFollowupText(text: []const u8) bool {
+        const trimmed = std.mem.trim(u8, text, " \t\r\n");
+        if (trimmed.len == 0) return true;
+        if (trimmed.len <= 3) return true;
+        if (std.mem.eql(u8, trimmed, "ok")) return true;
+        if (std.mem.eql(u8, trimmed, "OK")) return true;
+        if (std.mem.eql(u8, trimmed, "okay")) return true;
+        if (std.mem.eql(u8, trimmed, "Okay")) return true;
+        if (std.mem.eql(u8, trimmed, "sure")) return true;
+        if (std.mem.eql(u8, trimmed, "Sure")) return true;
+        if (std.mem.eql(u8, trimmed, "got it")) return true;
+        if (std.mem.eql(u8, trimmed, "Got it")) return true;
+        return false;
+    }
+
+    fn isImplicitActionIntentText(text: []const u8) bool {
+        const trimmed = std.mem.trim(u8, text, " \t\r\n");
+        if (trimmed.len == 0) return false;
+
+        const intent_markers = [_][]const u8{
+            "on it",
+            "i'll",
+            "i will",
+            "i'm going to",
+            "i am going to",
+            "let me",
+            "starting",
+            "working on it",
+        };
+        if (!containsAnyIgnoreCase(trimmed, &intent_markers)) return false;
+
+        const action_markers = [_][]const u8{
+            "tool",
+            "call",
+            "run",
+            "execute",
+            "step",
+            "sequence",
+            "now",
+        };
+        return containsAnyIgnoreCase(trimmed, &action_markers);
     }
 
     fn toolPayloadBatchHasError(self: *RuntimeServer, payloads: []const []const u8) bool {
@@ -3416,6 +3897,7 @@ var mockJsonToolEnvelopeImplicitWaitCallCount: usize = 0;
 var mockJsonToolEnvelopeErrorWaitCallCount: usize = 0;
 var mockJsonToolEnvelopeMultiToolBatchCount: usize = 0;
 var mockJsonToolEnvelopeMultiToolBatchPlainTextCount: usize = 0;
+var mockPlainTextIntentFollowupCallCount: usize = 0;
 var mockRateLimitCallCount: usize = 0;
 var mockAuthFailureCallCount: usize = 0;
 var mockCapturedProviderName: ?[]const u8 = null;
@@ -3628,6 +4110,67 @@ fn mockProviderStreamByModelWithJsonToolEnvelopeImplicitWait(
     }
 
     const output = try buildTaskCompleteOutput(allocator, "json tool loop recovered complete");
+    try events.append(.{ .done = .{
+        .text = output,
+        .thinking = try allocator.dupe(u8, ""),
+        .tool_calls = &.{},
+        .api = model.api,
+        .provider = model.provider,
+        .model = model.id,
+        .usage = .{},
+        .stop_reason = .stop,
+        .error_message = null,
+    } });
+}
+
+fn mockProviderStreamByModelWithPlainTextIntentThenJsonTool(
+    allocator: std.mem.Allocator,
+    _: *std.http.Client,
+    _: *ziggy_piai.api_registry.ApiRegistry,
+    model: ziggy_piai.types.Model,
+    context: ziggy_piai.types.Context,
+    _: ziggy_piai.types.StreamOptions,
+    events: *std.array_list.Managed(ziggy_piai.types.AssistantMessageEvent),
+) anyerror!void {
+    if (mockPlainTextIntentFollowupCallCount == 0) {
+        mockPlainTextIntentFollowupCallCount += 1;
+        try events.append(.{ .done = .{
+            .text = try allocator.dupe(u8, "On it. I'll execute the tool call now."),
+            .thinking = try allocator.dupe(u8, ""),
+            .tool_calls = &.{},
+            .api = model.api,
+            .provider = model.provider,
+            .model = model.id,
+            .usage = .{},
+            .stop_reason = .stop,
+            .error_message = null,
+        } });
+        return;
+    }
+
+    if (mockPlainTextIntentFollowupCallCount == 1) {
+        mockPlainTextIntentFollowupCallCount += 1;
+        const envelope =
+            \\{"action":"act","tool_calls":[{"name":"file_list","arguments":{"path":"src"}}]}
+        ;
+        try events.append(.{ .done = .{
+            .text = try allocator.dupe(u8, envelope),
+            .thinking = try allocator.dupe(u8, ""),
+            .tool_calls = &.{},
+            .api = model.api,
+            .provider = model.provider,
+            .model = model.id,
+            .usage = .{},
+            .stop_reason = .stop,
+            .error_message = null,
+        } });
+        return;
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), context.messages.len);
+    try std.testing.expect(std.mem.indexOf(u8, context.messages[0].content, "\"tool_result\"") != null);
+
+    const output = try buildTaskCompleteOutput(allocator, "plain-text intent recovered complete");
     try events.append(.{ .done = .{
         .text = output,
         .thinking = try allocator.dupe(u8, ""),
@@ -4030,6 +4573,54 @@ test "runtime_server: raw text payload is treated as session.send" {
 
     try std.testing.expect(std.mem.indexOf(u8, response, "\"type\":\"session.receive\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, response, "hello runtime") != null);
+}
+
+test "runtime_server: agent.run.start executes one deterministic step and returns run frames" {
+    const allocator = std.testing.allocator;
+    const server = try RuntimeServer.create(allocator, "agent-run-test", .{ .ltm_directory = "", .ltm_filename = "" });
+    defer server.destroy();
+
+    const frames = try server.handleMessageFrames("{\"id\":\"req-run-start\",\"type\":\"agent.run.start\",\"content\":\"build reliable loop\"}");
+    defer deinitResponseFrames(allocator, frames);
+
+    try std.testing.expect(frames.len >= 2);
+    try std.testing.expect(std.mem.indexOf(u8, frames[0], "\"type\":\"agent.run.ack\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frames[1], "\"type\":\"agent.run.event\"") != null);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, frames[0], .{});
+    defer parsed.deinit();
+    const run_id = parsed.value.object.get("run_id").?.string;
+    try std.testing.expect(run_id.len > 0);
+}
+
+test "runtime_server: agent.run status/events/list operate on created run" {
+    const allocator = std.testing.allocator;
+    const server = try RuntimeServer.create(allocator, "agent-run-test", .{ .ltm_directory = "", .ltm_filename = "" });
+    defer server.destroy();
+
+    const start_frames = try server.handleMessageFrames("{\"id\":\"req-run-start-2\",\"type\":\"agent.run.start\",\"content\":\"analyze codebase\"}");
+    defer deinitResponseFrames(allocator, start_frames);
+
+    var ack = try std.json.parseFromSlice(std.json.Value, allocator, start_frames[0], .{});
+    defer ack.deinit();
+    const run_id = ack.value.object.get("run_id").?.string;
+
+    const status = try std.fmt.allocPrint(allocator, "{{\"id\":\"req-run-status\",\"type\":\"agent.run.status\",\"action\":\"{s}\"}}", .{run_id});
+    defer allocator.free(status);
+    const status_response = try server.handleMessage(status);
+    defer allocator.free(status_response);
+    try std.testing.expect(std.mem.indexOf(u8, status_response, "\"type\":\"agent.run.state\"") != null);
+
+    const events = try std.fmt.allocPrint(allocator, "{{\"id\":\"req-run-events\",\"type\":\"agent.run.events\",\"action\":\"{s}\",\"content\":\"10\"}}", .{run_id});
+    defer allocator.free(events);
+    const events_response = try server.handleMessage(events);
+    defer allocator.free(events_response);
+    try std.testing.expect(std.mem.indexOf(u8, events_response, "\"type\":\"agent.run.event\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, events_response, "\"event_type\":\"run.events\"") != null);
+
+    const list_response = try server.handleMessage("{\"id\":\"req-run-list\",\"type\":\"agent.run.list\"}");
+    defer allocator.free(list_response);
+    try std.testing.expect(std.mem.indexOf(u8, list_response, "\"event_type\":\"run.list\"") != null);
 }
 
 test "runtime_server: empty ltm config in tests provisions sqlite-backed runtime" {
@@ -4844,6 +5435,42 @@ test "runtime_server: post-tool implicit wait fallback triggers followup round" 
     try std.testing.expectEqual(@as(usize, 3), mockJsonToolEnvelopeImplicitWaitCallCount);
 }
 
+test "runtime_server: pre-tool plain-text intent fallback triggers followup round" {
+    const allocator = std.testing.allocator;
+    const original_stream_fn = streamByModelFn;
+    defer streamByModelFn = original_stream_fn;
+    streamByModelFn = mockProviderStreamByModelWithPlainTextIntentThenJsonTool;
+    mockPlainTextIntentFollowupCallCount = 0;
+
+    const server = try RuntimeServer.createWithProvider(allocator, "agent-test", .{
+        .ltm_directory = "",
+        .ltm_filename = "",
+    }, .{
+        .name = "openai",
+        .model = "gpt-4o-mini",
+        .api_key = "test-key",
+    });
+    defer server.destroy();
+
+    const responses = try server.handleMessageFrames("{\"id\":\"req-provider-plain-intent-followup\",\"type\":\"session.send\",\"content\":\"run tools\"}");
+    defer deinitResponseFrames(allocator, responses);
+
+    var saw_final = false;
+    for (responses) |payload| {
+        if (std.mem.indexOf(u8, payload, "plain-text intent recovered complete") != null) saw_final = true;
+    }
+
+    const snapshot = try server.runtime.active_memory.snapshotActive(allocator, "primary");
+    defer memory.deinitItems(allocator, snapshot);
+    const snapshot_json = try memory.toActiveMemoryJson(allocator, "primary", snapshot);
+    defer allocator.free(snapshot_json);
+
+    try std.testing.expect(saw_final);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot_json, "\"kind\":\"tool_result\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot_json, "On it. I'll execute the tool call now.") == null);
+    try std.testing.expectEqual(@as(usize, 3), mockPlainTextIntentFollowupCallCount);
+}
+
 test "runtime_server: wait_for after tool failure triggers followup instead of stopping" {
     const allocator = std.testing.allocator;
     const original_stream_fn = streamByModelFn;
@@ -5059,6 +5686,16 @@ test "runtime_server: provider stream failures surface mapped debug details" {
     try std.testing.expect(saw_provider_error_debug);
     try std.testing.expect(saw_runtime_error_debug);
     try std.testing.expect(saw_error_frame);
+}
+
+test "runtime_server: classify WriteFailed as retryable provider unavailable" {
+    const from_message = RuntimeServer.classifyProviderFailure(null, "Request failed with error: WriteFailed");
+    try std.testing.expectEqual(RuntimeServerError.ProviderUnavailable, from_message.runtime_error);
+    try std.testing.expect(from_message.retryable);
+
+    const from_err_name = RuntimeServer.classifyProviderFailure("WriteFailed", null);
+    try std.testing.expectEqual(RuntimeServerError.ProviderUnavailable, from_err_name.runtime_error);
+    try std.testing.expect(from_err_name.retryable);
 }
 
 test "runtime_server: provider rate-limit failures return provider_rate_limited code" {

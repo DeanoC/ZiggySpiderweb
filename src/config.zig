@@ -30,6 +30,12 @@ pub const RuntimeConfig = struct {
     runtime_request_queue_max: usize = 128,
     chat_operation_timeout_ms: u64 = 120_000,
     control_operation_timeout_ms: u64 = 5_000,
+    run_checkpoint_interval_steps: usize = 1,
+    run_auto_resume_on_boot: bool = true,
+    tool_retry_max_attempts: usize = 3,
+    tool_lease_timeout_ms: u64 = 30_000,
+    max_inflight_tool_calls_per_run: usize = 1,
+    max_run_steps: usize = 1024,
     default_agent_id: []const u8 = "default",
     ltm_directory: []const u8 = ".spiderweb-ltm",
     ltm_filename: []const u8 = "runtime-memory.db",
@@ -48,6 +54,12 @@ pub const RuntimeConfig = struct {
             .runtime_request_queue_max = self.runtime_request_queue_max,
             .chat_operation_timeout_ms = self.chat_operation_timeout_ms,
             .control_operation_timeout_ms = self.control_operation_timeout_ms,
+            .run_checkpoint_interval_steps = self.run_checkpoint_interval_steps,
+            .run_auto_resume_on_boot = self.run_auto_resume_on_boot,
+            .tool_retry_max_attempts = self.tool_retry_max_attempts,
+            .tool_lease_timeout_ms = self.tool_lease_timeout_ms,
+            .max_inflight_tool_calls_per_run = self.max_inflight_tool_calls_per_run,
+            .max_run_steps = self.max_run_steps,
             .default_agent_id = try allocator.dupe(u8, self.default_agent_id),
             .ltm_directory = try allocator.dupe(u8, self.ltm_directory),
             .ltm_filename = try allocator.dupe(u8, self.ltm_filename),
@@ -96,6 +108,12 @@ const default_config =
     \\    "runtime_request_queue_max": 128,
     \\    "chat_operation_timeout_ms": 120000,
     \\    "control_operation_timeout_ms": 5000,
+    \\    "run_checkpoint_interval_steps": 1,
+    \\    "run_auto_resume_on_boot": true,
+    \\    "tool_retry_max_attempts": 3,
+    \\    "tool_lease_timeout_ms": 30000,
+    \\    "max_inflight_tool_calls_per_run": 1,
+    \\    "max_run_steps": 1024,
     \\    "default_agent_id": "default",
     \\    "ltm_directory": ".spiderweb-ltm",
     \\    "ltm_filename": "runtime-memory.db",
@@ -134,6 +152,12 @@ pub fn init(allocator: std.mem.Allocator, config_path: ?[]const u8) !Config {
             .runtime_request_queue_max = 128,
             .chat_operation_timeout_ms = 120_000,
             .control_operation_timeout_ms = 5_000,
+            .run_checkpoint_interval_steps = 1,
+            .run_auto_resume_on_boot = true,
+            .tool_retry_max_attempts = 3,
+            .tool_lease_timeout_ms = 30_000,
+            .max_inflight_tool_calls_per_run = 1,
+            .max_run_steps = 1024,
             .default_agent_id = try allocator.dupe(u8, "default"),
             .ltm_directory = try allocator.dupe(u8, ".spiderweb-ltm"),
             .ltm_filename = try allocator.dupe(u8, "runtime-memory.db"),
@@ -310,6 +334,36 @@ pub fn load(self: *Config) !void {
                             self.runtime.control_operation_timeout_ms = @intCast(value.integer);
                         }
                     }
+                    if (runtime_val.object.get("run_checkpoint_interval_steps")) |value| {
+                        if (value == .integer and value.integer > 0) {
+                            self.runtime.run_checkpoint_interval_steps = @intCast(value.integer);
+                        }
+                    }
+                    if (runtime_val.object.get("run_auto_resume_on_boot")) |value| {
+                        if (value == .bool) {
+                            self.runtime.run_auto_resume_on_boot = value.bool;
+                        }
+                    }
+                    if (runtime_val.object.get("tool_retry_max_attempts")) |value| {
+                        if (value == .integer and value.integer > 0) {
+                            self.runtime.tool_retry_max_attempts = @intCast(value.integer);
+                        }
+                    }
+                    if (runtime_val.object.get("tool_lease_timeout_ms")) |value| {
+                        if (value == .integer and value.integer > 0) {
+                            self.runtime.tool_lease_timeout_ms = @intCast(value.integer);
+                        }
+                    }
+                    if (runtime_val.object.get("max_inflight_tool_calls_per_run")) |value| {
+                        if (value == .integer and value.integer > 0) {
+                            self.runtime.max_inflight_tool_calls_per_run = @intCast(value.integer);
+                        }
+                    }
+                    if (runtime_val.object.get("max_run_steps")) |value| {
+                        if (value == .integer and value.integer > 0) {
+                            self.runtime.max_run_steps = @intCast(value.integer);
+                        }
+                    }
                     if (runtime_val.object.get("default_agent_id")) |value| {
                         if (value == .string and value.string.len > 0) {
                             self.allocator.free(self.runtime.default_agent_id);
@@ -422,6 +476,18 @@ pub fn save(self: Config) !void {
     try file.writeAll(chat_timeout_line);
     const control_timeout_line = try std.fmt.bufPrint(&buf, "    \"control_operation_timeout_ms\": {d},\n", .{self.runtime.control_operation_timeout_ms});
     try file.writeAll(control_timeout_line);
+    const run_checkpoint_line = try std.fmt.bufPrint(&buf, "    \"run_checkpoint_interval_steps\": {d},\n", .{self.runtime.run_checkpoint_interval_steps});
+    try file.writeAll(run_checkpoint_line);
+    const run_auto_resume_line = try std.fmt.bufPrint(&buf, "    \"run_auto_resume_on_boot\": {},\n", .{self.runtime.run_auto_resume_on_boot});
+    try file.writeAll(run_auto_resume_line);
+    const retry_attempts_line = try std.fmt.bufPrint(&buf, "    \"tool_retry_max_attempts\": {d},\n", .{self.runtime.tool_retry_max_attempts});
+    try file.writeAll(retry_attempts_line);
+    const lease_timeout_line = try std.fmt.bufPrint(&buf, "    \"tool_lease_timeout_ms\": {d},\n", .{self.runtime.tool_lease_timeout_ms});
+    try file.writeAll(lease_timeout_line);
+    const inflight_line = try std.fmt.bufPrint(&buf, "    \"max_inflight_tool_calls_per_run\": {d},\n", .{self.runtime.max_inflight_tool_calls_per_run});
+    try file.writeAll(inflight_line);
+    const max_run_steps_line = try std.fmt.bufPrint(&buf, "    \"max_run_steps\": {d},\n", .{self.runtime.max_run_steps});
+    try file.writeAll(max_run_steps_line);
     const default_agent_line = try std.fmt.bufPrint(&buf, "    \"default_agent_id\": \"{s}\",\n", .{self.runtime.default_agent_id});
     try file.writeAll(default_agent_line);
     const ltm_dir_line = try std.fmt.bufPrint(&buf, "    \"ltm_directory\": \"{s}\",\n", .{self.runtime.ltm_directory});
@@ -497,6 +563,12 @@ test "Config defaults" {
     try std.testing.expectEqual(@as(usize, 128), config.runtime.runtime_request_queue_max);
     try std.testing.expectEqual(@as(u64, 120_000), config.runtime.chat_operation_timeout_ms);
     try std.testing.expectEqual(@as(u64, 5_000), config.runtime.control_operation_timeout_ms);
+    try std.testing.expectEqual(@as(usize, 1), config.runtime.run_checkpoint_interval_steps);
+    try std.testing.expect(config.runtime.run_auto_resume_on_boot);
+    try std.testing.expectEqual(@as(usize, 3), config.runtime.tool_retry_max_attempts);
+    try std.testing.expectEqual(@as(u64, 30_000), config.runtime.tool_lease_timeout_ms);
+    try std.testing.expectEqual(@as(usize, 1), config.runtime.max_inflight_tool_calls_per_run);
+    try std.testing.expectEqual(@as(usize, 1024), config.runtime.max_run_steps);
     try std.testing.expectEqualStrings("default", config.runtime.default_agent_id);
     try std.testing.expectEqualStrings(".spiderweb-ltm", config.runtime.ltm_directory);
 }
