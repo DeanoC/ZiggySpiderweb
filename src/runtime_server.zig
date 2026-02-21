@@ -484,32 +484,71 @@ pub const RuntimeServer = struct {
 
         return self.waitForJob(job, operation_class) catch |err| switch (err) {
             RuntimeServerError.RuntimeJobTimeout => {
-                return self.wrapSingleFrame(try protocol.buildErrorWithCode(
-                    self.allocator,
-                    request_id,
-                    .runtime_timeout,
-                    "runtime operation timeout",
-                ));
+                return self.wrapRuntimeTimeoutResponse(request_id, operation_class, emit_debug);
             },
             RuntimeServerError.MissingJobResponse => {
                 self.destroyJob(job);
-                return self.wrapSingleFrame(try protocol.buildErrorWithCode(
-                    self.allocator,
-                    request_id,
-                    .execution_failed,
-                    "runtime worker did not produce response",
-                ));
+                return self.wrapRuntimeErrorResponse(request_id, err, emit_debug);
             },
             else => {
                 self.destroyJob(job);
-                return self.wrapSingleFrame(try protocol.buildErrorWithCode(
-                    self.allocator,
-                    request_id,
-                    .execution_failed,
-                    @errorName(err),
-                ));
+                return self.wrapRuntimeErrorResponse(request_id, err, emit_debug);
             },
         };
+    }
+
+    fn wrapRuntimeTimeoutResponse(
+        self: *RuntimeServer,
+        request_id: []const u8,
+        operation_class: RuntimeOperationClass,
+        emit_debug: bool,
+    ) ![][]u8 {
+        const timeout_ms = self.operationTimeoutNs(operation_class) / std.time.ns_per_ms;
+        const queue_depth = self.runtimeQueueDepth();
+        std.log.warn(
+            "runtime operation timeout request={s} class={s} timeout_ms={d} queue_depth={d}",
+            .{ request_id, @tagName(operation_class), timeout_ms, queue_depth },
+        );
+
+        if (!emit_debug) {
+            return self.wrapSingleFrame(try protocol.buildErrorWithCode(
+                self.allocator,
+                request_id,
+                .runtime_timeout,
+                "runtime operation timeout",
+            ));
+        }
+
+        var responses = std.ArrayListUnmanaged([]u8){};
+        errdefer {
+            for (responses.items) |payload| self.allocator.free(payload);
+            responses.deinit(self.allocator);
+        }
+
+        const timeout_payload_json = try std.fmt.allocPrint(
+            self.allocator,
+            "{{\"error\":\"RuntimeJobTimeout\",\"operation_class\":\"{s}\",\"timeout_ms\":{d},\"queue_depth\":{d}}}",
+            .{ @tagName(operation_class), timeout_ms, queue_depth },
+        );
+        defer self.allocator.free(timeout_payload_json);
+        try self.appendDebugFrame(&responses, request_id, "runtime.timeout", timeout_payload_json);
+
+        const runtime_error_payload_json = "{\"error\":\"RuntimeJobTimeout\"}";
+        try self.appendDebugFrame(&responses, request_id, "runtime.error", runtime_error_payload_json);
+
+        try responses.append(self.allocator, try protocol.buildErrorWithCode(
+            self.allocator,
+            request_id,
+            .runtime_timeout,
+            "runtime operation timeout",
+        ));
+        return responses.toOwnedSlice(self.allocator);
+    }
+
+    fn runtimeQueueDepth(self: *RuntimeServer) usize {
+        self.queue_mutex.lock();
+        defer self.queue_mutex.unlock();
+        return self.runtime_jobs.items.len;
     }
 
     fn enqueueJob(self: *RuntimeServer, job: *RuntimeQueueJob) !bool {
@@ -5980,6 +6019,58 @@ test "runtime_server: timed out provider session.send does not enqueue runtime w
     defer allocator.free(snapshot_json);
     try std.testing.expect(std.mem.indexOf(u8, snapshot_json, "\"role\":\"user\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot_json, "hello provider") != null);
+}
+
+test "runtime_server: runtime operation timeout emits debug timeout frame when debug enabled" {
+    const allocator = std.testing.allocator;
+    const original_stream_fn = streamByModelFn;
+    defer streamByModelFn = original_stream_fn;
+    streamByModelFn = mockProviderStreamByModelSlow;
+
+    const server = try RuntimeServer.createWithProvider(allocator, "agent-timeout-debug", .{
+        .chat_operation_timeout_ms = 10,
+        .ltm_directory = "",
+        .ltm_filename = "",
+    }, .{
+        .name = "openai",
+        .model = "gpt-4o-mini",
+        .api_key = "test-key",
+    });
+    defer server.destroy();
+
+    const responses = try server.handleMessageFramesWithDebug(
+        "{\"id\":\"req-provider-timeout-debug\",\"type\":\"session.send\",\"content\":\"hello provider\"}",
+        true,
+    );
+    defer deinitResponseFrames(allocator, responses);
+
+    var saw_timeout_debug = false;
+    var saw_runtime_error_debug = false;
+    var saw_timeout_error = false;
+    for (responses) |payload| {
+        if (std.mem.indexOf(u8, payload, "\"type\":\"debug.event\"") != null and
+            std.mem.indexOf(u8, payload, "\"category\":\"runtime.timeout\"") != null)
+        {
+            saw_timeout_debug = true;
+            try std.testing.expect(std.mem.indexOf(u8, payload, "\"operation_class\":\"chat\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, payload, "\"timeout_ms\":10") != null);
+        }
+        if (std.mem.indexOf(u8, payload, "\"type\":\"debug.event\"") != null and
+            std.mem.indexOf(u8, payload, "\"category\":\"runtime.error\"") != null and
+            std.mem.indexOf(u8, payload, "RuntimeJobTimeout") != null)
+        {
+            saw_runtime_error_debug = true;
+        }
+        if (std.mem.indexOf(u8, payload, "\"type\":\"error\"") != null and
+            std.mem.indexOf(u8, payload, "\"code\":\"runtime_timeout\"") != null)
+        {
+            saw_timeout_error = true;
+        }
+    }
+
+    try std.testing.expect(saw_timeout_debug);
+    try std.testing.expect(saw_runtime_error_debug);
+    try std.testing.expect(saw_timeout_error);
 }
 
 test "runtime_server: talk enqueue failure does not leave pending runtime work" {
