@@ -213,12 +213,29 @@ pub const RunEngine = struct {
     }
 
     pub fn beginStep(self: *RunEngine, run_id: []const u8, inline_input: ?[]const u8) !StepWork {
+        return self.beginStepInternal(run_id, inline_input, false);
+    }
+
+    pub fn beginResumedStep(self: *RunEngine, run_id: []const u8, inline_input: ?[]const u8) !StepWork {
+        return self.beginStepInternal(run_id, inline_input, true);
+    }
+
+    fn beginStepInternal(
+        self: *RunEngine,
+        run_id: []const u8,
+        inline_input: ?[]const u8,
+        allow_paused: bool,
+    ) !StepWork {
         self.mutex.lock();
         defer self.mutex.unlock();
 
         const run = self.runs.getPtr(run_id) orelse return RunEngineError.RunNotFound;
 
-        if (run.state == .paused or run.state == .cancelled or run.state == .completed or run.state == .failed) {
+        if ((run.state == .paused and !allow_paused) or
+            run.state == .cancelled or
+            run.state == .completed or
+            run.state == .failed)
+        {
             return RunEngineError.InvalidState;
         }
 
@@ -231,11 +248,16 @@ pub const RunEngine = struct {
         if (run.pending_inputs.items.len == 0) return RunEngineError.NoPendingInput;
 
         const input = run.pending_inputs.orderedRemove(0);
+        const was_paused = run.state == .paused;
         if (run.last_input) |value| self.allocator.free(value);
         run.last_input = try self.allocator.dupe(u8, input);
         run.step_count += 1;
         run.state = .running;
         run.updated_at_ms = std.time.milliTimestamp();
+
+        if (was_paused) {
+            _ = try self.appendEventLocked(run_id, "run.resumed", "{}", run.updated_at_ms);
+        }
 
         const payload = try std.fmt.allocPrint(self.allocator, "{{\"step\":{d}}}", .{run.step_count});
         defer self.allocator.free(payload);
@@ -375,19 +397,24 @@ pub const RunEngine = struct {
         const available = run.events.items.len;
         const take = @min(available, limit);
         var out = try allocator.alloc(RunEventView, take);
+        var initialized: usize = 0;
         errdefer {
-            for (out) |*event| event.deinit(allocator);
+            for (out[0..initialized]) |*event| event.deinit(allocator);
             allocator.free(out);
         }
 
         const start_idx = available - take;
         for (run.events.items[start_idx..], 0..) |event, idx| {
+            const owned_event_type = try allocator.dupe(u8, event.event_type);
+            errdefer allocator.free(owned_event_type);
+            const owned_payload = try allocator.dupe(u8, event.payload_json);
             out[idx] = .{
                 .seq = event.seq,
-                .event_type = try allocator.dupe(u8, event.event_type),
-                .payload_json = try allocator.dupe(u8, event.payload_json),
+                .event_type = owned_event_type,
+                .payload_json = owned_payload,
                 .created_at_ms = event.created_at_ms,
             };
+            initialized += 1;
         }
 
         return out;
@@ -771,4 +798,35 @@ test "run_engine: recovery keeps running runs when auto resume is enabled" {
     var snapshot = try restored.get(captured_run_id);
     defer snapshot.deinit(allocator);
     try std.testing.expectEqual(RunState.running, snapshot.state);
+}
+
+test "run_engine: listEvents returns out-of-memory without invalid deinit on partial copy" {
+    const allocator = std.testing.allocator;
+
+    const dir = try std.fmt.allocPrint(allocator, ".tmp-run-engine-events-oom-{d}", .{std.time.nanoTimestamp()});
+    defer allocator.free(dir);
+    defer std.fs.cwd().deleteTree(dir) catch {};
+    try std.fs.cwd().makePath(dir);
+
+    var mem_store = try ltm_store.VersionedMemStore.open(allocator, dir, "run.db");
+    defer mem_store.close();
+
+    var engine = try RunEngine.init(allocator, &mem_store, .{
+        .max_run_steps = 16,
+        .checkpoint_interval_steps = 1,
+    });
+    defer engine.deinit();
+
+    var started = try engine.start("events test");
+    defer started.deinit(allocator);
+
+    var step = try engine.beginStep(started.run_id, null);
+    defer step.deinit(allocator);
+    var completed = try engine.completeStep(started.run_id, "done", true);
+    defer completed.deinit(allocator);
+
+    var failing_state = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 2 });
+    const failing_allocator = failing_state.allocator();
+
+    try std.testing.expectError(error.OutOfMemory, engine.listEvents(failing_allocator, started.run_id, 2));
 }

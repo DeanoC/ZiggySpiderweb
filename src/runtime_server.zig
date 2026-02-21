@@ -1066,7 +1066,7 @@ pub const RuntimeServer = struct {
             return self.wrapRuntimeErrorResponse(request_id, err, job.emit_debug);
         };
         defer started.deinit(self.allocator);
-        return self.runSingleStep(job, request_id, started.run_id, null, true);
+        return self.runSingleStep(job, request_id, started.run_id, null, true, false);
     }
 
     fn handleRunStep(
@@ -1076,7 +1076,7 @@ pub const RuntimeServer = struct {
         run_id: []const u8,
         content: ?[]const u8,
     ) ![][]u8 {
-        return self.runSingleStep(job, request_id, run_id, content, false);
+        return self.runSingleStep(job, request_id, run_id, content, false, false);
     }
 
     fn handleRunResume(
@@ -1086,8 +1086,7 @@ pub const RuntimeServer = struct {
         run_id: []const u8,
         content: ?[]const u8,
     ) ![][]u8 {
-        _ = self.runs.resumeRun(run_id) catch |err| return self.wrapRuntimeErrorResponse(request_id, err, job.emit_debug);
-        return self.runSingleStep(job, request_id, run_id, content, false);
+        return self.runSingleStep(job, request_id, run_id, content, false, true);
     }
 
     fn handleRunPause(self: *RuntimeServer, request_id: []const u8, run_id: []const u8) ![][]u8 {
@@ -1210,8 +1209,9 @@ pub const RuntimeServer = struct {
         run_id: []const u8,
         content: ?[]const u8,
         include_ack: bool,
+        allow_paused_resume: bool,
     ) ![][]u8 {
-        var work = self.runs.beginStep(run_id, content) catch |err| {
+        var work = (if (allow_paused_resume) self.runs.beginResumedStep(run_id, content) else self.runs.beginStep(run_id, content)) catch |err| {
             return self.wrapRuntimeErrorResponse(request_id, err, job.emit_debug);
         };
         defer work.deinit(self.allocator);
@@ -4869,6 +4869,39 @@ test "runtime_server: run step fails and returns chat error frame when provider 
     const status = try server.handleMessage(status_req);
     defer allocator.free(status);
     try std.testing.expect(std.mem.indexOf(u8, status, "\"state\":\"failed\"") != null);
+}
+
+test "runtime_server: run resume without input keeps paused state" {
+    const allocator = std.testing.allocator;
+    const server = try RuntimeServer.create(allocator, "agent-run-resume", .{ .ltm_directory = "", .ltm_filename = "" });
+    defer server.destroy();
+
+    const start_frames = try server.handleMessageFrames("{\"id\":\"req-run-start-resume\",\"type\":\"agent.run.start\",\"content\":\"one step\"}");
+    defer deinitResponseFrames(allocator, start_frames);
+    try std.testing.expect(start_frames.len >= 1);
+
+    var ack = try std.json.parseFromSlice(std.json.Value, allocator, start_frames[0], .{});
+    defer ack.deinit();
+    const run_id = ack.value.object.get("run_id").?.string;
+
+    const pause_req = try std.fmt.allocPrint(allocator, "{{\"id\":\"req-run-pause-resume\",\"type\":\"agent.run.pause\",\"action\":\"{s}\"}}", .{run_id});
+    defer allocator.free(pause_req);
+    const pause_rsp = try server.handleMessage(pause_req);
+    defer allocator.free(pause_rsp);
+    try std.testing.expect(std.mem.indexOf(u8, pause_rsp, "\"state\":\"paused\"") != null);
+
+    const resume_req = try std.fmt.allocPrint(allocator, "{{\"id\":\"req-run-resume-empty\",\"type\":\"agent.run.resume\",\"action\":\"{s}\"}}", .{run_id});
+    defer allocator.free(resume_req);
+    const resume_rsp = try server.handleMessage(resume_req);
+    defer allocator.free(resume_rsp);
+    try std.testing.expect(std.mem.indexOf(u8, resume_rsp, "\"type\":\"error\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resume_rsp, "NoPendingInput") != null);
+
+    const status_req = try std.fmt.allocPrint(allocator, "{{\"id\":\"req-run-status-resume\",\"type\":\"agent.run.status\",\"action\":\"{s}\"}}", .{run_id});
+    defer allocator.free(status_req);
+    const status_rsp = try server.handleMessage(status_req);
+    defer allocator.free(status_rsp);
+    try std.testing.expect(std.mem.indexOf(u8, status_rsp, "\"state\":\"paused\"") != null);
 }
 
 test "runtime_server: empty ltm config in tests provisions sqlite-backed runtime" {
