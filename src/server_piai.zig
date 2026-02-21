@@ -34,11 +34,26 @@ const AgentRuntimeRegistry = struct {
         provider_config: ?Config.ProviderConfig,
         max_runtimes: usize,
     ) AgentRuntimeRegistry {
+        const configured_default = if (runtime_config.default_agent_id.len == 0)
+            runtime_server_mod.default_agent_id
+        else
+            runtime_config.default_agent_id;
+        const effective_default = if (isValidAgentId(configured_default))
+            configured_default
+        else
+            runtime_server_mod.default_agent_id;
+        if (!isValidAgentId(configured_default)) {
+            std.log.warn(
+                "Invalid default_agent_id '{s}', falling back to '{s}'",
+                .{ configured_default, effective_default },
+            );
+        }
+
         return .{
             .allocator = allocator,
             .runtime_config = runtime_config,
             .provider_config = provider_config,
-            .default_agent_id = if (runtime_config.default_agent_id.len == 0) runtime_server_mod.default_agent_id else runtime_config.default_agent_id,
+            .default_agent_id = effective_default,
             .max_runtimes = if (max_runtimes == 0) 1 else max_runtimes,
         };
     }
@@ -87,9 +102,10 @@ const AgentRuntimeRegistry = struct {
 
     fn isValidAgentId(agent_id: []const u8) bool {
         if (agent_id.len == 0 or agent_id.len > max_agent_id_len) return false;
+        if (std.mem.eql(u8, agent_id, ".")) return false;
         for (agent_id) |char| {
             if (std.ascii.isAlphanumeric(char)) continue;
-            if (char == '_' or char == '-' or char == '.') continue;
+            if (char == '_' or char == '-') continue;
             return false;
         }
         return true;
@@ -712,6 +728,16 @@ test "server_piai: parse route path extracts agent id" {
     try std.testing.expect(parseAgentIdFromStreamPath("/v1/agents/alpha/not-stream") == null);
     try std.testing.expect(AgentRuntimeRegistry.isValidAgentId("alpha-1"));
     try std.testing.expect(AgentRuntimeRegistry.isValidAgentId("agent_2"));
+    try std.testing.expect(!AgentRuntimeRegistry.isValidAgentId("."));
     try std.testing.expect(!AgentRuntimeRegistry.isValidAgentId("agent:bad"));
     try std.testing.expect(!AgentRuntimeRegistry.isValidAgentId(""));
+}
+
+test "server_piai: invalid configured default agent falls back to built-in default" {
+    const allocator = std.testing.allocator;
+    var cfg = Config.RuntimeConfig{};
+    cfg.default_agent_id = ".";
+
+    const registry = AgentRuntimeRegistry.initWithLimits(allocator, cfg, null, 8);
+    try std.testing.expectEqualStrings(runtime_server_mod.default_agent_id, registry.default_agent_id);
 }

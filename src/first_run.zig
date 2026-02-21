@@ -63,10 +63,15 @@ pub fn runFirstRun(allocator: std.mem.Allocator, args: []const []const u8) !void
     try configureCredentials(allocator, provider_name, non_interactive);
 
     // Step 3: Create first agent
+    var chosen_agent_name_owned: ?[]const u8 = null;
+    defer if (chosen_agent_name_owned) |value| allocator.free(value);
+
     const chosen_agent_name = if (non_interactive)
         agent_name_param orelse "ziggy"
-    else
-        try createAgentInteractive(agent_name_param);
+    else blk: {
+        chosen_agent_name_owned = try createAgentInteractive(allocator, agent_name_param);
+        break :blk chosen_agent_name_owned.?;
+    };
     const agent_name = normalizeAgentId(allocator, chosen_agent_name) catch |err| switch (err) {
         error.AgentIdTooLong => {
             std.log.err("Agent id must be at most {d} characters after normalization", .{max_agent_id_len});
@@ -114,9 +119,10 @@ pub fn runFirstRun(allocator: std.mem.Allocator, args: []const []const u8) !void
 
         if (!is_running) {
             try std.fs.File.stdout().writeAll("\nStart the server now? [Y/n]: ");
-            var buf: [8]u8 = undefined;
-            const n = try std.fs.File.stdin().read(buf[0..]);
-            if (n == 0 or (buf[0] != 'n' and buf[0] != 'N')) {
+            const line = try readLineTrimmedAlloc(allocator, 8);
+            defer if (line) |value| allocator.free(value);
+
+            if (line == null or line.?.len == 0 or (line.?[0] != 'n' and line.?[0] != 'N')) {
                 try std.fs.File.stdout().writeAll("\nStarting ZiggySpiderweb...\n");
 
                 // Check if systemd user service exists
@@ -169,52 +175,53 @@ fn selectProviderInteractive(allocator: std.mem.Allocator) !struct { []const u8,
 
     while (true) {
         try std.fs.File.stdout().writeAll("\nSelect [1-4]: ");
-        var buf: [16]u8 = undefined;
-        const n = try std.fs.File.stdin().read(buf[0..]);
-        if (n == 0) {
+        const choice_line = try readLineTrimmedAlloc(allocator, 16);
+        defer if (choice_line) |value| allocator.free(value);
+
+        if (choice_line == null) {
             // EOF - probably piped without input, use default
             return .{ "openai", "gpt-4o-mini" };
         }
 
-        const choice = std.mem.trim(u8, buf[0..n], " \r\n");
+        const choice = choice_line.?;
 
         if (std.mem.eql(u8, choice, "1")) {
-            return .{ "openai", try selectModel(&.{ "gpt-4o-mini", "gpt-4.1-mini" }) };
+            return .{ "openai", try selectModel(allocator, &.{ "gpt-4o-mini", "gpt-4.1-mini" }) };
         } else if (std.mem.eql(u8, choice, "2")) {
-            return .{ "openai-codex", try selectModel(&.{ "gpt-5.1-codex-mini", "gpt-5.1", "gpt-5.3-codex", "gpt-5.3-codex-spark" }) };
+            return .{ "openai-codex", try selectModel(allocator, &.{ "gpt-5.1-codex-mini", "gpt-5.1", "gpt-5.3-codex", "gpt-5.3-codex-spark" }) };
         } else if (std.mem.eql(u8, choice, "3")) {
-            return .{ "kimi-coding", try selectModel(&.{ "k2p5", "kimi-k2.5" }) };
+            return .{ "kimi-coding", try selectModel(allocator, &.{ "k2p5", "kimi-k2.5" }) };
         } else if (std.mem.eql(u8, choice, "4")) {
             try std.fs.File.stdout().writeAll("\nAvailable providers: openai, openai-codex, openai-codex-spark, kimi-coding\n");
             try std.fs.File.stdout().writeAll("Enter provider name: ");
-            var name_buf: [64]u8 = undefined;
-            const name_n = try std.fs.File.stdin().read(name_buf[0..]);
-            if (name_n == 0) continue;
+            const provider_name = try readLineTrimmedAlloc(allocator, 64);
+            defer if (provider_name) |value| allocator.free(value);
+            if (provider_name == null or provider_name.?.len == 0) continue;
 
             try std.fs.File.stdout().writeAll("Enter model name: ");
-            var model_buf: [64]u8 = undefined;
-            const model_n = try std.fs.File.stdin().read(model_buf[0..]);
+            const model_name = try readLineTrimmedAlloc(allocator, 64);
+            defer if (model_name) |value| allocator.free(value);
 
             return .{
-                try allocator.dupe(u8, std.mem.trim(u8, name_buf[0..name_n], " \r\n")),
-                if (model_n > 0) try allocator.dupe(u8, std.mem.trim(u8, model_buf[0..model_n], " \r\n")) else null,
+                try allocator.dupe(u8, provider_name.?),
+                if (model_name != null and model_name.?.len > 0) try allocator.dupe(u8, model_name.?) else null,
             };
         }
     }
 }
 
-fn selectModel(models: []const []const u8) !?[]const u8 {
+fn selectModel(allocator: std.mem.Allocator, models: []const []const u8) !?[]const u8 {
     try std.fs.File.stdout().writeAll("\nAvailable models:\n");
     for (models, 1..) |model, idx| {
         try print("  {d}) {s}\n", .{ idx, model });
     }
     try print("\nSelect [1-{d}]: ", .{models.len});
 
-    var buf: [16]u8 = undefined;
-    const n = try std.fs.File.stdin().read(buf[0..]);
-    if (n == 0) return models[0];
+    const choice_line = try readLineTrimmedAlloc(allocator, 16);
+    defer if (choice_line) |value| allocator.free(value);
+    if (choice_line == null or choice_line.?.len == 0) return models[0];
 
-    const choice = std.fmt.parseInt(usize, std.mem.trim(u8, buf[0..n], " \r\n"), 10) catch return models[0];
+    const choice = std.fmt.parseInt(usize, choice_line.?, 10) catch return models[0];
     if (choice < 1 or choice > models.len) return models[0];
 
     return models[choice - 1];
@@ -235,9 +242,9 @@ fn configureCredentials(allocator: std.mem.Allocator, provider_name: []const u8,
             try std.fs.File.stdout().writeAll("\nFound ~/.codex/auth.json - OAuth available\n");
             try std.fs.File.stdout().writeAll("Use Codex OAuth authentication? [Y/n]: ");
 
-            var buf: [8]u8 = undefined;
-            const n = try std.fs.File.stdin().read(buf[0..]);
-            if (n == 0 or (buf[0] != 'n' and buf[0] != 'N')) {
+            const line = try readLineTrimmedAlloc(allocator, 8);
+            defer if (line) |value| allocator.free(value);
+            if (line == null or line.?.len == 0 or (line.?[0] != 'n' and line.?[0] != 'N')) {
                 try std.fs.File.stdout().writeAll("Using Codex OAuth\n");
                 return;
             }
@@ -266,10 +273,9 @@ fn configureCredentials(allocator: std.mem.Allocator, provider_name: []const u8,
     try std.fs.File.stdout().writeAll("Your API key will be stored securely using secret-tool.\n\n");
     try std.fs.File.stdout().writeAll("Enter API key: ");
 
-    var key_buf: [256]u8 = undefined;
-    const key_n = try std.fs.File.stdin().read(key_buf[0..]);
-    if (key_n == 0) return;
-    const key = std.mem.trim(u8, key_buf[0..key_n], " \r\n");
+    const key = try readLineTrimmedAlloc(allocator, 256);
+    defer if (key) |value| allocator.free(value);
+    if (key == null or key.?.len == 0) return;
 
     if (!store.supportsSecureStorage()) {
         try std.fs.File.stdout().writeAll("\nWarning: No secure credential backend available.\n");
@@ -277,23 +283,54 @@ fn configureCredentials(allocator: std.mem.Allocator, provider_name: []const u8,
         return;
     }
 
-    try store.setProviderApiKey(provider_name, key);
+    try store.setProviderApiKey(provider_name, key.?);
     try std.fs.File.stdout().writeAll("API key stored securely\n");
 }
 
-fn createAgentInteractive(default_name: ?[]const u8) ![]const u8 {
+fn createAgentInteractive(allocator: std.mem.Allocator, default_name: ?[]const u8) ![]const u8 {
     try std.fs.File.stdout().writeAll("\n");
     try std.fs.File.stdout().writeAll("Name your first agent:\n");
     try print("  [default: {s}]: ", .{default_name orelse "ziggy"});
 
-    var buf: [64]u8 = undefined;
-    const n = try std.fs.File.stdin().read(buf[0..]);
-
-    if (n == 0) {
-        return default_name orelse "ziggy";
+    const line = try readLineTrimmedAlloc(allocator, 64);
+    if (line == null or line.?.len == 0) {
+        if (line) |value| allocator.free(value);
+        return allocator.dupe(u8, default_name orelse "ziggy");
     }
 
-    return std.mem.trim(u8, buf[0..n], " \r\n");
+    return line.?;
+}
+
+fn readLineTrimmedAlloc(allocator: std.mem.Allocator, max_len: usize) !?[]u8 {
+    var out = std.ArrayListUnmanaged(u8){};
+    errdefer out.deinit(allocator);
+
+    var saw_any = false;
+    var stdin = std.fs.File.stdin();
+    var byte: [1]u8 = undefined;
+    while (true) {
+        const n = try stdin.read(byte[0..]);
+        if (n == 0) break;
+        saw_any = true;
+
+        const ch = byte[0];
+        if (ch == '\n') break;
+        if (ch == '\r') continue;
+
+        if (out.items.len >= max_len) return error.InputTooLong;
+        try out.append(allocator, ch);
+    }
+
+    if (!saw_any and out.items.len == 0) return null;
+
+    const trimmed = std.mem.trim(u8, out.items, " \t");
+    if (trimmed.len == 0) {
+        out.deinit(allocator);
+        return try allocator.dupe(u8, "");
+    }
+    const dup = try allocator.dupe(u8, trimmed);
+    out.deinit(allocator);
+    return dup;
 }
 
 fn normalizeAgentId(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
@@ -306,7 +343,7 @@ fn normalizeAgentId(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
     var last_dash = false;
     for (trimmed) |ch| {
         const lower = std.ascii.toLower(ch);
-        if (std.ascii.isAlphanumeric(lower) or lower == '_' or lower == '-' or lower == '.') {
+        if (std.ascii.isAlphanumeric(lower) or lower == '_' or lower == '-') {
             try out.append(allocator, lower);
             last_dash = false;
             continue;

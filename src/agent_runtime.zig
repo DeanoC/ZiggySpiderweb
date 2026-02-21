@@ -11,6 +11,8 @@ const hook_registry = @import("hook_registry.zig");
 const system_hooks = @import("system_hooks.zig");
 const brain_specialization = @import("brain_specialization.zig");
 const Config = @import("config.zig");
+const transient_core_capabilities_key = "system:capabilities";
+const transient_core_identity_guidance_key = "system:identity_guidance";
 
 pub const RuntimeError = error{
     BrainNotFound,
@@ -525,6 +527,8 @@ pub const AgentRuntime = struct {
 
         var it = rom.entries.iterator();
         while (it.next()) |entry| {
+            if (isTransientCorePromptKey(entry.key_ptr.*)) continue;
+
             const core_kind = coreMemoryKindFromKey(entry.key_ptr.*);
             const core_name = try coreMemoryNameFromKey(self.allocator, entry.key_ptr.*);
             defer self.allocator.free(core_name);
@@ -597,6 +601,11 @@ pub const AgentRuntime = struct {
     fn coreMemoryKindFromKey(key: []const u8) []const u8 {
         if (std.mem.eql(u8, key, system_hooks.BASE_CORE_ROM_KEY)) return "core.base_prompt";
         return "core.system_prompt";
+    }
+
+    fn isTransientCorePromptKey(key: []const u8) bool {
+        return std.mem.eql(u8, key, transient_core_capabilities_key) or
+            std.mem.eql(u8, key, transient_core_identity_guidance_key);
     }
 
     fn isManagedCorePromptMemory(item: memory.ActiveMemoryItem) bool {

@@ -103,6 +103,23 @@ fn appendJsonEscaped(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(
     }
 }
 
+fn utf8SafePrefix(value: []const u8) []const u8 {
+    if (std.unicode.utf8ValidateSlice(value)) return value;
+    return value[0..longestValidUtf8PrefixLen(value)];
+}
+
+fn longestValidUtf8PrefixLen(value: []const u8) usize {
+    var i: usize = 0;
+    while (i < value.len) {
+        const seq_len = std.unicode.utf8ByteSequenceLength(value[i]) catch break;
+        const next = i + @as(usize, @intCast(seq_len));
+        if (next > value.len) break;
+        _ = std.unicode.utf8Decode(value[i..next]) catch break;
+        i = next;
+    }
+    return i;
+}
+
 fn shellQuoteSingle(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
     var out = std.ArrayListUnmanaged(u8){};
     errdefer out.deinit(allocator);
@@ -185,10 +202,21 @@ pub const BuiltinTools = struct {
         };
         const effective_max = @min(max_bytes, 8 * 1024 * 1024);
 
-        const content = std.fs.cwd().readFileAlloc(allocator, path, effective_max) catch |err| {
+        var file = std.fs.cwd().openFile(path, .{}) catch |err| {
             return fail(allocator, .execution_failed, @errorName(err));
         };
-        defer allocator.free(content);
+        defer file.close();
+
+        const file_size = file.getEndPos() catch 0;
+
+        const content_buffer = allocator.alloc(u8, effective_max) catch return fail(allocator, .execution_failed, "out of memory");
+        defer allocator.free(content_buffer);
+        const content_len = file.readAll(content_buffer) catch |err| {
+            return fail(allocator, .execution_failed, @errorName(err));
+        };
+        const raw_content = content_buffer[0..content_len];
+        const truncated = file_size > content_len;
+        const content = if (truncated) utf8SafePrefix(raw_content) else raw_content;
 
         var payload = std.ArrayListUnmanaged(u8){};
         errdefer payload.deinit(allocator);
@@ -197,6 +225,8 @@ pub const BuiltinTools = struct {
         appendJsonEscaped(allocator, &payload, path) catch return fail(allocator, .execution_failed, "out of memory");
         payload.appendSlice(allocator, "\",\"bytes\":") catch return fail(allocator, .execution_failed, "out of memory");
         payload.writer(allocator).print("{d}", .{content.len}) catch return fail(allocator, .execution_failed, "out of memory");
+        payload.appendSlice(allocator, ",\"truncated\":") catch return fail(allocator, .execution_failed, "out of memory");
+        payload.appendSlice(allocator, if (truncated) "true" else "false") catch return fail(allocator, .execution_failed, "out of memory");
         payload.appendSlice(allocator, ",\"content\":\"") catch return fail(allocator, .execution_failed, "out of memory");
         appendJsonEscaped(allocator, &payload, content) catch return fail(allocator, .execution_failed, "out of memory");
         payload.appendSlice(allocator, "\"}") catch return fail(allocator, .execution_failed, "out of memory");
@@ -507,6 +537,48 @@ fn testFileWriteReadImpl(allocator: std.mem.Allocator, _: []const u8) !void {
 
 test "tool_executor: file_write then file_read roundtrip" {
     try inTempCwd(std.testing.allocator, testFileWriteReadImpl);
+}
+
+fn testFileReadMaxBytesImpl(allocator: std.mem.Allocator, _: []const u8) !void {
+    try std.fs.cwd().writeFile(.{ .sub_path = "big.txt", .data = "abcdefghij" });
+
+    var read_parsed = try std.json.parseFromSlice(std.json.Value, allocator, "{\"path\":\"big.txt\",\"max_bytes\":4}", .{});
+    defer read_parsed.deinit();
+
+    var read_result = BuiltinTools.fileRead(allocator, read_parsed.value.object);
+    defer read_result.deinit(allocator);
+
+    try std.testing.expect(read_result == .success);
+    try std.testing.expect(std.mem.indexOf(u8, read_result.success.payload_json, "\"bytes\":4") != null);
+    try std.testing.expect(std.mem.indexOf(u8, read_result.success.payload_json, "\"truncated\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, read_result.success.payload_json, "\"content\":\"abcd\"") != null);
+}
+
+test "tool_executor: file_read max_bytes returns partial content" {
+    try inTempCwd(std.testing.allocator, testFileReadMaxBytesImpl);
+}
+
+fn testFileReadMaxBytesUtf8BoundaryImpl(allocator: std.mem.Allocator, _: []const u8) !void {
+    try std.fs.cwd().writeFile(.{ .sub_path = "utf8.txt", .data = "abc\xe2\x82\xacdef" });
+
+    var read_parsed = try std.json.parseFromSlice(std.json.Value, allocator, "{\"path\":\"utf8.txt\",\"max_bytes\":5}", .{});
+    defer read_parsed.deinit();
+
+    var read_result = BuiltinTools.fileRead(allocator, read_parsed.value.object);
+    defer read_result.deinit(allocator);
+
+    try std.testing.expect(read_result == .success);
+    try std.testing.expect(std.mem.indexOf(u8, read_result.success.payload_json, "\"truncated\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, read_result.success.payload_json, "\"bytes\":3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, read_result.success.payload_json, "\"content\":\"abc\"") != null);
+
+    var payload_parsed = try std.json.parseFromSlice(std.json.Value, allocator, read_result.success.payload_json, .{});
+    defer payload_parsed.deinit();
+    try std.testing.expect(payload_parsed.value == .object);
+}
+
+test "tool_executor: file_read max_bytes keeps truncated output utf8-safe" {
+    try inTempCwd(std.testing.allocator, testFileReadMaxBytesUtf8BoundaryImpl);
 }
 
 fn testFileListImpl(allocator: std.mem.Allocator, _: []const u8) !void {
