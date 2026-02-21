@@ -2673,6 +2673,17 @@ pub const RuntimeServer = struct {
                     return completion;
                 }
 
+                if (directive.action == .wait_for_user) {
+                    const wait_text = if (directive.message) |message|
+                        message
+                    else
+                        std.mem.trim(u8, assistant.text, " \t\r\n");
+                    const completion = try self.finalizeProviderCompletion(&debug_frames, wait_text, true, false);
+                    pending_tool_failure_followup = false;
+                    deinitOwnedAssistantMessage(self.allocator, &assistant);
+                    return completion;
+                }
+
                 pending_tool_failure_followup = false;
                 deinitOwnedAssistantMessage(self.allocator, &assistant);
                 return self.finalizeProviderCompletion(&debug_frames, "", true, false);
@@ -3311,7 +3322,8 @@ pub const RuntimeServer = struct {
             return .{ .action = .task_complete, .message = message, .reason = "task_complete_marker" };
         }
         if (message != null) {
-            return .{ .action = .task_complete, .message = message, .reason = "message_field" };
+            // Message-only JSON is an intent preamble, not a terminal completion signal.
+            return .{ .action = .followup_needed, .message = message, .reason = "message_field" };
         }
 
         return .{ .action = .wait_for_user, .reason = "json_without_markers" };
@@ -4153,6 +4165,7 @@ var mockJsonToolEnvelopeErrorWaitCallCount: usize = 0;
 var mockJsonToolEnvelopeMultiToolBatchCount: usize = 0;
 var mockJsonToolEnvelopeMultiToolBatchPlainTextCount: usize = 0;
 var mockPlainTextIntentFollowupCallCount: usize = 0;
+var mockJsonMessageOnlyFollowupCallCount: usize = 0;
 var mockRateLimitCallCount: usize = 0;
 var mockAuthFailureCallCount: usize = 0;
 var mockCapturedProviderName: ?[]const u8 = null;
@@ -4786,6 +4799,69 @@ fn mockProviderStreamByModelVerySlow(
     } });
 }
 
+fn mockProviderStreamByModelWaitWithMessage(
+    allocator: std.mem.Allocator,
+    _: *std.http.Client,
+    _: *ziggy_piai.api_registry.ApiRegistry,
+    _: ziggy_piai.types.Model,
+    _: ziggy_piai.types.Context,
+    _: ziggy_piai.types.StreamOptions,
+    events: *std.array_list.Managed(ziggy_piai.types.AssistantMessageEvent),
+) anyerror!void {
+    const payload = "{\"action\":\"wait_for\",\"message\":\"Please provide your API key\"}";
+    try events.append(.{ .done = .{
+        .text = try allocator.dupe(u8, payload),
+        .thinking = try allocator.dupe(u8, ""),
+        .tool_calls = &.{},
+        .api = "chat",
+        .provider = "openai",
+        .model = "gpt-4o-mini",
+        .usage = .{},
+        .stop_reason = .stop,
+        .error_message = null,
+    } });
+}
+
+fn mockProviderStreamByModelWithJsonMessageOnlyThenTaskComplete(
+    allocator: std.mem.Allocator,
+    _: *std.http.Client,
+    _: *ziggy_piai.api_registry.ApiRegistry,
+    model: ziggy_piai.types.Model,
+    _: ziggy_piai.types.Context,
+    _: ziggy_piai.types.StreamOptions,
+    events: *std.array_list.Managed(ziggy_piai.types.AssistantMessageEvent),
+) anyerror!void {
+    if (mockJsonMessageOnlyFollowupCallCount == 0) {
+        mockJsonMessageOnlyFollowupCallCount += 1;
+        try events.append(.{ .done = .{
+            .text = try allocator.dupe(u8, "{\"message\":\"I'll do that now.\"}"),
+            .thinking = try allocator.dupe(u8, ""),
+            .tool_calls = &.{},
+            .api = model.api,
+            .provider = model.provider,
+            .model = model.id,
+            .usage = .{},
+            .stop_reason = .stop,
+            .error_message = null,
+        } });
+        return;
+    }
+
+    mockJsonMessageOnlyFollowupCallCount += 1;
+    const output = try buildTaskCompleteOutput(allocator, "json message-only recovered complete");
+    try events.append(.{ .done = .{
+        .text = output,
+        .thinking = try allocator.dupe(u8, ""),
+        .tool_calls = &.{},
+        .api = model.api,
+        .provider = model.provider,
+        .model = model.id,
+        .usage = .{},
+        .stop_reason = .stop,
+        .error_message = null,
+    } });
+}
+
 fn mockProviderStreamByModelPlainTextNoMarkers(
     allocator: std.mem.Allocator,
     _: *std.http.Client,
@@ -4944,6 +5020,43 @@ test "runtime_server: agent.run.start marks completed when provider emits task_c
     const status = try server.handleMessage(status_req);
     defer allocator.free(status);
     try std.testing.expect(std.mem.indexOf(u8, status, "\"state\":\"completed\"") != null);
+}
+
+test "runtime_server: agent.run.start preserves wait_for directive message" {
+    const allocator = std.testing.allocator;
+    const original_stream_fn = streamByModelFn;
+    defer streamByModelFn = original_stream_fn;
+    streamByModelFn = mockProviderStreamByModelWaitWithMessage;
+
+    const server = try RuntimeServer.createWithProvider(allocator, "agent-run-provider-wait", .{
+        .ltm_directory = "",
+        .ltm_filename = "",
+    }, .{
+        .name = "openai",
+        .model = "gpt-4o-mini",
+        .api_key = "test-key",
+    });
+    defer server.destroy();
+
+    const frames = try server.handleMessageFrames("{\"id\":\"req-run-start-provider-wait\",\"type\":\"agent.run.start\",\"content\":\"continue\"}");
+    defer deinitResponseFrames(allocator, frames);
+
+    var saw_wait_message = false;
+    var saw_fallback_ok = false;
+    var saw_waiting_state = false;
+    for (frames) |payload| {
+        if (std.mem.indexOf(u8, payload, "Please provide your API key") != null) saw_wait_message = true;
+        if (std.mem.indexOf(u8, payload, "\"content\":\"ok\"") != null) saw_fallback_ok = true;
+        if (std.mem.indexOf(u8, payload, "\"type\":\"agent.run.state\"") != null and
+            std.mem.indexOf(u8, payload, "\"state\":\"waiting_for_user\"") != null)
+        {
+            saw_waiting_state = true;
+        }
+    }
+
+    try std.testing.expect(saw_wait_message);
+    try std.testing.expect(!saw_fallback_ok);
+    try std.testing.expect(saw_waiting_state);
 }
 
 test "runtime_server: run step fails and returns chat error frame when provider fails" {
@@ -6010,6 +6123,38 @@ test "runtime_server: pre-tool plain-text intent fallback triggers followup roun
     try std.testing.expect(std.mem.indexOf(u8, snapshot_json, "\"kind\":\"tool_result\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot_json, "On it. I'll execute the tool call now.") == null);
     try std.testing.expectEqual(@as(usize, 3), mockPlainTextIntentFollowupCallCount);
+}
+
+test "runtime_server: message-only JSON response triggers followup instead of task complete" {
+    const allocator = std.testing.allocator;
+    const original_stream_fn = streamByModelFn;
+    defer streamByModelFn = original_stream_fn;
+    streamByModelFn = mockProviderStreamByModelWithJsonMessageOnlyThenTaskComplete;
+    mockJsonMessageOnlyFollowupCallCount = 0;
+
+    const server = try RuntimeServer.createWithProvider(allocator, "agent-test", .{
+        .ltm_directory = "",
+        .ltm_filename = "",
+    }, .{
+        .name = "openai",
+        .model = "gpt-4o-mini",
+        .api_key = "test-key",
+    });
+    defer server.destroy();
+
+    const responses = try server.handleMessageFrames("{\"id\":\"req-provider-message-only-followup\",\"type\":\"session.send\",\"content\":\"do work\"}");
+    defer deinitResponseFrames(allocator, responses);
+
+    var saw_final = false;
+    var saw_message_only_as_final = false;
+    for (responses) |payload| {
+        if (std.mem.indexOf(u8, payload, "json message-only recovered complete") != null) saw_final = true;
+        if (std.mem.indexOf(u8, payload, "I'll do that now.") != null) saw_message_only_as_final = true;
+    }
+
+    try std.testing.expect(saw_final);
+    try std.testing.expect(!saw_message_only_as_final);
+    try std.testing.expectEqual(@as(usize, 2), mockJsonMessageOnlyFollowupCallCount);
 }
 
 test "runtime_server: wait_for after tool failure triggers followup instead of stopping" {

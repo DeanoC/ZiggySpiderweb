@@ -15,12 +15,15 @@ pub const RunMeta = struct {
     updated_at_ms: i64,
     last_input: ?[]u8 = null,
     last_output: ?[]u8 = null,
+    pending_inputs: [][]u8,
 
     pub fn deinit(self: *RunMeta, allocator: std.mem.Allocator) void {
         allocator.free(self.run_id);
         allocator.free(self.state);
         if (self.last_input) |value| allocator.free(value);
         if (self.last_output) |value| allocator.free(value);
+        for (self.pending_inputs) |value| allocator.free(value);
+        allocator.free(self.pending_inputs);
         self.* = undefined;
     }
 };
@@ -34,6 +37,7 @@ pub const RunMetaInput = struct {
     updated_at_ms: i64,
     last_input: ?[]const u8 = null,
     last_output: ?[]const u8 = null,
+    pending_inputs: []const []const u8 = &.{},
 };
 
 pub const RunEvent = struct {
@@ -238,6 +242,15 @@ fn buildMetaPayload(allocator: std.mem.Allocator, meta: RunMetaInput) ![]u8 {
         try out.appendSlice(allocator, "null");
     }
 
+    try out.appendSlice(allocator, ",\"pending_inputs\":[");
+    for (meta.pending_inputs, 0..) |value, idx| {
+        if (idx > 0) try out.append(allocator, ',');
+        try out.append(allocator, '"');
+        try appendEscaped(allocator, &out, value);
+        try out.append(allocator, '"');
+    }
+    try out.append(allocator, ']');
+
     try out.append(allocator, '}');
     return out.toOwnedSlice(allocator);
 }
@@ -270,17 +283,52 @@ fn parseMetaPayload(allocator: std.mem.Allocator, payload_json: []const u8) !Run
     const checkpoint_seq = intField(obj, "checkpoint_seq") orelse return RunStoreError.InvalidRunRecord;
     const created_at_ms = intField(obj, "created_at_ms") orelse return RunStoreError.InvalidRunRecord;
     const updated_at_ms = intField(obj, "updated_at_ms") orelse return RunStoreError.InvalidRunRecord;
+    const pending_inputs = if (obj.get("pending_inputs")) |value|
+        try parsePendingInputs(allocator, value)
+    else
+        try allocator.alloc([]u8, 0);
+    errdefer {
+        for (pending_inputs) |value| allocator.free(value);
+        allocator.free(pending_inputs);
+    }
+
+    const owned_run_id = try allocator.dupe(u8, run_id);
+    errdefer allocator.free(owned_run_id);
+    const owned_state = try allocator.dupe(u8, state);
+    errdefer allocator.free(owned_state);
+    const owned_last_input = if (stringField(obj, "last_input")) |value| try allocator.dupe(u8, value) else null;
+    errdefer if (owned_last_input) |value| allocator.free(value);
+    const owned_last_output = if (stringField(obj, "last_output")) |value| try allocator.dupe(u8, value) else null;
+    errdefer if (owned_last_output) |value| allocator.free(value);
 
     return .{
-        .run_id = try allocator.dupe(u8, run_id),
-        .state = try allocator.dupe(u8, state),
+        .run_id = owned_run_id,
+        .state = owned_state,
         .step_count = @intCast(step_count),
         .checkpoint_seq = @intCast(checkpoint_seq),
         .created_at_ms = created_at_ms,
         .updated_at_ms = updated_at_ms,
-        .last_input = if (stringField(obj, "last_input")) |value| try allocator.dupe(u8, value) else null,
-        .last_output = if (stringField(obj, "last_output")) |value| try allocator.dupe(u8, value) else null,
+        .last_input = owned_last_input,
+        .last_output = owned_last_output,
+        .pending_inputs = pending_inputs,
     };
+}
+
+fn parsePendingInputs(allocator: std.mem.Allocator, value: std.json.Value) ![][]u8 {
+    if (value != .array) return RunStoreError.InvalidRunRecord;
+
+    var out = std.ArrayListUnmanaged([]u8){};
+    errdefer {
+        for (out.items) |item| allocator.free(item);
+        out.deinit(allocator);
+    }
+
+    for (value.array.items) |item| {
+        if (item != .string) return RunStoreError.InvalidRunRecord;
+        try out.append(allocator, try allocator.dupe(u8, item.string));
+    }
+
+    return out.toOwnedSlice(allocator);
 }
 
 fn parseEventPayload(allocator: std.mem.Allocator, payload_json: []const u8) !RunEvent {
@@ -360,6 +408,7 @@ test "run_store: persists and loads run metadata and events" {
         .updated_at_ms = 2,
         .last_input = "hello",
         .last_output = "world",
+        .pending_inputs = &.{ "queued-1", "queued-2" },
     });
 
     const seq = try store.appendEvent(.{
@@ -374,6 +423,8 @@ test "run_store: persists and loads run metadata and events" {
     defer loaded.deinit(allocator);
     try std.testing.expectEqualStrings("run-1", loaded.run_id);
     try std.testing.expectEqualStrings("running", loaded.state);
+    try std.testing.expectEqual(@as(usize, 2), loaded.pending_inputs.len);
+    try std.testing.expectEqualStrings("queued-1", loaded.pending_inputs[0]);
 
     const ids = try store.listRunIds(allocator, 10);
     defer {
@@ -406,6 +457,33 @@ test "run_store: listEvents handles partially parsed records without invalid dei
     defer store.deinit();
 
     try std.testing.expectError(RunStoreError.InvalidRunEvent, store.listEvents(allocator, "run-1", 10));
+}
+
+test "run_store: loadMeta accepts records without pending_inputs" {
+    const allocator = std.testing.allocator;
+
+    const dir = try std.fmt.allocPrint(allocator, ".tmp-run-store-legacy-meta-{d}", .{std.time.nanoTimestamp()});
+    defer allocator.free(dir);
+    defer std.fs.cwd().deleteTree(dir) catch {};
+    try std.fs.cwd().makePath(dir);
+
+    var mem_store = try ltm_store.VersionedMemStore.open(allocator, dir, "run.db");
+    defer mem_store.close();
+
+    _ = try mem_store.appendAt(
+        "run:run-legacy:meta",
+        "run.meta",
+        "{\"run_id\":\"run-legacy\",\"state\":\"paused\",\"step_count\":2,\"checkpoint_seq\":1,\"created_at_ms\":1,\"updated_at_ms\":2,\"last_input\":null,\"last_output\":null}",
+        2,
+    );
+
+    var store = RunStore.init(allocator, &mem_store);
+    defer store.deinit();
+
+    var loaded = (try store.loadMeta(allocator, "run-legacy")).?;
+    defer loaded.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), loaded.pending_inputs.len);
 }
 
 test "run_store: listRunIds returns distinct runs even with heavy metadata churn" {

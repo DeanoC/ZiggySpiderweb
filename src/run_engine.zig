@@ -518,6 +518,7 @@ pub const RunEngine = struct {
             .updated_at_ms = run.updated_at_ms,
             .last_input = run.last_input,
             .last_output = run.last_output,
+            .pending_inputs = run.pending_inputs.items,
         });
     }
 
@@ -528,6 +529,13 @@ pub const RunEngine = struct {
         payload_json: []const u8,
         created_at_ms: i64,
     ) !u64 {
+        const run = self.runs.getPtr(run_id) orelse return RunEngineError.RunNotFound;
+        try run.events.ensureUnusedCapacity(self.allocator, 1);
+        const owned_event_type = try self.allocator.dupe(u8, event_type);
+        errdefer self.allocator.free(owned_event_type);
+        const owned_payload = try self.allocator.dupe(u8, payload_json);
+        errdefer self.allocator.free(owned_payload);
+
         const seq = try self.store.appendEvent(.{
             .run_id = run_id,
             .event_type = event_type,
@@ -535,11 +543,10 @@ pub const RunEngine = struct {
             .created_at_ms = created_at_ms,
         });
 
-        const run = self.runs.getPtr(run_id) orelse return RunEngineError.RunNotFound;
-        try run.events.append(self.allocator, .{
+        run.events.appendAssumeCapacity(.{
             .seq = seq,
-            .event_type = try self.allocator.dupe(u8, event_type),
-            .payload_json = try self.allocator.dupe(u8, payload_json),
+            .event_type = owned_event_type,
+            .payload_json = owned_payload,
             .created_at_ms = created_at_ms,
         });
         return seq;
@@ -568,6 +575,9 @@ pub const RunEngine = struct {
                 .last_output = if (meta.last_output) |value| try self.allocator.dupe(u8, value) else null,
             };
             errdefer run.deinit(self.allocator);
+            for (meta.pending_inputs) |value| {
+                try run.pending_inputs.append(self.allocator, try self.allocator.dupe(u8, value));
+            }
 
             if (run.state == .running and !self.config.run_auto_resume_on_boot) {
                 run.state = .paused;
@@ -870,6 +880,49 @@ test "run_engine: recovery keeps running runs when auto resume is enabled" {
     var snapshot = try restored.get(captured_run_id);
     defer snapshot.deinit(allocator);
     try std.testing.expectEqual(RunState.running, snapshot.state);
+}
+
+test "run_engine: recovery restores queued pending inputs" {
+    const allocator = std.testing.allocator;
+
+    const dir = try std.fmt.allocPrint(allocator, ".tmp-run-engine-recover-pending-{d}", .{std.time.nanoTimestamp()});
+    defer allocator.free(dir);
+    defer std.fs.cwd().deleteTree(dir) catch {};
+    try std.fs.cwd().makePath(dir);
+
+    var captured_run_id: []u8 = undefined;
+    {
+        var mem_store = try ltm_store.VersionedMemStore.open(allocator, dir, "run.db");
+        defer mem_store.close();
+
+        var first = try RunEngine.init(allocator, &mem_store, .{
+            .max_run_steps = 16,
+            .checkpoint_interval_steps = 1,
+        });
+        defer first.deinit();
+
+        var started = try first.start(null);
+        defer started.deinit(allocator);
+        captured_run_id = try allocator.dupe(u8, started.run_id);
+
+        var queued_a = try first.enqueueInput(started.run_id, "input-a");
+        defer queued_a.deinit(allocator);
+        var queued_b = try first.enqueueInput(started.run_id, "input-b");
+        defer queued_b.deinit(allocator);
+    }
+    defer allocator.free(captured_run_id);
+
+    var mem_store = try ltm_store.VersionedMemStore.open(allocator, dir, "run.db");
+    defer mem_store.close();
+    var restored = try RunEngine.init(allocator, &mem_store, .{
+        .max_run_steps = 16,
+        .checkpoint_interval_steps = 1,
+    });
+    defer restored.deinit();
+
+    var step = try restored.beginStep(captured_run_id, null);
+    defer step.deinit(allocator);
+    try std.testing.expectEqualStrings("input-a", step.input);
 }
 
 test "run_engine: listEvents returns out-of-memory without invalid deinit on partial copy" {
