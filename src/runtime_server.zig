@@ -47,6 +47,7 @@ const RuntimeServerError = error{
     ProviderTimeout,
     ProviderUnavailable,
     ProviderToolLoopExceeded,
+    RunStepAlreadyActive,
     MissingLtmStoreConfig,
 };
 
@@ -818,14 +819,21 @@ pub const RuntimeServer = struct {
         return job.cancelled;
     }
 
-    fn markRunStepActive(self: *RuntimeServer, run_id: []const u8) !void {
+    fn markRunStepActive(self: *RuntimeServer, run_id: []const u8) !bool {
         self.run_step_mutex.lock();
         defer self.run_step_mutex.unlock();
 
-        if (self.active_run_steps.contains(run_id)) return;
+        if (self.active_run_steps.contains(run_id)) return false;
         const owned_key = try self.allocator.dupe(u8, run_id);
         errdefer self.allocator.free(owned_key);
         try self.active_run_steps.put(self.allocator, owned_key, {});
+        return true;
+    }
+
+    fn isRunStepActive(self: *RuntimeServer, run_id: []const u8) bool {
+        self.run_step_mutex.lock();
+        defer self.run_step_mutex.unlock();
+        return self.active_run_steps.contains(run_id);
     }
 
     fn clearRunStepTracking(self: *RuntimeServer, run_id: []const u8) void {
@@ -1160,6 +1168,9 @@ pub const RuntimeServer = struct {
     }
 
     fn handleRunPause(self: *RuntimeServer, request_id: []const u8, run_id: []const u8) ![][]u8 {
+        if (self.isRunStepActive(run_id)) {
+            return self.wrapSingleFrame(try self.buildRuntimeErrorResponse(request_id, RuntimeServerError.RunStepAlreadyActive));
+        }
         var snapshot = self.runs.pause(run_id) catch |err| return self.wrapSingleFrame(try self.buildRuntimeErrorResponse(request_id, err));
         defer snapshot.deinit(self.allocator);
         return self.wrapSingleFrame(try protocol.buildAgentRunState(
@@ -1281,14 +1292,27 @@ pub const RuntimeServer = struct {
         include_ack: bool,
         allow_paused_resume: bool,
     ) ![][]u8 {
+        const owns_step_tracking = self.markRunStepActive(run_id) catch |err| {
+            return self.wrapRuntimeErrorResponse(request_id, err, job.emit_debug);
+        };
+        if (!owns_step_tracking) {
+            return self.wrapRuntimeErrorResponse(request_id, RuntimeServerError.RunStepAlreadyActive, job.emit_debug);
+        }
+        defer if (owns_step_tracking) self.clearRunStepTracking(run_id);
+
+        if (self.isRunStepCancelRequested(run_id)) {
+            _ = self.runs.cancel(run_id) catch {};
+            return self.wrapRuntimeErrorResponse(request_id, agent_runtime.RuntimeError.RuntimeCancelled, job.emit_debug);
+        }
+
         var work = (if (allow_paused_resume) self.runs.beginResumedStep(run_id, content) else self.runs.beginStep(run_id, content)) catch |err| {
+            if (err == run_engine.RunEngineError.InvalidState and self.isRunStepCancelRequested(run_id)) {
+                _ = self.runs.cancel(run_id) catch {};
+                return self.wrapRuntimeErrorResponse(request_id, agent_runtime.RuntimeError.RuntimeCancelled, job.emit_debug);
+            }
             return self.wrapRuntimeErrorResponse(request_id, err, job.emit_debug);
         };
         defer work.deinit(self.allocator);
-        self.markRunStepActive(run_id) catch |err| {
-            return self.wrapRuntimeErrorResponse(request_id, err, job.emit_debug);
-        };
-        defer self.clearRunStepTracking(run_id);
 
         const observe_payload = try std.fmt.allocPrint(self.allocator, "{{\"step\":{d}}}", .{work.step_count});
         defer self.allocator.free(observe_payload);
@@ -1528,6 +1552,7 @@ pub const RuntimeServer = struct {
             RuntimeServerError.ProviderUnavailable => protocol.buildErrorWithCode(self.allocator, request_id, .provider_unavailable, "provider temporarily unavailable"),
             RuntimeServerError.ProviderStreamFailed => protocol.buildErrorWithCode(self.allocator, request_id, .execution_failed, "provider stream failed"),
             RuntimeServerError.ProviderToolLoopExceeded => protocol.buildErrorWithCode(self.allocator, request_id, .execution_failed, "provider tool loop exceeded limits"),
+            RuntimeServerError.RunStepAlreadyActive => protocol.buildErrorWithCode(self.allocator, request_id, .execution_failed, "run step already active"),
             else => protocol.buildErrorWithCode(self.allocator, request_id, .execution_failed, @errorName(err)),
         };
     }
@@ -5275,6 +5300,146 @@ test "runtime_server: agent.run.cancel preempts active run step" {
     var snapshot = try server.runs.get(started.run_id);
     defer snapshot.deinit(allocator);
     try std.testing.expectEqual(run_engine.RunState.cancelled, snapshot.state);
+}
+
+test "runtime_server: agent.run.pause is rejected while run step is active" {
+    const allocator = std.testing.allocator;
+    const original_stream_fn = streamByModelFn;
+    defer streamByModelFn = original_stream_fn;
+    streamByModelFn = mockProviderStreamByModelVerySlow;
+
+    const server = try RuntimeServer.createWithProvider(allocator, "agent-run-pause-active", .{
+        .chat_operation_timeout_ms = 2_000,
+        .ltm_directory = "",
+        .ltm_filename = "",
+    }, .{
+        .name = "openai",
+        .model = "gpt-4o-mini",
+        .api_key = "test-key",
+    });
+    defer server.destroy();
+
+    var started = try server.runs.start(null);
+    defer started.deinit(allocator);
+
+    const step_req = try std.fmt.allocPrint(allocator, "{{\"id\":\"req-run-step-pause-active\",\"type\":\"agent.run.step\",\"action\":\"{s}\",\"content\":\"do work\"}}", .{started.run_id});
+    defer allocator.free(step_req);
+
+    const StepThread = struct {
+        server: *RuntimeServer,
+        request: []const u8,
+        response: ?[]u8 = null,
+        err: ?anyerror = null,
+
+        fn run(ctx: *@This()) void {
+            ctx.response = ctx.server.handleMessage(ctx.request) catch |err| {
+                ctx.err = err;
+                return;
+            };
+        }
+    };
+
+    var worker = StepThread{
+        .server = server,
+        .request = step_req,
+    };
+    const thread = try std.Thread.spawn(.{}, StepThread.run, .{&worker});
+
+    var saw_active = false;
+    var wait_ms: usize = 0;
+    while (wait_ms < 500) : (wait_ms += 5) {
+        if (server.isRunStepActive(started.run_id)) {
+            saw_active = true;
+            break;
+        }
+        std.Thread.sleep(5 * std.time.ns_per_ms);
+    }
+    try std.testing.expect(saw_active);
+
+    const pause_req = try std.fmt.allocPrint(allocator, "{{\"id\":\"req-run-pause-active\",\"type\":\"agent.run.pause\",\"action\":\"{s}\"}}", .{started.run_id});
+    defer allocator.free(pause_req);
+    const pause_rsp = try server.handleMessage(pause_req);
+    defer allocator.free(pause_rsp);
+    try std.testing.expect(std.mem.indexOf(u8, pause_rsp, "\"type\":\"error\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pause_rsp, "\"code\":\"execution_failed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pause_rsp, "run step already active") != null);
+
+    thread.join();
+    try std.testing.expect(worker.err == null);
+    try std.testing.expect(worker.response != null);
+    const step_rsp = worker.response.?;
+    defer allocator.free(step_rsp);
+    try std.testing.expect(std.mem.indexOf(u8, step_rsp, "\"state\":\"completed\"") != null);
+}
+
+test "runtime_server: concurrent run.step requests reject second active step" {
+    const allocator = std.testing.allocator;
+    const original_stream_fn = streamByModelFn;
+    defer streamByModelFn = original_stream_fn;
+    streamByModelFn = mockProviderStreamByModelVerySlow;
+
+    const server = try RuntimeServer.createWithProvider(allocator, "agent-run-concurrent-step", .{
+        .chat_operation_timeout_ms = 2_000,
+        .ltm_directory = "",
+        .ltm_filename = "",
+    }, .{
+        .name = "openai",
+        .model = "gpt-4o-mini",
+        .api_key = "test-key",
+    });
+    defer server.destroy();
+
+    var started = try server.runs.start(null);
+    defer started.deinit(allocator);
+
+    const step_req_1 = try std.fmt.allocPrint(allocator, "{{\"id\":\"req-run-step-concurrent-1\",\"type\":\"agent.run.step\",\"action\":\"{s}\",\"content\":\"first\"}}", .{started.run_id});
+    defer allocator.free(step_req_1);
+    const step_req_2 = try std.fmt.allocPrint(allocator, "{{\"id\":\"req-run-step-concurrent-2\",\"type\":\"agent.run.step\",\"action\":\"{s}\",\"content\":\"second\"}}", .{started.run_id});
+    defer allocator.free(step_req_2);
+
+    const StepThread = struct {
+        server: *RuntimeServer,
+        request: []const u8,
+        response: ?[]u8 = null,
+        err: ?anyerror = null,
+
+        fn run(ctx: *@This()) void {
+            ctx.response = ctx.server.handleMessage(ctx.request) catch |err| {
+                ctx.err = err;
+                return;
+            };
+        }
+    };
+
+    var worker = StepThread{
+        .server = server,
+        .request = step_req_1,
+    };
+    const thread = try std.Thread.spawn(.{}, StepThread.run, .{&worker});
+
+    var saw_active = false;
+    var wait_ms: usize = 0;
+    while (wait_ms < 500) : (wait_ms += 5) {
+        if (server.isRunStepActive(started.run_id)) {
+            saw_active = true;
+            break;
+        }
+        std.Thread.sleep(5 * std.time.ns_per_ms);
+    }
+    try std.testing.expect(saw_active);
+
+    const second_rsp = try server.handleMessage(step_req_2);
+    defer allocator.free(second_rsp);
+    try std.testing.expect(std.mem.indexOf(u8, second_rsp, "\"type\":\"error\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, second_rsp, "\"code\":\"execution_failed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, second_rsp, "run step already active") != null);
+
+    thread.join();
+    try std.testing.expect(worker.err == null);
+    try std.testing.expect(worker.response != null);
+    const first_rsp = worker.response.?;
+    defer allocator.free(first_rsp);
+    try std.testing.expect(std.mem.indexOf(u8, first_rsp, "\"state\":\"completed\"") != null);
 }
 
 test "runtime_server: empty ltm config in tests provisions sqlite-backed runtime" {
