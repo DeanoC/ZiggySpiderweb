@@ -1224,11 +1224,19 @@ pub const RuntimeServer = struct {
 
         var chat_meta = RunStepMeta{};
         const chat_frames = self.handleChat(job, request_id, work.input, &chat_meta) catch |err| {
-            if (err == RuntimeServerError.RuntimeJobCancelled) return err;
+            if (err == RuntimeServerError.RuntimeJobCancelled) {
+                _ = self.runs.abortStep(run_id, "runtime_job_cancelled", true) catch {};
+                return err;
+            }
             _ = self.runs.failStep(run_id, @errorName(err)) catch {};
             return err;
         };
         defer deinitResponseFrames(self.allocator, chat_frames);
+
+        if (self.isJobCancelled(job)) {
+            _ = self.runs.abortStep(run_id, "runtime_job_cancelled", true) catch {};
+            return RuntimeServerError.RuntimeJobCancelled;
+        }
 
         var extracted = try extractRunStepFrameResult(self.allocator, chat_frames);
         defer extracted.deinit(self.allocator);
@@ -1278,6 +1286,11 @@ pub const RuntimeServer = struct {
         else
             try self.allocator.dupe(u8, assistant_output);
         defer self.allocator.free(completion_output);
+
+        if (self.isJobCancelled(job)) {
+            _ = self.runs.abortStep(run_id, "runtime_job_cancelled", true) catch {};
+            return RuntimeServerError.RuntimeJobCancelled;
+        }
 
         self.runs.recordPhase(run_id, .decide, "{}") catch |err| return self.wrapRuntimeErrorResponse(request_id, err, job.emit_debug);
         self.runs.recordPhase(run_id, .act, "{}") catch |err| return self.wrapRuntimeErrorResponse(request_id, err, job.emit_debug);
@@ -4925,7 +4938,7 @@ test "runtime_server: extractRunStepFrameResult uses final session.receive conte
     try std.testing.expect(extracted.error_message == null);
 }
 
-test "runtime_server: cancelled run step does not mark run failed" {
+test "runtime_server: cancelled run step aborts and requeues input" {
     const allocator = std.testing.allocator;
     const server = try RuntimeServer.create(allocator, "agent-run-cancel", .{ .ltm_directory = "", .ltm_filename = "" });
     defer server.destroy();
@@ -4947,7 +4960,12 @@ test "runtime_server: cancelled run step does not mark run failed" {
 
     var snapshot = try server.runs.get(started.run_id);
     defer snapshot.deinit(allocator);
-    try std.testing.expectEqual(run_engine.RunState.running, snapshot.state);
+    try std.testing.expectEqual(run_engine.RunState.paused, snapshot.state);
+
+    var resumed = try server.runs.beginResumedStep(started.run_id, null);
+    defer resumed.deinit(allocator);
+    try std.testing.expectEqual(@as(u64, 1), resumed.step_count);
+    try std.testing.expectEqualStrings("cancel flow", resumed.input);
 }
 
 test "runtime_server: empty ltm config in tests provisions sqlite-backed runtime" {

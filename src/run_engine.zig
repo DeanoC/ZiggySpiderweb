@@ -391,6 +391,37 @@ pub const RunEngine = struct {
         return run.cloneSnapshot(self.allocator);
     }
 
+    pub fn abortStep(self: *RunEngine, run_id: []const u8, reason: []const u8, requeue_input: bool) !RunSnapshot {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const run = self.runs.getPtr(run_id) orelse return RunEngineError.RunNotFound;
+        if (run.state != .running) return RunEngineError.InvalidState;
+
+        if (requeue_input) {
+            if (run.last_input) |value| {
+                try run.pending_inputs.insert(self.allocator, 0, try self.allocator.dupe(u8, value));
+            }
+        }
+
+        run.state = .paused;
+        run.updated_at_ms = std.time.milliTimestamp();
+
+        const escaped_reason = try escapeJson(self.allocator, reason);
+        defer self.allocator.free(escaped_reason);
+        const payload = try std.fmt.allocPrint(
+            self.allocator,
+            "{{\"reason\":\"{s}\",\"requeued\":{}}}",
+            .{ escaped_reason, requeue_input },
+        );
+        defer self.allocator.free(payload);
+
+        _ = try self.appendEventLocked(run_id, "run.step_aborted", payload, run.updated_at_ms);
+        try self.persistMetaForRunLocked(run);
+
+        return run.cloneSnapshot(self.allocator);
+    }
+
     pub fn pause(self: *RunEngine, run_id: []const u8) !RunSnapshot {
         return self.setState(run_id, .paused, "run.paused");
     }
@@ -928,4 +959,29 @@ test "run_engine: beginStep keeps queued input when step start fails" {
     }
 
     try std.testing.expect(saw_begin_step_oom);
+}
+
+test "run_engine: abortStep pauses run and requeues last input" {
+    const allocator = std.testing.allocator;
+
+    var engine = try RunEngine.init(allocator, null, .{
+        .max_run_steps = 16,
+        .checkpoint_interval_steps = 1,
+    });
+    defer engine.deinit();
+
+    var started = try engine.start("requeue me");
+    defer started.deinit(allocator);
+
+    var step = try engine.beginStep(started.run_id, null);
+    defer step.deinit(allocator);
+    try std.testing.expectEqualStrings("requeue me", step.input);
+
+    var aborted = try engine.abortStep(started.run_id, "cancelled", true);
+    defer aborted.deinit(allocator);
+    try std.testing.expectEqual(RunState.paused, aborted.state);
+
+    var resumed = try engine.beginResumedStep(started.run_id, null);
+    defer resumed.deinit(allocator);
+    try std.testing.expectEqualStrings("requeue me", resumed.input);
 }
