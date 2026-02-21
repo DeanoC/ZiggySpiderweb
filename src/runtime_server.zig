@@ -1315,7 +1315,7 @@ pub const RuntimeServer = struct {
             return .{ .runtime_error = RuntimeServerError.ProviderUnavailable, .retryable = true };
         }
 
-        if (containsAnyIgnoreCase(err_name, &.{ "CompleteErrorUnavailable" })) {
+        if (containsAnyIgnoreCase(err_name, &.{"CompleteErrorUnavailable"})) {
             return .{ .runtime_error = RuntimeServerError.ProviderStreamFailed, .retryable = true };
         }
 
@@ -1472,10 +1472,9 @@ pub const RuntimeServer = struct {
 
         var provider_idx: usize = 0;
         for (brain_tool_specs) |spec| {
-            const provider_tool_name = try sanitizeProviderToolName(
+            const provider_tool_name = try providerToolNameFromRuntime(
                 self.allocator,
                 spec.name,
-                provider_idx,
                 provider_tool_name_map[0..provider_idx],
             );
             provider_tool_name_map[provider_idx] = .{
@@ -1492,10 +1491,9 @@ pub const RuntimeServer = struct {
         }
 
         for (world_tool_specs) |spec| {
-            const provider_tool_name = try sanitizeProviderToolName(
+            const provider_tool_name = try providerToolNameFromRuntime(
                 self.allocator,
                 spec.name,
-                provider_idx,
                 provider_tool_name_map[0..provider_idx],
             );
             provider_tool_name_map[provider_idx] = .{
@@ -1845,12 +1843,13 @@ pub const RuntimeServer = struct {
                     try self.appendAssistantStructuredToolCallMessage(brain_name, assistant.text, structured_tool_calls);
 
                     for (structured_tool_calls) |tool_call| {
+                        const runtime_tool_name = resolveRuntimeToolName(tool_call.name, provider_tool_name_map);
                         const args_with_call_id = try injectToolCallId(self.allocator, tool_call.arguments_json, tool_call.id);
                         defer self.allocator.free(args_with_call_id);
                         if (job.emit_debug) {
                             const tool_call_payload_json = try self.buildProviderStructuredToolCallDebugPayload(
                                 tool_call,
-                                tool_call.name,
+                                runtime_tool_name,
                                 args_with_call_id,
                                 round,
                             );
@@ -1862,7 +1861,7 @@ pub const RuntimeServer = struct {
                                 tool_call_payload_json,
                             );
                         }
-                        try self.runtime.queueToolUse(brain_name, tool_call.name, args_with_call_id);
+                        try self.runtime.queueToolUse(brain_name, runtime_tool_name, args_with_call_id);
                     }
 
                     var structured_tool_payloads = std.ArrayListUnmanaged([]u8){};
@@ -2483,38 +2482,30 @@ pub const RuntimeServer = struct {
         return provider_name;
     }
 
-    fn sanitizeProviderToolName(
+    fn providerToolNameFromRuntime(
         allocator: std.mem.Allocator,
         runtime_name: []const u8,
-        index: usize,
         existing: []const ProviderToolNameMapEntry,
     ) ![]u8 {
-        var out = std.ArrayListUnmanaged(u8){};
-        defer out.deinit(allocator);
-
-        for (runtime_name) |ch| {
-            const allowed = std.ascii.isAlphanumeric(ch) or ch == '_' or ch == '-';
-            try out.append(allocator, if (allowed) ch else '_');
-        }
-        if (out.items.len == 0) {
-            return std.fmt.allocPrint(allocator, "tool_{d}", .{index});
+        if (!isProviderCompatibleToolName(runtime_name)) {
+            std.log.warn("Invalid runtime tool name for provider schema: {s}", .{runtime_name});
+            return RuntimeServerError.ProviderRequestInvalid;
         }
 
-        const base = try out.toOwnedSlice(allocator);
-        errdefer allocator.free(base);
-        if (!toolNameExists(existing, base)) {
-            return base;
+        if (toolNameExists(existing, runtime_name)) {
+            std.log.warn("Duplicate provider tool name detected: {s}", .{runtime_name});
+            return RuntimeServerError.ProviderRequestInvalid;
         }
 
-        var suffix: usize = 2;
-        while (true) : (suffix += 1) {
-            const candidate = try std.fmt.allocPrint(allocator, "{s}_{d}", .{ base, suffix });
-            if (!toolNameExists(existing, candidate)) {
-                allocator.free(base);
-                return candidate;
-            }
-            allocator.free(candidate);
+        return allocator.dupe(u8, runtime_name);
+    }
+
+    fn isProviderCompatibleToolName(name: []const u8) bool {
+        if (name.len == 0) return false;
+        for (name) |ch| {
+            if (!std.ascii.isAlphanumeric(ch) and ch != '_' and ch != '-') return false;
         }
+        return true;
     }
 
     fn toolNameExists(existing: []const ProviderToolNameMapEntry, candidate: []const u8) bool {
@@ -3489,6 +3480,14 @@ fn writeAgentJsonForTest(allocator: std.mem.Allocator, agent_id: []const u8, bra
     });
 }
 
+fn mockWorldToolOk(allocator: std.mem.Allocator, _: std.json.ObjectMap) tool_registry.ToolExecutionResult {
+    const payload = allocator.dupe(u8, "{\"ok\":true}") catch {
+        const msg = allocator.dupe(u8, "out of memory") catch @panic("out of memory");
+        return .{ .failure = .{ .code = .execution_failed, .message = msg } };
+    };
+    return .{ .success = .{ .payload_json = payload } };
+}
+
 fn mockProviderStreamByModelWithToolLoop(
     allocator: std.mem.Allocator,
     _: *std.http.Client,
@@ -4198,6 +4197,56 @@ test "runtime_server: provider tool schemas include optional args and flexible c
     try std.testing.expect(saw_memory_search);
     try std.testing.expect(saw_memory_create);
     try std.testing.expect(saw_memory_mutate);
+}
+
+test "runtime_server: invalid provider tool name returns provider_request_invalid" {
+    const allocator = std.testing.allocator;
+    const server = try RuntimeServer.createWithProvider(allocator, "agent-test", .{
+        .ltm_directory = "",
+        .ltm_filename = "",
+    }, .{
+        .name = "openai",
+        .model = "gpt-4o-mini",
+        .api_key = "test-key",
+    });
+    defer server.destroy();
+
+    try server.runtime.world_tools.registerWorldTool(
+        "bad.tool.name",
+        "invalid provider tool name",
+        &[_]tool_registry.ToolParam{},
+        mockWorldToolOk,
+    );
+
+    const response = try server.handleMessage("{\"id\":\"req-invalid-tool-name\",\"type\":\"session.send\",\"content\":\"hello\"}");
+    defer allocator.free(response);
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "\"code\":\"provider_request_invalid\"") != null);
+}
+
+test "runtime_server: duplicate provider tool names return provider_request_invalid" {
+    const allocator = std.testing.allocator;
+    const server = try RuntimeServer.createWithProvider(allocator, "agent-test", .{
+        .ltm_directory = "",
+        .ltm_filename = "",
+    }, .{
+        .name = "openai",
+        .model = "gpt-4o-mini",
+        .api_key = "test-key",
+    });
+    defer server.destroy();
+
+    try server.runtime.world_tools.registerWorldTool(
+        "memory_load",
+        "conflicts with built-in brain tool",
+        &[_]tool_registry.ToolParam{},
+        mockWorldToolOk,
+    );
+
+    const response = try server.handleMessage("{\"id\":\"req-duplicate-tool-name\",\"type\":\"session.send\",\"content\":\"hello\"}");
+    defer allocator.free(response);
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "\"code\":\"provider_request_invalid\"") != null);
 }
 
 test "runtime_server: session.send returns all outbound runtime frames" {

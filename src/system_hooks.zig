@@ -145,24 +145,26 @@ fn ensureMemoryFromTemplate(
         // CORE.md is authoritative and write-protected by policy:
         // always synchronize LTM content with the current template file.
         if (std.mem.eql(u8, name, BASE_CORE_MEM_NAME)) {
-            const content = readTemplate(allocator, runtime, template_name) catch |err| {
+            const maybe_content = readTemplate(allocator, runtime, template_name) catch |err| blk: {
                 std.log.warn("Failed to load template {s}: {s}", .{ template_name, @errorName(err) });
-                return true;
+                break :blk null;
             };
-            defer allocator.free(content);
+            if (maybe_content) |content| {
+                defer allocator.free(content);
 
-            const escaped_content = try protocol.jsonEscape(allocator, content);
-            defer allocator.free(escaped_content);
-            const template_content_json = try std.fmt.allocPrint(allocator, "\"{s}\"", .{escaped_content});
-            defer allocator.free(template_content_json);
+                const escaped_content = try protocol.jsonEscape(allocator, content);
+                defer allocator.free(escaped_content);
+                const template_content_json = try std.fmt.allocPrint(allocator, "\"{s}\"", .{escaped_content});
+                defer allocator.free(template_content_json);
 
-            if (!std.mem.eql(u8, item.content_json, template_content_json)) {
-                var updated = runtime.active_memory.mutate(item.mem_id, template_content_json) catch |err| {
-                    std.log.warn("Failed to sync {s} from {s}: {s}", .{ name, template_name, @errorName(err) });
-                    return false;
-                };
-                updated.deinit(allocator);
-                std.log.info("Synced {s} from {s} for {s}/{s}", .{ name, template_name, runtime.agent_id, brain_name });
+                if (!std.mem.eql(u8, item.content_json, template_content_json)) {
+                    var updated = runtime.active_memory.mutate(item.mem_id, template_content_json) catch |err| {
+                        std.log.warn("Failed to sync {s} from {s}: {s}", .{ name, template_name, @errorName(err) });
+                        return false;
+                    };
+                    updated.deinit(allocator);
+                    std.log.info("Synced {s} from {s} for {s}/{s}", .{ name, template_name, runtime.agent_id, brain_name });
+                }
             }
         }
 
@@ -457,6 +459,55 @@ test "system_hooks: ensureIdentityMemories rehydrates persisted identity into ac
     try std.testing.expect(containsNamedMemory(after, SOUL_MEM_NAME));
     try std.testing.expect(containsNamedMemory(after, AGENT_MEM_NAME));
     try std.testing.expect(containsNamedMemory(after, IDENTITY_MEM_NAME));
+}
+
+test "system_hooks: ensureIdentityMemories rehydrates persisted CORE when template is unavailable" {
+    const allocator = std.testing.allocator;
+    const nonce = std.time.nanoTimestamp();
+    const ltm_dir = try std.fmt.allocPrint(allocator, ".tmp-system-hooks-ltm-missing-template-{d}", .{nonce});
+    defer allocator.free(ltm_dir);
+    defer std.fs.cwd().deleteTree(ltm_dir) catch {};
+    const assets_dir = try std.fmt.allocPrint(allocator, ".tmp-system-hooks-assets-missing-template-{d}", .{nonce});
+    defer allocator.free(assets_dir);
+    defer std.fs.cwd().deleteTree(assets_dir) catch {};
+
+    try std.fs.cwd().makePath(assets_dir);
+    inline for (.{ "CORE.md", "SOUL.md", "AGENT.md", "IDENTITY.md" }) |filename| {
+        const path = try std.fs.path.join(allocator, &.{ assets_dir, filename });
+        defer allocator.free(path);
+        try std.fs.cwd().writeFile(.{
+            .sub_path = path,
+            .data = "template-v1",
+        });
+    }
+
+    var first_cfg = Config.RuntimeConfig{};
+    first_cfg.assets_dir = assets_dir;
+
+    {
+        var runtime = try AgentRuntime.initWithPersistence(allocator, "agent-system-hooks-missing-template", &.{}, ltm_dir, "runtime-memory.db", first_cfg);
+        defer runtime.deinit();
+        try ensureIdentityMemories(&runtime, "primary");
+    }
+
+    const missing_assets_dir = try std.fmt.allocPrint(allocator, ".tmp-system-hooks-assets-missing-template-does-not-exist-{d}", .{nonce});
+    defer allocator.free(missing_assets_dir);
+
+    var second_cfg = Config.RuntimeConfig{};
+    second_cfg.assets_dir = missing_assets_dir;
+
+    var restarted = try AgentRuntime.initWithPersistence(allocator, "agent-system-hooks-missing-template", &.{}, ltm_dir, "runtime-memory.db", second_cfg);
+    defer restarted.deinit();
+
+    const before = try restarted.active_memory.snapshotActive(allocator, "primary");
+    defer memory.deinitItems(allocator, before);
+    try std.testing.expectEqual(@as(usize, 0), before.len);
+
+    try ensureIdentityMemories(&restarted, "primary");
+
+    const after = try restarted.active_memory.snapshotActive(allocator, "primary");
+    defer memory.deinitItems(allocator, after);
+    try std.testing.expect(containsNamedMemory(after, BASE_CORE_MEM_NAME));
 }
 
 test "system_hooks: ensureIdentityMemories mutates CORE memory on template sync" {
