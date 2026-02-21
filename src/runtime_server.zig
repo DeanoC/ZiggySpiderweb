@@ -1407,7 +1407,29 @@ pub const RuntimeServer = struct {
         self.runs.recordPhase(run_id, .integrate, "{}") catch |err| return self.wrapRuntimeErrorResponse(request_id, err, job.emit_debug);
         self.runs.recordPhase(run_id, .checkpoint, "{}") catch |err| return self.wrapRuntimeErrorResponse(request_id, err, job.emit_debug);
 
+        if (builtin.is_test) {
+            if (testBeforeCompleteStepHook) |hook| {
+                hook(self, run_id) catch |err| {
+                    return self.wrapRuntimeErrorResponse(request_id, err, job.emit_debug);
+                };
+            }
+        }
+
         var completed = self.runs.completeStep(run_id, completion_output, wait_for_user, chat_meta.task_complete) catch |err| {
+            if (err == run_engine.RunEngineError.InvalidState) {
+                if (self.isRunStepCancelRequested(run_id)) {
+                    _ = self.runs.cancel(run_id) catch {};
+                    return self.wrapRuntimeErrorResponse(request_id, agent_runtime.RuntimeError.RuntimeCancelled, job.emit_debug);
+                }
+
+                var snapshot = self.runs.get(run_id) catch {
+                    return self.wrapRuntimeErrorResponse(request_id, err, job.emit_debug);
+                };
+                defer snapshot.deinit(self.allocator);
+                if (snapshot.state == .cancelled) {
+                    return self.wrapRuntimeErrorResponse(request_id, agent_runtime.RuntimeError.RuntimeCancelled, job.emit_debug);
+                }
+            }
             return self.wrapRuntimeErrorResponse(request_id, err, job.emit_debug);
         };
         defer completed.deinit(self.allocator);
@@ -4193,6 +4215,7 @@ var mockPlainTextIntentFollowupCallCount: usize = 0;
 var mockJsonMessageOnlyFollowupCallCount: usize = 0;
 var mockRateLimitCallCount: usize = 0;
 var mockAuthFailureCallCount: usize = 0;
+var testBeforeCompleteStepHook: ?*const fn (*RuntimeServer, []const u8) anyerror!void = null;
 var mockCapturedProviderName: ?[]const u8 = null;
 var mockCapturedModelName: ?[]const u8 = null;
 var mockCapturedReasoning: ?[]const u8 = null;
@@ -4931,6 +4954,20 @@ fn mockProviderStreamByModelPlainTextUnicode(
     } });
 }
 
+fn cancelRunBeforeCompleteStepHook(server: *RuntimeServer, run_id: []const u8) anyerror!void {
+    // One-shot hook used by tests to inject cancellation in the completion window.
+    testBeforeCompleteStepHook = null;
+    const cancel_req = try std.fmt.allocPrint(
+        server.allocator,
+        "{{\"id\":\"req-run-cancel-complete-race\",\"type\":\"agent.run.cancel\",\"action\":\"{s}\"}}",
+        .{run_id},
+    );
+    defer server.allocator.free(cancel_req);
+
+    const cancel_rsp = try server.handleMessage(cancel_req);
+    defer server.allocator.free(cancel_rsp);
+}
+
 test "runtime_server: session.send dispatches through runtime and emits session.receive" {
     const allocator = std.testing.allocator;
     const server = try RuntimeServer.create(allocator, "agent-test", .{ .ltm_directory = "", .ltm_filename = "" });
@@ -5296,6 +5333,48 @@ test "runtime_server: agent.run.cancel preempts active run step" {
     const step_rsp = worker.response.?;
     defer allocator.free(step_rsp);
     try std.testing.expect(std.mem.indexOf(u8, step_rsp, "\"code\":\"runtime_cancelled\"") != null);
+
+    var snapshot = try server.runs.get(started.run_id);
+    defer snapshot.deinit(allocator);
+    try std.testing.expectEqual(run_engine.RunState.cancelled, snapshot.state);
+}
+
+test "runtime_server: cancel race before completeStep returns runtime_cancelled" {
+    const allocator = std.testing.allocator;
+    const original_stream_fn = streamByModelFn;
+    defer streamByModelFn = original_stream_fn;
+    streamByModelFn = mockProviderStreamByModel;
+
+    testBeforeCompleteStepHook = cancelRunBeforeCompleteStepHook;
+    defer testBeforeCompleteStepHook = null;
+
+    const server = try RuntimeServer.createWithProvider(allocator, "agent-run-cancel-complete-race", .{
+        .chat_operation_timeout_ms = 2_000,
+        .ltm_directory = "",
+        .ltm_filename = "",
+    }, .{
+        .name = "openai",
+        .model = "gpt-4o-mini",
+        .api_key = "test-key",
+    });
+    defer server.destroy();
+
+    var started = try server.runs.start(null);
+    defer started.deinit(allocator);
+
+    const step_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"id\":\"req-run-step-complete-race\",\"type\":\"agent.run.step\",\"action\":\"{s}\",\"content\":\"do work\"}}",
+        .{started.run_id},
+    );
+    defer allocator.free(step_req);
+
+    const step_rsp = try server.handleMessage(step_req);
+    defer allocator.free(step_rsp);
+    try std.testing.expect(std.mem.indexOf(u8, step_rsp, "\"type\":\"error\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, step_rsp, "\"code\":\"runtime_cancelled\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, step_rsp, "InvalidState") == null);
+    try std.testing.expect(std.mem.indexOf(u8, step_rsp, "\"code\":\"execution_failed\"") == null);
 
     var snapshot = try server.runs.get(started.run_id);
     defer snapshot.deinit(allocator);
