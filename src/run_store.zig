@@ -110,13 +110,13 @@ pub const RunStore = struct {
             return store.appendAt(base_id, "run.event", payload, event.created_at_ms);
         }
 
-        const owned_key = try self.allocator.dupe(u8, base_id);
-        errdefer self.allocator.free(owned_key);
         if (self.ephemeral_event_seq.getPtr(base_id)) |value| {
             value.* += 1;
             return value.*;
         }
 
+        const owned_key = try self.allocator.dupe(u8, base_id);
+        errdefer self.allocator.free(owned_key);
         try self.ephemeral_event_seq.put(self.allocator, owned_key, 1);
         return 1;
     }
@@ -141,14 +141,10 @@ pub const RunStore = struct {
         defer self.mutex.unlock();
 
         const store = self.mem_store orelse return try allocator.alloc([]u8, 0);
-        const records = try store.search(allocator, "run.meta", @max(limit * 8, 32));
-        defer ltm_store.deinitRecords(allocator, records);
-
-        var seen = std.StringHashMapUnmanaged(void){};
+        const base_ids = try store.listDistinctBaseIds(allocator, "run.meta", "run:%:meta", limit, 0);
         defer {
-            var it = seen.iterator();
-            while (it.next()) |entry| allocator.free(entry.key_ptr.*);
-            seen.deinit(allocator);
+            for (base_ids) |base_id| allocator.free(base_id);
+            allocator.free(base_ids);
         }
 
         var out = std.ArrayListUnmanaged([]u8){};
@@ -157,17 +153,9 @@ pub const RunStore = struct {
             out.deinit(allocator);
         }
 
-        for (records) |record| {
-            if (!std.mem.eql(u8, record.kind, "run.meta")) continue;
-            const run_id = parseRunIdFromBase(record.base_id) orelse continue;
-            if (seen.contains(run_id)) continue;
-
-            const owned_seen_key = try allocator.dupe(u8, run_id);
-            errdefer allocator.free(owned_seen_key);
-            try seen.put(allocator, owned_seen_key, {});
-
+        for (base_ids) |base_id| {
+            const run_id = parseRunIdFromBase(base_id) orelse continue;
             try out.append(allocator, try allocator.dupe(u8, run_id));
-            if (out.items.len >= limit) break;
         }
 
         return out.toOwnedSlice(allocator);
@@ -219,8 +207,7 @@ fn buildMetaPayload(allocator: std.mem.Allocator, meta: RunMetaInput) ![]u8 {
     var out = std.ArrayListUnmanaged(u8){};
     defer out.deinit(allocator);
 
-    try out.appendSlice(allocator,
-        "{\"run_id\":\"");
+    try out.appendSlice(allocator, "{\"run_id\":\"");
     try appendEscaped(allocator, &out, meta.run_id);
     try out.appendSlice(allocator, "\",\"state\":\"");
     try appendEscaped(allocator, &out, meta.state);
@@ -259,8 +246,7 @@ fn buildEventPayload(allocator: std.mem.Allocator, event: RunEventInput) ![]u8 {
     var out = std.ArrayListUnmanaged(u8){};
     defer out.deinit(allocator);
 
-    try out.appendSlice(allocator,
-        "{\"event_type\":\"");
+    try out.appendSlice(allocator, "{\"event_type\":\"");
     try appendEscaped(allocator, &out, event.event_type);
     try out.appendSlice(allocator, "\",\"created_at_ms\":");
     try out.writer(allocator).print("{d}", .{event.created_at_ms});
@@ -420,4 +406,50 @@ test "run_store: listEvents handles partially parsed records without invalid dei
     defer store.deinit();
 
     try std.testing.expectError(RunStoreError.InvalidRunEvent, store.listEvents(allocator, "run-1", 10));
+}
+
+test "run_store: listRunIds returns distinct runs even with heavy metadata churn" {
+    const allocator = std.testing.allocator;
+
+    const dir = try std.fmt.allocPrint(allocator, ".tmp-run-store-run-ids-{d}", .{std.time.nanoTimestamp()});
+    defer allocator.free(dir);
+    defer std.fs.cwd().deleteTree(dir) catch {};
+    try std.fs.cwd().makePath(dir);
+
+    var mem_store = try ltm_store.VersionedMemStore.open(allocator, dir, "run.db");
+    defer mem_store.close();
+
+    var store = RunStore.init(allocator, &mem_store);
+    defer store.deinit();
+
+    try store.persistMeta(.{
+        .run_id = "run-older",
+        .state = "created",
+        .step_count = 0,
+        .checkpoint_seq = 0,
+        .created_at_ms = 1,
+        .updated_at_ms = 1,
+    });
+
+    var i: u64 = 0;
+    while (i < 128) : (i += 1) {
+        try store.persistMeta(.{
+            .run_id = "run-busy",
+            .state = "running",
+            .step_count = i,
+            .checkpoint_seq = i,
+            .created_at_ms = 2,
+            .updated_at_ms = @as(i64, @intCast(100 + i)),
+        });
+    }
+
+    const ids = try store.listRunIds(allocator, 2);
+    defer {
+        for (ids) |id| allocator.free(id);
+        allocator.free(ids);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), ids.len);
+    try std.testing.expectEqualStrings("run-busy", ids[0]);
+    try std.testing.expectEqualStrings("run-older", ids[1]);
 }

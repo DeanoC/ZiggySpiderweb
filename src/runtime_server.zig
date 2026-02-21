@@ -275,7 +275,8 @@ pub const RuntimeServer = struct {
             effective_ltm_filename,
             runtime_cfg,
         );
-        errdefer runtime.deinit();
+        var runtime_owned_by_self = false;
+        errdefer if (!runtime_owned_by_self) runtime.deinit();
 
         var runs = try run_engine.RunEngine.init(
             allocator,
@@ -285,7 +286,8 @@ pub const RuntimeServer = struct {
                 .checkpoint_interval_steps = runtime_cfg.run_checkpoint_interval_steps,
             },
         );
-        errdefer runs.deinit();
+        var runs_owned_by_self = false;
+        errdefer if (!runs_owned_by_self) runs.deinit();
 
         self.* = .{
             .allocator = allocator,
@@ -300,6 +302,8 @@ pub const RuntimeServer = struct {
             .log_provider_requests = shouldLogProviderRequests(),
             .test_ltm_directory = test_ltm_directory,
         };
+        runtime_owned_by_self = true;
+        runs_owned_by_self = true;
         errdefer {
             self.runs.deinit();
             self.runtime.deinit();

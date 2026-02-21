@@ -445,7 +445,8 @@ pub const RunEngine = struct {
     }
 
     fn recoverLocked(self: *RunEngine) !void {
-        const ids = try self.store.listRunIds(self.allocator, 1024);
+        const recover_run_limit: usize = @intCast(std.math.maxInt(i64));
+        const ids = try self.store.listRunIds(self.allocator, recover_run_limit);
         defer {
             for (ids) |id| self.allocator.free(id);
             self.allocator.free(ids);
@@ -638,4 +639,46 @@ test "run_engine: recovery restores persisted run events" {
         }
     }
     try std.testing.expect(saw_started);
+}
+
+test "run_engine: recovery loads more than 1024 persisted runs" {
+    const allocator = std.testing.allocator;
+
+    const dir = try std.fmt.allocPrint(allocator, ".tmp-run-engine-recover-many-{d}", .{std.time.nanoTimestamp()});
+    defer allocator.free(dir);
+    defer std.fs.cwd().deleteTree(dir) catch {};
+    try std.fs.cwd().makePath(dir);
+
+    var mem_store = try ltm_store.VersionedMemStore.open(allocator, dir, "run.db");
+    defer mem_store.close();
+
+    {
+        var store = run_store.RunStore.init(allocator, &mem_store);
+        defer store.deinit();
+
+        var i: usize = 0;
+        while (i < 1100) : (i += 1) {
+            const run_id = try std.fmt.allocPrint(allocator, "run-{d}", .{i});
+            defer allocator.free(run_id);
+
+            try store.persistMeta(.{
+                .run_id = run_id,
+                .state = "created",
+                .step_count = i,
+                .checkpoint_seq = 0,
+                .created_at_ms = @as(i64, @intCast(i + 1)),
+                .updated_at_ms = @as(i64, @intCast(i + 1)),
+            });
+        }
+    }
+
+    var restored = try RunEngine.init(allocator, &mem_store, .{
+        .max_run_steps = 16,
+        .checkpoint_interval_steps = 1,
+    });
+    defer restored.deinit();
+
+    const snapshots = try restored.list(allocator);
+    defer deinitSnapshots(allocator, snapshots);
+    try std.testing.expectEqual(@as(usize, 1100), snapshots.len);
 }
