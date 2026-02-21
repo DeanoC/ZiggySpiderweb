@@ -1218,7 +1218,7 @@ pub const RuntimeServer = struct {
         };
 
         var chat_meta = RunStepMeta{};
-        const chat_frames = self.handleChat(job, run_id, work.input, &chat_meta) catch |err| {
+        const chat_frames = self.handleChat(job, request_id, work.input, &chat_meta) catch |err| {
             _ = self.runs.failStep(run_id, @errorName(err)) catch {};
             return err;
         };
@@ -4828,6 +4828,7 @@ test "runtime_server: run step fails and returns chat error frame when provider 
 
     var run_id: ?[]const u8 = null;
     var saw_error_frame = false;
+    var saw_error_request_match = false;
     var saw_failed_state = false;
     for (frames) |payload| {
         if (std.mem.indexOf(u8, payload, "\"type\":\"agent.run.ack\"") != null) {
@@ -4839,6 +4840,12 @@ test "runtime_server: run step fails and returns chat error frame when provider 
             std.mem.indexOf(u8, payload, "\"code\":\"provider_unavailable\"") != null)
         {
             saw_error_frame = true;
+            var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
+            defer parsed.deinit();
+            const request = parsed.value.object.get("request").?.string;
+            if (std.mem.eql(u8, request, "req-run-start-error")) {
+                saw_error_request_match = true;
+            }
         }
         if (std.mem.indexOf(u8, payload, "\"type\":\"agent.run.state\"") != null and
             std.mem.indexOf(u8, payload, "\"state\":\"failed\"") != null)
@@ -4849,6 +4856,7 @@ test "runtime_server: run step fails and returns chat error frame when provider 
 
     try std.testing.expect(run_id != null);
     try std.testing.expect(saw_error_frame);
+    try std.testing.expect(saw_error_request_match);
     try std.testing.expect(saw_failed_state);
 
     const status_req = try std.fmt.allocPrint(allocator, "{{\"id\":\"req-run-status-error\",\"type\":\"agent.run.status\",\"action\":\"{s}\"}}", .{run_id.?});

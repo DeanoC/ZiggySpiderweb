@@ -185,8 +185,12 @@ pub const RunStore = struct {
         defer ltm_store.deinitRecords(allocator, records);
 
         var out = try allocator.alloc(RunEvent, records.len);
+        var initialized: usize = 0;
         errdefer {
-            for (out) |*event| event.deinit(allocator);
+            var idx: usize = 0;
+            while (idx < initialized) : (idx += 1) {
+                out[idx].deinit(allocator);
+            }
             allocator.free(out);
         }
 
@@ -199,6 +203,7 @@ pub const RunStore = struct {
             parsed.seq = record.version;
             out[write_index] = parsed;
             write_index += 1;
+            initialized += 1;
         }
 
         return out;
@@ -395,4 +400,24 @@ test "run_store: persists and loads run metadata and events" {
     defer deinitEvents(allocator, events);
     try std.testing.expectEqual(@as(usize, 1), events.len);
     try std.testing.expectEqualStrings("run.started", events[0].event_type);
+}
+
+test "run_store: listEvents handles partially parsed records without invalid deinit" {
+    const allocator = std.testing.allocator;
+
+    const dir = try std.fmt.allocPrint(allocator, ".tmp-run-store-partial-{d}", .{std.time.nanoTimestamp()});
+    defer allocator.free(dir);
+    defer std.fs.cwd().deleteTree(dir) catch {};
+    try std.fs.cwd().makePath(dir);
+
+    var mem_store = try ltm_store.VersionedMemStore.open(allocator, dir, "run.db");
+    defer mem_store.close();
+
+    _ = try mem_store.appendAt("run:run-1:events", "run.event", "{\"event_type\":\"run.started\",\"created_at_ms\":1,\"payload\":{\"ok\":true}}", 1);
+    _ = try mem_store.appendAt("run:run-1:events", "run.event", "{\"event_type\":\"run.broken\",\"payload\":{\"ok\":false}}", 2);
+
+    var store = RunStore.init(allocator, &mem_store);
+    defer store.deinit();
+
+    try std.testing.expectError(RunStoreError.InvalidRunEvent, store.listEvents(allocator, "run-1", 10));
 }

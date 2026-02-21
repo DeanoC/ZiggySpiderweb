@@ -469,6 +469,18 @@ pub const RunEngine = struct {
 
             if (run.state == .running) run.state = .paused;
 
+            const recover_event_limit: usize = @intCast(std.math.maxInt(i64));
+            const persisted_events = try self.store.listEvents(self.allocator, run_id, recover_event_limit);
+            defer run_store.deinitEvents(self.allocator, persisted_events);
+            for (persisted_events) |event| {
+                try run.events.append(self.allocator, .{
+                    .seq = event.seq,
+                    .event_type = try self.allocator.dupe(u8, event.event_type),
+                    .payload_json = try self.allocator.dupe(u8, event.payload_json),
+                    .created_at_ms = event.created_at_ms,
+                });
+            }
+
             const owned_key = try self.allocator.dupe(u8, run.run_id);
             errdefer self.allocator.free(owned_key);
             try self.runs.put(self.allocator, owned_key, run);
@@ -573,4 +585,57 @@ test "run_engine: start, step and lifecycle transitions" {
     const events = try engine.listEvents(allocator, started.run_id, 32);
     defer deinitEvents(allocator, events);
     try std.testing.expect(events.len >= 5);
+}
+
+test "run_engine: recovery restores persisted run events" {
+    const allocator = std.testing.allocator;
+
+    const dir = try std.fmt.allocPrint(allocator, ".tmp-run-engine-recover-events-{d}", .{std.time.nanoTimestamp()});
+    defer allocator.free(dir);
+    defer std.fs.cwd().deleteTree(dir) catch {};
+    try std.fs.cwd().makePath(dir);
+
+    var captured_run_id: []u8 = undefined;
+    {
+        var mem_store = try ltm_store.VersionedMemStore.open(allocator, dir, "run.db");
+        defer mem_store.close();
+
+        var first = try RunEngine.init(allocator, &mem_store, .{
+            .max_run_steps = 16,
+            .checkpoint_interval_steps = 1,
+        });
+        defer first.deinit();
+
+        var started = try first.start("recover events");
+        defer started.deinit(allocator);
+        captured_run_id = try allocator.dupe(u8, started.run_id);
+
+        var step = try first.beginStep(started.run_id, null);
+        defer step.deinit(allocator);
+        try first.recordPhase(started.run_id, .observe, "{}");
+        var completed = try first.completeStep(started.run_id, "waiting", true);
+        defer completed.deinit(allocator);
+    }
+    defer allocator.free(captured_run_id);
+
+    var mem_store = try ltm_store.VersionedMemStore.open(allocator, dir, "run.db");
+    defer mem_store.close();
+    var restored = try RunEngine.init(allocator, &mem_store, .{
+        .max_run_steps = 16,
+        .checkpoint_interval_steps = 1,
+    });
+    defer restored.deinit();
+
+    const events = try restored.listEvents(allocator, captured_run_id, 64);
+    defer deinitEvents(allocator, events);
+    try std.testing.expect(events.len >= 4);
+
+    var saw_started = false;
+    for (events) |event| {
+        if (std.mem.eql(u8, event.event_type, "run.started")) {
+            saw_started = true;
+            break;
+        }
+    }
+    try std.testing.expect(saw_started);
 }
