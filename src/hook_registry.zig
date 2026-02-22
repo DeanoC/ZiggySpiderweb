@@ -1,117 +1,15 @@
 const std = @import("std");
 const AgentRuntime = @import("agent_runtime.zig").AgentRuntime;
 const brain_tools = @import("brain_tools.zig");
+const primitives = @import("ziggy-runtime-hooks").hook_primitives;
 
-pub const HookPhase = enum {
-    pre_observe,
-    post_observe,
-    pre_mutate,
-    post_mutate,
-    pre_results,
-    post_results,
-};
-
-pub const HookError = error{
-    HookFailed,
-    InvalidPhase,
-    OutOfMemory,
-};
-
-pub const HookPriority = enum(i16) {
-    /// System-first hooks (core prompt loading, validation)
-    system_first = -1000,
-
-    /// Default priority for brain specializations
-    normal = 0,
-
-    /// System-last hooks (metrics, cleanup)
-    system_last = 1000,
-};
-
-/// Core prompt entry for PreObserve hook pipeline
-pub const CoreEntry = struct {
-    key: []const u8,
-    value: []const u8,
-    mutable: bool = true,
-};
-
-/// Backward-compatible alias for older naming.
-pub const RomEntry = CoreEntry;
-
-/// Simple core prompt structure for PreObserve pipeline
-pub const CorePrompt = struct {
-    allocator: std.mem.Allocator,
-    entries: std.StringHashMapUnmanaged(CoreEntry),
-
-    pub fn init(allocator: std.mem.Allocator) CorePrompt {
-        return .{
-            .allocator = allocator,
-            .entries = .{},
-        };
-    }
-
-    pub fn deinit(self: *CorePrompt) void {
-        var it = self.entries.iterator();
-        while (it.next()) |entry| {
-            self.allocator.free(entry.key_ptr.*);
-            self.allocator.free(entry.value_ptr.value);
-        }
-        self.entries.deinit(self.allocator);
-    }
-
-    /// Set a key-value pair in core prompt memory (always mutable during PreObserve)
-    pub fn set(self: *CorePrompt, key: []const u8, value: []const u8) !void {
-        // Check if entry exists
-        if (self.entries.getEntry(key)) |existing| {
-            // Update existing entry - free old value, keep key
-            const old_value = existing.value_ptr.value;
-            const new_value = try self.allocator.dupe(u8, value);
-            existing.value_ptr.value = new_value;
-            self.allocator.free(old_value);
-            return;
-        }
-
-        // New entry - allocate both key and value
-        const owned_key = try self.allocator.dupe(u8, key);
-        errdefer self.allocator.free(owned_key);
-
-        const owned_value = try self.allocator.dupe(u8, value);
-        errdefer self.allocator.free(owned_value);
-
-        try self.entries.put(self.allocator, owned_key, .{
-            .key = owned_key,
-            .value = owned_value,
-            .mutable = true,
-        });
-    }
-
-    /// Get a value from core prompt memory
-    pub fn get(self: *const CorePrompt, key: []const u8) ?[]const u8 {
-        const entry = self.entries.get(key) orelse return null;
-        return entry.value;
-    }
-
-    /// Check if key exists
-    pub fn has(self: *const CorePrompt, key: []const u8) bool {
-        return self.entries.contains(key);
-    }
-
-    /// Get all keys (for debugging)
-    pub fn keys(self: *const CorePrompt, allocator: std.mem.Allocator) ![][]const u8 {
-        var result = std.ArrayList([]const u8).init(allocator);
-        errdefer result.deinit();
-
-        var it = self.entries.keyIterator();
-        while (it.next()) |key| {
-            try result.append(key.*);
-        }
-
-        return result.toOwnedSlice();
-    }
-};
-
-/// Backward-compatible alias for older naming.
-pub const Rom = CorePrompt;
+pub const HookPhase = primitives.HookPhase;
+pub const HookError = primitives.HookError;
+pub const HookPriority = primitives.HookPriority;
+pub const CoreEntry = primitives.CoreEntry;
+pub const RomEntry = primitives.RomEntry;
+pub const CorePrompt = primitives.CorePrompt;
+pub const Rom = primitives.Rom;
 
 /// Data passed to hooks varies by phase
 pub const HookData = union(HookPhase) {
@@ -202,39 +100,7 @@ pub const ObserveResult = struct {
 };
 
 /// Pending tool calls before execution
-pub const PendingTools = struct {
-    tools: std.ArrayListUnmanaged(ToolCall),
-
-    pub const ToolCall = struct {
-        name: []const u8,
-        args_json: []const u8,
-    };
-
-    pub fn init() PendingTools {
-        return .{ .tools = .{} };
-    }
-
-    pub fn deinit(self: *PendingTools, allocator: std.mem.Allocator) void {
-        for (self.tools.items) |*tool| {
-            allocator.free(tool.name);
-            allocator.free(tool.args_json);
-        }
-        self.tools.deinit(allocator);
-    }
-
-    pub fn add(self: *PendingTools, allocator: std.mem.Allocator, name: []const u8, args_json: []const u8) !void {
-        const owned_name = try allocator.dupe(u8, name);
-        errdefer allocator.free(owned_name);
-
-        const owned_args = try allocator.dupe(u8, args_json);
-        errdefer allocator.free(owned_args);
-
-        try self.tools.append(allocator, .{
-            .name = owned_name,
-            .args_json = owned_args,
-        });
-    }
-};
+pub const PendingTools = primitives.PendingTools;
 
 /// Results from tool execution
 pub const ToolResults = struct {
@@ -262,8 +128,8 @@ pub const HookFn = *const fn (
 
 /// Individual hook registration
 pub const Hook = struct {
-    name: []const u8,  // For debugging/logging
-    priority: i16,     // Lower = earlier in pipeline
+    name: []const u8, // For debugging/logging
+    priority: i16, // Lower = earlier in pipeline
     callback: HookFn,
 };
 
@@ -325,9 +191,7 @@ pub const HookRegistry = struct {
 
         for (list.items) |hook| {
             hook.callback(ctx, data) catch |err| {
-                std.log.err("Hook '{s}' failed in {s}: {s}", .{
-                    hook.name, @tagName(phase), @errorName(err)
-                });
+                std.log.err("Hook '{s}' failed in {s}: {s}", .{ hook.name, @tagName(phase), @errorName(err) });
                 return HookError.HookFailed;
             };
         }
