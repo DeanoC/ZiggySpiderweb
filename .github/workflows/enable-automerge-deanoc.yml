@@ -60,6 +60,40 @@ jobs:
               return;
             }
 
+            const pullRequestId = pull.node_id;
+            const disableAutoMerge = async (reason) => {
+              if (!pull.auto_merge) {
+                core.info(`Auto-merge already disabled for PR #${prNumber}: ${reason}`);
+                return;
+              }
+
+              try {
+                await github.graphql(
+                  `
+                    mutation($pullRequestId: ID!) {
+                      disablePullRequestAutoMerge(input: { pullRequestId: $pullRequestId }) {
+                        clientMutationId
+                      }
+                    }
+                  `,
+                  { pullRequestId },
+                );
+                core.notice(`Disabled auto-merge for PR #${prNumber}: ${reason}`);
+              } catch (error) {
+                const message = String(error?.message || error);
+                if (
+                  message.includes('is not enabled') ||
+                  message.includes('auto-merge is disabled') ||
+                  message.includes('auto merge is disabled') ||
+                  message.includes('not in the auto-merge queue')
+                ) {
+                  core.info(`Auto-merge already disabled for PR #${prNumber}: ${reason}`);
+                  return;
+                }
+                core.warning(`Could not disable auto-merge for PR #${prNumber}: ${message}`);
+              }
+            };
+
             const issueComments = await github.paginate(github.rest.issues.listComments, {
               owner,
               repo,
@@ -93,52 +127,6 @@ jobs:
             if (codexResponses.length === 0) {
               core.notice(`PR #${prNumber} is awaiting initial codex response; skipping.`);
               return;
-            }
-
-            const commits = await github.paginate(github.rest.pulls.listCommits, {
-              owner,
-              repo,
-              pull_number: prNumber,
-              per_page: 100,
-            });
-
-            const latestCommitAt = commits.reduce((latest, commit) => {
-              const commitAt = parseDate(commit.commit?.committer?.date ?? commit.commit?.author?.date);
-              return commitAt.getTime() > latest.getTime() ? commitAt : latest;
-            }, parseDate(pull.created_at));
-
-            const firstCodexResponseAt = codexResponses[0].at;
-            const latestCodexResponseAt = codexResponses[codexResponses.length - 1].at;
-            const hasSubsequentCycle = latestCommitAt.getTime() > firstCodexResponseAt.getTime();
-
-            const latestReviewRequest = [...reviewRequests]
-              .sort((a, b) => parseDate(a.created_at) - parseDate(b.created_at))
-              .pop();
-            const latestReviewRequestAt = latestReviewRequest ? parseDate(latestReviewRequest.created_at) : null;
-
-            if (hasSubsequentCycle) {
-              if (!latestReviewRequestAt || latestReviewRequestAt.getTime() < latestCommitAt.getTime()) {
-                core.notice(`PR #${prNumber} needs a fresh "@codex review" request after latest push.`);
-                return;
-              }
-            }
-
-            if (latestReviewRequestAt && latestCodexResponseAt.getTime() < latestReviewRequestAt.getTime()) {
-              core.notice(`PR #${prNumber} is awaiting codex response to latest request; skipping.`);
-              return;
-            }
-
-            const relevantStart = latestReviewRequestAt ?? firstCodexResponseAt;
-            const relevantCodexReviews = codexReviews.filter((review) => parseDate(review.submitted_at).getTime() >= relevantStart.getTime());
-
-            if (relevantCodexReviews.length > 0) {
-              const latestCodexReview = relevantCodexReviews
-                .sort((a, b) => parseDate(a.submitted_at) - parseDate(b.submitted_at))
-                .pop();
-              if (latestCodexReview.state === 'CHANGES_REQUESTED') {
-                core.notice(`PR #${prNumber} latest codex review requests changes; skipping.`);
-                return;
-              }
             }
 
             const unresolvedThreads = [];
@@ -193,11 +181,64 @@ jobs:
             }
 
             if (unresolvedThreads.length > 0) {
-              core.notice(`PR #${prNumber} has unresolved codex thread(s); skipping auto-merge enable.`);
+              await disableAutoMerge('unresolved codex review threads detected; manual merge is allowed.');
               return;
             }
 
-            const pullRequestId = pull.node_id;
+            const firstCodexResponseAt = codexResponses[0].at;
+            const latestCodexResponseAt = codexResponses[codexResponses.length - 1].at;
+            const tenMinutesMs = 10 * 60 * 1000;
+            const codexResponseAgeMs = Date.now() - latestCodexResponseAt.getTime();
+
+            if (codexResponseAgeMs > tenMinutesMs) {
+              await disableAutoMerge('latest codex response is older than 10 minutes; manual merge is allowed.');
+              return;
+            }
+
+            const commits = await github.paginate(github.rest.pulls.listCommits, {
+              owner,
+              repo,
+              pull_number: prNumber,
+              per_page: 100,
+            });
+
+            const latestCommitAt = commits.reduce((latest, commit) => {
+              const commitAt = parseDate(commit.commit?.committer?.date ?? commit.commit?.author?.date);
+              return commitAt.getTime() > latest.getTime() ? commitAt : latest;
+            }, parseDate(pull.created_at));
+
+            const hasSubsequentCycle = latestCommitAt.getTime() > firstCodexResponseAt.getTime();
+
+            const latestReviewRequest = [...reviewRequests]
+              .sort((a, b) => parseDate(a.created_at) - parseDate(b.created_at))
+              .pop();
+            const latestReviewRequestAt = latestReviewRequest ? parseDate(latestReviewRequest.created_at) : null;
+
+            if (hasSubsequentCycle) {
+              if (!latestReviewRequestAt || latestReviewRequestAt.getTime() < latestCommitAt.getTime()) {
+                core.notice(`PR #${prNumber} needs a fresh "@codex review" request after latest push.`);
+                return;
+              }
+            }
+
+            if (latestReviewRequestAt && latestCodexResponseAt.getTime() < latestReviewRequestAt.getTime()) {
+              core.notice(`PR #${prNumber} is awaiting codex response to latest request; skipping.`);
+              return;
+            }
+
+            const relevantStart = latestReviewRequestAt ?? firstCodexResponseAt;
+            const relevantCodexReviews = codexReviews.filter((review) => parseDate(review.submitted_at).getTime() >= relevantStart.getTime());
+
+            if (relevantCodexReviews.length > 0) {
+              const latestCodexReview = relevantCodexReviews
+                .sort((a, b) => parseDate(a.submitted_at) - parseDate(b.submitted_at))
+                .pop();
+              if (latestCodexReview.state === 'CHANGES_REQUESTED') {
+                core.notice(`PR #${prNumber} latest codex review requests changes; skipping.`);
+                return;
+              }
+            }
+
             try {
               await github.graphql(
                 `
