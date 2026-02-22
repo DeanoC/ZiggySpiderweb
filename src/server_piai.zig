@@ -591,6 +591,7 @@ fn handleWebSocketConnection(
                             },
                             .debug_subscribe, .debug_unsubscribe => {
                                 debug_stream_enabled = control_type == .debug_subscribe;
+                                fsrpc.setDebugStreamEnabled(debug_stream_enabled);
                                 const request_id = parsed.id orelse "generated";
                                 const payload_json = if (debug_stream_enabled)
                                     "{\"enabled\":true}"
@@ -624,6 +625,16 @@ fn handleWebSocketConnection(
                         const response = try fsrpc.handle(&parsed);
                         defer allocator.free(response);
                         try websocket_transport.writeFrame(stream, response, .text);
+
+                        const debug_frames = try fsrpc.drainPendingDebugFrames();
+                        if (debug_frames.len > 0) {
+                            defer allocator.free(debug_frames);
+                            for (debug_frames) |payload| {
+                                defer allocator.free(payload);
+                                try websocket_transport.writeFrame(stream, payload, .text);
+                                runtime_registry.maybeLogDebugFrame(agent_id, payload);
+                            }
+                        }
                         continue;
                     },
                 }
@@ -788,6 +799,21 @@ fn readServerFrame(allocator: std.mem.Allocator, stream: *std.net.Stream) !TestS
     return .{ .opcode = opcode, .payload = payload };
 }
 
+fn readServerFrameSkippingDebug(
+    allocator: std.mem.Allocator,
+    stream: *std.net.Stream,
+    debug_events_seen: ?*usize,
+) !TestServerFrame {
+    while (true) {
+        var frame = try readServerFrame(allocator, stream);
+        if (frame.opcode != 0x1 or std.mem.indexOf(u8, frame.payload, "\"type\":\"debug.event\"") == null) {
+            return frame;
+        }
+        if (debug_events_seen) |count| count.* += 1;
+        frame.deinit(allocator);
+    }
+}
+
 fn readExactFromStream(stream: *std.net.Stream, out: []u8) !void {
     var read_total: usize = 0;
     while (read_total < out.len) {
@@ -843,17 +869,22 @@ fn fsrpcConnectAndAttach(allocator: std.mem.Allocator, client: *std.net.Stream, 
     try std.testing.expect(std.mem.indexOf(u8, attach.payload, "\"type\":\"fsrpc.r_attach\"") != null);
 }
 
-fn fsrpcWriteChatInput(allocator: std.mem.Allocator, client: *std.net.Stream, content: []const u8) ![]u8 {
+fn fsrpcWriteChatInput(
+    allocator: std.mem.Allocator,
+    client: *std.net.Stream,
+    content: []const u8,
+    debug_events_seen: ?*usize,
+) ![]u8 {
     const encoded = try unified.encodeDataB64(allocator, content);
     defer allocator.free(encoded);
 
     try writeClientTextFrameMasked(client, "{\"channel\":\"fsrpc\",\"type\":\"fsrpc.t_walk\",\"tag\":10,\"fid\":1,\"newfid\":2,\"path\":[\"capabilities\",\"chat\",\"control\",\"input\"]}");
-    var walk = try readServerFrame(allocator, client);
+    var walk = try readServerFrameSkippingDebug(allocator, client, debug_events_seen);
     defer walk.deinit(allocator);
     try std.testing.expect(std.mem.indexOf(u8, walk.payload, "\"type\":\"fsrpc.r_walk\"") != null);
 
     try writeClientTextFrameMasked(client, "{\"channel\":\"fsrpc\",\"type\":\"fsrpc.t_open\",\"tag\":11,\"fid\":2,\"mode\":\"rw\"}");
-    var open = try readServerFrame(allocator, client);
+    var open = try readServerFrameSkippingDebug(allocator, client, debug_events_seen);
     defer open.deinit(allocator);
     try std.testing.expect(std.mem.indexOf(u8, open.payload, "\"type\":\"fsrpc.r_open\"") != null);
 
@@ -864,7 +895,7 @@ fn fsrpcWriteChatInput(allocator: std.mem.Allocator, client: *std.net.Stream, co
     );
     defer allocator.free(write_req);
     try writeClientTextFrameMasked(client, write_req);
-    var write = try readServerFrame(allocator, client);
+    var write = try readServerFrameSkippingDebug(allocator, client, debug_events_seen);
     defer write.deinit(allocator);
     try std.testing.expect(std.mem.indexOf(u8, write.payload, "\"type\":\"fsrpc.r_write\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, write.payload, "\"job\":\"job-") != null);
@@ -879,7 +910,7 @@ fn fsrpcWriteChatInput(allocator: std.mem.Allocator, client: *std.net.Stream, co
     const job_name = try allocator.dupe(u8, job.string);
 
     try writeClientTextFrameMasked(client, "{\"channel\":\"fsrpc\",\"type\":\"fsrpc.t_clunk\",\"tag\":13,\"fid\":2}");
-    var clunk = try readServerFrame(allocator, client);
+    var clunk = try readServerFrameSkippingDebug(allocator, client, debug_events_seen);
     defer clunk.deinit(allocator);
     try std.testing.expect(std.mem.indexOf(u8, clunk.payload, "\"type\":\"fsrpc.r_clunk\"") != null);
 
@@ -897,17 +928,17 @@ fn fsrpcReadJobResult(allocator: std.mem.Allocator, client: *std.net.Stream, job
     );
     defer allocator.free(walk_req);
     try writeClientTextFrameMasked(client, walk_req);
-    var walk = try readServerFrame(allocator, client);
+    var walk = try readServerFrameSkippingDebug(allocator, client, null);
     defer walk.deinit(allocator);
     try std.testing.expect(std.mem.indexOf(u8, walk.payload, "\"type\":\"fsrpc.r_walk\"") != null);
 
     try writeClientTextFrameMasked(client, "{\"channel\":\"fsrpc\",\"type\":\"fsrpc.t_open\",\"tag\":21,\"fid\":3,\"mode\":\"r\"}");
-    var open = try readServerFrame(allocator, client);
+    var open = try readServerFrameSkippingDebug(allocator, client, null);
     defer open.deinit(allocator);
     try std.testing.expect(std.mem.indexOf(u8, open.payload, "\"type\":\"fsrpc.r_open\"") != null);
 
     try writeClientTextFrameMasked(client, "{\"channel\":\"fsrpc\",\"type\":\"fsrpc.t_read\",\"tag\":22,\"fid\":3,\"offset\":0,\"count\":1048576}");
-    var read = try readServerFrame(allocator, client);
+    var read = try readServerFrameSkippingDebug(allocator, client, null);
     defer read.deinit(allocator);
     try std.testing.expect(std.mem.indexOf(u8, read.payload, "\"type\":\"fsrpc.r_read\"") != null);
 
@@ -925,7 +956,7 @@ fn fsrpcReadJobResult(allocator: std.mem.Allocator, client: *std.net.Stream, job
     _ = std.base64.standard.Decoder.decode(decoded, data_b64.string) catch return error.TestExpectedResponse;
 
     try writeClientTextFrameMasked(client, "{\"channel\":\"fsrpc\",\"type\":\"fsrpc.t_clunk\",\"tag\":23,\"fid\":3}");
-    var clunk = try readServerFrame(allocator, client);
+    var clunk = try readServerFrameSkippingDebug(allocator, client, null);
     defer clunk.deinit(allocator);
     try std.testing.expect(std.mem.indexOf(u8, clunk.payload, "\"type\":\"fsrpc.r_clunk\"") != null);
 
@@ -967,15 +998,17 @@ test "server_piai: websocket path handles unified control/fsrpc chat flow and re
     try std.testing.expect(std.mem.indexOf(u8, debug_sub.payload, "\"category\":\"control.subscription\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, debug_sub.payload, "\"enabled\":true") != null);
 
+    var debug_events_seen: usize = 0;
+    const job_name = try fsrpcWriteChatInput(allocator, &client, "hello", &debug_events_seen);
+    defer allocator.free(job_name);
+    try std.testing.expect(debug_events_seen > 0);
+
     try writeClientTextFrameMasked(&client, "{\"channel\":\"control\",\"type\":\"control.debug_unsubscribe\",\"id\":\"req-debug-unsub\"}");
     var debug_unsub = try readServerFrame(allocator, &client);
     defer debug_unsub.deinit(allocator);
     try std.testing.expect(std.mem.indexOf(u8, debug_unsub.payload, "\"type\":\"debug.event\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, debug_unsub.payload, "\"category\":\"control.subscription\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, debug_unsub.payload, "\"enabled\":false") != null);
-
-    const job_name = try fsrpcWriteChatInput(allocator, &client, "hello");
-    defer allocator.free(job_name);
 
     const result = try fsrpcReadJobResult(allocator, &client, job_name);
     defer allocator.free(result);
@@ -1023,7 +1056,7 @@ test "server_piai: route path agent id isolates runtime state across connections
         try performClientHandshake(allocator, &client, "/v2/agents/alpha/stream");
 
         try fsrpcConnectAndAttach(allocator, &client, "a-connect");
-        const alpha_job = try fsrpcWriteChatInput(allocator, &client, "alpha hello");
+        const alpha_job = try fsrpcWriteChatInput(allocator, &client, "alpha hello", null);
         defer allocator.free(alpha_job);
 
         try websocket_transport.writeFrame(&client, "", .close);
@@ -1041,7 +1074,7 @@ test "server_piai: route path agent id isolates runtime state across connections
         try performClientHandshake(allocator, &client, "/v2/agents/beta/stream");
 
         try fsrpcConnectAndAttach(allocator, &client, "b-connect");
-        const beta_job = try fsrpcWriteChatInput(allocator, &client, "beta hello");
+        const beta_job = try fsrpcWriteChatInput(allocator, &client, "beta hello", null);
         defer allocator.free(beta_job);
 
         try websocket_transport.writeFrame(&client, "", .close);

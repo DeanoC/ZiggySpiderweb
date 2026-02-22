@@ -50,6 +50,8 @@ pub const Session = struct {
 
     nodes: std.AutoHashMapUnmanaged(u32, Node) = .{},
     fids: std.AutoHashMapUnmanaged(u32, FidState) = .{},
+    pending_debug_frames: std.ArrayListUnmanaged([]u8) = .{},
+    debug_stream_enabled: bool = false,
 
     next_node_id: u32 = 1,
     next_job_id: u32 = 1,
@@ -72,6 +74,7 @@ pub const Session = struct {
     }
 
     pub fn deinit(self: *Session) void {
+        self.clearPendingDebugFrames();
         var it = self.nodes.iterator();
         while (it.next()) |entry| {
             var node = entry.value_ptr.*;
@@ -80,6 +83,18 @@ pub const Session = struct {
         self.nodes.deinit(self.allocator);
         self.fids.deinit(self.allocator);
         self.* = undefined;
+    }
+
+    pub fn setDebugStreamEnabled(self: *Session, enabled: bool) void {
+        self.debug_stream_enabled = enabled;
+        if (!enabled) self.clearPendingDebugFrames();
+    }
+
+    pub fn drainPendingDebugFrames(self: *Session) ![][]u8 {
+        if (self.pending_debug_frames.items.len == 0) return &.{};
+        const owned = try self.pending_debug_frames.toOwnedSlice(self.allocator);
+        self.pending_debug_frames = .{};
+        return owned;
     }
 
     pub fn handle(self: *Session, msg: *const unified.ParsedMessage) ![]u8 {
@@ -457,7 +472,7 @@ pub const Session = struct {
         var failure_message: []const u8 = "";
 
         var responses: ?[][]u8 = null;
-        if (self.runtime_server.handleMessageFrames(runtime_req)) |frames| {
+        if (self.runtime_server.handleMessageFramesWithDebug(runtime_req, self.debug_stream_enabled)) |frames| {
             responses = frames;
         } else |err| {
             failed = true;
@@ -469,6 +484,9 @@ pub const Session = struct {
             for (frames) |frame| {
                 try log_buf.appendSlice(self.allocator, frame);
                 try log_buf.append(self.allocator, '\n');
+                if (self.debug_stream_enabled and std.mem.indexOf(u8, frame, "\"type\":\"debug.event\"") != null) {
+                    try self.pending_debug_frames.append(self.allocator, try self.allocator.dupe(u8, frame));
+                }
 
                 const maybe = std.json.parseFromSlice(std.json.Value, self.allocator, frame, .{}) catch null;
                 if (maybe) |parsed| {
@@ -524,6 +542,12 @@ pub const Session = struct {
             .written = raw_input.len,
             .job_name = try self.allocator.dupe(u8, job_name),
         };
+    }
+
+    fn clearPendingDebugFrames(self: *Session) void {
+        for (self.pending_debug_frames.items) |payload| self.allocator.free(payload);
+        self.pending_debug_frames.deinit(self.allocator);
+        self.pending_debug_frames = .{};
     }
 };
 
