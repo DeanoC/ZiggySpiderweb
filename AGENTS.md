@@ -1,50 +1,48 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-This repository is a Zig project with source in `src/` and documentation in `README.md` and `design_docs/`.
+This repository is part of the Ziggy* codebase and is primarily a Zig project.
 
-- `src/main.zig` starts the gateway and parses CLI flags.
-- `src/server_piai.zig` hosts the websocket/event-loop server and OpenClaw message flow.
-- `src/protocol.zig` contains protocol parsing and response builders.
-- `src/config.zig` handles config loading/saving and API-key resolution.
-- `src/config_cli.zig` implements `spiderweb-config` commands.
-- Tests are inlined with `test` blocks (currently in source files, not separate test folders).
+- `src/` contains runtime/library source files.
+- `build.zig` defines build targets and dependency wiring.
+- `build.zig.zon` contains package metadata and dependency pins.
+- `README.md` documents setup, architecture notes, and usage.
+- Tests are implemented with Zig `test` blocks and, where present, files under `tests/`.
 
 ## Build, Test, and Development Commands
-- `zig build` — compiles both binaries: `spiderweb` and `spiderweb-config`.
-- `zig build test` — runs all Zig test blocks (currently includes config defaults test).
-- `zig build --release=safe` — builds an optimized safe release binary.
-- `zig build run -- --port 18790 --bind 127.0.0.1` — runs the server from the build system.
-- `zig build run -- --help` — prints runtime usage.
-- `zig fmt src/*.zig` — formats Zig source using the standard formatter.
-- If source code changes, you must run `zig build` and `zig build test` and confirm both pass before pushing to any remote.
+- `zig build` - build all configured artifacts for this repository.
+- `zig build test` - run the repository test suite.
+- `zig build --release=safe` - build optimized safe artifacts.
+- `zig fmt src/*.zig` - format Zig source files.
+- If source code changes, run `zig build` and `zig build test` and confirm both pass before pushing.
 
 ## Coding Style & Naming Conventions
-- Follow Zig style used in existing files: 4-space indentation, UTF-8 plain text.
-- Use `snake_case` for variables/functions/constants where possible; `PascalCase` for types and public structs/enums.
-- Keep errors explicit with `try`/`catch`; prefer early returns for failures.
-- Use small, single-purpose functions and short, actionable comments only when behavior is non-obvious.
+- Follow Zig style and keep code `zig fmt` clean.
+- Use `snake_case` for functions/variables/constants where possible.
+- Use `PascalCase` for public types (`struct`, `enum`, `union`).
+- Prefer explicit error handling with `try`/`catch` and early returns.
+- Keep functions focused and add concise comments only where behavior is non-obvious.
 
 ## Testing Guidelines
-- Add new behavior tests as `test "descriptive name"` blocks near related code.
-- Prefer focused unit tests and avoid relying on network calls in unit tests.
-- For behavior changes, run `zig build test` before finishing.
-- If behavior depends on protocol or client interoperability, add a short manual verification section in the PR (example command run).
+- Add tests close to the changed behavior using descriptive names.
+- Prefer focused tests with deterministic inputs.
+- For behavior changes, include both success and failure-path coverage where practical.
+- Run `zig build test` before opening or updating a PR.
 
 ## Commit & Pull Request Guidelines
-- Commit messages in this repo are mostly imperative and often prefixed by type (`fix:`, `refactor`, `Add ...`).
-- Suggested format: `type(scope): short imperative summary` (e.g., `fix(config): preserve default log level when env missing`).
-- PRs should include:
-  - Purpose and impact summary.
+- Use clear, imperative commit messages (Conventional prefixes like `feat:`, `fix:`, `refactor:` are preferred).
+- PR descriptions should include:
+  - Summary of purpose and impact.
   - Commands run (`zig build`, `zig build test`).
-  - Notes for any environment/config changes (provider keys, bind settings, log levels).
-- Remove secrets before sharing logs/screenshots; this project stores API keys in plain text config if set via CLI.
+  - Notes on compatibility/config changes when relevant.
 
-## Architecture & Runtime Notes
-- The process runs as a Linux-targeted websocket gateway and expects OpenClaw-compatible clients.
-- Core flow: `OpenClaw connect → websocket handshake → chat message parsing → provider stream proxy → OpenClaw frames`.
-- Keep protocol paths and message types stable (`/v1/agents/{agentId}/stream`) to preserve client compatibility.
+## Branch Protection And Review Gate
+- Direct pushes to `main` are not allowed.
+- All changes that update `main` must go through a pull request.
+- A PR must not be merged until `chatgpt-codex-connector` (including variants like `chatgpt-codex-connector[bot]`) has reviewed it.
+- Do not merge while any review comments from that reviewer remain outstanding.
+- Address each comment and resolve each review thread before merging.
 
 ## Compatibility Policy
-- Until `1.0.0`, backward compatibility is **not** guaranteed.
-- During this initial development phase, breaking changes to runtime behavior, memory schema, protocol payloads, and internal tool contracts are allowed.
+- Until `1.0.0`, backward compatibility is not guaranteed.
+- Breaking changes are allowed during early development, but should be documented in PR notes.
