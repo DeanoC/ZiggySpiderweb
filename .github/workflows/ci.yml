@@ -22,7 +22,7 @@ jobs:
           grep -q 'ziggy_memory_store' build.zig.zon
           grep -q 'ziggy_tool_runtime' build.zig.zon
           grep -q 'ziggy_runtime_hooks' build.zig.zon
-          grep -q '\\.hash =' build.zig.zon
+          grep -q '\.hash =' build.zig.zon
 
       - name: Install Zig
         run: |
