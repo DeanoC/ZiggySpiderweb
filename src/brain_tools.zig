@@ -1,9 +1,9 @@
 const std = @import("std");
-const memory = @import("memory.zig");
-const memid = @import("memid.zig");
+const memory = @import("ziggy-memory-store").memory;
+const memid = @import("ziggy-memory-store").memid;
 const brain_context = @import("brain_context.zig");
-const event_bus = @import("event_bus.zig");
-const tool_registry = @import("tool_registry.zig");
+const event_bus = @import("ziggy-runtime-hooks").event_bus;
+const tool_registry = @import("ziggy-tool-runtime").tool_registry;
 
 pub const ToolResult = struct {
     tool_name: []u8,

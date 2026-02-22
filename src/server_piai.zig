@@ -1,8 +1,8 @@
 const std = @import("std");
 const Config = @import("config.zig");
 const connection_dispatcher = @import("connection_dispatcher.zig");
-const memory = @import("memory.zig");
-const protocol = @import("protocol.zig");
+const memory = @import("ziggy-memory-store").memory;
+const protocol = @import("ziggy-spider-protocol").protocol;
 const runtime_server_mod = @import("runtime_server.zig");
 const websocket_transport = @import("websocket_transport.zig");
 

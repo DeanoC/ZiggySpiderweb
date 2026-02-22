@@ -1,6 +1,6 @@
 const std = @import("std");
-const ltm_store = @import("ltm_store.zig");
-const run_store = @import("run_store.zig");
+const ltm_store = @import("ziggy-memory-store").ltm_store;
+const run_store = @import("ziggy-memory-store").run_store;
 
 pub const RunState = enum {
     created,

@@ -1,18 +1,18 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const Config = @import("config.zig");
-const protocol = @import("protocol.zig");
+const protocol = @import("ziggy-spider-protocol").protocol;
 const agent_runtime = @import("agent_runtime.zig");
 const brain_tools = @import("brain_tools.zig");
 const brain_specialization = @import("brain_specialization.zig");
 const credential_store = @import("credential_store.zig");
 const memory_schema = @import("memory_schema.zig");
-const memory = @import("memory.zig");
-const memid = @import("memid.zig");
+const memory = @import("ziggy-memory-store").memory;
+const memid = @import("ziggy-memory-store").memid;
 const prompt_compiler = @import("prompt_compiler.zig");
 const run_engine = @import("run_engine.zig");
 const system_hooks = @import("system_hooks.zig");
-const tool_registry = @import("tool_registry.zig");
+const tool_registry = @import("ziggy-tool-runtime").tool_registry;
 const ziggy_piai = @import("ziggy-piai");
 
 pub const default_agent_id = "default";

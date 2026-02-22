@@ -1,5 +1,5 @@
 const std = @import("std");
-const event_bus = @import("event_bus.zig");
+const event_bus = @import("ziggy-runtime-hooks").event_bus;
 
 pub const ToolUse = struct {
     name: []u8,

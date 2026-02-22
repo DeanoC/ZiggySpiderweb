@@ -20,6 +20,10 @@
             .url = "https://github.com/DeanoC/ZiggyToolRuntime/archive/refs/tags/v0.1.0.tar.gz",
             .hash = "ziggy_tool_runtime-0.1.0-t8uaSEGuAACsRd_CxS3bTmnodmeUo1SYpBDONhrphUit",
         },
+        .ziggy_runtime_hooks = .{
+            .url = "https://github.com/DeanoC/ZiggyRuntimeHooks/archive/refs/tags/v0.1.0.tar.gz",
+            .hash = "ziggy_runtime_hooks-0.1.0-68kKIJYrAAB7dK_N4JV7gRrkvgL6aaxSRXhiG2xJbydt",
+        },
     },
     .paths = .{
         "build.zig",
