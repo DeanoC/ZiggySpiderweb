@@ -260,7 +260,17 @@ pub const Session = struct {
                 job_name = outcome.job_name;
             },
             else => {
-                try self.writeFileContent(state.node_id, offset, data);
+                self.writeFileContent(state.node_id, offset, data) catch |err| switch (err) {
+                    error.InvalidOffset => {
+                        return unified.buildFsrpcError(
+                            self.allocator,
+                            msg.tag,
+                            "invalid",
+                            "write offset is out of range",
+                        );
+                    },
+                    else => return err,
+                };
             },
         }
 
@@ -413,8 +423,8 @@ pub const Session = struct {
         const node_ptr = self.nodes.getPtr(node_id) orelse return error.MissingNode;
         if (node_ptr.kind != .file) return error.NotFile;
 
-        const base_offset: usize = @intCast(offset);
-        const required_len: usize = base_offset + data.len;
+        const base_offset = std.math.cast(usize, offset) orelse return error.InvalidOffset;
+        const required_len = std.math.add(usize, base_offset, data.len) catch return error.InvalidOffset;
         if (required_len <= node_ptr.content.len) {
             @memcpy(node_ptr.content[base_offset .. base_offset + data.len], data);
             return;
@@ -525,7 +535,9 @@ pub const Session = struct {
         }
 
         if (failed) {
-            const status = try std.fmt.allocPrint(self.allocator, "{{\"state\":\"failed\",\"error\":\"{s}\"}}", .{failure_message});
+            const escaped_failure = try unified.jsonEscape(self.allocator, failure_message);
+            defer self.allocator.free(escaped_failure);
+            const status = try std.fmt.allocPrint(self.allocator, "{{\"state\":\"failed\",\"error\":\"{s}\"}}", .{escaped_failure});
             defer self.allocator.free(status);
             try self.setFileContent(status_id, status);
             try self.setFileContent(result_id, failure_message);
