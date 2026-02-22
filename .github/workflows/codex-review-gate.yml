@@ -54,8 +54,7 @@ jobs:
               if (!login) return false;
               const normalized = login.toLowerCase();
               return normalized === 'chatgpt-codex-connector' ||
-                normalized === 'chatgpt-codex-connector[bot]' ||
-                normalized.startsWith('chatgpt-codex-connector');
+                normalized === 'chatgpt-codex-connector[bot]';
             };
 
             const reviews = await github.paginate(github.rest.pulls.listReviews, {
