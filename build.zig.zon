@@ -8,6 +8,18 @@
             .url = "https://github.com/DeanoC/ZiggyPiAi/archive/refs/heads/master.tar.gz",
             .hash = "N-V-__8AAFjyCgCnfD3PlWDmlBaYQ0YKwV1Amch11cZw7BHK",
         },
+        .ziggy_spider_protocol = .{
+            .url = "https://github.com/DeanoC/ZiggySpiderProtocol/archive/refs/tags/v0.1.0.tar.gz",
+            .hash = "ziggy_spider_protocol-0.1.0-Tn7uqxFxAADru6TiwRN12AgHK9UGtsNwI93n1rjSJAMw",
+        },
+        .ziggy_memory_store = .{
+            .url = "https://github.com/DeanoC/ZiggyMemoryStore/archive/refs/tags/v0.1.0.tar.gz",
+            .hash = "ziggy_memory_store-0.1.0-QlN-_5uGAQAT0z2xGi3yBmg3YOPYt288yaKoEjSBM_EU",
+        },
+        .ziggy_tool_runtime = .{
+            .url = "https://github.com/DeanoC/ZiggyToolRuntime/archive/refs/tags/v0.1.0.tar.gz",
+            .hash = "ziggy_tool_runtime-0.1.0-t8uaSEGuAACsRd_CxS3bTmnodmeUo1SYpBDONhrphUit",
+        },
     },
     .paths = .{
         "build.zig",
