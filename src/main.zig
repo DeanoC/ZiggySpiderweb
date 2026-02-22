@@ -8,18 +8,18 @@ comptime {
     _ = @import("brain_context.zig");
     _ = @import("brain_tools.zig");
     _ = @import("brain_specialization.zig");
-    _ = @import("event_bus.zig");
+    _ = @import("ziggy-runtime-hooks").event_bus;
     _ = @import("hook_registry.zig");
     _ = @import("system_hooks.zig");
-    _ = @import("ltm_store.zig");
-    _ = @import("memory.zig");
+    _ = @import("ziggy-memory-store").ltm_store;
+    _ = @import("ziggy-memory-store").memory;
     _ = @import("memory_schema.zig");
-    _ = @import("memid.zig");
+    _ = @import("ziggy-memory-store").memid;
     _ = @import("prompt_compiler.zig");
-    _ = @import("protocol.zig");
+    _ = @import("ziggy-spider-protocol").protocol;
     _ = @import("run_engine.zig");
-    _ = @import("run_store.zig");
-    _ = @import("tool_registry.zig");
+    _ = @import("ziggy-memory-store").run_store;
+    _ = @import("ziggy-tool-runtime").tool_registry;
 }
 
 pub fn main() !void {

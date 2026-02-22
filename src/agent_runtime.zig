@@ -1,12 +1,12 @@
 const std = @import("std");
-const ltm_store = @import("ltm_store.zig");
-const memory = @import("memory.zig");
-const memid = @import("memid.zig");
+const ltm_store = @import("ziggy-memory-store").ltm_store;
+const memory = @import("ziggy-memory-store").memory;
+const memid = @import("ziggy-memory-store").memid;
 const brain_context = @import("brain_context.zig");
 const brain_tools = @import("brain_tools.zig");
-const event_bus = @import("event_bus.zig");
-const tool_registry = @import("tool_registry.zig");
-const tool_executor = @import("tool_executor.zig");
+const event_bus = @import("ziggy-runtime-hooks").event_bus;
+const tool_registry = @import("ziggy-tool-runtime").tool_registry;
+const tool_executor = @import("ziggy-tool-runtime").tool_executor;
 const hook_registry = @import("hook_registry.zig");
 const system_hooks = @import("system_hooks.zig");
 const brain_specialization = @import("brain_specialization.zig");
@@ -1000,7 +1000,7 @@ test "agent_runtime: memory lifecycle create mutate evict load historical" {
     defer evict_tick.deinit(allocator);
     try std.testing.expect(evict_tick.tool_results[0].success);
 
-    const parsed = try @import("memid.zig").MemId.parse(mutated_id_copy);
+    const parsed = try memid.MemId.parse(mutated_id_copy);
     const latest_alias = try parsed.withVersion(null).format(allocator);
     defer allocator.free(latest_alias);
 
