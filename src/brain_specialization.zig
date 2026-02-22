@@ -241,23 +241,23 @@ pub fn loadBrainSpecializationFlat(
         return loadBrainSpecialization(allocator, runtime, brain_name);
     }
     defer flat_config.?.deinit();
-    
+
     // Get brain config from flat config
     const brain_cfg = flat_config.?.getBrainConfig(brain_name) orelse {
         // No config for this brain
         return null;
     };
-    
+
     // If template is specified, load and merge
     var merged_config: ?agent_config.BrainConfig = null;
     defer if (merged_config) |*m| m.deinit();
-    
+
     const effective_config = blk: {
         if (brain_cfg.template) |template_name| {
             var template = try agent_config.loadSubBrainTemplate(allocator, template_name);
             if (template) |*tmpl| {
                 defer tmpl.deinit();
-                
+
                 // Need to reconstruct BrainConfig from view for merging
                 var cfg = agent_config.BrainConfig.init(allocator);
                 cfg.provider.name = if (brain_cfg.provider.name) |n| try allocator.dupe(u8, n) else null;
@@ -265,7 +265,7 @@ pub fn loadBrainSpecializationFlat(
                 cfg.provider.think_level = if (brain_cfg.provider.think_level) |tl| try allocator.dupe(u8, tl) else null;
                 cfg.can_spawn_subbrains = brain_cfg.can_spawn_subbrains;
                 cfg.template = if (brain_cfg.template) |tn| try allocator.dupe(u8, tn) else null;
-                
+
                 // Copy arrays
                 if (brain_cfg.allowed_tools) |tools| {
                     cfg.allowed_tools = .{};
@@ -298,18 +298,18 @@ pub fn loadBrainSpecializationFlat(
                         try cfg.rom_overrides.?.append(allocator, entry);
                     }
                 }
-                
+
                 merged_config = try agent_config.mergeWithTemplate(allocator, cfg, tmpl.*);
                 break :blk merged_config.?.view();
             }
         }
         break :blk brain_cfg;
     };
-    
+
     // Convert to BrainSpecialization
     var spec = BrainSpecialization.init(allocator, brain_name);
     errdefer spec.deinit();
-    
+
     // Set provider info
     if (effective_config.provider.name) |name| {
         spec.provider_name = try allocator.dupe(u8, name);
@@ -320,10 +320,10 @@ pub fn loadBrainSpecializationFlat(
     if (effective_config.provider.think_level) |think| {
         spec.think_level = try allocator.dupe(u8, think);
     }
-    
+
     // Set spawn capability
     spec.can_spawn_subbrains = effective_config.can_spawn_subbrains;
-    
+
     // Copy tool lists
     if (effective_config.allowed_tools) |tools| {
         spec.allowed_tools = .{};
@@ -339,14 +339,14 @@ pub fn loadBrainSpecializationFlat(
             try spec.denied_tools.?.append(allocator, owned);
         }
     }
-    
+
     // Copy capabilities as role (just use first capability for now)
     if (effective_config.capabilities) |caps| {
         if (caps.items.len > 0) {
             spec.role = try allocator.dupe(u8, caps.items[0]);
         }
     }
-    
+
     // Copy ROM entries
     if (effective_config.rom_overrides) |roms| {
         for (roms.items) |rom| {
@@ -360,7 +360,7 @@ pub fn loadBrainSpecializationFlat(
             });
         }
     }
-    
+
     return spec;
 }
 

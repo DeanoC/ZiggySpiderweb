@@ -1,6 +1,6 @@
 # ZiggySpiderweb Test Environment Makefile
 
-.PHONY: help build up down shell test wipe logs
+.PHONY: help build up down shell test wipe logs status test-embed-multi-service
 
 help: ## Show this help message
 	@echo "ZiggySpiderweb Test Environment"
@@ -45,3 +45,6 @@ install-test: build up ## Test the install script
 local-install-test: build up ## Test local install.sh
 	@echo "Testing local install.sh..."
 	@docker exec -it spiderweb-test bash -c "cd /home/spiderweb/ziggy-spiderweb-src && ./install.sh"
+
+test-embed-multi-service: ## Run local embedded multi-service integration test
+	@bash ./test-embed-multi-service.sh
