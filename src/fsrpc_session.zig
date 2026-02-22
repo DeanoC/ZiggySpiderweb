@@ -480,12 +480,18 @@ pub const Session = struct {
 
         var failed = false;
         var failure_message: []const u8 = "";
+        var failure_message_owned: ?[]u8 = null;
+        defer if (failure_message_owned) |owned| self.allocator.free(owned);
 
         var responses: ?[][]u8 = null;
         if (self.runtime_server.handleMessageFramesWithDebug(runtime_req, self.debug_stream_enabled)) |frames| {
             responses = frames;
         } else |err| {
             failed = true;
+            if (failure_message_owned) |owned| {
+                self.allocator.free(owned);
+                failure_message_owned = null;
+            }
             failure_message = @errorName(err);
         }
         defer if (responses) |frames| runtime_server_mod.deinitResponseFrames(self.allocator, frames);
@@ -526,7 +532,9 @@ pub const Session = struct {
                         failed = true;
                         if (obj.get("message")) |msg| {
                             if (msg == .string) {
-                                failure_message = msg.string;
+                                if (failure_message_owned) |owned| self.allocator.free(owned);
+                                failure_message_owned = try self.allocator.dupe(u8, msg.string);
+                                failure_message = failure_message_owned.?;
                             }
                         }
                     }
