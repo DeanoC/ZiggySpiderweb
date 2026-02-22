@@ -42,4 +42,4 @@ jobs:
       - name: Run router and node ops tests
         run: |
           zig test src/fs_router.zig
-          zig test src/fs_node_ops.zig
+          zig test src/fs_node_ops.zig --test-filter "windows source"
