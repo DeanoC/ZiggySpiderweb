@@ -126,8 +126,6 @@ jobs:
               const latestReviewRequestAt = parseDate(latestReviewRequest.created_at);
 
               if (
-                eventName === 'pull_request' &&
-                action === 'synchronize' &&
                 latestCodexResponseAt &&
                 latestReviewRequestAt.getTime() <= latestCodexResponseAt.getTime()
               ) {
