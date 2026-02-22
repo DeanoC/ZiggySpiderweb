@@ -5,6 +5,8 @@ const memory = @import("ziggy-memory-store").memory;
 const protocol = @import("ziggy-spider-protocol").protocol;
 const runtime_server_mod = @import("runtime_server.zig");
 const websocket_transport = @import("websocket_transport.zig");
+const fsrpc_session = @import("fsrpc_session.zig");
+const unified = @import("ziggy-spider-protocol").unified;
 
 pub const RuntimeServer = runtime_server_mod.RuntimeServer;
 
@@ -451,7 +453,7 @@ pub fn run(
     defer dispatcher.destroy();
 
     std.log.info(
-        "Runtime websocket server listening at ws://{s}:{d}/v1/agents/{s}/stream",
+        "Runtime websocket server listening at ws://{s}:{d}/v2/agents/{s}/stream",
         .{ bind_addr, port, runtime_registry.default_agent_id },
     );
 
@@ -491,7 +493,10 @@ fn handleWebSocketConnection(
     var handshake = try websocket_transport.performHandshakeWithInfo(allocator, stream);
     defer handshake.deinit(allocator);
 
-    const agent_id = parseAgentIdFromStreamPath(handshake.path) orelse runtime_registry.getFirstAgentId() orelse runtime_registry.default_agent_id;
+    const agent_id = parseAgentIdFromStreamPath(handshake.path) orelse {
+        try sendWebSocketErrorAndClose(allocator, stream, .invalid_envelope, "invalid stream path");
+        return;
+    };
     const runtime_server = runtime_registry.getOrCreate(agent_id) catch |err| switch (err) {
         error.InvalidAgentId => {
             try sendWebSocketErrorAndClose(allocator, stream, .invalid_envelope, "invalid agent id");
@@ -503,6 +508,8 @@ fn handleWebSocketConnection(
         },
         else => return err,
     };
+    var fsrpc = try fsrpc_session.Session.init(allocator, runtime_server, agent_id);
+    defer fsrpc.deinit();
     var debug_stream_enabled = false;
 
     while (true) {
@@ -518,95 +525,130 @@ fn handleWebSocketConnection(
 
         switch (frame.opcode) {
             0x1 => {
-                const msg_type = protocol.parseMessageType(frame.payload);
-                if (msg_type == .connect) {
-                    var parsed_connect = protocol.parseMessage(allocator, frame.payload) catch {
-                        const invalid = try protocol.buildErrorWithCode(
-                            allocator,
-                            "unknown",
-                            .invalid_envelope,
-                            "invalid request envelope",
-                        );
-                        defer allocator.free(invalid);
-                        try websocket_transport.writeFrame(stream, invalid, .text);
-                        continue;
-                    };
-                    defer protocol.deinitParsedMessage(allocator, &parsed_connect);
-
-                    const request_id = parsed_connect.id orelse "generated";
-                    const connect_ack = try protocol.buildConnectAck(allocator, request_id);
-                    defer allocator.free(connect_ack);
-                    try websocket_transport.writeFrame(stream, connect_ack, .text);
-
-                    const bootstrap_responses = runtime_server.handleConnectBootstrapFrames(request_id) catch |err| blk: {
-                        const fallback = try protocol.buildErrorWithCode(
-                            allocator,
-                            request_id,
-                            .execution_failed,
-                            @errorName(err),
-                        );
-                        const wrapped = try allocator.alloc([]u8, 1);
-                        wrapped[0] = fallback;
-                        break :blk wrapped;
-                    };
-                    defer runtime_server_mod.deinitResponseFrames(allocator, bootstrap_responses);
-                    for (bootstrap_responses) |response| {
-                        try websocket_transport.writeFrame(stream, response, .text);
-                        runtime_registry.maybeLogDebugFrame(agent_id, response);
-                    }
-                    continue;
-                }
-
-                if (msg_type == .agent_control) {
-                    var parsed_control = protocol.parseMessage(allocator, frame.payload) catch {
-                        const invalid = try protocol.buildErrorWithCode(
-                            allocator,
-                            "unknown",
-                            .invalid_envelope,
-                            "invalid request envelope",
-                        );
-                        defer allocator.free(invalid);
-                        try websocket_transport.writeFrame(stream, invalid, .text);
-                        continue;
-                    };
-                    defer protocol.deinitParsedMessage(allocator, &parsed_control);
-
-                    const action = parsed_control.action orelse "";
-                    if (std.mem.eql(u8, action, "debug.subscribe") or std.mem.eql(u8, action, "debug.unsubscribe")) {
-                        debug_stream_enabled = std.mem.eql(u8, action, "debug.subscribe");
-                        const request_id = parsed_control.id orelse "generated";
-                        const payload_json = if (debug_stream_enabled)
-                            "{\"enabled\":true}"
-                        else
-                            "{\"enabled\":false}";
-                        const ack = try protocol.buildDebugEvent(
-                            allocator,
-                            request_id,
-                            "control.subscription",
-                            payload_json,
-                        );
-                        defer allocator.free(ack);
-                        try websocket_transport.writeFrame(stream, ack, .text);
-                        runtime_registry.maybeLogDebugFrame(agent_id, ack);
-                        continue;
-                    }
-                }
-
-                const responses = runtime_server.handleMessageFramesWithDebug(frame.payload, debug_stream_enabled) catch |err| blk: {
-                    const fallback = try protocol.buildErrorWithCode(
+                var parsed = unified.parseMessage(allocator, frame.payload) catch |err| {
+                    const response = try unified.buildControlError(
                         allocator,
-                        "unknown",
-                        .execution_failed,
+                        null,
+                        "invalid_envelope",
                         @errorName(err),
                     );
-                    const wrapped = try allocator.alloc([]u8, 1);
-                    wrapped[0] = fallback;
-                    break :blk wrapped;
-                };
-                defer runtime_server_mod.deinitResponseFrames(allocator, responses);
-                for (responses) |response| {
+                    defer allocator.free(response);
                     try websocket_transport.writeFrame(stream, response, .text);
-                    runtime_registry.maybeLogDebugFrame(agent_id, response);
+                    continue;
+                };
+                defer parsed.deinit(allocator);
+
+                switch (parsed.channel) {
+                    .control => {
+                        const control_type = parsed.control_type orelse {
+                            const response = try unified.buildControlError(
+                                allocator,
+                                parsed.id,
+                                "invalid_type",
+                                "missing control type",
+                            );
+                            defer allocator.free(response);
+                            try websocket_transport.writeFrame(stream, response, .text);
+                            continue;
+                        };
+
+                        switch (control_type) {
+                            .connect => {
+                                const payload = try std.fmt.allocPrint(
+                                    allocator,
+                                    "{{\"agent_id\":\"{s}\",\"session\":\"main\",\"protocol\":\"v2\"}}",
+                                    .{agent_id},
+                                );
+                                defer allocator.free(payload);
+                                const response = try unified.buildControlAck(
+                                    allocator,
+                                    .connect_ack,
+                                    parsed.id,
+                                    payload,
+                                );
+                                defer allocator.free(response);
+                                try websocket_transport.writeFrame(stream, response, .text);
+                                continue;
+                            },
+                            .ping => {
+                                const response = try unified.buildControlAck(
+                                    allocator,
+                                    .pong,
+                                    parsed.id,
+                                    "{}",
+                                );
+                                defer allocator.free(response);
+                                try websocket_transport.writeFrame(stream, response, .text);
+                                continue;
+                            },
+                            .session_attach, .session_resume => {
+                                const response = try unified.buildControlAck(
+                                    allocator,
+                                    control_type,
+                                    parsed.id,
+                                    "{\"session\":\"main\"}",
+                                );
+                                defer allocator.free(response);
+                                try websocket_transport.writeFrame(stream, response, .text);
+                                continue;
+                            },
+                            .debug_subscribe, .debug_unsubscribe => {
+                                debug_stream_enabled = control_type == .debug_subscribe;
+                                fsrpc.setDebugStreamEnabled(debug_stream_enabled);
+                                const request_id = parsed.id orelse "generated";
+                                const payload_json = if (debug_stream_enabled)
+                                    "{\"enabled\":true}"
+                                else
+                                    "{\"enabled\":false}";
+                                const ack = try protocol.buildDebugEvent(
+                                    allocator,
+                                    request_id,
+                                    "control.subscription",
+                                    payload_json,
+                                );
+                                defer allocator.free(ack);
+                                try websocket_transport.writeFrame(stream, ack, .text);
+                                runtime_registry.maybeLogDebugFrame(agent_id, ack);
+                                continue;
+                            },
+                            else => {
+                                const response = try unified.buildControlError(
+                                    allocator,
+                                    parsed.id,
+                                    "unsupported",
+                                    "unsupported control operation",
+                                );
+                                defer allocator.free(response);
+                                try websocket_transport.writeFrame(stream, response, .text);
+                                continue;
+                            },
+                        }
+                    },
+                    .fsrpc => {
+                        const response = try fsrpc.handle(&parsed);
+                        defer allocator.free(response);
+                        try websocket_transport.writeFrame(stream, response, .text);
+
+                        const debug_frames = try fsrpc.drainPendingDebugFrames();
+                        if (debug_frames.len > 0) {
+                            defer allocator.free(debug_frames);
+                            var idx: usize = 0;
+                            while (idx < debug_frames.len) : (idx += 1) {
+                                const payload = debug_frames[idx];
+                                websocket_transport.writeFrame(stream, payload, .text) catch |err| {
+                                    allocator.free(payload);
+                                    var rest = idx + 1;
+                                    while (rest < debug_frames.len) : (rest += 1) {
+                                        allocator.free(debug_frames[rest]);
+                                    }
+                                    return err;
+                                };
+                                runtime_registry.maybeLogDebugFrame(agent_id, payload);
+                                allocator.free(payload);
+                            }
+                        }
+                        continue;
+                    },
                 }
             },
             0x8 => {
@@ -635,7 +677,7 @@ fn sendWebSocketErrorAndClose(
 }
 
 fn parseAgentIdFromStreamPath(path: []const u8) ?[]const u8 {
-    const prefix = "/v1/agents/";
+    const prefix = "/v2/agents/";
     const stream_suffix = "/stream";
     if (!std.mem.startsWith(u8, path, prefix)) return null;
 
@@ -769,6 +811,21 @@ fn readServerFrame(allocator: std.mem.Allocator, stream: *std.net.Stream) !TestS
     return .{ .opcode = opcode, .payload = payload };
 }
 
+fn readServerFrameSkippingDebug(
+    allocator: std.mem.Allocator,
+    stream: *std.net.Stream,
+    debug_events_seen: ?*usize,
+) !TestServerFrame {
+    while (true) {
+        var frame = try readServerFrame(allocator, stream);
+        if (frame.opcode != 0x1 or std.mem.indexOf(u8, frame.payload, "\"type\":\"debug.event\"") == null) {
+            return frame;
+        }
+        if (debug_events_seen) |count| count.* += 1;
+        frame.deinit(allocator);
+    }
+}
+
 fn readExactFromStream(stream: *std.net.Stream, out: []u8) !void {
     var read_total: usize = 0;
     while (read_total < out.len) {
@@ -798,7 +855,127 @@ fn performClientHandshake(allocator: std.mem.Allocator, client: *std.net.Stream,
     try std.testing.expect(std.mem.indexOf(u8, handshake_response, "101 Switching Protocols") != null);
 }
 
-test "server_piai: websocket path handles connect/session.send and rejects chat.send" {
+fn fsrpcConnectAndAttach(allocator: std.mem.Allocator, client: *std.net.Stream, connect_id: []const u8) !void {
+    const connect_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"channel\":\"control\",\"type\":\"control.connect\",\"id\":\"{s}\"}}",
+        .{connect_id},
+    );
+    defer allocator.free(connect_req);
+    try writeClientTextFrameMasked(client, connect_req);
+
+    var connect_ack = try readServerFrame(allocator, client);
+    defer connect_ack.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0x1), connect_ack.opcode);
+    try std.testing.expect(std.mem.indexOf(u8, connect_ack.payload, "\"type\":\"control.connect_ack\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, connect_ack.payload, "\"ok\":true") != null);
+
+    try writeClientTextFrameMasked(client, "{\"channel\":\"fsrpc\",\"type\":\"fsrpc.t_version\",\"tag\":1,\"msize\":1048576,\"version\":\"styx-lite-1\"}");
+    var version = try readServerFrame(allocator, client);
+    defer version.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, version.payload, "\"type\":\"fsrpc.r_version\"") != null);
+
+    try writeClientTextFrameMasked(client, "{\"channel\":\"fsrpc\",\"type\":\"fsrpc.t_attach\",\"tag\":2,\"fid\":1}");
+    var attach = try readServerFrame(allocator, client);
+    defer attach.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, attach.payload, "\"type\":\"fsrpc.r_attach\"") != null);
+}
+
+fn fsrpcWriteChatInput(
+    allocator: std.mem.Allocator,
+    client: *std.net.Stream,
+    content: []const u8,
+    debug_events_seen: ?*usize,
+) ![]u8 {
+    const encoded = try unified.encodeDataB64(allocator, content);
+    defer allocator.free(encoded);
+
+    try writeClientTextFrameMasked(client, "{\"channel\":\"fsrpc\",\"type\":\"fsrpc.t_walk\",\"tag\":10,\"fid\":1,\"newfid\":2,\"path\":[\"capabilities\",\"chat\",\"control\",\"input\"]}");
+    var walk = try readServerFrameSkippingDebug(allocator, client, debug_events_seen);
+    defer walk.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, walk.payload, "\"type\":\"fsrpc.r_walk\"") != null);
+
+    try writeClientTextFrameMasked(client, "{\"channel\":\"fsrpc\",\"type\":\"fsrpc.t_open\",\"tag\":11,\"fid\":2,\"mode\":\"rw\"}");
+    var open = try readServerFrameSkippingDebug(allocator, client, debug_events_seen);
+    defer open.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, open.payload, "\"type\":\"fsrpc.r_open\"") != null);
+
+    const write_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"channel\":\"fsrpc\",\"type\":\"fsrpc.t_write\",\"tag\":12,\"fid\":2,\"offset\":0,\"data_b64\":\"{s}\"}}",
+        .{encoded},
+    );
+    defer allocator.free(write_req);
+    try writeClientTextFrameMasked(client, write_req);
+    var write = try readServerFrameSkippingDebug(allocator, client, debug_events_seen);
+    defer write.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, write.payload, "\"type\":\"fsrpc.r_write\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, write.payload, "\"job\":\"job-") != null);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, write.payload, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.TestExpectedResponse;
+    const payload = parsed.value.object.get("payload") orelse return error.TestExpectedResponse;
+    if (payload != .object) return error.TestExpectedResponse;
+    const job = payload.object.get("job") orelse return error.TestExpectedResponse;
+    if (job != .string) return error.TestExpectedResponse;
+    const job_name = try allocator.dupe(u8, job.string);
+
+    try writeClientTextFrameMasked(client, "{\"channel\":\"fsrpc\",\"type\":\"fsrpc.t_clunk\",\"tag\":13,\"fid\":2}");
+    var clunk = try readServerFrameSkippingDebug(allocator, client, debug_events_seen);
+    defer clunk.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, clunk.payload, "\"type\":\"fsrpc.r_clunk\"") != null);
+
+    return job_name;
+}
+
+fn fsrpcReadJobResult(allocator: std.mem.Allocator, client: *std.net.Stream, job_name: []const u8) ![]u8 {
+    const escaped_job = try unified.jsonEscape(allocator, job_name);
+    defer allocator.free(escaped_job);
+
+    const walk_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"channel\":\"fsrpc\",\"type\":\"fsrpc.t_walk\",\"tag\":20,\"fid\":1,\"newfid\":3,\"path\":[\"jobs\",\"{s}\",\"result.txt\"]}}",
+        .{escaped_job},
+    );
+    defer allocator.free(walk_req);
+    try writeClientTextFrameMasked(client, walk_req);
+    var walk = try readServerFrameSkippingDebug(allocator, client, null);
+    defer walk.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, walk.payload, "\"type\":\"fsrpc.r_walk\"") != null);
+
+    try writeClientTextFrameMasked(client, "{\"channel\":\"fsrpc\",\"type\":\"fsrpc.t_open\",\"tag\":21,\"fid\":3,\"mode\":\"r\"}");
+    var open = try readServerFrameSkippingDebug(allocator, client, null);
+    defer open.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, open.payload, "\"type\":\"fsrpc.r_open\"") != null);
+
+    try writeClientTextFrameMasked(client, "{\"channel\":\"fsrpc\",\"type\":\"fsrpc.t_read\",\"tag\":22,\"fid\":3,\"offset\":0,\"count\":1048576}");
+    var read = try readServerFrameSkippingDebug(allocator, client, null);
+    defer read.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, read.payload, "\"type\":\"fsrpc.r_read\"") != null);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, read.payload, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.TestExpectedResponse;
+    const payload = parsed.value.object.get("payload") orelse return error.TestExpectedResponse;
+    if (payload != .object) return error.TestExpectedResponse;
+    const data_b64 = payload.object.get("data_b64") orelse return error.TestExpectedResponse;
+    if (data_b64 != .string) return error.TestExpectedResponse;
+
+    const decoded_len = std.base64.standard.Decoder.calcSizeForSlice(data_b64.string) catch return error.TestExpectedResponse;
+    const decoded = try allocator.alloc(u8, decoded_len);
+    errdefer allocator.free(decoded);
+    _ = std.base64.standard.Decoder.decode(decoded, data_b64.string) catch return error.TestExpectedResponse;
+
+    try writeClientTextFrameMasked(client, "{\"channel\":\"fsrpc\",\"type\":\"fsrpc.t_clunk\",\"tag\":23,\"fid\":3}");
+    var clunk = try readServerFrameSkippingDebug(allocator, client, null);
+    defer clunk.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, clunk.payload, "\"type\":\"fsrpc.r_clunk\"") != null);
+
+    return decoded;
+}
+
+test "server_piai: websocket path handles unified control/fsrpc chat flow and rejects legacy session.send" {
     const allocator = std.testing.allocator;
     var runtime_registry = AgentRuntimeRegistry.init(allocator, .{
         .ltm_directory = "",
@@ -822,44 +999,39 @@ test "server_piai: websocket path handles connect/session.send and rejects chat.
     var client = try std.net.tcpConnectToAddress(listener.listen_address);
     defer client.close();
 
-    try performClientHandshake(allocator, &client, "/v1/agents/default/stream");
+    try performClientHandshake(allocator, &client, "/v2/agents/default/stream");
 
-    try writeClientTextFrameMasked(&client, "{\"id\":\"req-connect\",\"type\":\"connect\"}");
-    var connect_ack = try readServerFrame(allocator, &client);
-    defer connect_ack.deinit(allocator);
-    try std.testing.expectEqual(@as(u8, 0x1), connect_ack.opcode);
-    try std.testing.expect(std.mem.indexOf(u8, connect_ack.payload, "\"type\":\"connect.ack\"") != null);
-    var bootstrap_frame = try readServerFrame(allocator, &client);
-    defer bootstrap_frame.deinit(allocator);
-    try std.testing.expect(std.mem.indexOf(u8, bootstrap_frame.payload, "\"type\":\"session.receive\"") != null);
+    try fsrpcConnectAndAttach(allocator, &client, "req-connect");
 
-    try writeClientTextFrameMasked(&client, "{\"id\":\"req-session\",\"type\":\"session.send\",\"content\":\"hello\"}");
-    var session_frame = try readServerFrame(allocator, &client);
-    defer session_frame.deinit(allocator);
-    try std.testing.expectEqual(@as(u8, 0x1), session_frame.opcode);
-    try std.testing.expect(std.mem.indexOf(u8, session_frame.payload, "\"type\":\"session.receive\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, session_frame.payload, "\"type\":\"tool.event\"") == null);
-    try std.testing.expect(std.mem.indexOf(u8, session_frame.payload, "\"type\":\"memory.event\"") == null);
-
-    try writeClientTextFrameMasked(&client, "{\"id\":\"req-debug-sub\",\"type\":\"agent.control\",\"action\":\"debug.subscribe\"}");
+    try writeClientTextFrameMasked(&client, "{\"channel\":\"control\",\"type\":\"control.debug_subscribe\",\"id\":\"req-debug-sub\"}");
     var debug_sub = try readServerFrame(allocator, &client);
     defer debug_sub.deinit(allocator);
     try std.testing.expect(std.mem.indexOf(u8, debug_sub.payload, "\"type\":\"debug.event\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, debug_sub.payload, "\"category\":\"control.subscription\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, debug_sub.payload, "\"enabled\":true") != null);
 
-    try writeClientTextFrameMasked(&client, "{\"id\":\"req-debug-unsub\",\"type\":\"agent.control\",\"action\":\"debug.unsubscribe\"}");
+    var debug_events_seen: usize = 0;
+    const job_name = try fsrpcWriteChatInput(allocator, &client, "hello", &debug_events_seen);
+    defer allocator.free(job_name);
+    try std.testing.expect(debug_events_seen > 0);
+
+    try writeClientTextFrameMasked(&client, "{\"channel\":\"control\",\"type\":\"control.debug_unsubscribe\",\"id\":\"req-debug-unsub\"}");
     var debug_unsub = try readServerFrame(allocator, &client);
     defer debug_unsub.deinit(allocator);
     try std.testing.expect(std.mem.indexOf(u8, debug_unsub.payload, "\"type\":\"debug.event\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, debug_unsub.payload, "\"category\":\"control.subscription\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, debug_unsub.payload, "\"enabled\":false") != null);
 
-    try writeClientTextFrameMasked(&client, "{\"id\":\"req-chat\",\"type\":\"chat.send\",\"content\":\"legacy\"}");
+    const result = try fsrpcReadJobResult(allocator, &client, job_name);
+    defer allocator.free(result);
+    try std.testing.expect(result.len > 0);
+
+    try writeClientTextFrameMasked(&client, "{\"id\":\"req-chat\",\"type\":\"session.send\",\"content\":\"legacy\"}");
     var legacy_reply = try readServerFrame(allocator, &client);
     defer legacy_reply.deinit(allocator);
     try std.testing.expectEqual(@as(u8, 0x1), legacy_reply.opcode);
-    try std.testing.expect(std.mem.indexOf(u8, legacy_reply.payload, "\"code\":\"unsupported_message_type\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, legacy_reply.payload, "\"type\":\"control.error\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, legacy_reply.payload, "\"code\":\"invalid_envelope\"") != null);
 
     try websocket_transport.writeFrame(&client, "", .close);
     var close_reply = try readServerFrame(allocator, &client);
@@ -893,21 +1065,11 @@ test "server_piai: route path agent id isolates runtime state across connections
 
         var client = try std.net.tcpConnectToAddress(listener.listen_address);
         defer client.close();
-        try performClientHandshake(allocator, &client, "/v1/agents/alpha/stream");
+        try performClientHandshake(allocator, &client, "/v2/agents/alpha/stream");
 
-        try writeClientTextFrameMasked(&client, "{\"id\":\"a-connect\",\"type\":\"connect\"}");
-        var connect_ack = try readServerFrame(allocator, &client);
-        defer connect_ack.deinit(allocator);
-        try std.testing.expect(std.mem.indexOf(u8, connect_ack.payload, "\"type\":\"connect.ack\"") != null);
-        var bootstrap_frame = try readServerFrame(allocator, &client);
-        defer bootstrap_frame.deinit(allocator);
-        try std.testing.expect(std.mem.indexOf(u8, bootstrap_frame.payload, "\"type\":\"session.receive\"") != null);
-
-        try writeClientTextFrameMasked(&client, "{\"id\":\"a-msg\",\"type\":\"session.send\",\"content\":\"alpha hello\"}");
-        var alpha_reply = try readServerFrame(allocator, &client);
-        defer alpha_reply.deinit(allocator);
-        try std.testing.expect(std.mem.indexOf(u8, alpha_reply.payload, "\"type\":\"session.receive\"") != null);
-        try std.testing.expect(std.mem.indexOf(u8, alpha_reply.payload, "alpha hello") != null);
+        try fsrpcConnectAndAttach(allocator, &client, "a-connect");
+        const alpha_job = try fsrpcWriteChatInput(allocator, &client, "alpha hello", null);
+        defer allocator.free(alpha_job);
 
         try websocket_transport.writeFrame(&client, "", .close);
         var close_reply = try readServerFrame(allocator, &client);
@@ -921,21 +1083,11 @@ test "server_piai: route path agent id isolates runtime state across connections
 
         var client = try std.net.tcpConnectToAddress(listener.listen_address);
         defer client.close();
-        try performClientHandshake(allocator, &client, "/v1/agents/beta/stream");
+        try performClientHandshake(allocator, &client, "/v2/agents/beta/stream");
 
-        try writeClientTextFrameMasked(&client, "{\"id\":\"b-connect\",\"type\":\"connect\"}");
-        var connect_ack = try readServerFrame(allocator, &client);
-        defer connect_ack.deinit(allocator);
-        try std.testing.expect(std.mem.indexOf(u8, connect_ack.payload, "\"type\":\"connect.ack\"") != null);
-        var bootstrap_frame = try readServerFrame(allocator, &client);
-        defer bootstrap_frame.deinit(allocator);
-        try std.testing.expect(std.mem.indexOf(u8, bootstrap_frame.payload, "\"type\":\"session.receive\"") != null);
-
-        try writeClientTextFrameMasked(&client, "{\"id\":\"b-msg\",\"type\":\"session.send\",\"content\":\"beta hello\"}");
-        var beta_reply = try readServerFrame(allocator, &client);
-        defer beta_reply.deinit(allocator);
-        try std.testing.expect(std.mem.indexOf(u8, beta_reply.payload, "\"type\":\"session.receive\"") != null);
-        try std.testing.expect(std.mem.indexOf(u8, beta_reply.payload, "beta hello") != null);
+        try fsrpcConnectAndAttach(allocator, &client, "b-connect");
+        const beta_job = try fsrpcWriteChatInput(allocator, &client, "beta hello", null);
+        defer allocator.free(beta_job);
 
         try websocket_transport.writeFrame(&client, "", .close);
         var close_reply = try readServerFrame(allocator, &client);
@@ -990,15 +1142,12 @@ test "server_piai: runtime creation is capped to avoid unbounded per-agent growt
 
         var client = try std.net.tcpConnectToAddress(listener.listen_address);
         defer client.close();
-        try performClientHandshake(allocator, &client, "/v1/agents/alpha/stream");
+        try performClientHandshake(allocator, &client, "/v2/agents/alpha/stream");
 
-        try writeClientTextFrameMasked(&client, "{\"id\":\"alpha-connect\",\"type\":\"connect\"}");
+        try writeClientTextFrameMasked(&client, "{\"channel\":\"control\",\"type\":\"control.connect\",\"id\":\"alpha-connect\"}");
         var connect_ack = try readServerFrame(allocator, &client);
         defer connect_ack.deinit(allocator);
-        try std.testing.expect(std.mem.indexOf(u8, connect_ack.payload, "\"type\":\"connect.ack\"") != null);
-        var bootstrap_frame = try readServerFrame(allocator, &client);
-        defer bootstrap_frame.deinit(allocator);
-        try std.testing.expect(std.mem.indexOf(u8, bootstrap_frame.payload, "\"type\":\"session.receive\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, connect_ack.payload, "\"type\":\"control.connect_ack\"") != null);
 
         try websocket_transport.writeFrame(&client, "", .close);
         var close_reply = try readServerFrame(allocator, &client);
@@ -1012,7 +1161,7 @@ test "server_piai: runtime creation is capped to avoid unbounded per-agent growt
 
         var client = try std.net.tcpConnectToAddress(listener.listen_address);
         defer client.close();
-        try performClientHandshake(allocator, &client, "/v1/agents/beta/stream");
+        try performClientHandshake(allocator, &client, "/v2/agents/beta/stream");
 
         var limit_error = try readServerFrame(allocator, &client);
         defer limit_error.deinit(allocator);
@@ -1027,12 +1176,50 @@ test "server_piai: runtime creation is capped to avoid unbounded per-agent growt
     try std.testing.expect(server_ctx.err_name == null);
 }
 
+test "server_piai: websocket rejects unsupported route version" {
+    const allocator = std.testing.allocator;
+    var runtime_registry = AgentRuntimeRegistry.init(allocator, .{
+        .ltm_directory = "",
+        .ltm_filename = "",
+    }, null);
+    defer runtime_registry.deinit();
+
+    var listener = try (try std.net.Address.parseIp("127.0.0.1", 0)).listen(.{ .reuse_address = true });
+    defer listener.deinit();
+
+    var server_ctx = WsTestServerCtx{
+        .allocator = allocator,
+        .runtime_registry = &runtime_registry,
+        .listener = &listener,
+    };
+    defer server_ctx.deinit();
+
+    const server_thread = try std.Thread.spawn(.{}, runSingleWsConnection, .{&server_ctx});
+    defer server_thread.join();
+
+    var client = try std.net.tcpConnectToAddress(listener.listen_address);
+    defer client.close();
+    try performClientHandshake(allocator, &client, "/v1/agents/default/stream");
+
+    var invalid_path_error = try readServerFrame(allocator, &client);
+    defer invalid_path_error.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0x1), invalid_path_error.opcode);
+    try std.testing.expect(std.mem.indexOf(u8, invalid_path_error.payload, "\"code\":\"invalid_envelope\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, invalid_path_error.payload, "invalid stream path") != null);
+
+    var close_reply = try readServerFrame(allocator, &client);
+    defer close_reply.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0x8), close_reply.opcode);
+
+    try std.testing.expect(server_ctx.err_name == null);
+}
+
 test "server_piai: parse route path extracts agent id" {
-    const path = parseAgentIdFromStreamPath("/v1/agents/alpha/stream") orelse return error.TestExpectedAgent;
+    const path = parseAgentIdFromStreamPath("/v2/agents/alpha/stream") orelse return error.TestExpectedAgent;
     try std.testing.expectEqualStrings("alpha", path);
-    try std.testing.expect(parseAgentIdFromStreamPath("/v1/agents/alpha/stream?x=1") != null);
-    try std.testing.expect(parseAgentIdFromStreamPath("/v1/agents//stream") == null);
-    try std.testing.expect(parseAgentIdFromStreamPath("/v1/agents/alpha/not-stream") == null);
+    try std.testing.expect(parseAgentIdFromStreamPath("/v2/agents/alpha/stream?x=1") != null);
+    try std.testing.expect(parseAgentIdFromStreamPath("/v2/agents//stream") == null);
+    try std.testing.expect(parseAgentIdFromStreamPath("/v2/agents/alpha/not-stream") == null);
     try std.testing.expect(AgentRuntimeRegistry.isValidAgentId("alpha-1"));
     try std.testing.expect(AgentRuntimeRegistry.isValidAgentId("agent_2"));
     try std.testing.expect(!AgentRuntimeRegistry.isValidAgentId("."));

@@ -223,10 +223,10 @@ test "websocket_transport: compute accept key from RFC sample" {
 
 test "websocket_transport: extract request path from handshake line" {
     const request =
-        "GET /v1/agents/alpha/stream HTTP/1.1\r\n" ++
+        "GET /v2/agents/alpha/stream HTTP/1.1\r\n" ++
         "Host: localhost\r\n" ++
         "\r\n";
 
     const path = extractRequestPath(request) orelse return error.TestExpectedPath;
-    try std.testing.expectEqualStrings("/v1/agents/alpha/stream", path);
+    try std.testing.expectEqualStrings("/v2/agents/alpha/stream", path);
 }
