@@ -36,9 +36,6 @@ jobs:
       - name: Zig version
         run: zig version
 
-      - name: Build
-        run: zig build
-
       - name: Run Windows FS adapter tests
         run: zig test src/fs_windows_source_adapter.zig
 

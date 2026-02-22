@@ -53,7 +53,7 @@ fn prepareExport(
 
     return .{
         .root_real_path = root_real,
-        .root_inode = stat.inode,
+        .root_inode = inodeToU64(stat.inode),
         .default_caps = fs_source_adapter.defaultCapsForKind(adapter.source_kind),
     };
 }
@@ -343,6 +343,14 @@ fn isWithinRoot(root: []const u8, target: []const u8) bool {
     if (!std.mem.startsWith(u8, target, root)) return false;
     if (target.len <= root.len) return false;
     return target[root.len] == std.fs.path.sep;
+}
+
+fn inodeToU64(inode: anytype) u64 {
+    const InodeType = @TypeOf(inode);
+    if (comptime @typeInfo(InodeType).int.signedness == .signed) {
+        if (inode < 0) return 0;
+    }
+    return @intCast(inode);
 }
 
 test "fs_local_source_adapter: prepareExport resolves temp dir" {

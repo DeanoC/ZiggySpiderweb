@@ -3342,8 +3342,16 @@ fn clampI128ToI64(value: i128) i64 {
     return @intCast(value);
 }
 
-fn makeNodeId(export_index: usize, inode: u64) u64 {
-    return ((@as(u64, @intCast(export_index + 1))) << node_id_export_shift) | (inode & node_id_inode_mask);
+fn makeNodeId(export_index: usize, inode: anytype) u64 {
+    return ((@as(u64, @intCast(export_index + 1))) << node_id_export_shift) | (inodeToU64(inode) & node_id_inode_mask);
+}
+
+fn inodeToU64(inode: anytype) u64 {
+    const InodeType = @TypeOf(inode);
+    if (comptime @typeInfo(InodeType).int.signedness == .signed) {
+        if (inode < 0) return 0;
+    }
+    return @intCast(inode);
 }
 
 fn appendDirEntry(

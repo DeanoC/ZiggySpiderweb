@@ -548,7 +548,9 @@ test "Config defaults" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const cfg_path = try std.fs.path.join(allocator, &.{ tmp_dir.sub_path[0..], "config.json" });
+    const tmp_root = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_root);
+    const cfg_path = try std.fs.path.join(allocator, &.{ tmp_root, "config.json" });
 
     var config = try Config.init(allocator, cfg_path);
     defer config.deinit();

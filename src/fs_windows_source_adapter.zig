@@ -55,7 +55,7 @@ fn prepareExport(
 
     return .{
         .root_real_path = root_real,
-        .root_inode = stat.inode,
+        .root_inode = inodeToU64(stat.inode),
         .default_caps = fs_source_adapter.defaultCapsForKind(.windows),
     };
 }
@@ -219,11 +219,9 @@ pub fn lockFile(file: *std.fs.File, mode: LockMode, wait: bool) !void {
         return;
     }
 
-    const acquired = file.*.tryLock(lock_mode) catch |err| switch (err) {
-        error.FileLocksNotSupported => return error.OperationNotSupported,
-        else => return err,
-    };
-    if (!acquired) return error.WouldBlock;
+    // Zig 0.15.1 Windows stdlib lock API currently does not reliably support
+    // non-blocking lock probing through tryLock for our target matrix.
+    return error.OperationNotSupported;
 }
 
 fn isWithinRoot(root: []const u8, target: []const u8) bool {
@@ -231,6 +229,14 @@ fn isWithinRoot(root: []const u8, target: []const u8) bool {
     if (!std.mem.startsWith(u8, target, root)) return false;
     if (target.len <= root.len) return false;
     return target[root.len] == std.fs.path.sep;
+}
+
+fn inodeToU64(inode: anytype) u64 {
+    const InodeType = @TypeOf(inode);
+    if (comptime @typeInfo(InodeType).int.signedness == .signed) {
+        if (inode < 0) return 0;
+    }
+    return @intCast(inode);
 }
 
 test "fs_windows_source_adapter: rejects non-windows hosts" {
