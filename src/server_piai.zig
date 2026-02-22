@@ -453,8 +453,8 @@ pub fn run(
     defer dispatcher.destroy();
 
     std.log.info(
-        "Runtime websocket server listening at ws://{s}:{d}/v2/agents/{s}/stream",
-        .{ bind_addr, port, runtime_registry.default_agent_id },
+        "Runtime websocket server listening at ws://{s}:{d}",
+        .{ bind_addr, port },
     );
 
     while (true) {
@@ -493,8 +493,8 @@ fn handleWebSocketConnection(
     var handshake = try websocket_transport.performHandshakeWithInfo(allocator, stream);
     defer handshake.deinit(allocator);
 
-    const agent_id = parseAgentIdFromStreamPath(handshake.path) orelse {
-        try sendWebSocketErrorAndClose(allocator, stream, .invalid_envelope, "invalid stream path");
+    const agent_id = resolveAgentIdFromConnectionPath(handshake.path, runtime_registry.default_agent_id) orelse {
+        try sendWebSocketErrorAndClose(allocator, stream, .invalid_envelope, "invalid websocket path");
         return;
     };
     const runtime_server = runtime_registry.getOrCreate(agent_id) catch |err| switch (err) {
@@ -674,6 +674,13 @@ fn sendWebSocketErrorAndClose(
     defer allocator.free(payload);
     try websocket_transport.writeFrame(stream, payload, .text);
     try websocket_transport.writeFrame(stream, "", .close);
+}
+
+fn resolveAgentIdFromConnectionPath(path: []const u8, default_agent_id: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, path, "/") or std.mem.startsWith(u8, path, "/?")) {
+        return default_agent_id;
+    }
+    return parseAgentIdFromStreamPath(path);
 }
 
 fn parseAgentIdFromStreamPath(path: []const u8) ?[]const u8 {
@@ -975,7 +982,7 @@ fn fsrpcReadJobResult(allocator: std.mem.Allocator, client: *std.net.Stream, job
     return decoded;
 }
 
-test "server_piai: websocket path handles unified control/fsrpc chat flow and rejects legacy session.send" {
+test "server_piai: base websocket path handles unified control/fsrpc chat flow and rejects legacy session.send" {
     const allocator = std.testing.allocator;
     var runtime_registry = AgentRuntimeRegistry.init(allocator, .{
         .ltm_directory = "",
@@ -999,7 +1006,7 @@ test "server_piai: websocket path handles unified control/fsrpc chat flow and re
     var client = try std.net.tcpConnectToAddress(listener.listen_address);
     defer client.close();
 
-    try performClientHandshake(allocator, &client, "/v2/agents/default/stream");
+    try performClientHandshake(allocator, &client, "/");
 
     try fsrpcConnectAndAttach(allocator, &client, "req-connect");
 
@@ -1205,7 +1212,7 @@ test "server_piai: websocket rejects unsupported route version" {
     defer invalid_path_error.deinit(allocator);
     try std.testing.expectEqual(@as(u8, 0x1), invalid_path_error.opcode);
     try std.testing.expect(std.mem.indexOf(u8, invalid_path_error.payload, "\"code\":\"invalid_envelope\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, invalid_path_error.payload, "invalid stream path") != null);
+    try std.testing.expect(std.mem.indexOf(u8, invalid_path_error.payload, "invalid websocket path") != null);
 
     var close_reply = try readServerFrame(allocator, &client);
     defer close_reply.deinit(allocator);
@@ -1214,7 +1221,15 @@ test "server_piai: websocket rejects unsupported route version" {
     try std.testing.expect(server_ctx.err_name == null);
 }
 
-test "server_piai: parse route path extracts agent id" {
+test "server_piai: resolve connection path maps base URL to default agent" {
+    const resolved_root = resolveAgentIdFromConnectionPath("/", "default") orelse return error.TestExpectedAgent;
+    try std.testing.expectEqualStrings("default", resolved_root);
+    const resolved_query = resolveAgentIdFromConnectionPath("/?session=main", "default") orelse return error.TestExpectedAgent;
+    try std.testing.expectEqualStrings("default", resolved_query);
+    try std.testing.expect(resolveAgentIdFromConnectionPath("/v1/agents/default/stream", "default") == null);
+}
+
+test "server_piai: parse legacy route path extracts agent id" {
     const path = parseAgentIdFromStreamPath("/v2/agents/alpha/stream") orelse return error.TestExpectedAgent;
     try std.testing.expectEqualStrings("alpha", path);
     try std.testing.expect(parseAgentIdFromStreamPath("/v2/agents/alpha/stream?x=1") != null);
