@@ -50,7 +50,7 @@ fn prepareExport(
     const root_real = std.fs.cwd().realpathAlloc(allocator, path) catch return error.InvalidExportPath;
     errdefer allocator.free(root_real);
 
-    const stat = std.fs.cwd().statFile(root_real) catch return error.InvalidExportPath;
+    const stat = statPath(root_real) catch return error.InvalidExportPath;
     if (stat.kind != .directory) return error.InvalidExportPath;
 
     return .{
@@ -130,7 +130,7 @@ pub fn lookupChildAbsolute(
     errdefer allocator.free(resolved);
     if (!isWithinRoot(root_path, resolved)) return error.AccessDenied;
 
-    const stat = try std.fs.cwd().statFile(resolved);
+    const stat = try statPath(resolved);
     return .{
         .resolved_path = resolved,
         .stat = stat,
@@ -138,7 +138,7 @@ pub fn lookupChildAbsolute(
 }
 
 pub fn statAbsolute(path: []const u8) !std.fs.File.Stat {
-    return std.fs.cwd().statFile(path);
+    return statPath(path);
 }
 
 pub fn openDirAbsolute(path: []const u8) !std.fs.Dir {
@@ -167,7 +167,7 @@ pub fn createExclusiveAbsolute(path: []const u8, mode: u32) !std.fs.File {
 pub fn realpathAndStatAbsolute(allocator: std.mem.Allocator, path: []const u8) !LookupResult {
     const resolved = try std.fs.cwd().realpathAlloc(allocator, path);
     errdefer allocator.free(resolved);
-    const stat = try std.fs.cwd().statFile(resolved);
+    const stat = try statPath(resolved);
     return .{
         .resolved_path = resolved,
         .stat = stat,
@@ -229,6 +229,20 @@ fn isWithinRoot(root: []const u8, target: []const u8) bool {
     if (!std.mem.startsWith(u8, target, root)) return false;
     if (target.len <= root.len) return false;
     return target[root.len] == std.fs.path.sep;
+}
+
+fn statPath(path: []const u8) !std.fs.File.Stat {
+    return std.fs.cwd().statFile(path) catch |err| switch (err) {
+        error.IsDir => {
+            var dir = if (std.fs.path.isAbsolute(path))
+                try std.fs.openDirAbsolute(path, .{})
+            else
+                try std.fs.cwd().openDir(path, .{});
+            defer dir.close();
+            return try dir.stat();
+        },
+        else => return err,
+    };
 }
 
 fn inodeToU64(inode: anytype) u64 {
