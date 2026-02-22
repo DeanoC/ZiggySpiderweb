@@ -2,6 +2,36 @@
 The agents will see a unified file system, that in fact may be across multiple machines.
 The intent is to allow the to cooperate with the users local file system and cloud storage, in the same way the work with a nodes workspce.
 
+### Current implementation notes (feat/distributed-fs-v1)
+- Implemented transport is WebSocket + JSON envelopes first.
+- Binary `bytes` fields in JSON are represented as Base64 via `data_b64`.
+- `spiderweb-fs-node` and `spiderweb-fs-mount` are available as separate binaries.
+- `mount` is wired through libfuse3 runtime loading (`libfuse3.so.3`) and `fusermount3`.
+- Embeddable API is exposed via `src/fs_lib.zig` for integrating FS behavior into multi-use node processes.
+- Multi-source layering overview is captured in `design_docs/FileSystemSources.md`.
+- `EXPORTS` now includes source metadata scaffolding (`source_kind`, `source_id`, `caps.native_watch`, `caps.case_sensitive`) to support heterogeneous source routing.
+- Router now consumes `EXPORTS` metadata for capability-aware writable routing (write-intent operations avoid read-only exports inside alias failover groups).
+- Node-side source registration now goes through a formal `SourceAdapter` contract with explicit `linux`, `posix`, and host-gated `windows` adapters.
+- `gdrive` source kind now has working read-path support (`LOOKUP`, `GETATTR`, `READDIRP`, `OPEN`, `READ`, `CLOSE`) with optional live Google Drive API backing.
+- API mode is opt-in via `SPIDERWEB_GDRIVE_ENABLE_API=1` and an access token (`SPIDERWEB_GDRIVE_ACCESS_TOKEN`, `GDRIVE_ACCESS_TOKEN`, or `GOOGLE_DRIVE_ACCESS_TOKEN`); otherwise exports remain scaffolded with `.gdrive-status.txt`.
+- GDrive auth now supports credential handles per export (`gdrive_credential_handle` / CLI `:cred=<handle>`), with OAuth refresh-token bundles persisted via the secure credential store when available.
+- GDrive API mode now includes Drive Changes polling to emit `INVAL` / `INVAL_DIR` for cloud-side mutations seen by the node.
+- GDrive change polling tokens are now persisted per export when secure credential storage is available.
+- GDrive node metadata now tracks parent file IDs so move/rename-style changes can invalidate both old and new parent directories when available.
+- GDrive now includes write-path support in API mode (`CREATE`, `WRITE`, `TRUNCATE`, `MKDIR`, `UNLINK`, `RMDIR`, `RENAME`).
+- GDrive write commits now use resumable chunked uploads with optimistic generation checks before flush.
+- GDrive write handles now stage content in local temporary files and upload directly from file-backed staging buffers to reduce peak memory growth on large writes.
+- GDrive staging now defaults to `/tmp/spiderweb-gdrive-spool` (or `SPIDERWEB_GDRIVE_SPOOL_DIR`) and enforces a configurable cap via `SPIDERWEB_GDRIVE_SPOOL_MAX_BYTES`.
+- `STATFS` is now implemented end-to-end (`node -> router -> fuse`) with source-aware synthetic stats.
+- `HELLO.caps` values are now computed from active exports rather than fixed constants.
+- `EXPORTS.caps` now includes additional operation hints (`symlink`, `xattr`, `locks`, `statfs`) alongside `native_watch` and `case_sensitive`.
+- Router rename now performs a best-effort cross-endpoint file move fallback (`copy + unlink`) when policy allows; directory cross-endpoint renames still return `EXDEV`.
+- Source behavior policy decisions now live in a dedicated `fs_source_policy` layer used by router path/write/rename checks.
+- Router path cache behavior is now capability-aware for case-insensitive sources (name normalization + case-only rename guardrail).
+- Source adapter contract now exposes operation-level capability checks, and node-side unsupported-op routing is adapter-driven rather than hardcoded by source kind.
+- Local lock/xattr POSIX syscall behavior is now centralized in the local source adapter module to keep node dispatch focused on protocol flow.
+- Router endpoint selection now applies health-weighted, capability-aware scoring within alias groups when resolving paths.
+
 To do this the idea is to use a FUSE filesystem, that is built on top of WebSocket connections to the remote nodes mixed in with local node filesystem.
 
 Each node will have its project filesystems mapped to a workspace subtree.

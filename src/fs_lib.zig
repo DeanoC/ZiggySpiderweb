@@ -1,0 +1,22 @@
+pub const protocol = @import("fs_protocol.zig");
+pub const node_ops = @import("fs_node_ops.zig");
+pub const node_service = @import("fs_node_service.zig");
+pub const client = @import("fs_client.zig");
+pub const cache = @import("fs_cache.zig");
+pub const router = @import("fs_router.zig");
+pub const fuse_adapter = @import("fs_fuse_adapter.zig");
+pub const watch_runtime = @import("fs_watch_runtime.zig");
+pub const source_adapter = @import("fs_source_adapter.zig");
+pub const source_adapter_factory = @import("fs_source_adapter_factory.zig");
+pub const linux_source_adapter = @import("fs_linux_source_adapter.zig");
+pub const posix_source_adapter = @import("fs_posix_source_adapter.zig");
+pub const windows_source_adapter = @import("fs_windows_source_adapter.zig");
+pub const gdrive_source_adapter = @import("fs_gdrive_source_adapter.zig");
+pub const gdrive_backend = @import("fs_gdrive_backend.zig");
+
+pub const NodeService = node_service.NodeService;
+pub const ExportSpec = node_ops.ExportSpec;
+pub const SourceKind = source_adapter.SourceKind;
+pub const Router = router.Router;
+pub const EndpointConfig = router.EndpointConfig;
+pub const FuseAdapter = fuse_adapter.FuseAdapter;

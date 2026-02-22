@@ -7,26 +7,236 @@ on:
       - reopened
       - synchronize
       - ready_for_review
+  issue_comment:
+    types:
+      - created
+      - edited
 
 permissions:
-  contents: write
+  contents: read
+  issues: read
   pull-requests: write
 
 jobs:
   enable-automerge:
-    if: ${{ github.event.pull_request.user.login == 'DeanoC' && !github.event.pull_request.draft }}
+    if: ${{ github.event_name != 'issue_comment' || github.event.issue.pull_request != null }}
     runs-on: ubuntu-latest
     steps:
-      - name: Enable auto-merge for DeanoC PRs
+      - name: Enable auto-merge for DeanoC PRs after fresh codex review
         uses: actions/github-script@v7
         with:
           script: |
-            const pullRequestId = context.payload.pull_request?.node_id;
-            const prNumber = context.payload.pull_request?.number;
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const prNumber = context.payload.pull_request?.number ?? context.payload.issue?.number;
 
-            if (!pullRequestId || !prNumber) {
-              core.setFailed('Missing pull request metadata in event payload.');
+            if (!prNumber) {
+              core.notice('No pull request in event payload; skipping.');
               return;
+            }
+
+            const parseDate = (value) => {
+              const parsed = new Date(value ?? 0);
+              return Number.isNaN(parsed.getTime()) ? new Date(0) : parsed;
+            };
+
+            const isCodexReviewer = (login) => {
+              if (!login) return false;
+              const normalized = login.toLowerCase();
+              return normalized === 'chatgpt-codex-connector' ||
+                normalized === 'chatgpt-codex-connector[bot]';
+            };
+
+            const isCodexReviewRequest = (body) => /(^|\s)@codex\s+review(\b|$)/i.test(body ?? '');
+
+            const pull = (await github.rest.pulls.get({ owner, repo, pull_number: prNumber })).data;
+            if (pull.user?.login !== 'DeanoC') {
+              core.notice(`PR #${prNumber} author is ${pull.user?.login ?? 'unknown'}; skipping.`);
+              return;
+            }
+
+            if (pull.draft) {
+              core.notice(`PR #${prNumber} is draft; skipping.`);
+              return;
+            }
+
+            const pullRequestId = pull.node_id;
+            const disableAutoMerge = async (reason) => {
+              if (!pull.auto_merge) {
+                core.info(`Auto-merge already disabled for PR #${prNumber}: ${reason}`);
+                return;
+              }
+
+              try {
+                await github.graphql(
+                  `
+                    mutation($pullRequestId: ID!) {
+                      disablePullRequestAutoMerge(input: { pullRequestId: $pullRequestId }) {
+                        clientMutationId
+                      }
+                    }
+                  `,
+                  { pullRequestId },
+                );
+                core.notice(`Disabled auto-merge for PR #${prNumber}: ${reason}`);
+              } catch (error) {
+                const message = String(error?.message || error);
+                if (
+                  message.includes('is not enabled') ||
+                  message.includes('auto-merge is disabled') ||
+                  message.includes('auto merge is disabled') ||
+                  message.includes('not in the auto-merge queue')
+                ) {
+                  core.info(`Auto-merge already disabled for PR #${prNumber}: ${reason}`);
+                  return;
+                }
+                core.warning(`Could not disable auto-merge for PR #${prNumber}: ${message}`);
+              }
+            };
+
+            const issueComments = await github.paginate(github.rest.issues.listComments, {
+              owner,
+              repo,
+              issue_number: prNumber,
+              per_page: 100,
+            });
+
+            const reviewRequests = issueComments.filter((comment) => {
+              return comment.user?.login === 'DeanoC' && isCodexReviewRequest(comment.body);
+            });
+
+            const codexIssueComments = issueComments.filter((comment) => isCodexReviewer(comment.user?.login));
+
+            const reviews = await github.paginate(github.rest.pulls.listReviews, {
+              owner,
+              repo,
+              pull_number: prNumber,
+              per_page: 100,
+            });
+
+            const codexReviews = reviews.filter((review) => {
+              if (!isCodexReviewer(review.user?.login)) return false;
+              return review.state && review.state !== 'PENDING' && review.state !== 'DISMISSED';
+            });
+
+            const codexResponses = [
+              ...codexReviews.map((review) => ({ type: 'review', at: parseDate(review.submitted_at), state: review.state })),
+              ...codexIssueComments.map((comment) => ({ type: 'comment', at: parseDate(comment.created_at), state: null })),
+            ].sort((a, b) => a.at - b.at);
+
+            if (codexResponses.length === 0) {
+              core.notice(`PR #${prNumber} is awaiting initial codex response; skipping.`);
+              return;
+            }
+
+            const unresolvedThreads = [];
+            let cursor = null;
+
+            while (true) {
+              const query = `
+                query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
+                  repository(owner: $owner, name: $repo) {
+                    pullRequest(number: $number) {
+                      reviewThreads(first: 100, after: $cursor) {
+                        nodes {
+                          id
+                          isResolved
+                          comments(first: 100) {
+                            nodes {
+                              author {
+                                login
+                              }
+                              url
+                            }
+                          }
+                        }
+                        pageInfo {
+                          hasNextPage
+                          endCursor
+                        }
+                      }
+                    }
+                  }
+                }
+              `;
+
+              const result = await github.graphql(query, {
+                owner,
+                repo,
+                number: prNumber,
+                cursor,
+              });
+
+              const reviewThreads = result.repository.pullRequest.reviewThreads;
+              for (const thread of reviewThreads.nodes) {
+                if (thread.isResolved) continue;
+                const codexComment = thread.comments.nodes.find((comment) => isCodexReviewer(comment.author?.login));
+                if (codexComment) {
+                  unresolvedThreads.push(codexComment.url || thread.id);
+                }
+              }
+
+              if (!reviewThreads.pageInfo.hasNextPage) break;
+              cursor = reviewThreads.pageInfo.endCursor;
+            }
+
+            if (unresolvedThreads.length > 0) {
+              await disableAutoMerge('unresolved codex review threads detected; manual merge is allowed.');
+              return;
+            }
+
+            const firstCodexResponseAt = codexResponses[0].at;
+            const latestCodexResponseAt = codexResponses[codexResponses.length - 1].at;
+            const tenMinutesMs = 10 * 60 * 1000;
+            const codexResponseAgeMs = Date.now() - latestCodexResponseAt.getTime();
+
+            if (codexResponseAgeMs > tenMinutesMs) {
+              await disableAutoMerge('latest codex response is older than 10 minutes; manual merge is allowed.');
+              return;
+            }
+
+            const commits = await github.paginate(github.rest.pulls.listCommits, {
+              owner,
+              repo,
+              pull_number: prNumber,
+              per_page: 100,
+            });
+
+            const latestCommitAt = commits.reduce((latest, commit) => {
+              const commitAt = parseDate(commit.commit?.committer?.date ?? commit.commit?.author?.date);
+              return commitAt.getTime() > latest.getTime() ? commitAt : latest;
+            }, parseDate(pull.created_at));
+
+            const hasSubsequentCycle = latestCommitAt.getTime() > firstCodexResponseAt.getTime();
+
+            const latestReviewRequest = [...reviewRequests]
+              .sort((a, b) => parseDate(a.created_at) - parseDate(b.created_at))
+              .pop();
+            const latestReviewRequestAt = latestReviewRequest ? parseDate(latestReviewRequest.created_at) : null;
+
+            if (hasSubsequentCycle) {
+              if (!latestReviewRequestAt || latestReviewRequestAt.getTime() < latestCommitAt.getTime()) {
+                core.notice(`PR #${prNumber} needs a fresh "@codex review" request after latest push.`);
+                return;
+              }
+            }
+
+            if (latestReviewRequestAt && latestCodexResponseAt.getTime() < latestReviewRequestAt.getTime()) {
+              core.notice(`PR #${prNumber} is awaiting codex response to latest request; skipping.`);
+              return;
+            }
+
+            const relevantStart = latestReviewRequestAt ?? firstCodexResponseAt;
+            const relevantCodexReviews = codexReviews.filter((review) => parseDate(review.submitted_at).getTime() >= relevantStart.getTime());
+
+            if (relevantCodexReviews.length > 0) {
+              const latestCodexReview = relevantCodexReviews
+                .sort((a, b) => parseDate(a.submitted_at) - parseDate(b.submitted_at))
+                .pop();
+              if (latestCodexReview.state === 'CHANGES_REQUESTED') {
+                core.notice(`PR #${prNumber} latest codex review requests changes; skipping.`);
+                return;
+              }
             }
 
             try {
@@ -50,6 +260,10 @@ jobs:
               const message = String(error?.message || error);
               if (message.includes('already enabled')) {
                 core.info(`Auto-merge already enabled for PR #${prNumber}.`);
+                return;
+              }
+              if (message.includes('Resource not accessible by integration')) {
+                core.warning(`Auto-merge could not be enabled for PR #${prNumber}: ${message}`);
                 return;
               }
               throw error;

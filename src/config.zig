@@ -282,120 +282,120 @@ pub fn load(self: *Config) !void {
         }
     }
 
-            if (root.object.get("runtime")) |runtime_val| {
-                if (runtime_val == .object) {
-                    if (runtime_val.object.get("inbound_queue_max")) |value| {
-                        if (value == .integer and value.integer > 0) {
-                            self.runtime.inbound_queue_max = @intCast(value.integer);
-                        }
-                    }
-                    if (runtime_val.object.get("brain_tick_queue_max")) |value| {
-                        if (value == .integer and value.integer > 0) {
-                            self.runtime.brain_tick_queue_max = @intCast(value.integer);
-                        }
-                    }
-                    if (runtime_val.object.get("outbound_queue_max")) |value| {
-                        if (value == .integer and value.integer > 0) {
-                            self.runtime.outbound_queue_max = @intCast(value.integer);
-                        }
-                    }
-                    if (runtime_val.object.get("control_queue_max")) |value| {
-                        if (value == .integer and value.integer > 0) {
-                            self.runtime.control_queue_max = @intCast(value.integer);
-                        }
-                    }
-                    if (runtime_val.object.get("connection_worker_threads")) |value| {
-                        if (value == .integer and value.integer >= 0) {
-                            self.runtime.connection_worker_threads = @intCast(value.integer);
-                        }
-                    }
-                    if (runtime_val.object.get("connection_queue_max")) |value| {
-                        if (value == .integer and value.integer >= 0) {
-                            self.runtime.connection_queue_max = @intCast(value.integer);
-                        }
-                    }
-                    if (runtime_val.object.get("runtime_worker_threads")) |value| {
-                        if (value == .integer and value.integer >= 0) {
-                            self.runtime.runtime_worker_threads = @intCast(value.integer);
-                        }
-                    }
-                    if (runtime_val.object.get("runtime_request_queue_max")) |value| {
-                        if (value == .integer and value.integer >= 0) {
-                            self.runtime.runtime_request_queue_max = @intCast(value.integer);
-                        }
-                    }
-                    if (runtime_val.object.get("chat_operation_timeout_ms")) |value| {
-                        if (value == .integer and value.integer > 0) {
-                            self.runtime.chat_operation_timeout_ms = @intCast(value.integer);
-                        }
-                    }
-                    if (runtime_val.object.get("control_operation_timeout_ms")) |value| {
-                        if (value == .integer and value.integer > 0) {
-                            self.runtime.control_operation_timeout_ms = @intCast(value.integer);
-                        }
-                    }
-                    if (runtime_val.object.get("run_checkpoint_interval_steps")) |value| {
-                        if (value == .integer and value.integer > 0) {
-                            self.runtime.run_checkpoint_interval_steps = @intCast(value.integer);
-                        }
-                    }
-                    if (runtime_val.object.get("run_auto_resume_on_boot")) |value| {
-                        if (value == .bool) {
-                            self.runtime.run_auto_resume_on_boot = value.bool;
-                        }
-                    }
-                    if (runtime_val.object.get("tool_retry_max_attempts")) |value| {
-                        if (value == .integer and value.integer > 0) {
-                            self.runtime.tool_retry_max_attempts = @intCast(value.integer);
-                        }
-                    }
-                    if (runtime_val.object.get("tool_lease_timeout_ms")) |value| {
-                        if (value == .integer and value.integer > 0) {
-                            self.runtime.tool_lease_timeout_ms = @intCast(value.integer);
-                        }
-                    }
-                    if (runtime_val.object.get("max_inflight_tool_calls_per_run")) |value| {
-                        if (value == .integer and value.integer > 0) {
-                            self.runtime.max_inflight_tool_calls_per_run = @intCast(value.integer);
-                        }
-                    }
-                    if (runtime_val.object.get("max_run_steps")) |value| {
-                        if (value == .integer and value.integer > 0) {
-                            self.runtime.max_run_steps = @intCast(value.integer);
-                        }
-                    }
-                    if (runtime_val.object.get("default_agent_id")) |value| {
-                        if (value == .string and value.string.len > 0) {
-                            self.allocator.free(self.runtime.default_agent_id);
-                            self.runtime.default_agent_id = try self.allocator.dupe(u8, value.string);
-                        }
-                    }
-                    if (runtime_val.object.get("ltm_directory")) |value| {
-                        if (value == .string) {
-                            self.allocator.free(self.runtime.ltm_directory);
-                            self.runtime.ltm_directory = try self.allocator.dupe(u8, value.string);
-                        }
-                    }
-                    if (runtime_val.object.get("ltm_filename")) |value| {
-                        if (value == .string) {
-                            self.allocator.free(self.runtime.ltm_filename);
-                            self.runtime.ltm_filename = try self.allocator.dupe(u8, value.string);
-                        }
-                    }
-                    if (runtime_val.object.get("assets_dir")) |value| {
-                        if (value == .string) {
-                            self.allocator.free(self.runtime.assets_dir);
-                            self.runtime.assets_dir = try self.allocator.dupe(u8, value.string);
-                        }
-                    }
-                    if (runtime_val.object.get("agents_dir")) |value| {
-                        if (value == .string) {
-                            self.allocator.free(self.runtime.agents_dir);
-                            self.runtime.agents_dir = try self.allocator.dupe(u8, value.string);
-                        }
-                    }
+    if (root.object.get("runtime")) |runtime_val| {
+        if (runtime_val == .object) {
+            if (runtime_val.object.get("inbound_queue_max")) |value| {
+                if (value == .integer and value.integer > 0) {
+                    self.runtime.inbound_queue_max = @intCast(value.integer);
                 }
             }
+            if (runtime_val.object.get("brain_tick_queue_max")) |value| {
+                if (value == .integer and value.integer > 0) {
+                    self.runtime.brain_tick_queue_max = @intCast(value.integer);
+                }
+            }
+            if (runtime_val.object.get("outbound_queue_max")) |value| {
+                if (value == .integer and value.integer > 0) {
+                    self.runtime.outbound_queue_max = @intCast(value.integer);
+                }
+            }
+            if (runtime_val.object.get("control_queue_max")) |value| {
+                if (value == .integer and value.integer > 0) {
+                    self.runtime.control_queue_max = @intCast(value.integer);
+                }
+            }
+            if (runtime_val.object.get("connection_worker_threads")) |value| {
+                if (value == .integer and value.integer >= 0) {
+                    self.runtime.connection_worker_threads = @intCast(value.integer);
+                }
+            }
+            if (runtime_val.object.get("connection_queue_max")) |value| {
+                if (value == .integer and value.integer >= 0) {
+                    self.runtime.connection_queue_max = @intCast(value.integer);
+                }
+            }
+            if (runtime_val.object.get("runtime_worker_threads")) |value| {
+                if (value == .integer and value.integer >= 0) {
+                    self.runtime.runtime_worker_threads = @intCast(value.integer);
+                }
+            }
+            if (runtime_val.object.get("runtime_request_queue_max")) |value| {
+                if (value == .integer and value.integer >= 0) {
+                    self.runtime.runtime_request_queue_max = @intCast(value.integer);
+                }
+            }
+            if (runtime_val.object.get("chat_operation_timeout_ms")) |value| {
+                if (value == .integer and value.integer > 0) {
+                    self.runtime.chat_operation_timeout_ms = @intCast(value.integer);
+                }
+            }
+            if (runtime_val.object.get("control_operation_timeout_ms")) |value| {
+                if (value == .integer and value.integer > 0) {
+                    self.runtime.control_operation_timeout_ms = @intCast(value.integer);
+                }
+            }
+            if (runtime_val.object.get("run_checkpoint_interval_steps")) |value| {
+                if (value == .integer and value.integer > 0) {
+                    self.runtime.run_checkpoint_interval_steps = @intCast(value.integer);
+                }
+            }
+            if (runtime_val.object.get("run_auto_resume_on_boot")) |value| {
+                if (value == .bool) {
+                    self.runtime.run_auto_resume_on_boot = value.bool;
+                }
+            }
+            if (runtime_val.object.get("tool_retry_max_attempts")) |value| {
+                if (value == .integer and value.integer > 0) {
+                    self.runtime.tool_retry_max_attempts = @intCast(value.integer);
+                }
+            }
+            if (runtime_val.object.get("tool_lease_timeout_ms")) |value| {
+                if (value == .integer and value.integer > 0) {
+                    self.runtime.tool_lease_timeout_ms = @intCast(value.integer);
+                }
+            }
+            if (runtime_val.object.get("max_inflight_tool_calls_per_run")) |value| {
+                if (value == .integer and value.integer > 0) {
+                    self.runtime.max_inflight_tool_calls_per_run = @intCast(value.integer);
+                }
+            }
+            if (runtime_val.object.get("max_run_steps")) |value| {
+                if (value == .integer and value.integer > 0) {
+                    self.runtime.max_run_steps = @intCast(value.integer);
+                }
+            }
+            if (runtime_val.object.get("default_agent_id")) |value| {
+                if (value == .string and value.string.len > 0) {
+                    self.allocator.free(self.runtime.default_agent_id);
+                    self.runtime.default_agent_id = try self.allocator.dupe(u8, value.string);
+                }
+            }
+            if (runtime_val.object.get("ltm_directory")) |value| {
+                if (value == .string) {
+                    self.allocator.free(self.runtime.ltm_directory);
+                    self.runtime.ltm_directory = try self.allocator.dupe(u8, value.string);
+                }
+            }
+            if (runtime_val.object.get("ltm_filename")) |value| {
+                if (value == .string) {
+                    self.allocator.free(self.runtime.ltm_filename);
+                    self.runtime.ltm_filename = try self.allocator.dupe(u8, value.string);
+                }
+            }
+            if (runtime_val.object.get("assets_dir")) |value| {
+                if (value == .string) {
+                    self.allocator.free(self.runtime.assets_dir);
+                    self.runtime.assets_dir = try self.allocator.dupe(u8, value.string);
+                }
+            }
+            if (runtime_val.object.get("agents_dir")) |value| {
+                if (value == .string) {
+                    self.allocator.free(self.runtime.agents_dir);
+                    self.runtime.agents_dir = try self.allocator.dupe(u8, value.string);
+                }
+            }
+        }
+    }
 }
 pub fn save(self: Config) !void {
     // Ensure parent directory exists
@@ -548,7 +548,9 @@ test "Config defaults" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const cfg_path = try std.fs.path.join(allocator, &.{ tmp_dir.sub_path[0..], "config.json" });
+    const tmp_root = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_root);
+    const cfg_path = try std.fs.path.join(allocator, &.{ tmp_root, "config.json" });
 
     var config = try Config.init(allocator, cfg_path);
     defer config.deinit();

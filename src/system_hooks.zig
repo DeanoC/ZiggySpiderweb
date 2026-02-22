@@ -161,6 +161,18 @@ pub fn readTemplate(allocator: std.mem.Allocator, runtime: *AgentRuntime, templa
     return std.fs.cwd().readFileAlloc(allocator, template_path, 1024 * 1024);
 }
 
+fn logTemplateLoadFailure(template_name: []const u8, err: anyerror, has_fallback_memory: bool) void {
+    if (err == error.FileNotFound) {
+        if (has_fallback_memory) {
+            std.log.info("Template {s} not found; using persisted memory", .{template_name});
+            return;
+        }
+        std.log.info("Template {s} not found; skipping hatch", .{template_name});
+        return;
+    }
+    std.log.warn("Failed to load template {s}: {s}", .{ template_name, @errorName(err) });
+}
+
 fn ensureMemoryFromTemplate(
     runtime: *AgentRuntime,
     brain_name: []const u8,
@@ -177,7 +189,7 @@ fn ensureMemoryFromTemplate(
         // always synchronize LTM content with the current template file.
         if (std.mem.eql(u8, name, BASE_CORE_MEM_NAME)) {
             const maybe_content = readTemplate(allocator, runtime, template_name) catch |err| blk: {
-                std.log.warn("Failed to load template {s}: {s}", .{ template_name, @errorName(err) });
+                logTemplateLoadFailure(template_name, err, true);
                 break :blk null;
             };
             if (maybe_content) |content| {
@@ -256,7 +268,7 @@ fn ensureMemoryFromTemplate(
     }
 
     const content = readTemplate(allocator, runtime, template_name) catch |err| {
-        std.log.warn("Failed to load template {s}: {s}", .{ template_name, @errorName(err) });
+        logTemplateLoadFailure(template_name, err, false);
         return false;
     };
     defer allocator.free(content);
@@ -496,9 +508,14 @@ pub fn registerSystemHooks(registry: *hook_registry.HookRegistry) !void {
 
 test "system_hooks: ensureIdentityMemories rehydrates persisted identity into active memory" {
     const allocator = std.testing.allocator;
-    const ltm_dir = try std.fmt.allocPrint(allocator, ".tmp-system-hooks-ltm-{d}", .{std.time.nanoTimestamp()});
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const tmp_root = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_root);
+    const ltm_dir = try std.fs.path.join(allocator, &.{ tmp_root, "ltm" });
     defer allocator.free(ltm_dir);
-    defer std.fs.cwd().deleteTree(ltm_dir) catch {};
+    try std.fs.cwd().makePath(ltm_dir);
     const cfg = Config.RuntimeConfig{};
 
     {
@@ -528,13 +545,17 @@ test "system_hooks: ensureIdentityMemories rehydrates persisted identity into ac
 
 test "system_hooks: ensureIdentityMemories rehydrates persisted CORE when template is unavailable" {
     const allocator = std.testing.allocator;
-    const nonce = std.time.nanoTimestamp();
-    const ltm_dir = try std.fmt.allocPrint(allocator, ".tmp-system-hooks-ltm-missing-template-{d}", .{nonce});
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const tmp_root = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_root);
+    const ltm_dir = try std.fs.path.join(allocator, &.{ tmp_root, "ltm" });
     defer allocator.free(ltm_dir);
-    defer std.fs.cwd().deleteTree(ltm_dir) catch {};
-    const assets_dir = try std.fmt.allocPrint(allocator, ".tmp-system-hooks-assets-missing-template-{d}", .{nonce});
+    try std.fs.cwd().makePath(ltm_dir);
+
+    const assets_dir = try std.fs.path.join(allocator, &.{ tmp_root, "assets" });
     defer allocator.free(assets_dir);
-    defer std.fs.cwd().deleteTree(assets_dir) catch {};
 
     try std.fs.cwd().makePath(assets_dir);
     inline for (.{ "CORE.md", "SOUL.md", "AGENT.md", "IDENTITY.md" }) |filename| {
@@ -555,7 +576,7 @@ test "system_hooks: ensureIdentityMemories rehydrates persisted CORE when templa
         try ensureIdentityMemories(&runtime, "primary");
     }
 
-    const missing_assets_dir = try std.fmt.allocPrint(allocator, ".tmp-system-hooks-assets-missing-template-does-not-exist-{d}", .{nonce});
+    const missing_assets_dir = try std.fs.path.join(allocator, &.{ tmp_root, "missing-assets" });
     defer allocator.free(missing_assets_dir);
 
     var second_cfg = Config.RuntimeConfig{};
@@ -577,13 +598,17 @@ test "system_hooks: ensureIdentityMemories rehydrates persisted CORE when templa
 
 test "system_hooks: ensureIdentityMemories mutates CORE memory on template sync" {
     const allocator = std.testing.allocator;
-    const nonce = std.time.nanoTimestamp();
-    const ltm_dir = try std.fmt.allocPrint(allocator, ".tmp-system-hooks-ltm-sync-{d}", .{nonce});
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const tmp_root = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_root);
+    const ltm_dir = try std.fs.path.join(allocator, &.{ tmp_root, "ltm" });
     defer allocator.free(ltm_dir);
-    defer std.fs.cwd().deleteTree(ltm_dir) catch {};
-    const assets_dir = try std.fmt.allocPrint(allocator, ".tmp-system-hooks-assets-sync-{d}", .{nonce});
+    try std.fs.cwd().makePath(ltm_dir);
+
+    const assets_dir = try std.fs.path.join(allocator, &.{ tmp_root, "assets" });
     defer allocator.free(assets_dir);
-    defer std.fs.cwd().deleteTree(assets_dir) catch {};
 
     try std.fs.cwd().makePath(assets_dir);
 

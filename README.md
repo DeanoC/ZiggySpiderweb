@@ -1,5 +1,6 @@
 # ZiggySpiderweb 🕸️
 
+[![CI](https://github.com/DeanoC/ZiggySpiderweb/actions/workflows/ci.yml/badge.svg)](https://github.com/DeanoC/ZiggySpiderweb/actions/workflows/ci.yml)
 [![Zig](https://img.shields.io/badge/Zig-0.15.0-orange.svg)](https://ziglang.org)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
@@ -234,6 +235,87 @@ OpenClaw Client (ZSC, OpenClaw, etc.)
 │  Response Stream│  ← SSE deltas → OpenClaw frames
 └─────────────────┘
 ```
+
+## Distributed Filesystem (Experimental)
+
+Two new binaries provide the distributed filesystem protocol from `design_docs/FileSystem.md`:
+
+```bash
+# Start a node server exporting the current directory as RW
+./zig-out/bin/spiderweb-fs-node --export work=.:rw
+
+# List root entries through the mount/router client
+./zig-out/bin/spiderweb-fs-mount \
+  --endpoint a=ws://127.0.0.1:18891/v1/fs#work \
+  readdir /a
+
+# Read/write paths through the routed namespace
+./zig-out/bin/spiderweb-fs-mount --endpoint a=ws://127.0.0.1:18891/v1/fs#work cat /a/README.md
+./zig-out/bin/spiderweb-fs-mount --endpoint a=ws://127.0.0.1:18891/v1/fs#work write /a/.tmp-fs-test "hello"
+
+# Endpoint health/failover status
+./zig-out/bin/spiderweb-fs-mount --endpoint a=ws://127.0.0.1:18891/v1/fs#work status
+
+# Failover: configure multiple endpoints with the same mount name ("a")
+./zig-out/bin/spiderweb-fs-mount \
+  --endpoint a=ws://127.0.0.1:18891/v1/fs#work \
+  --endpoint a=ws://127.0.0.1:18892/v1/fs#work \
+  readdir /a
+```
+
+Notes:
+- Transport is WebSocket with JSON envelopes (binary MsgPack/CBOR planned).
+- JSON READ/WRITE payloads use `data_b64` for file bytes.
+- `mount` is now wired through libfuse3 at runtime (loads `libfuse3.so.3` and uses `fusermount3`).
+- Router health checks each endpoint and fails over within a shared endpoint name group.
+- Node/server now emits `evt` invalidations (`INVAL`, `INVAL_DIR`) and router caches are invalidated on receipt.
+- Node/server now broadcasts mutation invalidations to other connected FS clients (server-push fanout).
+- Node/server uses a native Linux `inotify` watcher when available, with scanner fallback for out-of-band local FS invalidations.
+- Router now keeps a background event-pump websocket per endpoint so idle mounts can ingest pushed invalidations.
+- `EXPORTS` includes source metadata (`source_kind`, `source_id`, and initial `caps`) as a foundation for heterogeneous source routing.
+- Router now parses export metadata from `EXPORTS` and uses it for capability-aware writable routing (write-intent path resolution skips read-only exports in an alias group when possible).
+- Node-side export registration now uses a formal source-adapter contract with explicit `linux`/`posix` adapters, a host-gated `windows` adapter with real execution helpers, and a `gdrive` adapter with read-path support (`LOOKUP`, `GETATTR`, `READDIRP`, `OPEN`, `READ`, `CLOSE`) plus write-path support in API mode (`CREATE`, `WRITE`, `TRUNCATE`, `MKDIR`, `UNLINK`, `RMDIR`, `RENAME`).
+- Google Drive API mode is opt-in: set `SPIDERWEB_GDRIVE_ENABLE_API=1` and provide an access token via `SPIDERWEB_GDRIVE_ACCESS_TOKEN` (or `GDRIVE_ACCESS_TOKEN` / `GOOGLE_DRIVE_ACCESS_TOKEN`).
+- For long-running gdrive sessions, per-export credential handles are supported (`:cred=<handle>` on `--export` or `ExportSpec.gdrive_credential_handle` in library mode).
+- Credential-handle secret values can be either a plain access token or a JSON OAuth bundle (`client_id`, `client_secret`, `refresh_token`, optional `access_token`, `expires_at_ms`) and are auto-refreshed against OAuth token endpoints.
+- GDrive endpoints are overridable for testing/dev via `SPIDERWEB_GDRIVE_API_BASE_URL`, `SPIDERWEB_GDRIVE_UPLOAD_BASE_URL`, and `SPIDERWEB_GDRIVE_OAUTH_BASE_URL`.
+- In API mode, gdrive exports now poll the Drive Changes feed and emit invalidation events (`INVAL` / `INVAL_DIR`) to keep mounted caches fresh.
+- Changes polling now persists per-export page tokens (`gdrive_changes_v1` state) through credential storage when secure storage is available.
+- Move/rename invalidations are parent-aware in API mode: node cache now tracks Drive parent IDs and invalidates old/new parent dirs when change metadata includes parent updates.
+- GDrive write flushes now use resumable chunk upload sessions (default chunk size `256 KiB`) and enforce optimistic generation checks before commit.
+- Router cache lookups now normalize names for case-insensitive exports, and case-only same-directory renames on case-insensitive sources are guarded as no-ops.
+- Without API mode enabled, `gdrive` exports stay scaffolded and expose `.gdrive-status.txt` for diagnostics.
+
+### Embedding As A Library
+
+The filesystem stack is also exposed as module `spiderweb_fs` (`src/fs_lib.zig`) for multi-use programs.
+
+```zig
+const fs = @import("spiderweb_fs");
+
+var service = try fs.NodeService.init(allocator, &[_]fs.ExportSpec{
+    .{
+        .name = "work",
+        .path = ".",
+        .ro = false,
+        .source_kind = fs.SourceKind.linux,
+        .source_id = "linux:work",
+    },
+});
+defer service.deinit();
+
+const response = try service.handleRequestJson("{\"t\":\"req\",\"id\":1,\"op\":\"HELLO\",\"a\":{}}");
+defer allocator.free(response);
+```
+
+Example program in this repo:
+- Build: `zig build example-embed-fs-node`
+- Run: `./zig-out/bin/embed-fs-node --export work=.:rw`
+
+Multi-service embedding example (FS + health + echo in one process):
+- Build: `zig build example-embed-multi-service-node`
+- Run: `./zig-out/bin/embed-multi-service-node --port 19910 --export work=.:rw`
+- Routes: `/v1/fs`, `/v1/health`, `/v1/echo`
 
 ## Protocol Support
 

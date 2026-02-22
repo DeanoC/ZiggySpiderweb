@@ -50,6 +50,29 @@ curl -fsSL https://raw.githubusercontent.com/DeanoC/ZiggySpiderweb/main/install.
 # Or run with pre-configured values (non-interactive mode coming soon)
 ```
 
+## Embedded Multi-Service Integration Test
+
+This repo also includes a local CI-style integration test for the embeddable
+filesystem + health services example.
+
+```bash
+# Run directly
+bash test-env/test-embed-multi-service.sh
+
+# Or through make
+cd test-env && make test-embed-multi-service
+```
+
+What it validates:
+- boots `embed-multi-service-node` with a temporary export
+- probes `/v1/fs` via `spiderweb-fs-mount` (`readdir` + `cat`)
+- probes `/v1/health` with a raw WebSocket handshake and validates `ok: true`
+
+Useful env vars:
+- `PORT` (default `21910`)
+- `BIND_ADDR` (default `127.0.0.1`)
+- `SKIP_BUILD=1` to skip `zig build` if binaries are already built
+
 ## Wiping and Restarting
 
 ```bash

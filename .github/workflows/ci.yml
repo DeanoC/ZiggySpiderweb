@@ -21,3 +21,25 @@ jobs:
         grep -q 'ziggy_runtime_hooks' build.zig.zon
         grep -q 'ziggy_run_orchestrator' build.zig.zon
         grep -q '\.hash =' build.zig.zon
+
+  windows-fs-tests:
+    name: windows-fs-tests
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.1
+
+      - name: Zig version
+        run: zig version
+
+      - name: Run Windows FS adapter tests
+        run: zig test src/fs_windows_source_adapter.zig
+
+      - name: Run router and node ops tests
+        run: |
+          zig test src/fs_router.zig
+          zig test src/fs_node_ops.zig --test-filter "windows source"

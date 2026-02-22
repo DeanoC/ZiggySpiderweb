@@ -7,10 +7,10 @@ pub const AgentConfig = struct {
     agent_id: ?[]u8,
     name: ?[]u8,
     description: ?[]u8,
-    
+
     primary: BrainConfig,
     sub_brains: std.StringHashMapUnmanaged(SubBrainConfig),
-    
+
     pub fn init(allocator: std.mem.Allocator) AgentConfig {
         return .{
             .allocator = allocator,
@@ -21,14 +21,14 @@ pub const AgentConfig = struct {
             .sub_brains = .{},
         };
     }
-    
+
     pub fn deinit(self: *AgentConfig) void {
         if (self.agent_id) |value| self.allocator.free(value);
         if (self.name) |value| self.allocator.free(value);
         if (self.description) |value| self.allocator.free(value);
-        
+
         self.primary.deinit();
-        
+
         var it = self.sub_brains.iterator();
         while (it.next()) |entry| {
             self.allocator.free(entry.key_ptr.*);
@@ -36,7 +36,7 @@ pub const AgentConfig = struct {
         }
         self.sub_brains.deinit(self.allocator);
     }
-    
+
     /// Get brain config for a specific brain name
     pub fn getBrainConfig(self: *const AgentConfig, brain_name: []const u8) ?BrainConfigView {
         if (std.mem.eql(u8, brain_name, "primary")) {
@@ -59,7 +59,7 @@ pub const BrainConfig = struct {
     capabilities: ?std.ArrayListUnmanaged([]u8),
     rom_overrides: ?std.ArrayListUnmanaged(RomEntry),
     template: ?[]u8,
-    
+
     pub fn init(allocator: std.mem.Allocator) BrainConfig {
         return .{
             .allocator = allocator,
@@ -72,10 +72,10 @@ pub const BrainConfig = struct {
             .template = null,
         };
     }
-    
+
     pub fn deinit(self: *BrainConfig) void {
         self.provider.deinit(self.allocator);
-        
+
         if (self.allowed_tools) |*tools| {
             for (tools.items) |tool| self.allocator.free(tool);
             tools.deinit(self.allocator);
@@ -94,7 +94,7 @@ pub const BrainConfig = struct {
         }
         if (self.template) |value| self.allocator.free(value);
     }
-    
+
     pub fn view(self: *const BrainConfig) BrainConfigView {
         return .{
             .provider = self.provider.view(),
@@ -122,16 +122,16 @@ pub const BrainConfigView = struct {
 /// Sub-brain configuration (extends base with template reference)
 pub const SubBrainConfig = struct {
     base: BrainConfig,
-    
+
     pub fn init(allocator: std.mem.Allocator) SubBrainConfig {
         return .{ .base = BrainConfig.init(allocator) };
     }
-    
+
     pub fn deinit(self: *SubBrainConfig, allocator: std.mem.Allocator) void {
         self.base.deinit();
         _ = allocator;
     }
-    
+
     pub fn view(self: *const SubBrainConfig) BrainConfigView {
         return self.base.view();
     }
@@ -142,15 +142,15 @@ pub const ProviderConfig = struct {
     name: ?[]u8,
     model: ?[]u8,
     think_level: ?[]u8,
-    
+
     pub const empty = ProviderConfig{ .name = null, .model = null, .think_level = null };
-    
+
     pub fn deinit(self: *ProviderConfig, allocator: std.mem.Allocator) void {
         if (self.name) |value| allocator.free(value);
         if (self.model) |value| allocator.free(value);
         if (self.think_level) |value| allocator.free(value);
     }
-    
+
     pub fn view(self: *const ProviderConfig) ProviderConfigView {
         return .{
             .name = self.name,
@@ -170,7 +170,7 @@ pub const ProviderConfigView = struct {
 pub const RomEntry = struct {
     key: []u8,
     value: []u8,
-    
+
     pub fn deinit(self: *RomEntry, allocator: std.mem.Allocator) void {
         allocator.free(self.key);
         allocator.free(self.value);
@@ -189,7 +189,7 @@ pub const SubBrainTemplate = struct {
     allowed_tools: ?std.ArrayListUnmanaged([]u8),
     denied_tools: ?std.ArrayListUnmanaged([]u8),
     can_spawn_subbrains: bool,
-    
+
     pub fn init(allocator: std.mem.Allocator) SubBrainTemplate {
         return .{
             .allocator = allocator,
@@ -204,14 +204,14 @@ pub const SubBrainTemplate = struct {
             .can_spawn_subbrains = false,
         };
     }
-    
+
     pub fn deinit(self: *SubBrainTemplate) void {
         if (self.name) |value| self.allocator.free(value);
         if (self.specialization) |value| self.allocator.free(value);
         if (self.description) |value| self.allocator.free(value);
-        
+
         self.default_provider.deinit(self.allocator);
-        
+
         if (self.capabilities) |*caps| {
             for (caps.items) |cap| self.allocator.free(cap);
             caps.deinit(self.allocator);
@@ -231,7 +231,6 @@ pub const SubBrainTemplate = struct {
     }
 };
 
-
 // ============================================================================
 // Loading Functions
 // ============================================================================
@@ -243,13 +242,13 @@ pub fn loadAgentConfig(
 ) !?AgentConfig {
     const config_path = try std.fmt.allocPrint(allocator, "agents/{s}_config.json", .{agent_id});
     defer allocator.free(config_path);
-    
+
     const content = std.fs.cwd().readFileAlloc(allocator, config_path, 1024 * 1024) catch |err| {
         if (err == error.FileNotFound) return null;
         return err;
     };
     defer allocator.free(content);
-    
+
     return try parseAgentConfig(allocator, content);
 }
 
@@ -257,13 +256,13 @@ pub fn loadAgentConfig(
 fn parseAgentConfig(allocator: std.mem.Allocator, json_content: []const u8) !AgentConfig {
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json_content, .{});
     defer parsed.deinit();
-    
+
     var config = AgentConfig.init(allocator);
     errdefer config.deinit();
-    
+
     if (parsed.value != .object) return config;
     const root = parsed.value.object;
-    
+
     // Parse agent metadata
     if (root.get("agent_id")) |v| {
         if (v == .string) config.agent_id = try allocator.dupe(u8, v.string);
@@ -274,12 +273,12 @@ fn parseAgentConfig(allocator: std.mem.Allocator, json_content: []const u8) !Age
     if (root.get("description")) |v| {
         if (v == .string) config.description = try allocator.dupe(u8, v.string);
     }
-    
+
     // Parse primary brain config
     if (root.get("primary")) |primary_json| {
         config.primary = try parseBrainConfig(allocator, primary_json);
     }
-    
+
     // Parse sub-brains
     if (root.get("sub_brains")) |subs_json| {
         if (subs_json == .object) {
@@ -287,15 +286,15 @@ fn parseAgentConfig(allocator: std.mem.Allocator, json_content: []const u8) !Age
             while (it.next()) |entry| {
                 const brain_name = try allocator.dupe(u8, entry.key_ptr.*);
                 errdefer allocator.free(brain_name);
-                
+
                 var sub_config = try parseSubBrainConfig(allocator, entry.value_ptr.*);
                 errdefer sub_config.deinit(allocator);
-                
+
                 try config.sub_brains.put(allocator, brain_name, sub_config);
             }
         }
     }
-    
+
     return config;
 }
 
@@ -303,20 +302,20 @@ fn parseAgentConfig(allocator: std.mem.Allocator, json_content: []const u8) !Age
 fn parseBrainConfig(allocator: std.mem.Allocator, json: std.json.Value) !BrainConfig {
     var config = BrainConfig.init(allocator);
     errdefer config.deinit();
-    
+
     if (json != .object) return config;
     const obj = json.object;
-    
+
     // Parse provider
     if (obj.get("provider")) |provider_json| {
         config.provider = try parseProviderConfig(allocator, provider_json);
     }
-    
+
     // Parse can_spawn_subbrains
     if (obj.get("can_spawn_subbrains")) |v| {
         if (v == .bool) config.can_spawn_subbrains = v.bool;
     }
-    
+
     // Parse allowed_tools
     if (obj.get("allowed_tools")) |tools_json| {
         if (tools_json == .array) {
@@ -329,7 +328,7 @@ fn parseBrainConfig(allocator: std.mem.Allocator, json: std.json.Value) !BrainCo
             }
         }
     }
-    
+
     // Parse denied_tools
     if (obj.get("denied_tools")) |tools_json| {
         if (tools_json == .array) {
@@ -342,7 +341,7 @@ fn parseBrainConfig(allocator: std.mem.Allocator, json: std.json.Value) !BrainCo
             }
         }
     }
-    
+
     // Parse capabilities
     if (obj.get("capabilities")) |caps_json| {
         if (caps_json == .array) {
@@ -355,7 +354,7 @@ fn parseBrainConfig(allocator: std.mem.Allocator, json: std.json.Value) !BrainCo
             }
         }
     }
-    
+
     // Parse rom_overrides
     if (obj.get("rom_overrides")) |roms_json| {
         if (roms_json == .array) {
@@ -365,7 +364,7 @@ fn parseBrainConfig(allocator: std.mem.Allocator, json: std.json.Value) !BrainCo
                     const key_json = rom.object.get("key") orelse continue;
                     const value_json = rom.object.get("value") orelse continue;
                     if (key_json != .string or value_json != .string) continue;
-                    
+
                     const entry = RomEntry{
                         .key = try allocator.dupe(u8, key_json.string),
                         .value = try allocator.dupe(u8, value_json.string),
@@ -375,12 +374,12 @@ fn parseBrainConfig(allocator: std.mem.Allocator, json: std.json.Value) !BrainCo
             }
         }
     }
-    
+
     // Parse template reference
     if (obj.get("template")) |v| {
         if (v == .string) config.template = try allocator.dupe(u8, v.string);
     }
-    
+
     return config;
 }
 
@@ -393,7 +392,7 @@ fn parseSubBrainConfig(allocator: std.mem.Allocator, json: std.json.Value) !SubB
 /// Parse provider config from JSON
 fn parseProviderConfig(allocator: std.mem.Allocator, json: std.json.Value) !ProviderConfig {
     var config = ProviderConfig.empty;
-    
+
     switch (json) {
         .string => {
             // Shorthand: "provider-name"
@@ -413,7 +412,7 @@ fn parseProviderConfig(allocator: std.mem.Allocator, json: std.json.Value) !Prov
         },
         else => {},
     }
-    
+
     return config;
 }
 
@@ -424,7 +423,7 @@ pub fn loadSubBrainTemplate(
 ) !?SubBrainTemplate {
     const path = try std.fmt.allocPrint(allocator, "templates/sub-brains/{s}.json", .{template_name});
     defer allocator.free(path);
-    
+
     const content = std.fs.cwd().readFileAlloc(allocator, path, 1024 * 1024) catch |err| {
         if (err == error.FileNotFound) {
             std.log.warn("Sub-brain template not found: {s}", .{template_name});
@@ -433,7 +432,7 @@ pub fn loadSubBrainTemplate(
         return err;
     };
     defer allocator.free(content);
-    
+
     return try parseSubBrainTemplate(allocator, content);
 }
 
@@ -441,13 +440,13 @@ pub fn loadSubBrainTemplate(
 fn parseSubBrainTemplate(allocator: std.mem.Allocator, json_content: []const u8) !SubBrainTemplate {
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json_content, .{});
     defer parsed.deinit();
-    
+
     var template = SubBrainTemplate.init(allocator);
     errdefer template.deinit();
-    
+
     if (parsed.value != .object) return template;
     const root = parsed.value.object;
-    
+
     // Parse metadata
     if (root.get("name")) |v| {
         if (v == .string) template.name = try allocator.dupe(u8, v.string);
@@ -458,12 +457,12 @@ fn parseSubBrainTemplate(allocator: std.mem.Allocator, json_content: []const u8)
     if (root.get("description")) |v| {
         if (v == .string) template.description = try allocator.dupe(u8, v.string);
     }
-    
+
     // Parse default provider
     if (root.get("default_provider")) |provider_json| {
         template.default_provider = try parseProviderConfig(allocator, provider_json);
     }
-    
+
     // Parse capabilities
     if (root.get("capabilities")) |caps_json| {
         if (caps_json == .array) {
@@ -476,7 +475,7 @@ fn parseSubBrainTemplate(allocator: std.mem.Allocator, json_content: []const u8)
             }
         }
     }
-    
+
     // Parse rom_entries
     if (root.get("rom_entries")) |roms_json| {
         if (roms_json == .array) {
@@ -486,7 +485,7 @@ fn parseSubBrainTemplate(allocator: std.mem.Allocator, json_content: []const u8)
                     const key_json = rom.object.get("key") orelse continue;
                     const value_json = rom.object.get("value") orelse continue;
                     if (key_json != .string or value_json != .string) continue;
-                    
+
                     const entry = RomEntry{
                         .key = try allocator.dupe(u8, key_json.string),
                         .value = try allocator.dupe(u8, value_json.string),
@@ -496,7 +495,7 @@ fn parseSubBrainTemplate(allocator: std.mem.Allocator, json_content: []const u8)
             }
         }
     }
-    
+
     // Parse allowed_tools
     if (root.get("allowed_tools")) |tools_json| {
         if (tools_json == .array) {
@@ -509,7 +508,7 @@ fn parseSubBrainTemplate(allocator: std.mem.Allocator, json_content: []const u8)
             }
         }
     }
-    
+
     // Parse denied_tools
     if (root.get("denied_tools")) |tools_json| {
         if (tools_json == .array) {
@@ -522,12 +521,12 @@ fn parseSubBrainTemplate(allocator: std.mem.Allocator, json_content: []const u8)
             }
         }
     }
-    
+
     // Parse can_spawn_subbrains
     if (root.get("can_spawn_subbrains")) |v| {
         if (v == .bool) template.can_spawn_subbrains = v.bool;
     }
-    
+
     return template;
 }
 
@@ -544,9 +543,9 @@ pub fn mergeWithTemplate(
 ) !BrainConfig {
     var merged = BrainConfig.init(allocator);
     errdefer merged.deinit();
-    
+
     // Template name/specialization/description become ROM entries if not already present
-    
+
     // Provider: Config overrides template
     if (config.provider.name) |_| {
         merged.provider = config.provider;
@@ -562,10 +561,10 @@ pub fn mergeWithTemplate(
         if (merged.provider.think_level) |old| allocator.free(old);
         merged.provider.think_level = try allocator.dupe(u8, think);
     }
-    
+
     // can_spawn_subbrains: Config overrides template
     merged.can_spawn_subbrains = config.can_spawn_subbrains or template.can_spawn_subbrains;
-    
+
     // Tools: Config replaces template (not merged)
     if (config.allowed_tools) |tools| {
         merged.allowed_tools = .{};
@@ -580,7 +579,7 @@ pub fn mergeWithTemplate(
             try merged.allowed_tools.?.append(allocator, owned);
         }
     }
-    
+
     if (config.denied_tools) |tools| {
         merged.denied_tools = .{};
         for (tools.items) |tool| {
@@ -594,7 +593,7 @@ pub fn mergeWithTemplate(
             try merged.denied_tools.?.append(allocator, owned);
         }
     }
-    
+
     // Capabilities: Config replaces template
     if (config.capabilities) |caps| {
         merged.capabilities = .{};
@@ -609,10 +608,10 @@ pub fn mergeWithTemplate(
             try merged.capabilities.?.append(allocator, owned);
         }
     }
-    
+
     // ROM entries: Template first, then config overrides/adds
     merged.rom_overrides = .{};
-    
+
     // Add template ROM entries
     if (template.rom_entries) |roms| {
         for (roms.items) |rom| {
@@ -623,7 +622,7 @@ pub fn mergeWithTemplate(
             try merged.rom_overrides.?.append(allocator, entry);
         }
     }
-    
+
     // Add config ROM overrides (will replace if key exists)
     if (config.rom_overrides) |roms| {
         for (roms.items) |rom| {
@@ -639,7 +638,7 @@ pub fn mergeWithTemplate(
                     }
                 }
             }
-            
+
             if (!found) {
                 const entry = RomEntry{
                     .key = try allocator.dupe(u8, rom.key),
@@ -649,6 +648,6 @@ pub fn mergeWithTemplate(
             }
         }
     }
-    
+
     return merged;
 }
