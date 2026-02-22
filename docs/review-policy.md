@@ -3,8 +3,8 @@
 This document is the source of truth for PR review and merge policy across Ziggy repositories.
 
 ## Branch Protection
-- Direct pushes to `main` are not allowed.
-- All updates to `main` must go through a pull request.
+- Direct pushes to the default branch are not allowed.
+- All updates to the default branch must go through a pull request.
 
 ## Codex Review Handling
 - `chatgpt-codex-connector` review is required before merge.
