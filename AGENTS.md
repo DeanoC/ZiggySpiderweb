@@ -37,18 +37,14 @@ This repository is part of the Ziggy* codebase and is primarily a Zig project.
   - Notes on compatibility/config changes when relevant.
 
 ## Branch Protection And Review Gate
-- Direct pushes to `main` are not allowed.
-- All changes that update `main` must go through a pull request.
-- A PR must not be merged until `chatgpt-codex-connector` (including variants like `chatgpt-codex-connector[bot]`) has reviewed it.
-- Do not merge while any review comments from that reviewer remain outstanding.
-- Every Codex review conversation thread must be explicitly resolved in GitHub before merge.
-- Replying is not enough: resolve the thread after addressing it.
-- After each Codex pass, immediately check for new open Codex threads and repeat: fix -> reply -> resolve -> `@codex review`.
-- Do not merge until there are zero open Codex review threads and no outstanding Codex comments.
-- The first Codex review cycle is automatic when a PR is opened.
-- After each additional change cycle (any push after Codex feedback), the PR author must comment `@codex review` to request a fresh Codex pass.
-- Merge requires a Codex response that is newer than both the latest `@codex review` request and the PR head commit.
-- Escape clause: if Codex is stalled (latest Codex response older than 10 minutes) or review threads cannot be cleared due tooling/infrastructure issues, auto-merge must remain disabled; a maintainer may merge manually only after posting an explicit override rationale on the PR.
+- Direct pushes to the default branch are not allowed.
+- All changes that update the default branch must go through a pull request.
+- Shared policy source of truth: https://github.com/DeanoC/ZiggySpiderweb/blob/main/docs/review-policy.md
+- `chatgpt-codex-connector` review is required before merge, and all Codex threads must be resolved.
+- If Codex reports any `P1`, push a fix and request follow-up with `@codex review` before merge.
+- For each `P2`/`P3`, open or link a GitHub issue and link it in the PR.
+- Auto-merge is disabled; merges are manual (human or AI maintainer).
+
 ## Compatibility Policy
 - Until `1.0.0`, backward compatibility is not guaranteed.
 - Breaking changes are allowed during early development, but should be documented in PR notes.
