@@ -3,6 +3,7 @@ const Config = @import("config.zig");
 const credential_store = @import("credential_store.zig");
 const ziggy_piai = @import("ziggy-piai");
 const first_run = @import("first_run.zig");
+const oauth_cli = @import("oauth_cli.zig");
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -23,6 +24,8 @@ pub fn main() !void {
         try handleConfigCommand(allocator, args[2..]);
     } else if (std.mem.eql(u8, command, "first-run")) {
         try first_run.runFirstRun(allocator, args[2..]);
+    } else if (std.mem.eql(u8, command, "oauth")) {
+        try oauth_cli.run(allocator, args[2..]);
     } else {
         std.log.err("Unknown command: {s}", .{command});
         try printUsage();
@@ -225,6 +228,8 @@ fn printUsage() !void {
         \\
         \\Usage:
         \\  spiderweb-config first-run [--non-interactive] [--provider <name>] [--model <model>] [--agent <name>]
+        \\  spiderweb-config oauth login <provider> [--enterprise-domain <domain>] [--no-set-provider]
+        \\  spiderweb-config oauth clear <provider>
         \\  spiderweb-config config              Show current config
         \\  spiderweb-config config path         Show config file path
         \\  spiderweb-config config set-provider <name> [model]
@@ -237,6 +242,8 @@ fn printUsage() !void {
         \\Examples:
         \\  spiderweb-config first-run
         \\  spiderweb-config first-run --non-interactive --provider openai-codex --agent ziggy
+        \\  spiderweb-config oauth login openai-codex
+        \\  spiderweb-config oauth login github-copilot --enterprise-domain github.example.com
         \\  spiderweb-config config set-provider openai gpt-4o
         \\  spiderweb-config config set-provider kimi-coding kimi-k2.5
         \\  spiderweb-config config set-server --bind 0.0.0.0 --port 9000

@@ -453,8 +453,8 @@ pub fn run(
     defer dispatcher.destroy();
 
     std.log.info(
-        "Runtime websocket server listening at ws://{s}:{d}/v2/agents/{s}/stream",
-        .{ bind_addr, port, runtime_registry.default_agent_id },
+        "Runtime websocket server listening at ws://{s}:{d}",
+        .{ bind_addr, port },
     );
 
     while (true) {
@@ -493,8 +493,8 @@ fn handleWebSocketConnection(
     var handshake = try websocket_transport.performHandshakeWithInfo(allocator, stream);
     defer handshake.deinit(allocator);
 
-    const agent_id = parseAgentIdFromStreamPath(handshake.path) orelse {
-        try sendWebSocketErrorAndClose(allocator, stream, .invalid_envelope, "invalid stream path");
+    const agent_id = resolveAgentIdFromConnectionPath(handshake.path, runtime_registry.default_agent_id) orelse {
+        try sendWebSocketErrorAndClose(allocator, stream, .invalid_envelope, "invalid websocket path");
         return;
     };
     const runtime_server = runtime_registry.getOrCreate(agent_id) catch |err| switch (err) {
@@ -676,21 +676,11 @@ fn sendWebSocketErrorAndClose(
     try websocket_transport.writeFrame(stream, "", .close);
 }
 
-fn parseAgentIdFromStreamPath(path: []const u8) ?[]const u8 {
-    const prefix = "/v2/agents/";
-    const stream_suffix = "/stream";
-    if (!std.mem.startsWith(u8, path, prefix)) return null;
-
-    const after_prefix = path[prefix.len..];
-    const suffix_at = std.mem.indexOf(u8, after_prefix, stream_suffix) orelse return null;
-    if (suffix_at == 0) return null;
-
-    const agent_id = after_prefix[0..suffix_at];
-    if (std.mem.indexOfScalar(u8, agent_id, '/') != null) return null;
-
-    const trailing = after_prefix[suffix_at + stream_suffix.len ..];
-    if (trailing.len != 0 and !std.mem.startsWith(u8, trailing, "?")) return null;
-    return agent_id;
+fn resolveAgentIdFromConnectionPath(path: []const u8, default_agent_id: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, path, "/") or std.mem.startsWith(u8, path, "/?")) {
+        return default_agent_id;
+    }
+    return null;
 }
 
 fn sendServiceUnavailable(stream: *std.net.Stream) !void {
@@ -975,7 +965,7 @@ fn fsrpcReadJobResult(allocator: std.mem.Allocator, client: *std.net.Stream, job
     return decoded;
 }
 
-test "server_piai: websocket path handles unified control/fsrpc chat flow and rejects legacy session.send" {
+test "server_piai: base websocket path handles unified control/fsrpc chat flow and rejects legacy session.send" {
     const allocator = std.testing.allocator;
     var runtime_registry = AgentRuntimeRegistry.init(allocator, .{
         .ltm_directory = "",
@@ -999,7 +989,7 @@ test "server_piai: websocket path handles unified control/fsrpc chat flow and re
     var client = try std.net.tcpConnectToAddress(listener.listen_address);
     defer client.close();
 
-    try performClientHandshake(allocator, &client, "/v2/agents/default/stream");
+    try performClientHandshake(allocator, &client, "/");
 
     try fsrpcConnectAndAttach(allocator, &client, "req-connect");
 
@@ -1041,7 +1031,7 @@ test "server_piai: websocket path handles unified control/fsrpc chat flow and re
     try std.testing.expect(server_ctx.err_name == null);
 }
 
-test "server_piai: route path agent id isolates runtime state across connections" {
+test "server_piai: base path routes all connections to default runtime" {
     const allocator = std.testing.allocator;
     var runtime_registry = AgentRuntimeRegistry.init(allocator, .{
         .ltm_directory = "",
@@ -1065,7 +1055,7 @@ test "server_piai: route path agent id isolates runtime state across connections
 
         var client = try std.net.tcpConnectToAddress(listener.listen_address);
         defer client.close();
-        try performClientHandshake(allocator, &client, "/v2/agents/alpha/stream");
+        try performClientHandshake(allocator, &client, "/");
 
         try fsrpcConnectAndAttach(allocator, &client, "a-connect");
         const alpha_job = try fsrpcWriteChatInput(allocator, &client, "alpha hello", null);
@@ -1083,7 +1073,7 @@ test "server_piai: route path agent id isolates runtime state across connections
 
         var client = try std.net.tcpConnectToAddress(listener.listen_address);
         defer client.close();
-        try performClientHandshake(allocator, &client, "/v2/agents/beta/stream");
+        try performClientHandshake(allocator, &client, "/");
 
         try fsrpcConnectAndAttach(allocator, &client, "b-connect");
         const beta_job = try fsrpcWriteChatInput(allocator, &client, "beta hello", null);
@@ -1095,28 +1085,20 @@ test "server_piai: route path agent id isolates runtime state across connections
         try std.testing.expectEqual(@as(u8, 0x8), close_reply.opcode);
     }
 
-    const alpha_runtime = try runtime_registry.getOrCreate("alpha");
-    const beta_runtime = try runtime_registry.getOrCreate("beta");
+    const runtime = try runtime_registry.getOrCreate(runtime_registry.default_agent_id);
+    const snapshot = try runtime.runtime.active_memory.snapshotActive(allocator, "primary");
+    defer memory.deinitItems(allocator, snapshot);
+    const snapshot_json = try memory.toActiveMemoryJson(allocator, "primary", snapshot);
+    defer allocator.free(snapshot_json);
 
-    const alpha_snapshot = try alpha_runtime.runtime.active_memory.snapshotActive(allocator, "primary");
-    defer memory.deinitItems(allocator, alpha_snapshot);
-    const alpha_json = try memory.toActiveMemoryJson(allocator, "primary", alpha_snapshot);
-    defer allocator.free(alpha_json);
-
-    const beta_snapshot = try beta_runtime.runtime.active_memory.snapshotActive(allocator, "primary");
-    defer memory.deinitItems(allocator, beta_snapshot);
-    const beta_json = try memory.toActiveMemoryJson(allocator, "primary", beta_snapshot);
-    defer allocator.free(beta_json);
-
-    try std.testing.expect(std.mem.indexOf(u8, alpha_json, "alpha hello") != null);
-    try std.testing.expect(std.mem.indexOf(u8, alpha_json, "beta hello") == null);
-    try std.testing.expect(std.mem.indexOf(u8, beta_json, "beta hello") != null);
-    try std.testing.expect(std.mem.indexOf(u8, beta_json, "alpha hello") == null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot_json, "alpha hello") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot_json, "beta hello") != null);
+    try std.testing.expectEqual(@as(usize, 1), runtime_registry.by_agent.count());
 
     try std.testing.expect(server_ctx.err_name == null);
 }
 
-test "server_piai: runtime creation is capped to avoid unbounded per-agent growth" {
+test "server_piai: runtime cap does not block repeated base-path reconnects" {
     const allocator = std.testing.allocator;
     var runtime_registry = AgentRuntimeRegistry.initWithLimits(
         allocator,
@@ -1142,7 +1124,7 @@ test "server_piai: runtime creation is capped to avoid unbounded per-agent growt
 
         var client = try std.net.tcpConnectToAddress(listener.listen_address);
         defer client.close();
-        try performClientHandshake(allocator, &client, "/v2/agents/alpha/stream");
+        try performClientHandshake(allocator, &client, "/");
 
         try writeClientTextFrameMasked(&client, "{\"channel\":\"control\",\"type\":\"control.connect\",\"id\":\"alpha-connect\"}");
         var connect_ack = try readServerFrame(allocator, &client);
@@ -1161,18 +1143,19 @@ test "server_piai: runtime creation is capped to avoid unbounded per-agent growt
 
         var client = try std.net.tcpConnectToAddress(listener.listen_address);
         defer client.close();
-        try performClientHandshake(allocator, &client, "/v2/agents/beta/stream");
+        try performClientHandshake(allocator, &client, "/");
 
-        var limit_error = try readServerFrame(allocator, &client);
-        defer limit_error.deinit(allocator);
-        try std.testing.expect(std.mem.indexOf(u8, limit_error.payload, "\"code\":\"queue_saturated\"") != null);
-        try std.testing.expect(std.mem.indexOf(u8, limit_error.payload, "agent runtime limit reached") != null);
+        try writeClientTextFrameMasked(&client, "{\"channel\":\"control\",\"type\":\"control.connect\",\"id\":\"beta-connect\"}");
+        var connect_ack = try readServerFrame(allocator, &client);
+        defer connect_ack.deinit(allocator);
+        try std.testing.expect(std.mem.indexOf(u8, connect_ack.payload, "\"type\":\"control.connect_ack\"") != null);
 
         var close_reply = try readServerFrame(allocator, &client);
         defer close_reply.deinit(allocator);
         try std.testing.expectEqual(@as(u8, 0x8), close_reply.opcode);
     }
 
+    try std.testing.expectEqual(@as(usize, 1), runtime_registry.by_agent.count());
     try std.testing.expect(server_ctx.err_name == null);
 }
 
@@ -1205,7 +1188,7 @@ test "server_piai: websocket rejects unsupported route version" {
     defer invalid_path_error.deinit(allocator);
     try std.testing.expectEqual(@as(u8, 0x1), invalid_path_error.opcode);
     try std.testing.expect(std.mem.indexOf(u8, invalid_path_error.payload, "\"code\":\"invalid_envelope\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, invalid_path_error.payload, "invalid stream path") != null);
+    try std.testing.expect(std.mem.indexOf(u8, invalid_path_error.payload, "invalid websocket path") != null);
 
     var close_reply = try readServerFrame(allocator, &client);
     defer close_reply.deinit(allocator);
@@ -1214,12 +1197,16 @@ test "server_piai: websocket rejects unsupported route version" {
     try std.testing.expect(server_ctx.err_name == null);
 }
 
-test "server_piai: parse route path extracts agent id" {
-    const path = parseAgentIdFromStreamPath("/v2/agents/alpha/stream") orelse return error.TestExpectedAgent;
-    try std.testing.expectEqualStrings("alpha", path);
-    try std.testing.expect(parseAgentIdFromStreamPath("/v2/agents/alpha/stream?x=1") != null);
-    try std.testing.expect(parseAgentIdFromStreamPath("/v2/agents//stream") == null);
-    try std.testing.expect(parseAgentIdFromStreamPath("/v2/agents/alpha/not-stream") == null);
+test "server_piai: resolve connection path maps base URL to default agent" {
+    const resolved_root = resolveAgentIdFromConnectionPath("/", "default") orelse return error.TestExpectedAgent;
+    try std.testing.expectEqualStrings("default", resolved_root);
+    const resolved_query = resolveAgentIdFromConnectionPath("/?session=main", "default") orelse return error.TestExpectedAgent;
+    try std.testing.expectEqualStrings("default", resolved_query);
+    try std.testing.expect(resolveAgentIdFromConnectionPath("/v2/agents/default/stream", "default") == null);
+    try std.testing.expect(resolveAgentIdFromConnectionPath("/v1/agents/default/stream", "default") == null);
+}
+
+test "server_piai: agent id validation allows safe identifiers only" {
     try std.testing.expect(AgentRuntimeRegistry.isValidAgentId("alpha-1"));
     try std.testing.expect(AgentRuntimeRegistry.isValidAgentId("agent_2"));
     try std.testing.expect(!AgentRuntimeRegistry.isValidAgentId("."));

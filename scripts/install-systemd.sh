@@ -12,6 +12,13 @@ CONFIG_DIR="${CONFIG_DIR:-/etc/spiderweb}"
 SERVICE_NAME="${SERVICE_NAME:-spiderweb}"
 PORT="${PORT:-18790}"
 BIND_ADDR="${BIND_ADDR:-0.0.0.0}"
+PROVIDER_NAME="${PROVIDER_NAME:-openai}"
+PROVIDER_MODEL="${PROVIDER_MODEL:-gpt-4o-mini}"
+OVERWRITE_CONFIG="${OVERWRITE_CONFIG:-0}"
+SERVICE_ENV_FILE="${SERVICE_ENV_FILE:-$CONFIG_DIR/service.env}"
+
+SERVICE_USER_HOME=""
+CREDENTIAL_STATUS="not configured"
 
 # Colors
 RED='\033[0;31m'
@@ -84,11 +91,14 @@ create_user() {
     fi
     
     # Ensure home directory exists and has correct permissions
-    USER_HOME=$(getent passwd "$INSTALL_USER" | cut -d: -f6)
-    if [ -n "$USER_HOME" ] && [ "$USER_HOME" != "/" ]; then
-        mkdir -p "$USER_HOME/.config/spiderweb"
-        chown -R "$INSTALL_USER:$INSTALL_USER" "$USER_HOME"
-        chmod 700 "$USER_HOME"
+    SERVICE_USER_HOME=$(getent passwd "$INSTALL_USER" | cut -d: -f6)
+    if [ -n "$SERVICE_USER_HOME" ] && [ "$SERVICE_USER_HOME" != "/" ]; then
+        mkdir -p "$SERVICE_USER_HOME/.config/spiderweb"
+        chown -R "$INSTALL_USER:$INSTALL_USER" "$SERVICE_USER_HOME"
+        chmod 700 "$SERVICE_USER_HOME"
+    else
+        log_error "Could not determine home directory for user '$INSTALL_USER'"
+        exit 1
     fi
 }
 
@@ -121,22 +131,22 @@ install_config() {
     
     CONFIG_FILE="$CONFIG_DIR/config.json"
     
-    if [ -f "$CONFIG_FILE" ]; then
+    if [ -f "$CONFIG_FILE" ] && [ "$OVERWRITE_CONFIG" != "1" ]; then
+        log_warn "Config already exists at $CONFIG_FILE; preserving existing file (set OVERWRITE_CONFIG=1 to replace)"
+    elif [ -f "$CONFIG_FILE" ]; then
         log_warn "Config already exists at $CONFIG_FILE"
         log_info "Backing up to $CONFIG_FILE.bak"
         cp "$CONFIG_FILE" "$CONFIG_FILE.bak"
-    fi
-    
-    # Generate default config
-    cat > "$CONFIG_FILE" <<EOF
+        # Generate default config
+        cat > "$CONFIG_FILE" <<EOF
 {
   "server": {
     "bind": "$BIND_ADDR",
     "port": $PORT
   },
   "provider": {
-    "name": "openai",
-    "model": "gpt-4o-mini"
+    "name": "$PROVIDER_NAME",
+    "model": "$PROVIDER_MODEL"
   },
   "log": {
     "level": "info"
@@ -147,22 +157,134 @@ install_config() {
   }
 }
 EOF
+    else
+        # Generate default config
+        cat > "$CONFIG_FILE" <<EOF
+{
+  "server": {
+    "bind": "$BIND_ADDR",
+    "port": $PORT
+  },
+  "provider": {
+    "name": "$PROVIDER_NAME",
+    "model": "$PROVIDER_MODEL"
+  },
+  "log": {
+    "level": "info"
+  },
+  "runtime": {
+    "ltm_directory": "/var/lib/spiderweb/.spiderweb-ltm",
+    "ltm_filename": "runtime-memory.db"
+  }
+}
+EOF
+    fi
     
     chmod 644 "$CONFIG_FILE"
     
     # Also copy to user's home directory where spiderweb looks for it
-    USER_HOME=$(getent passwd "$INSTALL_USER" | cut -d: -f6)
-    if [ -n "$USER_HOME" ] && [ -d "$USER_HOME" ]; then
-        mkdir -p "$USER_HOME/.config/spiderweb"
-        cp "$CONFIG_FILE" "$USER_HOME/.config/spiderweb/config.json"
-        chown -R "$INSTALL_USER:$INSTALL_USER" "$USER_HOME/.config"
-        chmod 755 "$USER_HOME/.config"
-        chmod 755 "$USER_HOME/.config/spiderweb"
-        chmod 644 "$USER_HOME/.config/spiderweb/config.json"
+    if [ -n "$SERVICE_USER_HOME" ] && [ -d "$SERVICE_USER_HOME" ]; then
+        mkdir -p "$SERVICE_USER_HOME/.config/spiderweb"
+        cp "$CONFIG_FILE" "$SERVICE_USER_HOME/.config/spiderweb/config.json"
+        chown -R "$INSTALL_USER:$INSTALL_USER" "$SERVICE_USER_HOME/.config"
+        chmod 755 "$SERVICE_USER_HOME/.config"
+        chmod 755 "$SERVICE_USER_HOME/.config/spiderweb"
+        chmod 644 "$SERVICE_USER_HOME/.config/spiderweb/config.json"
     fi
     
+    # Always derive provider/model from effective config so credential bootstrap matches runtime.
+    if command -v jq &> /dev/null; then
+        detected_provider="$(jq -r '.provider.name // empty' "$CONFIG_FILE" 2>/dev/null || true)"
+        detected_model="$(jq -r '.provider.model // empty' "$CONFIG_FILE" 2>/dev/null || true)"
+        if [ -n "$detected_provider" ]; then
+            PROVIDER_NAME="$detected_provider"
+        fi
+        if [ -n "$detected_model" ]; then
+            PROVIDER_MODEL="$detected_model"
+        fi
+    fi
+
     log_info "Config installed at $CONFIG_FILE"
     log_info "Edit with: spiderweb-config config"
+}
+
+configure_service_credentials() {
+    log_info "Configuring provider credentials for service account..."
+
+    # Start fresh; this file is optional and loaded via EnvironmentFile=-...
+    rm -f "$SERVICE_ENV_FILE"
+    install -m 640 -o root -g "$INSTALL_USER" /dev/null "$SERVICE_ENV_FILE"
+
+    if [[ "$PROVIDER_NAME" == openai-codex* ]]; then
+        if [ -n "${OPENAI_CODEX_API_KEY:-}" ]; then
+            printf 'OPENAI_CODEX_API_KEY=%s\n' "${OPENAI_CODEX_API_KEY}" >> "$SERVICE_ENV_FILE"
+            CREDENTIAL_STATUS="service env key: OPENAI_CODEX_API_KEY"
+        elif [ -n "${OPENAI_API_KEY:-}" ]; then
+            printf 'OPENAI_API_KEY=%s\n' "${OPENAI_API_KEY}" >> "$SERVICE_ENV_FILE"
+            CREDENTIAL_STATUS="service env key: OPENAI_API_KEY"
+        else
+            source_home=""
+            if [ -n "${SUDO_USER:-}" ] && [ "${SUDO_USER}" != "root" ]; then
+                source_home=$(getent passwd "${SUDO_USER}" | cut -d: -f6)
+            fi
+
+            if [ -n "$source_home" ] && [ -f "$source_home/.codex/auth.json" ]; then
+                mkdir -p "$SERVICE_USER_HOME/.codex"
+                cp "$source_home/.codex/auth.json" "$SERVICE_USER_HOME/.codex/auth.json"
+                chown -R "$INSTALL_USER:$INSTALL_USER" "$SERVICE_USER_HOME/.codex"
+                chmod 700 "$SERVICE_USER_HOME/.codex"
+                chmod 600 "$SERVICE_USER_HOME/.codex/auth.json"
+                CREDENTIAL_STATUS="imported Codex OAuth tokens to $SERVICE_USER_HOME/.codex/auth.json"
+            else
+                if [ -t 0 ]; then
+                    log_warn "No Codex credentials found for service user '$INSTALL_USER'."
+                    read -r -p "Run OAuth login now for '$INSTALL_USER'? [Y/n]: " oauth_confirm
+                    if [ -z "$oauth_confirm" ] || [[ ! "$oauth_confirm" =~ ^[Nn]$ ]]; then
+                        mkdir -p "$SERVICE_USER_HOME/.pi/agent"
+                        chown -R "$INSTALL_USER:$INSTALL_USER" "$SERVICE_USER_HOME/.pi"
+                        chmod 700 "$SERVICE_USER_HOME/.pi"
+                        chmod 700 "$SERVICE_USER_HOME/.pi/agent"
+
+                        if command -v runuser &> /dev/null; then
+                            if runuser -u "$INSTALL_USER" -- env HOME="$SERVICE_USER_HOME" SPIDERWEB_CONFIG="$CONFIG_DIR/config.json" "$INSTALL_DIR/bin/spiderweb-config" oauth login openai-codex --no-set-provider; then
+                                CREDENTIAL_STATUS="completed interactive OAuth login for openai-codex"
+                            else
+                                CREDENTIAL_STATUS="oauth login failed; set OPENAI_CODEX_API_KEY or provide $SERVICE_USER_HOME/.codex/auth.json"
+                            fi
+                        elif command -v sudo &> /dev/null; then
+                            if sudo -u "$INSTALL_USER" HOME="$SERVICE_USER_HOME" SPIDERWEB_CONFIG="$CONFIG_DIR/config.json" "$INSTALL_DIR/bin/spiderweb-config" oauth login openai-codex --no-set-provider; then
+                                CREDENTIAL_STATUS="completed interactive OAuth login for openai-codex"
+                            else
+                                CREDENTIAL_STATUS="oauth login failed; set OPENAI_CODEX_API_KEY or provide $SERVICE_USER_HOME/.codex/auth.json"
+                            fi
+                        else
+                            CREDENTIAL_STATUS="cannot run oauth login automatically (missing runuser/sudo); set OPENAI_CODEX_API_KEY or provide $SERVICE_USER_HOME/.codex/auth.json"
+                        fi
+                    else
+                        CREDENTIAL_STATUS="missing codex credentials (set OPENAI_CODEX_API_KEY or place $SERVICE_USER_HOME/.codex/auth.json)"
+                    fi
+                else
+                    CREDENTIAL_STATUS="missing codex credentials (set OPENAI_CODEX_API_KEY or place $SERVICE_USER_HOME/.codex/auth.json)"
+                fi
+            fi
+        fi
+    elif [ "$PROVIDER_NAME" = "openai" ]; then
+        if [ -n "${OPENAI_API_KEY:-}" ]; then
+            printf 'OPENAI_API_KEY=%s\n' "${OPENAI_API_KEY}" >> "$SERVICE_ENV_FILE"
+            CREDENTIAL_STATUS="service env key: OPENAI_API_KEY"
+        else
+            CREDENTIAL_STATUS="missing OPENAI_API_KEY"
+        fi
+    else
+        CREDENTIAL_STATUS="provider-specific bootstrap not automated for '$PROVIDER_NAME'"
+    fi
+
+    if [ ! -s "$SERVICE_ENV_FILE" ]; then
+        rm -f "$SERVICE_ENV_FILE"
+    else
+        chown root:"$INSTALL_USER" "$SERVICE_ENV_FILE"
+        chmod 640 "$SERVICE_ENV_FILE"
+    fi
 }
 
 install_systemd_service() {
@@ -182,7 +304,9 @@ Group=$INSTALL_USER
 
 # Environment
 Environment="SPIDERWEB_CONFIG=$CONFIG_DIR/config.json"
+Environment="HOME=$SERVICE_USER_HOME"
 Environment="RUST_LOG=info"
+EnvironmentFile=-$SERVICE_ENV_FILE
 
 # Working directory
 WorkingDirectory=/var/lib/spiderweb
@@ -202,7 +326,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=/var/lib/spiderweb /var/log/spiderweb /home/$INSTALL_USER/.config
+ReadWritePaths=/var/lib/spiderweb /var/log/spiderweb $SERVICE_USER_HOME/.config $SERVICE_USER_HOME/.codex $SERVICE_USER_HOME/.pi
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
@@ -239,11 +363,18 @@ set_permissions() {
     chown root:"$INSTALL_USER" "$CONFIG_DIR/config.json"
     chmod 755 "$CONFIG_DIR"
     chmod 644 "$CONFIG_DIR/config.json"
+
+    if [ -f "$SERVICE_ENV_FILE" ]; then
+        chown root:"$INSTALL_USER" "$SERVICE_ENV_FILE"
+        chmod 640 "$SERVICE_ENV_FILE"
+    fi
     
     # Set permissions on user's home config
-    USER_HOME=$(getent passwd "$INSTALL_USER" | cut -d: -f6)
-    if [ -n "$USER_HOME" ] && [ -d "$USER_HOME/.config" ]; then
-        chown -R "$INSTALL_USER:$INSTALL_USER" "$USER_HOME/.config"
+    if [ -n "$SERVICE_USER_HOME" ] && [ -d "$SERVICE_USER_HOME/.config" ]; then
+        chown -R "$INSTALL_USER:$INSTALL_USER" "$SERVICE_USER_HOME/.config"
+    fi
+    if [ -n "$SERVICE_USER_HOME" ] && [ -d "$SERVICE_USER_HOME/.pi" ]; then
+        chown -R "$INSTALL_USER:$INSTALL_USER" "$SERVICE_USER_HOME/.pi"
     fi
     
     log_info "Permissions set ✓"
@@ -259,10 +390,15 @@ print_summary() {
     echo "User:        $INSTALL_USER"
     echo "Install:     $INSTALL_DIR"
     echo "Config:      $CONFIG_DIR/config.json"
+    if [ -f "$SERVICE_ENV_FILE" ]; then
+        echo "Env file:    $SERVICE_ENV_FILE"
+    fi
     echo "Logs:        /var/log/spiderweb/"
     echo "Data:        /var/lib/spiderweb/"
     echo "Port:        $PORT"
     echo "Bind:        $BIND_ADDR"
+    echo "Provider:    $PROVIDER_NAME/$PROVIDER_MODEL"
+    echo "Credentials: $CREDENTIAL_STATUS"
     echo ""
     echo "Commands:"
     echo "  Start:     sudo systemctl start $SERVICE_NAME"
@@ -271,9 +407,14 @@ print_summary() {
     echo "  Logs:      sudo journalctl -u $SERVICE_NAME -f"
     echo "  Config:    sudo spiderweb-config config"
     echo ""
-    echo "Don't forget to set your API key:"
-    echo "  export OPENAI_API_KEY='your-key-here'"
-    echo "  # Or use spiderweb-config set-key"
+    echo "Credential notes:"
+    echo "  - For system services, keys must be available to user '$INSTALL_USER'."
+    echo "  - OpenAI/OpenAI Codex keys can be supplied via environment at install time:"
+    echo "      sudo OPENAI_API_KEY=... ./scripts/install-systemd.sh"
+    echo "      sudo OPENAI_CODEX_API_KEY=... PROVIDER_NAME=openai-codex PROVIDER_MODEL=gpt-5.1-codex-mini ./scripts/install-systemd.sh"
+    echo "  - For Codex OAuth, place auth at: $SERVICE_USER_HOME/.codex/auth.json"
+    echo "  - Or run OAuth login as service user:"
+    echo "      sudo -u $INSTALL_USER HOME=$SERVICE_USER_HOME SPIDERWEB_CONFIG=$CONFIG_DIR/config.json $INSTALL_DIR/bin/spiderweb-config oauth login openai-codex --no-set-provider"
     echo ""
 }
 
@@ -290,6 +431,7 @@ main() {
     create_user
     install_files
     install_config
+    configure_service_credentials
     install_systemd_service
     set_permissions
     print_summary

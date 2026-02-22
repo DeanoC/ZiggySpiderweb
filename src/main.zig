@@ -105,12 +105,14 @@ pub fn main() !void {
                 "  --help, -h       Show this help\n" ++
                 "\n" ++
                 "Configuration:\n" ++
+                "  spiderweb-config oauth login <provider> [--enterprise-domain <domain>] [--no-set-provider]\n" ++
+                "  spiderweb-config oauth clear <provider>\n" ++
                 "  spiderweb-config config              Show current config\n" ++
                 "  spiderweb-config config set-provider <name> [model]\n" ++
                 "  spiderweb-config config set-key <api-key> [provider]\n" ++
                 "  spiderweb-config config clear-key [provider]\n" ++
                 "\n" ++
-                "API key resolution order: secure credential backend (Linux: secret-tool), then provider env vars.\n";
+                "API key resolution order: secure credential backend (Linux: secret-tool), then provider OAuth/env keys.\n";
             std.debug.print("{s}", .{help});
             return;
         }
