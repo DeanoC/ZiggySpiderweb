@@ -9,7 +9,7 @@ comptime {
     _ = @import("brain_tools.zig");
     _ = @import("brain_specialization.zig");
     _ = @import("ziggy-runtime-hooks").event_bus;
-    _ = @import("ziggy-runtime-hooks").run_engine;
+    _ = @import("ziggy-run-orchestrator").run_engine;
     _ = @import("hook_registry.zig");
     _ = @import("system_hooks.zig");
     _ = @import("ziggy-memory-store").ltm_store;

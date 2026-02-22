@@ -24,6 +24,10 @@
             .url = "https://github.com/DeanoC/ZiggyRuntimeHooks/archive/a928d762d2ef3fe67b08b7bc2eba5b30b86c2c08.tar.gz",
             .hash = "ziggy_runtime_hooks-0.4.0-68kKIGUfAQAdnk_5_IAhBq0vkOxAZjbzBphuUMCbAqfp",
         },
+        .ziggy_run_orchestrator = .{
+            .url = "https://github.com/DeanoC/ZiggyRunOrchestrator/archive/dbd10f24fdecd5cce606b19ddde8d50a4a7b1ab9.tar.gz",
+            .hash = "ziggy_run_orchestrator-0.1.0-iczgkPzWAADoxANEsAoIo5hZcraQ5lZ8BOWeuX3RX3SI",
+        },
     },
     .paths = .{
         "build.zig",

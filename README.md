@@ -273,6 +273,7 @@ Spiderweb now imports shared modules directly:
 - `ziggy-memory-store`
 - `ziggy-tool-runtime`
 - `ziggy-runtime-hooks` (wave-2 extraction now includes `event_bus`, `hook_primitives`, and `hook_registry_engine`)
+- `ziggy-run-orchestrator` (run lifecycle engine + run-step orchestration helpers)
 
 Compatibility wrapper files (`src/protocol*.zig`, `src/memory*.zig`, `src/run_store.zig`, `src/tool_*.zig`) were marked for removal on February 22, 2026 with a target of `v0.3.0`, and are now removed. Use direct module imports in new code.
 

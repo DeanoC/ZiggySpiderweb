@@ -30,6 +30,11 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     const ziggy_runtime_hooks_module = ziggy_runtime_hooks_dep.module("ziggy-runtime-hooks");
+    const ziggy_run_orchestrator_dep = b.dependency("ziggy_run_orchestrator", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const ziggy_run_orchestrator_module = ziggy_run_orchestrator_dep.module("ziggy-run-orchestrator");
 
     // Spiderweb executable
     const spiderweb_mod = b.createModule(.{
@@ -42,6 +47,7 @@ pub fn build(b: *std.Build) void {
     spiderweb_mod.addImport("ziggy-memory-store", ziggy_memory_store_module);
     spiderweb_mod.addImport("ziggy-tool-runtime", ziggy_tool_runtime_module);
     spiderweb_mod.addImport("ziggy-runtime-hooks", ziggy_runtime_hooks_module);
+    spiderweb_mod.addImport("ziggy-run-orchestrator", ziggy_run_orchestrator_module);
 
     // Add agent_config module for flat config loading
     const agent_config_mod = b.createModule(.{
@@ -99,6 +105,7 @@ pub fn build(b: *std.Build) void {
     test_mod.addImport("ziggy-memory-store", ziggy_memory_store_module);
     test_mod.addImport("ziggy-tool-runtime", ziggy_tool_runtime_module);
     test_mod.addImport("ziggy-runtime-hooks", ziggy_runtime_hooks_module);
+    test_mod.addImport("ziggy-run-orchestrator", ziggy_run_orchestrator_module);
 
     const spiderweb_tests = b.addTest(.{
         .root_module = test_mod,
