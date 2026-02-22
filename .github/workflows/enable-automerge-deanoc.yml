@@ -29,8 +29,6 @@ jobs:
             const owner = context.repo.owner;
             const repo = context.repo.repo;
             const prNumber = context.payload.pull_request?.number ?? context.payload.issue?.number;
-            const eventName = context.eventName;
-            const action = context.payload.action ?? '';
 
             if (!prNumber) {
               core.notice('No pull request in event payload; skipping.');
@@ -92,52 +90,54 @@ jobs:
               ...codexIssueComments.map((comment) => ({ type: 'comment', at: parseDate(comment.created_at), state: null })),
             ].sort((a, b) => a.at - b.at);
 
-            const latestCodexResponseAt = codexResponses.length > 0 ? codexResponses[codexResponses.length - 1].at : null;
+            if (codexResponses.length === 0) {
+              core.notice(`PR #${prNumber} is awaiting initial codex response; skipping.`);
+              return;
+            }
 
-            if (reviewRequests.length === 0) {
-              if (eventName === 'pull_request_target' && action === 'synchronize') {
-                core.notice(`PR #${prNumber} needs a fresh \"@codex review\" request after synchronize.`);
+            const commits = await github.paginate(github.rest.pulls.listCommits, {
+              owner,
+              repo,
+              pull_number: prNumber,
+              per_page: 100,
+            });
+
+            const latestCommitAt = commits.reduce((latest, commit) => {
+              const commitAt = parseDate(commit.commit?.committer?.date ?? commit.commit?.author?.date);
+              return commitAt.getTime() > latest.getTime() ? commitAt : latest;
+            }, parseDate(pull.created_at));
+
+            const firstCodexResponseAt = codexResponses[0].at;
+            const latestCodexResponseAt = codexResponses[codexResponses.length - 1].at;
+            const hasSubsequentCycle = latestCommitAt.getTime() > firstCodexResponseAt.getTime();
+
+            const latestReviewRequest = [...reviewRequests]
+              .sort((a, b) => parseDate(a.created_at) - parseDate(b.created_at))
+              .pop();
+            const latestReviewRequestAt = latestReviewRequest ? parseDate(latestReviewRequest.created_at) : null;
+
+            if (hasSubsequentCycle) {
+              if (!latestReviewRequestAt || latestReviewRequestAt.getTime() < latestCommitAt.getTime()) {
+                core.notice(`PR #${prNumber} needs a fresh "@codex review" request after latest push.`);
                 return;
               }
+            }
 
-              if (codexResponses.length === 0) {
-                core.notice(`PR #${prNumber} is awaiting initial codex response; skipping.`);
+            if (latestReviewRequestAt && latestCodexResponseAt.getTime() < latestReviewRequestAt.getTime()) {
+              core.notice(`PR #${prNumber} is awaiting codex response to latest request; skipping.`);
+              return;
+            }
+
+            const relevantStart = latestReviewRequestAt ?? firstCodexResponseAt;
+            const relevantCodexReviews = codexReviews.filter((review) => parseDate(review.submitted_at).getTime() >= relevantStart.getTime());
+
+            if (relevantCodexReviews.length > 0) {
+              const latestCodexReview = relevantCodexReviews
+                .sort((a, b) => parseDate(a.submitted_at) - parseDate(b.submitted_at))
+                .pop();
+              if (latestCodexReview.state === 'CHANGES_REQUESTED') {
+                core.notice(`PR #${prNumber} latest codex review requests changes; skipping.`);
                 return;
-              }
-
-              if (codexReviews.length > 0) {
-                const latestCodexReview = [...codexReviews].sort((a, b) => parseDate(a.submitted_at) - parseDate(b.submitted_at))[codexReviews.length - 1];
-                if (latestCodexReview.state === 'CHANGES_REQUESTED') {
-                  core.notice(`PR #${prNumber} latest codex review requests changes; skipping.`);
-                  return;
-                }
-              }
-            } else {
-              const latestReviewRequest = [...reviewRequests].sort((a, b) => parseDate(a.created_at) - parseDate(b.created_at))[reviewRequests.length - 1];
-              const latestReviewRequestAt = parseDate(latestReviewRequest.created_at);
-
-              if (
-                latestCodexResponseAt &&
-                latestReviewRequestAt.getTime() <= latestCodexResponseAt.getTime()
-              ) {
-                core.notice(`PR #${prNumber} needs a new \"@codex review\" request after latest push.`);
-                return;
-              }
-
-              const relevantCodexReviews = codexReviews.filter((review) => parseDate(review.submitted_at).getTime() >= latestReviewRequestAt.getTime());
-              const relevantCodexIssueComments = codexIssueComments.filter((comment) => parseDate(comment.created_at).getTime() >= latestReviewRequestAt.getTime());
-
-              if (relevantCodexReviews.length === 0 && relevantCodexIssueComments.length === 0) {
-                core.notice(`PR #${prNumber} is awaiting codex response to latest request; skipping.`);
-                return;
-              }
-
-              if (relevantCodexReviews.length > 0) {
-                const latestCodexReview = [...relevantCodexReviews].sort((a, b) => parseDate(a.submitted_at) - parseDate(b.submitted_at))[relevantCodexReviews.length - 1];
-                if (latestCodexReview.state === 'CHANGES_REQUESTED') {
-                  core.notice(`PR #${prNumber} latest codex review after request is CHANGES_REQUESTED; skipping.`);
-                  return;
-                }
               }
             }
 
