@@ -203,10 +203,11 @@ fn hasNonWhitespace(value: []const u8) bool {
 
 test "identity: loadMergedPrompt applies precedence to headings" {
     const allocator = std.testing.allocator;
-    var tmp_dir = std.testing.tmpDir(.{});
-    defer tmp_dir.cleanup();
-    const dir_name = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    const dir_name = try std.fmt.allocPrint(allocator, ".tmp-identity-{d}", .{std.time.nanoTimestamp()});
     defer allocator.free(dir_name);
+    defer std.fs.cwd().deleteTree(dir_name) catch {};
+
+    try std.fs.cwd().makePath(dir_name);
     const agent_name = "agent-a";
 
     const agent_path = try std.fmt.allocPrint(allocator, "{s}/agents/{s}", .{ dir_name, agent_name });
@@ -236,10 +237,11 @@ test "identity: loadMergedPrompt applies precedence to headings" {
 
 test "identity: fallback to default prompt when no files present" {
     const allocator = std.testing.allocator;
-    var tmp_dir = std.testing.tmpDir(.{});
-    defer tmp_dir.cleanup();
-    const dir_name = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    const dir_name = try std.fmt.allocPrint(allocator, ".tmp-identity-empty-{d}", .{std.time.nanoTimestamp()});
     defer allocator.free(dir_name);
+    defer std.fs.cwd().deleteTree(dir_name) catch {};
+
+    try std.fs.cwd().makePath(dir_name);
 
     const prompt = try loadMergedPrompt(allocator, dir_name, "agent-none");
     defer allocator.free(prompt);

@@ -251,10 +251,9 @@ pub const RuntimeServer = struct {
             if (!builtin.is_test) return RuntimeServerError.MissingLtmStoreConfig;
             test_ltm_directory = try std.fmt.allocPrint(
                 allocator,
-                ".zig-cache/tmp/runtime-ltm-{d}",
-                .{std.time.nanoTimestamp()},
+                ".tmp-runtime-ltm-{s}-{d}",
+                .{ agent_id, std.time.nanoTimestamp() },
             );
-            try std.fs.cwd().makePath(test_ltm_directory.?);
             effective_ltm_directory = test_ltm_directory.?;
         }
         if (effective_ltm_filename.len == 0) {

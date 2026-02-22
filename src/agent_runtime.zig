@@ -960,12 +960,11 @@ test "agent_runtime: talk_brain schedules target brain tick for runtime loop" {
 test "agent_runtime: memory lifecycle create mutate evict load historical" {
     const allocator = std.testing.allocator;
     const cfg = Config.RuntimeConfig{};
-    var tmp_dir = std.testing.tmpDir(.{});
-    defer tmp_dir.cleanup();
-
-    const dir = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    const dir = try std.fmt.allocPrint(allocator, ".tmp-runtime-lifecycle-{d}", .{std.time.nanoTimestamp()});
     defer allocator.free(dir);
+    defer std.fs.cwd().deleteTree(dir) catch {};
 
+    try std.fs.cwd().makePath(dir);
     var runtime = try AgentRuntime.initWithPersistence(allocator, "agentA", &[_][]const u8{}, dir, "runtime.db", cfg);
     defer runtime.deinit();
 
