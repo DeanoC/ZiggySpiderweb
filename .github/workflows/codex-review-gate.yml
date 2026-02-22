@@ -1,7 +1,6 @@
 name: codex-review-gate
 
 on:
-  workflow_dispatch:
   pull_request:
     types:
       - opened
@@ -27,6 +26,7 @@ on:
 
 permissions:
   contents: read
+  issues: read
   pull-requests: read
 
 jobs:
@@ -47,12 +47,66 @@ jobs:
               return;
             }
 
+            const parseDate = (value) => {
+              const parsed = new Date(value ?? 0);
+              return Number.isNaN(parsed.getTime()) ? new Date(0) : parsed;
+            };
+
+            const isAtOrAfter = (value, threshold) => parseDate(value).getTime() >= threshold.getTime();
+
             const isCodexReviewer = (login) => {
               if (!login) return false;
               const normalized = login.toLowerCase();
               return normalized === 'chatgpt-codex-connector' ||
                 normalized === 'chatgpt-codex-connector[bot]';
             };
+
+            const isCodexReviewRequest = (body) => /(^|\s)@codex\s+review(\b|$)/i.test(body ?? '');
+
+            const pull = (await github.rest.pulls.get({ owner, repo, pull_number: prNumber })).data;
+            const prAuthor = pull.user?.login;
+            const headSha = pull.head?.sha;
+
+            if (!prAuthor || !headSha) {
+              core.setFailed('Unable to determine PR author or head SHA.');
+              return;
+            }
+
+            const headCommit = await github.rest.repos.getCommit({ owner, repo, ref: headSha });
+            const headTimestamp = parseDate(
+              headCommit.data.commit.committer?.date ??
+              headCommit.data.commit.author?.date
+            );
+
+            const issueComments = await github.paginate(github.rest.issues.listComments, {
+              owner,
+              repo,
+              issue_number: prNumber,
+              per_page: 100,
+            });
+
+            const reviewRequests = issueComments.filter((comment) => {
+              return comment.user?.login === prAuthor && isCodexReviewRequest(comment.body);
+            });
+
+            if (reviewRequests.length === 0) {
+              core.setFailed(`Missing "@codex review" comment from PR author (${prAuthor}).`);
+              return;
+            }
+
+            const latestReviewRequest = [...reviewRequests].sort((a, b) => {
+              return parseDate(a.created_at) - parseDate(b.created_at);
+            })[reviewRequests.length - 1];
+
+            const latestReviewRequestAt = parseDate(latestReviewRequest.created_at);
+
+            if (latestReviewRequestAt.getTime() < headTimestamp.getTime()) {
+              core.setFailed(
+                `Latest "@codex review" request predates HEAD (${headSha.slice(0, 7)}). ` +
+                'Add a fresh "@codex review" comment after your latest push.'
+              );
+              return;
+            }
 
             const reviews = await github.paginate(github.rest.pulls.listReviews, {
               owner,
@@ -66,18 +120,31 @@ jobs:
               return review.state && review.state !== 'PENDING' && review.state !== 'DISMISSED';
             });
 
-            if (codexReviews.length === 0) {
-              core.setFailed('Missing required review from chatgpt-codex-connector.');
+            const relevantCodexReviews = codexReviews.filter((review) => {
+              return isAtOrAfter(review.submitted_at, latestReviewRequestAt) &&
+                isAtOrAfter(review.submitted_at, headTimestamp);
+            });
+
+            const codexIssueResponses = issueComments.filter((comment) => {
+              if (!isCodexReviewer(comment.user?.login)) return false;
+              return isAtOrAfter(comment.created_at, latestReviewRequestAt) &&
+                isAtOrAfter(comment.created_at, headTimestamp);
+            });
+
+            if (relevantCodexReviews.length === 0 && codexIssueResponses.length === 0) {
+              core.setFailed('Missing codex response after latest "@codex review" request.');
               return;
             }
 
-            const latestCodexReview = [...codexReviews].sort((a, b) => {
-              return new Date(a.submitted_at || 0) - new Date(b.submitted_at || 0);
-            })[codexReviews.length - 1];
+            if (relevantCodexReviews.length > 0) {
+              const latestCodexReview = [...relevantCodexReviews].sort((a, b) => {
+                return parseDate(a.submitted_at) - parseDate(b.submitted_at);
+              })[relevantCodexReviews.length - 1];
 
-            if (latestCodexReview.state === 'CHANGES_REQUESTED') {
-              core.setFailed('Latest chatgpt-codex-connector review is CHANGES_REQUESTED.');
-              return;
+              if (latestCodexReview.state === 'CHANGES_REQUESTED') {
+                core.setFailed('Latest codex review after request is CHANGES_REQUESTED.');
+                return;
+              }
             }
 
             const unresolvedThreads = [];
@@ -132,7 +199,7 @@ jobs:
             }
 
             if (unresolvedThreads.length > 0) {
-              core.setFailed(`Found ${unresolvedThreads.length} unresolved review thread(s) from chatgpt-codex-connector.`);
+              core.setFailed(`Found ${unresolvedThreads.length} unresolved review thread(s) from codex.`);
               return;
             }
 
