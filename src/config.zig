@@ -193,6 +193,12 @@ pub fn deinit(self: *Config) void {
 }
 
 fn defaultConfigPath(allocator: std.mem.Allocator) ![]const u8 {
+    const configured = std.process.getEnvVarOwned(allocator, "SPIDERWEB_CONFIG") catch null;
+    if (configured) |path| {
+        if (path.len > 0) return path;
+        allocator.free(path);
+    }
+
     if (@import("builtin").os.tag == .windows) {
         const home = std.process.getEnvVarOwned(allocator, "USERPROFILE") catch {
             const cwd = std.process.getCwdAlloc(allocator) catch return try allocator.dupe(u8, ".spiderweb.json");
