@@ -1,0 +1,79 @@
+name: ziggy-shared-ci
+
+on:
+  workflow_call:
+    inputs:
+      verify_script:
+        required: false
+        type: string
+        default: ""
+      install_sqlite:
+        required: false
+        type: boolean
+        default: false
+      zig_version:
+        required: false
+        type: string
+        default: "0.15.1"
+      build_command:
+        required: false
+        type: string
+        default: "zig build"
+      test_command:
+        required: false
+        type: string
+        default: "zig build test"
+      extra_commands:
+        required: false
+        type: string
+        default: ""
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify repository checks
+        if: ${{ inputs.verify_script != '' }}
+        env:
+          VERIFY_SCRIPT: ${{ inputs.verify_script }}
+        run: |
+          printf '%s\n' "$VERIFY_SCRIPT" > /tmp/ziggy-ci-verify.sh
+          bash /tmp/ziggy-ci-verify.sh
+
+      - name: Install SQLite development package
+        if: ${{ inputs.install_sqlite }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsqlite3-dev
+
+      - name: Install Zig
+        env:
+          ZIG_VERSION: ${{ inputs.zig_version }}
+        run: |
+          curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" -o zig.tar.xz
+          tar -xf zig.tar.xz
+          export PATH="$PWD/zig-x86_64-linux-${ZIG_VERSION}:$PATH"
+          echo "$PWD/zig-x86_64-linux-${ZIG_VERSION}" >> "$GITHUB_PATH"
+          zig version
+
+      - name: Build
+        env:
+          BUILD_COMMAND: ${{ inputs.build_command }}
+        run: |
+          bash -lc "$BUILD_COMMAND"
+
+      - name: Test
+        env:
+          TEST_COMMAND: ${{ inputs.test_command }}
+        run: |
+          bash -lc "$TEST_COMMAND"
+
+      - name: Extra commands
+        if: ${{ inputs.extra_commands != '' }}
+        env:
+          EXTRA_COMMANDS: ${{ inputs.extra_commands }}
+        run: |
+          printf '%s\n' "$EXTRA_COMMANDS" > /tmp/ziggy-ci-extra.sh
+          bash /tmp/ziggy-ci-extra.sh

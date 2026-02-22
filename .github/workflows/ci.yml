@@ -8,33 +8,15 @@ on:
 
 jobs:
   build-and-test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Verify pinned Ziggy module dependencies
-        run: |
-          if grep -qE '\\.path = "\\.\\./Ziggy' build.zig.zon; then
-            echo "Local path Ziggy dependencies are not allowed in CI"
-            exit 1
-          fi
-          grep -q 'ziggy_spider_protocol' build.zig.zon
-          grep -q 'ziggy_memory_store' build.zig.zon
-          grep -q 'ziggy_tool_runtime' build.zig.zon
-          grep -q 'ziggy_runtime_hooks' build.zig.zon
-          grep -q '\.hash =' build.zig.zon
-
-      - name: Install Zig
-        run: |
-          ZIG_VERSION=0.15.1
-          curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" -o zig.tar.xz
-          tar -xf zig.tar.xz
-          export PATH="$PWD/zig-x86_64-linux-${ZIG_VERSION}:$PATH"
-          echo "$PWD/zig-x86_64-linux-${ZIG_VERSION}" >> "$GITHUB_PATH"
-          zig version
-
-      - name: Build
-        run: zig build
-
-      - name: Test
-        run: zig build test
+    uses: ./.github/workflows/ziggy-shared-ci.yml
+    with:
+      verify_script: |
+        if grep -qE '\.path = "\.\./Ziggy' build.zig.zon; then
+          echo "Local path Ziggy dependencies are not allowed in CI"
+          exit 1
+        fi
+        grep -q 'ziggy_spider_protocol' build.zig.zon
+        grep -q 'ziggy_memory_store' build.zig.zon
+        grep -q 'ziggy_tool_runtime' build.zig.zon
+        grep -q 'ziggy_runtime_hooks' build.zig.zon
+        grep -q '\.hash =' build.zig.zon

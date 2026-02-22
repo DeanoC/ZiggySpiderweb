@@ -11,6 +11,7 @@ const memory = @import("ziggy-memory-store").memory;
 const memid = @import("ziggy-memory-store").memid;
 const prompt_compiler = @import("prompt_compiler.zig");
 const run_engine = @import("ziggy-runtime-hooks").run_engine;
+const run_orchestration = @import("ziggy-runtime-hooks").run_orchestration_helpers;
 const system_hooks = @import("system_hooks.zig");
 const tool_registry = @import("ziggy-tool-runtime").tool_registry;
 const ziggy_piai = @import("ziggy-piai");
@@ -51,10 +52,7 @@ const RuntimeServerError = error{
     MissingLtmStoreConfig,
 };
 
-const RuntimeOperationClass = enum {
-    chat,
-    control,
-};
+const RuntimeOperationClass = run_orchestration.OperationClass;
 
 const RuntimeQueueJob = struct {
     msg_type: protocol.MessageType,
@@ -215,9 +213,7 @@ pub const RuntimeServer = struct {
     chat_operation_timeout_ms: u64 = 120_000,
     control_operation_timeout_ms: u64 = 5_000,
     runtime_jobs: std.ArrayListUnmanaged(*RuntimeQueueJob) = .{},
-    run_step_mutex: std.Thread.Mutex = .{},
-    active_run_steps: std.StringHashMapUnmanaged(void) = .{},
-    cancelled_run_steps: std.StringHashMapUnmanaged(void) = .{},
+    run_steps: run_orchestration.RunStepTracker,
     runtime_workers: []std.Thread,
     stopping: bool = false,
     test_ltm_directory: ?[]u8 = null,
@@ -302,6 +298,7 @@ pub const RuntimeServer = struct {
             .chat_operation_timeout_ms = runtime_cfg.chat_operation_timeout_ms,
             .control_operation_timeout_ms = runtime_cfg.control_operation_timeout_ms,
             .runtime_workers = try allocator.alloc(std.Thread, worker_count),
+            .run_steps = run_orchestration.RunStepTracker.init(allocator),
             .provider_runtime = provider_runtime,
             .default_agent_id = try allocator.dupe(u8, if (runtime_cfg.default_agent_id.len == 0) default_agent_id else runtime_cfg.default_agent_id),
             .log_provider_requests = shouldLogProviderRequests(),
@@ -365,14 +362,7 @@ pub const RuntimeServer = struct {
         self.runtime_jobs.deinit(self.allocator);
         self.queue_mutex.unlock();
 
-        self.run_step_mutex.lock();
-        var active_it = self.active_run_steps.iterator();
-        while (active_it.next()) |entry| self.allocator.free(entry.key_ptr.*);
-        self.active_run_steps.deinit(self.allocator);
-        var cancelled_it = self.cancelled_run_steps.iterator();
-        while (cancelled_it.next()) |entry| self.allocator.free(entry.key_ptr.*);
-        self.cancelled_run_steps.deinit(self.allocator);
-        self.run_step_mutex.unlock();
+        self.run_steps.deinit();
 
         self.allocator.free(self.runtime_workers);
         self.allocator.free(self.default_agent_id);
@@ -448,7 +438,7 @@ pub const RuntimeServer = struct {
                 return self.submitRuntimeJobAndAwait(parsed.msg_type, request_id, parsed.content, parsed.action, .control, emit_debug);
             },
             .agent_control => {
-                const operation_class: RuntimeOperationClass = if (isChatLikeControlAction(parsed.action)) .chat else .control;
+                const operation_class: RuntimeOperationClass = if (run_orchestration.isChatLikeControlAction(parsed.action)) .chat else .control;
                 return self.submitRuntimeJobAndAwait(
                     parsed.msg_type,
                     request_id,
@@ -820,53 +810,27 @@ pub const RuntimeServer = struct {
     }
 
     fn markRunStepActive(self: *RuntimeServer, run_id: []const u8) !bool {
-        self.run_step_mutex.lock();
-        defer self.run_step_mutex.unlock();
-
-        if (self.active_run_steps.contains(run_id)) return false;
-        const owned_key = try self.allocator.dupe(u8, run_id);
-        errdefer self.allocator.free(owned_key);
-        try self.active_run_steps.put(self.allocator, owned_key, {});
-        return true;
+        return self.run_steps.markRunStepActive(run_id);
     }
 
     fn isRunStepActive(self: *RuntimeServer, run_id: []const u8) bool {
-        self.run_step_mutex.lock();
-        defer self.run_step_mutex.unlock();
-        return self.active_run_steps.contains(run_id);
+        return self.run_steps.isRunStepActive(run_id);
     }
 
     fn clearRunStepTracking(self: *RuntimeServer, run_id: []const u8) void {
-        self.run_step_mutex.lock();
-        defer self.run_step_mutex.unlock();
-
-        if (self.active_run_steps.fetchRemove(run_id)) |entry| self.allocator.free(entry.key);
-        if (self.cancelled_run_steps.fetchRemove(run_id)) |entry| self.allocator.free(entry.key);
+        self.run_steps.clearRunStepTracking(run_id);
     }
 
     fn requestActiveRunStepCancel(self: *RuntimeServer, run_id: []const u8) !bool {
-        self.run_step_mutex.lock();
-        defer self.run_step_mutex.unlock();
-
-        if (!self.active_run_steps.contains(run_id)) return false;
-        if (!self.cancelled_run_steps.contains(run_id)) {
-            const owned_key = try self.allocator.dupe(u8, run_id);
-            errdefer self.allocator.free(owned_key);
-            try self.cancelled_run_steps.put(self.allocator, owned_key, {});
-        }
-        return true;
+        return self.run_steps.requestActiveRunStepCancel(run_id);
     }
 
     fn isRunStepCancelRequested(self: *RuntimeServer, run_id: []const u8) bool {
-        self.run_step_mutex.lock();
-        defer self.run_step_mutex.unlock();
-        return self.cancelled_run_steps.contains(run_id);
+        return self.run_steps.isRunStepCancelRequested(run_id);
     }
 
     fn isExecutionCancelled(self: *RuntimeServer, job: *RuntimeQueueJob, run_id: ?[]const u8) bool {
-        if (self.isJobCancelled(job)) return true;
-        if (run_id) |value| return self.isRunStepCancelRequested(value);
-        return false;
+        return self.run_steps.isExecutionCancelled(self.isJobCancelled(job), run_id);
     }
 
     fn createJob(
@@ -3704,11 +3668,11 @@ pub const RuntimeServer = struct {
     }
 
     fn operationTimeoutNs(self: *const RuntimeServer, operation_class: RuntimeOperationClass) u64 {
-        const timeout_ms = switch (operation_class) {
-            .chat => self.chat_operation_timeout_ms,
-            .control => self.control_operation_timeout_ms,
-        };
-        return timeout_ms * std.time.ns_per_ms;
+        return run_orchestration.operationTimeoutNs(
+            self.chat_operation_timeout_ms,
+            self.control_operation_timeout_ms,
+            operation_class,
+        );
     }
 
     fn logProviderRequestDebug(
@@ -3751,11 +3715,6 @@ pub const RuntimeServer = struct {
         std.log.debug("provider request end", .{});
     }
 };
-
-fn isChatLikeControlAction(action: ?[]const u8) bool {
-    const control_action = action orelse "state";
-    return std.mem.eql(u8, control_action, "goal") or std.mem.eql(u8, control_action, "plan");
-}
 
 fn shouldLogProviderRequests() bool {
     const env_value = std.process.getEnvVarOwned(std.heap.page_allocator, "SPIDERWEB_LOG_PROVIDER_REQUEST") catch return false;
@@ -5309,9 +5268,7 @@ test "runtime_server: agent.run.cancel preempts active run step" {
     var saw_active = false;
     var wait_ms: usize = 0;
     while (wait_ms < 500) : (wait_ms += 5) {
-        server.run_step_mutex.lock();
-        const active = server.active_run_steps.contains(started.run_id);
-        server.run_step_mutex.unlock();
+        const active = server.isRunStepActive(started.run_id);
         if (active) {
             saw_active = true;
             break;
