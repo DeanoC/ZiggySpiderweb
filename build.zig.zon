@@ -9,8 +9,7 @@
             .hash = "N-V-__8AALkBCwDkzKHmU553QXkf7d8LyyHkSBNgCpyuZiRg",
         },
         .ziggy_spider_protocol = .{
-            .url = "https://github.com/DeanoC/ZiggySpiderProtocol/archive/refs/tags/v0.1.0.tar.gz",
-            .hash = "ziggy_spider_protocol-0.1.0-Tn7uqxFxAADru6TiwRN12AgHK9UGtsNwI93n1rjSJAMw",
+            .path = "../ZiggySpiderProtocol",
         },
         .ziggy_memory_store = .{
             .url = "https://github.com/DeanoC/ZiggyMemoryStore/archive/refs/tags/v0.1.0.tar.gz",

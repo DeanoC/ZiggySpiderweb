@@ -63,13 +63,13 @@ zig build
 
 ```bash
 # Test connectivity
-zsc --gateway-test ping ws://127.0.0.1:18790/v1/agents/test/stream
+zsc --gateway-test ping ws://127.0.0.1:18790/v2/agents/test/stream
 
 # Send a message (requires API key)
-zsc --gateway-test echo ws://127.0.0.1:18790/v1/agents/test/stream
+zsc --gateway-test echo ws://127.0.0.1:18790/v2/agents/test/stream
 
 # Protocol compatibility check
-zsc --gateway-test probe ws://127.0.0.1:18790/v1/agents/test/stream
+zsc --gateway-test probe ws://127.0.0.1:18790/v2/agents/test/stream
 ```
 
 ## Configuration
@@ -222,7 +222,7 @@ OpenClaw Client (ZSC, OpenClaw, etc.)
     │ WebSocket / OpenClaw Protocol
     ▼
 ┌─────────────────┐
-│  HTTP Upgrade   │  ← GET /v1/agents/{agentId}/stream
+│  HTTP Upgrade   │  ← GET /v2/agents/{agentId}/stream
 ├─────────────────┤
 │  Session ACK    │  ← {"type":"connect.ack",...}
 ├─────────────────┤
