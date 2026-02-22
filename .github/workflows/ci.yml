@@ -19,4 +19,5 @@ jobs:
         grep -q 'ziggy_memory_store' build.zig.zon
         grep -q 'ziggy_tool_runtime' build.zig.zon
         grep -q 'ziggy_runtime_hooks' build.zig.zon
+        grep -q 'ziggy_run_orchestrator' build.zig.zon
         grep -q '\.hash =' build.zig.zon
