@@ -230,7 +230,7 @@ fn parseResponse(allocator: std.mem.Allocator, expected_id: u32, payload: []cons
     if (t != .string or !std.mem.eql(u8, t.string, "res")) return error.InvalidResponse;
 
     const id = root.get("id") orelse return error.InvalidResponse;
-    if (id != .integer or id.integer < 0) return error.InvalidResponse;
+    if (id != .integer or id.integer < 0 or id.integer > std.math.maxInt(u32)) return error.InvalidResponse;
     if (@as(u32, @intCast(id.integer)) != expected_id) return error.RequestIdMismatch;
 
     const ok = root.get("ok") orelse return error.InvalidResponse;
@@ -380,4 +380,10 @@ test "fs_client: parseWsUrl defaults path and port" {
     try std.testing.expectEqualStrings("localhost", parsed.host);
     try std.testing.expectEqual(@as(u16, 80), parsed.port);
     try std.testing.expectEqualStrings("/v1/fs", parsed.path);
+}
+
+test "fs_client: parseResponse rejects id above u32 range" {
+    const allocator = std.testing.allocator;
+    const payload = "{\"t\":\"res\",\"id\":4294967296,\"ok\":true,\"r\":{}}";
+    try std.testing.expectError(error.InvalidResponse, parseResponse(allocator, 1, payload));
 }

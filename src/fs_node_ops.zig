@@ -268,8 +268,10 @@ pub const NodeOps = struct {
         } else {
             for (specs) |spec| try self.addExport(spec);
         }
-        self.gdrive_spool_dir = try resolveGdriveSpoolDirForExports(allocator, self.exports.items);
-        try self.cleanupGdriveSpoolOrphans();
+        if (hasGdriveExports(self.exports.items)) {
+            self.gdrive_spool_dir = try resolveGdriveSpoolDirForExports(allocator, self.exports.items);
+            try self.cleanupGdriveSpoolOrphans();
+        }
 
         return self;
     }
@@ -3433,6 +3435,13 @@ fn resolveGdriveSpoolDirForExports(allocator: std.mem.Allocator, exports: []cons
     return resolveGdriveSpoolDir(allocator);
 }
 
+fn hasGdriveExports(exports: []const ExportConfig) bool {
+    for (exports) |export_cfg| {
+        if (export_cfg.source_kind == .gdrive) return true;
+    }
+    return false;
+}
+
 fn resolveGdriveSpoolDir(allocator: std.mem.Allocator) ![]u8 {
     if (std.process.getEnvVarOwned(allocator, gdrive_spool_dir_env_var)) |raw| {
         defer allocator.free(raw);
@@ -3780,6 +3789,21 @@ test "fs_node_ops: gdrive spool reservation enforces configured limit" {
     try std.testing.expectEqual(@as(u64, 2), node_ops.gdrive_spool_bytes_in_use);
 }
 
+test "fs_node_ops: local-only exports skip gdrive spool setup" {
+    const allocator = std.testing.allocator;
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    const root = try temp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+
+    var node_ops = try NodeOps.init(allocator, &[_]ExportSpec{
+        .{ .name = "work", .path = root, .desc = "workspace", .ro = false },
+    });
+    defer node_ops.deinit();
+
+    try std.testing.expect(node_ops.gdrive_spool_dir == null);
+}
+
 test "fs_node_ops: cleanupGdriveSpoolOrphans removes stale temp files" {
     const allocator = std.testing.allocator;
     var temp = std.testing.tmpDir(.{});
@@ -3789,6 +3813,7 @@ test "fs_node_ops: cleanupGdriveSpoolOrphans removes stale temp files" {
 
     var node_ops = try NodeOps.init(allocator, &[_]ExportSpec{
         .{ .name = "work", .path = root, .desc = "workspace", .ro = false },
+        .{ .name = "cloud", .path = "primary", .source_kind = .gdrive },
     });
     defer node_ops.deinit();
 
