@@ -2632,10 +2632,11 @@ pub const NodeOps = struct {
             return;
         }
 
-        const export_root = self.exports.items[ctx.export_index].root_path;
+        const export_cfg = self.exports.items[ctx.export_index];
+        const export_root = export_cfg.root_path;
         const maybe_parent = std.fs.path.dirname(ctx.path) orelse ctx.path;
         const parent_path = if (isWithinRoot(export_root, maybe_parent)) maybe_parent else export_root;
-        const parent_stat = std.fs.cwd().statFile(parent_path) catch |err| return err;
+        const parent_stat = sourceStatAbsolute(export_cfg.source_kind, parent_path) catch |err| return err;
         const parent_id = makeNodeId(ctx.export_index, parent_stat.inode);
         try self.setNodePath(parent_id, parent_path);
         try appendDirEntry(self.allocator, payload, "..", parent_id, parent_stat, first, self.uid, self.gid);
