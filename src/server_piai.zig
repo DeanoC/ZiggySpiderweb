@@ -493,7 +493,10 @@ fn handleWebSocketConnection(
     var handshake = try websocket_transport.performHandshakeWithInfo(allocator, stream);
     defer handshake.deinit(allocator);
 
-    const agent_id = parseAgentIdFromStreamPath(handshake.path) orelse runtime_registry.getFirstAgentId() orelse runtime_registry.default_agent_id;
+    const agent_id = parseAgentIdFromStreamPath(handshake.path) orelse {
+        try sendWebSocketErrorAndClose(allocator, stream, .invalid_envelope, "invalid stream path");
+        return;
+    };
     const runtime_server = runtime_registry.getOrCreate(agent_id) catch |err| switch (err) {
         error.InvalidAgentId => {
             try sendWebSocketErrorAndClose(allocator, stream, .invalid_envelope, "invalid agent id");
@@ -1160,6 +1163,44 @@ test "server_piai: runtime creation is capped to avoid unbounded per-agent growt
         defer close_reply.deinit(allocator);
         try std.testing.expectEqual(@as(u8, 0x8), close_reply.opcode);
     }
+
+    try std.testing.expect(server_ctx.err_name == null);
+}
+
+test "server_piai: websocket rejects unsupported route version" {
+    const allocator = std.testing.allocator;
+    var runtime_registry = AgentRuntimeRegistry.init(allocator, .{
+        .ltm_directory = "",
+        .ltm_filename = "",
+    }, null);
+    defer runtime_registry.deinit();
+
+    var listener = try (try std.net.Address.parseIp("127.0.0.1", 0)).listen(.{ .reuse_address = true });
+    defer listener.deinit();
+
+    var server_ctx = WsTestServerCtx{
+        .allocator = allocator,
+        .runtime_registry = &runtime_registry,
+        .listener = &listener,
+    };
+    defer server_ctx.deinit();
+
+    const server_thread = try std.Thread.spawn(.{}, runSingleWsConnection, .{&server_ctx});
+    defer server_thread.join();
+
+    var client = try std.net.tcpConnectToAddress(listener.listen_address);
+    defer client.close();
+    try performClientHandshake(allocator, &client, "/v1/agents/default/stream");
+
+    var invalid_path_error = try readServerFrame(allocator, &client);
+    defer invalid_path_error.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0x1), invalid_path_error.opcode);
+    try std.testing.expect(std.mem.indexOf(u8, invalid_path_error.payload, "\"code\":\"invalid_envelope\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, invalid_path_error.payload, "invalid stream path") != null);
+
+    var close_reply = try readServerFrame(allocator, &client);
+    defer close_reply.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0x8), close_reply.opcode);
 
     try std.testing.expect(server_ctx.err_name == null);
 }
