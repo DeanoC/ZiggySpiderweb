@@ -21,8 +21,8 @@
             .hash = "ziggy_tool_runtime-0.1.0-t8uaSEGuAACsRd_CxS3bTmnodmeUo1SYpBDONhrphUit",
         },
         .ziggy_runtime_hooks = .{
-            .url = "https://github.com/DeanoC/ZiggyRuntimeHooks/archive/refs/tags/v0.2.1.tar.gz",
-            .hash = "ziggy_runtime_hooks-0.2.1-68kKICc9AAALrXImDGgdRh8g-c0-LKYge8XRY_dA5tvf",
+            .url = "https://github.com/DeanoC/ZiggyRuntimeHooks/archive/refs/tags/v0.3.0.tar.gz",
+            .hash = "ziggy_runtime_hooks-0.3.0-68kKICJaAAAKwDDX_TlZQGcnmkbeWm0LSIfQHD_nMx0i",
         },
     },
     .paths = .{
