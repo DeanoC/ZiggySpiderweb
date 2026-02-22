@@ -1,0 +1,56 @@
+name: enable-automerge-deanoc
+
+on:
+  pull_request_target:
+    types:
+      - opened
+      - reopened
+      - synchronize
+      - ready_for_review
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  enable-automerge:
+    if: ${{ github.event.pull_request.user.login == 'DeanoC' && !github.event.pull_request.draft }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Enable auto-merge for DeanoC PRs
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const pullRequestId = context.payload.pull_request?.node_id;
+            const prNumber = context.payload.pull_request?.number;
+
+            if (!pullRequestId || !prNumber) {
+              core.setFailed('Missing pull request metadata in event payload.');
+              return;
+            }
+
+            try {
+              await github.graphql(
+                `
+                  mutation($pullRequestId: ID!) {
+                    enablePullRequestAutoMerge(
+                      input: {
+                        pullRequestId: $pullRequestId
+                        mergeMethod: SQUASH
+                      }
+                    ) {
+                      clientMutationId
+                    }
+                  }
+                `,
+                { pullRequestId },
+              );
+              core.info(`Enabled auto-merge for PR #${prNumber}.`);
+            } catch (error) {
+              const message = String(error?.message || error);
+              if (message.includes('already enabled')) {
+                core.info(`Auto-merge already enabled for PR #${prNumber}.`);
+                return;
+              }
+              throw error;
+            }
