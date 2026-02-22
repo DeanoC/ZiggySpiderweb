@@ -41,11 +41,14 @@ This repository is part of the Ziggy* codebase and is primarily a Zig project.
 - All changes that update `main` must go through a pull request.
 - A PR must not be merged until `chatgpt-codex-connector` (including variants like `chatgpt-codex-connector[bot]`) has reviewed it.
 - Do not merge while any review comments from that reviewer remain outstanding.
-- Address each comment and resolve each review thread before merging.
+- Every Codex review conversation thread must be explicitly resolved in GitHub before merge.
+- Replying is not enough: resolve the thread after addressing it.
+- After each Codex pass, immediately check for new open Codex threads and repeat: fix -> reply -> resolve -> `@codex review`.
+- Do not merge until there are zero open Codex review threads and no outstanding Codex comments.
 - The first Codex review cycle is automatic when a PR is opened.
 - After each additional change cycle (any push after Codex feedback), the PR author must comment `@codex review` to request a fresh Codex pass.
 - Merge requires a Codex response that is newer than both the latest `@codex review` request and the PR head commit.
-
+- Escape clause: if Codex is stalled (latest Codex response older than 10 minutes) or review threads cannot be cleared due tooling/infrastructure issues, auto-merge must remain disabled; a maintainer may merge manually only after posting an explicit override rationale on the PR.
 ## Compatibility Policy
 - Until `1.0.0`, backward compatibility is not guaranteed.
 - Breaking changes are allowed during early development, but should be documented in PR notes.
