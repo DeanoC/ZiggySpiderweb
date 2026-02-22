@@ -10,6 +10,21 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     const ziggy_piai_module = ziggy_piai_dep.module("ziggypiai");
+    const ziggy_spider_protocol_dep = b.dependency("ziggy_spider_protocol", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const ziggy_spider_protocol_module = ziggy_spider_protocol_dep.module("ziggy-spider-protocol");
+    const ziggy_memory_store_dep = b.dependency("ziggy_memory_store", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const ziggy_memory_store_module = ziggy_memory_store_dep.module("ziggy-memory-store");
+    const ziggy_tool_runtime_dep = b.dependency("ziggy_tool_runtime", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const ziggy_tool_runtime_module = ziggy_tool_runtime_dep.module("ziggy-tool-runtime");
 
     // Spiderweb executable
     const spiderweb_mod = b.createModule(.{
@@ -18,6 +33,9 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     spiderweb_mod.addImport("ziggy-piai", ziggy_piai_module);
+    spiderweb_mod.addImport("ziggy-spider-protocol", ziggy_spider_protocol_module);
+    spiderweb_mod.addImport("ziggy-memory-store", ziggy_memory_store_module);
+    spiderweb_mod.addImport("ziggy-tool-runtime", ziggy_tool_runtime_module);
 
     // Add agent_config module for flat config loading
     const agent_config_mod = b.createModule(.{
@@ -71,6 +89,9 @@ pub fn build(b: *std.Build) void {
     });
     test_mod.addImport("ziggy-piai", ziggy_piai_module);
     test_mod.addImport("agent_config", agent_config_mod);
+    test_mod.addImport("ziggy-spider-protocol", ziggy_spider_protocol_module);
+    test_mod.addImport("ziggy-memory-store", ziggy_memory_store_module);
+    test_mod.addImport("ziggy-tool-runtime", ziggy_tool_runtime_module);
 
     const spiderweb_tests = b.addTest(.{
         .root_module = test_mod,
