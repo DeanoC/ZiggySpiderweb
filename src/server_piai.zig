@@ -632,10 +632,19 @@ fn handleWebSocketConnection(
                         const debug_frames = try fsrpc.drainPendingDebugFrames();
                         if (debug_frames.len > 0) {
                             defer allocator.free(debug_frames);
-                            for (debug_frames) |payload| {
-                                defer allocator.free(payload);
-                                try websocket_transport.writeFrame(stream, payload, .text);
+                            var idx: usize = 0;
+                            while (idx < debug_frames.len) : (idx += 1) {
+                                const payload = debug_frames[idx];
+                                websocket_transport.writeFrame(stream, payload, .text) catch |err| {
+                                    allocator.free(payload);
+                                    var rest = idx + 1;
+                                    while (rest < debug_frames.len) : (rest += 1) {
+                                        allocator.free(debug_frames[rest]);
+                                    }
+                                    return err;
+                                };
                                 runtime_registry.maybeLogDebugFrame(agent_id, payload);
+                                allocator.free(payload);
                             }
                         }
                         continue;
