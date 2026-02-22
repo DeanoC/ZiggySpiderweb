@@ -241,7 +241,9 @@ fn parseResponse(allocator: std.mem.Allocator, expected_id: u32, payload: []cons
         if (err != .object) return error.InvalidResponse;
         const no = err.object.get("no") orelse return error.InvalidResponse;
         const msg = err.object.get("msg") orelse return error.InvalidResponse;
-        if (no != .integer or msg != .string) return error.InvalidResponse;
+        if (no != .integer or no.integer < std.math.minInt(i32) or no.integer > std.math.maxInt(i32) or msg != .string) {
+            return error.InvalidResponse;
+        }
 
         return .{
             .ok = false,
@@ -385,5 +387,17 @@ test "fs_client: parseWsUrl defaults path and port" {
 test "fs_client: parseResponse rejects id above u32 range" {
     const allocator = std.testing.allocator;
     const payload = "{\"t\":\"res\",\"id\":4294967296,\"ok\":true,\"r\":{}}";
+    try std.testing.expectError(error.InvalidResponse, parseResponse(allocator, 1, payload));
+}
+
+test "fs_client: parseResponse rejects err.no above i32 range" {
+    const allocator = std.testing.allocator;
+    const payload = "{\"t\":\"res\",\"id\":1,\"ok\":false,\"err\":{\"no\":2147483648,\"msg\":\"boom\"}}";
+    try std.testing.expectError(error.InvalidResponse, parseResponse(allocator, 1, payload));
+}
+
+test "fs_client: parseResponse rejects err.no below i32 range" {
+    const allocator = std.testing.allocator;
+    const payload = "{\"t\":\"res\",\"id\":1,\"ok\":false,\"err\":{\"no\":-2147483649,\"msg\":\"boom\"}}";
     try std.testing.expectError(error.InvalidResponse, parseResponse(allocator, 1, payload));
 }

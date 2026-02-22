@@ -63,8 +63,10 @@ pub const ParsedRequest = struct {
     node: ?u64,
     handle: ?u64,
     args: std.json.ObjectMap,
+    args_owned: bool = false,
 
     pub fn deinit(self: *ParsedRequest) void {
+        if (self.args_owned) self.args.deinit();
         self.parsed.deinit();
         self.* = undefined;
     }
@@ -120,7 +122,7 @@ pub fn parseRequest(allocator: std.mem.Allocator, payload: []const u8) !ParsedRe
 
     const node = try parseOptionalU64(root, "node");
     const handle = try parseOptionalU64(root, "h");
-    const args = try parseOptionalObject(root, "a");
+    const args = try parseOptionalObject(allocator, root, "a");
 
     return .{
         .parsed = parsed,
@@ -128,7 +130,8 @@ pub fn parseRequest(allocator: std.mem.Allocator, payload: []const u8) !ParsedRe
         .op = op,
         .node = node,
         .handle = handle,
-        .args = args,
+        .args = args.object,
+        .args_owned = args.owned,
     };
 }
 
@@ -300,10 +303,23 @@ pub fn jsonEscape(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
     return out.toOwnedSlice(allocator);
 }
 
-fn parseOptionalObject(root: std.json.ObjectMap, name: []const u8) !std.json.ObjectMap {
-    const value = root.get(name) orelse return root;
+const OptionalObject = struct {
+    object: std.json.ObjectMap,
+    owned: bool,
+};
+
+fn parseOptionalObject(allocator: std.mem.Allocator, root: std.json.ObjectMap, name: []const u8) !OptionalObject {
+    const value = root.get(name) orelse {
+        return .{
+            .object = std.json.ObjectMap.init(allocator),
+            .owned = true,
+        };
+    };
     if (value != .object) return RequestError.InvalidType;
-    return value.object;
+    return .{
+        .object = value.object,
+        .owned = false,
+    };
 }
 
 fn parseOptionalU64(root: std.json.ObjectMap, name: []const u8) !?u64 {
@@ -332,6 +348,18 @@ test "fs_protocol: parseRequest rejects unknown op" {
         \\{"t":"req","id":1,"op":"UNKNOWN"}
     ;
     try std.testing.expectError(RequestError.UnsupportedOperation, parseRequest(allocator, payload));
+}
+
+test "fs_protocol: parseRequest defaults missing args to empty object" {
+    const allocator = std.testing.allocator;
+    const payload =
+        \\{"t":"req","id":9,"op":"LOOKUP","node":42,"name":"hello.txt"}
+    ;
+    var parsed = try parseRequest(allocator, payload);
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), parsed.args.count());
+    try std.testing.expect(getRequiredString(parsed.args, "name") == null);
 }
 
 test "fs_protocol: buildErrorResponse escapes message" {
