@@ -22,13 +22,14 @@ jobs:
           grep -q 'ziggy_memory_store' build.zig.zon
           grep -q 'ziggy_tool_runtime' build.zig.zon
           grep -q 'ziggy_runtime_hooks' build.zig.zon
-          grep -q '\\.hash =' build.zig.zon
+          grep -q '\.hash =' build.zig.zon
 
       - name: Install Zig
         run: |
           ZIG_VERSION=0.15.1
           curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" -o zig.tar.xz
           tar -xf zig.tar.xz
+          export PATH="$PWD/zig-x86_64-linux-${ZIG_VERSION}:$PATH"
           echo "$PWD/zig-x86_64-linux-${ZIG_VERSION}" >> "$GITHUB_PATH"
           zig version
 
