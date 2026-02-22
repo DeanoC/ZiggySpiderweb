@@ -221,13 +221,18 @@ pub const Session = struct {
             .file => node.content,
         };
 
-        if (offset >= data.len) {
+        const start = std.math.cast(usize, offset) orelse {
+            return unified.buildFsrpcError(self.allocator, msg.tag, "invalid", "read offset is out of range");
+        };
+
+        if (start >= data.len) {
             const payload = "{\"data_b64\":\"\",\"n\":0,\"eof\":true}";
             return unified.buildFsrpcResponse(self.allocator, .r_read, msg.tag, payload);
         }
 
-        const end = @min(data.len, @as(usize, @intCast(offset)) + count);
-        const chunk = data[@intCast(offset)..end];
+        const requested_end = std.math.add(usize, start, @as(usize, count)) catch std.math.maxInt(usize);
+        const end = @min(data.len, requested_end);
+        const chunk = data[start..end];
         const encoded = try unified.encodeDataB64(self.allocator, chunk);
         defer self.allocator.free(encoded);
 
@@ -514,14 +519,14 @@ pub const Session = struct {
 
                     if (std.mem.eql(u8, type_value.string, "session.receive")) {
                         if (obj.get("content")) |content| {
-                            if (content == .string and result_text.len == 0) {
+                            if (content == .string) {
                                 self.allocator.free(result_text);
                                 result_text = try self.allocator.dupe(u8, content.string);
                             }
                         } else if (obj.get("payload")) |payload| {
                             if (payload == .object) {
                                 if (payload.object.get("content")) |content| {
-                                    if (content == .string and result_text.len == 0) {
+                                    if (content == .string) {
                                         self.allocator.free(result_text);
                                         result_text = try self.allocator.dupe(u8, content.string);
                                     }
