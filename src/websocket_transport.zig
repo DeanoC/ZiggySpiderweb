@@ -200,21 +200,33 @@ fn extractRequestPath(request: []const u8) ?[]const u8 {
 }
 
 fn extractAuthorizationHeader(request: []const u8) ?[]const u8 {
-    const prefixes = [_][]const u8{
-        "\r\nAuthorization:",
-        "\r\nauthorization:",
-        "Authorization:",
-        "authorization:",
-    };
+    var line_start: usize = 0;
+    var first_line = true;
+    while (line_start < request.len) {
+        const line_end = std.mem.indexOfPos(u8, request, line_start, "\r\n") orelse request.len;
+        const line = request[line_start..line_end];
 
-    for (prefixes) |prefix| {
-        if (std.mem.indexOf(u8, request, prefix)) |idx| {
-            var value_start = idx + prefix.len;
-            while (value_start < request.len and (request[value_start] == ' ' or request[value_start] == '\t')) : (value_start += 1) {}
-            const value_end = std.mem.indexOfPos(u8, request, value_start, "\r\n") orelse request.len;
-            const value = std.mem.trim(u8, request[value_start..value_end], " \t");
+        if (first_line) {
+            first_line = false;
+        } else {
+            if (line.len == 0) break;
+            const colon_idx = std.mem.indexOfScalar(u8, line, ':') orelse {
+                if (line_end == request.len) break;
+                line_start = line_end + 2;
+                continue;
+            };
+            const header_name = std.mem.trim(u8, line[0..colon_idx], " \t");
+            if (!std.ascii.eqlIgnoreCase(header_name, "Authorization")) {
+                if (line_end == request.len) break;
+                line_start = line_end + 2;
+                continue;
+            }
+            const value = std.mem.trim(u8, line[colon_idx + 1 ..], " \t");
             if (value.len > 0) return value;
         }
+
+        if (line_end == request.len) break;
+        line_start = line_end + 2;
     }
     return null;
 }
@@ -256,4 +268,25 @@ test "websocket_transport: extract request path from handshake line" {
 
     const path = extractRequestPath(request) orelse return error.TestExpectedPath;
     try std.testing.expectEqualStrings("/v2/agents/alpha/stream", path);
+}
+
+test "websocket_transport: extract authorization header matches exact header name only" {
+    const request =
+        "GET / HTTP/1.1\r\n" ++
+        "Host: localhost\r\n" ++
+        "X-Authorization: Bearer wrong\r\n" ++
+        "Authorization: Bearer right\r\n" ++
+        "\r\n";
+
+    const value = extractAuthorizationHeader(request) orelse return error.TestExpectedAuthorizationHeader;
+    try std.testing.expectEqualStrings("Bearer right", value);
+}
+
+test "websocket_transport: extract authorization header ignores x-authorization only request" {
+    const request =
+        "GET / HTTP/1.1\r\n" ++
+        "Host: localhost\r\n" ++
+        "X-Authorization: Bearer wrong\r\n" ++
+        "\r\n";
+    try std.testing.expect(extractAuthorizationHeader(request) == null);
 }

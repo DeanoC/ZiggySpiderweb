@@ -904,6 +904,10 @@ const AuthTokenStore = struct {
 
         self.mutex.lock();
         defer self.mutex.unlock();
+        const next_admin = if (role == .admin) replacement else self.admin_token;
+        const next_user = if (role == .user) replacement else self.user_token;
+        try self.persistTokensLocked(next_admin, next_user);
+
         switch (role) {
             .admin => {
                 const previous = self.admin_token;
@@ -916,7 +920,6 @@ const AuthTokenStore = struct {
                 self.allocator.free(previous);
             },
         }
-        self.persistLocked();
         return next;
     }
 
@@ -966,14 +969,16 @@ const AuthTokenStore = struct {
         errdefer self.allocator.free(next_user);
 
         self.mutex.lock();
+        defer self.mutex.unlock();
         const previous_admin = self.admin_token;
         const previous_user = self.user_token;
         self.admin_token = next_admin;
         self.user_token = next_user;
         self.allocator.free(previous_admin);
         self.allocator.free(previous_user);
-        self.persistLocked();
-        self.mutex.unlock();
+        self.persistTokensLocked(self.admin_token, self.user_token) catch |err| {
+            std.log.warn("failed to persist generated auth tokens: {s}", .{@errorName(err)});
+        };
 
         std.log.warn("Generated Spiderweb auth tokens (save these now):", .{});
         std.log.warn("  admin: {s}", .{self.admin_token});
@@ -1008,23 +1013,23 @@ const AuthTokenStore = struct {
         return true;
     }
 
-    fn persistLocked(self: *AuthTokenStore) void {
-        const path = self.path orelse return;
+    fn persistTokensLocked(self: *AuthTokenStore, admin_token: []const u8, user_token: []const u8) !void {
+        const path = self.path orelse return error.AuthTokenPathUnavailable;
         const payload = Persisted{
             .schema = 1,
-            .admin_token = self.admin_token,
-            .user_token = self.user_token,
+            .admin_token = admin_token,
+            .user_token = user_token,
             .updated_at_ms = std.time.milliTimestamp(),
         };
-        const bytes = std.json.Stringify.valueAlloc(self.allocator, payload, .{
+        const bytes = try std.json.Stringify.valueAlloc(self.allocator, payload, .{
             .emit_null_optional_fields = false,
             .whitespace = .indent_2,
-        }) catch return;
+        });
         defer self.allocator.free(bytes);
 
-        const file = std.fs.cwd().createFile(path, .{ .truncate = true }) catch return;
+        const file = try std.fs.cwd().createFile(path, .{ .truncate = true });
         defer file.close();
-        _ = file.writeAll(bytes) catch {};
+        try file.writeAll(bytes);
     }
 
     fn parseBearerToken(header_value: []const u8) ?[]const u8 {
@@ -2114,7 +2119,28 @@ fn handleWebSocketConnection(
                                     try writeFrameLocked(stream, &connection_write_mutex, response, .text);
                                     continue;
                                 };
-                                const rotated = try runtime_registry.rotateAuthToken(role);
+                                const rotated = runtime_registry.rotateAuthToken(role) catch |err| {
+                                    const active_binding = session_bindings.get(active_session_key) orelse return error.InvalidState;
+                                    runtime_registry.appendSecurityAuditAndDebug(
+                                        active_binding.agent_id,
+                                        .auth_rotate,
+                                        principal.role,
+                                        parsed.correlation_id orelse parsed.id,
+                                        "auth_rotate_persist_failed",
+                                        false,
+                                        "storage_error",
+                                        @errorName(err),
+                                    );
+                                    const response = try unified.buildControlError(
+                                        allocator,
+                                        parsed.id,
+                                        "storage_error",
+                                        @errorName(err),
+                                    );
+                                    defer allocator.free(response);
+                                    try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                    continue;
+                                };
                                 defer runtime_registry.allocator.free(rotated);
                                 const escaped_token = try unified.jsonEscape(allocator, rotated);
                                 defer allocator.free(escaped_token);
@@ -4242,6 +4268,68 @@ test "server_piai: auth matrix gates admin endpoints and handshake tokens" {
         defer close_reply.deinit(allocator);
         try std.testing.expectEqual(@as(u8, 0x8), close_reply.opcode);
     }
+
+    try std.testing.expect(server_ctx.err_name == null);
+}
+
+test "server_piai: control.auth_rotate reports storage_error when token persistence fails" {
+    const allocator = std.testing.allocator;
+    var runtime_registry = AgentRuntimeRegistry.init(allocator, .{
+        .ltm_directory = "",
+        .ltm_filename = "",
+    }, null);
+    defer runtime_registry.deinit();
+    try setAuthTokensForTests(&runtime_registry, "admin-secret", "user-secret");
+
+    if (runtime_registry.auth_tokens.path) |path| allocator.free(path);
+    runtime_registry.auth_tokens.path = try allocator.dupe(u8, "/");
+    const previous_admin = try allocator.dupe(u8, runtime_registry.auth_tokens.admin_token);
+    defer allocator.free(previous_admin);
+
+    var listener = try (try std.net.Address.parseIp("127.0.0.1", 0)).listen(.{ .reuse_address = true });
+    defer listener.deinit();
+
+    var server_ctx = WsTestServerCtx{
+        .allocator = allocator,
+        .runtime_registry = &runtime_registry,
+        .listener = &listener,
+    };
+    defer server_ctx.deinit();
+
+    const server_thread = try std.Thread.spawn(.{}, runSingleWsConnection, .{&server_ctx});
+    defer server_thread.join();
+
+    var client = try std.net.tcpConnectToAddress(listener.listen_address);
+    defer client.close();
+    try performClientHandshakeWithBearerToken(allocator, &client, "/", "admin-secret");
+
+    try writeClientTextFrameMasked(&client, "{\"channel\":\"control\",\"type\":\"control.version\",\"id\":\"rotate-fail-version\",\"payload\":{\"protocol\":\"unified-v2\"}}");
+    var version_ack = try readServerFrame(allocator, &client);
+    defer version_ack.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, version_ack.payload, "\"type\":\"control.version_ack\"") != null);
+
+    try writeClientTextFrameMasked(&client, "{\"channel\":\"control\",\"type\":\"control.connect\",\"id\":\"rotate-fail-connect\"}");
+    var connect_ack = try readServerFrame(allocator, &client);
+    defer connect_ack.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, connect_ack.payload, "\"type\":\"control.connect_ack\"") != null);
+
+    try writeClientTextFrameMasked(&client, "{\"channel\":\"control\",\"type\":\"control.auth_rotate\",\"id\":\"rotate-fail\",\"payload\":{\"role\":\"admin\"}}");
+    var rotate_error = try readServerFrame(allocator, &client);
+    defer rotate_error.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, rotate_error.payload, "\"type\":\"control.error\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rotate_error.payload, "\"code\":\"storage_error\"") != null);
+
+    try std.testing.expectEqualStrings(previous_admin, runtime_registry.auth_tokens.admin_token);
+
+    try writeClientTextFrameMasked(&client, "{\"channel\":\"control\",\"type\":\"control.ping\",\"id\":\"rotate-fail-ping\"}");
+    var pong = try readServerFrame(allocator, &client);
+    defer pong.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, pong.payload, "\"type\":\"control.pong\"") != null);
+
+    try websocket_transport.writeFrame(&client, "", .close);
+    var close_reply = try readServerFrame(allocator, &client);
+    defer close_reply.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0x8), close_reply.opcode);
 
     try std.testing.expect(server_ctx.err_name == null);
 }
