@@ -219,6 +219,20 @@ pub const ChatJobIndex = struct {
         return out.toOwnedSlice(allocator);
     }
 
+    pub fn hasInFlightForAgent(self: *ChatJobIndex, agent_id: []const u8) !bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        try self.pruneExpiredLocked(std.time.milliTimestamp());
+
+        var it = self.jobs.valueIterator();
+        while (it.next()) |record| {
+            if (!std.mem.eql(u8, record.agent_id, agent_id)) continue;
+            if (record.state == .queued or record.state == .running) return true;
+        }
+        return false;
+    }
+
     pub fn getJob(self: *ChatJobIndex, allocator: std.mem.Allocator, job_id: []const u8) !?JobView {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -486,4 +500,26 @@ test "chat_job_index: create and complete in memory" {
     try std.testing.expectEqual(JobState.done, view.state);
     try std.testing.expect(view.result_text != null);
     try std.testing.expectEqualStrings("result", view.result_text.?);
+}
+
+test "chat_job_index: hasInFlightForAgent tracks queued/running jobs" {
+    const allocator = std.testing.allocator;
+    var index = ChatJobIndex.init(allocator, "");
+    defer index.deinit();
+
+    const a_job = try index.createJob("agent-a", null);
+    defer allocator.free(a_job);
+    const b_job = try index.createJob("agent-b", null);
+    defer allocator.free(b_job);
+
+    try std.testing.expect(try index.hasInFlightForAgent("agent-a"));
+    try std.testing.expect(try index.hasInFlightForAgent("agent-b"));
+    try std.testing.expect(!(try index.hasInFlightForAgent("agent-c")));
+
+    try index.markRunning(a_job);
+    try std.testing.expect(try index.hasInFlightForAgent("agent-a"));
+
+    try index.markCompleted(a_job, true, "done", null, "");
+    try std.testing.expect(!(try index.hasInFlightForAgent("agent-a")));
+    try std.testing.expect(try index.hasInFlightForAgent("agent-b"));
 }

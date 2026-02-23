@@ -93,6 +93,16 @@ pub const Session = struct {
         self.* = undefined;
     }
 
+    pub fn setRuntimeBinding(
+        self: *Session,
+        runtime_server: *runtime_server_mod.RuntimeServer,
+        agent_id: []const u8,
+    ) !void {
+        self.runtime_server = runtime_server;
+        self.allocator.free(self.agent_id);
+        self.agent_id = try self.allocator.dupe(u8, agent_id);
+    }
+
     pub fn setDebugStreamEnabled(self: *Session, enabled: bool) void {
         self.debug_stream_enabled = enabled;
         if (!enabled) self.clearPendingDebugFrames();

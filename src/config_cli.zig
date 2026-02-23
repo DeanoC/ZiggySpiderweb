@@ -5,6 +5,8 @@ const ziggy_piai = @import("ziggy-piai");
 const first_run = @import("first_run.zig");
 const oauth_cli = @import("oauth_cli.zig");
 
+const auth_tokens_filename = "auth_tokens.json";
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -22,6 +24,8 @@ pub fn main() !void {
 
     if (std.mem.eql(u8, command, "config")) {
         try handleConfigCommand(allocator, args[2..]);
+    } else if (std.mem.eql(u8, command, "auth")) {
+        try handleAuthCommand(allocator, args[2..]);
     } else if (std.mem.eql(u8, command, "first-run")) {
         try first_run.runFirstRun(allocator, args[2..]);
     } else if (std.mem.eql(u8, command, "oauth")) {
@@ -31,6 +35,57 @@ pub fn main() !void {
         try printUsage();
         return error.UnknownCommand;
     }
+}
+
+fn handleAuthCommand(allocator: std.mem.Allocator, args: []const []const u8) !void {
+    const subcommand = if (args.len > 0) args[0] else "help";
+
+    if (std.mem.eql(u8, subcommand, "path")) {
+        var config = try Config.init(allocator, null);
+        defer config.deinit();
+        const path = try resolveAuthTokensPath(allocator, config.runtime.ltm_directory);
+        defer allocator.free(path);
+        const out = try std.fmt.allocPrint(allocator, "{s}\n", .{path});
+        defer allocator.free(out);
+        try std.fs.File.stdout().writeAll(out);
+        return;
+    }
+
+    if (std.mem.eql(u8, subcommand, "reset")) {
+        var confirmed = false;
+        for (args[1..]) |arg| {
+            if (std.mem.eql(u8, arg, "--yes")) {
+                confirmed = true;
+                continue;
+            }
+            std.log.err("Unknown auth reset arg: {s}", .{arg});
+            return error.InvalidArguments;
+        }
+        if (!confirmed) {
+            std.log.err("Refusing to reset auth tokens without --yes", .{});
+            std.log.info("Run: spiderweb-config auth reset --yes", .{});
+            return error.InvalidArguments;
+        }
+
+        var config = try Config.init(allocator, null);
+        defer config.deinit();
+        const path = try resolveAuthTokensPath(allocator, config.runtime.ltm_directory);
+        defer allocator.free(path);
+        const admin_token = try makeOpaqueToken(allocator, "sw-admin");
+        defer allocator.free(admin_token);
+        const user_token = try makeOpaqueToken(allocator, "sw-user");
+        defer allocator.free(user_token);
+        try persistAuthTokens(allocator, path, admin_token, user_token);
+
+        std.log.warn("Emergency auth token reset completed.", .{});
+        std.log.warn("  path:  {s}", .{path});
+        std.log.warn("  admin: {s}", .{admin_token});
+        std.log.warn("  user:  {s}", .{user_token});
+        std.log.warn("Restart spiderweb to apply new tokens for subsequent connections.", .{});
+        return;
+    }
+
+    try printAuthUsage();
 }
 
 fn handleConfigCommand(allocator: std.mem.Allocator, args: []const []const u8) !void {
@@ -223,11 +278,71 @@ fn installSystemdService(allocator: std.mem.Allocator) !void {
     std.log.info("Enable with: systemctl --user enable --now spiderweb", .{});
 }
 
+fn resolveAuthTokensPath(allocator: std.mem.Allocator, ltm_directory: []const u8) ![]u8 {
+    const base_dir = std.mem.trim(u8, ltm_directory, " \t\r\n");
+    const storage_dir = if (base_dir.len == 0) "." else base_dir;
+    try std.fs.cwd().makePath(storage_dir);
+    return std.fs.path.join(allocator, &.{ storage_dir, auth_tokens_filename });
+}
+
+fn makeOpaqueToken(allocator: std.mem.Allocator, prefix: []const u8) ![]u8 {
+    var random_bytes: [24]u8 = undefined;
+    std.crypto.random.bytes(&random_bytes);
+    var encoded_buf: [std.base64.url_safe_no_pad.Encoder.calcSize(random_bytes.len)]u8 = undefined;
+    const encoded = std.base64.url_safe_no_pad.Encoder.encode(&encoded_buf, &random_bytes);
+    return std.fmt.allocPrint(allocator, "{s}_{s}", .{ prefix, encoded });
+}
+
+fn persistAuthTokens(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    admin_token: []const u8,
+    user_token: []const u8,
+) !void {
+    const Persisted = struct {
+        schema: u32 = 1,
+        admin_token: []const u8,
+        user_token: []const u8,
+        updated_at_ms: i64,
+    };
+
+    const payload = Persisted{
+        .schema = 1,
+        .admin_token = admin_token,
+        .user_token = user_token,
+        .updated_at_ms = std.time.milliTimestamp(),
+    };
+    const bytes = try std.json.Stringify.valueAlloc(allocator, payload, .{
+        .emit_null_optional_fields = false,
+        .whitespace = .indent_2,
+    });
+    defer allocator.free(bytes);
+
+    var file = try std.fs.cwd().createFile(path, .{ .truncate = true });
+    defer file.close();
+    try file.writeAll(bytes);
+}
+
+fn printAuthUsage() !void {
+    const usage =
+        \\Auth token recovery commands:
+        \\  spiderweb-config auth path
+        \\  spiderweb-config auth reset --yes
+        \\
+        \\`auth reset --yes` regenerates BOTH admin and user tokens in auth_tokens.json.
+        \\Use only for emergency recovery (for example lost admin token).
+        \\
+    ;
+    try std.fs.File.stdout().writeAll(usage);
+}
+
 fn printUsage() !void {
     const usage =
         \\ZiggySpiderweb Configuration Tool
         \\
         \\Usage:
+        \\  spiderweb-config auth path
+        \\  spiderweb-config auth reset --yes
         \\  spiderweb-config first-run [--non-interactive] [--provider <name>] [--model <model>] [--agent <name>]
         \\  spiderweb-config oauth login <provider> [--enterprise-domain <domain>] [--no-set-provider]
         \\  spiderweb-config oauth clear <provider>
@@ -245,6 +360,8 @@ fn printUsage() !void {
         \\  spiderweb-config first-run --non-interactive --provider openai-codex --agent ziggy
         \\  spiderweb-config oauth login openai-codex
         \\  spiderweb-config oauth login github-copilot --enterprise-domain github.example.com
+        \\  spiderweb-config auth path
+        \\  spiderweb-config auth reset --yes
         \\  spiderweb-config config set-provider openai gpt-4o
         \\  spiderweb-config config set-provider kimi-coding kimi-k2.5
         \\  spiderweb-config config set-server --bind 0.0.0.0 --port 9000

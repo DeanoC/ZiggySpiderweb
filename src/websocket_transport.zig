@@ -32,9 +32,11 @@ pub const Frame = struct {
 
 pub const HandshakeInfo = struct {
     path: []u8,
+    authorization: ?[]u8 = null,
 
     pub fn deinit(self: *HandshakeInfo, allocator: std.mem.Allocator) void {
         allocator.free(self.path);
+        if (self.authorization) |value| allocator.free(value);
         self.* = undefined;
     }
 };
@@ -55,6 +57,11 @@ pub fn performHandshakeWithInfo(allocator: std.mem.Allocator, stream: *std.net.S
     const request_path = extractRequestPath(request) orelse return Error.InvalidHandshake;
     const owned_path = try allocator.dupe(u8, request_path);
     errdefer allocator.free(owned_path);
+    const authorization = if (extractAuthorizationHeader(request)) |value|
+        try allocator.dupe(u8, value)
+    else
+        null;
+    errdefer if (authorization) |value| allocator.free(value);
 
     const ws_key = extractWebSocketKey(request) orelse return Error.NoWebSocketKey;
     const accept_key = try computeWebSocketAcceptKey(allocator, ws_key);
@@ -71,7 +78,7 @@ pub fn performHandshakeWithInfo(allocator: std.mem.Allocator, stream: *std.net.S
     defer allocator.free(response);
 
     try stream.writeAll(response);
-    return .{ .path = owned_path };
+    return .{ .path = owned_path, .authorization = authorization };
 }
 
 pub fn readFrame(allocator: std.mem.Allocator, stream: *std.net.Stream, max_payload_bytes: usize) !Frame {
@@ -190,6 +197,26 @@ fn extractRequestPath(request: []const u8) ?[]const u8 {
     const path_end = std.mem.indexOfPos(u8, line, path_start, " ") orelse return null;
     if (path_end <= path_start) return null;
     return line[path_start..path_end];
+}
+
+fn extractAuthorizationHeader(request: []const u8) ?[]const u8 {
+    const prefixes = [_][]const u8{
+        "\r\nAuthorization:",
+        "\r\nauthorization:",
+        "Authorization:",
+        "authorization:",
+    };
+
+    for (prefixes) |prefix| {
+        if (std.mem.indexOf(u8, request, prefix)) |idx| {
+            var value_start = idx + prefix.len;
+            while (value_start < request.len and (request[value_start] == ' ' or request[value_start] == '\t')) : (value_start += 1) {}
+            const value_end = std.mem.indexOfPos(u8, request, value_start, "\r\n") orelse request.len;
+            const value = std.mem.trim(u8, request[value_start..value_end], " \t");
+            if (value.len > 0) return value;
+        }
+    }
+    return null;
 }
 
 fn computeWebSocketAcceptKey(allocator: std.mem.Allocator, client_key: []const u8) ![]u8 {
