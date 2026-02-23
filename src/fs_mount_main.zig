@@ -23,6 +23,7 @@ pub fn main() !void {
     var workspace_url: ?[]const u8 = null;
     var workspace_project_id: ?[]const u8 = null;
     var workspace_project_token: ?[]const u8 = null;
+    var workspace_auth_token: ?[]const u8 = null;
     var workspace_sync_interval_ms: u64 = 5_000;
 
     var i: usize = 1;
@@ -47,6 +48,10 @@ pub fn main() !void {
             i += 1;
             if (i >= args.len) return error.InvalidArguments;
             workspace_project_token = args[i];
+        } else if (std.mem.eql(u8, args[i], "--auth-token")) {
+            i += 1;
+            if (i >= args.len) return error.InvalidArguments;
+            workspace_auth_token = args[i];
         } else if (std.mem.eql(u8, args[i], "--help") or std.mem.eql(u8, args[i], "-h")) {
             try printHelp();
             return;
@@ -55,6 +60,10 @@ pub fn main() !void {
         }
     }
     if (workspace_project_token != null and workspace_project_id == null) return error.InvalidArguments;
+    const resolved_workspace_auth_token = workspace_auth_token orelse std.process.getEnvVarOwned(allocator, "SPIDERWEB_AUTH_TOKEN") catch null;
+    defer if (workspace_auth_token == null) {
+        if (resolved_workspace_auth_token) |token| allocator.free(token);
+    };
 
     if (workspace_url) |url| {
         var hydrated = try fetchWorkspaceEndpointSpecs(
@@ -62,6 +71,7 @@ pub fn main() !void {
             url,
             workspace_project_id,
             workspace_project_token,
+            resolved_workspace_auth_token,
         );
         defer hydrated.deinit(allocator);
         for (hydrated.items.items) |item| {
@@ -272,11 +282,13 @@ pub fn main() !void {
                     .workspace_url = try allocator.dupe(u8, url),
                     .project_id = if (workspace_project_id) |project_id| try allocator.dupe(u8, project_id) else null,
                     .project_token = if (workspace_project_token) |project_token| try allocator.dupe(u8, project_token) else null,
+                    .auth_token = if (resolved_workspace_auth_token) |token| try allocator.dupe(u8, token) else null,
                     .interval_ms = workspace_sync_interval_ms,
                 };
                 errdefer allocator.free(ctx.workspace_url);
                 errdefer if (ctx.project_id) |project_id| allocator.free(project_id);
                 errdefer if (ctx.project_token) |project_token| allocator.free(project_token);
+                errdefer if (ctx.auth_token) |token| allocator.free(token);
                 sync_thread = try std.Thread.spawn(.{}, workspaceSyncThreadMain, .{ctx});
                 sync_ctx = ctx;
             }
@@ -331,7 +343,7 @@ fn printHelp() !void {
         \\spiderweb-fs-mount - Distributed filesystem router client
         \\
         \\Usage:
-        \\  spiderweb-fs-mount [--workspace-url <ws-url>] [--project-id <id>] [--project-token <token>] [--workspace-sync-interval-ms <ms>] [--endpoint <name>=<ws-url>[#export][@/mount]] <command> [args]
+        \\  spiderweb-fs-mount [--workspace-url <ws-url>] [--project-id <id>] [--project-token <token>] [--auth-token <token>] [--workspace-sync-interval-ms <ms>] [--endpoint <name>=<ws-url>[#export][@/mount]] <command> [args]
         \\
         \\Commands:
         \\  getattr <path>
@@ -353,8 +365,10 @@ fn printHelp() !void {
         \\  spiderweb-fs-mount --endpoint a=ws://127.0.0.1:18891/v2/fs status
         \\  spiderweb-fs-mount --workspace-url ws://127.0.0.1:18790/ readdir /
         \\  spiderweb-fs-mount --workspace-url ws://127.0.0.1:18790/ --workspace-sync-interval-ms 5000 mount /mnt/spiderweb
+        \\  spiderweb-fs-mount --workspace-url ws://127.0.0.1:18790/ --auth-token sw-admin-... readdir /
         \\  spiderweb-fs-mount --endpoint a=ws://127.0.0.1:18891/v2/fs#work@/a --endpoint b=ws://127.0.0.1:18892/v2/fs#work@/a readdir /a
         \\    (repeat the same mount path to enable failover)
+        \\  Auth token for workspace control can also come from SPIDERWEB_AUTH_TOKEN.
         \\
     ;
     try std.fs.File.stdout().writeAll(help);
@@ -411,6 +425,7 @@ const WorkspaceSyncContext = struct {
     workspace_url: []u8,
     project_id: ?[]u8 = null,
     project_token: ?[]u8 = null,
+    auth_token: ?[]u8 = null,
     interval_ms: u64,
     stop: bool = false,
     stop_mutex: std.Thread.Mutex = .{},
@@ -433,6 +448,7 @@ const WorkspaceSyncContext = struct {
         self.allocator.free(self.workspace_url);
         if (self.project_id) |project_id| self.allocator.free(project_id);
         if (self.project_token) |project_token| self.allocator.free(project_token);
+        if (self.auth_token) |token| self.allocator.free(token);
         self.* = undefined;
     }
 
@@ -484,6 +500,7 @@ fn tryRefreshWorkspaceTopology(allocator: std.mem.Allocator, ctx: *WorkspaceSync
         ctx.workspace_url,
         if (ctx.project_id) |project_id| project_id else null,
         if (ctx.project_token) |project_token| project_token else null,
+        if (ctx.auth_token) |token| token else null,
     ) catch |err| {
         std.log.warn("workspace sync: fetch control.workspace_status failed: {s}", .{@errorName(err)});
         return;
@@ -529,7 +546,14 @@ fn pumpWorkspacePushSubscription(allocator: std.mem.Allocator, ctx: *WorkspaceSy
     var stream = try std.net.tcpConnectToHost(allocator, parsed_url.host, parsed_url.port);
     defer stream.close();
 
-    try performClientHandshake(allocator, &stream, parsed_url.host, parsed_url.port, parsed_url.path);
+    try performClientHandshake(
+        allocator,
+        &stream,
+        parsed_url.host,
+        parsed_url.port,
+        parsed_url.path,
+        if (ctx.auth_token) |token| token else null,
+    );
     try negotiateControlVersion(allocator, &stream, "fs-mount-push-version");
     try writeClientTextFrameMasked(
         allocator,
@@ -692,6 +716,7 @@ fn fetchWorkspaceEndpointSpecs(
     workspace_url: []const u8,
     project_id: ?[]const u8,
     project_token: ?[]const u8,
+    auth_token: ?[]const u8,
 ) !WorkspaceEndpointSpecs {
     var specs = WorkspaceEndpointSpecs{ .allocator = allocator };
     errdefer specs.deinit(allocator);
@@ -700,7 +725,14 @@ fn fetchWorkspaceEndpointSpecs(
     var stream = try std.net.tcpConnectToHost(allocator, parsed_url.host, parsed_url.port);
     defer stream.close();
 
-    try performClientHandshake(allocator, &stream, parsed_url.host, parsed_url.port, parsed_url.path);
+    try performClientHandshake(
+        allocator,
+        &stream,
+        parsed_url.host,
+        parsed_url.port,
+        parsed_url.path,
+        auth_token,
+    );
     try negotiateControlVersion(allocator, &stream, "fs-mount-version");
 
     try writeClientTextFrameMasked(
@@ -841,12 +873,18 @@ fn performClientHandshake(
     host: []const u8,
     port: u16,
     path: []const u8,
+    auth_token: ?[]const u8,
 ) !void {
     var nonce: [16]u8 = undefined;
     std.crypto.random.bytes(&nonce);
 
     var encoded_nonce: [std.base64.standard.Encoder.calcSize(nonce.len)]u8 = undefined;
     const key = std.base64.standard.Encoder.encode(&encoded_nonce, &nonce);
+    const authorization_line = if (auth_token) |token|
+        try std.fmt.allocPrint(allocator, "Authorization: Bearer {s}\r\n", .{token})
+    else
+        try allocator.dupe(u8, "");
+    defer allocator.free(authorization_line);
 
     const request = try std.fmt.allocPrint(
         allocator,
@@ -855,8 +893,9 @@ fn performClientHandshake(
             "Upgrade: websocket\r\n" ++
             "Connection: Upgrade\r\n" ++
             "Sec-WebSocket-Version: 13\r\n" ++
-            "Sec-WebSocket-Key: {s}\r\n\r\n",
-        .{ path, host, port, key },
+            "Sec-WebSocket-Key: {s}\r\n" ++
+            "{s}\r\n",
+        .{ path, host, port, key, authorization_line },
     );
     defer allocator.free(request);
 

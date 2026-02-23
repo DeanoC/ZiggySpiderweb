@@ -98,6 +98,21 @@ PY
 
 wait_for_control_ready() {
     for _ in $(seq 1 120); do
+        if [[ -z "${SPIDERWEB_AUTH_TOKEN:-}" ]] && [[ -n "${AUTH_TOKENS_FILE:-}" ]] && [[ -f "$AUTH_TOKENS_FILE" ]]; then
+            SPIDERWEB_AUTH_TOKEN="$(
+                python3 - "$AUTH_TOKENS_FILE" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    data = json.load(f)
+print(str(data.get("admin_token") or "").strip())
+PY
+            )"
+            if [[ -n "${SPIDERWEB_AUTH_TOKEN:-}" ]]; then
+                export SPIDERWEB_AUTH_TOKEN
+            fi
+        fi
         if control_call workspace_status >/dev/null 2>&1; then
             return 0
         fi
@@ -120,6 +135,7 @@ wait_for_node_ready() {
 
 TEST_TMP_DIR="$(mktemp -d)"
 LTM_DIR="$TEST_TMP_DIR/ltm"
+AUTH_TOKENS_FILE="$LTM_DIR/auth_tokens.json"
 SPIDER_WEB_ROOT="$TEST_TMP_DIR/spider-web-root"
 NODE1_EXPORT="$TEST_TMP_DIR/node1-export"
 NODE2_EXPORT="$TEST_TMP_DIR/node2-export"
