@@ -1200,10 +1200,12 @@ pub const ControlPlane = struct {
             return ControlPlaneError.ProjectAssignmentForbidden;
         }
         if (!created) {
-            if (!is_primary_agent) {
+            if (project.kind == .spider_web_builtin) {
+                if (requested_project_token) |project_token| {
+                    if (!secureTokenEql(project.mutation_token, project_token)) return ControlPlaneError.ProjectAuthFailed;
+                }
+            } else {
                 const project_token = requested_project_token orelse return ControlPlaneError.MissingField;
-                if (!secureTokenEql(project.mutation_token, project_token)) return ControlPlaneError.ProjectAuthFailed;
-            } else if (requested_project_token) |project_token| {
                 if (!secureTokenEql(project.mutation_token, project_token)) return ControlPlaneError.ProjectAuthFailed;
             }
             if (project.kind == .spider_web_builtin and
@@ -3518,7 +3520,7 @@ test "fs_control_plane: workspaceStatus supports explicit project selection" {
     );
 }
 
-test "fs_control_plane: projectUp requires project_token for existing project" {
+test "fs_control_plane: projectUp requires project_token for existing non-builtin project" {
     const allocator = std.testing.allocator;
     var plane = ControlPlane.init(allocator);
     defer plane.deinit();
@@ -3545,6 +3547,22 @@ test "fs_control_plane: projectUp requires project_token for existing project" {
     );
     defer allocator.free(bad_token_req);
     try std.testing.expectError(ControlPlaneError.ProjectAuthFailed, plane.projectUp("agent-up", bad_token_req));
+
+    const missing_token_primary_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"project_id\":\"{s}\",\"status\":\"paused\"}}",
+        .{project_id},
+    );
+    defer allocator.free(missing_token_primary_req);
+    try std.testing.expectError(ControlPlaneError.MissingField, plane.projectUp("default", missing_token_primary_req));
+
+    const bad_token_primary_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"project_id\":\"{s}\",\"project_token\":\"bad-token\",\"status\":\"paused\"}}",
+        .{project_id},
+    );
+    defer allocator.free(bad_token_primary_req);
+    try std.testing.expectError(ControlPlaneError.ProjectAuthFailed, plane.projectUp("default", bad_token_primary_req));
 
     const ok_req = try std.fmt.allocPrint(
         allocator,
