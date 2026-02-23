@@ -1837,6 +1837,8 @@ fn handleWebSocketConnection(
     };
     var fsrpc = try fsrpc_session.Session.init(allocator, runtime_server, &runtime_registry.job_index, initial_binding.agent_id);
     defer fsrpc.deinit();
+    var fsrpc_bound_session_key = try allocator.dupe(u8, "main");
+    defer allocator.free(fsrpc_bound_session_key);
     var debug_stream_enabled = false;
     var control_protocol_negotiated = false;
     var runtime_fsrpc_version_negotiated = false;
@@ -2820,7 +2822,14 @@ fn handleWebSocketConnection(
                             },
                             else => return err,
                         };
-                        try fsrpc.setRuntimeBinding(target_runtime, target_binding.agent_id);
+                        const needs_rebind = !std.mem.eql(u8, fsrpc_bound_session_key, target_session_key) or
+                            !std.mem.eql(u8, fsrpc.agent_id, target_binding.agent_id);
+                        if (needs_rebind) {
+                            try fsrpc.setRuntimeBinding(target_runtime, target_binding.agent_id);
+                            const next_bound_session_key = try allocator.dupe(u8, target_session_key);
+                            allocator.free(fsrpc_bound_session_key);
+                            fsrpc_bound_session_key = next_bound_session_key;
+                        }
                         const response = try fsrpc.handle(&parsed);
                         defer allocator.free(response);
                         try writeFrameLocked(stream, &connection_write_mutex, response, .text);
@@ -4029,6 +4038,47 @@ test "server_piai: operator token gate protects control mutations" {
     defer good.deinit(allocator);
     try std.testing.expect(std.mem.indexOf(u8, good.payload, "\"type\":\"control.project_create\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, good.payload, "\"project_id\"") != null);
+
+    try websocket_transport.writeFrame(&client, "", .close);
+    var close_reply = try readServerFrame(allocator, &client);
+    defer close_reply.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0x8), close_reply.opcode);
+
+    try std.testing.expect(server_ctx.err_name == null);
+}
+
+test "server_piai: fsrpc fid state survives across frames for unchanged binding" {
+    const allocator = std.testing.allocator;
+    var runtime_registry = AgentRuntimeRegistry.init(allocator, .{
+        .ltm_directory = "",
+        .ltm_filename = "",
+    }, null);
+    defer runtime_registry.deinit();
+    try setAuthTokensForTests(&runtime_registry, "admin-secret", "user-secret");
+
+    var listener = try (try std.net.Address.parseIp("127.0.0.1", 0)).listen(.{ .reuse_address = true });
+    defer listener.deinit();
+
+    var server_ctx = WsTestServerCtx{
+        .allocator = allocator,
+        .runtime_registry = &runtime_registry,
+        .listener = &listener,
+    };
+    defer server_ctx.deinit();
+
+    const server_thread = try std.Thread.spawn(.{}, runSingleWsConnection, .{&server_ctx});
+    defer server_thread.join();
+
+    var client = try std.net.tcpConnectToAddress(listener.listen_address);
+    defer client.close();
+
+    try performClientHandshakeWithBearerToken(allocator, &client, "/", "admin-secret");
+    try fsrpcConnectAndAttach(allocator, &client, "fid-survive");
+
+    try writeClientTextFrameMasked(&client, "{\"channel\":\"fsrpc\",\"type\":\"fsrpc.t_walk\",\"tag\":30,\"fid\":1,\"newfid\":2,\"path\":[\"capabilities\",\"chat\"]}");
+    var walk = try readServerFrame(allocator, &client);
+    defer walk.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, walk.payload, "\"type\":\"fsrpc.r_walk\"") != null);
 
     try websocket_transport.writeFrame(&client, "", .close);
     var close_reply = try readServerFrame(allocator, &client);
