@@ -1111,27 +1111,34 @@ pub const ControlPlane = struct {
         _ = try self.runReconcileCycleLocked(now_ms, false);
 
         var selected_project_id: ?[]const u8 = null;
+        var selected_project_token: ?[]const u8 = null;
         var payload = try parsePayload(self.allocator, payload_json);
         defer payload.deinit();
         if (getOptionalString(payload.value.object, "project_id")) |project_id| {
             try validateIdentifier(project_id, 128);
             selected_project_id = project_id;
         }
+        if (getOptionalString(payload.value.object, "project_token")) |project_token| {
+            try validateSecretToken(project_token, 256);
+            selected_project_token = project_token;
+        }
 
         const escaped_agent = try jsonEscape(self.allocator, agent_id);
         defer self.allocator.free(escaped_agent);
-        const effective_project_id = if (selected_project_id) |value|
-            value
-        else if (self.active_project_by_agent.get(agent_id)) |value|
-            value
-        else
-            null;
-        if (effective_project_id) |project_id| {
-            if (project_id.len > 0) {
-                if (self.projects.get(project_id) != null) {
-                    return try self.renderWorkspaceStatusForProjectLocked(agent_id, project_id, now_ms);
-                }
-                if (selected_project_id != null) return ControlPlaneError.ProjectNotFound;
+        if (selected_project_id) |project_id| {
+            const project = self.projects.get(project_id) orelse return ControlPlaneError.ProjectNotFound;
+            if (selected_project_token) |project_token| {
+                if (!secureTokenEql(project.mutation_token, project_token)) return ControlPlaneError.ProjectAuthFailed;
+            } else if (self.active_project_by_agent.get(agent_id)) |active_project_id| {
+                if (!std.mem.eql(u8, active_project_id, project_id)) return ControlPlaneError.ProjectAuthFailed;
+            } else {
+                return ControlPlaneError.ProjectAuthFailed;
+            }
+            return try self.renderWorkspaceStatusForProjectLocked(agent_id, project_id, now_ms);
+        }
+        if (self.active_project_by_agent.get(agent_id)) |active_project_id| {
+            if (active_project_id.len > 0 and self.projects.get(active_project_id) != null) {
+                return try self.renderWorkspaceStatusForProjectLocked(agent_id, active_project_id, now_ms);
             }
         }
 
@@ -3017,8 +3024,8 @@ test "fs_control_plane: workspaceStatus supports explicit project selection" {
 
     const selected_req = try std.fmt.allocPrint(
         allocator,
-        "{{\"project_id\":\"{s}\"}}",
-        .{project_id},
+        "{{\"project_id\":\"{s}\",\"project_token\":\"{s}\"}}",
+        .{ project_id, project_token },
     );
     defer allocator.free(selected_req);
     const selected = try plane.workspaceStatus("agent-selector", selected_req);
@@ -3026,6 +3033,17 @@ test "fs_control_plane: workspaceStatus supports explicit project selection" {
     try std.testing.expect(std.mem.indexOf(u8, selected, project_id) != null);
     try std.testing.expect(std.mem.indexOf(u8, selected, "\"mount_path\":\"/src\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, selected, "\"fs_auth_token\":\"") != null);
+
+    const selected_without_token = try std.fmt.allocPrint(
+        allocator,
+        "{{\"project_id\":\"{s}\"}}",
+        .{project_id},
+    );
+    defer allocator.free(selected_without_token);
+    try std.testing.expectError(
+        ControlPlaneError.ProjectAuthFailed,
+        plane.workspaceStatus("agent-selector", selected_without_token),
+    );
 
     try std.testing.expectError(
         ControlPlaneError.ProjectNotFound,

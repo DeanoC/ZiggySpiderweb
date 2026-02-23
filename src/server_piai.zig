@@ -1154,17 +1154,6 @@ const AgentRuntimeRegistry = struct {
         category: []const u8,
         payload_json: []const u8,
     ) void {
-        var subscribers = std.ArrayListUnmanaged(ControlTopologySubscriber){};
-        defer subscribers.deinit(self.allocator);
-
-        self.topology_subscribers_mutex.lock();
-        subscribers.appendSlice(self.allocator, self.topology_subscribers.items) catch {
-            self.topology_subscribers_mutex.unlock();
-            return;
-        };
-        self.topology_subscribers_mutex.unlock();
-        if (subscribers.items.len == 0) return;
-
         const event_json = protocol.buildDebugEvent(
             self.allocator,
             "workspace-topology",
@@ -1173,14 +1162,19 @@ const AgentRuntimeRegistry = struct {
         ) catch return;
         defer self.allocator.free(event_json);
 
-        for (subscribers.items) |subscriber| {
+        self.topology_subscribers_mutex.lock();
+        defer self.topology_subscribers_mutex.unlock();
+
+        var idx: usize = 0;
+        while (idx < self.topology_subscribers.items.len) {
+            const subscriber = self.topology_subscribers.items[idx];
             subscriber.write_mutex.lock();
             const write_result = websocket_transport.writeFrame(subscriber.stream, event_json, .text);
             subscriber.write_mutex.unlock();
             if (write_result) |_| {
-                // ok
+                idx += 1;
             } else |_| {
-                self.unregisterTopologySubscriber(subscriber.id);
+                _ = self.topology_subscribers.swapRemove(idx);
             }
         }
     }

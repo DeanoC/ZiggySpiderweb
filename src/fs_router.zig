@@ -46,7 +46,7 @@ const Endpoint = struct {
     url: []u8,
     export_name: ?[]u8,
     mount_path: []u8,
-    auth_token: ?[]u8,
+    auth_token: ?[]u8 = null,
     root_node_id: u64,
     export_read_only: ?bool = null,
     source_kind: ?[]u8 = null,
@@ -1357,11 +1357,11 @@ pub const Router = struct {
 
     fn isVirtualDirectoryPath(self: *const Router, path: []const u8) bool {
         if (path.len == 0 or path[0] != '/') return false;
-        if (std.mem.eql(u8, path, "/")) return true;
 
         for (self.endpoints.items) |endpoint| {
             if (std.mem.eql(u8, path, endpoint.mount_path)) return false;
         }
+        if (std.mem.eql(u8, path, "/")) return true;
         for (self.endpoints.items) |endpoint| {
             if (isStrictAncestorPath(path, endpoint.mount_path)) return true;
         }
@@ -2019,6 +2019,28 @@ test "fs_router: virtual directory listing reflects mount prefixes" {
     const project_attr = try router.getattr("/project");
     defer allocator.free(project_attr);
     try std.testing.expect(std.mem.indexOf(u8, project_attr, "\"k\":2") != null);
+}
+
+test "fs_router: root path is not virtual when an endpoint is mounted at slash" {
+    const allocator = std.testing.allocator;
+    var router = try Router.init(allocator, &[_]EndpointConfig{});
+    defer router.deinit();
+
+    const now = std.time.milliTimestamp();
+    try router.endpoints.append(allocator, .{
+        .name = try allocator.dupe(u8, "root-node"),
+        .url = try allocator.dupe(u8, "ws://127.0.0.1:65535/v2/fs"),
+        .export_name = null,
+        .mount_path = try allocator.dupe(u8, "/"),
+        .root_node_id = 42,
+        .export_read_only = false,
+        .caps_case_sensitive = true,
+        .healthy = true,
+        .last_health_check_ms = now,
+        .last_success_ms = now,
+    });
+
+    try std.testing.expect(!router.isVirtualDirectoryPath("/"));
 }
 
 test "fs_router: resolvePath honors explicit mount_path overlays" {

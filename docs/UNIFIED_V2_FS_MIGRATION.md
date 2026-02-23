@@ -37,8 +37,9 @@ This release is **unified v2 only**. Legacy compatibility paths were removed.
 - `control.project_token_revoke`
 
 2. Optional workspace selection:
-- `control.workspace_status` accepts optional payload `{"project_id":"<id>"}`
-- `spiderweb-fs-mount` supports `--project-id <id>`
+- `control.workspace_status` accepts optional payload `{"project_id":"<id>","project_token":"<token>"}`.
+- explicit `project_id` selection now requires either a matching `project_token` or an existing active binding for that agent.
+- `spiderweb-fs-mount` supports `--project-id <id> [--project-token <token>]`
 
 ## New Optional Hardening/Ops Flags
 

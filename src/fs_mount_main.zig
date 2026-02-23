@@ -22,6 +22,7 @@ pub fn main() !void {
     defer remaining.deinit(allocator);
     var workspace_url: ?[]const u8 = null;
     var workspace_project_id: ?[]const u8 = null;
+    var workspace_project_token: ?[]const u8 = null;
     var workspace_sync_interval_ms: u64 = 5_000;
 
     var i: usize = 1;
@@ -42,6 +43,10 @@ pub fn main() !void {
             i += 1;
             if (i >= args.len) return error.InvalidArguments;
             workspace_project_id = args[i];
+        } else if (std.mem.eql(u8, args[i], "--project-token")) {
+            i += 1;
+            if (i >= args.len) return error.InvalidArguments;
+            workspace_project_token = args[i];
         } else if (std.mem.eql(u8, args[i], "--help") or std.mem.eql(u8, args[i], "-h")) {
             try printHelp();
             return;
@@ -49,9 +54,15 @@ pub fn main() !void {
             try remaining.append(allocator, args[i]);
         }
     }
+    if (workspace_project_token != null and workspace_project_id == null) return error.InvalidArguments;
 
     if (workspace_url) |url| {
-        var hydrated = try fetchWorkspaceEndpointSpecs(allocator, url, workspace_project_id);
+        var hydrated = try fetchWorkspaceEndpointSpecs(
+            allocator,
+            url,
+            workspace_project_id,
+            workspace_project_token,
+        );
         defer hydrated.deinit(allocator);
         for (hydrated.items.items) |item| {
             const owned_name = try allocator.dupe(u8, item.name);
@@ -250,10 +261,12 @@ pub fn main() !void {
                     .adapter = &adapter,
                     .workspace_url = try allocator.dupe(u8, url),
                     .project_id = if (workspace_project_id) |project_id| try allocator.dupe(u8, project_id) else null,
+                    .project_token = if (workspace_project_token) |project_token| try allocator.dupe(u8, project_token) else null,
                     .interval_ms = workspace_sync_interval_ms,
                 };
                 errdefer allocator.free(ctx.workspace_url);
                 errdefer if (ctx.project_id) |project_id| allocator.free(project_id);
+                errdefer if (ctx.project_token) |project_token| allocator.free(project_token);
                 sync_thread = try std.Thread.spawn(.{}, workspaceSyncThreadMain, .{ctx});
                 sync_ctx = ctx;
             }
@@ -308,7 +321,7 @@ fn printHelp() !void {
         \\spiderweb-fs-mount - Distributed filesystem router client
         \\
         \\Usage:
-        \\  spiderweb-fs-mount [--workspace-url <ws-url>] [--workspace-sync-interval-ms <ms>] [--endpoint <name>=<ws-url>[#export][@/mount]] <command> [args]
+        \\  spiderweb-fs-mount [--workspace-url <ws-url>] [--project-id <id>] [--project-token <token>] [--workspace-sync-interval-ms <ms>] [--endpoint <name>=<ws-url>[#export][@/mount]] <command> [args]
         \\
         \\Commands:
         \\  getattr <path>
@@ -387,6 +400,7 @@ const WorkspaceSyncContext = struct {
     adapter: *fs_fuse_adapter.FuseAdapter,
     workspace_url: []u8,
     project_id: ?[]u8 = null,
+    project_token: ?[]u8 = null,
     interval_ms: u64,
     stop: bool = false,
     stop_mutex: std.Thread.Mutex = .{},
@@ -408,6 +422,7 @@ const WorkspaceSyncContext = struct {
     fn deinit(self: *WorkspaceSyncContext) void {
         self.allocator.free(self.workspace_url);
         if (self.project_id) |project_id| self.allocator.free(project_id);
+        if (self.project_token) |project_token| self.allocator.free(project_token);
         self.* = undefined;
     }
 
@@ -454,7 +469,12 @@ fn workspaceSyncThreadMain(ctx: *WorkspaceSyncContext) void {
 }
 
 fn tryRefreshWorkspaceTopology(allocator: std.mem.Allocator, ctx: *WorkspaceSyncContext) void {
-    var specs = fetchWorkspaceEndpointSpecs(allocator, ctx.workspace_url, if (ctx.project_id) |project_id| project_id else null) catch |err| {
+    var specs = fetchWorkspaceEndpointSpecs(
+        allocator,
+        ctx.workspace_url,
+        if (ctx.project_id) |project_id| project_id else null,
+        if (ctx.project_token) |project_token| project_token else null,
+    ) catch |err| {
         std.log.warn("workspace sync: fetch control.workspace_status failed: {s}", .{@errorName(err)});
         return;
     };
@@ -661,6 +681,7 @@ fn fetchWorkspaceEndpointSpecs(
     allocator: std.mem.Allocator,
     workspace_url: []const u8,
     project_id: ?[]const u8,
+    project_token: ?[]const u8,
 ) !WorkspaceEndpointSpecs {
     var specs = WorkspaceEndpointSpecs{ .allocator = allocator };
     errdefer specs.deinit(allocator);
@@ -688,6 +709,15 @@ fn fetchWorkspaceEndpointSpecs(
     const workspace_request = if (project_id) |selected_project| blk: {
         const escaped_project = try jsonEscape(allocator, selected_project);
         defer allocator.free(escaped_project);
+        if (project_token) |token| {
+            const escaped_token = try jsonEscape(allocator, token);
+            defer allocator.free(escaped_token);
+            break :blk try std.fmt.allocPrint(
+                allocator,
+                "{{\"channel\":\"control\",\"type\":\"control.workspace_status\",\"id\":\"fs-mount-workspace\",\"payload\":{{\"project_id\":\"{s}\",\"project_token\":\"{s}\"}}}}",
+                .{ escaped_project, escaped_token },
+            );
+        }
         break :blk try std.fmt.allocPrint(
             allocator,
             "{{\"channel\":\"control\",\"type\":\"control.workspace_status\",\"id\":\"fs-mount-workspace\",\"payload\":{{\"project_id\":\"{s}\"}}}}",

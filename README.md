@@ -286,7 +286,7 @@ Notes:
 - Router health checks each endpoint and fails over within a shared mount-path group.
 - `spiderweb-fs-mount status` now includes top-level router metrics, including `failover_events_total`.
 - `spiderweb-fs-mount mount` can run a workspace sync loop (`--workspace-sync-interval-ms`) that periodically reconciles endpoint topology from `control.workspace_status`.
-- `spiderweb-fs-mount` supports `--project-id <id>` to fetch/sync mounts for a specific project instead of the active agent binding.
+- `spiderweb-fs-mount` supports `--project-id <id> [--project-token <token>]` to fetch/sync mounts for a specific project instead of the active agent binding.
 - Workspace sync listens for push topology events via `control.debug_subscribe`:
   - full-refresh events: `control.workspace_topology`
   - project-scoped delta events: `control.workspace_topology_delta` (applied directly when `--project-id` is set)
