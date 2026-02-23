@@ -98,9 +98,11 @@ pub const Session = struct {
         runtime_server: *runtime_server_mod.RuntimeServer,
         agent_id: []const u8,
     ) !void {
+        const next_agent_id = try self.allocator.dupe(u8, agent_id);
+        const previous_agent_id = self.agent_id;
+        self.agent_id = next_agent_id;
+        self.allocator.free(previous_agent_id);
         self.runtime_server = runtime_server;
-        self.allocator.free(self.agent_id);
-        self.agent_id = try self.allocator.dupe(u8, agent_id);
     }
 
     pub fn setDebugStreamEnabled(self: *Session, enabled: bool) void {

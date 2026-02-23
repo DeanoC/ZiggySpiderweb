@@ -863,6 +863,7 @@ const AuthTokenStore = struct {
     path: ?[]u8 = null,
     admin_token: []u8,
     user_token: []u8,
+    mutex: std.Thread.Mutex = .{},
 
     fn init(allocator: std.mem.Allocator, runtime_config: Config.RuntimeConfig) AuthTokenStore {
         var store = AuthTokenStore{
@@ -884,6 +885,9 @@ const AuthTokenStore = struct {
     fn authenticate(self: *const AuthTokenStore, authorization_header: ?[]const u8) !ConnectionPrincipal {
         const raw = authorization_header orelse return error.AuthMissing;
         const token = parseBearerToken(raw) orelse return error.AuthMissing;
+        const mutex = @constCast(&self.mutex);
+        mutex.lock();
+        defer mutex.unlock();
         if (secureTokenEql(self.admin_token, token)) return .{ .role = .admin, .token_id = "admin" };
         if (secureTokenEql(self.user_token, token)) return .{ .role = .user, .token_id = "user" };
         return error.AuthFailed;
@@ -895,22 +899,31 @@ const AuthTokenStore = struct {
             .user => "sw-user",
         });
         errdefer self.allocator.free(next);
+        const replacement = try self.allocator.dupe(u8, next);
+        errdefer self.allocator.free(replacement);
 
+        self.mutex.lock();
+        defer self.mutex.unlock();
         switch (role) {
             .admin => {
-                self.allocator.free(self.admin_token);
-                self.admin_token = try self.allocator.dupe(u8, next);
+                const previous = self.admin_token;
+                self.admin_token = replacement;
+                self.allocator.free(previous);
             },
             .user => {
-                self.allocator.free(self.user_token);
-                self.user_token = try self.allocator.dupe(u8, next);
+                const previous = self.user_token;
+                self.user_token = replacement;
+                self.allocator.free(previous);
             },
         }
-        self.persist();
+        self.persistLocked();
         return next;
     }
 
     fn statusJson(self: *const AuthTokenStore) ![]u8 {
+        const mutex = @constCast(&self.mutex);
+        mutex.lock();
+        defer mutex.unlock();
         const escaped_admin = try unified.jsonEscape(self.allocator, self.admin_token);
         defer self.allocator.free(escaped_admin);
         const escaped_user = try unified.jsonEscape(self.allocator, self.user_token);
@@ -947,12 +960,20 @@ const AuthTokenStore = struct {
         defer self.allocator.free(generated_admin);
         const generated_user = makeOpaqueToken(self.allocator, "sw-user") catch return;
         defer self.allocator.free(generated_user);
+        const next_admin = self.allocator.dupe(u8, generated_admin) catch return;
+        errdefer self.allocator.free(next_admin);
+        const next_user = self.allocator.dupe(u8, generated_user) catch return;
+        errdefer self.allocator.free(next_user);
 
-        self.allocator.free(self.admin_token);
-        self.allocator.free(self.user_token);
-        self.admin_token = self.allocator.dupe(u8, generated_admin) catch return;
-        self.user_token = self.allocator.dupe(u8, generated_user) catch return;
-        self.persist();
+        self.mutex.lock();
+        const previous_admin = self.admin_token;
+        const previous_user = self.user_token;
+        self.admin_token = next_admin;
+        self.user_token = next_user;
+        self.allocator.free(previous_admin);
+        self.allocator.free(previous_user);
+        self.persistLocked();
+        self.mutex.unlock();
 
         std.log.warn("Generated Spiderweb auth tokens (save these now):", .{});
         std.log.warn("  admin: {s}", .{self.admin_token});
@@ -971,15 +992,23 @@ const AuthTokenStore = struct {
         });
         defer parsed.deinit();
         if (parsed.value.admin_token.len == 0 or parsed.value.user_token.len == 0) return false;
+        const next_admin = try self.allocator.dupe(u8, parsed.value.admin_token);
+        errdefer self.allocator.free(next_admin);
+        const next_user = try self.allocator.dupe(u8, parsed.value.user_token);
+        errdefer self.allocator.free(next_user);
 
-        self.allocator.free(self.admin_token);
-        self.allocator.free(self.user_token);
-        self.admin_token = try self.allocator.dupe(u8, parsed.value.admin_token);
-        self.user_token = try self.allocator.dupe(u8, parsed.value.user_token);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const previous_admin = self.admin_token;
+        const previous_user = self.user_token;
+        self.admin_token = next_admin;
+        self.user_token = next_user;
+        self.allocator.free(previous_admin);
+        self.allocator.free(previous_user);
         return true;
     }
 
-    fn persist(self: *AuthTokenStore) void {
+    fn persistLocked(self: *AuthTokenStore) void {
         const path = self.path orelse return;
         const payload = Persisted{
             .schema = 1,
