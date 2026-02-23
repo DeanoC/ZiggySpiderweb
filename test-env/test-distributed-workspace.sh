@@ -75,9 +75,10 @@ fi
 
 TEST_TMP_DIR="$(mktemp -d)"
 LTM_DIR="$TEST_TMP_DIR/ltm"
+SPIDER_WEB_ROOT="$TEST_TMP_DIR/spider-web-root"
 NODE1_EXPORT="$TEST_TMP_DIR/node1-export"
 NODE2_EXPORT="$TEST_TMP_DIR/node2-export"
-mkdir -p "$LTM_DIR" "$NODE1_EXPORT" "$NODE2_EXPORT"
+mkdir -p "$LTM_DIR" "$SPIDER_WEB_ROOT" "$NODE1_EXPORT" "$NODE2_EXPORT"
 
 SPIDERWEB_CONFIG_FILE="$TEST_TMP_DIR/spiderweb.json"
 cat > "$SPIDERWEB_CONFIG_FILE" <<EOF
@@ -89,7 +90,8 @@ cat > "$SPIDERWEB_CONFIG_FILE" <<EOF
   "runtime": {
     "default_agent_id": "default",
     "ltm_directory": "$LTM_DIR",
-    "ltm_filename": "runtime-memory.db"
+    "ltm_filename": "runtime-memory.db",
+    "spider_web_root": "$SPIDER_WEB_ROOT"
   }
 }
 EOF

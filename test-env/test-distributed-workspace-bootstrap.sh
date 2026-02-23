@@ -120,9 +120,10 @@ wait_for_node_ready() {
 
 TEST_TMP_DIR="$(mktemp -d)"
 LTM_DIR="$TEST_TMP_DIR/ltm"
+SPIDER_WEB_ROOT="$TEST_TMP_DIR/spider-web-root"
 NODE1_EXPORT="$TEST_TMP_DIR/node1-export"
 NODE2_EXPORT="$TEST_TMP_DIR/node2-export"
-mkdir -p "$LTM_DIR" "$NODE1_EXPORT" "$NODE2_EXPORT"
+mkdir -p "$LTM_DIR" "$SPIDER_WEB_ROOT" "$NODE1_EXPORT" "$NODE2_EXPORT"
 echo "bootstrap-node-1" > "$NODE1_EXPORT/bootstrap.txt"
 echo "bootstrap-node-2" > "$NODE2_EXPORT/bootstrap.txt"
 
@@ -136,7 +137,8 @@ cat > "$SPIDERWEB_CONFIG_FILE" <<EOF
   "runtime": {
     "default_agent_id": "default",
     "ltm_directory": "$LTM_DIR",
-    "ltm_filename": "runtime-memory.db"
+    "ltm_filename": "runtime-memory.db",
+    "spider_web_root": "$SPIDER_WEB_ROOT"
   }
 }
 EOF
