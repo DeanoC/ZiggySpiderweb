@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const Config = @import("config.zig");
 const credential_store = @import("credential_store.zig");
 const ziggy_piai = @import("ziggy-piai");
@@ -43,7 +44,7 @@ fn handleAuthCommand(allocator: std.mem.Allocator, args: []const []const u8) !vo
     if (std.mem.eql(u8, subcommand, "path")) {
         var config = try Config.init(allocator, null);
         defer config.deinit();
-        const path = try resolveAuthTokensPath(allocator, config.runtime.ltm_directory);
+        const path = try resolveAuthTokensPath(allocator, config.runtime.ltm_directory, config.config_path);
         defer allocator.free(path);
         const out = try std.fmt.allocPrint(allocator, "{s}\n", .{path});
         defer allocator.free(out);
@@ -69,7 +70,7 @@ fn handleAuthCommand(allocator: std.mem.Allocator, args: []const []const u8) !vo
 
         var config = try Config.init(allocator, null);
         defer config.deinit();
-        const path = try resolveAuthTokensPath(allocator, config.runtime.ltm_directory);
+        const path = try resolveAuthTokensPath(allocator, config.runtime.ltm_directory, config.config_path);
         defer allocator.free(path);
         const admin_token = try makeOpaqueToken(allocator, "sw-admin");
         defer allocator.free(admin_token);
@@ -278,11 +279,102 @@ fn installSystemdService(allocator: std.mem.Allocator) !void {
     std.log.info("Enable with: systemctl --user enable --now spiderweb", .{});
 }
 
-fn resolveAuthTokensPath(allocator: std.mem.Allocator, ltm_directory: []const u8) ![]u8 {
-    const base_dir = std.mem.trim(u8, ltm_directory, " \t\r\n");
-    const storage_dir = if (base_dir.len == 0) "." else base_dir;
+fn resolveAuthTokensPath(
+    allocator: std.mem.Allocator,
+    ltm_directory: []const u8,
+    config_path: []const u8,
+) ![]u8 {
+    const storage_dir = try resolveRuntimeStorageDirectory(allocator, ltm_directory, config_path);
+    defer allocator.free(storage_dir);
     try std.fs.cwd().makePath(storage_dir);
     return std.fs.path.join(allocator, &.{ storage_dir, auth_tokens_filename });
+}
+
+fn resolveRuntimeStorageDirectory(
+    allocator: std.mem.Allocator,
+    ltm_directory: []const u8,
+    config_path: []const u8,
+) ![]u8 {
+    const runtime_base = try resolveRuntimeBaseDirectory(allocator, config_path);
+    defer allocator.free(runtime_base);
+    return resolveRuntimeStorageDirectoryWithBase(allocator, ltm_directory, runtime_base);
+}
+
+fn resolveRuntimeStorageDirectoryWithBase(
+    allocator: std.mem.Allocator,
+    ltm_directory: []const u8,
+    runtime_base: []const u8,
+) ![]u8 {
+    const base_dir = std.mem.trim(u8, ltm_directory, " \t\r\n");
+    if (std.fs.path.isAbsolute(base_dir)) return allocator.dupe(u8, base_dir);
+    if (base_dir.len == 0) return allocator.dupe(u8, runtime_base);
+    return std.fs.path.join(allocator, &.{ runtime_base, base_dir });
+}
+
+fn resolveRuntimeBaseDirectory(allocator: std.mem.Allocator, config_path: []const u8) ![]u8 {
+    if (try detectServiceWorkingDirectory(allocator)) |service_dir| return service_dir;
+    return resolveConfigDirectory(allocator, config_path);
+}
+
+fn detectServiceWorkingDirectory(allocator: std.mem.Allocator) !?[]u8 {
+    const home = std.process.getEnvVarOwned(allocator, "HOME") catch null;
+    if (home) |home_dir| {
+        defer allocator.free(home_dir);
+        const user_service_path = try std.fs.path.join(allocator, &.{ home_dir, ".config", "systemd", "user", "spiderweb.service" });
+        defer allocator.free(user_service_path);
+        if (try parseServiceWorkingDirectory(allocator, user_service_path)) |dir| return dir;
+    }
+
+    if (try parseServiceWorkingDirectory(allocator, "/etc/systemd/system/spiderweb.service")) |dir| return dir;
+    return null;
+}
+
+fn parseServiceWorkingDirectory(allocator: std.mem.Allocator, service_path: []const u8) !?[]u8 {
+    const contents = readFileAllocAny(allocator, service_path, 128 * 1024) catch |err| switch (err) {
+        error.FileNotFound,
+        error.NotDir,
+        error.AccessDenied,
+        => return null,
+        else => return err,
+    };
+    defer allocator.free(contents);
+
+    var lines = std.mem.tokenizeAny(u8, contents, "\r\n");
+    while (lines.next()) |line_raw| {
+        const line = std.mem.trim(u8, line_raw, " \t");
+        if (line.len == 0) continue;
+        if (line[0] == '#' or line[0] == ';') continue;
+        if (!std.mem.startsWith(u8, line, "WorkingDirectory=")) continue;
+
+        const value = std.mem.trim(u8, line["WorkingDirectory=".len..], " \t\"");
+        if (value.len == 0) continue;
+        if (std.fs.path.isAbsolute(value)) return try allocator.dupe(u8, value);
+        const service_dir = std.fs.path.dirname(service_path) orelse ".";
+        return try std.fs.path.join(allocator, &.{ service_dir, value });
+    }
+    return null;
+}
+
+fn readFileAllocAny(allocator: std.mem.Allocator, path: []const u8, max_bytes: usize) ![]u8 {
+    if (std.fs.path.isAbsolute(path)) {
+        const file = try std.fs.openFileAbsolute(path, .{ .mode = .read_only });
+        defer file.close();
+        return file.readToEndAlloc(allocator, max_bytes);
+    }
+    return std.fs.cwd().readFileAlloc(allocator, path, max_bytes);
+}
+
+fn resolveConfigDirectory(allocator: std.mem.Allocator, config_path: []const u8) ![]u8 {
+    if (std.fs.path.isAbsolute(config_path)) {
+        const dir = std.fs.path.dirname(config_path) orelse "/";
+        return allocator.dupe(u8, dir);
+    }
+    const cwd = try std.process.getCwdAlloc(allocator);
+    defer allocator.free(cwd);
+    const absolute_config_path = try std.fs.path.join(allocator, &.{ cwd, config_path });
+    defer allocator.free(absolute_config_path);
+    const dir = std.fs.path.dirname(absolute_config_path) orelse cwd;
+    return allocator.dupe(u8, dir);
 }
 
 fn makeOpaqueToken(allocator: std.mem.Allocator, prefix: []const u8) ![]u8 {
@@ -318,8 +410,14 @@ fn persistAuthTokens(
     });
     defer allocator.free(bytes);
 
-    var file = try std.fs.cwd().createFile(path, .{ .truncate = true });
+    var file = try std.fs.cwd().createFile(path, .{
+        .truncate = true,
+        .mode = 0o600,
+    });
     defer file.close();
+    if (builtin.os.tag != .windows) {
+        try file.chmod(0o600);
+    }
     try file.writeAll(bytes);
 }
 
@@ -371,4 +469,48 @@ fn printUsage() !void {
     ;
     const stdout_file = std.fs.File.stdout();
     try stdout_file.writeAll(usage);
+}
+
+test "config_cli: resolve runtime storage directory keeps absolute ltm path" {
+    const allocator = std.testing.allocator;
+    const resolved = try resolveRuntimeStorageDirectoryWithBase(allocator, "/var/lib/spiderweb/ltm", "/ignored/base");
+    defer allocator.free(resolved);
+    try std.testing.expectEqualStrings("/var/lib/spiderweb/ltm", resolved);
+}
+
+test "config_cli: resolve runtime storage directory joins relative ltm path with runtime base" {
+    const allocator = std.testing.allocator;
+    const resolved = try resolveRuntimeStorageDirectoryWithBase(allocator, ".spiderweb-ltm", "/srv/spiderweb");
+    defer allocator.free(resolved);
+    const expected = try std.fs.path.join(allocator, &.{ "/srv/spiderweb", ".spiderweb-ltm" });
+    defer allocator.free(expected);
+    try std.testing.expectEqualStrings(expected, resolved);
+}
+
+test "config_cli: parse service working directory from unit file" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.writeFile(.{
+        .sub_path = "spiderweb.service",
+        .data =
+        \\[Unit]
+        \\Description=ZiggySpiderweb
+        \\
+        \\[Service]
+        \\WorkingDirectory=/opt/ziggy-spiderweb
+        \\ExecStart=/usr/bin/spiderweb
+        \\
+        ,
+    });
+
+    const root = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+    const service_path = try std.fs.path.join(allocator, &.{ root, "spiderweb.service" });
+    defer allocator.free(service_path);
+
+    const parsed = (try parseServiceWorkingDirectory(allocator, service_path)) orelse return error.TestExpectedWorkingDirectory;
+    defer allocator.free(parsed);
+    try std.testing.expectEqualStrings("/opt/ziggy-spiderweb", parsed);
 }

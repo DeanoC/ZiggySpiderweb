@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const Config = @import("config.zig");
 const connection_dispatcher = @import("connection_dispatcher.zig");
 const memory = @import("ziggy-memory-store").memory;
@@ -1027,8 +1028,14 @@ const AuthTokenStore = struct {
         });
         defer self.allocator.free(bytes);
 
-        const file = try std.fs.cwd().createFile(path, .{ .truncate = true });
+        const file = try std.fs.cwd().createFile(path, .{
+            .truncate = true,
+            .mode = 0o600,
+        });
         defer file.close();
+        if (builtin.os.tag != .windows) {
+            try file.chmod(0o600);
+        }
         try file.writeAll(bytes);
     }
 
