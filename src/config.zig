@@ -37,6 +37,7 @@ pub const RuntimeConfig = struct {
     max_inflight_tool_calls_per_run: usize = 1,
     max_run_steps: usize = 1024,
     default_agent_id: []const u8 = "default",
+    spider_web_root: []const u8 = "/",
     ltm_directory: []const u8 = ".spiderweb-ltm",
     ltm_filename: []const u8 = "runtime-memory.db",
     assets_dir: []const u8 = "templates",
@@ -61,6 +62,7 @@ pub const RuntimeConfig = struct {
             .max_inflight_tool_calls_per_run = self.max_inflight_tool_calls_per_run,
             .max_run_steps = self.max_run_steps,
             .default_agent_id = try allocator.dupe(u8, self.default_agent_id),
+            .spider_web_root = try allocator.dupe(u8, self.spider_web_root),
             .ltm_directory = try allocator.dupe(u8, self.ltm_directory),
             .ltm_filename = try allocator.dupe(u8, self.ltm_filename),
             .assets_dir = try allocator.dupe(u8, self.assets_dir),
@@ -70,6 +72,7 @@ pub const RuntimeConfig = struct {
 
     pub fn deinit(self: *RuntimeConfig, allocator: std.mem.Allocator) void {
         allocator.free(self.default_agent_id);
+        allocator.free(self.spider_web_root);
         allocator.free(self.ltm_directory);
         allocator.free(self.ltm_filename);
         allocator.free(self.assets_dir);
@@ -115,6 +118,7 @@ const default_config =
     \\    "max_inflight_tool_calls_per_run": 1,
     \\    "max_run_steps": 1024,
     \\    "default_agent_id": "default",
+    \\    "spider_web_root": "/",
     \\    "ltm_directory": ".spiderweb-ltm",
     \\    "ltm_filename": "runtime-memory.db",
     \\    "assets_dir": "templates",
@@ -159,6 +163,7 @@ pub fn init(allocator: std.mem.Allocator, config_path: ?[]const u8) !Config {
             .max_inflight_tool_calls_per_run = 1,
             .max_run_steps = 1024,
             .default_agent_id = try allocator.dupe(u8, "default"),
+            .spider_web_root = try allocator.dupe(u8, "/"),
             .ltm_directory = try allocator.dupe(u8, ".spiderweb-ltm"),
             .ltm_filename = try allocator.dupe(u8, "runtime-memory.db"),
             .assets_dir = try allocator.dupe(u8, "templates"),
@@ -376,6 +381,12 @@ pub fn load(self: *Config) !void {
                     self.runtime.default_agent_id = try self.allocator.dupe(u8, value.string);
                 }
             }
+            if (runtime_val.object.get("spider_web_root")) |value| {
+                if (value == .string and value.string.len > 0) {
+                    self.allocator.free(self.runtime.spider_web_root);
+                    self.runtime.spider_web_root = try self.allocator.dupe(u8, value.string);
+                }
+            }
             if (runtime_val.object.get("ltm_directory")) |value| {
                 if (value == .string) {
                     self.allocator.free(self.runtime.ltm_directory);
@@ -496,6 +507,8 @@ pub fn save(self: Config) !void {
     try file.writeAll(max_run_steps_line);
     const default_agent_line = try std.fmt.bufPrint(&buf, "    \"default_agent_id\": \"{s}\",\n", .{self.runtime.default_agent_id});
     try file.writeAll(default_agent_line);
+    const spider_web_root_line = try std.fmt.bufPrint(&buf, "    \"spider_web_root\": \"{s}\",\n", .{self.runtime.spider_web_root});
+    try file.writeAll(spider_web_root_line);
     const ltm_dir_line = try std.fmt.bufPrint(&buf, "    \"ltm_directory\": \"{s}\",\n", .{self.runtime.ltm_directory});
     try file.writeAll(ltm_dir_line);
     const ltm_file_line = try std.fmt.bufPrint(&buf, "    \"ltm_filename\": \"{s}\",\n", .{self.runtime.ltm_filename});
@@ -578,5 +591,6 @@ test "Config defaults" {
     try std.testing.expectEqual(@as(usize, 1), config.runtime.max_inflight_tool_calls_per_run);
     try std.testing.expectEqual(@as(usize, 1024), config.runtime.max_run_steps);
     try std.testing.expectEqualStrings("default", config.runtime.default_agent_id);
+    try std.testing.expectEqualStrings("/", config.runtime.spider_web_root);
     try std.testing.expectEqualStrings(".spiderweb-ltm", config.runtime.ltm_directory);
 }

@@ -31,6 +31,7 @@ const local_node_fs_url_env = "SPIDERWEB_LOCAL_NODE_FS_URL";
 const local_node_name_env = "SPIDERWEB_LOCAL_NODE_NAME";
 const local_node_lease_ttl_env = "SPIDERWEB_LOCAL_NODE_LEASE_TTL_MS";
 const local_node_heartbeat_ms_env = "SPIDERWEB_LOCAL_NODE_HEARTBEAT_MS";
+const local_node_default_export_name = "spider-web-root";
 const control_operator_token_env = "SPIDERWEB_CONTROL_OPERATOR_TOKEN";
 const control_project_scope_token_env = "SPIDERWEB_CONTROL_PROJECT_SCOPE_TOKEN";
 const control_node_scope_token_env = "SPIDERWEB_CONTROL_NODE_SCOPE_TOKEN";
@@ -466,6 +467,7 @@ const LocalFsNode = struct {
     service: fs_node_service.NodeService,
     hub: FsConnectionHub,
     node_name: []u8,
+    export_name: []u8,
     fs_url: []u8,
     lease_ttl_ms: u64,
     heartbeat_interval_ms: u64,
@@ -492,6 +494,7 @@ const LocalFsNode = struct {
             .service = try fs_node_service.NodeService.init(allocator, &[_]fs_node_ops.ExportSpec{export_spec}),
             .hub = .{ .allocator = allocator },
             .node_name = try allocator.dupe(u8, node_name),
+            .export_name = try allocator.dupe(u8, export_spec.name),
             .fs_url = try allocator.dupe(u8, fs_url),
             .lease_ttl_ms = lease_ttl_ms,
             .heartbeat_interval_ms = heartbeat_interval_ms,
@@ -500,6 +503,7 @@ const LocalFsNode = struct {
             endpoint.hub.deinit();
             endpoint.service.deinit();
             allocator.free(endpoint.node_name);
+            allocator.free(endpoint.export_name);
             allocator.free(endpoint.fs_url);
         }
 
@@ -545,6 +549,7 @@ const LocalFsNode = struct {
         self.hub.deinit();
         self.service.deinit();
         self.allocator.free(self.node_name);
+        self.allocator.free(self.export_name);
         self.allocator.free(self.fs_url);
         self.allocator.destroy(self);
     }
@@ -558,13 +563,20 @@ const LocalFsNode = struct {
         const payload_json = try control_plane.ensureNode(self.node_name, self.fs_url, self.lease_ttl_ms);
         defer self.allocator.free(payload_json);
         const registration = try parseNodeRegistrationFromJoinPayload(self.allocator, payload_json);
+        var mount_node_id: []u8 = undefined;
         self.registration_mutex.lock();
-        defer self.registration_mutex.unlock();
+        var unlock_needed = true;
+        defer if (unlock_needed) self.registration_mutex.unlock();
 
         if (self.registered_node_id) |prev| {
             if (std.mem.eql(u8, prev, registration.node_id)) {
+                mount_node_id = try self.allocator.dupe(u8, prev);
+                self.registration_mutex.unlock();
+                unlock_needed = false;
+                defer self.allocator.free(mount_node_id);
                 self.allocator.free(registration.node_id);
                 self.allocator.free(registration.node_secret);
+                try control_plane.ensureSpiderWebMount(mount_node_id, self.export_name);
                 return;
             }
             self.allocator.free(prev);
@@ -573,6 +585,11 @@ const LocalFsNode = struct {
 
         self.registered_node_id = registration.node_id;
         self.session_auth_token = registration.node_secret;
+        mount_node_id = try self.allocator.dupe(u8, self.registered_node_id.?);
+        self.registration_mutex.unlock();
+        unlock_needed = false;
+        defer self.allocator.free(mount_node_id);
+        try control_plane.ensureSpiderWebMount(mount_node_id, self.export_name);
     }
 
     fn requestHeartbeatStop(self: *LocalFsNode) void {
@@ -876,10 +893,14 @@ const AgentRuntimeRegistry = struct {
             .default_agent_id = effective_default,
             .max_runtimes = if (max_runtimes == 0) 1 else max_runtimes,
             .debug_stream_sink = debug_stream_sink,
-            .control_plane = fs_control_plane.ControlPlane.initWithPersistence(
+            .control_plane = fs_control_plane.ControlPlane.initWithPersistenceOptions(
                 allocator,
                 runtime_config.ltm_directory,
                 runtime_config.ltm_filename,
+                .{
+                    .primary_agent_id = effective_default,
+                    .spider_web_root = runtime_config.spider_web_root,
+                },
             ),
             .job_index = chat_job_index.ChatJobIndex.init(
                 allocator,
@@ -1231,13 +1252,21 @@ const AgentRuntimeRegistry = struct {
 
     fn maybeInitLocalFsNode(self: *AgentRuntimeRegistry, bind_addr: []const u8, port: u16) !void {
         const export_path_owned = std.process.getEnvVarOwned(self.allocator, local_node_export_path_env) catch |err| switch (err) {
-            error.EnvironmentVariableNotFound => return,
+            error.EnvironmentVariableNotFound => null,
             else => return err,
         };
-        defer self.allocator.free(export_path_owned);
-        const export_path = std.mem.trim(u8, export_path_owned, " \t\r\n");
+        defer if (export_path_owned) |value| self.allocator.free(value);
+        const configured_export_path = std.mem.trim(u8, self.runtime_config.spider_web_root, " \t\r\n");
+        const export_path = if (export_path_owned) |value| blk: {
+            const trimmed = std.mem.trim(u8, value, " \t\r\n");
+            if (trimmed.len > 0) break :blk trimmed;
+            break :blk configured_export_path;
+        } else configured_export_path;
         if (export_path.len == 0) {
-            std.log.warn("local fs node disabled: {s} is empty", .{local_node_export_path_env});
+            std.log.warn(
+                "local fs node disabled: both {s} and runtime.spider_web_root are empty",
+                .{local_node_export_path_env},
+            );
             return;
         }
 
@@ -1247,9 +1276,9 @@ const AgentRuntimeRegistry = struct {
         };
         defer if (export_name_owned) |value| self.allocator.free(value);
         const export_name = if (export_name_owned) |value|
-            if (std.mem.trim(u8, value, " \t\r\n").len > 0) std.mem.trim(u8, value, " \t\r\n") else "work"
+            if (std.mem.trim(u8, value, " \t\r\n").len > 0) std.mem.trim(u8, value, " \t\r\n") else local_node_default_export_name
         else
-            "work";
+            local_node_default_export_name;
 
         const export_ro = parseBoolEnv(self.allocator, local_node_export_ro_env, false);
 
@@ -2154,6 +2183,8 @@ fn controlPlaneErrorCode(err: anyerror) []const u8 {
         fs_control_plane.ControlPlaneError.NodeAuthFailed => "node_auth_failed",
         fs_control_plane.ControlPlaneError.ProjectNotFound => "project_not_found",
         fs_control_plane.ControlPlaneError.ProjectAuthFailed => "project_auth_failed",
+        fs_control_plane.ControlPlaneError.ProjectProtected => "project_protected",
+        fs_control_plane.ControlPlaneError.ProjectAssignmentForbidden => "project_assignment_forbidden",
         fs_control_plane.ControlPlaneError.MountConflict => "mount_conflict",
         fs_control_plane.ControlPlaneError.MountNotFound => "mount_not_found",
         else => "control_plane_error",

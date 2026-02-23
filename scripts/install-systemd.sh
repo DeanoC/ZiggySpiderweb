@@ -14,6 +14,7 @@ PORT="${PORT:-18790}"
 BIND_ADDR="${BIND_ADDR:-0.0.0.0}"
 PROVIDER_NAME="${PROVIDER_NAME:-openai}"
 PROVIDER_MODEL="${PROVIDER_MODEL:-gpt-4o-mini}"
+SPIDER_WEB_ROOT="${SPIDER_WEB_ROOT:-/}"
 OVERWRITE_CONFIG="${OVERWRITE_CONFIG:-0}"
 SERVICE_ENV_FILE="${SERVICE_ENV_FILE:-$CONFIG_DIR/service.env}"
 
@@ -152,6 +153,7 @@ install_config() {
     "level": "info"
   },
   "runtime": {
+    "spider_web_root": "$SPIDER_WEB_ROOT",
     "ltm_directory": "/var/lib/spiderweb/.spiderweb-ltm",
     "ltm_filename": "runtime-memory.db"
   }
@@ -173,6 +175,7 @@ EOF
     "level": "info"
   },
   "runtime": {
+    "spider_web_root": "$SPIDER_WEB_ROOT",
     "ltm_directory": "/var/lib/spiderweb/.spiderweb-ltm",
     "ltm_filename": "runtime-memory.db"
   }
