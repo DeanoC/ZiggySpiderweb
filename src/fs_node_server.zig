@@ -172,6 +172,30 @@ fn writeConnectionFrame(conn: *HubConnection, payload: []const u8, frame_type: w
     try websocket_transport.writeFrame(conn.stream, payload, frame_type);
 }
 
+fn writeStreamFrameLocked(
+    stream: *std.net.Stream,
+    write_mutex: *std.Thread.Mutex,
+    payload: []const u8,
+    frame_type: websocket_transport.FrameType,
+) !void {
+    write_mutex.lock();
+    defer write_mutex.unlock();
+    try websocket_transport.writeFrame(stream, payload, frame_type);
+}
+
+fn writeConnectionFrameMaybe(
+    connection: ?*HubConnection,
+    stream: *std.net.Stream,
+    write_mutex: *std.Thread.Mutex,
+    payload: []const u8,
+    frame_type: websocket_transport.FrameType,
+) !void {
+    if (connection) |conn| {
+        return writeConnectionFrame(conn, payload, frame_type);
+    }
+    return writeStreamFrameLocked(stream, write_mutex, payload, frame_type);
+}
+
 fn handleConnection(ctx: *ConnectionContext) !void {
     var handshake = try websocket_transport.performHandshakeWithInfo(ctx.allocator, &ctx.stream);
     defer handshake.deinit(ctx.allocator);
@@ -189,8 +213,9 @@ fn handleConnection(ctx: *ConnectionContext) !void {
         return error.InvalidPath;
     }
 
-    const connection = try ctx.hub.register(&ctx.stream);
-    defer ctx.hub.unregister(connection);
+    var connection: ?*HubConnection = null;
+    defer if (connection) |conn| ctx.hub.unregister(conn);
+    var connection_write_mutex: std.Thread.Mutex = .{};
     var fsrpc_negotiated = false;
 
     while (true) {
@@ -214,8 +239,8 @@ fn handleConnection(ctx: *ConnectionContext) !void {
                         @errorName(err),
                     );
                     defer ctx.allocator.free(response);
-                    try writeConnectionFrame(connection, response, .text);
-                    try writeConnectionFrame(connection, "", .close);
+                    try writeConnectionFrameMaybe(connection, &ctx.stream, &connection_write_mutex, response, .text);
+                    try writeConnectionFrameMaybe(connection, &ctx.stream, &connection_write_mutex, "", .close);
                     return;
                 };
                 defer parsed.deinit(ctx.allocator);
@@ -229,8 +254,8 @@ fn handleConnection(ctx: *ConnectionContext) !void {
                             "fsrpc.t_fs_hello must be negotiated first",
                         );
                         defer ctx.allocator.free(response);
-                        try writeConnectionFrame(connection, response, .text);
-                        try writeConnectionFrame(connection, "", .close);
+                        try writeConnectionFrameMaybe(connection, &ctx.stream, &connection_write_mutex, response, .text);
+                        try writeConnectionFrameMaybe(connection, &ctx.stream, &connection_write_mutex, "", .close);
                         return;
                     }
                     validateFsNodeHelloPayload(ctx.allocator, parsed.payload_json, ctx.required_auth_token) catch |err| {
@@ -241,10 +266,11 @@ fn handleConnection(ctx: *ConnectionContext) !void {
                             @errorName(err),
                         );
                         defer ctx.allocator.free(response);
-                        try writeConnectionFrame(connection, response, .text);
-                        try writeConnectionFrame(connection, "", .close);
+                        try writeConnectionFrameMaybe(connection, &ctx.stream, &connection_write_mutex, response, .text);
+                        try writeConnectionFrameMaybe(connection, &ctx.stream, &connection_write_mutex, "", .close);
                         return;
                     };
+                    connection = try ctx.hub.register(&ctx.stream);
                     fsrpc_negotiated = true;
                 } else if (parsed.fsrpc_type == .fs_t_hello) {
                     validateFsNodeHelloPayload(ctx.allocator, parsed.payload_json, ctx.required_auth_token) catch |err| {
@@ -255,8 +281,8 @@ fn handleConnection(ctx: *ConnectionContext) !void {
                             @errorName(err),
                         );
                         defer ctx.allocator.free(response);
-                        try writeConnectionFrame(connection, response, .text);
-                        try writeConnectionFrame(connection, "", .close);
+                        try writeConnectionFrameMaybe(connection, &ctx.stream, &connection_write_mutex, response, .text);
+                        try writeConnectionFrameMaybe(connection, &ctx.stream, &connection_write_mutex, "", .close);
                         return;
                     };
                 }
@@ -275,26 +301,27 @@ fn handleConnection(ctx: *ConnectionContext) !void {
                     };
                 };
                 defer handled.deinit(ctx.allocator);
+                const live_connection = connection orelse return error.InvalidConnectionState;
 
                 // Preserve existing response-stream ordering for the caller connection.
                 for (handled.events) |event| {
                     const event_json = try fs_node_service.buildInvalidationEventJson(ctx.allocator, event);
                     defer ctx.allocator.free(event_json);
-                    try writeConnectionFrame(connection, event_json, .text);
+                    try writeConnectionFrame(live_connection, event_json, .text);
                 }
 
                 // Fan out mutation invalidations to all other connected FS clients.
                 if (handled.events.len > 0) {
-                    ctx.hub.broadcastInvalidations(connection.id, handled.events);
+                    ctx.hub.broadcastInvalidations(live_connection.id, handled.events);
                 }
-                try writeConnectionFrame(connection, handled.response_json, .text);
+                try writeConnectionFrame(live_connection, handled.response_json, .text);
             },
             0x8 => {
-                writeConnectionFrame(connection, "", .close) catch {};
+                writeConnectionFrameMaybe(connection, &ctx.stream, &connection_write_mutex, "", .close) catch {};
                 return;
             },
             0x9 => {
-                try writeConnectionFrame(connection, frame.payload, .pong);
+                try writeConnectionFrameMaybe(connection, &ctx.stream, &connection_write_mutex, frame.payload, .pong);
             },
             0xA => {},
             else => {
@@ -305,7 +332,7 @@ fn handleConnection(ctx: *ConnectionContext) !void {
                     "unsupported websocket opcode",
                 );
                 defer ctx.allocator.free(response);
-                try writeConnectionFrame(connection, response, .text);
+                try writeConnectionFrameMaybe(connection, &ctx.stream, &connection_write_mutex, response, .text);
             },
         }
     }

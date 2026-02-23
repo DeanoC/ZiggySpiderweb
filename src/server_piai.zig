@@ -630,6 +630,30 @@ fn writeFsHubFrame(conn: *FsHubConnection, payload: []const u8, frame_type: webs
     try websocket_transport.writeFrame(conn.stream, payload, frame_type);
 }
 
+fn writeStreamFrameWithMutex(
+    stream: *std.net.Stream,
+    write_mutex: *std.Thread.Mutex,
+    payload: []const u8,
+    frame_type: websocket_transport.FrameType,
+) !void {
+    write_mutex.lock();
+    defer write_mutex.unlock();
+    try websocket_transport.writeFrame(stream, payload, frame_type);
+}
+
+fn writeFsHubFrameMaybe(
+    connection: ?*FsHubConnection,
+    stream: *std.net.Stream,
+    write_mutex: *std.Thread.Mutex,
+    payload: []const u8,
+    frame_type: websocket_transport.FrameType,
+) !void {
+    if (connection) |conn| {
+        return writeFsHubFrame(conn, payload, frame_type);
+    }
+    return writeStreamFrameWithMutex(stream, write_mutex, payload, frame_type);
+}
+
 fn handleLocalFsConnection(
     allocator: std.mem.Allocator,
     local_node: *LocalFsNode,
@@ -638,8 +662,9 @@ fn handleLocalFsConnection(
     const required_auth_token = try local_node.copySessionAuthToken(allocator);
     defer if (required_auth_token) |token| allocator.free(token);
 
-    const connection = try local_node.hub.register(stream);
-    defer local_node.hub.unregister(connection);
+    var connection: ?*FsHubConnection = null;
+    defer if (connection) |conn| local_node.hub.unregister(conn);
+    var connection_write_mutex: std.Thread.Mutex = .{};
     var fsrpc_negotiated = false;
 
     while (true) {
@@ -663,8 +688,8 @@ fn handleLocalFsConnection(
                         @errorName(err),
                     );
                     defer allocator.free(response);
-                    try writeFsHubFrame(connection, response, .text);
-                    try writeFsHubFrame(connection, "", .close);
+                    try writeFsHubFrameMaybe(connection, stream, &connection_write_mutex, response, .text);
+                    try writeFsHubFrameMaybe(connection, stream, &connection_write_mutex, "", .close);
                     return;
                 };
                 defer parsed.deinit(allocator);
@@ -678,8 +703,8 @@ fn handleLocalFsConnection(
                             "fsrpc.t_fs_hello must be negotiated first",
                         );
                         defer allocator.free(response);
-                        try writeFsHubFrame(connection, response, .text);
-                        try writeFsHubFrame(connection, "", .close);
+                        try writeFsHubFrameMaybe(connection, stream, &connection_write_mutex, response, .text);
+                        try writeFsHubFrameMaybe(connection, stream, &connection_write_mutex, "", .close);
                         return;
                     }
                     validateFsNodeHelloPayload(allocator, parsed.payload_json, required_auth_token) catch |err| {
@@ -690,10 +715,11 @@ fn handleLocalFsConnection(
                             @errorName(err),
                         );
                         defer allocator.free(response);
-                        try writeFsHubFrame(connection, response, .text);
-                        try writeFsHubFrame(connection, "", .close);
+                        try writeFsHubFrameMaybe(connection, stream, &connection_write_mutex, response, .text);
+                        try writeFsHubFrameMaybe(connection, stream, &connection_write_mutex, "", .close);
                         return;
                     };
+                    connection = try local_node.hub.register(stream);
                     fsrpc_negotiated = true;
                 } else if (parsed.fsrpc_type == .fs_t_hello) {
                     validateFsNodeHelloPayload(allocator, parsed.payload_json, required_auth_token) catch |err| {
@@ -704,8 +730,8 @@ fn handleLocalFsConnection(
                             @errorName(err),
                         );
                         defer allocator.free(response);
-                        try writeFsHubFrame(connection, response, .text);
-                        try writeFsHubFrame(connection, "", .close);
+                        try writeFsHubFrameMaybe(connection, stream, &connection_write_mutex, response, .text);
+                        try writeFsHubFrameMaybe(connection, stream, &connection_write_mutex, "", .close);
                         return;
                     };
                 }
@@ -723,24 +749,25 @@ fn handleLocalFsConnection(
                     };
                 };
                 defer handled.deinit(allocator);
+                const live_connection = connection orelse return error.InvalidConnectionState;
 
                 for (handled.events) |event| {
                     const event_json = try fs_node_service.buildInvalidationEventJson(allocator, event);
                     defer allocator.free(event_json);
-                    try writeFsHubFrame(connection, event_json, .text);
+                    try writeFsHubFrame(live_connection, event_json, .text);
                 }
 
                 if (handled.events.len > 0) {
-                    local_node.hub.broadcastInvalidations(connection.id, handled.events);
+                    local_node.hub.broadcastInvalidations(live_connection.id, handled.events);
                 }
-                try writeFsHubFrame(connection, handled.response_json, .text);
+                try writeFsHubFrame(live_connection, handled.response_json, .text);
             },
             0x8 => {
-                writeFsHubFrame(connection, "", .close) catch {};
+                writeFsHubFrameMaybe(connection, stream, &connection_write_mutex, "", .close) catch {};
                 return;
             },
             0x9 => {
-                try writeFsHubFrame(connection, frame.payload, .pong);
+                try writeFsHubFrameMaybe(connection, stream, &connection_write_mutex, frame.payload, .pong);
             },
             0xA => {},
             else => {
@@ -751,7 +778,7 @@ fn handleLocalFsConnection(
                     "unsupported websocket opcode",
                 );
                 defer allocator.free(response);
-                try writeFsHubFrame(connection, response, .text);
+                try writeFsHubFrameMaybe(connection, stream, &connection_write_mutex, response, .text);
             },
         }
     }
