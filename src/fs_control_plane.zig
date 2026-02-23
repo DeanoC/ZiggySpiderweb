@@ -542,7 +542,7 @@ pub const ControlPlane = struct {
         const now = std.time.milliTimestamp();
         try validateDisplayString(name_raw, 128);
         try validateIdentifier(status_raw, 64);
-        try validateDisplayString(vision_raw, 1024);
+        try validateDisplayStringAllowEmpty(vision_raw, 1024);
 
         const project_id = try makeSequentialId(self.allocator, "proj", &self.next_project_id);
         errdefer self.allocator.free(project_id);
@@ -592,7 +592,7 @@ pub const ControlPlane = struct {
             project.name = try self.allocator.dupe(u8, next_name);
         }
         if (getOptionalString(obj, "vision")) |next_vision| {
-            try validateDisplayString(next_vision, 1024);
+            try validateDisplayStringAllowEmpty(next_vision, 1024);
             self.allocator.free(project.vision);
             project.vision = try self.allocator.dupe(u8, next_vision);
         }
@@ -983,7 +983,7 @@ pub const ControlPlane = struct {
             const vision_raw = requested_vision orelse "";
             const status_raw = requested_status orelse "active";
             try validateDisplayString(name_raw, 128);
-            try validateDisplayString(vision_raw, 1024);
+            try validateDisplayStringAllowEmpty(vision_raw, 1024);
             try validateIdentifier(status_raw, 64);
 
             const project_id = try makeSequentialId(self.allocator, "proj", &self.next_project_id);
@@ -1023,7 +1023,7 @@ pub const ControlPlane = struct {
                 project.name = try self.allocator.dupe(u8, next_name);
             }
             if (requested_vision) |next_vision| {
-                try validateDisplayString(next_vision, 1024);
+                try validateDisplayStringAllowEmpty(next_vision, 1024);
                 self.allocator.free(project.vision);
                 project.vision = try self.allocator.dupe(u8, next_vision);
             }
@@ -2416,6 +2416,13 @@ fn validateDisplayString(value: []const u8, max_len: usize) !void {
     }
 }
 
+fn validateDisplayStringAllowEmpty(value: []const u8, max_len: usize) !void {
+    if (value.len > max_len) return ControlPlaneError.InvalidPayload;
+    for (value) |char| {
+        if (char < 0x20) return ControlPlaneError.InvalidPayload;
+    }
+}
+
 fn secureTokenEql(expected: []const u8, candidate: []const u8) bool {
     if (expected.len != candidate.len) return false;
     var diff: u8 = 0;
@@ -3209,6 +3216,41 @@ test "fs_control_plane: projectUp requires project_token for existing project" {
     const get_json = try plane.getProject(get_req);
     defer allocator.free(get_json);
     try std.testing.expect(std.mem.indexOf(u8, get_json, "\"status\":\"paused\"") != null);
+}
+
+test "fs_control_plane: project create/up allow omitted and empty vision" {
+    const allocator = std.testing.allocator;
+    var plane = ControlPlane.init(allocator);
+    defer plane.deinit();
+
+    const created = try plane.createProject("{\"name\":\"Visionless\"}");
+    defer allocator.free(created);
+    try std.testing.expect(std.mem.indexOf(u8, created, "\"vision\":\"\"") != null);
+
+    var parsed_created = try std.json.parseFromSlice(std.json.Value, allocator, created, .{});
+    defer parsed_created.deinit();
+    const project_id = parsed_created.value.object.get("project_id").?.string;
+    const project_token = parsed_created.value.object.get("project_token").?.string;
+
+    const clear_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"project_id\":\"{s}\",\"project_token\":\"{s}\",\"vision\":\"\"}}",
+        .{ project_id, project_token },
+    );
+    defer allocator.free(clear_req);
+    const cleared = try plane.projectUp("agent-vision", clear_req);
+    defer allocator.free(cleared);
+    try std.testing.expect(std.mem.indexOf(u8, cleared, "\"created\":false") != null);
+
+    const get_req = try std.fmt.allocPrint(allocator, "{{\"project_id\":\"{s}\"}}", .{project_id});
+    defer allocator.free(get_req);
+    const fetched = try plane.getProject(get_req);
+    defer allocator.free(fetched);
+    try std.testing.expect(std.mem.indexOf(u8, fetched, "\"vision\":\"\"") != null);
+
+    const up_created = try plane.projectUp("agent-vision", "{\"name\":\"UpNoVision\"}");
+    defer allocator.free(up_created);
+    try std.testing.expect(std.mem.indexOf(u8, up_created, "\"created\":true") != null);
 }
 
 test "fs_control_plane: snapshot encryption envelope roundtrip" {

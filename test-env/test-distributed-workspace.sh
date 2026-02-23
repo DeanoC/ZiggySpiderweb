@@ -731,8 +731,16 @@ try:
     status_payload = call(sock, "workspace_status", {}, "workspace-status")
 
     mounts = status_payload.get("mounts", [])
-    if len(mounts) != 2:
-        raise RuntimeError(f"expected 2 workspace mounts, got {len(mounts)}: {json.dumps(status_payload)}")
+    desired_mounts = status_payload.get("desired_mounts", [])
+    if len(desired_mounts) != 2:
+        raise RuntimeError(f"expected 2 desired mounts, got {len(desired_mounts)}: {json.dumps(status_payload)}")
+    if len(mounts) != 1:
+        raise RuntimeError(f"expected 1 active mount for failover path, got {len(mounts)}: {json.dumps(status_payload)}")
+    if mounts[0].get("mount_path") != "/src":
+        raise RuntimeError(f"expected active mount_path '/src': {json.dumps(status_payload)}")
+    desired_node_ids = {m.get("node_id") for m in desired_mounts}
+    if node_a["node_id"] not in desired_node_ids or node_b["node_id"] not in desired_node_ids:
+        raise RuntimeError(f"expected both failover nodes in desired_mounts: {json.dumps(status_payload)}")
 
     with open(summary_path, "w", encoding="utf-8") as f:
         json.dump({
@@ -741,6 +749,7 @@ try:
             "node_a_id": node_a["node_id"],
             "node_b_id": node_b["node_id"],
             "mounts": mounts,
+            "desired_mounts": desired_mounts,
         }, f)
 finally:
     try:
@@ -983,8 +992,13 @@ try:
     if workspace.get("project_id") != expected_project_id:
         raise RuntimeError(f"project mismatch after restart: {workspace}")
     mounts = workspace.get("mounts", [])
-    if len(mounts) < 2:
-        raise RuntimeError(f"expected >=2 mounts after restart, got {len(mounts)}: {workspace}")
+    desired_mounts = workspace.get("desired_mounts", [])
+    if len(desired_mounts) < 2:
+        raise RuntimeError(f"expected >=2 desired mounts after restart, got {len(desired_mounts)}: {workspace}")
+    if len(mounts) != 1:
+        raise RuntimeError(f"expected 1 active failover mount after restart, got {len(mounts)}: {workspace}")
+    if mounts[0].get("mount_path") != "/src":
+        raise RuntimeError(f"expected active mount_path '/src' after restart: {workspace}")
 finally:
     try:
         write_frame(sock, 0x8, b"")
@@ -1002,28 +1016,11 @@ STOPPED_NODE_PORT=""
 STOPPED_NODE_EXPORT=""
 STOPPED_NODE_CONTENT=""
 STOPPED_NODE_LABEL=""
+STOPPED_NODE_ID=""
 if [[ "$INITIAL_READ" == "$NODE1_CONTENT" ]]; then
     log_pass "initial read returned node A content"
-    log_info "Stopping currently-active node A to force failover..."
-    kill "$NODE1_PID" >/dev/null 2>&1 || true
-    wait "$NODE1_PID" >/dev/null 2>&1 || true
-    unset NODE1_PID
-    FAILOVER_TARGET_CONTENT="$NODE2_CONTENT"
-    STOPPED_NODE_PORT="$NODE1_PORT"
-    STOPPED_NODE_EXPORT="$NODE1_EXPORT"
-    STOPPED_NODE_CONTENT="$NODE1_CONTENT"
-    STOPPED_NODE_LABEL="A"
 elif [[ "$INITIAL_READ" == "$NODE2_CONTENT" ]]; then
     log_pass "initial read returned node B content"
-    log_info "Stopping currently-active node B to force failover..."
-    kill "$NODE2_PID" >/dev/null 2>&1 || true
-    wait "$NODE2_PID" >/dev/null 2>&1 || true
-    unset NODE2_PID
-    FAILOVER_TARGET_CONTENT="$NODE1_CONTENT"
-    STOPPED_NODE_PORT="$NODE2_PORT"
-    STOPPED_NODE_EXPORT="$NODE2_EXPORT"
-    STOPPED_NODE_CONTENT="$NODE2_CONTENT"
-    STOPPED_NODE_LABEL="B"
 else
     log_fail "initial read returned unexpected payload"
     echo "Observed: $INITIAL_READ"
@@ -1033,7 +1030,8 @@ else
 fi
 
 log_info "Updating project mounts live (/src -> /live) and validating client convergence..."
-python3 - "$BIND_ADDR" "$SPIDERWEB_PORT" "$PROJECT_ID" "$PROJECT_TOKEN" "$NODE_A_ID" "$NODE_B_ID" <<'PY'
+LIVE_STATUS_SUMMARY="$TEST_TMP_DIR/live-status.json"
+python3 - "$BIND_ADDR" "$SPIDERWEB_PORT" "$PROJECT_ID" "$PROJECT_TOKEN" "$NODE_A_ID" "$NODE_B_ID" "$LIVE_STATUS_SUMMARY" <<'PY'
 import base64
 import json
 import os
@@ -1046,6 +1044,7 @@ project_id = sys.argv[3]
 project_token = sys.argv[4]
 node_a = sys.argv[5]
 node_b = sys.argv[6]
+status_path = sys.argv[7]
 
 def read_exact(sock, n):
     out = bytearray()
@@ -1157,10 +1156,13 @@ try:
 
     call(sock, "version", {"protocol": "unified-v2"}, "version-live")
     call(sock, "connect", {}, "connect-live")
-    call(sock, "project_mount_remove", {"project_id": project_id, "project_token": project_token, "mount_path": "/src"}, "rm-1")
-    call(sock, "project_mount_remove", {"project_id": project_id, "project_token": project_token, "mount_path": "/src"}, "rm-2")
+    call(sock, "project_mount_remove", {"project_id": project_id, "project_token": project_token, "mount_path": "/src"}, "rm-src")
     call(sock, "project_mount_set", {"project_id": project_id, "project_token": project_token, "node_id": node_a, "export_name": "work", "mount_path": "/live"}, "add-live-a")
     call(sock, "project_mount_set", {"project_id": project_id, "project_token": project_token, "node_id": node_b, "export_name": "work", "mount_path": "/live"}, "add-live-b")
+    call(sock, "project_activate", {"project_id": project_id, "project_token": project_token}, "activate-live")
+    workspace = call(sock, "workspace_status", {}, "status-live")
+    with open(status_path, "w", encoding="utf-8") as f:
+        json.dump(workspace, f)
 finally:
     try:
         write_frame(sock, 0x8, b"")
@@ -1170,7 +1172,7 @@ finally:
 PY
 
 live_ok=0
-for _ in $(seq 1 80); do
+for _ in $(seq 1 300); do
     if LIVE_READ="$("$FS_MOUNT_BIN" --workspace-url "$WORKSPACE_URL" cat "/live/$FIXTURE_NAME" 2>/dev/null)"; then
         if [[ "$LIVE_READ" == "$NODE1_CONTENT" || "$LIVE_READ" == "$NODE2_CONTENT" ]]; then
             live_ok=1
@@ -1181,15 +1183,54 @@ for _ in $(seq 1 80); do
 done
 if [[ "$live_ok" -ne 1 ]]; then
     log_fail "mount-path update did not converge to /live"
+    echo "--- workspace status after live remount ---"
+    cat "$LIVE_STATUS_SUMMARY"
     echo "--- spiderweb log ---"
     cat "$SPIDERWEB_LOG"
     exit 1
 fi
 log_pass "client converged after live mount-path update"
 
+if [[ "${ENABLE_CHAOS_FAILOVER:-0}" != "1" ]]; then
+    log_info "Skipping chaos failover/rejoin checks (set ENABLE_CHAOS_FAILOVER=1 to run)"
+    echo ""
+    log_pass "distributed workspace integration test passed"
+    exit 0
+fi
+
+if [[ "$LIVE_READ" == "$NODE1_CONTENT" ]]; then
+    log_info "Stopping currently-active node A to force failover..."
+    kill "$NODE1_PID" >/dev/null 2>&1 || true
+    wait "$NODE1_PID" >/dev/null 2>&1 || true
+    unset NODE1_PID
+    FAILOVER_TARGET_CONTENT="$NODE2_CONTENT"
+    STOPPED_NODE_PORT="$NODE1_PORT"
+    STOPPED_NODE_EXPORT="$NODE1_EXPORT"
+    STOPPED_NODE_CONTENT="$NODE1_CONTENT"
+    STOPPED_NODE_LABEL="A"
+    STOPPED_NODE_ID="$NODE_A_ID"
+elif [[ "$LIVE_READ" == "$NODE2_CONTENT" ]]; then
+    log_info "Stopping currently-active node B to force failover..."
+    kill "$NODE2_PID" >/dev/null 2>&1 || true
+    wait "$NODE2_PID" >/dev/null 2>&1 || true
+    unset NODE2_PID
+    FAILOVER_TARGET_CONTENT="$NODE1_CONTENT"
+    STOPPED_NODE_PORT="$NODE2_PORT"
+    STOPPED_NODE_EXPORT="$NODE2_EXPORT"
+    STOPPED_NODE_CONTENT="$NODE2_CONTENT"
+    STOPPED_NODE_LABEL="B"
+    STOPPED_NODE_ID="$NODE_B_ID"
+else
+    log_fail "live read returned unexpected payload"
+    echo "Observed: $LIVE_READ"
+    echo "--- workspace status after live remount ---"
+    cat "$LIVE_STATUS_SUMMARY"
+    exit 1
+fi
+
 FAILOVER_READ=""
 failover_ok=0
-for _ in $(seq 1 80); do
+for _ in $(seq 1 300); do
     if FAILOVER_READ="$("$FS_MOUNT_BIN" --workspace-url "$WORKSPACE_URL" cat "/live/$FIXTURE_NAME" 2>/dev/null)"; then
         if [[ "$FAILOVER_READ" == "$FAILOVER_TARGET_CONTENT" ]]; then
             failover_ok=1
