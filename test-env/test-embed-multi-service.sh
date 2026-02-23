@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Integration test for embed-multi-service-node:
 # - boots embedded multi-service node
-# - probes /v1/fs via spiderweb-fs-mount
+# - probes /v2/fs via spiderweb-fs-mount
 # - probes /v1/health via a raw WebSocket handshake
 
 set -euo pipefail
@@ -70,7 +70,7 @@ printf '%s\n' "$FIXTURE_CONTENT" > "$EXPORT_DIR/$FIXTURE_NAME"
 SERVER_LOG="$TEST_TMP_DIR/embed-multi-service.log"
 READDIR_OUT="$TEST_TMP_DIR/readdir.json"
 READDIR_ERR="$TEST_TMP_DIR/readdir.err"
-ENDPOINT="a=ws://$BIND_ADDR:$PORT/v1/fs#work"
+ENDPOINT="a=ws://$BIND_ADDR:$PORT/v2/fs#work"
 
 log_info "Starting embed-multi-service-node on ws://$BIND_ADDR:$PORT ..."
 "$FS_NODE_BIN" \
@@ -80,7 +80,7 @@ log_info "Starting embed-multi-service-node on ws://$BIND_ADDR:$PORT ..."
     > "$SERVER_LOG" 2>&1 &
 SERVER_PID="$!"
 
-log_info "Waiting for /v1/fs readiness..."
+log_info "Waiting for /v2/fs readiness..."
 ready=0
 for _ in $(seq 1 80); do
     if ! kill -0 "$SERVER_PID" >/dev/null 2>&1; then
@@ -98,14 +98,14 @@ for _ in $(seq 1 80); do
 done
 
 if [[ "$ready" -ne 1 ]]; then
-    log_fail "Timed out waiting for /v1/fs readiness"
+    log_fail "Timed out waiting for /v2/fs readiness"
     echo "--- spiderweb-fs-mount stderr ---"
     cat "$READDIR_ERR"
     echo "--- server log ---"
     cat "$SERVER_LOG"
     exit 1
 fi
-log_pass "/v1/fs accepted requests"
+log_pass "/v2/fs accepted requests"
 
 if ! grep -Fq "\"name\":\"$FIXTURE_NAME\"" "$READDIR_OUT"; then
     log_fail "Directory listing did not contain $FIXTURE_NAME"

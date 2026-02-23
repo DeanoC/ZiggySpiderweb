@@ -1,5 +1,6 @@
 const std = @import("std");
 const fs_protocol = @import("fs_protocol.zig");
+const unified = @import("ziggy-spider-protocol").unified;
 
 pub const ClientResponse = struct {
     ok: bool,
@@ -50,6 +51,7 @@ pub const FsClient = struct {
     ) !ClientResponse {
         const req_id = self.next_id;
         self.next_id +%= 1;
+        const expected_type = fsrpcResponseType(op);
 
         const payload = try buildRequestJson(self.allocator, req_id, op, node, handle, args_json);
         defer self.allocator.free(payload);
@@ -61,11 +63,11 @@ pub const FsClient = struct {
 
             switch (frame.opcode) {
                 0x1 => {
-                    if (try fs_protocol.parseMaybeInvalidationEvent(self.allocator, frame.payload)) |event| {
+                    if (try parseMaybeFsInvalidationEvent(self.allocator, frame.payload)) |event| {
                         if (on_event) |callback| callback(on_event_ctx, event);
                         continue;
                     }
-                    return parseResponse(self.allocator, req_id, frame.payload);
+                    return parseResponse(self.allocator, req_id, expected_type, frame.payload);
                 },
                 0x8 => return error.ConnectionClosed,
                 0x9 => {
@@ -93,7 +95,7 @@ pub const FsClient = struct {
 
             switch (frame.opcode) {
                 0x1 => {
-                    if (try fs_protocol.parseMaybeInvalidationEvent(self.allocator, frame.payload)) |event| {
+                    if (try parseMaybeFsInvalidationEvent(self.allocator, frame.payload)) |event| {
                         if (on_event) |callback| callback(on_event_ctx, event);
                     }
                 },
@@ -131,7 +133,7 @@ fn parseWsUrl(url: []const u8) !ParsedUrl {
 
     const slash_idx = std.mem.indexOfScalar(u8, rest, '/') orelse rest.len;
     const host_port = rest[0..slash_idx];
-    const path = if (slash_idx < rest.len) rest[slash_idx..] else "/v1/fs";
+    const path = if (slash_idx < rest.len) rest[slash_idx..] else "/v2/fs";
     if (host_port.len == 0) return error.InvalidUrl;
 
     if (std.mem.lastIndexOfScalar(u8, host_port, ':')) |colon_idx| {
@@ -205,55 +207,71 @@ fn buildRequestJson(
     args_json: ?[]const u8,
 ) ![]u8 {
     const args = args_json orelse "{}";
+    const req_type = fsrpcRequestType(op);
     var payload = std.ArrayListUnmanaged(u8){};
     errdefer payload.deinit(allocator);
 
-    try payload.writer(allocator).print("{{\"t\":\"req\",\"id\":{d},\"op\":\"{s}\"", .{ req_id, fs_protocol.opName(op) });
+    try payload.writer(allocator).print(
+        "{{\"channel\":\"fsrpc\",\"type\":\"{s}\",\"tag\":{d}",
+        .{ unified.fsrpcTypeName(req_type), req_id },
+    );
     if (node) |node_id| {
         try payload.writer(allocator).print(",\"node\":{d}", .{node_id});
     }
     if (handle) |handle_id| {
         try payload.writer(allocator).print(",\"h\":{d}", .{handle_id});
     }
-    try payload.writer(allocator).print(",\"a\":{s}}}", .{args});
+    try payload.writer(allocator).print(",\"payload\":{s}}}", .{args});
 
     return payload.toOwnedSlice(allocator);
 }
 
-fn parseResponse(allocator: std.mem.Allocator, expected_id: u32, payload: []const u8) !ClientResponse {
+fn parseResponse(
+    allocator: std.mem.Allocator,
+    expected_id: u32,
+    expected_type: unified.FsrpcType,
+    payload: []const u8,
+) !ClientResponse {
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
     defer parsed.deinit();
 
     if (parsed.value != .object) return error.InvalidResponse;
     const root = parsed.value.object;
-    const t = root.get("t") orelse return error.InvalidResponse;
-    if (t != .string or !std.mem.eql(u8, t.string, "res")) return error.InvalidResponse;
+    const channel = root.get("channel") orelse return error.InvalidResponse;
+    if (channel != .string or !std.mem.eql(u8, channel.string, "fsrpc")) return error.InvalidResponse;
 
-    const id = root.get("id") orelse return error.InvalidResponse;
-    if (id != .integer or id.integer < 0 or id.integer > std.math.maxInt(u32)) return error.InvalidResponse;
-    if (@as(u32, @intCast(id.integer)) != expected_id) return error.RequestIdMismatch;
+    const type_value = root.get("type") orelse return error.InvalidResponse;
+    if (type_value != .string) return error.InvalidResponse;
+    const response_type = unified.fsrpcTypeFromString(type_value.string);
 
-    const ok = root.get("ok") orelse return error.InvalidResponse;
-    if (ok != .bool) return error.InvalidResponse;
+    const tag_raw = root.get("tag") orelse return error.InvalidResponse;
+    if (tag_raw != .integer or tag_raw.integer < 0 or tag_raw.integer > std.math.maxInt(u32)) return error.InvalidResponse;
+    if (@as(u32, @intCast(tag_raw.integer)) != expected_id) return error.RequestIdMismatch;
 
-    if (!ok.bool) {
-        const err = root.get("err") orelse return error.InvalidResponse;
+    if (response_type == .fs_err) {
+        const err = root.get("error") orelse return error.InvalidResponse;
         if (err != .object) return error.InvalidResponse;
-        const no = err.object.get("no") orelse return error.InvalidResponse;
-        const msg = err.object.get("msg") orelse return error.InvalidResponse;
-        if (no != .integer or no.integer < std.math.minInt(i32) or no.integer > std.math.maxInt(i32) or msg != .string) {
-            return error.InvalidResponse;
-        }
+
+        const errno_raw = err.object.get("errno") orelse err.object.get("no") orelse return error.InvalidResponse;
+        const message_raw = err.object.get("message") orelse err.object.get("msg") orelse return error.InvalidResponse;
+        if (errno_raw != .integer or errno_raw.integer < std.math.minInt(i32) or errno_raw.integer > std.math.maxInt(i32)) return error.InvalidResponse;
+        if (message_raw != .string) return error.InvalidResponse;
 
         return .{
             .ok = false,
-            .err_no = @intCast(no.integer),
-            .err_msg = try allocator.dupe(u8, msg.string),
+            .err_no = @intCast(errno_raw.integer),
+            .err_msg = try allocator.dupe(u8, message_raw.string),
             .result_json = try allocator.dupe(u8, ""),
         };
     }
 
-    const result_value = root.get("r") orelse return .{
+    if (!std.mem.eql(u8, type_value.string, unified.fsrpcTypeName(expected_type))) return error.InvalidResponse;
+
+    if (root.get("ok")) |ok| {
+        if (ok != .bool or !ok.bool) return error.InvalidResponse;
+    }
+
+    const result_value = root.get("payload") orelse return .{
         .ok = true,
         .err_msg = try allocator.dupe(u8, ""),
         .result_json = try allocator.dupe(u8, "{}"),
@@ -264,6 +282,124 @@ fn parseResponse(allocator: std.mem.Allocator, expected_id: u32, payload: []cons
         .err_msg = try allocator.dupe(u8, ""),
         .result_json = result_json,
     };
+}
+
+fn fsrpcRequestType(op: fs_protocol.Op) unified.FsrpcType {
+    return switch (op) {
+        .HELLO => .fs_t_hello,
+        .EXPORTS => .fs_t_exports,
+        .LOOKUP => .fs_t_lookup,
+        .GETATTR => .fs_t_getattr,
+        .READDIRP => .fs_t_readdirp,
+        .SYMLINK => .fs_t_symlink,
+        .SETXATTR => .fs_t_setxattr,
+        .GETXATTR => .fs_t_getxattr,
+        .LISTXATTR => .fs_t_listxattr,
+        .REMOVEXATTR => .fs_t_removexattr,
+        .OPEN => .fs_t_open,
+        .READ => .fs_t_read,
+        .CLOSE => .fs_t_close,
+        .LOCK => .fs_t_lock,
+        .CREATE => .fs_t_create,
+        .WRITE => .fs_t_write,
+        .TRUNCATE => .fs_t_truncate,
+        .UNLINK => .fs_t_unlink,
+        .MKDIR => .fs_t_mkdir,
+        .RMDIR => .fs_t_rmdir,
+        .RENAME => .fs_t_rename,
+        .STATFS => .fs_t_statfs,
+        .INVAL, .INVAL_DIR => @panic("invalidation events are not request operations"),
+    };
+}
+
+fn fsrpcResponseType(op: fs_protocol.Op) unified.FsrpcType {
+    return switch (op) {
+        .HELLO => .fs_r_hello,
+        .EXPORTS => .fs_r_exports,
+        .LOOKUP => .fs_r_lookup,
+        .GETATTR => .fs_r_getattr,
+        .READDIRP => .fs_r_readdirp,
+        .SYMLINK => .fs_r_symlink,
+        .SETXATTR => .fs_r_setxattr,
+        .GETXATTR => .fs_r_getxattr,
+        .LISTXATTR => .fs_r_listxattr,
+        .REMOVEXATTR => .fs_r_removexattr,
+        .OPEN => .fs_r_open,
+        .READ => .fs_r_read,
+        .CLOSE => .fs_r_close,
+        .LOCK => .fs_r_lock,
+        .CREATE => .fs_r_create,
+        .WRITE => .fs_r_write,
+        .TRUNCATE => .fs_r_truncate,
+        .UNLINK => .fs_r_unlink,
+        .MKDIR => .fs_r_mkdir,
+        .RMDIR => .fs_r_rmdir,
+        .RENAME => .fs_r_rename,
+        .STATFS => .fs_r_statfs,
+        .INVAL, .INVAL_DIR => @panic("invalidation events are not request operations"),
+    };
+}
+
+fn parseMaybeFsInvalidationEvent(allocator: std.mem.Allocator, payload: []const u8) !?fs_protocol.InvalidationEvent {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const root = parsed.value.object;
+
+    const channel = root.get("channel") orelse return null;
+    if (channel != .string or !std.mem.eql(u8, channel.string, "fsrpc")) return null;
+
+    const type_value = root.get("type") orelse return null;
+    if (type_value != .string) return null;
+
+    const event_payload = root.get("payload") orelse return null;
+    if (event_payload != .object) return error.InvalidResponse;
+    const args = event_payload.object;
+
+    if (std.mem.eql(u8, type_value.string, "fsrpc.e_fs_inval")) {
+        const node_raw = args.get("node") orelse return error.InvalidResponse;
+        if (node_raw != .integer or node_raw.integer < 0) return error.InvalidResponse;
+
+        const what = if (args.get("what")) |what_raw| blk: {
+            if (what_raw != .string) return error.InvalidResponse;
+            if (std.mem.eql(u8, what_raw.string, "attr")) break :blk fs_protocol.InvalidationWhat.attr;
+            if (std.mem.eql(u8, what_raw.string, "data")) break :blk fs_protocol.InvalidationWhat.data;
+            if (std.mem.eql(u8, what_raw.string, "all")) break :blk fs_protocol.InvalidationWhat.all;
+            return error.InvalidResponse;
+        } else fs_protocol.InvalidationWhat.all;
+
+        const gen = if (args.get("gen")) |gen_raw| blk: {
+            if (gen_raw != .integer or gen_raw.integer < 0) return error.InvalidResponse;
+            break :blk @as(u64, @intCast(gen_raw.integer));
+        } else null;
+
+        return .{
+            .INVAL = .{
+                .node = @intCast(node_raw.integer),
+                .what = what,
+                .gen = gen,
+            },
+        };
+    }
+
+    if (std.mem.eql(u8, type_value.string, "fsrpc.e_fs_inval_dir")) {
+        const dir_raw = args.get("dir") orelse return error.InvalidResponse;
+        if (dir_raw != .integer or dir_raw.integer < 0) return error.InvalidResponse;
+
+        const dir_gen = if (args.get("dir_gen")) |gen_raw| blk: {
+            if (gen_raw != .integer or gen_raw.integer < 0) return error.InvalidResponse;
+            break :blk @as(u64, @intCast(gen_raw.integer));
+        } else null;
+
+        return .{
+            .INVAL_DIR = .{
+                .dir = @intCast(dir_raw.integer),
+                .dir_gen = dir_gen,
+            },
+        };
+    }
+
+    return null;
 }
 
 fn readServerFrame(allocator: std.mem.Allocator, stream: *std.net.Stream, max_payload_bytes: usize) !Frame {
@@ -371,33 +507,33 @@ fn waitForReadable(stream: *std.net.Stream, timeout_ms: i32) !bool {
 }
 
 test "fs_client: parseWsUrl supports explicit port" {
-    const parsed = try parseWsUrl("ws://127.0.0.1:18891/v1/fs");
+    const parsed = try parseWsUrl("ws://127.0.0.1:18891/v2/fs");
     try std.testing.expectEqualStrings("127.0.0.1", parsed.host);
     try std.testing.expectEqual(@as(u16, 18891), parsed.port);
-    try std.testing.expectEqualStrings("/v1/fs", parsed.path);
+    try std.testing.expectEqualStrings("/v2/fs", parsed.path);
 }
 
 test "fs_client: parseWsUrl defaults path and port" {
     const parsed = try parseWsUrl("ws://localhost");
     try std.testing.expectEqualStrings("localhost", parsed.host);
     try std.testing.expectEqual(@as(u16, 80), parsed.port);
-    try std.testing.expectEqualStrings("/v1/fs", parsed.path);
+    try std.testing.expectEqualStrings("/v2/fs", parsed.path);
 }
 
-test "fs_client: parseResponse rejects id above u32 range" {
+test "fs_client: parseResponse rejects tag above u32 range" {
     const allocator = std.testing.allocator;
-    const payload = "{\"t\":\"res\",\"id\":4294967296,\"ok\":true,\"r\":{}}";
-    try std.testing.expectError(error.InvalidResponse, parseResponse(allocator, 1, payload));
+    const payload = "{\"channel\":\"fsrpc\",\"type\":\"fsrpc.r_fs_hello\",\"tag\":4294967296,\"ok\":true,\"payload\":{}}";
+    try std.testing.expectError(error.InvalidResponse, parseResponse(allocator, 1, .fs_r_hello, payload));
 }
 
-test "fs_client: parseResponse rejects err.no above i32 range" {
+test "fs_client: parseResponse rejects fs error errno above i32 range" {
     const allocator = std.testing.allocator;
-    const payload = "{\"t\":\"res\",\"id\":1,\"ok\":false,\"err\":{\"no\":2147483648,\"msg\":\"boom\"}}";
-    try std.testing.expectError(error.InvalidResponse, parseResponse(allocator, 1, payload));
+    const payload = "{\"channel\":\"fsrpc\",\"type\":\"fsrpc.err_fs\",\"tag\":1,\"ok\":false,\"error\":{\"errno\":2147483648,\"message\":\"boom\"}}";
+    try std.testing.expectError(error.InvalidResponse, parseResponse(allocator, 1, .fs_r_hello, payload));
 }
 
-test "fs_client: parseResponse rejects err.no below i32 range" {
+test "fs_client: parseResponse rejects fs error errno below i32 range" {
     const allocator = std.testing.allocator;
-    const payload = "{\"t\":\"res\",\"id\":1,\"ok\":false,\"err\":{\"no\":-2147483649,\"msg\":\"boom\"}}";
-    try std.testing.expectError(error.InvalidResponse, parseResponse(allocator, 1, payload));
+    const payload = "{\"channel\":\"fsrpc\",\"type\":\"fsrpc.err_fs\",\"tag\":1,\"ok\":false,\"error\":{\"errno\":-2147483649,\"message\":\"boom\"}}";
+    try std.testing.expectError(error.InvalidResponse, parseResponse(allocator, 1, .fs_r_hello, payload));
 }

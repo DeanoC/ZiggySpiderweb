@@ -51,79 +51,150 @@ pub const FuseAdapter = struct {
     }
 
     pub fn getattr(self: *FuseAdapter, path: []const u8) ![]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         return self.router.getattr(path);
     }
 
     pub fn readdir(self: *FuseAdapter, path: []const u8, cookie: u64, max_entries: u32) ![]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         return self.router.readdir(path, cookie, max_entries);
     }
 
     pub fn statfs(self: *FuseAdapter, path: []const u8) ![]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         return self.router.statfs(path);
     }
 
     pub fn open(self: *FuseAdapter, path: []const u8, flags: u32) !fs_router.OpenFile {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         return self.router.open(path, flags);
     }
 
+    pub fn openAndStoreHandle(self: *FuseAdapter, path: []const u8, flags: u32) !u64 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const open_file = try self.router.open(path, flags);
+        errdefer self.router.close(open_file) catch {};
+        const local_id = self.reserveLocalHandleLocked();
+        try self.handles.put(self.allocator, local_id, open_file);
+        return local_id;
+    }
+
     pub fn read(self: *FuseAdapter, file: fs_router.OpenFile, off: u64, len: u32) ![]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         return self.router.read(file, off, len);
     }
 
     pub fn release(self: *FuseAdapter, file: fs_router.OpenFile) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         try self.router.close(file);
     }
 
     pub fn create(self: *FuseAdapter, path: []const u8, mode: u32, flags: u32) !fs_router.OpenFile {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         return self.router.create(path, mode, flags);
     }
 
+    pub fn createAndStoreHandle(self: *FuseAdapter, path: []const u8, mode: u32, flags: u32) !u64 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const open_file = try self.router.create(path, mode, flags);
+        errdefer self.router.close(open_file) catch {};
+        const local_id = self.reserveLocalHandleLocked();
+        try self.handles.put(self.allocator, local_id, open_file);
+        return local_id;
+    }
+
     pub fn write(self: *FuseAdapter, file: fs_router.OpenFile, off: u64, data: []const u8) !u32 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         return self.router.write(file, off, data);
     }
 
     pub fn truncate(self: *FuseAdapter, path: []const u8, size: u64) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         try self.router.truncate(path, size);
     }
 
     pub fn unlink(self: *FuseAdapter, path: []const u8) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         try self.router.unlink(path);
     }
 
     pub fn mkdir(self: *FuseAdapter, path: []const u8) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         try self.router.mkdir(path);
     }
 
     pub fn rmdir(self: *FuseAdapter, path: []const u8) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         try self.router.rmdir(path);
     }
 
     pub fn rename(self: *FuseAdapter, old_path: []const u8, new_path: []const u8) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         try self.router.rename(old_path, new_path);
     }
 
     pub fn symlink(self: *FuseAdapter, target: []const u8, link_path: []const u8) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         try self.router.symlink(target, link_path);
     }
 
     pub fn setxattr(self: *FuseAdapter, path: []const u8, name: []const u8, value: []const u8, flags: u32) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         try self.router.setxattr(path, name, value, flags);
     }
 
     pub fn getxattr(self: *FuseAdapter, path: []const u8, name: []const u8) ![]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         return self.router.getxattr(path, name);
     }
 
     pub fn listxattr(self: *FuseAdapter, path: []const u8) ![]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         return self.router.listxattr(path);
     }
 
     pub fn removexattr(self: *FuseAdapter, path: []const u8, name: []const u8) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         try self.router.removexattr(path, name);
     }
 
     pub fn lock(self: *FuseAdapter, file: fs_router.OpenFile, mode: fs_router.LockMode, wait: bool) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         try self.router.lock(file, mode, wait);
+    }
+
+    pub fn tryReconcileEndpointsIfIdle(
+        self: *FuseAdapter,
+        endpoint_configs: []const fs_router.EndpointConfig,
+    ) !bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.handles.count() != 0) return false;
+        try self.router.reconcileEndpoints(endpoint_configs);
+        return true;
     }
 
     pub fn mount(self: *FuseAdapter, mountpoint: []const u8) !void {
@@ -194,18 +265,13 @@ pub const FuseAdapter = struct {
         if (rc != 0) return error.FuseMainFailed;
     }
 
-    fn storeOpenHandle(self: *FuseAdapter, open_file: fs_router.OpenFile) !u64 {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
+    fn reserveLocalHandleLocked(self: *FuseAdapter) u64 {
         var local_id = self.next_local_handle;
         self.next_local_handle +%= 1;
         if (local_id == 0) {
             local_id = self.next_local_handle;
             self.next_local_handle +%= 1;
         }
-
-        try self.handles.put(self.allocator, local_id, open_file);
         return local_id;
     }
 
@@ -278,17 +344,10 @@ fn cReaddir(
 
     if (std.mem.eql(u8, path, "/")) {
         if (filler == null) return -fs_protocol.Errno.EINVAL;
-        if (filler.?(buf, ".", null, 0, c.FUSE_FILL_DIR_DEFAULTS) != 0) return 0;
-        if (filler.?(buf, "..", null, 0, c.FUSE_FILL_DIR_DEFAULTS) != 0) return 0;
-
-        var idx: usize = 0;
-        while (idx < adapter.router.endpointCount()) : (idx += 1) {
-            const name = adapter.router.endpointName(idx) orelse continue;
-            const name_z = adapter.allocator.dupeZ(u8, name) catch return -fs_protocol.Errno.EIO;
-            defer adapter.allocator.free(name_z);
-            if (filler.?(buf, @ptrCast(name_z.ptr), null, 0, c.FUSE_FILL_DIR_DEFAULTS) != 0) break;
+        if (off <= 0) {
+            if (filler.?(buf, ".", null, 0, c.FUSE_FILL_DIR_DEFAULTS) != 0) return 0;
+            if (filler.?(buf, "..", null, 0, c.FUSE_FILL_DIR_DEFAULTS) != 0) return 0;
         }
-        return 0;
     }
 
     const cookie: u64 = if (off <= 0) 0 else @intCast(off);
@@ -328,14 +387,11 @@ fn cOpen(path_c: [*c]const u8, fi: ?*c.struct_fuse_file_info) callconv(.c) c_int
     if (path_c == null) return -fs_protocol.Errno.EINVAL;
     const path = std.mem.span(path_c);
     const flags = if (fi) |info| @as(u32, @intCast(c.spiderweb_fi_get_flags(info))) else @as(u32, 0);
-    const opened = adapter.open(path, flags) catch |err| return toFuseError(err);
     if (fi) |info| {
-        const local_id = adapter.storeOpenHandle(opened) catch {
-            adapter.release(opened) catch {};
-            return -fs_protocol.Errno.EIO;
-        };
+        const local_id = adapter.openAndStoreHandle(path, flags) catch |err| return toFuseError(err);
         c.spiderweb_fi_set_fh(info, local_id);
     } else {
+        const opened = adapter.open(path, flags) catch |err| return toFuseError(err);
         adapter.release(opened) catch {};
     }
     return 0;
@@ -432,14 +488,11 @@ fn cCreate(path_c: [*c]const u8, mode: c.mode_t, fi: ?*c.struct_fuse_file_info) 
     if (path_c == null) return -fs_protocol.Errno.EINVAL;
     const path = std.mem.span(path_c);
     const flags = if (fi) |info| @as(u32, @intCast(c.spiderweb_fi_get_flags(info))) else @as(u32, 2);
-    const opened = adapter.create(path, @intCast(mode), flags) catch |err| return toFuseError(err);
     if (fi) |info| {
-        const local_id = adapter.storeOpenHandle(opened) catch {
-            adapter.release(opened) catch {};
-            return -fs_protocol.Errno.EIO;
-        };
+        const local_id = adapter.createAndStoreHandle(path, @intCast(mode), flags) catch |err| return toFuseError(err);
         c.spiderweb_fi_set_fh(info, local_id);
     } else {
+        const opened = adapter.create(path, @intCast(mode), flags) catch |err| return toFuseError(err);
         adapter.release(opened) catch {};
     }
     return 0;
