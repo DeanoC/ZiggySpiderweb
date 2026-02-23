@@ -176,10 +176,18 @@ fn isOperatorTokenProtectedMutation(op_type: []const u8) bool {
         std.mem.eql(u8, op_type, "control.project_create") or
         std.mem.eql(u8, op_type, "control.project_update") or
         std.mem.eql(u8, op_type, "control.project_delete") or
+        std.mem.eql(u8, op_type, "control.project_activate") or
+        std.mem.eql(u8, op_type, "control.project_up") or
         std.mem.eql(u8, op_type, "control.project_mount_set") or
         std.mem.eql(u8, op_type, "control.project_mount_remove") or
         std.mem.eql(u8, op_type, "control.project_token_rotate") or
         std.mem.eql(u8, op_type, "control.project_token_revoke");
+}
+
+test "control_cli: operator token mutation whitelist includes project activate and up" {
+    try std.testing.expect(isOperatorTokenProtectedMutation("control.project_activate"));
+    try std.testing.expect(isOperatorTokenProtectedMutation("control.project_up"));
+    try std.testing.expect(!isOperatorTokenProtectedMutation("control.workspace_status"));
 }
 
 const ControlSend = struct {

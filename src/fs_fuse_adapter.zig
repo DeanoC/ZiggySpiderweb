@@ -327,36 +327,10 @@ fn cReaddir(
 
     if (std.mem.eql(u8, path, "/")) {
         if (filler == null) return -fs_protocol.Errno.EINVAL;
-        if (filler.?(buf, ".", null, 0, c.FUSE_FILL_DIR_DEFAULTS) != 0) return 0;
-        if (filler.?(buf, "..", null, 0, c.FUSE_FILL_DIR_DEFAULTS) != 0) return 0;
-
-        var emitted = std.ArrayListUnmanaged([]const u8){};
-        defer emitted.deinit(adapter.allocator);
-
-        var idx: usize = 0;
-        while (idx < adapter.router.endpointCount()) : (idx += 1) {
-            const mount_path = adapter.router.endpointMountPath(idx) orelse continue;
-            const trimmed = std.mem.trimLeft(u8, mount_path, "/");
-            if (trimmed.len == 0) continue;
-            const slash = std.mem.indexOfScalar(u8, trimmed, '/') orelse trimmed.len;
-            if (slash == 0) continue;
-            const name = trimmed[0..slash];
-
-            var exists = false;
-            for (emitted.items) |seen| {
-                if (std.mem.eql(u8, seen, name)) {
-                    exists = true;
-                    break;
-                }
-            }
-            if (exists) continue;
-            emitted.append(adapter.allocator, name) catch return -fs_protocol.Errno.EIO;
-
-            const name_z = adapter.allocator.dupeZ(u8, name) catch return -fs_protocol.Errno.EIO;
-            defer adapter.allocator.free(name_z);
-            if (filler.?(buf, @ptrCast(name_z.ptr), null, 0, c.FUSE_FILL_DIR_DEFAULTS) != 0) break;
+        if (off <= 0) {
+            if (filler.?(buf, ".", null, 0, c.FUSE_FILL_DIR_DEFAULTS) != 0) return 0;
+            if (filler.?(buf, "..", null, 0, c.FUSE_FILL_DIR_DEFAULTS) != 0) return 0;
         }
-        return 0;
     }
 
     const cookie: u64 = if (off <= 0) 0 else @intCast(off);
