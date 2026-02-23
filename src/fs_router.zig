@@ -3,6 +3,8 @@ const fs_protocol = @import("fs_protocol.zig");
 const fs_client = @import("fs_client.zig");
 const fs_cache = @import("fs_cache.zig");
 const fs_source_policy = @import("fs_source_policy.zig");
+const fsrpc_node_protocol_version = "unified-v2-fs";
+const fsrpc_node_proto_id: i64 = 2;
 
 const RouterError = error{
     InvalidPath,
@@ -29,6 +31,8 @@ pub const EndpointConfig = struct {
     name: []const u8,
     url: []const u8,
     export_name: ?[]const u8 = null,
+    mount_path: ?[]const u8 = null,
+    auth_token: ?[]const u8 = null,
 };
 
 pub const LockMode = enum {
@@ -41,6 +45,8 @@ const Endpoint = struct {
     name: []u8,
     url: []u8,
     export_name: ?[]u8,
+    mount_path: []u8,
+    auth_token: ?[]u8,
     root_node_id: u64,
     export_read_only: ?bool = null,
     source_kind: ?[]u8 = null,
@@ -64,6 +70,8 @@ const Endpoint = struct {
         allocator.free(self.name);
         allocator.free(self.url);
         if (self.export_name) |value| allocator.free(value);
+        allocator.free(self.mount_path);
+        if (self.auth_token) |value| allocator.free(value);
         self.clearExportMetadata(allocator);
         self.* = undefined;
     }
@@ -109,6 +117,11 @@ const ResolvedNode = struct {
     name: ?[]const u8,
 };
 
+const PathCandidate = struct {
+    endpoint_index: usize,
+    relative_path: []const u8,
+};
+
 const PendingInvalidation = struct {
     endpoint_index: u16,
     event: fs_protocol.InvalidationEvent,
@@ -127,6 +140,7 @@ pub const Router = struct {
     block_size: u32 = 256 * 1024,
     health_check_interval_ms: i64 = 2_000,
     unhealthy_retry_interval_ms: i64 = 1_500,
+    failover_events_total: u64 = 0,
 
     pub fn init(allocator: std.mem.Allocator, endpoint_configs: []const EndpointConfig) !Router {
         var router = Router{
@@ -142,10 +156,35 @@ pub const Router = struct {
         return router;
     }
 
+    pub fn reconcileEndpoints(self: *Router, endpoint_configs: []const EndpointConfig) !void {
+        try self.replaceEndpoints(endpoint_configs);
+    }
+
+    pub fn replaceEndpoints(self: *Router, endpoint_configs: []const EndpointConfig) !void {
+        const attr_ttl = self.attr_cache.ttl_ms;
+        const dir_ttl = self.dir_cache.ttl_ms;
+        const negative_ttl = self.negative_cache.ttl_ms;
+        const read_capacity = self.read_cache.capacity_blocks;
+
+        self.clearEndpoints();
+        self.clearPendingInvalidations();
+
+        self.attr_cache.deinit();
+        self.dir_cache.deinit();
+        self.negative_cache.deinit();
+        self.read_cache.deinit();
+        self.attr_cache = fs_cache.AttrCache.init(self.allocator, attr_ttl);
+        self.dir_cache = fs_cache.DirEntryCache.init(self.allocator, dir_ttl);
+        self.negative_cache = fs_cache.NegativeCache.init(self.allocator, negative_ttl);
+        self.read_cache = fs_cache.ReadBlockCache.init(self.allocator, read_capacity);
+
+        for (endpoint_configs) |cfg| try self.addEndpoint(cfg);
+    }
+
     pub fn deinit(self: *Router) void {
-        for (self.endpoints.items, 0..) |_, endpoint_index| self.stopEventPump(endpoint_index);
-        for (self.endpoints.items) |*endpoint| endpoint.deinit(self.allocator);
+        self.clearEndpoints();
         self.endpoints.deinit(self.allocator);
+        self.clearPendingInvalidations();
         self.pending_invalidations.deinit(self.allocator);
         self.attr_cache.deinit();
         self.dir_cache.deinit();
@@ -166,6 +205,11 @@ pub const Router = struct {
         return self.endpoints.items[index].name;
     }
 
+    pub fn endpointMountPath(self: *const Router, index: usize) ?[]const u8 {
+        if (index >= self.endpoints.items.len) return null;
+        return self.endpoints.items[index].mount_path;
+    }
+
     pub fn statusJson(self: *Router, force_probe: bool) ![]u8 {
         self.drainPendingInvalidations();
         if (force_probe) {
@@ -178,7 +222,10 @@ pub const Router = struct {
 
         var out = std.ArrayListUnmanaged(u8){};
         errdefer out.deinit(self.allocator);
-        try out.appendSlice(self.allocator, "{\"endpoints\":[");
+        try out.writer(self.allocator).print(
+            "{{\"metrics\":{{\"failover_events_total\":{d}}},\"endpoints\":[",
+            .{self.failover_events_total},
+        );
 
         for (self.endpoints.items, 0..) |endpoint, endpoint_index| {
             if (endpoint_index != 0) try out.append(self.allocator, ',');
@@ -189,6 +236,8 @@ pub const Router = struct {
             defer self.allocator.free(escaped_url);
             const escaped_export = try fs_protocol.jsonEscape(self.allocator, endpoint.export_name orelse "");
             defer self.allocator.free(escaped_export);
+            const escaped_mount = try fs_protocol.jsonEscape(self.allocator, endpoint.mount_path);
+            defer self.allocator.free(escaped_mount);
             const source_kind_json = if (endpoint.source_kind) |value| blk: {
                 const escaped = try fs_protocol.jsonEscape(self.allocator, value);
                 defer self.allocator.free(escaped);
@@ -203,10 +252,11 @@ pub const Router = struct {
             defer self.allocator.free(source_id_json);
 
             try out.writer(self.allocator).print(
-                "{{\"idx\":{d},\"name\":\"{s}\",\"url\":\"{s}\",\"export\":\"{s}\",\"root\":{d},\"export_ro\":{s},\"source_kind\":{s},\"source_id\":{s},\"caps\":{{\"native_watch\":{s},\"case_sensitive\":{s}}},\"healthy\":{s},\"has_client\":{s},\"consecutive_failures\":{d},\"last_health_check_ms\":{d},\"last_success_ms\":{d},\"last_failure_ms\":{d}}}",
+                "{{\"idx\":{d},\"name\":\"{s}\",\"mount_path\":\"{s}\",\"url\":\"{s}\",\"export\":\"{s}\",\"root\":{d},\"export_ro\":{s},\"source_kind\":{s},\"source_id\":{s},\"caps\":{{\"native_watch\":{s},\"case_sensitive\":{s}}},\"healthy\":{s},\"has_client\":{s},\"has_auth\":{s},\"consecutive_failures\":{d},\"last_health_check_ms\":{d},\"last_success_ms\":{d},\"last_failure_ms\":{d}}}",
                 .{
                     endpoint_index,
                     escaped_name,
+                    escaped_mount,
                     escaped_url,
                     escaped_export,
                     endpoint.root_node_id,
@@ -217,6 +267,7 @@ pub const Router = struct {
                     optionalBoolJson(endpoint.caps_case_sensitive),
                     if (endpoint.healthy) "true" else "false",
                     if (endpoint.client != null) "true" else "false",
+                    if (endpoint.auth_token != null) "true" else "false",
                     endpoint.consecutive_failures,
                     endpoint.last_health_check_ms,
                     endpoint.last_success_ms,
@@ -233,6 +284,14 @@ pub const Router = struct {
         self.drainPendingInvalidations();
         if (std.mem.eql(u8, path, "/")) {
             return self.allocator.dupe(u8, "{\"id\":1,\"k\":2,\"m\":16877,\"n\":2,\"u\":0,\"g\":0,\"sz\":0,\"at\":0,\"mt\":0,\"ct\":0,\"gen\":0}");
+        }
+        if (self.isVirtualDirectoryPath(path)) {
+            const node_id = virtualDirNodeId(path);
+            return std.fmt.allocPrint(
+                self.allocator,
+                "{{\"id\":{d},\"k\":2,\"m\":16877,\"n\":2,\"u\":0,\"g\":0,\"sz\":0,\"at\":0,\"mt\":0,\"ct\":0,\"gen\":0}}",
+                .{node_id},
+            );
         }
 
         const node = try self.resolvePath(path, false, .read_data);
@@ -253,6 +312,9 @@ pub const Router = struct {
 
     pub fn readdir(self: *Router, path: []const u8, cookie: u64, max_entries: u32) ![]u8 {
         self.drainPendingInvalidations();
+        if (self.isVirtualDirectoryPath(path)) {
+            return self.buildVirtualDirectoryListing(path, cookie, max_entries);
+        }
         const node = try self.resolvePath(path, false, .read_data);
         const args = try std.fmt.allocPrint(self.allocator, "{{\"cookie\":{d},\"max\":{d}}}", .{ cookie, max_entries });
         defer self.allocator.free(args);
@@ -687,10 +749,19 @@ pub const Router = struct {
 
     fn addEndpoint(self: *Router, cfg: EndpointConfig) !void {
         const endpoint_index = self.endpoints.items.len;
+        const mount_seed = if (cfg.mount_path) |path| path else blk: {
+            break :blk try std.fmt.allocPrint(self.allocator, "/{s}", .{cfg.name});
+        };
+        defer if (cfg.mount_path == null) self.allocator.free(mount_seed);
+        const mount_path = try normalizeMountPath(self.allocator, mount_seed);
+        errdefer self.allocator.free(mount_path);
+
         try self.endpoints.append(self.allocator, .{
             .name = try self.allocator.dupe(u8, cfg.name),
             .url = try self.allocator.dupe(u8, cfg.url),
             .export_name = if (cfg.export_name) |value| try self.allocator.dupe(u8, value) else null,
+            .mount_path = mount_path,
+            .auth_token = if (cfg.auth_token) |value| try self.allocator.dupe(u8, value) else null,
             .root_node_id = 0,
             .client = null,
             .healthy = false,
@@ -708,7 +779,7 @@ pub const Router = struct {
         self.reconnectEndpoint(endpoint_index) catch |err| {
             if (isEndpointFailureError(err)) {
                 const endpoint = &self.endpoints.items[endpoint_index];
-                if (self.seedRootFromAlias(cfg.name, endpoint_index)) |seeded_root| {
+                if (self.seedRootFromMountPath(endpoint.mount_path, endpoint_index)) |seeded_root| {
                     endpoint.root_node_id = seeded_root;
                 }
                 endpoint.healthy = false;
@@ -720,24 +791,61 @@ pub const Router = struct {
         };
     }
 
+    fn clearEndpoints(self: *Router) void {
+        for (self.endpoints.items, 0..) |_, endpoint_index| self.stopEventPump(endpoint_index);
+        for (self.endpoints.items) |*endpoint| endpoint.deinit(self.allocator);
+        self.endpoints.clearRetainingCapacity();
+    }
+
+    fn clearPendingInvalidations(self: *Router) void {
+        self.pending_invalidations_mutex.lock();
+        var pending = self.pending_invalidations;
+        self.pending_invalidations = .{};
+        self.pending_invalidations_mutex.unlock();
+        pending.deinit(self.allocator);
+    }
+
     fn resolvePath(
         self: *Router,
         path: []const u8,
         require_writable: bool,
         desired_op: fs_source_policy.Operation,
     ) !ResolvedNode {
-        const parsed = try parseEndpointPath(path);
+        if (path.len == 0 or path[0] != '/') return RouterError.InvalidPath;
+
+        var matched_prefix_len: usize = 0;
         var saw_matching_endpoint = false;
+        for (self.endpoints.items) |endpoint| {
+            if (matchPathToMount(path, endpoint.mount_path)) |matched| {
+                saw_matching_endpoint = true;
+                if (matched.mount_path_len > matched_prefix_len) {
+                    matched_prefix_len = matched.mount_path_len;
+                }
+            }
+        }
+
+        if (!saw_matching_endpoint) return RouterError.UnknownEndpoint;
+
+        var path_candidates = std.ArrayListUnmanaged(PathCandidate){};
+        defer path_candidates.deinit(self.allocator);
+        for (self.endpoints.items, 0..) |endpoint, endpoint_index| {
+            const matched = matchPathToMount(path, endpoint.mount_path) orelse continue;
+            if (matched.mount_path_len != matched_prefix_len) continue;
+            try path_candidates.append(self.allocator, .{
+                .endpoint_index = endpoint_index,
+                .relative_path = matched.relative_path,
+            });
+        }
+
         var saw_endpoint_failure = false;
         var saw_readonly_endpoint = false;
         var saw_writable_candidate = false;
         var saw_incompatible_endpoint = false;
-        var candidates = std.ArrayListUnmanaged(usize){};
+        var candidates = std.ArrayListUnmanaged(PathCandidate){};
         defer candidates.deinit(self.allocator);
 
-        for (self.endpoints.items, 0..) |endpoint, endpoint_index| {
-            if (!std.mem.eql(u8, endpoint.name, parsed.endpoint_name)) continue;
-            saw_matching_endpoint = true;
+        for (path_candidates.items) |candidate| {
+            const endpoint = self.endpoints.items[candidate.endpoint_index];
             if (!fs_source_policy.supports(endpointView(endpoint), desired_op)) {
                 saw_incompatible_endpoint = true;
                 continue;
@@ -747,11 +855,11 @@ pub const Router = struct {
                 continue;
             }
             saw_writable_candidate = true;
-            try candidates.append(self.allocator, endpoint_index);
+            try candidates.append(self.allocator, candidate);
         }
 
-        if (!saw_matching_endpoint) return RouterError.UnknownEndpoint;
         if (candidates.items.len == 0) {
+            if (require_writable and self.isVirtualDirectoryPath(path)) return RouterError.ReadOnlyFilesystem;
             if (require_writable and !saw_writable_candidate and saw_readonly_endpoint) {
                 return RouterError.ReadOnlyFilesystem;
             }
@@ -763,7 +871,8 @@ pub const Router = struct {
         defer self.allocator.free(attempted);
 
         for (0..2) |pass| {
-            for (candidates.items) |endpoint_index| {
+            for (candidates.items) |candidate| {
+                const endpoint_index = candidate.endpoint_index;
                 self.refreshEndpointHealth(endpoint_index, pass == 1) catch |err| {
                     if (isEndpointFailureError(err)) {
                         self.noteEndpointFailure(endpoint_index);
@@ -776,18 +885,28 @@ pub const Router = struct {
 
             @memset(attempted, false);
             var attempt_count: usize = 0;
+            var saw_candidate_failure = false;
             while (attempt_count < candidates.items.len) : (attempt_count += 1) {
                 const picked_rank = pickBestEndpointCandidate(self, candidates.items, attempted, desired_op, require_writable) orelse break;
                 attempted[picked_rank] = true;
-                const endpoint_index = candidates.items[picked_rank];
-                const resolved = self.resolvePathOnEndpoint(endpoint_index, parsed.relative_path) catch |err| {
+                const candidate = candidates.items[picked_rank];
+                const endpoint_index = candidate.endpoint_index;
+                const resolved = self.resolvePathOnEndpoint(endpoint_index, candidate.relative_path) catch |err| {
                     if (isEndpointFailureError(err)) {
                         self.noteEndpointFailure(endpoint_index);
                         saw_endpoint_failure = true;
+                        saw_candidate_failure = true;
                         continue;
                     }
                     return err;
                 };
+                if (saw_candidate_failure) {
+                    self.failover_events_total +%= 1;
+                    std.log.info(
+                        "fs router failover path={s} selected endpoint={s} total={d}",
+                        .{ path, self.endpoints.items[endpoint_index].name, self.failover_events_total },
+                    );
+                }
                 return resolved;
             }
         }
@@ -823,7 +942,7 @@ pub const Router = struct {
 
     fn pickBestEndpointCandidate(
         self: *const Router,
-        candidates: []const usize,
+        candidates: []const PathCandidate,
         attempted: []const bool,
         desired_op: fs_source_policy.Operation,
         require_writable: bool,
@@ -831,9 +950,9 @@ pub const Router = struct {
         const now = std.time.milliTimestamp();
         var best_rank: ?usize = null;
         var best_score: i64 = std.math.minInt(i64);
-        for (candidates, 0..) |endpoint_index, rank_idx| {
+        for (candidates, 0..) |candidate, rank_idx| {
             if (attempted[rank_idx]) continue;
-            const score = endpointRoutingScore(self.endpoints.items[endpoint_index], desired_op, require_writable, now);
+            const score = endpointRoutingScore(self.endpoints.items[candidate.endpoint_index], desired_op, require_writable, now);
             if (best_rank == null or score > best_score) {
                 best_rank = rank_idx;
                 best_score = score;
@@ -953,7 +1072,10 @@ pub const Router = struct {
         var replacement = try fs_client.FsClient.connect(self.allocator, endpoint.url);
         errdefer replacement.deinit();
 
-        var hello = try replacement.call(.HELLO, null, null, "{}", null, null);
+        const hello_payload = try self.buildFsHelloPayload(endpoint);
+        defer self.allocator.free(hello_payload);
+
+        var hello = try replacement.call(.HELLO, null, null, hello_payload, null, null);
         hello.deinit(self.allocator);
 
         var exports = try replacement.call(.EXPORTS, null, null, "{}", null, null);
@@ -1038,7 +1160,9 @@ pub const Router = struct {
         var event_client = try fs_client.FsClient.connect(self.allocator, endpoint.url);
         errdefer event_client.deinit();
 
-        var hello = try event_client.call(.HELLO, null, null, "{}", null, null);
+        const hello_payload = try self.buildFsHelloPayload(endpoint);
+        defer self.allocator.free(hello_payload);
+        var hello = try event_client.call(.HELLO, null, null, hello_payload, null, null);
         hello.deinit(self.allocator);
 
         endpoint.event_client = event_client;
@@ -1147,7 +1271,9 @@ pub const Router = struct {
         }
 
         endpoint.last_health_check_ms = now;
-        var hello = self.callEndpoint(@intCast(endpoint_index), .HELLO, null, null, "{}") catch |err| {
+        const hello_payload = try self.buildFsHelloPayload(endpoint);
+        defer self.allocator.free(hello_payload);
+        var hello = self.callEndpoint(@intCast(endpoint_index), .HELLO, null, null, hello_payload) catch |err| {
             if (isEndpointFailureError(err)) {
                 self.noteEndpointFailure(endpoint_index);
                 return;
@@ -1155,6 +1281,24 @@ pub const Router = struct {
             return err;
         };
         hello.deinit(self.allocator);
+    }
+
+    fn buildFsHelloPayload(self: *Router, endpoint: *const Endpoint) ![]u8 {
+        if (endpoint.auth_token) |auth_token| {
+            const escaped_auth = try fs_protocol.jsonEscape(self.allocator, auth_token);
+            defer self.allocator.free(escaped_auth);
+            return std.fmt.allocPrint(
+                self.allocator,
+                "{{\"protocol\":\"{s}\",\"proto\":{d},\"auth_token\":\"{s}\"}}",
+                .{ fsrpc_node_protocol_version, fsrpc_node_proto_id, escaped_auth },
+            );
+        }
+
+        return std.fmt.allocPrint(
+            self.allocator,
+            "{{\"protocol\":\"{s}\",\"proto\":{d}}}",
+            .{ fsrpc_node_protocol_version, fsrpc_node_proto_id },
+        );
     }
 
     fn noteEndpointSuccess(self: *Router, endpoint_index: usize) void {
@@ -1174,10 +1318,10 @@ pub const Router = struct {
         endpoint.last_health_check_ms = endpoint.last_failure_ms;
     }
 
-    fn seedRootFromAlias(self: *const Router, alias_name: []const u8, exclude_index: usize) ?u64 {
+    fn seedRootFromMountPath(self: *const Router, mount_path: []const u8, exclude_index: usize) ?u64 {
         for (self.endpoints.items, 0..) |endpoint, endpoint_index| {
             if (endpoint_index == exclude_index) continue;
-            if (!std.mem.eql(u8, endpoint.name, alias_name)) continue;
+            if (!std.mem.eql(u8, endpoint.mount_path, mount_path)) continue;
             if (endpoint.root_node_id != 0) return endpoint.root_node_id;
         }
         return null;
@@ -1210,38 +1354,137 @@ pub const Router = struct {
             try self.dir_cache.put(endpoint_index, dir_id, normalized_name, attr_json, now);
         }
     }
+
+    fn isVirtualDirectoryPath(self: *const Router, path: []const u8) bool {
+        if (path.len == 0 or path[0] != '/') return false;
+        if (std.mem.eql(u8, path, "/")) return true;
+
+        for (self.endpoints.items) |endpoint| {
+            if (std.mem.eql(u8, path, endpoint.mount_path)) return false;
+        }
+        for (self.endpoints.items) |endpoint| {
+            if (isStrictAncestorPath(path, endpoint.mount_path)) return true;
+        }
+        return false;
+    }
+
+    fn buildVirtualDirectoryListing(self: *Router, path: []const u8, cookie: u64, max_entries: u32) ![]u8 {
+        var children = std.ArrayListUnmanaged([]const u8){};
+        defer children.deinit(self.allocator);
+
+        for (self.endpoints.items) |endpoint| {
+            const child = childSegmentForVirtualDir(path, endpoint.mount_path) orelse continue;
+            var exists = false;
+            for (children.items) |seen| {
+                if (std.mem.eql(u8, seen, child)) {
+                    exists = true;
+                    break;
+                }
+            }
+            if (!exists) {
+                try children.append(self.allocator, child);
+            }
+        }
+
+        const start: usize = if (cookie > children.items.len) children.items.len else @intCast(cookie);
+        const max_count: usize = if (max_entries == 0) 0 else @intCast(max_entries);
+        const end = @min(children.items.len, start + max_count);
+        const next_cookie: u64 = if (end < children.items.len) @intCast(end) else 0;
+
+        var out = std.ArrayListUnmanaged(u8){};
+        errdefer out.deinit(self.allocator);
+        try out.appendSlice(self.allocator, "{\"ents\":[");
+        for (children.items[start..end], start..) |name, idx| {
+            if (idx != start) try out.append(self.allocator, ',');
+
+            const escaped_name = try fs_protocol.jsonEscape(self.allocator, name);
+            defer self.allocator.free(escaped_name);
+            const child_path = try joinPath(path, name, self.allocator);
+            defer self.allocator.free(child_path);
+            const node_id = virtualDirNodeId(child_path);
+
+            try out.writer(self.allocator).print(
+                "{{\"name\":\"{s}\",\"attr\":{{\"id\":{d},\"k\":2,\"m\":16877,\"n\":2,\"u\":0,\"g\":0,\"sz\":0,\"at\":0,\"mt\":0,\"ct\":0,\"gen\":0}}}}",
+                .{ escaped_name, node_id },
+            );
+        }
+        try out.writer(self.allocator).print("],\"next_cookie\":{d}}}", .{next_cookie});
+        return out.toOwnedSlice(self.allocator);
+    }
 };
 
-const ParsedEndpointPath = struct {
-    endpoint_name: []const u8,
+const MountMatch = struct {
+    mount_path_len: usize,
     relative_path: []const u8,
 };
 
-fn parseEndpointPath(path: []const u8) !ParsedEndpointPath {
-    if (path.len == 0 or path[0] != '/') return RouterError.InvalidPath;
-    if (path.len == 1) return RouterError.InvalidPath;
+fn matchPathToMount(path: []const u8, mount_path: []const u8) ?MountMatch {
+    if (path.len == 0 or path[0] != '/') return null;
+    if (mount_path.len == 0 or mount_path[0] != '/') return null;
 
-    const rest = path[1..];
-    const slash = std.mem.indexOfScalar(u8, rest, '/');
-    if (slash) |idx| {
-        const endpoint_name = rest[0..idx];
-        if (endpoint_name.len == 0) return RouterError.InvalidPath;
-
-        var relative = rest[idx + 1 ..];
-        while (relative.len > 0 and relative[0] == '/') {
-            relative = relative[1..];
-        }
-        return .{
-            .endpoint_name = endpoint_name,
-            .relative_path = relative,
-        };
+    if (std.mem.eql(u8, mount_path, "/")) {
+        if (std.mem.eql(u8, path, "/")) return .{ .mount_path_len = 1, .relative_path = "" };
+        var relative = path[1..];
+        while (relative.len > 0 and relative[0] == '/') relative = relative[1..];
+        return .{ .mount_path_len = 1, .relative_path = relative };
     }
 
-    if (rest.len == 0) return RouterError.InvalidPath;
+    if (!std.mem.startsWith(u8, path, mount_path)) return null;
+    if (path.len == mount_path.len) {
+        return .{
+            .mount_path_len = mount_path.len,
+            .relative_path = "",
+        };
+    }
+    if (path[mount_path.len] != '/') return null;
+
+    var relative = path[mount_path.len + 1 ..];
+    while (relative.len > 0 and relative[0] == '/') relative = relative[1..];
     return .{
-        .endpoint_name = rest,
-        .relative_path = "",
+        .mount_path_len = mount_path.len,
+        .relative_path = relative,
     };
+}
+
+fn isStrictAncestorPath(ancestor: []const u8, descendant: []const u8) bool {
+    if (ancestor.len == 0 or descendant.len == 0) return false;
+    if (!std.mem.startsWith(u8, descendant, ancestor)) return false;
+    if (ancestor.len >= descendant.len) return false;
+    if (std.mem.eql(u8, ancestor, "/")) return true;
+    return descendant[ancestor.len] == '/';
+}
+
+fn childSegmentForVirtualDir(path: []const u8, mount_path: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, path, mount_path)) return null;
+    if (!isStrictAncestorPath(path, mount_path)) return null;
+
+    const remainder = if (std.mem.eql(u8, path, "/"))
+        mount_path[1..]
+    else
+        mount_path[path.len + 1 ..];
+    if (remainder.len == 0) return null;
+    const slash = std.mem.indexOfScalar(u8, remainder, '/') orelse remainder.len;
+    if (slash == 0) return null;
+    return remainder[0..slash];
+}
+
+fn virtualDirNodeId(path: []const u8) u64 {
+    const hashed = std.hash.Wyhash.hash(0x5350_5756_4449_5231, path);
+    return if (hashed == 0) 1 else hashed;
+}
+
+fn normalizeMountPath(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
+    var trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0) return RouterError.InvalidPath;
+
+    trimmed = std.mem.trim(u8, trimmed, "/");
+    if (trimmed.len == 0) return allocator.dupe(u8, "/");
+    return std.fmt.allocPrint(allocator, "/{s}", .{trimmed});
+}
+
+fn joinPath(base: []const u8, child: []const u8, allocator: std.mem.Allocator) ![]u8 {
+    if (std.mem.eql(u8, base, "/")) return std.fmt.allocPrint(allocator, "/{s}", .{child});
+    return std.fmt.allocPrint(allocator, "{s}/{s}", .{ base, child });
 }
 
 fn isEndpointFailureError(err: anyerror) bool {
@@ -1719,14 +1962,92 @@ test "fs_router: case-only rename guard applies on case-insensitive sources" {
     try std.testing.expect(isCaseOnlyRenameGuard(false, true, "README.md", "readme.md"));
 }
 
-test "fs_router: parseEndpointPath handles endpoint root and nested path" {
-    const root = try parseEndpointPath("/a");
-    try std.testing.expectEqualStrings("a", root.endpoint_name);
+test "fs_router: matchPathToMount handles exact and nested paths" {
+    const root = matchPathToMount("/a", "/a") orelse return error.TestExpectedResult;
+    try std.testing.expectEqual(@as(usize, 2), root.mount_path_len);
     try std.testing.expectEqualStrings("", root.relative_path);
 
-    const nested = try parseEndpointPath("/a/src/main.zig");
-    try std.testing.expectEqualStrings("a", nested.endpoint_name);
+    const nested = matchPathToMount("/a/src/main.zig", "/a") orelse return error.TestExpectedResult;
+    try std.testing.expectEqual(@as(usize, 2), nested.mount_path_len);
     try std.testing.expectEqualStrings("src/main.zig", nested.relative_path);
+
+    try std.testing.expect(matchPathToMount("/abc", "/a") == null);
+}
+
+test "fs_router: childSegmentForVirtualDir returns next mount component" {
+    try std.testing.expectEqualStrings("project", childSegmentForVirtualDir("/", "/project/src") orelse return error.TestExpectedResult);
+    try std.testing.expectEqualStrings("src", childSegmentForVirtualDir("/project", "/project/src") orelse return error.TestExpectedResult);
+    try std.testing.expect(childSegmentForVirtualDir("/project/src", "/project/src") == null);
+}
+
+test "fs_router: virtual directory listing reflects mount prefixes" {
+    const allocator = std.testing.allocator;
+    var router = try Router.init(allocator, &[_]EndpointConfig{});
+    defer router.deinit();
+
+    const now = std.time.milliTimestamp();
+    try router.endpoints.append(allocator, .{
+        .name = try allocator.dupe(u8, "n1"),
+        .url = try allocator.dupe(u8, "ws://127.0.0.1:65535/v2/fs"),
+        .export_name = null,
+        .mount_path = try allocator.dupe(u8, "/project/src"),
+        .root_node_id = 10,
+        .export_read_only = false,
+        .caps_case_sensitive = true,
+        .healthy = true,
+        .last_health_check_ms = now,
+        .last_success_ms = now,
+    });
+    try router.endpoints.append(allocator, .{
+        .name = try allocator.dupe(u8, "n2"),
+        .url = try allocator.dupe(u8, "ws://127.0.0.1:65534/v2/fs"),
+        .export_name = null,
+        .mount_path = try allocator.dupe(u8, "/docs"),
+        .root_node_id = 20,
+        .export_read_only = false,
+        .caps_case_sensitive = true,
+        .healthy = true,
+        .last_health_check_ms = now,
+        .last_success_ms = now,
+    });
+
+    const root_listing = try router.readdir("/", 0, 100);
+    defer allocator.free(root_listing);
+    try std.testing.expect(std.mem.indexOf(u8, root_listing, "\"name\":\"project\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, root_listing, "\"name\":\"docs\"") != null);
+
+    const project_attr = try router.getattr("/project");
+    defer allocator.free(project_attr);
+    try std.testing.expect(std.mem.indexOf(u8, project_attr, "\"k\":2") != null);
+}
+
+test "fs_router: resolvePath honors explicit mount_path overlays" {
+    const allocator = std.testing.allocator;
+    var router = try Router.init(allocator, &[_]EndpointConfig{});
+    defer router.deinit();
+
+    const now = std.time.milliTimestamp();
+    try router.endpoints.append(allocator, .{
+        .name = try allocator.dupe(u8, "src-node"),
+        .url = try allocator.dupe(u8, "ws://127.0.0.1:65535/v2/fs"),
+        .export_name = null,
+        .mount_path = try allocator.dupe(u8, "/project/src"),
+        .root_node_id = 10,
+        .export_read_only = false,
+        .caps_case_sensitive = true,
+        .healthy = true,
+        .last_health_check_ms = now,
+        .last_success_ms = now,
+    });
+
+    const attr = "{\"id\":101,\"k\":1,\"m\":33188}";
+    try router.dir_cache.put(0, 10, "main.zig", attr, now);
+    try router.attr_cache.put(.{ .endpoint_index = 0, .node_id = 101 }, attr, 0, now);
+
+    const resolved = try router.resolvePath("/project/src/main.zig", false, .read_data);
+    try std.testing.expectEqual(@as(u16, 0), resolved.endpoint_index);
+    try std.testing.expectEqual(@as(u64, 101), resolved.node_id);
+    try std.testing.expectError(RouterError.UnknownEndpoint, router.resolvePath("/project/main.zig", false, .read_data));
 }
 
 test "fs_router: parseAttrSummary detects kind from explicit kind and mode bits" {
@@ -1773,6 +2094,7 @@ test "fs_router: endpointRoutingScore prefers healthy endpoints with recent succ
         .name = healthy_name[0..],
         .url = healthy_url[0..],
         .export_name = null,
+        .mount_path = @constCast("/a"),
         .root_node_id = 1,
         .export_read_only = false,
         .source_kind = @constCast("linux"),
@@ -1786,6 +2108,7 @@ test "fs_router: endpointRoutingScore prefers healthy endpoints with recent succ
         .name = degraded_name[0..],
         .url = degraded_url[0..],
         .export_name = null,
+        .mount_path = @constCast("/a"),
         .root_node_id = 1,
         .export_read_only = false,
         .source_kind = @constCast("linux"),
@@ -1812,6 +2135,7 @@ test "fs_router: endpointRoutingScore penalizes capability mismatch" {
         .name = linux_name[0..],
         .url = linux_url[0..],
         .export_name = null,
+        .mount_path = @constCast("/a"),
         .root_node_id = 1,
         .export_read_only = false,
         .source_kind = @constCast("linux"),
@@ -1823,6 +2147,7 @@ test "fs_router: endpointRoutingScore penalizes capability mismatch" {
         .name = gdrive_name[0..],
         .url = gdrive_url[0..],
         .export_name = null,
+        .mount_path = @constCast("/a"),
         .root_node_id = 1,
         .export_read_only = false,
         .source_kind = @constCast("gdrive"),
@@ -1850,7 +2175,7 @@ test "fs_router: statusJson renders empty endpoint list" {
 
     const status = try router.statusJson(false);
     defer allocator.free(status);
-    try std.testing.expectEqualStrings("{\"endpoints\":[]}", status);
+    try std.testing.expectEqualStrings("{\"metrics\":{\"failover_events_total\":0},\"endpoints\":[]}", status);
 }
 
 test "fs_router: applyInvalidationEvent clears affected caches" {
@@ -1921,8 +2246,9 @@ test "fs_router: invalidation plus endpoint failure falls back to sibling alias"
     const now = std.time.milliTimestamp();
     try router.endpoints.append(allocator, .{
         .name = try allocator.dupe(u8, "a"),
-        .url = try allocator.dupe(u8, "ws://127.0.0.1:65535/v1/fs"),
+        .url = try allocator.dupe(u8, "ws://127.0.0.1:65535/v2/fs"),
         .export_name = null,
+        .mount_path = try allocator.dupe(u8, "/a"),
         .root_node_id = 10,
         .export_read_only = false,
         .caps_native_watch = true,
@@ -1933,8 +2259,9 @@ test "fs_router: invalidation plus endpoint failure falls back to sibling alias"
     });
     try router.endpoints.append(allocator, .{
         .name = try allocator.dupe(u8, "a"),
-        .url = try allocator.dupe(u8, "ws://127.0.0.1:65534/v1/fs"),
+        .url = try allocator.dupe(u8, "ws://127.0.0.1:65534/v2/fs"),
         .export_name = null,
+        .mount_path = try allocator.dupe(u8, "/a"),
         .root_node_id = 20,
         .export_read_only = false,
         .caps_native_watch = false,
@@ -1971,4 +2298,35 @@ test "fs_router: invalidation plus endpoint failure falls back to sibling alias"
     const after = try router.resolvePath("/a/foo", false, .read_data);
     try std.testing.expectEqual(@as(u16, 1), after.endpoint_index);
     try std.testing.expectEqual(@as(u64, 201), after.node_id);
+    try std.testing.expectEqual(@as(u64, 1), router.failover_events_total);
+}
+
+test "fs_router: replaceEndpoints swaps mount topology and clears caches" {
+    const allocator = std.testing.allocator;
+    var router = try Router.init(allocator, &[_]EndpointConfig{});
+    defer router.deinit();
+
+    const now = std.time.milliTimestamp();
+    try router.endpoints.append(allocator, .{
+        .name = try allocator.dupe(u8, "a"),
+        .url = try allocator.dupe(u8, "ws://127.0.0.1:65535/v2/fs"),
+        .export_name = null,
+        .mount_path = try allocator.dupe(u8, "/a"),
+        .root_node_id = 10,
+        .export_read_only = false,
+        .caps_case_sensitive = true,
+        .healthy = true,
+        .last_health_check_ms = now,
+        .last_success_ms = now,
+    });
+    try router.dir_cache.put(0, 10, "foo", "{\"id\":123}", now);
+    try std.testing.expect(router.dir_cache.getFresh(0, 10, "foo", now) != null);
+
+    try router.replaceEndpoints(&[_]EndpointConfig{
+        .{ .name = "b", .url = "ws://127.0.0.1:65534/v2/fs", .mount_path = "/b" },
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), router.endpointCount());
+    try std.testing.expectEqualStrings("/b", router.endpointMountPath(0).?);
+    try std.testing.expect(router.dir_cache.getFresh(0, 10, "foo", now) == null);
 }

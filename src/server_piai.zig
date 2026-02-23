@@ -6,6 +6,11 @@ const protocol = @import("ziggy-spider-protocol").protocol;
 const runtime_server_mod = @import("runtime_server.zig");
 const websocket_transport = @import("websocket_transport.zig");
 const fsrpc_session = @import("fsrpc_session.zig");
+const fs_control_plane = @import("fs_control_plane.zig");
+const fs_protocol = @import("fs_protocol.zig");
+const fs_node_ops = @import("fs_node_ops.zig");
+const fs_node_service = @import("fs_node_service.zig");
+const fs_watch_runtime = @import("fs_watch_runtime.zig");
 const unified = @import("ziggy-spider-protocol").unified;
 
 pub const RuntimeServer = runtime_server_mod.RuntimeServer;
@@ -18,6 +23,19 @@ const debug_stream_archive_suffix = ".ndjson";
 const debug_stream_archive_suffix_gz = ".ndjson.gz";
 const debug_stream_rotate_max_bytes: u64 = 8 * 1024 * 1024;
 const debug_stream_archive_keep: usize = 8;
+const local_node_export_path_env = "SPIDERWEB_LOCAL_NODE_EXPORT_PATH";
+const local_node_export_name_env = "SPIDERWEB_LOCAL_NODE_EXPORT_NAME";
+const local_node_export_ro_env = "SPIDERWEB_LOCAL_NODE_EXPORT_RO";
+const local_node_fs_url_env = "SPIDERWEB_LOCAL_NODE_FS_URL";
+const local_node_name_env = "SPIDERWEB_LOCAL_NODE_NAME";
+const local_node_lease_ttl_env = "SPIDERWEB_LOCAL_NODE_LEASE_TTL_MS";
+const local_node_heartbeat_ms_env = "SPIDERWEB_LOCAL_NODE_HEARTBEAT_MS";
+const control_operator_token_env = "SPIDERWEB_CONTROL_OPERATOR_TOKEN";
+const metrics_port_env = "SPIDERWEB_METRICS_PORT";
+const control_protocol_version = "unified-v2";
+const fsrpc_runtime_protocol_version = "styx-lite-1";
+const fsrpc_node_protocol_version = "unified-v2-fs";
+const fsrpc_node_proto_id: i64 = 2;
 
 const DebugStreamFileSink = struct {
     allocator: std.mem.Allocator,
@@ -309,6 +327,423 @@ fn pathExists(path: []const u8) bool {
     return true;
 }
 
+fn parseBoolEnv(allocator: std.mem.Allocator, name: []const u8, default_value: bool) bool {
+    const raw = std.process.getEnvVarOwned(allocator, name) catch return default_value;
+    defer allocator.free(raw);
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0) return default_value;
+    if (std.ascii.eqlIgnoreCase(trimmed, "1") or std.ascii.eqlIgnoreCase(trimmed, "true") or std.ascii.eqlIgnoreCase(trimmed, "yes") or std.ascii.eqlIgnoreCase(trimmed, "on")) return true;
+    if (std.ascii.eqlIgnoreCase(trimmed, "0") or std.ascii.eqlIgnoreCase(trimmed, "false") or std.ascii.eqlIgnoreCase(trimmed, "no") or std.ascii.eqlIgnoreCase(trimmed, "off")) return false;
+    return default_value;
+}
+
+fn parseUnsignedEnv(allocator: std.mem.Allocator, name: []const u8, default_value: u64) u64 {
+    const raw = std.process.getEnvVarOwned(allocator, name) catch return default_value;
+    defer allocator.free(raw);
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0) return default_value;
+    return std.fmt.parseInt(u64, trimmed, 10) catch default_value;
+}
+
+fn parseOptionalEnvOwned(allocator: std.mem.Allocator, name: []const u8) ?[]u8 {
+    const raw = std.process.getEnvVarOwned(allocator, name) catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => return null,
+        else => return null,
+    };
+    defer allocator.free(raw);
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0) return null;
+    return allocator.dupe(u8, trimmed) catch null;
+}
+
+const FsHubConnection = struct {
+    id: u64,
+    stream: *std.net.Stream,
+    write_mutex: std.Thread.Mutex = .{},
+};
+
+const FsConnectionHub = struct {
+    allocator: std.mem.Allocator,
+    connections: std.ArrayListUnmanaged(*FsHubConnection) = .{},
+    mutex: std.Thread.Mutex = .{},
+    next_id: u64 = 1,
+
+    fn deinit(self: *FsConnectionHub) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        for (self.connections.items) |conn| self.allocator.destroy(conn);
+        self.connections.deinit(self.allocator);
+    }
+
+    fn register(self: *FsConnectionHub, stream: *std.net.Stream) !*FsHubConnection {
+        const conn = try self.allocator.create(FsHubConnection);
+        errdefer self.allocator.destroy(conn);
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        conn.* = .{
+            .id = self.next_id,
+            .stream = stream,
+        };
+        self.next_id +%= 1;
+        if (self.next_id == 0) self.next_id = 1;
+        try self.connections.append(self.allocator, conn);
+        return conn;
+    }
+
+    fn unregister(self: *FsConnectionHub, conn: *FsHubConnection) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        for (self.connections.items, 0..) |item, idx| {
+            if (item != conn) continue;
+            _ = self.connections.swapRemove(idx);
+            self.allocator.destroy(conn);
+            return;
+        }
+    }
+
+    fn broadcastInvalidations(self: *FsConnectionHub, origin_id: u64, events: []const fs_protocol.InvalidationEvent) void {
+        for (events) |event| {
+            const payload = fs_node_service.buildInvalidationEventJson(self.allocator, event) catch continue;
+            defer self.allocator.free(payload);
+            self.broadcastText(origin_id, payload);
+        }
+    }
+
+    fn broadcastText(self: *FsConnectionHub, origin_id: u64, payload: []const u8) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        for (self.connections.items) |conn| {
+            if (conn.id == origin_id) continue;
+            conn.write_mutex.lock();
+            websocket_transport.writeFrame(conn.stream, payload, .text) catch {
+                conn.stream.close();
+            };
+            conn.write_mutex.unlock();
+        }
+    }
+};
+
+const ControlTopologySubscriber = struct {
+    id: u64,
+    stream: *std.net.Stream,
+    write_mutex: *std.Thread.Mutex,
+};
+
+const LocalFsNode = struct {
+    allocator: std.mem.Allocator,
+    service: fs_node_service.NodeService,
+    hub: FsConnectionHub,
+    node_name: []u8,
+    fs_url: []u8,
+    lease_ttl_ms: u64,
+    heartbeat_interval_ms: u64,
+    heartbeat_stop: bool = false,
+    heartbeat_mutex: std.Thread.Mutex = .{},
+    heartbeat_thread: ?std.Thread = null,
+    registration_mutex: std.Thread.Mutex = .{},
+    registered_node_id: ?[]u8 = null,
+    session_auth_token: ?[]u8 = null,
+
+    fn create(
+        allocator: std.mem.Allocator,
+        export_spec: fs_node_ops.ExportSpec,
+        node_name: []const u8,
+        fs_url: []const u8,
+        lease_ttl_ms: u64,
+        heartbeat_interval_ms: u64,
+    ) !*LocalFsNode {
+        const endpoint = try allocator.create(LocalFsNode);
+        errdefer allocator.destroy(endpoint);
+
+        endpoint.* = .{
+            .allocator = allocator,
+            .service = try fs_node_service.NodeService.init(allocator, &[_]fs_node_ops.ExportSpec{export_spec}),
+            .hub = .{ .allocator = allocator },
+            .node_name = try allocator.dupe(u8, node_name),
+            .fs_url = try allocator.dupe(u8, fs_url),
+            .lease_ttl_ms = lease_ttl_ms,
+            .heartbeat_interval_ms = heartbeat_interval_ms,
+        };
+        errdefer {
+            endpoint.hub.deinit();
+            endpoint.service.deinit();
+            allocator.free(endpoint.node_name);
+            allocator.free(endpoint.fs_url);
+        }
+
+        if (fs_watch_runtime.spawnDetached(
+            allocator,
+            &endpoint.service,
+            emitLocalFsWatcherEvents,
+            @ptrCast(endpoint),
+            .{},
+        )) |backend| {
+            std.log.info("local fs node watcher backend active: {s}", .{@tagName(backend)});
+        } else |err| {
+            std.log.warn("local fs node watcher disabled: {s}", .{@errorName(err)});
+        }
+
+        return endpoint;
+    }
+
+    fn deinit(self: *LocalFsNode, control_plane: *fs_control_plane.ControlPlane) void {
+        self.requestHeartbeatStop();
+        if (self.heartbeat_thread) |thread| {
+            thread.join();
+            self.heartbeat_thread = null;
+        }
+
+        var owned_node_id: ?[]u8 = null;
+        var owned_auth_token: ?[]u8 = null;
+        self.registration_mutex.lock();
+        owned_node_id = self.registered_node_id;
+        self.registered_node_id = null;
+        owned_auth_token = self.session_auth_token;
+        self.session_auth_token = null;
+        self.registration_mutex.unlock();
+
+        if (owned_node_id) |node_id| {
+            control_plane.unregisterNodeById(node_id) catch |err| {
+                std.log.warn("local fs node unregister failed for {s}: {s}", .{ node_id, @errorName(err) });
+            };
+            self.allocator.free(node_id);
+        }
+        if (owned_auth_token) |token| self.allocator.free(token);
+
+        self.hub.deinit();
+        self.service.deinit();
+        self.allocator.free(self.node_name);
+        self.allocator.free(self.fs_url);
+        self.allocator.destroy(self);
+    }
+
+    fn startRegistrationAndHeartbeat(self: *LocalFsNode, control_plane: *fs_control_plane.ControlPlane) !void {
+        try self.refreshRegistration(control_plane);
+        self.heartbeat_thread = try std.Thread.spawn(.{}, localFsHeartbeatThreadMain, .{ self, control_plane });
+    }
+
+    fn refreshRegistration(self: *LocalFsNode, control_plane: *fs_control_plane.ControlPlane) !void {
+        const payload_json = try control_plane.ensureNode(self.node_name, self.fs_url, self.lease_ttl_ms);
+        defer self.allocator.free(payload_json);
+        const registration = try parseNodeRegistrationFromJoinPayload(self.allocator, payload_json);
+        self.registration_mutex.lock();
+        defer self.registration_mutex.unlock();
+
+        if (self.registered_node_id) |prev| {
+            if (std.mem.eql(u8, prev, registration.node_id)) {
+                self.allocator.free(registration.node_id);
+                self.allocator.free(registration.node_secret);
+                return;
+            }
+            self.allocator.free(prev);
+        }
+        if (self.session_auth_token) |existing| self.allocator.free(existing);
+
+        self.registered_node_id = registration.node_id;
+        self.session_auth_token = registration.node_secret;
+    }
+
+    fn requestHeartbeatStop(self: *LocalFsNode) void {
+        self.heartbeat_mutex.lock();
+        self.heartbeat_stop = true;
+        self.heartbeat_mutex.unlock();
+    }
+
+    fn shouldStopHeartbeat(self: *LocalFsNode) bool {
+        self.heartbeat_mutex.lock();
+        defer self.heartbeat_mutex.unlock();
+        return self.heartbeat_stop;
+    }
+
+    fn copySessionAuthToken(self: *LocalFsNode, allocator: std.mem.Allocator) !?[]u8 {
+        self.registration_mutex.lock();
+        defer self.registration_mutex.unlock();
+        if (self.session_auth_token) |token| {
+            const copy = try allocator.dupe(u8, token);
+            return @as(?[]u8, copy);
+        }
+        return null;
+    }
+};
+
+const NodeRegistration = struct {
+    node_id: []u8,
+    node_secret: []u8,
+};
+
+fn parseNodeRegistrationFromJoinPayload(allocator: std.mem.Allocator, payload_json: []const u8) !NodeRegistration {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload_json, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidPayload;
+    const node_id = parsed.value.object.get("node_id") orelse return error.MissingField;
+    if (node_id != .string or node_id.string.len == 0) return error.InvalidPayload;
+    const node_secret = parsed.value.object.get("node_secret") orelse return error.MissingField;
+    if (node_secret != .string or node_secret.string.len == 0) return error.InvalidPayload;
+
+    return .{
+        .node_id = try allocator.dupe(u8, node_id.string),
+        .node_secret = try allocator.dupe(u8, node_secret.string),
+    };
+}
+
+fn emitLocalFsWatcherEvents(ctx: ?*anyopaque, events: []const fs_protocol.InvalidationEvent) void {
+    const raw = ctx orelse return;
+    const node: *LocalFsNode = @ptrCast(@alignCast(raw));
+    node.hub.broadcastInvalidations(0, events);
+}
+
+fn writeFsHubFrame(conn: *FsHubConnection, payload: []const u8, frame_type: websocket_transport.FrameType) !void {
+    conn.write_mutex.lock();
+    defer conn.write_mutex.unlock();
+    try websocket_transport.writeFrame(conn.stream, payload, frame_type);
+}
+
+fn handleLocalFsConnection(
+    allocator: std.mem.Allocator,
+    local_node: *LocalFsNode,
+    stream: *std.net.Stream,
+) !void {
+    const required_auth_token = try local_node.copySessionAuthToken(allocator);
+    defer if (required_auth_token) |token| allocator.free(token);
+
+    const connection = try local_node.hub.register(stream);
+    defer local_node.hub.unregister(connection);
+    var fsrpc_negotiated = false;
+
+    while (true) {
+        var frame = websocket_transport.readFrame(
+            allocator,
+            stream,
+            4 * 1024 * 1024,
+        ) catch |err| switch (err) {
+            error.EndOfStream, websocket_transport.Error.ConnectionClosed => return,
+            else => return err,
+        };
+        defer frame.deinit(allocator);
+
+        switch (frame.opcode) {
+            0x1 => {
+                var parsed = unified.parseMessage(allocator, frame.payload) catch |err| {
+                    const response = try unified.buildFsrpcFsError(
+                        allocator,
+                        null,
+                        fs_protocol.Errno.EINVAL,
+                        @errorName(err),
+                    );
+                    defer allocator.free(response);
+                    try writeFsHubFrame(connection, response, .text);
+                    try writeFsHubFrame(connection, "", .close);
+                    return;
+                };
+                defer parsed.deinit(allocator);
+
+                if (!fsrpc_negotiated) {
+                    if (parsed.channel != .fsrpc or parsed.fsrpc_type != .fs_t_hello) {
+                        const response = try unified.buildFsrpcFsError(
+                            allocator,
+                            parsed.tag,
+                            fs_protocol.Errno.EINVAL,
+                            "fsrpc.t_fs_hello must be negotiated first",
+                        );
+                        defer allocator.free(response);
+                        try writeFsHubFrame(connection, response, .text);
+                        try writeFsHubFrame(connection, "", .close);
+                        return;
+                    }
+                    validateFsNodeHelloPayload(allocator, parsed.payload_json, required_auth_token) catch |err| {
+                        const response = try unified.buildFsrpcFsError(
+                            allocator,
+                            parsed.tag,
+                            fs_protocol.Errno.EINVAL,
+                            @errorName(err),
+                        );
+                        defer allocator.free(response);
+                        try writeFsHubFrame(connection, response, .text);
+                        try writeFsHubFrame(connection, "", .close);
+                        return;
+                    };
+                    fsrpc_negotiated = true;
+                } else if (parsed.fsrpc_type == .fs_t_hello) {
+                    validateFsNodeHelloPayload(allocator, parsed.payload_json, required_auth_token) catch |err| {
+                        const response = try unified.buildFsrpcFsError(
+                            allocator,
+                            parsed.tag,
+                            fs_protocol.Errno.EINVAL,
+                            @errorName(err),
+                        );
+                        defer allocator.free(response);
+                        try writeFsHubFrame(connection, response, .text);
+                        try writeFsHubFrame(connection, "", .close);
+                        return;
+                    };
+                }
+
+                var handled = local_node.service.handleRequestJsonWithEvents(frame.payload) catch |err| blk: {
+                    const fallback = try unified.buildFsrpcFsError(
+                        allocator,
+                        null,
+                        fs_protocol.Errno.EIO,
+                        @errorName(err),
+                    );
+                    break :blk fs_node_service.NodeService.HandledRequest{
+                        .response_json = fallback,
+                        .events = try allocator.alloc(fs_protocol.InvalidationEvent, 0),
+                    };
+                };
+                defer handled.deinit(allocator);
+
+                for (handled.events) |event| {
+                    const event_json = try fs_node_service.buildInvalidationEventJson(allocator, event);
+                    defer allocator.free(event_json);
+                    try writeFsHubFrame(connection, event_json, .text);
+                }
+
+                if (handled.events.len > 0) {
+                    local_node.hub.broadcastInvalidations(connection.id, handled.events);
+                }
+                try writeFsHubFrame(connection, handled.response_json, .text);
+            },
+            0x8 => {
+                writeFsHubFrame(connection, "", .close) catch {};
+                return;
+            },
+            0x9 => {
+                try writeFsHubFrame(connection, frame.payload, .pong);
+            },
+            0xA => {},
+            else => {
+                const response = try unified.buildFsrpcFsError(
+                    allocator,
+                    null,
+                    fs_protocol.Errno.EINVAL,
+                    "unsupported websocket opcode",
+                );
+                defer allocator.free(response);
+                try writeFsHubFrame(connection, response, .text);
+            },
+        }
+    }
+}
+
+fn localFsHeartbeatThreadMain(local_node: *LocalFsNode, control_plane: *fs_control_plane.ControlPlane) void {
+    while (true) {
+        var elapsed: u64 = 0;
+        while (elapsed < local_node.heartbeat_interval_ms) {
+            if (local_node.shouldStopHeartbeat()) return;
+            const step_ms: u64 = @min(@as(u64, 500), local_node.heartbeat_interval_ms - elapsed);
+            std.Thread.sleep(step_ms * std.time.ns_per_ms);
+            elapsed += step_ms;
+        }
+        if (local_node.shouldStopHeartbeat()) return;
+
+        local_node.refreshRegistration(control_plane) catch |err| {
+            std.log.warn("local fs node heartbeat refresh failed: {s}", .{@errorName(err)});
+        };
+    }
+}
+
 const AgentRuntimeRegistry = struct {
     allocator: std.mem.Allocator,
     runtime_config: Config.RuntimeConfig,
@@ -316,8 +751,14 @@ const AgentRuntimeRegistry = struct {
     default_agent_id: []const u8,
     max_runtimes: usize,
     debug_stream_sink: DebugStreamFileSink,
+    control_plane: fs_control_plane.ControlPlane,
+    control_operator_token: ?[]u8 = null,
+    local_fs_node: ?*LocalFsNode = null,
     mutex: std.Thread.Mutex = .{},
     by_agent: std.StringHashMapUnmanaged(*RuntimeServer) = .{},
+    topology_subscribers_mutex: std.Thread.Mutex = .{},
+    topology_subscribers: std.ArrayListUnmanaged(ControlTopologySubscriber) = .{},
+    next_topology_subscriber_id: u64 = 1,
 
     fn init(
         allocator: std.mem.Allocator,
@@ -348,6 +789,10 @@ const AgentRuntimeRegistry = struct {
             );
         }
         const debug_stream_sink = DebugStreamFileSink.init(allocator, runtime_config);
+        const operator_token = parseOptionalEnvOwned(allocator, control_operator_token_env);
+        if (operator_token != null) {
+            std.log.info("control-plane operator token enabled via {s}", .{control_operator_token_env});
+        }
 
         return .{
             .allocator = allocator,
@@ -356,6 +801,12 @@ const AgentRuntimeRegistry = struct {
             .default_agent_id = effective_default,
             .max_runtimes = if (max_runtimes == 0) 1 else max_runtimes,
             .debug_stream_sink = debug_stream_sink,
+            .control_plane = fs_control_plane.ControlPlane.initWithPersistence(
+                allocator,
+                runtime_config.ltm_directory,
+                runtime_config.ltm_filename,
+            ),
+            .control_operator_token = operator_token,
         };
     }
 
@@ -369,6 +820,16 @@ const AgentRuntimeRegistry = struct {
             entry.value_ptr.*.destroy();
         }
         self.by_agent.deinit(self.allocator);
+        self.clearTopologySubscribers();
+        if (self.local_fs_node) |local_fs_node| {
+            local_fs_node.deinit(&self.control_plane);
+            self.local_fs_node = null;
+        }
+        if (self.control_operator_token) |token| {
+            self.allocator.free(token);
+            self.control_operator_token = null;
+        }
+        self.control_plane.deinit();
         self.debug_stream_sink.deinit();
     }
 
@@ -425,6 +886,203 @@ const AgentRuntimeRegistry = struct {
     fn maybeLogDebugFrame(self: *AgentRuntimeRegistry, agent_id: []const u8, payload: []const u8) void {
         self.debug_stream_sink.append(agent_id, payload);
     }
+
+    fn clearTopologySubscribers(self: *AgentRuntimeRegistry) void {
+        self.topology_subscribers_mutex.lock();
+        defer self.topology_subscribers_mutex.unlock();
+        self.topology_subscribers.deinit(self.allocator);
+        self.topology_subscribers = .{};
+        self.next_topology_subscriber_id = 1;
+    }
+
+    fn registerTopologySubscriber(
+        self: *AgentRuntimeRegistry,
+        stream: *std.net.Stream,
+        write_mutex: *std.Thread.Mutex,
+    ) !u64 {
+        self.topology_subscribers_mutex.lock();
+        defer self.topology_subscribers_mutex.unlock();
+        const id = self.next_topology_subscriber_id;
+        self.next_topology_subscriber_id +%= 1;
+        if (self.next_topology_subscriber_id == 0) self.next_topology_subscriber_id = 1;
+        try self.topology_subscribers.append(self.allocator, .{
+            .id = id,
+            .stream = stream,
+            .write_mutex = write_mutex,
+        });
+        return id;
+    }
+
+    fn unregisterTopologySubscriber(self: *AgentRuntimeRegistry, subscriber_id: u64) void {
+        self.topology_subscribers_mutex.lock();
+        defer self.topology_subscribers_mutex.unlock();
+        var idx: usize = 0;
+        while (idx < self.topology_subscribers.items.len) : (idx += 1) {
+            if (self.topology_subscribers.items[idx].id != subscriber_id) continue;
+            _ = self.topology_subscribers.swapRemove(idx);
+            return;
+        }
+    }
+
+    fn emitWorkspaceTopologyChanged(self: *AgentRuntimeRegistry, reason: []const u8) void {
+        const escaped_reason = unified.jsonEscape(self.allocator, reason) catch return;
+        defer self.allocator.free(escaped_reason);
+        const payload_json = std.fmt.allocPrint(
+            self.allocator,
+            "{{\"event\":\"workspace_topology_changed\",\"reason\":\"{s}\",\"ts_ms\":{d}}}",
+            .{ escaped_reason, std.time.milliTimestamp() },
+        ) catch return;
+        defer self.allocator.free(payload_json);
+        self.broadcastTopologyDebugEvent("control.workspace_topology", payload_json);
+    }
+
+    fn emitWorkspaceTopologyProjectDelta(
+        self: *AgentRuntimeRegistry,
+        agent_id: []const u8,
+        reason: []const u8,
+        control_payload_json: []const u8,
+    ) void {
+        const project_id = extractProjectIdFromControlPayload(self.allocator, control_payload_json) catch return;
+        defer if (project_id) |value| self.allocator.free(value);
+        const selected_project = project_id orelse return;
+
+        const escaped_project = unified.jsonEscape(self.allocator, selected_project) catch return;
+        defer self.allocator.free(escaped_project);
+        const status_req = std.fmt.allocPrint(
+            self.allocator,
+            "{{\"project_id\":\"{s}\"}}",
+            .{escaped_project},
+        ) catch return;
+        defer self.allocator.free(status_req);
+
+        const status_json = self.control_plane.workspaceStatus(agent_id, status_req) catch return;
+        defer self.allocator.free(status_json);
+        if (std.mem.indexOf(u8, status_json, "\"project_id\":null") != null) return;
+
+        const escaped_reason = unified.jsonEscape(self.allocator, reason) catch return;
+        defer self.allocator.free(escaped_reason);
+        const escaped_agent = unified.jsonEscape(self.allocator, agent_id) catch return;
+        defer self.allocator.free(escaped_agent);
+
+        const payload_json = std.fmt.allocPrint(
+            self.allocator,
+            "{{\"event\":\"workspace_topology_delta\",\"reason\":\"{s}\",\"agent_id\":\"{s}\",\"status\":{s},\"ts_ms\":{d}}}",
+            .{ escaped_reason, escaped_agent, status_json, std.time.milliTimestamp() },
+        ) catch return;
+        defer self.allocator.free(payload_json);
+
+        self.broadcastTopologyDebugEvent("control.workspace_topology_delta", payload_json);
+    }
+
+    fn broadcastTopologyDebugEvent(
+        self: *AgentRuntimeRegistry,
+        category: []const u8,
+        payload_json: []const u8,
+    ) void {
+        var subscribers = std.ArrayListUnmanaged(ControlTopologySubscriber){};
+        defer subscribers.deinit(self.allocator);
+
+        self.topology_subscribers_mutex.lock();
+        subscribers.appendSlice(self.allocator, self.topology_subscribers.items) catch {
+            self.topology_subscribers_mutex.unlock();
+            return;
+        };
+        self.topology_subscribers_mutex.unlock();
+        if (subscribers.items.len == 0) return;
+
+        const event_json = protocol.buildDebugEvent(
+            self.allocator,
+            "workspace-topology",
+            category,
+            payload_json,
+        ) catch return;
+        defer self.allocator.free(event_json);
+
+        for (subscribers.items) |subscriber| {
+            subscriber.write_mutex.lock();
+            const write_result = websocket_transport.writeFrame(subscriber.stream, event_json, .text);
+            subscriber.write_mutex.unlock();
+            if (write_result) |_| {
+                // ok
+            } else |_| {
+                self.unregisterTopologySubscriber(subscriber.id);
+            }
+        }
+    }
+
+    fn maybeInitLocalFsNode(self: *AgentRuntimeRegistry, bind_addr: []const u8, port: u16) !void {
+        const export_path_owned = std.process.getEnvVarOwned(self.allocator, local_node_export_path_env) catch |err| switch (err) {
+            error.EnvironmentVariableNotFound => return,
+            else => return err,
+        };
+        defer self.allocator.free(export_path_owned);
+        const export_path = std.mem.trim(u8, export_path_owned, " \t\r\n");
+        if (export_path.len == 0) {
+            std.log.warn("local fs node disabled: {s} is empty", .{local_node_export_path_env});
+            return;
+        }
+
+        const export_name_owned = std.process.getEnvVarOwned(self.allocator, local_node_export_name_env) catch |err| switch (err) {
+            error.EnvironmentVariableNotFound => null,
+            else => return err,
+        };
+        defer if (export_name_owned) |value| self.allocator.free(value);
+        const export_name = if (export_name_owned) |value|
+            if (std.mem.trim(u8, value, " \t\r\n").len > 0) std.mem.trim(u8, value, " \t\r\n") else "work"
+        else
+            "work";
+
+        const export_ro = parseBoolEnv(self.allocator, local_node_export_ro_env, false);
+
+        const node_name_owned = std.process.getEnvVarOwned(self.allocator, local_node_name_env) catch |err| switch (err) {
+            error.EnvironmentVariableNotFound => null,
+            else => return err,
+        };
+        defer if (node_name_owned) |value| self.allocator.free(value);
+        const node_name = if (node_name_owned) |value|
+            if (std.mem.trim(u8, value, " \t\r\n").len > 0) std.mem.trim(u8, value, " \t\r\n") else "spiderweb-local"
+        else
+            "spiderweb-local";
+
+        const fs_url_owned = std.process.getEnvVarOwned(self.allocator, local_node_fs_url_env) catch |err| switch (err) {
+            error.EnvironmentVariableNotFound => null,
+            else => return err,
+        };
+        defer if (fs_url_owned) |value| self.allocator.free(value);
+        const fs_url = if (fs_url_owned) |value| blk: {
+            const trimmed = std.mem.trim(u8, value, " \t\r\n");
+            if (trimmed.len == 0) break :blk try std.fmt.allocPrint(self.allocator, "ws://{s}:{d}/v2/fs", .{ bind_addr, port });
+            break :blk try self.allocator.dupe(u8, trimmed);
+        } else try std.fmt.allocPrint(self.allocator, "ws://{s}:{d}/v2/fs", .{ bind_addr, port });
+        defer self.allocator.free(fs_url);
+
+        const lease_ttl_ms = parseUnsignedEnv(self.allocator, local_node_lease_ttl_env, 15 * 60 * 1000);
+        var heartbeat_ms = parseUnsignedEnv(self.allocator, local_node_heartbeat_ms_env, lease_ttl_ms / 2);
+        if (heartbeat_ms == 0) heartbeat_ms = 1_000;
+        if (heartbeat_ms > lease_ttl_ms) heartbeat_ms = lease_ttl_ms;
+
+        const local_node = try LocalFsNode.create(
+            self.allocator,
+            .{
+                .name = export_name,
+                .path = export_path,
+                .ro = export_ro,
+                .desc = "spiderweb-local-export",
+            },
+            node_name,
+            fs_url,
+            lease_ttl_ms,
+            heartbeat_ms,
+        );
+        errdefer local_node.deinit(&self.control_plane);
+        try local_node.startRegistrationAndHeartbeat(&self.control_plane);
+
+        self.local_fs_node = local_node;
+        std.log.info(
+            "local fs node enabled at ws://{s}:{d}/v2/fs export={s}:{s} ({s})",
+            .{ bind_addr, port, export_name, export_path, if (export_ro) "ro" else "rw" },
+        );
+    }
 };
 
 pub fn run(
@@ -438,6 +1096,35 @@ pub fn run(
     defer runtime_registry.deinit();
 
     _ = try runtime_registry.getOrCreate(runtime_registry.default_agent_id);
+    runtime_registry.maybeInitLocalFsNode(bind_addr, port) catch |err| {
+        std.log.warn("local fs node setup skipped: {s}", .{@errorName(err)});
+    };
+
+    const metrics_port_raw = parseUnsignedEnv(allocator, metrics_port_env, 0);
+    if (metrics_port_raw > 0) {
+        if (metrics_port_raw > std.math.maxInt(u16)) {
+            std.log.warn("ignoring {s}={d}: out of range", .{ metrics_port_env, metrics_port_raw });
+        } else {
+            const metrics_port: u16 = @intCast(metrics_port_raw);
+            const metrics_address = try std.net.Address.parseIp(bind_addr, metrics_port);
+            const listener_ptr = try allocator.create(std.net.Server);
+            errdefer allocator.destroy(listener_ptr);
+            listener_ptr.* = try metrics_address.listen(.{ .reuse_address = true });
+            // Listener intentionally lives for process lifetime; metrics thread owns accept loop.
+            errdefer listener_ptr.deinit();
+
+            const metrics_thread = try std.Thread.spawn(
+                .{},
+                runMetricsHttpServer,
+                .{ allocator, &runtime_registry, listener_ptr },
+            );
+            metrics_thread.detach();
+            std.log.info(
+                "Metrics HTTP endpoint listening at http://{s}:{d}/metrics",
+                .{ bind_addr, metrics_port },
+            );
+        }
+    }
 
     const address = try std.net.Address.parseIp(bind_addr, port);
     var tcp_server = try address.listen(.{ .reuse_address = true });
@@ -493,6 +1180,15 @@ fn handleWebSocketConnection(
     var handshake = try websocket_transport.performHandshakeWithInfo(allocator, stream);
     defer handshake.deinit(allocator);
 
+    if (std.mem.eql(u8, handshake.path, "/v2/fs")) {
+        const local_node = runtime_registry.local_fs_node orelse {
+            try sendWebSocketErrorAndClose(allocator, stream, .invalid_envelope, "local /v2/fs endpoint is disabled");
+            return;
+        };
+        try handleLocalFsConnection(allocator, local_node, stream);
+        return;
+    }
+
     const agent_id = resolveAgentIdFromConnectionPath(handshake.path, runtime_registry.default_agent_id) orelse {
         try sendWebSocketErrorAndClose(allocator, stream, .invalid_envelope, "invalid websocket path");
         return;
@@ -511,6 +1207,13 @@ fn handleWebSocketConnection(
     var fsrpc = try fsrpc_session.Session.init(allocator, runtime_server, agent_id);
     defer fsrpc.deinit();
     var debug_stream_enabled = false;
+    var control_protocol_negotiated = false;
+    var runtime_fsrpc_version_negotiated = false;
+    var connection_write_mutex: std.Thread.Mutex = .{};
+    var topology_subscriber_id: ?u64 = null;
+    defer if (topology_subscriber_id) |subscriber_id| {
+        runtime_registry.unregisterTopologySubscriber(subscriber_id);
+    };
 
     while (true) {
         var frame = websocket_transport.readFrame(
@@ -533,7 +1236,7 @@ fn handleWebSocketConnection(
                         @errorName(err),
                     );
                     defer allocator.free(response);
-                    try websocket_transport.writeFrame(stream, response, .text);
+                    try writeFrameLocked(stream, &connection_write_mutex, response, .text);
                     continue;
                 };
                 defer parsed.deinit(allocator);
@@ -548,16 +1251,64 @@ fn handleWebSocketConnection(
                                 "missing control type",
                             );
                             defer allocator.free(response);
-                            try websocket_transport.writeFrame(stream, response, .text);
+                            try writeFrameLocked(stream, &connection_write_mutex, response, .text);
                             continue;
                         };
 
+                        if (!control_protocol_negotiated and control_type != .version) {
+                            const response = try unified.buildControlError(
+                                allocator,
+                                parsed.id,
+                                "protocol_mismatch",
+                                "control.version must be negotiated first",
+                            );
+                            defer allocator.free(response);
+                            try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                            try writeFrameLocked(stream, &connection_write_mutex, "", .close);
+                            return;
+                        }
+
                         switch (control_type) {
+                            .version => {
+                                validateControlVersionPayload(allocator, parsed.payload_json) catch |err| {
+                                    const response = try unified.buildControlError(
+                                        allocator,
+                                        parsed.id,
+                                        "protocol_mismatch",
+                                        @errorName(err),
+                                    );
+                                    defer allocator.free(response);
+                                    try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                    try writeFrameLocked(stream, &connection_write_mutex, "", .close);
+                                    return;
+                                };
+                                control_protocol_negotiated = true;
+                                const payload = try std.fmt.allocPrint(
+                                    allocator,
+                                    "{{\"protocol\":\"{s}\",\"fsrpc_runtime\":\"{s}\",\"fsrpc_node\":\"{s}\",\"fsrpc_node_proto\":{d}}}",
+                                    .{
+                                        control_protocol_version,
+                                        fsrpc_runtime_protocol_version,
+                                        fsrpc_node_protocol_version,
+                                        fsrpc_node_proto_id,
+                                    },
+                                );
+                                defer allocator.free(payload);
+                                const response = try unified.buildControlAck(
+                                    allocator,
+                                    .version_ack,
+                                    parsed.id,
+                                    payload,
+                                );
+                                defer allocator.free(response);
+                                try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                continue;
+                            },
                             .connect => {
                                 const payload = try std.fmt.allocPrint(
                                     allocator,
-                                    "{{\"agent_id\":\"{s}\",\"session\":\"main\",\"protocol\":\"v2\"}}",
-                                    .{agent_id},
+                                    "{{\"agent_id\":\"{s}\",\"session\":\"main\",\"protocol\":\"{s}\"}}",
+                                    .{ agent_id, control_protocol_version },
                                 );
                                 defer allocator.free(payload);
                                 const response = try unified.buildControlAck(
@@ -567,7 +1318,7 @@ fn handleWebSocketConnection(
                                     payload,
                                 );
                                 defer allocator.free(response);
-                                try websocket_transport.writeFrame(stream, response, .text);
+                                try writeFrameLocked(stream, &connection_write_mutex, response, .text);
                                 continue;
                             },
                             .ping => {
@@ -578,7 +1329,20 @@ fn handleWebSocketConnection(
                                     "{}",
                                 );
                                 defer allocator.free(response);
-                                try websocket_transport.writeFrame(stream, response, .text);
+                                try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                continue;
+                            },
+                            .metrics => {
+                                const payload = try runtime_registry.control_plane.metricsJson();
+                                defer allocator.free(payload);
+                                const response = try unified.buildControlAck(
+                                    allocator,
+                                    .metrics,
+                                    parsed.id,
+                                    payload,
+                                );
+                                defer allocator.free(response);
+                                try writeFrameLocked(stream, &connection_write_mutex, response, .text);
                                 continue;
                             },
                             .session_attach, .session_resume => {
@@ -589,12 +1353,23 @@ fn handleWebSocketConnection(
                                     "{\"session\":\"main\"}",
                                 );
                                 defer allocator.free(response);
-                                try websocket_transport.writeFrame(stream, response, .text);
+                                try writeFrameLocked(stream, &connection_write_mutex, response, .text);
                                 continue;
                             },
                             .debug_subscribe, .debug_unsubscribe => {
                                 debug_stream_enabled = control_type == .debug_subscribe;
                                 fsrpc.setDebugStreamEnabled(debug_stream_enabled);
+                                if (debug_stream_enabled) {
+                                    if (topology_subscriber_id == null) {
+                                        topology_subscriber_id = try runtime_registry.registerTopologySubscriber(
+                                            stream,
+                                            &connection_write_mutex,
+                                        );
+                                    }
+                                } else if (topology_subscriber_id) |subscriber_id| {
+                                    runtime_registry.unregisterTopologySubscriber(subscriber_id);
+                                    topology_subscriber_id = null;
+                                }
                                 const request_id = parsed.id orelse "generated";
                                 const payload_json = if (debug_stream_enabled)
                                     "{\"enabled\":true}"
@@ -607,8 +1382,80 @@ fn handleWebSocketConnection(
                                     payload_json,
                                 );
                                 defer allocator.free(ack);
-                                try websocket_transport.writeFrame(stream, ack, .text);
+                                try writeFrameLocked(stream, &connection_write_mutex, ack, .text);
                                 runtime_registry.maybeLogDebugFrame(agent_id, ack);
+                                continue;
+                            },
+                            .node_invite_create,
+                            .node_join,
+                            .node_lease_refresh,
+                            .node_list,
+                            .node_get,
+                            .node_delete,
+                            .project_create,
+                            .project_update,
+                            .project_delete,
+                            .project_list,
+                            .project_get,
+                            .project_mount_set,
+                            .project_mount_remove,
+                            .project_mount_list,
+                            .project_token_rotate,
+                            .project_token_revoke,
+                            .project_activate,
+                            .workspace_status,
+                            => {
+                                if (runtime_registry.control_operator_token) |operator_token| {
+                                    if (isOperatorTokenProtectedMutation(control_type)) {
+                                        validateOperatorTokenPayload(allocator, operator_token, parsed.payload_json) catch |err| {
+                                            const code = switch (err) {
+                                                error.MissingField => "missing_field",
+                                                error.InvalidPayload => "invalid_payload",
+                                                else => "operator_auth_failed",
+                                            };
+                                            const response = try unified.buildControlError(
+                                                allocator,
+                                                parsed.id,
+                                                code,
+                                                @errorName(err),
+                                            );
+                                            defer allocator.free(response);
+                                            try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                            continue;
+                                        };
+                                    }
+                                }
+                                const payload_json = handleControlPlaneCommand(
+                                    runtime_registry,
+                                    control_type,
+                                    agent_id,
+                                    parsed.payload_json,
+                                ) catch |err| {
+                                    const response = try unified.buildControlError(
+                                        allocator,
+                                        parsed.id,
+                                        controlPlaneErrorCode(err),
+                                        @errorName(err),
+                                    );
+                                    defer allocator.free(response);
+                                    try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                    continue;
+                                };
+                                defer allocator.free(payload_json);
+
+                                const response = try unified.buildControlAck(
+                                    allocator,
+                                    control_type,
+                                    parsed.id,
+                                    payload_json,
+                                );
+                                defer allocator.free(response);
+                                try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                if (isWorkspaceTopologyMutation(control_type)) {
+                                    const reason = unified.controlTypeName(control_type);
+                                    runtime_registry.emitWorkspaceTopologyChanged(reason);
+                                    runtime_registry.emitWorkspaceTopologyProjectDelta(agent_id, reason, payload_json);
+                                }
                                 continue;
                             },
                             else => {
@@ -619,15 +1466,68 @@ fn handleWebSocketConnection(
                                     "unsupported control operation",
                                 );
                                 defer allocator.free(response);
-                                try websocket_transport.writeFrame(stream, response, .text);
+                                try writeFrameLocked(stream, &connection_write_mutex, response, .text);
                                 continue;
                             },
                         }
                     },
                     .fsrpc => {
+                        const fsrpc_type = parsed.fsrpc_type orelse {
+                            const response = try unified.buildFsrpcError(
+                                allocator,
+                                parsed.tag,
+                                "invalid_type",
+                                "missing fsrpc message type",
+                            );
+                            defer allocator.free(response);
+                            try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                            try writeFrameLocked(stream, &connection_write_mutex, "", .close);
+                            return;
+                        };
+                        if (!runtime_fsrpc_version_negotiated) {
+                            if (fsrpc_type != .t_version) {
+                                const response = try unified.buildFsrpcError(
+                                    allocator,
+                                    parsed.tag,
+                                    "protocol_mismatch",
+                                    "fsrpc.t_version must be negotiated first",
+                                );
+                                defer allocator.free(response);
+                                try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                try writeFrameLocked(stream, &connection_write_mutex, "", .close);
+                                return;
+                            }
+                            if (parsed.version == null or !std.mem.eql(u8, parsed.version.?, fsrpc_runtime_protocol_version)) {
+                                const response = try unified.buildFsrpcError(
+                                    allocator,
+                                    parsed.tag,
+                                    "protocol_mismatch",
+                                    "unsupported fsrpc runtime version",
+                                );
+                                defer allocator.free(response);
+                                try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                try writeFrameLocked(stream, &connection_write_mutex, "", .close);
+                                return;
+                            }
+                            runtime_fsrpc_version_negotiated = true;
+                        } else if (fsrpc_type == .t_version) {
+                            if (parsed.version == null or !std.mem.eql(u8, parsed.version.?, fsrpc_runtime_protocol_version)) {
+                                const response = try unified.buildFsrpcError(
+                                    allocator,
+                                    parsed.tag,
+                                    "protocol_mismatch",
+                                    "unsupported fsrpc runtime version",
+                                );
+                                defer allocator.free(response);
+                                try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                try writeFrameLocked(stream, &connection_write_mutex, "", .close);
+                                return;
+                            }
+                        }
+
                         const response = try fsrpc.handle(&parsed);
                         defer allocator.free(response);
-                        try websocket_transport.writeFrame(stream, response, .text);
+                        try writeFrameLocked(stream, &connection_write_mutex, response, .text);
 
                         const debug_frames = try fsrpc.drainPendingDebugFrames();
                         if (debug_frames.len > 0) {
@@ -635,7 +1535,7 @@ fn handleWebSocketConnection(
                             var idx: usize = 0;
                             while (idx < debug_frames.len) : (idx += 1) {
                                 const payload = debug_frames[idx];
-                                websocket_transport.writeFrame(stream, payload, .text) catch |err| {
+                                writeFrameLocked(stream, &connection_write_mutex, payload, .text) catch |err| {
                                     allocator.free(payload);
                                     var rest = idx + 1;
                                     while (rest < debug_frames.len) : (rest += 1) {
@@ -652,11 +1552,11 @@ fn handleWebSocketConnection(
                 }
             },
             0x8 => {
-                try websocket_transport.writeFrame(stream, "", .close);
+                try writeFrameLocked(stream, &connection_write_mutex, "", .close);
                 return;
             },
             0x9 => {
-                try websocket_transport.writeFrame(stream, frame.payload, .pong);
+                try writeFrameLocked(stream, &connection_write_mutex, frame.payload, .pong);
             },
             0xA => {},
             else => {},
@@ -676,6 +1576,163 @@ fn sendWebSocketErrorAndClose(
     try websocket_transport.writeFrame(stream, "", .close);
 }
 
+fn validateControlVersionPayload(allocator: std.mem.Allocator, payload_json: ?[]const u8) !void {
+    const raw = payload_json orelse return error.MissingField;
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidType;
+    const protocol_value = parsed.value.object.get("protocol") orelse return error.MissingField;
+    if (protocol_value != .string) return error.InvalidType;
+    if (!std.mem.eql(u8, protocol_value.string, control_protocol_version)) return error.ProtocolMismatch;
+}
+
+fn validateFsNodeHelloPayload(
+    allocator: std.mem.Allocator,
+    payload_json: ?[]const u8,
+    required_auth_token: ?[]const u8,
+) !void {
+    const raw = payload_json orelse return error.MissingField;
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidType;
+
+    const protocol_value = parsed.value.object.get("protocol") orelse return error.MissingField;
+    if (protocol_value != .string) return error.InvalidType;
+    if (!std.mem.eql(u8, protocol_value.string, fsrpc_node_protocol_version)) return error.ProtocolMismatch;
+
+    const proto_value = parsed.value.object.get("proto") orelse return error.MissingField;
+    if (proto_value != .integer) return error.InvalidType;
+    if (proto_value.integer != fsrpc_node_proto_id) return error.ProtocolMismatch;
+
+    if (required_auth_token) |expected| {
+        const auth_value = parsed.value.object.get("auth_token") orelse return error.AuthMissing;
+        if (auth_value != .string) return error.InvalidType;
+        if (!std.mem.eql(u8, auth_value.string, expected)) return error.AuthFailed;
+    }
+}
+
+fn writeFrameLocked(
+    stream: *std.net.Stream,
+    write_mutex: *std.Thread.Mutex,
+    payload: []const u8,
+    frame_type: websocket_transport.FrameType,
+) !void {
+    write_mutex.lock();
+    defer write_mutex.unlock();
+    try websocket_transport.writeFrame(stream, payload, frame_type);
+}
+
+fn isWorkspaceTopologyMutation(control_type: unified.ControlType) bool {
+    return switch (control_type) {
+        .node_join,
+        .node_lease_refresh,
+        .node_delete,
+        .project_create,
+        .project_update,
+        .project_delete,
+        .project_mount_set,
+        .project_mount_remove,
+        .project_activate,
+        => true,
+        else => false,
+    };
+}
+
+fn extractProjectIdFromControlPayload(allocator: std.mem.Allocator, payload_json: []const u8) !?[]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload_json, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const project_id = parsed.value.object.get("project_id") orelse return null;
+    if (project_id != .string or project_id.string.len == 0) return null;
+    const copy = try allocator.dupe(u8, project_id.string);
+    return @as(?[]u8, copy);
+}
+
+fn isOperatorTokenProtectedMutation(control_type: unified.ControlType) bool {
+    return switch (control_type) {
+        .node_invite_create,
+        .node_delete,
+        .project_create,
+        .project_update,
+        .project_delete,
+        .project_mount_set,
+        .project_mount_remove,
+        .project_token_rotate,
+        .project_token_revoke,
+        => true,
+        else => false,
+    };
+}
+
+fn validateOperatorTokenPayload(
+    allocator: std.mem.Allocator,
+    expected_token: []const u8,
+    payload_json: ?[]const u8,
+) !void {
+    const raw = payload_json orelse return error.MissingField;
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidPayload;
+    const token_value = parsed.value.object.get("operator_token") orelse return error.MissingField;
+    if (token_value != .string or token_value.string.len == 0) return error.InvalidPayload;
+    if (!secureTokenEql(expected_token, token_value.string)) return error.OperatorAuthFailed;
+}
+
+fn secureTokenEql(expected: []const u8, candidate: []const u8) bool {
+    if (expected.len != candidate.len) return false;
+    var diff: u8 = 0;
+    for (expected, candidate) |lhs, rhs| {
+        diff |= lhs ^ rhs;
+    }
+    return diff == 0;
+}
+
+fn handleControlPlaneCommand(
+    runtime_registry: *AgentRuntimeRegistry,
+    control_type: unified.ControlType,
+    agent_id: []const u8,
+    payload_json: ?[]const u8,
+) ![]u8 {
+    return switch (control_type) {
+        .node_invite_create => runtime_registry.control_plane.createNodeInvite(payload_json),
+        .node_join => runtime_registry.control_plane.nodeJoin(payload_json),
+        .node_lease_refresh => runtime_registry.control_plane.refreshNodeLease(payload_json),
+        .node_list => runtime_registry.control_plane.listNodes(),
+        .node_get => runtime_registry.control_plane.getNode(payload_json),
+        .node_delete => runtime_registry.control_plane.deleteNode(payload_json),
+        .project_create => runtime_registry.control_plane.createProject(payload_json),
+        .project_update => runtime_registry.control_plane.updateProject(payload_json),
+        .project_delete => runtime_registry.control_plane.deleteProject(payload_json),
+        .project_list => runtime_registry.control_plane.listProjects(),
+        .project_get => runtime_registry.control_plane.getProject(payload_json),
+        .project_mount_set => runtime_registry.control_plane.setProjectMount(payload_json),
+        .project_mount_remove => runtime_registry.control_plane.removeProjectMount(payload_json),
+        .project_mount_list => runtime_registry.control_plane.listProjectMounts(payload_json),
+        .project_token_rotate => runtime_registry.control_plane.rotateProjectToken(payload_json),
+        .project_token_revoke => runtime_registry.control_plane.revokeProjectToken(payload_json),
+        .project_activate => runtime_registry.control_plane.activateProject(agent_id, payload_json),
+        .workspace_status => runtime_registry.control_plane.workspaceStatus(agent_id, payload_json),
+        else => error.UnsupportedControlPlaneOperation,
+    };
+}
+
+fn controlPlaneErrorCode(err: anyerror) []const u8 {
+    return switch (err) {
+        fs_control_plane.ControlPlaneError.InvalidPayload => "invalid_payload",
+        fs_control_plane.ControlPlaneError.MissingField => "missing_field",
+        fs_control_plane.ControlPlaneError.InviteNotFound => "invite_not_found",
+        fs_control_plane.ControlPlaneError.InviteExpired => "invite_expired",
+        fs_control_plane.ControlPlaneError.InviteRedeemed => "invite_redeemed",
+        fs_control_plane.ControlPlaneError.NodeNotFound => "node_not_found",
+        fs_control_plane.ControlPlaneError.NodeAuthFailed => "node_auth_failed",
+        fs_control_plane.ControlPlaneError.ProjectNotFound => "project_not_found",
+        fs_control_plane.ControlPlaneError.ProjectAuthFailed => "project_auth_failed",
+        fs_control_plane.ControlPlaneError.MountConflict => "mount_conflict",
+        fs_control_plane.ControlPlaneError.MountNotFound => "mount_not_found",
+        else => "control_plane_error",
+    };
+}
+
 fn resolveAgentIdFromConnectionPath(path: []const u8, default_agent_id: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, path, "/") or std.mem.startsWith(u8, path, "/?")) {
         return default_agent_id;
@@ -690,6 +1747,124 @@ fn sendServiceUnavailable(stream: *std.net.Stream) !void {
         "Content-Length: 0\r\n" ++
         "\r\n";
     try stream.writeAll(payload);
+}
+
+fn runMetricsHttpServer(
+    allocator: std.mem.Allocator,
+    runtime_registry: *AgentRuntimeRegistry,
+    listener: *std.net.Server,
+) void {
+    while (true) {
+        var connection = listener.accept() catch |err| {
+            std.log.err("metrics accept failed: {s}", .{@errorName(err)});
+            std.Thread.sleep(250 * std.time.ns_per_ms);
+            continue;
+        };
+        defer connection.stream.close();
+
+        handleMetricsHttpConnection(allocator, runtime_registry, &connection.stream) catch |err| {
+            std.log.warn("metrics request failed: {s}", .{@errorName(err)});
+        };
+    }
+}
+
+fn handleMetricsHttpConnection(
+    allocator: std.mem.Allocator,
+    runtime_registry: *AgentRuntimeRegistry,
+    stream: *std.net.Stream,
+) !void {
+    var request_buf: [16 * 1024]u8 = undefined;
+    const request = try readHttpRequestIntoBuffer(stream, &request_buf);
+    const request_target = parseHttpRequestPath(request) orelse {
+        try writeHttpStatus(stream, "400 Bad Request", "text/plain; charset=utf-8", "bad request\n");
+        return;
+    };
+    const request_path = stripHttpRequestTargetQuery(request_target);
+
+    if (std.mem.eql(u8, request_path, "/livez")) {
+        try writeHttpStatus(stream, "200 OK", "text/plain; charset=utf-8", "ok\n");
+        return;
+    }
+
+    if (std.mem.eql(u8, request_path, "/readyz")) {
+        if (runtime_registry.getFirstAgentId() == null) {
+            try writeHttpStatus(stream, "503 Service Unavailable", "text/plain; charset=utf-8", "not ready\n");
+            return;
+        }
+        try writeHttpStatus(stream, "200 OK", "text/plain; charset=utf-8", "ready\n");
+        return;
+    }
+
+    if (std.mem.eql(u8, request_path, "/metrics")) {
+        const body = runtime_registry.control_plane.metricsPrometheus() catch |err| {
+            const err_msg = try std.fmt.allocPrint(allocator, "metrics formatter error: {s}\n", .{@errorName(err)});
+            defer allocator.free(err_msg);
+            try writeHttpStatus(stream, "500 Internal Server Error", "text/plain; charset=utf-8", err_msg);
+            return;
+        };
+        defer allocator.free(body);
+        try writeHttpStatus(stream, "200 OK", "text/plain; version=0.0.4; charset=utf-8", body);
+        return;
+    }
+
+    if (!std.mem.eql(u8, request_path, "/metrics.json")) {
+        try writeHttpStatus(stream, "404 Not Found", "text/plain; charset=utf-8", "not found\n");
+        return;
+    }
+
+    const json_body = runtime_registry.control_plane.metricsJson() catch |err| {
+        const err_msg = try std.fmt.allocPrint(allocator, "{{\"error\":\"{s}\"}}\n", .{@errorName(err)});
+        defer allocator.free(err_msg);
+        try writeHttpStatus(stream, "500 Internal Server Error", "application/json", err_msg);
+        return;
+    };
+    defer allocator.free(json_body);
+
+    try writeHttpStatus(stream, "200 OK", "application/json", json_body);
+}
+
+fn readHttpRequestIntoBuffer(stream: *std.net.Stream, buffer: []u8) ![]const u8 {
+    var used: usize = 0;
+    while (used < buffer.len) {
+        const read_n = try stream.read(buffer[used..]);
+        if (read_n == 0) return error.ConnectionClosed;
+        used += read_n;
+        if (std.mem.indexOf(u8, buffer[0..used], "\r\n\r\n") != null) {
+            return buffer[0..used];
+        }
+    }
+    return error.RequestTooLarge;
+}
+
+fn parseHttpRequestPath(request: []const u8) ?[]const u8 {
+    const line_end = std.mem.indexOf(u8, request, "\r\n") orelse return null;
+    const line = request[0..line_end];
+    if (!std.mem.startsWith(u8, line, "GET ")) return null;
+    const path_start = 4;
+    const path_end = std.mem.indexOfPos(u8, line, path_start, " ") orelse return null;
+    if (path_end <= path_start) return null;
+    return line[path_start..path_end];
+}
+
+fn stripHttpRequestTargetQuery(target: []const u8) []const u8 {
+    const query_start = std.mem.indexOfScalar(u8, target, '?') orelse return target;
+    return target[0..query_start];
+}
+
+fn writeHttpStatus(
+    stream: *std.net.Stream,
+    status: []const u8,
+    content_type: []const u8,
+    body: []const u8,
+) !void {
+    var header_buf: [256]u8 = undefined;
+    const response_headers = try std.fmt.bufPrint(
+        &header_buf,
+        "HTTP/1.1 {s}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n",
+        .{ status, content_type, body.len },
+    );
+    try stream.writeAll(response_headers);
+    if (body.len > 0) try stream.writeAll(body);
 }
 
 const WsTestServerCtx = struct {
@@ -846,6 +2021,12 @@ fn performClientHandshake(allocator: std.mem.Allocator, client: *std.net.Stream,
 }
 
 fn fsrpcConnectAndAttach(allocator: std.mem.Allocator, client: *std.net.Stream, connect_id: []const u8) !void {
+    try writeClientTextFrameMasked(client, "{\"channel\":\"control\",\"type\":\"control.version\",\"id\":\"version\",\"payload\":{\"protocol\":\"unified-v2\"}}");
+    var version_ack = try readServerFrame(allocator, client);
+    defer version_ack.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0x1), version_ack.opcode);
+    try std.testing.expect(std.mem.indexOf(u8, version_ack.payload, "\"type\":\"control.version_ack\"") != null);
+
     const connect_req = try std.fmt.allocPrint(
         allocator,
         "{{\"channel\":\"control\",\"type\":\"control.connect\",\"id\":\"{s}\"}}",
@@ -993,6 +2174,19 @@ test "server_piai: base websocket path handles unified control/fsrpc chat flow a
 
     try fsrpcConnectAndAttach(allocator, &client, "req-connect");
 
+    try writeClientTextFrameMasked(&client, "{\"channel\":\"control\",\"type\":\"control.ping\",\"id\":\"req-ping\"}");
+    var pong = try readServerFrame(allocator, &client);
+    defer pong.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, pong.payload, "\"type\":\"control.pong\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pong.payload, "\"payload\":{}") != null);
+
+    try writeClientTextFrameMasked(&client, "{\"channel\":\"control\",\"type\":\"control.metrics\",\"id\":\"req-metrics\"}");
+    var metrics = try readServerFrame(allocator, &client);
+    defer metrics.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, metrics.payload, "\"type\":\"control.metrics\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, metrics.payload, "\"nodes\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, metrics.payload, "\"projects\"") != null);
+
     try writeClientTextFrameMasked(&client, "{\"channel\":\"control\",\"type\":\"control.debug_subscribe\",\"id\":\"req-debug-sub\"}");
     var debug_sub = try readServerFrame(allocator, &client);
     defer debug_sub.deinit(allocator);
@@ -1027,6 +2221,151 @@ test "server_piai: base websocket path handles unified control/fsrpc chat flow a
     var close_reply = try readServerFrame(allocator, &client);
     defer close_reply.deinit(allocator);
     try std.testing.expectEqual(@as(u8, 0x8), close_reply.opcode);
+
+    try std.testing.expect(server_ctx.err_name == null);
+}
+
+test "server_piai: operator token gate protects control mutations" {
+    const allocator = std.testing.allocator;
+    var runtime_registry = AgentRuntimeRegistry.init(allocator, .{
+        .ltm_directory = "",
+        .ltm_filename = "",
+    }, null);
+    defer runtime_registry.deinit();
+    if (runtime_registry.control_operator_token) |token| {
+        allocator.free(token);
+    }
+    runtime_registry.control_operator_token = try allocator.dupe(u8, "operator-secret");
+
+    var listener = try (try std.net.Address.parseIp("127.0.0.1", 0)).listen(.{ .reuse_address = true });
+    defer listener.deinit();
+
+    var server_ctx = WsTestServerCtx{
+        .allocator = allocator,
+        .runtime_registry = &runtime_registry,
+        .listener = &listener,
+    };
+    defer server_ctx.deinit();
+
+    const server_thread = try std.Thread.spawn(.{}, runSingleWsConnection, .{&server_ctx});
+    defer server_thread.join();
+
+    var client = try std.net.tcpConnectToAddress(listener.listen_address);
+    defer client.close();
+    try performClientHandshake(allocator, &client, "/");
+
+    try writeClientTextFrameMasked(&client, "{\"channel\":\"control\",\"type\":\"control.version\",\"id\":\"v1\",\"payload\":{\"protocol\":\"unified-v2\"}}");
+    var version_ack = try readServerFrame(allocator, &client);
+    defer version_ack.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, version_ack.payload, "\"type\":\"control.version_ack\"") != null);
+
+    try writeClientTextFrameMasked(&client, "{\"channel\":\"control\",\"type\":\"control.connect\",\"id\":\"c1\"}");
+    var connect_ack = try readServerFrame(allocator, &client);
+    defer connect_ack.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, connect_ack.payload, "\"type\":\"control.connect_ack\"") != null);
+
+    try writeClientTextFrameMasked(&client, "{\"channel\":\"control\",\"type\":\"control.project_create\",\"id\":\"p-missing\",\"payload\":{\"name\":\"NoToken\"}}");
+    var missing_token = try readServerFrame(allocator, &client);
+    defer missing_token.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, missing_token.payload, "\"type\":\"control.error\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, missing_token.payload, "\"code\":\"missing_field\"") != null);
+
+    try writeClientTextFrameMasked(&client, "{\"channel\":\"control\",\"type\":\"control.project_create\",\"id\":\"p-bad\",\"payload\":{\"name\":\"BadToken\",\"operator_token\":\"wrong\"}}");
+    var bad_token = try readServerFrame(allocator, &client);
+    defer bad_token.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, bad_token.payload, "\"type\":\"control.error\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bad_token.payload, "\"code\":\"operator_auth_failed\"") != null);
+
+    try writeClientTextFrameMasked(&client, "{\"channel\":\"control\",\"type\":\"control.project_create\",\"id\":\"p-good\",\"payload\":{\"name\":\"GoodToken\",\"operator_token\":\"operator-secret\"}}");
+    var good = try readServerFrame(allocator, &client);
+    defer good.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, good.payload, "\"type\":\"control.project_create\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, good.payload, "\"project_id\"") != null);
+
+    try websocket_transport.writeFrame(&client, "", .close);
+    var close_reply = try readServerFrame(allocator, &client);
+    defer close_reply.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0x8), close_reply.opcode);
+
+    try std.testing.expect(server_ctx.err_name == null);
+}
+
+test "server_piai: workspace topology mutations are pushed to debug subscribers" {
+    const allocator = std.testing.allocator;
+    var runtime_registry = AgentRuntimeRegistry.init(allocator, .{
+        .ltm_directory = "",
+        .ltm_filename = "",
+    }, null);
+    defer runtime_registry.deinit();
+
+    var listener = try (try std.net.Address.parseIp("127.0.0.1", 0)).listen(.{ .reuse_address = true });
+    defer listener.deinit();
+
+    var server_ctx = WsTestServerCtx{
+        .allocator = allocator,
+        .runtime_registry = &runtime_registry,
+        .listener = &listener,
+    };
+    defer server_ctx.deinit();
+
+    const sub_server_thread = try std.Thread.spawn(.{}, runSingleWsConnection, .{&server_ctx});
+    defer sub_server_thread.join();
+    const mut_server_thread = try std.Thread.spawn(.{}, runSingleWsConnection, .{&server_ctx});
+    defer mut_server_thread.join();
+
+    var subscriber = try std.net.tcpConnectToAddress(listener.listen_address);
+    defer subscriber.close();
+    try performClientHandshake(allocator, &subscriber, "/");
+    try writeClientTextFrameMasked(&subscriber, "{\"channel\":\"control\",\"type\":\"control.version\",\"id\":\"sub-version\",\"payload\":{\"protocol\":\"unified-v2\"}}");
+    var sub_version_ack = try readServerFrame(allocator, &subscriber);
+    defer sub_version_ack.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, sub_version_ack.payload, "\"type\":\"control.version_ack\"") != null);
+    try writeClientTextFrameMasked(&subscriber, "{\"channel\":\"control\",\"type\":\"control.connect\",\"id\":\"sub-connect\"}");
+    var sub_connect_ack = try readServerFrame(allocator, &subscriber);
+    defer sub_connect_ack.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, sub_connect_ack.payload, "\"type\":\"control.connect_ack\"") != null);
+
+    try writeClientTextFrameMasked(&subscriber, "{\"channel\":\"control\",\"type\":\"control.debug_subscribe\",\"id\":\"sub-debug\"}");
+    var sub_debug_ack = try readServerFrame(allocator, &subscriber);
+    defer sub_debug_ack.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, sub_debug_ack.payload, "\"type\":\"debug.event\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sub_debug_ack.payload, "\"category\":\"control.subscription\"") != null);
+
+    var mutator = try std.net.tcpConnectToAddress(listener.listen_address);
+    defer mutator.close();
+    try performClientHandshake(allocator, &mutator, "/");
+    try writeClientTextFrameMasked(&mutator, "{\"channel\":\"control\",\"type\":\"control.version\",\"id\":\"mut-version\",\"payload\":{\"protocol\":\"unified-v2\"}}");
+    var mut_version_ack = try readServerFrame(allocator, &mutator);
+    defer mut_version_ack.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, mut_version_ack.payload, "\"type\":\"control.version_ack\"") != null);
+    try writeClientTextFrameMasked(&mutator, "{\"channel\":\"control\",\"type\":\"control.connect\",\"id\":\"mut-connect\"}");
+    var mut_connect_ack = try readServerFrame(allocator, &mutator);
+    defer mut_connect_ack.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, mut_connect_ack.payload, "\"type\":\"control.connect_ack\"") != null);
+
+    try writeClientTextFrameMasked(
+        &mutator,
+        "{\"channel\":\"control\",\"type\":\"control.project_create\",\"id\":\"mut-project\",\"payload\":{\"name\":\"Topology Test\"}}",
+    );
+    var project_created = try readServerFrame(allocator, &mutator);
+    defer project_created.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, project_created.payload, "\"type\":\"control.project_create\"") != null);
+
+    var pushed = try readServerFrame(allocator, &subscriber);
+    defer pushed.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, pushed.payload, "\"type\":\"debug.event\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pushed.payload, "\"category\":\"control.workspace_topology\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pushed.payload, "workspace_topology_changed") != null);
+
+    try websocket_transport.writeFrame(&mutator, "", .close);
+    var mut_close = try readServerFrame(allocator, &mutator);
+    defer mut_close.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0x8), mut_close.opcode);
+
+    try websocket_transport.writeFrame(&subscriber, "", .close);
+    var sub_close = try readServerFrame(allocator, &subscriber);
+    defer sub_close.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0x8), sub_close.opcode);
 
     try std.testing.expect(server_ctx.err_name == null);
 }
@@ -1126,6 +2465,11 @@ test "server_piai: runtime cap does not block repeated base-path reconnects" {
         defer client.close();
         try performClientHandshake(allocator, &client, "/");
 
+        try writeClientTextFrameMasked(&client, "{\"channel\":\"control\",\"type\":\"control.version\",\"id\":\"alpha-version\",\"payload\":{\"protocol\":\"unified-v2\"}}");
+        var version_ack = try readServerFrame(allocator, &client);
+        defer version_ack.deinit(allocator);
+        try std.testing.expect(std.mem.indexOf(u8, version_ack.payload, "\"type\":\"control.version_ack\"") != null);
+
         try writeClientTextFrameMasked(&client, "{\"channel\":\"control\",\"type\":\"control.connect\",\"id\":\"alpha-connect\"}");
         var connect_ack = try readServerFrame(allocator, &client);
         defer connect_ack.deinit(allocator);
@@ -1144,6 +2488,11 @@ test "server_piai: runtime cap does not block repeated base-path reconnects" {
         var client = try std.net.tcpConnectToAddress(listener.listen_address);
         defer client.close();
         try performClientHandshake(allocator, &client, "/");
+
+        try writeClientTextFrameMasked(&client, "{\"channel\":\"control\",\"type\":\"control.version\",\"id\":\"beta-version\",\"payload\":{\"protocol\":\"unified-v2\"}}");
+        var version_ack = try readServerFrame(allocator, &client);
+        defer version_ack.deinit(allocator);
+        try std.testing.expect(std.mem.indexOf(u8, version_ack.payload, "\"type\":\"control.version_ack\"") != null);
 
         try writeClientTextFrameMasked(&client, "{\"channel\":\"control\",\"type\":\"control.connect\",\"id\":\"beta-connect\"}");
         var connect_ack = try readServerFrame(allocator, &client);
@@ -1204,6 +2553,50 @@ test "server_piai: resolve connection path maps base URL to default agent" {
     try std.testing.expectEqualStrings("default", resolved_query);
     try std.testing.expect(resolveAgentIdFromConnectionPath("/v2/agents/default/stream", "default") == null);
     try std.testing.expect(resolveAgentIdFromConnectionPath("/v1/agents/default/stream", "default") == null);
+}
+
+test "server_piai: parseHttpRequestPath parses GET line" {
+    const request =
+        "GET /metrics HTTP/1.1\r\n" ++
+        "Host: localhost\r\n" ++
+        "\r\n";
+    const path = parseHttpRequestPath(request) orelse return error.TestExpectedPath;
+    try std.testing.expectEqualStrings("/metrics", path);
+}
+
+test "server_piai: stripHttpRequestTargetQuery removes query string" {
+    try std.testing.expectEqualStrings("/metrics", stripHttpRequestTargetQuery("/metrics?format=json"));
+    try std.testing.expectEqualStrings("/readyz", stripHttpRequestTargetQuery("/readyz"));
+}
+
+test "server_piai: validateFsNodeHelloPayload enforces optional auth_token" {
+    const allocator = std.testing.allocator;
+    try validateFsNodeHelloPayload(
+        allocator,
+        "{\"protocol\":\"unified-v2-fs\",\"proto\":2}",
+        null,
+    );
+    try validateFsNodeHelloPayload(
+        allocator,
+        "{\"protocol\":\"unified-v2-fs\",\"proto\":2,\"auth_token\":\"secret\"}",
+        "secret",
+    );
+    try std.testing.expectError(
+        error.AuthMissing,
+        validateFsNodeHelloPayload(
+            allocator,
+            "{\"protocol\":\"unified-v2-fs\",\"proto\":2}",
+            "secret",
+        ),
+    );
+    try std.testing.expectError(
+        error.AuthFailed,
+        validateFsNodeHelloPayload(
+            allocator,
+            "{\"protocol\":\"unified-v2-fs\",\"proto\":2,\"auth_token\":\"wrong\"}",
+            "secret",
+        ),
+    );
 }
 
 test "server_piai: agent id validation allows safe identifiers only" {

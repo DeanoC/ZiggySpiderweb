@@ -1821,7 +1821,7 @@ pub const NodeOps = struct {
         const hello_caps = self.computeHelloCaps();
         const response = std.fmt.allocPrint(
             self.allocator,
-            "{{\"proto\":1,\"node\":{{\"name\":\"spiderweb-fs-node\",\"os\":\"{s}\",\"ver\":\"0.1.0\"}},\"caps\":{{\"readdirp\":true,\"symlink\":{},\"xattr\":{},\"locks\":{},\"case_sensitive\":{},\"max_read\":{d},\"max_write\":{d}}}}}",
+            "{{\"protocol\":\"unified-v2-fs\",\"proto\":2,\"node\":{{\"name\":\"spiderweb-fs-node\",\"os\":\"{s}\",\"ver\":\"0.1.0\"}},\"caps\":{{\"readdirp\":true,\"symlink\":{},\"xattr\":{},\"locks\":{},\"case_sensitive\":{},\"max_read\":{d},\"max_write\":{d}}}}}",
             .{
                 @tagName(builtin.os.tag),
                 hello_caps.symlink,

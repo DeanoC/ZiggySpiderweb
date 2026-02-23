@@ -14,6 +14,7 @@ pub fn main() !void {
     var port: u16 = 18891;
     var exports = std.ArrayListUnmanaged(fs_node_ops.ExportSpec){};
     defer exports.deinit(allocator);
+    var auth_token: ?[]const u8 = null;
 
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -31,6 +32,10 @@ pub fn main() !void {
             if (i >= args.len) return error.InvalidArguments;
             const spec = parseExportFlag(args[i]) catch return error.InvalidArguments;
             try exports.append(allocator, spec);
+        } else if (std.mem.eql(u8, arg, "--auth-token")) {
+            i += 1;
+            if (i >= args.len) return error.InvalidArguments;
+            auth_token = args[i];
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             try printHelp();
             return;
@@ -41,7 +46,24 @@ pub fn main() !void {
         }
     }
 
+    if (auth_token == null) {
+        const from_env = std.process.getEnvVarOwned(allocator, "SPIDERWEB_FS_NODE_AUTH_TOKEN") catch |err| switch (err) {
+            error.EnvironmentVariableNotFound => null,
+            else => return err,
+        };
+        if (from_env) |raw| {
+            const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+            if (trimmed.len > 0) {
+                auth_token = try allocator.dupe(u8, trimmed);
+            }
+            allocator.free(raw);
+        }
+    }
+
     std.log.info("Starting spiderweb-fs-node on {s}:{d}", .{ bind_addr, port });
+    if (auth_token != null) {
+        std.log.info("FS node session auth enabled", .{});
+    }
     if (exports.items.len == 0) {
         std.log.info("No exports configured via CLI; using default export name='work' path='.' rw", .{});
     } else {
@@ -50,7 +72,7 @@ pub fn main() !void {
         }
     }
 
-    try fs_node_server.run(allocator, bind_addr, port, exports.items);
+    try fs_node_server.run(allocator, bind_addr, port, exports.items, auth_token);
 }
 
 fn parseExportFlag(raw: []const u8) !fs_node_ops.ExportSpec {
@@ -101,12 +123,14 @@ fn printHelp() !void {
         \\spiderweb-fs-node - Distributed filesystem node server
         \\
         \\Usage:
-        \\  spiderweb-fs-node [--bind <addr>] [--port <port>] [--export <name>=<path>[:ro|:rw][:cred=<handle>]]
+        \\  spiderweb-fs-node [--bind <addr>] [--port <port>] [--export <name>=<path>[:ro|:rw][:cred=<handle>]] [--auth-token <token>]
         \\
         \\Examples:
         \\  spiderweb-fs-node --export work=.:rw
         \\  spiderweb-fs-node --bind 0.0.0.0 --port 18891 --export repo=/home/user/repo:ro
         \\  spiderweb-fs-node --export cloud=drive:root:ro:cred=gdrive.team
+        \\  spiderweb-fs-node --auth-token my-node-session-token
+        \\  (or set SPIDERWEB_FS_NODE_AUTH_TOKEN in the environment)
         \\
     ;
     try std.fs.File.stdout().writeAll(help);

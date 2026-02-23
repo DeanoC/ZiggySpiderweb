@@ -4,12 +4,16 @@ const fs_protocol = @import("fs_protocol.zig");
 const fs_node_ops = @import("fs_node_ops.zig");
 const fs_node_service = @import("fs_node_service.zig");
 const fs_watch_runtime = @import("fs_watch_runtime.zig");
+const unified = @import("ziggy-spider-protocol").unified;
+const fsrpc_node_protocol_version = "unified-v2-fs";
+const fsrpc_node_proto_id: i64 = 2;
 
 pub fn run(
     allocator: std.mem.Allocator,
     bind_addr: []const u8,
     port: u16,
     export_specs: []const fs_node_ops.ExportSpec,
+    required_auth_token: ?[]const u8,
 ) !void {
     var service = try fs_node_service.NodeService.init(allocator, export_specs);
     defer service.deinit();
@@ -34,7 +38,7 @@ pub fn run(
     var tcp_server = try address.listen(.{ .reuse_address = true });
     defer tcp_server.deinit();
 
-    std.log.info("FS node websocket server listening at ws://{s}:{d}/v1/fs", .{ bind_addr, port });
+    std.log.info("FS node websocket server listening at ws://{s}:{d}/v2/fs", .{ bind_addr, port });
 
     while (true) {
         var connection = tcp_server.accept() catch |err| {
@@ -51,6 +55,7 @@ pub fn run(
             .stream = connection.stream,
             .service = &service,
             .hub = &hub,
+            .required_auth_token = required_auth_token,
         };
 
         const thread = std.Thread.spawn(.{}, connectionThreadMain, .{ctx}) catch |err| {
@@ -68,6 +73,7 @@ const ConnectionContext = struct {
     stream: std.net.Stream,
     service: *fs_node_service.NodeService,
     hub: *ConnectionHub,
+    required_auth_token: ?[]const u8,
 };
 
 fn connectionThreadMain(ctx: *ConnectionContext) void {
@@ -138,7 +144,7 @@ const ConnectionHub = struct {
         events: []const fs_protocol.InvalidationEvent,
     ) void {
         for (events) |event| {
-            const payload = fs_protocol.buildInvalidationEvent(self.allocator, event) catch continue;
+            const payload = fs_node_service.buildInvalidationEventJson(self.allocator, event) catch continue;
             defer self.allocator.free(payload);
             self.broadcastText(origin_id, payload);
         }
@@ -170,10 +176,10 @@ fn handleConnection(ctx: *ConnectionContext) !void {
     var handshake = try websocket_transport.performHandshakeWithInfo(ctx.allocator, &ctx.stream);
     defer handshake.deinit(ctx.allocator);
 
-    if (!std.mem.startsWith(u8, handshake.path, "/v1/fs")) {
-        const response = try fs_protocol.buildErrorResponse(
+    if (!(std.mem.eql(u8, handshake.path, "/v2/fs") or std.mem.eql(u8, handshake.path, "/"))) {
+        const response = try unified.buildFsrpcFsError(
             ctx.allocator,
-            0,
+            null,
             fs_protocol.Errno.EINVAL,
             "invalid FS endpoint path",
         );
@@ -185,6 +191,7 @@ fn handleConnection(ctx: *ConnectionContext) !void {
 
     const connection = try ctx.hub.register(&ctx.stream);
     defer ctx.hub.unregister(connection);
+    var fsrpc_negotiated = false;
 
     while (true) {
         var frame = websocket_transport.readFrame(
@@ -199,10 +206,65 @@ fn handleConnection(ctx: *ConnectionContext) !void {
 
         switch (frame.opcode) {
             0x1 => {
-                var handled = ctx.service.handleRequestJsonWithEvents(frame.payload) catch |err| blk: {
-                    const fallback_response = try fs_protocol.buildErrorResponse(
+                var parsed = unified.parseMessage(ctx.allocator, frame.payload) catch |err| {
+                    const response = try unified.buildFsrpcFsError(
                         ctx.allocator,
-                        0,
+                        null,
+                        fs_protocol.Errno.EINVAL,
+                        @errorName(err),
+                    );
+                    defer ctx.allocator.free(response);
+                    try writeConnectionFrame(connection, response, .text);
+                    try writeConnectionFrame(connection, "", .close);
+                    return;
+                };
+                defer parsed.deinit(ctx.allocator);
+
+                if (!fsrpc_negotiated) {
+                    if (parsed.channel != .fsrpc or parsed.fsrpc_type != .fs_t_hello) {
+                        const response = try unified.buildFsrpcFsError(
+                            ctx.allocator,
+                            parsed.tag,
+                            fs_protocol.Errno.EINVAL,
+                            "fsrpc.t_fs_hello must be negotiated first",
+                        );
+                        defer ctx.allocator.free(response);
+                        try writeConnectionFrame(connection, response, .text);
+                        try writeConnectionFrame(connection, "", .close);
+                        return;
+                    }
+                    validateFsNodeHelloPayload(ctx.allocator, parsed.payload_json, ctx.required_auth_token) catch |err| {
+                        const response = try unified.buildFsrpcFsError(
+                            ctx.allocator,
+                            parsed.tag,
+                            fs_protocol.Errno.EINVAL,
+                            @errorName(err),
+                        );
+                        defer ctx.allocator.free(response);
+                        try writeConnectionFrame(connection, response, .text);
+                        try writeConnectionFrame(connection, "", .close);
+                        return;
+                    };
+                    fsrpc_negotiated = true;
+                } else if (parsed.fsrpc_type == .fs_t_hello) {
+                    validateFsNodeHelloPayload(ctx.allocator, parsed.payload_json, ctx.required_auth_token) catch |err| {
+                        const response = try unified.buildFsrpcFsError(
+                            ctx.allocator,
+                            parsed.tag,
+                            fs_protocol.Errno.EINVAL,
+                            @errorName(err),
+                        );
+                        defer ctx.allocator.free(response);
+                        try writeConnectionFrame(connection, response, .text);
+                        try writeConnectionFrame(connection, "", .close);
+                        return;
+                    };
+                }
+
+                var handled = ctx.service.handleRequestJsonWithEvents(frame.payload) catch |err| blk: {
+                    const fallback_response = try unified.buildFsrpcFsError(
+                        ctx.allocator,
+                        null,
                         fs_protocol.Errno.EIO,
                         @errorName(err),
                     );
@@ -216,7 +278,7 @@ fn handleConnection(ctx: *ConnectionContext) !void {
 
                 // Preserve existing response-stream ordering for the caller connection.
                 for (handled.events) |event| {
-                    const event_json = try fs_protocol.buildInvalidationEvent(ctx.allocator, event);
+                    const event_json = try fs_node_service.buildInvalidationEventJson(ctx.allocator, event);
                     defer ctx.allocator.free(event_json);
                     try writeConnectionFrame(connection, event_json, .text);
                 }
@@ -236,9 +298,9 @@ fn handleConnection(ctx: *ConnectionContext) !void {
             },
             0xA => {},
             else => {
-                const response = try fs_protocol.buildErrorResponse(
+                const response = try unified.buildFsrpcFsError(
                     ctx.allocator,
-                    0,
+                    null,
                     fs_protocol.Errno.EINVAL,
                     "unsupported websocket opcode",
                 );
@@ -246,5 +308,30 @@ fn handleConnection(ctx: *ConnectionContext) !void {
                 try writeConnectionFrame(connection, response, .text);
             },
         }
+    }
+}
+
+fn validateFsNodeHelloPayload(
+    allocator: std.mem.Allocator,
+    payload_json: ?[]const u8,
+    required_auth_token: ?[]const u8,
+) !void {
+    const raw = payload_json orelse return error.MissingField;
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidType;
+
+    const protocol_value = parsed.value.object.get("protocol") orelse return error.MissingField;
+    if (protocol_value != .string) return error.InvalidType;
+    if (!std.mem.eql(u8, protocol_value.string, fsrpc_node_protocol_version)) return error.ProtocolMismatch;
+
+    const proto_value = parsed.value.object.get("proto") orelse return error.MissingField;
+    if (proto_value != .integer) return error.InvalidType;
+    if (proto_value.integer != fsrpc_node_proto_id) return error.ProtocolMismatch;
+
+    if (required_auth_token) |expected| {
+        const auth_value = parsed.value.object.get("auth_token") orelse return error.AuthMissing;
+        if (auth_value != .string) return error.InvalidType;
+        if (!std.mem.eql(u8, auth_value.string, expected)) return error.AuthFailed;
     }
 }

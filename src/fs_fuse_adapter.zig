@@ -51,79 +51,128 @@ pub const FuseAdapter = struct {
     }
 
     pub fn getattr(self: *FuseAdapter, path: []const u8) ![]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         return self.router.getattr(path);
     }
 
     pub fn readdir(self: *FuseAdapter, path: []const u8, cookie: u64, max_entries: u32) ![]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         return self.router.readdir(path, cookie, max_entries);
     }
 
     pub fn statfs(self: *FuseAdapter, path: []const u8) ![]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         return self.router.statfs(path);
     }
 
     pub fn open(self: *FuseAdapter, path: []const u8, flags: u32) !fs_router.OpenFile {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         return self.router.open(path, flags);
     }
 
     pub fn read(self: *FuseAdapter, file: fs_router.OpenFile, off: u64, len: u32) ![]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         return self.router.read(file, off, len);
     }
 
     pub fn release(self: *FuseAdapter, file: fs_router.OpenFile) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         try self.router.close(file);
     }
 
     pub fn create(self: *FuseAdapter, path: []const u8, mode: u32, flags: u32) !fs_router.OpenFile {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         return self.router.create(path, mode, flags);
     }
 
     pub fn write(self: *FuseAdapter, file: fs_router.OpenFile, off: u64, data: []const u8) !u32 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         return self.router.write(file, off, data);
     }
 
     pub fn truncate(self: *FuseAdapter, path: []const u8, size: u64) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         try self.router.truncate(path, size);
     }
 
     pub fn unlink(self: *FuseAdapter, path: []const u8) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         try self.router.unlink(path);
     }
 
     pub fn mkdir(self: *FuseAdapter, path: []const u8) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         try self.router.mkdir(path);
     }
 
     pub fn rmdir(self: *FuseAdapter, path: []const u8) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         try self.router.rmdir(path);
     }
 
     pub fn rename(self: *FuseAdapter, old_path: []const u8, new_path: []const u8) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         try self.router.rename(old_path, new_path);
     }
 
     pub fn symlink(self: *FuseAdapter, target: []const u8, link_path: []const u8) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         try self.router.symlink(target, link_path);
     }
 
     pub fn setxattr(self: *FuseAdapter, path: []const u8, name: []const u8, value: []const u8, flags: u32) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         try self.router.setxattr(path, name, value, flags);
     }
 
     pub fn getxattr(self: *FuseAdapter, path: []const u8, name: []const u8) ![]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         return self.router.getxattr(path, name);
     }
 
     pub fn listxattr(self: *FuseAdapter, path: []const u8) ![]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         return self.router.listxattr(path);
     }
 
     pub fn removexattr(self: *FuseAdapter, path: []const u8, name: []const u8) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         try self.router.removexattr(path, name);
     }
 
     pub fn lock(self: *FuseAdapter, file: fs_router.OpenFile, mode: fs_router.LockMode, wait: bool) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         try self.router.lock(file, mode, wait);
+    }
+
+    pub fn tryReconcileEndpointsIfIdle(
+        self: *FuseAdapter,
+        endpoint_configs: []const fs_router.EndpointConfig,
+    ) !bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.handles.count() != 0) return false;
+        try self.router.reconcileEndpoints(endpoint_configs);
+        return true;
     }
 
     pub fn mount(self: *FuseAdapter, mountpoint: []const u8) !void {
@@ -281,9 +330,28 @@ fn cReaddir(
         if (filler.?(buf, ".", null, 0, c.FUSE_FILL_DIR_DEFAULTS) != 0) return 0;
         if (filler.?(buf, "..", null, 0, c.FUSE_FILL_DIR_DEFAULTS) != 0) return 0;
 
+        var emitted = std.ArrayListUnmanaged([]const u8){};
+        defer emitted.deinit(adapter.allocator);
+
         var idx: usize = 0;
         while (idx < adapter.router.endpointCount()) : (idx += 1) {
-            const name = adapter.router.endpointName(idx) orelse continue;
+            const mount_path = adapter.router.endpointMountPath(idx) orelse continue;
+            const trimmed = std.mem.trimLeft(u8, mount_path, "/");
+            if (trimmed.len == 0) continue;
+            const slash = std.mem.indexOfScalar(u8, trimmed, '/') orelse trimmed.len;
+            if (slash == 0) continue;
+            const name = trimmed[0..slash];
+
+            var exists = false;
+            for (emitted.items) |seen| {
+                if (std.mem.eql(u8, seen, name)) {
+                    exists = true;
+                    break;
+                }
+            }
+            if (exists) continue;
+            emitted.append(adapter.allocator, name) catch return -fs_protocol.Errno.EIO;
+
             const name_z = adapter.allocator.dupeZ(u8, name) catch return -fs_protocol.Errno.EIO;
             defer adapter.allocator.free(name_z);
             if (filler.?(buf, @ptrCast(name_z.ptr), null, 0, c.FUSE_FILL_DIR_DEFAULTS) != 0) break;

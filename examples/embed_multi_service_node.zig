@@ -2,6 +2,7 @@ const std = @import("std");
 const fs = @import("spiderweb_fs");
 const websocket_transport = @import("websocket_transport");
 const fs_watch_runtime = fs.watch_runtime;
+const unified = @import("ziggy-spider-protocol").unified;
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -74,7 +75,7 @@ pub fn main() !void {
     defer tcp_server.deinit();
 
     std.log.info("embed-multi-service-node listening on ws://{s}:{d}", .{ bind_addr, port });
-    std.log.info("services: /v1/fs, /v1/health, /v1/echo", .{});
+    std.log.info("services: /v2/fs, /v1/health, /v1/echo", .{});
 
     while (true) {
         var connection = tcp_server.accept() catch |err| {
@@ -173,7 +174,7 @@ const ConnectionHub = struct {
 
     fn broadcastInvalidations(self: *ConnectionHub, origin_id: u64, events: []const fs.protocol.InvalidationEvent) void {
         for (events) |event| {
-            const payload = fs.protocol.buildInvalidationEvent(self.allocator, event) catch continue;
+            const payload = fs.node_service.buildInvalidationEventJson(self.allocator, event) catch continue;
             defer self.allocator.free(payload);
             self.broadcastText(origin_id, payload);
         }
@@ -209,7 +210,7 @@ fn handleConnection(
     var handshake = try websocket_transport.performHandshakeWithInfo(allocator, stream);
     defer handshake.deinit(allocator);
 
-    if (std.mem.startsWith(u8, handshake.path, "/v1/fs")) {
+    if (std.mem.startsWith(u8, handshake.path, "/v2/fs")) {
         const connection = try hub.register(stream);
         defer hub.unregister(connection);
         try serveFs(allocator, connection, service, hub);
@@ -252,9 +253,9 @@ fn serveFs(
         switch (frame.opcode) {
             0x1 => {
                 var handled = service.handleRequestJsonWithEvents(frame.payload) catch |err| blk: {
-                    const fallback_response = try fs.protocol.buildErrorResponse(
+                    const fallback_response = try unified.buildFsrpcFsError(
                         allocator,
-                        0,
+                        null,
                         fs.protocol.Errno.EIO,
                         @errorName(err),
                     );
@@ -266,7 +267,7 @@ fn serveFs(
                 };
                 defer handled.deinit(allocator);
                 for (handled.events) |event| {
-                    const event_json = try fs.protocol.buildInvalidationEvent(allocator, event);
+                    const event_json = try fs.node_service.buildInvalidationEventJson(allocator, event);
                     defer allocator.free(event_json);
                     try writeConnectionFrame(connection, event_json, .text);
                 }
@@ -377,7 +378,7 @@ fn printHelp() !void {
         \\  embed-multi-service-node [--bind <addr>] [--port <port>] [--export <name>=<path>[:ro|:rw]]
         \\
         \\WebSocket services:
-        \\  /v1/fs      - distributed filesystem request/response JSON
+        \\  /v2/fs      - distributed filesystem request/response JSON
         \\  /v1/health  - health status service
         \\  /v1/echo    - simple echo service
         \\
