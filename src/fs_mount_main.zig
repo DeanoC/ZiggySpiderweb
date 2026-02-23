@@ -66,29 +66,39 @@ pub fn main() !void {
         defer hydrated.deinit(allocator);
         for (hydrated.items.items) |item| {
             const owned_name = try allocator.dupe(u8, item.name);
-            errdefer allocator.free(owned_name);
-            try owned_endpoint_fields.append(allocator, owned_name);
+            owned_endpoint_fields.append(allocator, owned_name) catch |err| {
+                allocator.free(owned_name);
+                return err;
+            };
 
             const owned_url = try allocator.dupe(u8, item.url);
-            errdefer allocator.free(owned_url);
-            try owned_endpoint_fields.append(allocator, owned_url);
+            owned_endpoint_fields.append(allocator, owned_url) catch |err| {
+                allocator.free(owned_url);
+                return err;
+            };
 
             const owned_mount = try allocator.dupe(u8, item.mount_path);
-            errdefer allocator.free(owned_mount);
-            try owned_endpoint_fields.append(allocator, owned_mount);
+            owned_endpoint_fields.append(allocator, owned_mount) catch |err| {
+                allocator.free(owned_mount);
+                return err;
+            };
 
             var owned_export: ?[]u8 = null;
             if (item.export_name) |export_name| {
                 owned_export = try allocator.dupe(u8, export_name);
-                errdefer allocator.free(owned_export.?);
-                try owned_endpoint_fields.append(allocator, owned_export.?);
+                owned_endpoint_fields.append(allocator, owned_export.?) catch |err| {
+                    allocator.free(owned_export.?);
+                    return err;
+                };
             }
 
             var owned_auth: ?[]u8 = null;
             if (item.auth_token) |auth_token| {
                 owned_auth = try allocator.dupe(u8, auth_token);
-                errdefer allocator.free(owned_auth.?);
-                try owned_endpoint_fields.append(allocator, owned_auth.?);
+                owned_endpoint_fields.append(allocator, owned_auth.?) catch |err| {
+                    allocator.free(owned_auth.?);
+                    return err;
+                };
             }
 
             try endpoint_specs.append(allocator, .{
