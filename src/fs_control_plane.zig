@@ -740,24 +740,29 @@ pub const ControlPlane = struct {
         try validateSecretToken(project_token, 256);
         const project = self.projects.getPtr(project_id) orelse return ControlPlaneError.ProjectNotFound;
         if (!secureTokenEql(project.mutation_token, project_token)) return ControlPlaneError.ProjectAuthFailed;
-        if (project.kind == .spider_web_builtin and getOptionalString(obj, "status") != null) {
+        const next_name = getOptionalString(obj, "name");
+        const next_vision = getOptionalString(obj, "vision");
+        const next_status = getOptionalString(obj, "status");
+        if (project.kind == .spider_web_builtin and
+            (next_name != null or next_vision != null or next_status != null))
+        {
             return ControlPlaneError.ProjectProtected;
         }
 
-        if (getOptionalString(obj, "name")) |next_name| {
-            try validateDisplayString(next_name, 128);
+        if (next_name) |value| {
+            try validateDisplayString(value, 128);
             self.allocator.free(project.name);
-            project.name = try self.allocator.dupe(u8, next_name);
+            project.name = try self.allocator.dupe(u8, value);
         }
-        if (getOptionalString(obj, "vision")) |next_vision| {
-            try validateDisplayStringAllowEmpty(next_vision, 1024);
+        if (next_vision) |value| {
+            try validateDisplayStringAllowEmpty(value, 1024);
             self.allocator.free(project.vision);
-            project.vision = try self.allocator.dupe(u8, next_vision);
+            project.vision = try self.allocator.dupe(u8, value);
         }
-        if (getOptionalString(obj, "status")) |next_status| {
-            try validateIdentifier(next_status, 64);
+        if (next_status) |value| {
+            try validateIdentifier(value, 64);
             self.allocator.free(project.status);
-            project.status = try self.allocator.dupe(u8, next_status);
+            project.status = try self.allocator.dupe(u8, value);
         }
         project.updated_at_ms = std.time.milliTimestamp();
         self.project_updates_total +%= 1;
@@ -2860,6 +2865,35 @@ test "fs_control_plane: builtin spider web project is protected and primary-only
     try std.testing.expectError(
         ControlPlaneError.ProjectProtected,
         plane.deleteProject("{\"project_id\":\"spider-web\",\"project_token\":\"token\"}"),
+    );
+    const state_json = try plane.dumpState();
+    defer allocator.free(state_json);
+    var parsed_state = try std.json.parseFromSlice(std.json.Value, allocator, state_json, .{});
+    defer parsed_state.deinit();
+    const projects_val = parsed_state.value.object.get("projects").?;
+    try std.testing.expect(projects_val == .array);
+    var spider_token: ?[]const u8 = null;
+    for (projects_val.array.items) |item| {
+        if (item != .object) continue;
+        const id_val = item.object.get("id") orelse continue;
+        if (id_val != .string) continue;
+        if (!std.mem.eql(u8, id_val.string, spider_web_project_id)) continue;
+        const token_val = item.object.get("mutation_token") orelse continue;
+        if (token_val == .string) {
+            spider_token = token_val.string;
+            break;
+        }
+    }
+    try std.testing.expect(spider_token != null);
+    const update_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"project_id\":\"{s}\",\"project_token\":\"{s}\",\"name\":\"Renamed\",\"vision\":\"Changed\"}}",
+        .{ spider_web_project_id, spider_token.? },
+    );
+    defer allocator.free(update_req);
+    try std.testing.expectError(
+        ControlPlaneError.ProjectProtected,
+        plane.updateProject(update_req),
     );
     try std.testing.expectError(
         ControlPlaneError.ProjectAssignmentForbidden,
