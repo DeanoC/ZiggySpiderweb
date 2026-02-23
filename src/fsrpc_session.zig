@@ -98,11 +98,12 @@ pub const Session = struct {
         runtime_server: *runtime_server_mod.RuntimeServer,
         agent_id: []const u8,
     ) !void {
-        const next_agent_id = try self.allocator.dupe(u8, agent_id);
-        const previous_agent_id = self.agent_id;
-        self.agent_id = next_agent_id;
-        self.allocator.free(previous_agent_id);
-        self.runtime_server = runtime_server;
+        var rebound = try Session.init(self.allocator, runtime_server, self.job_index, agent_id);
+        rebound.debug_stream_enabled = self.debug_stream_enabled;
+
+        var previous = self.*;
+        self.* = rebound;
+        previous.deinit();
     }
 
     pub fn setDebugStreamEnabled(self: *Session, enabled: bool) void {
@@ -741,4 +742,45 @@ test "fsrpc_session: attach walk open read capability help" {
     const walk_res = try session.handle(&walk);
     defer allocator.free(walk_res);
     try std.testing.expect(std.mem.indexOf(u8, walk_res, "fsrpc.r_walk") != null);
+}
+
+test "fsrpc_session: setRuntimeBinding reseeds namespace and clears stale state" {
+    const allocator = std.testing.allocator;
+
+    var runtime_server_a = try runtime_server_mod.RuntimeServer.create(allocator, "agent-a", .{});
+    defer runtime_server_a.destroy();
+    var runtime_server_b = try runtime_server_mod.RuntimeServer.create(allocator, "agent-b", .{});
+    defer runtime_server_b.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    const job_a = try job_index.createJob("agent-a", "corr-a");
+    defer allocator.free(job_a);
+    try job_index.markCompleted(job_a, true, "result-a", null, "log-a");
+    const job_b = try job_index.createJob("agent-b", "corr-b");
+    defer allocator.free(job_b);
+    try job_index.markCompleted(job_b, true, "result-b", null, "log-b");
+
+    var session = try Session.init(allocator, runtime_server_a, &job_index, "agent-a");
+    defer session.deinit();
+
+    try std.testing.expect(session.lookupChild(session.jobs_root_id, job_a) != null);
+    try std.testing.expect(session.lookupChild(session.jobs_root_id, job_b) == null);
+
+    var attach = unified.ParsedMessage{
+        .channel = .fsrpc,
+        .fsrpc_type = .t_attach,
+        .tag = 11,
+        .fid = 77,
+    };
+    const attach_res = try session.handle(&attach);
+    defer allocator.free(attach_res);
+    try std.testing.expectEqual(@as(usize, 1), session.fids.count());
+
+    try session.setRuntimeBinding(runtime_server_b, "agent-b");
+
+    try std.testing.expect(std.mem.eql(u8, session.agent_id, "agent-b"));
+    try std.testing.expectEqual(@as(usize, 0), session.fids.count());
+    try std.testing.expect(session.lookupChild(session.jobs_root_id, job_a) == null);
+    try std.testing.expect(session.lookupChild(session.jobs_root_id, job_b) != null);
 }

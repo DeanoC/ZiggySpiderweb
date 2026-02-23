@@ -1981,6 +1981,28 @@ fn handleWebSocketConnection(
                                 continue;
                             },
                             .metrics => {
+                                if (principal.role != .admin) {
+                                    const active_binding = session_bindings.get(active_session_key) orelse return error.InvalidState;
+                                    runtime_registry.appendSecurityAuditAndDebug(
+                                        active_binding.agent_id,
+                                        .metrics,
+                                        principal.role,
+                                        parsed.correlation_id orelse parsed.id,
+                                        "metrics_forbidden",
+                                        false,
+                                        "forbidden",
+                                        "operation requires admin token",
+                                    );
+                                    const response = try unified.buildControlError(
+                                        allocator,
+                                        parsed.id,
+                                        "forbidden",
+                                        "operation requires admin token",
+                                    );
+                                    defer allocator.free(response);
+                                    try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                    continue;
+                                }
                                 const payload = try runtime_registry.control_plane.metricsJson();
                                 defer allocator.free(payload);
                                 const response = try unified.buildControlAck(
@@ -4100,6 +4122,12 @@ test "server_piai: auth matrix gates admin endpoints and handshake tokens" {
         defer connect_ack.deinit(allocator);
         try std.testing.expect(std.mem.indexOf(u8, connect_ack.payload, "\"type\":\"control.connect_ack\"") != null);
         try std.testing.expect(std.mem.indexOf(u8, connect_ack.payload, "\"role\":\"user\"") != null);
+
+        try writeClientTextFrameMasked(&user_client, "{\"channel\":\"control\",\"type\":\"control.metrics\",\"id\":\"user-metrics\"}");
+        var forbidden_metrics = try readServerFrame(allocator, &user_client);
+        defer forbidden_metrics.deinit(allocator);
+        try std.testing.expect(std.mem.indexOf(u8, forbidden_metrics.payload, "\"type\":\"control.error\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, forbidden_metrics.payload, "\"code\":\"forbidden\"") != null);
 
         try writeClientTextFrameMasked(&user_client, "{\"channel\":\"control\",\"type\":\"control.auth_status\",\"id\":\"user-auth-status\"}");
         var forbidden_status = try readServerFrame(allocator, &user_client);
