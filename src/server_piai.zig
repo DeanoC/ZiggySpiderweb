@@ -7,6 +7,7 @@ const runtime_server_mod = @import("runtime_server.zig");
 const websocket_transport = @import("websocket_transport.zig");
 const fsrpc_session = @import("fsrpc_session.zig");
 const fs_control_plane = @import("fs_control_plane.zig");
+const chat_job_index = @import("chat_job_index.zig");
 const fs_protocol = @import("fs_protocol.zig");
 const fs_node_ops = @import("fs_node_ops.zig");
 const fs_node_service = @import("fs_node_service.zig");
@@ -31,6 +32,8 @@ const local_node_name_env = "SPIDERWEB_LOCAL_NODE_NAME";
 const local_node_lease_ttl_env = "SPIDERWEB_LOCAL_NODE_LEASE_TTL_MS";
 const local_node_heartbeat_ms_env = "SPIDERWEB_LOCAL_NODE_HEARTBEAT_MS";
 const control_operator_token_env = "SPIDERWEB_CONTROL_OPERATOR_TOKEN";
+const control_project_scope_token_env = "SPIDERWEB_CONTROL_PROJECT_SCOPE_TOKEN";
+const control_node_scope_token_env = "SPIDERWEB_CONTROL_NODE_SCOPE_TOKEN";
 const metrics_port_env = "SPIDERWEB_METRICS_PORT";
 const control_protocol_version = "unified-v2";
 const fsrpc_runtime_protocol_version = "styx-lite-1";
@@ -431,6 +434,33 @@ const ControlTopologySubscriber = struct {
     write_mutex: *std.Thread.Mutex,
 };
 
+const ControlMutationScope = enum {
+    none,
+    node,
+    project,
+    operator,
+};
+
+const AuditRecord = struct {
+    id: u64,
+    timestamp_ms: i64,
+    agent_id: []u8,
+    control_type: []u8,
+    scope: ControlMutationScope,
+    correlation_id: ?[]u8 = null,
+    result: []u8,
+    error_code: ?[]u8 = null,
+
+    fn deinit(self: *AuditRecord, allocator: std.mem.Allocator) void {
+        allocator.free(self.agent_id);
+        allocator.free(self.control_type);
+        if (self.correlation_id) |value| allocator.free(value);
+        allocator.free(self.result);
+        if (self.error_code) |value| allocator.free(value);
+        self.* = undefined;
+    }
+};
+
 const LocalFsNode = struct {
     allocator: std.mem.Allocator,
     service: fs_node_service.NodeService,
@@ -752,13 +782,23 @@ const AgentRuntimeRegistry = struct {
     max_runtimes: usize,
     debug_stream_sink: DebugStreamFileSink,
     control_plane: fs_control_plane.ControlPlane,
+    job_index: chat_job_index.ChatJobIndex,
     control_operator_token: ?[]u8 = null,
+    control_project_scope_token: ?[]u8 = null,
+    control_node_scope_token: ?[]u8 = null,
     local_fs_node: ?*LocalFsNode = null,
     mutex: std.Thread.Mutex = .{},
     by_agent: std.StringHashMapUnmanaged(*RuntimeServer) = .{},
     topology_subscribers_mutex: std.Thread.Mutex = .{},
     topology_subscribers: std.ArrayListUnmanaged(ControlTopologySubscriber) = .{},
     next_topology_subscriber_id: u64 = 1,
+    audit_records_mutex: std.Thread.Mutex = .{},
+    audit_records: std.ArrayListUnmanaged(AuditRecord) = .{},
+    next_audit_record_id: u64 = 1,
+    reconcile_worker_thread: ?std.Thread = null,
+    reconcile_worker_stop: bool = false,
+    reconcile_worker_mutex: std.Thread.Mutex = .{},
+    reconcile_worker_interval_ms: u64 = 250,
 
     fn init(
         allocator: std.mem.Allocator,
@@ -790,8 +830,16 @@ const AgentRuntimeRegistry = struct {
         }
         const debug_stream_sink = DebugStreamFileSink.init(allocator, runtime_config);
         const operator_token = parseOptionalEnvOwned(allocator, control_operator_token_env);
+        const project_scope_token = parseOptionalEnvOwned(allocator, control_project_scope_token_env);
+        const node_scope_token = parseOptionalEnvOwned(allocator, control_node_scope_token_env);
         if (operator_token != null) {
             std.log.info("control-plane operator token enabled via {s}", .{control_operator_token_env});
+        }
+        if (project_scope_token != null) {
+            std.log.info("control-plane project-scope token enabled via {s}", .{control_project_scope_token_env});
+        }
+        if (node_scope_token != null) {
+            std.log.info("control-plane node-scope token enabled via {s}", .{control_node_scope_token_env});
         }
 
         return .{
@@ -806,11 +854,23 @@ const AgentRuntimeRegistry = struct {
                 runtime_config.ltm_directory,
                 runtime_config.ltm_filename,
             ),
+            .job_index = chat_job_index.ChatJobIndex.init(
+                allocator,
+                runtime_config.ltm_directory,
+            ),
             .control_operator_token = operator_token,
+            .control_project_scope_token = project_scope_token,
+            .control_node_scope_token = node_scope_token,
         };
     }
 
     fn deinit(self: *AgentRuntimeRegistry) void {
+        self.requestReconcileWorkerStop();
+        if (self.reconcile_worker_thread) |thread| {
+            thread.join();
+            self.reconcile_worker_thread = null;
+        }
+
         self.mutex.lock();
         defer self.mutex.unlock();
 
@@ -829,8 +889,46 @@ const AgentRuntimeRegistry = struct {
             self.allocator.free(token);
             self.control_operator_token = null;
         }
+        if (self.control_project_scope_token) |token| {
+            self.allocator.free(token);
+            self.control_project_scope_token = null;
+        }
+        if (self.control_node_scope_token) |token| {
+            self.allocator.free(token);
+            self.control_node_scope_token = null;
+        }
+        self.audit_records_mutex.lock();
+        for (self.audit_records.items) |*record| record.deinit(self.allocator);
+        self.audit_records.deinit(self.allocator);
+        self.audit_records = .{};
+        self.next_audit_record_id = 1;
+        self.audit_records_mutex.unlock();
+        self.job_index.deinit();
         self.control_plane.deinit();
         self.debug_stream_sink.deinit();
+    }
+
+    fn startReconcileWorker(self: *AgentRuntimeRegistry) !void {
+        self.reconcile_worker_mutex.lock();
+        self.reconcile_worker_stop = false;
+        self.reconcile_worker_mutex.unlock();
+        self.reconcile_worker_thread = try std.Thread.spawn(
+            .{},
+            reconcileWorkerMain,
+            .{self},
+        );
+    }
+
+    fn requestReconcileWorkerStop(self: *AgentRuntimeRegistry) void {
+        self.reconcile_worker_mutex.lock();
+        self.reconcile_worker_stop = true;
+        self.reconcile_worker_mutex.unlock();
+    }
+
+    fn shouldStopReconcileWorker(self: *AgentRuntimeRegistry) bool {
+        self.reconcile_worker_mutex.lock();
+        defer self.reconcile_worker_mutex.unlock();
+        return self.reconcile_worker_stop;
     }
 
     fn getOrCreate(self: *AgentRuntimeRegistry, agent_id: []const u8) !*RuntimeServer {
@@ -885,6 +983,83 @@ const AgentRuntimeRegistry = struct {
 
     fn maybeLogDebugFrame(self: *AgentRuntimeRegistry, agent_id: []const u8, payload: []const u8) void {
         self.debug_stream_sink.append(agent_id, payload);
+    }
+
+    fn appendAuditRecord(
+        self: *AgentRuntimeRegistry,
+        agent_id: []const u8,
+        control_type: unified.ControlType,
+        scope: ControlMutationScope,
+        correlation_id: ?[]const u8,
+        succeeded: bool,
+        error_code: ?[]const u8,
+    ) void {
+        self.audit_records_mutex.lock();
+        defer self.audit_records_mutex.unlock();
+
+        while (self.audit_records.items.len >= 2048) {
+            var removed = self.audit_records.orderedRemove(0);
+            removed.deinit(self.allocator);
+        }
+
+        const record = AuditRecord{
+            .id = self.next_audit_record_id,
+            .timestamp_ms = std.time.milliTimestamp(),
+            .agent_id = self.allocator.dupe(u8, agent_id) catch return,
+            .control_type = self.allocator.dupe(u8, unified.controlTypeName(control_type)) catch return,
+            .scope = scope,
+            .correlation_id = if (correlation_id) |value| self.allocator.dupe(u8, value) catch return else null,
+            .result = self.allocator.dupe(u8, if (succeeded) "ok" else "error") catch return,
+            .error_code = if (error_code) |value| self.allocator.dupe(u8, value) catch return else null,
+        };
+        self.audit_records.append(self.allocator, record) catch {
+            var cleanup = record;
+            cleanup.deinit(self.allocator);
+            return;
+        };
+        self.next_audit_record_id +%= 1;
+        if (self.next_audit_record_id == 0) self.next_audit_record_id = 1;
+    }
+
+    fn buildAuditTailPayload(self: *AgentRuntimeRegistry, payload_json: ?[]const u8) ![]u8 {
+        var limit: usize = 50;
+        var filter_agent: ?[]const u8 = null;
+        if (payload_json) |raw| {
+            var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, raw, .{});
+            defer parsed.deinit();
+            if (parsed.value != .object) return error.InvalidPayload;
+            if (parsed.value.object.get("limit")) |limit_val| {
+                if (limit_val != .integer or limit_val.integer < 0) return error.InvalidPayload;
+                limit = @intCast(limit_val.integer);
+                if (limit > 500) limit = 500;
+            }
+            if (parsed.value.object.get("agent_id")) |agent_val| {
+                if (agent_val != .string or agent_val.string.len == 0) return error.InvalidPayload;
+                filter_agent = agent_val.string;
+            }
+        }
+
+        self.audit_records_mutex.lock();
+        defer self.audit_records_mutex.unlock();
+
+        var out = std.ArrayListUnmanaged(u8){};
+        defer out.deinit(self.allocator);
+        try out.appendSlice(self.allocator, "{\"audit\":[");
+
+        var emitted: usize = 0;
+        var idx = self.audit_records.items.len;
+        while (idx > 0 and emitted < limit) {
+            idx -= 1;
+            const record = self.audit_records.items[idx];
+            if (filter_agent) |agent| {
+                if (!std.mem.eql(u8, agent, record.agent_id)) continue;
+            }
+            if (emitted != 0) try out.append(self.allocator, ',');
+            emitted += 1;
+            try appendAuditRecordJson(self.allocator, &out, record);
+        }
+        try out.appendSlice(self.allocator, "]}");
+        return out.toOwnedSlice(self.allocator);
     }
 
     fn clearTopologySubscribers(self: *AgentRuntimeRegistry) void {
@@ -1085,6 +1260,25 @@ const AgentRuntimeRegistry = struct {
     }
 };
 
+fn reconcileWorkerMain(runtime_registry: *AgentRuntimeRegistry) void {
+    while (true) {
+        if (runtime_registry.shouldStopReconcileWorker()) return;
+
+        const maybe_payload = runtime_registry.control_plane.runReconcileCycle(false) catch |err| {
+            std.log.warn("control-plane reconcile worker error: {s}", .{@errorName(err)});
+            if (runtime_registry.shouldStopReconcileWorker()) return;
+            std.Thread.sleep(runtime_registry.reconcile_worker_interval_ms * std.time.ns_per_ms);
+            continue;
+        };
+        if (maybe_payload) |payload| {
+            defer runtime_registry.allocator.free(payload);
+            runtime_registry.broadcastTopologyDebugEvent("control.reconcile", payload);
+        }
+
+        std.Thread.sleep(runtime_registry.reconcile_worker_interval_ms * std.time.ns_per_ms);
+    }
+}
+
 pub fn run(
     allocator: std.mem.Allocator,
     bind_addr: []const u8,
@@ -1099,6 +1293,7 @@ pub fn run(
     runtime_registry.maybeInitLocalFsNode(bind_addr, port) catch |err| {
         std.log.warn("local fs node setup skipped: {s}", .{@errorName(err)});
     };
+    try runtime_registry.startReconcileWorker();
 
     const metrics_port_raw = parseUnsignedEnv(allocator, metrics_port_env, 0);
     if (metrics_port_raw > 0) {
@@ -1204,7 +1399,7 @@ fn handleWebSocketConnection(
         },
         else => return err,
     };
-    var fsrpc = try fsrpc_session.Session.init(allocator, runtime_server, agent_id);
+    var fsrpc = try fsrpc_session.Session.init(allocator, runtime_server, &runtime_registry.job_index, agent_id);
     defer fsrpc.deinit();
     var debug_stream_enabled = false;
     var control_protocol_negotiated = false;
@@ -1404,26 +1599,50 @@ fn handleWebSocketConnection(
                             .project_token_revoke,
                             .project_activate,
                             .workspace_status,
+                            .reconcile_status,
+                            .project_up,
+                            .audit_tail,
                             => {
-                                if (runtime_registry.control_operator_token) |operator_token| {
-                                    if (isOperatorTokenProtectedMutation(control_type)) {
-                                        validateOperatorTokenPayload(allocator, operator_token, parsed.payload_json) catch |err| {
-                                            const code = switch (err) {
-                                                error.MissingField => "missing_field",
-                                                error.InvalidPayload => "invalid_payload",
-                                                else => "operator_auth_failed",
-                                            };
-                                            const response = try unified.buildControlError(
-                                                allocator,
-                                                parsed.id,
-                                                code,
-                                                @errorName(err),
-                                            );
-                                            defer allocator.free(response);
-                                            try writeFrameLocked(stream, &connection_write_mutex, response, .text);
-                                            continue;
+                                const scope = controlMutationScope(control_type);
+                                const correlation_id = parsed.correlation_id orelse parsed.id;
+                                if (scope != .none and correlation_id == null) {
+                                    const response = try buildControlErrorWithCorrelation(
+                                        allocator,
+                                        parsed.id,
+                                        null,
+                                        "correlation_required",
+                                        "missing correlation_id on mutating control operation",
+                                    );
+                                    defer allocator.free(response);
+                                    try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                    continue;
+                                }
+                                if (scope != .none) {
+                                    validateControlScopeTokens(allocator, runtime_registry, control_type, parsed.payload_json) catch |err| {
+                                        const code = switch (err) {
+                                            error.MissingField => "missing_field",
+                                            error.InvalidPayload => "invalid_payload",
+                                            else => "operator_auth_failed",
                                         };
-                                    }
+                                        runtime_registry.appendAuditRecord(
+                                            agent_id,
+                                            control_type,
+                                            scope,
+                                            correlation_id,
+                                            false,
+                                            code,
+                                        );
+                                        const response = try buildControlErrorWithCorrelation(
+                                            allocator,
+                                            parsed.id,
+                                            correlation_id,
+                                            code,
+                                            @errorName(err),
+                                        );
+                                        defer allocator.free(response);
+                                        try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                        continue;
+                                    };
                                 }
                                 const payload_json = handleControlPlaneCommand(
                                     runtime_registry,
@@ -1431,10 +1650,22 @@ fn handleWebSocketConnection(
                                     agent_id,
                                     parsed.payload_json,
                                 ) catch |err| {
-                                    const response = try unified.buildControlError(
+                                    const code = controlPlaneErrorCode(err);
+                                    if (scope != .none) {
+                                        runtime_registry.appendAuditRecord(
+                                            agent_id,
+                                            control_type,
+                                            scope,
+                                            correlation_id,
+                                            false,
+                                            code,
+                                        );
+                                    }
+                                    const response = try buildControlErrorWithCorrelation(
                                         allocator,
                                         parsed.id,
-                                        controlPlaneErrorCode(err),
+                                        correlation_id,
+                                        code,
                                         @errorName(err),
                                     );
                                     defer allocator.free(response);
@@ -1442,6 +1673,17 @@ fn handleWebSocketConnection(
                                     continue;
                                 };
                                 defer allocator.free(payload_json);
+
+                                if (scope != .none) {
+                                    runtime_registry.appendAuditRecord(
+                                        agent_id,
+                                        control_type,
+                                        scope,
+                                        correlation_id,
+                                        true,
+                                        null,
+                                    );
+                                }
 
                                 const response = try unified.buildControlAck(
                                     allocator,
@@ -1452,6 +1694,7 @@ fn handleWebSocketConnection(
                                 defer allocator.free(response);
                                 try writeFrameLocked(stream, &connection_write_mutex, response, .text);
                                 if (isWorkspaceTopologyMutation(control_type)) {
+                                    runtime_registry.control_plane.requestReconcile();
                                     const reason = unified.controlTypeName(control_type);
                                     runtime_registry.emitWorkspaceTopologyChanged(reason);
                                     runtime_registry.emitWorkspaceTopologyProjectDelta(agent_id, reason, payload_json);
@@ -1633,6 +1876,7 @@ fn isWorkspaceTopologyMutation(control_type: unified.ControlType) bool {
         .project_mount_set,
         .project_mount_remove,
         .project_activate,
+        .project_up,
         => true,
         else => false,
     };
@@ -1648,10 +1892,11 @@ fn extractProjectIdFromControlPayload(allocator: std.mem.Allocator, payload_json
     return @as(?[]u8, copy);
 }
 
-fn isOperatorTokenProtectedMutation(control_type: unified.ControlType) bool {
+fn controlMutationScope(control_type: unified.ControlType) ControlMutationScope {
     return switch (control_type) {
         .node_invite_create,
         .node_delete,
+        => .node,
         .project_create,
         .project_update,
         .project_delete,
@@ -1659,23 +1904,59 @@ fn isOperatorTokenProtectedMutation(control_type: unified.ControlType) bool {
         .project_mount_remove,
         .project_token_rotate,
         .project_token_revoke,
-        => true,
-        else => false,
+        .project_activate,
+        .project_up,
+        => .project,
+        else => .none,
     };
 }
 
-fn validateOperatorTokenPayload(
+fn validateControlScopeTokens(
     allocator: std.mem.Allocator,
-    expected_token: []const u8,
+    runtime_registry: *AgentRuntimeRegistry,
+    control_type: unified.ControlType,
     payload_json: ?[]const u8,
 ) !void {
+    const scope = controlMutationScope(control_type);
+    if (scope == .none) return;
+
     const raw = payload_json orelse return error.MissingField;
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidPayload;
-    const token_value = parsed.value.object.get("operator_token") orelse return error.MissingField;
-    if (token_value != .string or token_value.string.len == 0) return error.InvalidPayload;
-    if (!secureTokenEql(expected_token, token_value.string)) return error.OperatorAuthFailed;
+    const obj = parsed.value.object;
+
+    if (runtime_registry.control_operator_token) |operator_token| {
+        if (obj.get("operator_token")) |token_value| {
+            if (token_value != .string or token_value.string.len == 0) return error.InvalidPayload;
+            if (!secureTokenEql(operator_token, token_value.string)) return error.OperatorAuthFailed;
+            return;
+        }
+    }
+
+    switch (scope) {
+        .project => {
+            if (runtime_registry.control_project_scope_token) |token| {
+                const field = obj.get("project_scope_token") orelse return error.MissingField;
+                if (field != .string or field.string.len == 0) return error.InvalidPayload;
+                if (!secureTokenEql(token, field.string)) return error.OperatorAuthFailed;
+                return;
+            }
+        },
+        .node => {
+            if (runtime_registry.control_node_scope_token) |token| {
+                const field = obj.get("node_scope_token") orelse return error.MissingField;
+                if (field != .string or field.string.len == 0) return error.InvalidPayload;
+                if (!secureTokenEql(token, field.string)) return error.OperatorAuthFailed;
+                return;
+            }
+        },
+        .operator, .none => {},
+    }
+
+    if (runtime_registry.control_operator_token != null) {
+        return error.MissingField;
+    }
 }
 
 fn secureTokenEql(expected: []const u8, candidate: []const u8) bool {
@@ -1685,6 +1966,90 @@ fn secureTokenEql(expected: []const u8, candidate: []const u8) bool {
         diff |= lhs ^ rhs;
     }
     return diff == 0;
+}
+
+fn controlScopeName(scope: ControlMutationScope) []const u8 {
+    return switch (scope) {
+        .none => "none",
+        .node => "node",
+        .project => "project",
+        .operator => "operator",
+    };
+}
+
+fn appendAuditRecordJson(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    record: AuditRecord,
+) !void {
+    const escaped_agent = try unified.jsonEscape(allocator, record.agent_id);
+    defer allocator.free(escaped_agent);
+    const escaped_type = try unified.jsonEscape(allocator, record.control_type);
+    defer allocator.free(escaped_type);
+    const escaped_result = try unified.jsonEscape(allocator, record.result);
+    defer allocator.free(escaped_result);
+    const correlation_json = if (record.correlation_id) |value| blk: {
+        const escaped = try unified.jsonEscape(allocator, value);
+        defer allocator.free(escaped);
+        break :blk try std.fmt.allocPrint(allocator, "\"{s}\"", .{escaped});
+    } else try allocator.dupe(u8, "null");
+    defer allocator.free(correlation_json);
+    const error_json = if (record.error_code) |value| blk: {
+        const escaped = try unified.jsonEscape(allocator, value);
+        defer allocator.free(escaped);
+        break :blk try std.fmt.allocPrint(allocator, "\"{s}\"", .{escaped});
+    } else try allocator.dupe(u8, "null");
+    defer allocator.free(error_json);
+
+    try out.writer(allocator).print(
+        "{{\"id\":{d},\"timestamp_ms\":{d},\"agent_id\":\"{s}\",\"control_type\":\"{s}\",\"scope\":\"{s}\",\"correlation_id\":{s},\"result\":\"{s}\",\"error_code\":{s}}}",
+        .{
+            record.id,
+            record.timestamp_ms,
+            escaped_agent,
+            escaped_type,
+            controlScopeName(record.scope),
+            correlation_json,
+            escaped_result,
+            error_json,
+        },
+    );
+}
+
+fn buildControlErrorWithCorrelation(
+    allocator: std.mem.Allocator,
+    id: ?[]const u8,
+    correlation_id: ?[]const u8,
+    code: []const u8,
+    message: []const u8,
+) ![]u8 {
+    const escaped_code = try unified.jsonEscape(allocator, code);
+    defer allocator.free(escaped_code);
+    const escaped_message = try unified.jsonEscape(allocator, message);
+    defer allocator.free(escaped_message);
+
+    const correlation_json = if (correlation_id) |value| blk: {
+        const escaped = try unified.jsonEscape(allocator, value);
+        defer allocator.free(escaped);
+        break :blk try std.fmt.allocPrint(allocator, "\"{s}\"", .{escaped});
+    } else try allocator.dupe(u8, "null");
+    defer allocator.free(correlation_json);
+
+    if (id) |request_id| {
+        const escaped_id = try unified.jsonEscape(allocator, request_id);
+        defer allocator.free(escaped_id);
+        return std.fmt.allocPrint(
+            allocator,
+            "{{\"channel\":\"control\",\"type\":\"control.error\",\"id\":\"{s}\",\"ok\":false,\"error\":{{\"code\":\"{s}\",\"message\":\"{s}\",\"correlation_id\":{s}}}}}",
+            .{ escaped_id, escaped_code, escaped_message, correlation_json },
+        );
+    }
+
+    return std.fmt.allocPrint(
+        allocator,
+        "{{\"channel\":\"control\",\"type\":\"control.error\",\"ok\":false,\"error\":{{\"code\":\"{s}\",\"message\":\"{s}\",\"correlation_id\":{s}}}}}",
+        .{ escaped_code, escaped_message, correlation_json },
+    );
 }
 
 fn handleControlPlaneCommand(
@@ -1712,6 +2077,9 @@ fn handleControlPlaneCommand(
         .project_token_revoke => runtime_registry.control_plane.revokeProjectToken(payload_json),
         .project_activate => runtime_registry.control_plane.activateProject(agent_id, payload_json),
         .workspace_status => runtime_registry.control_plane.workspaceStatus(agent_id, payload_json),
+        .reconcile_status => runtime_registry.control_plane.reconcileStatus(payload_json),
+        .project_up => runtime_registry.control_plane.projectUp(agent_id, payload_json),
+        .audit_tail => runtime_registry.buildAuditTailPayload(payload_json),
         else => error.UnsupportedControlPlaneOperation,
     };
 }

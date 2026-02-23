@@ -1,6 +1,7 @@
 const std = @import("std");
 const unified = @import("ziggy-spider-protocol").unified;
 const runtime_server_mod = @import("runtime_server.zig");
+const chat_job_index = @import("chat_job_index.zig");
 
 const NodeKind = enum {
     dir,
@@ -18,6 +19,7 @@ const SpecialKind = enum {
 const WriteOutcome = struct {
     written: usize,
     job_name: ?[]u8 = null,
+    correlation_id: ?[]u8 = null,
 };
 
 const Node = struct {
@@ -47,6 +49,8 @@ const FidState = struct {
 pub const Session = struct {
     allocator: std.mem.Allocator,
     runtime_server: *runtime_server_mod.RuntimeServer,
+    job_index: *chat_job_index.ChatJobIndex,
+    agent_id: []u8,
 
     nodes: std.AutoHashMapUnmanaged(u32, Node) = .{},
     fids: std.AutoHashMapUnmanaged(u32, FidState) = .{},
@@ -54,7 +58,6 @@ pub const Session = struct {
     debug_stream_enabled: bool = false,
 
     next_node_id: u32 = 1,
-    next_job_id: u32 = 1,
 
     root_id: u32 = 0,
     jobs_root_id: u32 = 0,
@@ -63,12 +66,16 @@ pub const Session = struct {
     pub fn init(
         allocator: std.mem.Allocator,
         runtime_server: *runtime_server_mod.RuntimeServer,
+        job_index: *chat_job_index.ChatJobIndex,
         agent_id: []const u8,
     ) !Session {
         var self = Session{
             .allocator = allocator,
             .runtime_server = runtime_server,
+            .job_index = job_index,
+            .agent_id = try allocator.dupe(u8, agent_id),
         };
+        errdefer allocator.free(self.agent_id);
         try self.seedNamespace(agent_id);
         return self;
     }
@@ -82,6 +89,7 @@ pub const Session = struct {
         }
         self.nodes.deinit(self.allocator);
         self.fids.deinit(self.allocator);
+        self.allocator.free(self.agent_id);
         self.* = undefined;
     }
 
@@ -257,12 +265,15 @@ pub const Session = struct {
 
         var written: usize = data.len;
         var job_name: ?[]u8 = null;
+        var correlation_id: ?[]u8 = null;
         defer if (job_name) |value| self.allocator.free(value);
+        defer if (correlation_id) |value| self.allocator.free(value);
         switch (node.special) {
             .chat_input => {
-                const outcome = try self.handleChatInputWrite(data);
+                const outcome = try self.handleChatInputWrite(msg, data);
                 written = outcome.written;
                 job_name = outcome.job_name;
+                correlation_id = outcome.correlation_id;
             },
             else => {
                 self.writeFileContent(state.node_id, offset, data) catch |err| switch (err) {
@@ -282,6 +293,15 @@ pub const Session = struct {
         const payload = if (job_name) |job| blk: {
             const escaped = try unified.jsonEscape(self.allocator, job);
             defer self.allocator.free(escaped);
+            if (correlation_id) |corr| {
+                const escaped_corr = try unified.jsonEscape(self.allocator, corr);
+                defer self.allocator.free(escaped_corr);
+                break :blk try std.fmt.allocPrint(
+                    self.allocator,
+                    "{{\"n\":{d},\"job\":\"{s}\",\"result_path\":\"/jobs/{s}/result.txt\",\"correlation_id\":\"{s}\"}}",
+                    .{ written, escaped, escaped, escaped_corr },
+                );
+            }
             break :blk try std.fmt.allocPrint(
                 self.allocator,
                 "{{\"n\":{d},\"job\":\"{s}\",\"result_path\":\"/jobs/{s}/result.txt\"}}",
@@ -353,6 +373,7 @@ pub const Session = struct {
         self.chat_input_id = try self.addFile(control, "input", "", true, .chat_input);
 
         self.jobs_root_id = try self.addDir(self.root_id, "jobs", false);
+        try self.seedJobsFromIndex();
 
         const meta = try self.addDir(self.root_id, "meta", false);
         const protocol_json =
@@ -453,24 +474,91 @@ pub const Session = struct {
         node_ptr.content = try self.allocator.dupe(u8, data);
     }
 
-    fn handleChatInputWrite(self: *Session, raw_input: []const u8) !WriteOutcome {
+    fn seedJobsFromIndex(self: *Session) !void {
+        const jobs = try self.job_index.listJobsForAgent(self.allocator, self.agent_id);
+        defer chat_job_index.deinitJobViews(self.allocator, jobs);
+
+        for (jobs) |job| {
+            if (self.lookupChild(self.jobs_root_id, job.job_id) != null) continue;
+            const job_dir = try self.addDir(self.jobs_root_id, job.job_id, false);
+            const status_json = try self.buildJobStatusJson(job.state, job.correlation_id, job.error_text);
+            defer self.allocator.free(status_json);
+            _ = try self.addFile(job_dir, "status.json", status_json, true, .job_status);
+            _ = try self.addFile(job_dir, "result.txt", job.result_text orelse "", true, .job_result);
+            _ = try self.addFile(job_dir, "log.txt", job.log_text orelse "", true, .job_log);
+        }
+    }
+
+    fn buildJobStatusJson(
+        self: *Session,
+        state: chat_job_index.JobState,
+        correlation_id: ?[]const u8,
+        error_text: ?[]const u8,
+    ) ![]u8 {
+        const correlation_json = if (correlation_id) |value| blk: {
+            const escaped = try unified.jsonEscape(self.allocator, value);
+            defer self.allocator.free(escaped);
+            break :blk try std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped});
+        } else try self.allocator.dupe(u8, "null");
+        defer self.allocator.free(correlation_json);
+
+        const error_json = if (error_text) |value| blk: {
+            const escaped = try unified.jsonEscape(self.allocator, value);
+            defer self.allocator.free(escaped);
+            break :blk try std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped});
+        } else try self.allocator.dupe(u8, "null");
+        defer self.allocator.free(error_json);
+
+        return std.fmt.allocPrint(
+            self.allocator,
+            "{{\"state\":\"{s}\",\"correlation_id\":{s},\"error\":{s},\"updated_at_ms\":{d}}}",
+            .{
+                switch (state) {
+                    .queued => "queued",
+                    .running => "running",
+                    .done => "done",
+                    .failed => "failed",
+                },
+                correlation_json,
+                error_json,
+                std.time.milliTimestamp(),
+            },
+        );
+    }
+
+    fn handleChatInputWrite(self: *Session, msg: *const unified.ParsedMessage, raw_input: []const u8) !WriteOutcome {
         const input = std.mem.trim(u8, raw_input, " \t\r\n");
         if (input.len == 0) {
-            return .{ .written = 0, .job_name = null };
+            return .{ .written = 0, .job_name = null, .correlation_id = null };
         }
 
-        const job_name = try std.fmt.allocPrint(self.allocator, "job-{d}", .{self.next_job_id});
-        self.next_job_id += 1;
+        const correlation_id = msg.correlation_id orelse msg.id;
+        const job_name = try self.job_index.createJob(self.agent_id, correlation_id);
         defer self.allocator.free(job_name);
 
         const job_dir = try self.addDir(self.jobs_root_id, job_name, false);
-        const status_id = try self.addFile(job_dir, "status.json", "{\"state\":\"running\"}", true, .job_status);
+        const queued_status = try self.buildJobStatusJson(.queued, correlation_id, null);
+        defer self.allocator.free(queued_status);
+        const status_id = try self.addFile(job_dir, "status.json", queued_status, true, .job_status);
         const result_id = try self.addFile(job_dir, "result.txt", "", true, .job_result);
         const log_id = try self.addFile(job_dir, "log.txt", "", true, .job_log);
 
+        try self.job_index.markRunning(job_name);
+        const running_status = try self.buildJobStatusJson(.running, correlation_id, null);
+        defer self.allocator.free(running_status);
+        try self.setFileContent(status_id, running_status);
+
         const escaped = try unified.jsonEscape(self.allocator, input);
         defer self.allocator.free(escaped);
-        const runtime_req = try std.fmt.allocPrint(
+        const runtime_req = if (correlation_id) |value| blk: {
+            const escaped_corr = try unified.jsonEscape(self.allocator, value);
+            defer self.allocator.free(escaped_corr);
+            break :blk try std.fmt.allocPrint(
+                self.allocator,
+                "{{\"id\":\"{s}\",\"type\":\"session.send\",\"content\":\"{s}\",\"correlation_id\":\"{s}\"}}",
+                .{ job_name, escaped, escaped_corr },
+            );
+        } else try std.fmt.allocPrint(
             self.allocator,
             "{{\"id\":\"{s}\",\"type\":\"session.send\",\"content\":\"{s}\"}}",
             .{ job_name, escaped },
@@ -535,10 +623,10 @@ pub const Session = struct {
                         }
                     } else if (std.mem.eql(u8, type_value.string, "error")) {
                         failed = true;
-                        if (obj.get("message")) |msg| {
-                            if (msg == .string) {
+                        if (obj.get("message")) |err_msg| {
+                            if (err_msg == .string) {
                                 if (failure_message_owned) |owned| self.allocator.free(owned);
-                                failure_message_owned = try self.allocator.dupe(u8, msg.string);
+                                failure_message_owned = try self.allocator.dupe(u8, err_msg.string);
                                 failure_message = failure_message_owned.?;
                             }
                         }
@@ -548,24 +636,34 @@ pub const Session = struct {
         }
 
         if (failed) {
-            const escaped_failure = try unified.jsonEscape(self.allocator, failure_message);
-            defer self.allocator.free(escaped_failure);
-            const status = try std.fmt.allocPrint(self.allocator, "{{\"state\":\"failed\",\"error\":\"{s}\"}}", .{escaped_failure});
+            const status = try self.buildJobStatusJson(.failed, correlation_id, failure_message);
             defer self.allocator.free(status);
             try self.setFileContent(status_id, status);
             try self.setFileContent(result_id, failure_message);
         } else {
-            try self.setFileContent(status_id, "{\"state\":\"complete\"}");
+            const status = try self.buildJobStatusJson(.done, correlation_id, null);
+            defer self.allocator.free(status);
+            try self.setFileContent(status_id, status);
             try self.setFileContent(result_id, result_text);
         }
 
         const log_content = try log_buf.toOwnedSlice(self.allocator);
         defer self.allocator.free(log_content);
         try self.setFileContent(log_id, log_content);
+        self.job_index.markCompleted(
+            job_name,
+            !failed,
+            if (failed) failure_message else result_text,
+            if (failed) failure_message else null,
+            log_content,
+        ) catch |err| {
+            std.log.warn("chat job index completion update failed: {s}", .{@errorName(err)});
+        };
 
         return .{
             .written = raw_input.len,
             .job_name = try self.allocator.dupe(u8, job_name),
+            .correlation_id = if (correlation_id) |value| try self.allocator.dupe(u8, value) else null,
         };
     }
 
@@ -595,8 +693,10 @@ test "fsrpc_session: attach walk open read capability help" {
 
     var runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
     defer runtime_server.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
 
-    var session = try Session.init(allocator, runtime_server, "default");
+    var session = try Session.init(allocator, runtime_server, &job_index, "default");
     defer session.deinit();
 
     var attach = unified.ParsedMessage{

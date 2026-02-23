@@ -90,6 +90,24 @@ const Project = struct {
     }
 };
 
+const ReconcileState = enum {
+    idle,
+    pending,
+    running,
+    degraded,
+};
+
+const DriftSeverity = enum {
+    info,
+    warning,
+    err,
+};
+
+const ReconcileProjectSummary = struct {
+    drift_count: u32 = 0,
+    queue_depth: u32 = 0,
+};
+
 pub const ControlPlane = struct {
     allocator: std.mem.Allocator,
     store: ?*ltm_store.VersionedMemStore = null,
@@ -120,6 +138,19 @@ pub const ControlPlane = struct {
     project_token_revokes_total: u64 = 0,
     project_activations_total: u64 = 0,
     lease_reap_nodes_total: u64 = 0,
+
+    reconcile_state: ReconcileState = .pending,
+    reconcile_last_reconcile_ms: i64 = 0,
+    reconcile_last_success_ms: i64 = 0,
+    reconcile_last_error: ?[]u8 = null,
+    reconcile_queue_depth: u32 = 0,
+    reconcile_failed_ops_total: u64 = 0,
+    reconcile_cycles_total: u64 = 0,
+    reconcile_requested_at_ms: i64 = 0,
+    reconcile_debounce_ms: i64 = 250,
+    reconcile_retry_backoff_ms: i64 = 100,
+    reconcile_max_retries_per_cycle: u32 = 3,
+    reconcile_last_failed_ops: std.ArrayListUnmanaged([]u8) = .{},
 
     pub fn init(allocator: std.mem.Allocator) ControlPlane {
         return .{
@@ -208,6 +239,21 @@ pub const ControlPlane = struct {
         self.project_token_revokes_total = 0;
         self.project_activations_total = 0;
         self.lease_reap_nodes_total = 0;
+
+        if (self.reconcile_last_error) |value| {
+            self.allocator.free(value);
+            self.reconcile_last_error = null;
+        }
+        for (self.reconcile_last_failed_ops.items) |op| self.allocator.free(op);
+        self.reconcile_last_failed_ops.deinit(self.allocator);
+        self.reconcile_last_failed_ops = .{};
+        self.reconcile_state = .pending;
+        self.reconcile_last_reconcile_ms = 0;
+        self.reconcile_last_success_ms = 0;
+        self.reconcile_queue_depth = 0;
+        self.reconcile_failed_ops_total = 0;
+        self.reconcile_cycles_total = 0;
+        self.reconcile_requested_at_ms = 0;
     }
 
     pub fn createNodeInvite(self: *ControlPlane, payload_json: ?[]const u8) ![]u8 {
@@ -852,10 +898,217 @@ pub const ControlPlane = struct {
         );
     }
 
+    pub fn requestReconcile(self: *ControlPlane) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.requestReconcileLocked(std.time.milliTimestamp());
+    }
+
+    pub fn runReconcileCycle(self: *ControlPlane, force: bool) !?[]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const now_ms = std.time.milliTimestamp();
+        _ = self.reapExpiredLeasesLocked(now_ms);
+        const ran = try self.runReconcileCycleLocked(now_ms, force);
+        if (!ran) return null;
+        return try self.buildReconcileStatusPayloadLocked(null, true);
+    }
+
+    pub fn reconcileStatus(self: *ControlPlane, payload_json: ?[]const u8) ![]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const now_ms = std.time.milliTimestamp();
+        _ = self.reapExpiredLeasesLocked(now_ms);
+        _ = try self.runReconcileCycleLocked(now_ms, false);
+        return try self.buildReconcileStatusPayloadLocked(payload_json, true);
+    }
+
+    pub fn projectUp(self: *ControlPlane, agent_id: []const u8, payload_json: ?[]const u8) ![]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const now_ms = std.time.milliTimestamp();
+        _ = self.reapExpiredLeasesLocked(now_ms);
+
+        var payload = try parsePayload(self.allocator, payload_json);
+        defer payload.deinit();
+        const obj = payload.value.object;
+
+        const requested_project_id = getOptionalString(obj, "project_id");
+        const requested_name = getOptionalString(obj, "name") orelse getOptionalString(obj, "project_name");
+        const requested_vision = getOptionalString(obj, "vision");
+        const requested_status = getOptionalString(obj, "status");
+        const activate = getOptionalBool(obj, "activate", true) catch return ControlPlaneError.InvalidPayload;
+
+        var project_ptr: ?*Project = null;
+        var created = false;
+        var mounts_replaced = false;
+
+        if (requested_project_id) |project_id| {
+            try validateIdentifier(project_id, 128);
+            project_ptr = self.projects.getPtr(project_id);
+            if (project_ptr == null) return ControlPlaneError.ProjectNotFound;
+        } else if (requested_name) |project_name| {
+            try validateDisplayString(project_name, 128);
+            var project_it = self.projects.valueIterator();
+            while (project_it.next()) |project| {
+                if (std.mem.eql(u8, project.name, project_name)) {
+                    project_ptr = project;
+                    break;
+                }
+            }
+        }
+
+        if (project_ptr == null) {
+            const name_raw = requested_name orelse return ControlPlaneError.MissingField;
+            const vision_raw = requested_vision orelse "";
+            const status_raw = requested_status orelse "active";
+            try validateDisplayString(name_raw, 128);
+            try validateDisplayString(vision_raw, 1024);
+            try validateIdentifier(status_raw, 64);
+
+            const project_id = try makeSequentialId(self.allocator, "proj", &self.next_project_id);
+            errdefer self.allocator.free(project_id);
+            const mutation_token = try makeToken(self.allocator, "proj");
+            errdefer self.allocator.free(mutation_token);
+
+            const project = Project{
+                .id = project_id,
+                .name = try self.allocator.dupe(u8, name_raw),
+                .vision = try self.allocator.dupe(u8, vision_raw),
+                .status = try self.allocator.dupe(u8, status_raw),
+                .mutation_token = mutation_token,
+                .created_at_ms = now_ms,
+                .updated_at_ms = now_ms,
+            };
+            errdefer {
+                self.allocator.free(project.name);
+                self.allocator.free(project.vision);
+                self.allocator.free(project.status);
+                self.allocator.free(project.mutation_token);
+            }
+
+            try self.projects.put(self.allocator, project.id, project);
+            self.project_creates_total +%= 1;
+            project_ptr = self.projects.getPtr(project_id).?;
+            created = true;
+        }
+
+        const project = project_ptr.?;
+        if (!created) {
+            if (requested_name) |next_name| {
+                try validateDisplayString(next_name, 128);
+                self.allocator.free(project.name);
+                project.name = try self.allocator.dupe(u8, next_name);
+            }
+            if (requested_vision) |next_vision| {
+                try validateDisplayString(next_vision, 1024);
+                self.allocator.free(project.vision);
+                project.vision = try self.allocator.dupe(u8, next_vision);
+            }
+            if (requested_status) |next_status| {
+                try validateIdentifier(next_status, 64);
+                self.allocator.free(project.status);
+                project.status = try self.allocator.dupe(u8, next_status);
+            }
+        }
+
+        if (obj.get("desired_mounts")) |desired_val| {
+            if (desired_val != .array) return ControlPlaneError.InvalidPayload;
+            var next_mounts = std.ArrayListUnmanaged(ProjectMount){};
+            errdefer {
+                for (next_mounts.items) |*mount| mount.deinit(self.allocator);
+                next_mounts.deinit(self.allocator);
+            }
+
+            for (desired_val.array.items) |item| {
+                if (item != .object) return ControlPlaneError.InvalidPayload;
+                const mount_obj = item.object;
+                const node_id = getRequiredString(mount_obj, "node_id") catch return ControlPlaneError.MissingField;
+                const export_name = getRequiredString(mount_obj, "export_name") catch return ControlPlaneError.MissingField;
+                const mount_path_raw = getRequiredString(mount_obj, "mount_path") catch return ControlPlaneError.MissingField;
+                try validateIdentifier(node_id, 128);
+                try validateExportName(export_name);
+                if (!self.nodes.contains(node_id)) return ControlPlaneError.NodeNotFound;
+                const mount_path = try normalizeMountPath(self.allocator, mount_path_raw);
+                errdefer self.allocator.free(mount_path);
+
+                var duplicate_exact = false;
+                for (next_mounts.items) |existing| {
+                    if (std.mem.eql(u8, existing.mount_path, mount_path)) {
+                        if (std.mem.eql(u8, existing.node_id, node_id) and std.mem.eql(u8, existing.export_name, export_name)) {
+                            duplicate_exact = true;
+                            break;
+                        }
+                        continue;
+                    }
+                    if (mountPathsOverlap(existing.mount_path, mount_path)) return ControlPlaneError.MountConflict;
+                }
+                if (duplicate_exact) {
+                    self.allocator.free(mount_path);
+                    continue;
+                }
+
+                try next_mounts.append(self.allocator, .{
+                    .mount_path = mount_path,
+                    .node_id = try self.allocator.dupe(u8, node_id),
+                    .export_name = try self.allocator.dupe(u8, export_name),
+                });
+            }
+
+            for (project.mounts.items) |*mount| mount.deinit(self.allocator);
+            project.mounts.deinit(self.allocator);
+            project.mounts = next_mounts;
+            mounts_replaced = true;
+        }
+
+        project.updated_at_ms = now_ms;
+        if (!created) self.project_updates_total +%= 1;
+        if (mounts_replaced) self.mount_sets_total +%= 1;
+
+        if (activate) {
+            if (self.active_project_by_agent.getPtr(agent_id)) |existing| {
+                self.allocator.free(existing.*);
+                existing.* = try self.allocator.dupe(u8, project.id);
+            } else {
+                try self.active_project_by_agent.put(
+                    self.allocator,
+                    try self.allocator.dupe(u8, agent_id),
+                    try self.allocator.dupe(u8, project.id),
+                );
+            }
+            self.project_activations_total +%= 1;
+        }
+
+        self.requestReconcileLocked(now_ms);
+        _ = try self.runReconcileCycleLocked(now_ms, false);
+        self.persistSnapshotBestEffortLocked();
+
+        const workspace_json = try self.renderWorkspaceStatusForProjectLocked(agent_id, project.id, now_ms);
+        defer self.allocator.free(workspace_json);
+        const escaped_project = try jsonEscape(self.allocator, project.id);
+        defer self.allocator.free(escaped_project);
+        const escaped_token = try jsonEscape(self.allocator, project.mutation_token);
+        defer self.allocator.free(escaped_token);
+
+        return std.fmt.allocPrint(
+            self.allocator,
+            "{{\"project_id\":\"{s}\",\"project_token\":\"{s}\",\"created\":{s},\"activated\":{s},\"workspace\":{s}}}",
+            .{
+                escaped_project,
+                escaped_token,
+                if (created) "true" else "false",
+                if (activate) "true" else "false",
+                workspace_json,
+            },
+        );
+    }
+
     pub fn workspaceStatus(self: *ControlPlane, agent_id: []const u8, payload_json: ?[]const u8) ![]u8 {
         self.mutex.lock();
         defer self.mutex.unlock();
-        _ = self.reapExpiredLeasesLocked(std.time.milliTimestamp());
+        const now_ms = std.time.milliTimestamp();
+        _ = self.reapExpiredLeasesLocked(now_ms);
+        _ = try self.runReconcileCycleLocked(now_ms, false);
 
         var selected_project_id: ?[]const u8 = null;
         var payload = try parsePayload(self.allocator, payload_json);
@@ -875,39 +1128,407 @@ pub const ControlPlane = struct {
             null;
         if (effective_project_id) |project_id| {
             if (project_id.len > 0) {
-                if (self.projects.get(project_id)) |project| {
-                    const workspace_root = try std.fmt.allocPrint(self.allocator, "/spiderweb/projects/{s}/workspace", .{project_id});
-                    defer self.allocator.free(workspace_root);
-                    const escaped_project = try jsonEscape(self.allocator, project_id);
-                    defer self.allocator.free(escaped_project);
-                    const escaped_root = try jsonEscape(self.allocator, workspace_root);
-                    defer self.allocator.free(escaped_root);
-
-                    var out = std.ArrayListUnmanaged(u8){};
-                    errdefer out.deinit(self.allocator);
-                    try out.writer(self.allocator).print(
-                        "{{\"agent_id\":\"{s}\",\"project_id\":\"{s}\",\"workspace_root\":\"{s}\",\"mounts\":[",
-                        .{ escaped_agent, escaped_project, escaped_root },
-                    );
-                    for (project.mounts.items, 0..) |mount, idx| {
-                        if (idx != 0) try out.append(self.allocator, ',');
-                        try appendWorkspaceMountJson(
-                            self.allocator,
-                            &out,
-                            mount,
-                            self.nodes.get(mount.node_id),
-                        );
-                    }
-                    try out.appendSlice(self.allocator, "]}");
-                    return out.toOwnedSlice(self.allocator);
+                if (self.projects.get(project_id) != null) {
+                    return try self.renderWorkspaceStatusForProjectLocked(agent_id, project_id, now_ms);
                 }
                 if (selected_project_id != null) return ControlPlaneError.ProjectNotFound;
             }
         }
+
+        const last_error_json = if (self.reconcile_last_error) |value| blk: {
+            const escaped = try jsonEscape(self.allocator, value);
+            defer self.allocator.free(escaped);
+            break :blk try std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped});
+        } else try self.allocator.dupe(u8, "null");
+        defer self.allocator.free(last_error_json);
+
         return std.fmt.allocPrint(
             self.allocator,
-            "{{\"agent_id\":\"{s}\",\"project_id\":null,\"workspace_root\":null,\"mounts\":[]}}",
-            .{escaped_agent},
+            "{{\"agent_id\":\"{s}\",\"project_id\":null,\"workspace_root\":null,\"mounts\":[],\"desired_mounts\":[],\"actual_mounts\":[],\"drift\":{{\"count\":0,\"items\":[]}},\"reconcile_state\":\"{s}\",\"last_reconcile_ms\":{d},\"last_success_ms\":{d},\"last_error\":{s},\"queue_depth\":{d}}}",
+            .{
+                escaped_agent,
+                reconcileStateName(self.reconcile_state),
+                self.reconcile_last_reconcile_ms,
+                self.reconcile_last_success_ms,
+                last_error_json,
+                self.reconcile_queue_depth,
+            },
+        );
+    }
+
+    fn requestReconcileLocked(self: *ControlPlane, now_ms: i64) void {
+        self.reconcile_requested_at_ms = now_ms;
+        if (self.reconcile_state == .idle) self.reconcile_state = .pending;
+    }
+
+    fn clearReconcileFailureListLocked(self: *ControlPlane) void {
+        for (self.reconcile_last_failed_ops.items) |value| self.allocator.free(value);
+        self.reconcile_last_failed_ops.clearRetainingCapacity();
+    }
+
+    fn setReconcileLastErrorLocked(self: *ControlPlane, message: ?[]const u8) !void {
+        if (self.reconcile_last_error) |value| {
+            self.allocator.free(value);
+            self.reconcile_last_error = null;
+        }
+        if (message) |value| {
+            const copied = try self.allocator.dupe(u8, value);
+            self.reconcile_last_error = copied;
+        }
+    }
+
+    fn runReconcileCycleLocked(self: *ControlPlane, now_ms: i64, force: bool) !bool {
+        const periodic_interval_ms: i64 = 5_000;
+        if (!force) {
+            if (self.reconcile_requested_at_ms != 0) {
+                if (now_ms - self.reconcile_requested_at_ms < self.reconcile_debounce_ms) return false;
+            } else if (self.reconcile_last_reconcile_ms != 0) {
+                if (now_ms - self.reconcile_last_reconcile_ms < periodic_interval_ms) return false;
+            }
+        }
+
+        self.reconcile_state = .running;
+        self.reconcile_cycles_total +%= 1;
+
+        var new_failed_ops = std.ArrayListUnmanaged([]u8){};
+        var adopted_failed_ops = false;
+        defer if (!adopted_failed_ops) {
+            for (new_failed_ops.items) |value| self.allocator.free(value);
+            new_failed_ops.deinit(self.allocator);
+        };
+
+        var queue_depth: u32 = 0;
+        var project_it = self.projects.valueIterator();
+        while (project_it.next()) |project| {
+            var summary = try self.evaluateProjectDriftLocked(project.*, now_ms, null);
+            var attempt: u32 = 0;
+            while (summary.queue_depth > 0 and attempt + 1 < self.reconcile_max_retries_per_cycle) : (attempt += 1) {
+                _ = self.reconcile_retry_backoff_ms;
+                summary = try self.evaluateProjectDriftLocked(project.*, now_ms, null);
+            }
+            if (summary.queue_depth > 0) {
+                const final_summary = try self.evaluateProjectDriftLocked(project.*, now_ms, &new_failed_ops);
+                queue_depth +%= final_summary.queue_depth;
+            }
+        }
+
+        self.clearReconcileFailureListLocked();
+        self.reconcile_last_failed_ops = new_failed_ops;
+        adopted_failed_ops = true;
+
+        self.reconcile_queue_depth = queue_depth;
+        self.reconcile_last_reconcile_ms = now_ms;
+        self.reconcile_requested_at_ms = 0;
+
+        if (queue_depth == 0 and self.reconcile_last_failed_ops.items.len == 0) {
+            self.reconcile_state = .idle;
+            self.reconcile_last_success_ms = now_ms;
+            try self.setReconcileLastErrorLocked(null);
+        } else {
+            self.reconcile_state = .degraded;
+            self.reconcile_failed_ops_total +%= @as(u64, @intCast(self.reconcile_last_failed_ops.items.len));
+            if (self.reconcile_last_failed_ops.items.len > 0) {
+                try self.setReconcileLastErrorLocked(self.reconcile_last_failed_ops.items[0]);
+            } else {
+                try self.setReconcileLastErrorLocked("reconcile queue is non-empty");
+            }
+        }
+
+        return true;
+    }
+
+    fn buildReconcileStatusPayloadLocked(
+        self: *ControlPlane,
+        payload_json: ?[]const u8,
+        include_projects: bool,
+    ) ![]u8 {
+        var selected_project_id: ?[]const u8 = null;
+        if (payload_json != null) {
+            var payload = try parsePayload(self.allocator, payload_json);
+            defer payload.deinit();
+            if (getOptionalString(payload.value.object, "project_id")) |project_id| {
+                try validateIdentifier(project_id, 128);
+                if (!self.projects.contains(project_id)) return ControlPlaneError.ProjectNotFound;
+                selected_project_id = project_id;
+            }
+        }
+
+        const last_error_json = if (self.reconcile_last_error) |value| blk: {
+            const escaped = try jsonEscape(self.allocator, value);
+            defer self.allocator.free(escaped);
+            break :blk try std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped});
+        } else try self.allocator.dupe(u8, "null");
+        defer self.allocator.free(last_error_json);
+
+        var out = std.ArrayListUnmanaged(u8){};
+        errdefer out.deinit(self.allocator);
+        try out.writer(self.allocator).print(
+            "{{\"reconcile_state\":\"{s}\",\"last_reconcile_ms\":{d},\"last_success_ms\":{d},\"last_error\":{s},\"queue_depth\":{d},\"failed_ops_total\":{d},\"cycles_total\":{d},\"failed_ops\":[",
+            .{
+                reconcileStateName(self.reconcile_state),
+                self.reconcile_last_reconcile_ms,
+                self.reconcile_last_success_ms,
+                last_error_json,
+                self.reconcile_queue_depth,
+                self.reconcile_failed_ops_total,
+                self.reconcile_cycles_total,
+            },
+        );
+        for (self.reconcile_last_failed_ops.items, 0..) |message, idx| {
+            if (idx != 0) try out.append(self.allocator, ',');
+            const escaped = try jsonEscape(self.allocator, message);
+            defer self.allocator.free(escaped);
+            try out.writer(self.allocator).print("\"{s}\"", .{escaped});
+        }
+        try out.appendSlice(self.allocator, "]");
+
+        if (include_projects) {
+            const now_ms = std.time.milliTimestamp();
+            try out.appendSlice(self.allocator, ",\"projects\":[");
+            var first = true;
+            var project_it = self.projects.valueIterator();
+            while (project_it.next()) |project| {
+                if (selected_project_id) |selected| {
+                    if (!std.mem.eql(u8, selected, project.id)) continue;
+                }
+                const summary = try self.evaluateProjectDriftLocked(project.*, now_ms, null);
+                if (!first) try out.append(self.allocator, ',');
+                first = false;
+                const escaped_project = try jsonEscape(self.allocator, project.id);
+                defer self.allocator.free(escaped_project);
+                try out.writer(self.allocator).print(
+                    "{{\"project_id\":\"{s}\",\"mounts\":{d},\"drift_count\":{d},\"queue_depth\":{d}}}",
+                    .{
+                        escaped_project,
+                        project.mounts.items.len,
+                        summary.drift_count,
+                        summary.queue_depth,
+                    },
+                );
+            }
+            try out.appendSlice(self.allocator, "]");
+        }
+
+        try out.appendSlice(self.allocator, "}");
+        return out.toOwnedSlice(self.allocator);
+    }
+
+    fn renderWorkspaceStatusForProjectLocked(
+        self: *ControlPlane,
+        agent_id: []const u8,
+        project_id: []const u8,
+        now_ms: i64,
+    ) ![]u8 {
+        const project = self.projects.get(project_id) orelse return ControlPlaneError.ProjectNotFound;
+        const workspace_root = try std.fmt.allocPrint(self.allocator, "/spiderweb/projects/{s}/workspace", .{project_id});
+        defer self.allocator.free(workspace_root);
+        const escaped_agent = try jsonEscape(self.allocator, agent_id);
+        defer self.allocator.free(escaped_agent);
+        const escaped_project = try jsonEscape(self.allocator, project_id);
+        defer self.allocator.free(escaped_project);
+        const escaped_root = try jsonEscape(self.allocator, workspace_root);
+        defer self.allocator.free(escaped_root);
+        const last_error_json = if (self.reconcile_last_error) |value| blk: {
+            const escaped = try jsonEscape(self.allocator, value);
+            defer self.allocator.free(escaped);
+            break :blk try std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped});
+        } else try self.allocator.dupe(u8, "null");
+        defer self.allocator.free(last_error_json);
+
+        var out = std.ArrayListUnmanaged(u8){};
+        errdefer out.deinit(self.allocator);
+        try out.writer(self.allocator).print(
+            "{{\"agent_id\":\"{s}\",\"project_id\":\"{s}\",\"workspace_root\":\"{s}\"",
+            .{ escaped_agent, escaped_project, escaped_root },
+        );
+        const topology = try self.appendWorkspaceTopologyJsonLocked(&out, project, now_ms, null);
+        try out.writer(self.allocator).print(
+            ",\"reconcile_state\":\"{s}\",\"last_reconcile_ms\":{d},\"last_success_ms\":{d},\"last_error\":{s},\"queue_depth\":{d}}}",
+            .{
+                reconcileStateName(self.reconcile_state),
+                self.reconcile_last_reconcile_ms,
+                self.reconcile_last_success_ms,
+                last_error_json,
+                topology.queue_depth,
+            },
+        );
+        return out.toOwnedSlice(self.allocator);
+    }
+
+    fn appendWorkspaceTopologyJsonLocked(
+        self: *ControlPlane,
+        out: *std.ArrayListUnmanaged(u8),
+        project: Project,
+        now_ms: i64,
+        failed_ops: ?*std.ArrayListUnmanaged([]u8),
+    ) !ReconcileProjectSummary {
+        var first_by_path = std.StringHashMapUnmanaged(usize){};
+        defer first_by_path.deinit(self.allocator);
+        var selected_by_path = std.StringHashMapUnmanaged(usize){};
+        defer selected_by_path.deinit(self.allocator);
+
+        for (project.mounts.items, 0..) |mount, idx| {
+            if (!first_by_path.contains(mount.mount_path)) {
+                try first_by_path.put(self.allocator, mount.mount_path, idx);
+            }
+            if (selected_by_path.getPtr(mount.mount_path)) |selected_idx| {
+                if (self.shouldSelectCandidateMountLocked(project, selected_idx.*, idx, now_ms)) {
+                    selected_idx.* = idx;
+                }
+            } else {
+                try selected_by_path.put(self.allocator, mount.mount_path, idx);
+            }
+        }
+
+        try out.appendSlice(self.allocator, ",\"mounts\":[");
+        var first = true;
+        for (project.mounts.items, 0..) |mount, idx| {
+            const selected_idx = selected_by_path.get(mount.mount_path) orelse continue;
+            if (selected_idx != idx) continue;
+            if (!first) try out.append(self.allocator, ',');
+            first = false;
+            try appendWorkspaceMountJson(self.allocator, out, mount, self.nodes.get(mount.node_id));
+        }
+        try out.appendSlice(self.allocator, "],\"desired_mounts\":[");
+
+        first = true;
+        for (project.mounts.items) |mount| {
+            if (!first) try out.append(self.allocator, ',');
+            first = false;
+            try appendWorkspaceMountJson(self.allocator, out, mount, self.nodes.get(mount.node_id));
+        }
+        try out.appendSlice(self.allocator, "],\"actual_mounts\":[");
+
+        first = true;
+        for (project.mounts.items, 0..) |mount, idx| {
+            const selected_idx = selected_by_path.get(mount.mount_path) orelse continue;
+            if (selected_idx != idx) continue;
+            if (!first) try out.append(self.allocator, ',');
+            first = false;
+            try appendWorkspaceMountJson(self.allocator, out, mount, self.nodes.get(mount.node_id));
+        }
+        try out.appendSlice(self.allocator, "],\"drift\":{\"count\":");
+
+        var drift_items = std.ArrayListUnmanaged(u8){};
+        defer drift_items.deinit(self.allocator);
+        var summary = ReconcileProjectSummary{};
+        var first_drift = true;
+        for (project.mounts.items, 0..) |mount, idx| {
+            const first_idx = first_by_path.get(mount.mount_path) orelse continue;
+            if (first_idx != idx) continue;
+
+            const selected_idx = selected_by_path.get(mount.mount_path) orelse continue;
+            const selected_mount = project.mounts.items[selected_idx];
+            const selected_node = self.nodes.get(selected_mount.node_id);
+            const selected_online = if (selected_node) |resolved| resolved.lease_expires_at_ms > now_ms else false;
+
+            if (selected_node == null) {
+                summary.drift_count +%= 1;
+                summary.queue_depth +%= 1;
+                if (!first_drift) try drift_items.append(self.allocator, ',');
+                first_drift = false;
+                try appendDriftEntryJson(
+                    self.allocator,
+                    &drift_items,
+                    selected_mount.mount_path,
+                    "missing_node",
+                    .err,
+                    selected_mount.node_id,
+                    mount.node_id,
+                    "selected node is missing",
+                );
+                if (failed_ops) |ops| {
+                    const message = try std.fmt.allocPrint(
+                        self.allocator,
+                        "project={s} mount={s} node={s} missing",
+                        .{ project.id, selected_mount.mount_path, selected_mount.node_id },
+                    );
+                    try ops.append(self.allocator, message);
+                }
+                continue;
+            }
+
+            if (!selected_online) {
+                summary.drift_count +%= 1;
+                summary.queue_depth +%= 1;
+                if (!first_drift) try drift_items.append(self.allocator, ',');
+                first_drift = false;
+                try appendDriftEntryJson(
+                    self.allocator,
+                    &drift_items,
+                    selected_mount.mount_path,
+                    "node_offline",
+                    .err,
+                    selected_mount.node_id,
+                    mount.node_id,
+                    "selected node lease is expired",
+                );
+                if (failed_ops) |ops| {
+                    const message = try std.fmt.allocPrint(
+                        self.allocator,
+                        "project={s} mount={s} node={s} offline",
+                        .{ project.id, selected_mount.mount_path, selected_mount.node_id },
+                    );
+                    try ops.append(self.allocator, message);
+                }
+                continue;
+            }
+
+            if (selected_idx != first_idx) {
+                summary.drift_count +%= 1;
+                if (!first_drift) try drift_items.append(self.allocator, ',');
+                first_drift = false;
+                try appendDriftEntryJson(
+                    self.allocator,
+                    &drift_items,
+                    selected_mount.mount_path,
+                    "failover_active",
+                    .warning,
+                    selected_mount.node_id,
+                    mount.node_id,
+                    "using healthy failover node",
+                );
+            }
+        }
+
+        try out.writer(self.allocator).print("{d},\"items\":[{s}]}}", .{ summary.drift_count, drift_items.items });
+        return summary;
+    }
+
+    fn shouldSelectCandidateMountLocked(
+        self: *ControlPlane,
+        project: Project,
+        current_idx: usize,
+        candidate_idx: usize,
+        now_ms: i64,
+    ) bool {
+        const current_mount = project.mounts.items[current_idx];
+        const candidate_mount = project.mounts.items[candidate_idx];
+        const current_node = self.nodes.get(current_mount.node_id);
+        const candidate_node = self.nodes.get(candidate_mount.node_id);
+        const current_online = if (current_node) |value| value.lease_expires_at_ms > now_ms else false;
+        const candidate_online = if (candidate_node) |value| value.lease_expires_at_ms > now_ms else false;
+        if (candidate_online and !current_online) return true;
+        if (!candidate_online and current_online) return false;
+        if (candidate_online and current_online) {
+            return candidate_node.?.lease_expires_at_ms > current_node.?.lease_expires_at_ms;
+        }
+        return false;
+    }
+
+    fn evaluateProjectDriftLocked(
+        self: *ControlPlane,
+        project: Project,
+        now_ms: i64,
+        failed_ops: ?*std.ArrayListUnmanaged([]u8),
+    ) !ReconcileProjectSummary {
+        var scratch = std.ArrayListUnmanaged(u8){};
+        defer scratch.deinit(self.allocator);
+        return try self.appendWorkspaceTopologyJsonLocked(
+            &scratch,
+            project,
+            now_ms,
+            failed_ops,
         );
     }
 
@@ -1145,6 +1766,7 @@ pub const ControlPlane = struct {
     }
 
     fn persistSnapshotBestEffortLocked(self: *ControlPlane) void {
+        self.requestReconcileLocked(std.time.milliTimestamp());
         self.persistSnapshotLocked() catch |err| {
             std.log.warn("control-plane snapshot persist failed: {s}", .{@errorName(err)});
         };
@@ -1506,6 +2128,12 @@ fn getOptionalUnsigned(obj: std.json.ObjectMap, name: []const u8, default_value:
     return @intCast(value.integer);
 }
 
+fn getOptionalBool(obj: std.json.ObjectMap, name: []const u8, default_value: bool) !bool {
+    const value = obj.get(name) orelse return default_value;
+    if (value != .bool) return ControlPlaneError.InvalidPayload;
+    return value.bool;
+}
+
 fn getOptionalU64(obj: std.json.ObjectMap, name: []const u8, default_value: u64) !u64 {
     const value = obj.get(name) orelse return default_value;
     if (value != .integer or value.integer < 0) return error.InvalidSnapshot;
@@ -1632,6 +2260,57 @@ fn appendWorkspaceMountJson(
         "{{\"mount_path\":\"{s}\",\"node_id\":\"{s}\",\"export_name\":\"{s}\",\"node_name\":null,\"fs_url\":null,\"fs_auth_token\":null,\"online\":false}}",
         .{ escaped_path, escaped_node, escaped_export },
     );
+}
+
+fn appendDriftEntryJson(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    mount_path: []const u8,
+    kind: []const u8,
+    severity: DriftSeverity,
+    selected_node_id: []const u8,
+    desired_node_id: []const u8,
+    message: []const u8,
+) !void {
+    const escaped_path = try jsonEscape(allocator, mount_path);
+    defer allocator.free(escaped_path);
+    const escaped_kind = try jsonEscape(allocator, kind);
+    defer allocator.free(escaped_kind);
+    const escaped_selected = try jsonEscape(allocator, selected_node_id);
+    defer allocator.free(escaped_selected);
+    const escaped_desired = try jsonEscape(allocator, desired_node_id);
+    defer allocator.free(escaped_desired);
+    const escaped_message = try jsonEscape(allocator, message);
+    defer allocator.free(escaped_message);
+
+    try out.writer(allocator).print(
+        "{{\"mount_path\":\"{s}\",\"kind\":\"{s}\",\"severity\":\"{s}\",\"selected_node_id\":\"{s}\",\"desired_node_id\":\"{s}\",\"message\":\"{s}\"}}",
+        .{
+            escaped_path,
+            escaped_kind,
+            driftSeverityName(severity),
+            escaped_selected,
+            escaped_desired,
+            escaped_message,
+        },
+    );
+}
+
+fn reconcileStateName(state: ReconcileState) []const u8 {
+    return switch (state) {
+        .idle => "idle",
+        .pending => "pending",
+        .running => "running",
+        .degraded => "degraded",
+    };
+}
+
+fn driftSeverityName(severity: DriftSeverity) []const u8 {
+    return switch (severity) {
+        .info => "info",
+        .warning => "warning",
+        .err => "error",
+    };
 }
 
 fn renderProjectPayload(allocator: std.mem.Allocator, project: Project, include_project_token: bool) ![]u8 {

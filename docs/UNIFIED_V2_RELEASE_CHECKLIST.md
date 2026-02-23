@@ -26,6 +26,9 @@
 
 ## Integration Validation
 - [ ] `cd test-env && make test-distributed-workspace`
+- [ ] `cd test-env && make test-distributed-workspace-bootstrap`
+- [ ] `cd test-env && make test-distributed-workspace-drift`
+- [ ] `cd test-env && make test-distributed-workspace-matrix`
 - [ ] `cd test-env && make test-distributed-workspace-encrypted`
 - [ ] `cd test-env && make test-distributed-workspace-operator-token`
 - [ ] `cd test-env && make test-distributed-soak-chaos`

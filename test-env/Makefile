@@ -1,6 +1,6 @@
 # ZiggySpiderweb Test Environment Makefile
 
-.PHONY: help build up down shell test wipe logs status test-embed-multi-service test-distributed-workspace test-distributed-workspace-encrypted test-distributed-workspace-operator-token test-distributed-soak-chaos
+.PHONY: help build up down shell test wipe logs status test-embed-multi-service test-distributed-workspace test-distributed-workspace-bootstrap test-distributed-workspace-drift test-distributed-workspace-matrix test-distributed-workspace-encrypted test-distributed-workspace-operator-token test-distributed-soak-chaos
 
 help: ## Show this help message
 	@echo "ZiggySpiderweb Test Environment"
@@ -51,6 +51,15 @@ test-embed-multi-service: ## Run local embedded multi-service integration test
 
 test-distributed-workspace: ## Run distributed workspace failover integration test
 	@bash ./test-distributed-workspace.sh
+
+test-distributed-workspace-bootstrap: ## Run distributed workspace project_up bootstrap scenario
+	@bash ./test-distributed-workspace-bootstrap.sh
+
+test-distributed-workspace-drift: ## Run distributed workspace drift/reconcile scenario
+	@bash ./test-distributed-workspace-drift.sh
+
+test-distributed-workspace-matrix: ## Run distributed workspace matrix (failover/reconnect/bootstrap/drift)
+	@bash ./test-distributed-workspace-matrix.sh
 
 test-distributed-workspace-encrypted: ## Run distributed workspace test with encrypted control-plane persistence
 	@bash ./test-distributed-workspace-encrypted.sh

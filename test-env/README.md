@@ -85,12 +85,20 @@ This test exercises the control-plane + mount integration flow end-to-end:
 - verifies reads initially come from node A/B, kills the active node, and verifies failover
 - restarts the stopped node, rejoins/remounts it, then kills the surviving node to verify second failover convergence
 
+Additional focused scenarios:
+- `test-distributed-workspace-bootstrap.sh`: validates `control.project_up` bootstrap output and workspace desired/actual/drift schema.
+- `test-distributed-workspace-drift.sh`: forces a desired/actual mismatch and verifies drift + reconcile diagnostics.
+- `test-distributed-workspace-matrix.sh`: runs failover/reconnect/bootstrap/drift as one matrix entrypoint.
+
 ```bash
 # Run directly
 bash test-env/test-distributed-workspace.sh
 
 # Or through make
 cd test-env && make test-distributed-workspace
+cd test-env && make test-distributed-workspace-bootstrap
+cd test-env && make test-distributed-workspace-drift
+cd test-env && make test-distributed-workspace-matrix
 cd test-env && make test-distributed-workspace-encrypted
 cd test-env && make test-distributed-workspace-operator-token
 cd test-env && make test-distributed-soak-chaos

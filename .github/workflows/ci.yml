@@ -22,7 +22,7 @@ jobs:
         grep -q 'ziggy_run_orchestrator' build.zig.zon
         grep -q '\.hash =' build.zig.zon
       extra_commands: |
-        SKIP_BUILD=1 bash test-env/test-distributed-workspace.sh
+        SKIP_BUILD=1 bash test-env/test-distributed-workspace-matrix.sh
 
   windows-fs-tests:
     name: windows-fs-tests
