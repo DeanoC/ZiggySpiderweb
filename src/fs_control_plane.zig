@@ -740,27 +740,45 @@ pub const ControlPlane = struct {
         const project_id = getRequiredString(obj, "project_id") catch return ControlPlaneError.MissingField;
         const project_token = getRequiredString(obj, "project_token") catch return ControlPlaneError.MissingField;
         const mount_path_raw = getRequiredString(obj, "mount_path") catch return ControlPlaneError.MissingField;
+        const node_id_filter = getOptionalString(obj, "node_id");
+        const export_name_filter = getOptionalString(obj, "export_name");
         try validateIdentifier(project_id, 128);
         try validateSecretToken(project_token, 256);
+        if ((node_id_filter == null) != (export_name_filter == null)) return ControlPlaneError.MissingField;
+        if (node_id_filter) |node_id| try validateIdentifier(node_id, 128);
+        if (export_name_filter) |export_name| try validateExportName(export_name);
         const mount_path = try normalizeMountPath(self.allocator, mount_path_raw);
         defer self.allocator.free(mount_path);
 
         const project = self.projects.getPtr(project_id) orelse return ControlPlaneError.ProjectNotFound;
         if (!secureTokenEql(project.mutation_token, project_token)) return ControlPlaneError.ProjectAuthFailed;
-        var found = false;
+        var removed_count: u32 = 0;
         var i: usize = 0;
         while (i < project.mounts.items.len) {
-            if (std.mem.eql(u8, project.mounts.items[i].mount_path, mount_path)) {
-                var removed = project.mounts.orderedRemove(i);
-                removed.deinit(self.allocator);
-                found = true;
-                break;
+            const mount = project.mounts.items[i];
+            if (!std.mem.eql(u8, mount.mount_path, mount_path)) {
+                i += 1;
+                continue;
             }
-            i += 1;
+            if (node_id_filter) |node_id| {
+                if (!std.mem.eql(u8, mount.node_id, node_id)) {
+                    i += 1;
+                    continue;
+                }
+                if (!std.mem.eql(u8, mount.export_name, export_name_filter.?)) {
+                    i += 1;
+                    continue;
+                }
+            }
+
+            var removed = project.mounts.orderedRemove(i);
+            removed.deinit(self.allocator);
+            removed_count +%= 1;
+            if (node_id_filter != null) break;
         }
-        if (!found) return ControlPlaneError.MountNotFound;
+        if (removed_count == 0) return ControlPlaneError.MountNotFound;
         project.updated_at_ms = std.time.milliTimestamp();
-        self.mount_removes_total +%= 1;
+        self.mount_removes_total +%= removed_count;
         self.persistSnapshotBestEffortLocked();
 
         return renderProjectPayload(self.allocator, project.*, false);
@@ -2753,6 +2771,98 @@ test "fs_control_plane: identical mount path can be used for failover nodes" {
 
     try std.testing.expect(std.mem.indexOf(u8, second, "\"node_id\":\"node-1\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, second, "\"node_id\":\"node-2\"") != null);
+}
+
+test "fs_control_plane: removeProjectMount supports path-wide and targeted failover removal" {
+    const allocator = std.testing.allocator;
+    var plane = ControlPlane.init(allocator);
+    defer plane.deinit();
+
+    const invite_a_json = try plane.createNodeInvite(null);
+    defer allocator.free(invite_a_json);
+    var invite_a = try std.json.parseFromSlice(std.json.Value, allocator, invite_a_json, .{});
+    defer invite_a.deinit();
+    const token_a = invite_a.value.object.get("invite_token").?.string;
+
+    const join_a_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"invite_token\":\"{s}\",\"node_name\":\"alpha\",\"fs_url\":\"ws://127.0.0.1:18891/v2/fs\"}}",
+        .{token_a},
+    );
+    defer allocator.free(join_a_req);
+    const join_a_json = try plane.nodeJoin(join_a_req);
+    defer allocator.free(join_a_json);
+    var join_a = try std.json.parseFromSlice(std.json.Value, allocator, join_a_json, .{});
+    defer join_a.deinit();
+    const node_a = join_a.value.object.get("node_id").?.string;
+
+    const invite_b_json = try plane.createNodeInvite(null);
+    defer allocator.free(invite_b_json);
+    var invite_b = try std.json.parseFromSlice(std.json.Value, allocator, invite_b_json, .{});
+    defer invite_b.deinit();
+    const token_b = invite_b.value.object.get("invite_token").?.string;
+
+    const join_b_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"invite_token\":\"{s}\",\"node_name\":\"beta\",\"fs_url\":\"ws://127.0.0.1:18892/v2/fs\"}}",
+        .{token_b},
+    );
+    defer allocator.free(join_b_req);
+    const join_b_json = try plane.nodeJoin(join_b_req);
+    defer allocator.free(join_b_json);
+    var join_b = try std.json.parseFromSlice(std.json.Value, allocator, join_b_json, .{});
+    defer join_b.deinit();
+    const node_b = join_b.value.object.get("node_id").?.string;
+
+    const project_json = try plane.createProject("{\"name\":\"FailoverRemove\"}");
+    defer allocator.free(project_json);
+    var parsed_project = try std.json.parseFromSlice(std.json.Value, allocator, project_json, .{});
+    defer parsed_project.deinit();
+    const project_id = parsed_project.value.object.get("project_id").?.string;
+    const project_token = parsed_project.value.object.get("project_token").?.string;
+
+    const mount_a = try std.fmt.allocPrint(
+        allocator,
+        "{{\"project_id\":\"{s}\",\"project_token\":\"{s}\",\"node_id\":\"{s}\",\"export_name\":\"work\",\"mount_path\":\"/src\"}}",
+        .{ project_id, project_token, node_a },
+    );
+    defer allocator.free(mount_a);
+    const first = try plane.setProjectMount(mount_a);
+    defer allocator.free(first);
+
+    const mount_b = try std.fmt.allocPrint(
+        allocator,
+        "{{\"project_id\":\"{s}\",\"project_token\":\"{s}\",\"node_id\":\"{s}\",\"export_name\":\"work\",\"mount_path\":\"/src\"}}",
+        .{ project_id, project_token, node_b },
+    );
+    defer allocator.free(mount_b);
+    const second = try plane.setProjectMount(mount_b);
+    defer allocator.free(second);
+
+    const remove_targeted = try std.fmt.allocPrint(
+        allocator,
+        "{{\"project_id\":\"{s}\",\"project_token\":\"{s}\",\"mount_path\":\"/src\",\"node_id\":\"{s}\",\"export_name\":\"work\"}}",
+        .{ project_id, project_token, node_a },
+    );
+    defer allocator.free(remove_targeted);
+    const targeted_removed = try plane.removeProjectMount(remove_targeted);
+    defer allocator.free(targeted_removed);
+    const node_a_entry = try std.fmt.allocPrint(allocator, "\"node_id\":\"{s}\"", .{node_a});
+    defer allocator.free(node_a_entry);
+    const node_b_entry = try std.fmt.allocPrint(allocator, "\"node_id\":\"{s}\"", .{node_b});
+    defer allocator.free(node_b_entry);
+    try std.testing.expect(std.mem.indexOf(u8, targeted_removed, node_a_entry) == null);
+    try std.testing.expect(std.mem.indexOf(u8, targeted_removed, node_b_entry) != null);
+
+    const remove_all = try std.fmt.allocPrint(
+        allocator,
+        "{{\"project_id\":\"{s}\",\"project_token\":\"{s}\",\"mount_path\":\"/src\"}}",
+        .{ project_id, project_token },
+    );
+    defer allocator.free(remove_all);
+    const all_removed = try plane.removeProjectMount(remove_all);
+    defer allocator.free(all_removed);
+    try std.testing.expect(std.mem.indexOf(u8, all_removed, "\"mounts\":[]") != null);
 }
 
 test "fs_control_plane: lease reaper removes expired nodes and project mounts" {
