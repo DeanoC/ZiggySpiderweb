@@ -937,7 +937,9 @@ pub const ControlPlane = struct {
         const requested_name = getOptionalString(obj, "name") orelse getOptionalString(obj, "project_name");
         const requested_vision = getOptionalString(obj, "vision");
         const requested_status = getOptionalString(obj, "status");
+        const requested_project_token = getOptionalString(obj, "project_token");
         const activate = getOptionalBool(obj, "activate", true) catch return ControlPlaneError.InvalidPayload;
+        if (requested_project_token) |project_token| try validateSecretToken(project_token, 256);
 
         var project_ptr: ?*Project = null;
         var created = false;
@@ -995,6 +997,8 @@ pub const ControlPlane = struct {
 
         const project = project_ptr.?;
         if (!created) {
+            const project_token = requested_project_token orelse return ControlPlaneError.MissingField;
+            if (!secureTokenEql(project.mutation_token, project_token)) return ControlPlaneError.ProjectAuthFailed;
             if (requested_name) |next_name| {
                 try validateDisplayString(next_name, 128);
                 self.allocator.free(project.name);
@@ -3049,6 +3053,52 @@ test "fs_control_plane: workspaceStatus supports explicit project selection" {
         ControlPlaneError.ProjectNotFound,
         plane.workspaceStatus("agent-selector", "{\"project_id\":\"proj-missing\"}"),
     );
+}
+
+test "fs_control_plane: projectUp requires project_token for existing project" {
+    const allocator = std.testing.allocator;
+    var plane = ControlPlane.init(allocator);
+    defer plane.deinit();
+
+    const project_json = try plane.createProject("{\"name\":\"UpAuth\"}");
+    defer allocator.free(project_json);
+    var project = try std.json.parseFromSlice(std.json.Value, allocator, project_json, .{});
+    defer project.deinit();
+    const project_id = project.value.object.get("project_id").?.string;
+    const project_token = project.value.object.get("project_token").?.string;
+
+    const missing_token_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"project_id\":\"{s}\",\"status\":\"paused\"}}",
+        .{project_id},
+    );
+    defer allocator.free(missing_token_req);
+    try std.testing.expectError(ControlPlaneError.MissingField, plane.projectUp("agent-up", missing_token_req));
+
+    const bad_token_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"project_id\":\"{s}\",\"project_token\":\"bad-token\",\"status\":\"paused\"}}",
+        .{project_id},
+    );
+    defer allocator.free(bad_token_req);
+    try std.testing.expectError(ControlPlaneError.ProjectAuthFailed, plane.projectUp("agent-up", bad_token_req));
+
+    const ok_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"project_id\":\"{s}\",\"project_token\":\"{s}\",\"status\":\"paused\",\"activate\":false}}",
+        .{ project_id, project_token },
+    );
+    defer allocator.free(ok_req);
+    const ok_json = try plane.projectUp("agent-up", ok_req);
+    defer allocator.free(ok_json);
+    try std.testing.expect(std.mem.indexOf(u8, ok_json, "\"created\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ok_json, "\"activated\":false") != null);
+
+    const get_req = try std.fmt.allocPrint(allocator, "{{\"project_id\":\"{s}\"}}", .{project_id});
+    defer allocator.free(get_req);
+    const get_json = try plane.getProject(get_req);
+    defer allocator.free(get_json);
+    try std.testing.expect(std.mem.indexOf(u8, get_json, "\"status\":\"paused\"") != null);
 }
 
 test "fs_control_plane: snapshot encryption envelope roundtrip" {

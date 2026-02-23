@@ -1115,15 +1115,38 @@ const AgentRuntimeRegistry = struct {
         self: *AgentRuntimeRegistry,
         agent_id: []const u8,
         reason: []const u8,
-        control_payload_json: []const u8,
+        control_request_payload_json: ?[]const u8,
+        control_response_payload_json: []const u8,
     ) void {
-        const project_id = extractProjectIdFromControlPayload(self.allocator, control_payload_json) catch return;
-        defer if (project_id) |value| self.allocator.free(value);
-        const selected_project = project_id orelse return;
+        const response_project_id = extractProjectIdFromControlPayload(self.allocator, control_response_payload_json) catch return;
+        defer if (response_project_id) |value| self.allocator.free(value);
+        const request_project_id = if (control_request_payload_json) |value|
+            extractProjectIdFromControlPayload(self.allocator, value) catch return
+        else
+            null;
+        defer if (request_project_id) |value| self.allocator.free(value);
+        const selected_project = response_project_id orelse request_project_id orelse return;
+
+        const response_project_token = extractProjectTokenFromControlPayload(self.allocator, control_response_payload_json) catch return;
+        defer if (response_project_token) |value| self.allocator.free(value);
+        const request_project_token = if (control_request_payload_json) |value|
+            extractProjectTokenFromControlPayload(self.allocator, value) catch return
+        else
+            null;
+        defer if (request_project_token) |value| self.allocator.free(value);
+        const selected_project_token = response_project_token orelse request_project_token;
 
         const escaped_project = unified.jsonEscape(self.allocator, selected_project) catch return;
         defer self.allocator.free(escaped_project);
-        const status_req = std.fmt.allocPrint(
+        const status_req = if (selected_project_token) |project_token| blk: {
+            const escaped_token = unified.jsonEscape(self.allocator, project_token) catch return;
+            defer self.allocator.free(escaped_token);
+            break :blk std.fmt.allocPrint(
+                self.allocator,
+                "{{\"project_id\":\"{s}\",\"project_token\":\"{s}\"}}",
+                .{ escaped_project, escaped_token },
+            ) catch return;
+        } else std.fmt.allocPrint(
             self.allocator,
             "{{\"project_id\":\"{s}\"}}",
             .{escaped_project},
@@ -1691,7 +1714,12 @@ fn handleWebSocketConnection(
                                     runtime_registry.control_plane.requestReconcile();
                                     const reason = unified.controlTypeName(control_type);
                                     runtime_registry.emitWorkspaceTopologyChanged(reason);
-                                    runtime_registry.emitWorkspaceTopologyProjectDelta(agent_id, reason, payload_json);
+                                    runtime_registry.emitWorkspaceTopologyProjectDelta(
+                                        agent_id,
+                                        reason,
+                                        parsed.payload_json,
+                                        payload_json,
+                                    );
                                 }
                                 continue;
                             },
@@ -1883,6 +1911,16 @@ fn extractProjectIdFromControlPayload(allocator: std.mem.Allocator, payload_json
     const project_id = parsed.value.object.get("project_id") orelse return null;
     if (project_id != .string or project_id.string.len == 0) return null;
     const copy = try allocator.dupe(u8, project_id.string);
+    return @as(?[]u8, copy);
+}
+
+fn extractProjectTokenFromControlPayload(allocator: std.mem.Allocator, payload_json: []const u8) !?[]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload_json, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const project_token = parsed.value.object.get("project_token") orelse return null;
+    if (project_token != .string or project_token.string.len == 0) return null;
+    const copy = try allocator.dupe(u8, project_token.string);
     return @as(?[]u8, copy);
 }
 
@@ -2929,6 +2967,24 @@ test "server_piai: parseHttpRequestPath parses GET line" {
 test "server_piai: stripHttpRequestTargetQuery removes query string" {
     try std.testing.expectEqualStrings("/metrics", stripHttpRequestTargetQuery("/metrics?format=json"));
     try std.testing.expectEqualStrings("/readyz", stripHttpRequestTargetQuery("/readyz"));
+}
+
+test "server_piai: extract project payload helpers parse id and token" {
+    const allocator = std.testing.allocator;
+    const payload = "{\"project_id\":\"proj-7\",\"project_token\":\"proj-token-7\"}";
+
+    const project_id = try extractProjectIdFromControlPayload(allocator, payload);
+    defer if (project_id) |value| allocator.free(value);
+    try std.testing.expect(project_id != null);
+    try std.testing.expectEqualStrings("proj-7", project_id.?);
+
+    const project_token = try extractProjectTokenFromControlPayload(allocator, payload);
+    defer if (project_token) |value| allocator.free(value);
+    try std.testing.expect(project_token != null);
+    try std.testing.expectEqualStrings("proj-token-7", project_token.?);
+
+    const token_missing = try extractProjectTokenFromControlPayload(allocator, "{\"project_id\":\"proj-7\"}");
+    try std.testing.expect(token_missing == null);
 }
 
 test "server_piai: validateFsNodeHelloPayload enforces optional auth_token" {
