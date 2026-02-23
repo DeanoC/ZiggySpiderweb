@@ -1665,7 +1665,13 @@ fn jsonOptionalStringDup(allocator: std.mem.Allocator, value: ?std.json.Value) !
 fn splitParentChild(path: []const u8) !struct { parent_path: []const u8, name: []const u8 } {
     if (path.len == 0 or path[0] != '/') return RouterError.InvalidPath;
     const slash = std.mem.lastIndexOfScalar(u8, path, '/') orelse return RouterError.InvalidPath;
-    if (slash == 0 or slash == path.len - 1) return RouterError.InvalidPath;
+    if (slash == path.len - 1) return RouterError.InvalidPath;
+
+    if (slash == 0) {
+        const name_root = path[1..];
+        if (name_root.len == 0) return RouterError.InvalidPath;
+        return .{ .parent_path = "/", .name = name_root };
+    }
 
     const parent = path[0..slash];
     const name = path[slash + 1 ..];
@@ -1943,6 +1949,15 @@ test "fs_router: splitParentChild handles nested path" {
     const split = try splitParentChild("/a/src/main.zig");
     try std.testing.expectEqualStrings("/a/src", split.parent_path);
     try std.testing.expectEqualStrings("main.zig", split.name);
+}
+
+test "fs_router: splitParentChild supports root children and rejects root itself" {
+    const child = try splitParentChild("/main.zig");
+    try std.testing.expectEqualStrings("/", child.parent_path);
+    try std.testing.expectEqualStrings("main.zig", child.name);
+
+    try std.testing.expectError(RouterError.InvalidPath, splitParentChild("/"));
+    try std.testing.expectError(RouterError.InvalidPath, splitParentChild("/main.zig/"));
 }
 
 test "fs_router: normalizeNameForCache honors case sensitivity" {

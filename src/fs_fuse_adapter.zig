@@ -74,6 +74,17 @@ pub const FuseAdapter = struct {
         return self.router.open(path, flags);
     }
 
+    pub fn openAndStoreHandle(self: *FuseAdapter, path: []const u8, flags: u32) !u64 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const open_file = try self.router.open(path, flags);
+        errdefer self.router.close(open_file) catch {};
+        const local_id = self.reserveLocalHandleLocked();
+        try self.handles.put(self.allocator, local_id, open_file);
+        return local_id;
+    }
+
     pub fn read(self: *FuseAdapter, file: fs_router.OpenFile, off: u64, len: u32) ![]u8 {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -90,6 +101,17 @@ pub const FuseAdapter = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         return self.router.create(path, mode, flags);
+    }
+
+    pub fn createAndStoreHandle(self: *FuseAdapter, path: []const u8, mode: u32, flags: u32) !u64 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const open_file = try self.router.create(path, mode, flags);
+        errdefer self.router.close(open_file) catch {};
+        const local_id = self.reserveLocalHandleLocked();
+        try self.handles.put(self.allocator, local_id, open_file);
+        return local_id;
     }
 
     pub fn write(self: *FuseAdapter, file: fs_router.OpenFile, off: u64, data: []const u8) !u32 {
@@ -243,18 +265,13 @@ pub const FuseAdapter = struct {
         if (rc != 0) return error.FuseMainFailed;
     }
 
-    fn storeOpenHandle(self: *FuseAdapter, open_file: fs_router.OpenFile) !u64 {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
+    fn reserveLocalHandleLocked(self: *FuseAdapter) u64 {
         var local_id = self.next_local_handle;
         self.next_local_handle +%= 1;
         if (local_id == 0) {
             local_id = self.next_local_handle;
             self.next_local_handle +%= 1;
         }
-
-        try self.handles.put(self.allocator, local_id, open_file);
         return local_id;
     }
 
@@ -370,14 +387,11 @@ fn cOpen(path_c: [*c]const u8, fi: ?*c.struct_fuse_file_info) callconv(.c) c_int
     if (path_c == null) return -fs_protocol.Errno.EINVAL;
     const path = std.mem.span(path_c);
     const flags = if (fi) |info| @as(u32, @intCast(c.spiderweb_fi_get_flags(info))) else @as(u32, 0);
-    const opened = adapter.open(path, flags) catch |err| return toFuseError(err);
     if (fi) |info| {
-        const local_id = adapter.storeOpenHandle(opened) catch {
-            adapter.release(opened) catch {};
-            return -fs_protocol.Errno.EIO;
-        };
+        const local_id = adapter.openAndStoreHandle(path, flags) catch |err| return toFuseError(err);
         c.spiderweb_fi_set_fh(info, local_id);
     } else {
+        const opened = adapter.open(path, flags) catch |err| return toFuseError(err);
         adapter.release(opened) catch {};
     }
     return 0;
@@ -474,14 +488,11 @@ fn cCreate(path_c: [*c]const u8, mode: c.mode_t, fi: ?*c.struct_fuse_file_info) 
     if (path_c == null) return -fs_protocol.Errno.EINVAL;
     const path = std.mem.span(path_c);
     const flags = if (fi) |info| @as(u32, @intCast(c.spiderweb_fi_get_flags(info))) else @as(u32, 2);
-    const opened = adapter.create(path, @intCast(mode), flags) catch |err| return toFuseError(err);
     if (fi) |info| {
-        const local_id = adapter.storeOpenHandle(opened) catch {
-            adapter.release(opened) catch {};
-            return -fs_protocol.Errno.EIO;
-        };
+        const local_id = adapter.createAndStoreHandle(path, @intCast(mode), flags) catch |err| return toFuseError(err);
         c.spiderweb_fi_set_fh(info, local_id);
     } else {
+        const opened = adapter.create(path, @intCast(mode), flags) catch |err| return toFuseError(err);
         adapter.release(opened) catch {};
     }
     return 0;
