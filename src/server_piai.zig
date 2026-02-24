@@ -44,6 +44,9 @@ const control_protocol_version = "unified-v2";
 const fsrpc_runtime_protocol_version = "styx-lite-1";
 const fsrpc_node_protocol_version = "unified-v2-fs";
 const fsrpc_node_proto_id: i64 = 2;
+const runtime_warmup_wait_timeout_ms: i64 = 12_000;
+const runtime_warmup_stale_timeout_ms: i64 = 30_000;
+const runtime_warmup_poll_interval_ms: u64 = 100;
 
 const DebugStreamFileSink = struct {
     allocator: std.mem.Allocator,
@@ -353,6 +356,20 @@ fn parseUnsignedEnv(allocator: std.mem.Allocator, name: []const u8, default_valu
     return std.fmt.parseInt(u64, trimmed, 10) catch default_value;
 }
 
+fn pathIsAncestorOrEqual(parent_path_raw: []const u8, child_path_raw: []const u8) bool {
+    var parent = std.mem.trim(u8, parent_path_raw, " \t\r\n");
+    var child = std.mem.trim(u8, child_path_raw, " \t\r\n");
+    if (parent.len == 0 or child.len == 0) return false;
+
+    while (parent.len > 1 and parent[parent.len - 1] == '/') parent = parent[0 .. parent.len - 1];
+    while (child.len > 1 and child[child.len - 1] == '/') child = child[0 .. child.len - 1];
+
+    if (std.mem.eql(u8, parent, "/")) return true;
+    if (!std.mem.startsWith(u8, child, parent)) return false;
+    if (child.len == parent.len) return true;
+    return child[parent.len] == '/';
+}
+
 fn resolveInternalWsClientHost(bind_addr: []const u8) []const u8 {
     const trimmed = std.mem.trim(u8, bind_addr, " \t\r\n");
     if (trimmed.len == 0) return "127.0.0.1";
@@ -528,6 +545,7 @@ const LocalFsNode = struct {
         fs_url: []const u8,
         lease_ttl_ms: u64,
         heartbeat_interval_ms: u64,
+        watcher_enabled: bool,
     ) !*LocalFsNode {
         const endpoint = try allocator.create(LocalFsNode);
         errdefer allocator.destroy(endpoint);
@@ -550,7 +568,17 @@ const LocalFsNode = struct {
             allocator.free(endpoint.fs_url);
         }
 
-        if (fs_watch_runtime.spawnDetached(
+        const watch_disabled_for_root_export = std.mem.eql(u8, std.mem.trim(u8, export_spec.path, " \t\r\n"), "/");
+        const should_enable_watcher = watcher_enabled and !watch_disabled_for_root_export;
+        if (!should_enable_watcher) {
+            // Full-root recursive watcher scans can block on special mount points
+            // and starve fsrpc request handling (shared NodeService mutex).
+            if (watch_disabled_for_root_export) {
+                std.log.warn("local fs node watcher disabled: export root '/' can block fsrpc under recursive scans", .{});
+            } else {
+                std.log.warn("local fs node watcher disabled by runtime policy", .{});
+            }
+        } else if (fs_watch_runtime.spawnDetached(
             allocator,
             &endpoint.service,
             emitLocalFsWatcherEvents,
@@ -1499,6 +1527,7 @@ const AgentRuntimeRegistry = struct {
             if (self.by_agent.getPtr(agent_id)) |existing| {
                 if (std.mem.eql(u8, existing.project_id, resolved_project_id)) {
                     const runtime = existing.runtime;
+                    runtime.retain();
                     self.mutex.unlock();
                     return runtime;
                 }
@@ -1529,13 +1558,17 @@ const AgentRuntimeRegistry = struct {
                 var cleanup = entry;
                 cleanup.deinit(self.allocator);
                 entry_installed = true;
-                return existing.runtime;
+                const runtime = existing.runtime;
+                runtime.retain();
+                return runtime;
             }
             var replaced = existing.*;
             existing.* = entry;
             entry_installed = true;
+            const runtime = existing.runtime;
+            runtime.retain();
             replaced.deinit(self.allocator);
-            return existing.runtime;
+            return runtime;
         }
 
         if (self.by_agent.count() >= self.max_runtimes) return error.RuntimeLimitReached;
@@ -1545,7 +1578,9 @@ const AgentRuntimeRegistry = struct {
 
         try self.by_agent.put(self.allocator, owned_agent, entry);
         entry_installed = true;
-        return self.by_agent.getPtr(owned_agent).?.runtime;
+        const runtime = self.by_agent.getPtr(owned_agent).?.runtime;
+        runtime.retain();
+        return runtime;
     }
 
     fn createRuntimeEntry(
@@ -1955,10 +1990,26 @@ const AgentRuntimeRegistry = struct {
         defer self.allocator.free(binding_key);
 
         var should_spawn = false;
+        const now_ms = std.time.milliTimestamp();
         {
             self.runtime_warmups_mutex.lock();
             defer self.runtime_warmups_mutex.unlock();
             if (self.runtime_warmups.getPtr(binding_key)) |state| {
+                if (state.in_flight and state.state == .warming and state.updated_at_ms > 0 and
+                    (now_ms - state.updated_at_ms) >= runtime_warmup_stale_timeout_ms)
+                {
+                    state.in_flight = false;
+                    state.setError(self.allocator, "runtime_warmup_timeout", "sandbox runtime warmup timed out") catch {
+                        if (state.error_code) |value| self.allocator.free(value);
+                        if (state.error_message) |value| self.allocator.free(value);
+                        state.error_code = null;
+                        state.error_message = null;
+                        state.state = .err;
+                        state.runtime_ready = false;
+                        state.mount_ready = false;
+                        state.updated_at_ms = std.time.milliTimestamp();
+                    };
+                }
                 if (!state.in_flight and state.state != .ready) {
                     state.setWarming(self.allocator);
                     state.in_flight = true;
@@ -1986,6 +2037,25 @@ const AgentRuntimeRegistry = struct {
         }
 
         return self.runtimeAttachSnapshotByKey(binding_key);
+    }
+
+    fn waitForRuntimeWarmup(
+        self: *AgentRuntimeRegistry,
+        agent_id: []const u8,
+        project_id: ?[]const u8,
+        timeout_ms: i64,
+    ) SessionAttachStateSnapshot {
+        var snapshot = self.runtimeAttachSnapshot(agent_id, project_id);
+        if (snapshot.state != .warming or timeout_ms <= 0) return snapshot;
+
+        const started_ms = std.time.milliTimestamp();
+        while (snapshot.state == .warming) {
+            const elapsed_ms = std.time.milliTimestamp() - started_ms;
+            if (elapsed_ms >= timeout_ms) break;
+            std.Thread.sleep(runtime_warmup_poll_interval_ms * std.time.ns_per_ms);
+            snapshot = self.runtimeAttachSnapshot(agent_id, project_id);
+        }
+        return snapshot;
     }
 
     fn getFirstAgentId(self: *AgentRuntimeRegistry) ?[]const u8 {
@@ -2325,17 +2395,48 @@ const AgentRuntimeRegistry = struct {
         };
         defer if (export_path_owned) |value| self.allocator.free(value);
         const configured_export_path = std.mem.trim(u8, self.runtime_config.spider_web_root, " \t\r\n");
+        const cwd_owned = std.process.getCwdAlloc(self.allocator) catch null;
+        defer if (cwd_owned) |value| self.allocator.free(value);
+        const cwd_trimmed = if (cwd_owned) |value| std.mem.trim(u8, value, " \t\r\n") else "";
         const export_path = if (export_path_owned) |value| blk: {
             const trimmed = std.mem.trim(u8, value, " \t\r\n");
             if (trimmed.len > 0) break :blk trimmed;
+            if (std.mem.eql(u8, configured_export_path, "/") and cwd_trimmed.len > 0 and !std.mem.eql(u8, cwd_trimmed, "/")) {
+                break :blk cwd_trimmed;
+            }
             break :blk configured_export_path;
-        } else configured_export_path;
+        } else blk: {
+            if (std.mem.eql(u8, configured_export_path, "/") and cwd_trimmed.len > 0 and !std.mem.eql(u8, cwd_trimmed, "/")) {
+                break :blk cwd_trimmed;
+            }
+            break :blk configured_export_path;
+        };
+        const using_workdir_export_default = export_path_owned == null and
+            std.mem.eql(u8, configured_export_path, "/") and
+            cwd_trimmed.len > 0 and
+            !std.mem.eql(u8, cwd_trimmed, "/");
+        if (using_workdir_export_default) {
+            std.log.warn(
+                "local fs export defaulting to service working directory {s} because runtime.spider_web_root='/' (set runtime.spider_web_root or {s} to override)",
+                .{ export_path, local_node_export_path_env },
+            );
+        }
         if (export_path.len == 0) {
             std.log.warn(
                 "local fs node disabled: both {s} and runtime.spider_web_root are empty",
                 .{local_node_export_path_env},
             );
             return;
+        }
+        const mounts_root_trimmed = std.mem.trim(u8, self.runtime_config.sandbox_mounts_root, " \t\r\n");
+        const runtime_root_trimmed = std.mem.trim(u8, self.runtime_config.sandbox_runtime_root, " \t\r\n");
+        const watch_overlaps_sandbox = pathIsAncestorOrEqual(export_path, mounts_root_trimmed) or
+            pathIsAncestorOrEqual(export_path, runtime_root_trimmed);
+        if (watch_overlaps_sandbox) {
+            std.log.warn(
+                "local fs node watcher disabled: export path {s} overlaps sandbox roots mounts={s} runtime={s}",
+                .{ export_path, mounts_root_trimmed, runtime_root_trimmed },
+            );
         }
 
         const export_name_owned = std.process.getEnvVarOwned(self.allocator, local_node_export_name_env) catch |err| switch (err) {
@@ -2389,6 +2490,7 @@ const AgentRuntimeRegistry = struct {
             fs_url,
             lease_ttl_ms,
             heartbeat_ms,
+            !watch_overlaps_sandbox,
         );
         errdefer local_node.deinit(&self.control_plane);
         try local_node.startRegistrationAndHeartbeat(&self.control_plane);
@@ -2443,7 +2545,7 @@ fn runtimeWarmupThreadMain(ctx: *RuntimeWarmupThreadContext) void {
     const binding_key = ctx.binding_key orelse return;
     const agent_id = ctx.agent_id orelse return;
 
-    _ = ctx.runtime_registry.getOrCreate(
+    const runtime = ctx.runtime_registry.getOrCreate(
         agent_id,
         ctx.project_id,
         ctx.project_token,
@@ -2456,6 +2558,7 @@ fn runtimeWarmupThreadMain(ctx: *RuntimeWarmupThreadContext) void {
         );
         return;
     };
+    runtime.release();
 
     ctx.runtime_registry.markRuntimeWarmupReady(binding_key);
 }
@@ -3519,6 +3622,7 @@ fn handleWebSocketConnection(
                                             },
                                             else => return err,
                                         };
+                                        defer main_runtime.release();
                                         try session.setRuntimeBinding(main_runtime, main_binding.agent_id);
                                     }
                                 }
@@ -3840,6 +3944,13 @@ fn handleWebSocketConnection(
                             };
 
                             if (attach_state.state == .warming) {
+                                attach_state = runtime_registry.waitForRuntimeWarmup(
+                                    target_binding.agent_id,
+                                    target_binding.project_id,
+                                    runtime_warmup_wait_timeout_ms,
+                                );
+                            }
+                            if (attach_state.state == .warming) {
                                 const response = try unified.buildFsrpcError(
                                     allocator,
                                     parsed.tag,
@@ -3946,6 +4057,7 @@ fn handleWebSocketConnection(
                             },
                             else => return err,
                         };
+                        defer target_runtime.release();
                         if (fsrpc == null) {
                             fsrpc = try fsrpc_session.Session.init(allocator, target_runtime, &runtime_registry.job_index, target_binding.agent_id);
                             fsrpc.?.setDebugStreamEnabled(debug_stream_enabled);
@@ -4295,6 +4407,13 @@ fn tryHandleLegacySessionSendFrame(
         };
 
         if (attach_state.state == .warming) {
+            attach_state = runtime_registry.waitForRuntimeWarmup(
+                binding.agent_id,
+                binding.project_id,
+                runtime_warmup_wait_timeout_ms,
+            );
+        }
+        if (attach_state.state == .warming) {
             const response = try protocol.buildErrorWithCode(
                 allocator,
                 legacy.id orelse "generated",
@@ -4367,6 +4486,7 @@ fn tryHandleLegacySessionSendFrame(
         },
         else => return err,
     };
+    defer runtime_server.release();
 
     const responses = runtime_server.handleMessageFramesWithDebug(raw_payload, emit_debug) catch |err| {
         const response = try runtime_server.buildRuntimeErrorResponse(legacy.id orelse "generated", err);
@@ -5855,6 +5975,7 @@ test "server_piai: base path routes all connections to default runtime" {
     }
 
     const runtime = try runtime_registry.getOrCreate(runtime_registry.default_agent_id, null, null);
+    defer runtime.release();
     try std.testing.expect(runtime.kind == .local);
     const snapshot = try runtime.local.?.runtime.active_memory.snapshotActive(allocator, "primary");
     defer memory.deinitItems(allocator, snapshot);

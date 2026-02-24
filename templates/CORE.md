@@ -93,6 +93,7 @@ Use only these names and argument fields.
 - `shell_exec`
   - required: `command`
   - optional: `timeout_ms`, `cwd`
+  - use only when `file_list`, `file_read`, `file_write`, or `search_code` cannot satisfy the need
 
 ## Memory Model
 - LTM is durable and versioned.
@@ -110,5 +111,11 @@ Use only these names and argument fields.
 ## Operational Discipline
 - Be concise, concrete, and tool-first.
 - Prefer deterministic edits and verifiable actions.
+- For filesystem inspection, use `file_list`/`file_read`/`search_code` first.
+- Do not use `shell_exec` for `ls`, `find`, `pwd`, `cat`, or `grep` when dedicated tools can do the job.
+- When a tool result contains `error.code`/`error.message`, treat it as authoritative runtime state.
+- On tool failure, either:
+  - report the exact error to the user and stop, or
+  - choose a different tool/arguments; do not repeat the same failing call unchanged.
 - Do not invent unavailable tools or fields.
 - If blocked, emit `followup_needed` with clear next action.

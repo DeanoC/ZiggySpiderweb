@@ -2232,7 +2232,7 @@ pub const RuntimeServer = struct {
             const active_memory_prompt = if (include_followup_hint)
                 try std.fmt.allocPrint(
                     self.allocator,
-                    "{s}\n\n<loop_hint>\nPrevious output requested followup_needed.\nContinue reasoning and emit exactly one of: tool_calls, wait_for marker, or task_complete marker.\nDo not emit narrative status text without one of those markers; plain text without a marker is protocol-invalid and will be ignored.\n</loop_hint>",
+                    "{s}\n\n<loop_hint>\nPrevious step requested followup or a tool returned an error.\nContinue reasoning and emit exactly one of: tool_calls, wait_for marker, or task_complete marker.\nIf a tool failed, prefer surfacing the exact error message to the user or choosing a different tool; do not repeat the same failing call without a change.\nDo not emit narrative status text without one of those markers; plain text without a marker is protocol-invalid and will be ignored.\n</loop_hint>",
                     .{base_active_memory_prompt},
                 )
             else
@@ -2613,6 +2613,26 @@ pub const RuntimeServer = struct {
                         );
                     }
                     pending_tool_failure_followup = self.toolPayloadBatchHasError(structured_tool_payloads.items);
+                    if (pending_tool_failure_followup and self.toolPayloadBatchHasFilesystemUnavailableSignal(structured_tool_payloads.items)) {
+                        if (job.emit_debug) {
+                            const payload = try std.fmt.allocPrint(
+                                self.allocator,
+                                "{{\"round\":{d},\"reason\":\"filesystem_unavailable_tool_failure\"}}",
+                                .{round},
+                            );
+                            defer self.allocator.free(payload);
+                            try self.appendDebugFrame(&debug_frames, job.request_id, "provider.loop_exit", payload);
+                        }
+
+                        const filesystem_error = self.firstToolPayloadErrorMessage(structured_tool_payloads.items) orelse
+                            try self.allocator.dupe(u8, "filesystem_unavailable: project mount unavailable (input/output error)");
+                        defer self.allocator.free(filesystem_error);
+                        const completion = try self.finalizeProviderCompletion(&debug_frames, filesystem_error, true, false);
+                        pending_tool_failure_followup = false;
+                        deinitOwnedAssistantMessage(self.allocator, &assistant);
+                        return completion;
+                    }
+                    if (pending_tool_failure_followup) followup_requested = true;
                     deinitOwnedAssistantMessage(self.allocator, &assistant);
                     continue;
                 }
@@ -2938,6 +2958,26 @@ pub const RuntimeServer = struct {
                 );
             }
             pending_tool_failure_followup = self.toolPayloadBatchHasError(tool_payloads.items);
+            if (pending_tool_failure_followup and self.toolPayloadBatchHasFilesystemUnavailableSignal(tool_payloads.items)) {
+                if (job.emit_debug) {
+                    const payload = try std.fmt.allocPrint(
+                        self.allocator,
+                        "{{\"round\":{d},\"reason\":\"filesystem_unavailable_tool_failure\"}}",
+                        .{round},
+                    );
+                    defer self.allocator.free(payload);
+                    try self.appendDebugFrame(&debug_frames, job.request_id, "provider.loop_exit", payload);
+                }
+
+                const filesystem_error = self.firstToolPayloadErrorMessage(tool_payloads.items) orelse
+                    try self.allocator.dupe(u8, "filesystem_unavailable: project mount unavailable (input/output error)");
+                defer self.allocator.free(filesystem_error);
+                const completion = try self.finalizeProviderCompletion(&debug_frames, filesystem_error, true, false);
+                pending_tool_failure_followup = false;
+                deinitOwnedAssistantMessage(self.allocator, &assistant);
+                return completion;
+            }
+            if (pending_tool_failure_followup) followup_requested = true;
             deinitOwnedAssistantMessage(self.allocator, &assistant);
         }
 
@@ -3667,6 +3707,48 @@ pub const RuntimeServer = struct {
         return false;
     }
 
+    fn toolPayloadBatchHasFilesystemUnavailableSignal(self: *RuntimeServer, payloads: []const []const u8) bool {
+        for (payloads) |payload| {
+            if (self.toolPayloadIndicatesFilesystemUnavailable(payload)) return true;
+        }
+        return false;
+    }
+
+    fn firstToolPayloadErrorMessage(self: *RuntimeServer, payloads: []const []const u8) ?[]u8 {
+        for (payloads) |payload| {
+            const message = self.toolPayloadErrorMessage(payload) orelse continue;
+            return message;
+        }
+        return null;
+    }
+
+    fn toolPayloadIndicatesFilesystemUnavailable(self: *RuntimeServer, payload: []const u8) bool {
+        _ = self;
+        const markers = [_][]const u8{
+            "input/output error",
+            "sandbox tool request write failed",
+            "sandbox tool response read failed",
+            "sandbox child stdin pipe is unavailable",
+            "sandbox child stdout pipe is unavailable",
+            "sandbox child restart failed",
+            "project mount unavailable",
+        };
+        return containsAnyIgnoreCase(payload, &markers);
+    }
+
+    fn toolPayloadErrorMessage(self: *RuntimeServer, payload: []const u8) ?[]u8 {
+        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, payload, .{}) catch return null;
+        defer parsed.deinit();
+        if (parsed.value != .object) return null;
+        const err_val = parsed.value.object.get("error") orelse return null;
+        if (err_val != .object) return null;
+        const message_val = err_val.object.get("message") orelse return null;
+        if (message_val != .string) return null;
+        const trimmed = std.mem.trim(u8, message_val.string, " \t\r\n");
+        if (trimmed.len == 0) return null;
+        return self.allocator.dupe(u8, trimmed) catch null;
+    }
+
     fn toolPayloadHasError(self: *RuntimeServer, payload: []const u8) bool {
         var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, payload, .{}) catch {
             return std.mem.indexOf(u8, payload, "\"error\"") != null;
@@ -4344,6 +4426,7 @@ var mockLowSignalFollowupCallCount: usize = 0;
 var mockJsonMessageOnlyFollowupCallCount: usize = 0;
 var mockRateLimitCallCount: usize = 0;
 var mockAuthFailureCallCount: usize = 0;
+var mockFilesystemUnavailableShortCircuitCallCount: usize = 0;
 var testBeforeCompleteStepHook: ?*const fn (*RuntimeServer, []const u8) anyerror!void = null;
 var mockCapturedProviderName: ?[]const u8 = null;
 var mockCapturedModelName: ?[]const u8 = null;
@@ -4413,6 +4496,14 @@ fn mockWorldToolOk(allocator: std.mem.Allocator, _: std.json.ObjectMap) tool_reg
         return .{ .failure = .{ .code = .execution_failed, .message = msg } };
     };
     return .{ .success = .{ .payload_json = payload } };
+}
+
+fn mockWorldToolFilesystemUnavailable(allocator: std.mem.Allocator, _: std.json.ObjectMap) tool_registry.ToolExecutionResult {
+    const message = allocator.dupe(u8, "filesystem_unavailable: project mount unavailable (input/output error)") catch {
+        const msg = allocator.dupe(u8, "out of memory") catch @panic("out of memory");
+        return .{ .failure = .{ .code = .execution_failed, .message = msg } };
+    };
+    return .{ .failure = .{ .code = .execution_failed, .message = message } };
 }
 
 fn mockProviderStreamByModelWithToolLoop(
@@ -4741,6 +4832,34 @@ fn mockProviderStreamByModelWithJsonToolEnvelopeErrorThenWait(
     const output = try buildTaskCompleteOutput(allocator, "reported tool failure");
     try events.append(.{ .done = .{
         .text = output,
+        .thinking = try allocator.dupe(u8, ""),
+        .tool_calls = &.{},
+        .api = model.api,
+        .provider = model.provider,
+        .model = model.id,
+        .usage = .{},
+        .stop_reason = .stop,
+        .error_message = null,
+    } });
+}
+
+fn mockProviderStreamByModelWithFilesystemUnavailableToolFailure(
+    allocator: std.mem.Allocator,
+    _: *std.http.Client,
+    _: *ziggy_piai.api_registry.ApiRegistry,
+    model: ziggy_piai.types.Model,
+    _: ziggy_piai.types.Context,
+    _: ziggy_piai.types.StreamOptions,
+    events: *std.array_list.Managed(ziggy_piai.types.AssistantMessageEvent),
+) anyerror!void {
+    mockFilesystemUnavailableShortCircuitCallCount += 1;
+    if (mockFilesystemUnavailableShortCircuitCallCount > 1) return error.TestUnexpectedResult;
+
+    const envelope =
+        \\{"action":"act","tool_calls":[{"name":"fs_probe","arguments":{}}]}
+    ;
+    try events.append(.{ .done = .{
+        .text = try allocator.dupe(u8, envelope),
         .thinking = try allocator.dupe(u8, ""),
         .tool_calls = &.{},
         .api = model.api,
@@ -6693,6 +6812,39 @@ test "runtime_server: wait_for after tool failure triggers followup instead of s
     try std.testing.expect(saw_final);
     try std.testing.expect(!saw_generic_ok);
     try std.testing.expectEqual(@as(usize, 3), mockJsonToolEnvelopeErrorWaitCallCount);
+}
+
+test "runtime_server: filesystem-unavailable tool failure short-circuits provider followup loop" {
+    const allocator = std.testing.allocator;
+    const original_stream_fn = streamByModelFn;
+    defer streamByModelFn = original_stream_fn;
+    streamByModelFn = mockProviderStreamByModelWithFilesystemUnavailableToolFailure;
+    mockFilesystemUnavailableShortCircuitCallCount = 0;
+
+    const server = try RuntimeServer.createWithProvider(allocator, "agent-test", .{
+        .ltm_directory = "",
+        .ltm_filename = "",
+    }, .{
+        .name = "openai",
+        .model = "gpt-4o-mini",
+        .api_key = "test-key",
+    });
+    defer server.destroy();
+
+    try server.runtime.world_tools.registerWorldTool(
+        "fs_probe",
+        "filesystem probe",
+        &[_]tool_registry.ToolParam{},
+        mockWorldToolFilesystemUnavailable,
+    );
+
+    const response = try server.handleMessage("{\"id\":\"req-provider-filesystem-unavailable\",\"type\":\"session.send\",\"content\":\"list files\"}");
+    defer allocator.free(response);
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "\"type\":\"session.receive\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "filesystem_unavailable") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "project mount unavailable") != null);
+    try std.testing.expectEqual(@as(usize, 1), mockFilesystemUnavailableShortCircuitCallCount);
 }
 
 test "runtime_server: multiple structured tool calls are rejected with protocol error" {
