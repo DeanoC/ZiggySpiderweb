@@ -522,13 +522,17 @@ pub fn save(self: Config) !void {
     try file.writeAll("}\n");
 }
 pub fn setProvider(self: *Config, name: []const u8, model: ?[]const u8) !void {
-    self.allocator.free(self.provider.name);
-    self.provider.name = try self.allocator.dupe(u8, name);
+    const owned_name = try self.allocator.dupe(u8, name);
+    errdefer self.allocator.free(owned_name);
 
-    if (model) |m| {
-        if (self.provider.model) |old| self.allocator.free(old);
-        self.provider.model = try self.allocator.dupe(u8, m);
-    }
+    const owned_model = if (model) |m| try self.allocator.dupe(u8, m) else null;
+    errdefer if (owned_model) |m| self.allocator.free(m);
+
+    self.allocator.free(self.provider.name);
+    self.provider.name = owned_name;
+
+    if (self.provider.model) |old| self.allocator.free(old);
+    self.provider.model = owned_model;
 
     try self.save();
 }
@@ -593,4 +597,40 @@ test "Config defaults" {
     try std.testing.expectEqualStrings("default", config.runtime.default_agent_id);
     try std.testing.expectEqualStrings("/", config.runtime.spider_web_root);
     try std.testing.expectEqualStrings(".spiderweb-ltm", config.runtime.ltm_directory);
+}
+
+test "Config setProvider clears model when null requested" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const tmp_root = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_root);
+    const cfg_path = try std.fs.path.join(allocator, &.{ tmp_root, "config.json" });
+
+    var config = try Config.init(allocator, cfg_path);
+    defer config.deinit();
+
+    try config.setProvider("openai-codex", "gpt-5.3-codex");
+    try std.testing.expectEqualStrings("gpt-5.3-codex", config.provider.model.?);
+
+    try config.setProvider("openai-codex", null);
+    try std.testing.expect(config.provider.model == null);
+}
+
+test "Config setProvider safely reuses current model pointer" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const tmp_root = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_root);
+    const cfg_path = try std.fs.path.join(allocator, &.{ tmp_root, "config.json" });
+
+    var config = try Config.init(allocator, cfg_path);
+    defer config.deinit();
+
+    const existing_model = config.provider.model.?;
+    try config.setProvider(config.provider.name, existing_model);
+    try std.testing.expectEqualStrings("gpt-4o-mini", config.provider.model.?);
 }
