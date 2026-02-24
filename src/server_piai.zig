@@ -970,15 +970,15 @@ const AuthTokenStore = struct {
         self.* = undefined;
     }
 
-    fn authenticate(self: *const AuthTokenStore, authorization_header: ?[]const u8) ConnectionPrincipal {
-        const raw = authorization_header orelse return .{ .role = .user, .token_id = "anonymous" };
-        const token = parseBearerToken(raw) orelse return .{ .role = .user, .token_id = "anonymous" };
+    fn authenticate(self: *const AuthTokenStore, authorization_header: ?[]const u8) ?ConnectionPrincipal {
+        const raw = authorization_header orelse return null;
+        const token = parseBearerToken(raw) orelse return null;
         const mutex = @constCast(&self.mutex);
         mutex.lock();
         defer mutex.unlock();
         if (secureTokenEql(self.admin_token, token)) return .{ .role = .admin, .token_id = "admin" };
         if (secureTokenEql(self.user_token, token)) return .{ .role = .user, .token_id = "user" };
-        return .{ .role = .user, .token_id = "anonymous" };
+        return null;
     }
 
     fn rotateRoleToken(self: *AuthTokenStore, role: ConnectionRole) ![]u8 {
@@ -1185,6 +1185,7 @@ const AgentRuntimeRegistry = struct {
     workspace_url: ?[]u8 = null,
     mutex: std.Thread.Mutex = .{},
     by_agent: std.StringHashMapUnmanaged(AgentRuntimeEntry) = .{},
+    retired_entries: std.ArrayListUnmanaged(AgentRuntimeEntry) = .{},
     topology_subscribers_mutex: std.Thread.Mutex = .{},
     topology_subscribers: std.ArrayListUnmanaged(ControlTopologySubscriber) = .{},
     next_topology_subscriber_id: u64 = 1,
@@ -1282,6 +1283,8 @@ const AgentRuntimeRegistry = struct {
             runtime_entry.deinit(self.allocator);
         }
         self.by_agent.deinit(self.allocator);
+        for (self.retired_entries.items) |*runtime_entry| runtime_entry.deinit(self.allocator);
+        self.retired_entries.deinit(self.allocator);
         self.clearTopologySubscribers();
         if (self.local_fs_node) |local_fs_node| {
             local_fs_node.deinit(&self.control_plane);
@@ -1315,7 +1318,7 @@ const AgentRuntimeRegistry = struct {
         self.auth_tokens.deinit();
     }
 
-    fn authenticateConnection(self: *AgentRuntimeRegistry, authorization_header: ?[]const u8) ConnectionPrincipal {
+    fn authenticateConnection(self: *AgentRuntimeRegistry, authorization_header: ?[]const u8) ?ConnectionPrincipal {
         return self.auth_tokens.authenticate(authorization_header);
     }
 
@@ -1398,10 +1401,9 @@ const AgentRuntimeRegistry = struct {
             if (std.mem.eql(u8, existing.project_id, entry.project_id)) {
                 return existing.runtime;
             }
-            var previous = existing.*;
+            try self.retired_entries.append(self.allocator, existing.*);
             existing.* = entry;
             entry_installed = true;
-            previous.deinit(self.allocator);
             return existing.runtime;
         }
 
@@ -2129,7 +2131,10 @@ fn handleWebSocketConnection(
         return;
     };
 
-    const principal = runtime_registry.authenticateConnection(handshake.authorization);
+    const principal = runtime_registry.authenticateConnection(handshake.authorization) orelse {
+        try sendWebSocketErrorAndClose(allocator, stream, .provider_auth_failed, "forbidden");
+        return;
+    };
 
     var session_bindings: std.StringHashMapUnmanaged(SessionBinding) = .{};
     defer deinitSessionBindings(allocator, &session_bindings);
