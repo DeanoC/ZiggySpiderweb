@@ -2072,6 +2072,11 @@ pub const RuntimeServer = struct {
         return self.isExecutionCancelled(job, run_id);
     }
 
+    fn resetProviderHttpClient(self: *RuntimeServer, provider_runtime: *ProviderRuntime) void {
+        provider_runtime.http_client.deinit();
+        provider_runtime.http_client = .{ .allocator = self.allocator };
+    }
+
     fn modelEquals(a: ziggy_piai.types.Model, b: ziggy_piai.types.Model) bool {
         return std.mem.eql(u8, a.provider, b.provider) and std.mem.eql(u8, a.id, b.id);
     }
@@ -2354,6 +2359,7 @@ pub const RuntimeServer = struct {
                             try self.appendDebugFrame(&debug_frames, job.request_id, "provider.retry", retry_payload_json);
                         }
                         resetProviderEvents(self.allocator, &events);
+                        self.resetProviderHttpClient(provider_runtime);
                         if (self.waitProviderRetryBackoff(job, run_id, delay_ms)) return RuntimeServerError.RuntimeJobCancelled;
                         attempt_idx += 1;
                         continue :provider_attempt_loop;
@@ -2436,6 +2442,7 @@ pub const RuntimeServer = struct {
                             try self.appendDebugFrame(&debug_frames, job.request_id, "provider.retry", retry_payload_json);
                         }
                         resetProviderEvents(self.allocator, &events);
+                        self.resetProviderHttpClient(provider_runtime);
                         if (self.waitProviderRetryBackoff(job, run_id, delay_ms)) return RuntimeServerError.RuntimeJobCancelled;
                         attempt_idx += 1;
                         continue :provider_attempt_loop;
