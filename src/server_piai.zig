@@ -821,6 +821,7 @@ fn localFsHeartbeatThreadMain(local_node: *LocalFsNode, control_plane: *fs_contr
 
 const auth_tokens_filename = "auth_tokens.json";
 const user_default_agent_id = "user";
+const user_isolated_agent_id = "user-isolated";
 
 const ConnectionRole = enum {
     admin,
@@ -831,6 +832,16 @@ fn connectionRoleName(role: ConnectionRole) []const u8 {
     return switch (role) {
         .admin => "admin",
         .user => "user",
+    };
+}
+
+fn initialAgentIdForRole(role: ConnectionRole, primary_agent_id: []const u8) []const u8 {
+    return switch (role) {
+        .admin => primary_agent_id,
+        .user => if (std.mem.eql(u8, primary_agent_id, user_default_agent_id))
+            user_isolated_agent_id
+        else
+            user_default_agent_id,
     };
 }
 
@@ -1830,7 +1841,7 @@ fn handleWebSocketConnection(
     var session_bindings: std.StringHashMapUnmanaged(SessionBinding) = .{};
     defer deinitSessionBindings(allocator, &session_bindings);
 
-    const default_agent_id = if (principal.role == .admin) runtime_registry.default_agent_id else user_default_agent_id;
+    const default_agent_id = initialAgentIdForRole(principal.role, runtime_registry.default_agent_id);
     try upsertSessionBinding(allocator, &session_bindings, "main", default_agent_id, null, null);
 
     var active_session_key = try allocator.dupe(u8, "main");
@@ -4275,6 +4286,68 @@ test "server_piai: auth matrix gates admin endpoints and handshake tokens" {
         defer close_reply.deinit(allocator);
         try std.testing.expectEqual(@as(u8, 0x8), close_reply.opcode);
     }
+
+    try std.testing.expect(server_ctx.err_name == null);
+}
+
+test "server_piai: user connect avoids primary agent when primary id is user" {
+    const allocator = std.testing.allocator;
+    var runtime_registry = AgentRuntimeRegistry.init(allocator, .{
+        .ltm_directory = "",
+        .ltm_filename = "",
+    }, null);
+    defer runtime_registry.deinit();
+    try setAuthTokensForTests(&runtime_registry, "admin-secret", "user-secret");
+    allocator.free(runtime_registry.default_agent_id);
+    runtime_registry.default_agent_id = try allocator.dupe(u8, user_default_agent_id);
+
+    var listener = try (try std.net.Address.parseIp("127.0.0.1", 0)).listen(.{ .reuse_address = true });
+    defer listener.deinit();
+
+    var server_ctx = WsTestServerCtx{
+        .allocator = allocator,
+        .runtime_registry = &runtime_registry,
+        .listener = &listener,
+    };
+    defer server_ctx.deinit();
+
+    const server_thread = try std.Thread.spawn(.{}, runSingleWsConnection, .{&server_ctx});
+    defer server_thread.join();
+
+    var user_client = try std.net.tcpConnectToAddress(listener.listen_address);
+    defer user_client.close();
+    try performClientHandshakeWithBearerToken(allocator, &user_client, "/", "user-secret");
+
+    try writeClientTextFrameMasked(&user_client, "{\"channel\":\"control\",\"type\":\"control.version\",\"id\":\"user-avoid-primary-version\",\"payload\":{\"protocol\":\"unified-v2\"}}");
+    var version_ack = try readServerFrame(allocator, &user_client);
+    defer version_ack.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, version_ack.payload, "\"type\":\"control.version_ack\"") != null);
+
+    try writeClientTextFrameMasked(&user_client, "{\"channel\":\"control\",\"type\":\"control.connect\",\"id\":\"user-avoid-primary-connect\"}");
+    var connect_ack = try readServerFrame(allocator, &user_client);
+    defer connect_ack.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, connect_ack.payload, "\"type\":\"control.connect_ack\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, connect_ack.payload, "\"role\":\"user\"") != null);
+    const isolated_agent_fragment = try std.fmt.allocPrint(allocator, "\"agent_id\":\"{s}\"", .{user_isolated_agent_id});
+    defer allocator.free(isolated_agent_fragment);
+    try std.testing.expect(std.mem.indexOf(u8, connect_ack.payload, isolated_agent_fragment) != null);
+
+    const attach_primary = try std.fmt.allocPrint(
+        allocator,
+        "{{\"channel\":\"control\",\"type\":\"control.session_attach\",\"id\":\"user-attach-primary-user-id\",\"payload\":{{\"session_key\":\"main\",\"agent_id\":\"{s}\"}}}}",
+        .{runtime_registry.default_agent_id},
+    );
+    defer allocator.free(attach_primary);
+    try writeClientTextFrameMasked(&user_client, attach_primary);
+    var attach_forbidden = try readServerFrame(allocator, &user_client);
+    defer attach_forbidden.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, attach_forbidden.payload, "\"type\":\"control.error\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, attach_forbidden.payload, "\"code\":\"forbidden\"") != null);
+
+    try websocket_transport.writeFrame(&user_client, "", .close);
+    var close_reply = try readServerFrame(allocator, &user_client);
+    defer close_reply.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0x8), close_reply.opcode);
 
     try std.testing.expect(server_ctx.err_name == null);
 }

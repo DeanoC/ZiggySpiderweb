@@ -312,9 +312,10 @@ fn resolveRuntimeStorageDirectoryWithBase(
 }
 
 fn resolveRuntimeBaseDirectory(allocator: std.mem.Allocator, config_path: []const u8) ![]u8 {
-    if (try detectServiceWorkingDirectory(allocator)) |service_dir| return service_dir;
+    _ = config_path;
     if (try detectRunningSpiderwebWorkingDirectory(allocator)) |runtime_dir| return runtime_dir;
-    return resolveConfigDirectory(allocator, config_path);
+    if (try detectServiceWorkingDirectory(allocator)) |service_dir| return service_dir;
+    return std.process.getCwdAlloc(allocator);
 }
 
 fn detectServiceWorkingDirectory(allocator: std.mem.Allocator) !?[]u8 {
@@ -398,19 +399,6 @@ fn readFileAllocAny(allocator: std.mem.Allocator, path: []const u8, max_bytes: u
         return file.readToEndAlloc(allocator, max_bytes);
     }
     return std.fs.cwd().readFileAlloc(allocator, path, max_bytes);
-}
-
-fn resolveConfigDirectory(allocator: std.mem.Allocator, config_path: []const u8) ![]u8 {
-    if (std.fs.path.isAbsolute(config_path)) {
-        const dir = std.fs.path.dirname(config_path) orelse "/";
-        return allocator.dupe(u8, dir);
-    }
-    const cwd = try std.process.getCwdAlloc(allocator);
-    defer allocator.free(cwd);
-    const absolute_config_path = try std.fs.path.join(allocator, &.{ cwd, config_path });
-    defer allocator.free(absolute_config_path);
-    const dir = std.fs.path.dirname(absolute_config_path) orelse cwd;
-    return allocator.dupe(u8, dir);
 }
 
 fn makeOpaqueToken(allocator: std.mem.Allocator, prefix: []const u8) ![]u8 {
