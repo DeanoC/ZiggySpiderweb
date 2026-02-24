@@ -140,6 +140,17 @@ pub const SandboxRuntime = struct {
         self.allocator.destroy(self);
     }
 
+    pub fn isHealthy(self: *SandboxRuntime) bool {
+        if (!processIsAlive(self.child.id)) return false;
+
+        if (self.owns_mount_process) {
+            const mount_child = self.mount_process orelse return false;
+            if (!processIsAlive(mount_child.id)) return false;
+        }
+
+        return isMountPoint(self.allocator, self.workspace_mount_path);
+    }
+
     pub fn handleMessageFramesWithDebug(
         self: *SandboxRuntime,
         raw_json: []const u8,
@@ -472,6 +483,20 @@ fn runBestEffortCommand(allocator: std.mem.Allocator, argv: []const []const u8) 
 
     child.spawn() catch return;
     _ = child.wait() catch {};
+}
+
+fn processIsAlive(pid_raw: anytype) bool {
+    if (builtin.os.tag != .linux) return true;
+
+    const pid: std.posix.pid_t = @intCast(pid_raw);
+    if (pid <= 0) return false;
+
+    std.posix.kill(pid, 0) catch |err| switch (err) {
+        error.PermissionDenied => return true,
+        error.ProcessNotFound => return false,
+        else => return false,
+    };
+    return true;
 }
 
 fn ensurePathExists(path: []const u8) !void {

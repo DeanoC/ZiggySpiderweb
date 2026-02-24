@@ -2676,7 +2676,7 @@ pub const RuntimeServer = struct {
 
                     if (followup_rounds > MAX_PROVIDER_FOLLOWUP_ROUNDS) {
                         const exhausted_text = std.mem.trim(u8, assistant.text, " \t\r\n");
-                        if (exhausted_text.len > 0) {
+                        if (exhausted_text.len > 0 and !isLowSignalFollowupText(exhausted_text)) {
                             const completion = try self.finalizeProviderCompletion(&debug_frames, exhausted_text, false, false);
                             deinitOwnedAssistantMessage(self.allocator, &assistant);
                             return completion;
@@ -2706,7 +2706,7 @@ pub const RuntimeServer = struct {
 
                     if (followup_rounds > MAX_PROVIDER_FOLLOWUP_ROUNDS) {
                         const exhausted_text = std.mem.trim(u8, assistant.text, " \t\r\n");
-                        if (exhausted_text.len > 0) {
+                        if (exhausted_text.len > 0 and !isLowSignalFollowupText(exhausted_text)) {
                             const completion = try self.finalizeProviderCompletion(&debug_frames, exhausted_text, false, false);
                             deinitOwnedAssistantMessage(self.allocator, &assistant);
                             return completion;

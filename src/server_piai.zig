@@ -1459,6 +1459,27 @@ const AgentRuntimeRegistry = struct {
         return self.reconcile_worker_stop;
     }
 
+    const RemovedRuntimeEntry = struct {
+        key: []const u8,
+        entry: AgentRuntimeEntry,
+    };
+
+    fn takeUnhealthyRuntimeLocked(self: *AgentRuntimeRegistry, agent_id: []const u8) ?RemovedRuntimeEntry {
+        const existing = self.by_agent.getPtr(agent_id) orelse return null;
+        if (existing.runtime.isHealthy()) return null;
+        const removed = self.by_agent.fetchRemove(agent_id) orelse return null;
+        return .{
+            .key = removed.key,
+            .entry = removed.value,
+        };
+    }
+
+    fn deinitRemovedRuntime(self: *AgentRuntimeRegistry, removed: RemovedRuntimeEntry) void {
+        self.allocator.free(removed.key);
+        var entry = removed.entry;
+        entry.deinit(self.allocator);
+    }
+
     fn getOrCreate(
         self: *AgentRuntimeRegistry,
         agent_id: []const u8,
@@ -1469,16 +1490,22 @@ const AgentRuntimeRegistry = struct {
         const resolved_project_id = try self.resolveProjectId(agent_id, requested_project_id);
         errdefer self.allocator.free(resolved_project_id);
 
+        var removed_unhealthy: ?RemovedRuntimeEntry = null;
+        defer if (removed_unhealthy) |removed| self.deinitRemovedRuntime(removed);
+
         self.mutex.lock();
-        if (self.by_agent.getPtr(agent_id)) |existing| {
-            if (std.mem.eql(u8, existing.project_id, resolved_project_id)) {
-                const runtime = existing.runtime;
+        removed_unhealthy = self.takeUnhealthyRuntimeLocked(agent_id);
+        if (removed_unhealthy == null) {
+            if (self.by_agent.getPtr(agent_id)) |existing| {
+                if (std.mem.eql(u8, existing.project_id, resolved_project_id)) {
+                    const runtime = existing.runtime;
+                    self.mutex.unlock();
+                    return runtime;
+                }
+            } else if (self.by_agent.count() >= self.max_runtimes) {
                 self.mutex.unlock();
-                return runtime;
+                return error.RuntimeLimitReached;
             }
-        } else if (self.by_agent.count() >= self.max_runtimes) {
-            self.mutex.unlock();
-            return error.RuntimeLimitReached;
         }
         self.mutex.unlock();
 
@@ -1649,11 +1676,25 @@ const AgentRuntimeRegistry = struct {
     }
 
     fn hasRuntimeForBinding(self: *AgentRuntimeRegistry, agent_id: []const u8, project_id: ?[]const u8) bool {
+        var removed_unhealthy: ?RemovedRuntimeEntry = null;
+        var has_binding = false;
         self.mutex.lock();
-        defer self.mutex.unlock();
-        const existing = self.by_agent.get(agent_id) orelse return false;
-        if (project_id) |project| return std.mem.eql(u8, existing.project_id, project);
-        return true;
+        removed_unhealthy = self.takeUnhealthyRuntimeLocked(agent_id);
+        if (removed_unhealthy == null) {
+            if (self.by_agent.getPtr(agent_id)) |existing| {
+                has_binding = if (project_id) |project|
+                    std.mem.eql(u8, existing.project_id, project)
+                else
+                    true;
+            }
+        }
+        self.mutex.unlock();
+
+        if (removed_unhealthy) |removed| {
+            self.deinitRemovedRuntime(removed);
+            return false;
+        }
+        return has_binding;
     }
 
     fn runtimeBindingKey(self: *AgentRuntimeRegistry, agent_id: []const u8, project_id: ?[]const u8) ![]u8 {
@@ -3100,25 +3141,33 @@ fn handleWebSocketConnection(
                                 }
 
                                 if (attach_project_id != null and try runtime_registry.job_index.hasInFlightForAgent(attach_agent_id)) {
-                                    runtime_registry.appendSecurityAuditAndDebug(
-                                        current_binding.agent_id,
-                                        .session_attach,
-                                        principal.role,
-                                        security_correlation,
-                                        "session_attach_project_change_session_busy",
-                                        false,
-                                        "session_busy",
-                                        "cannot change project while agent has in-flight jobs",
-                                    );
-                                    const response = try unified.buildControlError(
-                                        allocator,
-                                        parsed.id,
-                                        "session_busy",
-                                        "cannot change project while agent has in-flight jobs",
-                                    );
-                                    defer allocator.free(response);
-                                    try writeFrameLocked(stream, &connection_write_mutex, response, .text);
-                                    continue;
+                                    const same_existing_binding = if (existing_binding) |binding|
+                                        std.mem.eql(u8, binding.agent_id, attach_agent_id) and optionalStringsEqual(binding.project_id, attach_project_id)
+                                    else
+                                        false;
+                                    const same_runtime_binding = runtime_registry.hasRuntimeForBinding(attach_agent_id, attach_project_id);
+
+                                    if (!same_existing_binding and !same_runtime_binding) {
+                                        runtime_registry.appendSecurityAuditAndDebug(
+                                            current_binding.agent_id,
+                                            .session_attach,
+                                            principal.role,
+                                            security_correlation,
+                                            "session_attach_project_change_session_busy",
+                                            false,
+                                            "session_busy",
+                                            "cannot change project while agent has in-flight jobs",
+                                        );
+                                        const response = try unified.buildControlError(
+                                            allocator,
+                                            parsed.id,
+                                            "session_busy",
+                                            "cannot change project while agent has in-flight jobs",
+                                        );
+                                        defer allocator.free(response);
+                                        try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                        continue;
+                                    }
                                 }
 
                                 if (attach_project_id) |project_id| {

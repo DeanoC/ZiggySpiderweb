@@ -2,7 +2,7 @@ const std = @import("std");
 const fs_router = @import("fs_router.zig");
 const fs_fuse_adapter = @import("fs_fuse_adapter.zig");
 
-const control_reply_timeout_ms: i32 = 15_000;
+const control_reply_timeout_ms: i32 = 45_000;
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
