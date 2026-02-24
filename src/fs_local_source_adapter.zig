@@ -339,10 +339,19 @@ pub fn removeXattrAbsolute(allocator: std.mem.Allocator, path: []const u8, name:
 }
 
 fn isWithinRoot(root: []const u8, target: []const u8) bool {
-    if (std.mem.eql(u8, root, target)) return true;
-    if (!std.mem.startsWith(u8, target, root)) return false;
-    if (target.len <= root.len) return false;
-    return target[root.len] == std.fs.path.sep;
+    var normalized_root = root;
+    while (normalized_root.len > 1 and normalized_root[normalized_root.len - 1] == std.fs.path.sep) {
+        normalized_root = normalized_root[0 .. normalized_root.len - 1];
+    }
+
+    if (normalized_root.len == 1 and normalized_root[0] == std.fs.path.sep) {
+        return target.len > 0 and target[0] == std.fs.path.sep;
+    }
+
+    if (std.mem.eql(u8, normalized_root, target)) return true;
+    if (!std.mem.startsWith(u8, target, normalized_root)) return false;
+    if (target.len <= normalized_root.len) return false;
+    return target[normalized_root.len] == std.fs.path.sep;
 }
 
 fn inodeToU64(inode: anytype) u64 {
@@ -376,6 +385,14 @@ test "fs_local_source_adapter: supportsOperationForKind reflects windows capabil
     try std.testing.expect(!supportsOperationForKind(.windows, .symlink));
     try std.testing.expect(!supportsOperationForKind(.windows, .getxattr));
     try std.testing.expect(supportsOperationForKind(.windows, .rename));
+}
+
+test "fs_local_source_adapter: isWithinRoot handles root and exact-prefix boundaries" {
+    try std.testing.expect(isWithinRoot("/", "/"));
+    try std.testing.expect(isWithinRoot("/", "/etc"));
+    try std.testing.expect(isWithinRoot("/safe", "/safe"));
+    try std.testing.expect(isWithinRoot("/safe", "/safe/project"));
+    try std.testing.expect(!isWithinRoot("/safe", "/safeguard"));
 }
 
 test "fs_local_source_adapter: execution helpers cover basic file lifecycle" {

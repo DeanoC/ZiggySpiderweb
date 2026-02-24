@@ -94,6 +94,8 @@ pub const AgentRuntime = struct {
     checkpoint: u64 = 0,
     hooks: hook_registry.HookRegistry,
     runtime_config: Config.RuntimeConfig,
+    world_tool_dispatch_ctx: ?*anyopaque = null,
+    world_tool_dispatch_fn: ?brain_tools.RemoteToolDispatchFn = null,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -188,6 +190,15 @@ pub const AgentRuntime = struct {
             self.ltm_store = null;
         }
         self.allocator.free(self.agent_id);
+    }
+
+    pub fn setWorldToolDispatch(
+        self: *AgentRuntime,
+        dispatch_ctx: ?*anyopaque,
+        dispatch_fn: ?brain_tools.RemoteToolDispatchFn,
+    ) void {
+        self.world_tool_dispatch_ctx = dispatch_ctx;
+        self.world_tool_dispatch_fn = dispatch_fn;
     }
 
     pub fn addBrain(self: *AgentRuntime, brain_name: []const u8) !void {
@@ -414,7 +425,14 @@ pub const AgentRuntime = struct {
         }
 
         // === MUTATE ===
-        var engine = brain_tools.Engine.initWithWorldTools(self.allocator, &self.active_memory, &self.bus, &self.world_tools);
+        var engine = brain_tools.Engine.initWithWorldToolsAndDispatch(
+            self.allocator,
+            &self.active_memory,
+            &self.bus,
+            &self.world_tools,
+            self.world_tool_dispatch_ctx,
+            self.world_tool_dispatch_fn,
+        );
         const results = try engine.executePending(brain);
         errdefer brain_tools.deinitResults(self.allocator, results);
 

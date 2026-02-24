@@ -3311,10 +3311,27 @@ fn isValidChildName(name: []const u8) bool {
 }
 
 fn isWithinRoot(root: []const u8, target: []const u8) bool {
-    if (std.mem.eql(u8, root, target)) return true;
-    if (!std.mem.startsWith(u8, target, root)) return false;
-    if (target.len <= root.len) return false;
-    return target[root.len] == std.fs.path.sep;
+    var normalized_root = root;
+    while (normalized_root.len > 1 and normalized_root[normalized_root.len - 1] == std.fs.path.sep) {
+        normalized_root = normalized_root[0 .. normalized_root.len - 1];
+    }
+
+    if (normalized_root.len == 1 and normalized_root[0] == std.fs.path.sep) {
+        return target.len > 0 and target[0] == std.fs.path.sep;
+    }
+
+    if (std.mem.eql(u8, normalized_root, target)) return true;
+    if (!std.mem.startsWith(u8, target, normalized_root)) return false;
+    if (target.len <= normalized_root.len) return false;
+    return target[normalized_root.len] == std.fs.path.sep;
+}
+
+test "fs_node_ops: isWithinRoot handles root and exact-prefix boundaries" {
+    try std.testing.expect(isWithinRoot("/", "/"));
+    try std.testing.expect(isWithinRoot("/", "/var"));
+    try std.testing.expect(isWithinRoot("/safe", "/safe"));
+    try std.testing.expect(isWithinRoot("/safe", "/safe/work"));
+    try std.testing.expect(!isWithinRoot("/safe", "/safeguard"));
 }
 
 fn kindCode(kind: std.fs.File.Kind) u8 {

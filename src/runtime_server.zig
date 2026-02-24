@@ -142,6 +142,7 @@ var streamByModelFn: StreamByModelFn = ziggy_piai.stream.streamByModel;
 
 const GetEnvApiKeyFn = *const fn (std.mem.Allocator, []const u8) ?[]const u8;
 var getEnvApiKeyFn: GetEnvApiKeyFn = ziggy_piai.env_api_keys.getEnvApiKey;
+const RemoteToolDispatchFn = brain_tools.RemoteToolDispatchFn;
 
 const ProviderRuntime = struct {
     model_registry: ziggy_piai.models.ModelRegistry,
@@ -228,9 +229,21 @@ pub const RuntimeServer = struct {
     runtime_workers: []std.Thread,
     stopping: bool = false,
     test_ltm_directory: ?[]u8 = null,
+    remote_tool_dispatch_ctx: ?*anyopaque = null,
+    remote_tool_dispatch_fn: ?RemoteToolDispatchFn = null,
 
     pub fn create(allocator: std.mem.Allocator, agent_id: []const u8, runtime_cfg: Config.RuntimeConfig) !*RuntimeServer {
-        return createInternal(allocator, agent_id, runtime_cfg, null);
+        return createInternal(allocator, agent_id, runtime_cfg, null, null, null);
+    }
+
+    pub fn createWithToolDispatch(
+        allocator: std.mem.Allocator,
+        agent_id: []const u8,
+        runtime_cfg: Config.RuntimeConfig,
+        dispatch_ctx: ?*anyopaque,
+        dispatch_fn: RemoteToolDispatchFn,
+    ) !*RuntimeServer {
+        return createInternal(allocator, agent_id, runtime_cfg, null, dispatch_ctx, dispatch_fn);
     }
 
     pub fn createWithProvider(
@@ -239,7 +252,25 @@ pub const RuntimeServer = struct {
         runtime_cfg: Config.RuntimeConfig,
         provider_cfg: Config.ProviderConfig,
     ) !*RuntimeServer {
-        return createInternal(allocator, agent_id, runtime_cfg, provider_cfg);
+        return createInternal(allocator, agent_id, runtime_cfg, provider_cfg, null, null);
+    }
+
+    pub fn createWithProviderAndToolDispatch(
+        allocator: std.mem.Allocator,
+        agent_id: []const u8,
+        runtime_cfg: Config.RuntimeConfig,
+        provider_cfg: Config.ProviderConfig,
+        dispatch_ctx: ?*anyopaque,
+        dispatch_fn: RemoteToolDispatchFn,
+    ) !*RuntimeServer {
+        return createInternal(
+            allocator,
+            agent_id,
+            runtime_cfg,
+            provider_cfg,
+            dispatch_ctx,
+            dispatch_fn,
+        );
     }
 
     fn createInternal(
@@ -247,6 +278,8 @@ pub const RuntimeServer = struct {
         agent_id: []const u8,
         runtime_cfg: Config.RuntimeConfig,
         provider_cfg: ?Config.ProviderConfig,
+        dispatch_ctx: ?*anyopaque,
+        dispatch_fn: ?RemoteToolDispatchFn,
     ) !*RuntimeServer {
         const worker_count = if (runtime_cfg.runtime_worker_threads == 0) 1 else runtime_cfg.runtime_worker_threads;
 
@@ -287,6 +320,7 @@ pub const RuntimeServer = struct {
             effective_ltm_filename,
             runtime_cfg,
         );
+        runtime.setWorldToolDispatch(dispatch_ctx, dispatch_fn);
         var runtime_owned_by_self = false;
         errdefer if (!runtime_owned_by_self) runtime.deinit();
 
@@ -315,6 +349,8 @@ pub const RuntimeServer = struct {
             .default_agent_id = try allocator.dupe(u8, if (runtime_cfg.default_agent_id.len == 0) default_agent_id else runtime_cfg.default_agent_id),
             .log_provider_requests = shouldLogProviderRequests(),
             .test_ltm_directory = test_ltm_directory,
+            .remote_tool_dispatch_ctx = dispatch_ctx,
+            .remote_tool_dispatch_fn = dispatch_fn,
         };
         runtime_owned_by_self = true;
         runs_owned_by_self = true;
@@ -1643,6 +1679,13 @@ pub const RuntimeServer = struct {
     fn setProviderErrorDebugPayload(self: *RuntimeServer, job: *RuntimeQueueJob, payload_json: []const u8) !void {
         if (job.provider_error_debug_payload) |existing| self.allocator.free(existing);
         job.provider_error_debug_payload = try self.allocator.dupe(u8, payload_json);
+
+        // Always emit provider failure details to server logs so mapped
+        // `provider_unavailable` errors are diagnosable without debug subscriptions.
+        const maybe_redacted = redactDebugPayload(self.allocator, payload_json) catch null;
+        defer if (maybe_redacted) |value| self.allocator.free(value);
+        const log_payload = maybe_redacted orelse payload_json;
+        std.log.warn("provider failure detail: {s}", .{log_payload});
     }
 
     fn wrapSingleFrame(self: *RuntimeServer, payload: []u8) ![][]u8 {

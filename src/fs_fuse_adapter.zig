@@ -190,7 +190,7 @@ pub const FuseAdapter = struct {
         self: *FuseAdapter,
         endpoint_configs: []const fs_router.EndpointConfig,
     ) !bool {
-        self.mutex.lock();
+        if (!self.mutex.tryLock()) return false;
         defer self.mutex.unlock();
         if (self.handles.count() != 0) return false;
         try self.router.reconcileEndpoints(endpoint_configs);
@@ -243,13 +243,20 @@ pub const FuseAdapter = struct {
 
         const argc: c_int = @intCast(argv.items.len);
         const argv_ptr: [*c][*c]u8 = @ptrCast(argv.items.ptr);
+        var fuse_version: c.struct_libfuse_version = .{
+            .major = 0,
+            .minor = 0,
+            .hotfix = 0,
+            .padding = 0,
+        };
+
         const rc = if (lib.lookup(FuseMainRealVersionedFn, "fuse_main_real_versioned")) |fuse_main_real_versioned|
             fuse_main_real_versioned(
                 argc,
                 argv_ptr,
                 &ops,
                 @sizeOf(c.struct_fuse_operations),
-                null,
+                &fuse_version,
                 null,
             )
         else if (lib.lookup(FuseMainRealFn, "fuse_main_real")) |fuse_main_real|
@@ -293,6 +300,9 @@ pub const FuseAdapter = struct {
 
 fn openFuseLibrary() !std.DynLib {
     const candidates = [_][]const u8{
+        "libfuse3.so.4",
+        "/lib/x86_64-linux-gnu/libfuse3.so.4",
+        "/usr/lib/x86_64-linux-gnu/libfuse3.so.4",
         "libfuse3.so.3",
         "/lib/x86_64-linux-gnu/libfuse3.so.3",
         "/usr/lib/x86_64-linux-gnu/libfuse3.so.3",
@@ -342,14 +352,6 @@ fn cReaddir(
     if (path_c == null) return -fs_protocol.Errno.EINVAL;
     const path = std.mem.span(path_c);
 
-    if (std.mem.eql(u8, path, "/")) {
-        if (filler == null) return -fs_protocol.Errno.EINVAL;
-        if (off <= 0) {
-            if (filler.?(buf, ".", null, 0, c.FUSE_FILL_DIR_DEFAULTS) != 0) return 0;
-            if (filler.?(buf, "..", null, 0, c.FUSE_FILL_DIR_DEFAULTS) != 0) return 0;
-        }
-    }
-
     const cookie: u64 = if (off <= 0) 0 else @intCast(off);
     const listing = adapter.readdir(path, cookie, 4096) catch |err| return toFuseError(err);
     defer adapter.allocator.free(listing);
@@ -361,13 +363,18 @@ fn cReaddir(
     if (ents != .array) return -fs_protocol.Errno.EIO;
 
     if (filler == null) return -fs_protocol.Errno.EINVAL;
+    var idx: u64 = 0;
     for (ents.array.items) |entry| {
         if (entry != .object) continue;
         const name_val = entry.object.get("name") orelse continue;
         if (name_val != .string) continue;
         const name_z = adapter.allocator.dupeZ(u8, name_val.string) catch return -fs_protocol.Errno.EIO;
         defer adapter.allocator.free(name_z);
-        if (filler.?(buf, @ptrCast(name_z.ptr), null, 0, c.FUSE_FILL_DIR_DEFAULTS) != 0) break;
+
+        const next_cookie = std.math.add(u64, cookie, idx + 1) catch std.math.maxInt(u64);
+        const next_off: c.off_t = std.math.cast(c.off_t, next_cookie) orelse 0;
+        if (filler.?(buf, @ptrCast(name_z.ptr), null, next_off, c.FUSE_FILL_DIR_DEFAULTS) != 0) break;
+        idx += 1;
     }
     return 0;
 }

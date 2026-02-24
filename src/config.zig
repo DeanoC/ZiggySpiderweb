@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const credential_store = @import("credential_store.zig");
 
 const Config = @This();
@@ -42,6 +43,12 @@ pub const RuntimeConfig = struct {
     ltm_filename: []const u8 = "runtime-memory.db",
     assets_dir: []const u8 = "templates",
     agents_dir: []const u8 = "agents",
+    sandbox_enabled: bool = builtin.os.tag == .linux and !builtin.is_test,
+    sandbox_mounts_root: []const u8 = "/var/lib/spiderweb/mounts",
+    sandbox_runtime_root: []const u8 = "/var/lib/spiderweb/runtime",
+    sandbox_launcher: []const u8 = "bwrap",
+    sandbox_fs_mount_bin: []const u8 = "spiderweb-fs-mount",
+    sandbox_agent_runtime_bin: []const u8 = "spiderweb-agent-runtime",
 
     pub fn clone(self: RuntimeConfig, allocator: std.mem.Allocator) !RuntimeConfig {
         return .{
@@ -67,6 +74,12 @@ pub const RuntimeConfig = struct {
             .ltm_filename = try allocator.dupe(u8, self.ltm_filename),
             .assets_dir = try allocator.dupe(u8, self.assets_dir),
             .agents_dir = try allocator.dupe(u8, self.agents_dir),
+            .sandbox_enabled = self.sandbox_enabled,
+            .sandbox_mounts_root = try allocator.dupe(u8, self.sandbox_mounts_root),
+            .sandbox_runtime_root = try allocator.dupe(u8, self.sandbox_runtime_root),
+            .sandbox_launcher = try allocator.dupe(u8, self.sandbox_launcher),
+            .sandbox_fs_mount_bin = try allocator.dupe(u8, self.sandbox_fs_mount_bin),
+            .sandbox_agent_runtime_bin = try allocator.dupe(u8, self.sandbox_agent_runtime_bin),
         };
     }
 
@@ -77,6 +90,11 @@ pub const RuntimeConfig = struct {
         allocator.free(self.ltm_filename);
         allocator.free(self.assets_dir);
         allocator.free(self.agents_dir);
+        allocator.free(self.sandbox_mounts_root);
+        allocator.free(self.sandbox_runtime_root);
+        allocator.free(self.sandbox_launcher);
+        allocator.free(self.sandbox_fs_mount_bin);
+        allocator.free(self.sandbox_agent_runtime_bin);
     }
 };
 
@@ -168,6 +186,12 @@ pub fn init(allocator: std.mem.Allocator, config_path: ?[]const u8) !Config {
             .ltm_filename = try allocator.dupe(u8, "runtime-memory.db"),
             .assets_dir = try allocator.dupe(u8, "templates"),
             .agents_dir = try allocator.dupe(u8, "agents"),
+            .sandbox_enabled = builtin.os.tag == .linux and !builtin.is_test,
+            .sandbox_mounts_root = try allocator.dupe(u8, "/var/lib/spiderweb/mounts"),
+            .sandbox_runtime_root = try allocator.dupe(u8, "/var/lib/spiderweb/runtime"),
+            .sandbox_launcher = try allocator.dupe(u8, "bwrap"),
+            .sandbox_fs_mount_bin = try allocator.dupe(u8, "spiderweb-fs-mount"),
+            .sandbox_agent_runtime_bin = try allocator.dupe(u8, "spiderweb-agent-runtime"),
         },
         .config_path = path,
     };
@@ -411,6 +435,41 @@ pub fn load(self: *Config) !void {
                     self.runtime.agents_dir = try self.allocator.dupe(u8, value.string);
                 }
             }
+            if (runtime_val.object.get("sandbox_enabled")) |value| {
+                if (value == .bool) {
+                    self.runtime.sandbox_enabled = value.bool;
+                }
+            }
+            if (runtime_val.object.get("sandbox_mounts_root")) |value| {
+                if (value == .string and value.string.len > 0) {
+                    self.allocator.free(self.runtime.sandbox_mounts_root);
+                    self.runtime.sandbox_mounts_root = try self.allocator.dupe(u8, value.string);
+                }
+            }
+            if (runtime_val.object.get("sandbox_runtime_root")) |value| {
+                if (value == .string and value.string.len > 0) {
+                    self.allocator.free(self.runtime.sandbox_runtime_root);
+                    self.runtime.sandbox_runtime_root = try self.allocator.dupe(u8, value.string);
+                }
+            }
+            if (runtime_val.object.get("sandbox_launcher")) |value| {
+                if (value == .string and value.string.len > 0) {
+                    self.allocator.free(self.runtime.sandbox_launcher);
+                    self.runtime.sandbox_launcher = try self.allocator.dupe(u8, value.string);
+                }
+            }
+            if (runtime_val.object.get("sandbox_fs_mount_bin")) |value| {
+                if (value == .string and value.string.len > 0) {
+                    self.allocator.free(self.runtime.sandbox_fs_mount_bin);
+                    self.runtime.sandbox_fs_mount_bin = try self.allocator.dupe(u8, value.string);
+                }
+            }
+            if (runtime_val.object.get("sandbox_agent_runtime_bin")) |value| {
+                if (value == .string and value.string.len > 0) {
+                    self.allocator.free(self.runtime.sandbox_agent_runtime_bin);
+                    self.runtime.sandbox_agent_runtime_bin = try self.allocator.dupe(u8, value.string);
+                }
+            }
         }
     }
 }
@@ -515,8 +574,20 @@ pub fn save(self: Config) !void {
     try file.writeAll(ltm_file_line);
     const assets_dir_line = try std.fmt.bufPrint(&buf, "    \"assets_dir\": \"{s}\",\n", .{self.runtime.assets_dir});
     try file.writeAll(assets_dir_line);
-    const agents_dir_line = try std.fmt.bufPrint(&buf, "    \"agents_dir\": \"{s}\"\n", .{self.runtime.agents_dir});
+    const agents_dir_line = try std.fmt.bufPrint(&buf, "    \"agents_dir\": \"{s}\",\n", .{self.runtime.agents_dir});
     try file.writeAll(agents_dir_line);
+    const sandbox_enabled_line = try std.fmt.bufPrint(&buf, "    \"sandbox_enabled\": {},\n", .{self.runtime.sandbox_enabled});
+    try file.writeAll(sandbox_enabled_line);
+    const sandbox_mounts_line = try std.fmt.bufPrint(&buf, "    \"sandbox_mounts_root\": \"{s}\",\n", .{self.runtime.sandbox_mounts_root});
+    try file.writeAll(sandbox_mounts_line);
+    const sandbox_runtime_line = try std.fmt.bufPrint(&buf, "    \"sandbox_runtime_root\": \"{s}\",\n", .{self.runtime.sandbox_runtime_root});
+    try file.writeAll(sandbox_runtime_line);
+    const sandbox_launcher_line = try std.fmt.bufPrint(&buf, "    \"sandbox_launcher\": \"{s}\",\n", .{self.runtime.sandbox_launcher});
+    try file.writeAll(sandbox_launcher_line);
+    const sandbox_fs_mount_line = try std.fmt.bufPrint(&buf, "    \"sandbox_fs_mount_bin\": \"{s}\",\n", .{self.runtime.sandbox_fs_mount_bin});
+    try file.writeAll(sandbox_fs_mount_line);
+    const sandbox_child_bin_line = try std.fmt.bufPrint(&buf, "    \"sandbox_agent_runtime_bin\": \"{s}\"\n", .{self.runtime.sandbox_agent_runtime_bin});
+    try file.writeAll(sandbox_child_bin_line);
     try file.writeAll("  }\n");
 
     try file.writeAll("}\n");

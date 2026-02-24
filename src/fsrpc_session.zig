@@ -1,6 +1,7 @@
 const std = @import("std");
 const unified = @import("ziggy-spider-protocol").unified;
 const runtime_server_mod = @import("runtime_server.zig");
+const runtime_handle_mod = @import("runtime_handle.zig");
 const chat_job_index = @import("chat_job_index.zig");
 
 const NodeKind = enum {
@@ -48,7 +49,7 @@ const FidState = struct {
 
 pub const Session = struct {
     allocator: std.mem.Allocator,
-    runtime_server: *runtime_server_mod.RuntimeServer,
+    runtime_handle: *runtime_handle_mod.RuntimeHandle,
     job_index: *chat_job_index.ChatJobIndex,
     agent_id: []u8,
 
@@ -65,17 +66,21 @@ pub const Session = struct {
 
     pub fn init(
         allocator: std.mem.Allocator,
-        runtime_server: *runtime_server_mod.RuntimeServer,
+        runtime_handle: *runtime_handle_mod.RuntimeHandle,
         job_index: *chat_job_index.ChatJobIndex,
         agent_id: []const u8,
     ) !Session {
+        const owned_agent = try allocator.dupe(u8, agent_id);
+        errdefer allocator.free(owned_agent);
+        runtime_handle.retain();
+        errdefer runtime_handle.release();
+
         var self = Session{
             .allocator = allocator,
-            .runtime_server = runtime_server,
+            .runtime_handle = runtime_handle,
             .job_index = job_index,
-            .agent_id = try allocator.dupe(u8, agent_id),
+            .agent_id = owned_agent,
         };
-        errdefer allocator.free(self.agent_id);
         try self.seedNamespace(agent_id);
         return self;
     }
@@ -90,15 +95,16 @@ pub const Session = struct {
         self.nodes.deinit(self.allocator);
         self.fids.deinit(self.allocator);
         self.allocator.free(self.agent_id);
+        self.runtime_handle.release();
         self.* = undefined;
     }
 
     pub fn setRuntimeBinding(
         self: *Session,
-        runtime_server: *runtime_server_mod.RuntimeServer,
+        runtime_handle: *runtime_handle_mod.RuntimeHandle,
         agent_id: []const u8,
     ) !void {
-        var rebound = try Session.init(self.allocator, runtime_server, self.job_index, agent_id);
+        var rebound = try Session.init(self.allocator, runtime_handle, self.job_index, agent_id);
         rebound.debug_stream_enabled = self.debug_stream_enabled;
 
         var previous = self.*;
@@ -590,7 +596,7 @@ pub const Session = struct {
         defer if (failure_message_owned) |owned| self.allocator.free(owned);
 
         var responses: ?[][]u8 = null;
-        if (self.runtime_server.handleMessageFramesWithDebug(runtime_req, self.debug_stream_enabled)) |frames| {
+        if (self.runtime_handle.handleMessageFramesWithDebug(runtime_req, self.debug_stream_enabled)) |frames| {
             responses = frames;
         } else |err| {
             failed = true;
@@ -704,12 +710,13 @@ fn nodeMode(node: Node) u32 {
 test "fsrpc_session: attach walk open read capability help" {
     const allocator = std.testing.allocator;
 
-    var runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
-    defer runtime_server.destroy();
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
     var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
     defer job_index.deinit();
 
-    var session = try Session.init(allocator, runtime_server, &job_index, "default");
+    var session = try Session.init(allocator, runtime_handle, &job_index, "default");
     defer session.deinit();
 
     var attach = unified.ParsedMessage{
@@ -747,10 +754,12 @@ test "fsrpc_session: attach walk open read capability help" {
 test "fsrpc_session: setRuntimeBinding reseeds namespace and clears stale state" {
     const allocator = std.testing.allocator;
 
-    var runtime_server_a = try runtime_server_mod.RuntimeServer.create(allocator, "agent-a", .{});
-    defer runtime_server_a.destroy();
-    var runtime_server_b = try runtime_server_mod.RuntimeServer.create(allocator, "agent-b", .{});
-    defer runtime_server_b.destroy();
+    const runtime_server_a = try runtime_server_mod.RuntimeServer.create(allocator, "agent-a", .{});
+    const runtime_server_b = try runtime_server_mod.RuntimeServer.create(allocator, "agent-b", .{});
+    const runtime_handle_a = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server_a);
+    defer runtime_handle_a.destroy();
+    const runtime_handle_b = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server_b);
+    defer runtime_handle_b.destroy();
     var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
     defer job_index.deinit();
 
@@ -761,7 +770,7 @@ test "fsrpc_session: setRuntimeBinding reseeds namespace and clears stale state"
     defer allocator.free(job_b);
     try job_index.markCompleted(job_b, true, "result-b", null, "log-b");
 
-    var session = try Session.init(allocator, runtime_server_a, &job_index, "agent-a");
+    var session = try Session.init(allocator, runtime_handle_a, &job_index, "agent-a");
     defer session.deinit();
 
     try std.testing.expect(session.lookupChild(session.jobs_root_id, job_a) != null);
@@ -777,7 +786,7 @@ test "fsrpc_session: setRuntimeBinding reseeds namespace and clears stale state"
     defer allocator.free(attach_res);
     try std.testing.expectEqual(@as(usize, 1), session.fids.count());
 
-    try session.setRuntimeBinding(runtime_server_b, "agent-b");
+    try session.setRuntimeBinding(runtime_handle_b, "agent-b");
 
     try std.testing.expect(std.mem.eql(u8, session.agent_id, "agent-b"));
     try std.testing.expectEqual(@as(usize, 0), session.fids.count());

@@ -157,6 +157,7 @@ pub const Router = struct {
     }
 
     pub fn reconcileEndpoints(self: *Router, endpoint_configs: []const EndpointConfig) !void {
+        if (self.topologyMatches(endpoint_configs)) return;
         try self.replaceEndpoints(endpoint_configs);
     }
 
@@ -179,6 +180,32 @@ pub const Router = struct {
         self.read_cache = fs_cache.ReadBlockCache.init(self.allocator, read_capacity);
 
         for (endpoint_configs) |cfg| try self.addEndpoint(cfg);
+    }
+
+    fn topologyMatches(self: *const Router, endpoint_configs: []const EndpointConfig) bool {
+        if (self.endpoints.items.len != endpoint_configs.len) return false;
+
+        for (self.endpoints.items, endpoint_configs) |endpoint, cfg| {
+            if (!std.mem.eql(u8, endpoint.name, cfg.name)) return false;
+            if (!std.mem.eql(u8, endpoint.url, cfg.url)) return false;
+            const mount_seed = if (cfg.mount_path) |path|
+                path
+            else
+                std.fmt.allocPrint(self.allocator, "/{s}", .{cfg.name}) catch return false;
+            defer if (cfg.mount_path == null) self.allocator.free(mount_seed);
+            const normalized_cfg = normalizeMountPath(self.allocator, mount_seed) catch return false;
+            defer self.allocator.free(normalized_cfg);
+            if (!std.mem.eql(u8, endpoint.mount_path, normalized_cfg)) return false;
+
+            const endpoint_export = endpoint.export_name;
+            const cfg_export = cfg.export_name;
+            if (!optionalSliceEql(endpoint_export, cfg_export)) return false;
+
+            const endpoint_auth = endpoint.auth_token;
+            const cfg_auth = cfg.auth_token;
+            if (!optionalSliceEql(endpoint_auth, cfg_auth)) return false;
+        }
+        return true;
     }
 
     pub fn deinit(self: *Router) void {
@@ -1072,7 +1099,7 @@ pub const Router = struct {
         var replacement = try fs_client.FsClient.connect(self.allocator, endpoint.url);
         errdefer replacement.deinit();
 
-        const hello_payload = try self.buildFsHelloPayload(endpoint);
+        const hello_payload = try self.buildFsHelloPayload(endpoint, false);
         defer self.allocator.free(hello_payload);
 
         var hello = try replacement.call(.HELLO, null, null, hello_payload, null, null);
@@ -1160,7 +1187,7 @@ pub const Router = struct {
         var event_client = try fs_client.FsClient.connect(self.allocator, endpoint.url);
         errdefer event_client.deinit();
 
-        const hello_payload = try self.buildFsHelloPayload(endpoint);
+        const hello_payload = try self.buildFsHelloPayload(endpoint, true);
         defer self.allocator.free(hello_payload);
         var hello = try event_client.call(.HELLO, null, null, hello_payload, null, null);
         hello.deinit(self.allocator);
@@ -1271,7 +1298,7 @@ pub const Router = struct {
         }
 
         endpoint.last_health_check_ms = now;
-        const hello_payload = try self.buildFsHelloPayload(endpoint);
+        const hello_payload = try self.buildFsHelloPayload(endpoint, false);
         defer self.allocator.free(hello_payload);
         var hello = self.callEndpoint(@intCast(endpoint_index), .HELLO, null, null, hello_payload) catch |err| {
             if (isEndpointFailureError(err)) {
@@ -1283,21 +1310,30 @@ pub const Router = struct {
         hello.deinit(self.allocator);
     }
 
-    fn buildFsHelloPayload(self: *Router, endpoint: *const Endpoint) ![]u8 {
+    fn buildFsHelloPayload(self: *Router, endpoint: *const Endpoint, subscribe_invalidations: bool) ![]u8 {
         if (endpoint.auth_token) |auth_token| {
             const escaped_auth = try fs_protocol.jsonEscape(self.allocator, auth_token);
             defer self.allocator.free(escaped_auth);
             return std.fmt.allocPrint(
                 self.allocator,
-                "{{\"protocol\":\"{s}\",\"proto\":{d},\"auth_token\":\"{s}\"}}",
-                .{ fsrpc_node_protocol_version, fsrpc_node_proto_id, escaped_auth },
+                "{{\"protocol\":\"{s}\",\"proto\":{d},\"auth_token\":\"{s}\",\"subscribe_invalidations\":{s}}}",
+                .{
+                    fsrpc_node_protocol_version,
+                    fsrpc_node_proto_id,
+                    escaped_auth,
+                    if (subscribe_invalidations) "true" else "false",
+                },
             );
         }
 
         return std.fmt.allocPrint(
             self.allocator,
-            "{{\"protocol\":\"{s}\",\"proto\":{d}}}",
-            .{ fsrpc_node_protocol_version, fsrpc_node_proto_id },
+            "{{\"protocol\":\"{s}\",\"proto\":{d},\"subscribe_invalidations\":{s}}}",
+            .{
+                fsrpc_node_protocol_version,
+                fsrpc_node_proto_id,
+                if (subscribe_invalidations) "true" else "false",
+            },
         );
     }
 
@@ -1471,6 +1507,12 @@ fn childSegmentForVirtualDir(path: []const u8, mount_path: []const u8) ?[]const 
 fn virtualDirNodeId(path: []const u8) u64 {
     const hashed = std.hash.Wyhash.hash(0x5350_5756_4449_5231, path);
     return if (hashed == 0) 1 else hashed;
+}
+
+fn optionalSliceEql(left: ?[]const u8, right: ?[]const u8) bool {
+    if (left == null and right == null) return true;
+    if (left == null or right == null) return false;
+    return std.mem.eql(u8, left.?, right.?);
 }
 
 fn normalizeMountPath(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {

@@ -2,6 +2,8 @@ const std = @import("std");
 const fs_router = @import("fs_router.zig");
 const fs_fuse_adapter = @import("fs_fuse_adapter.zig");
 
+const control_reply_timeout_ms: i32 = 15_000;
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -558,7 +560,7 @@ fn pumpWorkspacePushSubscription(allocator: std.mem.Allocator, ctx: *WorkspaceSy
     try writeClientTextFrameMasked(
         allocator,
         &stream,
-        "{\"channel\":\"control\",\"type\":\"control.connect\",\"id\":\"fs-mount-push-connect\"}",
+        "{\"channel\":\"control\",\"type\":\"control.connect\",\"id\":\"fs-mount-push-connect\",\"payload\":{}}",
     );
     const connect_payload = try readControlPayloadFor(
         allocator,
@@ -571,7 +573,7 @@ fn pumpWorkspacePushSubscription(allocator: std.mem.Allocator, ctx: *WorkspaceSy
     try writeClientTextFrameMasked(
         allocator,
         &stream,
-        "{\"channel\":\"control\",\"type\":\"control.debug_subscribe\",\"id\":\"fs-mount-push-subscribe\"}",
+        "{\"channel\":\"control\",\"type\":\"control.debug_subscribe\",\"id\":\"fs-mount-push-subscribe\",\"payload\":{}}",
     );
     try waitForDebugSubscriptionAck(allocator, &stream, "fs-mount-push-subscribe");
 
@@ -738,7 +740,7 @@ fn fetchWorkspaceEndpointSpecs(
     try writeClientTextFrameMasked(
         allocator,
         &stream,
-        "{\"channel\":\"control\",\"type\":\"control.connect\",\"id\":\"fs-mount-connect\"}",
+        "{\"channel\":\"control\",\"type\":\"control.connect\",\"id\":\"fs-mount-connect\",\"payload\":{}}",
     );
     const connect_payload = try readControlPayloadFor(
         allocator,
@@ -765,7 +767,7 @@ fn fetchWorkspaceEndpointSpecs(
             "{{\"channel\":\"control\",\"type\":\"control.workspace_status\",\"id\":\"fs-mount-workspace\",\"payload\":{{\"project_id\":\"{s}\"}}}}",
             .{escaped_project},
         );
-    } else try allocator.dupe(u8, "{\"channel\":\"control\",\"type\":\"control.workspace_status\",\"id\":\"fs-mount-workspace\"}");
+    } else try allocator.dupe(u8, "{\"channel\":\"control\",\"type\":\"control.workspace_status\",\"id\":\"fs-mount-workspace\",\"payload\":{}}");
     defer allocator.free(workspace_request);
     try writeClientTextFrameMasked(allocator, &stream, workspace_request);
     const payload_json = try readControlPayloadFor(
@@ -930,7 +932,15 @@ fn readControlPayloadFor(
     expected_id: []const u8,
     expected_type: []const u8,
 ) ![]u8 {
+    const deadline_ms = std.time.milliTimestamp() + @as(i64, control_reply_timeout_ms);
     while (true) {
+        const now_ms = std.time.milliTimestamp();
+        if (now_ms >= deadline_ms) return error.ControlRequestTimeout;
+        const remaining_i64 = deadline_ms - now_ms;
+        const remaining_ms: i32 = @intCast(@min(remaining_i64, @as(i64, std.math.maxInt(i32))));
+        if (!try waitReadable(stream, remaining_ms)) {
+            return error.ControlRequestTimeout;
+        }
         var frame = try readServerFrame(allocator, stream, 4 * 1024 * 1024);
         defer frame.deinit(allocator);
 
