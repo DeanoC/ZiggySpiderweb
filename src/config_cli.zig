@@ -5,6 +5,7 @@ const credential_store = @import("credential_store.zig");
 const ziggy_piai = @import("ziggy-piai");
 const first_run = @import("first_run.zig");
 const oauth_cli = @import("oauth_cli.zig");
+const provider_models = @import("provider_models.zig");
 
 const auth_tokens_filename = "auth_tokens.json";
 
@@ -135,7 +136,11 @@ fn handleConfigCommand(allocator: std.mem.Allocator, args: []const []const u8) !
         defer config.deinit();
 
         const provider = args[1];
-        const model = if (args.len >= 3) args[2] else null;
+        const requested_model = if (args.len >= 3) args[2] else provider_models.preferredDefaultModel(provider);
+        const model = if (requested_model) |value|
+            provider_models.remapLegacyModel(provider, value) orelse value
+        else
+            null;
 
         try config.setProvider(provider, model);
         std.log.info("Set provider to {s} (model: {s})", .{ provider, model orelse "default" });

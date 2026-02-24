@@ -1,5 +1,6 @@
 const std = @import("std");
 const Config = @import("config.zig");
+const provider_models = @import("provider_models.zig");
 const ziggy_piai = @import("ziggy-piai");
 
 const codex_oauth = ziggy_piai.oauth.openai_codex;
@@ -205,8 +206,19 @@ fn setProviderIfRequested(allocator: std.mem.Allocator, provider: []const u8, se
     if (!set_provider) return;
     var config = try Config.init(allocator, null);
     defer config.deinit();
-    try config.setProvider(provider, null);
-    std.log.info("Set provider to {s} (model: default)", .{provider});
+
+    var model_to_set: ?[]const u8 = null;
+    if (std.mem.eql(u8, config.provider.name, provider)) {
+        if (config.provider.model) |existing| {
+            model_to_set = provider_models.remapLegacyModel(provider, existing) orelse existing;
+        }
+    }
+    if (model_to_set == null) {
+        model_to_set = provider_models.preferredDefaultModel(provider);
+    }
+
+    try config.setProvider(provider, model_to_set);
+    std.log.info("Set provider to {s} (model: {s})", .{ provider, model_to_set orelse "default" });
 }
 
 fn runLogin(allocator: std.mem.Allocator, args: []const []const u8) !void {

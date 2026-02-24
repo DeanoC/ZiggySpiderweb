@@ -7,6 +7,7 @@ const brain_tools = @import("brain_tools.zig");
 const brain_specialization = @import("brain_specialization.zig");
 const credential_store = @import("credential_store.zig");
 const memory_schema = @import("memory_schema.zig");
+const provider_models = @import("provider_models.zig");
 const memory = @import("ziggy-memory-store").memory;
 const memid = @import("ziggy-memory-store").memid;
 const prompt_compiler = @import("prompt_compiler.zig");
@@ -174,6 +175,16 @@ const ProviderRuntime = struct {
         errdefer provider.deinit(allocator);
 
         if (provider_cfg.model) |value| provider.default_model_name = try allocator.dupe(u8, value);
+        if (provider.default_model_name) |configured_model| {
+            if (provider_models.remapLegacyModel(provider.default_provider_name, configured_model)) |mapped_model| {
+                std.log.warn(
+                    "Configured model {s}/{s} is deprecated; using {s}",
+                    .{ provider.default_provider_name, configured_model, mapped_model },
+                );
+                allocator.free(configured_model);
+                provider.default_model_name = try allocator.dupe(u8, mapped_model);
+            }
+        }
         if (builtin.is_test) {
             if (provider_cfg.api_key) |value| provider.test_only_api_key = try allocator.dupe(u8, value);
         }
@@ -1944,6 +1955,25 @@ pub const RuntimeServer = struct {
         return .{ .runtime_error = RuntimeServerError.ProviderStreamFailed, .retryable = false };
     }
 
+    fn shouldAttemptModelFallback(
+        failure: ProviderFailure,
+        stream_error_name: ?[]const u8,
+        provider_error_message: ?[]const u8,
+    ) bool {
+        if (failure.retryable) return true;
+        if (failure.runtime_error != RuntimeServerError.ProviderRequestInvalid) return false;
+
+        const err_name = stream_error_name orelse "";
+        const message = provider_error_message orelse "";
+        return containsAnyIgnoreCase(
+            message,
+            &.{ "model not found", "unsupported model", "unknown model", "deprecated model", "no such model", "does not exist" },
+        ) or containsAnyIgnoreCase(
+            err_name,
+            &.{ "ModelNotFound", "UnsupportedModel", "UnknownModel" },
+        );
+    }
+
     fn findProviderStreamMessage(events: []const ziggy_piai.types.AssistantMessageEvent) ?[]const u8 {
         for (events) |event| {
             switch (event) {
@@ -2285,7 +2315,7 @@ pub const RuntimeServer = struct {
                         continue :provider_attempt_loop;
                     }
 
-                    if (failure.retryable and !used_fallback) {
+                    if (shouldAttemptModelFallback(failure, stream_error_name, null) and !used_fallback) {
                         if (try self.selectFallbackModelWithApiKey(provider_runtime, selected_model)) |fallback_model| {
                             if (job.emit_debug) {
                                 const escaped_from_provider = try protocol.jsonEscape(self.allocator, selected_model.provider);
@@ -2367,7 +2397,7 @@ pub const RuntimeServer = struct {
                         continue :provider_attempt_loop;
                     }
 
-                    if (failure.retryable and !used_fallback) {
+                    if (shouldAttemptModelFallback(failure, null, provider_error_message) and !used_fallback) {
                         if (try self.selectFallbackModelWithApiKey(provider_runtime, selected_model)) |fallback_model| {
                             if (job.emit_debug) {
                                 const escaped_from_provider = try protocol.jsonEscape(self.allocator, selected_model.provider);
@@ -3244,7 +3274,25 @@ pub const RuntimeServer = struct {
 
     fn selectModel(provider_runtime: *const ProviderRuntime, provider_name: []const u8, model_name: ?[]const u8) ?ziggy_piai.types.Model {
         if (model_name) |selected_model_name| {
-            return provider_runtime.model_registry.getModel(provider_name, selected_model_name);
+            if (provider_runtime.model_registry.getModel(provider_name, selected_model_name)) |model| return model;
+
+            if (provider_models.remapLegacyModel(provider_name, selected_model_name)) |mapped_model_name| {
+                if (provider_runtime.model_registry.getModel(provider_name, mapped_model_name)) |mapped_model| {
+                    std.log.warn(
+                        "Selected model {s}/{s} is deprecated; using {s}",
+                        .{ provider_name, selected_model_name, mapped_model_name },
+                    );
+                    return mapped_model;
+                }
+            }
+
+            return null;
+        }
+
+        if (provider_models.preferredDefaultModel(provider_name)) |preferred_model_name| {
+            if (provider_runtime.model_registry.getModel(provider_name, preferred_model_name)) |preferred_model| {
+                return preferred_model;
+            }
         }
 
         for (provider_runtime.model_registry.models.items) |model| {
@@ -6036,7 +6084,7 @@ test "runtime_server: provider-only override resets inherited model selection" {
 
     try std.testing.expect(std.mem.indexOf(u8, response, "captured provider response") != null);
     try std.testing.expectEqualStrings("openai-codex", mockCapturedProviderName.?);
-    try std.testing.expectEqualStrings("gpt-5.1-codex-mini", mockCapturedModelName.?);
+    try std.testing.expectEqualStrings("gpt-5.3-codex", mockCapturedModelName.?);
     try std.testing.expect(mockCapturedApiKey != null);
     try std.testing.expectEqualStrings("configured-openai-key", mockCapturedApiKey.?);
 }
@@ -6082,6 +6130,42 @@ test "runtime_server: provider runtime falls back to env API key on secure-store
     try std.testing.expectEqualStrings("openai", mockCapturedProviderName.?);
     try std.testing.expect(mockCapturedApiKey != null);
     try std.testing.expectEqualStrings("env-openai-key", mockCapturedApiKey.?);
+}
+
+test "runtime_server: legacy codex model id remaps to current default" {
+    const allocator = std.testing.allocator;
+    const original_stream_fn = streamByModelFn;
+    defer streamByModelFn = original_stream_fn;
+    streamByModelFn = mockProviderStreamCaptureConfig;
+
+    mockCapturedProviderName = null;
+    mockCapturedModelName = null;
+    mockCapturedReasoning = null;
+    if (mockCapturedApiKey) |value| {
+        allocator.free(value);
+        mockCapturedApiKey = null;
+    }
+    defer if (mockCapturedApiKey) |value| {
+        allocator.free(value);
+        mockCapturedApiKey = null;
+    };
+
+    const server = try RuntimeServer.createWithProvider(allocator, "agent-legacy-model-remap", .{
+        .ltm_directory = "",
+        .ltm_filename = "",
+    }, .{
+        .name = "openai-codex",
+        .model = "gpt-5.1",
+        .api_key = "test-key",
+    });
+    defer server.destroy();
+
+    const response = try server.handleMessage("{\"id\":\"req-legacy-model-remap\",\"type\":\"session.send\",\"content\":\"hello\"}");
+    defer allocator.free(response);
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "captured provider response") != null);
+    try std.testing.expectEqualStrings("openai-codex", mockCapturedProviderName.?);
+    try std.testing.expectEqualStrings("gpt-5.3-codex", mockCapturedModelName.?);
 }
 
 test "runtime_server: agent.json can override primary brain provider model and think level" {
