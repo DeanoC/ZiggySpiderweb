@@ -927,6 +927,85 @@ const ConnectionPrincipal = struct {
     token_id: []const u8,
 };
 
+const SessionAttachState = enum {
+    warming,
+    ready,
+    err,
+};
+
+const SessionAttachStateSnapshot = struct {
+    state: SessionAttachState = .warming,
+    runtime_ready: bool = false,
+    mount_ready: bool = false,
+    error_code: ?[]const u8 = null,
+    error_message: ?[]const u8 = null,
+    updated_at_ms: i64 = 0,
+};
+
+const RuntimeWarmupState = struct {
+    state: SessionAttachState = .warming,
+    runtime_ready: bool = false,
+    mount_ready: bool = false,
+    error_code: ?[]u8 = null,
+    error_message: ?[]u8 = null,
+    updated_at_ms: i64 = 0,
+    in_flight: bool = false,
+
+    fn deinit(self: *RuntimeWarmupState, allocator: std.mem.Allocator) void {
+        if (self.error_code) |value| allocator.free(value);
+        if (self.error_message) |value| allocator.free(value);
+        self.* = undefined;
+    }
+
+    fn setWarming(self: *RuntimeWarmupState, allocator: std.mem.Allocator) void {
+        if (self.error_code) |value| allocator.free(value);
+        if (self.error_message) |value| allocator.free(value);
+        self.error_code = null;
+        self.error_message = null;
+        self.state = .warming;
+        self.runtime_ready = false;
+        self.mount_ready = false;
+        self.updated_at_ms = std.time.milliTimestamp();
+    }
+
+    fn setReady(self: *RuntimeWarmupState, allocator: std.mem.Allocator) void {
+        if (self.error_code) |value| allocator.free(value);
+        if (self.error_message) |value| allocator.free(value);
+        self.error_code = null;
+        self.error_message = null;
+        self.state = .ready;
+        self.runtime_ready = true;
+        self.mount_ready = true;
+        self.updated_at_ms = std.time.milliTimestamp();
+    }
+
+    fn setError(self: *RuntimeWarmupState, allocator: std.mem.Allocator, code: []const u8, message: []const u8) !void {
+        if (self.error_code) |value| allocator.free(value);
+        if (self.error_message) |value| allocator.free(value);
+        self.error_code = try allocator.dupe(u8, code);
+        errdefer {
+            allocator.free(self.error_code.?);
+            self.error_code = null;
+        }
+        self.error_message = try allocator.dupe(u8, message);
+        self.state = .err;
+        self.runtime_ready = false;
+        self.mount_ready = false;
+        self.updated_at_ms = std.time.milliTimestamp();
+    }
+
+    fn snapshot(self: *const RuntimeWarmupState) SessionAttachStateSnapshot {
+        return .{
+            .state = self.state,
+            .runtime_ready = self.runtime_ready,
+            .mount_ready = self.mount_ready,
+            .error_code = self.error_code,
+            .error_message = self.error_message,
+            .updated_at_ms = self.updated_at_ms,
+        };
+    }
+};
+
 const SessionBinding = struct {
     agent_id: []u8,
     project_id: ?[]u8 = null,
@@ -1186,6 +1265,12 @@ const AgentRuntimeRegistry = struct {
     workspace_url: ?[]u8 = null,
     mutex: std.Thread.Mutex = .{},
     by_agent: std.StringHashMapUnmanaged(AgentRuntimeEntry) = .{},
+    runtime_warmups_mutex: std.Thread.Mutex = .{},
+    runtime_warmups: std.StringHashMapUnmanaged(RuntimeWarmupState) = .{},
+    runtime_warmup_lifecycle_mutex: std.Thread.Mutex = .{},
+    runtime_warmup_lifecycle_cond: std.Thread.Condition = .{},
+    runtime_warmup_inflight: usize = 0,
+    runtime_warmup_stopping: bool = false,
     topology_subscribers_mutex: std.Thread.Mutex = .{},
     topology_subscribers: std.ArrayListUnmanaged(ControlTopologySubscriber) = .{},
     next_topology_subscriber_id: u64 = 1,
@@ -1273,6 +1358,13 @@ const AgentRuntimeRegistry = struct {
             self.reconcile_worker_thread = null;
         }
 
+        self.runtime_warmup_lifecycle_mutex.lock();
+        self.runtime_warmup_stopping = true;
+        while (self.runtime_warmup_inflight > 0) {
+            self.runtime_warmup_lifecycle_cond.wait(&self.runtime_warmup_lifecycle_mutex);
+        }
+        self.runtime_warmup_lifecycle_mutex.unlock();
+
         self.mutex.lock();
         defer self.mutex.unlock();
 
@@ -1283,6 +1375,16 @@ const AgentRuntimeRegistry = struct {
             runtime_entry.deinit(self.allocator);
         }
         self.by_agent.deinit(self.allocator);
+        self.runtime_warmups_mutex.lock();
+        var warmup_it = self.runtime_warmups.iterator();
+        while (warmup_it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            var warmup = entry.value_ptr.*;
+            warmup.deinit(self.allocator);
+        }
+        self.runtime_warmups.deinit(self.allocator);
+        self.runtime_warmups = .{};
+        self.runtime_warmups_mutex.unlock();
         self.clearTopologySubscribers();
         if (self.local_fs_node) |local_fs_node| {
             local_fs_node.deinit(&self.control_plane);
@@ -1544,6 +1646,305 @@ const AgentRuntimeRegistry = struct {
             return false;
         }
         return true;
+    }
+
+    fn hasRuntimeForBinding(self: *AgentRuntimeRegistry, agent_id: []const u8, project_id: ?[]const u8) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const existing = self.by_agent.get(agent_id) orelse return false;
+        if (project_id) |project| return std.mem.eql(u8, existing.project_id, project);
+        return true;
+    }
+
+    fn runtimeBindingKey(self: *AgentRuntimeRegistry, agent_id: []const u8, project_id: ?[]const u8) ![]u8 {
+        const project = project_id orelse "__auto__";
+        return std.fmt.allocPrint(self.allocator, "{s}\x1F{s}", .{ agent_id, project });
+    }
+
+    fn runtimeAttachSnapshotByKey(self: *AgentRuntimeRegistry, binding_key: []const u8) SessionAttachStateSnapshot {
+        self.runtime_warmups_mutex.lock();
+        defer self.runtime_warmups_mutex.unlock();
+        if (self.runtime_warmups.getPtr(binding_key)) |state| {
+            return state.snapshot();
+        }
+        return .{
+            .state = .warming,
+            .runtime_ready = false,
+            .mount_ready = false,
+            .updated_at_ms = std.time.milliTimestamp(),
+        };
+    }
+
+    fn runtimeAttachSnapshot(self: *AgentRuntimeRegistry, agent_id: []const u8, project_id: ?[]const u8) SessionAttachStateSnapshot {
+        if (!self.runtime_config.sandbox_enabled) {
+            return .{
+                .state = .ready,
+                .runtime_ready = true,
+                .mount_ready = true,
+                .updated_at_ms = std.time.milliTimestamp(),
+            };
+        }
+        if (self.hasRuntimeForBinding(agent_id, project_id)) {
+            return .{
+                .state = .ready,
+                .runtime_ready = true,
+                .mount_ready = true,
+                .updated_at_ms = std.time.milliTimestamp(),
+            };
+        }
+        const binding_key = self.runtimeBindingKey(agent_id, project_id) catch {
+            return .{
+                .state = .warming,
+                .runtime_ready = false,
+                .mount_ready = false,
+                .updated_at_ms = std.time.milliTimestamp(),
+            };
+        };
+        defer self.allocator.free(binding_key);
+        return self.runtimeAttachSnapshotByKey(binding_key);
+    }
+
+    const RuntimeWarmupErrorInfo = struct {
+        code: []const u8,
+        message: []const u8,
+    };
+
+    fn mapRuntimeWarmupError(err: anyerror) RuntimeWarmupErrorInfo {
+        return switch (err) {
+            error.InvalidAgentId => .{
+                .code = "invalid_payload",
+                .message = "invalid agent_id",
+            },
+            error.InvalidProjectId => .{
+                .code = "invalid_payload",
+                .message = "invalid project_id",
+            },
+            error.RuntimeLimitReached => .{
+                .code = "queue_saturated",
+                .message = "agent runtime limit reached",
+            },
+            error.ProjectRequired => .{
+                .code = "sandbox_mount_missing",
+                .message = "sandbox requires a project binding",
+            },
+            error.SandboxMountUnavailable => .{
+                .code = "sandbox_mount_unavailable",
+                .message = "sandbox mount is unavailable",
+            },
+            error.InvalidSandboxConfig => .{
+                .code = "sandbox_invalid_config",
+                .message = "sandbox config is invalid",
+            },
+            error.ProjectResolutionFailed => .{
+                .code = "sandbox_mount_unavailable",
+                .message = "sandbox project resolution failed",
+            },
+            else => .{
+                .code = "execution_failed",
+                .message = @errorName(err),
+            },
+        };
+    }
+
+    fn emitSessionAttachStateDebugEvent(
+        self: *AgentRuntimeRegistry,
+        binding_key: []const u8,
+        state: SessionAttachStateSnapshot,
+    ) void {
+        const escaped_binding = unified.jsonEscape(self.allocator, binding_key) catch return;
+        defer self.allocator.free(escaped_binding);
+        const escaped_state = unified.jsonEscape(self.allocator, sessionAttachStateName(state.state)) catch return;
+        defer self.allocator.free(escaped_state);
+
+        const error_code_json = if (state.error_code) |value| blk: {
+            const escaped = unified.jsonEscape(self.allocator, value) catch return;
+            defer self.allocator.free(escaped);
+            break :blk std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped}) catch return;
+        } else self.allocator.dupe(u8, "null") catch return;
+        defer self.allocator.free(error_code_json);
+
+        const error_message_json = if (state.error_message) |value| blk: {
+            const escaped = unified.jsonEscape(self.allocator, value) catch return;
+            defer self.allocator.free(escaped);
+            break :blk std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped}) catch return;
+        } else self.allocator.dupe(u8, "null") catch return;
+        defer self.allocator.free(error_message_json);
+
+        const payload_json = std.fmt.allocPrint(
+            self.allocator,
+            "{{\"binding\":\"{s}\",\"state\":\"{s}\",\"runtime_ready\":{},\"mount_ready\":{},\"error_code\":{s},\"error_message\":{s},\"updated_at_ms\":{d}}}",
+            .{
+                escaped_binding,
+                escaped_state,
+                state.runtime_ready,
+                state.mount_ready,
+                error_code_json,
+                error_message_json,
+                state.updated_at_ms,
+            },
+        ) catch return;
+        defer self.allocator.free(payload_json);
+
+        self.broadcastTopologyDebugEvent("control.session_attach_state", payload_json);
+    }
+
+    fn markRuntimeWarmupReady(self: *AgentRuntimeRegistry, binding_key: []const u8) void {
+        var snapshot = SessionAttachStateSnapshot{
+            .state = .ready,
+            .runtime_ready = true,
+            .mount_ready = true,
+            .updated_at_ms = std.time.milliTimestamp(),
+        };
+        self.runtime_warmups_mutex.lock();
+        if (self.runtime_warmups.getPtr(binding_key)) |state| {
+            state.setReady(self.allocator);
+            state.in_flight = false;
+            snapshot = state.snapshot();
+        }
+        self.runtime_warmups_mutex.unlock();
+        self.emitSessionAttachStateDebugEvent(binding_key, snapshot);
+    }
+
+    fn markRuntimeWarmupError(self: *AgentRuntimeRegistry, binding_key: []const u8, code: []const u8, message: []const u8) void {
+        var snapshot = SessionAttachStateSnapshot{
+            .state = .err,
+            .runtime_ready = false,
+            .mount_ready = false,
+            .error_code = code,
+            .error_message = message,
+            .updated_at_ms = std.time.milliTimestamp(),
+        };
+        self.runtime_warmups_mutex.lock();
+        if (self.runtime_warmups.getPtr(binding_key)) |state| {
+            state.setError(self.allocator, code, message) catch {
+                if (state.error_code) |value| self.allocator.free(value);
+                if (state.error_message) |value| self.allocator.free(value);
+                state.error_code = null;
+                state.error_message = null;
+                state.state = .err;
+                state.runtime_ready = false;
+                state.mount_ready = false;
+                state.updated_at_ms = std.time.milliTimestamp();
+            };
+            state.in_flight = false;
+            snapshot = state.snapshot();
+        }
+        self.runtime_warmups_mutex.unlock();
+        self.emitSessionAttachStateDebugEvent(binding_key, snapshot);
+    }
+
+    fn beginRuntimeWarmupThread(self: *AgentRuntimeRegistry) !void {
+        self.runtime_warmup_lifecycle_mutex.lock();
+        defer self.runtime_warmup_lifecycle_mutex.unlock();
+        if (self.runtime_warmup_stopping) return error.ShuttingDown;
+        self.runtime_warmup_inflight += 1;
+    }
+
+    fn finishRuntimeWarmupThread(self: *AgentRuntimeRegistry) void {
+        self.runtime_warmup_lifecycle_mutex.lock();
+        if (self.runtime_warmup_inflight > 0) {
+            self.runtime_warmup_inflight -= 1;
+        }
+        if (self.runtime_warmup_stopping and self.runtime_warmup_inflight == 0) {
+            self.runtime_warmup_lifecycle_cond.broadcast();
+        } else if (self.runtime_warmup_inflight == 0) {
+            self.runtime_warmup_lifecycle_cond.signal();
+        }
+        self.runtime_warmup_lifecycle_mutex.unlock();
+    }
+
+    fn spawnRuntimeWarmupThread(
+        self: *AgentRuntimeRegistry,
+        binding_key: []const u8,
+        agent_id: []const u8,
+        project_id: ?[]const u8,
+        project_token: ?[]const u8,
+    ) !void {
+        try self.beginRuntimeWarmupThread();
+        errdefer self.finishRuntimeWarmupThread();
+
+        const ctx = try self.allocator.create(RuntimeWarmupThreadContext);
+        ctx.* = .{
+            .allocator = self.allocator,
+            .runtime_registry = self,
+            .binding_key = null,
+            .agent_id = null,
+            .project_id = null,
+            .project_token = null,
+        };
+        errdefer ctx.deinit();
+
+        ctx.binding_key = try self.allocator.dupe(u8, binding_key);
+        ctx.agent_id = try self.allocator.dupe(u8, agent_id);
+        if (project_id) |value| {
+            ctx.project_id = try self.allocator.dupe(u8, value);
+        }
+        if (project_token) |value| {
+            ctx.project_token = try self.allocator.dupe(u8, value);
+        }
+
+        const thread = try std.Thread.spawn(.{}, runtimeWarmupThreadMain, .{ctx});
+        thread.detach();
+    }
+
+    fn ensureRuntimeWarmup(
+        self: *AgentRuntimeRegistry,
+        agent_id: []const u8,
+        project_id: ?[]const u8,
+        project_token: ?[]const u8,
+    ) !SessionAttachStateSnapshot {
+        if (!self.runtime_config.sandbox_enabled) {
+            return .{
+                .state = .ready,
+                .runtime_ready = true,
+                .mount_ready = true,
+                .updated_at_ms = std.time.milliTimestamp(),
+            };
+        }
+        if (self.hasRuntimeForBinding(agent_id, project_id)) {
+            return .{
+                .state = .ready,
+                .runtime_ready = true,
+                .mount_ready = true,
+                .updated_at_ms = std.time.milliTimestamp(),
+            };
+        }
+
+        const binding_key = try self.runtimeBindingKey(agent_id, project_id);
+        defer self.allocator.free(binding_key);
+
+        var should_spawn = false;
+        {
+            self.runtime_warmups_mutex.lock();
+            defer self.runtime_warmups_mutex.unlock();
+            if (self.runtime_warmups.getPtr(binding_key)) |state| {
+                if (!state.in_flight and state.state != .ready) {
+                    state.setWarming(self.allocator);
+                    state.in_flight = true;
+                    should_spawn = true;
+                }
+            } else {
+                const owned_key = try self.allocator.dupe(u8, binding_key);
+                errdefer self.allocator.free(owned_key);
+                var state = RuntimeWarmupState{};
+                state.setWarming(self.allocator);
+                state.in_flight = true;
+                try self.runtime_warmups.put(self.allocator, owned_key, state);
+                should_spawn = true;
+            }
+        }
+
+        if (should_spawn) {
+            self.spawnRuntimeWarmupThread(binding_key, agent_id, project_id, project_token) catch |spawn_err| {
+                self.markRuntimeWarmupError(
+                    binding_key,
+                    "execution_failed",
+                    @errorName(spawn_err),
+                );
+            };
+        }
+
+        return self.runtimeAttachSnapshotByKey(binding_key);
     }
 
     fn getFirstAgentId(self: *AgentRuntimeRegistry) ?[]const u8 {
@@ -1970,6 +2371,54 @@ const AgentRuntimeRegistry = struct {
     }
 };
 
+fn sessionAttachStateName(state: SessionAttachState) []const u8 {
+    return switch (state) {
+        .warming => "warming",
+        .ready => "ready",
+        .err => "error",
+    };
+}
+
+const RuntimeWarmupThreadContext = struct {
+    allocator: std.mem.Allocator,
+    runtime_registry: *AgentRuntimeRegistry,
+    binding_key: ?[]u8 = null,
+    agent_id: ?[]u8 = null,
+    project_id: ?[]u8 = null,
+    project_token: ?[]u8 = null,
+
+    fn deinit(self: *RuntimeWarmupThreadContext) void {
+        if (self.binding_key) |value| self.allocator.free(value);
+        if (self.agent_id) |value| self.allocator.free(value);
+        if (self.project_id) |value| self.allocator.free(value);
+        if (self.project_token) |value| self.allocator.free(value);
+        self.allocator.destroy(self);
+    }
+};
+
+fn runtimeWarmupThreadMain(ctx: *RuntimeWarmupThreadContext) void {
+    defer ctx.deinit();
+    defer ctx.runtime_registry.finishRuntimeWarmupThread();
+    const binding_key = ctx.binding_key orelse return;
+    const agent_id = ctx.agent_id orelse return;
+
+    _ = ctx.runtime_registry.getOrCreate(
+        agent_id,
+        ctx.project_id,
+        ctx.project_token,
+    ) catch |err| {
+        const info = AgentRuntimeRegistry.mapRuntimeWarmupError(err);
+        ctx.runtime_registry.markRuntimeWarmupError(
+            binding_key,
+            info.code,
+            info.message,
+        );
+        return;
+    };
+
+    ctx.runtime_registry.markRuntimeWarmupReady(binding_key);
+}
+
 const LocalFsBootstrapContext = struct {
     allocator: std.mem.Allocator,
     runtime_registry: *AgentRuntimeRegistry,
@@ -2158,6 +2607,10 @@ fn handleWebSocketConnection(
 
     const default_agent_id = initialAgentIdForRole(principal.role, runtime_registry.default_agent_id);
     try upsertSessionBinding(allocator, &session_bindings, "main", default_agent_id, null, null);
+    _ = runtime_registry.ensureRuntimeWarmup(default_agent_id, null, null) catch |err| blk: {
+        std.log.warn("default session warmup failed: {s}", .{@errorName(err)});
+        break :blk SessionAttachStateSnapshot{};
+    };
 
     var active_session_key = try allocator.dupe(u8, "main");
     defer allocator.free(active_session_key);
@@ -2668,76 +3121,6 @@ fn handleWebSocketConnection(
                                     continue;
                                 }
 
-                                _ = runtime_registry.getOrCreate(attach_agent_id, attach_project_id, attach_project_token) catch |attach_err| switch (attach_err) {
-                                    error.InvalidAgentId => {
-                                        const response = try unified.buildControlError(
-                                            allocator,
-                                            parsed.id,
-                                            "invalid_payload",
-                                            "invalid agent_id",
-                                        );
-                                        defer allocator.free(response);
-                                        try writeFrameLocked(stream, &connection_write_mutex, response, .text);
-                                        continue;
-                                    },
-                                    error.InvalidProjectId => {
-                                        const response = try unified.buildControlError(
-                                            allocator,
-                                            parsed.id,
-                                            "invalid_payload",
-                                            "invalid project_id",
-                                        );
-                                        defer allocator.free(response);
-                                        try writeFrameLocked(stream, &connection_write_mutex, response, .text);
-                                        continue;
-                                    },
-                                    error.RuntimeLimitReached => {
-                                        const response = try unified.buildControlError(
-                                            allocator,
-                                            parsed.id,
-                                            "queue_saturated",
-                                            "agent runtime limit reached",
-                                        );
-                                        defer allocator.free(response);
-                                        try writeFrameLocked(stream, &connection_write_mutex, response, .text);
-                                        continue;
-                                    },
-                                    error.ProjectRequired => {
-                                        const response = try unified.buildControlError(
-                                            allocator,
-                                            parsed.id,
-                                            "sandbox_mount_missing",
-                                            "sandbox requires a project binding",
-                                        );
-                                        defer allocator.free(response);
-                                        try writeFrameLocked(stream, &connection_write_mutex, response, .text);
-                                        continue;
-                                    },
-                                    error.SandboxMountUnavailable => {
-                                        const response = try unified.buildControlError(
-                                            allocator,
-                                            parsed.id,
-                                            "sandbox_mount_unavailable",
-                                            "sandbox mount is unavailable",
-                                        );
-                                        defer allocator.free(response);
-                                        try writeFrameLocked(stream, &connection_write_mutex, response, .text);
-                                        continue;
-                                    },
-                                    error.InvalidSandboxConfig => {
-                                        const response = try unified.buildControlError(
-                                            allocator,
-                                            parsed.id,
-                                            "sandbox_invalid_config",
-                                            "sandbox config is invalid",
-                                        );
-                                        defer allocator.free(response);
-                                        try writeFrameLocked(stream, &connection_write_mutex, response, .text);
-                                        continue;
-                                    },
-                                    else => return attach_err,
-                                };
-
                                 if (attach_project_id) |project_id| {
                                     const activate_payload = try buildProjectActivatePayload(allocator, project_id, attach_project_token);
                                     defer allocator.free(activate_payload);
@@ -2766,91 +3149,30 @@ fn handleWebSocketConnection(
                                 active_session_key = try allocator.dupe(u8, session_key);
 
                                 const active_binding = session_bindings.get(session_key) orelse return error.InvalidState;
-                                if (fsrpc) |*session| {
-                                    const active_runtime = runtime_registry.getOrCreate(
-                                        active_binding.agent_id,
-                                        active_binding.project_id,
-                                        active_binding.project_token,
-                                    ) catch |err| switch (err) {
-                                        error.InvalidAgentId => {
-                                            const response = try unified.buildControlError(
-                                                allocator,
-                                                parsed.id,
-                                                "invalid_payload",
-                                                "invalid agent_id",
-                                            );
-                                            defer allocator.free(response);
-                                            try writeFrameLocked(stream, &connection_write_mutex, response, .text);
-                                            continue;
-                                        },
-                                        error.InvalidProjectId => {
-                                            const response = try unified.buildControlError(
-                                                allocator,
-                                                parsed.id,
-                                                "invalid_payload",
-                                                "invalid project_id",
-                                            );
-                                            defer allocator.free(response);
-                                            try writeFrameLocked(stream, &connection_write_mutex, response, .text);
-                                            continue;
-                                        },
-                                        error.RuntimeLimitReached => {
-                                            const response = try unified.buildControlError(
-                                                allocator,
-                                                parsed.id,
-                                                "queue_saturated",
-                                                "agent runtime limit reached",
-                                            );
-                                            defer allocator.free(response);
-                                            try writeFrameLocked(stream, &connection_write_mutex, response, .text);
-                                            continue;
-                                        },
-                                        error.ProjectRequired => {
-                                            const response = try unified.buildControlError(
-                                                allocator,
-                                                parsed.id,
-                                                "sandbox_mount_missing",
-                                                "sandbox requires a project binding",
-                                            );
-                                            defer allocator.free(response);
-                                            try writeFrameLocked(stream, &connection_write_mutex, response, .text);
-                                            continue;
-                                        },
-                                        error.SandboxMountUnavailable => {
-                                            const response = try unified.buildControlError(
-                                                allocator,
-                                                parsed.id,
-                                                "sandbox_mount_unavailable",
-                                                "sandbox mount is unavailable",
-                                            );
-                                            defer allocator.free(response);
-                                            try writeFrameLocked(stream, &connection_write_mutex, response, .text);
-                                            continue;
-                                        },
-                                        error.InvalidSandboxConfig => {
-                                            const response = try unified.buildControlError(
-                                                allocator,
-                                                parsed.id,
-                                                "sandbox_invalid_config",
-                                                "sandbox config is invalid",
-                                            );
-                                            defer allocator.free(response);
-                                            try writeFrameLocked(stream, &connection_write_mutex, response, .text);
-                                            continue;
-                                        },
-                                        else => return err,
-                                    };
-                                    try session.setRuntimeBinding(active_runtime, active_binding.agent_id);
-                                }
-                                const workspace_status_owned: ?[]u8 = runtime_registry.control_plane.workspaceStatus(active_binding.agent_id, null) catch null;
-                                defer if (workspace_status_owned) |value| allocator.free(value);
-                                const workspace_status = if (workspace_status_owned) |value| value else "{}";
+                                const attach_state = runtime_registry.ensureRuntimeWarmup(
+                                    active_binding.agent_id,
+                                    active_binding.project_id,
+                                    active_binding.project_token,
+                                ) catch |warm_err| {
+                                    const response = try unified.buildControlError(
+                                        allocator,
+                                        parsed.id,
+                                        "execution_failed",
+                                        @errorName(warm_err),
+                                    );
+                                    defer allocator.free(response);
+                                    try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                    continue;
+                                };
+                                const attach_json = try buildSessionAttachStateJson(allocator, attach_state);
+                                defer allocator.free(attach_json);
                                 const ack_payload = try buildSessionAttachAckPayload(
                                     allocator,
                                     session_key,
                                     active_binding.agent_id,
                                     active_binding.project_id,
-                                    workspace_status,
+                                    "{}",
+                                    attach_json,
                                 );
                                 defer allocator.free(ack_payload);
 
@@ -2859,6 +3181,71 @@ fn handleWebSocketConnection(
                                     .session_attach,
                                     parsed.id,
                                     ack_payload,
+                                );
+                                defer allocator.free(response);
+                                try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                continue;
+                            },
+                            .session_status => {
+                                var payload = try parseControlPayloadObject(allocator, parsed.payload_json);
+                                defer payload.deinit();
+                                if (payload.value != .object) {
+                                    const response = try unified.buildControlError(
+                                        allocator,
+                                        parsed.id,
+                                        "invalid_payload",
+                                        "session_status payload must be an object",
+                                    );
+                                    defer allocator.free(response);
+                                    try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                    continue;
+                                }
+
+                                const payload_session_key = getOptionalStringField(payload.value.object, "session_key");
+                                const session_key = if (payload_session_key) |value| value else active_session_key;
+                                const binding = session_bindings.get(session_key) orelse {
+                                    const response = try unified.buildControlError(
+                                        allocator,
+                                        parsed.id,
+                                        "not_found",
+                                        "session_key not found",
+                                    );
+                                    defer allocator.free(response);
+                                    try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                    continue;
+                                };
+
+                                const attach_state = runtime_registry.ensureRuntimeWarmup(
+                                    binding.agent_id,
+                                    binding.project_id,
+                                    binding.project_token,
+                                ) catch |warm_err| {
+                                    const response = try unified.buildControlError(
+                                        allocator,
+                                        parsed.id,
+                                        "execution_failed",
+                                        @errorName(warm_err),
+                                    );
+                                    defer allocator.free(response);
+                                    try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                    continue;
+                                };
+
+                                const attach_json = try buildSessionAttachStateJson(allocator, attach_state);
+                                defer allocator.free(attach_json);
+                                const payload_json = try buildSessionStatusPayload(
+                                    allocator,
+                                    session_key,
+                                    binding.agent_id,
+                                    binding.project_id,
+                                    attach_json,
+                                );
+                                defer allocator.free(payload_json);
+                                const response = try unified.buildControlAck(
+                                    allocator,
+                                    .session_status,
+                                    parsed.id,
+                                    payload_json,
                                 );
                                 defer allocator.free(response);
                                 try writeFrameLocked(stream, &connection_write_mutex, response, .text);
@@ -2903,91 +3290,30 @@ fn handleWebSocketConnection(
 
                                 allocator.free(active_session_key);
                                 active_session_key = try allocator.dupe(u8, session_key);
-                                if (fsrpc) |*session| {
-                                    const active_runtime = runtime_registry.getOrCreate(
-                                        binding.agent_id,
-                                        binding.project_id,
-                                        binding.project_token,
-                                    ) catch |err| switch (err) {
-                                        error.InvalidAgentId => {
-                                            const response = try unified.buildControlError(
-                                                allocator,
-                                                parsed.id,
-                                                "invalid_payload",
-                                                "invalid agent_id",
-                                            );
-                                            defer allocator.free(response);
-                                            try writeFrameLocked(stream, &connection_write_mutex, response, .text);
-                                            continue;
-                                        },
-                                        error.InvalidProjectId => {
-                                            const response = try unified.buildControlError(
-                                                allocator,
-                                                parsed.id,
-                                                "invalid_payload",
-                                                "invalid project_id",
-                                            );
-                                            defer allocator.free(response);
-                                            try writeFrameLocked(stream, &connection_write_mutex, response, .text);
-                                            continue;
-                                        },
-                                        error.RuntimeLimitReached => {
-                                            const response = try unified.buildControlError(
-                                                allocator,
-                                                parsed.id,
-                                                "queue_saturated",
-                                                "agent runtime limit reached",
-                                            );
-                                            defer allocator.free(response);
-                                            try writeFrameLocked(stream, &connection_write_mutex, response, .text);
-                                            continue;
-                                        },
-                                        error.ProjectRequired => {
-                                            const response = try unified.buildControlError(
-                                                allocator,
-                                                parsed.id,
-                                                "sandbox_mount_missing",
-                                                "sandbox requires a project binding",
-                                            );
-                                            defer allocator.free(response);
-                                            try writeFrameLocked(stream, &connection_write_mutex, response, .text);
-                                            continue;
-                                        },
-                                        error.SandboxMountUnavailable => {
-                                            const response = try unified.buildControlError(
-                                                allocator,
-                                                parsed.id,
-                                                "sandbox_mount_unavailable",
-                                                "sandbox mount is unavailable",
-                                            );
-                                            defer allocator.free(response);
-                                            try writeFrameLocked(stream, &connection_write_mutex, response, .text);
-                                            continue;
-                                        },
-                                        error.InvalidSandboxConfig => {
-                                            const response = try unified.buildControlError(
-                                                allocator,
-                                                parsed.id,
-                                                "sandbox_invalid_config",
-                                                "sandbox config is invalid",
-                                            );
-                                            defer allocator.free(response);
-                                            try writeFrameLocked(stream, &connection_write_mutex, response, .text);
-                                            continue;
-                                        },
-                                        else => return err,
-                                    };
-                                    try session.setRuntimeBinding(active_runtime, binding.agent_id);
-                                }
-                                const workspace_status_owned: ?[]u8 = runtime_registry.control_plane.workspaceStatus(binding.agent_id, null) catch null;
-                                defer if (workspace_status_owned) |value| allocator.free(value);
-                                const workspace_status = if (workspace_status_owned) |value| value else "{}";
+                                const attach_state = runtime_registry.ensureRuntimeWarmup(
+                                    binding.agent_id,
+                                    binding.project_id,
+                                    binding.project_token,
+                                ) catch |warm_err| {
+                                    const response = try unified.buildControlError(
+                                        allocator,
+                                        parsed.id,
+                                        "execution_failed",
+                                        @errorName(warm_err),
+                                    );
+                                    defer allocator.free(response);
+                                    try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                    continue;
+                                };
+                                const attach_json = try buildSessionAttachStateJson(allocator, attach_state);
+                                defer allocator.free(attach_json);
                                 const ack_payload = try buildSessionAttachAckPayload(
                                     allocator,
                                     session_key,
                                     binding.agent_id,
                                     binding.project_id,
-                                    workspace_status,
+                                    "{}",
+                                    attach_json,
                                 );
                                 defer allocator.free(ack_payload);
 
@@ -3412,6 +3738,24 @@ fn handleWebSocketConnection(
                                 return;
                             }
                         }
+                        if (fsrpc_type == .t_version) {
+                            const negotiated_msize = parsed.msize orelse 1_048_576;
+                            const payload = try std.fmt.allocPrint(
+                                allocator,
+                                "{{\"msize\":{d},\"version\":\"{s}\"}}",
+                                .{ negotiated_msize, fsrpc_runtime_protocol_version },
+                            );
+                            defer allocator.free(payload);
+                            const response = try unified.buildFsrpcResponse(
+                                allocator,
+                                .r_version,
+                                parsed.tag,
+                                payload,
+                            );
+                            defer allocator.free(response);
+                            try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                            continue;
+                        }
 
                         const target_session_key = parsed.session_key orelse active_session_key;
                         const target_binding = session_bindings.get(target_session_key) orelse {
@@ -3425,6 +3769,50 @@ fn handleWebSocketConnection(
                             try writeFrameLocked(stream, &connection_write_mutex, response, .text);
                             continue;
                         };
+                        var attach_state = runtime_registry.runtimeAttachSnapshot(
+                            target_binding.agent_id,
+                            target_binding.project_id,
+                        );
+                        if (attach_state.state != .ready) {
+                            attach_state = runtime_registry.ensureRuntimeWarmup(
+                                target_binding.agent_id,
+                                target_binding.project_id,
+                                target_binding.project_token,
+                            ) catch |warm_err| {
+                                const response = try unified.buildFsrpcError(
+                                    allocator,
+                                    parsed.tag,
+                                    "execution_failed",
+                                    @errorName(warm_err),
+                                );
+                                defer allocator.free(response);
+                                try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                continue;
+                            };
+
+                            if (attach_state.state == .warming) {
+                                const response = try unified.buildFsrpcError(
+                                    allocator,
+                                    parsed.tag,
+                                    "runtime_warming",
+                                    "runtime is warming",
+                                );
+                                defer allocator.free(response);
+                                try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                continue;
+                            }
+                            if (attach_state.state == .err) {
+                                const response = try unified.buildFsrpcError(
+                                    allocator,
+                                    parsed.tag,
+                                    attach_state.error_code orelse "runtime_unavailable",
+                                    attach_state.error_message orelse "runtime is unavailable",
+                                );
+                                defer allocator.free(response);
+                                try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                continue;
+                            }
+                        }
                         const target_runtime = runtime_registry.getOrCreate(
                             target_binding.agent_id,
                             target_binding.project_id,
@@ -3491,6 +3879,17 @@ fn handleWebSocketConnection(
                                     parsed.tag,
                                     "sandbox_invalid_config",
                                     "sandbox config is invalid",
+                                );
+                                defer allocator.free(response);
+                                try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                continue;
+                            },
+                            error.ProjectResolutionFailed => {
+                                const response = try unified.buildFsrpcError(
+                                    allocator,
+                                    parsed.tag,
+                                    "sandbox_mount_unavailable",
+                                    "sandbox project resolution failed",
                                 );
                                 defer allocator.free(response);
                                 try writeFrameLocked(stream, &connection_write_mutex, response, .text);
@@ -3644,12 +4043,43 @@ fn buildProjectActivatePayload(
     return std.fmt.allocPrint(allocator, "{{\"project_id\":\"{s}\"}}", .{escaped_project});
 }
 
+fn buildSessionAttachStateJson(allocator: std.mem.Allocator, state: SessionAttachStateSnapshot) ![]u8 {
+    const escaped_state = try unified.jsonEscape(allocator, sessionAttachStateName(state.state));
+    defer allocator.free(escaped_state);
+    const error_code_json = if (state.error_code) |value| blk: {
+        const escaped = try unified.jsonEscape(allocator, value);
+        defer allocator.free(escaped);
+        break :blk try std.fmt.allocPrint(allocator, "\"{s}\"", .{escaped});
+    } else try allocator.dupe(u8, "null");
+    defer allocator.free(error_code_json);
+    const error_message_json = if (state.error_message) |value| blk: {
+        const escaped = try unified.jsonEscape(allocator, value);
+        defer allocator.free(escaped);
+        break :blk try std.fmt.allocPrint(allocator, "\"{s}\"", .{escaped});
+    } else try allocator.dupe(u8, "null");
+    defer allocator.free(error_message_json);
+
+    return std.fmt.allocPrint(
+        allocator,
+        "{{\"state\":\"{s}\",\"runtime_ready\":{},\"mount_ready\":{},\"error_code\":{s},\"error_message\":{s},\"updated_at_ms\":{d}}}",
+        .{
+            escaped_state,
+            state.runtime_ready,
+            state.mount_ready,
+            error_code_json,
+            error_message_json,
+            state.updated_at_ms,
+        },
+    );
+}
+
 fn buildSessionAttachAckPayload(
     allocator: std.mem.Allocator,
     session_key: []const u8,
     agent_id: []const u8,
     project_id: ?[]const u8,
     workspace_json: []const u8,
+    attach_json: []const u8,
 ) ![]u8 {
     const escaped_session = try unified.jsonEscape(allocator, session_key);
     defer allocator.free(escaped_session);
@@ -3664,8 +4094,33 @@ fn buildSessionAttachAckPayload(
 
     return std.fmt.allocPrint(
         allocator,
-        "{{\"session_key\":\"{s}\",\"agent_id\":\"{s}\",\"project_id\":{s},\"workspace\":{s}}}",
-        .{ escaped_session, escaped_agent, project_json, workspace_json },
+        "{{\"session_key\":\"{s}\",\"agent_id\":\"{s}\",\"project_id\":{s},\"workspace\":{s},\"attach\":{s}}}",
+        .{ escaped_session, escaped_agent, project_json, workspace_json, attach_json },
+    );
+}
+
+fn buildSessionStatusPayload(
+    allocator: std.mem.Allocator,
+    session_key: []const u8,
+    agent_id: []const u8,
+    project_id: ?[]const u8,
+    attach_json: []const u8,
+) ![]u8 {
+    const escaped_session = try unified.jsonEscape(allocator, session_key);
+    defer allocator.free(escaped_session);
+    const escaped_agent = try unified.jsonEscape(allocator, agent_id);
+    defer allocator.free(escaped_agent);
+    const project_json = if (project_id) |value| blk: {
+        const escaped = try unified.jsonEscape(allocator, value);
+        defer allocator.free(escaped);
+        break :blk try std.fmt.allocPrint(allocator, "\"{s}\"", .{escaped});
+    } else try allocator.dupe(u8, "null");
+    defer allocator.free(project_json);
+
+    return std.fmt.allocPrint(
+        allocator,
+        "{{\"session_key\":\"{s}\",\"agent_id\":\"{s}\",\"project_id\":{s},\"attach\":{s}}}",
+        .{ escaped_session, escaped_agent, project_json, attach_json },
     );
 }
 
@@ -3769,6 +4224,50 @@ fn tryHandleLegacySessionSendFrame(
         try writeFrameLocked(stream, write_mutex, response, .text);
         return true;
     };
+    var attach_state = runtime_registry.runtimeAttachSnapshot(
+        binding.agent_id,
+        binding.project_id,
+    );
+    if (attach_state.state != .ready) {
+        attach_state = runtime_registry.ensureRuntimeWarmup(
+            binding.agent_id,
+            binding.project_id,
+            binding.project_token,
+        ) catch |warm_err| {
+            const response = try protocol.buildErrorWithCode(
+                allocator,
+                legacy.id orelse "generated",
+                .execution_failed,
+                @errorName(warm_err),
+            );
+            defer allocator.free(response);
+            try writeFrameLocked(stream, write_mutex, response, .text);
+            return true;
+        };
+
+        if (attach_state.state == .warming) {
+            const response = try protocol.buildErrorWithCode(
+                allocator,
+                legacy.id orelse "generated",
+                .execution_failed,
+                "runtime is warming",
+            );
+            defer allocator.free(response);
+            try writeFrameLocked(stream, write_mutex, response, .text);
+            return true;
+        }
+        if (attach_state.state == .err) {
+            const response = try protocol.buildErrorWithCode(
+                allocator,
+                legacy.id orelse "generated",
+                .execution_failed,
+                attach_state.error_message orelse "runtime is unavailable",
+            );
+            defer allocator.free(response);
+            try writeFrameLocked(stream, write_mutex, response, .text);
+            return true;
+        }
+    }
 
     const runtime_server = runtime_registry.getOrCreate(
         binding.agent_id,
@@ -3807,6 +4306,12 @@ fn tryHandleLegacySessionSendFrame(
         },
         error.InvalidSandboxConfig => {
             const response = try protocol.buildErrorWithCode(allocator, legacy.id orelse "generated", .execution_failed, "sandbox config is invalid");
+            defer allocator.free(response);
+            try writeFrameLocked(stream, write_mutex, response, .text);
+            return true;
+        },
+        error.ProjectResolutionFailed => {
+            const response = try protocol.buildErrorWithCode(allocator, legacy.id orelse "generated", .execution_failed, "sandbox project resolution failed");
             defer allocator.free(response);
             try writeFrameLocked(stream, write_mutex, response, .text);
             return true;
