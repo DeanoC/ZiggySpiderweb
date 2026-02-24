@@ -313,6 +313,7 @@ fn resolveRuntimeStorageDirectoryWithBase(
 
 fn resolveRuntimeBaseDirectory(allocator: std.mem.Allocator, config_path: []const u8) ![]u8 {
     if (try detectServiceWorkingDirectory(allocator)) |service_dir| return service_dir;
+    if (try detectRunningSpiderwebWorkingDirectory(allocator)) |runtime_dir| return runtime_dir;
     return resolveConfigDirectory(allocator, config_path);
 }
 
@@ -326,6 +327,41 @@ fn detectServiceWorkingDirectory(allocator: std.mem.Allocator) !?[]u8 {
     }
 
     if (try parseServiceWorkingDirectory(allocator, "/etc/systemd/system/spiderweb.service")) |dir| return dir;
+    return null;
+}
+
+fn detectRunningSpiderwebWorkingDirectory(allocator: std.mem.Allocator) !?[]u8 {
+    if (builtin.os.tag != .linux) return null;
+
+    var proc_dir = std.fs.openDirAbsolute("/proc", .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound,
+        error.NotDir,
+        error.AccessDenied,
+        => return null,
+        else => return err,
+    };
+    defer proc_dir.close();
+
+    var iter = proc_dir.iterate();
+    while (try iter.next()) |entry| {
+        if (entry.kind != .directory) continue;
+        _ = std.fmt.parseInt(u32, entry.name, 10) catch continue;
+
+        const comm_path = try std.fmt.allocPrint(allocator, "/proc/{s}/comm", .{entry.name});
+        defer allocator.free(comm_path);
+        const comm_contents = readFileAllocAny(allocator, comm_path, 512) catch continue;
+        defer allocator.free(comm_contents);
+        const process_name = std.mem.trim(u8, comm_contents, " \t\r\n");
+        if (!std.mem.eql(u8, process_name, "spiderweb")) continue;
+
+        const cwd_path = try std.fmt.allocPrint(allocator, "/proc/{s}/cwd", .{entry.name});
+        defer allocator.free(cwd_path);
+        var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const cwd = std.posix.readlink(cwd_path, &cwd_buf) catch continue;
+        if (cwd.len == 0) continue;
+        return try allocator.dupe(u8, cwd);
+    }
+
     return null;
 }
 
