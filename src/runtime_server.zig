@@ -1547,17 +1547,18 @@ pub const RuntimeServer = struct {
         run_id: ?[]const u8,
         tool_payloads: ?*std.ArrayListUnmanaged([]u8),
     ) !void {
-        const started_ms = std.time.milliTimestamp();
+        var last_progress_ms = std.time.milliTimestamp();
 
         while (true) {
             if (self.isExecutionCancelled(job, run_id)) return RuntimeServerError.RuntimeJobCancelled;
 
-            if (std.time.milliTimestamp() - started_ms > INTERNAL_TICK_TIMEOUT_MS) {
+            if (std.time.milliTimestamp() - last_progress_ms > INTERNAL_TICK_TIMEOUT_MS) {
                 return RuntimeServerError.RuntimeTickTimeout;
             }
 
             const tick_opt = try self.runtime.tickNext();
             if (tick_opt == null) break;
+            last_progress_ms = std.time.milliTimestamp();
 
             var tick = tick_opt.?;
             defer tick.deinit(self.allocator);
@@ -2559,7 +2560,7 @@ pub const RuntimeServer = struct {
                             try self.appendDebugFrame(&debug_frames, job.request_id, "provider.loop_exit", payload);
                         }
                         deinitOwnedAssistantMessage(self.allocator, &assistant);
-                        return self.finalizeProviderCompletion(&debug_frames, "", true, false);
+                        return RuntimeServerError.ProviderToolLoopExceeded;
                     }
                     total_calls += structured_tool_calls.len;
                     try self.appendAssistantStructuredToolCallMessage(brain_name, assistant.text, structured_tool_calls);
@@ -2620,24 +2621,27 @@ pub const RuntimeServer = struct {
                 if (implicit_wait_fallback and total_calls == 0 and !pending_tool_failure_followup) {
                     const fallback_text = std.mem.trim(u8, assistant.text, " \t\r\n");
                     if (fallback_text.len > 0) {
-                        if (isImplicitActionIntentText(fallback_text)) {
+                        if (isImplicitActionIntentText(fallback_text) or isLowSignalFollowupText(fallback_text)) {
                             followup_rounds += 1;
                             if (job.emit_debug) {
                                 const escaped_reason = try protocol.jsonEscape(self.allocator, directive.reason);
                                 defer self.allocator.free(escaped_reason);
+                                const followup_reason = if (isLowSignalFollowupText(fallback_text))
+                                    "pre_tool_implicit_wait_low_signal"
+                                else
+                                    "pre_tool_implicit_wait_action_intent";
                                 const payload = try std.fmt.allocPrint(
                                     self.allocator,
-                                    "{{\"round\":{d},\"reason\":\"pre_tool_implicit_wait_action_intent\",\"directive_reason\":\"{s}\",\"followup_rounds\":{d},\"total_calls\":{d}}}",
-                                    .{ round, escaped_reason, followup_rounds, total_calls },
+                                    "{{\"round\":{d},\"reason\":\"{s}\",\"directive_reason\":\"{s}\",\"followup_rounds\":{d},\"total_calls\":{d}}}",
+                                    .{ round, followup_reason, escaped_reason, followup_rounds, total_calls },
                                 );
                                 defer self.allocator.free(payload);
                                 try self.appendDebugFrame(&debug_frames, job.request_id, "provider.followup", payload);
                             }
 
                             if (followup_rounds > MAX_PROVIDER_FOLLOWUP_ROUNDS) {
-                                const completion = try self.finalizeProviderCompletion(&debug_frames, fallback_text, false, false);
                                 deinitOwnedAssistantMessage(self.allocator, &assistant);
-                                return completion;
+                                return RuntimeServerError.ProviderToolLoopExceeded;
                             }
 
                             followup_requested = true;
@@ -2752,6 +2756,28 @@ pub const RuntimeServer = struct {
 
                 if (directive.action == .task_complete) {
                     const completion_text = directive.message orelse assistant.text;
+                    const completion_trimmed = std.mem.trim(u8, completion_text, " \t\r\n");
+                    if (total_calls == 0 and !pending_tool_failure_followup and isLowSignalFollowupText(completion_trimmed)) {
+                        followup_rounds += 1;
+                        if (job.emit_debug) {
+                            const escaped_reason = try protocol.jsonEscape(self.allocator, directive.reason);
+                            defer self.allocator.free(escaped_reason);
+                            const payload = try std.fmt.allocPrint(
+                                self.allocator,
+                                "{{\"round\":{d},\"reason\":\"pre_tool_low_signal_task_complete\",\"directive_reason\":\"{s}\",\"followup_rounds\":{d}}}",
+                                .{ round, escaped_reason, followup_rounds },
+                            );
+                            defer self.allocator.free(payload);
+                            try self.appendDebugFrame(&debug_frames, job.request_id, "provider.followup", payload);
+                        }
+                        if (followup_rounds > MAX_PROVIDER_FOLLOWUP_ROUNDS) {
+                            deinitOwnedAssistantMessage(self.allocator, &assistant);
+                            return RuntimeServerError.ProviderToolLoopExceeded;
+                        }
+                        followup_requested = true;
+                        deinitOwnedAssistantMessage(self.allocator, &assistant);
+                        continue;
+                    }
                     const completion = try self.finalizeProviderCompletion(&debug_frames, completion_text, false, true);
                     pending_tool_failure_followup = false;
                     deinitOwnedAssistantMessage(self.allocator, &assistant);
@@ -2759,19 +2785,63 @@ pub const RuntimeServer = struct {
                 }
 
                 if (directive.action == .wait_for_user) {
-                    const wait_text = if (directive.message) |message|
+                    const wait_text_raw = if (directive.message) |message|
                         message
                     else
                         std.mem.trim(u8, assistant.text, " \t\r\n");
+                    const wait_text = std.mem.trim(u8, wait_text_raw, " \t\r\n");
+                    if (wait_text.len == 0 or
+                        (total_calls == 0 and !pending_tool_failure_followup and isLowSignalFollowupText(wait_text)))
+                    {
+                        followup_rounds += 1;
+                        if (job.emit_debug) {
+                            const escaped_reason = try protocol.jsonEscape(self.allocator, directive.reason);
+                            defer self.allocator.free(escaped_reason);
+                            const followup_reason = if (wait_text.len == 0)
+                                "empty_wait_for"
+                            else
+                                "pre_tool_low_signal_wait_for";
+                            const payload = try std.fmt.allocPrint(
+                                self.allocator,
+                                "{{\"round\":{d},\"reason\":\"{s}\",\"directive_reason\":\"{s}\",\"followup_rounds\":{d},\"total_calls\":{d}}}",
+                                .{ round, followup_reason, escaped_reason, followup_rounds, total_calls },
+                            );
+                            defer self.allocator.free(payload);
+                            try self.appendDebugFrame(&debug_frames, job.request_id, "provider.followup", payload);
+                        }
+                        if (followup_rounds > MAX_PROVIDER_FOLLOWUP_ROUNDS) {
+                            deinitOwnedAssistantMessage(self.allocator, &assistant);
+                            return RuntimeServerError.ProviderToolLoopExceeded;
+                        }
+                        followup_requested = true;
+                        deinitOwnedAssistantMessage(self.allocator, &assistant);
+                        continue;
+                    }
                     const completion = try self.finalizeProviderCompletion(&debug_frames, wait_text, true, false);
                     pending_tool_failure_followup = false;
                     deinitOwnedAssistantMessage(self.allocator, &assistant);
                     return completion;
                 }
 
-                pending_tool_failure_followup = false;
+                followup_rounds += 1;
+                if (job.emit_debug) {
+                    const escaped_reason = try protocol.jsonEscape(self.allocator, directive.reason);
+                    defer self.allocator.free(escaped_reason);
+                    const payload = try std.fmt.allocPrint(
+                        self.allocator,
+                        "{{\"round\":{d},\"reason\":\"unknown_directive_fallback\",\"directive_reason\":\"{s}\",\"followup_rounds\":{d},\"total_calls\":{d}}}",
+                        .{ round, escaped_reason, followup_rounds, total_calls },
+                    );
+                    defer self.allocator.free(payload);
+                    try self.appendDebugFrame(&debug_frames, job.request_id, "provider.followup", payload);
+                }
+                if (followup_rounds > MAX_PROVIDER_FOLLOWUP_ROUNDS) {
+                    deinitOwnedAssistantMessage(self.allocator, &assistant);
+                    return RuntimeServerError.ProviderToolLoopExceeded;
+                }
+                followup_requested = true;
                 deinitOwnedAssistantMessage(self.allocator, &assistant);
-                return self.finalizeProviderCompletion(&debug_frames, "", true, false);
+                continue;
             }
 
             if (tool_calls.len > 1) {
@@ -2814,7 +2884,7 @@ pub const RuntimeServer = struct {
                     try self.appendDebugFrame(&debug_frames, job.request_id, "provider.loop_exit", payload);
                 }
                 deinitOwnedAssistantMessage(self.allocator, &assistant);
-                return self.finalizeProviderCompletion(&debug_frames, "", true, false);
+                return RuntimeServerError.ProviderToolLoopExceeded;
             }
             total_calls += tool_calls.len;
 
@@ -2873,7 +2943,7 @@ pub const RuntimeServer = struct {
             defer self.allocator.free(payload);
             try self.appendDebugFrame(&debug_frames, job.request_id, "provider.loop_exit", payload);
         }
-        return self.finalizeProviderCompletion(&debug_frames, "", true, false);
+        return RuntimeServerError.ProviderToolLoopExceeded;
     }
 
     fn buildProviderInstructions(
@@ -4263,6 +4333,7 @@ var mockJsonToolEnvelopeErrorWaitCallCount: usize = 0;
 var mockJsonToolEnvelopeMultiToolBatchCount: usize = 0;
 var mockJsonToolEnvelopeMultiToolBatchPlainTextCount: usize = 0;
 var mockPlainTextIntentFollowupCallCount: usize = 0;
+var mockLowSignalFollowupCallCount: usize = 0;
 var mockJsonMessageOnlyFollowupCallCount: usize = 0;
 var mockRateLimitCallCount: usize = 0;
 var mockAuthFailureCallCount: usize = 0;
@@ -4538,6 +4609,67 @@ fn mockProviderStreamByModelWithPlainTextIntentThenJsonTool(
     try std.testing.expect(std.mem.indexOf(u8, context.messages[0].content, "\"tool_result\"") != null);
 
     const output = try buildTaskCompleteOutput(allocator, "plain-text intent recovered complete");
+    try events.append(.{ .done = .{
+        .text = output,
+        .thinking = try allocator.dupe(u8, ""),
+        .tool_calls = &.{},
+        .api = model.api,
+        .provider = model.provider,
+        .model = model.id,
+        .usage = .{},
+        .stop_reason = .stop,
+        .error_message = null,
+    } });
+}
+
+fn mockProviderStreamByModelWithLowSignalThenJsonTool(
+    allocator: std.mem.Allocator,
+    _: *std.http.Client,
+    _: *ziggy_piai.api_registry.ApiRegistry,
+    model: ziggy_piai.types.Model,
+    context: ziggy_piai.types.Context,
+    _: ziggy_piai.types.StreamOptions,
+    events: *std.array_list.Managed(ziggy_piai.types.AssistantMessageEvent),
+) anyerror!void {
+    if (mockLowSignalFollowupCallCount == 0) {
+        mockLowSignalFollowupCallCount += 1;
+        try events.append(.{ .done = .{
+            .text = try allocator.dupe(u8, "ok"),
+            .thinking = try allocator.dupe(u8, ""),
+            .tool_calls = &.{},
+            .api = model.api,
+            .provider = model.provider,
+            .model = model.id,
+            .usage = .{},
+            .stop_reason = .stop,
+            .error_message = null,
+        } });
+        return;
+    }
+
+    if (mockLowSignalFollowupCallCount == 1) {
+        mockLowSignalFollowupCallCount += 1;
+        const envelope =
+            \\{"action":"act","tool_calls":[{"name":"file_list","arguments":{"path":"src"}}]}
+        ;
+        try events.append(.{ .done = .{
+            .text = try allocator.dupe(u8, envelope),
+            .thinking = try allocator.dupe(u8, ""),
+            .tool_calls = &.{},
+            .api = model.api,
+            .provider = model.provider,
+            .model = model.id,
+            .usage = .{},
+            .stop_reason = .stop,
+            .error_message = null,
+        } });
+        return;
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), context.messages.len);
+    try std.testing.expect(std.mem.indexOf(u8, context.messages[0].content, "\"tool_result\"") != null);
+
+    const output = try buildTaskCompleteOutput(allocator, "low-signal fallback recovered complete");
     try events.append(.{ .done = .{
         .text = output,
         .thinking = try allocator.dupe(u8, ""),
@@ -6454,6 +6586,44 @@ test "runtime_server: pre-tool plain-text intent fallback triggers followup roun
     try std.testing.expectEqual(@as(usize, 3), mockPlainTextIntentFollowupCallCount);
 }
 
+test "runtime_server: pre-tool low-signal fallback triggers followup round" {
+    const allocator = std.testing.allocator;
+    const original_stream_fn = streamByModelFn;
+    defer streamByModelFn = original_stream_fn;
+    streamByModelFn = mockProviderStreamByModelWithLowSignalThenJsonTool;
+    mockLowSignalFollowupCallCount = 0;
+
+    const server = try RuntimeServer.createWithProvider(allocator, "agent-test", .{
+        .ltm_directory = "",
+        .ltm_filename = "",
+    }, .{
+        .name = "openai",
+        .model = "gpt-4o-mini",
+        .api_key = "test-key",
+    });
+    defer server.destroy();
+
+    const responses = try server.handleMessageFrames("{\"id\":\"req-provider-low-signal-followup\",\"type\":\"session.send\",\"content\":\"run tools\"}");
+    defer deinitResponseFrames(allocator, responses);
+
+    var saw_final = false;
+    var saw_generic_ok = false;
+    for (responses) |payload| {
+        if (std.mem.indexOf(u8, payload, "low-signal fallback recovered complete") != null) saw_final = true;
+        if (std.mem.indexOf(u8, payload, "\"content\":\"ok\"") != null) saw_generic_ok = true;
+    }
+
+    const snapshot = try server.runtime.active_memory.snapshotActive(allocator, "primary");
+    defer memory.deinitItems(allocator, snapshot);
+    const snapshot_json = try memory.toActiveMemoryJson(allocator, "primary", snapshot);
+    defer allocator.free(snapshot_json);
+
+    try std.testing.expect(saw_final);
+    try std.testing.expect(!saw_generic_ok);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot_json, "\"kind\":\"tool_result\"") != null);
+    try std.testing.expectEqual(@as(usize, 3), mockLowSignalFollowupCallCount);
+}
+
 test "runtime_server: message-only JSON response triggers followup instead of task complete" {
     const allocator = std.testing.allocator;
     const original_stream_fn = streamByModelFn;
@@ -6604,8 +6774,8 @@ test "runtime_server: provider tool-call cap does not persist unexecuted tool-ca
     const response = try server.handleMessage("{\"id\":\"req-provider-too-many-tools\",\"type\":\"session.send\",\"content\":\"use many tools\"}");
     defer allocator.free(response);
 
-    try std.testing.expect(std.mem.indexOf(u8, response, "\"type\":\"session.receive\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, response, "\"content\":\"ok\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "\"type\":\"error\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "\"code\":\"execution_failed\"") != null);
 
     const snapshot = try server.runtime.active_memory.snapshotActive(allocator, "primary");
     defer memory.deinitItems(allocator, snapshot);
