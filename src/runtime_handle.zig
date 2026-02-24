@@ -14,6 +14,7 @@ pub const RuntimeHandle = struct {
     kind: Kind,
     local: ?*runtime_server_mod.RuntimeServer = null,
     sandbox: ?*sandbox_runtime.SandboxRuntime = null,
+    ref_count: std.atomic.Value(u32) = std.atomic.Value(u32).init(1),
 
     pub fn createLocal(
         allocator: std.mem.Allocator,
@@ -25,6 +26,7 @@ pub const RuntimeHandle = struct {
             .kind = .local,
             .local = runtime,
             .sandbox = null,
+            .ref_count = std.atomic.Value(u32).init(1),
         };
         return handle;
     }
@@ -39,6 +41,7 @@ pub const RuntimeHandle = struct {
             .kind = .sandbox,
             .local = null,
             .sandbox = runtime,
+            .ref_count = std.atomic.Value(u32).init(1),
         };
         return handle;
     }
@@ -54,11 +57,12 @@ pub const RuntimeHandle = struct {
             .kind = .local_sandbox,
             .local = runtime,
             .sandbox = sandbox,
+            .ref_count = std.atomic.Value(u32).init(1),
         };
         return handle;
     }
 
-    pub fn destroy(self: *RuntimeHandle) void {
+    fn destroyOwned(self: *RuntimeHandle) void {
         switch (self.kind) {
             .local => {
                 if (self.local) |runtime| runtime.destroy();
@@ -72,6 +76,21 @@ pub const RuntimeHandle = struct {
             },
         }
         self.allocator.destroy(self);
+    }
+
+    pub fn retain(self: *RuntimeHandle) void {
+        const previous = self.ref_count.fetchAdd(1, .monotonic);
+        std.debug.assert(previous > 0);
+    }
+
+    pub fn release(self: *RuntimeHandle) void {
+        const previous = self.ref_count.fetchSub(1, .acq_rel);
+        std.debug.assert(previous > 0);
+        if (previous == 1) self.destroyOwned();
+    }
+
+    pub fn destroy(self: *RuntimeHandle) void {
+        self.release();
     }
 
     pub fn handleMessageFramesWithDebug(

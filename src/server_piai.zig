@@ -1185,7 +1185,6 @@ const AgentRuntimeRegistry = struct {
     workspace_url: ?[]u8 = null,
     mutex: std.Thread.Mutex = .{},
     by_agent: std.StringHashMapUnmanaged(AgentRuntimeEntry) = .{},
-    retired_entries: std.ArrayListUnmanaged(AgentRuntimeEntry) = .{},
     topology_subscribers_mutex: std.Thread.Mutex = .{},
     topology_subscribers: std.ArrayListUnmanaged(ControlTopologySubscriber) = .{},
     next_topology_subscriber_id: u64 = 1,
@@ -1283,8 +1282,6 @@ const AgentRuntimeRegistry = struct {
             runtime_entry.deinit(self.allocator);
         }
         self.by_agent.deinit(self.allocator);
-        for (self.retired_entries.items) |*runtime_entry| runtime_entry.deinit(self.allocator);
-        self.retired_entries.deinit(self.allocator);
         self.clearTopologySubscribers();
         if (self.local_fs_node) |local_fs_node| {
             local_fs_node.deinit(&self.control_plane);
@@ -1399,11 +1396,15 @@ const AgentRuntimeRegistry = struct {
 
         if (self.by_agent.getPtr(agent_id)) |existing| {
             if (std.mem.eql(u8, existing.project_id, entry.project_id)) {
+                var cleanup = entry;
+                cleanup.deinit(self.allocator);
+                entry_installed = true;
                 return existing.runtime;
             }
-            try self.retired_entries.append(self.allocator, existing.*);
+            var replaced = existing.*;
             existing.* = entry;
             entry_installed = true;
+            replaced.deinit(self.allocator);
             return existing.runtime;
         }
 

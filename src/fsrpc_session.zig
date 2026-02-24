@@ -70,13 +70,17 @@ pub const Session = struct {
         job_index: *chat_job_index.ChatJobIndex,
         agent_id: []const u8,
     ) !Session {
+        const owned_agent = try allocator.dupe(u8, agent_id);
+        errdefer allocator.free(owned_agent);
+        runtime_handle.retain();
+        errdefer runtime_handle.release();
+
         var self = Session{
             .allocator = allocator,
             .runtime_handle = runtime_handle,
             .job_index = job_index,
-            .agent_id = try allocator.dupe(u8, agent_id),
+            .agent_id = owned_agent,
         };
-        errdefer allocator.free(self.agent_id);
         try self.seedNamespace(agent_id);
         return self;
     }
@@ -91,6 +95,7 @@ pub const Session = struct {
         self.nodes.deinit(self.allocator);
         self.fids.deinit(self.allocator);
         self.allocator.free(self.agent_id);
+        self.runtime_handle.release();
         self.* = undefined;
     }
 
