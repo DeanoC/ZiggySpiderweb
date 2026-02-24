@@ -46,6 +46,88 @@ log_success() {
     echo -e "${GREEN}[OK]${NC} $1"
 }
 
+print_auth_tokens_summary() {
+    local config_cmd="${INSTALL_DIR}/spiderweb-config"
+    local has_auth_cli=false
+    if [[ ! -x "$config_cmd" ]]; then
+        config_cmd="$(command -v spiderweb-config || true)"
+    fi
+
+    local -a candidates=()
+    candidates+=("${REPO_DIR}/.spiderweb-ltm/auth_tokens.json")
+
+    local config_file="${HOME}/.config/spiderweb/config.json"
+    if [[ -f "$config_file" ]]; then
+        local ltm_dir
+        ltm_dir="$(jq -r '.runtime.ltm_directory // empty' "$config_file" 2>/dev/null || true)"
+        if [[ -n "$ltm_dir" ]]; then
+            if [[ "$ltm_dir" == /* ]]; then
+                candidates+=("${ltm_dir}/auth_tokens.json")
+            else
+                candidates+=("${REPO_DIR}/${ltm_dir#./}/auth_tokens.json")
+            fi
+        fi
+    fi
+
+    if [[ -n "$config_cmd" ]]; then
+        local raw_auth_path
+        raw_auth_path=""
+        if raw_auth_path="$("$config_cmd" auth path 2>/dev/null | tr -d '\r' | tail -n1)"; then
+            has_auth_cli=true
+        fi
+        if [[ -n "$raw_auth_path" ]]; then
+            if [[ "$raw_auth_path" == /* ]]; then
+                candidates+=("$raw_auth_path")
+            else
+                candidates+=("${REPO_DIR}/${raw_auth_path#./}")
+            fi
+        fi
+    fi
+
+    local token_file=""
+    for _ in $(seq 1 100); do
+        for candidate in "${candidates[@]}"; do
+            if [[ -f "$candidate" ]]; then
+                token_file="$candidate"
+                break 2
+            fi
+        done
+        sleep 0.2
+    done
+
+    if [[ -n "$token_file" ]]; then
+        local admin_token
+        local user_token
+        admin_token="$(jq -r '.admin_token // empty' "$token_file" 2>/dev/null || true)"
+        user_token="$(jq -r '.user_token // empty' "$token_file" 2>/dev/null || true)"
+        if [[ -n "$admin_token" && -n "$user_token" ]]; then
+            echo ""
+            log_success "Auth tokens (save these now):"
+            echo "  admin: $admin_token"
+            echo "  user:  $user_token"
+            echo "  path:  $token_file"
+            return
+        fi
+    fi
+
+    echo ""
+    log_warn "Could not locate generated auth tokens."
+    echo "Checked:"
+    for candidate in "${candidates[@]}"; do
+        echo "  - $candidate"
+    done
+    if [[ -n "$config_cmd" ]] && [[ "$has_auth_cli" == "true" ]]; then
+        echo "If needed, generate new tokens with:"
+        echo "  $config_cmd auth reset --yes"
+        echo "Then restart spiderweb so new tokens are active."
+    elif [[ -n "$config_cmd" ]]; then
+        echo "Token reset command is unavailable in this spiderweb-config build."
+        echo "Update spiderweb and rerun install.sh to get auth token management commands."
+    else
+        echo "Could not locate spiderweb-config in PATH or ${INSTALL_DIR}."
+    fi
+}
+
 # Detect if we're being piped
 if [[ ! -t 0 ]]; then
     echo ""
@@ -89,6 +171,7 @@ fi
 # Clone and build
 REPO_DIR="${HOME}/.local/share/ziggy-spiderweb"
 INSTALL_DIR="${HOME}/.local/bin"
+export PATH="${INSTALL_DIR}:${PATH}"
 
 # Check if spiderweb is running and offer to stop it first
 SPIDERWEB_RUNNING=false
@@ -189,9 +272,10 @@ if [[ "$INSTALL_ZSS" == "true" ]]; then
     cp zig-out/bin/zss-tui "$INSTALL_DIR/" 2>/dev/null || true
     
     log_success "ZiggyStarSpider installed!"
-    
-    log_success "ZiggyStarSpider installed!"
 fi
+
+# Ensure remaining install steps run from the spiderweb repo.
+cd "$REPO_DIR"
 
 # Ask about systemd service
 INSTALL_SYSTEMD=false
@@ -300,7 +384,7 @@ if [[ -n "${SPIDERWEB_NON_INTERACTIVE:-}" ]]; then
 else
     # Clear any leftover input before running first-run
     while IFS= read -r -t 0.1 dummy 2>/dev/null; do : ; done
-    spiderweb-config first-run
+    "${INSTALL_DIR}/spiderweb-config" first-run
 fi
 
 # Only configure bind address in interactive mode (when we asked the user)
@@ -309,12 +393,12 @@ if [[ -t 0 ]]; then
     
     # Get current port from config - spiderweb-config outputs "Bind: <host>:<port>"
     # Extract port from format like "Bind: 127.0.0.1:18790"
-    DETECTED_PORT=$(spiderweb-config config 2>/dev/null | grep -oP 'Bind: [^:]+:\K\d+' || echo "18790")
+    DETECTED_PORT=$("${INSTALL_DIR}/spiderweb-config" config 2>/dev/null | grep -oP 'Bind: [^:]+:\K\d+' || echo "18790")
     if [[ -n "$DETECTED_PORT" ]]; then
         CURRENT_PORT="$DETECTED_PORT"
     fi
     
-    spiderweb-config config set-server --bind "$BIND_ADDRESS" --port "$CURRENT_PORT"
+    "${INSTALL_DIR}/spiderweb-config" config set-server --bind "$BIND_ADDRESS" --port "$CURRENT_PORT"
     
     # Restart service if running to apply new bind address
     if [[ "$INSTALL_SYSTEMD" == "true" ]] || [[ "$SYSTEMD_EXISTS" == "true" ]]; then
@@ -333,7 +417,7 @@ if [[ -t 0 ]]; then
             pkill -x spiderweb 2>/dev/null || true
             sleep 1
             # spiderweb-config first-run will have started it, or user can start manually
-            spiderweb &
+            "${INSTALL_DIR}/spiderweb" &
         fi
     fi
 fi
@@ -351,6 +435,15 @@ if [[ "$INSTALL_ZSS" == "true" ]]; then
 fi
 echo ""
 
+ACTIVE_CONFIG_CMD="$(command -v spiderweb-config || true)"
+if [[ -n "$ACTIVE_CONFIG_CMD" ]] && [[ "$ACTIVE_CONFIG_CMD" != "${INSTALL_DIR}/spiderweb-config" ]]; then
+    echo ""
+    log_warn "Another spiderweb-config is earlier in PATH: $ACTIVE_CONFIG_CMD"
+    echo "Use the latest build at:"
+    echo "  ${INSTALL_DIR}/spiderweb-config"
+    echo "Then update PATH to prefer ${INSTALL_DIR} and run: hash -r"
+fi
+
 if [[ "$INSTALL_SYSTEMD" == "true" ]]; then
     echo "Systemd service installed and started ($SYSTEMD_SCOPE scope)"
 elif [[ "$SYSTEMD_EXISTS" == "true" ]]; then
@@ -359,6 +452,8 @@ else
     echo "To install systemd service later:"
     echo "  spiderweb-config config install-service"
 fi
+
+print_auth_tokens_summary
 
 echo ""
 if [[ "$INSTALL_ZSS" == "true" ]]; then

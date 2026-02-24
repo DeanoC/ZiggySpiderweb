@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const Config = @import("config.zig");
 const connection_dispatcher = @import("connection_dispatcher.zig");
 const memory = @import("ziggy-memory-store").memory;
@@ -818,6 +819,262 @@ fn localFsHeartbeatThreadMain(local_node: *LocalFsNode, control_plane: *fs_contr
     }
 }
 
+const auth_tokens_filename = "auth_tokens.json";
+const user_default_agent_id = "user";
+const user_isolated_agent_id = "user-isolated";
+
+const ConnectionRole = enum {
+    admin,
+    user,
+};
+
+fn connectionRoleName(role: ConnectionRole) []const u8 {
+    return switch (role) {
+        .admin => "admin",
+        .user => "user",
+    };
+}
+
+fn initialAgentIdForRole(role: ConnectionRole, primary_agent_id: []const u8) []const u8 {
+    return switch (role) {
+        .admin => primary_agent_id,
+        .user => if (std.mem.eql(u8, primary_agent_id, user_default_agent_id))
+            user_isolated_agent_id
+        else
+            user_default_agent_id,
+    };
+}
+
+const ConnectionPrincipal = struct {
+    role: ConnectionRole,
+    token_id: []const u8,
+};
+
+const SessionBinding = struct {
+    agent_id: []u8,
+    project_id: ?[]u8 = null,
+    project_token: ?[]u8 = null,
+
+    fn deinit(self: *SessionBinding, allocator: std.mem.Allocator) void {
+        allocator.free(self.agent_id);
+        if (self.project_id) |value| allocator.free(value);
+        if (self.project_token) |value| allocator.free(value);
+        self.* = undefined;
+    }
+};
+
+const AuthTokenStore = struct {
+    const Persisted = struct {
+        schema: u32 = 1,
+        admin_token: []const u8,
+        user_token: []const u8,
+        updated_at_ms: i64,
+    };
+
+    allocator: std.mem.Allocator,
+    path: ?[]u8 = null,
+    admin_token: []u8,
+    user_token: []u8,
+    mutex: std.Thread.Mutex = .{},
+
+    fn init(allocator: std.mem.Allocator, runtime_config: Config.RuntimeConfig) AuthTokenStore {
+        var store = AuthTokenStore{
+            .allocator = allocator,
+            .admin_token = allocator.dupe(u8, "") catch @panic("oom"),
+            .user_token = allocator.dupe(u8, "") catch @panic("oom"),
+        };
+        store.loadOrGenerate(runtime_config);
+        return store;
+    }
+
+    fn deinit(self: *AuthTokenStore) void {
+        if (self.path) |value| self.allocator.free(value);
+        self.allocator.free(self.admin_token);
+        self.allocator.free(self.user_token);
+        self.* = undefined;
+    }
+
+    fn authenticate(self: *const AuthTokenStore, authorization_header: ?[]const u8) !ConnectionPrincipal {
+        const raw = authorization_header orelse return error.AuthMissing;
+        const token = parseBearerToken(raw) orelse return error.AuthMissing;
+        const mutex = @constCast(&self.mutex);
+        mutex.lock();
+        defer mutex.unlock();
+        if (secureTokenEql(self.admin_token, token)) return .{ .role = .admin, .token_id = "admin" };
+        if (secureTokenEql(self.user_token, token)) return .{ .role = .user, .token_id = "user" };
+        return error.AuthFailed;
+    }
+
+    fn rotateRoleToken(self: *AuthTokenStore, role: ConnectionRole) ![]u8 {
+        const next = try makeOpaqueToken(self.allocator, switch (role) {
+            .admin => "sw-admin",
+            .user => "sw-user",
+        });
+        errdefer self.allocator.free(next);
+        const replacement = try self.allocator.dupe(u8, next);
+        errdefer self.allocator.free(replacement);
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const next_admin = if (role == .admin) replacement else self.admin_token;
+        const next_user = if (role == .user) replacement else self.user_token;
+        try self.persistTokensLocked(next_admin, next_user);
+
+        switch (role) {
+            .admin => {
+                const previous = self.admin_token;
+                self.admin_token = replacement;
+                self.allocator.free(previous);
+            },
+            .user => {
+                const previous = self.user_token;
+                self.user_token = replacement;
+                self.allocator.free(previous);
+            },
+        }
+        return next;
+    }
+
+    fn statusJson(self: *const AuthTokenStore) ![]u8 {
+        const mutex = @constCast(&self.mutex);
+        mutex.lock();
+        defer mutex.unlock();
+        const escaped_admin = try unified.jsonEscape(self.allocator, self.admin_token);
+        defer self.allocator.free(escaped_admin);
+        const escaped_user = try unified.jsonEscape(self.allocator, self.user_token);
+        defer self.allocator.free(escaped_user);
+        const path_json = if (self.path) |value| blk: {
+            const escaped_path = try unified.jsonEscape(self.allocator, value);
+            defer self.allocator.free(escaped_path);
+            break :blk try std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped_path});
+        } else try self.allocator.dupe(u8, "null");
+        defer self.allocator.free(path_json);
+        return std.fmt.allocPrint(
+            self.allocator,
+            "{{\"admin_token\":\"{s}\",\"user_token\":\"{s}\",\"path\":{s}}}",
+            .{
+                escaped_admin,
+                escaped_user,
+                path_json,
+            },
+        );
+    }
+
+    fn loadOrGenerate(self: *AuthTokenStore, runtime_config: Config.RuntimeConfig) void {
+        const base_dir = std.mem.trim(u8, runtime_config.ltm_directory, " \t\r\n");
+        const storage_dir = if (base_dir.len == 0) "." else base_dir;
+        ensureDirectoryExists(storage_dir) catch {};
+        self.path = std.fs.path.join(self.allocator, &.{ storage_dir, auth_tokens_filename }) catch null;
+
+        if (self.path) |path| {
+            const loaded = self.loadFromPath(path) catch false;
+            if (loaded) return;
+        }
+
+        const generated_admin = makeOpaqueToken(self.allocator, "sw-admin") catch return;
+        defer self.allocator.free(generated_admin);
+        const generated_user = makeOpaqueToken(self.allocator, "sw-user") catch return;
+        defer self.allocator.free(generated_user);
+        const next_admin = self.allocator.dupe(u8, generated_admin) catch return;
+        errdefer self.allocator.free(next_admin);
+        const next_user = self.allocator.dupe(u8, generated_user) catch return;
+        errdefer self.allocator.free(next_user);
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const previous_admin = self.admin_token;
+        const previous_user = self.user_token;
+        self.admin_token = next_admin;
+        self.user_token = next_user;
+        self.allocator.free(previous_admin);
+        self.allocator.free(previous_user);
+        self.persistTokensLocked(self.admin_token, self.user_token) catch |err| {
+            std.log.warn("failed to persist generated auth tokens: {s}", .{@errorName(err)});
+        };
+
+        std.log.warn("Generated Spiderweb auth tokens (save these now):", .{});
+        std.log.warn("  admin: {s}", .{self.admin_token});
+        std.log.warn("  user:  {s}", .{self.user_token});
+    }
+
+    fn loadFromPath(self: *AuthTokenStore, path: []const u8) !bool {
+        const raw = std.fs.cwd().readFileAlloc(self.allocator, path, 64 * 1024) catch |err| switch (err) {
+            error.FileNotFound => return false,
+            else => return err,
+        };
+        defer self.allocator.free(raw);
+
+        const parsed = try std.json.parseFromSlice(Persisted, self.allocator, raw, .{
+            .ignore_unknown_fields = true,
+        });
+        defer parsed.deinit();
+        if (parsed.value.admin_token.len == 0 or parsed.value.user_token.len == 0) return false;
+        const next_admin = try self.allocator.dupe(u8, parsed.value.admin_token);
+        errdefer self.allocator.free(next_admin);
+        const next_user = try self.allocator.dupe(u8, parsed.value.user_token);
+        errdefer self.allocator.free(next_user);
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const previous_admin = self.admin_token;
+        const previous_user = self.user_token;
+        self.admin_token = next_admin;
+        self.user_token = next_user;
+        self.allocator.free(previous_admin);
+        self.allocator.free(previous_user);
+        return true;
+    }
+
+    fn persistTokensLocked(self: *AuthTokenStore, admin_token: []const u8, user_token: []const u8) !void {
+        const path = self.path orelse return error.AuthTokenPathUnavailable;
+        const payload = Persisted{
+            .schema = 1,
+            .admin_token = admin_token,
+            .user_token = user_token,
+            .updated_at_ms = std.time.milliTimestamp(),
+        };
+        const bytes = try std.json.Stringify.valueAlloc(self.allocator, payload, .{
+            .emit_null_optional_fields = false,
+            .whitespace = .indent_2,
+        });
+        defer self.allocator.free(bytes);
+
+        const file = try std.fs.cwd().createFile(path, .{
+            .truncate = true,
+            .mode = 0o600,
+        });
+        defer file.close();
+        if (builtin.os.tag != .windows) {
+            try file.chmod(0o600);
+        }
+        try file.writeAll(bytes);
+    }
+
+    fn parseBearerToken(header_value: []const u8) ?[]const u8 {
+        const trimmed = std.mem.trim(u8, header_value, " \t");
+        if (trimmed.len == 0) return null;
+        if (std.mem.startsWith(u8, trimmed, "Bearer ")) {
+            const token = std.mem.trim(u8, trimmed["Bearer ".len..], " \t");
+            if (token.len == 0) return null;
+            return token;
+        }
+        if (std.mem.startsWith(u8, trimmed, "bearer ")) {
+            const token = std.mem.trim(u8, trimmed["bearer ".len..], " \t");
+            if (token.len == 0) return null;
+            return token;
+        }
+        return trimmed;
+    }
+
+    fn makeOpaqueToken(allocator: std.mem.Allocator, prefix: []const u8) ![]u8 {
+        var random_bytes: [24]u8 = undefined;
+        std.crypto.random.bytes(&random_bytes);
+        var encoded_buf: [std.base64.url_safe_no_pad.Encoder.calcSize(random_bytes.len)]u8 = undefined;
+        const encoded = std.base64.url_safe_no_pad.Encoder.encode(&encoded_buf, &random_bytes);
+        return std.fmt.allocPrint(allocator, "{s}_{s}", .{ prefix, encoded });
+    }
+};
+
 const AgentRuntimeRegistry = struct {
     allocator: std.mem.Allocator,
     runtime_config: Config.RuntimeConfig,
@@ -827,6 +1084,7 @@ const AgentRuntimeRegistry = struct {
     debug_stream_sink: DebugStreamFileSink,
     control_plane: fs_control_plane.ControlPlane,
     job_index: chat_job_index.ChatJobIndex,
+    auth_tokens: AuthTokenStore,
     control_operator_token: ?[]u8 = null,
     control_project_scope_token: ?[]u8 = null,
     control_node_scope_token: ?[]u8 = null,
@@ -906,6 +1164,7 @@ const AgentRuntimeRegistry = struct {
                 allocator,
                 runtime_config.ltm_directory,
             ),
+            .auth_tokens = AuthTokenStore.init(allocator, runtime_config),
             .control_operator_token = operator_token,
             .control_project_scope_token = project_scope_token,
             .control_node_scope_token = node_scope_token,
@@ -954,6 +1213,19 @@ const AgentRuntimeRegistry = struct {
         self.job_index.deinit();
         self.control_plane.deinit();
         self.debug_stream_sink.deinit();
+        self.auth_tokens.deinit();
+    }
+
+    fn authenticateConnection(self: *AgentRuntimeRegistry, authorization_header: ?[]const u8) !ConnectionPrincipal {
+        return self.auth_tokens.authenticate(authorization_header);
+    }
+
+    fn authStatusJson(self: *AgentRuntimeRegistry) ![]u8 {
+        return self.auth_tokens.statusJson();
+    }
+
+    fn rotateAuthToken(self: *AgentRuntimeRegistry, role: ConnectionRole) ![]u8 {
+        return self.auth_tokens.rotateRoleToken(role);
     }
 
     fn startReconcileWorker(self: *AgentRuntimeRegistry) !void {
@@ -1033,10 +1305,10 @@ const AgentRuntimeRegistry = struct {
         self.debug_stream_sink.append(agent_id, payload);
     }
 
-    fn appendAuditRecord(
+    fn appendAuditRecordName(
         self: *AgentRuntimeRegistry,
         agent_id: []const u8,
-        control_type: unified.ControlType,
+        control_type_name: []const u8,
         scope: ControlMutationScope,
         correlation_id: ?[]const u8,
         succeeded: bool,
@@ -1054,7 +1326,7 @@ const AgentRuntimeRegistry = struct {
             .id = self.next_audit_record_id,
             .timestamp_ms = std.time.milliTimestamp(),
             .agent_id = self.allocator.dupe(u8, agent_id) catch return,
-            .control_type = self.allocator.dupe(u8, unified.controlTypeName(control_type)) catch return,
+            .control_type = self.allocator.dupe(u8, control_type_name) catch return,
             .scope = scope,
             .correlation_id = if (correlation_id) |value| self.allocator.dupe(u8, value) catch return else null,
             .result = self.allocator.dupe(u8, if (succeeded) "ok" else "error") catch return,
@@ -1067,6 +1339,101 @@ const AgentRuntimeRegistry = struct {
         };
         self.next_audit_record_id +%= 1;
         if (self.next_audit_record_id == 0) self.next_audit_record_id = 1;
+    }
+
+    fn appendAuditRecord(
+        self: *AgentRuntimeRegistry,
+        agent_id: []const u8,
+        control_type: unified.ControlType,
+        scope: ControlMutationScope,
+        correlation_id: ?[]const u8,
+        succeeded: bool,
+        error_code: ?[]const u8,
+    ) void {
+        self.appendAuditRecordName(
+            agent_id,
+            unified.controlTypeName(control_type),
+            scope,
+            correlation_id,
+            succeeded,
+            error_code,
+        );
+    }
+
+    fn appendSecurityAuditAndDebug(
+        self: *AgentRuntimeRegistry,
+        agent_id: []const u8,
+        control_type: unified.ControlType,
+        role: ConnectionRole,
+        correlation_id: ?[]const u8,
+        event_name: []const u8,
+        succeeded: bool,
+        error_code: ?[]const u8,
+        message: ?[]const u8,
+    ) void {
+        self.appendAuditRecord(
+            agent_id,
+            control_type,
+            .none,
+            correlation_id,
+            succeeded,
+            error_code,
+        );
+
+        const escaped_event = unified.jsonEscape(self.allocator, event_name) catch return;
+        defer self.allocator.free(escaped_event);
+        const escaped_control_type = unified.jsonEscape(self.allocator, unified.controlTypeName(control_type)) catch return;
+        defer self.allocator.free(escaped_control_type);
+        const escaped_role = unified.jsonEscape(self.allocator, connectionRoleName(role)) catch return;
+        defer self.allocator.free(escaped_role);
+        const escaped_result = unified.jsonEscape(self.allocator, if (succeeded) "ok" else "error") catch return;
+        defer self.allocator.free(escaped_result);
+
+        const correlation_json = if (correlation_id) |value| blk: {
+            const escaped = unified.jsonEscape(self.allocator, value) catch return;
+            defer self.allocator.free(escaped);
+            break :blk std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped}) catch return;
+        } else self.allocator.dupe(u8, "null") catch return;
+        defer self.allocator.free(correlation_json);
+
+        const error_json = if (error_code) |value| blk: {
+            const escaped = unified.jsonEscape(self.allocator, value) catch return;
+            defer self.allocator.free(escaped);
+            break :blk std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped}) catch return;
+        } else self.allocator.dupe(u8, "null") catch return;
+        defer self.allocator.free(error_json);
+
+        const message_json = if (message) |value| blk: {
+            const escaped = unified.jsonEscape(self.allocator, value) catch return;
+            defer self.allocator.free(escaped);
+            break :blk std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped}) catch return;
+        } else self.allocator.dupe(u8, "null") catch return;
+        defer self.allocator.free(message_json);
+
+        const payload_json = std.fmt.allocPrint(
+            self.allocator,
+            "{{\"event\":\"{s}\",\"control_type\":\"{s}\",\"role\":\"{s}\",\"result\":\"{s}\",\"correlation_id\":{s},\"error_code\":{s},\"message\":{s},\"ts_ms\":{d}}}",
+            .{
+                escaped_event,
+                escaped_control_type,
+                escaped_role,
+                escaped_result,
+                correlation_json,
+                error_json,
+                message_json,
+                std.time.milliTimestamp(),
+            },
+        ) catch return;
+        defer self.allocator.free(payload_json);
+
+        const debug_json = protocol.buildDebugEvent(
+            self.allocator,
+            correlation_id orelse "security",
+            "control.security",
+            payload_json,
+        ) catch return;
+        defer self.allocator.free(debug_json);
+        self.maybeLogDebugFrame(agent_id, debug_json);
     }
 
     fn buildAuditTailPayload(self: *AgentRuntimeRegistry, payload_json: ?[]const u8) ![]u8 {
@@ -1457,13 +1824,32 @@ fn handleWebSocketConnection(
         return;
     }
 
-    const agent_id = resolveAgentIdFromConnectionPath(handshake.path, runtime_registry.default_agent_id) orelse {
+    _ = resolveAgentIdFromConnectionPath(handshake.path, runtime_registry.default_agent_id) orelse {
         try sendWebSocketErrorAndClose(allocator, stream, .invalid_envelope, "invalid websocket path");
         return;
     };
-    const runtime_server = runtime_registry.getOrCreate(agent_id) catch |err| switch (err) {
+
+    const principal = runtime_registry.authenticateConnection(handshake.authorization) catch |err| {
+        const reason = switch (err) {
+            error.AuthMissing => "missing authorization token",
+            else => "invalid authorization token",
+        };
+        try sendWebSocketErrorAndClose(allocator, stream, .provider_auth_failed, reason);
+        return;
+    };
+
+    var session_bindings: std.StringHashMapUnmanaged(SessionBinding) = .{};
+    defer deinitSessionBindings(allocator, &session_bindings);
+
+    const default_agent_id = initialAgentIdForRole(principal.role, runtime_registry.default_agent_id);
+    try upsertSessionBinding(allocator, &session_bindings, "main", default_agent_id, null, null);
+
+    var active_session_key = try allocator.dupe(u8, "main");
+    defer allocator.free(active_session_key);
+    const initial_binding = session_bindings.get("main") orelse return error.InvalidState;
+    const runtime_server = runtime_registry.getOrCreate(initial_binding.agent_id) catch |err| switch (err) {
         error.InvalidAgentId => {
-            try sendWebSocketErrorAndClose(allocator, stream, .invalid_envelope, "invalid agent id");
+            try sendWebSocketErrorAndClose(allocator, stream, .invalid_envelope, "invalid initial agent id");
             return;
         },
         error.RuntimeLimitReached => {
@@ -1472,8 +1858,10 @@ fn handleWebSocketConnection(
         },
         else => return err,
     };
-    var fsrpc = try fsrpc_session.Session.init(allocator, runtime_server, &runtime_registry.job_index, agent_id);
+    var fsrpc = try fsrpc_session.Session.init(allocator, runtime_server, &runtime_registry.job_index, initial_binding.agent_id);
     defer fsrpc.deinit();
+    var fsrpc_bound_session_key = try allocator.dupe(u8, "main");
+    defer allocator.free(fsrpc_bound_session_key);
     var debug_stream_enabled = false;
     var control_protocol_negotiated = false;
     var runtime_fsrpc_version_negotiated = false;
@@ -1497,6 +1885,18 @@ fn handleWebSocketConnection(
         switch (frame.opcode) {
             0x1 => {
                 var parsed = unified.parseMessage(allocator, frame.payload) catch |err| {
+                    if (try tryHandleLegacySessionSendFrame(
+                        allocator,
+                        runtime_registry,
+                        stream,
+                        &connection_write_mutex,
+                        frame.payload,
+                        &session_bindings,
+                        active_session_key,
+                        debug_stream_enabled,
+                    )) {
+                        continue;
+                    }
                     const response = try unified.buildControlError(
                         allocator,
                         null,
@@ -1573,10 +1973,15 @@ fn handleWebSocketConnection(
                                 continue;
                             },
                             .connect => {
+                                const active_binding = session_bindings.get(active_session_key) orelse return error.InvalidState;
+                                const escaped_role = switch (principal.role) {
+                                    .admin => "admin",
+                                    .user => "user",
+                                };
                                 const payload = try std.fmt.allocPrint(
                                     allocator,
-                                    "{{\"agent_id\":\"{s}\",\"session\":\"main\",\"protocol\":\"{s}\"}}",
-                                    .{ agent_id, control_protocol_version },
+                                    "{{\"agent_id\":\"{s}\",\"session\":\"{s}\",\"protocol\":\"{s}\",\"role\":\"{s}\"}}",
+                                    .{ active_binding.agent_id, active_session_key, control_protocol_version, escaped_role },
                                 );
                                 defer allocator.free(payload);
                                 const response = try unified.buildControlAck(
@@ -1601,6 +2006,28 @@ fn handleWebSocketConnection(
                                 continue;
                             },
                             .metrics => {
+                                if (principal.role != .admin) {
+                                    const active_binding = session_bindings.get(active_session_key) orelse return error.InvalidState;
+                                    runtime_registry.appendSecurityAuditAndDebug(
+                                        active_binding.agent_id,
+                                        .metrics,
+                                        principal.role,
+                                        parsed.correlation_id orelse parsed.id,
+                                        "metrics_forbidden",
+                                        false,
+                                        "forbidden",
+                                        "operation requires admin token",
+                                    );
+                                    const response = try unified.buildControlError(
+                                        allocator,
+                                        parsed.id,
+                                        "forbidden",
+                                        "operation requires admin token",
+                                    );
+                                    defer allocator.free(response);
+                                    try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                    continue;
+                                }
                                 const payload = try runtime_registry.control_plane.metricsJson();
                                 defer allocator.free(payload);
                                 const response = try unified.buildControlAck(
@@ -1613,12 +2040,543 @@ fn handleWebSocketConnection(
                                 try writeFrameLocked(stream, &connection_write_mutex, response, .text);
                                 continue;
                             },
-                            .session_attach, .session_resume => {
+                            .auth_status => {
+                                if (principal.role != .admin) {
+                                    const active_binding = session_bindings.get(active_session_key) orelse return error.InvalidState;
+                                    runtime_registry.appendSecurityAuditAndDebug(
+                                        active_binding.agent_id,
+                                        .auth_status,
+                                        principal.role,
+                                        parsed.correlation_id orelse parsed.id,
+                                        "auth_status_forbidden",
+                                        false,
+                                        "forbidden",
+                                        "operation requires admin token",
+                                    );
+                                    const response = try unified.buildControlError(
+                                        allocator,
+                                        parsed.id,
+                                        "forbidden",
+                                        "operation requires admin token",
+                                    );
+                                    defer allocator.free(response);
+                                    try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                    continue;
+                                }
+                                const payload = try runtime_registry.authStatusJson();
+                                defer allocator.free(payload);
                                 const response = try unified.buildControlAck(
                                     allocator,
-                                    control_type,
+                                    .auth_status,
                                     parsed.id,
-                                    "{\"session\":\"main\"}",
+                                    payload,
+                                );
+                                defer allocator.free(response);
+                                try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                continue;
+                            },
+                            .auth_rotate => {
+                                if (principal.role != .admin) {
+                                    const active_binding = session_bindings.get(active_session_key) orelse return error.InvalidState;
+                                    runtime_registry.appendSecurityAuditAndDebug(
+                                        active_binding.agent_id,
+                                        .auth_rotate,
+                                        principal.role,
+                                        parsed.correlation_id orelse parsed.id,
+                                        "auth_rotate_forbidden",
+                                        false,
+                                        "forbidden",
+                                        "operation requires admin token",
+                                    );
+                                    const response = try unified.buildControlError(
+                                        allocator,
+                                        parsed.id,
+                                        "forbidden",
+                                        "operation requires admin token",
+                                    );
+                                    defer allocator.free(response);
+                                    try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                    continue;
+                                }
+                                var payload = try parseControlPayloadObject(allocator, parsed.payload_json);
+                                defer payload.deinit();
+                                if (payload.value != .object) {
+                                    const response = try unified.buildControlError(
+                                        allocator,
+                                        parsed.id,
+                                        "invalid_payload",
+                                        "auth_rotate payload must be an object",
+                                    );
+                                    defer allocator.free(response);
+                                    try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                    continue;
+                                }
+                                const role_name = getRequiredStringField(payload.value.object, "role") catch {
+                                    const response = try unified.buildControlError(
+                                        allocator,
+                                        parsed.id,
+                                        "missing_field",
+                                        "role is required",
+                                    );
+                                    defer allocator.free(response);
+                                    try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                    continue;
+                                };
+                                const role: ConnectionRole = if (std.mem.eql(u8, role_name, "admin"))
+                                    .admin
+                                else if (std.mem.eql(u8, role_name, "user"))
+                                    .user
+                                else {
+                                    const response = try unified.buildControlError(
+                                        allocator,
+                                        parsed.id,
+                                        "invalid_payload",
+                                        "role must be 'admin' or 'user'",
+                                    );
+                                    defer allocator.free(response);
+                                    try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                    continue;
+                                };
+                                const rotated = runtime_registry.rotateAuthToken(role) catch |err| {
+                                    const active_binding = session_bindings.get(active_session_key) orelse return error.InvalidState;
+                                    runtime_registry.appendSecurityAuditAndDebug(
+                                        active_binding.agent_id,
+                                        .auth_rotate,
+                                        principal.role,
+                                        parsed.correlation_id orelse parsed.id,
+                                        "auth_rotate_persist_failed",
+                                        false,
+                                        "storage_error",
+                                        @errorName(err),
+                                    );
+                                    const response = try unified.buildControlError(
+                                        allocator,
+                                        parsed.id,
+                                        "storage_error",
+                                        @errorName(err),
+                                    );
+                                    defer allocator.free(response);
+                                    try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                    continue;
+                                };
+                                defer runtime_registry.allocator.free(rotated);
+                                const escaped_token = try unified.jsonEscape(allocator, rotated);
+                                defer allocator.free(escaped_token);
+                                const payload_json = try std.fmt.allocPrint(
+                                    allocator,
+                                    "{{\"role\":\"{s}\",\"token\":\"{s}\"}}",
+                                    .{
+                                        if (role == .admin) "admin" else "user",
+                                        escaped_token,
+                                    },
+                                );
+                                defer allocator.free(payload_json);
+                                const active_binding = session_bindings.get(active_session_key) orelse return error.InvalidState;
+                                runtime_registry.appendSecurityAuditAndDebug(
+                                    active_binding.agent_id,
+                                    .auth_rotate,
+                                    principal.role,
+                                    parsed.correlation_id orelse parsed.id,
+                                    if (role == .admin) "auth_rotate_admin_success" else "auth_rotate_user_success",
+                                    true,
+                                    null,
+                                    null,
+                                );
+                                const response = try unified.buildControlAck(
+                                    allocator,
+                                    .auth_rotate,
+                                    parsed.id,
+                                    payload_json,
+                                );
+                                defer allocator.free(response);
+                                try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                continue;
+                            },
+                            .session_attach => {
+                                var payload = try parseControlPayloadObject(allocator, parsed.payload_json);
+                                defer payload.deinit();
+                                if (payload.value != .object) {
+                                    const response = try unified.buildControlError(
+                                        allocator,
+                                        parsed.id,
+                                        "invalid_payload",
+                                        "session_attach payload must be an object",
+                                    );
+                                    defer allocator.free(response);
+                                    try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                    continue;
+                                }
+
+                                const session_key = getRequiredStringField(payload.value.object, "session_key") catch {
+                                    const response = try unified.buildControlError(
+                                        allocator,
+                                        parsed.id,
+                                        "missing_field",
+                                        "session_key is required",
+                                    );
+                                    defer allocator.free(response);
+                                    try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                    continue;
+                                };
+                                const attach_agent_id = getRequiredStringField(payload.value.object, "agent_id") catch {
+                                    const response = try unified.buildControlError(
+                                        allocator,
+                                        parsed.id,
+                                        "missing_field",
+                                        "agent_id is required",
+                                    );
+                                    defer allocator.free(response);
+                                    try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                    continue;
+                                };
+                                const attach_project_id = getOptionalStringField(payload.value.object, "project_id");
+                                const attach_project_token = getOptionalStringField(payload.value.object, "project_token");
+                                const current_binding = session_bindings.get(active_session_key) orelse return error.InvalidState;
+                                const security_correlation = parsed.correlation_id orelse parsed.id;
+
+                                if (!isValidSessionKey(session_key)) {
+                                    const response = try unified.buildControlError(
+                                        allocator,
+                                        parsed.id,
+                                        "invalid_payload",
+                                        "invalid session_key",
+                                    );
+                                    defer allocator.free(response);
+                                    try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                    continue;
+                                }
+                                if (!AgentRuntimeRegistry.isValidAgentId(attach_agent_id)) {
+                                    const response = try unified.buildControlError(
+                                        allocator,
+                                        parsed.id,
+                                        "invalid_payload",
+                                        "invalid agent_id",
+                                    );
+                                    defer allocator.free(response);
+                                    try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                    continue;
+                                }
+                                if (principal.role == .user and std.mem.eql(u8, attach_agent_id, runtime_registry.default_agent_id)) {
+                                    runtime_registry.appendSecurityAuditAndDebug(
+                                        current_binding.agent_id,
+                                        .session_attach,
+                                        principal.role,
+                                        security_correlation,
+                                        "session_attach_forbidden_primary_agent",
+                                        false,
+                                        "forbidden",
+                                        "user role cannot attach to primary agent",
+                                    );
+                                    const response = try unified.buildControlError(
+                                        allocator,
+                                        parsed.id,
+                                        "forbidden",
+                                        "user role cannot attach to primary agent",
+                                    );
+                                    defer allocator.free(response);
+                                    try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                    continue;
+                                }
+                                if (principal.role == .user and attach_project_id != null and std.mem.eql(u8, attach_project_id.?, fs_control_plane.spider_web_project_id)) {
+                                    runtime_registry.appendSecurityAuditAndDebug(
+                                        current_binding.agent_id,
+                                        .session_attach,
+                                        principal.role,
+                                        security_correlation,
+                                        "session_attach_forbidden_spiderweb_project",
+                                        false,
+                                        "forbidden",
+                                        "user role cannot attach to spider-web project",
+                                    );
+                                    const response = try unified.buildControlError(
+                                        allocator,
+                                        parsed.id,
+                                        "forbidden",
+                                        "user role cannot attach to spider-web project",
+                                    );
+                                    defer allocator.free(response);
+                                    try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                    continue;
+                                }
+
+                                const existing_binding = session_bindings.get(session_key);
+                                const rebind_requested = if (existing_binding) |binding|
+                                    !std.mem.eql(u8, binding.agent_id, attach_agent_id) or
+                                        !optionalStringsEqual(binding.project_id, attach_project_id)
+                                else
+                                    false;
+
+                                if (rebind_requested) {
+                                    if (try runtime_registry.job_index.hasInFlightForAgent(existing_binding.?.agent_id)) {
+                                        runtime_registry.appendSecurityAuditAndDebug(
+                                            current_binding.agent_id,
+                                            .session_attach,
+                                            principal.role,
+                                            security_correlation,
+                                            "session_attach_rebind_session_busy",
+                                            false,
+                                            "session_busy",
+                                            "cannot rebind session while current agent has in-flight jobs",
+                                        );
+                                        const response = try unified.buildControlError(
+                                            allocator,
+                                            parsed.id,
+                                            "session_busy",
+                                            "cannot rebind session while current agent has in-flight jobs",
+                                        );
+                                        defer allocator.free(response);
+                                        try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                        continue;
+                                    }
+                                }
+
+                                if (attach_project_id != null and try runtime_registry.job_index.hasInFlightForAgent(attach_agent_id)) {
+                                    runtime_registry.appendSecurityAuditAndDebug(
+                                        current_binding.agent_id,
+                                        .session_attach,
+                                        principal.role,
+                                        security_correlation,
+                                        "session_attach_project_change_session_busy",
+                                        false,
+                                        "session_busy",
+                                        "cannot change project while agent has in-flight jobs",
+                                    );
+                                    const response = try unified.buildControlError(
+                                        allocator,
+                                        parsed.id,
+                                        "session_busy",
+                                        "cannot change project while agent has in-flight jobs",
+                                    );
+                                    defer allocator.free(response);
+                                    try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                    continue;
+                                }
+
+                                _ = runtime_registry.getOrCreate(attach_agent_id) catch |attach_err| switch (attach_err) {
+                                    error.InvalidAgentId => {
+                                        const response = try unified.buildControlError(
+                                            allocator,
+                                            parsed.id,
+                                            "invalid_payload",
+                                            "invalid agent_id",
+                                        );
+                                        defer allocator.free(response);
+                                        try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                        continue;
+                                    },
+                                    error.RuntimeLimitReached => {
+                                        const response = try unified.buildControlError(
+                                            allocator,
+                                            parsed.id,
+                                            "queue_saturated",
+                                            "agent runtime limit reached",
+                                        );
+                                        defer allocator.free(response);
+                                        try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                        continue;
+                                    },
+                                    else => return attach_err,
+                                };
+
+                                if (attach_project_id) |project_id| {
+                                    const activate_payload = try buildProjectActivatePayload(allocator, project_id, attach_project_token);
+                                    defer allocator.free(activate_payload);
+                                    _ = runtime_registry.control_plane.activateProject(attach_agent_id, activate_payload) catch |activate_err| {
+                                        const response = try unified.buildControlError(
+                                            allocator,
+                                            parsed.id,
+                                            controlPlaneErrorCode(activate_err),
+                                            @errorName(activate_err),
+                                        );
+                                        defer allocator.free(response);
+                                        try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                        continue;
+                                    };
+                                }
+
+                                try upsertSessionBinding(
+                                    allocator,
+                                    &session_bindings,
+                                    session_key,
+                                    attach_agent_id,
+                                    attach_project_id,
+                                    attach_project_token,
+                                );
+                                allocator.free(active_session_key);
+                                active_session_key = try allocator.dupe(u8, session_key);
+
+                                const active_binding = session_bindings.get(session_key) orelse return error.InvalidState;
+                                const active_runtime = try runtime_registry.getOrCreate(active_binding.agent_id);
+                                try fsrpc.setRuntimeBinding(active_runtime, active_binding.agent_id);
+                                const workspace_status_owned: ?[]u8 = runtime_registry.control_plane.workspaceStatus(active_binding.agent_id, null) catch null;
+                                defer if (workspace_status_owned) |value| allocator.free(value);
+                                const workspace_status = if (workspace_status_owned) |value| value else "{}";
+                                const ack_payload = try buildSessionAttachAckPayload(
+                                    allocator,
+                                    session_key,
+                                    active_binding.agent_id,
+                                    active_binding.project_id,
+                                    workspace_status,
+                                );
+                                defer allocator.free(ack_payload);
+
+                                const response = try unified.buildControlAck(
+                                    allocator,
+                                    .session_attach,
+                                    parsed.id,
+                                    ack_payload,
+                                );
+                                defer allocator.free(response);
+                                try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                continue;
+                            },
+                            .session_resume => {
+                                var payload = try parseControlPayloadObject(allocator, parsed.payload_json);
+                                defer payload.deinit();
+                                if (payload.value != .object) {
+                                    const response = try unified.buildControlError(
+                                        allocator,
+                                        parsed.id,
+                                        "invalid_payload",
+                                        "session_resume payload must be an object",
+                                    );
+                                    defer allocator.free(response);
+                                    try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                    continue;
+                                }
+                                const session_key = getRequiredStringField(payload.value.object, "session_key") catch {
+                                    const response = try unified.buildControlError(
+                                        allocator,
+                                        parsed.id,
+                                        "missing_field",
+                                        "session_key is required",
+                                    );
+                                    defer allocator.free(response);
+                                    try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                    continue;
+                                };
+                                const binding = session_bindings.get(session_key) orelse {
+                                    const response = try unified.buildControlError(
+                                        allocator,
+                                        parsed.id,
+                                        "not_found",
+                                        "session_key not found",
+                                    );
+                                    defer allocator.free(response);
+                                    try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                    continue;
+                                };
+
+                                allocator.free(active_session_key);
+                                active_session_key = try allocator.dupe(u8, session_key);
+                                const active_runtime = try runtime_registry.getOrCreate(binding.agent_id);
+                                try fsrpc.setRuntimeBinding(active_runtime, binding.agent_id);
+                                const workspace_status_owned: ?[]u8 = runtime_registry.control_plane.workspaceStatus(binding.agent_id, null) catch null;
+                                defer if (workspace_status_owned) |value| allocator.free(value);
+                                const workspace_status = if (workspace_status_owned) |value| value else "{}";
+                                const ack_payload = try buildSessionAttachAckPayload(
+                                    allocator,
+                                    session_key,
+                                    binding.agent_id,
+                                    binding.project_id,
+                                    workspace_status,
+                                );
+                                defer allocator.free(ack_payload);
+
+                                const response = try unified.buildControlAck(
+                                    allocator,
+                                    .session_resume,
+                                    parsed.id,
+                                    ack_payload,
+                                );
+                                defer allocator.free(response);
+                                try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                continue;
+                            },
+                            .session_list => {
+                                const payload_json = try buildSessionListPayload(allocator, &session_bindings, active_session_key);
+                                defer allocator.free(payload_json);
+                                const response = try unified.buildControlAck(
+                                    allocator,
+                                    .session_list,
+                                    parsed.id,
+                                    payload_json,
+                                );
+                                defer allocator.free(response);
+                                try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                continue;
+                            },
+                            .session_close => {
+                                var payload = try parseControlPayloadObject(allocator, parsed.payload_json);
+                                defer payload.deinit();
+                                if (payload.value != .object) {
+                                    const response = try unified.buildControlError(
+                                        allocator,
+                                        parsed.id,
+                                        "invalid_payload",
+                                        "session_close payload must be an object",
+                                    );
+                                    defer allocator.free(response);
+                                    try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                    continue;
+                                }
+                                const session_key = getRequiredStringField(payload.value.object, "session_key") catch {
+                                    const response = try unified.buildControlError(
+                                        allocator,
+                                        parsed.id,
+                                        "missing_field",
+                                        "session_key is required",
+                                    );
+                                    defer allocator.free(response);
+                                    try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                    continue;
+                                };
+                                if (std.mem.eql(u8, session_key, "main")) {
+                                    const response = try unified.buildControlError(
+                                        allocator,
+                                        parsed.id,
+                                        "forbidden",
+                                        "main session cannot be closed",
+                                    );
+                                    defer allocator.free(response);
+                                    try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                    continue;
+                                }
+                                if (session_bindings.fetchRemove(session_key)) |removed| {
+                                    allocator.free(removed.key);
+                                    var binding = removed.value;
+                                    binding.deinit(allocator);
+                                } else {
+                                    const response = try unified.buildControlError(
+                                        allocator,
+                                        parsed.id,
+                                        "not_found",
+                                        "session_key not found",
+                                    );
+                                    defer allocator.free(response);
+                                    try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                    continue;
+                                }
+
+                                if (std.mem.eql(u8, active_session_key, session_key)) {
+                                    allocator.free(active_session_key);
+                                    active_session_key = try allocator.dupe(u8, "main");
+                                    const main_binding = session_bindings.get("main") orelse return error.InvalidState;
+                                    const main_runtime = try runtime_registry.getOrCreate(main_binding.agent_id);
+                                    try fsrpc.setRuntimeBinding(main_runtime, main_binding.agent_id);
+                                }
+
+                                const payload_json = try std.fmt.allocPrint(
+                                    allocator,
+                                    "{{\"session_key\":\"{s}\",\"closed\":true,\"active_session\":\"{s}\"}}",
+                                    .{ session_key, active_session_key },
+                                );
+                                defer allocator.free(payload_json);
+                                const response = try unified.buildControlAck(
+                                    allocator,
+                                    .session_close,
+                                    parsed.id,
+                                    payload_json,
                                 );
                                 defer allocator.free(response);
                                 try writeFrameLocked(stream, &connection_write_mutex, response, .text);
@@ -1651,7 +2609,8 @@ fn handleWebSocketConnection(
                                 );
                                 defer allocator.free(ack);
                                 try writeFrameLocked(stream, &connection_write_mutex, ack, .text);
-                                runtime_registry.maybeLogDebugFrame(agent_id, ack);
+                                const active_binding = session_bindings.get(active_session_key) orelse return error.InvalidState;
+                                runtime_registry.maybeLogDebugFrame(active_binding.agent_id, ack);
                                 continue;
                             },
                             .node_invite_create,
@@ -1676,8 +2635,32 @@ fn handleWebSocketConnection(
                             .project_up,
                             .audit_tail,
                             => {
-                                const scope = controlMutationScope(control_type);
+                                const active_binding = session_bindings.get(active_session_key) orelse return error.InvalidState;
+                                const control_agent_id = active_binding.agent_id;
                                 const correlation_id = parsed.correlation_id orelse parsed.id;
+                                if (principal.role == .user and isControlAdminOnly(control_type)) {
+                                    runtime_registry.appendSecurityAuditAndDebug(
+                                        control_agent_id,
+                                        control_type,
+                                        principal.role,
+                                        correlation_id,
+                                        "admin_only_forbidden",
+                                        false,
+                                        "forbidden",
+                                        "operation requires admin token",
+                                    );
+                                    const response = try buildControlErrorWithCorrelation(
+                                        allocator,
+                                        parsed.id,
+                                        correlation_id,
+                                        "forbidden",
+                                        "operation requires admin token",
+                                    );
+                                    defer allocator.free(response);
+                                    try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                    continue;
+                                }
+                                const scope = controlMutationScope(control_type);
                                 if (scope != .none and correlation_id == null) {
                                     const response = try buildControlErrorWithCorrelation(
                                         allocator,
@@ -1698,7 +2681,7 @@ fn handleWebSocketConnection(
                                             else => "operator_auth_failed",
                                         };
                                         runtime_registry.appendAuditRecord(
-                                            agent_id,
+                                            control_agent_id,
                                             control_type,
                                             scope,
                                             correlation_id,
@@ -1720,13 +2703,13 @@ fn handleWebSocketConnection(
                                 const payload_json = handleControlPlaneCommand(
                                     runtime_registry,
                                     control_type,
-                                    agent_id,
+                                    control_agent_id,
                                     parsed.payload_json,
                                 ) catch |err| {
                                     const code = controlPlaneErrorCode(err);
                                     if (scope != .none) {
                                         runtime_registry.appendAuditRecord(
-                                            agent_id,
+                                            control_agent_id,
                                             control_type,
                                             scope,
                                             correlation_id,
@@ -1749,7 +2732,7 @@ fn handleWebSocketConnection(
 
                                 if (scope != .none) {
                                     runtime_registry.appendAuditRecord(
-                                        agent_id,
+                                        control_agent_id,
                                         control_type,
                                         scope,
                                         correlation_id,
@@ -1771,7 +2754,7 @@ fn handleWebSocketConnection(
                                     const reason = unified.controlTypeName(control_type);
                                     runtime_registry.emitWorkspaceTopologyChanged(reason);
                                     runtime_registry.emitWorkspaceTopologyProjectDelta(
-                                        agent_id,
+                                        control_agent_id,
                                         reason,
                                         parsed.payload_json,
                                         payload_json,
@@ -1846,6 +2829,51 @@ fn handleWebSocketConnection(
                             }
                         }
 
+                        const target_session_key = parsed.session_key orelse active_session_key;
+                        const target_binding = session_bindings.get(target_session_key) orelse {
+                            const response = try unified.buildFsrpcError(
+                                allocator,
+                                parsed.tag,
+                                "session_not_found",
+                                "unknown session_key",
+                            );
+                            defer allocator.free(response);
+                            try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                            continue;
+                        };
+                        const target_runtime = runtime_registry.getOrCreate(target_binding.agent_id) catch |err| switch (err) {
+                            error.InvalidAgentId => {
+                                const response = try unified.buildFsrpcError(
+                                    allocator,
+                                    parsed.tag,
+                                    "invalid_agent",
+                                    "invalid session agent",
+                                );
+                                defer allocator.free(response);
+                                try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                continue;
+                            },
+                            error.RuntimeLimitReached => {
+                                const response = try unified.buildFsrpcError(
+                                    allocator,
+                                    parsed.tag,
+                                    "queue_saturated",
+                                    "agent runtime limit reached",
+                                );
+                                defer allocator.free(response);
+                                try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                continue;
+                            },
+                            else => return err,
+                        };
+                        const needs_rebind = !std.mem.eql(u8, fsrpc_bound_session_key, target_session_key) or
+                            !std.mem.eql(u8, fsrpc.agent_id, target_binding.agent_id);
+                        if (needs_rebind) {
+                            try fsrpc.setRuntimeBinding(target_runtime, target_binding.agent_id);
+                            const next_bound_session_key = try allocator.dupe(u8, target_session_key);
+                            allocator.free(fsrpc_bound_session_key);
+                            fsrpc_bound_session_key = next_bound_session_key;
+                        }
                         const response = try fsrpc.handle(&parsed);
                         defer allocator.free(response);
                         try writeFrameLocked(stream, &connection_write_mutex, response, .text);
@@ -1864,7 +2892,7 @@ fn handleWebSocketConnection(
                                     }
                                     return err;
                                 };
-                                runtime_registry.maybeLogDebugFrame(agent_id, payload);
+                                runtime_registry.maybeLogDebugFrame(target_binding.agent_id, payload);
                                 allocator.free(payload);
                             }
                         }
@@ -1883,6 +2911,276 @@ fn handleWebSocketConnection(
             else => {},
         }
     }
+}
+
+fn deinitSessionBindings(allocator: std.mem.Allocator, map: *std.StringHashMapUnmanaged(SessionBinding)) void {
+    var it = map.iterator();
+    while (it.next()) |entry| {
+        allocator.free(entry.key_ptr.*);
+        var binding = entry.value_ptr.*;
+        binding.deinit(allocator);
+    }
+    map.deinit(allocator);
+    map.* = .{};
+}
+
+fn upsertSessionBinding(
+    allocator: std.mem.Allocator,
+    map: *std.StringHashMapUnmanaged(SessionBinding),
+    session_key: []const u8,
+    agent_id: []const u8,
+    project_id: ?[]const u8,
+    project_token: ?[]const u8,
+) !void {
+    if (map.getPtr(session_key)) |existing| {
+        existing.deinit(allocator);
+        existing.* = .{
+            .agent_id = try allocator.dupe(u8, agent_id),
+            .project_id = if (project_id) |value| try allocator.dupe(u8, value) else null,
+            .project_token = if (project_token) |value| try allocator.dupe(u8, value) else null,
+        };
+        return;
+    }
+
+    try map.put(
+        allocator,
+        try allocator.dupe(u8, session_key),
+        .{
+            .agent_id = try allocator.dupe(u8, agent_id),
+            .project_id = if (project_id) |value| try allocator.dupe(u8, value) else null,
+            .project_token = if (project_token) |value| try allocator.dupe(u8, value) else null,
+        },
+    );
+}
+
+fn isValidSessionKey(value: []const u8) bool {
+    if (value.len == 0 or value.len > 128) return false;
+    for (value) |char| {
+        if (std.ascii.isAlphanumeric(char)) continue;
+        if (char == '-' or char == '_' or char == '.' or char == ':') continue;
+        return false;
+    }
+    return true;
+}
+
+fn parseControlPayloadObject(allocator: std.mem.Allocator, payload_json: ?[]const u8) !std.json.Parsed(std.json.Value) {
+    return std.json.parseFromSlice(std.json.Value, allocator, payload_json orelse "{}", .{});
+}
+
+fn getRequiredStringField(obj: std.json.ObjectMap, field: []const u8) ![]const u8 {
+    const value = obj.get(field) orelse return error.MissingField;
+    if (value != .string or value.string.len == 0) return error.InvalidPayload;
+    return value.string;
+}
+
+fn getOptionalStringField(obj: std.json.ObjectMap, field: []const u8) ?[]const u8 {
+    const value = obj.get(field) orelse return null;
+    if (value != .string or value.string.len == 0) return null;
+    return value.string;
+}
+
+fn optionalStringsEqual(left: ?[]const u8, right: ?[]const u8) bool {
+    if (left == null and right == null) return true;
+    if (left == null or right == null) return false;
+    return std.mem.eql(u8, left.?, right.?);
+}
+
+fn buildProjectActivatePayload(
+    allocator: std.mem.Allocator,
+    project_id: []const u8,
+    project_token: ?[]const u8,
+) ![]u8 {
+    const escaped_project = try unified.jsonEscape(allocator, project_id);
+    defer allocator.free(escaped_project);
+    if (project_token) |token| {
+        const escaped_token = try unified.jsonEscape(allocator, token);
+        defer allocator.free(escaped_token);
+        return std.fmt.allocPrint(
+            allocator,
+            "{{\"project_id\":\"{s}\",\"project_token\":\"{s}\"}}",
+            .{ escaped_project, escaped_token },
+        );
+    }
+    return std.fmt.allocPrint(allocator, "{{\"project_id\":\"{s}\"}}", .{escaped_project});
+}
+
+fn buildSessionAttachAckPayload(
+    allocator: std.mem.Allocator,
+    session_key: []const u8,
+    agent_id: []const u8,
+    project_id: ?[]const u8,
+    workspace_json: []const u8,
+) ![]u8 {
+    const escaped_session = try unified.jsonEscape(allocator, session_key);
+    defer allocator.free(escaped_session);
+    const escaped_agent = try unified.jsonEscape(allocator, agent_id);
+    defer allocator.free(escaped_agent);
+    const project_json = if (project_id) |value| blk: {
+        const escaped = try unified.jsonEscape(allocator, value);
+        defer allocator.free(escaped);
+        break :blk try std.fmt.allocPrint(allocator, "\"{s}\"", .{escaped});
+    } else try allocator.dupe(u8, "null");
+    defer allocator.free(project_json);
+
+    return std.fmt.allocPrint(
+        allocator,
+        "{{\"session_key\":\"{s}\",\"agent_id\":\"{s}\",\"project_id\":{s},\"workspace\":{s}}}",
+        .{ escaped_session, escaped_agent, project_json, workspace_json },
+    );
+}
+
+fn buildSessionListPayload(
+    allocator: std.mem.Allocator,
+    map: *const std.StringHashMapUnmanaged(SessionBinding),
+    active_session_key: []const u8,
+) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8){};
+    defer out.deinit(allocator);
+
+    const escaped_active = try unified.jsonEscape(allocator, active_session_key);
+    defer allocator.free(escaped_active);
+    try out.writer(allocator).print("{{\"active_session\":\"{s}\",\"sessions\":[", .{escaped_active});
+
+    var first = true;
+    var it = map.iterator();
+    while (it.next()) |entry| {
+        if (!first) try out.append(allocator, ',');
+        first = false;
+        const escaped_key = try unified.jsonEscape(allocator, entry.key_ptr.*);
+        defer allocator.free(escaped_key);
+        const escaped_agent = try unified.jsonEscape(allocator, entry.value_ptr.agent_id);
+        defer allocator.free(escaped_agent);
+        const project_json = if (entry.value_ptr.project_id) |project_id| blk: {
+            const escaped_project = try unified.jsonEscape(allocator, project_id);
+            defer allocator.free(escaped_project);
+            break :blk try std.fmt.allocPrint(allocator, "\"{s}\"", .{escaped_project});
+        } else try allocator.dupe(u8, "null");
+        defer allocator.free(project_json);
+        try out.writer(allocator).print(
+            "{{\"session_key\":\"{s}\",\"agent_id\":\"{s}\",\"project_id\":{s}}}",
+            .{ escaped_key, escaped_agent, project_json },
+        );
+    }
+    try out.appendSlice(allocator, "]}");
+    return out.toOwnedSlice(allocator);
+}
+
+fn parseSessionKeyFromLegacyMessage(allocator: std.mem.Allocator, raw_json: []const u8) ?[]u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw_json, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    if (parsed.value.object.get("session_key")) |session_value| {
+        if (session_value == .string and session_value.string.len > 0) {
+            return allocator.dupe(u8, session_value.string) catch null;
+        }
+    }
+    if (parsed.value.object.get("sessionKey")) |session_value| {
+        if (session_value == .string and session_value.string.len > 0) {
+            return allocator.dupe(u8, session_value.string) catch null;
+        }
+    }
+    return null;
+}
+
+fn decorateSessionReceiveFrame(
+    allocator: std.mem.Allocator,
+    frame_payload: []const u8,
+    session_key: []const u8,
+) ![]u8 {
+    if (std.mem.indexOf(u8, frame_payload, "\"type\":\"session.receive\"") == null) {
+        return allocator.dupe(u8, frame_payload);
+    }
+    if (std.mem.indexOf(u8, frame_payload, "\"session_key\"") != null) {
+        return allocator.dupe(u8, frame_payload);
+    }
+
+    const trimmed = std.mem.trimRight(u8, frame_payload, " \t\r\n");
+    if (trimmed.len == 0 or trimmed[trimmed.len - 1] != '}') {
+        return allocator.dupe(u8, frame_payload);
+    }
+    const escaped_session = try unified.jsonEscape(allocator, session_key);
+    defer allocator.free(escaped_session);
+    return std.fmt.allocPrint(
+        allocator,
+        "{s},\"session_key\":\"{s}\"}}",
+        .{ trimmed[0 .. trimmed.len - 1], escaped_session },
+    );
+}
+
+fn tryHandleLegacySessionSendFrame(
+    allocator: std.mem.Allocator,
+    runtime_registry: *AgentRuntimeRegistry,
+    stream: *std.net.Stream,
+    write_mutex: *std.Thread.Mutex,
+    raw_payload: []const u8,
+    session_bindings: *std.StringHashMapUnmanaged(SessionBinding),
+    active_session_key: []const u8,
+    emit_debug: bool,
+) !bool {
+    var legacy = protocol.parseMessage(allocator, raw_payload) catch return false;
+    defer protocol.deinitParsedMessage(allocator, &legacy);
+    if (legacy.msg_type != .session_send) return false;
+
+    const session_key = parseSessionKeyFromLegacyMessage(allocator, raw_payload) orelse try allocator.dupe(u8, active_session_key);
+    defer allocator.free(session_key);
+    const binding = session_bindings.get(session_key) orelse {
+        const response = try protocol.buildErrorWithCode(allocator, legacy.id orelse "generated", .invalid_envelope, "unknown session_key");
+        defer allocator.free(response);
+        try writeFrameLocked(stream, write_mutex, response, .text);
+        return true;
+    };
+
+    const runtime_server = runtime_registry.getOrCreate(binding.agent_id) catch |err| switch (err) {
+        error.InvalidAgentId => {
+            const response = try protocol.buildErrorWithCode(allocator, legacy.id orelse "generated", .invalid_envelope, "invalid session agent");
+            defer allocator.free(response);
+            try writeFrameLocked(stream, write_mutex, response, .text);
+            return true;
+        },
+        error.RuntimeLimitReached => {
+            const response = try protocol.buildErrorWithCode(allocator, legacy.id orelse "generated", .queue_saturated, "agent runtime limit reached");
+            defer allocator.free(response);
+            try writeFrameLocked(stream, write_mutex, response, .text);
+            return true;
+        },
+        else => return err,
+    };
+
+    const responses = runtime_server.handleMessageFramesWithDebug(raw_payload, emit_debug) catch |err| {
+        const response = try runtime_server.buildRuntimeErrorResponse(legacy.id orelse "generated", err);
+        defer allocator.free(response);
+        try writeFrameLocked(stream, write_mutex, response, .text);
+        return true;
+    };
+    defer {
+        for (responses) |item| allocator.free(item);
+        allocator.free(responses);
+    }
+
+    for (responses) |item| {
+        const decorated = try decorateSessionReceiveFrame(allocator, item, session_key);
+        defer allocator.free(decorated);
+        try writeFrameLocked(stream, write_mutex, decorated, .text);
+        runtime_registry.maybeLogDebugFrame(binding.agent_id, decorated);
+    }
+    return true;
+}
+
+fn isControlAdminOnly(control_type: unified.ControlType) bool {
+    return switch (control_type) {
+        .metrics,
+        .auth_status,
+        .auth_rotate,
+        .node_invite_create,
+        .node_join,
+        .node_lease_refresh,
+        .node_list,
+        .node_get,
+        .node_delete,
+        .audit_tail,
+        => true,
+        else => false,
+    };
 }
 
 fn sendWebSocketErrorAndClose(
@@ -2348,6 +3646,18 @@ fn runSingleWsConnection(ctx: *WsTestServerCtx) void {
     };
 }
 
+fn setAuthTokensForTests(
+    runtime_registry: *AgentRuntimeRegistry,
+    admin_token: []const u8,
+    user_token: []const u8,
+) !void {
+    const allocator = runtime_registry.allocator;
+    allocator.free(runtime_registry.auth_tokens.admin_token);
+    allocator.free(runtime_registry.auth_tokens.user_token);
+    runtime_registry.auth_tokens.admin_token = try allocator.dupe(u8, admin_token);
+    runtime_registry.auth_tokens.user_token = try allocator.dupe(u8, user_token);
+}
+
 fn readHttpHeadersAlloc(allocator: std.mem.Allocator, stream: *std.net.Stream, max_bytes: usize) ![]u8 {
     var out = std.ArrayListUnmanaged(u8){};
     errdefer out.deinit(allocator);
@@ -2458,7 +3768,37 @@ fn readExactFromStream(stream: *std.net.Stream, out: []u8) !void {
     }
 }
 
-fn performClientHandshake(allocator: std.mem.Allocator, client: *std.net.Stream, path: []const u8) !void {
+fn performClientHandshake(
+    allocator: std.mem.Allocator,
+    client: *std.net.Stream,
+    path: []const u8,
+) !void {
+    try performClientHandshakeWithAuthorization(allocator, client, path, null);
+}
+
+fn performClientHandshakeWithBearerToken(
+    allocator: std.mem.Allocator,
+    client: *std.net.Stream,
+    path: []const u8,
+    token: []const u8,
+) !void {
+    const auth_header = try std.fmt.allocPrint(allocator, "Bearer {s}", .{token});
+    defer allocator.free(auth_header);
+    try performClientHandshakeWithAuthorization(allocator, client, path, auth_header);
+}
+
+fn performClientHandshakeWithAuthorization(
+    allocator: std.mem.Allocator,
+    client: *std.net.Stream,
+    path: []const u8,
+    authorization: ?[]const u8,
+) !void {
+    const auth_line = if (authorization) |value|
+        try std.fmt.allocPrint(allocator, "Authorization: {s}\r\n", .{value})
+    else
+        try allocator.dupe(u8, "");
+    defer allocator.free(auth_line);
+
     const handshake = try std.fmt.allocPrint(
         allocator,
         "GET {s} HTTP/1.1\r\n" ++
@@ -2467,8 +3807,9 @@ fn performClientHandshake(allocator: std.mem.Allocator, client: *std.net.Stream,
             "Connection: Upgrade\r\n" ++
             "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" ++
             "Sec-WebSocket-Version: 13\r\n" ++
+            "{s}" ++
             "\r\n",
-        .{path},
+        .{ path, auth_line },
     );
     defer allocator.free(handshake);
     try client.writeAll(handshake);
@@ -2611,6 +3952,7 @@ test "server_piai: base websocket path handles unified control/fsrpc chat flow a
         .ltm_filename = "",
     }, null);
     defer runtime_registry.deinit();
+    try setAuthTokensForTests(&runtime_registry, "admin-secret", "user-secret");
 
     var listener = try (try std.net.Address.parseIp("127.0.0.1", 0)).listen(.{ .reuse_address = true });
     defer listener.deinit();
@@ -2628,7 +3970,7 @@ test "server_piai: base websocket path handles unified control/fsrpc chat flow a
     var client = try std.net.tcpConnectToAddress(listener.listen_address);
     defer client.close();
 
-    try performClientHandshake(allocator, &client, "/");
+    try performClientHandshakeWithBearerToken(allocator, &client, "/", "admin-secret");
 
     try fsrpcConnectAndAttach(allocator, &client, "req-connect");
 
@@ -2690,6 +4032,7 @@ test "server_piai: operator token gate protects control mutations" {
         .ltm_filename = "",
     }, null);
     defer runtime_registry.deinit();
+    try setAuthTokensForTests(&runtime_registry, "admin-secret", "user-secret");
     if (runtime_registry.control_operator_token) |token| {
         allocator.free(token);
     }
@@ -2710,7 +4053,7 @@ test "server_piai: operator token gate protects control mutations" {
 
     var client = try std.net.tcpConnectToAddress(listener.listen_address);
     defer client.close();
-    try performClientHandshake(allocator, &client, "/");
+    try performClientHandshakeWithBearerToken(allocator, &client, "/", "admin-secret");
 
     try writeClientTextFrameMasked(&client, "{\"channel\":\"control\",\"type\":\"control.version\",\"id\":\"v1\",\"payload\":{\"protocol\":\"unified-v2\"}}");
     var version_ack = try readServerFrame(allocator, &client);
@@ -2748,6 +4091,400 @@ test "server_piai: operator token gate protects control mutations" {
     try std.testing.expect(server_ctx.err_name == null);
 }
 
+test "server_piai: fsrpc fid state survives across frames for unchanged binding" {
+    const allocator = std.testing.allocator;
+    var runtime_registry = AgentRuntimeRegistry.init(allocator, .{
+        .ltm_directory = "",
+        .ltm_filename = "",
+    }, null);
+    defer runtime_registry.deinit();
+    try setAuthTokensForTests(&runtime_registry, "admin-secret", "user-secret");
+
+    var listener = try (try std.net.Address.parseIp("127.0.0.1", 0)).listen(.{ .reuse_address = true });
+    defer listener.deinit();
+
+    var server_ctx = WsTestServerCtx{
+        .allocator = allocator,
+        .runtime_registry = &runtime_registry,
+        .listener = &listener,
+    };
+    defer server_ctx.deinit();
+
+    const server_thread = try std.Thread.spawn(.{}, runSingleWsConnection, .{&server_ctx});
+    defer server_thread.join();
+
+    var client = try std.net.tcpConnectToAddress(listener.listen_address);
+    defer client.close();
+
+    try performClientHandshakeWithBearerToken(allocator, &client, "/", "admin-secret");
+    try fsrpcConnectAndAttach(allocator, &client, "fid-survive");
+
+    try writeClientTextFrameMasked(&client, "{\"channel\":\"fsrpc\",\"type\":\"fsrpc.t_walk\",\"tag\":30,\"fid\":1,\"newfid\":2,\"path\":[\"capabilities\",\"chat\"]}");
+    var walk = try readServerFrame(allocator, &client);
+    defer walk.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, walk.payload, "\"type\":\"fsrpc.r_walk\"") != null);
+
+    try websocket_transport.writeFrame(&client, "", .close);
+    var close_reply = try readServerFrame(allocator, &client);
+    defer close_reply.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0x8), close_reply.opcode);
+
+    try std.testing.expect(server_ctx.err_name == null);
+}
+
+test "server_piai: auth matrix gates admin endpoints and handshake tokens" {
+    const allocator = std.testing.allocator;
+    var runtime_registry = AgentRuntimeRegistry.init(allocator, .{
+        .ltm_directory = "",
+        .ltm_filename = "",
+    }, null);
+    defer runtime_registry.deinit();
+    try setAuthTokensForTests(&runtime_registry, "admin-secret", "user-secret");
+
+    var listener = try (try std.net.Address.parseIp("127.0.0.1", 0)).listen(.{ .reuse_address = true });
+    defer listener.deinit();
+
+    var server_ctx = WsTestServerCtx{
+        .allocator = allocator,
+        .runtime_registry = &runtime_registry,
+        .listener = &listener,
+    };
+    defer server_ctx.deinit();
+
+    {
+        const server_thread = try std.Thread.spawn(.{}, runSingleWsConnection, .{&server_ctx});
+        defer server_thread.join();
+
+        var admin_client = try std.net.tcpConnectToAddress(listener.listen_address);
+        defer admin_client.close();
+        try performClientHandshakeWithBearerToken(allocator, &admin_client, "/", "admin-secret");
+
+        try writeClientTextFrameMasked(&admin_client, "{\"channel\":\"control\",\"type\":\"control.version\",\"id\":\"admin-version\",\"payload\":{\"protocol\":\"unified-v2\"}}");
+        var version_ack = try readServerFrame(allocator, &admin_client);
+        defer version_ack.deinit(allocator);
+        try std.testing.expect(std.mem.indexOf(u8, version_ack.payload, "\"type\":\"control.version_ack\"") != null);
+
+        try writeClientTextFrameMasked(&admin_client, "{\"channel\":\"control\",\"type\":\"control.connect\",\"id\":\"admin-connect\"}");
+        var connect_ack = try readServerFrame(allocator, &admin_client);
+        defer connect_ack.deinit(allocator);
+        try std.testing.expect(std.mem.indexOf(u8, connect_ack.payload, "\"type\":\"control.connect_ack\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, connect_ack.payload, "\"role\":\"admin\"") != null);
+
+        try writeClientTextFrameMasked(&admin_client, "{\"channel\":\"control\",\"type\":\"control.auth_status\",\"id\":\"admin-auth-status\"}");
+        var auth_status = try readServerFrame(allocator, &admin_client);
+        defer auth_status.deinit(allocator);
+        try std.testing.expect(std.mem.indexOf(u8, auth_status.payload, "\"type\":\"control.auth_status\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, auth_status.payload, "\"admin_token\":\"admin-secret\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, auth_status.payload, "\"user_token\":\"user-secret\"") != null);
+
+        try writeClientTextFrameMasked(&admin_client, "{\"channel\":\"control\",\"type\":\"control.auth_rotate\",\"id\":\"admin-auth-rotate\",\"payload\":{\"role\":\"admin\"}}");
+        var auth_rotate = try readServerFrame(allocator, &admin_client);
+        defer auth_rotate.deinit(allocator);
+        try std.testing.expect(std.mem.indexOf(u8, auth_rotate.payload, "\"type\":\"control.auth_rotate\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, auth_rotate.payload, "\"role\":\"admin\"") != null);
+
+        try writeClientTextFrameMasked(
+            &admin_client,
+            "{\"channel\":\"control\",\"type\":\"control.audit_tail\",\"id\":\"admin-audit\",\"payload\":{\"limit\":10}}",
+        );
+        var admin_audit = try readServerFrame(allocator, &admin_client);
+        defer admin_audit.deinit(allocator);
+        try std.testing.expect(std.mem.indexOf(u8, admin_audit.payload, "\"type\":\"control.audit_tail\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, admin_audit.payload, "\"control_type\":\"control.auth_rotate\"") != null);
+
+        try websocket_transport.writeFrame(&admin_client, "", .close);
+        var close_reply = try readServerFrame(allocator, &admin_client);
+        defer close_reply.deinit(allocator);
+        try std.testing.expectEqual(@as(u8, 0x8), close_reply.opcode);
+    }
+
+    {
+        const server_thread = try std.Thread.spawn(.{}, runSingleWsConnection, .{&server_ctx});
+        defer server_thread.join();
+
+        var user_client = try std.net.tcpConnectToAddress(listener.listen_address);
+        defer user_client.close();
+        try performClientHandshakeWithBearerToken(allocator, &user_client, "/", "user-secret");
+
+        try writeClientTextFrameMasked(&user_client, "{\"channel\":\"control\",\"type\":\"control.version\",\"id\":\"user-version\",\"payload\":{\"protocol\":\"unified-v2\"}}");
+        var version_ack = try readServerFrame(allocator, &user_client);
+        defer version_ack.deinit(allocator);
+        try std.testing.expect(std.mem.indexOf(u8, version_ack.payload, "\"type\":\"control.version_ack\"") != null);
+
+        try writeClientTextFrameMasked(&user_client, "{\"channel\":\"control\",\"type\":\"control.connect\",\"id\":\"user-connect\"}");
+        var connect_ack = try readServerFrame(allocator, &user_client);
+        defer connect_ack.deinit(allocator);
+        try std.testing.expect(std.mem.indexOf(u8, connect_ack.payload, "\"type\":\"control.connect_ack\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, connect_ack.payload, "\"role\":\"user\"") != null);
+
+        try writeClientTextFrameMasked(&user_client, "{\"channel\":\"control\",\"type\":\"control.metrics\",\"id\":\"user-metrics\"}");
+        var forbidden_metrics = try readServerFrame(allocator, &user_client);
+        defer forbidden_metrics.deinit(allocator);
+        try std.testing.expect(std.mem.indexOf(u8, forbidden_metrics.payload, "\"type\":\"control.error\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, forbidden_metrics.payload, "\"code\":\"forbidden\"") != null);
+
+        try writeClientTextFrameMasked(&user_client, "{\"channel\":\"control\",\"type\":\"control.auth_status\",\"id\":\"user-auth-status\"}");
+        var forbidden_status = try readServerFrame(allocator, &user_client);
+        defer forbidden_status.deinit(allocator);
+        try std.testing.expect(std.mem.indexOf(u8, forbidden_status.payload, "\"type\":\"control.error\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, forbidden_status.payload, "\"code\":\"forbidden\"") != null);
+
+        try writeClientTextFrameMasked(&user_client, "{\"channel\":\"control\",\"type\":\"control.auth_rotate\",\"id\":\"user-auth-rotate\",\"payload\":{\"role\":\"user\"}}");
+        var forbidden_rotate = try readServerFrame(allocator, &user_client);
+        defer forbidden_rotate.deinit(allocator);
+        try std.testing.expect(std.mem.indexOf(u8, forbidden_rotate.payload, "\"type\":\"control.error\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, forbidden_rotate.payload, "\"code\":\"forbidden\"") != null);
+
+        const attach_default = try std.fmt.allocPrint(
+            allocator,
+            "{{\"channel\":\"control\",\"type\":\"control.session_attach\",\"id\":\"user-attach-default\",\"payload\":{{\"session_key\":\"main\",\"agent_id\":\"{s}\"}}}}",
+            .{runtime_registry.default_agent_id},
+        );
+        defer allocator.free(attach_default);
+        try writeClientTextFrameMasked(&user_client, attach_default);
+        var forbidden_attach = try readServerFrame(allocator, &user_client);
+        defer forbidden_attach.deinit(allocator);
+        try std.testing.expect(std.mem.indexOf(u8, forbidden_attach.payload, "\"type\":\"control.error\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, forbidden_attach.payload, "\"code\":\"forbidden\"") != null);
+
+        try websocket_transport.writeFrame(&user_client, "", .close);
+        var close_reply = try readServerFrame(allocator, &user_client);
+        defer close_reply.deinit(allocator);
+        try std.testing.expectEqual(@as(u8, 0x8), close_reply.opcode);
+    }
+
+    {
+        const server_thread = try std.Thread.spawn(.{}, runSingleWsConnection, .{&server_ctx});
+        defer server_thread.join();
+
+        var bad_client = try std.net.tcpConnectToAddress(listener.listen_address);
+        defer bad_client.close();
+        try performClientHandshakeWithBearerToken(allocator, &bad_client, "/", "wrong-secret");
+
+        var auth_error = try readServerFrame(allocator, &bad_client);
+        defer auth_error.deinit(allocator);
+        try std.testing.expect(std.mem.indexOf(u8, auth_error.payload, "\"code\":\"provider_auth_failed\"") != null);
+
+        var close_reply = try readServerFrame(allocator, &bad_client);
+        defer close_reply.deinit(allocator);
+        try std.testing.expectEqual(@as(u8, 0x8), close_reply.opcode);
+    }
+
+    {
+        const server_thread = try std.Thread.spawn(.{}, runSingleWsConnection, .{&server_ctx});
+        defer server_thread.join();
+
+        var missing_client = try std.net.tcpConnectToAddress(listener.listen_address);
+        defer missing_client.close();
+        try performClientHandshake(allocator, &missing_client, "/");
+
+        var auth_error = try readServerFrame(allocator, &missing_client);
+        defer auth_error.deinit(allocator);
+        try std.testing.expect(std.mem.indexOf(u8, auth_error.payload, "\"code\":\"provider_auth_failed\"") != null);
+
+        var close_reply = try readServerFrame(allocator, &missing_client);
+        defer close_reply.deinit(allocator);
+        try std.testing.expectEqual(@as(u8, 0x8), close_reply.opcode);
+    }
+
+    try std.testing.expect(server_ctx.err_name == null);
+}
+
+test "server_piai: user connect avoids primary agent when primary id is user" {
+    const allocator = std.testing.allocator;
+    var runtime_registry = AgentRuntimeRegistry.init(allocator, .{
+        .ltm_directory = "",
+        .ltm_filename = "",
+    }, null);
+    defer runtime_registry.deinit();
+    try setAuthTokensForTests(&runtime_registry, "admin-secret", "user-secret");
+    allocator.free(runtime_registry.default_agent_id);
+    runtime_registry.default_agent_id = try allocator.dupe(u8, user_default_agent_id);
+
+    var listener = try (try std.net.Address.parseIp("127.0.0.1", 0)).listen(.{ .reuse_address = true });
+    defer listener.deinit();
+
+    var server_ctx = WsTestServerCtx{
+        .allocator = allocator,
+        .runtime_registry = &runtime_registry,
+        .listener = &listener,
+    };
+    defer server_ctx.deinit();
+
+    const server_thread = try std.Thread.spawn(.{}, runSingleWsConnection, .{&server_ctx});
+    defer server_thread.join();
+
+    var user_client = try std.net.tcpConnectToAddress(listener.listen_address);
+    defer user_client.close();
+    try performClientHandshakeWithBearerToken(allocator, &user_client, "/", "user-secret");
+
+    try writeClientTextFrameMasked(&user_client, "{\"channel\":\"control\",\"type\":\"control.version\",\"id\":\"user-avoid-primary-version\",\"payload\":{\"protocol\":\"unified-v2\"}}");
+    var version_ack = try readServerFrame(allocator, &user_client);
+    defer version_ack.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, version_ack.payload, "\"type\":\"control.version_ack\"") != null);
+
+    try writeClientTextFrameMasked(&user_client, "{\"channel\":\"control\",\"type\":\"control.connect\",\"id\":\"user-avoid-primary-connect\"}");
+    var connect_ack = try readServerFrame(allocator, &user_client);
+    defer connect_ack.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, connect_ack.payload, "\"type\":\"control.connect_ack\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, connect_ack.payload, "\"role\":\"user\"") != null);
+    const isolated_agent_fragment = try std.fmt.allocPrint(allocator, "\"agent_id\":\"{s}\"", .{user_isolated_agent_id});
+    defer allocator.free(isolated_agent_fragment);
+    try std.testing.expect(std.mem.indexOf(u8, connect_ack.payload, isolated_agent_fragment) != null);
+
+    const attach_primary = try std.fmt.allocPrint(
+        allocator,
+        "{{\"channel\":\"control\",\"type\":\"control.session_attach\",\"id\":\"user-attach-primary-user-id\",\"payload\":{{\"session_key\":\"main\",\"agent_id\":\"{s}\"}}}}",
+        .{runtime_registry.default_agent_id},
+    );
+    defer allocator.free(attach_primary);
+    try writeClientTextFrameMasked(&user_client, attach_primary);
+    var attach_forbidden = try readServerFrame(allocator, &user_client);
+    defer attach_forbidden.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, attach_forbidden.payload, "\"type\":\"control.error\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, attach_forbidden.payload, "\"code\":\"forbidden\"") != null);
+
+    try websocket_transport.writeFrame(&user_client, "", .close);
+    var close_reply = try readServerFrame(allocator, &user_client);
+    defer close_reply.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0x8), close_reply.opcode);
+
+    try std.testing.expect(server_ctx.err_name == null);
+}
+
+test "server_piai: control.auth_rotate reports storage_error when token persistence fails" {
+    const allocator = std.testing.allocator;
+    var runtime_registry = AgentRuntimeRegistry.init(allocator, .{
+        .ltm_directory = "",
+        .ltm_filename = "",
+    }, null);
+    defer runtime_registry.deinit();
+    try setAuthTokensForTests(&runtime_registry, "admin-secret", "user-secret");
+
+    if (runtime_registry.auth_tokens.path) |path| allocator.free(path);
+    runtime_registry.auth_tokens.path = try allocator.dupe(u8, "/");
+    const previous_admin = try allocator.dupe(u8, runtime_registry.auth_tokens.admin_token);
+    defer allocator.free(previous_admin);
+
+    var listener = try (try std.net.Address.parseIp("127.0.0.1", 0)).listen(.{ .reuse_address = true });
+    defer listener.deinit();
+
+    var server_ctx = WsTestServerCtx{
+        .allocator = allocator,
+        .runtime_registry = &runtime_registry,
+        .listener = &listener,
+    };
+    defer server_ctx.deinit();
+
+    const server_thread = try std.Thread.spawn(.{}, runSingleWsConnection, .{&server_ctx});
+    defer server_thread.join();
+
+    var client = try std.net.tcpConnectToAddress(listener.listen_address);
+    defer client.close();
+    try performClientHandshakeWithBearerToken(allocator, &client, "/", "admin-secret");
+
+    try writeClientTextFrameMasked(&client, "{\"channel\":\"control\",\"type\":\"control.version\",\"id\":\"rotate-fail-version\",\"payload\":{\"protocol\":\"unified-v2\"}}");
+    var version_ack = try readServerFrame(allocator, &client);
+    defer version_ack.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, version_ack.payload, "\"type\":\"control.version_ack\"") != null);
+
+    try writeClientTextFrameMasked(&client, "{\"channel\":\"control\",\"type\":\"control.connect\",\"id\":\"rotate-fail-connect\"}");
+    var connect_ack = try readServerFrame(allocator, &client);
+    defer connect_ack.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, connect_ack.payload, "\"type\":\"control.connect_ack\"") != null);
+
+    try writeClientTextFrameMasked(&client, "{\"channel\":\"control\",\"type\":\"control.auth_rotate\",\"id\":\"rotate-fail\",\"payload\":{\"role\":\"admin\"}}");
+    var rotate_error = try readServerFrame(allocator, &client);
+    defer rotate_error.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, rotate_error.payload, "\"type\":\"control.error\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rotate_error.payload, "\"code\":\"storage_error\"") != null);
+
+    try std.testing.expectEqualStrings(previous_admin, runtime_registry.auth_tokens.admin_token);
+
+    try writeClientTextFrameMasked(&client, "{\"channel\":\"control\",\"type\":\"control.ping\",\"id\":\"rotate-fail-ping\"}");
+    var pong = try readServerFrame(allocator, &client);
+    defer pong.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, pong.payload, "\"type\":\"control.pong\"") != null);
+
+    try websocket_transport.writeFrame(&client, "", .close);
+    var close_reply = try readServerFrame(allocator, &client);
+    defer close_reply.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0x8), close_reply.opcode);
+
+    try std.testing.expect(server_ctx.err_name == null);
+}
+
+test "server_piai: session_attach rejects project changes while jobs are in-flight" {
+    const allocator = std.testing.allocator;
+    var runtime_registry = AgentRuntimeRegistry.init(allocator, .{
+        .ltm_directory = "",
+        .ltm_filename = "",
+    }, null);
+    defer runtime_registry.deinit();
+    try setAuthTokensForTests(&runtime_registry, "admin-secret", "user-secret");
+
+    const busy_job = try runtime_registry.job_index.createJob(runtime_registry.default_agent_id, null);
+    defer allocator.free(busy_job);
+    try runtime_registry.job_index.markRunning(busy_job);
+
+    var listener = try (try std.net.Address.parseIp("127.0.0.1", 0)).listen(.{ .reuse_address = true });
+    defer listener.deinit();
+
+    var server_ctx = WsTestServerCtx{
+        .allocator = allocator,
+        .runtime_registry = &runtime_registry,
+        .listener = &listener,
+    };
+    defer server_ctx.deinit();
+
+    const server_thread = try std.Thread.spawn(.{}, runSingleWsConnection, .{&server_ctx});
+    defer server_thread.join();
+
+    var client = try std.net.tcpConnectToAddress(listener.listen_address);
+    defer client.close();
+    try performClientHandshakeWithBearerToken(allocator, &client, "/", "admin-secret");
+
+    try writeClientTextFrameMasked(&client, "{\"channel\":\"control\",\"type\":\"control.version\",\"id\":\"busy-version\",\"payload\":{\"protocol\":\"unified-v2\"}}");
+    var version_ack = try readServerFrame(allocator, &client);
+    defer version_ack.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, version_ack.payload, "\"type\":\"control.version_ack\"") != null);
+
+    try writeClientTextFrameMasked(&client, "{\"channel\":\"control\",\"type\":\"control.connect\",\"id\":\"busy-connect\"}");
+    var connect_ack = try readServerFrame(allocator, &client);
+    defer connect_ack.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, connect_ack.payload, "\"type\":\"control.connect_ack\"") != null);
+
+    const attach_request = try std.fmt.allocPrint(
+        allocator,
+        "{{\"channel\":\"control\",\"type\":\"control.session_attach\",\"id\":\"busy-attach\",\"payload\":{{\"session_key\":\"main\",\"agent_id\":\"{s}\",\"project_id\":\"proj-busy\"}}}}",
+        .{runtime_registry.default_agent_id},
+    );
+    defer allocator.free(attach_request);
+    try writeClientTextFrameMasked(&client, attach_request);
+
+    var attach_error = try readServerFrame(allocator, &client);
+    defer attach_error.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, attach_error.payload, "\"type\":\"control.error\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, attach_error.payload, "\"code\":\"session_busy\"") != null);
+
+    try writeClientTextFrameMasked(
+        &client,
+        "{\"channel\":\"control\",\"type\":\"control.audit_tail\",\"id\":\"busy-audit\",\"payload\":{\"limit\":10}}",
+    );
+    var audit_reply = try readServerFrame(allocator, &client);
+    defer audit_reply.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, audit_reply.payload, "\"type\":\"control.audit_tail\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, audit_reply.payload, "\"control_type\":\"control.session_attach\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, audit_reply.payload, "\"error_code\":\"session_busy\"") != null);
+
+    try websocket_transport.writeFrame(&client, "", .close);
+    var close_reply = try readServerFrame(allocator, &client);
+    defer close_reply.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0x8), close_reply.opcode);
+
+    try std.testing.expect(server_ctx.err_name == null);
+}
+
 test "server_piai: workspace topology mutations are pushed to debug subscribers" {
     const allocator = std.testing.allocator;
     var runtime_registry = AgentRuntimeRegistry.init(allocator, .{
@@ -2755,6 +4492,7 @@ test "server_piai: workspace topology mutations are pushed to debug subscribers"
         .ltm_filename = "",
     }, null);
     defer runtime_registry.deinit();
+    try setAuthTokensForTests(&runtime_registry, "admin-secret", "user-secret");
 
     var listener = try (try std.net.Address.parseIp("127.0.0.1", 0)).listen(.{ .reuse_address = true });
     defer listener.deinit();
@@ -2773,7 +4511,7 @@ test "server_piai: workspace topology mutations are pushed to debug subscribers"
 
     var subscriber = try std.net.tcpConnectToAddress(listener.listen_address);
     defer subscriber.close();
-    try performClientHandshake(allocator, &subscriber, "/");
+    try performClientHandshakeWithBearerToken(allocator, &subscriber, "/", "admin-secret");
     try writeClientTextFrameMasked(&subscriber, "{\"channel\":\"control\",\"type\":\"control.version\",\"id\":\"sub-version\",\"payload\":{\"protocol\":\"unified-v2\"}}");
     var sub_version_ack = try readServerFrame(allocator, &subscriber);
     defer sub_version_ack.deinit(allocator);
@@ -2791,7 +4529,7 @@ test "server_piai: workspace topology mutations are pushed to debug subscribers"
 
     var mutator = try std.net.tcpConnectToAddress(listener.listen_address);
     defer mutator.close();
-    try performClientHandshake(allocator, &mutator, "/");
+    try performClientHandshakeWithBearerToken(allocator, &mutator, "/", "admin-secret");
     try writeClientTextFrameMasked(&mutator, "{\"channel\":\"control\",\"type\":\"control.version\",\"id\":\"mut-version\",\"payload\":{\"protocol\":\"unified-v2\"}}");
     var mut_version_ack = try readServerFrame(allocator, &mutator);
     defer mut_version_ack.deinit(allocator);
@@ -2835,6 +4573,7 @@ test "server_piai: base path routes all connections to default runtime" {
         .ltm_filename = "",
     }, null);
     defer runtime_registry.deinit();
+    try setAuthTokensForTests(&runtime_registry, "admin-secret", "user-secret");
 
     var listener = try (try std.net.Address.parseIp("127.0.0.1", 0)).listen(.{ .reuse_address = true });
     defer listener.deinit();
@@ -2852,7 +4591,7 @@ test "server_piai: base path routes all connections to default runtime" {
 
         var client = try std.net.tcpConnectToAddress(listener.listen_address);
         defer client.close();
-        try performClientHandshake(allocator, &client, "/");
+        try performClientHandshakeWithBearerToken(allocator, &client, "/", "admin-secret");
 
         try fsrpcConnectAndAttach(allocator, &client, "a-connect");
         const alpha_job = try fsrpcWriteChatInput(allocator, &client, "alpha hello", null);
@@ -2870,7 +4609,7 @@ test "server_piai: base path routes all connections to default runtime" {
 
         var client = try std.net.tcpConnectToAddress(listener.listen_address);
         defer client.close();
-        try performClientHandshake(allocator, &client, "/");
+        try performClientHandshakeWithBearerToken(allocator, &client, "/", "admin-secret");
 
         try fsrpcConnectAndAttach(allocator, &client, "b-connect");
         const beta_job = try fsrpcWriteChatInput(allocator, &client, "beta hello", null);
@@ -2904,6 +4643,7 @@ test "server_piai: runtime cap does not block repeated base-path reconnects" {
         1,
     );
     defer runtime_registry.deinit();
+    try setAuthTokensForTests(&runtime_registry, "admin-secret", "user-secret");
 
     var listener = try (try std.net.Address.parseIp("127.0.0.1", 0)).listen(.{ .reuse_address = true });
     defer listener.deinit();
@@ -2921,7 +4661,7 @@ test "server_piai: runtime cap does not block repeated base-path reconnects" {
 
         var client = try std.net.tcpConnectToAddress(listener.listen_address);
         defer client.close();
-        try performClientHandshake(allocator, &client, "/");
+        try performClientHandshakeWithBearerToken(allocator, &client, "/", "admin-secret");
 
         try writeClientTextFrameMasked(&client, "{\"channel\":\"control\",\"type\":\"control.version\",\"id\":\"alpha-version\",\"payload\":{\"protocol\":\"unified-v2\"}}");
         var version_ack = try readServerFrame(allocator, &client);
@@ -2945,7 +4685,7 @@ test "server_piai: runtime cap does not block repeated base-path reconnects" {
 
         var client = try std.net.tcpConnectToAddress(listener.listen_address);
         defer client.close();
-        try performClientHandshake(allocator, &client, "/");
+        try performClientHandshakeWithBearerToken(allocator, &client, "/", "admin-secret");
 
         try writeClientTextFrameMasked(&client, "{\"channel\":\"control\",\"type\":\"control.version\",\"id\":\"beta-version\",\"payload\":{\"protocol\":\"unified-v2\"}}");
         var version_ack = try readServerFrame(allocator, &client);

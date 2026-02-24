@@ -75,6 +75,7 @@ fi
 
 TEST_TMP_DIR="$(mktemp -d)"
 LTM_DIR="$TEST_TMP_DIR/ltm"
+AUTH_TOKENS_FILE="$LTM_DIR/auth_tokens.json"
 SPIDER_WEB_ROOT="$TEST_TMP_DIR/spider-web-root"
 NODE1_EXPORT="$TEST_TMP_DIR/node1-export"
 NODE2_EXPORT="$TEST_TMP_DIR/node2-export"
@@ -122,11 +123,42 @@ start_spiderweb() {
 
 start_spiderweb
 
+load_spiderweb_auth_token() {
+    if [[ -n "${SPIDERWEB_AUTH_TOKEN:-}" ]]; then
+        return 0
+    fi
+    if [[ ! -f "$AUTH_TOKENS_FILE" ]]; then
+        return 1
+    fi
+    local token
+    token="$(python3 - "$AUTH_TOKENS_FILE" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    data = json.load(f)
+token = str(data.get("admin_token") or "").strip()
+if token:
+    print(token)
+PY
+)" || return 1
+    if [[ -z "$token" ]]; then
+        return 1
+    fi
+    SPIDERWEB_AUTH_TOKEN="$token"
+    export SPIDERWEB_AUTH_TOKEN
+    return 0
+}
+
 wait_for_control_ready() {
     local ready=0
     for _ in $(seq 1 120); do
         if ! kill -0 "$SPIDERWEB_PID" >/dev/null 2>&1; then
             return 1
+        fi
+        if ! load_spiderweb_auth_token; then
+            sleep 0.1
+            continue
         fi
         if python3 - "$BIND_ADDR" "$SPIDERWEB_PORT" <<'PY' >/dev/null 2>&1
 import base64
@@ -210,6 +242,8 @@ def read_text(sock):
 sock = socket.create_connection((host, port), timeout=2)
 sock.settimeout(2)
 try:
+    auth_token = os.environ.get("SPIDERWEB_AUTH_TOKEN", "").strip()
+    auth_header = f"Authorization: Bearer {auth_token}\r\n" if auth_token else ""
     key = base64.b64encode(os.urandom(16)).decode("ascii")
     req = (
         "GET / HTTP/1.1\r\n"
@@ -218,6 +252,7 @@ try:
         "Connection: Upgrade\r\n"
         f"Sec-WebSocket-Key: {key}\r\n"
         "Sec-WebSocket-Version: 13\r\n"
+        f"{auth_header}"
         "\r\n"
     ).encode("ascii")
     sock.sendall(req)
@@ -356,6 +391,8 @@ def call(sock, op, payload, request_id):
 sock = socket.create_connection((host, port), timeout=3)
 sock.settimeout(3)
 try:
+    auth_token = os.environ.get("SPIDERWEB_AUTH_TOKEN", "").strip()
+    auth_header = f"Authorization: Bearer {auth_token}\r\n" if auth_token else ""
     key = base64.b64encode(os.urandom(16)).decode("ascii")
     req = (
         "GET / HTTP/1.1\r\n"
@@ -364,6 +401,7 @@ try:
         "Connection: Upgrade\r\n"
         f"Sec-WebSocket-Key: {key}\r\n"
         "Sec-WebSocket-Version: 13\r\n"
+        f"{auth_header}"
         "\r\n"
     ).encode("ascii")
     sock.sendall(req)
@@ -667,6 +705,8 @@ def call(sock, op, payload, request_id):
 sock = socket.create_connection((host, port), timeout=3)
 sock.settimeout(3)
 try:
+    auth_token = os.environ.get("SPIDERWEB_AUTH_TOKEN", "").strip()
+    auth_header = f"Authorization: Bearer {auth_token}\r\n" if auth_token else ""
     key = base64.b64encode(os.urandom(16)).decode("ascii")
     req = (
         "GET / HTTP/1.1\r\n"
@@ -675,6 +715,7 @@ try:
         "Connection: Upgrade\r\n"
         f"Sec-WebSocket-Key: {key}\r\n"
         "Sec-WebSocket-Version: 13\r\n"
+        f"{auth_header}"
         "\r\n"
     ).encode("ascii")
     sock.sendall(req)
@@ -970,6 +1011,8 @@ def call(sock, op, payload, request_id):
 sock = socket.create_connection((host, port), timeout=3)
 sock.settimeout(3)
 try:
+    auth_token = os.environ.get("SPIDERWEB_AUTH_TOKEN", "").strip()
+    auth_header = f"Authorization: Bearer {auth_token}\r\n" if auth_token else ""
     key = base64.b64encode(os.urandom(16)).decode("ascii")
     req = (
         "GET / HTTP/1.1\r\n"
@@ -978,6 +1021,7 @@ try:
         "Connection: Upgrade\r\n"
         f"Sec-WebSocket-Key: {key}\r\n"
         "Sec-WebSocket-Version: 13\r\n"
+        f"{auth_header}"
         "\r\n"
     ).encode("ascii")
     sock.sendall(req)
@@ -1138,6 +1182,8 @@ def call(sock, op, payload, request_id):
 sock = socket.create_connection((host, port), timeout=3)
 sock.settimeout(3)
 try:
+    auth_token = os.environ.get("SPIDERWEB_AUTH_TOKEN", "").strip()
+    auth_header = f"Authorization: Bearer {auth_token}\r\n" if auth_token else ""
     key = base64.b64encode(os.urandom(16)).decode("ascii")
     req = (
         "GET / HTTP/1.1\r\n"
@@ -1146,6 +1192,7 @@ try:
         "Connection: Upgrade\r\n"
         f"Sec-WebSocket-Key: {key}\r\n"
         "Sec-WebSocket-Version: 13\r\n"
+        f"{auth_header}"
         "\r\n"
     ).encode("ascii")
     sock.sendall(req)
@@ -1387,6 +1434,8 @@ def call(sock, op, payload, request_id):
 sock = socket.create_connection((host, port), timeout=3)
 sock.settimeout(3)
 try:
+    auth_token = os.environ.get("SPIDERWEB_AUTH_TOKEN", "").strip()
+    auth_header = f"Authorization: Bearer {auth_token}\r\n" if auth_token else ""
     key = base64.b64encode(os.urandom(16)).decode("ascii")
     req = (
         "GET / HTTP/1.1\r\n"
@@ -1395,6 +1444,7 @@ try:
         "Connection: Upgrade\r\n"
         f"Sec-WebSocket-Key: {key}\r\n"
         "Sec-WebSocket-Version: 13\r\n"
+        f"{auth_header}"
         "\r\n"
     ).encode("ascii")
     sock.sendall(req)

@@ -28,6 +28,7 @@ pub fn main() !void {
 
     var url: []const u8 = default_ws_url;
     var operator_token: ?[]const u8 = null;
+    var auth_token: ?[]const u8 = null;
     var op_arg: ?[]const u8 = null;
     var payload_arg: ?[]const u8 = null;
 
@@ -44,6 +45,12 @@ pub fn main() !void {
             i += 1;
             if (i >= args.len) return error.InvalidArguments;
             operator_token = args[i];
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--auth-token")) {
+            i += 1;
+            if (i >= args.len) return error.InvalidArguments;
+            auth_token = args[i];
             continue;
         }
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
@@ -77,7 +84,18 @@ pub fn main() !void {
     var stream = try std.net.tcpConnectToHost(allocator, parsed_url.host, parsed_url.port);
     defer stream.close();
 
-    try performClientHandshake(allocator, &stream, parsed_url.host, parsed_url.port, parsed_url.path);
+    const connect_auth_token = auth_token orelse std.process.getEnvVarOwned(allocator, "SPIDERWEB_AUTH_TOKEN") catch null;
+    defer if (auth_token == null) {
+        if (connect_auth_token) |value| allocator.free(value);
+    };
+    try performClientHandshake(
+        allocator,
+        &stream,
+        parsed_url.host,
+        parsed_url.port,
+        parsed_url.path,
+        connect_auth_token,
+    );
 
     try sendControlMessage(
         allocator,
@@ -311,7 +329,13 @@ fn performClientHandshake(
     host: []const u8,
     port: u16,
     path: []const u8,
+    auth_token: ?[]const u8,
 ) !void {
+    const auth_line = if (auth_token) |token| blk: {
+        break :blk try std.fmt.allocPrint(allocator, "Authorization: Bearer {s}\r\n", .{token});
+    } else try allocator.dupe(u8, "");
+    defer allocator.free(auth_line);
+
     const handshake = try std.fmt.allocPrint(
         allocator,
         "GET {s} HTTP/1.1\r\n" ++
@@ -320,8 +344,9 @@ fn performClientHandshake(
             "Connection: Upgrade\r\n" ++
             "Sec-WebSocket-Key: c3BpZGVyd2ViLWNvbnRyb2wtY2xp\r\n" ++
             "Sec-WebSocket-Version: 13\r\n" ++
+            "{s}" ++
             "\r\n",
-        .{ path, host, port },
+        .{ path, host, port, auth_line },
     );
     defer allocator.free(handshake);
 
@@ -456,15 +481,17 @@ fn printHelp() !void {
         \\spiderweb-control - Unified v2 control-plane CLI
         \\
         \\Usage:
-        \\  spiderweb-control [--url <ws-url>] [--operator-token <token>] <operation> [payload-json]
+        \\  spiderweb-control [--url <ws-url>] [--auth-token <token>] [--operator-token <token>] <operation> [payload-json]
         \\
         \\Notes:
         \\  - Automatically negotiates control.version and control.connect before the operation.
+        \\  - Provide auth via --auth-token or SPIDERWEB_AUTH_TOKEN.
         \\  - <operation> may be passed as either "workspace_status" or "control.workspace_status".
         \\  - Prints the full control reply envelope as JSON.
         \\
         \\Examples:
         \\  spiderweb-control workspace_status
+        \\  spiderweb-control --auth-token sw-admin-... auth_status
         \\  spiderweb-control project_list
         \\  spiderweb-control project_create '{"name":"Demo"}'
         \\  spiderweb-control --operator-token mytoken project_create '{"name":"Secure"}'
