@@ -9,6 +9,17 @@ const provider_models = @import("provider_models.zig");
 
 const auth_tokens_filename = "auth_tokens.json";
 
+const AuthStatusSnapshot = struct {
+    admin_token: []u8,
+    user_token: []u8,
+
+    fn deinit(self: *AuthStatusSnapshot, allocator: std.mem.Allocator) void {
+        allocator.free(self.admin_token);
+        allocator.free(self.user_token);
+        self.* = undefined;
+    }
+};
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -50,6 +61,53 @@ fn handleAuthCommand(allocator: std.mem.Allocator, args: []const []const u8) !vo
         const out = try std.fmt.allocPrint(allocator, "{s}\n", .{path});
         defer allocator.free(out);
         try std.fs.File.stdout().writeAll(out);
+        return;
+    }
+
+    if (std.mem.eql(u8, subcommand, "status")) {
+        var reveal_tokens = false;
+        for (args[1..]) |arg| {
+            if (std.mem.eql(u8, arg, "--reveal")) {
+                reveal_tokens = true;
+                continue;
+            }
+            std.log.err("Unknown auth status arg: {s}", .{arg});
+            return error.InvalidArguments;
+        }
+
+        var config = try Config.init(allocator, null);
+        defer config.deinit();
+        const path = try resolveAuthTokensPath(allocator, config.runtime.ltm_directory, config.config_path);
+        defer allocator.free(path);
+
+        var snapshot = try loadAuthStatusSnapshot(allocator, path);
+        defer snapshot.deinit(allocator);
+
+        const admin_display_owned = if (reveal_tokens)
+            null
+        else
+            try maskTokenForDisplay(allocator, snapshot.admin_token);
+        defer if (admin_display_owned) |value| allocator.free(value);
+
+        const user_display_owned = if (reveal_tokens)
+            null
+        else
+            try maskTokenForDisplay(allocator, snapshot.user_token);
+        defer if (user_display_owned) |value| allocator.free(value);
+
+        const admin_display = if (admin_display_owned) |value| value else snapshot.admin_token;
+        const user_display = if (user_display_owned) |value| value else snapshot.user_token;
+
+        const out = try std.fmt.allocPrint(
+            allocator,
+            "Auth status\n  admin_token: {s}\n  user_token:  {s}\n  path:        {s}\n",
+            .{ admin_display, user_display, path },
+        );
+        defer allocator.free(out);
+        try std.fs.File.stdout().writeAll(out);
+        if (!reveal_tokens) {
+            try std.fs.File.stdout().writeAll("  note: tokens are masked; run `spiderweb-config auth status --reveal` for full values\n");
+        }
         return;
     }
 
@@ -414,6 +472,35 @@ fn makeOpaqueToken(allocator: std.mem.Allocator, prefix: []const u8) ![]u8 {
     return std.fmt.allocPrint(allocator, "{s}_{s}", .{ prefix, encoded });
 }
 
+fn maskTokenForDisplay(allocator: std.mem.Allocator, token: []const u8) ![]u8 {
+    if (token.len == 0) return allocator.dupe(u8, "(empty)");
+    if (token.len <= 8) return allocator.dupe(u8, "****");
+    return std.fmt.allocPrint(
+        allocator,
+        "{s}...{s}",
+        .{ token[0..4], token[token.len - 4 ..] },
+    );
+}
+
+fn loadAuthStatusSnapshot(allocator: std.mem.Allocator, path: []const u8) !AuthStatusSnapshot {
+    const raw = try readFileAllocAny(allocator, path, 64 * 1024);
+    defer allocator.free(raw);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidResponse;
+
+    const admin_val = parsed.value.object.get("admin_token") orelse return error.InvalidResponse;
+    if (admin_val != .string or admin_val.string.len == 0) return error.InvalidResponse;
+    const user_val = parsed.value.object.get("user_token") orelse return error.InvalidResponse;
+    if (user_val != .string or user_val.string.len == 0) return error.InvalidResponse;
+
+    return .{
+        .admin_token = try allocator.dupe(u8, admin_val.string),
+        .user_token = try allocator.dupe(u8, user_val.string),
+    };
+}
+
 fn persistAuthTokens(
     allocator: std.mem.Allocator,
     path: []const u8,
@@ -454,6 +541,7 @@ fn printAuthUsage() !void {
     const usage =
         \\Auth token recovery commands:
         \\  spiderweb-config auth path
+        \\  spiderweb-config auth status [--reveal]
         \\  spiderweb-config auth reset --yes
         \\
         \\`auth reset --yes` regenerates BOTH admin and user tokens in auth_tokens.json.
@@ -469,6 +557,7 @@ fn printUsage() !void {
         \\
         \\Usage:
         \\  spiderweb-config auth path
+        \\  spiderweb-config auth status [--reveal]
         \\  spiderweb-config auth reset --yes
         \\  spiderweb-config first-run [--non-interactive] [--provider <name>] [--model <model>] [--agent <name>]
         \\  spiderweb-config oauth login <provider> [--enterprise-domain <domain>] [--no-set-provider]
@@ -488,6 +577,7 @@ fn printUsage() !void {
         \\  spiderweb-config oauth login openai-codex
         \\  spiderweb-config oauth login github-copilot --enterprise-domain github.example.com
         \\  spiderweb-config auth path
+        \\  spiderweb-config auth status --reveal
         \\  spiderweb-config auth reset --yes
         \\  spiderweb-config config set-provider openai gpt-4o
         \\  spiderweb-config config set-provider kimi-coding kimi-k2.5

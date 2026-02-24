@@ -2,6 +2,9 @@ const std = @import("std");
 const fs_protocol = @import("fs_protocol.zig");
 const unified = @import("ziggy-spider-protocol").unified;
 
+const request_response_timeout_ms: i32 = 15_000;
+const max_event_frames_per_pump: usize = 256;
+
 pub const ClientResponse = struct {
     ok: bool,
     err_no: i32 = fs_protocol.Errno.SUCCESS,
@@ -52,12 +55,19 @@ pub const FsClient = struct {
         const req_id = self.next_id;
         self.next_id +%= 1;
         const expected_type = fsrpcResponseType(op);
+        const deadline_ms = std.time.milliTimestamp() + @as(i64, request_response_timeout_ms);
 
         const payload = try buildRequestJson(self.allocator, req_id, op, node, handle, args_json);
         defer self.allocator.free(payload);
         try writeClientTextFrame(self.allocator, &self.stream, payload);
 
         while (true) {
+            const now_ms = std.time.milliTimestamp();
+            if (now_ms >= deadline_ms) return error.TimedOut;
+            const remaining_i64 = deadline_ms - now_ms;
+            const remaining_ms: i32 = @intCast(@min(remaining_i64, @as(i64, std.math.maxInt(i32))));
+            if (!try waitForReadable(&self.stream, remaining_ms)) return error.TimedOut;
+
             var frame = try readServerFrame(self.allocator, &self.stream, 4 * 1024 * 1024);
             defer frame.deinit(self.allocator);
 
@@ -89,6 +99,7 @@ pub const FsClient = struct {
         if (timeout_ms < -1) return error.InvalidTimeout;
         if (!try waitForReadable(&self.stream, timeout_ms)) return;
 
+        var processed_frames: usize = 0;
         while (true) {
             var frame = try readServerFrame(self.allocator, &self.stream, 4 * 1024 * 1024);
             defer frame.deinit(self.allocator);
@@ -105,6 +116,8 @@ pub const FsClient = struct {
                 else => return error.InvalidFrameOpcode,
             }
 
+            processed_frames += 1;
+            if (processed_frames >= max_event_frames_per_pump) break;
             if (!try waitForReadable(&self.stream, 0)) break;
         }
     }

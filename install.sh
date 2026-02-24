@@ -21,7 +21,7 @@ cleanup_on_error() {
         echo "[ERROR] Installation failed (exit code: $exit_code)"
         echo ""
         echo "Try running with --non-interactive or install dependencies:"
-        echo "  sudo apt-get install curl jq git libsecret-tools sqlite3 build-essential"
+        echo "  sudo apt-get install curl jq git bubblewrap fuse3 libsecret-tools sqlite3 build-essential"
         echo ""
     fi
     exit $exit_code
@@ -44,6 +44,24 @@ log_warn() {
 
 log_success() {
     echo -e "${GREEN}[OK]${NC} $1"
+}
+
+ensure_git_repo() {
+    local dir="$1"
+    local url="$2"
+    local name
+    name="$(basename "$dir")"
+
+    if [[ -d "$dir/.git" ]]; then
+        log_info "Updating ${name}..."
+        git -C "$dir" pull -q || log_warn "Failed to update ${name}; using existing checkout"
+    elif [[ -d "$dir" ]]; then
+        log_warn "${name} exists but is not a git repo: $dir"
+        log_warn "Skipping clone and using existing directory"
+    else
+        log_info "Cloning ${name}..."
+        git clone -q "$url" "$dir"
+    fi
 }
 
 print_auth_tokens_summary() {
@@ -151,10 +169,63 @@ fi
 # Check dependencies
 log_info "Checking dependencies..."
 
+has_fuse3_runtime() {
+    if command -v ldconfig >/dev/null 2>&1; then
+        if ldconfig -p 2>/dev/null | grep -qE 'libfuse3\.so(\.(4|3))?'; then
+            return 0
+        fi
+    fi
+    local candidates=(
+        "/lib*/libfuse3.so.4"
+        "/usr/lib*/libfuse3.so.4"
+        "/lib*/libfuse3.so.3"
+        "/usr/lib*/libfuse3.so.3"
+        "/lib*/libfuse3.so"
+        "/usr/lib*/libfuse3.so"
+    )
+    local pattern
+    for pattern in "${candidates[@]}"; do
+        if compgen -G "$pattern" > /dev/null; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+append_apt_dep() {
+    local dep="$1"
+    local existing
+    for existing in "${APT_DEPS[@]}"; do
+        if [[ "$existing" == "$dep" ]]; then
+            return 0
+        fi
+    done
+    APT_DEPS+=("$dep")
+}
+
+add_first_available_pkg() {
+    local dep_name="$1"
+    shift
+    local pkg
+    for pkg in "$@"; do
+        if apt-cache show "$pkg" >/dev/null 2>&1; then
+            append_apt_dep "$pkg"
+            return 0
+        fi
+    done
+    log_warn "No apt package found for ${dep_name}; install it manually if missing."
+    return 1
+}
+
 DEPS_MISSING=()
+NEEDS_APT_INSTALL=false
+APT_DEPS=(libsecret-tools sqlite3 build-essential)
+
 for cmd in curl jq git; do
     if ! command -v "$cmd" &> /dev/null; then
         DEPS_MISSING+=("$cmd")
+        NEEDS_APT_INSTALL=true
+        append_apt_dep "$cmd"
     fi
 done
 
@@ -162,10 +233,49 @@ if ! command -v zig &> /dev/null; then
     DEPS_MISSING+=("zig")
 fi
 
-if [[ ${#DEPS_MISSING[@]} -gt 0 ]]; then
-    log_info "Installing dependencies: ${DEPS_MISSING[*]}"
+if ! command -v bwrap &> /dev/null; then
+    DEPS_MISSING+=("bwrap")
+    NEEDS_APT_INSTALL=true
+    add_first_available_pkg "bwrap" bubblewrap || true
+fi
+
+if ! command -v fusermount3 &> /dev/null; then
+    DEPS_MISSING+=("fusermount3")
+    NEEDS_APT_INSTALL=true
+    add_first_available_pkg "fusermount3" fuse3 || true
+fi
+
+if ! has_fuse3_runtime; then
+    DEPS_MISSING+=("libfuse3.so.3/libfuse3.so.4")
+    NEEDS_APT_INSTALL=true
+    add_first_available_pkg "libfuse3 runtime" libfuse3-4 libfuse3-3 fuse3 libfuse3-dev || true
+fi
+
+if [[ "$NEEDS_APT_INSTALL" == "true" ]]; then
+    log_info "Installing dependencies: ${APT_DEPS[*]}"
     sudo apt-get update -qq
-    sudo apt-get install -y -qq curl jq git libsecret-tools sqlite3 build-essential
+    sudo apt-get install -y -qq "${APT_DEPS[@]}"
+fi
+
+if ! command -v zig &> /dev/null; then
+    echo "Error: zig compiler is required but was not found in PATH."
+    echo "Install zig and rerun install.sh."
+    exit 1
+fi
+
+POST_MISSING=()
+for cmd in curl jq git bwrap fusermount3; do
+    if ! command -v "$cmd" &> /dev/null; then
+        POST_MISSING+=("$cmd")
+    fi
+done
+if ! has_fuse3_runtime; then
+    POST_MISSING+=("libfuse3.so.3/libfuse3.so.4")
+fi
+if [[ ${#POST_MISSING[@]} -gt 0 ]]; then
+    echo "Error: missing required dependencies: ${POST_MISSING[*]}"
+    echo "Install them and rerun install.sh."
+    exit 1
 fi
 
 # Clone and build
@@ -217,6 +327,15 @@ if [[ ! -d "$REPO_DIR" ]]; then
     git clone -q https://github.com/DeanoC/ZiggySpiderweb.git "$REPO_DIR"
 fi
 
+REPO_BASE_DIR="$(dirname "$REPO_DIR")"
+log_info "Ensuring local Ziggy module dependencies..."
+ensure_git_repo "${REPO_BASE_DIR}/ZiggyPiAi" "https://github.com/DeanoC/ZiggyPiAi.git"
+ensure_git_repo "${REPO_BASE_DIR}/ZiggySpiderProtocol" "https://github.com/DeanoC/ZiggySpiderProtocol.git"
+ensure_git_repo "${REPO_BASE_DIR}/ZiggyMemoryStore" "https://github.com/DeanoC/ZiggyMemoryStore.git"
+ensure_git_repo "${REPO_BASE_DIR}/ZiggyToolRuntime" "https://github.com/DeanoC/ZiggyToolRuntime.git"
+ensure_git_repo "${REPO_BASE_DIR}/ZiggyRuntimeHooks" "https://github.com/DeanoC/ZiggyRuntimeHooks.git"
+ensure_git_repo "${REPO_BASE_DIR}/ZiggyRunOrchestrator" "https://github.com/DeanoC/ZiggyRunOrchestrator.git"
+
 cd "$REPO_DIR"
 
 log_info "Building ZiggySpiderweb..."
@@ -225,14 +344,27 @@ zig build -Doptimize=ReleaseSafe
 log_info "Installing binaries..."
 mkdir -p "$INSTALL_DIR"
 
+SPIDERWEB_BINARIES=(spiderweb spiderweb-config spiderweb-control spiderweb-fs-mount spiderweb-agent-runtime)
+for bin in "${SPIDERWEB_BINARIES[@]}"; do
+    if [[ ! -x "zig-out/bin/${bin}" ]]; then
+        echo "Error: expected build artifact missing: zig-out/bin/${bin}"
+        exit 1
+    fi
+done
+
 # Copy binaries (spiderweb should be stopped by now)
-if ! cp zig-out/bin/spiderweb "$INSTALL_DIR/" 2>/dev/null; then
+copy_without_sudo=true
+for bin in "${SPIDERWEB_BINARIES[@]}"; do
+    if ! cp "zig-out/bin/${bin}" "$INSTALL_DIR/" 2>/dev/null; then
+        copy_without_sudo=false
+        break
+    fi
+done
+if [[ "$copy_without_sudo" != "true" ]]; then
     log_info "Need elevated permissions to update binary..."
-    sudo cp zig-out/bin/spiderweb "$INSTALL_DIR/"
-    sudo cp zig-out/bin/spiderweb-config "$INSTALL_DIR/"
-else
-    cp zig-out/bin/spiderweb "$INSTALL_DIR/"
-    cp zig-out/bin/spiderweb-config "$INSTALL_DIR/"
+    for bin in "${SPIDERWEB_BINARIES[@]}"; do
+        sudo cp "zig-out/bin/${bin}" "$INSTALL_DIR/"
+    done
 fi
 
 log_success "Build complete!"
@@ -427,8 +559,9 @@ echo ""
 log_success "Installation complete!"
 echo ""
 echo "Binaries installed to:"
-echo "  $INSTALL_DIR/spiderweb"
-echo "  $INSTALL_DIR/spiderweb-config"
+for bin in "${SPIDERWEB_BINARIES[@]}"; do
+    echo "  $INSTALL_DIR/${bin}"
+done
 if [[ "$INSTALL_ZSS" == "true" ]]; then
     echo "  $INSTALL_DIR/zss"
     echo "  $INSTALL_DIR/zss-tui"

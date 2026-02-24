@@ -5,6 +5,8 @@ const connection_dispatcher = @import("connection_dispatcher.zig");
 const memory = @import("ziggy-memory-store").memory;
 const protocol = @import("ziggy-spider-protocol").protocol;
 const runtime_server_mod = @import("runtime_server.zig");
+const runtime_handle_mod = @import("runtime_handle.zig");
+const sandbox_runtime_mod = @import("sandbox_runtime.zig");
 const websocket_transport = @import("websocket_transport.zig");
 const fsrpc_session = @import("fsrpc_session.zig");
 const fs_control_plane = @import("fs_control_plane.zig");
@@ -350,6 +352,30 @@ fn parseUnsignedEnv(allocator: std.mem.Allocator, name: []const u8, default_valu
     return std.fmt.parseInt(u64, trimmed, 10) catch default_value;
 }
 
+fn resolveInternalWsClientHost(bind_addr: []const u8) []const u8 {
+    const trimmed = std.mem.trim(u8, bind_addr, " \t\r\n");
+    if (trimmed.len == 0) return "127.0.0.1";
+    if (std.mem.eql(u8, trimmed, "0.0.0.0")) return "127.0.0.1";
+    if (std.mem.eql(u8, trimmed, "::")) return "127.0.0.1";
+    if (std.mem.eql(u8, trimmed, "[::]")) return "127.0.0.1";
+    return trimmed;
+}
+
+fn formatInternalWsUrl(
+    allocator: std.mem.Allocator,
+    bind_addr: []const u8,
+    port: u16,
+    path: []const u8,
+) ![]u8 {
+    const host = resolveInternalWsClientHost(bind_addr);
+    const is_ipv6_literal = std.mem.indexOfScalar(u8, host, ':') != null and
+        !(host.len >= 2 and host[0] == '[' and host[host.len - 1] == ']');
+    if (is_ipv6_literal) {
+        return std.fmt.allocPrint(allocator, "ws://[{s}]:{d}{s}", .{ host, port, path });
+    }
+    return std.fmt.allocPrint(allocator, "ws://{s}:{d}{s}", .{ host, port, path });
+}
+
 fn parseOptionalEnvOwned(allocator: std.mem.Allocator, name: []const u8) ?[]u8 {
     const raw = std.process.getEnvVarOwned(allocator, name) catch |err| switch (err) {
         error.EnvironmentVariableNotFound => return null,
@@ -365,6 +391,7 @@ const FsHubConnection = struct {
     id: u64,
     stream: *std.net.Stream,
     write_mutex: std.Thread.Mutex = .{},
+    allow_invalidations: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
 };
 
 const FsConnectionHub = struct {
@@ -380,7 +407,7 @@ const FsConnectionHub = struct {
         self.connections.deinit(self.allocator);
     }
 
-    fn register(self: *FsConnectionHub, stream: *std.net.Stream) !*FsHubConnection {
+    fn register(self: *FsConnectionHub, stream: *std.net.Stream, allow_invalidations: bool) !*FsHubConnection {
         const conn = try self.allocator.create(FsHubConnection);
         errdefer self.allocator.destroy(conn);
 
@@ -390,6 +417,7 @@ const FsConnectionHub = struct {
             .id = self.next_id,
             .stream = stream,
         };
+        conn.allow_invalidations.store(allow_invalidations, .release);
         self.next_id +%= 1;
         if (self.next_id == 0) self.next_id = 1;
         try self.connections.append(self.allocator, conn);
@@ -421,11 +449,24 @@ const FsConnectionHub = struct {
         defer self.mutex.unlock();
         for (self.connections.items) |conn| {
             if (conn.id == origin_id) continue;
-            conn.write_mutex.lock();
+            if (!conn.allow_invalidations.load(.acquire)) continue;
+            // Drop invalidation frames when a connection is busy to avoid starving
+            // in-band request/response traffic on the same websocket.
+            if (!conn.write_mutex.tryLock()) continue;
             websocket_transport.writeFrame(conn.stream, payload, .text) catch {
                 conn.stream.close();
             };
             conn.write_mutex.unlock();
+        }
+    }
+
+    fn disableInvalidations(self: *FsConnectionHub, conn_id: u64) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        for (self.connections.items) |conn| {
+            if (conn.id != conn_id) continue;
+            conn.allow_invalidations.store(false, .release);
+            return;
         }
     }
 };
@@ -684,6 +725,7 @@ fn handleLocalFsConnection(
     defer if (connection) |conn| local_node.hub.unregister(conn);
     var connection_write_mutex: std.Thread.Mutex = .{};
     var fsrpc_negotiated = false;
+    var hello_allow_invalidations = false;
 
     while (true) {
         var frame = websocket_transport.readFrame(
@@ -712,7 +754,20 @@ fn handleLocalFsConnection(
                 };
                 defer parsed.deinit(allocator);
 
+                var register_after_response = false;
                 if (!fsrpc_negotiated) {
+                    if (parsed.channel == .control) {
+                        const response = try unified.buildControlError(
+                            allocator,
+                            parsed.id,
+                            "invalid_endpoint",
+                            "wrong websocket endpoint: use / for control protocol (/v2/fs is fsrpc-only)",
+                        );
+                        defer allocator.free(response);
+                        try writeFsHubFrameMaybe(connection, stream, &connection_write_mutex, response, .text);
+                        try writeFsHubFrameMaybe(connection, stream, &connection_write_mutex, "", .close);
+                        return;
+                    }
                     if (parsed.channel != .fsrpc or parsed.fsrpc_type != .fs_t_hello) {
                         const response = try unified.buildFsrpcFsError(
                             allocator,
@@ -725,7 +780,7 @@ fn handleLocalFsConnection(
                         try writeFsHubFrameMaybe(connection, stream, &connection_write_mutex, "", .close);
                         return;
                     }
-                    validateFsNodeHelloPayload(allocator, parsed.payload_json, required_auth_token) catch |err| {
+                    const hello_opts = validateFsNodeHelloPayload(allocator, parsed.payload_json, required_auth_token) catch |err| {
                         const response = try unified.buildFsrpcFsError(
                             allocator,
                             parsed.tag,
@@ -737,10 +792,11 @@ fn handleLocalFsConnection(
                         try writeFsHubFrameMaybe(connection, stream, &connection_write_mutex, "", .close);
                         return;
                     };
-                    connection = try local_node.hub.register(stream);
+                    hello_allow_invalidations = hello_opts.allow_invalidations;
                     fsrpc_negotiated = true;
+                    register_after_response = true;
                 } else if (parsed.fsrpc_type == .fs_t_hello) {
-                    validateFsNodeHelloPayload(allocator, parsed.payload_json, required_auth_token) catch |err| {
+                    const hello_opts = validateFsNodeHelloPayload(allocator, parsed.payload_json, required_auth_token) catch |err| {
                         const response = try unified.buildFsrpcFsError(
                             allocator,
                             parsed.tag,
@@ -752,6 +808,12 @@ fn handleLocalFsConnection(
                         try writeFsHubFrameMaybe(connection, stream, &connection_write_mutex, "", .close);
                         return;
                     };
+                    hello_allow_invalidations = hello_opts.allow_invalidations;
+                    if (connection) |live_connection| {
+                        if (!hello_allow_invalidations) {
+                            local_node.hub.disableInvalidations(live_connection.id);
+                        }
+                    }
                 }
 
                 var handled = local_node.service.handleRequestJsonWithEvents(frame.payload) catch |err| blk: {
@@ -767,18 +829,32 @@ fn handleLocalFsConnection(
                     };
                 };
                 defer handled.deinit(allocator);
-                const live_connection = connection orelse return error.InvalidConnectionState;
+                if (connection) |live_connection| {
+                    if (parsed.fsrpc_type != .fs_t_hello) {
+                        local_node.hub.disableInvalidations(live_connection.id);
+                    }
+                    for (handled.events) |event| {
+                        const event_json = try fs_node_service.buildInvalidationEventJson(allocator, event);
+                        defer allocator.free(event_json);
+                        try writeFsHubFrame(live_connection, event_json, .text);
+                    }
 
-                for (handled.events) |event| {
-                    const event_json = try fs_node_service.buildInvalidationEventJson(allocator, event);
-                    defer allocator.free(event_json);
-                    try writeFsHubFrame(live_connection, event_json, .text);
+                    if (handled.events.len > 0) {
+                        local_node.hub.broadcastInvalidations(live_connection.id, handled.events);
+                    }
+                    try writeFsHubFrame(live_connection, handled.response_json, .text);
+                } else {
+                    for (handled.events) |event| {
+                        const event_json = try fs_node_service.buildInvalidationEventJson(allocator, event);
+                        defer allocator.free(event_json);
+                        try writeStreamFrameWithMutex(stream, &connection_write_mutex, event_json, .text);
+                    }
+                    try writeStreamFrameWithMutex(stream, &connection_write_mutex, handled.response_json, .text);
                 }
 
-                if (handled.events.len > 0) {
-                    local_node.hub.broadcastInvalidations(live_connection.id, handled.events);
+                if (register_after_response) {
+                    connection = try local_node.hub.register(stream, hello_allow_invalidations);
                 }
-                try writeFsHubFrame(live_connection, handled.response_json, .text);
             },
             0x8 => {
                 writeFsHubFrameMaybe(connection, stream, &connection_write_mutex, "", .close) catch {};
@@ -894,15 +970,15 @@ const AuthTokenStore = struct {
         self.* = undefined;
     }
 
-    fn authenticate(self: *const AuthTokenStore, authorization_header: ?[]const u8) !ConnectionPrincipal {
-        const raw = authorization_header orelse return error.AuthMissing;
-        const token = parseBearerToken(raw) orelse return error.AuthMissing;
+    fn authenticate(self: *const AuthTokenStore, authorization_header: ?[]const u8) ConnectionPrincipal {
+        const raw = authorization_header orelse return .{ .role = .user, .token_id = "anonymous" };
+        const token = parseBearerToken(raw) orelse return .{ .role = .user, .token_id = "anonymous" };
         const mutex = @constCast(&self.mutex);
         mutex.lock();
         defer mutex.unlock();
         if (secureTokenEql(self.admin_token, token)) return .{ .role = .admin, .token_id = "admin" };
         if (secureTokenEql(self.user_token, token)) return .{ .role = .user, .token_id = "user" };
-        return error.AuthFailed;
+        return .{ .role = .user, .token_id = "anonymous" };
     }
 
     fn rotateRoleToken(self: *AuthTokenStore, role: ConnectionRole) ![]u8 {
@@ -1073,6 +1149,23 @@ const AuthTokenStore = struct {
         const encoded = std.base64.url_safe_no_pad.Encoder.encode(&encoded_buf, &random_bytes);
         return std.fmt.allocPrint(allocator, "{s}_{s}", .{ prefix, encoded });
     }
+
+    fn copyAdminToken(self: *AuthTokenStore) ![]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.allocator.dupe(u8, self.admin_token);
+    }
+};
+
+const AgentRuntimeEntry = struct {
+    runtime: *runtime_handle_mod.RuntimeHandle,
+    project_id: []u8,
+
+    fn deinit(self: *AgentRuntimeEntry, allocator: std.mem.Allocator) void {
+        self.runtime.destroy();
+        allocator.free(self.project_id);
+        self.* = undefined;
+    }
 };
 
 const AgentRuntimeRegistry = struct {
@@ -1089,8 +1182,9 @@ const AgentRuntimeRegistry = struct {
     control_project_scope_token: ?[]u8 = null,
     control_node_scope_token: ?[]u8 = null,
     local_fs_node: ?*LocalFsNode = null,
+    workspace_url: ?[]u8 = null,
     mutex: std.Thread.Mutex = .{},
-    by_agent: std.StringHashMapUnmanaged(*RuntimeServer) = .{},
+    by_agent: std.StringHashMapUnmanaged(AgentRuntimeEntry) = .{},
     topology_subscribers_mutex: std.Thread.Mutex = .{},
     topology_subscribers: std.ArrayListUnmanaged(ControlTopologySubscriber) = .{},
     next_topology_subscriber_id: u64 = 1,
@@ -1184,7 +1278,8 @@ const AgentRuntimeRegistry = struct {
         var it = self.by_agent.iterator();
         while (it.next()) |entry| {
             self.allocator.free(entry.key_ptr.*);
-            entry.value_ptr.*.destroy();
+            var runtime_entry = entry.value_ptr.*;
+            runtime_entry.deinit(self.allocator);
         }
         self.by_agent.deinit(self.allocator);
         self.clearTopologySubscribers();
@@ -1204,6 +1299,10 @@ const AgentRuntimeRegistry = struct {
             self.allocator.free(token);
             self.control_node_scope_token = null;
         }
+        if (self.workspace_url) |value| {
+            self.allocator.free(value);
+            self.workspace_url = null;
+        }
         self.audit_records_mutex.lock();
         for (self.audit_records.items) |*record| record.deinit(self.allocator);
         self.audit_records.deinit(self.allocator);
@@ -1216,12 +1315,18 @@ const AgentRuntimeRegistry = struct {
         self.auth_tokens.deinit();
     }
 
-    fn authenticateConnection(self: *AgentRuntimeRegistry, authorization_header: ?[]const u8) !ConnectionPrincipal {
+    fn authenticateConnection(self: *AgentRuntimeRegistry, authorization_header: ?[]const u8) ConnectionPrincipal {
         return self.auth_tokens.authenticate(authorization_header);
     }
 
     fn authStatusJson(self: *AgentRuntimeRegistry) ![]u8 {
         return self.auth_tokens.statusJson();
+    }
+
+    fn getLocalFsNode(self: *AgentRuntimeRegistry) ?*LocalFsNode {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.local_fs_node;
     }
 
     fn rotateAuthToken(self: *AgentRuntimeRegistry, role: ConnectionRole) ![]u8 {
@@ -1251,34 +1356,164 @@ const AgentRuntimeRegistry = struct {
         return self.reconcile_worker_stop;
     }
 
-    fn getOrCreate(self: *AgentRuntimeRegistry, agent_id: []const u8) !*RuntimeServer {
+    fn getOrCreate(
+        self: *AgentRuntimeRegistry,
+        agent_id: []const u8,
+        requested_project_id: ?[]const u8,
+        requested_project_token: ?[]const u8,
+    ) !*runtime_handle_mod.RuntimeHandle {
+        if (!isValidAgentId(agent_id)) return error.InvalidAgentId;
+        const resolved_project_id = try self.resolveProjectId(agent_id, requested_project_id);
+        errdefer self.allocator.free(resolved_project_id);
+
+        self.mutex.lock();
+        if (self.by_agent.getPtr(agent_id)) |existing| {
+            if (std.mem.eql(u8, existing.project_id, resolved_project_id)) {
+                const runtime = existing.runtime;
+                self.mutex.unlock();
+                return runtime;
+            }
+        } else if (self.by_agent.count() >= self.max_runtimes) {
+            self.mutex.unlock();
+            return error.RuntimeLimitReached;
+        }
+        self.mutex.unlock();
+
+        const entry = try self.createRuntimeEntry(
+            agent_id,
+            resolved_project_id,
+            requested_project_token,
+        );
+        self.allocator.free(resolved_project_id);
+        var entry_installed = false;
+        errdefer if (!entry_installed) {
+            var cleanup = entry;
+            cleanup.deinit(self.allocator);
+        };
+
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        if (self.by_agent.get(agent_id)) |existing| return existing;
-        if (!isValidAgentId(agent_id)) return error.InvalidAgentId;
+        if (self.by_agent.getPtr(agent_id)) |existing| {
+            if (std.mem.eql(u8, existing.project_id, entry.project_id)) {
+                return existing.runtime;
+            }
+            var previous = existing.*;
+            existing.* = entry;
+            entry_installed = true;
+            previous.deinit(self.allocator);
+            return existing.runtime;
+        }
+
         if (self.by_agent.count() >= self.max_runtimes) return error.RuntimeLimitReached;
 
         const owned_agent = try self.allocator.dupe(u8, agent_id);
         errdefer self.allocator.free(owned_agent);
 
+        try self.by_agent.put(self.allocator, owned_agent, entry);
+        entry_installed = true;
+        return self.by_agent.getPtr(owned_agent).?.runtime;
+    }
+
+    fn createRuntimeEntry(
+        self: *AgentRuntimeRegistry,
+        agent_id: []const u8,
+        project_id: []const u8,
+        project_token: ?[]const u8,
+    ) !AgentRuntimeEntry {
+        if (self.runtime_config.sandbox_enabled) {
+            const workspace_url = self.workspace_url orelse return error.InvalidSandboxConfig;
+            const workspace_auth = try self.auth_tokens.copyAdminToken();
+            defer self.allocator.free(workspace_auth);
+            const sandbox_runtime = sandbox_runtime_mod.SandboxRuntime.create(.{
+                .allocator = self.allocator,
+                .agent_id = agent_id,
+                .project_id = project_id,
+                .project_token = project_token,
+                .workspace_url = workspace_url,
+                .workspace_auth_token = workspace_auth,
+                .runtime_cfg = self.runtime_config,
+            }) catch |err| switch (err) {
+                error.ProjectMountUnavailable => return error.SandboxMountUnavailable,
+                else => return error.InvalidSandboxConfig,
+            };
+            errdefer sandbox_runtime.destroy();
+
+            const runtime_server = if (self.provider_config) |provider_cfg|
+                try RuntimeServer.createWithProviderAndToolDispatch(
+                    self.allocator,
+                    agent_id,
+                    self.runtime_config,
+                    provider_cfg,
+                    sandbox_runtime,
+                    sandbox_runtime_mod.SandboxRuntime.dispatchWorldTool,
+                )
+            else
+                try RuntimeServer.createWithToolDispatch(
+                    self.allocator,
+                    agent_id,
+                    self.runtime_config,
+                    sandbox_runtime,
+                    sandbox_runtime_mod.SandboxRuntime.dispatchWorldTool,
+                );
+            errdefer runtime_server.destroy();
+
+            const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocalWithSandbox(
+                self.allocator,
+                runtime_server,
+                sandbox_runtime,
+            );
+            errdefer runtime_handle.destroy();
+            return .{
+                .runtime = runtime_handle,
+                .project_id = try self.allocator.dupe(u8, project_id),
+            };
+        }
+
         const runtime_server = if (self.provider_config) |provider_cfg|
             try RuntimeServer.createWithProvider(
                 self.allocator,
-                owned_agent,
+                agent_id,
                 self.runtime_config,
                 provider_cfg,
             )
         else
             try RuntimeServer.create(
                 self.allocator,
-                owned_agent,
+                agent_id,
                 self.runtime_config,
             );
         errdefer runtime_server.destroy();
 
-        try self.by_agent.put(self.allocator, owned_agent, runtime_server);
-        return runtime_server;
+        const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(self.allocator, runtime_server);
+        errdefer runtime_handle.destroy();
+        return .{
+            .runtime = runtime_handle,
+            .project_id = try self.allocator.dupe(u8, project_id),
+        };
+    }
+
+    fn resolveProjectId(
+        self: *AgentRuntimeRegistry,
+        agent_id: []const u8,
+        requested_project_id: ?[]const u8,
+    ) ![]u8 {
+        if (requested_project_id) |project_id| {
+            return self.allocator.dupe(u8, project_id);
+        }
+
+        if (!self.runtime_config.sandbox_enabled) {
+            return self.allocator.dupe(u8, "__local__");
+        }
+
+        const status_payload = self.control_plane.workspaceStatus(agent_id, null) catch {
+            return error.ProjectResolutionFailed;
+        };
+        defer self.allocator.free(status_payload);
+        const selected = extractProjectIdFromControlPayload(self.allocator, status_payload) catch return error.ProjectResolutionFailed;
+        defer if (selected) |value| self.allocator.free(value);
+        if (selected) |project_id| return self.allocator.dupe(u8, project_id);
+        return error.ProjectRequired;
     }
 
     fn isValidAgentId(agent_id: []const u8) bool {
@@ -1618,6 +1853,11 @@ const AgentRuntimeRegistry = struct {
     }
 
     fn maybeInitLocalFsNode(self: *AgentRuntimeRegistry, bind_addr: []const u8, port: u16) !void {
+        self.mutex.lock();
+        const existing_node = self.local_fs_node;
+        self.mutex.unlock();
+        if (existing_node != null) return;
+
         const export_path_owned = std.process.getEnvVarOwned(self.allocator, local_node_export_path_env) catch |err| switch (err) {
             error.EnvironmentVariableNotFound => null,
             else => return err,
@@ -1666,9 +1906,9 @@ const AgentRuntimeRegistry = struct {
         defer if (fs_url_owned) |value| self.allocator.free(value);
         const fs_url = if (fs_url_owned) |value| blk: {
             const trimmed = std.mem.trim(u8, value, " \t\r\n");
-            if (trimmed.len == 0) break :blk try std.fmt.allocPrint(self.allocator, "ws://{s}:{d}/v2/fs", .{ bind_addr, port });
+            if (trimmed.len == 0) break :blk try formatInternalWsUrl(self.allocator, bind_addr, port, "/v2/fs");
             break :blk try self.allocator.dupe(u8, trimmed);
-        } else try std.fmt.allocPrint(self.allocator, "ws://{s}:{d}/v2/fs", .{ bind_addr, port });
+        } else try formatInternalWsUrl(self.allocator, bind_addr, port, "/v2/fs");
         defer self.allocator.free(fs_url);
 
         const lease_ttl_ms = parseUnsignedEnv(self.allocator, local_node_lease_ttl_env, 15 * 60 * 1000);
@@ -1692,13 +1932,75 @@ const AgentRuntimeRegistry = struct {
         errdefer local_node.deinit(&self.control_plane);
         try local_node.startRegistrationAndHeartbeat(&self.control_plane);
 
-        self.local_fs_node = local_node;
+        var installed = false;
+        self.mutex.lock();
+        if (self.local_fs_node == null) {
+            self.local_fs_node = local_node;
+            installed = true;
+        }
+        self.mutex.unlock();
+        if (!installed) {
+            local_node.deinit(&self.control_plane);
+            return;
+        }
+
         std.log.info(
-            "local fs node enabled at ws://{s}:{d}/v2/fs export={s}:{s} ({s})",
-            .{ bind_addr, port, export_name, export_path, if (export_ro) "ro" else "rw" },
+            "local fs node enabled at {s} export={s}:{s} ({s})",
+            .{ fs_url, export_name, export_path, if (export_ro) "ro" else "rw" },
         );
     }
 };
+
+const LocalFsBootstrapContext = struct {
+    allocator: std.mem.Allocator,
+    runtime_registry: *AgentRuntimeRegistry,
+    bind_addr: []u8,
+    port: u16,
+};
+
+fn startLocalFsBootstrapThread(
+    allocator: std.mem.Allocator,
+    runtime_registry: *AgentRuntimeRegistry,
+    bind_addr: []const u8,
+    port: u16,
+) void {
+    const bind_addr_owned = allocator.dupe(u8, bind_addr) catch |err| {
+        std.log.warn("local fs node bootstrap disabled: {s}", .{@errorName(err)});
+        return;
+    };
+    errdefer allocator.free(bind_addr_owned);
+
+    const ctx = allocator.create(LocalFsBootstrapContext) catch |err| {
+        allocator.free(bind_addr_owned);
+        std.log.warn("local fs node bootstrap disabled: {s}", .{@errorName(err)});
+        return;
+    };
+    ctx.* = .{
+        .allocator = allocator,
+        .runtime_registry = runtime_registry,
+        .bind_addr = bind_addr_owned,
+        .port = port,
+    };
+
+    const thread = std.Thread.spawn(.{}, localFsBootstrapThreadMain, .{ctx}) catch |err| {
+        allocator.free(bind_addr_owned);
+        allocator.destroy(ctx);
+        std.log.warn("local fs node bootstrap thread failed: {s}", .{@errorName(err)});
+        return;
+    };
+    thread.detach();
+}
+
+fn localFsBootstrapThreadMain(ctx: *LocalFsBootstrapContext) void {
+    defer {
+        ctx.allocator.free(ctx.bind_addr);
+        ctx.allocator.destroy(ctx);
+    }
+
+    ctx.runtime_registry.maybeInitLocalFsNode(ctx.bind_addr, ctx.port) catch |err| {
+        std.log.warn("local fs node setup skipped: {s}", .{@errorName(err)});
+    };
+}
 
 fn reconcileWorkerMain(runtime_registry: *AgentRuntimeRegistry) void {
     while (true) {
@@ -1729,10 +2031,7 @@ pub fn run(
     var runtime_registry = AgentRuntimeRegistry.init(allocator, runtime_config, provider_config);
     defer runtime_registry.deinit();
 
-    _ = try runtime_registry.getOrCreate(runtime_registry.default_agent_id);
-    runtime_registry.maybeInitLocalFsNode(bind_addr, port) catch |err| {
-        std.log.warn("local fs node setup skipped: {s}", .{@errorName(err)});
-    };
+    runtime_registry.workspace_url = try formatInternalWsUrl(allocator, bind_addr, port, "/");
     try runtime_registry.startReconcileWorker();
 
     const metrics_port_raw = parseUnsignedEnv(allocator, metrics_port_env, 0);
@@ -1778,6 +2077,7 @@ pub fn run(
         "Runtime websocket server listening at ws://{s}:{d}",
         .{ bind_addr, port },
     );
+    startLocalFsBootstrapThread(allocator, &runtime_registry, bind_addr, port);
 
     while (true) {
         var connection = tcp_server.accept() catch |err| {
@@ -1816,7 +2116,7 @@ fn handleWebSocketConnection(
     defer handshake.deinit(allocator);
 
     if (std.mem.eql(u8, handshake.path, "/v2/fs")) {
-        const local_node = runtime_registry.local_fs_node orelse {
+        const local_node = runtime_registry.getLocalFsNode() orelse {
             try sendWebSocketErrorAndClose(allocator, stream, .invalid_envelope, "local /v2/fs endpoint is disabled");
             return;
         };
@@ -1829,14 +2129,7 @@ fn handleWebSocketConnection(
         return;
     };
 
-    const principal = runtime_registry.authenticateConnection(handshake.authorization) catch |err| {
-        const reason = switch (err) {
-            error.AuthMissing => "missing authorization token",
-            else => "invalid authorization token",
-        };
-        try sendWebSocketErrorAndClose(allocator, stream, .provider_auth_failed, reason);
-        return;
-    };
+    const principal = runtime_registry.authenticateConnection(handshake.authorization);
 
     var session_bindings: std.StringHashMapUnmanaged(SessionBinding) = .{};
     defer deinitSessionBindings(allocator, &session_bindings);
@@ -1846,20 +2139,8 @@ fn handleWebSocketConnection(
 
     var active_session_key = try allocator.dupe(u8, "main");
     defer allocator.free(active_session_key);
-    const initial_binding = session_bindings.get("main") orelse return error.InvalidState;
-    const runtime_server = runtime_registry.getOrCreate(initial_binding.agent_id) catch |err| switch (err) {
-        error.InvalidAgentId => {
-            try sendWebSocketErrorAndClose(allocator, stream, .invalid_envelope, "invalid initial agent id");
-            return;
-        },
-        error.RuntimeLimitReached => {
-            try sendWebSocketErrorAndClose(allocator, stream, .queue_saturated, "agent runtime limit reached");
-            return;
-        },
-        else => return err,
-    };
-    var fsrpc = try fsrpc_session.Session.init(allocator, runtime_server, &runtime_registry.job_index, initial_binding.agent_id);
-    defer fsrpc.deinit();
+    var fsrpc: ?fsrpc_session.Session = null;
+    defer if (fsrpc) |*session| session.deinit();
     var fsrpc_bound_session_key = try allocator.dupe(u8, "main");
     defer allocator.free(fsrpc_bound_session_key);
     var debug_stream_enabled = false;
@@ -2352,7 +2633,7 @@ fn handleWebSocketConnection(
                                     continue;
                                 }
 
-                                _ = runtime_registry.getOrCreate(attach_agent_id) catch |attach_err| switch (attach_err) {
+                                _ = runtime_registry.getOrCreate(attach_agent_id, attach_project_id, attach_project_token) catch |attach_err| switch (attach_err) {
                                     error.InvalidAgentId => {
                                         const response = try unified.buildControlError(
                                             allocator,
@@ -2370,6 +2651,39 @@ fn handleWebSocketConnection(
                                             parsed.id,
                                             "queue_saturated",
                                             "agent runtime limit reached",
+                                        );
+                                        defer allocator.free(response);
+                                        try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                        continue;
+                                    },
+                                    error.ProjectRequired => {
+                                        const response = try unified.buildControlError(
+                                            allocator,
+                                            parsed.id,
+                                            "sandbox_mount_missing",
+                                            "sandbox requires a project binding",
+                                        );
+                                        defer allocator.free(response);
+                                        try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                        continue;
+                                    },
+                                    error.SandboxMountUnavailable => {
+                                        const response = try unified.buildControlError(
+                                            allocator,
+                                            parsed.id,
+                                            "sandbox_mount_unavailable",
+                                            "sandbox mount is unavailable",
+                                        );
+                                        defer allocator.free(response);
+                                        try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                        continue;
+                                    },
+                                    error.InvalidSandboxConfig => {
+                                        const response = try unified.buildControlError(
+                                            allocator,
+                                            parsed.id,
+                                            "sandbox_invalid_config",
+                                            "sandbox config is invalid",
                                         );
                                         defer allocator.free(response);
                                         try writeFrameLocked(stream, &connection_write_mutex, response, .text);
@@ -2406,8 +2720,71 @@ fn handleWebSocketConnection(
                                 active_session_key = try allocator.dupe(u8, session_key);
 
                                 const active_binding = session_bindings.get(session_key) orelse return error.InvalidState;
-                                const active_runtime = try runtime_registry.getOrCreate(active_binding.agent_id);
-                                try fsrpc.setRuntimeBinding(active_runtime, active_binding.agent_id);
+                                if (fsrpc) |*session| {
+                                    const active_runtime = runtime_registry.getOrCreate(
+                                        active_binding.agent_id,
+                                        active_binding.project_id,
+                                        active_binding.project_token,
+                                    ) catch |err| switch (err) {
+                                        error.InvalidAgentId => {
+                                            const response = try unified.buildControlError(
+                                                allocator,
+                                                parsed.id,
+                                                "invalid_payload",
+                                                "invalid agent_id",
+                                            );
+                                            defer allocator.free(response);
+                                            try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                            continue;
+                                        },
+                                        error.RuntimeLimitReached => {
+                                            const response = try unified.buildControlError(
+                                                allocator,
+                                                parsed.id,
+                                                "queue_saturated",
+                                                "agent runtime limit reached",
+                                            );
+                                            defer allocator.free(response);
+                                            try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                            continue;
+                                        },
+                                        error.ProjectRequired => {
+                                            const response = try unified.buildControlError(
+                                                allocator,
+                                                parsed.id,
+                                                "sandbox_mount_missing",
+                                                "sandbox requires a project binding",
+                                            );
+                                            defer allocator.free(response);
+                                            try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                            continue;
+                                        },
+                                        error.SandboxMountUnavailable => {
+                                            const response = try unified.buildControlError(
+                                                allocator,
+                                                parsed.id,
+                                                "sandbox_mount_unavailable",
+                                                "sandbox mount is unavailable",
+                                            );
+                                            defer allocator.free(response);
+                                            try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                            continue;
+                                        },
+                                        error.InvalidSandboxConfig => {
+                                            const response = try unified.buildControlError(
+                                                allocator,
+                                                parsed.id,
+                                                "sandbox_invalid_config",
+                                                "sandbox config is invalid",
+                                            );
+                                            defer allocator.free(response);
+                                            try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                            continue;
+                                        },
+                                        else => return err,
+                                    };
+                                    try session.setRuntimeBinding(active_runtime, active_binding.agent_id);
+                                }
                                 const workspace_status_owned: ?[]u8 = runtime_registry.control_plane.workspaceStatus(active_binding.agent_id, null) catch null;
                                 defer if (workspace_status_owned) |value| allocator.free(value);
                                 const workspace_status = if (workspace_status_owned) |value| value else "{}";
@@ -2469,8 +2846,71 @@ fn handleWebSocketConnection(
 
                                 allocator.free(active_session_key);
                                 active_session_key = try allocator.dupe(u8, session_key);
-                                const active_runtime = try runtime_registry.getOrCreate(binding.agent_id);
-                                try fsrpc.setRuntimeBinding(active_runtime, binding.agent_id);
+                                if (fsrpc) |*session| {
+                                    const active_runtime = runtime_registry.getOrCreate(
+                                        binding.agent_id,
+                                        binding.project_id,
+                                        binding.project_token,
+                                    ) catch |err| switch (err) {
+                                        error.InvalidAgentId => {
+                                            const response = try unified.buildControlError(
+                                                allocator,
+                                                parsed.id,
+                                                "invalid_payload",
+                                                "invalid agent_id",
+                                            );
+                                            defer allocator.free(response);
+                                            try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                            continue;
+                                        },
+                                        error.RuntimeLimitReached => {
+                                            const response = try unified.buildControlError(
+                                                allocator,
+                                                parsed.id,
+                                                "queue_saturated",
+                                                "agent runtime limit reached",
+                                            );
+                                            defer allocator.free(response);
+                                            try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                            continue;
+                                        },
+                                        error.ProjectRequired => {
+                                            const response = try unified.buildControlError(
+                                                allocator,
+                                                parsed.id,
+                                                "sandbox_mount_missing",
+                                                "sandbox requires a project binding",
+                                            );
+                                            defer allocator.free(response);
+                                            try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                            continue;
+                                        },
+                                        error.SandboxMountUnavailable => {
+                                            const response = try unified.buildControlError(
+                                                allocator,
+                                                parsed.id,
+                                                "sandbox_mount_unavailable",
+                                                "sandbox mount is unavailable",
+                                            );
+                                            defer allocator.free(response);
+                                            try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                            continue;
+                                        },
+                                        error.InvalidSandboxConfig => {
+                                            const response = try unified.buildControlError(
+                                                allocator,
+                                                parsed.id,
+                                                "sandbox_invalid_config",
+                                                "sandbox config is invalid",
+                                            );
+                                            defer allocator.free(response);
+                                            try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                            continue;
+                                        },
+                                        else => return err,
+                                    };
+                                    try session.setRuntimeBinding(active_runtime, binding.agent_id);
+                                }
                                 const workspace_status_owned: ?[]u8 = runtime_registry.control_plane.workspaceStatus(binding.agent_id, null) catch null;
                                 defer if (workspace_status_owned) |value| allocator.free(value);
                                 const workspace_status = if (workspace_status_owned) |value| value else "{}";
@@ -2561,9 +3001,72 @@ fn handleWebSocketConnection(
                                 if (std.mem.eql(u8, active_session_key, session_key)) {
                                     allocator.free(active_session_key);
                                     active_session_key = try allocator.dupe(u8, "main");
-                                    const main_binding = session_bindings.get("main") orelse return error.InvalidState;
-                                    const main_runtime = try runtime_registry.getOrCreate(main_binding.agent_id);
-                                    try fsrpc.setRuntimeBinding(main_runtime, main_binding.agent_id);
+                                    if (fsrpc) |*session| {
+                                        const main_binding = session_bindings.get("main") orelse return error.InvalidState;
+                                        const main_runtime = runtime_registry.getOrCreate(
+                                            main_binding.agent_id,
+                                            main_binding.project_id,
+                                            main_binding.project_token,
+                                        ) catch |err| switch (err) {
+                                            error.InvalidAgentId => {
+                                                const response = try unified.buildControlError(
+                                                    allocator,
+                                                    parsed.id,
+                                                    "invalid_payload",
+                                                    "invalid agent_id",
+                                                );
+                                                defer allocator.free(response);
+                                                try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                                continue;
+                                            },
+                                            error.RuntimeLimitReached => {
+                                                const response = try unified.buildControlError(
+                                                    allocator,
+                                                    parsed.id,
+                                                    "queue_saturated",
+                                                    "agent runtime limit reached",
+                                                );
+                                                defer allocator.free(response);
+                                                try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                                continue;
+                                            },
+                                            error.ProjectRequired => {
+                                                const response = try unified.buildControlError(
+                                                    allocator,
+                                                    parsed.id,
+                                                    "sandbox_mount_missing",
+                                                    "sandbox requires a project binding",
+                                                );
+                                                defer allocator.free(response);
+                                                try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                                continue;
+                                            },
+                                            error.SandboxMountUnavailable => {
+                                                const response = try unified.buildControlError(
+                                                    allocator,
+                                                    parsed.id,
+                                                    "sandbox_mount_unavailable",
+                                                    "sandbox mount is unavailable",
+                                                );
+                                                defer allocator.free(response);
+                                                try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                                continue;
+                                            },
+                                            error.InvalidSandboxConfig => {
+                                                const response = try unified.buildControlError(
+                                                    allocator,
+                                                    parsed.id,
+                                                    "sandbox_invalid_config",
+                                                    "sandbox config is invalid",
+                                                );
+                                                defer allocator.free(response);
+                                                try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                                continue;
+                                            },
+                                            else => return err,
+                                        };
+                                        try session.setRuntimeBinding(main_runtime, main_binding.agent_id);
+                                    }
                                 }
 
                                 const payload_json = try std.fmt.allocPrint(
@@ -2584,7 +3087,9 @@ fn handleWebSocketConnection(
                             },
                             .debug_subscribe, .debug_unsubscribe => {
                                 debug_stream_enabled = control_type == .debug_subscribe;
-                                fsrpc.setDebugStreamEnabled(debug_stream_enabled);
+                                if (fsrpc) |*session| {
+                                    session.setDebugStreamEnabled(debug_stream_enabled);
+                                }
                                 if (debug_stream_enabled) {
                                     if (topology_subscriber_id == null) {
                                         topology_subscriber_id = try runtime_registry.registerTopologySubscriber(
@@ -2841,7 +3346,11 @@ fn handleWebSocketConnection(
                             try writeFrameLocked(stream, &connection_write_mutex, response, .text);
                             continue;
                         };
-                        const target_runtime = runtime_registry.getOrCreate(target_binding.agent_id) catch |err| switch (err) {
+                        const target_runtime = runtime_registry.getOrCreate(
+                            target_binding.agent_id,
+                            target_binding.project_id,
+                            target_binding.project_token,
+                        ) catch |err| switch (err) {
                             error.InvalidAgentId => {
                                 const response = try unified.buildFsrpcError(
                                     allocator,
@@ -2864,21 +3373,62 @@ fn handleWebSocketConnection(
                                 try writeFrameLocked(stream, &connection_write_mutex, response, .text);
                                 continue;
                             },
+                            error.ProjectRequired => {
+                                const response = try unified.buildFsrpcError(
+                                    allocator,
+                                    parsed.tag,
+                                    "sandbox_mount_missing",
+                                    "sandbox requires a project binding",
+                                );
+                                defer allocator.free(response);
+                                try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                continue;
+                            },
+                            error.SandboxMountUnavailable => {
+                                const response = try unified.buildFsrpcError(
+                                    allocator,
+                                    parsed.tag,
+                                    "sandbox_mount_unavailable",
+                                    "sandbox mount is unavailable",
+                                );
+                                defer allocator.free(response);
+                                try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                continue;
+                            },
+                            error.InvalidSandboxConfig => {
+                                const response = try unified.buildFsrpcError(
+                                    allocator,
+                                    parsed.tag,
+                                    "sandbox_invalid_config",
+                                    "sandbox config is invalid",
+                                );
+                                defer allocator.free(response);
+                                try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                continue;
+                            },
                             else => return err,
                         };
-                        const needs_rebind = !std.mem.eql(u8, fsrpc_bound_session_key, target_session_key) or
-                            !std.mem.eql(u8, fsrpc.agent_id, target_binding.agent_id);
-                        if (needs_rebind) {
-                            try fsrpc.setRuntimeBinding(target_runtime, target_binding.agent_id);
+                        if (fsrpc == null) {
+                            fsrpc = try fsrpc_session.Session.init(allocator, target_runtime, &runtime_registry.job_index, target_binding.agent_id);
+                            fsrpc.?.setDebugStreamEnabled(debug_stream_enabled);
                             const next_bound_session_key = try allocator.dupe(u8, target_session_key);
                             allocator.free(fsrpc_bound_session_key);
                             fsrpc_bound_session_key = next_bound_session_key;
+                        } else {
+                            const needs_rebind = !std.mem.eql(u8, fsrpc_bound_session_key, target_session_key) or
+                                !std.mem.eql(u8, fsrpc.?.agent_id, target_binding.agent_id);
+                            if (needs_rebind) {
+                                try fsrpc.?.setRuntimeBinding(target_runtime, target_binding.agent_id);
+                                const next_bound_session_key = try allocator.dupe(u8, target_session_key);
+                                allocator.free(fsrpc_bound_session_key);
+                                fsrpc_bound_session_key = next_bound_session_key;
+                            }
                         }
-                        const response = try fsrpc.handle(&parsed);
+                        const response = try fsrpc.?.handle(&parsed);
                         defer allocator.free(response);
                         try writeFrameLocked(stream, &connection_write_mutex, response, .text);
 
-                        const debug_frames = try fsrpc.drainPendingDebugFrames();
+                        const debug_frames = try fsrpc.?.drainPendingDebugFrames();
                         if (debug_frames.len > 0) {
                             defer allocator.free(debug_frames);
                             var idx: usize = 0;
@@ -3130,7 +3680,11 @@ fn tryHandleLegacySessionSendFrame(
         return true;
     };
 
-    const runtime_server = runtime_registry.getOrCreate(binding.agent_id) catch |err| switch (err) {
+    const runtime_server = runtime_registry.getOrCreate(
+        binding.agent_id,
+        binding.project_id,
+        binding.project_token,
+    ) catch |err| switch (err) {
         error.InvalidAgentId => {
             const response = try protocol.buildErrorWithCode(allocator, legacy.id orelse "generated", .invalid_envelope, "invalid session agent");
             defer allocator.free(response);
@@ -3139,6 +3693,24 @@ fn tryHandleLegacySessionSendFrame(
         },
         error.RuntimeLimitReached => {
             const response = try protocol.buildErrorWithCode(allocator, legacy.id orelse "generated", .queue_saturated, "agent runtime limit reached");
+            defer allocator.free(response);
+            try writeFrameLocked(stream, write_mutex, response, .text);
+            return true;
+        },
+        error.ProjectRequired => {
+            const response = try protocol.buildErrorWithCode(allocator, legacy.id orelse "generated", .execution_failed, "sandbox requires a project binding");
+            defer allocator.free(response);
+            try writeFrameLocked(stream, write_mutex, response, .text);
+            return true;
+        },
+        error.SandboxMountUnavailable => {
+            const response = try protocol.buildErrorWithCode(allocator, legacy.id orelse "generated", .execution_failed, "sandbox mount is unavailable");
+            defer allocator.free(response);
+            try writeFrameLocked(stream, write_mutex, response, .text);
+            return true;
+        },
+        error.InvalidSandboxConfig => {
+            const response = try protocol.buildErrorWithCode(allocator, legacy.id orelse "generated", .execution_failed, "sandbox config is invalid");
             defer allocator.free(response);
             try writeFrameLocked(stream, write_mutex, response, .text);
             return true;
@@ -3205,11 +3777,15 @@ fn validateControlVersionPayload(allocator: std.mem.Allocator, payload_json: ?[]
     if (!std.mem.eql(u8, protocol_value.string, control_protocol_version)) return error.ProtocolMismatch;
 }
 
+const FsNodeHelloOptions = struct {
+    allow_invalidations: bool = false,
+};
+
 fn validateFsNodeHelloPayload(
     allocator: std.mem.Allocator,
     payload_json: ?[]const u8,
     required_auth_token: ?[]const u8,
-) !void {
+) !FsNodeHelloOptions {
     const raw = payload_json orelse return error.MissingField;
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
     defer parsed.deinit();
@@ -3228,6 +3804,13 @@ fn validateFsNodeHelloPayload(
         if (auth_value != .string) return error.InvalidType;
         if (!std.mem.eql(u8, auth_value.string, expected)) return error.AuthFailed;
     }
+
+    var opts = FsNodeHelloOptions{};
+    if (parsed.value.object.get("subscribe_invalidations")) |value| {
+        if (value != .bool) return error.InvalidType;
+        opts.allow_invalidations = value.bool;
+    }
+    return opts;
 }
 
 fn writeFrameLocked(
@@ -4621,8 +5204,9 @@ test "server_piai: base path routes all connections to default runtime" {
         try std.testing.expectEqual(@as(u8, 0x8), close_reply.opcode);
     }
 
-    const runtime = try runtime_registry.getOrCreate(runtime_registry.default_agent_id);
-    const snapshot = try runtime.runtime.active_memory.snapshotActive(allocator, "primary");
+    const runtime = try runtime_registry.getOrCreate(runtime_registry.default_agent_id, null, null);
+    try std.testing.expect(runtime.kind == .local);
+    const snapshot = try runtime.local.?.runtime.active_memory.snapshotActive(allocator, "primary");
     defer memory.deinitItems(allocator, snapshot);
     const snapshot_json = try memory.toActiveMemoryJson(allocator, "primary", snapshot);
     defer allocator.free(snapshot_json);

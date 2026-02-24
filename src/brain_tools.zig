@@ -4,6 +4,7 @@ const memid = @import("ziggy-memory-store").memid;
 const brain_context = @import("brain_context.zig");
 const event_bus = @import("ziggy-runtime-hooks").event_bus;
 const tool_registry = @import("ziggy-tool-runtime").tool_registry;
+const tool_executor = @import("ziggy-tool-runtime").tool_executor;
 
 pub const ToolResult = struct {
     tool_name: []u8,
@@ -85,6 +86,8 @@ pub const Engine = struct {
     runtime_memory: *memory.RuntimeMemory,
     bus: *event_bus.EventBus,
     world_tools: ?*const tool_registry.ToolRegistry = null,
+    world_tool_dispatch_ctx: ?*anyopaque = null,
+    world_tool_dispatch_fn: ?tool_executor.RemoteToolExecutorFn = null,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -109,6 +112,24 @@ pub const Engine = struct {
             .runtime_memory = runtime_memory,
             .bus = bus,
             .world_tools = world_tools,
+        };
+    }
+
+    pub fn initWithWorldToolsAndDispatch(
+        allocator: std.mem.Allocator,
+        runtime_memory: *memory.RuntimeMemory,
+        bus: *event_bus.EventBus,
+        world_tools: ?*const tool_registry.ToolRegistry,
+        world_tool_dispatch_ctx: ?*anyopaque,
+        world_tool_dispatch_fn: ?tool_executor.RemoteToolExecutorFn,
+    ) Engine {
+        return .{
+            .allocator = allocator,
+            .runtime_memory = runtime_memory,
+            .bus = bus,
+            .world_tools = world_tools,
+            .world_tool_dispatch_ctx = world_tool_dispatch_ctx,
+            .world_tool_dispatch_fn = world_tool_dispatch_fn,
         };
     }
 
@@ -248,7 +269,7 @@ pub const Engine = struct {
             return .{ .result = talk.result, .talk_id = talk.talk_id };
         }
 
-        if (self.world_tools != null) {
+        if (self.world_tools != null or self.world_tool_dispatch_fn != null) {
             return .{ .result = try self.execWorldTool(tool_use.name, args) };
         }
 
@@ -256,12 +277,39 @@ pub const Engine = struct {
     }
 
     fn execWorldTool(self: *Engine, tool_name: []const u8, args: std.json.ObjectMap) !ToolResult {
-        const world_tools = self.world_tools orelse return self.failure(tool_name, "unsupported_tool", "Unsupported brain tool");
         const tool_call_id = if (args.get("_tool_call_id")) |value|
             if (value == .string) value.string else null
         else
             null;
-        var outcome = world_tools.executeWorld(self.allocator, tool_name, args);
+        var outcome = blk: {
+            if (self.world_tool_dispatch_fn) |dispatch_fn| {
+                const dispatch_ctx = self.world_tool_dispatch_ctx orelse break :blk self.failureResult(
+                    .execution_failed,
+                    "world tool dispatch context unavailable",
+                );
+
+                const args_json = std.json.Stringify.valueAlloc(
+                    self.allocator,
+                    std.json.Value{ .object = args },
+                    .{
+                        .emit_null_optional_fields = true,
+                        .whitespace = .minified,
+                    },
+                ) catch break :blk self.failureResult(
+                    .execution_failed,
+                    "failed to serialize world tool arguments",
+                );
+                defer self.allocator.free(args_json);
+
+                break :blk dispatch_fn(dispatch_ctx, self.allocator, tool_name, args_json);
+            }
+
+            const world_tools = self.world_tools orelse break :blk self.failureResult(
+                .tool_not_executable,
+                "Unsupported brain tool",
+            );
+            break :blk world_tools.executeWorld(self.allocator, tool_name, args);
+        };
         defer outcome.deinit(self.allocator);
 
         return switch (outcome) {
@@ -300,6 +348,17 @@ pub const Engine = struct {
                 return self.failure(tool_name, @tagName(failure_info.code), failure_info.message);
             },
         };
+    }
+
+    fn failureResult(
+        self: *Engine,
+        code: tool_registry.ToolErrorCode,
+        message: []const u8,
+    ) tool_registry.ToolExecutionResult {
+        return .{ .failure = .{
+            .code = code,
+            .message = self.allocator.dupe(u8, message) catch self.allocator.dupe(u8, "out of memory") catch @panic("out of memory"),
+        } };
     }
 
     fn execMemoryCreate(

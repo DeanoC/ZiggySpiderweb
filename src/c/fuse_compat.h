@@ -105,8 +105,6 @@ struct fuse_operations {
     int (*fallocate)(const char *, int, off_t, off_t, struct fuse_file_info *);
     ssize_t (*copy_file_range)(const char *path_in, struct fuse_file_info *fi_in, off_t offset_in, const char *path_out, struct fuse_file_info *fi_out, off_t offset_out, size_t size, int flags);
     off_t (*lseek)(const char *, off_t off, int whence, struct fuse_file_info *);
-    int (*statx)(const char *path, int flags, int mask, struct statx *stxbuf, struct fuse_file_info *fi);
-    int (*syncfs)(const char *path);
 };
 
 int fuse_main_real_versioned(int argc, char *argv[],
