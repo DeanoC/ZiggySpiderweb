@@ -95,7 +95,7 @@ pub const AgentRuntime = struct {
     hooks: hook_registry.HookRegistry,
     runtime_config: Config.RuntimeConfig,
     world_tool_dispatch_ctx: ?*anyopaque = null,
-    world_tool_dispatch_fn: ?tool_executor.RemoteToolExecutorFn = null,
+    world_tool_dispatch_fn: ?brain_tools.RemoteToolDispatchFn = null,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -195,7 +195,7 @@ pub const AgentRuntime = struct {
     pub fn setWorldToolDispatch(
         self: *AgentRuntime,
         dispatch_ctx: ?*anyopaque,
-        dispatch_fn: ?tool_executor.RemoteToolExecutorFn,
+        dispatch_fn: ?brain_tools.RemoteToolDispatchFn,
     ) void {
         self.world_tool_dispatch_ctx = dispatch_ctx;
         self.world_tool_dispatch_fn = dispatch_fn;

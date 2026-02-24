@@ -41,13 +41,17 @@ pub const SandboxRuntime = struct {
         const mounts_root_trimmed = std.mem.trim(u8, runtime_cfg_for_child.sandbox_mounts_root, " \t\r\n");
         if (mounts_root_trimmed.len == 0) return error.InvalidSandboxConfig;
 
-        const project_mount_path = try std.fs.path.join(options.allocator, &.{ mounts_root_trimmed, options.project_id });
-        errdefer options.allocator.free(project_mount_path);
-
         try ensurePathExists(mounts_root_trimmed);
-        // Hard-cut behavior: always recycle the project mount path so stale mounts cannot poison runtime startup.
-        detachMountAtPath(options.allocator, project_mount_path);
-        try ensurePathExists(project_mount_path);
+        const project_mount_root = try std.fs.path.join(options.allocator, &.{ mounts_root_trimmed, options.project_id });
+        defer options.allocator.free(project_mount_root);
+        try ensurePathExists(project_mount_root);
+
+        const workspace_mount_path = try makeRuntimeMountPath(options.allocator, project_mount_root, options.agent_id);
+        errdefer options.allocator.free(workspace_mount_path);
+        // Runtime-unique mount path: recycle only this runtime's path so concurrent
+        // agents on the same project do not unmount each other.
+        detachMountAtPath(options.allocator, workspace_mount_path);
+        try ensurePathExists(workspace_mount_path);
 
         const child_bin_path = try resolveChildBinaryPath(options.allocator, std.mem.trim(u8, runtime_cfg_for_child.sandbox_agent_runtime_bin, " \t\r\n"));
         errdefer options.allocator.free(child_bin_path);
@@ -80,11 +84,11 @@ pub const SandboxRuntime = struct {
             options.project_id,
             options.project_token,
             options.workspace_auth_token,
-            project_mount_path,
+            workspace_mount_path,
         );
         owns_mount_process = true;
-        try waitForMountPoint(options.allocator, project_mount_path, mount_startup_timeout_ms);
-        if (!isMountPoint(options.allocator, project_mount_path)) {
+        try waitForMountPoint(options.allocator, workspace_mount_path, mount_startup_timeout_ms);
+        if (!isMountPoint(options.allocator, workspace_mount_path)) {
             return error.ProjectMountUnavailable;
         }
 
@@ -92,7 +96,7 @@ pub const SandboxRuntime = struct {
             options.allocator,
             std.mem.trim(u8, runtime_cfg_for_child.sandbox_launcher, " \t\r\n"),
             child_bin_path,
-            project_mount_path,
+            workspace_mount_path,
             options.agent_id,
             runtime_cfg_for_child,
         );
@@ -105,7 +109,7 @@ pub const SandboxRuntime = struct {
             .allocator = options.allocator,
             .agent_id = try options.allocator.dupe(u8, options.agent_id),
             .project_id = try options.allocator.dupe(u8, options.project_id),
-            .workspace_mount_path = project_mount_path,
+            .workspace_mount_path = workspace_mount_path,
             .child_bin_path = child_bin_path,
             .mount_process = mount_process,
             .owns_mount_process = owns_mount_process,
@@ -206,6 +210,19 @@ pub const SandboxRuntime = struct {
         return runtime.executeWorldTool(allocator, tool_name, args_json);
     }
 };
+
+fn makeRuntimeMountPath(
+    allocator: std.mem.Allocator,
+    project_mount_root: []const u8,
+    agent_id: []const u8,
+) ![]u8 {
+    var nonce_bytes: [8]u8 = undefined;
+    std.crypto.random.bytes(&nonce_bytes);
+    const nonce = std.fmt.bytesToHex(nonce_bytes, .lower);
+    const mount_leaf = try std.fmt.allocPrint(allocator, "{s}-{s}", .{ agent_id, nonce });
+    defer allocator.free(mount_leaf);
+    return std.fs.path.join(allocator, &.{ project_mount_root, mount_leaf });
+}
 
 fn buildToolRequestLine(allocator: std.mem.Allocator, tool_name: []const u8, args_json: []const u8) ![]u8 {
     const escaped_tool_name = try std.json.Stringify.valueAlloc(allocator, tool_name, .{

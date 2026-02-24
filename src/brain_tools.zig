@@ -4,7 +4,13 @@ const memid = @import("ziggy-memory-store").memid;
 const brain_context = @import("brain_context.zig");
 const event_bus = @import("ziggy-runtime-hooks").event_bus;
 const tool_registry = @import("ziggy-tool-runtime").tool_registry;
-const tool_executor = @import("ziggy-tool-runtime").tool_executor;
+
+pub const RemoteToolDispatchFn = *const fn (
+    ctx: *anyopaque,
+    allocator: std.mem.Allocator,
+    tool_name: []const u8,
+    args_json: []const u8,
+) tool_registry.ToolExecutionResult;
 
 pub const ToolResult = struct {
     tool_name: []u8,
@@ -87,7 +93,7 @@ pub const Engine = struct {
     bus: *event_bus.EventBus,
     world_tools: ?*const tool_registry.ToolRegistry = null,
     world_tool_dispatch_ctx: ?*anyopaque = null,
-    world_tool_dispatch_fn: ?tool_executor.RemoteToolExecutorFn = null,
+    world_tool_dispatch_fn: ?RemoteToolDispatchFn = null,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -121,7 +127,7 @@ pub const Engine = struct {
         bus: *event_bus.EventBus,
         world_tools: ?*const tool_registry.ToolRegistry,
         world_tool_dispatch_ctx: ?*anyopaque,
-        world_tool_dispatch_fn: ?tool_executor.RemoteToolExecutorFn,
+        world_tool_dispatch_fn: ?RemoteToolDispatchFn,
     ) Engine {
         return .{
             .allocator = allocator,

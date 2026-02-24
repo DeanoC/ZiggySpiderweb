@@ -21,6 +21,7 @@ pub const RuntimeServer = runtime_server_mod.RuntimeServer;
 
 const default_max_agent_runtimes: usize = 64;
 const max_agent_id_len: usize = 64;
+const max_project_id_len: usize = 128;
 const debug_stream_log_filename = "debug-stream.ndjson";
 const debug_stream_archive_prefix = "debug-stream-";
 const debug_stream_archive_suffix = ".ndjson";
@@ -1502,6 +1503,7 @@ const AgentRuntimeRegistry = struct {
         requested_project_id: ?[]const u8,
     ) ![]u8 {
         if (requested_project_id) |project_id| {
+            if (!isValidProjectId(project_id)) return error.InvalidProjectId;
             return self.allocator.dupe(u8, project_id);
         }
 
@@ -1515,7 +1517,10 @@ const AgentRuntimeRegistry = struct {
         defer self.allocator.free(status_payload);
         const selected = extractProjectIdFromControlPayload(self.allocator, status_payload) catch return error.ProjectResolutionFailed;
         defer if (selected) |value| self.allocator.free(value);
-        if (selected) |project_id| return self.allocator.dupe(u8, project_id);
+        if (selected) |project_id| {
+            if (!isValidProjectId(project_id)) return error.InvalidProjectId;
+            return self.allocator.dupe(u8, project_id);
+        }
         return error.ProjectRequired;
     }
 
@@ -1525,6 +1530,17 @@ const AgentRuntimeRegistry = struct {
         for (agent_id) |char| {
             if (std.ascii.isAlphanumeric(char)) continue;
             if (char == '_' or char == '-') continue;
+            return false;
+        }
+        return true;
+    }
+
+    fn isValidProjectId(project_id: []const u8) bool {
+        if (project_id.len == 0 or project_id.len > max_project_id_len) return false;
+        if (std.mem.eql(u8, project_id, ".") or std.mem.eql(u8, project_id, "..")) return false;
+        for (project_id) |char| {
+            if (std.ascii.isAlphanumeric(char)) continue;
+            if (char == '_' or char == '-' or char == '.') continue;
             return false;
         }
         return true;
@@ -2543,6 +2559,19 @@ fn handleWebSocketConnection(
                                     try writeFrameLocked(stream, &connection_write_mutex, response, .text);
                                     continue;
                                 }
+                                if (attach_project_id) |project_id| {
+                                    if (!AgentRuntimeRegistry.isValidProjectId(project_id)) {
+                                        const response = try unified.buildControlError(
+                                            allocator,
+                                            parsed.id,
+                                            "invalid_payload",
+                                            "invalid project_id",
+                                        );
+                                        defer allocator.free(response);
+                                        try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                        continue;
+                                    }
+                                }
                                 if (principal.role == .user and std.mem.eql(u8, attach_agent_id, runtime_registry.default_agent_id)) {
                                     runtime_registry.appendSecurityAuditAndDebug(
                                         current_binding.agent_id,
@@ -2651,6 +2680,17 @@ fn handleWebSocketConnection(
                                         try writeFrameLocked(stream, &connection_write_mutex, response, .text);
                                         continue;
                                     },
+                                    error.InvalidProjectId => {
+                                        const response = try unified.buildControlError(
+                                            allocator,
+                                            parsed.id,
+                                            "invalid_payload",
+                                            "invalid project_id",
+                                        );
+                                        defer allocator.free(response);
+                                        try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                        continue;
+                                    },
                                     error.RuntimeLimitReached => {
                                         const response = try unified.buildControlError(
                                             allocator,
@@ -2738,6 +2778,17 @@ fn handleWebSocketConnection(
                                                 parsed.id,
                                                 "invalid_payload",
                                                 "invalid agent_id",
+                                            );
+                                            defer allocator.free(response);
+                                            try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                            continue;
+                                        },
+                                        error.InvalidProjectId => {
+                                            const response = try unified.buildControlError(
+                                                allocator,
+                                                parsed.id,
+                                                "invalid_payload",
+                                                "invalid project_id",
                                             );
                                             defer allocator.free(response);
                                             try writeFrameLocked(stream, &connection_write_mutex, response, .text);
@@ -2864,6 +2915,17 @@ fn handleWebSocketConnection(
                                                 parsed.id,
                                                 "invalid_payload",
                                                 "invalid agent_id",
+                                            );
+                                            defer allocator.free(response);
+                                            try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                            continue;
+                                        },
+                                        error.InvalidProjectId => {
+                                            const response = try unified.buildControlError(
+                                                allocator,
+                                                parsed.id,
+                                                "invalid_payload",
+                                                "invalid project_id",
                                             );
                                             defer allocator.free(response);
                                             try writeFrameLocked(stream, &connection_write_mutex, response, .text);
@@ -3020,6 +3082,17 @@ fn handleWebSocketConnection(
                                                     parsed.id,
                                                     "invalid_payload",
                                                     "invalid agent_id",
+                                                );
+                                                defer allocator.free(response);
+                                                try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                                continue;
+                                            },
+                                            error.InvalidProjectId => {
+                                                const response = try unified.buildControlError(
+                                                    allocator,
+                                                    parsed.id,
+                                                    "invalid_payload",
+                                                    "invalid project_id",
                                                 );
                                                 defer allocator.free(response);
                                                 try writeFrameLocked(stream, &connection_write_mutex, response, .text);
@@ -3368,6 +3441,17 @@ fn handleWebSocketConnection(
                                 try writeFrameLocked(stream, &connection_write_mutex, response, .text);
                                 continue;
                             },
+                            error.InvalidProjectId => {
+                                const response = try unified.buildFsrpcError(
+                                    allocator,
+                                    parsed.tag,
+                                    "invalid_project",
+                                    "invalid session project",
+                                );
+                                defer allocator.free(response);
+                                try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                continue;
+                            },
                             error.RuntimeLimitReached => {
                                 const response = try unified.buildFsrpcError(
                                     allocator,
@@ -3693,6 +3777,12 @@ fn tryHandleLegacySessionSendFrame(
     ) catch |err| switch (err) {
         error.InvalidAgentId => {
             const response = try protocol.buildErrorWithCode(allocator, legacy.id orelse "generated", .invalid_envelope, "invalid session agent");
+            defer allocator.free(response);
+            try writeFrameLocked(stream, write_mutex, response, .text);
+            return true;
+        },
+        error.InvalidProjectId => {
+            const response = try protocol.buildErrorWithCode(allocator, legacy.id orelse "generated", .invalid_envelope, "invalid session project");
             defer allocator.free(response);
             try writeFrameLocked(stream, write_mutex, response, .text);
             return true;
@@ -5411,6 +5501,15 @@ test "server_piai: agent id validation allows safe identifiers only" {
     try std.testing.expect(!AgentRuntimeRegistry.isValidAgentId("."));
     try std.testing.expect(!AgentRuntimeRegistry.isValidAgentId("agent:bad"));
     try std.testing.expect(!AgentRuntimeRegistry.isValidAgentId(""));
+}
+
+test "server_piai: project id validation rejects traversal-like values" {
+    try std.testing.expect(AgentRuntimeRegistry.isValidProjectId("proj-1"));
+    try std.testing.expect(AgentRuntimeRegistry.isValidProjectId("proj.alpha_2"));
+    try std.testing.expect(!AgentRuntimeRegistry.isValidProjectId(""));
+    try std.testing.expect(!AgentRuntimeRegistry.isValidProjectId("."));
+    try std.testing.expect(!AgentRuntimeRegistry.isValidProjectId(".."));
+    try std.testing.expect(!AgentRuntimeRegistry.isValidProjectId("proj/../../etc"));
 }
 
 test "server_piai: invalid configured default agent falls back to built-in default" {

@@ -15,7 +15,6 @@ const run_engine = @import("ziggy-run-orchestrator").run_engine;
 const run_orchestration = @import("ziggy-run-orchestrator").run_orchestration_helpers;
 const system_hooks = @import("system_hooks.zig");
 const tool_registry = @import("ziggy-tool-runtime").tool_registry;
-const tool_executor = @import("ziggy-tool-runtime").tool_executor;
 const ziggy_piai = @import("ziggy-piai");
 
 pub const default_agent_id = "default";
@@ -143,7 +142,7 @@ var streamByModelFn: StreamByModelFn = ziggy_piai.stream.streamByModel;
 
 const GetEnvApiKeyFn = *const fn (std.mem.Allocator, []const u8) ?[]const u8;
 var getEnvApiKeyFn: GetEnvApiKeyFn = ziggy_piai.env_api_keys.getEnvApiKey;
-const RemoteToolDispatchFn = tool_executor.RemoteToolExecutorFn;
+const RemoteToolDispatchFn = brain_tools.RemoteToolDispatchFn;
 
 const ProviderRuntime = struct {
     model_registry: ziggy_piai.models.ModelRegistry,
