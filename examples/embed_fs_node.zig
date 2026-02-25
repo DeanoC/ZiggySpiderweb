@@ -105,8 +105,8 @@ fn printHelp() !void {
         \\  embed-fs-node [--export <name>=<path>[:ro|:rw]]
         \\
         \\Then send one JSON request per line, e.g.:
-        \\  {"channel":"fsrpc","type":"fsrpc.fs_t_hello","tag":1,"payload":{}}
-        \\  {"channel":"fsrpc","type":"fsrpc.fs_t_exports","tag":2,"payload":{}}
+        \\  {"channel":"acheron","type":"acheron.fs_t_hello","tag":1,"payload":{}}
+        \\  {"channel":"acheron","type":"acheron.fs_t_exports","tag":2,"payload":{}}
         \\
     ;
     try std.fs.File.stdout().writeAll(help);

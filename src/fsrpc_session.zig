@@ -3,6 +3,7 @@ const unified = @import("ziggy-spider-protocol").unified;
 const runtime_server_mod = @import("runtime_server.zig");
 const runtime_handle_mod = @import("runtime_handle.zig");
 const chat_job_index = @import("chat_job_index.zig");
+const world_policy = @import("world_policy.zig");
 
 const NodeKind = enum {
     dir,
@@ -48,10 +49,19 @@ const FidState = struct {
 };
 
 pub const Session = struct {
+    pub const NamespaceOptions = struct {
+        project_id: ?[]const u8 = null,
+        agents_dir: []const u8 = "agents",
+        projects_dir: []const u8 = "projects",
+    };
+
     allocator: std.mem.Allocator,
     runtime_handle: *runtime_handle_mod.RuntimeHandle,
     job_index: *chat_job_index.ChatJobIndex,
     agent_id: []u8,
+    project_id: ?[]u8 = null,
+    agents_dir: []u8,
+    projects_dir: []u8,
 
     nodes: std.AutoHashMapUnmanaged(u32, Node) = .{},
     fids: std.AutoHashMapUnmanaged(u32, FidState) = .{},
@@ -70,8 +80,27 @@ pub const Session = struct {
         job_index: *chat_job_index.ChatJobIndex,
         agent_id: []const u8,
     ) !Session {
+        return initWithOptions(allocator, runtime_handle, job_index, agent_id, .{});
+    }
+
+    pub fn initWithOptions(
+        allocator: std.mem.Allocator,
+        runtime_handle: *runtime_handle_mod.RuntimeHandle,
+        job_index: *chat_job_index.ChatJobIndex,
+        agent_id: []const u8,
+        options: NamespaceOptions,
+    ) !Session {
         const owned_agent = try allocator.dupe(u8, agent_id);
         errdefer allocator.free(owned_agent);
+        const owned_project = if (options.project_id) |value|
+            try allocator.dupe(u8, value)
+        else
+            null;
+        errdefer if (owned_project) |value| allocator.free(value);
+        const owned_agents_dir = try allocator.dupe(u8, options.agents_dir);
+        errdefer allocator.free(owned_agents_dir);
+        const owned_projects_dir = try allocator.dupe(u8, options.projects_dir);
+        errdefer allocator.free(owned_projects_dir);
         runtime_handle.retain();
         errdefer runtime_handle.release();
 
@@ -80,8 +109,11 @@ pub const Session = struct {
             .runtime_handle = runtime_handle,
             .job_index = job_index,
             .agent_id = owned_agent,
+            .project_id = owned_project,
+            .agents_dir = owned_agents_dir,
+            .projects_dir = owned_projects_dir,
         };
-        try self.seedNamespace(agent_id);
+        try self.seedNamespace();
         return self;
     }
 
@@ -95,6 +127,9 @@ pub const Session = struct {
         self.nodes.deinit(self.allocator);
         self.fids.deinit(self.allocator);
         self.allocator.free(self.agent_id);
+        if (self.project_id) |value| self.allocator.free(value);
+        self.allocator.free(self.agents_dir);
+        self.allocator.free(self.projects_dir);
         self.runtime_handle.release();
         self.* = undefined;
     }
@@ -104,7 +139,24 @@ pub const Session = struct {
         runtime_handle: *runtime_handle_mod.RuntimeHandle,
         agent_id: []const u8,
     ) !void {
-        var rebound = try Session.init(self.allocator, runtime_handle, self.job_index, agent_id);
+        try self.setRuntimeBindingWithOptions(
+            runtime_handle,
+            agent_id,
+            .{
+                .project_id = self.project_id,
+                .agents_dir = self.agents_dir,
+                .projects_dir = self.projects_dir,
+            },
+        );
+    }
+
+    pub fn setRuntimeBindingWithOptions(
+        self: *Session,
+        runtime_handle: *runtime_handle_mod.RuntimeHandle,
+        agent_id: []const u8,
+        options: NamespaceOptions,
+    ) !void {
+        var rebound = try Session.initWithOptions(self.allocator, runtime_handle, self.job_index, agent_id, options);
         rebound.debug_stream_enabled = self.debug_stream_enabled;
 
         var previous = self.*;
@@ -125,8 +177,8 @@ pub const Session = struct {
     }
 
     pub fn handle(self: *Session, msg: *const unified.ParsedMessage) ![]u8 {
-        const msg_type = msg.fsrpc_type orelse {
-            return unified.buildFsrpcError(self.allocator, msg.tag, "invalid_type", "missing fsrpc message type");
+        const msg_type = msg.acheron_type orelse {
+            return unified.buildFsrpcError(self.allocator, msg.tag, "invalid_type", "missing acheron message type");
         };
 
         return switch (msg_type) {
@@ -139,7 +191,7 @@ pub const Session = struct {
             .t_stat => self.handleStat(msg),
             .t_clunk => self.handleClunk(msg),
             .t_flush => self.handleFlush(msg),
-            else => unified.buildFsrpcError(self.allocator, msg.tag, "unsupported", "unsupported fsrpc operation"),
+            else => unified.buildFsrpcError(self.allocator, msg.tag, "unsupported", "unsupported acheron operation"),
         };
     }
 
@@ -147,7 +199,7 @@ pub const Session = struct {
         const msize = msg.msize orelse 1_048_576;
         const payload = try std.fmt.allocPrint(
             self.allocator,
-            "{{\"msize\":{d},\"version\":\"styx-lite-1\"}}",
+            "{{\"msize\":{d},\"version\":\"acheron-1\"}}",
             .{msize},
         );
         defer self.allocator.free(payload);
@@ -317,13 +369,13 @@ pub const Session = struct {
                 defer self.allocator.free(escaped_corr);
                 break :blk try std.fmt.allocPrint(
                     self.allocator,
-                    "{{\"n\":{d},\"job\":\"{s}\",\"result_path\":\"/jobs/{s}/result.txt\",\"correlation_id\":\"{s}\"}}",
+                    "{{\"n\":{d},\"job\":\"{s}\",\"result_path\":\"/agents/self/jobs/{s}/result.txt\",\"correlation_id\":\"{s}\"}}",
                     .{ written, escaped, escaped, escaped_corr },
                 );
             }
             break :blk try std.fmt.allocPrint(
                 self.allocator,
-                "{{\"n\":{d},\"job\":\"{s}\",\"result_path\":\"/jobs/{s}/result.txt\"}}",
+                "{{\"n\":{d},\"job\":\"{s}\",\"result_path\":\"/agents/self/jobs/{s}/result.txt\"}}",
                 .{ written, escaped, escaped },
             );
         } else try std.fmt.allocPrint(self.allocator, "{{\"n\":{d}}}", .{written});
@@ -358,46 +410,222 @@ pub const Session = struct {
         return unified.buildFsrpcResponse(self.allocator, .r_flush, msg.tag, "{}");
     }
 
-    fn seedNamespace(self: *Session, agent_id: []const u8) !void {
+    fn seedNamespace(self: *Session) !void {
+        var policy = try world_policy.load(
+            self.allocator,
+            .{
+                .agent_id = self.agent_id,
+                .project_id = self.project_id,
+                .agents_dir = self.agents_dir,
+                .projects_dir = self.projects_dir,
+            },
+        );
+        defer policy.deinit(self.allocator);
+
         self.root_id = try self.addDir(null, "/", false);
-        _ = try self.addDir(self.root_id, "workspace", false);
+        const nodes_root = try self.addDir(self.root_id, "nodes", false);
+        const agents_root = try self.addDir(self.root_id, "agents", false);
+        const projects_root = try self.addDir(self.root_id, "projects", false);
+        const meta_root = try self.addDir(self.root_id, "meta", false);
+        const debug_root: ?u32 = if (policy.show_debug)
+            try self.addDir(self.root_id, "debug", false)
+        else
+            null;
 
-        const capabilities = try self.addDir(self.root_id, "capabilities", false);
-        const chat = try self.addDir(capabilities, "chat", false);
+        try self.addDirectoryDescriptors(
+            nodes_root,
+            "Nodes",
+            "{\"kind\":\"collection\",\"entries\":\"node directories\",\"shape\":\"/nodes/<node_id>/{fs,camera,screen,user,terminal}\"}",
+            "{\"read\":true,\"write\":false}",
+            "Connected node resources are surfaced here.",
+        );
+        try self.addDirectoryDescriptors(
+            agents_root,
+            "Agents",
+            "{\"kind\":\"collection\",\"entries\":\"agent directories\",\"self\":\"/agents/self\"}",
+            "{\"read\":true,\"write\":true}",
+            "Agent-visible chat/jobs/memory views.",
+        );
+        try self.addDirectoryDescriptors(
+            projects_root,
+            "Projects",
+            "{\"kind\":\"collection\",\"entries\":\"project directories\",\"shape\":\"/projects/<project_id>/{fs,agents,meta}\"}",
+            "{\"read\":true,\"write\":false}",
+            "Project-centric cross-node and agent views.",
+        );
 
-        const help_md =
+        for (policy.nodes.items) |node| {
+            const node_dir = try self.addDir(nodes_root, node.id, false);
+            const node_schema = "{\"kind\":\"node\",\"resources\":[\"fs\",\"camera\",\"screen\",\"user\",\"terminal\"]}";
+            const node_caps = try std.fmt.allocPrint(
+                self.allocator,
+                "{{\"fs\":{s},\"camera\":{s},\"screen\":{s},\"user\":{s},\"terminal\":{s}}}",
+                .{
+                    if (node.resources.fs) "true" else "false",
+                    if (node.resources.camera) "true" else "false",
+                    if (node.resources.screen) "true" else "false",
+                    if (node.resources.user) "true" else "false",
+                    if (node.terminals.items.len > 0) "true" else "false",
+                },
+            );
+            defer self.allocator.free(node_caps);
+            try self.addDirectoryDescriptors(
+                node_dir,
+                "Node Endpoint",
+                node_schema,
+                node_caps,
+                "Node resource roots. Entries may be unavailable based on policy.",
+            );
+
+            if (node.resources.fs) _ = try self.addDir(node_dir, "fs", false);
+            if (node.resources.camera) _ = try self.addDir(node_dir, "camera", false);
+            if (node.resources.screen) _ = try self.addDir(node_dir, "screen", false);
+            if (node.resources.user) _ = try self.addDir(node_dir, "user", false);
+            if (node.terminals.items.len > 0) {
+                const terminal_root = try self.addDir(node_dir, "terminal", false);
+                for (node.terminals.items) |terminal_id| {
+                    _ = try self.addDir(terminal_root, terminal_id, false);
+                }
+            }
+        }
+
+        const self_agent_dir = try self.addDir(agents_root, "self", false);
+        const chat = try self.addDir(self_agent_dir, "chat", false);
+        const control = try self.addDir(chat, "control", false);
+        const examples = try self.addDir(chat, "examples", false);
+        self.chat_input_id = try self.addFile(control, "input", "", true, .chat_input);
+        _ = try self.addFile(examples, "send.txt", "hello from acheron chat", false, .none);
+
+        const chat_help_md =
             "# Chat Capability\n\n" ++
             "Write UTF-8 text to `control/input` to create a chat job.\n" ++
-            "Read `/jobs/<job-id>/result.txt` for assistant output.\n";
-        _ = try self.addFile(chat, "help.md", help_md, false, .none);
+            "Read `/agents/self/jobs/<job-id>/result.txt` for assistant output.\n";
+        _ = try self.addFile(chat, "README.md", chat_help_md, false, .none);
+        _ = try self.addFile(chat, "SCHEMA.json", "{\"name\":\"chat\",\"input\":\"control/input\",\"jobs\":\"/agents/self/jobs\",\"result\":\"result.txt\"}", false, .none);
+        _ = try self.addFile(chat, "CAPS.json", "{\"write_input\":true,\"read_jobs\":true}", false, .none);
 
-        const schema_json =
-            "{\"name\":\"chat\",\"input\":\"control/input\",\"jobs\":\"/jobs\",\"result\":\"result.txt\"}";
-        _ = try self.addFile(chat, "schema.json", schema_json, false, .none);
-
-        const escaped_agent = try unified.jsonEscape(self.allocator, agent_id);
+        const escaped_agent = try unified.jsonEscape(self.allocator, self.agent_id);
         defer self.allocator.free(escaped_agent);
-        const meta_json = try std.fmt.allocPrint(
+        const escaped_project = if (policy.project_id.len > 0) blk: {
+            break :blk try unified.jsonEscape(self.allocator, policy.project_id);
+        } else try self.allocator.dupe(u8, "");
+        defer self.allocator.free(escaped_project);
+        const chat_meta_json = try std.fmt.allocPrint(
             self.allocator,
-            "{{\"name\":\"chat\",\"version\":\"1\",\"agent_id\":\"{s}\",\"cost_hint\":\"provider-dependent\",\"latency_hint\":\"seconds\"}}",
-            .{escaped_agent},
+            "{{\"name\":\"chat\",\"version\":\"1\",\"agent_id\":\"{s}\",\"project_id\":\"{s}\",\"cost_hint\":\"provider-dependent\",\"latency_hint\":\"seconds\"}}",
+            .{ escaped_agent, escaped_project },
         );
-        defer self.allocator.free(meta_json);
-        _ = try self.addFile(chat, "meta.json", meta_json, false, .none);
+        defer self.allocator.free(chat_meta_json);
+        _ = try self.addFile(chat, "meta.json", chat_meta_json, false, .none);
 
-        const examples = try self.addDir(chat, "examples", false);
-        _ = try self.addFile(examples, "send.txt", "hello from fsrpc chat", false, .none);
-
-        const control = try self.addDir(chat, "control", false);
-        self.chat_input_id = try self.addFile(control, "input", "", true, .chat_input);
-
-        self.jobs_root_id = try self.addDir(self.root_id, "jobs", false);
+        self.jobs_root_id = try self.addDir(self_agent_dir, "jobs", false);
+        try self.addDirectoryDescriptors(
+            self.jobs_root_id,
+            "Jobs",
+            "{\"kind\":\"collection\",\"entries\":\"job_id\",\"files\":[\"status.json\",\"result.txt\",\"log.txt\"]}",
+            "{\"read\":true,\"write\":false}",
+            "Chat job status and outputs.",
+        );
         try self.seedJobsFromIndex();
 
-        const meta = try self.addDir(self.root_id, "meta", false);
+        if (!std.mem.eql(u8, self.agent_id, "self")) {
+            const agent_dir = try self.addDir(agents_root, self.agent_id, false);
+            _ = try self.addFile(agent_dir, "README.md", "Primary agent path. Canonical interactive path is /agents/self.\n", false, .none);
+            _ = try self.addFile(agent_dir, "LINK.txt", "/agents/self\n", false, .none);
+        }
+
+        for (policy.visible_agents.items) |agent_name| {
+            if (std.mem.eql(u8, agent_name, "self")) continue;
+            if (std.mem.eql(u8, agent_name, self.agent_id)) continue;
+            const agent_dir = try self.addDir(agents_root, agent_name, false);
+            _ = try self.addFile(agent_dir, "README.md", "Visible peer agent entry.\n", false, .none);
+            const link = try std.fmt.allocPrint(self.allocator, "/agents/{s}\n", .{agent_name});
+            defer self.allocator.free(link);
+            _ = try self.addFile(agent_dir, "LINK.txt", link, false, .none);
+        }
+
+        const project_dir = try self.addDir(projects_root, policy.project_id, false);
+        const project_fs_dir = try self.addDir(project_dir, "fs", false);
+        const project_agents_dir = try self.addDir(project_dir, "agents", false);
+        const project_meta_dir = try self.addDir(project_dir, "meta", false);
+        try self.addDirectoryDescriptors(
+            project_dir,
+            "Project",
+            "{\"kind\":\"project\",\"children\":[\"fs\",\"agents\",\"meta\"]}",
+            "{\"read\":true,\"write\":false}",
+            "Project-composed world view.",
+        );
+
+        for (policy.project_links.items) |link| {
+            const target = try std.fmt.allocPrint(self.allocator, "/nodes/{s}/{s}\n", .{ link.node_id, link.resource });
+            defer self.allocator.free(target);
+            _ = try self.addFile(project_fs_dir, link.name, target, false, .none);
+        }
+
+        _ = try self.addFile(project_agents_dir, "self", "/agents/self\n", false, .none);
+        for (policy.visible_agents.items) |agent_name| {
+            if (std.mem.eql(u8, agent_name, "self")) continue;
+            const target = try std.fmt.allocPrint(self.allocator, "/agents/{s}\n", .{agent_name});
+            defer self.allocator.free(target);
+            _ = try self.addFile(project_agents_dir, agent_name, target, false, .none);
+        }
+
+        _ = try self.addFile(project_meta_dir, "README.md", "Project metadata and link topology.\n", false, .none);
+
+        if (debug_root) |dir_id| {
+            try self.addDirectoryDescriptors(
+                dir_id,
+                "Debug",
+                "{\"kind\":\"debug\",\"entries\":[\"README.md\",\"stream.log\"]}",
+                "{\"read\":true,\"write\":false}",
+                "Privileged debug surface.",
+            );
+            _ = try self.addFile(dir_id, "stream.log", "", false, .none);
+        }
+
+        try self.addDirectoryDescriptors(
+            meta_root,
+            "Meta",
+            "{\"kind\":\"meta\",\"entries\":[\"protocol.json\",\"view.json\"]}",
+            "{\"read\":true,\"write\":false}",
+            "Protocol and effective view metadata.",
+        );
         const protocol_json =
-            "{\"channel\":\"fsrpc\",\"version\":\"styx-lite-1\",\"ops\":[\"t_version\",\"t_attach\",\"t_walk\",\"t_open\",\"t_read\",\"t_write\",\"t_stat\",\"t_clunk\",\"t_flush\"]}";
-        _ = try self.addFile(meta, "protocol.json", protocol_json, false, .none);
+            "{\"channel\":\"acheron\",\"version\":\"acheron-1\",\"layout\":\"world-v1\",\"ops\":[\"t_version\",\"t_attach\",\"t_walk\",\"t_open\",\"t_read\",\"t_write\",\"t_stat\",\"t_clunk\",\"t_flush\"]}";
+        _ = try self.addFile(meta_root, "protocol.json", protocol_json, false, .none);
+        const view_json = try std.fmt.allocPrint(
+            self.allocator,
+            "{{\"agent_id\":\"{s}\",\"project_id\":\"{s}\",\"show_debug\":{s},\"nodes\":{d},\"visible_agents\":{d},\"project_links\":{d}}}",
+            .{
+                escaped_agent,
+                escaped_project,
+                if (policy.show_debug) "true" else "false",
+                policy.nodes.items.len,
+                policy.visible_agents.items.len,
+                policy.project_links.items.len,
+            },
+        );
+        defer self.allocator.free(view_json);
+        _ = try self.addFile(meta_root, "view.json", view_json, false, .none);
+    }
+
+    fn addDirectoryDescriptors(
+        self: *Session,
+        dir_id: u32,
+        title: []const u8,
+        schema_json: []const u8,
+        caps_json: []const u8,
+        instructions: []const u8,
+    ) !void {
+        const readme = try std.fmt.allocPrint(
+            self.allocator,
+            "# {s}\n\n{s}\n",
+            .{ title, instructions },
+        );
+        defer self.allocator.free(readme);
+        _ = try self.addFile(dir_id, "README.md", readme, false, .none);
+        _ = try self.addFile(dir_id, "SCHEMA.json", schema_json, false, .none);
+        _ = try self.addFile(dir_id, "CAPS.json", caps_json, false, .none);
     }
 
     fn addDir(self: *Session, parent: ?u32, name: []const u8, writable: bool) !u32 {
@@ -720,27 +948,29 @@ test "fsrpc_session: attach walk open read capability help" {
     defer session.deinit();
 
     var attach = unified.ParsedMessage{
-        .channel = .fsrpc,
-        .fsrpc_type = .t_attach,
+        .channel = .acheron,
+        .acheron_type = .t_attach,
         .tag = 1,
         .fid = 1,
     };
     const attach_res = try session.handle(&attach);
     defer allocator.free(attach_res);
-    try std.testing.expect(std.mem.indexOf(u8, attach_res, "fsrpc.r_attach") != null);
+    try std.testing.expect(std.mem.indexOf(u8, attach_res, "acheron.r_attach") != null);
 
-    const path = try allocator.alloc([]u8, 2);
-    path[0] = try allocator.dupe(u8, "capabilities");
-    path[1] = try allocator.dupe(u8, "chat");
+    const path = try allocator.alloc([]u8, 3);
+    path[0] = try allocator.dupe(u8, "agents");
+    path[1] = try allocator.dupe(u8, "self");
+    path[2] = try allocator.dupe(u8, "chat");
     defer {
         allocator.free(path[0]);
         allocator.free(path[1]);
+        allocator.free(path[2]);
         allocator.free(path);
     }
 
     var walk = unified.ParsedMessage{
-        .channel = .fsrpc,
-        .fsrpc_type = .t_walk,
+        .channel = .acheron,
+        .acheron_type = .t_walk,
         .tag = 2,
         .fid = 1,
         .newfid = 2,
@@ -748,7 +978,7 @@ test "fsrpc_session: attach walk open read capability help" {
     };
     const walk_res = try session.handle(&walk);
     defer allocator.free(walk_res);
-    try std.testing.expect(std.mem.indexOf(u8, walk_res, "fsrpc.r_walk") != null);
+    try std.testing.expect(std.mem.indexOf(u8, walk_res, "acheron.r_walk") != null);
 }
 
 test "fsrpc_session: setRuntimeBinding reseeds namespace and clears stale state" {
@@ -777,8 +1007,8 @@ test "fsrpc_session: setRuntimeBinding reseeds namespace and clears stale state"
     try std.testing.expect(session.lookupChild(session.jobs_root_id, job_b) == null);
 
     var attach = unified.ParsedMessage{
-        .channel = .fsrpc,
-        .fsrpc_type = .t_attach,
+        .channel = .acheron,
+        .acheron_type = .t_attach,
         .tag = 11,
         .fid = 77,
     };

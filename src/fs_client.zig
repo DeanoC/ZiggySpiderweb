@@ -225,8 +225,8 @@ fn buildRequestJson(
     errdefer payload.deinit(allocator);
 
     try payload.writer(allocator).print(
-        "{{\"channel\":\"fsrpc\",\"type\":\"{s}\",\"tag\":{d}",
-        .{ unified.fsrpcTypeName(req_type), req_id },
+        "{{\"channel\":\"acheron\",\"type\":\"{s}\",\"tag\":{d}",
+        .{ unified.acheronTypeName(req_type), req_id },
     );
     if (node) |node_id| {
         try payload.writer(allocator).print(",\"node\":{d}", .{node_id});
@@ -251,11 +251,11 @@ fn parseResponse(
     if (parsed.value != .object) return error.InvalidResponse;
     const root = parsed.value.object;
     const channel = root.get("channel") orelse return error.InvalidResponse;
-    if (channel != .string or !std.mem.eql(u8, channel.string, "fsrpc")) return error.InvalidResponse;
+    if (channel != .string or !std.mem.eql(u8, channel.string, "acheron")) return error.InvalidResponse;
 
     const type_value = root.get("type") orelse return error.InvalidResponse;
     if (type_value != .string) return error.InvalidResponse;
-    const response_type = unified.fsrpcTypeFromString(type_value.string);
+    const response_type = unified.acheronTypeFromString(type_value.string);
 
     const tag_raw = root.get("tag") orelse return error.InvalidResponse;
     if (tag_raw != .integer or tag_raw.integer < 0 or tag_raw.integer > std.math.maxInt(u32)) return error.InvalidResponse;
@@ -278,7 +278,7 @@ fn parseResponse(
         };
     }
 
-    if (!std.mem.eql(u8, type_value.string, unified.fsrpcTypeName(expected_type))) return error.InvalidResponse;
+    if (!std.mem.eql(u8, type_value.string, unified.acheronTypeName(expected_type))) return error.InvalidResponse;
 
     if (root.get("ok")) |ok| {
         if (ok != .bool or !ok.bool) return error.InvalidResponse;
@@ -360,7 +360,7 @@ fn parseMaybeFsInvalidationEvent(allocator: std.mem.Allocator, payload: []const 
     const root = parsed.value.object;
 
     const channel = root.get("channel") orelse return null;
-    if (channel != .string or !std.mem.eql(u8, channel.string, "fsrpc")) return null;
+    if (channel != .string or !std.mem.eql(u8, channel.string, "acheron")) return null;
 
     const type_value = root.get("type") orelse return null;
     if (type_value != .string) return null;
@@ -369,7 +369,7 @@ fn parseMaybeFsInvalidationEvent(allocator: std.mem.Allocator, payload: []const 
     if (event_payload != .object) return error.InvalidResponse;
     const args = event_payload.object;
 
-    if (std.mem.eql(u8, type_value.string, "fsrpc.e_fs_inval")) {
+    if (std.mem.eql(u8, type_value.string, "acheron.e_fs_inval")) {
         const node_raw = args.get("node") orelse return error.InvalidResponse;
         if (node_raw != .integer or node_raw.integer < 0) return error.InvalidResponse;
 
@@ -395,7 +395,7 @@ fn parseMaybeFsInvalidationEvent(allocator: std.mem.Allocator, payload: []const 
         };
     }
 
-    if (std.mem.eql(u8, type_value.string, "fsrpc.e_fs_inval_dir")) {
+    if (std.mem.eql(u8, type_value.string, "acheron.e_fs_inval_dir")) {
         const dir_raw = args.get("dir") orelse return error.InvalidResponse;
         if (dir_raw != .integer or dir_raw.integer < 0) return error.InvalidResponse;
 
@@ -535,18 +535,18 @@ test "fs_client: parseWsUrl defaults path and port" {
 
 test "fs_client: parseResponse rejects tag above u32 range" {
     const allocator = std.testing.allocator;
-    const payload = "{\"channel\":\"fsrpc\",\"type\":\"fsrpc.r_fs_hello\",\"tag\":4294967296,\"ok\":true,\"payload\":{}}";
+    const payload = "{\"channel\":\"acheron\",\"type\":\"acheron.r_fs_hello\",\"tag\":4294967296,\"ok\":true,\"payload\":{}}";
     try std.testing.expectError(error.InvalidResponse, parseResponse(allocator, 1, .fs_r_hello, payload));
 }
 
 test "fs_client: parseResponse rejects fs error errno above i32 range" {
     const allocator = std.testing.allocator;
-    const payload = "{\"channel\":\"fsrpc\",\"type\":\"fsrpc.err_fs\",\"tag\":1,\"ok\":false,\"error\":{\"errno\":2147483648,\"message\":\"boom\"}}";
+    const payload = "{\"channel\":\"acheron\",\"type\":\"acheron.err_fs\",\"tag\":1,\"ok\":false,\"error\":{\"errno\":2147483648,\"message\":\"boom\"}}";
     try std.testing.expectError(error.InvalidResponse, parseResponse(allocator, 1, .fs_r_hello, payload));
 }
 
 test "fs_client: parseResponse rejects fs error errno below i32 range" {
     const allocator = std.testing.allocator;
-    const payload = "{\"channel\":\"fsrpc\",\"type\":\"fsrpc.err_fs\",\"tag\":1,\"ok\":false,\"error\":{\"errno\":-2147483649,\"message\":\"boom\"}}";
+    const payload = "{\"channel\":\"acheron\",\"type\":\"acheron.err_fs\",\"tag\":1,\"ok\":false,\"error\":{\"errno\":-2147483649,\"message\":\"boom\"}}";
     try std.testing.expectError(error.InvalidResponse, parseResponse(allocator, 1, .fs_r_hello, payload));
 }

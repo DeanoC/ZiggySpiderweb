@@ -280,7 +280,7 @@ Two new binaries provide the distributed filesystem protocol from `design_docs/F
 ```
 
 Notes:
-- Transport is unified v2 WebSocket JSON using `channel=fsrpc` and `type=fsrpc.t_fs_*` / `fsrpc.r_fs_*` / `fsrpc.e_fs_*` / `fsrpc.err_fs`.
+- Transport is unified v2 WebSocket JSON using `channel=acheron` and `type=acheron.t_fs_*` / `acheron.r_fs_*` / `acheron.e_fs_*` / `acheron.err_fs`.
 - JSON READ/WRITE payloads use `data_b64` for file bytes.
 - `mount` is now wired through libfuse3 at runtime (loads `libfuse3.so.3` and uses `fusermount3`).
 - Router health checks each endpoint and fails over within a shared mount-path group.
@@ -295,8 +295,8 @@ Notes:
 - Project token lifecycle control ops are available: `control.project_token_rotate` and `control.project_token_revoke`.
 - `control.ping`/`control.pong` is now a lightweight liveness probe (`payload: {}`), and metrics moved to `control.metrics`.
 - Control clients must negotiate `control.version` (`{"protocol":"unified-v2"}`) before other control operations.
-- Runtime fsrpc clients must negotiate `fsrpc.t_version` first (`"version":"styx-lite-1"`).
-- FS node/router sessions must negotiate `fsrpc.t_fs_hello` first with payload `{"protocol":"unified-v2-fs","proto":2}`; `auth_token` is optional and enforced when node session auth is enabled.
+- Runtime Acheron clients must negotiate `acheron.t_version` first (`"version":"acheron-1"`).
+- FS node/router sessions must negotiate `acheron.t_fs_hello` first with payload `{"protocol":"unified-v2-fs","proto":2}`; `auth_token` is optional and enforced when node session auth is enabled.
 - Optional control mutation gate: set `SPIDERWEB_CONTROL_OPERATOR_TOKEN`; protected mutations require matching `payload.operator_token`.
 - Optional encrypted control-plane state snapshots: set `SPIDERWEB_CONTROL_STATE_KEY_HEX` to a 64-char AES-256 key (hex).
 - Optional HTTP observability endpoint: set `SPIDERWEB_METRICS_PORT`; then:
@@ -311,7 +311,7 @@ Notes:
   - `SPIDERWEB_LOCAL_NODE_EXPORT_RO` (optional boolean)
   - `SPIDERWEB_LOCAL_NODE_NAME`, `SPIDERWEB_LOCAL_NODE_FS_URL`, `SPIDERWEB_LOCAL_NODE_LEASE_TTL_MS`, `SPIDERWEB_LOCAL_NODE_HEARTBEAT_MS` (optional registration/lease settings)
 - External `spiderweb-fs-node` can enforce session auth on `/v2/fs` using `--auth-token` (or `SPIDERWEB_FS_NODE_AUTH_TOKEN`).
-- Node/server now emits `fsrpc.e_fs_inval` / `fsrpc.e_fs_inval_dir` invalidations and router caches are invalidated on receipt.
+- Node/server now emits `acheron.e_fs_inval` / `acheron.e_fs_inval_dir` invalidations and router caches are invalidated on receipt.
 - Node/server now broadcasts mutation invalidations to other connected FS clients (server-push fanout).
 - Node/server uses a native Linux `inotify` watcher when available, with scanner fallback for out-of-band local FS invalidations.
 - Router now keeps a background event-pump websocket per endpoint so idle mounts can ingest pushed invalidations.
@@ -347,7 +347,7 @@ var service = try fs.NodeService.init(allocator, &[_]fs.ExportSpec{
 });
 defer service.deinit();
 
-const response = try service.handleRequestJson("{\"channel\":\"fsrpc\",\"type\":\"fsrpc.t_fs_hello\",\"tag\":1,\"payload\":{\"protocol\":\"unified-v2-fs\",\"proto\":2}}");
+const response = try service.handleRequestJson("{\"channel\":\"acheron\",\"type\":\"acheron.t_fs_hello\",\"tag\":1,\"payload\":{\"protocol\":\"unified-v2-fs\",\"proto\":2}}");
 defer allocator.free(response);
 ```
 

@@ -1,16 +1,16 @@
 # Unified v2 Release Checklist
 
 ## Protocol
-- [ ] Confirm all clients send explicit `channel` (`control` / `fsrpc`).
+- [ ] Confirm all clients send explicit `channel` (`control` / `acheron`).
 - [ ] Confirm all clients use canonical unified v2 type names.
 - [ ] Verify control negotiation order:
   1. `control.version` (`{"protocol":"unified-v2"}`)
   2. `control.connect`
-- [ ] Verify runtime fsrpc negotiation order:
-  1. `fsrpc.t_version` (`"version":"styx-lite-1"`)
-  2. `fsrpc.t_attach`
+- [ ] Verify runtime Acheron negotiation order:
+  1. `acheron.t_version` (`"version":"acheron-1"`)
+  2. `acheron.t_attach`
 - [ ] Verify FS routing negotiation order:
-  1. `fsrpc.t_fs_hello` (`{"protocol":"unified-v2-fs","proto":2,...}`)
+  1. `acheron.t_fs_hello` (`{"protocol":"unified-v2-fs","proto":2,...}`)
 
 ## Auth and Security
 - [ ] If enabling control mutation gate, set `SPIDERWEB_CONTROL_OPERATOR_TOKEN` and validate protected operations require `payload.operator_token`.

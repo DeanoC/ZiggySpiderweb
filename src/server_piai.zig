@@ -51,7 +51,7 @@ const control_project_scope_token_env = "SPIDERWEB_CONTROL_PROJECT_SCOPE_TOKEN";
 const control_node_scope_token_env = "SPIDERWEB_CONTROL_NODE_SCOPE_TOKEN";
 const metrics_port_env = "SPIDERWEB_METRICS_PORT";
 const control_protocol_version = "unified-v2";
-const fsrpc_runtime_protocol_version = "styx-lite-1";
+const fsrpc_runtime_protocol_version = "acheron-1";
 const fsrpc_node_protocol_version = "unified-v2-fs";
 const fsrpc_node_proto_id: i64 = 2;
 const min_connection_worker_threads: usize = 16;
@@ -850,12 +850,12 @@ fn handleLocalFsConnection(
                         try writeFsHubFrameMaybe(connection, stream, &connection_write_mutex, "", .close);
                         return;
                     }
-                    if (parsed.channel != .fsrpc or parsed.fsrpc_type != .fs_t_hello) {
+                    if (parsed.channel != .acheron or parsed.acheron_type != .fs_t_hello) {
                         const response = try unified.buildFsrpcFsError(
                             allocator,
                             parsed.tag,
                             fs_protocol.Errno.EINVAL,
-                            "fsrpc.t_fs_hello must be negotiated first",
+                            "acheron.t_fs_hello must be negotiated first",
                         );
                         defer allocator.free(response);
                         try writeFsHubFrameMaybe(connection, stream, &connection_write_mutex, response, .text);
@@ -877,7 +877,7 @@ fn handleLocalFsConnection(
                     hello_allow_invalidations = hello_opts.allow_invalidations;
                     fsrpc_negotiated = true;
                     register_after_response = true;
-                } else if (parsed.fsrpc_type == .fs_t_hello) {
+                } else if (parsed.acheron_type == .fs_t_hello) {
                     const hello_opts = validateFsNodeHelloPayload(allocator, parsed.payload_json, required_auth_token) catch |err| {
                         const response = try unified.buildFsrpcFsError(
                             allocator,
@@ -912,7 +912,7 @@ fn handleLocalFsConnection(
                 };
                 defer handled.deinit(allocator);
                 if (connection) |live_connection| {
-                    if (parsed.fsrpc_type != .fs_t_hello) {
+                    if (parsed.acheron_type != .fs_t_hello) {
                         local_node.hub.disableInvalidations(live_connection.id);
                     }
                     for (handled.events) |event| {
@@ -4070,7 +4070,15 @@ fn handleWebSocketConnection(
                                             else => return err,
                                         };
                                         defer main_runtime.release();
-                                        try session.setRuntimeBinding(main_runtime, main_binding.agent_id);
+                                        try session.setRuntimeBindingWithOptions(
+                                            main_runtime,
+                                            main_binding.agent_id,
+                                            .{
+                                                .project_id = main_binding.project_id,
+                                                .agents_dir = runtime_registry.runtime_config.agents_dir,
+                                                .projects_dir = "projects",
+                                            },
+                                        );
                                     }
                                 }
 
@@ -4285,7 +4293,7 @@ fn handleWebSocketConnection(
                             },
                         }
                     },
-                    .fsrpc => {
+                    .acheron => {
                         if (connect_gate_error) |gate| {
                             const response = try unified.buildFsrpcError(
                                 allocator,
@@ -4297,7 +4305,7 @@ fn handleWebSocketConnection(
                             try writeFrameLocked(stream, &connection_write_mutex, response, .text);
                             continue;
                         }
-                        const fsrpc_type = parsed.fsrpc_type orelse {
+                        const fsrpc_type = parsed.acheron_type orelse {
                             const response = try unified.buildFsrpcError(
                                 allocator,
                                 parsed.tag,
@@ -4315,7 +4323,7 @@ fn handleWebSocketConnection(
                                     allocator,
                                     parsed.tag,
                                     "protocol_mismatch",
-                                    "fsrpc.t_version must be negotiated first",
+                                    "acheron.t_version must be negotiated first",
                                 );
                                 defer allocator.free(response);
                                 try writeFrameLocked(stream, &connection_write_mutex, response, .text);
@@ -4511,7 +4519,17 @@ fn handleWebSocketConnection(
                         };
                         defer target_runtime.release();
                         if (fsrpc == null) {
-                            fsrpc = try fsrpc_session.Session.init(allocator, target_runtime, &runtime_registry.job_index, target_binding.agent_id);
+                            fsrpc = try fsrpc_session.Session.initWithOptions(
+                                allocator,
+                                target_runtime,
+                                &runtime_registry.job_index,
+                                target_binding.agent_id,
+                                .{
+                                    .project_id = target_binding.project_id,
+                                    .agents_dir = runtime_registry.runtime_config.agents_dir,
+                                    .projects_dir = "projects",
+                                },
+                            );
                             fsrpc.?.setDebugStreamEnabled(debug_stream_enabled);
                             const next_bound_session_key = try allocator.dupe(u8, target_session_key);
                             allocator.free(fsrpc_bound_session_key);
@@ -4520,7 +4538,15 @@ fn handleWebSocketConnection(
                             const needs_rebind = !std.mem.eql(u8, fsrpc_bound_session_key, target_session_key) or
                                 !std.mem.eql(u8, fsrpc.?.agent_id, target_binding.agent_id);
                             if (needs_rebind) {
-                                try fsrpc.?.setRuntimeBinding(target_runtime, target_binding.agent_id);
+                                try fsrpc.?.setRuntimeBindingWithOptions(
+                                    target_runtime,
+                                    target_binding.agent_id,
+                                    .{
+                                        .project_id = target_binding.project_id,
+                                        .agents_dir = runtime_registry.runtime_config.agents_dir,
+                                        .projects_dir = "projects",
+                                    },
+                                );
                                 const next_bound_session_key = try allocator.dupe(u8, target_session_key);
                                 allocator.free(fsrpc_bound_session_key);
                                 fsrpc_bound_session_key = next_bound_session_key;
@@ -5680,15 +5706,15 @@ fn fsrpcConnectAndAttach(allocator: std.mem.Allocator, client: *std.net.Stream, 
     try std.testing.expect(std.mem.indexOf(u8, connect_ack.payload, "\"type\":\"control.connect_ack\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, connect_ack.payload, "\"ok\":true") != null);
 
-    try writeClientTextFrameMasked(client, "{\"channel\":\"fsrpc\",\"type\":\"fsrpc.t_version\",\"tag\":1,\"msize\":1048576,\"version\":\"styx-lite-1\"}");
+    try writeClientTextFrameMasked(client, "{\"channel\":\"acheron\",\"type\":\"acheron.t_version\",\"tag\":1,\"msize\":1048576,\"version\":\"acheron-1\"}");
     var version = try readServerFrame(allocator, client);
     defer version.deinit(allocator);
-    try std.testing.expect(std.mem.indexOf(u8, version.payload, "\"type\":\"fsrpc.r_version\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, version.payload, "\"type\":\"acheron.r_version\"") != null);
 
-    try writeClientTextFrameMasked(client, "{\"channel\":\"fsrpc\",\"type\":\"fsrpc.t_attach\",\"tag\":2,\"fid\":1}");
+    try writeClientTextFrameMasked(client, "{\"channel\":\"acheron\",\"type\":\"acheron.t_attach\",\"tag\":2,\"fid\":1}");
     var attach = try readServerFrame(allocator, client);
     defer attach.deinit(allocator);
-    try std.testing.expect(std.mem.indexOf(u8, attach.payload, "\"type\":\"fsrpc.r_attach\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, attach.payload, "\"type\":\"acheron.r_attach\"") != null);
 }
 
 fn fsrpcWriteChatInput(
@@ -5700,26 +5726,26 @@ fn fsrpcWriteChatInput(
     const encoded = try unified.encodeDataB64(allocator, content);
     defer allocator.free(encoded);
 
-    try writeClientTextFrameMasked(client, "{\"channel\":\"fsrpc\",\"type\":\"fsrpc.t_walk\",\"tag\":10,\"fid\":1,\"newfid\":2,\"path\":[\"capabilities\",\"chat\",\"control\",\"input\"]}");
+    try writeClientTextFrameMasked(client, "{\"channel\":\"acheron\",\"type\":\"acheron.t_walk\",\"tag\":10,\"fid\":1,\"newfid\":2,\"path\":[\"capabilities\",\"chat\",\"control\",\"input\"]}");
     var walk = try readServerFrameSkippingDebug(allocator, client, debug_events_seen);
     defer walk.deinit(allocator);
-    try std.testing.expect(std.mem.indexOf(u8, walk.payload, "\"type\":\"fsrpc.r_walk\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, walk.payload, "\"type\":\"acheron.r_walk\"") != null);
 
-    try writeClientTextFrameMasked(client, "{\"channel\":\"fsrpc\",\"type\":\"fsrpc.t_open\",\"tag\":11,\"fid\":2,\"mode\":\"rw\"}");
+    try writeClientTextFrameMasked(client, "{\"channel\":\"acheron\",\"type\":\"acheron.t_open\",\"tag\":11,\"fid\":2,\"mode\":\"rw\"}");
     var open = try readServerFrameSkippingDebug(allocator, client, debug_events_seen);
     defer open.deinit(allocator);
-    try std.testing.expect(std.mem.indexOf(u8, open.payload, "\"type\":\"fsrpc.r_open\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, open.payload, "\"type\":\"acheron.r_open\"") != null);
 
     const write_req = try std.fmt.allocPrint(
         allocator,
-        "{{\"channel\":\"fsrpc\",\"type\":\"fsrpc.t_write\",\"tag\":12,\"fid\":2,\"offset\":0,\"data_b64\":\"{s}\"}}",
+        "{{\"channel\":\"acheron\",\"type\":\"acheron.t_write\",\"tag\":12,\"fid\":2,\"offset\":0,\"data_b64\":\"{s}\"}}",
         .{encoded},
     );
     defer allocator.free(write_req);
     try writeClientTextFrameMasked(client, write_req);
     var write = try readServerFrameSkippingDebug(allocator, client, debug_events_seen);
     defer write.deinit(allocator);
-    try std.testing.expect(std.mem.indexOf(u8, write.payload, "\"type\":\"fsrpc.r_write\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, write.payload, "\"type\":\"acheron.r_write\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, write.payload, "\"job\":\"job-") != null);
 
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, write.payload, .{});
@@ -5731,10 +5757,10 @@ fn fsrpcWriteChatInput(
     if (job != .string) return error.TestExpectedResponse;
     const job_name = try allocator.dupe(u8, job.string);
 
-    try writeClientTextFrameMasked(client, "{\"channel\":\"fsrpc\",\"type\":\"fsrpc.t_clunk\",\"tag\":13,\"fid\":2}");
+    try writeClientTextFrameMasked(client, "{\"channel\":\"acheron\",\"type\":\"acheron.t_clunk\",\"tag\":13,\"fid\":2}");
     var clunk = try readServerFrameSkippingDebug(allocator, client, debug_events_seen);
     defer clunk.deinit(allocator);
-    try std.testing.expect(std.mem.indexOf(u8, clunk.payload, "\"type\":\"fsrpc.r_clunk\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, clunk.payload, "\"type\":\"acheron.r_clunk\"") != null);
 
     return job_name;
 }
@@ -5745,24 +5771,24 @@ fn fsrpcReadJobResult(allocator: std.mem.Allocator, client: *std.net.Stream, job
 
     const walk_req = try std.fmt.allocPrint(
         allocator,
-        "{{\"channel\":\"fsrpc\",\"type\":\"fsrpc.t_walk\",\"tag\":20,\"fid\":1,\"newfid\":3,\"path\":[\"jobs\",\"{s}\",\"result.txt\"]}}",
+        "{{\"channel\":\"acheron\",\"type\":\"acheron.t_walk\",\"tag\":20,\"fid\":1,\"newfid\":3,\"path\":[\"jobs\",\"{s}\",\"result.txt\"]}}",
         .{escaped_job},
     );
     defer allocator.free(walk_req);
     try writeClientTextFrameMasked(client, walk_req);
     var walk = try readServerFrameSkippingDebug(allocator, client, null);
     defer walk.deinit(allocator);
-    try std.testing.expect(std.mem.indexOf(u8, walk.payload, "\"type\":\"fsrpc.r_walk\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, walk.payload, "\"type\":\"acheron.r_walk\"") != null);
 
-    try writeClientTextFrameMasked(client, "{\"channel\":\"fsrpc\",\"type\":\"fsrpc.t_open\",\"tag\":21,\"fid\":3,\"mode\":\"r\"}");
+    try writeClientTextFrameMasked(client, "{\"channel\":\"acheron\",\"type\":\"acheron.t_open\",\"tag\":21,\"fid\":3,\"mode\":\"r\"}");
     var open = try readServerFrameSkippingDebug(allocator, client, null);
     defer open.deinit(allocator);
-    try std.testing.expect(std.mem.indexOf(u8, open.payload, "\"type\":\"fsrpc.r_open\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, open.payload, "\"type\":\"acheron.r_open\"") != null);
 
-    try writeClientTextFrameMasked(client, "{\"channel\":\"fsrpc\",\"type\":\"fsrpc.t_read\",\"tag\":22,\"fid\":3,\"offset\":0,\"count\":1048576}");
+    try writeClientTextFrameMasked(client, "{\"channel\":\"acheron\",\"type\":\"acheron.t_read\",\"tag\":22,\"fid\":3,\"offset\":0,\"count\":1048576}");
     var read = try readServerFrameSkippingDebug(allocator, client, null);
     defer read.deinit(allocator);
-    try std.testing.expect(std.mem.indexOf(u8, read.payload, "\"type\":\"fsrpc.r_read\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, read.payload, "\"type\":\"acheron.r_read\"") != null);
 
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, read.payload, .{});
     defer parsed.deinit();
@@ -5777,15 +5803,15 @@ fn fsrpcReadJobResult(allocator: std.mem.Allocator, client: *std.net.Stream, job
     errdefer allocator.free(decoded);
     _ = std.base64.standard.Decoder.decode(decoded, data_b64.string) catch return error.TestExpectedResponse;
 
-    try writeClientTextFrameMasked(client, "{\"channel\":\"fsrpc\",\"type\":\"fsrpc.t_clunk\",\"tag\":23,\"fid\":3}");
+    try writeClientTextFrameMasked(client, "{\"channel\":\"acheron\",\"type\":\"acheron.t_clunk\",\"tag\":23,\"fid\":3}");
     var clunk = try readServerFrameSkippingDebug(allocator, client, null);
     defer clunk.deinit(allocator);
-    try std.testing.expect(std.mem.indexOf(u8, clunk.payload, "\"type\":\"fsrpc.r_clunk\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, clunk.payload, "\"type\":\"acheron.r_clunk\"") != null);
 
     return decoded;
 }
 
-test "server_piai: base websocket path handles unified control/fsrpc chat flow and rejects legacy session.send" {
+test "server_piai: base websocket path handles unified control/acheron chat flow and rejects legacy session.send" {
     const allocator = std.testing.allocator;
     var runtime_registry = AgentRuntimeRegistry.init(allocator, .{
         .ltm_directory = "",
@@ -5960,10 +5986,10 @@ test "server_piai: fsrpc fid state survives across frames for unchanged binding"
     try performClientHandshakeWithBearerToken(allocator, &client, "/", "admin-secret");
     try fsrpcConnectAndAttach(allocator, &client, "fid-survive");
 
-    try writeClientTextFrameMasked(&client, "{\"channel\":\"fsrpc\",\"type\":\"fsrpc.t_walk\",\"tag\":30,\"fid\":1,\"newfid\":2,\"path\":[\"capabilities\",\"chat\"]}");
+    try writeClientTextFrameMasked(&client, "{\"channel\":\"acheron\",\"type\":\"acheron.t_walk\",\"tag\":30,\"fid\":1,\"newfid\":2,\"path\":[\"capabilities\",\"chat\"]}");
     var walk = try readServerFrame(allocator, &client);
     defer walk.deinit(allocator);
-    try std.testing.expect(std.mem.indexOf(u8, walk.payload, "\"type\":\"fsrpc.r_walk\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, walk.payload, "\"type\":\"acheron.r_walk\"") != null);
 
     try websocket_transport.writeFrame(&client, "", .close);
     var close_reply = try readServerFrame(allocator, &client);
