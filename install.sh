@@ -10,6 +10,8 @@
 #
 # NON-INTERACTIVE with options:
 #   curl ... | SPIDERWEB_PROVIDER=openai-codex SPIDERWEB_AGENT=ziggy bash
+# Pin installer repo refs (for testing non-main branches):
+#   curl .../install.sh | SPIDERWEB_GIT_REF=feat/foo ZSS_GIT_REF=feat/bar bash
 
 set -euo pipefail
 
@@ -49,18 +51,41 @@ log_success() {
 ensure_git_repo() {
     local dir="$1"
     local url="$2"
+    local ref="${3:-}"
     local name
     name="$(basename "$dir")"
 
     if [[ -d "$dir/.git" ]]; then
-        log_info "Updating ${name}..."
-        git -C "$dir" pull -q || log_warn "Failed to update ${name}; using existing checkout"
+        log_info "Updating ${name}${ref:+ (ref: ${ref})}..."
+        git -C "$dir" remote set-url origin "$url" >/dev/null 2>&1 || true
+        if [[ -n "$ref" ]]; then
+            git -C "$dir" fetch -q origin || log_warn "Failed to fetch ${name}; using existing checkout"
+            if git -C "$dir" rev-parse --verify --quiet "refs/remotes/origin/${ref}" >/dev/null; then
+                if git -C "$dir" rev-parse --verify --quiet "$ref" >/dev/null; then
+                    git -C "$dir" checkout -q "$ref" || log_warn "Failed to checkout ${name} ref ${ref}; using current branch"
+                else
+                    git -C "$dir" checkout -q -B "$ref" "origin/$ref" || log_warn "Failed to create local branch ${ref} for ${name}; using current branch"
+                fi
+                git -C "$dir" pull -q --ff-only origin "$ref" || log_warn "Failed to fast-forward ${name} ref ${ref}; using current checkout"
+            else
+                git -C "$dir" checkout -q "$ref" || log_warn "Ref ${ref} not found on origin for ${name}; using current checkout"
+            fi
+        else
+            git -C "$dir" pull -q || log_warn "Failed to update ${name}; using existing checkout"
+        fi
     elif [[ -d "$dir" ]]; then
         log_warn "${name} exists but is not a git repo: $dir"
         log_warn "Skipping clone and using existing directory"
     else
-        log_info "Cloning ${name}..."
-        git clone -q "$url" "$dir"
+        log_info "Cloning ${name}${ref:+ (ref: ${ref})}..."
+        if [[ -n "$ref" ]]; then
+            if ! git clone -q --branch "$ref" "$url" "$dir"; then
+                log_warn "Clone with ref ${ref} failed for ${name}; falling back to default branch"
+                git clone -q "$url" "$dir"
+            fi
+        else
+            git clone -q "$url" "$dir"
+        fi
     fi
 }
 
@@ -293,6 +318,10 @@ fi
 REPO_DIR="${HOME}/.local/share/ziggy-spiderweb"
 INSTALL_DIR="${HOME}/.local/bin"
 export PATH="${INSTALL_DIR}:${PATH}"
+SPIDERWEB_REPO_URL="${SPIDERWEB_REPO_URL:-https://github.com/DeanoC/ZiggySpiderweb.git}"
+SPIDERWEB_GIT_REF="${SPIDERWEB_GIT_REF:-main}"
+ZSS_REPO_URL="${ZSS_REPO_URL:-https://github.com/DeanoC/ZiggyStarSpider.git}"
+ZSS_GIT_REF="${ZSS_GIT_REF:-main}"
 
 # Check if spiderweb is running and offer to stop it first
 SPIDERWEB_RUNNING=false
@@ -332,11 +361,8 @@ if [[ -d "$REPO_DIR" ]]; then
     fi
 fi
 
-if [[ ! -d "$REPO_DIR" ]]; then
-    log_info "Cloning ZiggySpiderweb..."
-    mkdir -p "$(dirname "$REPO_DIR")"
-    git clone -q https://github.com/DeanoC/ZiggySpiderweb.git "$REPO_DIR"
-fi
+mkdir -p "$(dirname "$REPO_DIR")"
+ensure_git_repo "$REPO_DIR" "$SPIDERWEB_REPO_URL" "$SPIDERWEB_GIT_REF"
 
 REPO_BASE_DIR="$(dirname "$REPO_DIR")"
 log_info "Ensuring local Ziggy module dependencies..."
@@ -392,17 +418,10 @@ fi
 
 if [[ "$INSTALL_ZSS" == "true" ]]; then
     ZSS_REPO="${HOME}/.local/share/ziggy-starspider"
-    
-    if [[ -d "$ZSS_REPO" ]]; then
-        log_info "ZiggyStarSpider already exists, updating..."
-        cd "$ZSS_REPO"
-        git pull -q
-    else
-        log_info "Cloning ZiggyStarSpider..."
-        mkdir -p "$(dirname "$ZSS_REPO")"
-        git clone -q https://github.com/DeanoC/ZiggyStarSpider.git "$ZSS_REPO"
-        cd "$ZSS_REPO"
-    fi
+
+    mkdir -p "$(dirname "$ZSS_REPO")"
+    ensure_git_repo "$ZSS_REPO" "$ZSS_REPO_URL" "$ZSS_GIT_REF"
+    cd "$ZSS_REPO"
     
     log_info "Building ZiggyStarSpider CLI..."
     zig build cli -Doptimize=ReleaseSafe -Dtarget=native
