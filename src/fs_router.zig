@@ -802,20 +802,12 @@ pub const Router = struct {
                 removed.deinit(self.allocator);
             }
         }
-
-        self.reconnectEndpoint(endpoint_index) catch |err| {
-            if (isEndpointFailureError(err)) {
-                const endpoint = &self.endpoints.items[endpoint_index];
-                if (self.seedRootFromMountPath(endpoint.mount_path, endpoint_index)) |seeded_root| {
-                    endpoint.root_node_id = seeded_root;
-                }
-                endpoint.healthy = false;
-                endpoint.last_failure_ms = std.time.milliTimestamp();
-                endpoint.last_health_check_ms = endpoint.last_failure_ms;
-                return;
-            }
-            return err;
-        };
+        // Keep startup non-blocking: endpoint transport handshakes are established lazily
+        // on first real access instead of during topology install.
+        const endpoint = &self.endpoints.items[endpoint_index];
+        if (self.seedRootFromMountPath(endpoint.mount_path, endpoint_index)) |seeded_root| {
+            endpoint.root_node_id = seeded_root;
+        }
     }
 
     fn clearEndpoints(self: *Router) void {

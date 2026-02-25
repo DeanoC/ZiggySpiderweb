@@ -51,6 +51,7 @@ const control_protocol_version = "unified-v2";
 const fsrpc_runtime_protocol_version = "styx-lite-1";
 const fsrpc_node_protocol_version = "unified-v2-fs";
 const fsrpc_node_proto_id: i64 = 2;
+const min_connection_worker_threads: usize = 16;
 const runtime_warmup_wait_timeout_ms: i64 = 12_000;
 const runtime_warmup_stale_timeout_ms: i64 = 30_000;
 const runtime_warmup_poll_interval_ms: u64 = 100;
@@ -1662,9 +1663,15 @@ const AgentRuntimeRegistry = struct {
                 .workspace_url = workspace_url,
                 .workspace_auth_token = workspace_auth,
                 .runtime_cfg = self.runtime_config,
-            }) catch |err| switch (err) {
-                error.ProjectMountUnavailable => return error.SandboxMountUnavailable,
-                else => return error.InvalidSandboxConfig,
+            }) catch |err| {
+                std.log.warn(
+                    "sandbox runtime create failed: agent={s} project={s} err={s}",
+                    .{ agent_id, project_id, @errorName(err) },
+                );
+                switch (err) {
+                    error.ProjectMountUnavailable => return error.SandboxMountUnavailable,
+                    else => return error.InvalidSandboxConfig,
+                }
             };
             errdefer sandbox_runtime.destroy();
 
@@ -2681,6 +2688,11 @@ fn runtimeWarmupThreadMain(ctx: *RuntimeWarmupThreadContext) void {
         ctx.project_id,
         ctx.project_token,
     ) catch |err| {
+        std.log.warn("runtime warmup thread failed: agent={s} project={s} err={s}", .{
+            agent_id,
+            ctx.project_id orelse "__auto__",
+            @errorName(err),
+        });
         const info = AgentRuntimeRegistry.mapRuntimeWarmupError(err);
         ctx.runtime_registry.markRuntimeWarmupError(
             binding_key,
@@ -2807,9 +2819,18 @@ pub fn run(
     var tcp_server = try address.listen(.{ .reuse_address = true });
     defer tcp_server.deinit();
 
+    const configured_connection_workers = runtime_config.connection_worker_threads;
+    const effective_connection_workers = @max(configured_connection_workers, min_connection_worker_threads);
+    if (effective_connection_workers != configured_connection_workers) {
+        std.log.warn(
+            "runtime.connection_worker_threads={d} is too low for fsrpc endpoint fan-out; using {d}",
+            .{ configured_connection_workers, effective_connection_workers },
+        );
+    }
+
     const dispatcher = try connection_dispatcher.ConnectionDispatcher.create(
         allocator,
-        runtime_config.connection_worker_threads,
+        effective_connection_workers,
         runtime_config.connection_queue_max,
         workerHandleConnection,
         &runtime_registry,
@@ -2881,8 +2902,12 @@ fn handleWebSocketConnection(
     defer deinitSessionBindings(allocator, &session_bindings);
 
     const default_agent_id = initialAgentIdForRole(principal.role, runtime_registry.default_agent_id);
-    try upsertSessionBinding(allocator, &session_bindings, "main", default_agent_id, null, null);
-    var initial_warmup_snapshot = runtime_registry.ensureRuntimeWarmup(default_agent_id, null, null, true) catch |err| blk: {
+    const default_project_id: ?[]const u8 = if (principal.role == .admin)
+        fs_control_plane.spider_web_project_id
+    else
+        null;
+    try upsertSessionBinding(allocator, &session_bindings, "main", default_agent_id, default_project_id, null);
+    var initial_warmup_snapshot = runtime_registry.ensureRuntimeWarmup(default_agent_id, default_project_id, null, true) catch |err| blk: {
         std.log.warn("default session warmup failed: {s}", .{@errorName(err)});
         break :blk SessionAttachStateSnapshot{};
     };
