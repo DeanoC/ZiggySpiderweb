@@ -60,13 +60,13 @@ pub fn main() !void {
             .config_path = try allocator.dupe(u8, ".spiderweb.json"),
         };
         // Need to handle deinit, but we already have an error path
-        std.log.info("Starting ZiggySpiderweb v0.2.0 (Pi AI)", .{});
+        std.log.info("Starting ZiggySpiderweb v0.3.0 (Pi AI)", .{});
         try server.run(allocator, cfg.server.bind, cfg.server.port, cfg.provider, cfg.runtime);
         return;
     };
     defer config.deinit();
 
-    std.log.info("Starting ZiggySpiderweb v0.2.0 (Pi AI)", .{});
+    std.log.info("Starting ZiggySpiderweb v0.3.0 (Pi AI)", .{});
     std.log.info("Config: {s}", .{config.config_path});
     std.log.info("Provider: {s}/{s}", .{ config.provider.name, config.provider.model orelse "default" });
     std.log.info("Default agent route: {s}", .{config.runtime.default_agent_id});
@@ -93,7 +93,7 @@ pub fn main() !void {
             }
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             const help =
-                "ZiggySpiderweb v0.2.0 - Pi AI Gateway for OpenClaw Protocol\n" ++
+                "ZiggySpiderweb v0.3.0 - Pi AI Gateway for OpenClaw Protocol\n" ++
                 "\n" ++
                 "A WebSocket gateway that proxies OpenClaw protocol messages to Pi AI providers.\n" ++
                 "\n" ++
@@ -105,12 +105,14 @@ pub fn main() !void {
                 "  --help, -h       Show this help\n" ++
                 "\n" ++
                 "Configuration:\n" ++
+                "  spiderweb-config oauth login <provider> [--enterprise-domain <domain>] [--no-set-provider]\n" ++
+                "  spiderweb-config oauth clear <provider>\n" ++
                 "  spiderweb-config config              Show current config\n" ++
                 "  spiderweb-config config set-provider <name> [model]\n" ++
                 "  spiderweb-config config set-key <api-key> [provider]\n" ++
                 "  spiderweb-config config clear-key [provider]\n" ++
                 "\n" ++
-                "API key resolution order: secure credential backend (Linux: secret-tool), then provider env vars.\n";
+                "API key resolution order: secure credential backend (Linux: secret-tool), then provider OAuth/env keys.\n";
             std.debug.print("{s}", .{help});
             return;
         }

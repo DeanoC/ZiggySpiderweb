@@ -63,13 +63,13 @@ zig build
 
 ```bash
 # Test connectivity
-zsc --gateway-test ping ws://127.0.0.1:18790/v1/agents/test/stream
+zsc --gateway-test ping ws://127.0.0.1:18790
 
 # Send a message (requires API key)
-zsc --gateway-test echo ws://127.0.0.1:18790/v1/agents/test/stream
+zsc --gateway-test echo ws://127.0.0.1:18790
 
 # Protocol compatibility check
-zsc --gateway-test probe ws://127.0.0.1:18790/v1/agents/test/stream
+zsc --gateway-test probe ws://127.0.0.1:18790
 ```
 
 ## Configuration
@@ -222,7 +222,7 @@ OpenClaw Client (ZSC, OpenClaw, etc.)
     │ WebSocket / OpenClaw Protocol
     ▼
 ┌─────────────────┐
-│  HTTP Upgrade   │  ← GET /v1/agents/{agentId}/stream
+│  HTTP Upgrade   │  ← GET /
 ├─────────────────┤
 │  Session ACK    │  ← {"type":"connect.ack",...}
 ├─────────────────┤
@@ -246,29 +246,72 @@ Two new binaries provide the distributed filesystem protocol from `design_docs/F
 
 # List root entries through the mount/router client
 ./zig-out/bin/spiderweb-fs-mount \
-  --endpoint a=ws://127.0.0.1:18891/v1/fs#work \
-  readdir /a
+  --endpoint a=ws://127.0.0.1:18891/v2/fs#work@/src \
+  readdir /
 
-# Read/write paths through the routed namespace
-./zig-out/bin/spiderweb-fs-mount --endpoint a=ws://127.0.0.1:18891/v1/fs#work cat /a/README.md
-./zig-out/bin/spiderweb-fs-mount --endpoint a=ws://127.0.0.1:18891/v1/fs#work write /a/.tmp-fs-test "hello"
+# Read through an explicit mount prefix
+./zig-out/bin/spiderweb-fs-mount \
+  --endpoint a=ws://127.0.0.1:18891/v2/fs#work@/src \
+  cat /src/README.md
+
+# Read/write paths through the routed namespace (default mount is /<name> when @/mount is omitted)
+./zig-out/bin/spiderweb-fs-mount --endpoint a=ws://127.0.0.1:18891/v2/fs#work cat /a/README.md
+./zig-out/bin/spiderweb-fs-mount --endpoint a=ws://127.0.0.1:18891/v2/fs#work write /a/.tmp-fs-test "hello"
+
+# Hydrate mounts from spiderweb control workspace_status (active project for default agent)
+./zig-out/bin/spiderweb-fs-mount \
+  --workspace-url ws://127.0.0.1:18790/ \
+  readdir /
+
+# Keep mounted endpoints synced from control.workspace_status while running FUSE
+./zig-out/bin/spiderweb-fs-mount \
+  --workspace-url ws://127.0.0.1:18790/ \
+  --workspace-sync-interval-ms 5000 \
+  mount /mnt/spiderweb
 
 # Endpoint health/failover status
-./zig-out/bin/spiderweb-fs-mount --endpoint a=ws://127.0.0.1:18891/v1/fs#work status
+./zig-out/bin/spiderweb-fs-mount --endpoint a=ws://127.0.0.1:18891/v2/fs#work status
 
-# Failover: configure multiple endpoints with the same mount name ("a")
+# Failover: configure multiple endpoints with the same mount path ("/a")
 ./zig-out/bin/spiderweb-fs-mount \
-  --endpoint a=ws://127.0.0.1:18891/v1/fs#work \
-  --endpoint a=ws://127.0.0.1:18892/v1/fs#work \
+  --endpoint a=ws://127.0.0.1:18891/v2/fs#work@/a \
+  --endpoint b=ws://127.0.0.1:18892/v2/fs#work@/a \
   readdir /a
 ```
 
 Notes:
-- Transport is WebSocket with JSON envelopes (binary MsgPack/CBOR planned).
+- Transport is unified v2 WebSocket JSON using `channel=fsrpc` and `type=fsrpc.t_fs_*` / `fsrpc.r_fs_*` / `fsrpc.e_fs_*` / `fsrpc.err_fs`.
 - JSON READ/WRITE payloads use `data_b64` for file bytes.
 - `mount` is now wired through libfuse3 at runtime (loads `libfuse3.so.3` and uses `fusermount3`).
-- Router health checks each endpoint and fails over within a shared endpoint name group.
-- Node/server now emits `evt` invalidations (`INVAL`, `INVAL_DIR`) and router caches are invalidated on receipt.
+- Router health checks each endpoint and fails over within a shared mount-path group.
+- `spiderweb-fs-mount status` now includes top-level router metrics, including `failover_events_total`.
+- `spiderweb-fs-mount mount` can run a workspace sync loop (`--workspace-sync-interval-ms`) that periodically reconciles endpoint topology from `control.workspace_status`.
+- `spiderweb-fs-mount` supports `--project-id <id> [--project-token <token>]` to fetch/sync mounts for a specific project instead of the active agent binding.
+- Workspace sync listens for push topology events via `control.debug_subscribe`:
+  - full-refresh events: `control.workspace_topology`
+  - project-scoped delta events: `control.workspace_topology_delta` (applied directly when `--project-id` is set)
+  - polling fallback remains enabled.
+- Control-plane project mutations (`project_update`, `project_delete`, `project_mount_set`, `project_mount_remove`, `project_activate`) require a `project_token` returned by `control.project_create`.
+- Project token lifecycle control ops are available: `control.project_token_rotate` and `control.project_token_revoke`.
+- `control.ping`/`control.pong` is now a lightweight liveness probe (`payload: {}`), and metrics moved to `control.metrics`.
+- Control clients must negotiate `control.version` (`{"protocol":"unified-v2"}`) before other control operations.
+- Runtime fsrpc clients must negotiate `fsrpc.t_version` first (`"version":"styx-lite-1"`).
+- FS node/router sessions must negotiate `fsrpc.t_fs_hello` first with payload `{"protocol":"unified-v2-fs","proto":2}`; `auth_token` is optional and enforced when node session auth is enabled.
+- Optional control mutation gate: set `SPIDERWEB_CONTROL_OPERATOR_TOKEN`; protected mutations require matching `payload.operator_token`.
+- Optional encrypted control-plane state snapshots: set `SPIDERWEB_CONTROL_STATE_KEY_HEX` to a 64-char AES-256 key (hex).
+- Optional HTTP observability endpoint: set `SPIDERWEB_METRICS_PORT`; then:
+  - `GET /livez` returns process liveness
+  - `GET /readyz` returns readiness
+  - `GET /metrics` returns Prometheus text format
+  - `GET /metrics.json` returns control-plane metrics JSON
+- `spiderweb-control` CLI negotiates `control.version` + `control.connect` and executes a single control op for scripting/debug use.
+- Spiderweb can host a local in-process `/v2/fs` node (same protocol as external nodes) with:
+  - `SPIDERWEB_LOCAL_NODE_EXPORT_PATH` (required to enable)
+  - `SPIDERWEB_LOCAL_NODE_EXPORT_NAME` (optional, default `work`)
+  - `SPIDERWEB_LOCAL_NODE_EXPORT_RO` (optional boolean)
+  - `SPIDERWEB_LOCAL_NODE_NAME`, `SPIDERWEB_LOCAL_NODE_FS_URL`, `SPIDERWEB_LOCAL_NODE_LEASE_TTL_MS`, `SPIDERWEB_LOCAL_NODE_HEARTBEAT_MS` (optional registration/lease settings)
+- External `spiderweb-fs-node` can enforce session auth on `/v2/fs` using `--auth-token` (or `SPIDERWEB_FS_NODE_AUTH_TOKEN`).
+- Node/server now emits `fsrpc.e_fs_inval` / `fsrpc.e_fs_inval_dir` invalidations and router caches are invalidated on receipt.
 - Node/server now broadcasts mutation invalidations to other connected FS clients (server-push fanout).
 - Node/server uses a native Linux `inotify` watcher when available, with scanner fallback for out-of-band local FS invalidations.
 - Router now keeps a background event-pump websocket per endpoint so idle mounts can ingest pushed invalidations.
@@ -304,7 +347,7 @@ var service = try fs.NodeService.init(allocator, &[_]fs.ExportSpec{
 });
 defer service.deinit();
 
-const response = try service.handleRequestJson("{\"t\":\"req\",\"id\":1,\"op\":\"HELLO\",\"a\":{}}");
+const response = try service.handleRequestJson("{\"channel\":\"fsrpc\",\"type\":\"fsrpc.t_fs_hello\",\"tag\":1,\"payload\":{\"protocol\":\"unified-v2-fs\",\"proto\":2}}");
 defer allocator.free(response);
 ```
 
@@ -315,7 +358,7 @@ Example program in this repo:
 Multi-service embedding example (FS + health + echo in one process):
 - Build: `zig build example-embed-multi-service-node`
 - Run: `./zig-out/bin/embed-multi-service-node --port 19910 --export work=.:rw`
-- Routes: `/v1/fs`, `/v1/health`, `/v1/echo`
+- Routes: `/v2/fs`, `/v1/health`, `/v1/echo`
 
 ## Protocol Support
 
@@ -358,6 +401,9 @@ Spiderweb now imports shared modules directly:
 - `ziggy-run-orchestrator` (run lifecycle engine + run-step orchestration helpers)
 
 Compatibility wrapper files (`src/protocol*.zig`, `src/memory*.zig`, `src/run_store.zig`, `src/tool_*.zig`) were marked for removal on February 22, 2026 with a target of `v0.3.0`, and are now removed. Use direct module imports in new code.
+
+Unified v2 FS/control migration details:
+- `docs/UNIFIED_V2_FS_MIGRATION.md`
 
 ## Related Projects
 

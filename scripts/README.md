@@ -26,11 +26,16 @@ sudo spiderweb-config config
 sudo nano /etc/spiderweb/config.json
 ```
 
-Set your API key:
+Set credentials for the active provider:
 ```bash
-export OPENAI_API_KEY="sk-..."
-# Or use the config CLI:
-sudo spiderweb-config set-key "sk-..."
+# API key providers
+sudo OPENAI_API_KEY="sk-..." ./install-systemd.sh
+
+# OAuth providers (run as service user so tokens are stored for that account)
+sudo -u spiderweb HOME=/home/spiderweb SPIDERWEB_CONFIG=/etc/spiderweb/config.json /opt/spiderweb/bin/spiderweb-config oauth login openai-codex --no-set-provider
+
+# Optional: set provider explicitly in config
+sudo SPIDERWEB_CONFIG=/etc/spiderweb/config.json spiderweb-config config set-provider openai-codex gpt-5.1-codex-mini
 ```
 
 ## Service Management
@@ -80,7 +85,12 @@ This performs a full local + system cleanup for fresh-install testing and requir
 | `CONFIG_DIR` | `/etc/spiderweb` | Config directory |
 | `SERVICE_NAME` | `spiderweb` | systemd service name |
 | `PORT` | `18790` | Default listening port |
-| `BIND_ADDR` | `127.0.0.1` | Default bind address |
+| `BIND_ADDR` | `0.0.0.0` | Default bind address |
+| `PROVIDER_NAME` | `openai` | Provider written to generated config |
+| `PROVIDER_MODEL` | `gpt-4o-mini` | Model written to generated config |
+| `OVERWRITE_CONFIG` | `0` | If `1`, replace existing `/etc/spiderweb/config.json` |
+| `OPENAI_API_KEY` | unset | Writes `OPENAI_API_KEY` to service env file when provider is `openai` |
+| `OPENAI_CODEX_API_KEY` | unset | Writes `OPENAI_CODEX_API_KEY` for `openai-codex*` providers |
 
 Example with custom settings:
 ```bash

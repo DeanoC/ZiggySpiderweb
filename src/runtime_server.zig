@@ -7,6 +7,7 @@ const brain_tools = @import("brain_tools.zig");
 const brain_specialization = @import("brain_specialization.zig");
 const credential_store = @import("credential_store.zig");
 const memory_schema = @import("memory_schema.zig");
+const provider_models = @import("provider_models.zig");
 const memory = @import("ziggy-memory-store").memory;
 const memid = @import("ziggy-memory-store").memid;
 const prompt_compiler = @import("prompt_compiler.zig");
@@ -141,6 +142,7 @@ var streamByModelFn: StreamByModelFn = ziggy_piai.stream.streamByModel;
 
 const GetEnvApiKeyFn = *const fn (std.mem.Allocator, []const u8) ?[]const u8;
 var getEnvApiKeyFn: GetEnvApiKeyFn = ziggy_piai.env_api_keys.getEnvApiKey;
+const RemoteToolDispatchFn = brain_tools.RemoteToolDispatchFn;
 
 const ProviderRuntime = struct {
     model_registry: ziggy_piai.models.ModelRegistry,
@@ -174,6 +176,16 @@ const ProviderRuntime = struct {
         errdefer provider.deinit(allocator);
 
         if (provider_cfg.model) |value| provider.default_model_name = try allocator.dupe(u8, value);
+        if (provider.default_model_name) |configured_model| {
+            if (provider_models.remapLegacyModel(provider.default_provider_name, configured_model)) |mapped_model| {
+                std.log.warn(
+                    "Configured model {s}/{s} is deprecated; using {s}",
+                    .{ provider.default_provider_name, configured_model, mapped_model },
+                );
+                allocator.free(configured_model);
+                provider.default_model_name = try allocator.dupe(u8, mapped_model);
+            }
+        }
         if (builtin.is_test) {
             if (provider_cfg.api_key) |value| provider.test_only_api_key = try allocator.dupe(u8, value);
         }
@@ -217,9 +229,21 @@ pub const RuntimeServer = struct {
     runtime_workers: []std.Thread,
     stopping: bool = false,
     test_ltm_directory: ?[]u8 = null,
+    remote_tool_dispatch_ctx: ?*anyopaque = null,
+    remote_tool_dispatch_fn: ?RemoteToolDispatchFn = null,
 
     pub fn create(allocator: std.mem.Allocator, agent_id: []const u8, runtime_cfg: Config.RuntimeConfig) !*RuntimeServer {
-        return createInternal(allocator, agent_id, runtime_cfg, null);
+        return createInternal(allocator, agent_id, runtime_cfg, null, null, null);
+    }
+
+    pub fn createWithToolDispatch(
+        allocator: std.mem.Allocator,
+        agent_id: []const u8,
+        runtime_cfg: Config.RuntimeConfig,
+        dispatch_ctx: ?*anyopaque,
+        dispatch_fn: RemoteToolDispatchFn,
+    ) !*RuntimeServer {
+        return createInternal(allocator, agent_id, runtime_cfg, null, dispatch_ctx, dispatch_fn);
     }
 
     pub fn createWithProvider(
@@ -228,7 +252,25 @@ pub const RuntimeServer = struct {
         runtime_cfg: Config.RuntimeConfig,
         provider_cfg: Config.ProviderConfig,
     ) !*RuntimeServer {
-        return createInternal(allocator, agent_id, runtime_cfg, provider_cfg);
+        return createInternal(allocator, agent_id, runtime_cfg, provider_cfg, null, null);
+    }
+
+    pub fn createWithProviderAndToolDispatch(
+        allocator: std.mem.Allocator,
+        agent_id: []const u8,
+        runtime_cfg: Config.RuntimeConfig,
+        provider_cfg: Config.ProviderConfig,
+        dispatch_ctx: ?*anyopaque,
+        dispatch_fn: RemoteToolDispatchFn,
+    ) !*RuntimeServer {
+        return createInternal(
+            allocator,
+            agent_id,
+            runtime_cfg,
+            provider_cfg,
+            dispatch_ctx,
+            dispatch_fn,
+        );
     }
 
     fn createInternal(
@@ -236,6 +278,8 @@ pub const RuntimeServer = struct {
         agent_id: []const u8,
         runtime_cfg: Config.RuntimeConfig,
         provider_cfg: ?Config.ProviderConfig,
+        dispatch_ctx: ?*anyopaque,
+        dispatch_fn: ?RemoteToolDispatchFn,
     ) !*RuntimeServer {
         const worker_count = if (runtime_cfg.runtime_worker_threads == 0) 1 else runtime_cfg.runtime_worker_threads;
 
@@ -276,6 +320,7 @@ pub const RuntimeServer = struct {
             effective_ltm_filename,
             runtime_cfg,
         );
+        runtime.setWorldToolDispatch(dispatch_ctx, dispatch_fn);
         var runtime_owned_by_self = false;
         errdefer if (!runtime_owned_by_self) runtime.deinit();
 
@@ -304,6 +349,8 @@ pub const RuntimeServer = struct {
             .default_agent_id = try allocator.dupe(u8, if (runtime_cfg.default_agent_id.len == 0) default_agent_id else runtime_cfg.default_agent_id),
             .log_provider_requests = shouldLogProviderRequests(),
             .test_ltm_directory = test_ltm_directory,
+            .remote_tool_dispatch_ctx = dispatch_ctx,
+            .remote_tool_dispatch_fn = dispatch_fn,
         };
         runtime_owned_by_self = true;
         runs_owned_by_self = true;
@@ -1632,6 +1679,13 @@ pub const RuntimeServer = struct {
     fn setProviderErrorDebugPayload(self: *RuntimeServer, job: *RuntimeQueueJob, payload_json: []const u8) !void {
         if (job.provider_error_debug_payload) |existing| self.allocator.free(existing);
         job.provider_error_debug_payload = try self.allocator.dupe(u8, payload_json);
+
+        // Always emit provider failure details to server logs so mapped
+        // `provider_unavailable` errors are diagnosable without debug subscriptions.
+        const maybe_redacted = redactDebugPayload(self.allocator, payload_json) catch null;
+        defer if (maybe_redacted) |value| self.allocator.free(value);
+        const log_payload = maybe_redacted orelse payload_json;
+        std.log.warn("provider failure detail: {s}", .{log_payload});
     }
 
     fn wrapSingleFrame(self: *RuntimeServer, payload: []u8) ![][]u8 {
@@ -1942,6 +1996,25 @@ pub const RuntimeServer = struct {
         }
 
         return .{ .runtime_error = RuntimeServerError.ProviderStreamFailed, .retryable = false };
+    }
+
+    fn shouldAttemptModelFallback(
+        failure: ProviderFailure,
+        stream_error_name: ?[]const u8,
+        provider_error_message: ?[]const u8,
+    ) bool {
+        if (failure.retryable) return true;
+        if (failure.runtime_error != RuntimeServerError.ProviderRequestInvalid) return false;
+
+        const err_name = stream_error_name orelse "";
+        const message = provider_error_message orelse "";
+        return containsAnyIgnoreCase(
+            message,
+            &.{ "model not found", "unsupported model", "unknown model", "deprecated model", "no such model", "does not exist" },
+        ) or containsAnyIgnoreCase(
+            err_name,
+            &.{ "ModelNotFound", "UnsupportedModel", "UnknownModel" },
+        );
     }
 
     fn findProviderStreamMessage(events: []const ziggy_piai.types.AssistantMessageEvent) ?[]const u8 {
@@ -2285,7 +2358,7 @@ pub const RuntimeServer = struct {
                         continue :provider_attempt_loop;
                     }
 
-                    if (failure.retryable and !used_fallback) {
+                    if (shouldAttemptModelFallback(failure, stream_error_name, null) and !used_fallback) {
                         if (try self.selectFallbackModelWithApiKey(provider_runtime, selected_model)) |fallback_model| {
                             if (job.emit_debug) {
                                 const escaped_from_provider = try protocol.jsonEscape(self.allocator, selected_model.provider);
@@ -2367,7 +2440,7 @@ pub const RuntimeServer = struct {
                         continue :provider_attempt_loop;
                     }
 
-                    if (failure.retryable and !used_fallback) {
+                    if (shouldAttemptModelFallback(failure, null, provider_error_message) and !used_fallback) {
                         if (try self.selectFallbackModelWithApiKey(provider_runtime, selected_model)) |fallback_model| {
                             if (job.emit_debug) {
                                 const escaped_from_provider = try protocol.jsonEscape(self.allocator, selected_model.provider);
@@ -3244,7 +3317,25 @@ pub const RuntimeServer = struct {
 
     fn selectModel(provider_runtime: *const ProviderRuntime, provider_name: []const u8, model_name: ?[]const u8) ?ziggy_piai.types.Model {
         if (model_name) |selected_model_name| {
-            return provider_runtime.model_registry.getModel(provider_name, selected_model_name);
+            if (provider_runtime.model_registry.getModel(provider_name, selected_model_name)) |model| return model;
+
+            if (provider_models.remapLegacyModel(provider_name, selected_model_name)) |mapped_model_name| {
+                if (provider_runtime.model_registry.getModel(provider_name, mapped_model_name)) |mapped_model| {
+                    std.log.warn(
+                        "Selected model {s}/{s} is deprecated; using {s}",
+                        .{ provider_name, selected_model_name, mapped_model_name },
+                    );
+                    return mapped_model;
+                }
+            }
+
+            return null;
+        }
+
+        if (provider_models.preferredDefaultModel(provider_name)) |preferred_model_name| {
+            if (provider_runtime.model_registry.getModel(provider_name, preferred_model_name)) |preferred_model| {
+                return preferred_model;
+            }
         }
 
         for (provider_runtime.model_registry.models.items) |model| {
@@ -6036,7 +6127,7 @@ test "runtime_server: provider-only override resets inherited model selection" {
 
     try std.testing.expect(std.mem.indexOf(u8, response, "captured provider response") != null);
     try std.testing.expectEqualStrings("openai-codex", mockCapturedProviderName.?);
-    try std.testing.expectEqualStrings("gpt-5.1-codex-mini", mockCapturedModelName.?);
+    try std.testing.expectEqualStrings("gpt-5.3-codex", mockCapturedModelName.?);
     try std.testing.expect(mockCapturedApiKey != null);
     try std.testing.expectEqualStrings("configured-openai-key", mockCapturedApiKey.?);
 }
@@ -6082,6 +6173,42 @@ test "runtime_server: provider runtime falls back to env API key on secure-store
     try std.testing.expectEqualStrings("openai", mockCapturedProviderName.?);
     try std.testing.expect(mockCapturedApiKey != null);
     try std.testing.expectEqualStrings("env-openai-key", mockCapturedApiKey.?);
+}
+
+test "runtime_server: legacy codex model id remaps to current default" {
+    const allocator = std.testing.allocator;
+    const original_stream_fn = streamByModelFn;
+    defer streamByModelFn = original_stream_fn;
+    streamByModelFn = mockProviderStreamCaptureConfig;
+
+    mockCapturedProviderName = null;
+    mockCapturedModelName = null;
+    mockCapturedReasoning = null;
+    if (mockCapturedApiKey) |value| {
+        allocator.free(value);
+        mockCapturedApiKey = null;
+    }
+    defer if (mockCapturedApiKey) |value| {
+        allocator.free(value);
+        mockCapturedApiKey = null;
+    };
+
+    const server = try RuntimeServer.createWithProvider(allocator, "agent-legacy-model-remap", .{
+        .ltm_directory = "",
+        .ltm_filename = "",
+    }, .{
+        .name = "openai-codex",
+        .model = "gpt-5.1",
+        .api_key = "test-key",
+    });
+    defer server.destroy();
+
+    const response = try server.handleMessage("{\"id\":\"req-legacy-model-remap\",\"type\":\"session.send\",\"content\":\"hello\"}");
+    defer allocator.free(response);
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "captured provider response") != null);
+    try std.testing.expectEqualStrings("openai-codex", mockCapturedProviderName.?);
+    try std.testing.expectEqualStrings("gpt-5.3-codex", mockCapturedModelName.?);
 }
 
 test "runtime_server: agent.json can override primary brain provider model and think level" {

@@ -1,6 +1,7 @@
 const std = @import("std");
 const Config = @import("config.zig");
 const credential_store = @import("credential_store.zig");
+const provider_models = @import("provider_models.zig");
 const ziggy_piai = @import("ziggy-piai");
 const max_agent_id_len: usize = 64;
 
@@ -49,7 +50,7 @@ pub fn runFirstRun(allocator: std.mem.Allocator, args: []const []const u8) !void
     try std.fs.File.stdout().writeAll("\n");
 
     // Step 1: Provider selection
-    const provider_name, const model_name = if (non_interactive) blk: {
+    const provider_name, const selected_model_name = if (non_interactive) blk: {
         const p = provider_param orelse {
             std.log.err("--provider required in non-interactive mode", .{});
             return error.InvalidArguments;
@@ -58,6 +59,16 @@ pub fn runFirstRun(allocator: std.mem.Allocator, args: []const []const u8) !void
     } else blk: {
         break :blk try selectProviderInteractive(allocator);
     };
+
+    var model_name = selected_model_name;
+    if (model_name) |value| {
+        if (provider_models.remapLegacyModel(provider_name, value)) |mapped| {
+            std.log.warn("Model {s}/{s} is deprecated; using {s}", .{ provider_name, value, mapped });
+            model_name = mapped;
+        }
+    } else {
+        model_name = provider_models.preferredDefaultModel(provider_name);
+    }
 
     // Step 2: Configure credentials
     try configureCredentials(allocator, provider_name, non_interactive);
@@ -100,7 +111,7 @@ pub fn runFirstRun(allocator: std.mem.Allocator, args: []const []const u8) !void
     try std.fs.File.stdout().writeAll("  Config: ~/.config/spiderweb/config.json\n");
     try std.fs.File.stdout().writeAll("\nNext steps:\n");
     try std.fs.File.stdout().writeAll("  Start server:    spiderweb\n");
-    try print("  Connect client:  zss connect --url ws://127.0.0.1:18790/v1/agents/{s}/stream\n", .{agent_name});
+    try std.fs.File.stdout().writeAll("  Connect client:  zss connect --url ws://127.0.0.1:18790\n");
     try std.fs.File.stdout().writeAll("\nInstall systemd service:\n");
     try std.fs.File.stdout().writeAll("  spiderweb-config config install-service\n");
 
@@ -169,7 +180,7 @@ fn selectProviderInteractive(allocator: std.mem.Allocator) !struct { []const u8,
     try std.fs.File.stdout().writeAll("\nSelect your AI provider:\n\n");
     try std.fs.File.stdout().writeAll("Quick setup:\n");
     try std.fs.File.stdout().writeAll("  1) OpenAI        - GPT-4o, GPT-4.1\n");
-    try std.fs.File.stdout().writeAll("  2) OpenAI Codex  - GPT-5.1, GPT-5.2, GPT-5.3 (with OAuth support)\n");
+    try std.fs.File.stdout().writeAll("  2) OpenAI Codex  - GPT-5.3 Codex (with OAuth support)\n");
     try std.fs.File.stdout().writeAll("  3) Kimi Coding   - Kimi K2, K2.5 (Moonshot AI)\n");
     try std.fs.File.stdout().writeAll("\n  4) Manual setup  - Other providers\n");
 
@@ -188,7 +199,7 @@ fn selectProviderInteractive(allocator: std.mem.Allocator) !struct { []const u8,
         if (std.mem.eql(u8, choice, "1")) {
             return .{ "openai", try selectModel(allocator, &.{ "gpt-4o-mini", "gpt-4.1-mini" }) };
         } else if (std.mem.eql(u8, choice, "2")) {
-            return .{ "openai-codex", try selectModel(allocator, &.{ "gpt-5.1-codex-mini", "gpt-5.1", "gpt-5.3-codex", "gpt-5.3-codex-spark" }) };
+            return .{ "openai-codex", try selectModel(allocator, &.{ "gpt-5.3-codex", "gpt-5.3-codex-spark", "gpt-5.2-codex", "gpt-5.1-codex-mini" }) };
         } else if (std.mem.eql(u8, choice, "3")) {
             return .{ "kimi-coding", try selectModel(allocator, &.{ "k2p5", "kimi-k2.5" }) };
         } else if (std.mem.eql(u8, choice, "4")) {

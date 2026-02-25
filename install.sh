@@ -21,7 +21,7 @@ cleanup_on_error() {
         echo "[ERROR] Installation failed (exit code: $exit_code)"
         echo ""
         echo "Try running with --non-interactive or install dependencies:"
-        echo "  sudo apt-get install curl jq git libsecret-tools sqlite3 build-essential"
+        echo "  sudo apt-get install curl jq git bubblewrap fuse3 libsecret-tools sqlite3 build-essential"
         echo ""
     fi
     exit $exit_code
@@ -44,6 +44,106 @@ log_warn() {
 
 log_success() {
     echo -e "${GREEN}[OK]${NC} $1"
+}
+
+ensure_git_repo() {
+    local dir="$1"
+    local url="$2"
+    local name
+    name="$(basename "$dir")"
+
+    if [[ -d "$dir/.git" ]]; then
+        log_info "Updating ${name}..."
+        git -C "$dir" pull -q || log_warn "Failed to update ${name}; using existing checkout"
+    elif [[ -d "$dir" ]]; then
+        log_warn "${name} exists but is not a git repo: $dir"
+        log_warn "Skipping clone and using existing directory"
+    else
+        log_info "Cloning ${name}..."
+        git clone -q "$url" "$dir"
+    fi
+}
+
+print_auth_tokens_summary() {
+    local config_cmd="${INSTALL_DIR}/spiderweb-config"
+    local has_auth_cli=false
+    if [[ ! -x "$config_cmd" ]]; then
+        config_cmd="$(command -v spiderweb-config || true)"
+    fi
+
+    local -a candidates=()
+    candidates+=("${REPO_DIR}/.spiderweb-ltm/auth_tokens.json")
+
+    local config_file="${HOME}/.config/spiderweb/config.json"
+    if [[ -f "$config_file" ]]; then
+        local ltm_dir
+        ltm_dir="$(jq -r '.runtime.ltm_directory // empty' "$config_file" 2>/dev/null || true)"
+        if [[ -n "$ltm_dir" ]]; then
+            if [[ "$ltm_dir" == /* ]]; then
+                candidates+=("${ltm_dir}/auth_tokens.json")
+            else
+                candidates+=("${REPO_DIR}/${ltm_dir#./}/auth_tokens.json")
+            fi
+        fi
+    fi
+
+    if [[ -n "$config_cmd" ]]; then
+        local raw_auth_path
+        raw_auth_path=""
+        if raw_auth_path="$("$config_cmd" auth path 2>/dev/null | tr -d '\r' | tail -n1)"; then
+            has_auth_cli=true
+        fi
+        if [[ -n "$raw_auth_path" ]]; then
+            if [[ "$raw_auth_path" == /* ]]; then
+                candidates+=("$raw_auth_path")
+            else
+                candidates+=("${REPO_DIR}/${raw_auth_path#./}")
+            fi
+        fi
+    fi
+
+    local token_file=""
+    for _ in $(seq 1 100); do
+        for candidate in "${candidates[@]}"; do
+            if [[ -f "$candidate" ]]; then
+                token_file="$candidate"
+                break 2
+            fi
+        done
+        sleep 0.2
+    done
+
+    if [[ -n "$token_file" ]]; then
+        local admin_token
+        local user_token
+        admin_token="$(jq -r '.admin_token // empty' "$token_file" 2>/dev/null || true)"
+        user_token="$(jq -r '.user_token // empty' "$token_file" 2>/dev/null || true)"
+        if [[ -n "$admin_token" && -n "$user_token" ]]; then
+            echo ""
+            log_success "Auth tokens (save these now):"
+            echo "  admin: $admin_token"
+            echo "  user:  $user_token"
+            echo "  path:  $token_file"
+            return
+        fi
+    fi
+
+    echo ""
+    log_warn "Could not locate generated auth tokens."
+    echo "Checked:"
+    for candidate in "${candidates[@]}"; do
+        echo "  - $candidate"
+    done
+    if [[ -n "$config_cmd" ]] && [[ "$has_auth_cli" == "true" ]]; then
+        echo "If needed, generate new tokens with:"
+        echo "  $config_cmd auth reset --yes"
+        echo "Then restart spiderweb so new tokens are active."
+    elif [[ -n "$config_cmd" ]]; then
+        echo "Token reset command is unavailable in this spiderweb-config build."
+        echo "Update spiderweb and rerun install.sh to get auth token management commands."
+    else
+        echo "Could not locate spiderweb-config in PATH or ${INSTALL_DIR}."
+    fi
 }
 
 # Detect if we're being piped
@@ -69,10 +169,63 @@ fi
 # Check dependencies
 log_info "Checking dependencies..."
 
+has_fuse3_runtime() {
+    if command -v ldconfig >/dev/null 2>&1; then
+        if ldconfig -p 2>/dev/null | grep -qE 'libfuse3\.so(\.(4|3))?'; then
+            return 0
+        fi
+    fi
+    local candidates=(
+        "/lib*/libfuse3.so.4"
+        "/usr/lib*/libfuse3.so.4"
+        "/lib*/libfuse3.so.3"
+        "/usr/lib*/libfuse3.so.3"
+        "/lib*/libfuse3.so"
+        "/usr/lib*/libfuse3.so"
+    )
+    local pattern
+    for pattern in "${candidates[@]}"; do
+        if compgen -G "$pattern" > /dev/null; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+append_apt_dep() {
+    local dep="$1"
+    local existing
+    for existing in "${APT_DEPS[@]}"; do
+        if [[ "$existing" == "$dep" ]]; then
+            return 0
+        fi
+    done
+    APT_DEPS+=("$dep")
+}
+
+add_first_available_pkg() {
+    local dep_name="$1"
+    shift
+    local pkg
+    for pkg in "$@"; do
+        if apt-cache show "$pkg" >/dev/null 2>&1; then
+            append_apt_dep "$pkg"
+            return 0
+        fi
+    done
+    log_warn "No apt package found for ${dep_name}; install it manually if missing."
+    return 1
+}
+
 DEPS_MISSING=()
+NEEDS_APT_INSTALL=false
+APT_DEPS=(libsecret-tools sqlite3 build-essential)
+
 for cmd in curl jq git; do
     if ! command -v "$cmd" &> /dev/null; then
         DEPS_MISSING+=("$cmd")
+        NEEDS_APT_INSTALL=true
+        append_apt_dep "$cmd"
     fi
 done
 
@@ -80,15 +233,55 @@ if ! command -v zig &> /dev/null; then
     DEPS_MISSING+=("zig")
 fi
 
-if [[ ${#DEPS_MISSING[@]} -gt 0 ]]; then
-    log_info "Installing dependencies: ${DEPS_MISSING[*]}"
+if ! command -v bwrap &> /dev/null; then
+    DEPS_MISSING+=("bwrap")
+    NEEDS_APT_INSTALL=true
+    add_first_available_pkg "bwrap" bubblewrap || true
+fi
+
+if ! command -v fusermount3 &> /dev/null; then
+    DEPS_MISSING+=("fusermount3")
+    NEEDS_APT_INSTALL=true
+    add_first_available_pkg "fusermount3" fuse3 || true
+fi
+
+if ! has_fuse3_runtime; then
+    DEPS_MISSING+=("libfuse3.so.3/libfuse3.so.4")
+    NEEDS_APT_INSTALL=true
+    add_first_available_pkg "libfuse3 runtime" libfuse3-4 libfuse3-3 fuse3 libfuse3-dev || true
+fi
+
+if [[ "$NEEDS_APT_INSTALL" == "true" ]]; then
+    log_info "Installing dependencies: ${APT_DEPS[*]}"
     sudo apt-get update -qq
-    sudo apt-get install -y -qq curl jq git libsecret-tools sqlite3 build-essential
+    sudo apt-get install -y -qq "${APT_DEPS[@]}"
+fi
+
+if ! command -v zig &> /dev/null; then
+    echo "Error: zig compiler is required but was not found in PATH."
+    echo "Install zig and rerun install.sh."
+    exit 1
+fi
+
+POST_MISSING=()
+for cmd in curl jq git bwrap fusermount3; do
+    if ! command -v "$cmd" &> /dev/null; then
+        POST_MISSING+=("$cmd")
+    fi
+done
+if ! has_fuse3_runtime; then
+    POST_MISSING+=("libfuse3.so.3/libfuse3.so.4")
+fi
+if [[ ${#POST_MISSING[@]} -gt 0 ]]; then
+    echo "Error: missing required dependencies: ${POST_MISSING[*]}"
+    echo "Install them and rerun install.sh."
+    exit 1
 fi
 
 # Clone and build
 REPO_DIR="${HOME}/.local/share/ziggy-spiderweb"
 INSTALL_DIR="${HOME}/.local/bin"
+export PATH="${INSTALL_DIR}:${PATH}"
 
 # Check if spiderweb is running and offer to stop it first
 SPIDERWEB_RUNNING=false
@@ -134,6 +327,15 @@ if [[ ! -d "$REPO_DIR" ]]; then
     git clone -q https://github.com/DeanoC/ZiggySpiderweb.git "$REPO_DIR"
 fi
 
+REPO_BASE_DIR="$(dirname "$REPO_DIR")"
+log_info "Ensuring local Ziggy module dependencies..."
+ensure_git_repo "${REPO_BASE_DIR}/ZiggyPiAi" "https://github.com/DeanoC/ZiggyPiAi.git"
+ensure_git_repo "${REPO_BASE_DIR}/ZiggySpiderProtocol" "https://github.com/DeanoC/ZiggySpiderProtocol.git"
+ensure_git_repo "${REPO_BASE_DIR}/ZiggyMemoryStore" "https://github.com/DeanoC/ZiggyMemoryStore.git"
+ensure_git_repo "${REPO_BASE_DIR}/ZiggyToolRuntime" "https://github.com/DeanoC/ZiggyToolRuntime.git"
+ensure_git_repo "${REPO_BASE_DIR}/ZiggyRuntimeHooks" "https://github.com/DeanoC/ZiggyRuntimeHooks.git"
+ensure_git_repo "${REPO_BASE_DIR}/ZiggyRunOrchestrator" "https://github.com/DeanoC/ZiggyRunOrchestrator.git"
+
 cd "$REPO_DIR"
 
 log_info "Building ZiggySpiderweb..."
@@ -142,14 +344,27 @@ zig build -Doptimize=ReleaseSafe
 log_info "Installing binaries..."
 mkdir -p "$INSTALL_DIR"
 
+SPIDERWEB_BINARIES=(spiderweb spiderweb-config spiderweb-control spiderweb-fs-mount spiderweb-agent-runtime)
+for bin in "${SPIDERWEB_BINARIES[@]}"; do
+    if [[ ! -x "zig-out/bin/${bin}" ]]; then
+        echo "Error: expected build artifact missing: zig-out/bin/${bin}"
+        exit 1
+    fi
+done
+
 # Copy binaries (spiderweb should be stopped by now)
-if ! cp zig-out/bin/spiderweb "$INSTALL_DIR/" 2>/dev/null; then
+copy_without_sudo=true
+for bin in "${SPIDERWEB_BINARIES[@]}"; do
+    if ! cp "zig-out/bin/${bin}" "$INSTALL_DIR/" 2>/dev/null; then
+        copy_without_sudo=false
+        break
+    fi
+done
+if [[ "$copy_without_sudo" != "true" ]]; then
     log_info "Need elevated permissions to update binary..."
-    sudo cp zig-out/bin/spiderweb "$INSTALL_DIR/"
-    sudo cp zig-out/bin/spiderweb-config "$INSTALL_DIR/"
-else
-    cp zig-out/bin/spiderweb "$INSTALL_DIR/"
-    cp zig-out/bin/spiderweb-config "$INSTALL_DIR/"
+    for bin in "${SPIDERWEB_BINARIES[@]}"; do
+        sudo cp "zig-out/bin/${bin}" "$INSTALL_DIR/"
+    done
 fi
 
 log_success "Build complete!"
@@ -189,9 +404,10 @@ if [[ "$INSTALL_ZSS" == "true" ]]; then
     cp zig-out/bin/zss-tui "$INSTALL_DIR/" 2>/dev/null || true
     
     log_success "ZiggyStarSpider installed!"
-    
-    log_success "ZiggyStarSpider installed!"
 fi
+
+# Ensure remaining install steps run from the spiderweb repo.
+cd "$REPO_DIR"
 
 # Ask about systemd service
 INSTALL_SYSTEMD=false
@@ -300,7 +516,7 @@ if [[ -n "${SPIDERWEB_NON_INTERACTIVE:-}" ]]; then
 else
     # Clear any leftover input before running first-run
     while IFS= read -r -t 0.1 dummy 2>/dev/null; do : ; done
-    spiderweb-config first-run
+    "${INSTALL_DIR}/spiderweb-config" first-run
 fi
 
 # Only configure bind address in interactive mode (when we asked the user)
@@ -309,12 +525,12 @@ if [[ -t 0 ]]; then
     
     # Get current port from config - spiderweb-config outputs "Bind: <host>:<port>"
     # Extract port from format like "Bind: 127.0.0.1:18790"
-    DETECTED_PORT=$(spiderweb-config config 2>/dev/null | grep -oP 'Bind: [^:]+:\K\d+' || echo "18790")
+    DETECTED_PORT=$("${INSTALL_DIR}/spiderweb-config" config 2>/dev/null | grep -oP 'Bind: [^:]+:\K\d+' || echo "18790")
     if [[ -n "$DETECTED_PORT" ]]; then
         CURRENT_PORT="$DETECTED_PORT"
     fi
     
-    spiderweb-config config set-server --bind "$BIND_ADDRESS" --port "$CURRENT_PORT"
+    "${INSTALL_DIR}/spiderweb-config" config set-server --bind "$BIND_ADDRESS" --port "$CURRENT_PORT"
     
     # Restart service if running to apply new bind address
     if [[ "$INSTALL_SYSTEMD" == "true" ]] || [[ "$SYSTEMD_EXISTS" == "true" ]]; then
@@ -333,7 +549,7 @@ if [[ -t 0 ]]; then
             pkill -x spiderweb 2>/dev/null || true
             sleep 1
             # spiderweb-config first-run will have started it, or user can start manually
-            spiderweb &
+            "${INSTALL_DIR}/spiderweb" &
         fi
     fi
 fi
@@ -343,13 +559,23 @@ echo ""
 log_success "Installation complete!"
 echo ""
 echo "Binaries installed to:"
-echo "  $INSTALL_DIR/spiderweb"
-echo "  $INSTALL_DIR/spiderweb-config"
+for bin in "${SPIDERWEB_BINARIES[@]}"; do
+    echo "  $INSTALL_DIR/${bin}"
+done
 if [[ "$INSTALL_ZSS" == "true" ]]; then
     echo "  $INSTALL_DIR/zss"
     echo "  $INSTALL_DIR/zss-tui"
 fi
 echo ""
+
+ACTIVE_CONFIG_CMD="$(command -v spiderweb-config || true)"
+if [[ -n "$ACTIVE_CONFIG_CMD" ]] && [[ "$ACTIVE_CONFIG_CMD" != "${INSTALL_DIR}/spiderweb-config" ]]; then
+    echo ""
+    log_warn "Another spiderweb-config is earlier in PATH: $ACTIVE_CONFIG_CMD"
+    echo "Use the latest build at:"
+    echo "  ${INSTALL_DIR}/spiderweb-config"
+    echo "Then update PATH to prefer ${INSTALL_DIR} and run: hash -r"
+fi
 
 if [[ "$INSTALL_SYSTEMD" == "true" ]]; then
     echo "Systemd service installed and started ($SYSTEMD_SCOPE scope)"
@@ -359,6 +585,8 @@ else
     echo "To install systemd service later:"
     echo "  spiderweb-config config install-service"
 fi
+
+print_auth_tokens_summary
 
 echo ""
 if [[ "$INSTALL_ZSS" == "true" ]]; then

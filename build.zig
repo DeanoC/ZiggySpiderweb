@@ -43,6 +43,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     spiderweb_fs_mod.addIncludePath(b.path("src/c"));
+    spiderweb_fs_mod.addImport("ziggy-spider-protocol", ziggy_spider_protocol_module);
 
     // Example: embeddable filesystem service
     const embed_fs_node_example_mod = b.createModule(.{
@@ -75,6 +76,7 @@ pub fn build(b: *std.Build) void {
     });
     embed_multi_service_mod.addIncludePath(b.path("src/c"));
     embed_multi_service_mod.addImport("spiderweb_fs", spiderweb_fs_mod);
+    embed_multi_service_mod.addImport("ziggy-spider-protocol", ziggy_spider_protocol_module);
     const websocket_transport_mod = b.createModule(.{
         .root_source_file = b.path("src/websocket_transport.zig"),
         .target = target,
@@ -129,12 +131,37 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(spiderweb);
 
+    // Agent runtime child executable (sandbox target)
+    const agent_runtime_child_mod = b.createModule(.{
+        .root_source_file = b.path("src/agent_runtime_child_main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    agent_runtime_child_mod.addIncludePath(b.path("src/c"));
+    agent_runtime_child_mod.addImport("ziggy-piai", ziggy_piai_module);
+    agent_runtime_child_mod.addImport("ziggy-spider-protocol", ziggy_spider_protocol_module);
+    agent_runtime_child_mod.addImport("ziggy-memory-store", ziggy_memory_store_module);
+    agent_runtime_child_mod.addImport("ziggy-tool-runtime", ziggy_tool_runtime_module);
+    agent_runtime_child_mod.addImport("ziggy-runtime-hooks", ziggy_runtime_hooks_module);
+    agent_runtime_child_mod.addImport("ziggy-run-orchestrator", ziggy_run_orchestrator_module);
+    agent_runtime_child_mod.addImport("agent_config", agent_config_mod);
+
+    const spiderweb_agent_runtime = b.addExecutable(.{
+        .name = "spiderweb-agent-runtime",
+        .root_module = agent_runtime_child_mod,
+    });
+    spiderweb_agent_runtime.addCSourceFile(.{ .file = b.path("src/c/fuse_compat.c") });
+    spiderweb_agent_runtime.linkLibC();
+    spiderweb_agent_runtime.linkSystemLibrary("sqlite3");
+    b.installArtifact(spiderweb_agent_runtime);
+
     // Distributed filesystem node executable
     const fs_node_mod = b.createModule(.{
         .root_source_file = b.path("src/fs_node_main.zig"),
         .target = target,
         .optimize = optimize,
     });
+    fs_node_mod.addImport("ziggy-spider-protocol", ziggy_spider_protocol_module);
     const spiderweb_fs_node = b.addExecutable(.{
         .name = "spiderweb-fs-node",
         .root_module = fs_node_mod,
@@ -149,6 +176,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     fs_mount_mod.addIncludePath(b.path("src/c"));
+    fs_mount_mod.addImport("ziggy-spider-protocol", ziggy_spider_protocol_module);
     const spiderweb_fs_mount = b.addExecutable(.{
         .name = "spiderweb-fs-mount",
         .root_module = fs_mount_mod,
@@ -172,6 +200,21 @@ pub fn build(b: *std.Build) void {
     config_cli.linkLibC();
 
     b.installArtifact(config_cli);
+
+    // Control-plane CLI executable
+    const control_mod = b.createModule(.{
+        .root_source_file = b.path("src/control_cli.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const control_cli = b.addExecutable(.{
+        .name = "spiderweb-control",
+        .root_module = control_mod,
+    });
+    control_cli.linkLibC();
+
+    b.installArtifact(control_cli);
 
     // Run command
     const run_cmd = b.addRunArtifact(spiderweb);
