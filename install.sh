@@ -175,13 +175,24 @@ has_fuse3_runtime() {
             return 0
         fi
     fi
+    if command -v dpkg >/dev/null 2>&1; then
+        if dpkg -s libfuse3-4 >/dev/null 2>&1 || dpkg -s libfuse3-3 >/dev/null 2>&1 || dpkg -s libfuse3-dev >/dev/null 2>&1; then
+            return 0
+        fi
+    fi
     local candidates=(
         "/lib*/libfuse3.so.4"
         "/usr/lib*/libfuse3.so.4"
+        "/lib/*/libfuse3.so.4"
+        "/usr/lib/*/libfuse3.so.4"
         "/lib*/libfuse3.so.3"
         "/usr/lib*/libfuse3.so.3"
+        "/lib/*/libfuse3.so.3"
+        "/usr/lib/*/libfuse3.so.3"
         "/lib*/libfuse3.so"
         "/usr/lib*/libfuse3.so"
+        "/lib/*/libfuse3.so"
+        "/usr/lib/*/libfuse3.so"
     )
     local pattern
     for pattern in "${candidates[@]}"; do
