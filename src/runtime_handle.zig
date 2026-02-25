@@ -116,4 +116,12 @@ pub const RuntimeHandle = struct {
             },
         };
     }
+
+    pub fn isHealthy(self: *RuntimeHandle) bool {
+        return switch (self.kind) {
+            .local => true,
+            .local_sandbox => if (self.sandbox) |runtime| runtime.isHealthy() else false,
+            .sandbox => if (self.sandbox) |runtime| runtime.isHealthy() else false,
+        };
+    }
 };

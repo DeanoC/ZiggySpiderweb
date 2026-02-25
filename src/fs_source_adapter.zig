@@ -6,6 +6,7 @@ pub const SourceKind = enum {
     posix,
     windows,
     gdrive,
+    namespace,
 
     pub fn asString(self: SourceKind) []const u8 {
         return @tagName(self);
@@ -114,6 +115,14 @@ pub fn defaultCapsForKind(source_kind: SourceKind) SourceCaps {
             .statfs = true,
         },
         .gdrive => .{
+            .native_watch = false,
+            .case_sensitive = true,
+            .symlink = false,
+            .xattr = false,
+            .locks = false,
+            .statfs = true,
+        },
+        .namespace => .{
             .native_watch = false,
             .case_sensitive = true,
             .symlink = false,

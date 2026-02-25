@@ -4,6 +4,7 @@ const fs_linux_source_adapter = @import("fs_linux_source_adapter.zig");
 const fs_posix_source_adapter = @import("fs_posix_source_adapter.zig");
 const fs_windows_source_adapter = @import("fs_windows_source_adapter.zig");
 const fs_gdrive_source_adapter = @import("fs_gdrive_source_adapter.zig");
+const fs_namespace_source_adapter = @import("fs_namespace_source_adapter.zig");
 const fs_local_source_adapter = @import("fs_local_source_adapter.zig");
 
 pub fn create(
@@ -15,6 +16,7 @@ pub fn create(
         .posix => fs_posix_source_adapter.init(allocator),
         .windows => fs_windows_source_adapter.init(allocator),
         .gdrive => fs_gdrive_source_adapter.init(),
+        .namespace => fs_namespace_source_adapter.init(),
     };
 }
 
@@ -42,6 +44,12 @@ test "fs_source_adapter_factory: gdrive scaffold is supported" {
     const allocator = std.testing.allocator;
     var gdrive = try create(allocator, .gdrive);
     gdrive.deinit(allocator);
+}
+
+test "fs_source_adapter_factory: namespace scaffold is supported" {
+    const allocator = std.testing.allocator;
+    var namespace = try create(allocator, .namespace);
+    namespace.deinit(allocator);
 }
 
 test "fs_source_adapter_factory: source capability matrix is consistent" {

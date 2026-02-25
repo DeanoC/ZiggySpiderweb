@@ -77,7 +77,7 @@ pub fn supportsOperationForKind(source_kind: fs_source_adapter.SourceKind, op: f
             .symlink, .setxattr, .getxattr, .listxattr, .removexattr => false,
             else => true,
         },
-        .gdrive => false,
+        .gdrive, .namespace => false,
     };
 }
 

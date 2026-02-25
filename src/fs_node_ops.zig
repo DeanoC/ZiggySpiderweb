@@ -20,6 +20,16 @@ const gdrive_spool_default_dir: []const u8 = "/tmp/spiderweb-gdrive-spool";
 const gdrive_spool_file_prefix: []const u8 = "spiderweb-gdrive-spool-";
 const gdrive_spool_file_suffix: []const u8 = ".tmp";
 const gdrive_spool_default_limit_bytes: u64 = 512 * 1024 * 1024;
+const namespace_protocol_json =
+    "{\"channel\":\"fsrpc\",\"version\":\"styx-lite-1\",\"ops\":[\"t_version\",\"t_attach\",\"t_walk\",\"t_open\",\"t_read\",\"t_write\",\"t_stat\",\"t_clunk\",\"t_flush\"]}";
+const namespace_chat_help_md =
+    "# Chat Capability\n\n" ++
+    "Write UTF-8 text to `control/input` to create a chat job.\n" ++
+    "Read `/jobs/<job-id>/result.txt` for assistant output.\n";
+const namespace_chat_schema_json =
+    "{\"name\":\"chat\",\"input\":\"control/input\",\"jobs\":\"/jobs\",\"result\":\"result.txt\"}";
+const namespace_chat_meta_json =
+    "{\"name\":\"chat\",\"version\":\"1\",\"agent_id\":\"system\",\"cost_hint\":\"provider-dependent\",\"latency_hint\":\"seconds\"}";
 
 const max_read_bytes: u32 = 1024 * 1024;
 const max_write_bytes: usize = 1024 * 1024;
@@ -140,6 +150,54 @@ const GdriveWriteHandle = struct {
     }
 };
 
+const NamespaceNodeKind = enum {
+    file,
+    dir,
+};
+
+const NamespaceNode = struct {
+    id: u64,
+    parent_id: ?u64,
+    name: []u8,
+    path: []u8,
+    kind: NamespaceNodeKind,
+    generation: u64,
+    writable: bool,
+    content: []u8,
+    children: std.StringHashMapUnmanaged(u64) = .{},
+
+    fn deinit(self: *NamespaceNode, allocator: std.mem.Allocator) void {
+        allocator.free(self.name);
+        allocator.free(self.path);
+        allocator.free(self.content);
+        self.children.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+const NamespaceExport = struct {
+    role: []u8,
+    root_id: u64,
+    next_inode: u64 = 1,
+    nodes: std.AutoHashMapUnmanaged(u64, NamespaceNode) = .{},
+    path_to_node: std.StringHashMapUnmanaged(u64) = .{},
+
+    fn deinit(self: *NamespaceExport, allocator: std.mem.Allocator) void {
+        allocator.free(self.role);
+        var it = self.nodes.valueIterator();
+        while (it.next()) |node| node.deinit(allocator);
+        self.nodes.deinit(allocator);
+        self.path_to_node.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+const NamespaceOpenHandle = struct {
+    export_index: usize,
+    node_id: u64,
+    caps: HandleCaps,
+};
+
 const GdriveNode = struct {
     export_index: usize,
     parent_node_id: ?u64,
@@ -224,6 +282,8 @@ pub const NodeOps = struct {
     exports: std.ArrayListUnmanaged(ExportConfig) = .{},
     node_paths: std.AutoHashMapUnmanaged(u64, []u8) = .{},
     handles: std.AutoHashMapUnmanaged(u64, OpenHandle) = .{},
+    namespace_handles: std.AutoHashMapUnmanaged(u64, NamespaceOpenHandle) = .{},
+    namespace_exports: std.AutoHashMapUnmanaged(usize, NamespaceExport) = .{},
     gdrive_handles: std.AutoHashMapUnmanaged(u64, GdriveOpenHandle) = .{},
     gdrive_write_handles: std.AutoHashMapUnmanaged(u64, GdriveWriteHandle) = .{},
     gdrive_nodes: std.AutoHashMapUnmanaged(u64, GdriveNode) = .{},
@@ -284,6 +344,10 @@ pub const NodeOps = struct {
         var handle_it = self.handles.valueIterator();
         while (handle_it.next()) |handle| handle.file.close();
         self.handles.deinit(self.allocator);
+        self.namespace_handles.deinit(self.allocator);
+        var namespace_it = self.namespace_exports.valueIterator();
+        while (namespace_it.next()) |ns_export| ns_export.deinit(self.allocator);
+        self.namespace_exports.deinit(self.allocator);
         self.gdrive_handles.deinit(self.allocator);
         var gdrive_write_it = self.gdrive_write_handles.valueIterator();
         while (gdrive_write_it.next()) |handle| {
@@ -531,6 +595,8 @@ pub const NodeOps = struct {
         if (source_kind == .gdrive) {
             self.ensureGdriveScaffoldNodes(export_index) catch return error.InvalidExportPath;
             self.initializeGdriveAuth(export_index) catch {};
+        } else if (source_kind == .namespace) {
+            self.ensureNamespaceScaffold(export_index) catch return error.InvalidExportPath;
         }
     }
 
@@ -561,6 +627,693 @@ pub const NodeOps = struct {
                 .is_dir = true,
             },
         ) catch {};
+    }
+
+    fn ensureNamespaceScaffold(self: *NodeOps, export_index: usize) !void {
+        if (export_index >= self.exports.items.len) return error.FileNotFound;
+        const export_cfg = self.exports.items[export_index];
+        if (export_cfg.source_kind != .namespace) return;
+
+        var ns = NamespaceExport{
+            .role = try self.allocator.dupe(u8, export_cfg.source_id),
+            .root_id = export_cfg.root_node_id,
+            .next_inode = 1,
+        };
+        errdefer ns.deinit(self.allocator);
+
+        const root = NamespaceNode{
+            .id = export_cfg.root_node_id,
+            .parent_id = null,
+            .name = try self.allocator.dupe(u8, "/"),
+            .path = try self.allocator.dupe(u8, "/"),
+            .kind = .dir,
+            .generation = export_cfg.root_node_id,
+            .writable = std.mem.eql(u8, export_cfg.source_id, "jobs"),
+            .content = try self.allocator.dupe(u8, ""),
+        };
+        try ns.nodes.put(self.allocator, root.id, root);
+        const root_path_ref = ns.nodes.getPtr(root.id).?.path;
+        try ns.path_to_node.put(self.allocator, root_path_ref, root.id);
+        try self.setNodePath(root.id, root_path_ref);
+
+        if (std.mem.eql(u8, export_cfg.source_id, "meta")) {
+            _ = try self.namespaceCreateNode(export_index, &ns, root.id, "protocol.json", .file, false, namespace_protocol_json);
+        } else if (std.mem.eql(u8, export_cfg.source_id, "capabilities")) {
+            const chat_dir = try self.namespaceCreateNode(export_index, &ns, root.id, "chat", .dir, false, "");
+            _ = try self.namespaceCreateNode(export_index, &ns, chat_dir, "help.md", .file, false, namespace_chat_help_md);
+            _ = try self.namespaceCreateNode(export_index, &ns, chat_dir, "schema.json", .file, false, namespace_chat_schema_json);
+            _ = try self.namespaceCreateNode(export_index, &ns, chat_dir, "meta.json", .file, false, namespace_chat_meta_json);
+            const examples_dir = try self.namespaceCreateNode(export_index, &ns, chat_dir, "examples", .dir, false, "");
+            _ = try self.namespaceCreateNode(export_index, &ns, examples_dir, "send.txt", .file, false, "hello from fsrpc chat");
+            const control_dir = try self.namespaceCreateNode(export_index, &ns, chat_dir, "control", .dir, true, "");
+            _ = try self.namespaceCreateNode(export_index, &ns, control_dir, "input", .file, true, "");
+        }
+
+        if (try self.namespace_exports.fetchPut(self.allocator, export_index, ns)) |existing| {
+            var replaced = existing.value;
+            replaced.deinit(self.allocator);
+        }
+    }
+
+    fn namespaceCreateNode(
+        self: *NodeOps,
+        export_index: usize,
+        ns: *NamespaceExport,
+        parent_id: u64,
+        name: []const u8,
+        kind: NamespaceNodeKind,
+        writable: bool,
+        content: []const u8,
+    ) !u64 {
+        if (!isValidChildName(name)) return error.InvalidArgument;
+        const parent = ns.nodes.get(parent_id) orelse return error.FileNotFound;
+        if (parent.kind != .dir) return error.NotDir;
+        if (parent.children.get(name) != null) return error.PathAlreadyExists;
+
+        const node_id = try self.namespaceAllocNodeId(export_index, ns);
+        const path = try namespaceJoinPath(self.allocator, parent.path, name);
+        errdefer self.allocator.free(path);
+
+        const node = NamespaceNode{
+            .id = node_id,
+            .parent_id = parent_id,
+            .name = try self.allocator.dupe(u8, name),
+            .path = path,
+            .kind = kind,
+            .generation = node_id,
+            .writable = writable,
+            .content = try self.allocator.dupe(u8, content),
+        };
+        try ns.nodes.put(self.allocator, node_id, node);
+        errdefer {
+            if (ns.nodes.fetchRemove(node_id)) |removed| {
+                var orphan = removed.value;
+                orphan.deinit(self.allocator);
+            }
+        }
+
+        const child = ns.nodes.get(node_id).?;
+        try ns.path_to_node.put(self.allocator, child.path, node_id);
+
+        var parent_ptr = ns.nodes.getPtr(parent_id) orelse return error.FileNotFound;
+        try parent_ptr.children.put(self.allocator, child.name, node_id);
+        try self.setNodePath(node_id, child.path);
+        return node_id;
+    }
+
+    fn namespaceAllocNodeId(
+        self: *const NodeOps,
+        export_index: usize,
+        ns: *NamespaceExport,
+    ) !u64 {
+        var attempts: usize = 0;
+        while (attempts < 1_000_000) : (attempts += 1) {
+            ns.next_inode +%= 1;
+            if (ns.next_inode == 0) ns.next_inode = 1;
+            const candidate = makeNodeId(export_index, ns.next_inode);
+            if (!ns.nodes.contains(candidate)) return candidate;
+        }
+        _ = self;
+        return error.OutOfMemory;
+    }
+
+    fn namespaceExportFor(self: *NodeOps, export_index: usize) ?*NamespaceExport {
+        return self.namespace_exports.getPtr(export_index);
+    }
+
+    fn namespaceBumpGeneration(self: *NodeOps, ns: *NamespaceExport, node_id: u64) void {
+        _ = self;
+        const node = ns.nodes.getPtr(node_id) orelse return;
+        node.generation +%= 1;
+        if (node.generation == 0) node.generation = 1;
+    }
+
+    fn buildNamespaceAttrJson(self: *NodeOps, node: NamespaceNode) ![]u8 {
+        const is_dir = node.kind == .dir;
+        const mode: u32 = if (is_dir)
+            if (node.writable) 0o040755 else 0o040555
+        else if (node.writable)
+            0o100644
+        else
+            0o100444;
+        const kind_code: u8 = if (is_dir) 2 else 1;
+        const nlink: u32 = if (is_dir) 2 else 1;
+        const size: u64 = if (is_dir) 0 else @intCast(node.content.len);
+        return std.fmt.allocPrint(
+            self.allocator,
+            "{{\"id\":{d},\"k\":{d},\"m\":{d},\"n\":{d},\"u\":{d},\"g\":{d},\"sz\":{d},\"at\":{d},\"mt\":{d},\"ct\":{d},\"gen\":{d}}}",
+            .{ node.id, kind_code, mode, nlink, self.uid, self.gid, size, @as(i64, 0), @as(i64, 0), @as(i64, 0), node.generation },
+        );
+    }
+
+    fn namespaceUpdateNodePathRecursive(
+        self: *NodeOps,
+        ns: *NamespaceExport,
+        node_id: u64,
+        new_path: []const u8,
+    ) !void {
+        var child_ids = std.ArrayListUnmanaged(u64){};
+        defer child_ids.deinit(self.allocator);
+
+        {
+            const node = ns.nodes.getPtr(node_id) orelse return error.FileNotFound;
+            const old_path = node.path;
+            const replacement = if (!std.mem.eql(u8, old_path, new_path))
+                try self.allocator.dupe(u8, new_path)
+            else
+                null;
+            _ = ns.path_to_node.fetchRemove(old_path);
+            if (replacement) |owned| {
+                node.path = owned;
+                self.allocator.free(old_path);
+            }
+
+            try ns.path_to_node.put(self.allocator, node.path, node_id);
+            try self.setNodePath(node_id, node.path);
+
+            var child_it = node.children.valueIterator();
+            while (child_it.next()) |child_id| {
+                try child_ids.append(self.allocator, child_id.*);
+            }
+        }
+
+        for (child_ids.items) |child_id| {
+            const child = ns.nodes.get(child_id) orelse continue;
+            const child_path = try namespaceJoinPath(self.allocator, new_path, child.name);
+            defer self.allocator.free(child_path);
+            try self.namespaceUpdateNodePathRecursive(ns, child_id, child_path);
+        }
+    }
+
+    fn namespaceRemoveNodeRecursive(
+        self: *NodeOps,
+        ns: *NamespaceExport,
+        node_id: u64,
+    ) !void {
+        var child_ids = std.ArrayListUnmanaged(u64){};
+        defer child_ids.deinit(self.allocator);
+
+        const node = ns.nodes.get(node_id) orelse return error.FileNotFound;
+        var child_it = node.children.valueIterator();
+        while (child_it.next()) |child_id| {
+            try child_ids.append(self.allocator, child_id.*);
+        }
+
+        for (child_ids.items) |child_id| {
+            try self.namespaceRemoveNodeRecursive(ns, child_id);
+        }
+
+        if (ns.nodes.fetchRemove(node_id)) |removed| {
+            var owned = removed.value;
+            _ = ns.path_to_node.fetchRemove(owned.path);
+            if (self.node_paths.fetchRemove(node_id)) |existing| {
+                self.allocator.free(existing.value);
+            }
+            owned.deinit(self.allocator);
+        }
+    }
+
+    fn namespaceIsAncestorOf(ns: *const NamespaceExport, ancestor_id: u64, node_id: u64) bool {
+        var cursor: ?u64 = node_id;
+        while (cursor) |current| {
+            if (current == ancestor_id) return true;
+            const node = ns.nodes.get(current) orelse return false;
+            cursor = node.parent_id;
+        }
+        return false;
+    }
+
+    fn opNamespaceLookup(self: *NodeOps, parent: NodeContext, name: []const u8) DispatchResult {
+        const ns = self.namespaceExportFor(parent.export_index) orelse {
+            return DispatchResult.failure(fs_protocol.Errno.EIO, "namespace export missing");
+        };
+        const parent_node = ns.nodes.get(parent.node_id) orelse {
+            return DispatchResult.failure(fs_protocol.Errno.ENOENT, "file not found");
+        };
+        if (parent_node.kind != .dir) return DispatchResult.failure(fs_protocol.Errno.ENOTDIR, "node is not a directory");
+
+        const child_id: u64 = if (std.mem.eql(u8, name, "."))
+            parent.node_id
+        else if (std.mem.eql(u8, name, ".."))
+            parent_node.parent_id orelse parent.node_id
+        else
+            parent_node.children.get(name) orelse return DispatchResult.failure(fs_protocol.Errno.ENOENT, "file not found");
+        const child = ns.nodes.get(child_id) orelse return DispatchResult.failure(fs_protocol.Errno.ENOENT, "file not found");
+        self.setNodePath(child.id, child.path) catch return DispatchResult.failure(fs_protocol.Errno.EIO, "out of memory");
+
+        const attr_json = self.buildNamespaceAttrJson(child) catch return DispatchResult.failure(fs_protocol.Errno.EIO, "out of memory");
+        defer self.allocator.free(attr_json);
+        const response = std.fmt.allocPrint(self.allocator, "{{\"attr\":{s}}}", .{attr_json}) catch return DispatchResult.failure(fs_protocol.Errno.EIO, "out of memory");
+        return DispatchResult.success(response);
+    }
+
+    fn opNamespaceGetattr(self: *NodeOps, ctx: NodeContext) DispatchResult {
+        const ns = self.namespaceExportFor(ctx.export_index) orelse {
+            return DispatchResult.failure(fs_protocol.Errno.EIO, "namespace export missing");
+        };
+        const node = ns.nodes.get(ctx.node_id) orelse return DispatchResult.failure(fs_protocol.Errno.ENOENT, "file not found");
+        self.setNodePath(node.id, node.path) catch return DispatchResult.failure(fs_protocol.Errno.EIO, "out of memory");
+
+        const attr_json = self.buildNamespaceAttrJson(node) catch return DispatchResult.failure(fs_protocol.Errno.EIO, "out of memory");
+        defer self.allocator.free(attr_json);
+        const response = std.fmt.allocPrint(self.allocator, "{{\"attr\":{s}}}", .{attr_json}) catch return DispatchResult.failure(fs_protocol.Errno.EIO, "out of memory");
+        return DispatchResult.success(response);
+    }
+
+    fn opNamespaceReaddirPlus(self: *NodeOps, ctx: NodeContext, cookie: u64, max_entries: u32) DispatchResult {
+        const ns = self.namespaceExportFor(ctx.export_index) orelse {
+            return DispatchResult.failure(fs_protocol.Errno.EIO, "namespace export missing");
+        };
+        const dir_node = ns.nodes.get(ctx.node_id) orelse return DispatchResult.failure(fs_protocol.Errno.ENOENT, "file not found");
+        if (dir_node.kind != .dir) return DispatchResult.failure(fs_protocol.Errno.ENOTDIR, "node is not a directory");
+
+        const ChildEntry = struct {
+            name: []u8,
+            node_id: u64,
+        };
+
+        var child_entries = std.ArrayListUnmanaged(ChildEntry){};
+        defer {
+            for (child_entries.items) |entry| self.allocator.free(entry.name);
+            child_entries.deinit(self.allocator);
+        }
+
+        var child_it = dir_node.children.iterator();
+        while (child_it.next()) |entry| {
+            const name_copy = self.allocator.dupe(u8, entry.key_ptr.*) catch return DispatchResult.failure(fs_protocol.Errno.EIO, "out of memory");
+            child_entries.append(self.allocator, .{
+                .name = name_copy,
+                .node_id = entry.value_ptr.*,
+            }) catch return DispatchResult.failure(fs_protocol.Errno.EIO, "out of memory");
+        }
+        std.sort.pdq(
+            ChildEntry,
+            child_entries.items,
+            {},
+            struct {
+                fn lessThan(_: void, lhs: ChildEntry, rhs: ChildEntry) bool {
+                    return std.mem.lessThan(u8, lhs.name, rhs.name);
+                }
+            }.lessThan,
+        );
+
+        var payload = std.ArrayListUnmanaged(u8){};
+        errdefer payload.deinit(self.allocator);
+        payload.appendSlice(self.allocator, "{\"ents\":[") catch return DispatchResult.failure(fs_protocol.Errno.EIO, "out of memory");
+
+        var first = true;
+        var emitted: u32 = 0;
+        var count: u64 = 0;
+        var has_more = false;
+
+        const dotdot_id = dir_node.parent_id orelse ctx.node_id;
+        const synthetic_entries = [_]struct { name: []const u8, node_id: u64 }{
+            .{ .name = ".", .node_id = ctx.node_id },
+            .{ .name = "..", .node_id = dotdot_id },
+        };
+        for (synthetic_entries) |entry| {
+            defer count += 1;
+            if (count < cookie) continue;
+            if (emitted >= max_entries) {
+                has_more = true;
+                break;
+            }
+
+            const child = ns.nodes.get(entry.node_id) orelse continue;
+            const escaped_name = fs_protocol.jsonEscape(self.allocator, entry.name) catch return DispatchResult.failure(fs_protocol.Errno.EIO, "out of memory");
+            defer self.allocator.free(escaped_name);
+            const attr_json = self.buildNamespaceAttrJson(child) catch return DispatchResult.failure(fs_protocol.Errno.EIO, "out of memory");
+            defer self.allocator.free(attr_json);
+
+            if (!first) payload.append(self.allocator, ',') catch return DispatchResult.failure(fs_protocol.Errno.EIO, "out of memory");
+            first = false;
+            payload.writer(self.allocator).print("{{\"name\":\"{s}\",\"attr\":{s}}}", .{ escaped_name, attr_json }) catch return DispatchResult.failure(fs_protocol.Errno.EIO, "out of memory");
+            emitted += 1;
+        }
+
+        if (!has_more) {
+            for (child_entries.items) |entry| {
+                defer count += 1;
+                if (count < cookie) continue;
+                if (emitted >= max_entries) {
+                    has_more = true;
+                    break;
+                }
+
+                const child = ns.nodes.get(entry.node_id) orelse continue;
+                const escaped_name = fs_protocol.jsonEscape(self.allocator, entry.name) catch return DispatchResult.failure(fs_protocol.Errno.EIO, "out of memory");
+                defer self.allocator.free(escaped_name);
+                const attr_json = self.buildNamespaceAttrJson(child) catch return DispatchResult.failure(fs_protocol.Errno.EIO, "out of memory");
+                defer self.allocator.free(attr_json);
+
+                if (!first) payload.append(self.allocator, ',') catch return DispatchResult.failure(fs_protocol.Errno.EIO, "out of memory");
+                first = false;
+                payload.writer(self.allocator).print("{{\"name\":\"{s}\",\"attr\":{s}}}", .{ escaped_name, attr_json }) catch return DispatchResult.failure(fs_protocol.Errno.EIO, "out of memory");
+                emitted += 1;
+            }
+        }
+
+        payload.writer(self.allocator).print(
+            "],\"next\":{d},\"eof\":{},\"dir_gen\":{d}}}",
+            .{ cookie + emitted, !has_more, dir_node.generation },
+        ) catch return DispatchResult.failure(fs_protocol.Errno.EIO, "out of memory");
+
+        return DispatchResult.success(payload.toOwnedSlice(self.allocator) catch return DispatchResult.failure(fs_protocol.Errno.EIO, "out of memory"));
+    }
+
+    fn opNamespaceOpen(self: *NodeOps, ctx: NodeContext, node_id: u64, flags: u32) DispatchResult {
+        const ns = self.namespaceExportFor(ctx.export_index) orelse {
+            return DispatchResult.failure(fs_protocol.Errno.EIO, "namespace export missing");
+        };
+        const node = ns.nodes.get(node_id) orelse return DispatchResult.failure(fs_protocol.Errno.ENOENT, "file not found");
+        if (node.kind == .dir) return DispatchResult.failure(fs_protocol.Errno.EISDIR, "is a directory");
+
+        const access = accessModeFromFlags(flags);
+        const export_cfg = self.exports.items[ctx.export_index];
+        if (export_cfg.ro and access.wr) return DispatchResult.failure(fs_protocol.Errno.EROFS, "export is read-only");
+        if (access.wr and !node.writable) return DispatchResult.failure(fs_protocol.Errno.EROFS, "export is read-only");
+
+        const handle_id = self.next_handle_id;
+        self.next_handle_id += 1;
+        self.namespace_handles.put(self.allocator, handle_id, .{
+            .export_index = ctx.export_index,
+            .node_id = node_id,
+            .caps = .{ .rd = access.rd, .wr = access.wr },
+        }) catch return DispatchResult.failure(fs_protocol.Errno.EIO, "out of memory");
+
+        const response = std.fmt.allocPrint(
+            self.allocator,
+            "{{\"h\":{d},\"caps\":{{\"rd\":{},\"wr\":{}}},\"gen\":{d}}}",
+            .{ handle_id, access.rd, access.wr, node.generation },
+        ) catch return DispatchResult.failure(fs_protocol.Errno.EIO, "out of memory");
+        return DispatchResult.success(response);
+    }
+
+    fn opNamespaceRead(self: *NodeOps, handle_id: u64, off: u64, len: u32) DispatchResult {
+        const handle = self.namespace_handles.get(handle_id) orelse return DispatchResult.failure(fs_protocol.Errno.EBADF, "unknown handle");
+        if (!handle.caps.rd) return DispatchResult.failure(fs_protocol.Errno.EBADF, "handle not readable");
+
+        const ns = self.namespaceExportFor(handle.export_index) orelse return DispatchResult.failure(fs_protocol.Errno.EIO, "namespace export missing");
+        const node = ns.nodes.get(handle.node_id) orelse return DispatchResult.failure(fs_protocol.Errno.ENOENT, "file not found");
+        if (node.kind == .dir) return DispatchResult.failure(fs_protocol.Errno.EISDIR, "is a directory");
+
+        const start: usize = std.math.cast(usize, off) orelse node.content.len;
+        if (start >= node.content.len) {
+            const response = self.allocator.dupe(u8, "{\"data_b64\":\"\",\"eof\":true}") catch return DispatchResult.failure(fs_protocol.Errno.EIO, "out of memory");
+            return DispatchResult.success(response);
+        }
+
+        const max_len: usize = len;
+        const requested_end = std.math.add(usize, start, max_len) catch std.math.maxInt(usize);
+        const end = @min(node.content.len, requested_end);
+        const bytes = node.content[start..end];
+
+        const encoded = encodeBase64(self.allocator, bytes) catch return DispatchResult.failure(fs_protocol.Errno.EIO, "out of memory");
+        defer self.allocator.free(encoded);
+        const eof = end >= node.content.len;
+        const response = std.fmt.allocPrint(self.allocator, "{{\"data_b64\":\"{s}\",\"eof\":{}}}", .{ encoded, eof }) catch return DispatchResult.failure(fs_protocol.Errno.EIO, "out of memory");
+        return DispatchResult.success(response);
+    }
+
+    fn opNamespaceCreate(self: *NodeOps, parent: NodeContext, name: []const u8, mode: u32, flags: u32) DispatchResult {
+        _ = mode;
+        const export_cfg = self.exports.items[parent.export_index];
+        if (export_cfg.ro) return DispatchResult.failure(fs_protocol.Errno.EROFS, "export is read-only");
+
+        const ns = self.namespaceExportFor(parent.export_index) orelse return DispatchResult.failure(fs_protocol.Errno.EIO, "namespace export missing");
+        const parent_node = ns.nodes.get(parent.node_id) orelse return DispatchResult.failure(fs_protocol.Errno.ENOENT, "file not found");
+        if (parent_node.kind != .dir) return DispatchResult.failure(fs_protocol.Errno.ENOTDIR, "node is not a directory");
+        if (!parent_node.writable) return DispatchResult.failure(fs_protocol.Errno.EROFS, "export is read-only");
+
+        const node_id = self.namespaceCreateNode(parent.export_index, ns, parent.node_id, name, .file, true, "") catch |err| return mapError(err);
+        self.namespaceBumpGeneration(ns, parent.node_id);
+        const node = ns.nodes.get(node_id) orelse return DispatchResult.failure(fs_protocol.Errno.EIO, "namespace node missing");
+
+        const access = accessModeFromFlags(flags);
+        const handle_id = self.next_handle_id;
+        self.next_handle_id += 1;
+        self.namespace_handles.put(self.allocator, handle_id, .{
+            .export_index = parent.export_index,
+            .node_id = node_id,
+            .caps = .{ .rd = access.rd, .wr = true },
+        }) catch return DispatchResult.failure(fs_protocol.Errno.EIO, "out of memory");
+
+        const attr_json = self.buildNamespaceAttrJson(node) catch return DispatchResult.failure(fs_protocol.Errno.EIO, "out of memory");
+        defer self.allocator.free(attr_json);
+        const response = std.fmt.allocPrint(self.allocator, "{{\"attr\":{s},\"h\":{d}}}", .{ attr_json, handle_id }) catch return DispatchResult.failure(fs_protocol.Errno.EIO, "out of memory");
+        self.queueInvalidation(.{
+            .INVAL_DIR = .{
+                .dir = parent.node_id,
+                .dir_gen = null,
+            },
+        });
+        self.queueInvalidation(.{
+            .INVAL = .{
+                .node = node_id,
+                .what = .all,
+                .gen = node.generation,
+            },
+        });
+        return DispatchResult.success(response);
+    }
+
+    fn opNamespaceWrite(self: *NodeOps, handle_id: u64, off: u64, data_b64: []const u8) DispatchResult {
+        const handle = self.namespace_handles.get(handle_id) orelse return DispatchResult.failure(fs_protocol.Errno.EBADF, "unknown handle");
+        if (!handle.caps.wr) return DispatchResult.failure(fs_protocol.Errno.EBADF, "handle not writable");
+
+        const export_cfg = self.exports.items[handle.export_index];
+        if (export_cfg.ro) return DispatchResult.failure(fs_protocol.Errno.EROFS, "export is read-only");
+
+        const decoded = decodeBase64(self.allocator, data_b64) catch return DispatchResult.failure(fs_protocol.Errno.EINVAL, "invalid base64 payload");
+        defer self.allocator.free(decoded);
+        if (decoded.len > max_write_bytes) return DispatchResult.failure(fs_protocol.Errno.EINVAL, "WRITE exceeds max_write");
+
+        const ns = self.namespaceExportFor(handle.export_index) orelse return DispatchResult.failure(fs_protocol.Errno.EIO, "namespace export missing");
+        const node = ns.nodes.getPtr(handle.node_id) orelse return DispatchResult.failure(fs_protocol.Errno.ENOENT, "file not found");
+        if (node.kind == .dir) return DispatchResult.failure(fs_protocol.Errno.EISDIR, "is a directory");
+        if (!node.writable) return DispatchResult.failure(fs_protocol.Errno.EROFS, "export is read-only");
+
+        if (decoded.len > 0) {
+            const off_usize = std.math.cast(usize, off) orelse return DispatchResult.failure(fs_protocol.Errno.EINVAL, "write offset too large");
+            const required_end = std.math.add(usize, off_usize, decoded.len) catch return DispatchResult.failure(fs_protocol.Errno.EINVAL, "write too large");
+            if (required_end > node.content.len) {
+                const resized = self.allocator.alloc(u8, required_end) catch return DispatchResult.failure(fs_protocol.Errno.EIO, "out of memory");
+                if (node.content.len > 0) @memcpy(resized[0..node.content.len], node.content);
+                @memset(resized[node.content.len..], 0);
+                self.allocator.free(node.content);
+                node.content = resized;
+            }
+            @memcpy(node.content[off_usize .. off_usize + decoded.len], decoded);
+            self.namespaceBumpGeneration(ns, node.id);
+            self.queueInvalidation(.{
+                .INVAL = .{
+                    .node = node.id,
+                    .what = .data,
+                    .gen = node.generation,
+                },
+            });
+        }
+
+        const response = std.fmt.allocPrint(self.allocator, "{{\"n\":{d}}}", .{decoded.len}) catch return DispatchResult.failure(fs_protocol.Errno.EIO, "out of memory");
+        return DispatchResult.success(response);
+    }
+
+    fn opNamespaceTruncate(self: *NodeOps, ctx: NodeContext, size: u64) DispatchResult {
+        const export_cfg = self.exports.items[ctx.export_index];
+        if (export_cfg.ro) return DispatchResult.failure(fs_protocol.Errno.EROFS, "export is read-only");
+
+        const ns = self.namespaceExportFor(ctx.export_index) orelse return DispatchResult.failure(fs_protocol.Errno.EIO, "namespace export missing");
+        const node = ns.nodes.getPtr(ctx.node_id) orelse return DispatchResult.failure(fs_protocol.Errno.ENOENT, "file not found");
+        if (node.kind == .dir) return DispatchResult.failure(fs_protocol.Errno.EISDIR, "is a directory");
+        if (!node.writable) return DispatchResult.failure(fs_protocol.Errno.EROFS, "export is read-only");
+
+        const new_len = std.math.cast(usize, size) orelse return DispatchResult.failure(fs_protocol.Errno.EINVAL, "truncate size too large");
+        if (new_len != node.content.len) {
+            const resized = self.allocator.alloc(u8, new_len) catch return DispatchResult.failure(fs_protocol.Errno.EIO, "out of memory");
+            const copy_len = @min(node.content.len, new_len);
+            if (copy_len > 0) @memcpy(resized[0..copy_len], node.content[0..copy_len]);
+            if (new_len > copy_len) @memset(resized[copy_len..new_len], 0);
+            self.allocator.free(node.content);
+            node.content = resized;
+            self.namespaceBumpGeneration(ns, node.id);
+        }
+
+        self.queueInvalidation(.{
+            .INVAL = .{
+                .node = node.id,
+                .what = .all,
+                .gen = node.generation,
+            },
+        });
+        const response = self.allocator.dupe(u8, "{}") catch return DispatchResult.failure(fs_protocol.Errno.EIO, "out of memory");
+        return DispatchResult.success(response);
+    }
+
+    fn opNamespaceUnlink(self: *NodeOps, parent: NodeContext, name: []const u8) DispatchResult {
+        const export_cfg = self.exports.items[parent.export_index];
+        if (export_cfg.ro) return DispatchResult.failure(fs_protocol.Errno.EROFS, "export is read-only");
+
+        const ns = self.namespaceExportFor(parent.export_index) orelse return DispatchResult.failure(fs_protocol.Errno.EIO, "namespace export missing");
+        const parent_node = ns.nodes.get(parent.node_id) orelse return DispatchResult.failure(fs_protocol.Errno.ENOENT, "file not found");
+        if (parent_node.kind != .dir) return DispatchResult.failure(fs_protocol.Errno.ENOTDIR, "node is not a directory");
+        if (!parent_node.writable) return DispatchResult.failure(fs_protocol.Errno.EROFS, "export is read-only");
+
+        const child_id = parent_node.children.get(name) orelse return DispatchResult.failure(fs_protocol.Errno.ENOENT, "file not found");
+        const child = ns.nodes.get(child_id) orelse return DispatchResult.failure(fs_protocol.Errno.ENOENT, "file not found");
+        if (child.kind == .dir) return DispatchResult.failure(fs_protocol.Errno.EISDIR, "is a directory");
+
+        {
+            const parent_mut = ns.nodes.getPtr(parent.node_id) orelse return DispatchResult.failure(fs_protocol.Errno.ENOENT, "file not found");
+            _ = parent_mut.children.fetchRemove(name);
+        }
+        self.namespaceRemoveNodeRecursive(ns, child_id) catch |err| return mapError(err);
+        self.namespaceBumpGeneration(ns, parent.node_id);
+        self.queueInvalidation(.{
+            .INVAL_DIR = .{
+                .dir = parent.node_id,
+                .dir_gen = null,
+            },
+        });
+        const response = self.allocator.dupe(u8, "{}") catch return DispatchResult.failure(fs_protocol.Errno.EIO, "out of memory");
+        return DispatchResult.success(response);
+    }
+
+    fn opNamespaceMkdir(self: *NodeOps, parent: NodeContext, name: []const u8) DispatchResult {
+        const export_cfg = self.exports.items[parent.export_index];
+        if (export_cfg.ro) return DispatchResult.failure(fs_protocol.Errno.EROFS, "export is read-only");
+
+        const ns = self.namespaceExportFor(parent.export_index) orelse return DispatchResult.failure(fs_protocol.Errno.EIO, "namespace export missing");
+        const parent_node = ns.nodes.get(parent.node_id) orelse return DispatchResult.failure(fs_protocol.Errno.ENOENT, "file not found");
+        if (parent_node.kind != .dir) return DispatchResult.failure(fs_protocol.Errno.ENOTDIR, "node is not a directory");
+        if (!parent_node.writable) return DispatchResult.failure(fs_protocol.Errno.EROFS, "export is read-only");
+
+        _ = self.namespaceCreateNode(parent.export_index, ns, parent.node_id, name, .dir, true, "") catch |err| return mapError(err);
+        self.namespaceBumpGeneration(ns, parent.node_id);
+        self.queueInvalidation(.{
+            .INVAL_DIR = .{
+                .dir = parent.node_id,
+                .dir_gen = null,
+            },
+        });
+        const response = self.allocator.dupe(u8, "{}") catch return DispatchResult.failure(fs_protocol.Errno.EIO, "out of memory");
+        return DispatchResult.success(response);
+    }
+
+    fn opNamespaceRmdir(self: *NodeOps, parent: NodeContext, name: []const u8) DispatchResult {
+        const export_cfg = self.exports.items[parent.export_index];
+        if (export_cfg.ro) return DispatchResult.failure(fs_protocol.Errno.EROFS, "export is read-only");
+
+        const ns = self.namespaceExportFor(parent.export_index) orelse return DispatchResult.failure(fs_protocol.Errno.EIO, "namespace export missing");
+        const parent_node = ns.nodes.get(parent.node_id) orelse return DispatchResult.failure(fs_protocol.Errno.ENOENT, "file not found");
+        if (parent_node.kind != .dir) return DispatchResult.failure(fs_protocol.Errno.ENOTDIR, "node is not a directory");
+        if (!parent_node.writable) return DispatchResult.failure(fs_protocol.Errno.EROFS, "export is read-only");
+
+        const child_id = parent_node.children.get(name) orelse return DispatchResult.failure(fs_protocol.Errno.ENOENT, "file not found");
+        const child = ns.nodes.get(child_id) orelse return DispatchResult.failure(fs_protocol.Errno.ENOENT, "file not found");
+        if (child.kind != .dir) return DispatchResult.failure(fs_protocol.Errno.ENOTDIR, "not a directory");
+        if (child.children.count() != 0) return DispatchResult.failure(fs_protocol.Errno.ENOTEMPTY, "directory not empty");
+
+        {
+            const parent_mut = ns.nodes.getPtr(parent.node_id) orelse return DispatchResult.failure(fs_protocol.Errno.ENOENT, "file not found");
+            _ = parent_mut.children.fetchRemove(name);
+        }
+        self.namespaceRemoveNodeRecursive(ns, child_id) catch |err| return mapError(err);
+        self.namespaceBumpGeneration(ns, parent.node_id);
+        self.queueInvalidation(.{
+            .INVAL_DIR = .{
+                .dir = parent.node_id,
+                .dir_gen = null,
+            },
+        });
+        const response = self.allocator.dupe(u8, "{}") catch return DispatchResult.failure(fs_protocol.Errno.EIO, "out of memory");
+        return DispatchResult.success(response);
+    }
+
+    fn opNamespaceRename(
+        self: *NodeOps,
+        old_parent: NodeContext,
+        new_parent: NodeContext,
+        old_name: []const u8,
+        new_name: []const u8,
+    ) DispatchResult {
+        const export_cfg = self.exports.items[old_parent.export_index];
+        if (export_cfg.ro) return DispatchResult.failure(fs_protocol.Errno.EROFS, "export is read-only");
+
+        const ns = self.namespaceExportFor(old_parent.export_index) orelse return DispatchResult.failure(fs_protocol.Errno.EIO, "namespace export missing");
+        const old_parent_node = ns.nodes.get(old_parent.node_id) orelse return DispatchResult.failure(fs_protocol.Errno.ENOENT, "file not found");
+        const new_parent_node = ns.nodes.get(new_parent.node_id) orelse return DispatchResult.failure(fs_protocol.Errno.ENOENT, "file not found");
+        if (old_parent_node.kind != .dir or new_parent_node.kind != .dir) return DispatchResult.failure(fs_protocol.Errno.ENOTDIR, "node is not a directory");
+        if (!old_parent_node.writable or !new_parent_node.writable) return DispatchResult.failure(fs_protocol.Errno.EROFS, "export is read-only");
+
+        const moving_id = old_parent_node.children.get(old_name) orelse return DispatchResult.failure(fs_protocol.Errno.ENOENT, "file not found");
+        if (new_parent_node.children.get(new_name) != null) return DispatchResult.failure(fs_protocol.Errno.EEXIST, "path exists");
+
+        if (old_parent.node_id == new_parent.node_id and std.mem.eql(u8, old_name, new_name)) {
+            const response = self.allocator.dupe(u8, "{}") catch return DispatchResult.failure(fs_protocol.Errno.EIO, "out of memory");
+            return DispatchResult.success(response);
+        }
+
+        const moving_node = ns.nodes.get(moving_id) orelse return DispatchResult.failure(fs_protocol.Errno.ENOENT, "file not found");
+        if (moving_node.kind == .dir and namespaceIsAncestorOf(ns, moving_id, new_parent.node_id)) {
+            return DispatchResult.failure(fs_protocol.Errno.EINVAL, "invalid rename target");
+        }
+
+        const owned_new_name = self.allocator.dupe(u8, new_name) catch return DispatchResult.failure(fs_protocol.Errno.EIO, "out of memory");
+        var new_name_installed = false;
+        defer if (!new_name_installed) self.allocator.free(owned_new_name);
+
+        {
+            const old_parent_mut = ns.nodes.getPtr(old_parent.node_id) orelse return DispatchResult.failure(fs_protocol.Errno.ENOENT, "file not found");
+            _ = old_parent_mut.children.fetchRemove(old_name);
+        }
+
+        {
+            const moving_mut = ns.nodes.getPtr(moving_id) orelse return DispatchResult.failure(fs_protocol.Errno.ENOENT, "file not found");
+            const old_name_owned = moving_mut.name;
+            moving_mut.name = owned_new_name;
+            new_name_installed = true;
+            self.allocator.free(old_name_owned);
+            moving_mut.parent_id = new_parent.node_id;
+            self.namespaceBumpGeneration(ns, moving_id);
+        }
+
+        {
+            const new_parent_mut = ns.nodes.getPtr(new_parent.node_id) orelse return DispatchResult.failure(fs_protocol.Errno.ENOENT, "file not found");
+            const moving_now = ns.nodes.get(moving_id) orelse return DispatchResult.failure(fs_protocol.Errno.ENOENT, "file not found");
+            new_parent_mut.children.put(self.allocator, moving_now.name, moving_id) catch return DispatchResult.failure(fs_protocol.Errno.EIO, "out of memory");
+        }
+
+        const parent_path = (ns.nodes.get(new_parent.node_id) orelse return DispatchResult.failure(fs_protocol.Errno.ENOENT, "file not found")).path;
+        const moving_name = (ns.nodes.get(moving_id) orelse return DispatchResult.failure(fs_protocol.Errno.ENOENT, "file not found")).name;
+        const new_path = namespaceJoinPath(self.allocator, parent_path, moving_name) catch return DispatchResult.failure(fs_protocol.Errno.EIO, "out of memory");
+        defer self.allocator.free(new_path);
+        self.namespaceUpdateNodePathRecursive(ns, moving_id, new_path) catch |err| return mapError(err);
+
+        self.namespaceBumpGeneration(ns, old_parent.node_id);
+        self.namespaceBumpGeneration(ns, new_parent.node_id);
+        self.queueInvalidation(.{
+            .INVAL_DIR = .{
+                .dir = old_parent.node_id,
+                .dir_gen = null,
+            },
+        });
+        if (old_parent.node_id != new_parent.node_id) {
+            self.queueInvalidation(.{
+                .INVAL_DIR = .{
+                    .dir = new_parent.node_id,
+                    .dir_gen = null,
+                },
+            });
+        }
+        self.queueInvalidation(.{
+            .INVAL = .{
+                .node = moving_id,
+                .what = .all,
+                .gen = null,
+            },
+        });
+        const response = self.allocator.dupe(u8, "{}") catch return DispatchResult.failure(fs_protocol.Errno.EIO, "out of memory");
+        return DispatchResult.success(response);
     }
 
     fn gdriveStatusNodeId(self: *const NodeOps, export_index: usize) u64 {
@@ -1938,6 +2691,9 @@ pub const NodeOps = struct {
 
         const parent = self.resolveNode(parent_id) catch |err| return mapError(err);
         const export_cfg = self.exports.items[parent.export_index];
+        if (export_cfg.source_kind == .namespace) {
+            return self.opNamespaceLookup(parent, name);
+        }
         if (export_cfg.source_kind == .gdrive) {
             return self.opGdriveLookup(parent, name);
         }
@@ -1964,6 +2720,9 @@ pub const NodeOps = struct {
         const node_id = req.node orelse return DispatchResult.failure(fs_protocol.Errno.EINVAL, "GETATTR requires node");
         const ctx = self.resolveNode(node_id) catch |err| return mapError(err);
         const export_cfg = self.exports.items[ctx.export_index];
+        if (export_cfg.source_kind == .namespace) {
+            return self.opNamespaceGetattr(ctx);
+        }
         if (export_cfg.source_kind == .gdrive) {
             return self.opGdriveGetattr(ctx);
         }
@@ -2105,6 +2864,9 @@ pub const NodeOps = struct {
 
         const ctx = self.resolveNode(dir_id) catch |err| return mapError(err);
         const export_cfg = self.exports.items[ctx.export_index];
+        if (export_cfg.source_kind == .namespace) {
+            return self.opNamespaceReaddirPlus(ctx, cookie, max_entries);
+        }
         if (export_cfg.source_kind == .gdrive) {
             return self.opGdriveReaddirPlus(ctx, cookie, max_entries);
         }
@@ -2172,6 +2934,9 @@ pub const NodeOps = struct {
         const flags = fs_protocol.getOptionalU32(req.args, "flags", 0) catch return DispatchResult.failure(fs_protocol.Errno.EINVAL, "flags must be u32");
         const ctx = self.resolveNode(node_id) catch |err| return mapError(err);
         const export_cfg = self.exports.items[ctx.export_index];
+        if (export_cfg.source_kind == .namespace) {
+            return self.opNamespaceOpen(ctx, node_id, flags);
+        }
         if (export_cfg.source_kind == .gdrive) {
             return self.opGdriveOpen(ctx, node_id, flags);
         }
@@ -2208,6 +2973,9 @@ pub const NodeOps = struct {
         const len_requested = fs_protocol.getOptionalU32(req.args, "len", 65536) catch return DispatchResult.failure(fs_protocol.Errno.EINVAL, "len must be u32");
         const len = @min(len_requested, max_read_bytes);
 
+        if (self.namespace_handles.contains(handle_id)) {
+            return self.opNamespaceRead(handle_id, off, len);
+        }
         if (self.gdrive_handles.contains(handle_id) or self.gdrive_write_handles.contains(handle_id)) {
             return self.opGdriveRead(handle_id, off, len);
         }
@@ -2234,6 +3002,10 @@ pub const NodeOps = struct {
 
     fn opClose(self: *NodeOps, req: fs_protocol.ParsedRequest) DispatchResult {
         const handle_id = req.handle orelse return DispatchResult.failure(fs_protocol.Errno.EINVAL, "CLOSE requires h");
+        if (self.namespace_handles.fetchRemove(handle_id) != null) {
+            const response = self.allocator.dupe(u8, "{}") catch return DispatchResult.failure(fs_protocol.Errno.EIO, "out of memory");
+            return DispatchResult.success(response);
+        }
         if (self.gdrive_handles.contains(handle_id) or self.gdrive_write_handles.contains(handle_id)) return self.opGdriveClose(handle_id);
         const removed = self.handles.fetchRemove(handle_id) orelse return DispatchResult.failure(fs_protocol.Errno.EBADF, "unknown handle");
         removed.value.file.close();
@@ -2246,6 +3018,9 @@ pub const NodeOps = struct {
         const kind = fs_protocol.getRequiredString(req.args, "kind") orelse return DispatchResult.failure(fs_protocol.Errno.EINVAL, "LOCK requires a.kind");
         const wait = fs_protocol.getOptionalBool(req.args, "wait", true) catch return DispatchResult.failure(fs_protocol.Errno.EINVAL, "wait must be bool");
 
+        if (self.namespace_handles.contains(handle_id)) {
+            return DispatchResult.failure(fs_protocol.Errno.ENOSYS, "source adapter operation not yet implemented");
+        }
         if (self.gdrive_handles.contains(handle_id) or self.gdrive_write_handles.contains(handle_id)) {
             return DispatchResult.failure(fs_protocol.Errno.ENOSYS, "source adapter operation not yet implemented");
         }
@@ -2275,6 +3050,7 @@ pub const NodeOps = struct {
 
         const parent = self.resolveNode(parent_id) catch |err| return mapError(err);
         const export_cfg = self.exports.items[parent.export_index];
+        if (export_cfg.source_kind == .namespace) return self.opNamespaceCreate(parent, name, mode, flags);
         if (export_cfg.ro) return DispatchResult.failure(fs_protocol.Errno.EROFS, "export is read-only");
         if (export_cfg.source_kind == .gdrive) return self.opGdriveCreate(parent, name, mode, flags);
 
@@ -2328,6 +3104,9 @@ pub const NodeOps = struct {
         const off = fs_protocol.getOptionalU64(req.args, "off", 0) catch return DispatchResult.failure(fs_protocol.Errno.EINVAL, "off must be u64");
         const data_b64 = fs_protocol.getRequiredString(req.args, "data_b64") orelse return DispatchResult.failure(fs_protocol.Errno.EINVAL, "WRITE requires a.data_b64");
 
+        if (self.namespace_handles.contains(handle_id)) {
+            return self.opNamespaceWrite(handle_id, off, data_b64);
+        }
         if (self.gdrive_write_handles.getPtr(handle_id)) |handle| {
             if (!handle.caps.wr) return DispatchResult.failure(fs_protocol.Errno.EBADF, "handle not writable");
             const decoded = decodeBase64(self.allocator, data_b64) catch return DispatchResult.failure(fs_protocol.Errno.EINVAL, "invalid base64 payload");
@@ -2387,6 +3166,7 @@ pub const NodeOps = struct {
         const size = fs_protocol.getOptionalU64(req.args, "sz", 0) catch return DispatchResult.failure(fs_protocol.Errno.EINVAL, "sz must be u64");
         const ctx = self.resolveNode(node_id) catch |err| return mapError(err);
         const export_cfg = self.exports.items[ctx.export_index];
+        if (export_cfg.source_kind == .namespace) return self.opNamespaceTruncate(ctx, size);
         if (export_cfg.ro) return DispatchResult.failure(fs_protocol.Errno.EROFS, "export is read-only");
         if (export_cfg.source_kind == .gdrive) return self.opGdriveTruncate(ctx, size);
 
@@ -2410,6 +3190,7 @@ pub const NodeOps = struct {
 
         const parent = self.resolveNode(parent_id) catch |err| return mapError(err);
         const export_cfg = self.exports.items[parent.export_index];
+        if (export_cfg.source_kind == .namespace) return self.opNamespaceUnlink(parent, name);
         if (export_cfg.ro) return DispatchResult.failure(fs_protocol.Errno.EROFS, "export is read-only");
         if (export_cfg.source_kind == .gdrive) return self.opGdriveDeleteByName(parent, name, false);
 
@@ -2435,6 +3216,7 @@ pub const NodeOps = struct {
 
         const parent = self.resolveNode(parent_id) catch |err| return mapError(err);
         const export_cfg = self.exports.items[parent.export_index];
+        if (export_cfg.source_kind == .namespace) return self.opNamespaceMkdir(parent, name);
         if (export_cfg.ro) return DispatchResult.failure(fs_protocol.Errno.EROFS, "export is read-only");
         if (export_cfg.source_kind == .gdrive) return self.opGdriveMkdir(parent, name);
 
@@ -2460,6 +3242,7 @@ pub const NodeOps = struct {
 
         const parent = self.resolveNode(parent_id) catch |err| return mapError(err);
         const export_cfg = self.exports.items[parent.export_index];
+        if (export_cfg.source_kind == .namespace) return self.opNamespaceRmdir(parent, name);
         if (export_cfg.ro) return DispatchResult.failure(fs_protocol.Errno.EROFS, "export is read-only");
         if (export_cfg.source_kind == .gdrive) return self.opGdriveDeleteByName(parent, name, true);
 
@@ -2490,6 +3273,7 @@ pub const NodeOps = struct {
         if (old_parent.export_index != new_parent.export_index) return DispatchResult.failure(fs_protocol.Errno.EXDEV, "cross-export rename is not supported");
 
         const export_cfg = self.exports.items[old_parent.export_index];
+        if (export_cfg.source_kind == .namespace) return self.opNamespaceRename(old_parent, new_parent, old_name, new_name);
         if (export_cfg.ro) return DispatchResult.failure(fs_protocol.Errno.EROFS, "export is read-only");
         if (export_cfg.source_kind == .gdrive) return self.opGdriveRename(old_parent, new_parent, old_name, new_name);
 
@@ -3014,7 +3798,7 @@ pub const NodeOps = struct {
 
     fn collectWatchSnapshot(self: *NodeOps, out: *std.AutoHashMapUnmanaged(u64, WatchedNode)) !void {
         for (self.exports.items, 0..) |export_cfg, export_index| {
-            if (export_cfg.source_kind == .gdrive) continue;
+            if (export_cfg.source_kind == .gdrive or export_cfg.source_kind == .namespace) continue;
             const root_stat = std.fs.cwd().statFile(export_cfg.root_path) catch |err| {
                 if (err == error.FileNotFound or err == error.AccessDenied) continue;
                 return err;
@@ -3308,6 +4092,13 @@ fn isValidChildName(name: []const u8) bool {
     if (std.mem.indexOfScalar(u8, name, '\\')) |_| return false;
     if (std.mem.indexOfScalar(u8, name, 0)) |_| return false;
     return true;
+}
+
+fn namespaceJoinPath(allocator: std.mem.Allocator, parent_path: []const u8, name: []const u8) ![]u8 {
+    if (std.mem.eql(u8, parent_path, "/")) {
+        return std.fmt.allocPrint(allocator, "/{s}", .{name});
+    }
+    return std.fmt.allocPrint(allocator, "{s}/{s}", .{ parent_path, name });
 }
 
 fn isWithinRoot(root: []const u8, target: []const u8) bool {
@@ -3999,6 +4790,174 @@ test "fs_node_ops: exports honor source metadata overrides" {
     try std.testing.expectEqual(true, export0.get("caps").?.object.get("xattr").?.bool);
     try std.testing.expectEqual(true, export0.get("caps").?.object.get("locks").?.bool);
     try std.testing.expectEqual(true, export0.get("caps").?.object.get("statfs").?.bool);
+}
+
+test "fs_node_ops: namespace exports scaffold synthetic control trees" {
+    const allocator = std.testing.allocator;
+    const meta_export_name = "spider-web-meta";
+    const capabilities_export_name = "spider-web-capabilities";
+    const jobs_export_name = "spider-web-jobs";
+
+    var node_ops = try NodeOps.init(allocator, &[_]ExportSpec{
+        .{
+            .name = meta_export_name,
+            .path = "meta",
+            .source_kind = .namespace,
+            .source_id = "meta",
+            .ro = true,
+        },
+        .{
+            .name = capabilities_export_name,
+            .path = "capabilities",
+            .source_kind = .namespace,
+            .source_id = "capabilities",
+            .ro = true,
+        },
+        .{
+            .name = jobs_export_name,
+            .path = "jobs",
+            .source_kind = .namespace,
+            .source_id = "jobs",
+            .ro = false,
+        },
+    });
+    defer node_ops.deinit();
+
+    const meta_idx = node_ops.exportByName(meta_export_name).?;
+    const capabilities_idx = node_ops.exportByName(capabilities_export_name).?;
+    const meta_root = node_ops.exports.items[meta_idx].root_node_id;
+    const capabilities_root = node_ops.exports.items[capabilities_idx].root_node_id;
+
+    const meta_lookup_json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"t\":\"req\",\"id\":1,\"op\":\"LOOKUP\",\"node\":{d},\"a\":{{\"name\":\"protocol.json\"}}}}",
+        .{meta_root},
+    );
+    defer allocator.free(meta_lookup_json);
+    var meta_lookup = try fs_protocol.parseRequest(allocator, meta_lookup_json);
+    defer meta_lookup.deinit();
+    var meta_lookup_result = node_ops.dispatch(meta_lookup);
+    defer meta_lookup_result.deinit(allocator);
+    try std.testing.expectEqual(fs_protocol.Errno.SUCCESS, meta_lookup_result.err_no);
+
+    const meta_create_json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"t\":\"req\",\"id\":2,\"op\":\"CREATE\",\"node\":{d},\"a\":{{\"name\":\"illegal.txt\",\"mode\":33188,\"flags\":2}}}}",
+        .{meta_root},
+    );
+    defer allocator.free(meta_create_json);
+    var meta_create = try fs_protocol.parseRequest(allocator, meta_create_json);
+    defer meta_create.deinit();
+    var meta_create_result = node_ops.dispatch(meta_create);
+    defer meta_create_result.deinit(allocator);
+    try std.testing.expectEqual(fs_protocol.Errno.EROFS, meta_create_result.err_no);
+
+    const cap_lookup_json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"t\":\"req\",\"id\":3,\"op\":\"LOOKUP\",\"node\":{d},\"a\":{{\"name\":\"chat\"}}}}",
+        .{capabilities_root},
+    );
+    defer allocator.free(cap_lookup_json);
+    var cap_lookup = try fs_protocol.parseRequest(allocator, cap_lookup_json);
+    defer cap_lookup.deinit();
+    var cap_lookup_result = node_ops.dispatch(cap_lookup);
+    defer cap_lookup_result.deinit(allocator);
+    try std.testing.expectEqual(fs_protocol.Errno.SUCCESS, cap_lookup_result.err_no);
+}
+
+test "fs_node_ops: namespace jobs export supports create write read" {
+    const allocator = std.testing.allocator;
+    const jobs_export_name = "spider-web-jobs";
+
+    var node_ops = try NodeOps.init(allocator, &[_]ExportSpec{
+        .{
+            .name = jobs_export_name,
+            .path = "jobs",
+            .source_kind = .namespace,
+            .source_id = "jobs",
+            .ro = false,
+        },
+    });
+    defer node_ops.deinit();
+
+    const jobs_idx = node_ops.exportByName(jobs_export_name).?;
+    const jobs_root = node_ops.exports.items[jobs_idx].root_node_id;
+
+    const create_json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"t\":\"req\",\"id\":1,\"op\":\"CREATE\",\"node\":{d},\"a\":{{\"name\":\"job-1.txt\",\"mode\":33188,\"flags\":2}}}}",
+        .{jobs_root},
+    );
+    defer allocator.free(create_json);
+    var create_req = try fs_protocol.parseRequest(allocator, create_json);
+    defer create_req.deinit();
+    var create_result = node_ops.dispatch(create_req);
+    defer create_result.deinit(allocator);
+    try std.testing.expectEqual(fs_protocol.Errno.SUCCESS, create_result.err_no);
+
+    var create_parsed = try std.json.parseFromSlice(std.json.Value, allocator, create_result.result_json.?, .{});
+    defer create_parsed.deinit();
+    const node_id: u64 = @intCast(create_parsed.value.object.get("attr").?.object.get("id").?.integer);
+    const handle_id: u64 = @intCast(create_parsed.value.object.get("h").?.integer);
+
+    const write_json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"t\":\"req\",\"id\":2,\"op\":\"WRITE\",\"h\":{d},\"a\":{{\"off\":0,\"data_b64\":\"aGVsbG8=\"}}}}",
+        .{handle_id},
+    );
+    defer allocator.free(write_json);
+    var write_req = try fs_protocol.parseRequest(allocator, write_json);
+    defer write_req.deinit();
+    var write_result = node_ops.dispatch(write_req);
+    defer write_result.deinit(allocator);
+    try std.testing.expectEqual(fs_protocol.Errno.SUCCESS, write_result.err_no);
+
+    const close_json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"t\":\"req\",\"id\":3,\"op\":\"CLOSE\",\"h\":{d}}}",
+        .{handle_id},
+    );
+    defer allocator.free(close_json);
+    var close_req = try fs_protocol.parseRequest(allocator, close_json);
+    defer close_req.deinit();
+    var close_result = node_ops.dispatch(close_req);
+    defer close_result.deinit(allocator);
+    try std.testing.expectEqual(fs_protocol.Errno.SUCCESS, close_result.err_no);
+
+    const open_json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"t\":\"req\",\"id\":4,\"op\":\"OPEN\",\"node\":{d},\"a\":{{\"flags\":0}}}}",
+        .{node_id},
+    );
+    defer allocator.free(open_json);
+    var open_req = try fs_protocol.parseRequest(allocator, open_json);
+    defer open_req.deinit();
+    var open_result = node_ops.dispatch(open_req);
+    defer open_result.deinit(allocator);
+    try std.testing.expectEqual(fs_protocol.Errno.SUCCESS, open_result.err_no);
+
+    var open_parsed = try std.json.parseFromSlice(std.json.Value, allocator, open_result.result_json.?, .{});
+    defer open_parsed.deinit();
+    const read_handle: u64 = @intCast(open_parsed.value.object.get("h").?.integer);
+
+    const read_json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"t\":\"req\",\"id\":5,\"op\":\"READ\",\"h\":{d},\"a\":{{\"off\":0,\"len\":64}}}}",
+        .{read_handle},
+    );
+    defer allocator.free(read_json);
+    var read_req = try fs_protocol.parseRequest(allocator, read_json);
+    defer read_req.deinit();
+    var read_result = node_ops.dispatch(read_req);
+    defer read_result.deinit(allocator);
+    try std.testing.expectEqual(fs_protocol.Errno.SUCCESS, read_result.err_no);
+
+    var read_parsed = try std.json.parseFromSlice(std.json.Value, allocator, read_result.result_json.?, .{});
+    defer read_parsed.deinit();
+    const encoded = read_parsed.value.object.get("data_b64").?.string;
+    const decoded = try decodeBase64(allocator, encoded);
+    defer allocator.free(decoded);
+    try std.testing.expectEqualStrings("hello", decoded);
 }
 
 test "fs_node_ops: gdrive scaffold supports read path and guards writes" {
