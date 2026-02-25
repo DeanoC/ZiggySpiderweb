@@ -25,7 +25,7 @@ pub const RuntimeConfig = struct {
     brain_tick_queue_max: usize = 256,
     outbound_queue_max: usize = 512,
     control_queue_max: usize = 128,
-    connection_worker_threads: usize = 4,
+    connection_worker_threads: usize = 16,
     connection_queue_max: usize = 128,
     runtime_worker_threads: usize = 2,
     runtime_request_queue_max: usize = 128,
@@ -123,7 +123,7 @@ const default_config =
     \\    "brain_tick_queue_max": 256,
     \\    "outbound_queue_max": 512,
     \\    "control_queue_max": 128,
-    \\    "connection_worker_threads": 4,
+    \\    "connection_worker_threads": 16,
     \\    "connection_queue_max": 128,
     \\    "runtime_worker_threads": 2,
     \\    "runtime_request_queue_max": 128,
@@ -145,8 +145,53 @@ const default_config =
     \\}
 ;
 
+const SandboxPathDefaults = struct {
+    mounts_root: []u8,
+    runtime_root: []u8,
+
+    fn deinit(self: *SandboxPathDefaults, allocator: std.mem.Allocator) void {
+        allocator.free(self.mounts_root);
+        allocator.free(self.runtime_root);
+        self.* = undefined;
+    }
+};
+
+fn resolveSandboxPathDefaults(allocator: std.mem.Allocator) !SandboxPathDefaults {
+    if (builtin.os.tag != .linux) {
+        return .{
+            .mounts_root = try allocator.dupe(u8, "/var/lib/spiderweb/mounts"),
+            .runtime_root = try allocator.dupe(u8, "/var/lib/spiderweb/runtime"),
+        };
+    }
+
+    if (std.posix.geteuid() == 0) {
+        return .{
+            .mounts_root = try allocator.dupe(u8, "/var/lib/spiderweb/mounts"),
+            .runtime_root = try allocator.dupe(u8, "/var/lib/spiderweb/runtime"),
+        };
+    }
+
+    const home = std.process.getEnvVarOwned(allocator, "HOME") catch null;
+    if (home == null) {
+        return .{
+            .mounts_root = try allocator.dupe(u8, "/var/lib/spiderweb/mounts"),
+            .runtime_root = try allocator.dupe(u8, "/var/lib/spiderweb/runtime"),
+        };
+    }
+    defer allocator.free(home.?);
+
+    const sandbox_root = try std.fs.path.join(allocator, &.{ home.?, ".local", "share", "ziggy-spiderweb", ".spiderweb-sandbox" });
+    defer allocator.free(sandbox_root);
+    return .{
+        .mounts_root = try std.fs.path.join(allocator, &.{ sandbox_root, "mounts" }),
+        .runtime_root = try std.fs.path.join(allocator, &.{ sandbox_root, "runtime" }),
+    };
+}
+
 pub fn init(allocator: std.mem.Allocator, config_path: ?[]const u8) !Config {
     const path = config_path orelse try defaultConfigPath(allocator);
+    var sandbox_defaults = try resolveSandboxPathDefaults(allocator);
+    defer sandbox_defaults.deinit(allocator);
 
     var self = Config{
         .allocator = allocator,
@@ -168,7 +213,7 @@ pub fn init(allocator: std.mem.Allocator, config_path: ?[]const u8) !Config {
             .brain_tick_queue_max = 256,
             .outbound_queue_max = 512,
             .control_queue_max = 128,
-            .connection_worker_threads = 4,
+            .connection_worker_threads = 16,
             .connection_queue_max = 128,
             .runtime_worker_threads = 2,
             .runtime_request_queue_max = 128,
@@ -187,8 +232,8 @@ pub fn init(allocator: std.mem.Allocator, config_path: ?[]const u8) !Config {
             .assets_dir = try allocator.dupe(u8, "templates"),
             .agents_dir = try allocator.dupe(u8, "agents"),
             .sandbox_enabled = builtin.os.tag == .linux and !builtin.is_test,
-            .sandbox_mounts_root = try allocator.dupe(u8, "/var/lib/spiderweb/mounts"),
-            .sandbox_runtime_root = try allocator.dupe(u8, "/var/lib/spiderweb/runtime"),
+            .sandbox_mounts_root = try allocator.dupe(u8, sandbox_defaults.mounts_root),
+            .sandbox_runtime_root = try allocator.dupe(u8, sandbox_defaults.runtime_root),
             .sandbox_launcher = try allocator.dupe(u8, "bwrap"),
             .sandbox_fs_mount_bin = try allocator.dupe(u8, "spiderweb-fs-mount"),
             .sandbox_agent_runtime_bin = try allocator.dupe(u8, "spiderweb-agent-runtime"),
@@ -654,7 +699,7 @@ test "Config defaults" {
     try std.testing.expectEqualStrings("127.0.0.1", config.server.bind);
     try std.testing.expectEqual(@as(u16, 18790), config.server.port);
     try std.testing.expectEqual(@as(usize, 512), config.runtime.inbound_queue_max);
-    try std.testing.expectEqual(@as(usize, 4), config.runtime.connection_worker_threads);
+    try std.testing.expectEqual(@as(usize, 16), config.runtime.connection_worker_threads);
     try std.testing.expectEqual(@as(usize, 2), config.runtime.runtime_worker_threads);
     try std.testing.expectEqual(@as(usize, 128), config.runtime.runtime_request_queue_max);
     try std.testing.expectEqual(@as(u64, 120_000), config.runtime.chat_operation_timeout_ms);

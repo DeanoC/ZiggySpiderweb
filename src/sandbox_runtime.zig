@@ -28,6 +28,7 @@ pub const SandboxRuntime = struct {
     workspace_auth_token: ?[]u8 = null,
     workspace_mount_path: []u8,
     workspace_bind_source_path: []u8,
+    fs_mount_bin_path: []u8,
     child_bin_path: []u8,
     mount_process: ?std.process.Child = null,
     owns_mount_process: bool = false,
@@ -51,7 +52,6 @@ pub const SandboxRuntime = struct {
         const project_mount_root = try std.fs.path.join(options.allocator, &.{ mounts_root_trimmed, options.project_id });
         defer options.allocator.free(project_mount_root);
         try ensurePathExists(project_mount_root);
-        cleanupStaleAgentMounts(options.allocator, project_mount_root, options.agent_id);
 
         const workspace_mount_path = try makeRuntimeMountPath(options.allocator, project_mount_root, options.agent_id);
         errdefer options.allocator.free(workspace_mount_path);
@@ -59,6 +59,13 @@ pub const SandboxRuntime = struct {
         // agents on the same project do not unmount each other.
         detachMountAtPath(options.allocator, workspace_mount_path);
         try ensurePathExists(workspace_mount_path);
+
+        const fs_mount_bin_path = try resolveSiblingBinaryPath(
+            options.allocator,
+            std.mem.trim(u8, runtime_cfg_for_child.sandbox_fs_mount_bin, " \t\r\n"),
+            "spiderweb-fs-mount",
+        );
+        errdefer options.allocator.free(fs_mount_bin_path);
 
         const child_bin_path = try resolveChildBinaryPath(options.allocator, std.mem.trim(u8, runtime_cfg_for_child.sandbox_agent_runtime_bin, " \t\r\n"));
         errdefer options.allocator.free(child_bin_path);
@@ -86,7 +93,7 @@ pub const SandboxRuntime = struct {
 
         mount_process = try spawnProjectMountProcess(
             options.allocator,
-            std.mem.trim(u8, runtime_cfg_for_child.sandbox_fs_mount_bin, " \t\r\n"),
+            fs_mount_bin_path,
             options.workspace_url,
             options.project_id,
             options.project_token,
@@ -94,7 +101,7 @@ pub const SandboxRuntime = struct {
             workspace_mount_path,
         );
         owns_mount_process = true;
-        try waitForMountPoint(options.allocator, workspace_mount_path, mount_startup_timeout_ms);
+        try waitForMountPoint(options.allocator, workspace_mount_path, mount_startup_timeout_ms, &(mount_process.?));
         if (!isMountPoint(options.allocator, workspace_mount_path)) {
             return error.ProjectMountUnavailable;
         }
@@ -123,6 +130,7 @@ pub const SandboxRuntime = struct {
             .workspace_auth_token = if (options.workspace_auth_token) |value| try options.allocator.dupe(u8, value) else null,
             .workspace_mount_path = workspace_mount_path,
             .workspace_bind_source_path = workspace_bind_source_path,
+            .fs_mount_bin_path = fs_mount_bin_path,
             .child_bin_path = child_bin_path,
             .mount_process = mount_process,
             .owns_mount_process = owns_mount_process,
@@ -153,6 +161,7 @@ pub const SandboxRuntime = struct {
         if (self.workspace_auth_token) |value| self.allocator.free(value);
         self.allocator.free(self.workspace_mount_path);
         self.allocator.free(self.workspace_bind_source_path);
+        self.allocator.free(self.fs_mount_bin_path);
         self.allocator.free(self.child_bin_path);
         self.runtime_cfg.deinit(self.allocator);
         self.allocator.destroy(self);
@@ -197,80 +206,88 @@ pub const SandboxRuntime = struct {
         };
         defer allocator.free(request_line);
 
-        if (!processIsAlive(self.child.id)) {
-            self.restartChildRuntime() catch |err| {
+        var attempt: usize = 0;
+        request_attempt_loop: while (attempt < 2) : (attempt += 1) {
+            if (!processIsAlive(self.child.id)) {
+                self.restartChildRuntime() catch |err| {
+                    return toolBridgeFailureOwned(
+                        allocator,
+                        std.fmt.allocPrint(allocator, "sandbox child restart failed before request: {s}", .{@errorName(err)}) catch null,
+                    );
+                };
+            }
+
+            const child_stdin = self.child.stdin orelse return toolBridgeFailure(allocator, "sandbox child stdin pipe is unavailable");
+            const child_stdout = self.child.stdout orelse return toolBridgeFailure(allocator, "sandbox child stdout pipe is unavailable");
+
+            child_stdin.writeAll(request_line) catch |err| {
+                if (isRecoverableBridgeError(err) and attempt + 1 < 2) {
+                    self.restartChildRuntime() catch |restart_err| {
+                        return toolBridgeFailureOwned(
+                            allocator,
+                            std.fmt.allocPrint(allocator, "sandbox tool request write failed: {s}; restart failed: {s}", .{ @errorName(err), @errorName(restart_err) }) catch null,
+                        );
+                    };
+                    continue :request_attempt_loop;
+                }
                 return toolBridgeFailureOwned(
                     allocator,
-                    std.fmt.allocPrint(allocator, "sandbox child restart failed before request: {s}", .{@errorName(err)}) catch null,
+                    std.fmt.allocPrint(allocator, "sandbox tool request write failed: {s}", .{@errorName(err)}) catch null,
                 );
             };
-        }
-
-        const child_stdin = self.child.stdin orelse return toolBridgeFailure(allocator, "sandbox child stdin pipe is unavailable");
-        const child_stdout = self.child.stdout orelse return toolBridgeFailure(allocator, "sandbox child stdout pipe is unavailable");
-
-        child_stdin.writeAll(request_line) catch |err| {
-            if (isRecoverableBridgeError(err)) {
-                self.restartChildRuntime() catch |restart_err| {
-                    return toolBridgeFailureOwned(
-                        allocator,
-                        std.fmt.allocPrint(allocator, "sandbox tool request write failed: {s}; restart failed: {s}", .{ @errorName(err), @errorName(restart_err) }) catch null,
-                    );
-                };
-            }
-            return toolBridgeFailureOwned(
-                allocator,
-                std.fmt.allocPrint(allocator, "sandbox tool request write failed: {s}", .{@errorName(err)}) catch null,
-            );
-        };
-        child_stdin.writeAll("\n") catch |err| {
-            if (isRecoverableBridgeError(err)) {
-                self.restartChildRuntime() catch |restart_err| {
-                    return toolBridgeFailureOwned(
-                        allocator,
-                        std.fmt.allocPrint(allocator, "sandbox tool request newline failed: {s}; restart failed: {s}", .{ @errorName(err), @errorName(restart_err) }) catch null,
-                    );
-                };
-            }
-            return toolBridgeFailureOwned(
-                allocator,
-                std.fmt.allocPrint(allocator, "sandbox tool request newline failed: {s}", .{@errorName(err)}) catch null,
-            );
-        };
-
-        const response_line = readLineAlloc(allocator, child_stdout, max_ipc_line_bytes) catch |err| {
-            if (isRecoverableBridgeError(err)) {
-                self.restartChildRuntime() catch |restart_err| {
-                    return toolBridgeFailureOwned(
-                        allocator,
-                        std.fmt.allocPrint(allocator, "sandbox tool response read failed: {s}; restart failed: {s}", .{ @errorName(err), @errorName(restart_err) }) catch null,
-                    );
-                };
-            }
-            return toolBridgeFailureOwned(
-                allocator,
-                std.fmt.allocPrint(allocator, "sandbox tool response read failed: {s}", .{@errorName(err)}) catch null,
-            );
-        };
-        defer allocator.free(response_line);
-
-        var parsed_result = parseToolResponseLine(allocator, response_line) catch |err| {
-            return toolBridgeFailureOwned(
-                allocator,
-                std.fmt.allocPrint(allocator, "sandbox tool response parse failed: {s}", .{@errorName(err)}) catch null,
-            );
-        };
-        if (shouldRestartOnToolFailure(parsed_result)) {
-            parsed_result.deinit(allocator);
-            self.restartMountAndChild() catch |restart_err| {
+            child_stdin.writeAll("\n") catch |err| {
+                if (isRecoverableBridgeError(err) and attempt + 1 < 2) {
+                    self.restartChildRuntime() catch |restart_err| {
+                        return toolBridgeFailureOwned(
+                            allocator,
+                            std.fmt.allocPrint(allocator, "sandbox tool request newline failed: {s}; restart failed: {s}", .{ @errorName(err), @errorName(restart_err) }) catch null,
+                        );
+                    };
+                    continue :request_attempt_loop;
+                }
                 return toolBridgeFailureOwned(
                     allocator,
-                    std.fmt.allocPrint(allocator, "sandbox mount/runtime restart failed: {s}", .{@errorName(restart_err)}) catch null,
+                    std.fmt.allocPrint(allocator, "sandbox tool request newline failed: {s}", .{@errorName(err)}) catch null,
                 );
             };
-            return toolBridgeFailure(allocator, "sandbox runtime restarted after tool failure; request was not retried");
+
+            const response_line = readLineAlloc(allocator, child_stdout, max_ipc_line_bytes) catch |err| {
+                if (isRecoverableBridgeError(err) and attempt + 1 < 2) {
+                    self.restartChildRuntime() catch |restart_err| {
+                        return toolBridgeFailureOwned(
+                            allocator,
+                            std.fmt.allocPrint(allocator, "sandbox tool response read failed: {s}; restart failed: {s}", .{ @errorName(err), @errorName(restart_err) }) catch null,
+                        );
+                    };
+                    continue :request_attempt_loop;
+                }
+                return toolBridgeFailureOwned(
+                    allocator,
+                    std.fmt.allocPrint(allocator, "sandbox tool response read failed: {s}", .{@errorName(err)}) catch null,
+                );
+            };
+            defer allocator.free(response_line);
+
+            var parsed_result = parseToolResponseLine(allocator, response_line) catch |err| {
+                return toolBridgeFailureOwned(
+                    allocator,
+                    std.fmt.allocPrint(allocator, "sandbox tool response parse failed: {s}", .{@errorName(err)}) catch null,
+                );
+            };
+            if (shouldRestartOnToolFailure(parsed_result)) {
+                parsed_result.deinit(allocator);
+                self.restartMountAndChild() catch |restart_err| {
+                    return toolBridgeFailureOwned(
+                        allocator,
+                        std.fmt.allocPrint(allocator, "sandbox mount/runtime restart failed: {s}", .{@errorName(restart_err)}) catch null,
+                    );
+                };
+                return toolBridgeFailure(allocator, "sandbox runtime restarted after tool failure; request was not retried");
+            }
+            return parsed_result;
         }
-        return parsed_result;
+
+        return toolBridgeFailure(allocator, "sandbox tool bridge retry exhausted");
     }
 
     fn restartChildRuntime(self: *SandboxRuntime) !void {
@@ -305,7 +322,7 @@ pub const SandboxRuntime = struct {
 
         var mount_process = try spawnProjectMountProcess(
             self.allocator,
-            std.mem.trim(u8, self.runtime_cfg.sandbox_fs_mount_bin, " \t\r\n"),
+            self.fs_mount_bin_path,
             self.workspace_url,
             self.project_id,
             self.project_token,
@@ -317,7 +334,7 @@ pub const SandboxRuntime = struct {
             _ = mount_process.wait() catch {};
         }
 
-        try waitForMountPoint(self.allocator, self.workspace_mount_path, mount_startup_timeout_ms);
+        try waitForMountPoint(self.allocator, self.workspace_mount_path, mount_startup_timeout_ms, &mount_process);
         if (!isMountPoint(self.allocator, self.workspace_mount_path)) {
             return error.ProjectMountUnavailable;
         }
@@ -521,6 +538,7 @@ fn spawnProjectMountProcess(
     mount_path: []const u8,
 ) !std.process.Child {
     const fs_mount_bin = if (fs_mount_bin_raw.len > 0) fs_mount_bin_raw else "spiderweb-fs-mount";
+    try ensurePathExists(mount_path);
 
     var args = std.ArrayListUnmanaged([]const u8){};
     defer args.deinit(allocator);
@@ -704,6 +722,22 @@ fn processIsAlive(pid_raw: anytype) bool {
     return true;
 }
 
+fn processIsZombie(allocator: std.mem.Allocator, pid_raw: anytype) bool {
+    if (builtin.os.tag != .linux) return false;
+
+    const pid: std.posix.pid_t = @intCast(pid_raw);
+    if (pid <= 0) return false;
+
+    var path_buf: [64]u8 = undefined;
+    const stat_path = std.fmt.bufPrint(&path_buf, "/proc/{d}/stat", .{pid}) catch return false;
+    const stat_content = std.fs.cwd().readFileAlloc(allocator, stat_path, 4096) catch return false;
+    defer allocator.free(stat_content);
+
+    const close_paren = std.mem.lastIndexOfScalar(u8, stat_content, ')') orelse return false;
+    if (close_paren + 2 >= stat_content.len) return false;
+    return stat_content[close_paren + 2] == 'Z';
+}
+
 fn ensurePathExists(path: []const u8) !void {
     if (std.fs.path.isAbsolute(path)) {
         var root = try std.fs.openDirAbsolute("/", .{});
@@ -716,17 +750,40 @@ fn ensurePathExists(path: []const u8) !void {
     try std.fs.cwd().makePath(path);
 }
 
-fn waitForMountPoint(allocator: std.mem.Allocator, mount_path: []const u8, timeout_ms: u64) !void {
+fn waitForMountPoint(
+    allocator: std.mem.Allocator,
+    mount_path: []const u8,
+    timeout_ms: u64,
+    mount_process: *const std.process.Child,
+) !void {
     const started_ms = std.time.milliTimestamp();
     const timeout_i64: i64 = @intCast(timeout_ms);
 
     while (true) {
         if (isMountPoint(allocator, mount_path)) return;
+        if (processIsZombie(allocator, mount_process.id)) {
+            std.log.warn(
+                "sandbox mount process exited (zombie) before mountpoint became ready: pid={d} mount={s}",
+                .{ mount_process.id, mount_path },
+            );
+            return error.ProjectMountUnavailable;
+        }
+        if (!processIsAlive(mount_process.id)) {
+            std.log.warn(
+                "sandbox mount process exited before mountpoint became ready: pid={d} mount={s}",
+                .{ mount_process.id, mount_path },
+            );
+            return error.ProjectMountUnavailable;
+        }
 
         const elapsed = std.time.milliTimestamp() - started_ms;
         if (elapsed >= timeout_i64) break;
         std.Thread.sleep(mount_poll_interval_ms * std.time.ns_per_ms);
     }
+    std.log.warn(
+        "sandbox mountpoint wait timed out after {d}ms: pid={d} mount={s} alive={}",
+        .{ timeout_ms, mount_process.id, mount_path, processIsAlive(mount_process.id) },
+    );
     return error.ProjectMountUnavailable;
 }
 
@@ -796,4 +853,24 @@ fn resolveChildBinaryPath(allocator: std.mem.Allocator, configured: []const u8) 
 
     const child_name = if (configured.len > 0) configured else "spiderweb-agent-runtime";
     return std.fs.path.join(allocator, &.{ self_dir, child_name });
+}
+
+fn resolveSiblingBinaryPath(
+    allocator: std.mem.Allocator,
+    configured: []const u8,
+    fallback_name: []const u8,
+) ![]u8 {
+    const candidate_name = if (configured.len > 0) configured else fallback_name;
+    if (std.fs.path.isAbsolute(candidate_name)) {
+        return allocator.dupe(u8, candidate_name);
+    }
+
+    const self_exe = try std.fs.selfExePathAlloc(allocator);
+    defer allocator.free(self_exe);
+    const self_dir = std.fs.path.dirname(self_exe) orelse return error.InvalidExecutablePath;
+    const sibling_candidate = try std.fs.path.join(allocator, &.{ self_dir, candidate_name });
+    errdefer allocator.free(sibling_candidate);
+    if (pathExists(sibling_candidate)) return sibling_candidate;
+
+    return allocator.dupe(u8, candidate_name);
 }

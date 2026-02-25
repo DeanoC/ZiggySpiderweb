@@ -10,6 +10,8 @@
 #
 # NON-INTERACTIVE with options:
 #   curl ... | SPIDERWEB_PROVIDER=openai-codex SPIDERWEB_AGENT=ziggy bash
+# Pin installer repo refs (for testing non-main branches):
+#   curl .../install.sh | SPIDERWEB_GIT_REF=feat/foo ZSS_GIT_REF=feat/bar bash
 
 set -euo pipefail
 
@@ -49,18 +51,41 @@ log_success() {
 ensure_git_repo() {
     local dir="$1"
     local url="$2"
+    local ref="${3:-}"
     local name
     name="$(basename "$dir")"
 
     if [[ -d "$dir/.git" ]]; then
-        log_info "Updating ${name}..."
-        git -C "$dir" pull -q || log_warn "Failed to update ${name}; using existing checkout"
+        log_info "Updating ${name}${ref:+ (ref: ${ref})}..."
+        git -C "$dir" remote set-url origin "$url" >/dev/null 2>&1 || true
+        if [[ -n "$ref" ]]; then
+            git -C "$dir" fetch -q origin || log_warn "Failed to fetch ${name}; using existing checkout"
+            if git -C "$dir" rev-parse --verify --quiet "refs/remotes/origin/${ref}" >/dev/null; then
+                if git -C "$dir" rev-parse --verify --quiet "$ref" >/dev/null; then
+                    git -C "$dir" checkout -q "$ref" || log_warn "Failed to checkout ${name} ref ${ref}; using current branch"
+                else
+                    git -C "$dir" checkout -q -B "$ref" "origin/$ref" || log_warn "Failed to create local branch ${ref} for ${name}; using current branch"
+                fi
+                git -C "$dir" pull -q --ff-only origin "$ref" || log_warn "Failed to fast-forward ${name} ref ${ref}; using current checkout"
+            else
+                git -C "$dir" checkout -q "$ref" || log_warn "Ref ${ref} not found on origin for ${name}; using current checkout"
+            fi
+        else
+            git -C "$dir" pull -q || log_warn "Failed to update ${name}; using existing checkout"
+        fi
     elif [[ -d "$dir" ]]; then
         log_warn "${name} exists but is not a git repo: $dir"
         log_warn "Skipping clone and using existing directory"
     else
-        log_info "Cloning ${name}..."
-        git clone -q "$url" "$dir"
+        log_info "Cloning ${name}${ref:+ (ref: ${ref})}..."
+        if [[ -n "$ref" ]]; then
+            if ! git clone -q --branch "$ref" "$url" "$dir"; then
+                log_warn "Clone with ref ${ref} failed for ${name}; falling back to default branch"
+                git clone -q "$url" "$dir"
+            fi
+        else
+            git clone -q "$url" "$dir"
+        fi
     fi
 }
 
@@ -70,48 +95,17 @@ print_auth_tokens_summary() {
     if [[ ! -x "$config_cmd" ]]; then
         config_cmd="$(command -v spiderweb-config || true)"
     fi
-
-    local -a candidates=()
-    candidates+=("${REPO_DIR}/.spiderweb-ltm/auth_tokens.json")
-
-    local config_file="${HOME}/.config/spiderweb/config.json"
-    if [[ -f "$config_file" ]]; then
-        local ltm_dir
-        ltm_dir="$(jq -r '.runtime.ltm_directory // empty' "$config_file" 2>/dev/null || true)"
-        if [[ -n "$ltm_dir" ]]; then
-            if [[ "$ltm_dir" == /* ]]; then
-                candidates+=("${ltm_dir}/auth_tokens.json")
-            else
-                candidates+=("${REPO_DIR}/${ltm_dir#./}/auth_tokens.json")
-            fi
-        fi
-    fi
-
     if [[ -n "$config_cmd" ]]; then
-        local raw_auth_path
-        raw_auth_path=""
-        if raw_auth_path="$("$config_cmd" auth path 2>/dev/null | tr -d '\r' | tail -n1)"; then
+        if "$config_cmd" auth path >/dev/null 2>&1; then
             has_auth_cli=true
         fi
-        if [[ -n "$raw_auth_path" ]]; then
-            if [[ "$raw_auth_path" == /* ]]; then
-                candidates+=("$raw_auth_path")
-            else
-                candidates+=("${REPO_DIR}/${raw_auth_path#./}")
-            fi
-        fi
     fi
 
-    local token_file=""
-    for _ in $(seq 1 100); do
-        for candidate in "${candidates[@]}"; do
-            if [[ -f "$candidate" ]]; then
-                token_file="$candidate"
-                break 2
-            fi
-        done
-        sleep 0.2
-    done
+    local -a candidates=()
+    collect_auth_token_candidates "$config_cmd" candidates
+
+    local token_file
+    token_file="$(resolve_auth_tokens_file "$config_cmd")"
 
     if [[ -n "$token_file" ]]; then
         local admin_token
@@ -146,6 +140,119 @@ print_auth_tokens_summary() {
     fi
 }
 
+collect_auth_token_candidates() {
+    local config_cmd="${1:-}"
+    local -n out_ref="$2"
+    out_ref=()
+    out_ref+=("${REPO_DIR}/.spiderweb-ltm/auth_tokens.json")
+
+    local config_file="${HOME}/.config/spiderweb/config.json"
+    if [[ -f "$config_file" ]]; then
+        local ltm_dir
+        ltm_dir="$(jq -r '.runtime.ltm_directory // empty' "$config_file" 2>/dev/null || true)"
+        if [[ -n "$ltm_dir" ]]; then
+            if [[ "$ltm_dir" == /* ]]; then
+                out_ref+=("${ltm_dir}/auth_tokens.json")
+            else
+                out_ref+=("${REPO_DIR}/${ltm_dir#./}/auth_tokens.json")
+            fi
+        fi
+    fi
+
+    if [[ -n "$config_cmd" ]]; then
+        local raw_auth_path
+        raw_auth_path=""
+        if raw_auth_path="$("$config_cmd" auth path 2>/dev/null | tr -d '\r' | tail -n1)"; then
+            :
+        fi
+        if [[ -n "$raw_auth_path" ]]; then
+            if [[ "$raw_auth_path" == /* ]]; then
+                out_ref+=("$raw_auth_path")
+            else
+                out_ref+=("${REPO_DIR}/${raw_auth_path#./}")
+            fi
+        fi
+    fi
+}
+
+resolve_auth_tokens_file() {
+    local config_cmd="${1:-}"
+    local attempts="${2:-100}"
+    local poll_interval="${3:-0.2}"
+    local -a candidates=()
+    collect_auth_token_candidates "$config_cmd" candidates
+
+    local token_file=""
+    for _ in $(seq 1 "$attempts"); do
+        for candidate in "${candidates[@]}"; do
+            if [[ -f "$candidate" ]]; then
+                token_file="$candidate"
+                break 2
+            fi
+        done
+        sleep "$poll_interval"
+    done
+    echo "$token_file"
+}
+
+sync_zss_auth_tokens() {
+    local config_cmd="${INSTALL_DIR}/spiderweb-config"
+    if [[ ! -x "$config_cmd" ]]; then
+        config_cmd="$(command -v spiderweb-config || true)"
+    fi
+
+    local token_file
+    token_file="$(resolve_auth_tokens_file "$config_cmd" 5 0.2)"
+    if [[ -z "$token_file" ]]; then
+        log_warn "Skipping zss auth sync: spiderweb auth token file not found yet."
+        return 0
+    fi
+
+    local admin_token
+    local user_token
+    admin_token="$(jq -r '.admin_token // empty' "$token_file" 2>/dev/null || true)"
+    user_token="$(jq -r '.user_token // empty' "$token_file" 2>/dev/null || true)"
+    if [[ -z "$admin_token" || -z "$user_token" ]]; then
+        log_warn "Skipping zss auth sync: auth token file is missing admin/user tokens."
+        return 0
+    fi
+
+    local zss_config_dir="${HOME}/.config/zss"
+    local zss_config_file="${zss_config_dir}/config.json"
+    mkdir -p "$zss_config_dir"
+
+    local tmp_file
+    tmp_file="$(mktemp)"
+    if [[ -f "$zss_config_file" ]] && jq empty "$zss_config_file" >/dev/null 2>&1; then
+        if jq \
+            --arg admin "$admin_token" \
+            --arg user "$user_token" \
+            '.admin_token = $admin
+             | .user_token = $user
+             | .active_role = (.active_role // "admin")
+             | .server_url = (.server_url // "ws://127.0.0.1:18790")' \
+            "$zss_config_file" > "$tmp_file"; then
+            mv "$tmp_file" "$zss_config_file"
+            chmod 600 "$zss_config_file" 2>/dev/null || true
+            log_success "Synced zss auth tokens from spiderweb auth store"
+            return 0
+        fi
+    fi
+
+    if ! jq -n \
+        --arg admin "$admin_token" \
+        --arg user "$user_token" \
+        --arg server "ws://127.0.0.1:18790" \
+        '{ server_url: $server, admin_token: $admin, user_token: $user, active_role: "admin" }' > "$tmp_file"; then
+        rm -f "$tmp_file"
+        log_warn "Failed to write zss auth config."
+        return 0
+    fi
+    mv "$tmp_file" "$zss_config_file"
+    chmod 600 "$zss_config_file" 2>/dev/null || true
+    log_success "Initialized zss config with current spiderweb auth tokens"
+}
+
 # Detect if we're being piped
 if [[ ! -t 0 ]]; then
     echo ""
@@ -175,13 +282,24 @@ has_fuse3_runtime() {
             return 0
         fi
     fi
+    if command -v dpkg >/dev/null 2>&1; then
+        if dpkg -s libfuse3-4 >/dev/null 2>&1 || dpkg -s libfuse3-3 >/dev/null 2>&1 || dpkg -s libfuse3-dev >/dev/null 2>&1; then
+            return 0
+        fi
+    fi
     local candidates=(
         "/lib*/libfuse3.so.4"
         "/usr/lib*/libfuse3.so.4"
+        "/lib/*/libfuse3.so.4"
+        "/usr/lib/*/libfuse3.so.4"
         "/lib*/libfuse3.so.3"
         "/usr/lib*/libfuse3.so.3"
+        "/lib/*/libfuse3.so.3"
+        "/usr/lib/*/libfuse3.so.3"
         "/lib*/libfuse3.so"
         "/usr/lib*/libfuse3.so"
+        "/lib/*/libfuse3.so"
+        "/usr/lib/*/libfuse3.so"
     )
     local pattern
     for pattern in "${candidates[@]}"; do
@@ -282,6 +400,10 @@ fi
 REPO_DIR="${HOME}/.local/share/ziggy-spiderweb"
 INSTALL_DIR="${HOME}/.local/bin"
 export PATH="${INSTALL_DIR}:${PATH}"
+SPIDERWEB_REPO_URL="${SPIDERWEB_REPO_URL:-https://github.com/DeanoC/ZiggySpiderweb.git}"
+SPIDERWEB_GIT_REF="${SPIDERWEB_GIT_REF:-main}"
+ZSS_REPO_URL="${ZSS_REPO_URL:-https://github.com/DeanoC/ZiggyStarSpider.git}"
+ZSS_GIT_REF="${ZSS_GIT_REF:-main}"
 
 # Check if spiderweb is running and offer to stop it first
 SPIDERWEB_RUNNING=false
@@ -321,11 +443,8 @@ if [[ -d "$REPO_DIR" ]]; then
     fi
 fi
 
-if [[ ! -d "$REPO_DIR" ]]; then
-    log_info "Cloning ZiggySpiderweb..."
-    mkdir -p "$(dirname "$REPO_DIR")"
-    git clone -q https://github.com/DeanoC/ZiggySpiderweb.git "$REPO_DIR"
-fi
+mkdir -p "$(dirname "$REPO_DIR")"
+ensure_git_repo "$REPO_DIR" "$SPIDERWEB_REPO_URL" "$SPIDERWEB_GIT_REF"
 
 REPO_BASE_DIR="$(dirname "$REPO_DIR")"
 log_info "Ensuring local Ziggy module dependencies..."
@@ -381,17 +500,10 @@ fi
 
 if [[ "$INSTALL_ZSS" == "true" ]]; then
     ZSS_REPO="${HOME}/.local/share/ziggy-starspider"
-    
-    if [[ -d "$ZSS_REPO" ]]; then
-        log_info "ZiggyStarSpider already exists, updating..."
-        cd "$ZSS_REPO"
-        git pull -q
-    else
-        log_info "Cloning ZiggyStarSpider..."
-        mkdir -p "$(dirname "$ZSS_REPO")"
-        git clone -q https://github.com/DeanoC/ZiggyStarSpider.git "$ZSS_REPO"
-        cd "$ZSS_REPO"
-    fi
+
+    mkdir -p "$(dirname "$ZSS_REPO")"
+    ensure_git_repo "$ZSS_REPO" "$ZSS_REPO_URL" "$ZSS_GIT_REF"
+    cd "$ZSS_REPO"
     
     log_info "Building ZiggyStarSpider CLI..."
     zig build cli -Doptimize=ReleaseSafe -Dtarget=native
@@ -584,6 +696,16 @@ elif [[ "$SYSTEMD_EXISTS" == "true" ]]; then
 else
     echo "To install systemd service later:"
     echo "  spiderweb-config config install-service"
+fi
+
+SYNC_ZSS_AUTH=false
+if [[ "$INSTALL_ZSS" == "true" ]]; then
+    SYNC_ZSS_AUTH=true
+elif [[ -x "${INSTALL_DIR}/zss" ]] || command -v zss >/dev/null 2>&1 || [[ -f "${HOME}/.config/zss/config.json" ]]; then
+    SYNC_ZSS_AUTH=true
+fi
+if [[ "$SYNC_ZSS_AUTH" == "true" ]]; then
+    sync_zss_auth_tokens
 fi
 
 print_auth_tokens_summary

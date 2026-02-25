@@ -51,6 +51,7 @@ const control_protocol_version = "unified-v2";
 const fsrpc_runtime_protocol_version = "styx-lite-1";
 const fsrpc_node_protocol_version = "unified-v2-fs";
 const fsrpc_node_proto_id: i64 = 2;
+const min_connection_worker_threads: usize = 16;
 const runtime_warmup_wait_timeout_ms: i64 = 12_000;
 const runtime_warmup_stale_timeout_ms: i64 = 30_000;
 const runtime_warmup_poll_interval_ms: u64 = 100;
@@ -1662,9 +1663,15 @@ const AgentRuntimeRegistry = struct {
                 .workspace_url = workspace_url,
                 .workspace_auth_token = workspace_auth,
                 .runtime_cfg = self.runtime_config,
-            }) catch |err| switch (err) {
-                error.ProjectMountUnavailable => return error.SandboxMountUnavailable,
-                else => return error.InvalidSandboxConfig,
+            }) catch |err| {
+                std.log.warn(
+                    "sandbox runtime create failed: agent={s} project={s} err={s}",
+                    .{ agent_id, project_id, @errorName(err) },
+                );
+                switch (err) {
+                    error.ProjectMountUnavailable => return error.SandboxMountUnavailable,
+                    else => return error.InvalidSandboxConfig,
+                }
             };
             errdefer sandbox_runtime.destroy();
 
@@ -2054,6 +2061,7 @@ const AgentRuntimeRegistry = struct {
         agent_id: []const u8,
         project_id: ?[]const u8,
         project_token: ?[]const u8,
+        retry_on_error: bool,
     ) !SessionAttachStateSnapshot {
         if (!self.runtime_config.sandbox_enabled) {
             return .{
@@ -2096,10 +2104,15 @@ const AgentRuntimeRegistry = struct {
                         state.updated_at_ms = std.time.milliTimestamp();
                     };
                 }
-                if (!state.in_flight and state.state != .ready) {
-                    state.setWarming(self.allocator);
-                    state.in_flight = true;
-                    should_spawn = true;
+                if (!state.in_flight) {
+                    if (state.state == .err and !retry_on_error) {
+                        // Preserve sticky error state for read-only status probes so callers can
+                        // surface the real failure instead of oscillating forever in "warming".
+                    } else if (state.state != .ready) {
+                        state.setWarming(self.allocator);
+                        state.in_flight = true;
+                        should_spawn = true;
+                    }
                 }
             } else {
                 const owned_key = try self.allocator.dupe(u8, binding_key);
@@ -2675,6 +2688,11 @@ fn runtimeWarmupThreadMain(ctx: *RuntimeWarmupThreadContext) void {
         ctx.project_id,
         ctx.project_token,
     ) catch |err| {
+        std.log.warn("runtime warmup thread failed: agent={s} project={s} err={s}", .{
+            agent_id,
+            ctx.project_id orelse "__auto__",
+            @errorName(err),
+        });
         const info = AgentRuntimeRegistry.mapRuntimeWarmupError(err);
         ctx.runtime_registry.markRuntimeWarmupError(
             binding_key,
@@ -2801,9 +2819,18 @@ pub fn run(
     var tcp_server = try address.listen(.{ .reuse_address = true });
     defer tcp_server.deinit();
 
+    const configured_connection_workers = runtime_config.connection_worker_threads;
+    const effective_connection_workers = @max(configured_connection_workers, min_connection_worker_threads);
+    if (effective_connection_workers != configured_connection_workers) {
+        std.log.warn(
+            "runtime.connection_worker_threads={d} is too low for fsrpc endpoint fan-out; using {d}",
+            .{ configured_connection_workers, effective_connection_workers },
+        );
+    }
+
     const dispatcher = try connection_dispatcher.ConnectionDispatcher.create(
         allocator,
-        runtime_config.connection_worker_threads,
+        effective_connection_workers,
         runtime_config.connection_queue_max,
         workerHandleConnection,
         &runtime_registry,
@@ -2875,8 +2902,12 @@ fn handleWebSocketConnection(
     defer deinitSessionBindings(allocator, &session_bindings);
 
     const default_agent_id = initialAgentIdForRole(principal.role, runtime_registry.default_agent_id);
-    try upsertSessionBinding(allocator, &session_bindings, "main", default_agent_id, null, null);
-    var initial_warmup_snapshot = runtime_registry.ensureRuntimeWarmup(default_agent_id, null, null) catch |err| blk: {
+    const default_project_id: ?[]const u8 = if (principal.role == .admin)
+        fs_control_plane.spider_web_project_id
+    else
+        null;
+    try upsertSessionBinding(allocator, &session_bindings, "main", default_agent_id, default_project_id, null);
+    var initial_warmup_snapshot = runtime_registry.ensureRuntimeWarmup(default_agent_id, default_project_id, null, true) catch |err| blk: {
         std.log.warn("default session warmup failed: {s}", .{@errorName(err)});
         break :blk SessionAttachStateSnapshot{};
     };
@@ -3431,6 +3462,7 @@ fn handleWebSocketConnection(
                                     active_binding.agent_id,
                                     active_binding.project_id,
                                     active_binding.project_token,
+                                    true,
                                 ) catch |warm_err| {
                                     const response = try unified.buildControlError(
                                         allocator,
@@ -3498,6 +3530,7 @@ fn handleWebSocketConnection(
                                     binding.agent_id,
                                     binding.project_id,
                                     binding.project_token,
+                                    false,
                                 ) catch |warm_err| {
                                     const response = try unified.buildControlError(
                                         allocator,
@@ -3574,6 +3607,7 @@ fn handleWebSocketConnection(
                                     binding.agent_id,
                                     binding.project_id,
                                     binding.project_token,
+                                    true,
                                 ) catch |warm_err| {
                                     const response = try unified.buildControlError(
                                         allocator,
@@ -4061,6 +4095,7 @@ fn handleWebSocketConnection(
                                 target_binding.agent_id,
                                 target_binding.project_id,
                                 target_binding.project_token,
+                                true,
                             ) catch |warm_err| {
                                 const response = try unified.buildFsrpcError(
                                     allocator,
@@ -4528,6 +4563,7 @@ fn tryHandleLegacySessionSendFrame(
             binding.agent_id,
             binding.project_id,
             binding.project_token,
+            true,
         ) catch |warm_err| {
             const response = try protocol.buildErrorWithCode(
                 allocator,

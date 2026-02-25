@@ -802,20 +802,12 @@ pub const Router = struct {
                 removed.deinit(self.allocator);
             }
         }
-
-        self.reconnectEndpoint(endpoint_index) catch |err| {
-            if (isEndpointFailureError(err)) {
-                const endpoint = &self.endpoints.items[endpoint_index];
-                if (self.seedRootFromMountPath(endpoint.mount_path, endpoint_index)) |seeded_root| {
-                    endpoint.root_node_id = seeded_root;
-                }
-                endpoint.healthy = false;
-                endpoint.last_failure_ms = std.time.milliTimestamp();
-                endpoint.last_health_check_ms = endpoint.last_failure_ms;
-                return;
-            }
-            return err;
-        };
+        // Keep startup non-blocking: endpoint transport handshakes are established lazily
+        // on first real access instead of during topology install.
+        const endpoint = &self.endpoints.items[endpoint_index];
+        if (self.seedRootFromMountPath(endpoint.mount_path, endpoint_index)) |seeded_root| {
+            endpoint.root_node_id = seeded_root;
+        }
     }
 
     fn clearEndpoints(self: *Router) void {
@@ -868,15 +860,12 @@ pub const Router = struct {
         var saw_readonly_endpoint = false;
         var saw_writable_candidate = false;
         var saw_incompatible_endpoint = false;
+        var saw_supported_endpoint = false;
         var candidates = std.ArrayListUnmanaged(PathCandidate){};
         defer candidates.deinit(self.allocator);
 
         for (path_candidates.items) |candidate| {
             const endpoint = self.endpoints.items[candidate.endpoint_index];
-            if (!fs_source_policy.supports(endpointView(endpoint), desired_op)) {
-                saw_incompatible_endpoint = true;
-                continue;
-            }
             if (!endpointMatchesWriteRequirement(endpoint.export_read_only, require_writable)) {
                 saw_readonly_endpoint = true;
                 continue;
@@ -890,7 +879,6 @@ pub const Router = struct {
             if (require_writable and !saw_writable_candidate and saw_readonly_endpoint) {
                 return RouterError.ReadOnlyFilesystem;
             }
-            if (saw_incompatible_endpoint) return RouterError.OperationNotSupported;
             return RouterError.IOError;
         }
 
@@ -918,6 +906,12 @@ pub const Router = struct {
                 attempted[picked_rank] = true;
                 const candidate = candidates.items[picked_rank];
                 const endpoint_index = candidate.endpoint_index;
+                const endpoint = self.endpoints.items[endpoint_index];
+                if (!endpointSupportsOperationForRouting(endpoint, desired_op)) {
+                    saw_incompatible_endpoint = true;
+                    continue;
+                }
+                saw_supported_endpoint = true;
                 const resolved = self.resolvePathOnEndpoint(endpoint_index, candidate.relative_path) catch |err| {
                     if (isEndpointFailureError(err)) {
                         self.noteEndpointFailure(endpoint_index);
@@ -941,12 +935,23 @@ pub const Router = struct {
         if (require_writable and !saw_writable_candidate and saw_readonly_endpoint) {
             return RouterError.ReadOnlyFilesystem;
         }
-        if (saw_incompatible_endpoint) return RouterError.OperationNotSupported;
+        if (!saw_supported_endpoint and saw_incompatible_endpoint) return RouterError.OperationNotSupported;
         if (saw_endpoint_failure) return RouterError.EndpointUnavailable;
+        if (saw_incompatible_endpoint) return RouterError.OperationNotSupported;
         return RouterError.IOError;
     }
 
     fn resolvePathOnEndpoint(self: *Router, endpoint_index: usize, relative_path: []const u8) !ResolvedNode {
+        const endpoint = &self.endpoints.items[endpoint_index];
+        if (endpoint.root_node_id == 0 and endpoint.client == null) {
+            self.reconnectEndpoint(endpoint_index) catch |err| {
+                if (isEndpointFailureError(err)) {
+                    self.noteEndpointFailure(endpoint_index);
+                }
+                return err;
+            };
+        }
+
         var node_id = self.endpoints.items[endpoint_index].root_node_id;
         var parent_id: ?u64 = null;
         var final_name: ?[]const u8 = null;
@@ -1593,6 +1598,13 @@ fn endpointView(endpoint: Endpoint) fs_source_policy.EndpointView {
     };
 }
 
+fn endpointSupportsOperationForRouting(endpoint: Endpoint, desired_op: fs_source_policy.Operation) bool {
+    // Fresh endpoints may not have export metadata yet; allow one optimistic route
+    // attempt so reconnect/export hydration can establish true capabilities.
+    if (endpoint.source_kind == null) return true;
+    return fs_source_policy.supports(endpointView(endpoint), desired_op);
+}
+
 fn endpointRoutingScore(
     endpoint: Endpoint,
     desired_op: fs_source_policy.Operation,
@@ -1606,7 +1618,7 @@ fn endpointRoutingScore(
         score -= 2000;
     }
 
-    if (!fs_source_policy.supports(endpointView(endpoint), desired_op)) score -= 10_000;
+    if (!endpointSupportsOperationForRouting(endpoint, desired_op)) score -= 10_000;
     if (require_writable and endpoint.export_read_only == true) score -= 10_000;
 
     if (endpoint.caps_native_watch == true) score += 20;
@@ -2127,6 +2139,35 @@ test "fs_router: resolvePath honors explicit mount_path overlays" {
     try std.testing.expectEqual(@as(u16, 0), resolved.endpoint_index);
     try std.testing.expectEqual(@as(u64, 101), resolved.node_id);
     try std.testing.expectError(RouterError.UnknownEndpoint, router.resolvePath("/project/main.zig", false, .read_data));
+}
+
+test "fs_router: resolvePath allows advanced ops before source metadata hydration" {
+    const allocator = std.testing.allocator;
+    var router = try Router.init(allocator, &[_]EndpointConfig{});
+    defer router.deinit();
+
+    const now = std.time.milliTimestamp();
+    try router.endpoints.append(allocator, .{
+        .name = try allocator.dupe(u8, "fresh"),
+        .url = try allocator.dupe(u8, "ws://127.0.0.1:65535/v2/fs"),
+        .export_name = null,
+        .mount_path = try allocator.dupe(u8, "/a"),
+        .root_node_id = 10,
+        .export_read_only = false,
+        .source_kind = null,
+        .caps_case_sensitive = true,
+        .healthy = true,
+        .last_health_check_ms = now,
+        .last_success_ms = now,
+    });
+
+    const attr = "{\"id\":101,\"k\":1,\"m\":33188}";
+    try router.dir_cache.put(0, 10, "foo", attr, now);
+    try router.attr_cache.put(.{ .endpoint_index = 0, .node_id = 101 }, attr, 0, now);
+
+    const resolved = try router.resolvePath("/a/foo", false, .xattr);
+    try std.testing.expectEqual(@as(u16, 0), resolved.endpoint_index);
+    try std.testing.expectEqual(@as(u64, 101), resolved.node_id);
 }
 
 test "fs_router: parseAttrSummary detects kind from explicit kind and mode bits" {
