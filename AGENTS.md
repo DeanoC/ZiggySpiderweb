@@ -37,13 +37,14 @@ This repository is part of the Ziggy* codebase and is primarily a Zig project.
   - Notes on compatibility/config changes when relevant.
 
 ## Branch Protection And Review Gate
-- Direct pushes to the default branch are not allowed.
-- All changes that update the default branch must go through a pull request.
-- Shared policy source of truth: https://github.com/DeanoC/ZiggySpiderweb/blob/main/docs/review-policy.md
-- `chatgpt-codex-connector` review is required before merge, and all Codex threads must be resolved.
-- If Codex reports any `P1`, push a fix and request follow-up with `@codex review` before merge.
-- For each `P2`/`P3`, open or link a GitHub issue and link it in the PR.
-- Auto-merge is disabled; merges are manual (human or AI maintainer).
+- Direct pushes to `main` are not allowed.
+- All changes that update `main` must go through a pull request.
+- A PR must not be merged until `chatgpt-codex-connector` (including variants like `chatgpt-codex-connector[bot]`) has reviewed it.
+- Do not merge while any review comments from that reviewer remain outstanding.
+- Address each comment and resolve each review thread before merging.
+- The first Codex review cycle is automatic when a PR is opened; this is the only required Codex pass.
+- After additional pushes, follow-up `@codex review` requests are optional and are not merge blockers.
+- Auto-merge is allowed only when there are zero open Codex comments/threads; otherwise merge manually once comments are addressed.
 
 ## Compatibility Policy
 - Until `1.0.0`, backward compatibility is not guaranteed.
