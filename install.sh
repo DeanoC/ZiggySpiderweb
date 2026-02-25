@@ -95,48 +95,17 @@ print_auth_tokens_summary() {
     if [[ ! -x "$config_cmd" ]]; then
         config_cmd="$(command -v spiderweb-config || true)"
     fi
-
-    local -a candidates=()
-    candidates+=("${REPO_DIR}/.spiderweb-ltm/auth_tokens.json")
-
-    local config_file="${HOME}/.config/spiderweb/config.json"
-    if [[ -f "$config_file" ]]; then
-        local ltm_dir
-        ltm_dir="$(jq -r '.runtime.ltm_directory // empty' "$config_file" 2>/dev/null || true)"
-        if [[ -n "$ltm_dir" ]]; then
-            if [[ "$ltm_dir" == /* ]]; then
-                candidates+=("${ltm_dir}/auth_tokens.json")
-            else
-                candidates+=("${REPO_DIR}/${ltm_dir#./}/auth_tokens.json")
-            fi
-        fi
-    fi
-
     if [[ -n "$config_cmd" ]]; then
-        local raw_auth_path
-        raw_auth_path=""
-        if raw_auth_path="$("$config_cmd" auth path 2>/dev/null | tr -d '\r' | tail -n1)"; then
+        if "$config_cmd" auth path >/dev/null 2>&1; then
             has_auth_cli=true
         fi
-        if [[ -n "$raw_auth_path" ]]; then
-            if [[ "$raw_auth_path" == /* ]]; then
-                candidates+=("$raw_auth_path")
-            else
-                candidates+=("${REPO_DIR}/${raw_auth_path#./}")
-            fi
-        fi
     fi
 
-    local token_file=""
-    for _ in $(seq 1 100); do
-        for candidate in "${candidates[@]}"; do
-            if [[ -f "$candidate" ]]; then
-                token_file="$candidate"
-                break 2
-            fi
-        done
-        sleep 0.2
-    done
+    local -a candidates=()
+    collect_auth_token_candidates "$config_cmd" candidates
+
+    local token_file
+    token_file="$(resolve_auth_tokens_file "$config_cmd")"
 
     if [[ -n "$token_file" ]]; then
         local admin_token
@@ -169,6 +138,119 @@ print_auth_tokens_summary() {
     else
         echo "Could not locate spiderweb-config in PATH or ${INSTALL_DIR}."
     fi
+}
+
+collect_auth_token_candidates() {
+    local config_cmd="${1:-}"
+    local -n out_ref="$2"
+    out_ref=()
+    out_ref+=("${REPO_DIR}/.spiderweb-ltm/auth_tokens.json")
+
+    local config_file="${HOME}/.config/spiderweb/config.json"
+    if [[ -f "$config_file" ]]; then
+        local ltm_dir
+        ltm_dir="$(jq -r '.runtime.ltm_directory // empty' "$config_file" 2>/dev/null || true)"
+        if [[ -n "$ltm_dir" ]]; then
+            if [[ "$ltm_dir" == /* ]]; then
+                out_ref+=("${ltm_dir}/auth_tokens.json")
+            else
+                out_ref+=("${REPO_DIR}/${ltm_dir#./}/auth_tokens.json")
+            fi
+        fi
+    fi
+
+    if [[ -n "$config_cmd" ]]; then
+        local raw_auth_path
+        raw_auth_path=""
+        if raw_auth_path="$("$config_cmd" auth path 2>/dev/null | tr -d '\r' | tail -n1)"; then
+            :
+        fi
+        if [[ -n "$raw_auth_path" ]]; then
+            if [[ "$raw_auth_path" == /* ]]; then
+                out_ref+=("$raw_auth_path")
+            else
+                out_ref+=("${REPO_DIR}/${raw_auth_path#./}")
+            fi
+        fi
+    fi
+}
+
+resolve_auth_tokens_file() {
+    local config_cmd="${1:-}"
+    local attempts="${2:-100}"
+    local poll_interval="${3:-0.2}"
+    local -a candidates=()
+    collect_auth_token_candidates "$config_cmd" candidates
+
+    local token_file=""
+    for _ in $(seq 1 "$attempts"); do
+        for candidate in "${candidates[@]}"; do
+            if [[ -f "$candidate" ]]; then
+                token_file="$candidate"
+                break 2
+            fi
+        done
+        sleep "$poll_interval"
+    done
+    echo "$token_file"
+}
+
+sync_zss_auth_tokens() {
+    local config_cmd="${INSTALL_DIR}/spiderweb-config"
+    if [[ ! -x "$config_cmd" ]]; then
+        config_cmd="$(command -v spiderweb-config || true)"
+    fi
+
+    local token_file
+    token_file="$(resolve_auth_tokens_file "$config_cmd" 5 0.2)"
+    if [[ -z "$token_file" ]]; then
+        log_warn "Skipping zss auth sync: spiderweb auth token file not found yet."
+        return 0
+    fi
+
+    local admin_token
+    local user_token
+    admin_token="$(jq -r '.admin_token // empty' "$token_file" 2>/dev/null || true)"
+    user_token="$(jq -r '.user_token // empty' "$token_file" 2>/dev/null || true)"
+    if [[ -z "$admin_token" || -z "$user_token" ]]; then
+        log_warn "Skipping zss auth sync: auth token file is missing admin/user tokens."
+        return 0
+    fi
+
+    local zss_config_dir="${HOME}/.config/zss"
+    local zss_config_file="${zss_config_dir}/config.json"
+    mkdir -p "$zss_config_dir"
+
+    local tmp_file
+    tmp_file="$(mktemp)"
+    if [[ -f "$zss_config_file" ]] && jq empty "$zss_config_file" >/dev/null 2>&1; then
+        if jq \
+            --arg admin "$admin_token" \
+            --arg user "$user_token" \
+            '.admin_token = $admin
+             | .user_token = $user
+             | .active_role = (.active_role // "admin")
+             | .server_url = (.server_url // "ws://127.0.0.1:18790")' \
+            "$zss_config_file" > "$tmp_file"; then
+            mv "$tmp_file" "$zss_config_file"
+            chmod 600 "$zss_config_file" 2>/dev/null || true
+            log_success "Synced zss auth tokens from spiderweb auth store"
+            return 0
+        fi
+    fi
+
+    if ! jq -n \
+        --arg admin "$admin_token" \
+        --arg user "$user_token" \
+        --arg server "ws://127.0.0.1:18790" \
+        '{ server_url: $server, admin_token: $admin, user_token: $user, active_role: "admin" }' > "$tmp_file"; then
+        rm -f "$tmp_file"
+        log_warn "Failed to write zss auth config."
+        return 0
+    fi
+    mv "$tmp_file" "$zss_config_file"
+    chmod 600 "$zss_config_file" 2>/dev/null || true
+    log_success "Initialized zss config with current spiderweb auth tokens"
 }
 
 # Detect if we're being piped
@@ -614,6 +696,16 @@ elif [[ "$SYSTEMD_EXISTS" == "true" ]]; then
 else
     echo "To install systemd service later:"
     echo "  spiderweb-config config install-service"
+fi
+
+SYNC_ZSS_AUTH=false
+if [[ "$INSTALL_ZSS" == "true" ]]; then
+    SYNC_ZSS_AUTH=true
+elif [[ -x "${INSTALL_DIR}/zss" ]] || command -v zss >/dev/null 2>&1 || [[ -f "${HOME}/.config/zss/config.json" ]]; then
+    SYNC_ZSS_AUTH=true
+fi
+if [[ "$SYNC_ZSS_AUTH" == "true" ]]; then
+    sync_zss_auth_tokens
 fi
 
 print_auth_tokens_summary
