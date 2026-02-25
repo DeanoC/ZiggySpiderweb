@@ -29,7 +29,7 @@ pub const RuntimeConfig = struct {
     connection_queue_max: usize = 128,
     runtime_worker_threads: usize = 2,
     runtime_request_queue_max: usize = 128,
-    chat_operation_timeout_ms: u64 = 120_000,
+    chat_operation_timeout_ms: u64 = 300_000,
     control_operation_timeout_ms: u64 = 5_000,
     run_checkpoint_interval_steps: usize = 1,
     run_auto_resume_on_boot: bool = true,
@@ -127,7 +127,7 @@ const default_config =
     \\    "connection_queue_max": 128,
     \\    "runtime_worker_threads": 2,
     \\    "runtime_request_queue_max": 128,
-    \\    "chat_operation_timeout_ms": 120000,
+    \\    "chat_operation_timeout_ms": 300000,
     \\    "control_operation_timeout_ms": 5000,
     \\    "run_checkpoint_interval_steps": 1,
     \\    "run_auto_resume_on_boot": true,
@@ -217,7 +217,7 @@ pub fn init(allocator: std.mem.Allocator, config_path: ?[]const u8) !Config {
             .connection_queue_max = 128,
             .runtime_worker_threads = 2,
             .runtime_request_queue_max = 128,
-            .chat_operation_timeout_ms = 120_000,
+            .chat_operation_timeout_ms = 300_000,
             .control_operation_timeout_ms = 5_000,
             .run_checkpoint_interval_steps = 1,
             .run_auto_resume_on_boot = true,
@@ -702,7 +702,7 @@ test "Config defaults" {
     try std.testing.expectEqual(@as(usize, 16), config.runtime.connection_worker_threads);
     try std.testing.expectEqual(@as(usize, 2), config.runtime.runtime_worker_threads);
     try std.testing.expectEqual(@as(usize, 128), config.runtime.runtime_request_queue_max);
-    try std.testing.expectEqual(@as(u64, 120_000), config.runtime.chat_operation_timeout_ms);
+    try std.testing.expectEqual(@as(u64, 300_000), config.runtime.chat_operation_timeout_ms);
     try std.testing.expectEqual(@as(u64, 5_000), config.runtime.control_operation_timeout_ms);
     try std.testing.expectEqual(@as(usize, 1), config.runtime.run_checkpoint_interval_steps);
     try std.testing.expect(config.runtime.run_auto_resume_on_boot);
