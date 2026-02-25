@@ -2548,8 +2548,13 @@ pub const RuntimeServer = struct {
                         pending_tool_failure_followup = true;
                         followup_rounds += 1;
                         if (followup_rounds > MAX_PROVIDER_FOLLOWUP_ROUNDS) {
+                            const completion = try self.finalizeProviderLoopGuardFallback(
+                                &debug_frames,
+                                assistant.text,
+                                "provider_followup_cap_multi_tool_batch",
+                            );
                             deinitOwnedAssistantMessage(self.allocator, &assistant);
-                            return RuntimeServerError.ProviderToolLoopExceeded;
+                            return completion;
                         }
                         followup_requested = true;
                         deinitOwnedAssistantMessage(self.allocator, &assistant);
@@ -2667,8 +2672,13 @@ pub const RuntimeServer = struct {
                             }
 
                             if (followup_rounds > MAX_PROVIDER_FOLLOWUP_ROUNDS) {
+                                const completion = try self.finalizeProviderLoopGuardFallback(
+                                    &debug_frames,
+                                    assistant.text,
+                                    "provider_followup_cap_pre_tool_implicit_wait",
+                                );
                                 deinitOwnedAssistantMessage(self.allocator, &assistant);
-                                return RuntimeServerError.ProviderToolLoopExceeded;
+                                return completion;
                             }
 
                             followup_requested = true;
@@ -2712,8 +2722,13 @@ pub const RuntimeServer = struct {
                             deinitOwnedAssistantMessage(self.allocator, &assistant);
                             return completion;
                         }
+                        const completion = try self.finalizeProviderLoopGuardFallback(
+                            &debug_frames,
+                            assistant.text,
+                            "provider_followup_cap_post_tool_implicit_wait",
+                        );
                         deinitOwnedAssistantMessage(self.allocator, &assistant);
-                        return RuntimeServerError.ProviderToolLoopExceeded;
+                        return completion;
                     }
 
                     followup_requested = true;
@@ -2742,8 +2757,13 @@ pub const RuntimeServer = struct {
                             deinitOwnedAssistantMessage(self.allocator, &assistant);
                             return completion;
                         }
+                        const completion = try self.finalizeProviderLoopGuardFallback(
+                            &debug_frames,
+                            assistant.text,
+                            "provider_followup_cap_post_tool_error_wait",
+                        );
                         deinitOwnedAssistantMessage(self.allocator, &assistant);
-                        return RuntimeServerError.ProviderToolLoopExceeded;
+                        return completion;
                     }
 
                     followup_requested = true;
@@ -2772,8 +2792,13 @@ pub const RuntimeServer = struct {
                             deinitOwnedAssistantMessage(self.allocator, &assistant);
                             return completion;
                         }
+                        const completion = try self.finalizeProviderLoopGuardFallback(
+                            &debug_frames,
+                            assistant.text,
+                            "provider_followup_cap_followup_needed",
+                        );
                         deinitOwnedAssistantMessage(self.allocator, &assistant);
-                        return RuntimeServerError.ProviderToolLoopExceeded;
+                        return completion;
                     }
 
                     followup_requested = true;
@@ -2798,8 +2823,13 @@ pub const RuntimeServer = struct {
                             try self.appendDebugFrame(&debug_frames, job.request_id, "provider.followup", payload);
                         }
                         if (followup_rounds > MAX_PROVIDER_FOLLOWUP_ROUNDS) {
+                            const completion = try self.finalizeProviderLoopGuardFallback(
+                                &debug_frames,
+                                assistant.text,
+                                "provider_followup_cap_pre_tool_low_signal_task_complete",
+                            );
                             deinitOwnedAssistantMessage(self.allocator, &assistant);
-                            return RuntimeServerError.ProviderToolLoopExceeded;
+                            return completion;
                         }
                         followup_requested = true;
                         deinitOwnedAssistantMessage(self.allocator, &assistant);
@@ -2837,8 +2867,13 @@ pub const RuntimeServer = struct {
                             try self.appendDebugFrame(&debug_frames, job.request_id, "provider.followup", payload);
                         }
                         if (followup_rounds > MAX_PROVIDER_FOLLOWUP_ROUNDS) {
+                            const completion = try self.finalizeProviderLoopGuardFallback(
+                                &debug_frames,
+                                assistant.text,
+                                "provider_followup_cap_wait_for",
+                            );
                             deinitOwnedAssistantMessage(self.allocator, &assistant);
-                            return RuntimeServerError.ProviderToolLoopExceeded;
+                            return completion;
                         }
                         followup_requested = true;
                         deinitOwnedAssistantMessage(self.allocator, &assistant);
@@ -2863,8 +2898,13 @@ pub const RuntimeServer = struct {
                     try self.appendDebugFrame(&debug_frames, job.request_id, "provider.followup", payload);
                 }
                 if (followup_rounds > MAX_PROVIDER_FOLLOWUP_ROUNDS) {
+                    const completion = try self.finalizeProviderLoopGuardFallback(
+                        &debug_frames,
+                        assistant.text,
+                        "provider_followup_cap_unknown_directive",
+                    );
                     deinitOwnedAssistantMessage(self.allocator, &assistant);
-                    return RuntimeServerError.ProviderToolLoopExceeded;
+                    return completion;
                 }
                 followup_requested = true;
                 deinitOwnedAssistantMessage(self.allocator, &assistant);
@@ -2892,8 +2932,13 @@ pub const RuntimeServer = struct {
                 pending_tool_failure_followup = true;
                 followup_rounds += 1;
                 if (followup_rounds > MAX_PROVIDER_FOLLOWUP_ROUNDS) {
+                    const completion = try self.finalizeProviderLoopGuardFallback(
+                        &debug_frames,
+                        assistant.text,
+                        "provider_followup_cap_multi_tool_batch_legacy",
+                    );
                     deinitOwnedAssistantMessage(self.allocator, &assistant);
-                    return RuntimeServerError.ProviderToolLoopExceeded;
+                    return completion;
                 }
                 followup_requested = true;
                 deinitOwnedAssistantMessage(self.allocator, &assistant);
@@ -2990,7 +3035,11 @@ pub const RuntimeServer = struct {
             defer self.allocator.free(payload);
             try self.appendDebugFrame(&debug_frames, job.request_id, "provider.loop_exit", payload);
         }
-        return RuntimeServerError.ProviderToolLoopExceeded;
+        return self.finalizeProviderLoopGuardFallback(
+            &debug_frames,
+            "",
+            "provider_round_cap",
+        );
     }
 
     fn buildProviderInstructions(
@@ -3634,6 +3683,33 @@ pub const RuntimeServer = struct {
             .task_complete = task_complete,
             .debug_frames = owned_debug_frames,
         };
+    }
+
+    fn finalizeProviderLoopGuardFallback(
+        self: *RuntimeServer,
+        debug_frames: *std.ArrayListUnmanaged([]u8),
+        assistant_text: []const u8,
+        reason: []const u8,
+    ) !ProviderCompletion {
+        const trimmed = std.mem.trim(u8, assistant_text, " \t\r\n");
+        const fallback_text = if (trimmed.len > 0 and !isLowSignalFollowupText(trimmed))
+            trimmed
+        else
+            "I hit an internal reasoning loop while preparing that response. Please retry.";
+
+        if (debug_frames.items.len > 0) {
+            const escaped_reason = try protocol.jsonEscape(self.allocator, reason);
+            defer self.allocator.free(escaped_reason);
+            const payload = try std.fmt.allocPrint(
+                self.allocator,
+                "{{\"reason\":\"{s}\",\"fallback\":\"loop_guard_completion\"}}",
+                .{escaped_reason},
+            );
+            defer self.allocator.free(payload);
+            try self.appendDebugFrame(debug_frames, "provider-loop-guard", "provider.loop_guard_fallback", payload);
+        }
+
+        return self.finalizeProviderCompletion(debug_frames, fallback_text, true, false);
     }
 
     fn jsonObjectBool(obj: std.json.ObjectMap, field: []const u8) ?bool {

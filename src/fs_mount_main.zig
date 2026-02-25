@@ -262,6 +262,7 @@ pub fn main() !void {
 
     if (std.mem.eql(u8, command, "mount")) {
         if (remaining.items.len < 2) return error.InvalidArguments;
+        try ensurePathExists(remaining.items[1]);
         var sync_ctx: ?*WorkspaceSyncContext = null;
         var sync_thread: ?std.Thread = null;
         defer {
@@ -374,6 +375,18 @@ fn printHelp() !void {
         \\
     ;
     try std.fs.File.stdout().writeAll(help);
+}
+
+fn ensurePathExists(path: []const u8) !void {
+    if (std.fs.path.isAbsolute(path)) {
+        var root = try std.fs.openDirAbsolute("/", .{});
+        defer root.close();
+        const rel = std.mem.trimLeft(u8, path, "/");
+        if (rel.len == 0) return;
+        try root.makePath(rel);
+        return;
+    }
+    try std.fs.cwd().makePath(path);
 }
 
 const WorkspaceEndpointSpec = struct {
