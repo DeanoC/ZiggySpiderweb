@@ -2697,6 +2697,9 @@ pub const NodeOps = struct {
         if (export_cfg.source_kind == .gdrive) {
             return self.opGdriveLookup(parent, name);
         }
+        if (isHiddenLocalExportChild(export_cfg.source_kind, name)) {
+            return DispatchResult.failure(fs_protocol.Errno.ENOENT, "file not found");
+        }
         const looked = sourceLookupChildAbsolute(
             export_cfg.source_kind,
             self.allocator,
@@ -2860,7 +2863,7 @@ pub const NodeOps = struct {
         const dir_id = req.node orelse return DispatchResult.failure(fs_protocol.Errno.EINVAL, "READDIRP requires node");
         const cookie = fs_protocol.getOptionalU64(req.args, "cookie", 0) catch return DispatchResult.failure(fs_protocol.Errno.EINVAL, "cookie must be u64");
         const requested_max = fs_protocol.getOptionalU32(req.args, "max", 128) catch return DispatchResult.failure(fs_protocol.Errno.EINVAL, "max must be u32");
-        const max_entries = @min(requested_max, 4096);
+        const max_entries = @min(requested_max, 16384);
 
         const ctx = self.resolveNode(dir_id) catch |err| return mapError(err);
         const export_cfg = self.exports.items[ctx.export_index];
@@ -2897,14 +2900,16 @@ pub const NodeOps = struct {
 
         var it = dir.iterate();
         while (it.next() catch |err| return mapError(err)) |entry| {
-            defer count += 1;
-            if (count < cookie) continue;
+            if (!isValidChildName(entry.name)) continue;
+            if (isHiddenLocalExportChild(export_cfg.source_kind, entry.name)) continue;
+            if (count < cookie) {
+                count += 1;
+                continue;
+            }
             if (emitted >= max_entries) {
                 has_more = true;
                 break;
             }
-
-            if (!isValidChildName(entry.name)) continue;
 
             const looked = sourceLookupChildAbsolute(
                 export_cfg.source_kind,
@@ -2924,6 +2929,7 @@ pub const NodeOps = struct {
                 return DispatchResult.failure(fs_protocol.Errno.EIO, "out of memory");
             };
             emitted += 1;
+            count += 1;
         }
 
         return self.finishReaddirPayload(&payload, cookie, emitted, !has_more, dir_stat);
@@ -4092,6 +4098,13 @@ fn isValidChildName(name: []const u8) bool {
     if (std.mem.indexOfScalar(u8, name, '\\')) |_| return false;
     if (std.mem.indexOfScalar(u8, name, 0)) |_| return false;
     return true;
+}
+
+fn isHiddenLocalExportChild(source_kind: fs_source_adapter.SourceKind, name: []const u8) bool {
+    return switch (source_kind) {
+        .namespace, .gdrive => false,
+        else => std.mem.eql(u8, name, ".spiderweb-sandbox"),
+    };
 }
 
 fn namespaceJoinPath(allocator: std.mem.Allocator, parent_path: []const u8, name: []const u8) ![]u8 {
@@ -5284,6 +5297,126 @@ test "fs_node_ops: readdir includes regular files" {
 
     try std.testing.expectEqual(fs_protocol.Errno.SUCCESS, readdir_result.err_no);
     try std.testing.expect(std.mem.indexOf(u8, readdir_result.result_json.?, "\"hello.txt\"") != null);
+}
+
+test "fs_node_ops: local export hides sandbox runtime folder" {
+    const allocator = std.testing.allocator;
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+
+    try temp.dir.writeFile(.{ .sub_path = "hello.txt", .data = "hello" });
+    try temp.dir.makePath(".spiderweb-sandbox/mounts/system");
+    try temp.dir.writeFile(.{ .sub_path = ".spiderweb-sandbox/mounts/system/ignore.txt", .data = "hidden" });
+
+    const root = try temp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+
+    var node_ops = try NodeOps.init(allocator, &[_]ExportSpec{
+        .{ .name = "work", .path = root, .ro = false },
+    });
+    defer node_ops.deinit();
+
+    var exports_req = try fs_protocol.parseRequest(allocator, "{\"t\":\"req\",\"id\":1,\"op\":\"EXPORTS\"}");
+    defer exports_req.deinit();
+    var exports_result = node_ops.dispatch(exports_req);
+    defer exports_result.deinit(allocator);
+
+    var exports_parsed = try std.json.parseFromSlice(std.json.Value, allocator, exports_result.result_json.?, .{});
+    defer exports_parsed.deinit();
+    const root_id = exports_parsed.value.object.get("exports").?.array.items[0].object.get("root").?.integer;
+
+    const readdir_json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"t\":\"req\",\"id\":2,\"op\":\"READDIRP\",\"node\":{d},\"a\":{{\"cookie\":0,\"max\":128}}}}",
+        .{root_id},
+    );
+    defer allocator.free(readdir_json);
+    var readdir_req = try fs_protocol.parseRequest(allocator, readdir_json);
+    defer readdir_req.deinit();
+    var readdir_result = node_ops.dispatch(readdir_req);
+    defer readdir_result.deinit(allocator);
+    try std.testing.expectEqual(fs_protocol.Errno.SUCCESS, readdir_result.err_no);
+    try std.testing.expect(std.mem.indexOf(u8, readdir_result.result_json.?, "\"hello.txt\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, readdir_result.result_json.?, "\".spiderweb-sandbox\"") == null);
+
+    const lookup_json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"t\":\"req\",\"id\":3,\"op\":\"LOOKUP\",\"node\":{d},\"a\":{{\"name\":\".spiderweb-sandbox\"}}}}",
+        .{root_id},
+    );
+    defer allocator.free(lookup_json);
+    var lookup_req = try fs_protocol.parseRequest(allocator, lookup_json);
+    defer lookup_req.deinit();
+    const lookup_result = node_ops.dispatch(lookup_req);
+    try std.testing.expectEqual(fs_protocol.Errno.ENOENT, lookup_result.err_no);
+}
+
+test "fs_node_ops: local readdir paging skips hidden entries without duplicates" {
+    const allocator = std.testing.allocator;
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+
+    try temp.dir.writeFile(.{ .sub_path = "alpha.txt", .data = "a" });
+    try temp.dir.writeFile(.{ .sub_path = "beta.txt", .data = "b" });
+    try temp.dir.makePath(".spiderweb-sandbox/mounts/system");
+
+    const root = try temp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+
+    var node_ops = try NodeOps.init(allocator, &[_]ExportSpec{
+        .{ .name = "work", .path = root, .ro = false },
+    });
+    defer node_ops.deinit();
+
+    var exports_req = try fs_protocol.parseRequest(allocator, "{\"t\":\"req\",\"id\":1,\"op\":\"EXPORTS\"}");
+    defer exports_req.deinit();
+    var exports_result = node_ops.dispatch(exports_req);
+    defer exports_result.deinit(allocator);
+    var exports_parsed = try std.json.parseFromSlice(std.json.Value, allocator, exports_result.result_json.?, .{});
+    defer exports_parsed.deinit();
+    const root_id = exports_parsed.value.object.get("exports").?.array.items[0].object.get("root").?.integer;
+
+    var seen = std.StringHashMapUnmanaged(void){};
+    defer {
+        var it = seen.keyIterator();
+        while (it.next()) |key| allocator.free(key.*);
+        seen.deinit(allocator);
+    }
+
+    var cookie: u64 = 0;
+    var page: usize = 0;
+    var done = false;
+    while (!done and page < 32) : (page += 1) {
+        const req_json = try std.fmt.allocPrint(
+            allocator,
+            "{{\"t\":\"req\",\"id\":{d},\"op\":\"READDIRP\",\"node\":{d},\"a\":{{\"cookie\":{d},\"max\":1}}}}",
+            .{ page + 10, root_id, cookie },
+        );
+        defer allocator.free(req_json);
+        var readdir_req = try fs_protocol.parseRequest(allocator, req_json);
+        defer readdir_req.deinit();
+        var readdir_result = node_ops.dispatch(readdir_req);
+        defer readdir_result.deinit(allocator);
+        try std.testing.expectEqual(fs_protocol.Errno.SUCCESS, readdir_result.err_no);
+
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, readdir_result.result_json.?, .{});
+        defer parsed.deinit();
+        const ents = parsed.value.object.get("ents").?.array.items;
+        for (ents) |entry| {
+            const name = entry.object.get("name").?.string;
+            try std.testing.expect(!std.mem.eql(u8, name, ".spiderweb-sandbox"));
+            if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
+            try std.testing.expect(!seen.contains(name));
+            try seen.put(allocator, try allocator.dupe(u8, name), {});
+        }
+
+        cookie = @intCast(parsed.value.object.get("next").?.integer);
+        done = parsed.value.object.get("eof").?.bool;
+    }
+
+    try std.testing.expect(done);
+    try std.testing.expect(seen.contains("alpha.txt"));
+    try std.testing.expect(seen.contains("beta.txt"));
 }
 
 test "fs_node_ops: filesystem watcher reports out-of-band mutations" {

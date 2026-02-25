@@ -35,6 +35,7 @@ const local_node_fs_url_env = "SPIDERWEB_LOCAL_NODE_FS_URL";
 const local_node_name_env = "SPIDERWEB_LOCAL_NODE_NAME";
 const local_node_lease_ttl_env = "SPIDERWEB_LOCAL_NODE_LEASE_TTL_MS";
 const local_node_heartbeat_ms_env = "SPIDERWEB_LOCAL_NODE_HEARTBEAT_MS";
+const local_node_watcher_enabled_env = "SPIDERWEB_LOCAL_NODE_WATCHER_ENABLED";
 const system_agent_id = "mother";
 const system_project_id = fs_control_plane.spider_web_project_id;
 const local_node_default_workspace_export_name = "system-workspace";
@@ -2751,7 +2752,8 @@ const AgentRuntimeRegistry = struct {
         const overlaps_runtime_root = pathIsAncestorOrEqual(export_path, runtime_root_trimmed) or
             pathIsAncestorOrEqual(runtime_root_trimmed, export_path);
         const watch_overlaps_sandbox = overlaps_mounts_root or overlaps_runtime_root;
-        if (watch_overlaps_sandbox) {
+        const watcher_requested = parseBoolEnv(self.allocator, local_node_watcher_enabled_env, false);
+        if (watcher_requested and watch_overlaps_sandbox) {
             std.log.warn(
                 "local fs node watcher disabled: export path {s} overlaps sandbox roots mounts={s} runtime={s}",
                 .{ export_path, mounts_root_trimmed, runtime_root_trimmed },
@@ -2844,7 +2846,7 @@ const AgentRuntimeRegistry = struct {
             fs_url,
             lease_ttl_ms,
             heartbeat_ms,
-            !watch_overlaps_sandbox,
+            watcher_requested and !watch_overlaps_sandbox,
         );
         errdefer local_node.deinit(&self.control_plane);
         try local_node.startRegistrationAndHeartbeat(&self.control_plane);

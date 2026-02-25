@@ -253,7 +253,7 @@ pub const FuseAdapter = struct {
         try appendArgZ(self.allocator, &argv, "spiderweb-fs-mount");
         try appendArgZ(self.allocator, &argv, "-f");
         try appendArgZ(self.allocator, &argv, "-o");
-        try appendArgZ(self.allocator, &argv, "default_permissions");
+        try appendArgZ(self.allocator, &argv, "default_permissions,attr_timeout=120,entry_timeout=120,negative_timeout=10");
         try appendArgZ(self.allocator, &argv, mountpoint);
 
         active_adapter = self;
@@ -376,7 +376,7 @@ fn cReaddir(
     const path = std.mem.span(path_c);
 
     const cookie: u64 = if (off <= 0) 0 else @intCast(off);
-    const listing = adapter.readdir(path, cookie, 4096) catch |err| return toFuseError(err);
+    const listing = adapter.readdir(path, cookie, 16384) catch |err| return toFuseError(err);
     defer adapter.allocator.free(listing);
 
     var parsed = std.json.parseFromSlice(std.json.Value, adapter.allocator, listing, .{}) catch return -fs_protocol.Errno.EIO;
@@ -396,7 +396,17 @@ fn cReaddir(
 
         const next_cookie = std.math.add(u64, cookie, idx + 1) catch std.math.maxInt(u64);
         const next_off: c.off_t = std.math.cast(c.off_t, next_cookie) orelse 0;
-        if (filler.?(buf, @ptrCast(name_z.ptr), null, next_off, c.FUSE_FILL_DIR_DEFAULTS) != 0) break;
+        var stat_buf: c.struct_stat = std.mem.zeroes(c.struct_stat);
+        var stat_ptr: [*c]const c.struct_stat = null;
+        if (entry.object.get("attr")) |attr_val| {
+            if (attr_val == .object) {
+                if (parseAttrFromObject(attr_val.object)) |attr| {
+                    fillStatFromParsedAttr(&stat_buf, attr);
+                    stat_ptr = @ptrCast(&stat_buf);
+                } else |_| {}
+            }
+        }
+        if (filler.?(buf, @ptrCast(name_z.ptr), stat_ptr, next_off, c.FUSE_FILL_DIR_DEFAULTS) != 0) break;
         idx += 1;
     }
     return 0;
@@ -699,30 +709,7 @@ const ParsedStatfs = struct {
 
 fn parseAndFillStat(allocator: std.mem.Allocator, st: [*c]c.struct_stat, attr_json: []const u8) !void {
     const attr = try parseAttr(allocator, attr_json);
-    st.* = std.mem.zeroes(c.struct_stat);
-
-    if (@hasField(c.struct_stat, "st_ino")) st.*.st_ino = @intCast(attr.id);
-    if (@hasField(c.struct_stat, "st_mode")) st.*.st_mode = @intCast(attr.mode);
-    if (@hasField(c.struct_stat, "st_nlink")) st.*.st_nlink = @intCast(attr.nlink);
-    if (@hasField(c.struct_stat, "st_uid")) st.*.st_uid = @intCast(attr.uid);
-    if (@hasField(c.struct_stat, "st_gid")) st.*.st_gid = @intCast(attr.gid);
-    if (@hasField(c.struct_stat, "st_size")) st.*.st_size = @intCast(attr.size);
-
-    if (@hasField(c.struct_stat, "st_atim")) {
-        st.*.st_atim = makeTimespec(@TypeOf(st.*.st_atim), attr.atime_ns);
-    } else if (@hasField(c.struct_stat, "st_atimespec")) {
-        st.*.st_atimespec = makeTimespec(@TypeOf(st.*.st_atimespec), attr.atime_ns);
-    }
-    if (@hasField(c.struct_stat, "st_mtim")) {
-        st.*.st_mtim = makeTimespec(@TypeOf(st.*.st_mtim), attr.mtime_ns);
-    } else if (@hasField(c.struct_stat, "st_mtimespec")) {
-        st.*.st_mtimespec = makeTimespec(@TypeOf(st.*.st_mtimespec), attr.mtime_ns);
-    }
-    if (@hasField(c.struct_stat, "st_ctim")) {
-        st.*.st_ctim = makeTimespec(@TypeOf(st.*.st_ctim), attr.ctime_ns);
-    } else if (@hasField(c.struct_stat, "st_ctimespec")) {
-        st.*.st_ctimespec = makeTimespec(@TypeOf(st.*.st_ctimespec), attr.ctime_ns);
-    }
+    fillStatFromParsedAttr(st, attr);
 }
 
 fn parseAndFillStatvfs(allocator: std.mem.Allocator, st: [*c]c.struct_statvfs, statfs_json: []const u8) !void {
@@ -756,17 +743,48 @@ fn parseAttr(allocator: std.mem.Allocator, json: []const u8) !ParsedAttr {
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidAttrJson;
 
+    return parseAttrFromObject(parsed.value.object);
+}
+
+fn parseAttrFromObject(obj: std.json.ObjectMap) !ParsedAttr {
     return .{
-        .id = try readRequiredU64(parsed.value.object, "id"),
-        .mode = @intCast(try readRequiredU64(parsed.value.object, "m")),
-        .nlink = @intCast(try readRequiredU64(parsed.value.object, "n")),
-        .uid = @intCast(try readRequiredU64(parsed.value.object, "u")),
-        .gid = @intCast(try readRequiredU64(parsed.value.object, "g")),
-        .size = try readRequiredU64(parsed.value.object, "sz"),
-        .atime_ns = try readRequiredI64(parsed.value.object, "at"),
-        .mtime_ns = try readRequiredI64(parsed.value.object, "mt"),
-        .ctime_ns = try readRequiredI64(parsed.value.object, "ct"),
+        .id = try readRequiredU64(obj, "id"),
+        .mode = @intCast(try readRequiredU64(obj, "m")),
+        .nlink = @intCast(try readRequiredU64(obj, "n")),
+        .uid = @intCast(try readRequiredU64(obj, "u")),
+        .gid = @intCast(try readRequiredU64(obj, "g")),
+        .size = try readRequiredU64(obj, "sz"),
+        .atime_ns = try readRequiredI64(obj, "at"),
+        .mtime_ns = try readRequiredI64(obj, "mt"),
+        .ctime_ns = try readRequiredI64(obj, "ct"),
     };
+}
+
+fn fillStatFromParsedAttr(st: [*c]c.struct_stat, attr: ParsedAttr) void {
+    st.* = std.mem.zeroes(c.struct_stat);
+
+    if (@hasField(c.struct_stat, "st_ino")) st.*.st_ino = @intCast(attr.id);
+    if (@hasField(c.struct_stat, "st_mode")) st.*.st_mode = @intCast(attr.mode);
+    if (@hasField(c.struct_stat, "st_nlink")) st.*.st_nlink = @intCast(attr.nlink);
+    if (@hasField(c.struct_stat, "st_uid")) st.*.st_uid = @intCast(attr.uid);
+    if (@hasField(c.struct_stat, "st_gid")) st.*.st_gid = @intCast(attr.gid);
+    if (@hasField(c.struct_stat, "st_size")) st.*.st_size = @intCast(attr.size);
+
+    if (@hasField(c.struct_stat, "st_atim")) {
+        st.*.st_atim = makeTimespec(@TypeOf(st.*.st_atim), attr.atime_ns);
+    } else if (@hasField(c.struct_stat, "st_atimespec")) {
+        st.*.st_atimespec = makeTimespec(@TypeOf(st.*.st_atimespec), attr.atime_ns);
+    }
+    if (@hasField(c.struct_stat, "st_mtim")) {
+        st.*.st_mtim = makeTimespec(@TypeOf(st.*.st_mtim), attr.mtime_ns);
+    } else if (@hasField(c.struct_stat, "st_mtimespec")) {
+        st.*.st_mtimespec = makeTimespec(@TypeOf(st.*.st_mtimespec), attr.mtime_ns);
+    }
+    if (@hasField(c.struct_stat, "st_ctim")) {
+        st.*.st_ctim = makeTimespec(@TypeOf(st.*.st_ctim), attr.ctime_ns);
+    } else if (@hasField(c.struct_stat, "st_ctimespec")) {
+        st.*.st_ctimespec = makeTimespec(@TypeOf(st.*.st_ctimespec), attr.ctime_ns);
+    }
 }
 
 fn parseStatfs(allocator: std.mem.Allocator, json: []const u8) !ParsedStatfs {

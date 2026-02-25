@@ -180,7 +180,18 @@ fn resolveSandboxPathDefaults(allocator: std.mem.Allocator) !SandboxPathDefaults
     }
     defer allocator.free(home.?);
 
-    const sandbox_root = try std.fs.path.join(allocator, &.{ home.?, ".local", "share", "ziggy-spiderweb", ".spiderweb-sandbox" });
+    const xdg_state_home = std.process.getEnvVarOwned(allocator, "XDG_STATE_HOME") catch null;
+    defer if (xdg_state_home) |value| allocator.free(value);
+
+    const sandbox_root = blk: {
+        if (xdg_state_home) |raw_state_home| {
+            const state_home = std.mem.trim(u8, raw_state_home, " \t\r\n");
+            if (state_home.len > 0) {
+                break :blk try std.fs.path.join(allocator, &.{ state_home, "ziggy-spiderweb", "sandbox" });
+            }
+        }
+        break :blk try std.fs.path.join(allocator, &.{ home.?, ".local", "state", "ziggy-spiderweb", "sandbox" });
+    };
     defer allocator.free(sandbox_root);
     return .{
         .mounts_root = try std.fs.path.join(allocator, &.{ sandbox_root, "mounts" }),
