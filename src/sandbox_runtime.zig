@@ -197,88 +197,80 @@ pub const SandboxRuntime = struct {
         };
         defer allocator.free(request_line);
 
-        var attempt: usize = 0;
-        while (attempt < 2) : (attempt += 1) {
-            if (!processIsAlive(self.child.id)) {
-                self.restartChildRuntime() catch |err| {
-                    return toolBridgeFailureOwned(
-                        allocator,
-                        std.fmt.allocPrint(allocator, "sandbox child restart failed before request: {s}", .{@errorName(err)}) catch null,
-                    );
-                };
-            }
-
-            const child_stdin = self.child.stdin orelse return toolBridgeFailure(allocator, "sandbox child stdin pipe is unavailable");
-            const child_stdout = self.child.stdout orelse return toolBridgeFailure(allocator, "sandbox child stdout pipe is unavailable");
-
-            child_stdin.writeAll(request_line) catch |err| {
-                if (attempt == 0 and isRecoverableBridgeError(err)) {
-                    self.restartChildRuntime() catch |restart_err| {
-                        return toolBridgeFailureOwned(
-                            allocator,
-                            std.fmt.allocPrint(allocator, "sandbox tool request write failed: {s}; restart failed: {s}", .{ @errorName(err), @errorName(restart_err) }) catch null,
-                        );
-                    };
-                    continue;
-                }
+        if (!processIsAlive(self.child.id)) {
+            self.restartChildRuntime() catch |err| {
                 return toolBridgeFailureOwned(
                     allocator,
-                    std.fmt.allocPrint(allocator, "sandbox tool request write failed: {s}", .{@errorName(err)}) catch null,
+                    std.fmt.allocPrint(allocator, "sandbox child restart failed before request: {s}", .{@errorName(err)}) catch null,
                 );
             };
-            child_stdin.writeAll("\n") catch |err| {
-                if (attempt == 0 and isRecoverableBridgeError(err)) {
-                    self.restartChildRuntime() catch |restart_err| {
-                        return toolBridgeFailureOwned(
-                            allocator,
-                            std.fmt.allocPrint(allocator, "sandbox tool request newline failed: {s}; restart failed: {s}", .{ @errorName(err), @errorName(restart_err) }) catch null,
-                        );
-                    };
-                    continue;
-                }
-                return toolBridgeFailureOwned(
-                    allocator,
-                    std.fmt.allocPrint(allocator, "sandbox tool request newline failed: {s}", .{@errorName(err)}) catch null,
-                );
-            };
-
-            const response_line = readLineAlloc(allocator, child_stdout, max_ipc_line_bytes) catch |err| {
-                if (attempt == 0 and isRecoverableBridgeError(err)) {
-                    self.restartChildRuntime() catch |restart_err| {
-                        return toolBridgeFailureOwned(
-                            allocator,
-                            std.fmt.allocPrint(allocator, "sandbox tool response read failed: {s}; restart failed: {s}", .{ @errorName(err), @errorName(restart_err) }) catch null,
-                        );
-                    };
-                    continue;
-                }
-                return toolBridgeFailureOwned(
-                    allocator,
-                    std.fmt.allocPrint(allocator, "sandbox tool response read failed: {s}", .{@errorName(err)}) catch null,
-                );
-            };
-            defer allocator.free(response_line);
-
-            var parsed_result = parseToolResponseLine(allocator, response_line) catch |err| {
-                return toolBridgeFailureOwned(
-                    allocator,
-                    std.fmt.allocPrint(allocator, "sandbox tool response parse failed: {s}", .{@errorName(err)}) catch null,
-                );
-            };
-            if (attempt == 0 and shouldRestartOnToolFailure(parsed_result)) {
-                parsed_result.deinit(allocator);
-                self.restartMountAndChild() catch |restart_err| {
-                    return toolBridgeFailureOwned(
-                        allocator,
-                        std.fmt.allocPrint(allocator, "sandbox mount/runtime restart failed: {s}", .{@errorName(restart_err)}) catch null,
-                    );
-                };
-                continue;
-            }
-            return parsed_result;
         }
 
-        return toolBridgeFailure(allocator, "sandbox tool bridge failed");
+        const child_stdin = self.child.stdin orelse return toolBridgeFailure(allocator, "sandbox child stdin pipe is unavailable");
+        const child_stdout = self.child.stdout orelse return toolBridgeFailure(allocator, "sandbox child stdout pipe is unavailable");
+
+        child_stdin.writeAll(request_line) catch |err| {
+            if (isRecoverableBridgeError(err)) {
+                self.restartChildRuntime() catch |restart_err| {
+                    return toolBridgeFailureOwned(
+                        allocator,
+                        std.fmt.allocPrint(allocator, "sandbox tool request write failed: {s}; restart failed: {s}", .{ @errorName(err), @errorName(restart_err) }) catch null,
+                    );
+                };
+            }
+            return toolBridgeFailureOwned(
+                allocator,
+                std.fmt.allocPrint(allocator, "sandbox tool request write failed: {s}", .{@errorName(err)}) catch null,
+            );
+        };
+        child_stdin.writeAll("\n") catch |err| {
+            if (isRecoverableBridgeError(err)) {
+                self.restartChildRuntime() catch |restart_err| {
+                    return toolBridgeFailureOwned(
+                        allocator,
+                        std.fmt.allocPrint(allocator, "sandbox tool request newline failed: {s}; restart failed: {s}", .{ @errorName(err), @errorName(restart_err) }) catch null,
+                    );
+                };
+            }
+            return toolBridgeFailureOwned(
+                allocator,
+                std.fmt.allocPrint(allocator, "sandbox tool request newline failed: {s}", .{@errorName(err)}) catch null,
+            );
+        };
+
+        const response_line = readLineAlloc(allocator, child_stdout, max_ipc_line_bytes) catch |err| {
+            if (isRecoverableBridgeError(err)) {
+                self.restartChildRuntime() catch |restart_err| {
+                    return toolBridgeFailureOwned(
+                        allocator,
+                        std.fmt.allocPrint(allocator, "sandbox tool response read failed: {s}; restart failed: {s}", .{ @errorName(err), @errorName(restart_err) }) catch null,
+                    );
+                };
+            }
+            return toolBridgeFailureOwned(
+                allocator,
+                std.fmt.allocPrint(allocator, "sandbox tool response read failed: {s}", .{@errorName(err)}) catch null,
+            );
+        };
+        defer allocator.free(response_line);
+
+        var parsed_result = parseToolResponseLine(allocator, response_line) catch |err| {
+            return toolBridgeFailureOwned(
+                allocator,
+                std.fmt.allocPrint(allocator, "sandbox tool response parse failed: {s}", .{@errorName(err)}) catch null,
+            );
+        };
+        if (shouldRestartOnToolFailure(parsed_result)) {
+            parsed_result.deinit(allocator);
+            self.restartMountAndChild() catch |restart_err| {
+                return toolBridgeFailureOwned(
+                    allocator,
+                    std.fmt.allocPrint(allocator, "sandbox mount/runtime restart failed: {s}", .{@errorName(restart_err)}) catch null,
+                );
+            };
+            return toolBridgeFailure(allocator, "sandbox runtime restarted after tool failure; request was not retried");
+        }
+        return parsed_result;
     }
 
     fn restartChildRuntime(self: *SandboxRuntime) !void {
@@ -438,6 +430,7 @@ fn cleanupStaleAgentMounts(
     }
 }
 
+
 fn resolveWorkspaceBindSourcePath(
     allocator: std.mem.Allocator,
     workspace_mount_path: []const u8,
@@ -591,14 +584,6 @@ fn spawnSandboxChild(
     try args.append(allocator, "/tmp");
     try args.append(allocator, "--tmpfs");
     try args.append(allocator, sandbox_namespace_root);
-    try args.append(allocator, "--dir");
-    try args.append(allocator, "/underworld/meta");
-    try args.append(allocator, "--dir");
-    try args.append(allocator, "/underworld/capabilities");
-    try args.append(allocator, "--dir");
-    try args.append(allocator, "/underworld/jobs");
-    try args.append(allocator, "--dir");
-    try args.append(allocator, sandbox_workspace_path);
     try args.append(allocator, "--ro-bind");
     try args.append(allocator, "/usr");
     try args.append(allocator, "/usr");
@@ -622,7 +607,7 @@ fn spawnSandboxChild(
     try args.append(allocator, child_dir);
     try args.append(allocator, "--bind");
     try args.append(allocator, workspace_bind_source_path);
-    try args.append(allocator, sandbox_workspace_path);
+    try args.append(allocator, sandbox_namespace_root);
     try args.append(allocator, "--chdir");
     try args.append(allocator, sandbox_namespace_root);
     try args.append(allocator, "--setenv");

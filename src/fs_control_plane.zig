@@ -10,7 +10,7 @@ pub const spider_web_project_id = "spider-web";
 const spider_web_project_name = "Spider Web";
 const spider_web_project_status = "active";
 const spider_web_project_vision = "System project for Spiderweb control and host integrations";
-const spider_web_project_mount_path = "/";
+const spider_web_workspace_mount_path = "/workspace";
 const spider_web_project_kind_name = "spider_web_builtin";
 const normal_project_kind_name = "normal";
 const default_primary_agent_id = "default";
@@ -35,6 +35,11 @@ pub const ControlPlaneError = error{
     ProjectAssignmentForbidden,
     MountConflict,
     MountNotFound,
+};
+
+pub const SpiderWebMountSpec = struct {
+    mount_path: []const u8,
+    export_name: []const u8,
 };
 
 const Invite = struct {
@@ -310,32 +315,75 @@ pub const ControlPlane = struct {
     }
 
     pub fn ensureSpiderWebMount(self: *ControlPlane, node_id: []const u8, export_name: []const u8) !void {
+        const mount_specs = [_]SpiderWebMountSpec{
+            .{ .mount_path = spider_web_workspace_mount_path, .export_name = export_name },
+        };
+        return self.ensureSpiderWebMounts(node_id, &mount_specs);
+    }
+
+    pub fn ensureSpiderWebMounts(
+        self: *ControlPlane,
+        node_id: []const u8,
+        mount_specs: []const SpiderWebMountSpec,
+    ) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
         const now_ms = std.time.milliTimestamp();
         _ = self.reapExpiredLeasesLocked(now_ms);
         try validateIdentifier(node_id, 128);
-        try validateExportName(export_name);
+        if (mount_specs.len == 0) return ControlPlaneError.MissingField;
         if (!self.nodes.contains(node_id)) return ControlPlaneError.NodeNotFound;
         try self.ensureBuiltinSpiderWebProjectLocked(now_ms);
         const project = self.projects.getPtr(spider_web_project_id) orelse return ControlPlaneError.ProjectNotFound;
 
-        var unchanged = false;
-        if (project.mounts.items.len == 1) {
-            const only_mount = project.mounts.items[0];
-            unchanged = std.mem.eql(u8, only_mount.mount_path, spider_web_project_mount_path) and
-                std.mem.eql(u8, only_mount.node_id, node_id) and
-                std.mem.eql(u8, only_mount.export_name, export_name);
+        var normalized_paths = std.ArrayListUnmanaged([]u8){};
+        defer {
+            for (normalized_paths.items) |path| self.allocator.free(path);
+            normalized_paths.deinit(self.allocator);
+        }
+
+        for (mount_specs) |spec| {
+            try validateExportName(spec.export_name);
+            const normalized = try normalizeMountPath(self.allocator, spec.mount_path);
+            errdefer self.allocator.free(normalized);
+            for (normalized_paths.items) |existing| {
+                if (std.mem.eql(u8, existing, normalized)) {
+                    self.allocator.free(normalized);
+                    return ControlPlaneError.MountConflict;
+                }
+                if (mountPathsOverlap(existing, normalized)) {
+                    self.allocator.free(normalized);
+                    return ControlPlaneError.MountConflict;
+                }
+            }
+            try normalized_paths.append(self.allocator, normalized);
+        }
+
+        var unchanged = project.mounts.items.len == mount_specs.len;
+        if (unchanged) {
+            for (project.mounts.items, 0..) |existing, idx| {
+                const expected_path = normalized_paths.items[idx];
+                const expected_export = mount_specs[idx].export_name;
+                if (!std.mem.eql(u8, existing.mount_path, expected_path) or
+                    !std.mem.eql(u8, existing.node_id, node_id) or
+                    !std.mem.eql(u8, existing.export_name, expected_export))
+                {
+                    unchanged = false;
+                    break;
+                }
+            }
         }
         if (unchanged) return;
 
         for (project.mounts.items) |*mount| mount.deinit(self.allocator);
         project.mounts.clearRetainingCapacity();
-        try project.mounts.append(self.allocator, .{
-            .mount_path = try self.allocator.dupe(u8, spider_web_project_mount_path),
-            .node_id = try self.allocator.dupe(u8, node_id),
-            .export_name = try self.allocator.dupe(u8, export_name),
-        });
+        for (mount_specs, 0..) |spec, idx| {
+            try project.mounts.append(self.allocator, .{
+                .mount_path = try self.allocator.dupe(u8, normalized_paths.items[idx]),
+                .node_id = try self.allocator.dupe(u8, node_id),
+                .export_name = try self.allocator.dupe(u8, spec.export_name),
+            });
+        }
         project.updated_at_ms = now_ms;
         self.mount_sets_total +%= 1;
         self.persistSnapshotBestEffortLocked();
@@ -2931,8 +2979,35 @@ test "fs_control_plane: builtin spider web mount can be bound from local node" {
     const status = try plane.workspaceStatus("default", "{\"project_id\":\"spider-web\"}");
     defer allocator.free(status);
     try std.testing.expect(std.mem.indexOf(u8, status, "\"project_id\":\"spider-web\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, status, "\"mount_path\":\"/\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status, "\"mount_path\":\"/workspace\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, status, "\"export_name\":\"spider-web-root\"") != null);
+}
+
+test "fs_control_plane: builtin spider web mounts support namespace topology" {
+    const allocator = std.testing.allocator;
+    var plane = ControlPlane.init(allocator);
+    defer plane.deinit();
+
+    const joined = try plane.ensureNode("spiderweb-local", "ws://127.0.0.1:18891/v2/fs", 60_000);
+    defer allocator.free(joined);
+    var parsed_join = try std.json.parseFromSlice(std.json.Value, allocator, joined, .{});
+    defer parsed_join.deinit();
+    const node_id = parsed_join.value.object.get("node_id").?.string;
+
+    const mounts = [_]SpiderWebMountSpec{
+        .{ .mount_path = "/meta", .export_name = "meta" },
+        .{ .mount_path = "/capabilities", .export_name = "capabilities" },
+        .{ .mount_path = "/jobs", .export_name = "jobs" },
+        .{ .mount_path = "/workspace", .export_name = "workspace" },
+    };
+    try plane.ensureSpiderWebMounts(node_id, &mounts);
+
+    const status = try plane.workspaceStatus("default", "{\"project_id\":\"spider-web\"}");
+    defer allocator.free(status);
+    try std.testing.expect(std.mem.indexOf(u8, status, "\"mount_path\":\"/meta\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status, "\"mount_path\":\"/capabilities\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status, "\"mount_path\":\"/jobs\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status, "\"mount_path\":\"/workspace\"") != null);
 }
 
 test "fs_control_plane: invite join lease flow works" {

@@ -35,7 +35,14 @@ const local_node_fs_url_env = "SPIDERWEB_LOCAL_NODE_FS_URL";
 const local_node_name_env = "SPIDERWEB_LOCAL_NODE_NAME";
 const local_node_lease_ttl_env = "SPIDERWEB_LOCAL_NODE_LEASE_TTL_MS";
 const local_node_heartbeat_ms_env = "SPIDERWEB_LOCAL_NODE_HEARTBEAT_MS";
-const local_node_default_export_name = "spider-web-root";
+const local_node_default_workspace_export_name = "spider-web-workspace";
+const local_node_meta_export_name = "spider-web-meta";
+const local_node_capabilities_export_name = "spider-web-capabilities";
+const local_node_jobs_export_name = "spider-web-jobs";
+const local_node_mount_meta = "/meta";
+const local_node_mount_capabilities = "/capabilities";
+const local_node_mount_jobs = "/jobs";
+const local_node_mount_workspace = "/workspace";
 const control_operator_token_env = "SPIDERWEB_CONTROL_OPERATOR_TOKEN";
 const control_project_scope_token_env = "SPIDERWEB_CONTROL_PROJECT_SCOPE_TOKEN";
 const control_node_scope_token_env = "SPIDERWEB_CONTROL_NODE_SCOPE_TOKEN";
@@ -522,12 +529,23 @@ const AuditRecord = struct {
     }
 };
 
+const LocalFsMountSpec = struct {
+    mount_path: []u8,
+    export_name: []u8,
+
+    fn deinit(self: *LocalFsMountSpec, allocator: std.mem.Allocator) void {
+        allocator.free(self.mount_path);
+        allocator.free(self.export_name);
+        self.* = undefined;
+    }
+};
+
 const LocalFsNode = struct {
     allocator: std.mem.Allocator,
     service: fs_node_service.NodeService,
     hub: FsConnectionHub,
     node_name: []u8,
-    export_name: []u8,
+    mount_specs: std.ArrayListUnmanaged(LocalFsMountSpec) = .{},
     fs_url: []u8,
     lease_ttl_ms: u64,
     heartbeat_interval_ms: u64,
@@ -540,7 +558,8 @@ const LocalFsNode = struct {
 
     fn create(
         allocator: std.mem.Allocator,
-        export_spec: fs_node_ops.ExportSpec,
+        export_specs: []const fs_node_ops.ExportSpec,
+        mount_specs: []const fs_control_plane.SpiderWebMountSpec,
         node_name: []const u8,
         fs_url: []const u8,
         lease_ttl_ms: u64,
@@ -550,12 +569,27 @@ const LocalFsNode = struct {
         const endpoint = try allocator.create(LocalFsNode);
         errdefer allocator.destroy(endpoint);
 
+        if (export_specs.len == 0) return error.InvalidPayload;
+        if (mount_specs.len == 0) return error.InvalidPayload;
+
+        var owned_mount_specs = std.ArrayListUnmanaged(LocalFsMountSpec){};
+        errdefer {
+            for (owned_mount_specs.items) |*item| item.deinit(allocator);
+            owned_mount_specs.deinit(allocator);
+        }
+        for (mount_specs) |spec| {
+            try owned_mount_specs.append(allocator, .{
+                .mount_path = try allocator.dupe(u8, spec.mount_path),
+                .export_name = try allocator.dupe(u8, spec.export_name),
+            });
+        }
+
         endpoint.* = .{
             .allocator = allocator,
-            .service = try fs_node_service.NodeService.init(allocator, &[_]fs_node_ops.ExportSpec{export_spec}),
+            .service = try fs_node_service.NodeService.init(allocator, export_specs),
             .hub = .{ .allocator = allocator },
             .node_name = try allocator.dupe(u8, node_name),
-            .export_name = try allocator.dupe(u8, export_spec.name),
+            .mount_specs = owned_mount_specs,
             .fs_url = try allocator.dupe(u8, fs_url),
             .lease_ttl_ms = lease_ttl_ms,
             .heartbeat_interval_ms = heartbeat_interval_ms,
@@ -564,11 +598,13 @@ const LocalFsNode = struct {
             endpoint.hub.deinit();
             endpoint.service.deinit();
             allocator.free(endpoint.node_name);
-            allocator.free(endpoint.export_name);
+            for (endpoint.mount_specs.items) |*item| item.deinit(allocator);
+            endpoint.mount_specs.deinit(allocator);
             allocator.free(endpoint.fs_url);
         }
 
-        const watch_disabled_for_root_export = std.mem.eql(u8, std.mem.trim(u8, export_spec.path, " \t\r\n"), "/");
+        const watch_source_export = export_specs[0];
+        const watch_disabled_for_root_export = std.mem.eql(u8, std.mem.trim(u8, watch_source_export.path, " \t\r\n"), "/");
         const should_enable_watcher = watcher_enabled and !watch_disabled_for_root_export;
         if (!should_enable_watcher) {
             // Full-root recursive watcher scans can block on special mount points
@@ -620,7 +656,8 @@ const LocalFsNode = struct {
         self.hub.deinit();
         self.service.deinit();
         self.allocator.free(self.node_name);
-        self.allocator.free(self.export_name);
+        for (self.mount_specs.items) |*item| item.deinit(self.allocator);
+        self.mount_specs.deinit(self.allocator);
         self.allocator.free(self.fs_url);
         self.allocator.destroy(self);
     }
@@ -647,7 +684,7 @@ const LocalFsNode = struct {
                 defer self.allocator.free(mount_node_id);
                 self.allocator.free(registration.node_id);
                 self.allocator.free(registration.node_secret);
-                try control_plane.ensureSpiderWebMount(mount_node_id, self.export_name);
+                try self.ensureSpiderWebMounts(control_plane, mount_node_id);
                 return;
             }
             self.allocator.free(prev);
@@ -660,7 +697,19 @@ const LocalFsNode = struct {
         self.registration_mutex.unlock();
         unlock_needed = false;
         defer self.allocator.free(mount_node_id);
-        try control_plane.ensureSpiderWebMount(mount_node_id, self.export_name);
+        try self.ensureSpiderWebMounts(control_plane, mount_node_id);
+    }
+
+    fn ensureSpiderWebMounts(self: *LocalFsNode, control_plane: *fs_control_plane.ControlPlane, node_id: []const u8) !void {
+        const specs = try self.allocator.alloc(fs_control_plane.SpiderWebMountSpec, self.mount_specs.items.len);
+        defer self.allocator.free(specs);
+        for (self.mount_specs.items, 0..) |spec, idx| {
+            specs[idx] = .{
+                .mount_path = spec.mount_path,
+                .export_name = spec.export_name,
+            };
+        }
+        try control_plane.ensureSpiderWebMounts(node_id, specs);
     }
 
     fn requestHeartbeatStop(self: *LocalFsNode) void {
@@ -965,9 +1014,15 @@ const SessionAttachStateSnapshot = struct {
     state: SessionAttachState = .warming,
     runtime_ready: bool = false,
     mount_ready: bool = false,
-    error_code: ?[]const u8 = null,
-    error_message: ?[]const u8 = null,
+    error_code: ?[]u8 = null,
+    error_message: ?[]u8 = null,
     updated_at_ms: i64 = 0,
+
+    fn deinit(self: *SessionAttachStateSnapshot, allocator: std.mem.Allocator) void {
+        if (self.error_code) |value| allocator.free(value);
+        if (self.error_message) |value| allocator.free(value);
+        self.* = undefined;
+    }
 };
 
 const RuntimeWarmupState = struct {
@@ -1022,15 +1077,21 @@ const RuntimeWarmupState = struct {
         self.updated_at_ms = std.time.milliTimestamp();
     }
 
-    fn snapshot(self: *const RuntimeWarmupState) SessionAttachStateSnapshot {
-        return .{
+    fn snapshotOwned(self: *const RuntimeWarmupState, allocator: std.mem.Allocator) !SessionAttachStateSnapshot {
+        var snapshot = SessionAttachStateSnapshot{
             .state = self.state,
             .runtime_ready = self.runtime_ready,
             .mount_ready = self.mount_ready,
-            .error_code = self.error_code,
-            .error_message = self.error_message,
             .updated_at_ms = self.updated_at_ms,
         };
+        if (self.error_code) |value| {
+            snapshot.error_code = try allocator.dupe(u8, value);
+        }
+        errdefer if (snapshot.error_code) |value| allocator.free(value);
+        if (self.error_message) |value| {
+            snapshot.error_message = try allocator.dupe(u8, value);
+        }
+        return snapshot;
     }
 };
 
@@ -1741,7 +1802,12 @@ const AgentRuntimeRegistry = struct {
         self.runtime_warmups_mutex.lock();
         defer self.runtime_warmups_mutex.unlock();
         if (self.runtime_warmups.getPtr(binding_key)) |state| {
-            return state.snapshot();
+            return state.snapshotOwned(self.allocator) catch .{
+                .state = state.state,
+                .runtime_ready = state.runtime_ready,
+                .mount_ready = state.mount_ready,
+                .updated_at_ms = state.updated_at_ms,
+            };
         }
         return .{
             .state = .warming,
@@ -1871,11 +1937,18 @@ const AgentRuntimeRegistry = struct {
             .mount_ready = true,
             .updated_at_ms = std.time.milliTimestamp(),
         };
+        defer snapshot.deinit(self.allocator);
         self.runtime_warmups_mutex.lock();
         if (self.runtime_warmups.getPtr(binding_key)) |state| {
             state.setReady(self.allocator);
             state.in_flight = false;
-            snapshot = state.snapshot();
+            snapshot.deinit(self.allocator);
+            snapshot = state.snapshotOwned(self.allocator) catch .{
+                .state = .ready,
+                .runtime_ready = true,
+                .mount_ready = true,
+                .updated_at_ms = std.time.milliTimestamp(),
+            };
         }
         self.runtime_warmups_mutex.unlock();
         self.emitSessionAttachStateDebugEvent(binding_key, snapshot);
@@ -1886,10 +1959,11 @@ const AgentRuntimeRegistry = struct {
             .state = .err,
             .runtime_ready = false,
             .mount_ready = false,
-            .error_code = code,
-            .error_message = message,
             .updated_at_ms = std.time.milliTimestamp(),
         };
+        snapshot.error_code = self.allocator.dupe(u8, code) catch null;
+        snapshot.error_message = self.allocator.dupe(u8, message) catch null;
+        defer snapshot.deinit(self.allocator);
         self.runtime_warmups_mutex.lock();
         if (self.runtime_warmups.getPtr(binding_key)) |state| {
             state.setError(self.allocator, code, message) catch {
@@ -1903,7 +1977,19 @@ const AgentRuntimeRegistry = struct {
                 state.updated_at_ms = std.time.milliTimestamp();
             };
             state.in_flight = false;
-            snapshot = state.snapshot();
+            snapshot.deinit(self.allocator);
+            snapshot = state.snapshotOwned(self.allocator) catch .{
+                .state = .err,
+                .runtime_ready = false,
+                .mount_ready = false,
+                .updated_at_ms = std.time.milliTimestamp(),
+            };
+            if (snapshot.error_code == null) {
+                snapshot.error_code = self.allocator.dupe(u8, code) catch null;
+            }
+            if (snapshot.error_message == null) {
+                snapshot.error_message = self.allocator.dupe(u8, message) catch null;
+            }
         }
         self.runtime_warmups_mutex.unlock();
         self.emitSessionAttachStateDebugEvent(binding_key, snapshot);
@@ -2053,6 +2139,7 @@ const AgentRuntimeRegistry = struct {
             const elapsed_ms = std.time.milliTimestamp() - started_ms;
             if (elapsed_ms >= timeout_ms) break;
             std.Thread.sleep(runtime_warmup_poll_interval_ms * std.time.ns_per_ms);
+            snapshot.deinit(self.allocator);
             snapshot = self.runtimeAttachSnapshot(agent_id, project_id);
         }
         return snapshot;
@@ -2444,10 +2531,10 @@ const AgentRuntimeRegistry = struct {
             else => return err,
         };
         defer if (export_name_owned) |value| self.allocator.free(value);
-        const export_name = if (export_name_owned) |value|
-            if (std.mem.trim(u8, value, " \t\r\n").len > 0) std.mem.trim(u8, value, " \t\r\n") else local_node_default_export_name
+        const workspace_export_name = if (export_name_owned) |value|
+            if (std.mem.trim(u8, value, " \t\r\n").len > 0) std.mem.trim(u8, value, " \t\r\n") else local_node_default_workspace_export_name
         else
-            local_node_default_export_name;
+            local_node_default_workspace_export_name;
 
         const export_ro = parseBoolEnv(self.allocator, local_node_export_ro_env, false);
 
@@ -2478,14 +2565,49 @@ const AgentRuntimeRegistry = struct {
         if (heartbeat_ms == 0) heartbeat_ms = 1_000;
         if (heartbeat_ms > lease_ttl_ms) heartbeat_ms = lease_ttl_ms;
 
-        const local_node = try LocalFsNode.create(
-            self.allocator,
+        const export_specs = [_]fs_node_ops.ExportSpec{
             .{
-                .name = export_name,
+                .name = workspace_export_name,
                 .path = export_path,
                 .ro = export_ro,
-                .desc = "spiderweb-local-export",
+                .desc = "spiderweb-workspace-export",
             },
+            .{
+                .name = local_node_meta_export_name,
+                .path = "meta",
+                .ro = true,
+                .desc = "spiderweb-meta-export",
+                .source_kind = .namespace,
+                .source_id = "meta",
+            },
+            .{
+                .name = local_node_capabilities_export_name,
+                .path = "capabilities",
+                .ro = true,
+                .desc = "spiderweb-capabilities-export",
+                .source_kind = .namespace,
+                .source_id = "capabilities",
+            },
+            .{
+                .name = local_node_jobs_export_name,
+                .path = "jobs",
+                .ro = false,
+                .desc = "spiderweb-jobs-export",
+                .source_kind = .namespace,
+                .source_id = "jobs",
+            },
+        };
+        const mount_specs = [_]fs_control_plane.SpiderWebMountSpec{
+            .{ .mount_path = local_node_mount_meta, .export_name = local_node_meta_export_name },
+            .{ .mount_path = local_node_mount_capabilities, .export_name = local_node_capabilities_export_name },
+            .{ .mount_path = local_node_mount_jobs, .export_name = local_node_jobs_export_name },
+            .{ .mount_path = local_node_mount_workspace, .export_name = workspace_export_name },
+        };
+
+        const local_node = try LocalFsNode.create(
+            self.allocator,
+            &export_specs,
+            &mount_specs,
             node_name,
             fs_url,
             lease_ttl_ms,
@@ -2508,8 +2630,8 @@ const AgentRuntimeRegistry = struct {
         }
 
         std.log.info(
-            "local fs node enabled at {s} export={s}:{s} ({s})",
-            .{ fs_url, export_name, export_path, if (export_ro) "ro" else "rw" },
+            "local fs node enabled at {s} workspace={s}:{s} ({s}) namespace=synthetic",
+            .{ fs_url, workspace_export_name, export_path, if (export_ro) "ro" else "rw" },
         );
     }
 };
@@ -2751,10 +2873,11 @@ fn handleWebSocketConnection(
 
     const default_agent_id = initialAgentIdForRole(principal.role, runtime_registry.default_agent_id);
     try upsertSessionBinding(allocator, &session_bindings, "main", default_agent_id, null, null);
-    _ = runtime_registry.ensureRuntimeWarmup(default_agent_id, null, null) catch |err| blk: {
+    var initial_warmup_snapshot = runtime_registry.ensureRuntimeWarmup(default_agent_id, null, null) catch |err| blk: {
         std.log.warn("default session warmup failed: {s}", .{@errorName(err)});
         break :blk SessionAttachStateSnapshot{};
     };
+    defer initial_warmup_snapshot.deinit(allocator);
 
     var active_session_key = try allocator.dupe(u8, "main");
     defer allocator.free(active_session_key);
@@ -3301,7 +3424,7 @@ fn handleWebSocketConnection(
                                 active_session_key = try allocator.dupe(u8, session_key);
 
                                 const active_binding = session_bindings.get(session_key) orelse return error.InvalidState;
-                                const attach_state = runtime_registry.ensureRuntimeWarmup(
+                                var attach_state = runtime_registry.ensureRuntimeWarmup(
                                     active_binding.agent_id,
                                     active_binding.project_id,
                                     active_binding.project_token,
@@ -3316,6 +3439,7 @@ fn handleWebSocketConnection(
                                     try writeFrameLocked(stream, &connection_write_mutex, response, .text);
                                     continue;
                                 };
+                                defer attach_state.deinit(allocator);
                                 const attach_json = try buildSessionAttachStateJson(allocator, attach_state);
                                 defer allocator.free(attach_json);
                                 const ack_payload = try buildSessionAttachAckPayload(
@@ -3367,7 +3491,7 @@ fn handleWebSocketConnection(
                                     continue;
                                 };
 
-                                const attach_state = runtime_registry.ensureRuntimeWarmup(
+                                var attach_state = runtime_registry.ensureRuntimeWarmup(
                                     binding.agent_id,
                                     binding.project_id,
                                     binding.project_token,
@@ -3382,6 +3506,7 @@ fn handleWebSocketConnection(
                                     try writeFrameLocked(stream, &connection_write_mutex, response, .text);
                                     continue;
                                 };
+                                defer attach_state.deinit(allocator);
 
                                 const attach_json = try buildSessionAttachStateJson(allocator, attach_state);
                                 defer allocator.free(attach_json);
@@ -3442,7 +3567,7 @@ fn handleWebSocketConnection(
 
                                 allocator.free(active_session_key);
                                 active_session_key = try allocator.dupe(u8, session_key);
-                                const attach_state = runtime_registry.ensureRuntimeWarmup(
+                                var attach_state = runtime_registry.ensureRuntimeWarmup(
                                     binding.agent_id,
                                     binding.project_id,
                                     binding.project_token,
@@ -3457,6 +3582,7 @@ fn handleWebSocketConnection(
                                     try writeFrameLocked(stream, &connection_write_mutex, response, .text);
                                     continue;
                                 };
+                                defer attach_state.deinit(allocator);
                                 const attach_json = try buildSessionAttachStateJson(allocator, attach_state);
                                 defer allocator.free(attach_json);
                                 const ack_payload = try buildSessionAttachAckPayload(
@@ -3926,8 +4052,9 @@ fn handleWebSocketConnection(
                             target_binding.agent_id,
                             target_binding.project_id,
                         );
+                        defer attach_state.deinit(allocator);
                         if (attach_state.state != .ready) {
-                            attach_state = runtime_registry.ensureRuntimeWarmup(
+                            const warmed_attach_state = runtime_registry.ensureRuntimeWarmup(
                                 target_binding.agent_id,
                                 target_binding.project_id,
                                 target_binding.project_token,
@@ -3942,8 +4069,11 @@ fn handleWebSocketConnection(
                                 try writeFrameLocked(stream, &connection_write_mutex, response, .text);
                                 continue;
                             };
+                            attach_state.deinit(allocator);
+                            attach_state = warmed_attach_state;
 
                             if (attach_state.state == .warming) {
+                                attach_state.deinit(allocator);
                                 attach_state = runtime_registry.waitForRuntimeWarmup(
                                     target_binding.agent_id,
                                     target_binding.project_id,
@@ -4389,8 +4519,9 @@ fn tryHandleLegacySessionSendFrame(
         binding.agent_id,
         binding.project_id,
     );
+    defer attach_state.deinit(allocator);
     if (attach_state.state != .ready) {
-        attach_state = runtime_registry.ensureRuntimeWarmup(
+        const warmed_attach_state = runtime_registry.ensureRuntimeWarmup(
             binding.agent_id,
             binding.project_id,
             binding.project_token,
@@ -4405,8 +4536,11 @@ fn tryHandleLegacySessionSendFrame(
             try writeFrameLocked(stream, write_mutex, response, .text);
             return true;
         };
+        attach_state.deinit(allocator);
+        attach_state = warmed_attach_state;
 
         if (attach_state.state == .warming) {
+            attach_state.deinit(allocator);
             attach_state = runtime_registry.waitForRuntimeWarmup(
                 binding.agent_id,
                 binding.project_id,

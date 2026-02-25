@@ -23,6 +23,7 @@ const SourceKind = enum {
     posix,
     windows,
     gdrive,
+    namespace,
     unknown,
 };
 
@@ -32,6 +33,7 @@ fn classify(kind: ?[]const u8) SourceKind {
     if (std.ascii.eqlIgnoreCase(raw, "posix")) return .posix;
     if (std.ascii.eqlIgnoreCase(raw, "windows")) return .windows;
     if (std.ascii.eqlIgnoreCase(raw, "gdrive")) return .gdrive;
+    if (std.ascii.eqlIgnoreCase(raw, "namespace")) return .namespace;
     return .unknown;
 }
 
@@ -48,6 +50,10 @@ fn supportsKind(kind: SourceKind, op: Operation) bool {
             .symlink, .xattr => false,
         },
         .gdrive => switch (op) {
+            .read_data, .write_data, .create, .remove, .rename, .statfs => true,
+            .symlink, .xattr, .locks => false,
+        },
+        .namespace => switch (op) {
             .read_data, .write_data, .create, .remove, .rename, .statfs => true,
             .symlink, .xattr, .locks => false,
         },
