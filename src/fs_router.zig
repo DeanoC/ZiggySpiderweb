@@ -939,6 +939,16 @@ pub const Router = struct {
     }
 
     fn resolvePathOnEndpoint(self: *Router, endpoint_index: usize, relative_path: []const u8) !ResolvedNode {
+        const endpoint = &self.endpoints.items[endpoint_index];
+        if (endpoint.root_node_id == 0 and endpoint.client == null) {
+            self.reconnectEndpoint(endpoint_index) catch |err| {
+                if (isEndpointFailureError(err)) {
+                    self.noteEndpointFailure(endpoint_index);
+                }
+                return err;
+            };
+        }
+
         var node_id = self.endpoints.items[endpoint_index].root_node_id;
         var parent_id: ?u64 = null;
         var final_name: ?[]const u8 = null;
