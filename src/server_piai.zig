@@ -2517,8 +2517,11 @@ const AgentRuntimeRegistry = struct {
         }
         const mounts_root_trimmed = std.mem.trim(u8, self.runtime_config.sandbox_mounts_root, " \t\r\n");
         const runtime_root_trimmed = std.mem.trim(u8, self.runtime_config.sandbox_runtime_root, " \t\r\n");
-        const watch_overlaps_sandbox = pathIsAncestorOrEqual(export_path, mounts_root_trimmed) or
-            pathIsAncestorOrEqual(export_path, runtime_root_trimmed);
+        const overlaps_mounts_root = pathIsAncestorOrEqual(export_path, mounts_root_trimmed) or
+            pathIsAncestorOrEqual(mounts_root_trimmed, export_path);
+        const overlaps_runtime_root = pathIsAncestorOrEqual(export_path, runtime_root_trimmed) or
+            pathIsAncestorOrEqual(runtime_root_trimmed, export_path);
+        const watch_overlaps_sandbox = overlaps_mounts_root or overlaps_runtime_root;
         if (watch_overlaps_sandbox) {
             std.log.warn(
                 "local fs node watcher disabled: export path {s} overlaps sandbox roots mounts={s} runtime={s}",

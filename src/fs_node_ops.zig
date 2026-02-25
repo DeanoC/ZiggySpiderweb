@@ -1024,7 +1024,8 @@ pub const NodeOps = struct {
         }
 
         const max_len: usize = len;
-        const end = @min(node.content.len, start + max_len);
+        const requested_end = std.math.add(usize, start, max_len) catch std.math.maxInt(usize);
+        const end = @min(node.content.len, requested_end);
         const bytes = node.content[start..end];
 
         const encoded = encodeBase64(self.allocator, bytes) catch return DispatchResult.failure(fs_protocol.Errno.EIO, "out of memory");
@@ -1257,6 +1258,10 @@ pub const NodeOps = struct {
             return DispatchResult.failure(fs_protocol.Errno.EINVAL, "invalid rename target");
         }
 
+        const owned_new_name = self.allocator.dupe(u8, new_name) catch return DispatchResult.failure(fs_protocol.Errno.EIO, "out of memory");
+        var new_name_installed = false;
+        defer if (!new_name_installed) self.allocator.free(owned_new_name);
+
         {
             const old_parent_mut = ns.nodes.getPtr(old_parent.node_id) orelse return DispatchResult.failure(fs_protocol.Errno.ENOENT, "file not found");
             _ = old_parent_mut.children.fetchRemove(old_name);
@@ -1264,8 +1269,10 @@ pub const NodeOps = struct {
 
         {
             const moving_mut = ns.nodes.getPtr(moving_id) orelse return DispatchResult.failure(fs_protocol.Errno.ENOENT, "file not found");
-            self.allocator.free(moving_mut.name);
-            moving_mut.name = self.allocator.dupe(u8, new_name) catch return DispatchResult.failure(fs_protocol.Errno.EIO, "out of memory");
+            const old_name_owned = moving_mut.name;
+            moving_mut.name = owned_new_name;
+            new_name_installed = true;
+            self.allocator.free(old_name_owned);
             moving_mut.parent_id = new_parent.node_id;
             self.namespaceBumpGeneration(ns, moving_id);
         }
