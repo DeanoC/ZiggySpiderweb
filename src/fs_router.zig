@@ -132,6 +132,9 @@ pub const Router = struct {
     endpoints: std.ArrayListUnmanaged(Endpoint) = .{},
     attr_cache: fs_cache.AttrCache,
     dir_cache: fs_cache.DirEntryCache,
+    dir_listing_cache: fs_cache.DirListingCache,
+    dir_complete_cache: fs_cache.DirCompleteCache,
+    dir_prime_cache: fs_cache.DirCompleteCache,
     negative_cache: fs_cache.NegativeCache,
     read_cache: fs_cache.ReadBlockCache,
     pending_invalidations: std.ArrayListUnmanaged(PendingInvalidation) = .{},
@@ -145,9 +148,12 @@ pub const Router = struct {
     pub fn init(allocator: std.mem.Allocator, endpoint_configs: []const EndpointConfig) !Router {
         var router = Router{
             .allocator = allocator,
-            .attr_cache = fs_cache.AttrCache.init(allocator, 3000),
-            .dir_cache = fs_cache.DirEntryCache.init(allocator, 3000),
-            .negative_cache = fs_cache.NegativeCache.init(allocator, 1000),
+            .attr_cache = fs_cache.AttrCache.init(allocator, 300_000),
+            .dir_cache = fs_cache.DirEntryCache.init(allocator, 300_000),
+            .dir_listing_cache = fs_cache.DirListingCache.init(allocator, 300_000),
+            .dir_complete_cache = fs_cache.DirCompleteCache.init(allocator, 300_000),
+            .dir_prime_cache = fs_cache.DirCompleteCache.init(allocator, 30_000),
+            .negative_cache = fs_cache.NegativeCache.init(allocator, 15_000),
             .read_cache = fs_cache.ReadBlockCache.init(allocator, 256),
         };
         errdefer router.deinit();
@@ -164,6 +170,9 @@ pub const Router = struct {
     pub fn replaceEndpoints(self: *Router, endpoint_configs: []const EndpointConfig) !void {
         const attr_ttl = self.attr_cache.ttl_ms;
         const dir_ttl = self.dir_cache.ttl_ms;
+        const dir_listing_ttl = self.dir_listing_cache.ttl_ms;
+        const dir_complete_ttl = self.dir_complete_cache.ttl_ms;
+        const dir_prime_ttl = self.dir_prime_cache.ttl_ms;
         const negative_ttl = self.negative_cache.ttl_ms;
         const read_capacity = self.read_cache.capacity_blocks;
 
@@ -172,10 +181,16 @@ pub const Router = struct {
 
         self.attr_cache.deinit();
         self.dir_cache.deinit();
+        self.dir_listing_cache.deinit();
+        self.dir_complete_cache.deinit();
+        self.dir_prime_cache.deinit();
         self.negative_cache.deinit();
         self.read_cache.deinit();
         self.attr_cache = fs_cache.AttrCache.init(self.allocator, attr_ttl);
         self.dir_cache = fs_cache.DirEntryCache.init(self.allocator, dir_ttl);
+        self.dir_listing_cache = fs_cache.DirListingCache.init(self.allocator, dir_listing_ttl);
+        self.dir_complete_cache = fs_cache.DirCompleteCache.init(self.allocator, dir_complete_ttl);
+        self.dir_prime_cache = fs_cache.DirCompleteCache.init(self.allocator, dir_prime_ttl);
         self.negative_cache = fs_cache.NegativeCache.init(self.allocator, negative_ttl);
         self.read_cache = fs_cache.ReadBlockCache.init(self.allocator, read_capacity);
 
@@ -215,6 +230,9 @@ pub const Router = struct {
         self.pending_invalidations.deinit(self.allocator);
         self.attr_cache.deinit();
         self.dir_cache.deinit();
+        self.dir_listing_cache.deinit();
+        self.dir_complete_cache.deinit();
+        self.dir_prime_cache.deinit();
         self.negative_cache.deinit();
         self.read_cache.deinit();
     }
@@ -343,6 +361,17 @@ pub const Router = struct {
             return self.buildVirtualDirectoryListing(path, cookie, max_entries);
         }
         const node = try self.resolvePath(path, false, .read_data);
+        const cache_key = fs_cache.NodeKey{
+            .endpoint_index = node.endpoint_index,
+            .node_id = node.node_id,
+        };
+        const now = std.time.milliTimestamp();
+        if (cookie == 0) {
+            if (self.dir_listing_cache.getFresh(cache_key, now)) |cached_listing| {
+                return self.allocator.dupe(u8, cached_listing);
+            }
+        }
+
         const args = try std.fmt.allocPrint(self.allocator, "{{\"cookie\":{d},\"max\":{d}}}", .{ cookie, max_entries });
         defer self.allocator.free(args);
 
@@ -350,7 +379,18 @@ pub const Router = struct {
         defer response.deinit(self.allocator);
         if (!response.ok) return mapErrno(response.err_no);
 
-        try self.updateCachesFromReaddir(node.endpoint_index, node.node_id, response.result_json);
+        const update = try self.updateCachesFromReaddir(node.endpoint_index, node.node_id, response.result_json);
+        if (cookie == 0) {
+            try self.dir_prime_cache.markComplete(cache_key, std.time.milliTimestamp());
+            if (update.complete) {
+                try self.dir_listing_cache.put(cache_key, response.result_json, std.time.milliTimestamp());
+                try self.dir_complete_cache.markComplete(cache_key, std.time.milliTimestamp());
+            } else {
+                self.dir_listing_cache.invalidateDir(node.endpoint_index, node.node_id);
+                self.dir_complete_cache.invalidateDir(node.endpoint_index, node.node_id);
+                self.dir_prime_cache.invalidateDir(node.endpoint_index, node.node_id);
+            }
+        }
         return self.allocator.dupe(u8, response.result_json);
     }
 
@@ -383,6 +423,9 @@ pub const Router = struct {
         defer response.deinit(self.allocator);
         if (!response.ok) return mapErrno(response.err_no);
         self.dir_cache.invalidateDir(parent.endpoint_index, parent.node_id);
+        self.dir_listing_cache.invalidateDir(parent.endpoint_index, parent.node_id);
+        self.dir_complete_cache.invalidateDir(parent.endpoint_index, parent.node_id);
+        self.dir_prime_cache.invalidateDir(parent.endpoint_index, parent.node_id);
         self.negative_cache.invalidateDir(parent.endpoint_index, parent.node_id);
     }
 
@@ -532,6 +575,9 @@ pub const Router = struct {
         defer response.deinit(self.allocator);
         if (!response.ok) return mapErrno(response.err_no);
         self.dir_cache.invalidateDir(parent.endpoint_index, parent.node_id);
+        self.dir_listing_cache.invalidateDir(parent.endpoint_index, parent.node_id);
+        self.dir_complete_cache.invalidateDir(parent.endpoint_index, parent.node_id);
+        self.dir_prime_cache.invalidateDir(parent.endpoint_index, parent.node_id);
         self.negative_cache.invalidateDir(parent.endpoint_index, parent.node_id);
 
         const open_file = try parseCreateResult(response.result_json, parent.endpoint_index);
@@ -581,6 +627,9 @@ pub const Router = struct {
         defer response.deinit(self.allocator);
         if (!response.ok) return mapErrno(response.err_no);
         self.dir_cache.invalidateDir(parent.endpoint_index, parent.node_id);
+        self.dir_listing_cache.invalidateDir(parent.endpoint_index, parent.node_id);
+        self.dir_complete_cache.invalidateDir(parent.endpoint_index, parent.node_id);
+        self.dir_prime_cache.invalidateDir(parent.endpoint_index, parent.node_id);
         self.negative_cache.invalidateDir(parent.endpoint_index, parent.node_id);
     }
 
@@ -598,6 +647,9 @@ pub const Router = struct {
         defer response.deinit(self.allocator);
         if (!response.ok) return mapErrno(response.err_no);
         self.dir_cache.invalidateDir(parent.endpoint_index, parent.node_id);
+        self.dir_listing_cache.invalidateDir(parent.endpoint_index, parent.node_id);
+        self.dir_complete_cache.invalidateDir(parent.endpoint_index, parent.node_id);
+        self.dir_prime_cache.invalidateDir(parent.endpoint_index, parent.node_id);
         self.negative_cache.invalidateDir(parent.endpoint_index, parent.node_id);
     }
 
@@ -615,6 +667,9 @@ pub const Router = struct {
         defer response.deinit(self.allocator);
         if (!response.ok) return mapErrno(response.err_no);
         self.dir_cache.invalidateDir(parent.endpoint_index, parent.node_id);
+        self.dir_listing_cache.invalidateDir(parent.endpoint_index, parent.node_id);
+        self.dir_complete_cache.invalidateDir(parent.endpoint_index, parent.node_id);
+        self.dir_prime_cache.invalidateDir(parent.endpoint_index, parent.node_id);
         self.negative_cache.invalidateDir(parent.endpoint_index, parent.node_id);
     }
 
@@ -665,6 +720,12 @@ pub const Router = struct {
         if (!response.ok) return mapErrno(response.err_no);
         self.dir_cache.invalidateDir(old_parent.endpoint_index, old_parent.node_id);
         self.dir_cache.invalidateDir(new_parent.endpoint_index, new_parent.node_id);
+        self.dir_listing_cache.invalidateDir(old_parent.endpoint_index, old_parent.node_id);
+        self.dir_listing_cache.invalidateDir(new_parent.endpoint_index, new_parent.node_id);
+        self.dir_complete_cache.invalidateDir(old_parent.endpoint_index, old_parent.node_id);
+        self.dir_complete_cache.invalidateDir(new_parent.endpoint_index, new_parent.node_id);
+        self.dir_prime_cache.invalidateDir(old_parent.endpoint_index, old_parent.node_id);
+        self.dir_prime_cache.invalidateDir(new_parent.endpoint_index, new_parent.node_id);
         self.negative_cache.invalidateDir(old_parent.endpoint_index, old_parent.node_id);
         self.negative_cache.invalidateDir(new_parent.endpoint_index, new_parent.node_id);
     }
@@ -770,6 +831,12 @@ pub const Router = struct {
         });
         self.dir_cache.invalidateDir(old_parent.endpoint_index, old_parent.node_id);
         self.dir_cache.invalidateDir(new_parent.endpoint_index, new_parent.node_id);
+        self.dir_listing_cache.invalidateDir(old_parent.endpoint_index, old_parent.node_id);
+        self.dir_listing_cache.invalidateDir(new_parent.endpoint_index, new_parent.node_id);
+        self.dir_complete_cache.invalidateDir(old_parent.endpoint_index, old_parent.node_id);
+        self.dir_complete_cache.invalidateDir(new_parent.endpoint_index, new_parent.node_id);
+        self.dir_prime_cache.invalidateDir(old_parent.endpoint_index, old_parent.node_id);
+        self.dir_prime_cache.invalidateDir(new_parent.endpoint_index, new_parent.node_id);
         self.negative_cache.invalidateDir(old_parent.endpoint_index, old_parent.node_id);
         self.negative_cache.invalidateDir(new_parent.endpoint_index, new_parent.node_id);
     }
@@ -994,6 +1061,11 @@ pub const Router = struct {
     }
 
     fn lookupChild(self: *Router, endpoint_index: usize, parent_id: u64, name: []const u8) !u64 {
+        const endpoint_u16: u16 = @intCast(endpoint_index);
+        const dir_key = fs_cache.NodeKey{
+            .endpoint_index = endpoint_u16,
+            .node_id = parent_id,
+        };
         const normalized_name = try normalizeNameForCache(
             self.allocator,
             self.endpoints.items[endpoint_index].caps_case_sensitive,
@@ -1001,12 +1073,17 @@ pub const Router = struct {
         );
         defer self.allocator.free(normalized_name);
         const now = std.time.milliTimestamp();
-        if (self.negative_cache.containsFresh(@intCast(endpoint_index), parent_id, normalized_name, now)) {
+        if (self.negative_cache.containsFresh(endpoint_u16, parent_id, normalized_name, now)) {
             return RouterError.FileNotFound;
         }
 
-        if (self.dir_cache.getFresh(@intCast(endpoint_index), parent_id, normalized_name, now)) |cached_attr| {
-            return try extractNodeIdFromAttr(cached_attr);
+        if (self.dir_cache.getFresh(endpoint_u16, parent_id, normalized_name, now)) |cached| {
+            return cached.node_id;
+        }
+
+        if (self.dir_complete_cache.isFresh(dir_key, now)) {
+            try self.negative_cache.put(endpoint_u16, parent_id, normalized_name, now);
+            return RouterError.FileNotFound;
         }
 
         const escaped_name = try fs_protocol.jsonEscape(self.allocator, name);
@@ -1014,11 +1091,11 @@ pub const Router = struct {
         const args = try std.fmt.allocPrint(self.allocator, "{{\"name\":\"{s}\"}}", .{escaped_name});
         defer self.allocator.free(args);
 
-        const response = try self.callEndpoint(@intCast(endpoint_index), .LOOKUP, parent_id, null, args);
+        const response = try self.callEndpoint(endpoint_u16, .LOOKUP, parent_id, null, args);
         defer response.deinit(self.allocator);
         if (!response.ok) {
             if (response.err_no == fs_protocol.Errno.ENOENT) {
-                try self.negative_cache.put(@intCast(endpoint_index), parent_id, normalized_name, now);
+                try self.negative_cache.put(endpoint_u16, parent_id, normalized_name, std.time.milliTimestamp());
             }
             return mapErrno(response.err_no);
         }
@@ -1026,9 +1103,31 @@ pub const Router = struct {
         const attr = try extractAttrFromWrapper(self.allocator, response.result_json);
         defer self.allocator.free(attr.attr_json);
 
-        try self.attr_cache.put(.{ .endpoint_index = @intCast(endpoint_index), .node_id = attr.node_id }, attr.attr_json, 0, now);
-        try self.dir_cache.put(@intCast(endpoint_index), parent_id, normalized_name, attr.attr_json, now);
+        const now_after_lookup = std.time.milliTimestamp();
+        try self.attr_cache.put(.{ .endpoint_index = endpoint_u16, .node_id = attr.node_id }, attr.attr_json, 0, now_after_lookup);
+        try self.dir_cache.put(endpoint_u16, parent_id, normalized_name, attr.node_id, attr.attr_json, now_after_lookup);
+        if (!self.dir_complete_cache.isFresh(dir_key, now_after_lookup) and !self.dir_prime_cache.isFresh(dir_key, now_after_lookup)) {
+            try self.dir_prime_cache.markComplete(dir_key, now_after_lookup);
+            self.primeDirectoryCache(endpoint_u16, parent_id) catch {};
+        }
         return attr.node_id;
+    }
+
+    fn primeDirectoryCache(self: *Router, endpoint_index: u16, dir_id: u64) !void {
+        const args = try std.fmt.allocPrint(self.allocator, "{{\"cookie\":0,\"max\":4096}}", .{});
+        defer self.allocator.free(args);
+
+        const response = try self.callEndpoint(endpoint_index, .READDIRP, dir_id, null, args);
+        defer response.deinit(self.allocator);
+        if (!response.ok) return mapErrno(response.err_no);
+
+        const update = try self.updateCachesFromReaddir(endpoint_index, dir_id, response.result_json);
+        if (update.complete) {
+            try self.dir_complete_cache.markComplete(.{
+                .endpoint_index = endpoint_index,
+                .node_id = dir_id,
+            }, std.time.milliTimestamp());
+        }
     }
 
     fn callEndpoint(
@@ -1275,6 +1374,9 @@ pub const Router = struct {
 
                 if (ev.what == .all) {
                     self.dir_cache.invalidateDir(endpoint_index, ev.node);
+                    self.dir_listing_cache.invalidateDir(endpoint_index, ev.node);
+                    self.dir_complete_cache.invalidateDir(endpoint_index, ev.node);
+                    self.dir_prime_cache.invalidateDir(endpoint_index, ev.node);
                     self.negative_cache.invalidateDir(endpoint_index, ev.node);
                 }
 
@@ -1288,6 +1390,9 @@ pub const Router = struct {
                     .node_id = ev.dir,
                 });
                 self.dir_cache.invalidateDir(endpoint_index, ev.dir);
+                self.dir_listing_cache.invalidateDir(endpoint_index, ev.dir);
+                self.dir_complete_cache.invalidateDir(endpoint_index, ev.dir);
+                self.dir_prime_cache.invalidateDir(endpoint_index, ev.dir);
                 self.negative_cache.invalidateDir(endpoint_index, ev.dir);
             },
         }
@@ -1368,12 +1473,23 @@ pub const Router = struct {
         return null;
     }
 
-    fn updateCachesFromReaddir(self: *Router, endpoint_index: u16, dir_id: u64, payload_json: []const u8) !void {
+    const ReaddirCacheUpdate = struct {
+        complete: bool,
+        next_cookie: u64,
+    };
+
+    fn updateCachesFromReaddir(self: *Router, endpoint_index: u16, dir_id: u64, payload_json: []const u8) !ReaddirCacheUpdate {
         var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, payload_json, .{});
         defer parsed.deinit();
-        if (parsed.value != .object) return;
-        const ents = parsed.value.object.get("ents") orelse return;
-        if (ents != .array) return;
+        if (parsed.value != .object) return .{ .complete = false, .next_cookie = 0 };
+        const next_cookie = parsed.value.object.get("next_cookie");
+        const parsed_next_cookie: u64 = if (next_cookie) |value|
+            (if (value == .integer and value.integer >= 0) @as(u64, @intCast(value.integer)) else 0)
+        else
+            0;
+        const complete = parsed_next_cookie == 0;
+        const ents = parsed.value.object.get("ents") orelse return .{ .complete = complete, .next_cookie = parsed_next_cookie };
+        if (ents != .array) return .{ .complete = complete, .next_cookie = parsed_next_cookie };
 
         const now = std.time.milliTimestamp();
         for (ents.array.items) |entry| {
@@ -1382,9 +1498,9 @@ pub const Router = struct {
             const attr_val = entry.object.get("attr") orelse continue;
             if (name_val != .string or attr_val != .object) continue;
 
+            const node_id = extractNodeIdFromAttrValue(attr_val) catch continue;
             const attr_json = try std.fmt.allocPrint(self.allocator, "{f}", .{std.json.fmt(attr_val, .{})});
             defer self.allocator.free(attr_json);
-            const node_id = extractNodeIdFromAttr(attr_json) catch continue;
             try self.attr_cache.put(.{ .endpoint_index = endpoint_index, .node_id = node_id }, attr_json, 0, now);
             const normalized_name = try normalizeNameForCache(
                 self.allocator,
@@ -1392,8 +1508,9 @@ pub const Router = struct {
                 name_val.string,
             );
             defer self.allocator.free(normalized_name);
-            try self.dir_cache.put(endpoint_index, dir_id, normalized_name, attr_json, now);
+            try self.dir_cache.put(endpoint_index, dir_id, normalized_name, node_id, attr_json, now);
         }
+        return .{ .complete = complete, .next_cookie = parsed_next_cookie };
     }
 
     fn isVirtualDirectoryPath(self: *const Router, path: []const u8) bool {
@@ -1823,8 +1940,12 @@ fn extractAttrFromWrapper(allocator: std.mem.Allocator, json: []const u8) !AttrE
 fn extractNodeIdFromAttr(attr_json: []const u8) !u64 {
     var parsed = try std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, attr_json, .{});
     defer parsed.deinit();
-    if (parsed.value != .object) return RouterError.InvalidResponse;
-    const id_val = parsed.value.object.get("id") orelse return RouterError.InvalidResponse;
+    return extractNodeIdFromAttrValue(parsed.value);
+}
+
+fn extractNodeIdFromAttrValue(attr_value: std.json.Value) !u64 {
+    if (attr_value != .object) return RouterError.InvalidResponse;
+    const id_val = attr_value.object.get("id") orelse return RouterError.InvalidResponse;
     if (id_val != .integer or id_val.integer < 0) return RouterError.InvalidResponse;
     return @intCast(id_val.integer);
 }
@@ -2132,13 +2253,37 @@ test "fs_router: resolvePath honors explicit mount_path overlays" {
     });
 
     const attr = "{\"id\":101,\"k\":1,\"m\":33188}";
-    try router.dir_cache.put(0, 10, "main.zig", attr, now);
+    try router.dir_cache.put(0, 10, "main.zig", 101, attr, now);
     try router.attr_cache.put(.{ .endpoint_index = 0, .node_id = 101 }, attr, 0, now);
 
     const resolved = try router.resolvePath("/project/src/main.zig", false, .read_data);
     try std.testing.expectEqual(@as(u16, 0), resolved.endpoint_index);
     try std.testing.expectEqual(@as(u64, 101), resolved.node_id);
     try std.testing.expectError(RouterError.UnknownEndpoint, router.resolvePath("/project/main.zig", false, .read_data));
+}
+
+test "fs_router: lookupChild treats missing entry as negative when full readdir cache is present" {
+    const allocator = std.testing.allocator;
+    var router = try Router.init(allocator, &[_]EndpointConfig{});
+    defer router.deinit();
+
+    const now = std.time.milliTimestamp();
+    try router.endpoints.append(allocator, .{
+        .name = try allocator.dupe(u8, "root-node"),
+        .url = try allocator.dupe(u8, "ws://127.0.0.1:65535/v2/fs"),
+        .export_name = null,
+        .mount_path = try allocator.dupe(u8, "/"),
+        .root_node_id = 1,
+        .export_read_only = false,
+        .caps_case_sensitive = true,
+        .healthy = true,
+        .last_health_check_ms = now,
+        .last_success_ms = now,
+    });
+    try router.dir_complete_cache.markComplete(.{ .endpoint_index = 0, .node_id = 1 }, now);
+
+    try std.testing.expectError(RouterError.FileNotFound, router.lookupChild(0, 1, "bar"));
+    try std.testing.expect(router.negative_cache.containsFresh(0, 1, "bar", now));
 }
 
 test "fs_router: resolvePath allows advanced ops before source metadata hydration" {
@@ -2162,7 +2307,7 @@ test "fs_router: resolvePath allows advanced ops before source metadata hydratio
     });
 
     const attr = "{\"id\":101,\"k\":1,\"m\":33188}";
-    try router.dir_cache.put(0, 10, "foo", attr, now);
+    try router.dir_cache.put(0, 10, "foo", 101, attr, now);
     try router.attr_cache.put(.{ .endpoint_index = 0, .node_id = 101 }, attr, 0, now);
 
     const resolved = try router.resolvePath("/a/foo", false, .xattr);
@@ -2304,7 +2449,10 @@ test "fs_router: applyInvalidationEvent clears affected caches" {
     defer router.deinit();
 
     try router.attr_cache.put(.{ .endpoint_index = 0, .node_id = 42 }, "{\"id\":42}", 0, 1000);
-    try router.dir_cache.put(0, 77, "x", "{\"id\":42}", 1000);
+    try router.dir_cache.put(0, 77, "x", 42, "{\"id\":42}", 1000);
+    try router.dir_listing_cache.put(.{ .endpoint_index = 0, .node_id = 77 }, "{\"ents\":[],\"next_cookie\":0}", 1000);
+    try router.dir_complete_cache.markComplete(.{ .endpoint_index = 0, .node_id = 77 }, 1000);
+    try router.dir_prime_cache.markComplete(.{ .endpoint_index = 0, .node_id = 77 }, 1000);
     try router.negative_cache.put(0, 77, "missing", 1000);
     try router.read_cache.put(.{ .endpoint_index = 0, .handle_id = 9, .block_index = 0 }, "data");
 
@@ -2327,6 +2475,9 @@ test "fs_router: applyInvalidationEvent clears affected caches" {
     });
 
     try std.testing.expect(router.dir_cache.getFresh(0, 77, "x", 1000) == null);
+    try std.testing.expect(router.dir_listing_cache.getFresh(.{ .endpoint_index = 0, .node_id = 77 }, 1000) == null);
+    try std.testing.expect(!router.dir_complete_cache.isFresh(.{ .endpoint_index = 0, .node_id = 77 }, 1000));
+    try std.testing.expect(!router.dir_prime_cache.isFresh(.{ .endpoint_index = 0, .node_id = 77 }, 1000));
     try std.testing.expect(!router.negative_cache.containsFresh(0, 77, "missing", 1000));
 }
 
@@ -2394,9 +2545,9 @@ test "fs_router: invalidation plus endpoint failure falls back to sibling alias"
     // Seed both endpoints with cached LOOKUP results for /a/foo.
     const attr_primary = "{\"id\":101,\"k\":1,\"m\":33188}";
     const attr_secondary = "{\"id\":201,\"k\":1,\"m\":33188}";
-    try router.dir_cache.put(0, 10, "foo", attr_primary, now);
+    try router.dir_cache.put(0, 10, "foo", 101, attr_primary, now);
     try router.attr_cache.put(.{ .endpoint_index = 0, .node_id = 101 }, attr_primary, 0, now);
-    try router.dir_cache.put(1, 20, "foo", attr_secondary, now);
+    try router.dir_cache.put(1, 20, "foo", 201, attr_secondary, now);
     try router.attr_cache.put(.{ .endpoint_index = 1, .node_id = 201 }, attr_secondary, 0, now);
 
     const before = try router.resolvePath("/a/foo", false, .read_data);
@@ -2439,8 +2590,14 @@ test "fs_router: replaceEndpoints swaps mount topology and clears caches" {
         .last_health_check_ms = now,
         .last_success_ms = now,
     });
-    try router.dir_cache.put(0, 10, "foo", "{\"id\":123}", now);
+    try router.dir_cache.put(0, 10, "foo", 123, "{\"id\":123}", now);
+    try router.dir_listing_cache.put(.{ .endpoint_index = 0, .node_id = 10 }, "{\"ents\":[],\"next_cookie\":0}", now);
+    try router.dir_complete_cache.markComplete(.{ .endpoint_index = 0, .node_id = 10 }, now);
+    try router.dir_prime_cache.markComplete(.{ .endpoint_index = 0, .node_id = 10 }, now);
     try std.testing.expect(router.dir_cache.getFresh(0, 10, "foo", now) != null);
+    try std.testing.expect(router.dir_listing_cache.getFresh(.{ .endpoint_index = 0, .node_id = 10 }, now) != null);
+    try std.testing.expect(router.dir_complete_cache.isFresh(.{ .endpoint_index = 0, .node_id = 10 }, now));
+    try std.testing.expect(router.dir_prime_cache.isFresh(.{ .endpoint_index = 0, .node_id = 10 }, now));
 
     try router.replaceEndpoints(&[_]EndpointConfig{
         .{ .name = "b", .url = "ws://127.0.0.1:65534/v2/fs", .mount_path = "/b" },
@@ -2449,4 +2606,7 @@ test "fs_router: replaceEndpoints swaps mount topology and clears caches" {
     try std.testing.expectEqual(@as(usize, 1), router.endpointCount());
     try std.testing.expectEqualStrings("/b", router.endpointMountPath(0).?);
     try std.testing.expect(router.dir_cache.getFresh(0, 10, "foo", now) == null);
+    try std.testing.expect(router.dir_listing_cache.getFresh(.{ .endpoint_index = 0, .node_id = 10 }, now) == null);
+    try std.testing.expect(!router.dir_complete_cache.isFresh(.{ .endpoint_index = 0, .node_id = 10 }, now));
+    try std.testing.expect(!router.dir_prime_cache.isFresh(.{ .endpoint_index = 0, .node_id = 10 }, now));
 }

@@ -6,14 +6,14 @@ const persistence_kind = "control_plane_state_v1";
 const persistence_key_env = "SPIDERWEB_CONTROL_STATE_KEY_HEX";
 const persistence_cipher = std.crypto.aead.aes_gcm.Aes256Gcm;
 const persistence_aad = "spiderweb-control-plane-state-v1";
-pub const spider_web_project_id = "spider-web";
-const spider_web_project_name = "Spider Web";
+pub const spider_web_project_id = "system";
+const spider_web_project_name = "System";
 const spider_web_project_status = "active";
 const spider_web_project_vision = "System project for Spiderweb control and host integrations";
 const spider_web_workspace_mount_path = "/workspace";
-const spider_web_project_kind_name = "spider_web_builtin";
+const spider_web_project_kind_name = "system_builtin";
 const normal_project_kind_name = "normal";
-const default_primary_agent_id = "default";
+const default_primary_agent_id = "mother";
 const default_spider_web_root = "/";
 
 const ProjectKind = enum {
@@ -1125,7 +1125,7 @@ pub const ControlPlane = struct {
         }
         self.project_activations_total +%= 1;
         if (project.kind == .spider_web_builtin and project.mounts.items.len == 0 and self.spider_web_root.len > 0) {
-            std.log.info("spider-web project active without mount; waiting for local node registration (root={s})", .{self.spider_web_root});
+            std.log.info("system project active without mount; waiting for local node registration (root={s})", .{self.spider_web_root});
         }
         self.persistSnapshotBestEffortLocked();
 
@@ -2901,20 +2901,20 @@ fn decodeBase64(allocator: std.mem.Allocator, data: []const u8) ![]u8 {
     return out;
 }
 
-test "fs_control_plane: builtin spider web project is protected and primary-only" {
+test "fs_control_plane: builtin system project is protected and primary-only" {
     const allocator = std.testing.allocator;
     var plane = ControlPlane.init(allocator);
     defer plane.deinit();
 
     const projects_json = try plane.listProjects();
     defer allocator.free(projects_json);
-    try std.testing.expect(std.mem.indexOf(u8, projects_json, "\"project_id\":\"spider-web\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, projects_json, "\"kind\":\"spider_web_builtin\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, projects_json, "\"project_id\":\"system\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, projects_json, "\"kind\":\"system_builtin\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, projects_json, "\"is_delete_protected\":true") != null);
 
     try std.testing.expectError(
         ControlPlaneError.ProjectProtected,
-        plane.deleteProject("{\"project_id\":\"spider-web\",\"project_token\":\"token\"}"),
+        plane.deleteProject("{\"project_id\":\"system\",\"project_token\":\"token\"}"),
     );
     const state_json = try plane.dumpState();
     defer allocator.free(state_json);
@@ -2947,23 +2947,23 @@ test "fs_control_plane: builtin spider web project is protected and primary-only
     );
     try std.testing.expectError(
         ControlPlaneError.ProjectAssignmentForbidden,
-        plane.activateProject("agent-worker", "{\"project_id\":\"spider-web\",\"project_token\":\"token\"}"),
+        plane.activateProject("agent-worker", "{\"project_id\":\"system\",\"project_token\":\"token\"}"),
     );
     try std.testing.expectError(
         ControlPlaneError.ProjectAssignmentForbidden,
-        plane.workspaceStatus("agent-worker", "{\"project_id\":\"spider-web\"}"),
+        plane.workspaceStatus("agent-worker", "{\"project_id\":\"system\"}"),
     );
 
-    const activated = try plane.activateProject("default", "{\"project_id\":\"spider-web\"}");
+    const activated = try plane.activateProject("mother", "{\"project_id\":\"system\"}");
     defer allocator.free(activated);
-    try std.testing.expect(std.mem.indexOf(u8, activated, "\"project_id\":\"spider-web\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, activated, "\"project_id\":\"system\"") != null);
 
-    const status = try plane.workspaceStatus("default", "{\"project_id\":\"spider-web\"}");
+    const status = try plane.workspaceStatus("mother", "{\"project_id\":\"system\"}");
     defer allocator.free(status);
-    try std.testing.expect(std.mem.indexOf(u8, status, "\"project_id\":\"spider-web\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status, "\"project_id\":\"system\"") != null);
 }
 
-test "fs_control_plane: builtin spider web mount can be bound from local node" {
+test "fs_control_plane: builtin system mount can be bound from local node" {
     const allocator = std.testing.allocator;
     var plane = ControlPlane.init(allocator);
     defer plane.deinit();
@@ -2974,16 +2974,16 @@ test "fs_control_plane: builtin spider web mount can be bound from local node" {
     defer parsed_join.deinit();
     const node_id = parsed_join.value.object.get("node_id").?.string;
 
-    try plane.ensureSpiderWebMount(node_id, "spider-web-root");
+    try plane.ensureSpiderWebMount(node_id, "system-root");
 
-    const status = try plane.workspaceStatus("default", "{\"project_id\":\"spider-web\"}");
+    const status = try plane.workspaceStatus("mother", "{\"project_id\":\"system\"}");
     defer allocator.free(status);
-    try std.testing.expect(std.mem.indexOf(u8, status, "\"project_id\":\"spider-web\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status, "\"project_id\":\"system\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, status, "\"mount_path\":\"/workspace\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, status, "\"export_name\":\"spider-web-root\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status, "\"export_name\":\"system-root\"") != null);
 }
 
-test "fs_control_plane: builtin spider web mounts support namespace topology" {
+test "fs_control_plane: builtin system mounts support namespace topology" {
     const allocator = std.testing.allocator;
     var plane = ControlPlane.init(allocator);
     defer plane.deinit();
@@ -3002,7 +3002,7 @@ test "fs_control_plane: builtin spider web mounts support namespace topology" {
     };
     try plane.ensureSpiderWebMounts(node_id, &mounts);
 
-    const status = try plane.workspaceStatus("default", "{\"project_id\":\"spider-web\"}");
+    const status = try plane.workspaceStatus("mother", "{\"project_id\":\"system\"}");
     defer allocator.free(status);
     try std.testing.expect(std.mem.indexOf(u8, status, "\"mount_path\":\"/meta\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, status, "\"mount_path\":\"/capabilities\"") != null);

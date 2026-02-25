@@ -29,7 +29,7 @@ pub const RuntimeConfig = struct {
     connection_queue_max: usize = 128,
     runtime_worker_threads: usize = 2,
     runtime_request_queue_max: usize = 128,
-    chat_operation_timeout_ms: u64 = 120_000,
+    chat_operation_timeout_ms: u64 = 300_000,
     control_operation_timeout_ms: u64 = 5_000,
     run_checkpoint_interval_steps: usize = 1,
     run_auto_resume_on_boot: bool = true,
@@ -37,7 +37,7 @@ pub const RuntimeConfig = struct {
     tool_lease_timeout_ms: u64 = 30_000,
     max_inflight_tool_calls_per_run: usize = 1,
     max_run_steps: usize = 1024,
-    default_agent_id: []const u8 = "default",
+    default_agent_id: []const u8 = "mother",
     spider_web_root: []const u8 = "/",
     ltm_directory: []const u8 = ".spiderweb-ltm",
     ltm_filename: []const u8 = "runtime-memory.db",
@@ -127,7 +127,7 @@ const default_config =
     \\    "connection_queue_max": 128,
     \\    "runtime_worker_threads": 2,
     \\    "runtime_request_queue_max": 128,
-    \\    "chat_operation_timeout_ms": 120000,
+    \\    "chat_operation_timeout_ms": 300000,
     \\    "control_operation_timeout_ms": 5000,
     \\    "run_checkpoint_interval_steps": 1,
     \\    "run_auto_resume_on_boot": true,
@@ -135,7 +135,7 @@ const default_config =
     \\    "tool_lease_timeout_ms": 30000,
     \\    "max_inflight_tool_calls_per_run": 1,
     \\    "max_run_steps": 1024,
-    \\    "default_agent_id": "default",
+    \\    "default_agent_id": "mother",
     \\    "spider_web_root": "/",
     \\    "ltm_directory": ".spiderweb-ltm",
     \\    "ltm_filename": "runtime-memory.db",
@@ -180,7 +180,18 @@ fn resolveSandboxPathDefaults(allocator: std.mem.Allocator) !SandboxPathDefaults
     }
     defer allocator.free(home.?);
 
-    const sandbox_root = try std.fs.path.join(allocator, &.{ home.?, ".local", "share", "ziggy-spiderweb", ".spiderweb-sandbox" });
+    const xdg_state_home = std.process.getEnvVarOwned(allocator, "XDG_STATE_HOME") catch null;
+    defer if (xdg_state_home) |value| allocator.free(value);
+
+    const sandbox_root = blk: {
+        if (xdg_state_home) |raw_state_home| {
+            const state_home = std.mem.trim(u8, raw_state_home, " \t\r\n");
+            if (state_home.len > 0) {
+                break :blk try std.fs.path.join(allocator, &.{ state_home, "ziggy-spiderweb", "sandbox" });
+            }
+        }
+        break :blk try std.fs.path.join(allocator, &.{ home.?, ".local", "state", "ziggy-spiderweb", "sandbox" });
+    };
     defer allocator.free(sandbox_root);
     return .{
         .mounts_root = try std.fs.path.join(allocator, &.{ sandbox_root, "mounts" }),
@@ -217,7 +228,7 @@ pub fn init(allocator: std.mem.Allocator, config_path: ?[]const u8) !Config {
             .connection_queue_max = 128,
             .runtime_worker_threads = 2,
             .runtime_request_queue_max = 128,
-            .chat_operation_timeout_ms = 120_000,
+            .chat_operation_timeout_ms = 300_000,
             .control_operation_timeout_ms = 5_000,
             .run_checkpoint_interval_steps = 1,
             .run_auto_resume_on_boot = true,
@@ -225,7 +236,7 @@ pub fn init(allocator: std.mem.Allocator, config_path: ?[]const u8) !Config {
             .tool_lease_timeout_ms = 30_000,
             .max_inflight_tool_calls_per_run = 1,
             .max_run_steps = 1024,
-            .default_agent_id = try allocator.dupe(u8, "default"),
+            .default_agent_id = try allocator.dupe(u8, "mother"),
             .spider_web_root = try allocator.dupe(u8, "/"),
             .ltm_directory = try allocator.dupe(u8, ".spiderweb-ltm"),
             .ltm_filename = try allocator.dupe(u8, "runtime-memory.db"),
@@ -702,7 +713,7 @@ test "Config defaults" {
     try std.testing.expectEqual(@as(usize, 16), config.runtime.connection_worker_threads);
     try std.testing.expectEqual(@as(usize, 2), config.runtime.runtime_worker_threads);
     try std.testing.expectEqual(@as(usize, 128), config.runtime.runtime_request_queue_max);
-    try std.testing.expectEqual(@as(u64, 120_000), config.runtime.chat_operation_timeout_ms);
+    try std.testing.expectEqual(@as(u64, 300_000), config.runtime.chat_operation_timeout_ms);
     try std.testing.expectEqual(@as(u64, 5_000), config.runtime.control_operation_timeout_ms);
     try std.testing.expectEqual(@as(usize, 1), config.runtime.run_checkpoint_interval_steps);
     try std.testing.expect(config.runtime.run_auto_resume_on_boot);
@@ -710,7 +721,7 @@ test "Config defaults" {
     try std.testing.expectEqual(@as(u64, 30_000), config.runtime.tool_lease_timeout_ms);
     try std.testing.expectEqual(@as(usize, 1), config.runtime.max_inflight_tool_calls_per_run);
     try std.testing.expectEqual(@as(usize, 1024), config.runtime.max_run_steps);
-    try std.testing.expectEqualStrings("default", config.runtime.default_agent_id);
+    try std.testing.expectEqualStrings("mother", config.runtime.default_agent_id);
     try std.testing.expectEqualStrings("/", config.runtime.spider_web_root);
     try std.testing.expectEqualStrings(".spiderweb-ltm", config.runtime.ltm_directory);
 }

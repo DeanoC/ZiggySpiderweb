@@ -7,25 +7,6 @@ pub const NodeKey = struct {
     node_id: u64,
 };
 
-pub const DirNameKey = struct {
-    endpoint_index: u16,
-    dir_id: u64,
-    name: []const u8,
-
-    fn clone(self: DirNameKey, allocator: std.mem.Allocator) !DirNameKey {
-        return .{
-            .endpoint_index = self.endpoint_index,
-            .dir_id = self.dir_id,
-            .name = try allocator.dupe(u8, self.name),
-        };
-    }
-
-    fn deinit(self: *DirNameKey, allocator: std.mem.Allocator) void {
-        allocator.free(self.name);
-        self.* = undefined;
-    }
-};
-
 pub const HandleBlockKey = struct {
     endpoint_index: u16,
     handle_id: u64,
@@ -39,7 +20,17 @@ pub const AttrValue = struct {
 };
 
 pub const DirValue = struct {
+    node_id: u64,
     attr_json: []u8,
+    expires_at_ms: i64,
+};
+
+pub const DirListingValue = struct {
+    payload_json: []u8,
+    expires_at_ms: i64,
+};
+
+pub const DirCompleteValue = struct {
     expires_at_ms: i64,
 };
 
@@ -93,10 +84,29 @@ pub const AttrCache = struct {
     }
 };
 
+pub const DirLookup = struct {
+    node_id: u64,
+    attr_json: []const u8,
+};
+
+const DirBucket = struct {
+    entries: std.StringHashMapUnmanaged(DirValue) = .{},
+
+    fn deinit(self: *DirBucket, allocator: std.mem.Allocator) void {
+        var it = self.entries.iterator();
+        while (it.next()) |entry| {
+            allocator.free(entry.key_ptr.*);
+            allocator.free(entry.value_ptr.attr_json);
+        }
+        self.entries.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
 pub const DirEntryCache = struct {
     allocator: std.mem.Allocator,
     ttl_ms: i64,
-    map: std.ArrayListUnmanaged(struct { key: DirNameKey, value: DirValue }) = .{},
+    map: std.AutoHashMapUnmanaged(NodeKey, DirBucket) = .{},
 
     pub fn init(allocator: std.mem.Allocator, ttl_ms: i64) DirEntryCache {
         return .{
@@ -106,64 +116,133 @@ pub const DirEntryCache = struct {
     }
 
     pub fn deinit(self: *DirEntryCache) void {
-        for (self.map.items) |*item| {
-            item.key.deinit(self.allocator);
-            self.allocator.free(item.value.attr_json);
-        }
+        var it = self.map.valueIterator();
+        while (it.next()) |bucket| bucket.deinit(self.allocator);
         self.map.deinit(self.allocator);
     }
 
-    pub fn getFresh(self: *DirEntryCache, endpoint_index: u16, dir_id: u64, name: []const u8, now_ms: i64) ?[]const u8 {
-        for (self.map.items) |item| {
-            if (item.key.endpoint_index != endpoint_index) continue;
-            if (item.key.dir_id != dir_id) continue;
-            if (!std.mem.eql(u8, item.key.name, name)) continue;
-            if (item.value.expires_at_ms < now_ms) return null;
-            return item.value.attr_json;
-        }
-        return null;
+    pub fn getFresh(self: *DirEntryCache, endpoint_index: u16, dir_id: u64, name: []const u8, now_ms: i64) ?DirLookup {
+        const bucket = self.map.getPtr(.{ .endpoint_index = endpoint_index, .node_id = dir_id }) orelse return null;
+        const value = bucket.entries.get(name) orelse return null;
+        if (value.expires_at_ms < now_ms) return null;
+        return .{
+            .node_id = value.node_id,
+            .attr_json = value.attr_json,
+        };
     }
 
-    pub fn put(self: *DirEntryCache, endpoint_index: u16, dir_id: u64, name: []const u8, attr_json: []const u8, now_ms: i64) !void {
-        for (self.map.items) |*item| {
-            if (item.key.endpoint_index != endpoint_index) continue;
-            if (item.key.dir_id != dir_id) continue;
-            if (!std.mem.eql(u8, item.key.name, name)) continue;
-            self.allocator.free(item.value.attr_json);
-            item.value.attr_json = try self.allocator.dupe(u8, attr_json);
-            item.value.expires_at_ms = now_ms + self.ttl_ms;
+    pub fn put(self: *DirEntryCache, endpoint_index: u16, dir_id: u64, name: []const u8, node_id: u64, attr_json: []const u8, now_ms: i64) !void {
+        const key = NodeKey{ .endpoint_index = endpoint_index, .node_id = dir_id };
+        const bucket_gop = try self.map.getOrPut(self.allocator, key);
+        if (!bucket_gop.found_existing) bucket_gop.value_ptr.* = .{};
+        const bucket = bucket_gop.value_ptr;
+
+        if (bucket.entries.getPtr(name)) |existing| {
+            self.allocator.free(existing.attr_json);
+            existing.* = .{
+                .node_id = node_id,
+                .attr_json = try self.allocator.dupe(u8, attr_json),
+                .expires_at_ms = now_ms + self.ttl_ms,
+            };
             return;
         }
 
-        try self.map.append(self.allocator, .{
-            .key = try (DirNameKey{ .endpoint_index = endpoint_index, .dir_id = dir_id, .name = name }).clone(self.allocator),
-            .value = .{
-                .attr_json = try self.allocator.dupe(u8, attr_json),
-                .expires_at_ms = now_ms + self.ttl_ms,
-            },
+        const owned_name = try self.allocator.dupe(u8, name);
+        errdefer self.allocator.free(owned_name);
+        try bucket.entries.put(self.allocator, owned_name, .{
+            .node_id = node_id,
+            .attr_json = try self.allocator.dupe(u8, attr_json),
+            .expires_at_ms = now_ms + self.ttl_ms,
         });
     }
 
     pub fn invalidateDir(self: *DirEntryCache, endpoint_index: u16, dir_id: u64) void {
-        var i: usize = 0;
-        while (i < self.map.items.len) {
-            const item = self.map.items[i];
-            if (item.key.endpoint_index != endpoint_index or item.key.dir_id != dir_id) {
-                i += 1;
-                continue;
-            }
-
-            self.map.items[i].key.deinit(self.allocator);
-            self.allocator.free(self.map.items[i].value.attr_json);
-            _ = self.map.swapRemove(i);
+        if (self.map.fetchRemove(.{ .endpoint_index = endpoint_index, .node_id = dir_id })) |removed| {
+            var bucket = removed.value;
+            bucket.deinit(self.allocator);
         }
+    }
+};
+
+pub const DirListingCache = struct {
+    allocator: std.mem.Allocator,
+    ttl_ms: i64,
+    map: std.AutoHashMapUnmanaged(NodeKey, DirListingValue) = .{},
+
+    pub fn init(allocator: std.mem.Allocator, ttl_ms: i64) DirListingCache {
+        return .{
+            .allocator = allocator,
+            .ttl_ms = if (ttl_ms <= 0) DefaultTtlMs else ttl_ms,
+        };
+    }
+
+    pub fn deinit(self: *DirListingCache) void {
+        var it = self.map.valueIterator();
+        while (it.next()) |entry| self.allocator.free(entry.payload_json);
+        self.map.deinit(self.allocator);
+    }
+
+    pub fn getFresh(self: *DirListingCache, key: NodeKey, now_ms: i64) ?[]const u8 {
+        const entry = self.map.get(key) orelse return null;
+        if (entry.expires_at_ms < now_ms) return null;
+        return entry.payload_json;
+    }
+
+    pub fn put(self: *DirListingCache, key: NodeKey, payload_json: []const u8, now_ms: i64) !void {
+        const owned = try self.allocator.dupe(u8, payload_json);
+        errdefer self.allocator.free(owned);
+
+        if (try self.map.fetchPut(self.allocator, key, .{
+            .payload_json = owned,
+            .expires_at_ms = now_ms + self.ttl_ms,
+        })) |existing| {
+            self.allocator.free(existing.value.payload_json);
+        }
+    }
+
+    pub fn invalidateDir(self: *DirListingCache, endpoint_index: u16, dir_id: u64) void {
+        if (self.map.fetchRemove(.{ .endpoint_index = endpoint_index, .node_id = dir_id })) |entry| {
+            self.allocator.free(entry.value.payload_json);
+        }
+    }
+};
+
+pub const DirCompleteCache = struct {
+    allocator: std.mem.Allocator,
+    ttl_ms: i64,
+    map: std.AutoHashMapUnmanaged(NodeKey, DirCompleteValue) = .{},
+
+    pub fn init(allocator: std.mem.Allocator, ttl_ms: i64) DirCompleteCache {
+        return .{
+            .allocator = allocator,
+            .ttl_ms = if (ttl_ms <= 0) DefaultTtlMs else ttl_ms,
+        };
+    }
+
+    pub fn deinit(self: *DirCompleteCache) void {
+        self.map.deinit(self.allocator);
+    }
+
+    pub fn isFresh(self: *DirCompleteCache, key: NodeKey, now_ms: i64) bool {
+        const entry = self.map.get(key) orelse return false;
+        return entry.expires_at_ms >= now_ms;
+    }
+
+    pub fn markComplete(self: *DirCompleteCache, key: NodeKey, now_ms: i64) !void {
+        _ = try self.map.fetchPut(self.allocator, key, .{
+            .expires_at_ms = now_ms + self.ttl_ms,
+        });
+    }
+
+    pub fn invalidateDir(self: *DirCompleteCache, endpoint_index: u16, dir_id: u64) void {
+        _ = self.map.remove(.{ .endpoint_index = endpoint_index, .node_id = dir_id });
     }
 };
 
 pub const NegativeCache = struct {
     allocator: std.mem.Allocator,
     ttl_ms: i64,
-    map: std.ArrayListUnmanaged(struct { key: DirNameKey, value: NegativeValue }) = .{},
+    map: std.AutoHashMapUnmanaged(NodeKey, std.StringHashMapUnmanaged(NegativeValue)) = .{},
 
     pub fn init(allocator: std.mem.Allocator, ttl_ms: i64) NegativeCache {
         return .{
@@ -173,46 +252,45 @@ pub const NegativeCache = struct {
     }
 
     pub fn deinit(self: *NegativeCache) void {
-        for (self.map.items) |*item| item.key.deinit(self.allocator);
+        var it = self.map.valueIterator();
+        while (it.next()) |names| {
+            var names_it = names.iterator();
+            while (names_it.next()) |entry| self.allocator.free(entry.key_ptr.*);
+            names.deinit(self.allocator);
+        }
         self.map.deinit(self.allocator);
     }
 
     pub fn put(self: *NegativeCache, endpoint_index: u16, dir_id: u64, name: []const u8, now_ms: i64) !void {
-        for (self.map.items) |*item| {
-            if (item.key.endpoint_index == endpoint_index and item.key.dir_id == dir_id and std.mem.eql(u8, item.key.name, name)) {
-                item.value.expires_at_ms = now_ms + self.ttl_ms;
-                return;
-            }
+        const key = NodeKey{ .endpoint_index = endpoint_index, .node_id = dir_id };
+        const bucket_gop = try self.map.getOrPut(self.allocator, key);
+        if (!bucket_gop.found_existing) bucket_gop.value_ptr.* = .{};
+        const bucket = bucket_gop.value_ptr;
+
+        if (bucket.getPtr(name)) |existing| {
+            existing.expires_at_ms = now_ms + self.ttl_ms;
+            return;
         }
 
-        try self.map.append(self.allocator, .{
-            .key = try (DirNameKey{ .endpoint_index = endpoint_index, .dir_id = dir_id, .name = name }).clone(self.allocator),
-            .value = .{
-                .expires_at_ms = now_ms + self.ttl_ms,
-            },
+        const owned_name = try self.allocator.dupe(u8, name);
+        errdefer self.allocator.free(owned_name);
+        try bucket.put(self.allocator, owned_name, .{
+            .expires_at_ms = now_ms + self.ttl_ms,
         });
     }
 
     pub fn containsFresh(self: *NegativeCache, endpoint_index: u16, dir_id: u64, name: []const u8, now_ms: i64) bool {
-        for (self.map.items) |item| {
-            if (item.key.endpoint_index != endpoint_index) continue;
-            if (item.key.dir_id != dir_id) continue;
-            if (!std.mem.eql(u8, item.key.name, name)) continue;
-            return item.value.expires_at_ms >= now_ms;
-        }
-        return false;
+        const bucket = self.map.getPtr(.{ .endpoint_index = endpoint_index, .node_id = dir_id }) orelse return false;
+        const value = bucket.get(name) orelse return false;
+        return value.expires_at_ms >= now_ms;
     }
 
     pub fn invalidateDir(self: *NegativeCache, endpoint_index: u16, dir_id: u64) void {
-        var i: usize = 0;
-        while (i < self.map.items.len) {
-            const item = self.map.items[i];
-            if (item.key.endpoint_index != endpoint_index or item.key.dir_id != dir_id) {
-                i += 1;
-                continue;
-            }
-            self.map.items[i].key.deinit(self.allocator);
-            _ = self.map.swapRemove(i);
+        if (self.map.fetchRemove(.{ .endpoint_index = endpoint_index, .node_id = dir_id })) |removed| {
+            var names = removed.value;
+            var it = names.iterator();
+            while (it.next()) |entry| self.allocator.free(entry.key_ptr.*);
+            names.deinit(self.allocator);
         }
     }
 };
@@ -328,4 +406,26 @@ test "fs_cache: negative cache expires" {
     try cache.put(1, 9, "missing.txt", 1000);
     try std.testing.expect(cache.containsFresh(1, 9, "missing.txt", 1025));
     try std.testing.expect(!cache.containsFresh(1, 9, "missing.txt", 2000));
+}
+
+test "fs_cache: directory listing cache respects ttl" {
+    const allocator = std.testing.allocator;
+    var cache = DirListingCache.init(allocator, 100);
+    defer cache.deinit();
+
+    const key = NodeKey{ .endpoint_index = 2, .node_id = 99 };
+    try cache.put(key, "{\"ents\":[],\"next_cookie\":0}", 1000);
+    try std.testing.expect(cache.getFresh(key, 1050) != null);
+    try std.testing.expect(cache.getFresh(key, 1205) == null);
+}
+
+test "fs_cache: directory complete cache respects ttl" {
+    const allocator = std.testing.allocator;
+    var cache = DirCompleteCache.init(allocator, 100);
+    defer cache.deinit();
+
+    const key = NodeKey{ .endpoint_index = 3, .node_id = 77 };
+    try cache.markComplete(key, 2000);
+    try std.testing.expect(cache.isFresh(key, 2050));
+    try std.testing.expect(!cache.isFresh(key, 2201));
 }

@@ -252,14 +252,21 @@ pub const SandboxRuntime = struct {
             };
 
             const response_line = readLineAlloc(allocator, child_stdout, max_ipc_line_bytes) catch |err| {
-                if (isRecoverableBridgeError(err) and attempt + 1 < 2) {
+                if (isRecoverableBridgeError(err)) {
                     self.restartChildRuntime() catch |restart_err| {
                         return toolBridgeFailureOwned(
                             allocator,
                             std.fmt.allocPrint(allocator, "sandbox tool response read failed: {s}; restart failed: {s}", .{ @errorName(err), @errorName(restart_err) }) catch null,
                         );
                     };
-                    continue :request_attempt_loop;
+                    return toolBridgeFailureOwned(
+                        allocator,
+                        std.fmt.allocPrint(
+                            allocator,
+                            "sandbox tool response read failed: {s}; runtime restarted; request was not retried",
+                            .{@errorName(err)},
+                        ) catch null,
+                    );
                 }
                 return toolBridgeFailureOwned(
                     allocator,

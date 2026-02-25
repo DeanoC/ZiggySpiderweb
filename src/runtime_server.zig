@@ -222,7 +222,7 @@ pub const RuntimeServer = struct {
     queue_mutex: std.Thread.Mutex = .{},
     queue_cond: std.Thread.Condition = .{},
     runtime_queue_max: usize = 128,
-    chat_operation_timeout_ms: u64 = 120_000,
+    chat_operation_timeout_ms: u64 = 300_000,
     control_operation_timeout_ms: u64 = 5_000,
     runtime_jobs: std.ArrayListUnmanaged(*RuntimeQueueJob) = .{},
     run_steps: run_orchestration.RunStepTracker,

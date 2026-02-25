@@ -6,6 +6,7 @@ const c = if (builtin.os.tag == .windows)
 else
     @cImport({
         @cInclude("sys/file.h");
+        @cInclude("sys/stat.h");
         @cInclude("sys/xattr.h");
     });
 
@@ -106,15 +107,110 @@ pub fn lookupChildAbsolute(
     const joined = try std.fs.path.join(allocator, &.{ parent_path, name });
     defer allocator.free(joined);
 
+    if (!isWithinRoot(root_path, joined)) return error.AccessDenied;
+
+    if (builtin.os.tag != .windows) {
+        const joined_z = try allocator.dupeZ(u8, joined);
+        defer allocator.free(joined_z);
+        const lst = try lstatFileNoPanicZ(joined_z.ptr);
+        if (lst.kind != .sym_link) {
+            return .{
+                .resolved_path = try allocator.dupe(u8, joined),
+                .stat = lst,
+            };
+        }
+    }
+
     const resolved = try std.fs.cwd().realpathAlloc(allocator, joined);
     errdefer allocator.free(resolved);
     if (!isWithinRoot(root_path, resolved)) return error.AccessDenied;
 
-    const stat = try std.fs.cwd().statFile(resolved);
+    const stat = if (builtin.os.tag == .windows)
+        try std.fs.cwd().statFile(resolved)
+    else blk: {
+        const resolved_z = try allocator.dupeZ(u8, resolved);
+        defer allocator.free(resolved_z);
+        break :blk try statFileNoPanicZ(resolved_z.ptr);
+    };
     return .{
         .resolved_path = resolved,
         .stat = stat,
     };
+}
+
+fn statFileNoPanicZ(path_z: [*:0]const u8) !std.fs.File.Stat {
+    var st: c.struct_stat = std.mem.zeroes(c.struct_stat);
+    while (true) {
+        const rc = c.stat(path_z, &st);
+        switch (std.posix.errno(rc)) {
+            .SUCCESS => return fileStatFromC(st),
+            .INTR => continue,
+            .ACCES, .PERM => return error.AccessDenied,
+            .NOENT, .NOTDIR, .NOTCONN => return error.FileNotFound,
+            else => |errno_no| return posixErrnoToError(errno_no),
+        }
+    }
+}
+
+fn lstatFileNoPanicZ(path_z: [*:0]const u8) !std.fs.File.Stat {
+    var st: c.struct_stat = std.mem.zeroes(c.struct_stat);
+    while (true) {
+        const rc = c.lstat(path_z, &st);
+        switch (std.posix.errno(rc)) {
+            .SUCCESS => return fileStatFromC(st),
+            .INTR => continue,
+            .ACCES, .PERM => return error.AccessDenied,
+            .NOENT, .NOTDIR, .NOTCONN => return error.FileNotFound,
+            else => |errno_no| return posixErrnoToError(errno_no),
+        }
+    }
+}
+
+fn fileStatFromC(st: c.struct_stat) std.fs.File.Stat {
+    const mode: u32 = @intCast(st.st_mode);
+    const atime = if (@hasField(c.struct_stat, "st_atim"))
+        timespecToNs(st.st_atim)
+    else if (@hasField(c.struct_stat, "st_atimespec"))
+        timespecToNs(st.st_atimespec)
+    else
+        @as(i128, 0);
+    const mtime = if (@hasField(c.struct_stat, "st_mtim"))
+        timespecToNs(st.st_mtim)
+    else if (@hasField(c.struct_stat, "st_mtimespec"))
+        timespecToNs(st.st_mtimespec)
+    else
+        @as(i128, 0);
+    const ctime = if (@hasField(c.struct_stat, "st_ctim"))
+        timespecToNs(st.st_ctim)
+    else if (@hasField(c.struct_stat, "st_ctimespec"))
+        timespecToNs(st.st_ctimespec)
+    else
+        @as(i128, 0);
+    const size_i128: i128 = @intCast(st.st_size);
+    const size: u64 = if (size_i128 < 0) 0 else @intCast(size_i128);
+
+    return .{
+        .inode = @intCast(st.st_ino),
+        .size = size,
+        .mode = @intCast(mode),
+        .kind = switch (mode & std.posix.S.IFMT) {
+            std.posix.S.IFBLK => .block_device,
+            std.posix.S.IFCHR => .character_device,
+            std.posix.S.IFDIR => .directory,
+            std.posix.S.IFIFO => .named_pipe,
+            std.posix.S.IFLNK => .sym_link,
+            std.posix.S.IFREG => .file,
+            std.posix.S.IFSOCK => .unix_domain_socket,
+            else => .unknown,
+        },
+        .atime = atime,
+        .mtime = mtime,
+        .ctime = ctime,
+    };
+}
+
+fn timespecToNs(ts: anytype) i128 {
+    return @as(i128, ts.tv_sec) * std.time.ns_per_s + @as(i128, ts.tv_nsec);
 }
 
 pub fn statAbsolute(path: []const u8) !std.fs.File.Stat {
