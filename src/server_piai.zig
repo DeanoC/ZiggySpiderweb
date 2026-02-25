@@ -35,10 +35,12 @@ const local_node_fs_url_env = "SPIDERWEB_LOCAL_NODE_FS_URL";
 const local_node_name_env = "SPIDERWEB_LOCAL_NODE_NAME";
 const local_node_lease_ttl_env = "SPIDERWEB_LOCAL_NODE_LEASE_TTL_MS";
 const local_node_heartbeat_ms_env = "SPIDERWEB_LOCAL_NODE_HEARTBEAT_MS";
-const local_node_default_workspace_export_name = "spider-web-workspace";
-const local_node_meta_export_name = "spider-web-meta";
-const local_node_capabilities_export_name = "spider-web-capabilities";
-const local_node_jobs_export_name = "spider-web-jobs";
+const system_agent_id = "mother";
+const system_project_id = fs_control_plane.spider_web_project_id;
+const local_node_default_workspace_export_name = "system-workspace";
+const local_node_meta_export_name = "system-meta";
+const local_node_capabilities_export_name = "system-capabilities";
+const local_node_jobs_export_name = "system-jobs";
 const local_node_mount_meta = "/meta";
 const local_node_mount_capabilities = "/capabilities";
 const local_node_mount_jobs = "/jobs";
@@ -975,8 +977,6 @@ fn localFsHeartbeatThreadMain(local_node: *LocalFsNode, control_plane: *fs_contr
 }
 
 const auth_tokens_filename = "auth_tokens.json";
-const user_default_agent_id = "user";
-const user_isolated_agent_id = "user-isolated";
 
 const ConnectionRole = enum {
     admin,
@@ -987,16 +987,6 @@ fn connectionRoleName(role: ConnectionRole) []const u8 {
     return switch (role) {
         .admin => "admin",
         .user => "user",
-    };
-}
-
-fn initialAgentIdForRole(role: ConnectionRole, primary_agent_id: []const u8) []const u8 {
-    return switch (role) {
-        .admin => primary_agent_id,
-        .user => if (std.mem.eql(u8, primary_agent_id, user_default_agent_id))
-            user_isolated_agent_id
-        else
-            user_default_agent_id,
     };
 }
 
@@ -1109,11 +1099,29 @@ const SessionBinding = struct {
     }
 };
 
+const RememberedTarget = struct {
+    agent_id: []u8,
+    project_id: []u8,
+
+    fn deinit(self: *RememberedTarget, allocator: std.mem.Allocator) void {
+        allocator.free(self.agent_id);
+        allocator.free(self.project_id);
+        self.* = undefined;
+    }
+};
+
 const AuthTokenStore = struct {
+    const PersistedTarget = struct {
+        agent_id: ?[]const u8 = null,
+        project_id: ?[]const u8 = null,
+    };
+
     const Persisted = struct {
-        schema: u32 = 1,
+        schema: u32 = 2,
         admin_token: []const u8,
         user_token: []const u8,
+        admin_last_target: ?PersistedTarget = null,
+        user_last_target: ?PersistedTarget = null,
         updated_at_ms: i64,
     };
 
@@ -1121,6 +1129,8 @@ const AuthTokenStore = struct {
     path: ?[]u8 = null,
     admin_token: []u8,
     user_token: []u8,
+    admin_last_target: ?RememberedTarget = null,
+    user_last_target: ?RememberedTarget = null,
     mutex: std.Thread.Mutex = .{},
 
     fn init(allocator: std.mem.Allocator, runtime_config: Config.RuntimeConfig) AuthTokenStore {
@@ -1137,6 +1147,8 @@ const AuthTokenStore = struct {
         if (self.path) |value| self.allocator.free(value);
         self.allocator.free(self.admin_token);
         self.allocator.free(self.user_token);
+        if (self.admin_last_target) |*target| target.deinit(self.allocator);
+        if (self.user_last_target) |*target| target.deinit(self.allocator);
         self.* = undefined;
     }
 
@@ -1162,23 +1174,87 @@ const AuthTokenStore = struct {
 
         self.mutex.lock();
         defer self.mutex.unlock();
-        const next_admin = if (role == .admin) replacement else self.admin_token;
-        const next_user = if (role == .user) replacement else self.user_token;
-        try self.persistTokensLocked(next_admin, next_user);
-
         switch (role) {
             .admin => {
                 const previous = self.admin_token;
                 self.admin_token = replacement;
+                self.persistCurrentStateLocked() catch |err| {
+                    self.admin_token = previous;
+                    self.allocator.free(replacement);
+                    return err;
+                };
                 self.allocator.free(previous);
             },
             .user => {
                 const previous = self.user_token;
                 self.user_token = replacement;
+                self.persistCurrentStateLocked() catch |err| {
+                    self.user_token = previous;
+                    self.allocator.free(replacement);
+                    return err;
+                };
                 self.allocator.free(previous);
             },
         }
         return next;
+    }
+
+    fn rememberedTargetOwned(self: *const AuthTokenStore, role: ConnectionRole) !?RememberedTarget {
+        const mutex = @constCast(&self.mutex);
+        mutex.lock();
+        defer mutex.unlock();
+        const stored = switch (role) {
+            .admin => self.admin_last_target,
+            .user => self.user_last_target,
+        } orelse return null;
+        return .{
+            .agent_id = try self.allocator.dupe(u8, stored.agent_id),
+            .project_id = try self.allocator.dupe(u8, stored.project_id),
+        };
+    }
+
+    fn setRememberedTarget(self: *AuthTokenStore, role: ConnectionRole, agent_id: []const u8, project_id: []const u8) !void {
+        const next_agent = try self.allocator.dupe(u8, agent_id);
+        errdefer self.allocator.free(next_agent);
+        const next_project = try self.allocator.dupe(u8, project_id);
+        errdefer self.allocator.free(next_project);
+        var next_target = RememberedTarget{
+            .agent_id = next_agent,
+            .project_id = next_project,
+        };
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const slot = switch (role) {
+            .admin => &self.admin_last_target,
+            .user => &self.user_last_target,
+        };
+        var previous = slot.*;
+        slot.* = next_target;
+        self.persistCurrentStateLocked() catch |err| {
+            slot.* = previous;
+            next_target.deinit(self.allocator);
+            return err;
+        };
+        if (previous) |*value| value.deinit(self.allocator);
+    }
+
+    fn clearRememberedTarget(self: *AuthTokenStore, role: ConnectionRole) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const slot = switch (role) {
+            .admin => &self.admin_last_target,
+            .user => &self.user_last_target,
+        };
+        var previous = slot.*;
+        slot.* = null;
+        self.persistCurrentStateLocked() catch |err| {
+            slot.* = previous;
+            return err;
+        };
+        if (previous) |*value| value.deinit(self.allocator);
     }
 
     fn statusJson(self: *const AuthTokenStore) ![]u8 {
@@ -1195,13 +1271,39 @@ const AuthTokenStore = struct {
             break :blk try std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped_path});
         } else try self.allocator.dupe(u8, "null");
         defer self.allocator.free(path_json);
+        const admin_target_json = if (self.admin_last_target) |target| blk: {
+            const escaped_agent = try unified.jsonEscape(self.allocator, target.agent_id);
+            defer self.allocator.free(escaped_agent);
+            const escaped_project = try unified.jsonEscape(self.allocator, target.project_id);
+            defer self.allocator.free(escaped_project);
+            break :blk try std.fmt.allocPrint(
+                self.allocator,
+                "{{\"agent_id\":\"{s}\",\"project_id\":\"{s}\"}}",
+                .{ escaped_agent, escaped_project },
+            );
+        } else try self.allocator.dupe(u8, "null");
+        defer self.allocator.free(admin_target_json);
+        const user_target_json = if (self.user_last_target) |target| blk: {
+            const escaped_agent = try unified.jsonEscape(self.allocator, target.agent_id);
+            defer self.allocator.free(escaped_agent);
+            const escaped_project = try unified.jsonEscape(self.allocator, target.project_id);
+            defer self.allocator.free(escaped_project);
+            break :blk try std.fmt.allocPrint(
+                self.allocator,
+                "{{\"agent_id\":\"{s}\",\"project_id\":\"{s}\"}}",
+                .{ escaped_agent, escaped_project },
+            );
+        } else try self.allocator.dupe(u8, "null");
+        defer self.allocator.free(user_target_json);
         return std.fmt.allocPrint(
             self.allocator,
-            "{{\"admin_token\":\"{s}\",\"user_token\":\"{s}\",\"path\":{s}}}",
+            "{{\"admin_token\":\"{s}\",\"user_token\":\"{s}\",\"path\":{s},\"admin_last_target\":{s},\"user_last_target\":{s}}}",
             .{
                 escaped_admin,
                 escaped_user,
                 path_json,
+                admin_target_json,
+                user_target_json,
             },
         );
     }
@@ -1234,7 +1336,7 @@ const AuthTokenStore = struct {
         self.user_token = next_user;
         self.allocator.free(previous_admin);
         self.allocator.free(previous_user);
-        self.persistTokensLocked(self.admin_token, self.user_token) catch |err| {
+        self.persistCurrentStateLocked() catch |err| {
             std.log.warn("failed to persist generated auth tokens: {s}", .{@errorName(err)});
         };
 
@@ -1259,24 +1361,42 @@ const AuthTokenStore = struct {
         errdefer self.allocator.free(next_admin);
         const next_user = try self.allocator.dupe(u8, parsed.value.user_token);
         errdefer self.allocator.free(next_user);
+        var next_admin_target = try copyPersistedTarget(self.allocator, parsed.value.admin_last_target);
+        errdefer if (next_admin_target) |*target| target.deinit(self.allocator);
+        var next_user_target = try copyPersistedTarget(self.allocator, parsed.value.user_last_target);
+        errdefer if (next_user_target) |*target| target.deinit(self.allocator);
 
         self.mutex.lock();
         defer self.mutex.unlock();
         const previous_admin = self.admin_token;
         const previous_user = self.user_token;
+        var previous_admin_target = self.admin_last_target;
+        var previous_user_target = self.user_last_target;
         self.admin_token = next_admin;
         self.user_token = next_user;
+        self.admin_last_target = next_admin_target;
+        self.user_last_target = next_user_target;
         self.allocator.free(previous_admin);
         self.allocator.free(previous_user);
+        if (previous_admin_target) |*target| target.deinit(self.allocator);
+        if (previous_user_target) |*target| target.deinit(self.allocator);
         return true;
     }
 
-    fn persistTokensLocked(self: *AuthTokenStore, admin_token: []const u8, user_token: []const u8) !void {
+    fn persistCurrentStateLocked(self: *AuthTokenStore) !void {
         const path = self.path orelse return error.AuthTokenPathUnavailable;
         const payload = Persisted{
-            .schema = 1,
-            .admin_token = admin_token,
-            .user_token = user_token,
+            .schema = 2,
+            .admin_token = self.admin_token,
+            .user_token = self.user_token,
+            .admin_last_target = if (self.admin_last_target) |value| .{
+                .agent_id = value.agent_id,
+                .project_id = value.project_id,
+            } else null,
+            .user_last_target = if (self.user_last_target) |value| .{
+                .agent_id = value.agent_id,
+                .project_id = value.project_id,
+            } else null,
             .updated_at_ms = std.time.milliTimestamp(),
         };
         const bytes = try std.json.Stringify.valueAlloc(self.allocator, payload, .{
@@ -1294,6 +1414,16 @@ const AuthTokenStore = struct {
             try file.chmod(0o600);
         }
         try file.writeAll(bytes);
+    }
+
+    fn copyPersistedTarget(allocator: std.mem.Allocator, persisted: ?PersistedTarget) !?RememberedTarget {
+        const value = persisted orelse return null;
+        const agent_id = value.agent_id orelse return null;
+        const project_id = value.project_id orelse return null;
+        return .{
+            .agent_id = try allocator.dupe(u8, agent_id),
+            .project_id = try allocator.dupe(u8, project_id),
+        };
     }
 
     fn parseBearerToken(header_value: []const u8) ?[]const u8 {
@@ -1387,13 +1517,13 @@ const AgentRuntimeRegistry = struct {
         max_runtimes: usize,
     ) AgentRuntimeRegistry {
         const configured_default = if (runtime_config.default_agent_id.len == 0)
-            runtime_server_mod.default_agent_id
+            system_agent_id
         else
             runtime_config.default_agent_id;
         const effective_default = if (isValidAgentId(configured_default))
             configured_default
         else
-            runtime_server_mod.default_agent_id;
+            system_agent_id;
         if (!isValidAgentId(configured_default)) {
             std.log.warn(
                 "Invalid default_agent_id '{s}', falling back to '{s}'",
@@ -1524,6 +1654,102 @@ const AgentRuntimeRegistry = struct {
 
     fn rotateAuthToken(self: *AgentRuntimeRegistry, role: ConnectionRole) ![]u8 {
         return self.auth_tokens.rotateRoleToken(role);
+    }
+
+    const ConnectGateError = struct {
+        code: []const u8,
+        message: []const u8,
+    };
+
+    const InitialSessionBinding = struct {
+        binding: SessionBinding,
+        connect_gate_error: ?ConnectGateError = null,
+    };
+
+    fn projectExists(self: *AgentRuntimeRegistry, project_id: []const u8) bool {
+        const escaped_project = unified.jsonEscape(self.allocator, project_id) catch return false;
+        defer self.allocator.free(escaped_project);
+        const payload = std.fmt.allocPrint(self.allocator, "{{\"project_id\":\"{s}\"}}", .{escaped_project}) catch return false;
+        defer self.allocator.free(payload);
+        const result = self.control_plane.getProject(payload) catch return false;
+        self.allocator.free(result);
+        return true;
+    }
+
+    fn canPrincipalUseTarget(self: *AgentRuntimeRegistry, role: ConnectionRole, agent_id: []const u8, project_id: []const u8) bool {
+        if (!isValidAgentId(agent_id)) return false;
+        if (!isValidProjectId(project_id)) return false;
+        if (!self.projectExists(project_id)) return false;
+        if (role == .user and std.mem.eql(u8, agent_id, system_agent_id)) return false;
+        if (role == .user and std.mem.eql(u8, project_id, system_project_id)) return false;
+        return true;
+    }
+
+    fn clearRememberedTargetForRole(self: *AgentRuntimeRegistry, role: ConnectionRole) void {
+        self.auth_tokens.clearRememberedTarget(role) catch |err| {
+            std.log.warn("failed to clear invalid remembered target for {s}: {s}", .{ connectionRoleName(role), @errorName(err) });
+        };
+    }
+
+    fn buildInitialSessionBinding(self: *AgentRuntimeRegistry, role: ConnectionRole) !InitialSessionBinding {
+        var remembered = try self.auth_tokens.rememberedTargetOwned(role);
+        defer if (remembered) |*target| target.deinit(self.allocator);
+
+        if (remembered) |target| {
+            if (self.canPrincipalUseTarget(role, target.agent_id, target.project_id)) {
+                return .{
+                    .binding = .{
+                        .agent_id = try self.allocator.dupe(u8, target.agent_id),
+                        .project_id = try self.allocator.dupe(u8, target.project_id),
+                        .project_token = null,
+                    },
+                };
+            }
+            self.clearRememberedTargetForRole(role);
+            if (role == .user) {
+                return .{
+                    .binding = .{
+                        .agent_id = try self.allocator.dupe(u8, system_agent_id),
+                        .project_id = try self.allocator.dupe(u8, system_project_id),
+                        .project_token = null,
+                    },
+                    .connect_gate_error = .{
+                        .code = "last_target_invalid",
+                        .message = "last remembered project/agent target is unavailable; ask an admin to provision a project",
+                    },
+                };
+            }
+        }
+
+        if (role == .admin) {
+            return .{
+                .binding = .{
+                    .agent_id = try self.allocator.dupe(u8, system_agent_id),
+                    .project_id = try self.allocator.dupe(u8, system_project_id),
+                    .project_token = null,
+                },
+            };
+        }
+
+        return .{
+            .binding = .{
+                .agent_id = try self.allocator.dupe(u8, system_agent_id),
+                .project_id = try self.allocator.dupe(u8, system_project_id),
+                .project_token = null,
+            },
+            .connect_gate_error = .{
+                .code = "provisioning_required",
+                .message = "no non-system project/agent is available for this user token; ask an admin to provision one",
+            },
+        };
+    }
+
+    fn rememberPrincipalTarget(self: *AgentRuntimeRegistry, principal: ConnectionPrincipal, agent_id: []const u8, project_id: ?[]const u8) void {
+        const concrete_project = project_id orelse return;
+        if (std.mem.eql(u8, concrete_project, system_project_id)) return;
+        self.auth_tokens.setRememberedTarget(principal.role, agent_id, concrete_project) catch |err| {
+            std.log.warn("failed to persist last target for {s}: {s}", .{ connectionRoleName(principal.role), @errorName(err) });
+        };
     }
 
     fn startReconcileWorker(self: *AgentRuntimeRegistry) !void {
@@ -1734,6 +1960,7 @@ const AgentRuntimeRegistry = struct {
         agent_id: []const u8,
         requested_project_id: ?[]const u8,
     ) ![]u8 {
+        _ = agent_id;
         if (requested_project_id) |project_id| {
             if (!isValidProjectId(project_id)) return error.InvalidProjectId;
             return self.allocator.dupe(u8, project_id);
@@ -1741,17 +1968,6 @@ const AgentRuntimeRegistry = struct {
 
         if (!self.runtime_config.sandbox_enabled) {
             return self.allocator.dupe(u8, "__local__");
-        }
-
-        const status_payload = self.control_plane.workspaceStatus(agent_id, null) catch {
-            return error.ProjectResolutionFailed;
-        };
-        defer self.allocator.free(status_payload);
-        const selected = extractProjectIdFromControlPayload(self.allocator, status_payload) catch return error.ProjectResolutionFailed;
-        defer if (selected) |value| self.allocator.free(value);
-        if (selected) |project_id| {
-            if (!isValidProjectId(project_id)) return error.InvalidProjectId;
-            return self.allocator.dupe(u8, project_id);
         }
         return error.ProjectRequired;
     }
@@ -2901,16 +3117,29 @@ fn handleWebSocketConnection(
     var session_bindings: std.StringHashMapUnmanaged(SessionBinding) = .{};
     defer deinitSessionBindings(allocator, &session_bindings);
 
-    const default_agent_id = initialAgentIdForRole(principal.role, runtime_registry.default_agent_id);
-    const default_project_id: ?[]const u8 = if (principal.role == .admin)
-        fs_control_plane.spider_web_project_id
+    var initial_binding = try runtime_registry.buildInitialSessionBinding(principal.role);
+    defer initial_binding.binding.deinit(allocator);
+    var connect_gate_error = initial_binding.connect_gate_error;
+    try upsertSessionBinding(
+        allocator,
+        &session_bindings,
+        "main",
+        initial_binding.binding.agent_id,
+        initial_binding.binding.project_id,
+        initial_binding.binding.project_token,
+    );
+    var initial_warmup_snapshot = if (connect_gate_error == null)
+        runtime_registry.ensureRuntimeWarmup(
+            initial_binding.binding.agent_id,
+            initial_binding.binding.project_id,
+            initial_binding.binding.project_token,
+            true,
+        ) catch |err| blk: {
+            std.log.warn("default session warmup failed: {s}", .{@errorName(err)});
+            break :blk SessionAttachStateSnapshot{};
+        }
     else
-        null;
-    try upsertSessionBinding(allocator, &session_bindings, "main", default_agent_id, default_project_id, null);
-    var initial_warmup_snapshot = runtime_registry.ensureRuntimeWarmup(default_agent_id, default_project_id, null, true) catch |err| blk: {
-        std.log.warn("default session warmup failed: {s}", .{@errorName(err)});
-        break :blk SessionAttachStateSnapshot{};
-    };
+        SessionAttachStateSnapshot{};
     defer initial_warmup_snapshot.deinit(allocator);
 
     var active_session_key = try allocator.dupe(u8, "main");
@@ -2950,6 +3179,7 @@ fn handleWebSocketConnection(
                         frame.payload,
                         &session_bindings,
                         active_session_key,
+                        connect_gate_error,
                         debug_stream_enabled,
                     )) {
                         continue;
@@ -2992,6 +3222,18 @@ fn handleWebSocketConnection(
                             try writeFrameLocked(stream, &connection_write_mutex, "", .close);
                             return;
                         }
+                        if (connect_gate_error != null and control_type != .version and control_type != .connect) {
+                            const gate = connect_gate_error.?;
+                            const response = try unified.buildControlError(
+                                allocator,
+                                parsed.id,
+                                gate.code,
+                                gate.message,
+                            );
+                            defer allocator.free(response);
+                            try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                            continue;
+                        }
 
                         switch (control_type) {
                             .version => {
@@ -3030,6 +3272,17 @@ fn handleWebSocketConnection(
                                 continue;
                             },
                             .connect => {
+                                if (connect_gate_error) |gate| {
+                                    const response = try unified.buildControlError(
+                                        allocator,
+                                        parsed.id,
+                                        gate.code,
+                                        gate.message,
+                                    );
+                                    defer allocator.free(response);
+                                    try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                    continue;
+                                }
                                 const active_binding = session_bindings.get(active_session_key) orelse return error.InvalidState;
                                 const escaped_role = switch (principal.role) {
                                     .admin => "admin",
@@ -3286,8 +3539,8 @@ fn handleWebSocketConnection(
                                     try writeFrameLocked(stream, &connection_write_mutex, response, .text);
                                     continue;
                                 };
-                                const attach_project_id = getOptionalStringField(payload.value.object, "project_id");
-                                const attach_project_token = getOptionalStringField(payload.value.object, "project_token");
+                                var attach_project_id = getOptionalStringField(payload.value.object, "project_id");
+                                var attach_project_token = getOptionalStringField(payload.value.object, "project_token");
                                 const current_binding = session_bindings.get(active_session_key) orelse return error.InvalidState;
                                 const security_correlation = parsed.correlation_id orelse parsed.id;
 
@@ -3326,50 +3579,69 @@ fn handleWebSocketConnection(
                                         continue;
                                     }
                                 }
-                                if (principal.role == .user and std.mem.eql(u8, attach_agent_id, runtime_registry.default_agent_id)) {
-                                    runtime_registry.appendSecurityAuditAndDebug(
-                                        current_binding.agent_id,
-                                        .session_attach,
-                                        principal.role,
-                                        security_correlation,
-                                        "session_attach_forbidden_primary_agent",
-                                        false,
-                                        "forbidden",
-                                        "user role cannot attach to primary agent",
-                                    );
-                                    const response = try unified.buildControlError(
-                                        allocator,
-                                        parsed.id,
-                                        "forbidden",
-                                        "user role cannot attach to primary agent",
-                                    );
-                                    defer allocator.free(response);
-                                    try writeFrameLocked(stream, &connection_write_mutex, response, .text);
-                                    continue;
+
+                                const existing_binding = session_bindings.get(session_key);
+                                if (attach_project_id == null and existing_binding != null and std.mem.eql(u8, existing_binding.?.agent_id, attach_agent_id)) {
+                                    attach_project_id = existing_binding.?.project_id;
+                                    attach_project_token = existing_binding.?.project_token;
                                 }
-                                if (principal.role == .user and attach_project_id != null and std.mem.eql(u8, attach_project_id.?, fs_control_plane.spider_web_project_id)) {
-                                    runtime_registry.appendSecurityAuditAndDebug(
-                                        current_binding.agent_id,
-                                        .session_attach,
-                                        principal.role,
-                                        security_correlation,
-                                        "session_attach_forbidden_spiderweb_project",
-                                        false,
-                                        "forbidden",
-                                        "user role cannot attach to spider-web project",
-                                    );
+                                if (attach_project_id == null and principal.role == .admin and std.mem.eql(u8, attach_agent_id, system_agent_id)) {
+                                    attach_project_id = system_project_id;
+                                }
+                                if (attach_project_id == null and principal.role == .user) {
                                     const response = try unified.buildControlError(
                                         allocator,
                                         parsed.id,
-                                        "forbidden",
-                                        "user role cannot attach to spider-web project",
+                                        "provisioning_required",
+                                        "no non-system project/agent is available for this user token; ask an admin to provision one",
                                     );
                                     defer allocator.free(response);
                                     try writeFrameLocked(stream, &connection_write_mutex, response, .text);
                                     continue;
                                 }
 
-                                const existing_binding = session_bindings.get(session_key);
+                                if (principal.role == .user and std.mem.eql(u8, attach_agent_id, system_agent_id)) {
+                                    runtime_registry.appendSecurityAuditAndDebug(
+                                        current_binding.agent_id,
+                                        .session_attach,
+                                        principal.role,
+                                        security_correlation,
+                                        "session_attach_forbidden_system_agent",
+                                        false,
+                                        "forbidden",
+                                        "user role cannot attach to mother agent",
+                                    );
+                                    const response = try unified.buildControlError(
+                                        allocator,
+                                        parsed.id,
+                                        "forbidden",
+                                        "user role cannot attach to mother agent",
+                                    );
+                                    defer allocator.free(response);
+                                    try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                    continue;
+                                }
+                                if (principal.role == .user and attach_project_id != null and std.mem.eql(u8, attach_project_id.?, system_project_id)) {
+                                    runtime_registry.appendSecurityAuditAndDebug(
+                                        current_binding.agent_id,
+                                        .session_attach,
+                                        principal.role,
+                                        security_correlation,
+                                        "session_attach_forbidden_system_project",
+                                        false,
+                                        "forbidden",
+                                        "user role cannot attach to system project",
+                                    );
+                                    const response = try unified.buildControlError(
+                                        allocator,
+                                        parsed.id,
+                                        "forbidden",
+                                        "user role cannot attach to system project",
+                                    );
+                                    defer allocator.free(response);
+                                    try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                    continue;
+                                }
                                 const rebind_requested = if (existing_binding) |binding|
                                     !std.mem.eql(u8, binding.agent_id, attach_agent_id) or
                                         !optionalStringsEqual(binding.project_id, attach_project_id)
@@ -3495,6 +3767,12 @@ fn handleWebSocketConnection(
                                 );
                                 defer allocator.free(response);
                                 try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                connect_gate_error = null;
+                                runtime_registry.rememberPrincipalTarget(
+                                    principal,
+                                    active_binding.agent_id,
+                                    active_binding.project_id,
+                                );
                                 continue;
                             },
                             .session_status => {
@@ -4002,6 +4280,17 @@ fn handleWebSocketConnection(
                         }
                     },
                     .fsrpc => {
+                        if (connect_gate_error) |gate| {
+                            const response = try unified.buildFsrpcError(
+                                allocator,
+                                parsed.tag,
+                                gate.code,
+                                gate.message,
+                            );
+                            defer allocator.free(response);
+                            try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                            continue;
+                        }
                         const fsrpc_type = parsed.fsrpc_type orelse {
                             const response = try unified.buildFsrpcError(
                                 allocator,
@@ -4207,17 +4496,6 @@ fn handleWebSocketConnection(
                                     parsed.tag,
                                     "sandbox_invalid_config",
                                     "sandbox config is invalid",
-                                );
-                                defer allocator.free(response);
-                                try writeFrameLocked(stream, &connection_write_mutex, response, .text);
-                                continue;
-                            },
-                            error.ProjectResolutionFailed => {
-                                const response = try unified.buildFsrpcError(
-                                    allocator,
-                                    parsed.tag,
-                                    "sandbox_mount_unavailable",
-                                    "sandbox project resolution failed",
                                 );
                                 defer allocator.free(response);
                                 try writeFrameLocked(stream, &connection_write_mutex, response, .text);
@@ -4539,11 +4817,23 @@ fn tryHandleLegacySessionSendFrame(
     raw_payload: []const u8,
     session_bindings: *std.StringHashMapUnmanaged(SessionBinding),
     active_session_key: []const u8,
+    connect_gate_error: ?AgentRuntimeRegistry.ConnectGateError,
     emit_debug: bool,
 ) !bool {
     var legacy = protocol.parseMessage(allocator, raw_payload) catch return false;
     defer protocol.deinitParsedMessage(allocator, &legacy);
     if (legacy.msg_type != .session_send) return false;
+    if (connect_gate_error) |gate| {
+        const response = try protocol.buildErrorWithCode(
+            allocator,
+            legacy.id orelse "generated",
+            .execution_failed,
+            gate.message,
+        );
+        defer allocator.free(response);
+        try writeFrameLocked(stream, write_mutex, response, .text);
+        return true;
+    }
 
     const session_key = parseSessionKeyFromLegacyMessage(allocator, raw_payload) orelse try allocator.dupe(u8, active_session_key);
     defer allocator.free(session_key);
@@ -4647,12 +4937,6 @@ fn tryHandleLegacySessionSendFrame(
         },
         error.InvalidSandboxConfig => {
             const response = try protocol.buildErrorWithCode(allocator, legacy.id orelse "generated", .execution_failed, "sandbox config is invalid");
-            defer allocator.free(response);
-            try writeFrameLocked(stream, write_mutex, response, .text);
-            return true;
-        },
-        error.ProjectResolutionFailed => {
-            const response = try protocol.buildErrorWithCode(allocator, legacy.id orelse "generated", .execution_failed, "sandbox project resolution failed");
             defer allocator.free(response);
             try writeFrameLocked(stream, write_mutex, response, .text);
             return true;
@@ -5180,8 +5464,32 @@ fn setAuthTokensForTests(
     const allocator = runtime_registry.allocator;
     allocator.free(runtime_registry.auth_tokens.admin_token);
     allocator.free(runtime_registry.auth_tokens.user_token);
+    if (runtime_registry.auth_tokens.admin_last_target) |*target| target.deinit(allocator);
+    if (runtime_registry.auth_tokens.user_last_target) |*target| target.deinit(allocator);
     runtime_registry.auth_tokens.admin_token = try allocator.dupe(u8, admin_token);
     runtime_registry.auth_tokens.user_token = try allocator.dupe(u8, user_token);
+    runtime_registry.auth_tokens.admin_last_target = null;
+    runtime_registry.auth_tokens.user_last_target = null;
+}
+
+fn seedUserRememberedTargetForTests(
+    runtime_registry: *AgentRuntimeRegistry,
+    agent_id: []const u8,
+) !void {
+    const allocator = runtime_registry.allocator;
+    const project_up = try runtime_registry.control_plane.projectUp(
+        agent_id,
+        "{\"name\":\"User Seed Project\",\"activate\":true}",
+    );
+    defer allocator.free(project_up);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, project_up, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.TestExpectedResult;
+    const project_id_value = parsed.value.object.get("project_id") orelse return error.TestExpectedResult;
+    if (project_id_value != .string) return error.TestExpectedResult;
+
+    try runtime_registry.auth_tokens.setRememberedTarget(.user, agent_id, project_id_value.string);
 }
 
 fn readHttpHeadersAlloc(allocator: std.mem.Allocator, stream: *std.net.Stream, max_bytes: usize) ![]u8 {
@@ -5479,6 +5787,7 @@ test "server_piai: base websocket path handles unified control/fsrpc chat flow a
     }, null);
     defer runtime_registry.deinit();
     try setAuthTokensForTests(&runtime_registry, "admin-secret", "user-secret");
+    try seedUserRememberedTargetForTests(&runtime_registry, "user-auth");
 
     var listener = try (try std.net.Address.parseIp("127.0.0.1", 0)).listen(.{ .reuse_address = true });
     defer listener.deinit();
@@ -5771,7 +6080,7 @@ test "server_piai: auth matrix gates admin endpoints and handshake tokens" {
         var forbidden_attach = try readServerFrame(allocator, &user_client);
         defer forbidden_attach.deinit(allocator);
         try std.testing.expect(std.mem.indexOf(u8, forbidden_attach.payload, "\"type\":\"control.error\"") != null);
-        try std.testing.expect(std.mem.indexOf(u8, forbidden_attach.payload, "\"code\":\"forbidden\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, forbidden_attach.payload, "\"code\":\"provisioning_required\"") != null);
 
         try websocket_transport.writeFrame(&user_client, "", .close);
         var close_reply = try readServerFrame(allocator, &user_client);
@@ -5816,7 +6125,7 @@ test "server_piai: auth matrix gates admin endpoints and handshake tokens" {
     try std.testing.expect(server_ctx.err_name == null);
 }
 
-test "server_piai: user connect avoids primary agent when primary id is user" {
+test "server_piai: user connect is rejected when no remembered non-system target exists" {
     const allocator = std.testing.allocator;
     var runtime_registry = AgentRuntimeRegistry.init(allocator, .{
         .ltm_directory = "",
@@ -5824,8 +6133,6 @@ test "server_piai: user connect avoids primary agent when primary id is user" {
     }, null);
     defer runtime_registry.deinit();
     try setAuthTokensForTests(&runtime_registry, "admin-secret", "user-secret");
-    allocator.free(runtime_registry.default_agent_id);
-    runtime_registry.default_agent_id = try allocator.dupe(u8, user_default_agent_id);
 
     var listener = try (try std.net.Address.parseIp("127.0.0.1", 0)).listen(.{ .reuse_address = true });
     defer listener.deinit();
@@ -5850,13 +6157,10 @@ test "server_piai: user connect avoids primary agent when primary id is user" {
     try std.testing.expect(std.mem.indexOf(u8, version_ack.payload, "\"type\":\"control.version_ack\"") != null);
 
     try writeClientTextFrameMasked(&user_client, "{\"channel\":\"control\",\"type\":\"control.connect\",\"id\":\"user-avoid-primary-connect\"}");
-    var connect_ack = try readServerFrame(allocator, &user_client);
-    defer connect_ack.deinit(allocator);
-    try std.testing.expect(std.mem.indexOf(u8, connect_ack.payload, "\"type\":\"control.connect_ack\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, connect_ack.payload, "\"role\":\"user\"") != null);
-    const isolated_agent_fragment = try std.fmt.allocPrint(allocator, "\"agent_id\":\"{s}\"", .{user_isolated_agent_id});
-    defer allocator.free(isolated_agent_fragment);
-    try std.testing.expect(std.mem.indexOf(u8, connect_ack.payload, isolated_agent_fragment) != null);
+    var connect_err = try readServerFrame(allocator, &user_client);
+    defer connect_err.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, connect_err.payload, "\"type\":\"control.error\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, connect_err.payload, "\"code\":\"provisioning_required\"") != null);
 
     const attach_primary = try std.fmt.allocPrint(
         allocator,
@@ -5868,7 +6172,7 @@ test "server_piai: user connect avoids primary agent when primary id is user" {
     var attach_forbidden = try readServerFrame(allocator, &user_client);
     defer attach_forbidden.deinit(allocator);
     try std.testing.expect(std.mem.indexOf(u8, attach_forbidden.payload, "\"type\":\"control.error\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, attach_forbidden.payload, "\"code\":\"forbidden\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, attach_forbidden.payload, "\"code\":\"provisioning_required\"") != null);
 
     try websocket_transport.writeFrame(&user_client, "", .close);
     var close_reply = try readServerFrame(allocator, &user_client);
@@ -6366,7 +6670,7 @@ test "server_piai: invalid configured default agent falls back to built-in defau
     cfg.default_agent_id = ".";
 
     const registry = AgentRuntimeRegistry.initWithLimits(allocator, cfg, null, 8);
-    try std.testing.expectEqualStrings(runtime_server_mod.default_agent_id, registry.default_agent_id);
+    try std.testing.expectEqualStrings(system_agent_id, registry.default_agent_id);
 }
 
 test "server_piai: parseArchiveTimestamp accepts rotated debug archive names" {
