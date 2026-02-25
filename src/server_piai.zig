@@ -2054,6 +2054,7 @@ const AgentRuntimeRegistry = struct {
         agent_id: []const u8,
         project_id: ?[]const u8,
         project_token: ?[]const u8,
+        retry_on_error: bool,
     ) !SessionAttachStateSnapshot {
         if (!self.runtime_config.sandbox_enabled) {
             return .{
@@ -2096,10 +2097,15 @@ const AgentRuntimeRegistry = struct {
                         state.updated_at_ms = std.time.milliTimestamp();
                     };
                 }
-                if (!state.in_flight and state.state != .ready) {
-                    state.setWarming(self.allocator);
-                    state.in_flight = true;
-                    should_spawn = true;
+                if (!state.in_flight) {
+                    if (state.state == .err and !retry_on_error) {
+                        // Preserve sticky error state for read-only status probes so callers can
+                        // surface the real failure instead of oscillating forever in "warming".
+                    } else if (state.state != .ready) {
+                        state.setWarming(self.allocator);
+                        state.in_flight = true;
+                        should_spawn = true;
+                    }
                 }
             } else {
                 const owned_key = try self.allocator.dupe(u8, binding_key);
@@ -2876,7 +2882,7 @@ fn handleWebSocketConnection(
 
     const default_agent_id = initialAgentIdForRole(principal.role, runtime_registry.default_agent_id);
     try upsertSessionBinding(allocator, &session_bindings, "main", default_agent_id, null, null);
-    var initial_warmup_snapshot = runtime_registry.ensureRuntimeWarmup(default_agent_id, null, null) catch |err| blk: {
+    var initial_warmup_snapshot = runtime_registry.ensureRuntimeWarmup(default_agent_id, null, null, true) catch |err| blk: {
         std.log.warn("default session warmup failed: {s}", .{@errorName(err)});
         break :blk SessionAttachStateSnapshot{};
     };
@@ -3431,6 +3437,7 @@ fn handleWebSocketConnection(
                                     active_binding.agent_id,
                                     active_binding.project_id,
                                     active_binding.project_token,
+                                    true,
                                 ) catch |warm_err| {
                                     const response = try unified.buildControlError(
                                         allocator,
@@ -3498,6 +3505,7 @@ fn handleWebSocketConnection(
                                     binding.agent_id,
                                     binding.project_id,
                                     binding.project_token,
+                                    false,
                                 ) catch |warm_err| {
                                     const response = try unified.buildControlError(
                                         allocator,
@@ -3574,6 +3582,7 @@ fn handleWebSocketConnection(
                                     binding.agent_id,
                                     binding.project_id,
                                     binding.project_token,
+                                    true,
                                 ) catch |warm_err| {
                                     const response = try unified.buildControlError(
                                         allocator,
@@ -4061,6 +4070,7 @@ fn handleWebSocketConnection(
                                 target_binding.agent_id,
                                 target_binding.project_id,
                                 target_binding.project_token,
+                                true,
                             ) catch |warm_err| {
                                 const response = try unified.buildFsrpcError(
                                     allocator,
@@ -4528,6 +4538,7 @@ fn tryHandleLegacySessionSendFrame(
             binding.agent_id,
             binding.project_id,
             binding.project_token,
+            true,
         ) catch |warm_err| {
             const response = try protocol.buildErrorWithCode(
                 allocator,
