@@ -43,6 +43,11 @@ pub const DirValue = struct {
     expires_at_ms: i64,
 };
 
+pub const DirListingValue = struct {
+    payload_json: []u8,
+    expires_at_ms: i64,
+};
+
 pub const NegativeValue = struct {
     expires_at_ms: i64,
 };
@@ -156,6 +161,49 @@ pub const DirEntryCache = struct {
             self.map.items[i].key.deinit(self.allocator);
             self.allocator.free(self.map.items[i].value.attr_json);
             _ = self.map.swapRemove(i);
+        }
+    }
+};
+
+pub const DirListingCache = struct {
+    allocator: std.mem.Allocator,
+    ttl_ms: i64,
+    map: std.AutoHashMapUnmanaged(NodeKey, DirListingValue) = .{},
+
+    pub fn init(allocator: std.mem.Allocator, ttl_ms: i64) DirListingCache {
+        return .{
+            .allocator = allocator,
+            .ttl_ms = if (ttl_ms <= 0) DefaultTtlMs else ttl_ms,
+        };
+    }
+
+    pub fn deinit(self: *DirListingCache) void {
+        var it = self.map.valueIterator();
+        while (it.next()) |entry| self.allocator.free(entry.payload_json);
+        self.map.deinit(self.allocator);
+    }
+
+    pub fn getFresh(self: *DirListingCache, key: NodeKey, now_ms: i64) ?[]const u8 {
+        const entry = self.map.get(key) orelse return null;
+        if (entry.expires_at_ms < now_ms) return null;
+        return entry.payload_json;
+    }
+
+    pub fn put(self: *DirListingCache, key: NodeKey, payload_json: []const u8, now_ms: i64) !void {
+        const owned = try self.allocator.dupe(u8, payload_json);
+        errdefer self.allocator.free(owned);
+
+        if (try self.map.fetchPut(self.allocator, key, .{
+            .payload_json = owned,
+            .expires_at_ms = now_ms + self.ttl_ms,
+        })) |existing| {
+            self.allocator.free(existing.value.payload_json);
+        }
+    }
+
+    pub fn invalidateDir(self: *DirListingCache, endpoint_index: u16, dir_id: u64) void {
+        if (self.map.fetchRemove(.{ .endpoint_index = endpoint_index, .node_id = dir_id })) |entry| {
+            self.allocator.free(entry.value.payload_json);
         }
     }
 };
@@ -328,4 +376,15 @@ test "fs_cache: negative cache expires" {
     try cache.put(1, 9, "missing.txt", 1000);
     try std.testing.expect(cache.containsFresh(1, 9, "missing.txt", 1025));
     try std.testing.expect(!cache.containsFresh(1, 9, "missing.txt", 2000));
+}
+
+test "fs_cache: directory listing cache respects ttl" {
+    const allocator = std.testing.allocator;
+    var cache = DirListingCache.init(allocator, 100);
+    defer cache.deinit();
+
+    const key = NodeKey{ .endpoint_index = 2, .node_id = 99 };
+    try cache.put(key, "{\"ents\":[],\"next_cookie\":0}", 1000);
+    try std.testing.expect(cache.getFresh(key, 1050) != null);
+    try std.testing.expect(cache.getFresh(key, 1205) == null);
 }
