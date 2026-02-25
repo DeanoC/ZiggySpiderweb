@@ -3224,7 +3224,11 @@ fn handleWebSocketConnection(
                             try writeFrameLocked(stream, &connection_write_mutex, "", .close);
                             return;
                         }
-                        if (connect_gate_error != null and control_type != .version and control_type != .connect) {
+                        if (connect_gate_error != null and
+                            control_type != .version and
+                            control_type != .connect and
+                            control_type != .session_attach)
+                        {
                             const gate = connect_gate_error.?;
                             const response = try unified.buildControlError(
                                 allocator,
