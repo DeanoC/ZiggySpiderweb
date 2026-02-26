@@ -36,6 +36,11 @@ and falls back to policy node resources (`fs`, `camera`, `screen`, `user`, `term
 for `/nodes/<node_id>/services/*`, with per-service `SCHEMA.json`, `CAPS.json`,
 and `STATUS.json`.
 
+Node resource roots (`/nodes/<node_id>/fs`, `camera`, `screen`, `user`, `terminal/*`)
+follow the same service view:
+- when service catalog is available, roots are derived from advertised service kinds
+- otherwise roots are derived from policy fallback resources
+
 When project workspace mounts reference nodes not present in policy, runtime creates
 discovered `/nodes/<node_id>` entries so project FS links always resolve.
 
@@ -90,6 +95,8 @@ Project metadata now includes:
 
 Runtime uses project token (when bound) for workspace status lookup and falls back
 to policy-derived placeholder status if control-plane status is unavailable.
+Fallback control-plane status is accepted only when `project_id` matches the
+requested project to avoid cross-project topology leakage.
 
 ## Policy Files
 
