@@ -1073,6 +1073,31 @@ pub const Session = struct {
         return id;
     }
 
+    fn appendServiceIndexEntry(
+        self: *Session,
+        out: *std.ArrayListUnmanaged(u8),
+        first: *bool,
+        service_id: []const u8,
+        kind: []const u8,
+        state: []const u8,
+        endpoint: []const u8,
+    ) !void {
+        if (!first.*) try out.append(self.allocator, ',');
+        first.* = false;
+        const escaped_service_id = try unified.jsonEscape(self.allocator, service_id);
+        defer self.allocator.free(escaped_service_id);
+        const escaped_kind = try unified.jsonEscape(self.allocator, kind);
+        defer self.allocator.free(escaped_kind);
+        const escaped_state = try unified.jsonEscape(self.allocator, state);
+        defer self.allocator.free(escaped_state);
+        const escaped_endpoint = try unified.jsonEscape(self.allocator, endpoint);
+        defer self.allocator.free(escaped_endpoint);
+        try out.writer(self.allocator).print(
+            "{{\"service_id\":\"{s}\",\"kind\":\"{s}\",\"state\":\"{s}\",\"endpoint\":\"{s}\"}}",
+            .{ escaped_service_id, escaped_kind, escaped_state, escaped_endpoint },
+        );
+    }
+
     fn addNodeServices(self: *Session, node_dir: u32, node: world_policy.NodePolicy) !NodeResourceView {
         var view = NodeResourceView{};
         errdefer view.deinit(self.allocator);
@@ -1085,22 +1110,48 @@ pub const Session = struct {
             "{\"read\":true,\"write\":false}",
             "Node service descriptors. This view prefers control-plane catalog data and falls back to policy.",
         );
+        var services_index = std.ArrayListUnmanaged(u8){};
+        defer services_index.deinit(self.allocator);
+        try services_index.append(self.allocator, '[');
+        var services_index_first = true;
 
-        if (try self.loadNodeServicesFromControlPlane(node.id)) |catalog_value| {
-            var catalog = catalog_value;
-            defer catalog.deinit(self.allocator);
-            for (catalog.items.items) |service| {
-                try self.addNodeServiceEntry(
-                    services_root,
-                    service.service_id,
-                    service.kind,
-                    service.state,
-                    service.endpoint,
-                    service.caps_json,
-                );
-                try view.observe(self.allocator, service.kind, service.service_id, service.endpoint);
-            }
-            return view;
+        switch (try self.loadNodeServicesFromControlPlane(node.id)) {
+            .catalog => |catalog_value| {
+                var catalog = catalog_value;
+                defer catalog.deinit(self.allocator);
+                for (catalog.items.items) |service| {
+                    try self.addNodeServiceEntry(
+                        services_root,
+                        service.service_id,
+                        service.kind,
+                        service.state,
+                        service.endpoint,
+                        service.caps_json,
+                    );
+                    try view.observe(self.allocator, service.kind, service.service_id, service.endpoint);
+                    try self.appendServiceIndexEntry(
+                        &services_index,
+                        &services_index_first,
+                        service.service_id,
+                        service.kind,
+                        service.state,
+                        service.endpoint,
+                    );
+                }
+                try services_index.append(self.allocator, ']');
+                const services_index_json = try services_index.toOwnedSlice(self.allocator);
+                defer self.allocator.free(services_index_json);
+                _ = try self.addFile(services_root, "SERVICES.json", services_index_json, false, .none);
+                return view;
+            },
+            .empty => {
+                try services_index.append(self.allocator, ']');
+                const services_index_json = try services_index.toOwnedSlice(self.allocator);
+                defer self.allocator.free(services_index_json);
+                _ = try self.addFile(services_root, "SERVICES.json", services_index_json, false, .none);
+                return view;
+            },
+            .unavailable => {},
         }
 
         if (node.resources.fs) {
@@ -1109,6 +1160,7 @@ pub const Session = struct {
             defer self.allocator.free(endpoint);
             try self.addNodeServiceEntry(services_root, "fs", "fs", "online", endpoint, caps);
             try view.observe(self.allocator, "fs", "fs", endpoint);
+            try self.appendServiceIndexEntry(&services_index, &services_index_first, "fs", "fs", "online", endpoint);
         }
         if (node.resources.camera) {
             const caps = "{\"still\":true}";
@@ -1116,6 +1168,7 @@ pub const Session = struct {
             defer self.allocator.free(endpoint);
             try self.addNodeServiceEntry(services_root, "camera", "camera", "online", endpoint, caps);
             try view.observe(self.allocator, "camera", "camera", endpoint);
+            try self.appendServiceIndexEntry(&services_index, &services_index_first, "camera", "camera", "online", endpoint);
         }
         if (node.resources.screen) {
             const caps = "{\"capture\":true}";
@@ -1123,6 +1176,7 @@ pub const Session = struct {
             defer self.allocator.free(endpoint);
             try self.addNodeServiceEntry(services_root, "screen", "screen", "online", endpoint, caps);
             try view.observe(self.allocator, "screen", "screen", endpoint);
+            try self.appendServiceIndexEntry(&services_index, &services_index_first, "screen", "screen", "online", endpoint);
         }
         if (node.resources.user) {
             const caps = "{\"interaction\":true}";
@@ -1130,6 +1184,7 @@ pub const Session = struct {
             defer self.allocator.free(endpoint);
             try self.addNodeServiceEntry(services_root, "user", "user", "online", endpoint, caps);
             try view.observe(self.allocator, "user", "user", endpoint);
+            try self.appendServiceIndexEntry(&services_index, &services_index_first, "user", "user", "online", endpoint);
         }
 
         for (node.terminals.items) |terminal_id| {
@@ -1147,8 +1202,13 @@ pub const Session = struct {
             defer self.allocator.free(caps);
             try self.addNodeServiceEntry(services_root, service_id, "terminal", "online", endpoint, caps);
             try view.observe(self.allocator, "terminal", service_id, endpoint);
+            try self.appendServiceIndexEntry(&services_index, &services_index_first, service_id, "terminal", "online", endpoint);
         }
 
+        try services_index.append(self.allocator, ']');
+        const services_index_json = try services_index.toOwnedSlice(self.allocator);
+        defer self.allocator.free(services_index_json);
+        _ = try self.addFile(services_root, "SERVICES.json", services_index_json, false, .none);
         return view;
     }
 
@@ -1179,8 +1239,14 @@ pub const Session = struct {
         }
     };
 
-    fn loadNodeServicesFromControlPlane(self: *Session, node_id: []const u8) !?NodeServiceCatalog {
-        const plane = self.control_plane orelse return null;
+    const NodeServiceCatalogResult = union(enum) {
+        unavailable,
+        empty,
+        catalog: NodeServiceCatalog,
+    };
+
+    fn loadNodeServicesFromControlPlane(self: *Session, node_id: []const u8) !NodeServiceCatalogResult {
+        const plane = self.control_plane orelse return .unavailable;
         const escaped_node_id = try unified.jsonEscape(self.allocator, node_id);
         defer self.allocator.free(escaped_node_id);
         const request_json = try std.fmt.allocPrint(
@@ -1190,14 +1256,15 @@ pub const Session = struct {
         );
         defer self.allocator.free(request_json);
 
-        const response_json = plane.nodeServiceGet(request_json) catch return null;
+        const response_json = plane.nodeServiceGet(request_json) catch return .unavailable;
         defer self.allocator.free(response_json);
 
-        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, response_json, .{}) catch return null;
+        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, response_json, .{}) catch return .unavailable;
         defer parsed.deinit();
-        if (parsed.value != .object) return null;
-        const services_val = parsed.value.object.get("services") orelse return null;
-        if (services_val != .array or services_val.array.items.len == 0) return null;
+        if (parsed.value != .object) return .unavailable;
+        const services_val = parsed.value.object.get("services") orelse return .unavailable;
+        if (services_val != .array) return .unavailable;
+        if (services_val.array.items.len == 0) return .empty;
 
         var catalog = NodeServiceCatalog{};
         errdefer catalog.deinit(self.allocator);
@@ -1251,9 +1318,9 @@ pub const Session = struct {
 
         if (catalog.items.items.len == 0) {
             catalog.deinit(self.allocator);
-            return null;
+            return .empty;
         }
-        return catalog;
+        return .{ .catalog = catalog };
     }
 
     fn addNodeServiceEntry(
@@ -1736,6 +1803,7 @@ test "fsrpc_session: node services namespace exposes service descriptors" {
     const local_node = session.lookupChild(nodes_root, "local") orelse return error.TestExpectedResponse;
     const node_status = session.lookupChild(local_node, "STATUS.json") orelse return error.TestExpectedResponse;
     const services_root = session.lookupChild(local_node, "services") orelse return error.TestExpectedResponse;
+    const services_index_id = session.lookupChild(services_root, "SERVICES.json") orelse return error.TestExpectedResponse;
     const fs_service = session.lookupChild(services_root, "fs") orelse return error.TestExpectedResponse;
     const terminal_service = session.lookupChild(services_root, "terminal-1") orelse return error.TestExpectedResponse;
 
@@ -1747,8 +1815,11 @@ test "fsrpc_session: node services namespace exposes service descriptors" {
     const fs_caps_node = session.nodes.get(fs_caps) orelse return error.TestExpectedResponse;
     const terminal_caps_node = session.nodes.get(terminal_caps) orelse return error.TestExpectedResponse;
     const node_status_node = session.nodes.get(node_status) orelse return error.TestExpectedResponse;
+    const services_index_node = session.nodes.get(services_index_id) orelse return error.TestExpectedResponse;
 
     try std.testing.expect(std.mem.indexOf(u8, node_status_node.content, "\"state\":\"configured\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, services_index_node.content, "\"service_id\":\"fs\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, services_index_node.content, "\"service_id\":\"terminal-1\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, fs_status_node.content, "\"state\":\"online\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, fs_status_node.content, "/nodes/local/fs") != null);
     try std.testing.expect(std.mem.indexOf(u8, fs_caps_node.content, "\"rw\":true") != null);
@@ -1837,6 +1908,8 @@ test "fsrpc_session: node services namespace prefers control-plane catalog" {
     const node_caps_id = session.lookupChild(node_dir, "CAPS.json") orelse return error.TestExpectedResponse;
     const node_caps = session.nodes.get(node_caps_id) orelse return error.TestExpectedResponse;
     const services_root = session.lookupChild(node_dir, "services") orelse return error.TestExpectedResponse;
+    const services_index_id = session.lookupChild(services_root, "SERVICES.json") orelse return error.TestExpectedResponse;
+    const services_index = session.nodes.get(services_index_id) orelse return error.TestExpectedResponse;
     const terminal = session.lookupChild(services_root, "terminal-9") orelse return error.TestExpectedResponse;
     const status_id = session.lookupChild(terminal, "STATUS.json") orelse return error.TestExpectedResponse;
     const status_node = session.nodes.get(status_id) orelse return error.TestExpectedResponse;
@@ -1845,9 +1918,104 @@ test "fsrpc_session: node services namespace prefers control-plane catalog" {
 
     try std.testing.expect(std.mem.indexOf(u8, node_caps.content, "\"fs\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, node_caps.content, "\"terminal\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, services_index.content, "\"service_id\":\"terminal-9\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, status_node.content, "\"state\":\"degraded\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, status_node.content, "/nodes/") != null);
     try std.testing.expect(std.mem.indexOf(u8, caps_node.content, "\"terminal_id\":\"9\"") != null);
+}
+
+test "fsrpc_session: empty control-plane service catalog suppresses policy fallback roots" {
+    const allocator = std.testing.allocator;
+
+    var control_plane = fs_control_plane.ControlPlane.init(allocator);
+    defer control_plane.deinit();
+
+    const ensured = try control_plane.ensureNode("edge-empty-services", "ws://127.0.0.1:18891/v2/fs", 60_000);
+    defer allocator.free(ensured);
+    var ensured_parsed = try std.json.parseFromSlice(std.json.Value, allocator, ensured, .{});
+    defer ensured_parsed.deinit();
+    if (ensured_parsed.value != .object) return error.TestExpectedResponse;
+    const node_id = ensured_parsed.value.object.get("node_id") orelse return error.TestExpectedResponse;
+    if (node_id != .string) return error.TestExpectedResponse;
+    const node_secret = ensured_parsed.value.object.get("node_secret") orelse return error.TestExpectedResponse;
+    if (node_secret != .string) return error.TestExpectedResponse;
+
+    const escaped_node_id = try unified.jsonEscape(allocator, node_id.string);
+    defer allocator.free(escaped_node_id);
+    const escaped_node_secret = try unified.jsonEscape(allocator, node_secret.string);
+    defer allocator.free(escaped_node_secret);
+    const upsert_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"node_id\":\"{s}\",\"node_secret\":\"{s}\",\"services\":[]}}",
+        .{ escaped_node_id, escaped_node_secret },
+    );
+    defer allocator.free(upsert_req);
+    const upserted = try control_plane.nodeServiceUpsert(upsert_req);
+    defer allocator.free(upserted);
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const root = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+    const agents_dir = try std.fmt.allocPrint(allocator, "{s}/agents", .{root});
+    defer allocator.free(agents_dir);
+    const projects_dir = try std.fmt.allocPrint(allocator, "{s}/projects", .{root});
+    defer allocator.free(projects_dir);
+    const agent_policy_dir = try std.fmt.allocPrint(allocator, "{s}/default", .{agents_dir});
+    defer allocator.free(agent_policy_dir);
+    const project_dir = try std.fmt.allocPrint(allocator, "{s}/proj-empty", .{projects_dir});
+    defer allocator.free(project_dir);
+    try std.fs.cwd().makePath(agent_policy_dir);
+    try std.fs.cwd().makePath(project_dir);
+
+    const agent_policy_path = try std.fmt.allocPrint(allocator, "{s}/agent_policy.json", .{agent_policy_dir});
+    defer allocator.free(agent_policy_path);
+    const agent_policy_json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"project_id\":\"proj-empty\",\"nodes\":[{{\"id\":\"{s}\",\"resources\":{{\"fs\":true,\"camera\":false,\"screen\":false,\"user\":false}},\"terminals\":[\"1\"]}}],\"visible_agents\":[\"default\"],\"project_links\":[]}}",
+        .{escaped_node_id},
+    );
+    defer allocator.free(agent_policy_json);
+    try std.fs.cwd().writeFile(.{
+        .sub_path = agent_policy_path,
+        .data = agent_policy_json,
+    });
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "default",
+        .{
+            .project_id = "proj-empty",
+            .agents_dir = agents_dir,
+            .projects_dir = projects_dir,
+            .control_plane = &control_plane,
+        },
+    );
+    defer session.deinit();
+
+    const nodes_root = session.lookupChild(session.root_id, "nodes") orelse return error.TestExpectedResponse;
+    const node_dir = session.lookupChild(nodes_root, node_id.string) orelse return error.TestExpectedResponse;
+    const node_caps_id = session.lookupChild(node_dir, "CAPS.json") orelse return error.TestExpectedResponse;
+    const node_caps = session.nodes.get(node_caps_id) orelse return error.TestExpectedResponse;
+    const services_root = session.lookupChild(node_dir, "services") orelse return error.TestExpectedResponse;
+    const services_index_id = session.lookupChild(services_root, "SERVICES.json") orelse return error.TestExpectedResponse;
+    const services_index = session.nodes.get(services_index_id) orelse return error.TestExpectedResponse;
+
+    try std.testing.expect(session.lookupChild(services_root, "fs") == null);
+    try std.testing.expect(session.lookupChild(services_root, "terminal-1") == null);
+    try std.testing.expect(session.lookupChild(node_dir, "fs") == null);
+    try std.testing.expect(session.lookupChild(node_dir, "terminal") == null);
+    try std.testing.expect(std.mem.eql(u8, services_index.content, "[]"));
+    try std.testing.expect(std.mem.indexOf(u8, node_caps.content, "\"fs\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, node_caps.content, "\"terminal\":false") != null);
 }
 
 test "fsrpc_session: project meta includes control-plane workspace status" {

@@ -35,12 +35,15 @@ Current runtime behavior prefers `control.node_service_get` catalog data when av
 and falls back to policy node resources (`fs`, `camera`, `screen`, `user`, `terminal-*`)
 for `/nodes/<node_id>/services/*`, with per-service `SCHEMA.json`, `CAPS.json`,
 and `STATUS.json`.
+`/nodes/<node_id>/services/SERVICES.json` provides a flat service index.
 
 Node resource roots (`/nodes/<node_id>/fs`, `camera`, `screen`, `user`, `terminal/*`)
 follow the same service view:
 - when service catalog is available, roots are derived from advertised service kinds
 - otherwise roots are derived from policy fallback resources
 Node-level `CAPS.json` uses the same effective service view.
+If a node advertises an explicit empty service catalog, runtime exposes no fallback
+policy roots for that node.
 
 When project workspace mounts reference nodes not present in policy, runtime creates
 discovered `/nodes/<node_id>` entries so project FS links always resolve.
