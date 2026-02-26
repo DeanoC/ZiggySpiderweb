@@ -102,6 +102,7 @@ Workspace status payloads include mount auth token redaction by role:
 Project metadata now includes:
 
 - `topology.json` (policy-derived node + link view)
+- `nodes.json` (project node membership summary with per-node selected-mount state and count)
 - `workspace_status.json` (live `control.workspace_status` when available)
 - `mounts.json` (selected mount entries from workspace status `mounts`)
 - `desired_mounts.json` (desired mount set from workspace status `desired_mounts`)

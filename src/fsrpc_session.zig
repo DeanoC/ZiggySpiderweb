@@ -562,7 +562,7 @@ pub const Session = struct {
         try self.addDirectoryDescriptors(
             project_meta_dir,
             "Project Metadata",
-            "{\"kind\":\"metadata\",\"files\":[\"topology.json\",\"workspace_status.json\",\"mounts.json\",\"desired_mounts.json\",\"actual_mounts.json\",\"drift.json\",\"reconcile.json\",\"availability.json\",\"health.json\"]}",
+            "{\"kind\":\"metadata\",\"files\":[\"topology.json\",\"nodes.json\",\"workspace_status.json\",\"mounts.json\",\"desired_mounts.json\",\"actual_mounts.json\",\"drift.json\",\"reconcile.json\",\"availability.json\",\"health.json\"]}",
             "{\"read\":true,\"write\":false}",
             "Project topology and availability metadata.",
         );
@@ -638,6 +638,14 @@ pub const Session = struct {
         _ = try self.addFile(project_meta_dir, "topology.json", topology_json, false, .none);
 
         if (workspace_status_json) |status_json| {
+            if (try self.extractWorkspaceNodes(status_json)) |nodes_json| {
+                defer self.allocator.free(nodes_json);
+                _ = try self.addFile(project_meta_dir, "nodes.json", nodes_json, false, .none);
+            } else {
+                const fallback_nodes = try self.buildFallbackProjectNodesJson(policy);
+                defer self.allocator.free(fallback_nodes);
+                _ = try self.addFile(project_meta_dir, "nodes.json", fallback_nodes, false, .none);
+            }
             _ = try self.addFile(project_meta_dir, "workspace_status.json", status_json, false, .none);
             if (try self.extractWorkspaceMounts(status_json)) |mounts_json| {
                 defer self.allocator.free(mounts_json);
@@ -686,6 +694,9 @@ pub const Session = struct {
 
         const fallback_status = try self.buildFallbackWorkspaceStatusJson(policy);
         defer self.allocator.free(fallback_status);
+        const fallback_nodes = try self.buildFallbackProjectNodesJson(policy);
+        defer self.allocator.free(fallback_nodes);
+        _ = try self.addFile(project_meta_dir, "nodes.json", fallback_nodes, false, .none);
         _ = try self.addFile(project_meta_dir, "workspace_status.json", fallback_status, false, .none);
         _ = try self.addFile(project_meta_dir, "mounts.json", "[]", false, .none);
         _ = try self.addFile(project_meta_dir, "desired_mounts.json", "[]", false, .none);
@@ -1040,6 +1051,23 @@ pub const Session = struct {
         return out.toOwnedSlice(self.allocator);
     }
 
+    fn buildFallbackProjectNodesJson(self: *Session, policy: world_policy.Policy) ![]u8 {
+        var out = std.ArrayListUnmanaged(u8){};
+        errdefer out.deinit(self.allocator);
+        try out.appendSlice(self.allocator, "[");
+        for (policy.nodes.items, 0..) |node, idx| {
+            if (idx != 0) try out.append(self.allocator, ',');
+            const escaped_node_id = try unified.jsonEscape(self.allocator, node.id);
+            defer self.allocator.free(escaped_node_id);
+            try out.writer(self.allocator).print(
+                "{{\"node_id\":\"{s}\",\"state\":\"unknown\",\"mounts\":0}}",
+                .{escaped_node_id},
+            );
+        }
+        try out.appendSlice(self.allocator, "]");
+        return out.toOwnedSlice(self.allocator);
+    }
+
     fn loadProjectWorkspaceStatus(self: *Session, project_id: []const u8) !?[]u8 {
         const plane = self.control_plane orelse return null;
         const escaped_project_id = try unified.jsonEscape(self.allocator, project_id);
@@ -1097,6 +1125,81 @@ pub const Session = struct {
         if (availability_value != .object) return null;
         const rendered = try std.fmt.allocPrint(self.allocator, "{f}", .{std.json.fmt(availability_value, .{})});
         return rendered;
+    }
+
+    fn extractWorkspaceNodes(self: *Session, workspace_status_json: []const u8) !?[]u8 {
+        const NodeSummary = struct {
+            node_id: []const u8,
+            state_rank: u8,
+            mounts: u32,
+        };
+        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, workspace_status_json, .{}) catch return null;
+        defer parsed.deinit();
+        if (parsed.value != .object) return null;
+        const mounts_value = parsed.value.object.get("mounts") orelse return null;
+        if (mounts_value != .array) return null;
+
+        var summaries = std.ArrayListUnmanaged(NodeSummary){};
+        defer summaries.deinit(self.allocator);
+        for (mounts_value.array.items) |mount_value| {
+            if (mount_value != .object) continue;
+            const node_id_value = mount_value.object.get("node_id") orelse continue;
+            if (node_id_value != .string or node_id_value.string.len == 0) continue;
+            const state = if (mount_value.object.get("state")) |value|
+                if (value == .string) value.string else "unknown"
+            else
+                "unknown";
+            const rank = mountStateRank(state);
+
+            var merged = false;
+            for (summaries.items) |*entry| {
+                if (!std.mem.eql(u8, entry.node_id, node_id_value.string)) continue;
+                entry.mounts +%= 1;
+                if (rank > entry.state_rank) entry.state_rank = rank;
+                merged = true;
+                break;
+            }
+            if (!merged) {
+                try summaries.append(self.allocator, .{
+                    .node_id = node_id_value.string,
+                    .state_rank = rank,
+                    .mounts = 1,
+                });
+            }
+        }
+
+        var out = std.ArrayListUnmanaged(u8){};
+        errdefer out.deinit(self.allocator);
+        try out.appendSlice(self.allocator, "[");
+        for (summaries.items, 0..) |entry, idx| {
+            if (idx != 0) try out.append(self.allocator, ',');
+            const escaped_node_id = try unified.jsonEscape(self.allocator, entry.node_id);
+            defer self.allocator.free(escaped_node_id);
+            const state = mountStateNameFromRank(entry.state_rank);
+            try out.writer(self.allocator).print(
+                "{{\"node_id\":\"{s}\",\"state\":\"{s}\",\"mounts\":{d}}}",
+                .{ escaped_node_id, state, entry.mounts },
+            );
+        }
+        try out.appendSlice(self.allocator, "]");
+        const rendered = try out.toOwnedSlice(self.allocator);
+        return rendered;
+    }
+
+    fn mountStateRank(state: []const u8) u8 {
+        if (std.mem.eql(u8, state, "missing")) return 3;
+        if (std.mem.eql(u8, state, "degraded")) return 2;
+        if (std.mem.eql(u8, state, "online")) return 1;
+        return 0;
+    }
+
+    fn mountStateNameFromRank(rank: u8) []const u8 {
+        return switch (rank) {
+            3 => "missing",
+            2 => "degraded",
+            1 => "online",
+            else => "unknown",
+        };
     }
 
     fn extractWorkspaceMounts(self: *Session, workspace_status_json: []const u8) !?[]u8 {
@@ -2380,6 +2483,7 @@ test "fsrpc_session: project meta includes control-plane workspace status" {
     const mount_link_id = session.lookupChild(project_fs_node, "mount::src") orelse return error.TestExpectedResponse;
     const node_link_id = session.lookupChild(project_nodes_node, node_id.string) orelse return error.TestExpectedResponse;
     const topology_id = session.lookupChild(meta_node, "topology.json") orelse return error.TestExpectedResponse;
+    const nodes_meta_id = session.lookupChild(meta_node, "nodes.json") orelse return error.TestExpectedResponse;
     const workspace_id = session.lookupChild(meta_node, "workspace_status.json") orelse return error.TestExpectedResponse;
     const mounts_id = session.lookupChild(meta_node, "mounts.json") orelse return error.TestExpectedResponse;
     const desired_mounts_id = session.lookupChild(meta_node, "desired_mounts.json") orelse return error.TestExpectedResponse;
@@ -2396,6 +2500,7 @@ test "fsrpc_session: project meta includes control-plane workspace status" {
     const mount_link_node = session.nodes.get(mount_link_id) orelse return error.TestExpectedResponse;
     const node_link_node = session.nodes.get(node_link_id) orelse return error.TestExpectedResponse;
     const topology_node = session.nodes.get(topology_id) orelse return error.TestExpectedResponse;
+    const nodes_meta_node = session.nodes.get(nodes_meta_id) orelse return error.TestExpectedResponse;
     const workspace_node = session.nodes.get(workspace_id) orelse return error.TestExpectedResponse;
     const mounts_node = session.nodes.get(mounts_id) orelse return error.TestExpectedResponse;
     const desired_mounts_node = session.nodes.get(desired_mounts_id) orelse return error.TestExpectedResponse;
@@ -2409,6 +2514,7 @@ test "fsrpc_session: project meta includes control-plane workspace status" {
     try std.testing.expect(std.mem.indexOf(u8, project_nodes_schema.content, "\"kind\":\"collection\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, project_agents_caps.content, "\"read\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, meta_schema.content, "\"workspace_status.json\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, meta_schema.content, "\"nodes.json\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, meta_schema.content, "\"desired_mounts.json\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, meta_schema.content, "\"actual_mounts.json\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, meta_schema.content, "\"drift.json\"") != null);
@@ -2420,6 +2526,10 @@ test "fsrpc_session: project meta includes control-plane workspace status" {
     try std.testing.expect(std.mem.indexOf(u8, node_link_node.content, node_id.string) != null);
     try std.testing.expect(std.mem.indexOf(u8, topology_node.content, "\"project_links\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, topology_node.content, node_id.string) != null);
+    try std.testing.expect(std.mem.indexOf(u8, nodes_meta_node.content, "\"node_id\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, nodes_meta_node.content, node_id.string) != null);
+    try std.testing.expect(std.mem.indexOf(u8, nodes_meta_node.content, "\"state\":\"online\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, nodes_meta_node.content, "\"mounts\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, workspace_node.content, "\"mount_path\":\"/src\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, mounts_node.content, "\"mount_path\":\"/src\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, desired_mounts_node.content, "\"mount_path\":\"/src\"") != null);
@@ -2648,6 +2758,7 @@ test "fsrpc_session: project workspace fallback is scoped to requested project" 
     try std.testing.expect(leaked_node_link == null);
 
     const meta_node = session.lookupChild(project_node, "meta") orelse return error.TestExpectedResponse;
+    const nodes_meta_id = session.lookupChild(meta_node, "nodes.json") orelse return error.TestExpectedResponse;
     const workspace_id = session.lookupChild(meta_node, "workspace_status.json") orelse return error.TestExpectedResponse;
     const mounts_id = session.lookupChild(meta_node, "mounts.json") orelse return error.TestExpectedResponse;
     const desired_mounts_id = session.lookupChild(meta_node, "desired_mounts.json") orelse return error.TestExpectedResponse;
@@ -2655,6 +2766,7 @@ test "fsrpc_session: project workspace fallback is scoped to requested project" 
     const drift_id = session.lookupChild(meta_node, "drift.json") orelse return error.TestExpectedResponse;
     const reconcile_id = session.lookupChild(meta_node, "reconcile.json") orelse return error.TestExpectedResponse;
     const health_id = session.lookupChild(meta_node, "health.json") orelse return error.TestExpectedResponse;
+    const nodes_meta_node = session.nodes.get(nodes_meta_id) orelse return error.TestExpectedResponse;
     const workspace_node = session.nodes.get(workspace_id) orelse return error.TestExpectedResponse;
     const mounts_node = session.nodes.get(mounts_id) orelse return error.TestExpectedResponse;
     const desired_mounts_node = session.nodes.get(desired_mounts_id) orelse return error.TestExpectedResponse;
@@ -2662,6 +2774,9 @@ test "fsrpc_session: project workspace fallback is scoped to requested project" 
     const drift_node = session.nodes.get(drift_id) orelse return error.TestExpectedResponse;
     const reconcile_node = session.nodes.get(reconcile_id) orelse return error.TestExpectedResponse;
     const health_node = session.nodes.get(health_id) orelse return error.TestExpectedResponse;
+    try std.testing.expect(std.mem.indexOf(u8, nodes_meta_node.content, "\"node_id\":\"local\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, nodes_meta_node.content, "\"state\":\"unknown\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, nodes_meta_node.content, node_id.string) == null);
     try std.testing.expect(std.mem.indexOf(u8, workspace_node.content, "\"source\":\"policy\"") != null);
     try std.testing.expect(std.mem.eql(u8, mounts_node.content, "[]"));
     try std.testing.expect(std.mem.eql(u8, desired_mounts_node.content, "[]"));
