@@ -4636,7 +4636,11 @@ fn handleWebSocketConnection(
                                 if (attach_project_id) |project_id| {
                                     const activate_payload = try buildProjectActivatePayload(allocator, project_id, attach_project_token);
                                     defer allocator.free(activate_payload);
-                                    _ = runtime_registry.control_plane.activateProject(attach_agent_id, activate_payload) catch |activate_err| {
+                                    _ = runtime_registry.control_plane.activateProjectWithRole(
+                                        attach_agent_id,
+                                        activate_payload,
+                                        principal.role == .admin,
+                                    ) catch |activate_err| {
                                         const response = try unified.buildControlError(
                                             allocator,
                                             parsed.id,
@@ -5156,6 +5160,7 @@ fn handleWebSocketConnection(
                                     runtime_registry,
                                     control_type,
                                     control_agent_id,
+                                    principal.role == .admin,
                                     parsed.payload_json,
                                 ) catch |err| {
                                     const code = controlPlaneErrorCode(err);
@@ -6271,6 +6276,7 @@ fn handleControlPlaneCommand(
     runtime_registry: *AgentRuntimeRegistry,
     control_type: unified.ControlType,
     agent_id: []const u8,
+    is_admin: bool,
     payload_json: ?[]const u8,
 ) ![]u8 {
     return switch (control_type) {
@@ -6287,19 +6293,19 @@ fn handleControlPlaneCommand(
         .node_get => runtime_registry.control_plane.getNode(payload_json),
         .node_delete => runtime_registry.control_plane.deleteNode(payload_json),
         .project_create => runtime_registry.control_plane.createProject(payload_json),
-        .project_update => runtime_registry.control_plane.updateProject(payload_json),
-        .project_delete => runtime_registry.control_plane.deleteProject(payload_json),
+        .project_update => runtime_registry.control_plane.updateProjectWithRole(payload_json, is_admin),
+        .project_delete => runtime_registry.control_plane.deleteProjectWithRole(payload_json, is_admin),
         .project_list => runtime_registry.control_plane.listProjects(),
-        .project_get => runtime_registry.control_plane.getProject(payload_json),
-        .project_mount_set => runtime_registry.control_plane.setProjectMount(payload_json),
-        .project_mount_remove => runtime_registry.control_plane.removeProjectMount(payload_json),
-        .project_mount_list => runtime_registry.control_plane.listProjectMounts(payload_json),
-        .project_token_rotate => runtime_registry.control_plane.rotateProjectToken(payload_json),
-        .project_token_revoke => runtime_registry.control_plane.revokeProjectToken(payload_json),
-        .project_activate => runtime_registry.control_plane.activateProject(agent_id, payload_json),
-        .workspace_status => runtime_registry.control_plane.workspaceStatus(agent_id, payload_json),
+        .project_get => runtime_registry.control_plane.getProjectWithRole(payload_json, is_admin),
+        .project_mount_set => runtime_registry.control_plane.setProjectMountWithRole(payload_json, is_admin),
+        .project_mount_remove => runtime_registry.control_plane.removeProjectMountWithRole(payload_json, is_admin),
+        .project_mount_list => runtime_registry.control_plane.listProjectMountsWithRole(payload_json, is_admin),
+        .project_token_rotate => runtime_registry.control_plane.rotateProjectTokenWithRole(payload_json, is_admin),
+        .project_token_revoke => runtime_registry.control_plane.revokeProjectTokenWithRole(payload_json, is_admin),
+        .project_activate => runtime_registry.control_plane.activateProjectWithRole(agent_id, payload_json, is_admin),
+        .workspace_status => runtime_registry.control_plane.workspaceStatusWithRole(agent_id, payload_json, is_admin),
         .reconcile_status => runtime_registry.control_plane.reconcileStatus(payload_json),
-        .project_up => runtime_registry.control_plane.projectUp(agent_id, payload_json),
+        .project_up => runtime_registry.control_plane.projectUpWithRole(agent_id, payload_json, is_admin),
         .audit_tail => runtime_registry.buildAuditTailPayload(payload_json),
         else => error.UnsupportedControlPlaneOperation,
     };
