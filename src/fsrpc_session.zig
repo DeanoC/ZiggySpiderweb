@@ -607,6 +607,12 @@ pub const Session = struct {
 
         if (workspace_status_json) |status_json| {
             _ = try self.addFile(project_meta_dir, "workspace_status.json", status_json, false, .none);
+            if (try self.extractWorkspaceMounts(status_json)) |mounts_json| {
+                defer self.allocator.free(mounts_json);
+                _ = try self.addFile(project_meta_dir, "mounts.json", mounts_json, false, .none);
+            } else {
+                _ = try self.addFile(project_meta_dir, "mounts.json", "[]", false, .none);
+            }
             if (try self.extractWorkspaceAvailability(status_json)) |availability_json| {
                 defer self.allocator.free(availability_json);
                 _ = try self.addFile(project_meta_dir, "availability.json", availability_json, false, .none);
@@ -617,6 +623,7 @@ pub const Session = struct {
         const fallback_status = try self.buildFallbackWorkspaceStatusJson(policy);
         defer self.allocator.free(fallback_status);
         _ = try self.addFile(project_meta_dir, "workspace_status.json", fallback_status, false, .none);
+        _ = try self.addFile(project_meta_dir, "mounts.json", "[]", false, .none);
         _ = try self.addFile(project_meta_dir, "availability.json", "{\"mounts_total\":0,\"online\":0,\"degraded\":0,\"missing\":0}", false, .none);
     }
 
@@ -701,16 +708,19 @@ pub const Session = struct {
         discovered_from_workspace: bool,
     ) !void {
         const node_dir = try self.addDir(nodes_root, node.id, false);
+        var resource_view = try self.addNodeServices(node_dir, node);
+        defer resource_view.deinit(self.allocator);
+
         const node_schema = "{\"kind\":\"node\",\"children\":[\"services\",\"fs\",\"camera\",\"screen\",\"user\",\"terminal\"]}";
         const node_caps = try std.fmt.allocPrint(
             self.allocator,
             "{{\"fs\":{s},\"camera\":{s},\"screen\":{s},\"user\":{s},\"terminal\":{s}}}",
             .{
-                if (node.resources.fs) "true" else "false",
-                if (node.resources.camera) "true" else "false",
-                if (node.resources.screen) "true" else "false",
-                if (node.resources.user) "true" else "false",
-                if (node.terminals.items.len > 0) "true" else "false",
+                if (resource_view.fs) "true" else "false",
+                if (resource_view.camera) "true" else "false",
+                if (resource_view.screen) "true" else "false",
+                if (resource_view.user) "true" else "false",
+                if (resource_view.terminals.items.len > 0) "true" else "false",
             },
         );
         defer self.allocator.free(node_caps);
@@ -725,8 +735,6 @@ pub const Session = struct {
                 "Node resource roots. Entries may be unavailable based on policy.",
         );
         try self.addNodeRuntimeMetadataFiles(node_dir, node.id, discovered_from_workspace);
-        var resource_view = try self.addNodeServices(node_dir, node);
-        defer resource_view.deinit(self.allocator);
 
         if (resource_view.fs) _ = try self.addDir(node_dir, "fs", false);
         if (resource_view.camera) _ = try self.addDir(node_dir, "camera", false);
@@ -981,6 +989,16 @@ pub const Session = struct {
         const availability_value = parsed.value.object.get("availability") orelse return null;
         if (availability_value != .object) return null;
         const rendered = try std.fmt.allocPrint(self.allocator, "{f}", .{std.json.fmt(availability_value, .{})});
+        return rendered;
+    }
+
+    fn extractWorkspaceMounts(self: *Session, workspace_status_json: []const u8) !?[]u8 {
+        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, workspace_status_json, .{}) catch return null;
+        defer parsed.deinit();
+        if (parsed.value != .object) return null;
+        const mounts_value = parsed.value.object.get("mounts") orelse return null;
+        if (mounts_value != .array) return null;
+        const rendered = try std.fmt.allocPrint(self.allocator, "{f}", .{std.json.fmt(mounts_value, .{})});
         return rendered;
     }
 
@@ -1816,6 +1834,8 @@ test "fsrpc_session: node services namespace prefers control-plane catalog" {
 
     const nodes_root = session.lookupChild(session.root_id, "nodes") orelse return error.TestExpectedResponse;
     const node_dir = session.lookupChild(nodes_root, node_id.string) orelse return error.TestExpectedResponse;
+    const node_caps_id = session.lookupChild(node_dir, "CAPS.json") orelse return error.TestExpectedResponse;
+    const node_caps = session.nodes.get(node_caps_id) orelse return error.TestExpectedResponse;
     const services_root = session.lookupChild(node_dir, "services") orelse return error.TestExpectedResponse;
     const terminal = session.lookupChild(services_root, "terminal-9") orelse return error.TestExpectedResponse;
     const status_id = session.lookupChild(terminal, "STATUS.json") orelse return error.TestExpectedResponse;
@@ -1823,6 +1843,8 @@ test "fsrpc_session: node services namespace prefers control-plane catalog" {
     const caps_id = session.lookupChild(terminal, "CAPS.json") orelse return error.TestExpectedResponse;
     const caps_node = session.nodes.get(caps_id) orelse return error.TestExpectedResponse;
 
+    try std.testing.expect(std.mem.indexOf(u8, node_caps.content, "\"fs\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, node_caps.content, "\"terminal\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, status_node.content, "\"state\":\"degraded\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, status_node.content, "/nodes/") != null);
     try std.testing.expect(std.mem.indexOf(u8, caps_node.content, "\"terminal_id\":\"9\"") != null);
@@ -1933,11 +1955,13 @@ test "fsrpc_session: project meta includes control-plane workspace status" {
     const mount_link_id = session.lookupChild(project_fs_node, "mount::src") orelse return error.TestExpectedResponse;
     const topology_id = session.lookupChild(meta_node, "topology.json") orelse return error.TestExpectedResponse;
     const workspace_id = session.lookupChild(meta_node, "workspace_status.json") orelse return error.TestExpectedResponse;
+    const mounts_id = session.lookupChild(meta_node, "mounts.json") orelse return error.TestExpectedResponse;
     const availability_id = session.lookupChild(meta_node, "availability.json") orelse return error.TestExpectedResponse;
 
     const mount_link_node = session.nodes.get(mount_link_id) orelse return error.TestExpectedResponse;
     const topology_node = session.nodes.get(topology_id) orelse return error.TestExpectedResponse;
     const workspace_node = session.nodes.get(workspace_id) orelse return error.TestExpectedResponse;
+    const mounts_node = session.nodes.get(mounts_id) orelse return error.TestExpectedResponse;
     const availability_node = session.nodes.get(availability_id) orelse return error.TestExpectedResponse;
 
     try std.testing.expect(std.mem.indexOf(u8, mount_link_node.content, "/nodes/") != null);
@@ -1945,6 +1969,7 @@ test "fsrpc_session: project meta includes control-plane workspace status" {
     try std.testing.expect(std.mem.indexOf(u8, topology_node.content, "\"project_links\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, topology_node.content, node_id.string) != null);
     try std.testing.expect(std.mem.indexOf(u8, workspace_node.content, "\"mount_path\":\"/src\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mounts_node.content, "\"mount_path\":\"/src\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, workspace_node.content, "\"state\":\"online\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, availability_node.content, "\"mounts_total\":1") != null);
 }
@@ -2159,8 +2184,11 @@ test "fsrpc_session: project workspace fallback is scoped to requested project" 
 
     const meta_node = session.lookupChild(project_node, "meta") orelse return error.TestExpectedResponse;
     const workspace_id = session.lookupChild(meta_node, "workspace_status.json") orelse return error.TestExpectedResponse;
+    const mounts_id = session.lookupChild(meta_node, "mounts.json") orelse return error.TestExpectedResponse;
     const workspace_node = session.nodes.get(workspace_id) orelse return error.TestExpectedResponse;
+    const mounts_node = session.nodes.get(mounts_id) orelse return error.TestExpectedResponse;
     try std.testing.expect(std.mem.indexOf(u8, workspace_node.content, "\"source\":\"policy\"") != null);
+    try std.testing.expect(std.mem.eql(u8, mounts_node.content, "[]"));
     try std.testing.expect(std.mem.indexOf(u8, workspace_node.content, project_b_id.string) == null);
 }
 
@@ -2243,12 +2271,16 @@ test "fsrpc_session: node roots are derived from control-plane service kinds" {
 
     const nodes_root = session.lookupChild(session.root_id, "nodes") orelse return error.TestExpectedResponse;
     const node_dir = session.lookupChild(nodes_root, node_id.string) orelse return error.TestExpectedResponse;
+    const node_caps_id = session.lookupChild(node_dir, "CAPS.json") orelse return error.TestExpectedResponse;
+    const node_caps = session.nodes.get(node_caps_id) orelse return error.TestExpectedResponse;
     const camera_dir = session.lookupChild(node_dir, "camera");
     const fs_dir = session.lookupChild(node_dir, "fs");
     const terminal_root = session.lookupChild(node_dir, "terminal") orelse return error.TestExpectedResponse;
     const terminal_3 = session.lookupChild(terminal_root, "3") orelse return error.TestExpectedResponse;
     _ = terminal_3;
 
+    try std.testing.expect(std.mem.indexOf(u8, node_caps.content, "\"camera\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, node_caps.content, "\"fs\":false") != null);
     try std.testing.expect(camera_dir != null);
     try std.testing.expect(fs_dir == null);
 }

@@ -40,6 +40,7 @@ Node resource roots (`/nodes/<node_id>/fs`, `camera`, `screen`, `user`, `termina
 follow the same service view:
 - when service catalog is available, roots are derived from advertised service kinds
 - otherwise roots are derived from policy fallback resources
+Node-level `CAPS.json` uses the same effective service view.
 
 When project workspace mounts reference nodes not present in policy, runtime creates
 discovered `/nodes/<node_id>` entries so project FS links always resolve.
@@ -91,6 +92,7 @@ Project metadata now includes:
 
 - `topology.json` (policy-derived node + link view)
 - `workspace_status.json` (live `control.workspace_status` when available)
+- `mounts.json` (selected mount entries from workspace status `mounts`)
 - `availability.json` (extracted workspace availability rollup)
 
 Runtime uses project token (when bound) for workspace status lookup and falls back
