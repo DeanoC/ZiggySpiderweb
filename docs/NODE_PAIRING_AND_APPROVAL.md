@@ -107,7 +107,11 @@ Privileged agents can manage pairing through WorldFS without direct control RPC 
 - Approve request: write JSON payload to `/debug/pairing/control/approve.json`
 - Deny request: write JSON payload to `/debug/pairing/control/deny.json`
 - Refresh queue snapshot: write any payload to `/debug/pairing/control/refresh`
-- Inspect operation outcomes: `/debug/pairing/last_result.json` and `/debug/pairing/last_error.json`
+- Create invite token: write optional payload to `/debug/pairing/invites/control/create.json`
+- Refresh invite snapshot: write any payload to `/debug/pairing/invites/control/refresh`
+- Read active invites: `/debug/pairing/invites/active.json`
+- Inspect queue outcomes: `/debug/pairing/last_result.json` and `/debug/pairing/last_error.json`
+- Inspect invite outcomes: `/debug/pairing/invites/last_result.json` and `/debug/pairing/invites/last_error.json`
 
 ## Node Daemon Loop (`spiderweb-fs-node`)
 

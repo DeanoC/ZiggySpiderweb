@@ -558,6 +558,50 @@ pub const ControlPlane = struct {
         );
     }
 
+    pub fn listNodeInvites(self: *ControlPlane, payload_json: ?[]const u8) ![]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        _ = self.reapExpiredLeasesLocked(std.time.milliTimestamp());
+
+        var payload = try parsePayload(self.allocator, payload_json);
+        defer payload.deinit();
+        const obj = payload.value.object;
+
+        const include_redeemed = getOptionalBool(obj, "include_redeemed", false) catch return ControlPlaneError.InvalidPayload;
+        const include_expired = getOptionalBool(obj, "include_expired", false) catch return ControlPlaneError.InvalidPayload;
+        const now = std.time.milliTimestamp();
+
+        var out = std.ArrayListUnmanaged(u8){};
+        defer out.deinit(self.allocator);
+        try out.appendSlice(self.allocator, "{\"invites\":[");
+        var first = true;
+        var invite_it = self.invites.valueIterator();
+        while (invite_it.next()) |invite| {
+            const expired = invite.expires_at_ms <= now;
+            if (!include_redeemed and invite.redeemed) continue;
+            if (!include_expired and expired) continue;
+            if (!first) try out.append(self.allocator, ',');
+            first = false;
+            const escaped_id = try jsonEscape(self.allocator, invite.id);
+            defer self.allocator.free(escaped_id);
+            const escaped_token = try jsonEscape(self.allocator, invite.token);
+            defer self.allocator.free(escaped_token);
+            try out.writer(self.allocator).print(
+                "{{\"invite_id\":\"{s}\",\"invite_token\":\"{s}\",\"created_at_ms\":{d},\"expires_at_ms\":{d},\"redeemed\":{s},\"expired\":{s}}}",
+                .{
+                    escaped_id,
+                    escaped_token,
+                    invite.created_at_ms,
+                    invite.expires_at_ms,
+                    if (invite.redeemed) "true" else "false",
+                    if (expired) "true" else "false",
+                },
+            );
+        }
+        try out.appendSlice(self.allocator, "]}");
+        return out.toOwnedSlice(self.allocator);
+    }
+
     pub fn nodeJoinRequest(self: *ControlPlane, payload_json: ?[]const u8) ![]u8 {
         self.mutex.lock();
         defer self.mutex.unlock();

@@ -75,9 +75,15 @@ When debug is enabled (typically `mother`), WorldFS exposes manual node pairing 
 - `/debug/pairing/control/approve.json` (writable, payload for `control.node_join_approve`)
 - `/debug/pairing/control/deny.json` (writable, payload for `control.node_join_deny`)
 - `/debug/pairing/control/refresh` (writable trigger to refresh queue snapshot)
+- `/debug/pairing/invites/active.json` (snapshot of active invite tokens from `control.node_invite_create` state)
+- `/debug/pairing/invites/last_result.json` (last invite create/refresh result envelope)
+- `/debug/pairing/invites/last_error.json` (last invite action error envelope or `null`)
+- `/debug/pairing/invites/control/create.json` (writable, payload for `control.node_invite_create`)
+- `/debug/pairing/invites/control/refresh` (writable trigger to refresh invite snapshot)
 
-Writing to approve/deny/refresh updates `pending.json` and last result/error files so an
-operator agent can complete pairing workflows entirely through filesystem operations.
+Writing to queue and invite control files updates snapshot/result/error files so an
+operator agent can complete both manual-approval and invite-token pairing workflows
+entirely through filesystem operations.
 
 ## Project View
 
