@@ -102,6 +102,7 @@ cd test-env && make test-distributed-workspace-matrix
 cd test-env && make test-distributed-workspace-encrypted
 cd test-env && make test-distributed-workspace-operator-token
 cd test-env && make test-distributed-soak-chaos
+cd test-env && make test-unified-v2-protocol
 ```
 
 Useful env vars:
@@ -113,6 +114,29 @@ Useful env vars:
 - `SPIDERWEB_CONTROL_STATE_KEY_HEX` (optional; enables encrypted control-plane snapshot storage)
 - `ASSERT_OPERATOR_TOKEN_GATE=1` (optional; assert mutation deny/allow behavior before the main workflow)
 - `SPIDERWEB_METRICS_PORT` (optional; enables HTTP `/livez`, `/readyz`, `/metrics` (Prometheus), `/metrics.json` (JSON))
+- `SKIP_BUILD=1` to skip `zig build` if binaries are already built
+
+## Unified v2 Protocol Validation
+
+Validates protocol-level contract points used in release checks:
+- control negotiation order (`control.version` -> `control.connect`)
+- runtime Acheron negotiation order (`acheron.t_version` -> `acheron.t_attach`)
+- standalone FS routing order (`acheron.t_fs_hello` must come first)
+- standalone FS HELLO auth-token enforcement (`--auth-token`)
+- source-level envelope/type guard in core client code paths
+
+```bash
+# Run directly
+bash test-env/test-unified-v2-protocol.sh
+
+# Or through make
+cd test-env && make test-unified-v2-protocol
+```
+
+Useful env vars:
+- `SPIDERWEB_PORT` (default `28794`)
+- `FS_NODE_PORT` (default `28931`)
+- `BIND_ADDR` (default `127.0.0.1`)
 - `SKIP_BUILD=1` to skip `zig build` if binaries are already built
 
 ## Soak / Chaos Suite
