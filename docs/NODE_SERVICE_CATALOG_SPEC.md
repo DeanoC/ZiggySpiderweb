@@ -1,6 +1,8 @@
-# Node Service Catalog Spec (v1)
+# Node Service Catalog Spec (v2)
 
-The service catalog describes non-mount capabilities available on a node.
+The service catalog describes node-exported namespace services and their
+mount metadata. This is the control-plane source used to project
+`/nodes/<node_id>/services/*` and dynamic mount roots in Acheron WorldFS.
 
 ## Control Operations
 
@@ -28,6 +30,15 @@ Each service entry:
 - `state` (`string`, required)
 - `endpoints` (`array<string>`, required, absolute paths)
 - `capabilities` (`object`, optional, default `{}`)
+- `mounts` (`array<object>`, optional, default `[]`)
+  - `mount_id` (`string`, required)
+  - `mount_path` (`string`, required, absolute path)
+  - `state` (`string`, optional; defaults to service state)
+- `ops` (`object`, optional, default `{}`)
+- `runtime` (`object`, optional, default `{}`)
+- `permissions` (`object`, optional, default `{}`)
+- `schema` (`object`, optional, default `{}`)
+- `help_md` (`string`, optional)
 
 ### Example
 
@@ -44,7 +55,19 @@ Each service entry:
       "version": "1",
       "state": "online",
       "endpoints": ["/nodes/node-2/camera"],
-      "capabilities": { "still": true }
+      "capabilities": { "still": true },
+      "mounts": [
+        {
+          "mount_id": "camera",
+          "mount_path": "/nodes/node-2/camera",
+          "state": "online"
+        }
+      ],
+      "ops": { "model": "namespace", "style": "plan9" },
+      "runtime": { "type": "native_proc", "abi": "namespace-driver-v1" },
+      "permissions": { "default": "deny-by-default" },
+      "schema": { "model": "namespace-mount" },
+      "help_md": "Camera namespace driver"
     },
     {
       "service_id": "terminal",
@@ -52,7 +75,19 @@ Each service entry:
       "version": "1",
       "state": "degraded",
       "endpoints": ["/nodes/node-2/terminal/1"],
-      "capabilities": { "pty": true }
+      "capabilities": { "pty": true },
+      "mounts": [
+        {
+          "mount_id": "terminal-1",
+          "mount_path": "/nodes/node-2/terminal/1",
+          "state": "degraded"
+        }
+      ],
+      "ops": { "model": "namespace", "style": "plan9", "interactive": true },
+      "runtime": { "type": "builtin", "abi": "namespace-driver-v1" },
+      "permissions": { "default": "deny-by-default", "device": "terminal" },
+      "schema": { "model": "namespace-mount" },
+      "help_md": "Builtin terminal namespace driver"
     }
   ]
 }
@@ -78,6 +113,9 @@ Response fields:
 - Service IDs must be unique within one upsert payload.
 - `endpoints` must be absolute-style paths.
 - `capabilities` must be a JSON object.
+- `mounts`, when present, must be an array of objects with absolute
+  `mount_path` values.
+- `ops`, `runtime`, `permissions`, and `schema` must be JSON objects.
 
 ## `spiderweb-fs-node` Provider Mapping
 
@@ -88,10 +126,15 @@ When `spiderweb-fs-node` runs in control daemon mode (`--control-url`), it auto-
   - `kind`: `fs`
   - endpoint: `/nodes/<node_id>/fs`
   - capabilities: `rw`, `export_count`
+  - mounts: `/nodes/<node_id>/fs`
 - Terminal provider (repeat `--terminal-id <id>`):
   - `service_id`: `terminal-<id>`
   - `kind`: `terminal`
   - endpoint: `/nodes/<node_id>/terminal/<id>`
   - capabilities: `pty=true`, `terminal_id`
+  - mounts: `/nodes/<node_id>/terminal/<id>`
+- Extra namespace services (from `--service-manifest` / `--services-dir`):
+  - appended to the upsert payload after built-in providers
+  - validated for shape and duplicate `service_id`s before publish
 
 Use `--no-fs-service` to disable FS service advertisement and `--label <key=value>` to attach node labels.

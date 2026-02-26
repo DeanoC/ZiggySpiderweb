@@ -12,7 +12,13 @@ This document defines the agent-visible runtime namespace for Acheron sessions.
 │       │   └── <service_id>/
 │       │       ├── SCHEMA.json
 │       │       ├── STATUS.json
-│       │       └── CAPS.json
+│       │       ├── CAPS.json
+│       │       ├── MOUNTS.json
+│       │       ├── OPS.json
+│       │       ├── RUNTIME.json
+│       │       ├── PERMISSIONS.json
+│       │       └── README.md
+│       ├── <dynamic_mount_roots...>
 │       └── README.md
 ├── agents/
 │   └── self/
@@ -38,13 +44,17 @@ for `/nodes/<node_id>/services/*`, with per-service `SCHEMA.json`, `CAPS.json`,
 and `STATUS.json`.
 `/nodes/<node_id>/services/SERVICES.json` provides a flat service index.
 
-Node resource roots (`/nodes/<node_id>/fs`, `camera`, `screen`, `user`, `terminal/*`)
+Node resource roots (`/nodes/<node_id>/fs`, `camera`, `screen`, `user`, `terminal/*`,
+and custom roots like `drive/*`)
 follow the same service view:
-- when service catalog is available, roots are derived from advertised service kinds
+- when service catalog is available, roots are derived from service `mount_path`
+  metadata (with kind-based compatibility behavior for legacy services)
 - otherwise roots are derived from policy fallback resources
 Node-level `CAPS.json` uses the same effective service view.
 If a node advertises an explicit empty service catalog, runtime exposes no fallback
 policy roots for that node.
+
+For phase tracking and backlog, see `docs/NODE_NAMESPACE_EXTENSION_PHASES.md`.
 
 When project workspace mounts reference nodes not present in policy, runtime creates
 discovered `/nodes/<node_id>` entries so project FS links always resolve.

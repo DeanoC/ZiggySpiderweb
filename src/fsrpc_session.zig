@@ -1074,7 +1074,7 @@ pub const Session = struct {
         var resource_view = try self.addNodeServices(node_dir, node);
         defer resource_view.deinit(self.allocator);
 
-        const node_schema = "{\"kind\":\"node\",\"children\":[\"services\",\"fs\",\"camera\",\"screen\",\"user\",\"terminal\"]}";
+        const node_schema = "{\"kind\":\"node\",\"children\":\"services + mount roots\"}";
         const node_caps = try std.fmt.allocPrint(
             self.allocator,
             "{{\"fs\":{s},\"camera\":{s},\"screen\":{s},\"user\":{s},\"terminal\":{s}}}",
@@ -1099,14 +1099,22 @@ pub const Session = struct {
         );
         try self.addNodeRuntimeMetadataFiles(node_dir, node.id, discovered_from_workspace);
 
-        if (resource_view.fs) _ = try self.addDir(node_dir, "fs", false);
-        if (resource_view.camera) _ = try self.addDir(node_dir, "camera", false);
-        if (resource_view.screen) _ = try self.addDir(node_dir, "screen", false);
-        if (resource_view.user) _ = try self.addDir(node_dir, "user", false);
+        if (resource_view.fs and self.lookupChild(node_dir, "fs") == null) _ = try self.addDir(node_dir, "fs", false);
+        if (resource_view.camera and self.lookupChild(node_dir, "camera") == null) _ = try self.addDir(node_dir, "camera", false);
+        if (resource_view.screen and self.lookupChild(node_dir, "screen") == null) _ = try self.addDir(node_dir, "screen", false);
+        if (resource_view.user and self.lookupChild(node_dir, "user") == null) _ = try self.addDir(node_dir, "user", false);
         if (resource_view.terminals.items.len > 0) {
-            const terminal_root = try self.addDir(node_dir, "terminal", false);
+            const terminal_root = if (self.lookupChild(node_dir, "terminal")) |existing| existing else try self.addDir(node_dir, "terminal", false);
             for (resource_view.terminals.items) |terminal_id| {
-                _ = try self.addDir(terminal_root, terminal_id, false);
+                if (self.lookupChild(terminal_root, terminal_id) == null) {
+                    _ = try self.addDir(terminal_root, terminal_id, false);
+                }
+            }
+        }
+
+        for (resource_view.roots.items) |root_name| {
+            if (self.lookupChild(node_dir, root_name) == null) {
+                _ = try self.addDir(node_dir, root_name, false);
             }
         }
     }
@@ -1898,44 +1906,118 @@ pub const Session = struct {
         screen: bool = false,
         user: bool = false,
         terminals: std.ArrayListUnmanaged([]u8) = .{},
+        roots: std.ArrayListUnmanaged([]u8) = .{},
 
         fn deinit(self: *NodeResourceView, allocator: std.mem.Allocator) void {
             for (self.terminals.items) |terminal_id| allocator.free(terminal_id);
             self.terminals.deinit(allocator);
+            for (self.roots.items) |root| allocator.free(root);
+            self.roots.deinit(allocator);
             self.* = undefined;
         }
 
-        fn observe(self: *NodeResourceView, allocator: std.mem.Allocator, kind: []const u8, service_id: []const u8, endpoint: []const u8) !void {
+        fn addRoot(self: *NodeResourceView, allocator: std.mem.Allocator, root: []const u8) !void {
+            if (root.len == 0) return;
+            for (self.roots.items) |existing| {
+                if (std.mem.eql(u8, existing, root)) return;
+            }
+            try self.roots.append(allocator, try allocator.dupe(u8, root));
+        }
+
+        fn observeMounts(
+            self: *NodeResourceView,
+            allocator: std.mem.Allocator,
+            node_id: []const u8,
+            mounts_json: []const u8,
+        ) !void {
+            if (mounts_json.len == 0) return;
+            var parsed = std.json.parseFromSlice(std.json.Value, allocator, mounts_json, .{}) catch return;
+            defer parsed.deinit();
+            if (parsed.value != .array) return;
+            for (parsed.value.array.items) |mount| {
+                if (mount != .object) continue;
+                const mount_path_value = mount.object.get("mount_path") orelse continue;
+                if (mount_path_value != .string) continue;
+                const root = nodeRootNameFromPath(node_id, mount_path_value.string) orelse continue;
+                try self.addRoot(allocator, root);
+            }
+        }
+
+        fn observe(
+            self: *NodeResourceView,
+            allocator: std.mem.Allocator,
+            node_id: []const u8,
+            kind: []const u8,
+            service_id: []const u8,
+            endpoint: []const u8,
+            mounts_json: []const u8,
+        ) !void {
+            var handled_terminal = false;
             if (std.mem.eql(u8, kind, "fs")) {
                 self.fs = true;
-                return;
+                try self.addRoot(allocator, "fs");
             }
             if (std.mem.eql(u8, kind, "camera")) {
                 self.camera = true;
-                return;
+                try self.addRoot(allocator, "camera");
             }
             if (std.mem.eql(u8, kind, "screen")) {
                 self.screen = true;
-                return;
+                try self.addRoot(allocator, "screen");
             }
             if (std.mem.eql(u8, kind, "user")) {
                 self.user = true;
-                return;
+                try self.addRoot(allocator, "user");
             }
-            if (!std.mem.eql(u8, kind, "terminal")) return;
+            if (std.mem.eql(u8, kind, "terminal")) {
+                handled_terminal = true;
+                try self.addRoot(allocator, "terminal");
 
-            const maybe_terminal_id = if (std.mem.startsWith(u8, service_id, "terminal-") and service_id.len > "terminal-".len)
-                service_id["terminal-".len..]
-            else
-                terminalIdFromEndpoint(endpoint);
-            const terminal_id = maybe_terminal_id orelse return;
-            if (terminal_id.len == 0) return;
-            for (self.terminals.items) |existing| {
-                if (std.mem.eql(u8, existing, terminal_id)) return;
+                const maybe_terminal_id = if (std.mem.startsWith(u8, service_id, "terminal-") and service_id.len > "terminal-".len)
+                    service_id["terminal-".len..]
+                else
+                    terminalIdFromEndpoint(endpoint);
+                const terminal_id = maybe_terminal_id orelse {
+                    try self.observeMounts(allocator, node_id, mounts_json);
+                    return;
+                };
+                if (terminal_id.len == 0) {
+                    try self.observeMounts(allocator, node_id, mounts_json);
+                    return;
+                }
+                for (self.terminals.items) |existing| {
+                    if (std.mem.eql(u8, existing, terminal_id)) {
+                        try self.observeMounts(allocator, node_id, mounts_json);
+                        return;
+                    }
+                }
+                try self.terminals.append(allocator, try allocator.dupe(u8, terminal_id));
             }
-            try self.terminals.append(allocator, try allocator.dupe(u8, terminal_id));
+
+            try self.observeMounts(allocator, node_id, mounts_json);
+            if (!handled_terminal and nodeRootNameFromPath(node_id, endpoint)) |root| {
+                try self.addRoot(allocator, root);
+            }
         }
     };
+
+    fn nodeRootNameFromPath(node_id: []const u8, mount_path: []const u8) ?[]const u8 {
+        if (!std.mem.startsWith(u8, mount_path, "/nodes/")) return null;
+        const after_nodes = mount_path["/nodes/".len..];
+        if (!std.mem.startsWith(u8, after_nodes, node_id)) return null;
+        if (after_nodes.len <= node_id.len or after_nodes[node_id.len] != '/') return null;
+        const tail = after_nodes[node_id.len + 1 ..];
+        if (tail.len == 0) return null;
+        const slash = std.mem.indexOfScalar(u8, tail, '/') orelse tail.len;
+        const root = tail[0..slash];
+        if (root.len == 0) return null;
+        for (root) |char| {
+            if (std.ascii.isAlphanumeric(char)) continue;
+            if (char == '-' or char == '_' or char == '.') continue;
+            return null;
+        }
+        return root;
+    }
 
     fn terminalIdFromEndpoint(endpoint: []const u8) ?[]const u8 {
         if (endpoint.len == 0) return null;
@@ -1983,7 +2065,7 @@ pub const Session = struct {
         try self.addDirectoryDescriptors(
             services_root,
             "Node Services",
-            "{\"kind\":\"collection\",\"entries\":\"service_id\",\"shape\":\"/nodes/<node_id>/services/<service_id>/{SCHEMA.json,STATUS.json,CAPS.json}\"}",
+            "{\"kind\":\"collection\",\"entries\":\"service_id\",\"shape\":\"/nodes/<node_id>/services/<service_id>/{SCHEMA.json,STATUS.json,CAPS.json,MOUNTS.json,OPS.json,RUNTIME.json,PERMISSIONS.json}\"}",
             "{\"read\":true,\"write\":false}",
             "Node service descriptors. This view prefers control-plane catalog data and falls back to policy.",
         );
@@ -2004,8 +2086,21 @@ pub const Session = struct {
                         service.state,
                         service.endpoint,
                         service.caps_json,
+                        service.mounts_json,
+                        service.ops_json,
+                        service.runtime_json,
+                        service.permissions_json,
+                        service.schema_json,
+                        service.help_md,
                     );
-                    try view.observe(self.allocator, service.kind, service.service_id, service.endpoint);
+                    try view.observe(
+                        self.allocator,
+                        node.id,
+                        service.kind,
+                        service.service_id,
+                        service.endpoint,
+                        service.mounts_json,
+                    );
                     try self.appendServiceIndexEntry(
                         &services_index,
                         &services_index_first,
@@ -2033,34 +2128,110 @@ pub const Session = struct {
 
         if (node.resources.fs) {
             const caps = "{\"rw\":true}";
+            const mounts = try std.fmt.allocPrint(
+                self.allocator,
+                "[{{\"mount_id\":\"fs\",\"mount_path\":\"/nodes/{s}/fs\",\"state\":\"online\"}}]",
+                .{node.id},
+            );
+            defer self.allocator.free(mounts);
             const endpoint = try std.fmt.allocPrint(self.allocator, "/nodes/{s}/fs", .{node.id});
             defer self.allocator.free(endpoint);
-            try self.addNodeServiceEntry(services_root, "fs", "fs", "online", endpoint, caps);
-            try view.observe(self.allocator, "fs", "fs", endpoint);
+            try self.addNodeServiceEntry(
+                services_root,
+                "fs",
+                "fs",
+                "online",
+                endpoint,
+                caps,
+                mounts,
+                "{\"model\":\"namespace\"}",
+                "{\"type\":\"builtin\"}",
+                "{\"scope\":\"project\"}",
+                "{\"model\":\"filesystem\"}",
+                "Project node filesystem export.",
+            );
+            try view.observe(self.allocator, node.id, "fs", "fs", endpoint, mounts);
             try self.appendServiceIndexEntry(&services_index, &services_index_first, "fs", "fs", "online", endpoint);
         }
         if (node.resources.camera) {
             const caps = "{\"still\":true}";
+            const mounts = try std.fmt.allocPrint(
+                self.allocator,
+                "[{{\"mount_id\":\"camera\",\"mount_path\":\"/nodes/{s}/camera\",\"state\":\"online\"}}]",
+                .{node.id},
+            );
+            defer self.allocator.free(mounts);
             const endpoint = try std.fmt.allocPrint(self.allocator, "/nodes/{s}/camera", .{node.id});
             defer self.allocator.free(endpoint);
-            try self.addNodeServiceEntry(services_root, "camera", "camera", "online", endpoint, caps);
-            try view.observe(self.allocator, "camera", "camera", endpoint);
+            try self.addNodeServiceEntry(
+                services_root,
+                "camera",
+                "camera",
+                "online",
+                endpoint,
+                caps,
+                mounts,
+                "{\"model\":\"namespace\"}",
+                "{\"type\":\"builtin\"}",
+                "{\"scope\":\"node\"}",
+                "{\"model\":\"camera\"}",
+                "Camera capture namespace.",
+            );
+            try view.observe(self.allocator, node.id, "camera", "camera", endpoint, mounts);
             try self.appendServiceIndexEntry(&services_index, &services_index_first, "camera", "camera", "online", endpoint);
         }
         if (node.resources.screen) {
             const caps = "{\"capture\":true}";
+            const mounts = try std.fmt.allocPrint(
+                self.allocator,
+                "[{{\"mount_id\":\"screen\",\"mount_path\":\"/nodes/{s}/screen\",\"state\":\"online\"}}]",
+                .{node.id},
+            );
+            defer self.allocator.free(mounts);
             const endpoint = try std.fmt.allocPrint(self.allocator, "/nodes/{s}/screen", .{node.id});
             defer self.allocator.free(endpoint);
-            try self.addNodeServiceEntry(services_root, "screen", "screen", "online", endpoint, caps);
-            try view.observe(self.allocator, "screen", "screen", endpoint);
+            try self.addNodeServiceEntry(
+                services_root,
+                "screen",
+                "screen",
+                "online",
+                endpoint,
+                caps,
+                mounts,
+                "{\"model\":\"namespace\"}",
+                "{\"type\":\"builtin\"}",
+                "{\"scope\":\"node\"}",
+                "{\"model\":\"screen\"}",
+                "Screen capture namespace.",
+            );
+            try view.observe(self.allocator, node.id, "screen", "screen", endpoint, mounts);
             try self.appendServiceIndexEntry(&services_index, &services_index_first, "screen", "screen", "online", endpoint);
         }
         if (node.resources.user) {
             const caps = "{\"interaction\":true}";
+            const mounts = try std.fmt.allocPrint(
+                self.allocator,
+                "[{{\"mount_id\":\"user\",\"mount_path\":\"/nodes/{s}/user\",\"state\":\"online\"}}]",
+                .{node.id},
+            );
+            defer self.allocator.free(mounts);
             const endpoint = try std.fmt.allocPrint(self.allocator, "/nodes/{s}/user", .{node.id});
             defer self.allocator.free(endpoint);
-            try self.addNodeServiceEntry(services_root, "user", "user", "online", endpoint, caps);
-            try view.observe(self.allocator, "user", "user", endpoint);
+            try self.addNodeServiceEntry(
+                services_root,
+                "user",
+                "user",
+                "online",
+                endpoint,
+                caps,
+                mounts,
+                "{\"model\":\"namespace\"}",
+                "{\"type\":\"builtin\"}",
+                "{\"scope\":\"node\"}",
+                "{\"model\":\"user\"}",
+                "User interaction namespace.",
+            );
+            try view.observe(self.allocator, node.id, "user", "user", endpoint, mounts);
             try self.appendServiceIndexEntry(&services_index, &services_index_first, "user", "user", "online", endpoint);
         }
 
@@ -2077,8 +2248,27 @@ pub const Session = struct {
                 .{escaped_terminal_id},
             );
             defer self.allocator.free(caps);
-            try self.addNodeServiceEntry(services_root, service_id, "terminal", "online", endpoint, caps);
-            try view.observe(self.allocator, "terminal", service_id, endpoint);
+            const mounts = try std.fmt.allocPrint(
+                self.allocator,
+                "[{{\"mount_id\":\"{s}\",\"mount_path\":\"/nodes/{s}/terminal/{s}\",\"state\":\"online\"}}]",
+                .{ service_id, node.id, terminal_id },
+            );
+            defer self.allocator.free(mounts);
+            try self.addNodeServiceEntry(
+                services_root,
+                service_id,
+                "terminal",
+                "online",
+                endpoint,
+                caps,
+                mounts,
+                "{\"model\":\"namespace\"}",
+                "{\"type\":\"builtin\"}",
+                "{\"scope\":\"node\"}",
+                "{\"model\":\"terminal\"}",
+                "Interactive terminal namespace.",
+            );
+            try view.observe(self.allocator, node.id, "terminal", service_id, endpoint, mounts);
             try self.appendServiceIndexEntry(&services_index, &services_index_first, service_id, "terminal", "online", endpoint);
         }
 
@@ -2096,6 +2286,12 @@ pub const Session = struct {
             state: []u8,
             endpoint: []u8,
             caps_json: []u8,
+            mounts_json: []u8,
+            ops_json: []u8,
+            runtime_json: []u8,
+            permissions_json: []u8,
+            schema_json: []u8,
+            help_md: ?[]u8 = null,
 
             fn deinit(self: *Entry, allocator: std.mem.Allocator) void {
                 allocator.free(self.service_id);
@@ -2103,6 +2299,12 @@ pub const Session = struct {
                 allocator.free(self.state);
                 allocator.free(self.endpoint);
                 allocator.free(self.caps_json);
+                allocator.free(self.mounts_json);
+                allocator.free(self.ops_json);
+                allocator.free(self.runtime_json);
+                allocator.free(self.permissions_json);
+                allocator.free(self.schema_json);
+                if (self.help_md) |value| allocator.free(value);
                 self.* = undefined;
             }
         };
@@ -2184,12 +2386,72 @@ pub const Session = struct {
                 try self.allocator.dupe(u8, "{}");
             errdefer self.allocator.free(caps_json);
 
+            const mounts_json = if (item.object.get("mounts")) |mounts|
+                if (mounts == .array)
+                    try std.fmt.allocPrint(self.allocator, "{f}", .{std.json.fmt(mounts, .{})})
+                else
+                    try self.allocator.dupe(u8, "[]")
+            else
+                try self.allocator.dupe(u8, "[]");
+            errdefer self.allocator.free(mounts_json);
+
+            const ops_json = if (item.object.get("ops")) |ops|
+                if (ops == .object)
+                    try std.fmt.allocPrint(self.allocator, "{f}", .{std.json.fmt(ops, .{})})
+                else
+                    try self.allocator.dupe(u8, "{}")
+            else
+                try self.allocator.dupe(u8, "{}");
+            errdefer self.allocator.free(ops_json);
+
+            const runtime_json = if (item.object.get("runtime")) |runtime|
+                if (runtime == .object)
+                    try std.fmt.allocPrint(self.allocator, "{f}", .{std.json.fmt(runtime, .{})})
+                else
+                    try self.allocator.dupe(u8, "{}")
+            else
+                try self.allocator.dupe(u8, "{}");
+            errdefer self.allocator.free(runtime_json);
+
+            const permissions_json = if (item.object.get("permissions")) |permissions|
+                if (permissions == .object)
+                    try std.fmt.allocPrint(self.allocator, "{f}", .{std.json.fmt(permissions, .{})})
+                else
+                    try self.allocator.dupe(u8, "{}")
+            else
+                try self.allocator.dupe(u8, "{}");
+            errdefer self.allocator.free(permissions_json);
+
+            const schema_json = if (item.object.get("schema")) |schema|
+                if (schema == .object)
+                    try std.fmt.allocPrint(self.allocator, "{f}", .{std.json.fmt(schema, .{})})
+                else
+                    try self.allocator.dupe(u8, "{}")
+            else
+                try self.allocator.dupe(u8, "{}");
+            errdefer self.allocator.free(schema_json);
+
+            const help_md = if (item.object.get("help_md")) |help|
+                if (help == .string and help.string.len > 0)
+                    try self.allocator.dupe(u8, help.string)
+                else
+                    null
+            else
+                null;
+            errdefer if (help_md) |value| self.allocator.free(value);
+
             try catalog.items.append(self.allocator, .{
                 .service_id = try self.allocator.dupe(u8, service_id_val.string),
                 .kind = try self.allocator.dupe(u8, kind_val.string),
                 .state = try self.allocator.dupe(u8, state),
                 .endpoint = resolved_endpoint,
                 .caps_json = caps_json,
+                .mounts_json = mounts_json,
+                .ops_json = ops_json,
+                .runtime_json = runtime_json,
+                .permissions_json = permissions_json,
+                .schema_json = schema_json,
+                .help_md = help_md,
             });
         }
 
@@ -2208,6 +2470,12 @@ pub const Session = struct {
         state: []const u8,
         endpoint: []const u8,
         caps_json: []const u8,
+        mounts_json: []const u8,
+        ops_json: []const u8,
+        runtime_json: []const u8,
+        permissions_json: []const u8,
+        schema_json: []const u8,
+        help_md: ?[]const u8,
     ) !void {
         const service_dir = try self.addDir(services_root, service_id, false);
 
@@ -2220,21 +2488,17 @@ pub const Session = struct {
         const escaped_endpoint = try unified.jsonEscape(self.allocator, endpoint);
         defer self.allocator.free(escaped_endpoint);
 
-        const schema = try std.fmt.allocPrint(
-            self.allocator,
-            "{{\"service_id\":\"{s}\",\"kind\":\"{s}\",\"version\":\"1\",\"endpoint\":\"{s}\"}}",
-            .{ escaped_service_id, escaped_kind, escaped_endpoint },
-        );
-        defer self.allocator.free(schema);
-        const readme = try std.fmt.allocPrint(
-            self.allocator,
-            "# Service `{s}`\n\nService metadata for this node capability.\n",
-            .{service_id},
-        );
-        defer self.allocator.free(readme);
+        const readme = if (help_md) |value|
+            value
+        else
+            "# Service metadata for this node capability.\n";
         _ = try self.addFile(service_dir, "README.md", readme, false, .none);
-        _ = try self.addFile(service_dir, "SCHEMA.json", schema, false, .none);
+        _ = try self.addFile(service_dir, "SCHEMA.json", schema_json, false, .none);
         _ = try self.addFile(service_dir, "CAPS.json", caps_json, false, .none);
+        _ = try self.addFile(service_dir, "MOUNTS.json", mounts_json, false, .none);
+        _ = try self.addFile(service_dir, "OPS.json", ops_json, false, .none);
+        _ = try self.addFile(service_dir, "RUNTIME.json", runtime_json, false, .none);
+        _ = try self.addFile(service_dir, "PERMISSIONS.json", permissions_json, false, .none);
 
         const status = try std.fmt.allocPrint(
             self.allocator,
@@ -4129,6 +4393,107 @@ test "fsrpc_session: node roots are derived from control-plane service kinds" {
     try std.testing.expect(std.mem.indexOf(u8, node_caps.content, "\"fs\":false") != null);
     try std.testing.expect(camera_dir != null);
     try std.testing.expect(fs_dir == null);
+}
+
+test "fsrpc_session: control-plane mounts expose custom node roots and metadata files" {
+    const allocator = std.testing.allocator;
+
+    var control_plane = fs_control_plane.ControlPlane.init(allocator);
+    defer control_plane.deinit();
+
+    const ensured = try control_plane.ensureNode("edge-custom-mounts", "ws://127.0.0.1:18891/v2/fs", 60_000);
+    defer allocator.free(ensured);
+    var ensured_parsed = try std.json.parseFromSlice(std.json.Value, allocator, ensured, .{});
+    defer ensured_parsed.deinit();
+    if (ensured_parsed.value != .object) return error.TestExpectedResponse;
+    const node_id = ensured_parsed.value.object.get("node_id") orelse return error.TestExpectedResponse;
+    if (node_id != .string) return error.TestExpectedResponse;
+    const node_secret = ensured_parsed.value.object.get("node_secret") orelse return error.TestExpectedResponse;
+    if (node_secret != .string) return error.TestExpectedResponse;
+
+    const escaped_node_id = try unified.jsonEscape(allocator, node_id.string);
+    defer allocator.free(escaped_node_id);
+    const escaped_node_secret = try unified.jsonEscape(allocator, node_secret.string);
+    defer allocator.free(escaped_node_secret);
+    const upsert_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"node_id\":\"{s}\",\"node_secret\":\"{s}\",\"services\":[{{\"service_id\":\"gdrive-main\",\"kind\":\"gdrive\",\"version\":\"1\",\"state\":\"online\",\"endpoints\":[\"/nodes/{s}/services/gdrive-main\"],\"capabilities\":{{\"provider\":\"google\"}},\"mounts\":[{{\"mount_id\":\"drive-main\",\"mount_path\":\"/nodes/{s}/drive/main\",\"state\":\"online\"}}],\"ops\":{{\"model\":\"namespace\"}},\"runtime\":{{\"type\":\"native_proc\"}},\"permissions\":{{\"default\":\"deny-by-default\"}},\"schema\":{{\"model\":\"namespace-mount\"}},\"help_md\":\"Google Drive namespace mount\"}}]}}",
+        .{ escaped_node_id, escaped_node_secret, escaped_node_id, escaped_node_id },
+    );
+    defer allocator.free(upsert_req);
+    const upserted = try control_plane.nodeServiceUpsert(upsert_req);
+    defer allocator.free(upserted);
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const root = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+    const agents_dir = try std.fmt.allocPrint(allocator, "{s}/agents", .{root});
+    defer allocator.free(agents_dir);
+    const projects_dir = try std.fmt.allocPrint(allocator, "{s}/projects", .{root});
+    defer allocator.free(projects_dir);
+    const agent_policy_dir = try std.fmt.allocPrint(allocator, "{s}/default", .{agents_dir});
+    defer allocator.free(agent_policy_dir);
+    const project_dir = try std.fmt.allocPrint(allocator, "{s}/proj-custom-mounts", .{projects_dir});
+    defer allocator.free(project_dir);
+    try std.fs.cwd().makePath(agent_policy_dir);
+    try std.fs.cwd().makePath(project_dir);
+
+    const agent_policy_path = try std.fmt.allocPrint(allocator, "{s}/agent_policy.json", .{agent_policy_dir});
+    defer allocator.free(agent_policy_path);
+    const agent_policy_json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"project_id\":\"proj-custom-mounts\",\"nodes\":[{{\"id\":\"{s}\",\"resources\":{{\"fs\":false,\"camera\":false,\"screen\":false,\"user\":false}},\"terminals\":[]}}],\"visible_agents\":[\"default\"],\"project_links\":[]}}",
+        .{escaped_node_id},
+    );
+    defer allocator.free(agent_policy_json);
+    try std.fs.cwd().writeFile(.{
+        .sub_path = agent_policy_path,
+        .data = agent_policy_json,
+    });
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "default",
+        .{
+            .project_id = "proj-custom-mounts",
+            .agents_dir = agents_dir,
+            .projects_dir = projects_dir,
+            .control_plane = &control_plane,
+        },
+    );
+    defer session.deinit();
+
+    const nodes_root = session.lookupChild(session.root_id, "nodes") orelse return error.TestExpectedResponse;
+    const node_dir = session.lookupChild(nodes_root, node_id.string) orelse return error.TestExpectedResponse;
+    const drive_root = session.lookupChild(node_dir, "drive") orelse return error.TestExpectedResponse;
+    _ = drive_root;
+    const services_root = session.lookupChild(node_dir, "services") orelse return error.TestExpectedResponse;
+    const gdrive_service = session.lookupChild(services_root, "gdrive-main") orelse return error.TestExpectedResponse;
+    const mounts_id = session.lookupChild(gdrive_service, "MOUNTS.json") orelse return error.TestExpectedResponse;
+    const ops_id = session.lookupChild(gdrive_service, "OPS.json") orelse return error.TestExpectedResponse;
+    const runtime_id = session.lookupChild(gdrive_service, "RUNTIME.json") orelse return error.TestExpectedResponse;
+    const permissions_id = session.lookupChild(gdrive_service, "PERMISSIONS.json") orelse return error.TestExpectedResponse;
+    const readme_id = session.lookupChild(gdrive_service, "README.md") orelse return error.TestExpectedResponse;
+    const mounts_node = session.nodes.get(mounts_id) orelse return error.TestExpectedResponse;
+    const ops_node = session.nodes.get(ops_id) orelse return error.TestExpectedResponse;
+    const runtime_node = session.nodes.get(runtime_id) orelse return error.TestExpectedResponse;
+    const permissions_node = session.nodes.get(permissions_id) orelse return error.TestExpectedResponse;
+    const readme_node = session.nodes.get(readme_id) orelse return error.TestExpectedResponse;
+
+    try std.testing.expect(std.mem.indexOf(u8, mounts_node.content, "\"mount_path\":\"/nodes/") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ops_node.content, "\"model\":\"namespace\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, runtime_node.content, "\"type\":\"native_proc\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, permissions_node.content, "\"deny-by-default\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, readme_node.content, "Google Drive namespace mount") != null);
 }
 
 test "fsrpc_session: control-plane registered nodes appear under global nodes namespace" {
