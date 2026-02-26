@@ -176,6 +176,10 @@ const DriftSeverity = enum {
 const ReconcileProjectSummary = struct {
     drift_count: u32 = 0,
     queue_depth: u32 = 0,
+    mounts_total: u32 = 0,
+    online_mounts: u32 = 0,
+    degraded_mounts: u32 = 0,
+    missing_mounts: u32 = 0,
 };
 
 pub const ControlPlane = struct {
@@ -1693,7 +1697,7 @@ pub const ControlPlane = struct {
 
         return std.fmt.allocPrint(
             self.allocator,
-            "{{\"agent_id\":\"{s}\",\"project_id\":null,\"workspace_root\":null,\"mounts\":[],\"desired_mounts\":[],\"actual_mounts\":[],\"drift\":{{\"count\":0,\"items\":[]}},\"reconcile_state\":\"{s}\",\"last_reconcile_ms\":{d},\"last_success_ms\":{d},\"last_error\":{s},\"queue_depth\":{d}}}",
+            "{{\"agent_id\":\"{s}\",\"project_id\":null,\"workspace_root\":null,\"mounts\":[],\"desired_mounts\":[],\"actual_mounts\":[],\"drift\":{{\"count\":0,\"items\":[]}},\"availability\":{{\"mounts_total\":0,\"online\":0,\"degraded\":0,\"missing\":0}},\"reconcile_state\":\"{s}\",\"last_reconcile_ms\":{d},\"last_success_ms\":{d},\"last_error\":{s},\"queue_depth\":{d}}}",
             .{
                 escaped_agent,
                 reconcileStateName(self.reconcile_state),
@@ -1846,10 +1850,14 @@ pub const ControlPlane = struct {
                 const escaped_project = try jsonEscape(self.allocator, project.id);
                 defer self.allocator.free(escaped_project);
                 try out.writer(self.allocator).print(
-                    "{{\"project_id\":\"{s}\",\"mounts\":{d},\"drift_count\":{d},\"queue_depth\":{d}}}",
+                    "{{\"project_id\":\"{s}\",\"mounts\":{d},\"selected_mounts\":{d},\"online_mounts\":{d},\"degraded_mounts\":{d},\"missing_mounts\":{d},\"drift_count\":{d},\"queue_depth\":{d}}}",
                     .{
                         escaped_project,
                         project.mounts.items.len,
+                        summary.mounts_total,
+                        summary.online_mounts,
+                        summary.degraded_mounts,
+                        summary.missing_mounts,
                         summary.drift_count,
                         summary.queue_depth,
                     },
@@ -1897,6 +1905,8 @@ pub const ControlPlane = struct {
             null,
             self.isPrimaryAgent(agent_id),
         );
+        try out.appendSlice(self.allocator, ",\"availability\":");
+        try appendWorkspaceAvailabilityJson(self.allocator, &out, topology);
         try out.writer(self.allocator).print(
             ",\"reconcile_state\":\"{s}\",\"last_reconcile_ms\":{d},\"last_success_ms\":{d},\"last_error\":{s},\"queue_depth\":{d}}}",
             .{
@@ -1935,6 +1945,18 @@ pub const ControlPlane = struct {
                 try selected_by_path.put(self.allocator, mount.mount_path, idx);
             }
         }
+        var summary = ReconcileProjectSummary{};
+        for (project.mounts.items, 0..) |mount, idx| {
+            const selected_idx = selected_by_path.get(mount.mount_path) orelse continue;
+            if (selected_idx != idx) continue;
+            summary.mounts_total +%= 1;
+            const state_rank = mountCandidateAvailabilityRank(self.nodes.get(mount.node_id), now_ms);
+            switch (state_rank) {
+                2 => summary.online_mounts +%= 1,
+                1 => summary.degraded_mounts +%= 1,
+                else => summary.missing_mounts +%= 1,
+            }
+        }
 
         try out.appendSlice(self.allocator, ",\"mounts\":[");
         var first = true;
@@ -1967,7 +1989,6 @@ pub const ControlPlane = struct {
 
         var drift_items = std.ArrayListUnmanaged(u8){};
         defer drift_items.deinit(self.allocator);
-        var summary = ReconcileProjectSummary{};
         var first_drift = true;
         for (project.mounts.items, 0..) |mount, idx| {
             const first_idx = first_by_path.get(mount.mount_path) orelse continue;
@@ -2226,6 +2247,110 @@ pub const ControlPlane = struct {
         active_project_bindings: usize,
         mounts_total: usize,
     };
+
+    pub const AvailabilitySnapshot = struct {
+        nodes_online: usize = 0,
+        nodes_total: usize = 0,
+        mounts_online: usize = 0,
+        mounts_degraded: usize = 0,
+        mounts_missing: usize = 0,
+        mounts_total: usize = 0,
+        project_mount_digest: u64 = 0,
+
+        pub fn eql(lhs: AvailabilitySnapshot, rhs: AvailabilitySnapshot) bool {
+            return lhs.nodes_online == rhs.nodes_online and
+                lhs.nodes_total == rhs.nodes_total and
+                lhs.mounts_online == rhs.mounts_online and
+                lhs.mounts_degraded == rhs.mounts_degraded and
+                lhs.mounts_missing == rhs.mounts_missing and
+                lhs.mounts_total == rhs.mounts_total and
+                lhs.project_mount_digest == rhs.project_mount_digest;
+        }
+    };
+
+    const ProjectAvailabilitySnapshot = struct {
+        online_mounts: usize = 0,
+        degraded_mounts: usize = 0,
+        missing_mounts: usize = 0,
+        mounts_total: usize = 0,
+        digest: u64 = 0,
+    };
+
+    pub fn availabilitySnapshot(self: *ControlPlane) AvailabilitySnapshot {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const now_ms = std.time.milliTimestamp();
+        return self.collectAvailabilitySnapshotLocked(now_ms);
+    }
+
+    fn collectAvailabilitySnapshotLocked(self: *ControlPlane, now_ms: i64) AvailabilitySnapshot {
+        var snapshot = AvailabilitySnapshot{
+            .nodes_total = self.nodes.count(),
+        };
+        var nodes_it = self.nodes.valueIterator();
+        while (nodes_it.next()) |node| {
+            if (node.lease_expires_at_ms > now_ms) snapshot.nodes_online += 1;
+        }
+
+        var digest_acc: u64 = 0;
+        var project_it = self.projects.valueIterator();
+        while (project_it.next()) |project| {
+            const project_snapshot = self.collectProjectAvailabilitySnapshotLocked(project.*, now_ms);
+            snapshot.mounts_online += project_snapshot.online_mounts;
+            snapshot.mounts_degraded += project_snapshot.degraded_mounts;
+            snapshot.mounts_missing += project_snapshot.missing_mounts;
+            snapshot.mounts_total += project_snapshot.mounts_total;
+            digest_acc +%= project_snapshot.digest *% 0x9e3779b185ebca87;
+        }
+        snapshot.project_mount_digest = digest_acc;
+        return snapshot;
+    }
+
+    fn collectProjectAvailabilitySnapshotLocked(
+        self: *ControlPlane,
+        project: Project,
+        now_ms: i64,
+    ) ProjectAvailabilitySnapshot {
+        var out = ProjectAvailabilitySnapshot{
+            .digest = std.hash.Wyhash.hash(0, project.id),
+        };
+        const mounts = project.mounts.items;
+
+        var idx: usize = 0;
+        while (idx < mounts.len) : (idx += 1) {
+            const mount = mounts[idx];
+            var seen_before = false;
+            var selected_idx = idx;
+
+            var candidate_idx: usize = 0;
+            while (candidate_idx < mounts.len) : (candidate_idx += 1) {
+                const candidate = mounts[candidate_idx];
+                if (!std.mem.eql(u8, candidate.mount_path, mount.mount_path)) continue;
+                if (candidate_idx < idx) {
+                    seen_before = true;
+                    break;
+                }
+                if (self.shouldSelectCandidateMountLocked(project, selected_idx, candidate_idx, now_ms)) {
+                    selected_idx = candidate_idx;
+                }
+            }
+            if (seen_before) continue;
+
+            const selected_mount = mounts[selected_idx];
+            const state_rank = mountCandidateAvailabilityRank(self.nodes.get(selected_mount.node_id), now_ms);
+            out.mounts_total += 1;
+            switch (state_rank) {
+                2 => out.online_mounts += 1,
+                1 => out.degraded_mounts += 1,
+                else => out.missing_mounts += 1,
+            }
+
+            const mount_hash = hashMountAvailabilityItem(selected_mount, state_rank);
+            out.digest +%= mount_hash *% 0xbf58476d1ce4e5b9;
+        }
+
+        return out;
+    }
 
     fn collectMetricsLocked(self: *ControlPlane, now_ms: i64) MetricsSnapshot {
         var online_nodes: usize = 0;
@@ -3151,6 +3276,35 @@ fn appendMountJson(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8
         "{{\"mount_path\":\"{s}\",\"node_id\":\"{s}\",\"export_name\":\"{s}\"}}",
         .{ escaped_path, escaped_node, escaped_export },
     );
+}
+
+fn appendWorkspaceAvailabilityJson(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    summary: ReconcileProjectSummary,
+) !void {
+    try out.writer(allocator).print(
+        "{{\"mounts_total\":{d},\"online\":{d},\"degraded\":{d},\"missing\":{d}}}",
+        .{
+            summary.mounts_total,
+            summary.online_mounts,
+            summary.degraded_mounts,
+            summary.missing_mounts,
+        },
+    );
+}
+
+fn hashMountAvailabilityItem(mount: ProjectMount, state_rank: u8) u64 {
+    var hasher = std.hash.Wyhash.init(0);
+    hasher.update(mount.mount_path);
+    hasher.update("\x1f");
+    hasher.update(mount.node_id);
+    hasher.update("\x1f");
+    hasher.update(mount.export_name);
+    hasher.update("\x1f");
+    const state = [1]u8{state_rank};
+    hasher.update(&state);
+    return hasher.final();
 }
 
 fn appendWorkspaceMountJson(
@@ -4285,6 +4439,11 @@ test "fs_control_plane: workspace topology prefers best available candidate and 
     try std.testing.expect(std.mem.eql(u8, selected_offline.get("node_id").?.string, node_b_id));
     try std.testing.expect(std.mem.eql(u8, selected_offline.get("state").?.string, "degraded"));
     try std.testing.expect(selected_offline.get("online").?.bool == false);
+    const availability_offline = status_offline.value.object.get("availability").?.object;
+    try std.testing.expectEqual(@as(i64, 1), availability_offline.get("mounts_total").?.integer);
+    try std.testing.expectEqual(@as(i64, 0), availability_offline.get("online").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), availability_offline.get("degraded").?.integer);
+    try std.testing.expectEqual(@as(i64, 0), availability_offline.get("missing").?.integer);
 
     const drift_items_offline = status_offline.value.object.get("drift").?.object.get("items").?.array.items;
     try std.testing.expect(drift_items_offline.len > 0);
@@ -4310,6 +4469,11 @@ test "fs_control_plane: workspace topology prefers best available candidate and 
     try std.testing.expect(std.mem.eql(u8, selected_missing.get("node_id").?.string, node_b_id));
     try std.testing.expect(std.mem.eql(u8, selected_missing.get("state").?.string, "degraded"));
     try std.testing.expect(selected_missing.get("online").?.bool == false);
+    const availability_missing = status_missing.value.object.get("availability").?.object;
+    try std.testing.expectEqual(@as(i64, 1), availability_missing.get("mounts_total").?.integer);
+    try std.testing.expectEqual(@as(i64, 0), availability_missing.get("online").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), availability_missing.get("degraded").?.integer);
+    try std.testing.expectEqual(@as(i64, 0), availability_missing.get("missing").?.integer);
 }
 
 test "fs_control_plane: pending join request list approve and deny flow works" {

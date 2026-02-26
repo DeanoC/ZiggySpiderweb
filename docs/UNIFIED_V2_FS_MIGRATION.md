@@ -41,7 +41,9 @@ This release is **unified v2 only**. Legacy compatibility paths were removed.
 - explicit `project_id` selection now requires either a matching `project_token` or an existing active binding for that agent.
 - `spiderweb-fs-mount` supports `--project-id <id> [--project-token <token>]`
 - workspace topology mount entries now expose both `online` (`bool`) and `state` (`online`, `degraded`, `missing`) fields.
+- workspace status payloads now include `availability` rollups (`mounts_total`, `online`, `degraded`, `missing`).
 - when multiple mounts share a `mount_path`, control-plane selection is deterministic and availability-aware (`online` > `degraded` > `missing`, then latest lease expiry).
+- debug subscribers now receive `control.workspace_availability` events when availability transitions are detected.
 
 ## New Optional Hardening/Ops Flags
 

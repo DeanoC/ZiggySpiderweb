@@ -317,12 +317,15 @@ Notes:
 - `control.workspace_status` mount entries include:
   - `online` (`bool`) for quick health checks
   - `state` (`online`, `degraded`, `missing`) for deterministic availability reasoning
+- `control.workspace_status` also includes a top-level `availability` rollup:
+  - `mounts_total`, `online`, `degraded`, `missing`
 - Control-plane mount selection for a shared `mount_path` is availability-aware and deterministic:
   - rank: `online` > `degraded` (lease expired) > `missing` node
   - tie-break: latest `lease_expires_at_ms`
 - Workspace sync listens for push topology events via `control.debug_subscribe`:
   - full-refresh events: `control.workspace_topology`
   - project-scoped delta events: `control.workspace_topology_delta` (applied directly when `--project-id` is set)
+  - availability rollup events: `control.workspace_availability` (emitted when node/project availability transitions)
   - polling fallback remains enabled.
 - Control-plane project mutations (`project_update`, `project_delete`, `project_mount_set`, `project_mount_remove`, `project_activate`) require a `project_token` returned by `control.project_create`.
 - Project token lifecycle control ops are available: `control.project_token_rotate` and `control.project_token_revoke`.
