@@ -15,6 +15,7 @@ const fs_protocol = @import("fs_protocol.zig");
 const fs_node_ops = @import("fs_node_ops.zig");
 const fs_node_service = @import("fs_node_service.zig");
 const fs_watch_runtime = @import("fs_watch_runtime.zig");
+const agent_registry_mod = @import("agent_registry.zig");
 const unified = @import("ziggy-spider-protocol").unified;
 
 pub const RuntimeServer = runtime_server_mod.RuntimeServer;
@@ -2533,6 +2534,57 @@ const AgentRuntimeRegistry = struct {
         return self.auth_tokens.statusJson();
     }
 
+    fn listAgentsPayloadWithRole(self: *AgentRuntimeRegistry, is_admin: bool) ![]u8 {
+        _ = is_admin;
+        var registry = agent_registry_mod.AgentRegistry.init(
+            self.allocator,
+            ".",
+            self.runtime_config.agents_dir,
+            self.runtime_config.assets_dir,
+        );
+        defer registry.deinit();
+        try registry.scan();
+
+        var out = std.ArrayListUnmanaged(u8){};
+        errdefer out.deinit(self.allocator);
+        try out.appendSlice(self.allocator, "{\"agents\":[");
+        var first = true;
+        for (registry.listAgents()) |agent| {
+            if (!first) try out.append(self.allocator, ',');
+            first = false;
+            try appendAgentInfoJson(self.allocator, &out, agent);
+        }
+        try out.appendSlice(self.allocator, "]}");
+        return out.toOwnedSlice(self.allocator);
+    }
+
+    fn getAgentPayloadWithRole(
+        self: *AgentRuntimeRegistry,
+        payload_json: ?[]const u8,
+        is_admin: bool,
+    ) ![]u8 {
+        _ = is_admin;
+        const agent_id = try parseAgentIdFromPayload(self.allocator, payload_json);
+        defer self.allocator.free(agent_id);
+
+        var registry = agent_registry_mod.AgentRegistry.init(
+            self.allocator,
+            ".",
+            self.runtime_config.agents_dir,
+            self.runtime_config.assets_dir,
+        );
+        defer registry.deinit();
+        try registry.scan();
+
+        const agent = registry.getAgent(agent_id) orelse return error.AgentNotFound;
+        var out = std.ArrayListUnmanaged(u8){};
+        errdefer out.deinit(self.allocator);
+        try out.appendSlice(self.allocator, "{\"agent\":");
+        try appendAgentInfoJson(self.allocator, &out, agent.*);
+        try out.append(self.allocator, '}');
+        return out.toOwnedSlice(self.allocator);
+    }
+
     fn getLocalFsNode(self: *AgentRuntimeRegistry) ?*LocalFsNode {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -4162,7 +4214,9 @@ fn handleWebSocketConnection(
                         if (connect_gate_error != null and
                             control_type != .version and
                             control_type != .connect and
-                            control_type != .session_attach)
+                            control_type != .session_attach and
+                            control_type != .agent_list and
+                            control_type != .agent_get)
                         {
                             const gate = connect_gate_error.?;
                             const response = try unified.buildControlError(
@@ -5081,6 +5135,8 @@ fn handleWebSocketConnection(
                             .node_lease_refresh,
                             .node_service_upsert,
                             .node_service_get,
+                            .agent_list,
+                            .agent_get,
                             .node_list,
                             .node_get,
                             .node_delete,
@@ -6299,6 +6355,8 @@ fn handleControlPlaneCommand(
         .node_lease_refresh => runtime_registry.control_plane.refreshNodeLease(payload_json),
         .node_service_upsert => runtime_registry.control_plane.nodeServiceUpsert(payload_json),
         .node_service_get => runtime_registry.control_plane.nodeServiceGet(payload_json),
+        .agent_list => runtime_registry.listAgentsPayloadWithRole(is_admin),
+        .agent_get => runtime_registry.getAgentPayloadWithRole(payload_json, is_admin),
         .node_list => runtime_registry.control_plane.listNodes(),
         .node_get => runtime_registry.control_plane.getNode(payload_json),
         .node_delete => runtime_registry.control_plane.deleteNode(payload_json),
@@ -6329,6 +6387,7 @@ fn controlPlaneErrorCode(err: anyerror) []const u8 {
         fs_control_plane.ControlPlaneError.InviteExpired => "invite_expired",
         fs_control_plane.ControlPlaneError.InviteRedeemed => "invite_redeemed",
         fs_control_plane.ControlPlaneError.NodeNotFound => "node_not_found",
+        error.AgentNotFound => "agent_not_found",
         fs_control_plane.ControlPlaneError.NodeAuthFailed => "node_auth_failed",
         fs_control_plane.ControlPlaneError.PendingJoinNotFound => "pending_join_not_found",
         fs_control_plane.ControlPlaneError.ProjectNotFound => "project_not_found",
@@ -6339,6 +6398,59 @@ fn controlPlaneErrorCode(err: anyerror) []const u8 {
         fs_control_plane.ControlPlaneError.MountNotFound => "mount_not_found",
         else => "control_plane_error",
     };
+}
+
+fn parseAgentIdFromPayload(allocator: std.mem.Allocator, payload_json: ?[]const u8) ![]u8 {
+    const raw = payload_json orelse return error.MissingField;
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidPayload;
+    const id_val = parsed.value.object.get("agent_id") orelse return error.MissingField;
+    if (id_val != .string or id_val.string.len == 0) return error.InvalidPayload;
+    return allocator.dupe(u8, id_val.string);
+}
+
+fn agentCapabilityName(value: agent_registry_mod.AgentCapability) []const u8 {
+    return switch (value) {
+        .chat => "chat",
+        .code => "code",
+        .plan => "plan",
+        .research => "research",
+    };
+}
+
+fn appendAgentInfoJson(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    agent: agent_registry_mod.AgentInfo,
+) !void {
+    const escaped_id = try unified.jsonEscape(allocator, agent.id);
+    defer allocator.free(escaped_id);
+    const escaped_name = try unified.jsonEscape(allocator, agent.name);
+    defer allocator.free(escaped_name);
+    const escaped_description = try unified.jsonEscape(allocator, agent.description);
+    defer allocator.free(escaped_description);
+
+    try out.writer(allocator).print(
+        "{{\"id\":\"{s}\",\"name\":\"{s}\",\"description\":\"{s}\",\"is_default\":{s},\"identity_loaded\":{s},\"needs_hatching\":{s},\"capabilities\":[",
+        .{
+            escaped_id,
+            escaped_name,
+            escaped_description,
+            if (agent.is_default) "true" else "false",
+            if (agent.identity_loaded) "true" else "false",
+            if (agent.needs_hatching) "true" else "false",
+        },
+    );
+
+    for (agent.capabilities.items, 0..) |capability, index| {
+        if (index > 0) try out.append(allocator, ',');
+        const escaped_capability = try unified.jsonEscape(allocator, agentCapabilityName(capability));
+        defer allocator.free(escaped_capability);
+        try out.writer(allocator).print("\"{s}\"", .{escaped_capability});
+    }
+
+    try out.appendSlice(allocator, "]}");
 }
 
 fn resolveAgentIdFromConnectionPath(path: []const u8, default_agent_id: []const u8) ?[]const u8 {
@@ -6900,6 +7012,108 @@ test "server_piai: base websocket path handles unified control/acheron chat flow
     try std.testing.expectEqual(@as(u8, 0x8), close_reply.opcode);
 
     try std.testing.expect(server_ctx.err_name == null);
+}
+
+test "server_piai: control.agent_list and control.agent_get expose registry metadata" {
+    const allocator = std.testing.allocator;
+    const nonce = std.crypto.random.int(u64);
+    const root = try std.fmt.allocPrint(allocator, ".tmp-agent-registry-{d}", .{nonce});
+    defer allocator.free(root);
+    defer std.fs.cwd().deleteTree(root) catch {};
+    try std.fs.cwd().makePath(root);
+
+    const agents_dir = try std.fs.path.join(allocator, &.{ root, "agents" });
+    defer allocator.free(agents_dir);
+    try std.fs.cwd().makePath(agents_dir);
+
+    const mother_dir = try std.fs.path.join(allocator, &.{ agents_dir, "mother" });
+    defer allocator.free(mother_dir);
+    try std.fs.cwd().makePath(mother_dir);
+    const mother_json_path = try std.fs.path.join(allocator, &.{ mother_dir, "agent.json" });
+    defer allocator.free(mother_json_path);
+    try std.fs.cwd().writeFile(.{
+        .sub_path = mother_json_path,
+        .data =
+        \\{
+        \\  "name": "Mother",
+        \\  "description": "Primary orchestrator",
+        \\  "is_default": true,
+        \\  "capabilities": ["chat","plan"]
+        \\}
+        ,
+    });
+
+    const bob_dir = try std.fs.path.join(allocator, &.{ agents_dir, "bob" });
+    defer allocator.free(bob_dir);
+    try std.fs.cwd().makePath(bob_dir);
+    const bob_json_path = try std.fs.path.join(allocator, &.{ bob_dir, "agent.json" });
+    defer allocator.free(bob_json_path);
+    try std.fs.cwd().writeFile(.{
+        .sub_path = bob_json_path,
+        .data =
+        \\{
+        \\  "name": "Bob",
+        \\  "description": "Worker agent",
+        \\  "capabilities": ["chat","code"]
+        \\}
+        ,
+    });
+
+    var runtime_registry = AgentRuntimeRegistry.init(allocator, .{
+        .ltm_directory = "",
+        .ltm_filename = "",
+        .agents_dir = agents_dir,
+        .assets_dir = root,
+        .default_agent_id = "mother",
+    }, null);
+    defer runtime_registry.deinit();
+    try setAuthTokensForTests(&runtime_registry, "admin-secret", "user-secret");
+    try seedUserRememberedTargetForTests(&runtime_registry, "user-auth");
+
+    var listener = try (try std.net.Address.parseIp("127.0.0.1", 0)).listen(.{ .reuse_address = true });
+    defer listener.deinit();
+
+    var server_ctx = WsTestServerCtx{
+        .allocator = allocator,
+        .runtime_registry = &runtime_registry,
+        .listener = &listener,
+    };
+    defer server_ctx.deinit();
+
+    const server_thread = try std.Thread.spawn(.{}, runSingleWsConnection, .{&server_ctx});
+    defer server_thread.join();
+
+    var client = try std.net.tcpConnectToAddress(listener.listen_address);
+    defer client.close();
+    try performClientHandshakeWithBearerToken(allocator, &client, "/", "admin-secret");
+
+    try writeClientTextFrameMasked(&client, "{\"channel\":\"control\",\"type\":\"control.version\",\"id\":\"agent-version\",\"payload\":{\"protocol\":\"unified-v2\"}}");
+    var version_ack = try readServerFrame(allocator, &client);
+    defer version_ack.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, version_ack.payload, "\"type\":\"control.version_ack\"") != null);
+
+    try writeClientTextFrameMasked(&client, "{\"channel\":\"control\",\"type\":\"control.connect\",\"id\":\"agent-connect\"}");
+    var connect_ack = try readServerFrame(allocator, &client);
+    defer connect_ack.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, connect_ack.payload, "\"type\":\"control.connect_ack\"") != null);
+
+    try writeClientTextFrameMasked(&client, "{\"channel\":\"control\",\"type\":\"control.agent_list\",\"id\":\"agent-list\"}");
+    var list_reply = try readServerFrame(allocator, &client);
+    defer list_reply.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, list_reply.payload, "\"type\":\"control.agent_list\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, list_reply.payload, "\"id\":\"mother\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, list_reply.payload, "\"id\":\"bob\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, list_reply.payload, "\"capabilities\":[\"chat\",\"plan\"]") != null);
+
+    try writeClientTextFrameMasked(
+        &client,
+        "{\"channel\":\"control\",\"type\":\"control.agent_get\",\"id\":\"agent-get\",\"payload\":{\"agent_id\":\"bob\"}}",
+    );
+    var get_reply = try readServerFrame(allocator, &client);
+    defer get_reply.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, get_reply.payload, "\"type\":\"control.agent_get\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, get_reply.payload, "\"id\":\"bob\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, get_reply.payload, "\"name\":\"Bob\"") != null);
 }
 
 test "server_piai: operator token gate protects control mutations" {
