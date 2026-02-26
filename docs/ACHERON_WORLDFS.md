@@ -106,6 +106,7 @@ Project metadata now includes:
 - `agents.json` (project-visible agents and their `/agents/*` link targets)
 - `sources.json` (provenance for project FS/nodes/meta views: control-plane workspace vs policy fallback)
 - `contracts.json` (stable project-view contract index for directories, metadata files, and link semantics)
+- `paths.json` (canonical project and global path entrypoints for agent path resolution)
 - `workspace_status.json` (live `control.workspace_status` when available)
 - `mounts.json` (selected mount entries from workspace status `mounts`)
 - `desired_mounts.json` (desired mount set from workspace status `desired_mounts`)
