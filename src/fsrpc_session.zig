@@ -3002,6 +3002,180 @@ test "fsrpc_session: project workspace mount nodes are discovered outside policy
     try std.testing.expect(std.mem.indexOf(u8, mount_link_node.content, "/fs") != null);
 }
 
+test "fsrpc_session: project meta summary and alerts reflect degraded and missing mounts" {
+    const allocator = std.testing.allocator;
+
+    var control_plane = fs_control_plane.ControlPlane.init(allocator);
+    defer control_plane.deinit();
+
+    const ensured = try control_plane.ensureNode("edge-alerts", "ws://127.0.0.1:18891/v2/fs", 60_000);
+    defer allocator.free(ensured);
+    var ensured_parsed = try std.json.parseFromSlice(std.json.Value, allocator, ensured, .{});
+    defer ensured_parsed.deinit();
+    if (ensured_parsed.value != .object) return error.TestExpectedResponse;
+    const node_id = ensured_parsed.value.object.get("node_id") orelse return error.TestExpectedResponse;
+    if (node_id != .string) return error.TestExpectedResponse;
+
+    const created_project = try control_plane.createProject("{\"name\":\"ProjectAlertsState\"}");
+    defer allocator.free(created_project);
+    var project_parsed = try std.json.parseFromSlice(std.json.Value, allocator, created_project, .{});
+    defer project_parsed.deinit();
+    if (project_parsed.value != .object) return error.TestExpectedResponse;
+    const project_id = project_parsed.value.object.get("project_id") orelse return error.TestExpectedResponse;
+    if (project_id != .string) return error.TestExpectedResponse;
+    const project_token = project_parsed.value.object.get("project_token") orelse return error.TestExpectedResponse;
+    if (project_token != .string) return error.TestExpectedResponse;
+
+    const escaped_project_id = try unified.jsonEscape(allocator, project_id.string);
+    defer allocator.free(escaped_project_id);
+    const escaped_project_token = try unified.jsonEscape(allocator, project_token.string);
+    defer allocator.free(escaped_project_token);
+    const escaped_node_id = try unified.jsonEscape(allocator, node_id.string);
+    defer allocator.free(escaped_node_id);
+
+    const mount_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"project_id\":\"{s}\",\"project_token\":\"{s}\",\"node_id\":\"{s}\",\"export_name\":\"work\",\"mount_path\":\"/src\"}}",
+        .{ escaped_project_id, escaped_project_token, escaped_node_id },
+    );
+    defer allocator.free(mount_req);
+    const mounted = try control_plane.setProjectMount(mount_req);
+    defer allocator.free(mounted);
+
+    const up_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"project_id\":\"{s}\",\"project_token\":\"{s}\"}}",
+        .{ escaped_project_id, escaped_project_token },
+    );
+    defer allocator.free(up_req);
+    const up = try control_plane.projectUp("default", up_req);
+    defer allocator.free(up);
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const root = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+    const agents_dir = try std.fmt.allocPrint(allocator, "{s}/agents", .{root});
+    defer allocator.free(agents_dir);
+    const projects_dir = try std.fmt.allocPrint(allocator, "{s}/projects", .{root});
+    defer allocator.free(projects_dir);
+    const agent_policy_dir = try std.fmt.allocPrint(allocator, "{s}/default", .{agents_dir});
+    defer allocator.free(agent_policy_dir);
+    const project_dir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ projects_dir, project_id.string });
+    defer allocator.free(project_dir);
+    try std.fs.cwd().makePath(agent_policy_dir);
+    try std.fs.cwd().makePath(project_dir);
+
+    const agent_policy_path = try std.fmt.allocPrint(allocator, "{s}/agent_policy.json", .{agent_policy_dir});
+    defer allocator.free(agent_policy_path);
+    const agent_policy_json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"project_id\":\"{s}\",\"nodes\":[{{\"id\":\"{s}\",\"resources\":{{\"fs\":true,\"camera\":false,\"screen\":false,\"user\":false}},\"terminals\":[]}}],\"visible_agents\":[\"default\"],\"project_links\":[{{\"name\":\"{s}::fs\",\"node_id\":\"{s}\",\"resource\":\"fs\"}}]}}",
+        .{ escaped_project_id, escaped_node_id, escaped_node_id, escaped_node_id },
+    );
+    defer allocator.free(agent_policy_json);
+    try std.fs.cwd().writeFile(.{
+        .sub_path = agent_policy_path,
+        .data = agent_policy_json,
+    });
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    const stale_now = std.time.milliTimestamp();
+    control_plane.mutex.lock();
+    if (control_plane.nodes.getPtr(node_id.string)) |node| node.lease_expires_at_ms = stale_now - 1_000;
+    control_plane.mutex.unlock();
+
+    {
+        var degraded_session = try Session.initWithOptions(
+            allocator,
+            runtime_handle,
+            &job_index,
+            "default",
+            .{
+                .project_id = project_id.string,
+                .project_token = project_token.string,
+                .agents_dir = agents_dir,
+                .projects_dir = projects_dir,
+                .control_plane = &control_plane,
+            },
+        );
+        defer degraded_session.deinit();
+
+        const projects_root = degraded_session.lookupChild(degraded_session.root_id, "projects") orelse return error.TestExpectedResponse;
+        const project_node = degraded_session.lookupChild(projects_root, project_id.string) orelse return error.TestExpectedResponse;
+        const meta_node = degraded_session.lookupChild(project_node, "meta") orelse return error.TestExpectedResponse;
+        const summary_id = degraded_session.lookupChild(meta_node, "summary.json") orelse return error.TestExpectedResponse;
+        const alerts_id = degraded_session.lookupChild(meta_node, "alerts.json") orelse return error.TestExpectedResponse;
+        const workspace_id = degraded_session.lookupChild(meta_node, "workspace_status.json") orelse return error.TestExpectedResponse;
+        const availability_id = degraded_session.lookupChild(meta_node, "availability.json") orelse return error.TestExpectedResponse;
+
+        const summary_node = degraded_session.nodes.get(summary_id) orelse return error.TestExpectedResponse;
+        const alerts_node = degraded_session.nodes.get(alerts_id) orelse return error.TestExpectedResponse;
+        const workspace_node = degraded_session.nodes.get(workspace_id) orelse return error.TestExpectedResponse;
+        const availability_node = degraded_session.nodes.get(availability_id) orelse return error.TestExpectedResponse;
+
+        try std.testing.expect(std.mem.indexOf(u8, summary_node.content, "\"state\":\"degraded\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, alerts_node.content, "\"id\":\"degraded_mounts\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, alerts_node.content, "\"id\":\"workspace_drift\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, alerts_node.content, "\"id\":\"reconcile_queue\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, alerts_node.content, "\"id\":\"missing_mounts\"") == null);
+        try std.testing.expect(std.mem.indexOf(u8, workspace_node.content, "\"state\":\"degraded\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, availability_node.content, "\"degraded\":1") != null);
+        try std.testing.expect(std.mem.indexOf(u8, availability_node.content, "\"missing\":0") != null);
+    }
+
+    control_plane.mutex.lock();
+    if (control_plane.nodes.fetchRemove(node_id.string)) |removed| {
+        var node = removed.value;
+        node.deinit(allocator);
+    }
+    control_plane.mutex.unlock();
+
+    {
+        var missing_session = try Session.initWithOptions(
+            allocator,
+            runtime_handle,
+            &job_index,
+            "default",
+            .{
+                .project_id = project_id.string,
+                .project_token = project_token.string,
+                .agents_dir = agents_dir,
+                .projects_dir = projects_dir,
+                .control_plane = &control_plane,
+            },
+        );
+        defer missing_session.deinit();
+
+        const projects_root = missing_session.lookupChild(missing_session.root_id, "projects") orelse return error.TestExpectedResponse;
+        const project_node = missing_session.lookupChild(projects_root, project_id.string) orelse return error.TestExpectedResponse;
+        const meta_node = missing_session.lookupChild(project_node, "meta") orelse return error.TestExpectedResponse;
+        const summary_id = missing_session.lookupChild(meta_node, "summary.json") orelse return error.TestExpectedResponse;
+        const alerts_id = missing_session.lookupChild(meta_node, "alerts.json") orelse return error.TestExpectedResponse;
+        const workspace_id = missing_session.lookupChild(meta_node, "workspace_status.json") orelse return error.TestExpectedResponse;
+        const availability_id = missing_session.lookupChild(meta_node, "availability.json") orelse return error.TestExpectedResponse;
+
+        const summary_node = missing_session.nodes.get(summary_id) orelse return error.TestExpectedResponse;
+        const alerts_node = missing_session.nodes.get(alerts_id) orelse return error.TestExpectedResponse;
+        const workspace_node = missing_session.nodes.get(workspace_id) orelse return error.TestExpectedResponse;
+        const availability_node = missing_session.nodes.get(availability_id) orelse return error.TestExpectedResponse;
+
+        try std.testing.expect(std.mem.indexOf(u8, summary_node.content, "\"state\":\"missing\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, alerts_node.content, "\"id\":\"missing_mounts\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, alerts_node.content, "\"id\":\"workspace_drift\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, alerts_node.content, "\"id\":\"reconcile_queue\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, alerts_node.content, "\"id\":\"degraded_mounts\"") == null);
+        try std.testing.expect(std.mem.indexOf(u8, workspace_node.content, "\"state\":\"missing\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, availability_node.content, "\"missing\":1") != null);
+        try std.testing.expect(std.mem.indexOf(u8, availability_node.content, "\"degraded\":0") != null);
+    }
+}
+
 test "fsrpc_session: project workspace fallback is scoped to requested project" {
     const allocator = std.testing.allocator;
 
