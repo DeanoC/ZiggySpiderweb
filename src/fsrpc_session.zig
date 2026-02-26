@@ -554,7 +554,7 @@ pub const Session = struct {
         try self.addDirectoryDescriptors(
             project_meta_dir,
             "Project Metadata",
-            "{\"kind\":\"metadata\",\"files\":[\"topology.json\",\"workspace_status.json\",\"mounts.json\",\"desired_mounts.json\",\"actual_mounts.json\",\"drift.json\",\"reconcile.json\",\"availability.json\"]}",
+            "{\"kind\":\"metadata\",\"files\":[\"topology.json\",\"workspace_status.json\",\"mounts.json\",\"desired_mounts.json\",\"actual_mounts.json\",\"drift.json\",\"reconcile.json\",\"availability.json\",\"health.json\"]}",
             "{\"read\":true,\"write\":false}",
             "Project topology and availability metadata.",
         );
@@ -662,6 +662,12 @@ pub const Session = struct {
             } else {
                 _ = try self.addFile(project_meta_dir, "availability.json", "{\"mounts_total\":0,\"online\":0,\"degraded\":0,\"missing\":0}", false, .none);
             }
+            if (try self.extractWorkspaceHealth(status_json)) |health_json| {
+                defer self.allocator.free(health_json);
+                _ = try self.addFile(project_meta_dir, "health.json", health_json, false, .none);
+            } else {
+                _ = try self.addFile(project_meta_dir, "health.json", "{\"state\":\"unknown\",\"availability\":{\"mounts_total\":0,\"online\":0,\"degraded\":0,\"missing\":0},\"drift_count\":0,\"reconcile_state\":\"unknown\",\"queue_depth\":0}", false, .none);
+            }
             return;
         }
 
@@ -674,6 +680,7 @@ pub const Session = struct {
         _ = try self.addFile(project_meta_dir, "drift.json", "{\"count\":0,\"items\":[]}", false, .none);
         _ = try self.addFile(project_meta_dir, "reconcile.json", "{\"reconcile_state\":\"unknown\",\"last_reconcile_ms\":0,\"last_success_ms\":0,\"last_error\":null,\"queue_depth\":0}", false, .none);
         _ = try self.addFile(project_meta_dir, "availability.json", "{\"mounts_total\":0,\"online\":0,\"degraded\":0,\"missing\":0}", false, .none);
+        _ = try self.addFile(project_meta_dir, "health.json", "{\"state\":\"unknown\",\"availability\":{\"mounts_total\":0,\"online\":0,\"degraded\":0,\"missing\":0},\"drift_count\":0,\"reconcile_state\":\"unknown\",\"queue_depth\":0}", false, .none);
     }
 
     fn addProjectFsLinksFromPolicy(
@@ -1122,6 +1129,75 @@ pub const Session = struct {
             self.allocator,
             "{{\"reconcile_state\":\"{s}\",\"last_reconcile_ms\":{d},\"last_success_ms\":{d},\"last_error\":{s},\"queue_depth\":{d}}}",
             .{ escaped_state, last_reconcile_ms, last_success_ms, last_error_json, queue_depth },
+        );
+        return rendered;
+    }
+
+    fn extractWorkspaceHealth(self: *Session, workspace_status_json: []const u8) !?[]u8 {
+        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, workspace_status_json, .{}) catch return null;
+        defer parsed.deinit();
+        if (parsed.value != .object) return null;
+
+        var mounts_total: i64 = 0;
+        var online: i64 = 0;
+        var degraded: i64 = 0;
+        var missing: i64 = 0;
+        if (parsed.value.object.get("availability")) |availability_value| {
+            if (availability_value == .object) {
+                if (availability_value.object.get("mounts_total")) |value| {
+                    if (value == .integer and value.integer >= 0) mounts_total = value.integer;
+                }
+                if (availability_value.object.get("online")) |value| {
+                    if (value == .integer and value.integer >= 0) online = value.integer;
+                }
+                if (availability_value.object.get("degraded")) |value| {
+                    if (value == .integer and value.integer >= 0) degraded = value.integer;
+                }
+                if (availability_value.object.get("missing")) |value| {
+                    if (value == .integer and value.integer >= 0) missing = value.integer;
+                }
+            }
+        }
+
+        var drift_count: i64 = 0;
+        if (parsed.value.object.get("drift")) |drift_value| {
+            if (drift_value == .object) {
+                if (drift_value.object.get("count")) |value| {
+                    if (value == .integer and value.integer >= 0) drift_count = value.integer;
+                }
+            }
+        }
+
+        const reconcile_state = blk: {
+            if (parsed.value.object.get("reconcile_state")) |value| {
+                if (value == .string and value.string.len > 0) break :blk value.string;
+            }
+            break :blk "unknown";
+        };
+        const queue_depth: i64 = blk: {
+            if (parsed.value.object.get("queue_depth")) |value| {
+                if (value == .integer and value.integer >= 0) break :blk value.integer;
+            }
+            break :blk 0;
+        };
+        const state = blk: {
+            if (missing > 0) break :blk "missing";
+            if (degraded > 0 or drift_count > 0 or queue_depth > 0 or std.mem.eql(u8, reconcile_state, "degraded")) {
+                break :blk "degraded";
+            }
+            if (std.mem.eql(u8, reconcile_state, "unknown")) break :blk "unknown";
+            break :blk "healthy";
+        };
+
+        const escaped_state = try unified.jsonEscape(self.allocator, state);
+        defer self.allocator.free(escaped_state);
+        const escaped_reconcile_state = try unified.jsonEscape(self.allocator, reconcile_state);
+        defer self.allocator.free(escaped_reconcile_state);
+
+        const rendered = try std.fmt.allocPrint(
+            self.allocator,
+            "{{\"state\":\"{s}\",\"availability\":{{\"mounts_total\":{d},\"online\":{d},\"degraded\":{d},\"missing\":{d}}},\"drift_count\":{d},\"reconcile_state\":\"{s}\",\"queue_depth\":{d}}}",
+            .{ escaped_state, mounts_total, online, degraded, missing, drift_count, escaped_reconcile_state, queue_depth },
         );
         return rendered;
     }
@@ -2257,6 +2333,7 @@ test "fsrpc_session: project meta includes control-plane workspace status" {
     const drift_id = session.lookupChild(meta_node, "drift.json") orelse return error.TestExpectedResponse;
     const reconcile_id = session.lookupChild(meta_node, "reconcile.json") orelse return error.TestExpectedResponse;
     const availability_id = session.lookupChild(meta_node, "availability.json") orelse return error.TestExpectedResponse;
+    const health_id = session.lookupChild(meta_node, "health.json") orelse return error.TestExpectedResponse;
 
     const project_fs_schema = session.nodes.get(project_fs_schema_id) orelse return error.TestExpectedResponse;
     const project_agents_caps = session.nodes.get(project_agents_caps_id) orelse return error.TestExpectedResponse;
@@ -2270,6 +2347,7 @@ test "fsrpc_session: project meta includes control-plane workspace status" {
     const drift_node = session.nodes.get(drift_id) orelse return error.TestExpectedResponse;
     const reconcile_node = session.nodes.get(reconcile_id) orelse return error.TestExpectedResponse;
     const availability_node = session.nodes.get(availability_id) orelse return error.TestExpectedResponse;
+    const health_node = session.nodes.get(health_id) orelse return error.TestExpectedResponse;
 
     try std.testing.expect(std.mem.indexOf(u8, project_fs_schema.content, "\"kind\":\"collection\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, project_agents_caps.content, "\"read\":true") != null);
@@ -2278,6 +2356,7 @@ test "fsrpc_session: project meta includes control-plane workspace status" {
     try std.testing.expect(std.mem.indexOf(u8, meta_schema.content, "\"actual_mounts.json\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, meta_schema.content, "\"drift.json\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, meta_schema.content, "\"reconcile.json\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, meta_schema.content, "\"health.json\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, mount_link_node.content, "/nodes/") != null);
     try std.testing.expect(std.mem.indexOf(u8, mount_link_node.content, "/fs") != null);
     try std.testing.expect(std.mem.indexOf(u8, topology_node.content, "\"project_links\"") != null);
@@ -2291,6 +2370,9 @@ test "fsrpc_session: project meta includes control-plane workspace status" {
     try std.testing.expect(std.mem.indexOf(u8, reconcile_node.content, "\"queue_depth\":") != null);
     try std.testing.expect(std.mem.indexOf(u8, workspace_node.content, "\"state\":\"online\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, availability_node.content, "\"mounts_total\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, health_node.content, "\"availability\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, health_node.content, "\"mounts_total\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, health_node.content, "\"drift_count\":0") != null);
 }
 
 test "fsrpc_session: project workspace mount nodes are discovered outside policy" {
@@ -2508,18 +2590,21 @@ test "fsrpc_session: project workspace fallback is scoped to requested project" 
     const actual_mounts_id = session.lookupChild(meta_node, "actual_mounts.json") orelse return error.TestExpectedResponse;
     const drift_id = session.lookupChild(meta_node, "drift.json") orelse return error.TestExpectedResponse;
     const reconcile_id = session.lookupChild(meta_node, "reconcile.json") orelse return error.TestExpectedResponse;
+    const health_id = session.lookupChild(meta_node, "health.json") orelse return error.TestExpectedResponse;
     const workspace_node = session.nodes.get(workspace_id) orelse return error.TestExpectedResponse;
     const mounts_node = session.nodes.get(mounts_id) orelse return error.TestExpectedResponse;
     const desired_mounts_node = session.nodes.get(desired_mounts_id) orelse return error.TestExpectedResponse;
     const actual_mounts_node = session.nodes.get(actual_mounts_id) orelse return error.TestExpectedResponse;
     const drift_node = session.nodes.get(drift_id) orelse return error.TestExpectedResponse;
     const reconcile_node = session.nodes.get(reconcile_id) orelse return error.TestExpectedResponse;
+    const health_node = session.nodes.get(health_id) orelse return error.TestExpectedResponse;
     try std.testing.expect(std.mem.indexOf(u8, workspace_node.content, "\"source\":\"policy\"") != null);
     try std.testing.expect(std.mem.eql(u8, mounts_node.content, "[]"));
     try std.testing.expect(std.mem.eql(u8, desired_mounts_node.content, "[]"));
     try std.testing.expect(std.mem.eql(u8, actual_mounts_node.content, "[]"));
     try std.testing.expect(std.mem.eql(u8, drift_node.content, "{\"count\":0,\"items\":[]}"));
     try std.testing.expect(std.mem.eql(u8, reconcile_node.content, "{\"reconcile_state\":\"unknown\",\"last_reconcile_ms\":0,\"last_success_ms\":0,\"last_error\":null,\"queue_depth\":0}"));
+    try std.testing.expect(std.mem.eql(u8, health_node.content, "{\"state\":\"unknown\",\"availability\":{\"mounts_total\":0,\"online\":0,\"degraded\":0,\"missing\":0},\"drift_count\":0,\"reconcile_state\":\"unknown\",\"queue_depth\":0}"));
     try std.testing.expect(std.mem.indexOf(u8, workspace_node.content, project_b_id.string) == null);
 }
 

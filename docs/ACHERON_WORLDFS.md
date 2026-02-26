@@ -104,6 +104,7 @@ Project metadata now includes:
 - `drift.json` (workspace drift summary from workspace status `drift`)
 - `reconcile.json` (workspace reconcile health from `reconcile_state`, timestamps, `last_error`, and `queue_depth`)
 - `availability.json` (extracted workspace availability rollup)
+- `health.json` (single-file health summary combining availability, drift count, and reconcile state)
 
 Runtime uses project token (when bound) for workspace status lookup and falls back
 to policy-derived placeholder status if control-plane status is unavailable.
