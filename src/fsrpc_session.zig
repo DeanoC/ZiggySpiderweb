@@ -435,7 +435,7 @@ pub const Session = struct {
         try self.addDirectoryDescriptors(
             nodes_root,
             "Nodes",
-            "{\"kind\":\"collection\",\"entries\":\"node directories\",\"shape\":\"/nodes/<node_id>/{fs,camera,screen,user,terminal}\"}",
+            "{\"kind\":\"collection\",\"entries\":\"node directories\",\"shape\":\"/nodes/<node_id>/{services,fs,camera,screen,user,terminal}\"}",
             "{\"read\":true,\"write\":false}",
             "Connected node resources are surfaced here.",
         );
@@ -456,7 +456,7 @@ pub const Session = struct {
 
         for (policy.nodes.items) |node| {
             const node_dir = try self.addDir(nodes_root, node.id, false);
-            const node_schema = "{\"kind\":\"node\",\"resources\":[\"fs\",\"camera\",\"screen\",\"user\",\"terminal\"]}";
+            const node_schema = "{\"kind\":\"node\",\"children\":[\"services\",\"fs\",\"camera\",\"screen\",\"user\",\"terminal\"]}";
             const node_caps = try std.fmt.allocPrint(
                 self.allocator,
                 "{{\"fs\":{s},\"camera\":{s},\"screen\":{s},\"user\":{s},\"terminal\":{s}}}",
@@ -476,6 +476,7 @@ pub const Session = struct {
                 node_caps,
                 "Node resource roots. Entries may be unavailable based on policy.",
             );
+            try self.addNodeServices(node_dir, node);
 
             if (node.resources.fs) _ = try self.addDir(node_dir, "fs", false);
             if (node.resources.camera) _ = try self.addDir(node_dir, "camera", false);
@@ -626,6 +627,100 @@ pub const Session = struct {
         _ = try self.addFile(dir_id, "README.md", readme, false, .none);
         _ = try self.addFile(dir_id, "SCHEMA.json", schema_json, false, .none);
         _ = try self.addFile(dir_id, "CAPS.json", caps_json, false, .none);
+    }
+
+    fn addNodeServices(self: *Session, node_dir: u32, node: world_policy.NodePolicy) !void {
+        const services_root = try self.addDir(node_dir, "services", false);
+        try self.addDirectoryDescriptors(
+            services_root,
+            "Node Services",
+            "{\"kind\":\"collection\",\"entries\":\"service_id\",\"shape\":\"/nodes/<node_id>/services/<service_id>/{SCHEMA.json,STATUS.json,CAPS.json}\"}",
+            "{\"read\":true,\"write\":false}",
+            "Node service descriptors. This view is generated from current world policy.",
+        );
+
+        if (node.resources.fs) {
+            const caps = "{\"rw\":true}";
+            const endpoint = try std.fmt.allocPrint(self.allocator, "/nodes/{s}/fs", .{node.id});
+            defer self.allocator.free(endpoint);
+            try self.addNodeServiceEntry(services_root, "fs", "fs", endpoint, caps);
+        }
+        if (node.resources.camera) {
+            const caps = "{\"still\":true}";
+            const endpoint = try std.fmt.allocPrint(self.allocator, "/nodes/{s}/camera", .{node.id});
+            defer self.allocator.free(endpoint);
+            try self.addNodeServiceEntry(services_root, "camera", "camera", endpoint, caps);
+        }
+        if (node.resources.screen) {
+            const caps = "{\"capture\":true}";
+            const endpoint = try std.fmt.allocPrint(self.allocator, "/nodes/{s}/screen", .{node.id});
+            defer self.allocator.free(endpoint);
+            try self.addNodeServiceEntry(services_root, "screen", "screen", endpoint, caps);
+        }
+        if (node.resources.user) {
+            const caps = "{\"interaction\":true}";
+            const endpoint = try std.fmt.allocPrint(self.allocator, "/nodes/{s}/user", .{node.id});
+            defer self.allocator.free(endpoint);
+            try self.addNodeServiceEntry(services_root, "user", "user", endpoint, caps);
+        }
+
+        for (node.terminals.items) |terminal_id| {
+            const service_id = try std.fmt.allocPrint(self.allocator, "terminal-{s}", .{terminal_id});
+            defer self.allocator.free(service_id);
+            const endpoint = try std.fmt.allocPrint(self.allocator, "/nodes/{s}/terminal/{s}", .{ node.id, terminal_id });
+            defer self.allocator.free(endpoint);
+            const escaped_terminal_id = try unified.jsonEscape(self.allocator, terminal_id);
+            defer self.allocator.free(escaped_terminal_id);
+            const caps = try std.fmt.allocPrint(
+                self.allocator,
+                "{{\"pty\":true,\"terminal_id\":\"{s}\"}}",
+                .{escaped_terminal_id},
+            );
+            defer self.allocator.free(caps);
+            try self.addNodeServiceEntry(services_root, service_id, "terminal", endpoint, caps);
+        }
+    }
+
+    fn addNodeServiceEntry(
+        self: *Session,
+        services_root: u32,
+        service_id: []const u8,
+        kind: []const u8,
+        endpoint: []const u8,
+        caps_json: []const u8,
+    ) !void {
+        const service_dir = try self.addDir(services_root, service_id, false);
+
+        const escaped_service_id = try unified.jsonEscape(self.allocator, service_id);
+        defer self.allocator.free(escaped_service_id);
+        const escaped_kind = try unified.jsonEscape(self.allocator, kind);
+        defer self.allocator.free(escaped_kind);
+        const escaped_endpoint = try unified.jsonEscape(self.allocator, endpoint);
+        defer self.allocator.free(escaped_endpoint);
+
+        const schema = try std.fmt.allocPrint(
+            self.allocator,
+            "{{\"service_id\":\"{s}\",\"kind\":\"{s}\",\"version\":\"1\",\"endpoint\":\"{s}\"}}",
+            .{ escaped_service_id, escaped_kind, escaped_endpoint },
+        );
+        defer self.allocator.free(schema);
+        const readme = try std.fmt.allocPrint(
+            self.allocator,
+            "# Service `{s}`\n\nPolicy-derived service metadata.\n",
+            .{service_id},
+        );
+        defer self.allocator.free(readme);
+        _ = try self.addFile(service_dir, "README.md", readme, false, .none);
+        _ = try self.addFile(service_dir, "SCHEMA.json", schema, false, .none);
+        _ = try self.addFile(service_dir, "CAPS.json", caps_json, false, .none);
+
+        const status = try std.fmt.allocPrint(
+            self.allocator,
+            "{{\"service_id\":\"{s}\",\"kind\":\"{s}\",\"state\":\"online\",\"endpoint\":\"{s}\"}}",
+            .{ escaped_service_id, escaped_kind, escaped_endpoint },
+        );
+        defer self.allocator.free(status);
+        _ = try self.addFile(service_dir, "STATUS.json", status, false, .none);
     }
 
     fn addDir(self: *Session, parent: ?u32, name: []const u8, writable: bool) !u32 {
@@ -1022,4 +1117,36 @@ test "fsrpc_session: setRuntimeBinding reseeds namespace and clears stale state"
     try std.testing.expectEqual(@as(usize, 0), session.fids.count());
     try std.testing.expect(session.lookupChild(session.jobs_root_id, job_a) == null);
     try std.testing.expect(session.lookupChild(session.jobs_root_id, job_b) != null);
+}
+
+test "fsrpc_session: node services namespace exposes service descriptors" {
+    const allocator = std.testing.allocator;
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.init(allocator, runtime_handle, &job_index, "default");
+    defer session.deinit();
+
+    const nodes_root = session.lookupChild(session.root_id, "nodes") orelse return error.TestExpectedResponse;
+    const local_node = session.lookupChild(nodes_root, "local") orelse return error.TestExpectedResponse;
+    const services_root = session.lookupChild(local_node, "services") orelse return error.TestExpectedResponse;
+    const fs_service = session.lookupChild(services_root, "fs") orelse return error.TestExpectedResponse;
+    const terminal_service = session.lookupChild(services_root, "terminal-1") orelse return error.TestExpectedResponse;
+
+    const fs_status = session.lookupChild(fs_service, "STATUS.json") orelse return error.TestExpectedResponse;
+    const fs_caps = session.lookupChild(fs_service, "CAPS.json") orelse return error.TestExpectedResponse;
+    const terminal_caps = session.lookupChild(terminal_service, "CAPS.json") orelse return error.TestExpectedResponse;
+
+    const fs_status_node = session.nodes.get(fs_status) orelse return error.TestExpectedResponse;
+    const fs_caps_node = session.nodes.get(fs_caps) orelse return error.TestExpectedResponse;
+    const terminal_caps_node = session.nodes.get(terminal_caps) orelse return error.TestExpectedResponse;
+
+    try std.testing.expect(std.mem.indexOf(u8, fs_status_node.content, "\"state\":\"online\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fs_status_node.content, "/nodes/local/fs") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fs_caps_node.content, "\"rw\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, terminal_caps_node.content, "\"terminal_id\":\"1\"") != null);
 }

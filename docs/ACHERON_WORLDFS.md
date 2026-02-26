@@ -31,6 +31,10 @@ Major directories include:
 Node-level service capability metadata is managed via control-plane service catalog
 operations and rendered into `/nodes/<node_id>/services/*`.
 
+Current runtime behavior seeds `/nodes/<node_id>/services/*` from policy node resources
+(`fs`, `camera`, `screen`, `user`, `terminal-*`) with per-service `SCHEMA.json`,
+`CAPS.json`, and `STATUS.json`.
+
 ## Chat and Jobs
 
 - Chat input path: `/agents/self/chat/control/input`
