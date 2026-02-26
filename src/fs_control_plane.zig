@@ -1943,7 +1943,7 @@ pub const ControlPlane = struct {
             if (selected_idx != idx) continue;
             if (!first) try out.append(self.allocator, ',');
             first = false;
-            try appendWorkspaceMountJson(self.allocator, out, mount, self.nodes.get(mount.node_id), include_node_secrets);
+            try appendWorkspaceMountJson(self.allocator, out, mount, self.nodes.get(mount.node_id), include_node_secrets, now_ms);
         }
         try out.appendSlice(self.allocator, "],\"desired_mounts\":[");
 
@@ -1951,7 +1951,7 @@ pub const ControlPlane = struct {
         for (project.mounts.items) |mount| {
             if (!first) try out.append(self.allocator, ',');
             first = false;
-            try appendWorkspaceMountJson(self.allocator, out, mount, self.nodes.get(mount.node_id), include_node_secrets);
+            try appendWorkspaceMountJson(self.allocator, out, mount, self.nodes.get(mount.node_id), include_node_secrets, now_ms);
         }
         try out.appendSlice(self.allocator, "],\"actual_mounts\":[");
 
@@ -1961,7 +1961,7 @@ pub const ControlPlane = struct {
             if (selected_idx != idx) continue;
             if (!first) try out.append(self.allocator, ',');
             first = false;
-            try appendWorkspaceMountJson(self.allocator, out, mount, self.nodes.get(mount.node_id), include_node_secrets);
+            try appendWorkspaceMountJson(self.allocator, out, mount, self.nodes.get(mount.node_id), include_node_secrets, now_ms);
         }
         try out.appendSlice(self.allocator, "],\"drift\":{\"count\":");
 
@@ -2062,14 +2062,28 @@ pub const ControlPlane = struct {
         const candidate_mount = project.mounts.items[candidate_idx];
         const current_node = self.nodes.get(current_mount.node_id);
         const candidate_node = self.nodes.get(candidate_mount.node_id);
-        const current_online = if (current_node) |value| value.lease_expires_at_ms > now_ms else false;
-        const candidate_online = if (candidate_node) |value| value.lease_expires_at_ms > now_ms else false;
-        if (candidate_online and !current_online) return true;
-        if (!candidate_online and current_online) return false;
-        if (candidate_online and current_online) {
-            return candidate_node.?.lease_expires_at_ms > current_node.?.lease_expires_at_ms;
-        }
+        const current_rank = mountCandidateAvailabilityRank(current_node, now_ms);
+        const candidate_rank = mountCandidateAvailabilityRank(candidate_node, now_ms);
+        if (candidate_rank != current_rank) return candidate_rank > current_rank;
+
+        const current_lease = mountCandidateLeaseOrMin(current_node);
+        const candidate_lease = mountCandidateLeaseOrMin(candidate_node);
+        if (candidate_lease != current_lease) return candidate_lease > current_lease;
+
         return false;
+    }
+
+    fn mountCandidateAvailabilityRank(node: ?Node, now_ms: i64) u8 {
+        if (node) |resolved| {
+            if (resolved.lease_expires_at_ms > now_ms) return 2;
+            return 1;
+        }
+        return 0;
+    }
+
+    fn mountCandidateLeaseOrMin(node: ?Node) i64 {
+        if (node) |resolved| return resolved.lease_expires_at_ms;
+        return std.math.minInt(i64);
     }
 
     fn evaluateProjectDriftLocked(
@@ -3145,6 +3159,7 @@ fn appendWorkspaceMountJson(
     mount: ProjectMount,
     node: ?Node,
     include_node_secrets: bool,
+    now_ms: i64,
 ) !void {
     const escaped_path = try jsonEscape(allocator, mount.mount_path);
     defer allocator.free(escaped_path);
@@ -3164,9 +3179,10 @@ fn appendWorkspaceMountJson(
             break :blk try std.fmt.allocPrint(allocator, "\"{s}\"", .{escaped_auth});
         } else try allocator.dupe(u8, "null");
         defer allocator.free(auth_json);
-        const online = resolved.lease_expires_at_ms > std.time.milliTimestamp();
+        const online = resolved.lease_expires_at_ms > now_ms;
+        const state = if (online) "online" else "degraded";
         try out.writer(allocator).print(
-            "{{\"mount_path\":\"{s}\",\"node_id\":\"{s}\",\"export_name\":\"{s}\",\"node_name\":\"{s}\",\"fs_url\":\"{s}\",\"fs_auth_token\":{s},\"online\":{s}}}",
+            "{{\"mount_path\":\"{s}\",\"node_id\":\"{s}\",\"export_name\":\"{s}\",\"node_name\":\"{s}\",\"fs_url\":\"{s}\",\"fs_auth_token\":{s},\"online\":{s},\"state\":\"{s}\"}}",
             .{
                 escaped_path,
                 escaped_node,
@@ -3175,13 +3191,14 @@ fn appendWorkspaceMountJson(
                 escaped_url,
                 auth_json,
                 if (online) "true" else "false",
+                state,
             },
         );
         return;
     }
 
     try out.writer(allocator).print(
-        "{{\"mount_path\":\"{s}\",\"node_id\":\"{s}\",\"export_name\":\"{s}\",\"node_name\":null,\"fs_url\":null,\"fs_auth_token\":null,\"online\":false}}",
+        "{{\"mount_path\":\"{s}\",\"node_id\":\"{s}\",\"export_name\":\"{s}\",\"node_name\":null,\"fs_url\":null,\"fs_auth_token\":null,\"online\":false,\"state\":\"missing\"}}",
         .{ escaped_path, escaped_node, escaped_export },
     );
 }
@@ -4201,6 +4218,98 @@ test "fs_control_plane: workspaceStatus supports explicit project selection" {
         ControlPlaneError.ProjectNotFound,
         plane.workspaceStatus("agent-selector", "{\"project_id\":\"proj-missing\"}"),
     );
+}
+
+test "fs_control_plane: workspace topology prefers best available candidate and marks degraded mounts" {
+    const allocator = std.testing.allocator;
+    var plane = ControlPlane.init(allocator);
+    defer plane.deinit();
+
+    const node_a_json = try plane.ensureNode("alpha", "ws://127.0.0.1:18891/v2/fs", 60_000);
+    defer allocator.free(node_a_json);
+    var node_a_payload = try std.json.parseFromSlice(std.json.Value, allocator, node_a_json, .{});
+    defer node_a_payload.deinit();
+    const node_a_id = node_a_payload.value.object.get("node_id").?.string;
+
+    const node_b_json = try plane.ensureNode("bravo", "ws://127.0.0.1:18892/v2/fs", 60_000);
+    defer allocator.free(node_b_json);
+    var node_b_payload = try std.json.parseFromSlice(std.json.Value, allocator, node_b_json, .{});
+    defer node_b_payload.deinit();
+    const node_b_id = node_b_payload.value.object.get("node_id").?.string;
+
+    const project_json = try plane.createProject("{\"name\":\"Failover Select\"}");
+    defer allocator.free(project_json);
+    var project = try std.json.parseFromSlice(std.json.Value, allocator, project_json, .{});
+    defer project.deinit();
+    const project_id = project.value.object.get("project_id").?.string;
+    const project_token = project.value.object.get("project_token").?.string;
+
+    const mount_primary = try std.fmt.allocPrint(
+        allocator,
+        "{{\"project_id\":\"{s}\",\"project_token\":\"{s}\",\"node_id\":\"{s}\",\"export_name\":\"work\",\"mount_path\":\"/src\"}}",
+        .{ project_id, project_token, node_a_id },
+    );
+    defer allocator.free(mount_primary);
+    const mounted_primary = try plane.setProjectMount(mount_primary);
+    defer allocator.free(mounted_primary);
+
+    const mount_failover = try std.fmt.allocPrint(
+        allocator,
+        "{{\"project_id\":\"{s}\",\"project_token\":\"{s}\",\"node_id\":\"{s}\",\"export_name\":\"work\",\"mount_path\":\"/src\"}}",
+        .{ project_id, project_token, node_b_id },
+    );
+    defer allocator.free(mount_failover);
+    const mounted_failover = try plane.setProjectMount(mount_failover);
+    defer allocator.free(mounted_failover);
+
+    const stale_now = std.time.milliTimestamp();
+    plane.mutex.lock();
+    if (plane.nodes.getPtr(node_a_id)) |node| node.lease_expires_at_ms = stale_now - 5_000;
+    if (plane.nodes.getPtr(node_b_id)) |node| node.lease_expires_at_ms = stale_now - 1_000;
+    plane.mutex.unlock();
+
+    const selected_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"project_id\":\"{s}\",\"project_token\":\"{s}\"}}",
+        .{ project_id, project_token },
+    );
+    defer allocator.free(selected_req);
+
+    const status_offline_json = try plane.workspaceStatus("agent-selector", selected_req);
+    defer allocator.free(status_offline_json);
+    var status_offline = try std.json.parseFromSlice(std.json.Value, allocator, status_offline_json, .{});
+    defer status_offline.deinit();
+    const mounts_offline = status_offline.value.object.get("mounts").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), mounts_offline.len);
+    const selected_offline = mounts_offline[0].object;
+    try std.testing.expect(std.mem.eql(u8, selected_offline.get("node_id").?.string, node_b_id));
+    try std.testing.expect(std.mem.eql(u8, selected_offline.get("state").?.string, "degraded"));
+    try std.testing.expect(selected_offline.get("online").?.bool == false);
+
+    const drift_items_offline = status_offline.value.object.get("drift").?.object.get("items").?.array.items;
+    try std.testing.expect(drift_items_offline.len > 0);
+    const drift_item_offline = drift_items_offline[0].object;
+    try std.testing.expect(std.mem.eql(u8, drift_item_offline.get("kind").?.string, "node_offline"));
+    try std.testing.expect(std.mem.eql(u8, drift_item_offline.get("selected_node_id").?.string, node_b_id));
+    try std.testing.expect(std.mem.eql(u8, drift_item_offline.get("desired_node_id").?.string, node_a_id));
+
+    plane.mutex.lock();
+    if (plane.nodes.fetchRemove(node_a_id)) |removed| {
+        var node = removed.value;
+        node.deinit(allocator);
+    }
+    plane.mutex.unlock();
+
+    const status_missing_json = try plane.workspaceStatus("agent-selector", selected_req);
+    defer allocator.free(status_missing_json);
+    var status_missing = try std.json.parseFromSlice(std.json.Value, allocator, status_missing_json, .{});
+    defer status_missing.deinit();
+    const mounts_missing = status_missing.value.object.get("mounts").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), mounts_missing.len);
+    const selected_missing = mounts_missing[0].object;
+    try std.testing.expect(std.mem.eql(u8, selected_missing.get("node_id").?.string, node_b_id));
+    try std.testing.expect(std.mem.eql(u8, selected_missing.get("state").?.string, "degraded"));
+    try std.testing.expect(selected_missing.get("online").?.bool == false);
 }
 
 test "fs_control_plane: pending join request list approve and deny flow works" {

@@ -260,6 +260,17 @@ Two new binaries provide the distributed filesystem protocol from `design_docs/F
   --pair-mode request \
   --node-name edge-1
 
+# Advertise terminal services + labels to node service catalog
+./zig-out/bin/spiderweb-fs-node \
+  --export work=.:rw \
+  --control-url ws://127.0.0.1:18790/ \
+  --pair-mode request \
+  --node-name edge-1 \
+  --terminal-id 1 \
+  --terminal-id 2 \
+  --label site=hq \
+  --label tier=edge
+
 # List root entries through the mount/router client
 ./zig-out/bin/spiderweb-fs-mount \
   --endpoint a=ws://127.0.0.1:18891/v2/fs#work@/src \
@@ -303,6 +314,12 @@ Notes:
 - `spiderweb-fs-mount status` now includes top-level router metrics, including `failover_events_total`.
 - `spiderweb-fs-mount mount` can run a workspace sync loop (`--workspace-sync-interval-ms`) that periodically reconciles endpoint topology from `control.workspace_status`.
 - `spiderweb-fs-mount` supports `--project-id <id> [--project-token <token>]` to fetch/sync mounts for a specific project instead of the active agent binding.
+- `control.workspace_status` mount entries include:
+  - `online` (`bool`) for quick health checks
+  - `state` (`online`, `degraded`, `missing`) for deterministic availability reasoning
+- Control-plane mount selection for a shared `mount_path` is availability-aware and deterministic:
+  - rank: `online` > `degraded` (lease expired) > `missing` node
+  - tie-break: latest `lease_expires_at_ms`
 - Workspace sync listens for push topology events via `control.debug_subscribe`:
   - full-refresh events: `control.workspace_topology`
   - project-scoped delta events: `control.workspace_topology_delta` (applied directly when `--project-id` is set)
@@ -332,6 +349,10 @@ Notes:
   - persisted node credentials/state (`--state-file`, default `.spiderweb-fs-node-state.json`)
   - background lease refresh with reconnect backoff (`--refresh-interval-ms`, `--reconnect-backoff-ms`, `--reconnect-backoff-max-ms`)
   - `--control-auth-token` (or `SPIDERWEB_AUTH_TOKEN`) for control websocket auth
+  - modular service catalog advertisement via `control.node_service_upsert`:
+    - FS provider enabled by default (disable with `--no-fs-service`)
+    - terminal providers via repeated `--terminal-id <id>`
+    - node labels via repeated `--label <key=value>`
 - Node/server now emits `acheron.e_fs_inval` / `acheron.e_fs_inval_dir` invalidations and router caches are invalidated on receipt.
 - Node/server now broadcasts mutation invalidations to other connected FS clients (server-push fanout).
 - Node/server uses a native Linux `inotify` watcher when available, with scanner fallback for out-of-band local FS invalidations.
