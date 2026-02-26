@@ -270,6 +270,9 @@ pub const Session = struct {
                 continue;
             }
 
+            self.refreshDynamicDirectory(node_id) catch |err| {
+                std.log.warn("dynamic directory refresh failed during walk: {s}", .{@errorName(err)});
+            };
             const next = self.lookupChild(node_id, segment) orelse {
                 return unified.buildFsrpcError(self.allocator, msg.tag, "enoent", "walk segment not found");
             };
@@ -324,6 +327,12 @@ pub const Session = struct {
         const state = self.fids.get(fid) orelse return unified.buildFsrpcError(self.allocator, msg.tag, "enoent", "unknown fid");
         const node = self.nodes.get(state.node_id) orelse return unified.buildFsrpcError(self.allocator, msg.tag, "eio", "missing node");
 
+        if (node.kind == .dir) {
+            self.refreshDynamicDirectory(state.node_id) catch |err| {
+                std.log.warn("dynamic directory refresh failed during read: {s}", .{@errorName(err)});
+            };
+        }
+
         var data_owned: ?[]u8 = null;
         defer if (data_owned) |value| self.allocator.free(value);
 
@@ -357,6 +366,11 @@ pub const Session = struct {
         );
         defer self.allocator.free(payload);
         return unified.buildFsrpcResponse(self.allocator, .r_read, msg.tag, payload);
+    }
+
+    fn refreshDynamicDirectory(self: *Session, dir_id: u32) !void {
+        if (dir_id != self.nodes_root_id) return;
+        try self.addNodeDirectoriesFromControlPlane(self.nodes_root_id);
     }
 
     fn handleWrite(self: *Session, msg: *const unified.ParsedMessage) ![]u8 {
@@ -4117,4 +4131,103 @@ test "fsrpc_session: control-plane registered nodes appear under global nodes na
     try std.testing.expect(discovered_fs != null);
     try std.testing.expect(std.mem.indexOf(u8, discovered_status.content, "\"source\":\"control_plane\"") != null);
     try std.testing.expect(system_project_node_link == null);
+}
+
+test "fsrpc_session: global nodes directory discovers late control-plane nodes on read" {
+    const allocator = std.testing.allocator;
+
+    var control_plane = fs_control_plane.ControlPlane.init(allocator);
+    defer control_plane.deinit();
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "default",
+        .{
+            .agents_dir = ".does-not-exist",
+            .projects_dir = ".does-not-exist",
+            .control_plane = &control_plane,
+        },
+    );
+    defer session.deinit();
+
+    const ensured = try control_plane.ensureNode("late-discovered-node", "ws://127.0.0.1:19991/v2/fs", 60_000);
+    defer allocator.free(ensured);
+    var ensured_parsed = try std.json.parseFromSlice(std.json.Value, allocator, ensured, .{});
+    defer ensured_parsed.deinit();
+    if (ensured_parsed.value != .object) return error.TestExpectedResponse;
+    const node_id = ensured_parsed.value.object.get("node_id") orelse return error.TestExpectedResponse;
+    if (node_id != .string) return error.TestExpectedResponse;
+
+    var attach = unified.ParsedMessage{
+        .channel = .acheron,
+        .acheron_type = .t_attach,
+        .tag = 1,
+        .fid = 101,
+    };
+    const attach_res = try session.handle(&attach);
+    defer allocator.free(attach_res);
+    try std.testing.expect(std.mem.indexOf(u8, attach_res, "acheron.r_attach") != null);
+
+    const path = try allocPathSegments(allocator, &.{"nodes"});
+    defer freePathSegments(allocator, path);
+    var walk = unified.ParsedMessage{
+        .channel = .acheron,
+        .acheron_type = .t_walk,
+        .tag = 2,
+        .fid = 101,
+        .newfid = 102,
+        .path = path,
+    };
+    const walk_res = try session.handle(&walk);
+    defer allocator.free(walk_res);
+    try std.testing.expect(std.mem.indexOf(u8, walk_res, "acheron.r_walk") != null);
+
+    var open = unified.ParsedMessage{
+        .channel = .acheron,
+        .acheron_type = .t_open,
+        .tag = 3,
+        .fid = 102,
+        .mode = "r",
+    };
+    const open_res = try session.handle(&open);
+    defer allocator.free(open_res);
+    try std.testing.expect(std.mem.indexOf(u8, open_res, "acheron.r_open") != null);
+
+    var read = unified.ParsedMessage{
+        .channel = .acheron,
+        .acheron_type = .t_read,
+        .tag = 4,
+        .fid = 102,
+        .offset = 0,
+        .count = 16 * 1024,
+    };
+    const read_res = try session.handle(&read);
+    defer allocator.free(read_res);
+    try std.testing.expect(std.mem.indexOf(u8, read_res, "acheron.r_read") != null);
+
+    var read_parsed = try std.json.parseFromSlice(std.json.Value, allocator, read_res, .{});
+    defer read_parsed.deinit();
+    if (read_parsed.value != .object) return error.TestExpectedResponse;
+    const payload_value = read_parsed.value.object.get("payload") orelse return error.TestExpectedResponse;
+    if (payload_value != .object) return error.TestExpectedResponse;
+    const data_b64_value = payload_value.object.get("data_b64") orelse return error.TestExpectedResponse;
+    if (data_b64_value != .string) return error.TestExpectedResponse;
+
+    const decoded_len = std.base64.standard.Decoder.calcSizeForSlice(data_b64_value.string) catch return error.TestExpectedResponse;
+    const decoded = try allocator.alloc(u8, decoded_len);
+    defer allocator.free(decoded);
+    _ = std.base64.standard.Decoder.decode(decoded, data_b64_value.string) catch return error.TestExpectedResponse;
+
+    try std.testing.expect(std.mem.indexOf(u8, decoded, node_id.string) != null);
+
+    const nodes_root = session.lookupChild(session.root_id, "nodes") orelse return error.TestExpectedResponse;
+    try std.testing.expect(session.lookupChild(nodes_root, node_id.string) != null);
 }
