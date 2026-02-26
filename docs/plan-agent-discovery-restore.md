@@ -219,4 +219,4 @@ zss session history --limit 5
 - [x] Client can restore last active session
 - [x] Session history shows summaries
 - [x] Works across client reconnects
-- [ ] Sessions properly archived after timeout
+- [x] Sessions properly archived after timeout

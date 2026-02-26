@@ -2205,6 +2205,7 @@ const AuthTokenStore = struct {
         };
 
         const now_ms = std.time.milliTimestamp();
+        _ = self.pruneExpiredSessionHistoryLocked(history, now_ms);
         for (history.items) |*entry| {
             if (std.mem.eql(u8, entry.session_key, session_key) and
                 std.mem.eql(u8, entry.agent_id, agent_id) and
@@ -2262,6 +2263,13 @@ const AuthTokenStore = struct {
             .admin => &self.admin_session_history,
             .user => &self.user_session_history,
         };
+        const now_ms = std.time.milliTimestamp();
+        const pruned = self.pruneExpiredSessionHistoryLocked(history, now_ms);
+        if (pruned) {
+            self.persistCurrentStateLocked() catch |err| {
+                std.log.warn("failed to persist pruned session history: {s}", .{@errorName(err)});
+            };
+        }
         for (history.items) |*entry| {
             if (agent_id_filter) |filter| {
                 if (!std.mem.eql(u8, entry.agent_id, filter)) continue;
@@ -2302,6 +2310,27 @@ const AuthTokenStore = struct {
                 history.items[j] = tmp;
             }
         }
+    }
+
+    fn pruneExpiredSessionHistoryLocked(
+        self: *AuthTokenStore,
+        history: *std.ArrayListUnmanaged(SessionHistoryEntry),
+        now_ms: i64,
+    ) bool {
+        const max_age_ms: i64 = 24 * 60 * 60 * 1000;
+        var removed_any = false;
+        var idx: usize = 0;
+        while (idx < history.items.len) {
+            const age_ms = now_ms - history.items[idx].last_active_ms;
+            if (age_ms > max_age_ms) {
+                var removed = history.orderedRemove(idx);
+                removed.deinit(self.allocator);
+                removed_any = true;
+                continue;
+            }
+            idx += 1;
+        }
+        return removed_any;
     }
 
     fn statusJson(self: *const AuthTokenStore) ![]u8 {
