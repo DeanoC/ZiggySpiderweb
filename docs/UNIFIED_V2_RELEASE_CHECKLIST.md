@@ -34,5 +34,5 @@
 - [ ] `cd test-env && make test-distributed-soak-chaos`
 
 ## Client / Tooling Updates
-- [ ] Update automation/scripts to use `spiderweb-control` for control-plane calls where appropriate.
-- [ ] Update mount workflows using project pinning (`--project-id`) to benefit from project-scoped topology deltas.
+- [x] Update automation/scripts to use `spiderweb-control` for control-plane calls where appropriate.
+- [x] Update mount workflows using project pinning (`--project-id`) to benefit from project-scoped topology deltas.
