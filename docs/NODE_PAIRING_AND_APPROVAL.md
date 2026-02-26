@@ -99,6 +99,16 @@ Response payload:
 - Approval queue operations require operator-scope auth token if configured.
 - `control.node_join_request` is intentionally non-admin to allow unpaired join proposals.
 
+## Acheron WorldFS Operator Surface
+
+Privileged agents can manage pairing through WorldFS without direct control RPC calls:
+
+- Read pending requests: `/debug/pairing/pending.json`
+- Approve request: write JSON payload to `/debug/pairing/control/approve.json`
+- Deny request: write JSON payload to `/debug/pairing/control/deny.json`
+- Refresh queue snapshot: write any payload to `/debug/pairing/control/refresh`
+- Inspect operation outcomes: `/debug/pairing/last_result.json` and `/debug/pairing/last_error.json`
+
 ## Node Daemon Loop (`spiderweb-fs-node`)
 
 `spiderweb-fs-node` can now run as a pairing/lease daemon when `--control-url` is set.

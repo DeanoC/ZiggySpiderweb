@@ -17,12 +17,21 @@ const SpecialKind = enum {
     job_status,
     job_result,
     job_log,
+    pairing_refresh,
+    pairing_approve,
+    pairing_deny,
 };
 
 const WriteOutcome = struct {
     written: usize,
     job_name: ?[]u8 = null,
     correlation_id: ?[]u8 = null,
+};
+
+const PairingAction = enum {
+    refresh,
+    approve,
+    deny,
 };
 
 const Node = struct {
@@ -76,8 +85,12 @@ pub const Session = struct {
     next_node_id: u32 = 1,
 
     root_id: u32 = 0,
+    nodes_root_id: u32 = 0,
     jobs_root_id: u32 = 0,
     chat_input_id: u32 = 0,
+    pairing_pending_id: u32 = 0,
+    pairing_last_result_id: u32 = 0,
+    pairing_last_error_id: u32 = 0,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -361,6 +374,18 @@ pub const Session = struct {
                 job_name = outcome.job_name;
                 correlation_id = outcome.correlation_id;
             },
+            .pairing_refresh => {
+                const outcome = try self.handlePairingControlWrite(.refresh, data);
+                written = outcome.written;
+            },
+            .pairing_approve => {
+                const outcome = try self.handlePairingControlWrite(.approve, data);
+                written = outcome.written;
+            },
+            .pairing_deny => {
+                const outcome = try self.handlePairingControlWrite(.deny, data);
+                written = outcome.written;
+            },
             else => {
                 self.writeFileContent(state.node_id, offset, data) catch |err| switch (err) {
                     error.InvalidOffset => {
@@ -439,6 +464,7 @@ pub const Session = struct {
 
         self.root_id = try self.addDir(null, "/", false);
         const nodes_root = try self.addDir(self.root_id, "nodes", false);
+        self.nodes_root_id = nodes_root;
         const agents_root = try self.addDir(self.root_id, "agents", false);
         const projects_root = try self.addDir(self.root_id, "projects", false);
         const meta_root = try self.addDir(self.root_id, "meta", false);
@@ -600,11 +626,12 @@ pub const Session = struct {
             try self.addDirectoryDescriptors(
                 dir_id,
                 "Debug",
-                "{\"kind\":\"debug\",\"entries\":[\"README.md\",\"stream.log\"]}",
+                "{\"kind\":\"debug\",\"entries\":[\"README.md\",\"stream.log\",\"pairing\"]}",
                 "{\"read\":true,\"write\":false}",
                 "Privileged debug surface.",
             );
             _ = try self.addFile(dir_id, "stream.log", "", false, .none);
+            try self.addDebugPairingSurface(dir_id);
         }
 
         try self.addDirectoryDescriptors(
@@ -755,6 +782,41 @@ pub const Session = struct {
         _ = try self.addFile(project_meta_dir, "reconcile.json", "{\"reconcile_state\":\"unknown\",\"last_reconcile_ms\":0,\"last_success_ms\":0,\"last_error\":null,\"queue_depth\":0}", false, .none);
         _ = try self.addFile(project_meta_dir, "availability.json", "{\"mounts_total\":0,\"online\":0,\"degraded\":0,\"missing\":0}", false, .none);
         _ = try self.addFile(project_meta_dir, "health.json", "{\"state\":\"unknown\",\"availability\":{\"mounts_total\":0,\"online\":0,\"degraded\":0,\"missing\":0},\"drift_count\":0,\"reconcile_state\":\"unknown\",\"queue_depth\":0}", false, .none);
+    }
+
+    fn addDebugPairingSurface(self: *Session, debug_root: u32) !void {
+        const pairing_dir = try self.addDir(debug_root, "pairing", false);
+        const control_dir = try self.addDir(pairing_dir, "control", false);
+        try self.addDirectoryDescriptors(
+            pairing_dir,
+            "Pairing Queue",
+            "{\"kind\":\"pairing_queue\",\"entries\":[\"pending.json\",\"last_result.json\",\"last_error.json\",\"control\"]}",
+            "{\"read\":true,\"write\":false}",
+            "Node pairing review queue. Read pending requests and use control files to approve, deny, or refresh.",
+        );
+        try self.addDirectoryDescriptors(
+            control_dir,
+            "Pairing Control",
+            "{\"kind\":\"pairing_control\",\"writes\":{\"approve.json\":\"control.node_join_approve payload\",\"deny.json\":\"control.node_join_deny payload\",\"refresh\":\"refresh pending queue snapshot\"}}",
+            "{\"approve\":true,\"deny\":true,\"refresh\":true}",
+            "Write JSON payloads to approve/deny request IDs. Write any content to refresh the queue snapshot.",
+        );
+
+        const pending_json = try self.loadPendingNodeJoinsJson();
+        defer self.allocator.free(pending_json);
+        self.pairing_pending_id = try self.addFile(pairing_dir, "pending.json", pending_json, false, .none);
+        self.pairing_last_result_id = try self.addFile(pairing_dir, "last_result.json", "{\"status\":\"idle\"}", false, .none);
+        self.pairing_last_error_id = try self.addFile(pairing_dir, "last_error.json", "null", false, .none);
+        _ = try self.addFile(control_dir, "approve.json", "", true, .pairing_approve);
+        _ = try self.addFile(control_dir, "deny.json", "", true, .pairing_deny);
+        _ = try self.addFile(control_dir, "refresh", "", true, .pairing_refresh);
+    }
+
+    fn loadPendingNodeJoinsJson(self: *Session) ![]u8 {
+        const plane = self.control_plane orelse return self.allocator.dupe(u8, "{\"pending\":[]}");
+        return plane.listPendingNodeJoins("{}") catch blk: {
+            break :blk try self.allocator.dupe(u8, "{\"pending\":[]}");
+        };
     }
 
     fn addProjectFsLinksFromPolicy(
@@ -2138,6 +2200,109 @@ pub const Session = struct {
         node_ptr.content = try self.allocator.dupe(u8, data);
     }
 
+    fn handlePairingControlWrite(self: *Session, action: PairingAction, raw_input: []const u8) !WriteOutcome {
+        const written = raw_input.len;
+        const payload = std.mem.trim(u8, raw_input, " \t\r\n");
+        const plane = self.control_plane orelse {
+            try self.setPairingLastResultError(action, "ControlPlaneUnavailable");
+            return .{ .written = written };
+        };
+
+        switch (action) {
+            .refresh => {
+                const list_json = plane.listPendingNodeJoins(if (payload.len == 0) "{}" else payload) catch |err| {
+                    try self.setPairingLastResultError(action, @errorName(err));
+                    try self.refreshPairingPendingSnapshot();
+                    return .{ .written = written };
+                };
+                defer self.allocator.free(list_json);
+                try self.setPairingLastResultSuccess(action, list_json);
+                try self.setPairingPendingContent(list_json);
+                return .{ .written = written };
+            },
+            .approve => {
+                const approve_json = plane.approvePendingNodeJoin(payload) catch |err| {
+                    try self.setPairingLastResultError(action, @errorName(err));
+                    try self.refreshPairingPendingSnapshot();
+                    return .{ .written = written };
+                };
+                defer self.allocator.free(approve_json);
+                try self.setPairingLastResultSuccess(action, approve_json);
+                try self.refreshPairingPendingSnapshot();
+                return .{ .written = written };
+            },
+            .deny => {
+                const deny_json = plane.denyPendingNodeJoin(payload) catch |err| {
+                    try self.setPairingLastResultError(action, @errorName(err));
+                    try self.refreshPairingPendingSnapshot();
+                    return .{ .written = written };
+                };
+                defer self.allocator.free(deny_json);
+                try self.setPairingLastResultSuccess(action, deny_json);
+                try self.refreshPairingPendingSnapshot();
+                return .{ .written = written };
+            },
+        }
+    }
+
+    fn pairingActionName(action: PairingAction) []const u8 {
+        return switch (action) {
+            .refresh => "refresh",
+            .approve => "approve",
+            .deny => "deny",
+        };
+    }
+
+    fn setPairingPendingContent(self: *Session, payload: []const u8) !void {
+        if (self.pairing_pending_id == 0) return;
+        try self.setFileContent(self.pairing_pending_id, payload);
+    }
+
+    fn refreshPairingPendingSnapshot(self: *Session) !void {
+        if (self.pairing_pending_id == 0) return;
+        const payload = try self.loadPendingNodeJoinsJson();
+        defer self.allocator.free(payload);
+        try self.setPairingPendingContent(payload);
+    }
+
+    fn setPairingLastResultSuccess(self: *Session, action: PairingAction, payload: []const u8) !void {
+        if (self.pairing_last_result_id != 0) {
+            const action_name = pairingActionName(action);
+            const escaped_action = try unified.jsonEscape(self.allocator, action_name);
+            defer self.allocator.free(escaped_action);
+            const result_json = try std.fmt.allocPrint(
+                self.allocator,
+                "{{\"ok\":true,\"action\":\"{s}\",\"at_ms\":{d},\"response\":{s}}}",
+                .{ escaped_action, std.time.milliTimestamp(), payload },
+            );
+            defer self.allocator.free(result_json);
+            try self.setFileContent(self.pairing_last_result_id, result_json);
+        }
+        if (self.pairing_last_error_id != 0) {
+            try self.setFileContent(self.pairing_last_error_id, "null");
+        }
+    }
+
+    fn setPairingLastResultError(self: *Session, action: PairingAction, error_name: []const u8) !void {
+        const action_name = pairingActionName(action);
+        const escaped_action = try unified.jsonEscape(self.allocator, action_name);
+        defer self.allocator.free(escaped_action);
+        const escaped_error = try unified.jsonEscape(self.allocator, error_name);
+        defer self.allocator.free(escaped_error);
+        const payload = try std.fmt.allocPrint(
+            self.allocator,
+            "{{\"ok\":false,\"action\":\"{s}\",\"error\":\"{s}\",\"at_ms\":{d}}}",
+            .{ escaped_action, escaped_error, std.time.milliTimestamp() },
+        );
+        defer self.allocator.free(payload);
+        if (self.pairing_last_result_id != 0) {
+            try self.setFileContent(self.pairing_last_result_id, payload);
+        }
+        if (self.pairing_last_error_id != 0) {
+            try self.setFileContent(self.pairing_last_error_id, payload);
+        }
+    }
+
     fn seedJobsFromIndex(self: *Session) !void {
         const jobs = try self.job_index.listJobsForAgent(self.allocator, self.agent_id);
         defer chat_job_index.deinitJobViews(self.allocator, jobs);
@@ -2375,6 +2540,83 @@ fn projectMountPathToLinkName(allocator: std.mem.Allocator, mount_path: []const 
     return out.toOwnedSlice(allocator);
 }
 
+fn allocPathSegments(allocator: std.mem.Allocator, segments: []const []const u8) ![][]u8 {
+    var path = try allocator.alloc([]u8, segments.len);
+    errdefer allocator.free(path);
+    var filled: usize = 0;
+    errdefer {
+        var idx: usize = 0;
+        while (idx < filled) : (idx += 1) allocator.free(path[idx]);
+    }
+    for (segments, 0..) |segment, idx| {
+        path[idx] = try allocator.dupe(u8, segment);
+        filled = idx + 1;
+    }
+    return path;
+}
+
+fn freePathSegments(allocator: std.mem.Allocator, path: [][]u8) void {
+    for (path) |segment| allocator.free(segment);
+    allocator.free(path);
+}
+
+fn protocolWriteFile(
+    session: *Session,
+    allocator: std.mem.Allocator,
+    attach_fid: u32,
+    walk_fid: u32,
+    segments: []const []const u8,
+    data: []const u8,
+    tag_base: u16,
+) !void {
+    var attach = unified.ParsedMessage{
+        .channel = .acheron,
+        .acheron_type = .t_attach,
+        .tag = tag_base,
+        .fid = attach_fid,
+    };
+    const attach_res = try session.handle(&attach);
+    defer allocator.free(attach_res);
+    try std.testing.expect(std.mem.indexOf(u8, attach_res, "acheron.r_attach") != null);
+
+    const path = try allocPathSegments(allocator, segments);
+    defer freePathSegments(allocator, path);
+    var walk = unified.ParsedMessage{
+        .channel = .acheron,
+        .acheron_type = .t_walk,
+        .tag = tag_base + 1,
+        .fid = attach_fid,
+        .newfid = walk_fid,
+        .path = path,
+    };
+    const walk_res = try session.handle(&walk);
+    defer allocator.free(walk_res);
+    try std.testing.expect(std.mem.indexOf(u8, walk_res, "acheron.r_walk") != null);
+
+    var open = unified.ParsedMessage{
+        .channel = .acheron,
+        .acheron_type = .t_open,
+        .tag = tag_base + 2,
+        .fid = walk_fid,
+        .mode = "w",
+    };
+    const open_res = try session.handle(&open);
+    defer allocator.free(open_res);
+    try std.testing.expect(std.mem.indexOf(u8, open_res, "acheron.r_open") != null);
+
+    var write = unified.ParsedMessage{
+        .channel = .acheron,
+        .acheron_type = .t_write,
+        .tag = tag_base + 3,
+        .fid = walk_fid,
+        .offset = 0,
+        .data = data,
+    };
+    const write_res = try session.handle(&write);
+    defer allocator.free(write_res);
+    try std.testing.expect(std.mem.indexOf(u8, write_res, "acheron.r_write") != null);
+}
+
 test "fsrpc_session: attach walk open read capability help" {
     const allocator = std.testing.allocator;
 
@@ -2419,6 +2661,153 @@ test "fsrpc_session: attach walk open read capability help" {
     const walk_res = try session.handle(&walk);
     defer allocator.free(walk_res);
     try std.testing.expect(std.mem.indexOf(u8, walk_res, "acheron.r_walk") != null);
+}
+
+test "fsrpc_session: debug pairing queue supports refresh approve deny actions" {
+    const allocator = std.testing.allocator;
+
+    var control_plane = fs_control_plane.ControlPlane.init(allocator);
+    defer control_plane.deinit();
+
+    const req_a_json = try control_plane.nodeJoinRequest(
+        "{\"node_name\":\"desk-a\",\"fs_url\":\"ws://127.0.0.1:18891/v2/fs\",\"platform\":{\"os\":\"linux\",\"arch\":\"amd64\",\"runtime_kind\":\"native\"}}",
+    );
+    defer allocator.free(req_a_json);
+    var req_a = try std.json.parseFromSlice(std.json.Value, allocator, req_a_json, .{});
+    defer req_a.deinit();
+    if (req_a.value != .object) return error.TestExpectedResponse;
+    const request_a = req_a.value.object.get("request_id") orelse return error.TestExpectedResponse;
+    if (request_a != .string) return error.TestExpectedResponse;
+
+    const req_b_json = try control_plane.nodeJoinRequest(
+        "{\"node_name\":\"desk-b\",\"fs_url\":\"ws://127.0.0.1:28891/v2/fs\",\"platform\":{\"os\":\"windows\",\"arch\":\"amd64\",\"runtime_kind\":\"native\"}}",
+    );
+    defer allocator.free(req_b_json);
+    var req_b = try std.json.parseFromSlice(std.json.Value, allocator, req_b_json, .{});
+    defer req_b.deinit();
+    if (req_b.value != .object) return error.TestExpectedResponse;
+    const request_b = req_b.value.object.get("request_id") orelse return error.TestExpectedResponse;
+    if (request_b != .string) return error.TestExpectedResponse;
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "mother", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "mother",
+        .{
+            .control_plane = &control_plane,
+        },
+    );
+    defer session.deinit();
+
+    const debug_root = session.lookupChild(session.root_id, "debug") orelse return error.TestExpectedResponse;
+    const pairing_dir = session.lookupChild(debug_root, "pairing") orelse return error.TestExpectedResponse;
+    const pending_id = session.lookupChild(pairing_dir, "pending.json") orelse return error.TestExpectedResponse;
+    const last_result_id = session.lookupChild(pairing_dir, "last_result.json") orelse return error.TestExpectedResponse;
+    const last_error_id = session.lookupChild(pairing_dir, "last_error.json") orelse return error.TestExpectedResponse;
+    const pending_before = session.nodes.get(pending_id) orelse return error.TestExpectedResponse;
+    try std.testing.expect(std.mem.indexOf(u8, pending_before.content, request_a.string) != null);
+    try std.testing.expect(std.mem.indexOf(u8, pending_before.content, request_b.string) != null);
+
+    const escaped_request_a = try unified.jsonEscape(allocator, request_a.string);
+    defer allocator.free(escaped_request_a);
+    const approve_payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"request_id\":\"{s}\",\"lease_ttl_ms\":900000}}",
+        .{escaped_request_a},
+    );
+    defer allocator.free(approve_payload);
+    try protocolWriteFile(
+        &session,
+        allocator,
+        40,
+        41,
+        &.{ "debug", "pairing", "control", "approve.json" },
+        approve_payload,
+        400,
+    );
+
+    const pending_after_approve = session.nodes.get(pending_id) orelse return error.TestExpectedResponse;
+    try std.testing.expect(std.mem.indexOf(u8, pending_after_approve.content, request_a.string) == null);
+    try std.testing.expect(std.mem.indexOf(u8, pending_after_approve.content, request_b.string) != null);
+
+    const last_result_after_approve = session.nodes.get(last_result_id) orelse return error.TestExpectedResponse;
+    try std.testing.expect(std.mem.indexOf(u8, last_result_after_approve.content, "\"ok\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, last_result_after_approve.content, "\"action\":\"approve\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, last_result_after_approve.content, "\"node_name\":\"desk-a\"") != null);
+    const last_error_after_approve = session.nodes.get(last_error_id) orelse return error.TestExpectedResponse;
+    try std.testing.expect(std.mem.eql(u8, last_error_after_approve.content, "null"));
+
+    const req_c_json = try control_plane.nodeJoinRequest(
+        "{\"node_name\":\"desk-c\",\"fs_url\":\"ws://127.0.0.1:38891/v2/fs\",\"platform\":{\"os\":\"android\",\"arch\":\"arm64\",\"runtime_kind\":\"mobile\"}}",
+    );
+    defer allocator.free(req_c_json);
+    var req_c = try std.json.parseFromSlice(std.json.Value, allocator, req_c_json, .{});
+    defer req_c.deinit();
+    if (req_c.value != .object) return error.TestExpectedResponse;
+    const request_c = req_c.value.object.get("request_id") orelse return error.TestExpectedResponse;
+    if (request_c != .string) return error.TestExpectedResponse;
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        42,
+        43,
+        &.{ "debug", "pairing", "control", "refresh" },
+        "{}",
+        410,
+    );
+
+    const pending_after_refresh = session.nodes.get(pending_id) orelse return error.TestExpectedResponse;
+    try std.testing.expect(std.mem.indexOf(u8, pending_after_refresh.content, request_b.string) != null);
+    try std.testing.expect(std.mem.indexOf(u8, pending_after_refresh.content, request_c.string) != null);
+
+    const escaped_request_b = try unified.jsonEscape(allocator, request_b.string);
+    defer allocator.free(escaped_request_b);
+    const deny_payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"request_id\":\"{s}\"}}",
+        .{escaped_request_b},
+    );
+    defer allocator.free(deny_payload);
+    try protocolWriteFile(
+        &session,
+        allocator,
+        44,
+        45,
+        &.{ "debug", "pairing", "control", "deny.json" },
+        deny_payload,
+        420,
+    );
+
+    const pending_after_deny = session.nodes.get(pending_id) orelse return error.TestExpectedResponse;
+    try std.testing.expect(std.mem.indexOf(u8, pending_after_deny.content, request_b.string) == null);
+    try std.testing.expect(std.mem.indexOf(u8, pending_after_deny.content, request_c.string) != null);
+
+    const last_result_after_deny = session.nodes.get(last_result_id) orelse return error.TestExpectedResponse;
+    try std.testing.expect(std.mem.indexOf(u8, last_result_after_deny.content, "\"ok\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, last_result_after_deny.content, "\"action\":\"deny\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, last_result_after_deny.content, "\"denied\":true") != null);
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        46,
+        47,
+        &.{ "debug", "pairing", "control", "deny.json" },
+        deny_payload,
+        430,
+    );
+    const last_error_after_repeat_deny = session.nodes.get(last_error_id) orelse return error.TestExpectedResponse;
+    try std.testing.expect(std.mem.indexOf(u8, last_error_after_repeat_deny.content, "\"ok\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, last_error_after_repeat_deny.content, "\"action\":\"deny\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, last_error_after_repeat_deny.content, "PendingJoinNotFound") != null);
 }
 
 test "fsrpc_session: setRuntimeBinding reseeds namespace and clears stale state" {

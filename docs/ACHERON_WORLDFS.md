@@ -20,6 +20,7 @@ This document defines the agent-visible runtime namespace for Acheron sessions.
 │   └── <project_id>/
 ├── meta/
 └── debug/            # policy-gated
+    └── pairing/
 ```
 
 Major directories include:
@@ -63,6 +64,20 @@ Node directories also expose:
 
 - `job`
 - `result_path` (now `/agents/self/jobs/<job>/result.txt`)
+
+## Debug Pairing Queue
+
+When debug is enabled (typically `mother`), WorldFS exposes manual node pairing controls:
+
+- `/debug/pairing/pending.json` (snapshot of `control.node_join_pending_list`)
+- `/debug/pairing/last_result.json` (last approve/deny/refresh result envelope)
+- `/debug/pairing/last_error.json` (last error envelope or `null`)
+- `/debug/pairing/control/approve.json` (writable, payload for `control.node_join_approve`)
+- `/debug/pairing/control/deny.json` (writable, payload for `control.node_join_deny`)
+- `/debug/pairing/control/refresh` (writable trigger to refresh queue snapshot)
+
+Writing to approve/deny/refresh updates `pending.json` and last result/error files so an
+operator agent can complete pairing workflows entirely through filesystem operations.
 
 ## Project View
 
