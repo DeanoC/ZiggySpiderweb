@@ -108,6 +108,7 @@ Project metadata now includes:
 - `contracts.json` (stable project-view contract index for directories, metadata files, and link semantics)
 - `paths.json` (canonical project and global path entrypoints for agent path resolution)
 - `summary.json` (single-file project rollup: sources, key counts, and workspace health state)
+- `alerts.json` (derived risk signals from availability, drift, and reconcile queue/state)
 - `workspace_status.json` (live `control.workspace_status` when available)
 - `mounts.json` (selected mount entries from workspace status `mounts`)
 - `desired_mounts.json` (desired mount set from workspace status `desired_mounts`)
