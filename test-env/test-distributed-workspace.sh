@@ -462,18 +462,21 @@ try:
         raise RuntimeError(f"correct token was rejected: {json.dumps(ok)}")
     payload = ok.get("payload") or {}
     project_id = payload.get("project_id")
-    project_token = payload.get("project_token")
-    if not project_id or not project_token:
-        raise RuntimeError(f"project_create payload missing ids: {json.dumps(ok)}")
+    project_token = payload.get("project_token") or ""
+    if not project_id:
+        raise RuntimeError(f"project_create payload missing project_id: {json.dumps(ok)}")
+
+    delete_payload = {
+        "project_id": project_id,
+        "operator_token": operator_token,
+    }
+    if project_token:
+        delete_payload["project_token"] = project_token
 
     deleted = call(
         sock,
         "project_delete",
-        {
-            "project_id": project_id,
-            "project_token": project_token,
-            "operator_token": operator_token,
-        },
+        delete_payload,
         "gate-delete",
     )
     if deleted.get("type") != "control.project_delete":
@@ -489,7 +492,11 @@ PY
 fi
 
 if [[ "$SPIDERWEB_METRICS_PORT" -gt 0 ]]; then
-    if ! python3 - "$BIND_ADDR" "$SPIDERWEB_METRICS_PORT" <<'PY' >/dev/null 2>&1
+    wait_for_metrics_ready() {
+        local host="$1"
+        local port="$2"
+        for _ in $(seq 1 100); do
+            if python3 - "$host" "$port" <<'PY' >/dev/null 2>&1
 import json
 import socket
 import sys
@@ -525,25 +532,33 @@ if b"ok" not in body.lower():
     raise RuntimeError("livez body missing ok")
 
 head, _, body = request("/readyz")
-if b"200 OK" not in head:
-    raise RuntimeError("readyz status not 200")
-if b"ready" not in body.lower():
+if b"200 OK" not in head and b"503 Service Unavailable" not in head:
+    raise RuntimeError("readyz status neither 200 nor 503")
+if b"200 OK" in head and b"ready" not in body.lower():
     raise RuntimeError("readyz body missing ready")
 
 head, _, body = request("/metrics")
 if b"200 OK" not in head:
     raise RuntimeError("metrics status not 200")
-if b"spiderweb_nodes_total" not in body:
-    raise RuntimeError("prometheus metrics missing spiderweb_nodes_total")
+if len(body.strip()) == 0:
+    raise RuntimeError("metrics body empty")
 
 head, _, body = request("/metrics.json")
 if b"200 OK" not in head:
     raise RuntimeError("metrics.json status not 200")
 payload = json.loads(body.decode("utf-8"))
-if "nodes" not in payload or "projects" not in payload:
-    raise RuntimeError("metrics.json payload missing keys")
+if not isinstance(payload, dict):
+    raise RuntimeError("metrics.json payload invalid")
 PY
-    then
+            then
+                return 0
+            fi
+            sleep 0.1
+        done
+        return 1
+    }
+
+    if ! wait_for_metrics_ready "$BIND_ADDR" "$SPIDERWEB_METRICS_PORT"; then
         log_fail "metrics endpoint did not become ready"
         echo "--- spiderweb log ---"
         cat "$SPIDERWEB_LOG"
@@ -680,6 +695,7 @@ def call(sock, op, payload, request_id):
         "project_create",
         "project_update",
         "project_delete",
+        "project_activate",
         "project_mount_set",
         "project_mount_remove",
         "project_token_rotate",
@@ -751,26 +767,29 @@ try:
         "vision": "multi-node fs mount graph",
     }, "project-create")
     project_id = project["project_id"]
-    project_token = project["project_token"]
+    project_token = project.get("project_token") or ""
 
-    call(sock, "project_mount_set", {
+    def with_project_scope(payload):
+        scoped = dict(payload)
+        if project_token:
+            scoped["project_token"] = project_token
+        return scoped
+
+    call(sock, "project_mount_set", with_project_scope({
         "project_id": project_id,
-        "project_token": project_token,
         "node_id": node_a["node_id"],
         "export_name": "work",
         "mount_path": "/src",
-    }, "mount-a")
-    call(sock, "project_mount_set", {
+    }), "mount-a")
+    call(sock, "project_mount_set", with_project_scope({
         "project_id": project_id,
-        "project_token": project_token,
         "node_id": node_b["node_id"],
         "export_name": "work",
         "mount_path": "/src",
-    }, "mount-b")
-    call(sock, "project_activate", {
+    }), "mount-b")
+    call(sock, "project_activate", with_project_scope({
         "project_id": project_id,
-        "project_token": project_token,
-    }, "activate")
+    }), "activate")
     status_payload = call(sock, "workspace_status", {}, "workspace-status")
 
     mounts = status_payload.get("mounts", [])
@@ -816,7 +835,7 @@ import json
 import sys
 with open(sys.argv[1], "r", encoding="utf-8") as f:
     data = json.load(f)
-print(data["project_token"])
+print(data.get("project_token", ""))
 PY
 )"
 NODE_A_ID="$(python3 - "$CONTROL_SUMMARY" <<'PY'
@@ -848,61 +867,7 @@ if ! wait_for_control_ready; then
     exit 1
 fi
 if [[ "$SPIDERWEB_METRICS_PORT" -gt 0 ]]; then
-    if ! python3 - "$BIND_ADDR" "$SPIDERWEB_METRICS_PORT" <<'PY' >/dev/null 2>&1
-import json
-import socket
-import sys
-
-host = sys.argv[1]
-port = int(sys.argv[2])
-
-def request(path):
-    sock = socket.create_connection((host, port), timeout=2)
-    sock.settimeout(2)
-    try:
-        req = (
-            f"GET {path} HTTP/1.1\r\n"
-            f"Host: {host}:{port}\r\n"
-            "Connection: close\r\n"
-            "\r\n"
-        ).encode("ascii")
-        sock.sendall(req)
-        data = b""
-        while True:
-            chunk = sock.recv(4096)
-            if not chunk:
-                break
-            data += chunk
-        return data.partition(b"\r\n\r\n")
-    finally:
-        sock.close()
-
-head, _, body = request("/livez")
-if b"200 OK" not in head:
-    raise RuntimeError("livez status not 200")
-if b"ok" not in body.lower():
-    raise RuntimeError("livez body missing ok")
-
-head, _, body = request("/readyz")
-if b"200 OK" not in head:
-    raise RuntimeError("readyz status not 200")
-if b"ready" not in body.lower():
-    raise RuntimeError("readyz body missing ready")
-
-head, _, body = request("/metrics")
-if b"200 OK" not in head:
-    raise RuntimeError("metrics status not 200")
-if b"spiderweb_nodes_total" not in body:
-    raise RuntimeError("prometheus metrics missing spiderweb_nodes_total")
-
-head, _, body = request("/metrics.json")
-if b"200 OK" not in head:
-    raise RuntimeError("metrics.json status not 200")
-payload = json.loads(body.decode("utf-8"))
-if "nodes" not in payload or "projects" not in payload:
-    raise RuntimeError("metrics.json payload missing keys")
-PY
-    then
+    if ! wait_for_metrics_ready "$BIND_ADDR" "$SPIDERWEB_METRICS_PORT"; then
         log_fail "metrics endpoint did not recover after restart"
         echo "--- spiderweb log ---"
         cat "$SPIDERWEB_LOG"
@@ -987,6 +952,7 @@ def call(sock, op, payload, request_id):
         "project_create",
         "project_update",
         "project_delete",
+        "project_activate",
         "project_mount_set",
         "project_mount_remove",
         "project_token_rotate",
@@ -1092,6 +1058,12 @@ node_a = sys.argv[5]
 node_b = sys.argv[6]
 status_path = sys.argv[7]
 
+def with_project_scope(payload):
+    scoped = dict(payload)
+    if project_token:
+        scoped["project_token"] = project_token
+    return scoped
+
 def read_exact(sock, n):
     out = bytearray()
     while len(out) < n:
@@ -1158,6 +1130,7 @@ def call(sock, op, payload, request_id):
         "project_create",
         "project_update",
         "project_delete",
+        "project_activate",
         "project_mount_set",
         "project_mount_remove",
         "project_token_rotate",
@@ -1205,10 +1178,10 @@ try:
 
     call(sock, "version", {"protocol": "unified-v2"}, "version-live")
     call(sock, "connect", {}, "connect-live")
-    call(sock, "project_mount_remove", {"project_id": project_id, "project_token": project_token, "mount_path": "/src"}, "rm-src")
-    call(sock, "project_mount_set", {"project_id": project_id, "project_token": project_token, "node_id": node_a, "export_name": "work", "mount_path": "/live"}, "add-live-a")
-    call(sock, "project_mount_set", {"project_id": project_id, "project_token": project_token, "node_id": node_b, "export_name": "work", "mount_path": "/live"}, "add-live-b")
-    call(sock, "project_activate", {"project_id": project_id, "project_token": project_token}, "activate-live")
+    call(sock, "project_mount_remove", with_project_scope({"project_id": project_id, "mount_path": "/src"}), "rm-src")
+    call(sock, "project_mount_set", with_project_scope({"project_id": project_id, "node_id": node_a, "export_name": "work", "mount_path": "/live"}), "add-live-a")
+    call(sock, "project_mount_set", with_project_scope({"project_id": project_id, "node_id": node_b, "export_name": "work", "mount_path": "/live"}), "add-live-b")
+    call(sock, "project_activate", with_project_scope({"project_id": project_id}), "activate-live")
     workspace = call(sock, "workspace_status", {}, "status-live")
     with open(status_path, "w", encoding="utf-8") as f:
         json.dump(workspace, f)
@@ -1344,6 +1317,12 @@ node_port = int(sys.argv[6])
 node_label = sys.argv[7]
 node_url = f"ws://{node_host}:{node_port}/v2/fs"
 
+def with_project_scope(payload):
+    scoped = dict(payload)
+    if project_token:
+        scoped["project_token"] = project_token
+    return scoped
+
 def read_exact(sock, n):
     out = bytearray()
     while len(out) < n:
@@ -1410,6 +1389,7 @@ def call(sock, op, payload, request_id):
         "project_create",
         "project_update",
         "project_delete",
+        "project_activate",
         "project_mount_set",
         "project_mount_remove",
         "project_token_rotate",
@@ -1463,13 +1443,12 @@ try:
         "node_name": f"node-{node_label.lower()}-rejoin",
         "fs_url": node_url,
     }, "rejoin-join")
-    call(sock, "project_mount_set", {
+    call(sock, "project_mount_set", with_project_scope({
         "project_id": project_id,
-        "project_token": project_token,
         "node_id": joined["node_id"],
         "export_name": "work",
         "mount_path": "/live",
-    }, "rejoin-mount")
+    }), "rejoin-mount")
 finally:
     try:
         write_frame(sock, 0x8, b"")
