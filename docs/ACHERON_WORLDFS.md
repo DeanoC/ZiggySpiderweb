@@ -99,6 +99,9 @@ Project metadata now includes:
 - `topology.json` (policy-derived node + link view)
 - `workspace_status.json` (live `control.workspace_status` when available)
 - `mounts.json` (selected mount entries from workspace status `mounts`)
+- `desired_mounts.json` (desired mount set from workspace status `desired_mounts`)
+- `actual_mounts.json` (resolved/selected mount set from workspace status `actual_mounts`)
+- `drift.json` (workspace drift summary from workspace status `drift`)
 - `availability.json` (extracted workspace availability rollup)
 
 Runtime uses project token (when bound) for workspace status lookup and falls back
