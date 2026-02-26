@@ -897,6 +897,18 @@ pub const ControlPlane = struct {
         return self.renderNodeJoinPayload(node.id);
     }
 
+    pub fn authenticateNodeSession(self: *ControlPlane, node_id: []const u8, node_secret: []const u8) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        _ = self.reapExpiredLeasesLocked(std.time.milliTimestamp());
+
+        try validateIdentifier(node_id, 128);
+        try validateSecretToken(node_secret, 256);
+        const node = self.nodes.getPtr(node_id) orelse return ControlPlaneError.NodeNotFound;
+        if (!secureTokenEql(node.secret, node_secret)) return ControlPlaneError.NodeAuthFailed;
+        node.last_seen_ms = std.time.milliTimestamp();
+    }
+
     pub fn ensureNode(
         self: *ControlPlane,
         node_name: []const u8,

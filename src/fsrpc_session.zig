@@ -510,7 +510,11 @@ pub const Session = struct {
             "Project-centric cross-node and agent views.",
         );
 
-        for (policy.nodes.items) |node| try self.addNodeDirectory(nodes_root, node, false);
+        try self.addNodeDirectoriesFromControlPlane(nodes_root);
+        for (policy.nodes.items) |node| {
+            if (self.lookupChild(nodes_root, node.id) != null) continue;
+            try self.addNodeDirectory(nodes_root, node, false);
+        }
 
         const self_agent_dir = try self.addDir(agents_root, "self", false);
         const chat = try self.addDir(self_agent_dir, "chat", false);
@@ -615,11 +619,11 @@ pub const Session = struct {
         else
             false;
         if (!loaded_live_mounts) try self.addProjectFsLinksFromPolicy(project_fs_dir, policy);
+        try self.addProjectNodeLinksFromPolicy(project_nodes_dir, policy);
         const loaded_live_nodes = if (workspace_status_json) |json|
             try self.addProjectNodeLinksFromWorkspaceStatus(project_nodes_dir, json)
         else
             false;
-        if (!loaded_live_nodes) try self.addProjectNodeLinksFromPolicy(project_nodes_dir, policy);
 
         _ = try self.addFile(project_agents_dir, "self", "/agents/self\n", false, .none);
         for (policy.visible_agents.items) |agent_name| {
@@ -862,6 +866,48 @@ pub const Session = struct {
         return plane.listNodeInvites("{}") catch blk: {
             break :blk try self.allocator.dupe(u8, "{\"invites\":[]}");
         };
+    }
+
+    fn addNodeDirectoriesFromControlPlane(self: *Session, nodes_root: u32) !void {
+        const plane = self.control_plane orelse return;
+        const payload_json = plane.listNodes() catch return;
+        defer self.allocator.free(payload_json);
+
+        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, payload_json, .{}) catch return;
+        defer parsed.deinit();
+        if (parsed.value != .object) return;
+        const nodes_value = parsed.value.object.get("nodes") orelse return;
+        if (nodes_value != .array) return;
+
+        for (nodes_value.array.items) |node_value| {
+            if (node_value != .object) continue;
+            const node_id_value = node_value.object.get("node_id") orelse continue;
+            if (node_id_value != .string or node_id_value.string.len == 0) continue;
+            if (self.lookupChild(nodes_root, node_id_value.string) != null) continue;
+
+            const fs_available = blk: {
+                if (node_value.object.get("fs_url")) |fs_url_value| {
+                    if (fs_url_value == .string and fs_url_value.string.len > 0) break :blk true;
+                }
+                break :blk false;
+            };
+
+            var discovered = world_policy.NodePolicy{
+                .id = try self.allocator.dupe(u8, node_id_value.string),
+                .resources = .{
+                    .fs = fs_available,
+                    .camera = false,
+                    .screen = false,
+                    .user = false,
+                },
+            };
+            defer {
+                self.allocator.free(discovered.id);
+                for (discovered.terminals.items) |terminal_id| self.allocator.free(terminal_id);
+                discovered.terminals.deinit(self.allocator);
+            }
+            try self.addNodeDirectory(nodes_root, discovered, false);
+        }
     }
 
     fn addProjectFsLinksFromPolicy(
@@ -4022,4 +4068,53 @@ test "fsrpc_session: node roots are derived from control-plane service kinds" {
     try std.testing.expect(std.mem.indexOf(u8, node_caps.content, "\"fs\":false") != null);
     try std.testing.expect(camera_dir != null);
     try std.testing.expect(fs_dir == null);
+}
+
+test "fsrpc_session: control-plane registered nodes appear under global nodes namespace" {
+    const allocator = std.testing.allocator;
+
+    var control_plane = fs_control_plane.ControlPlane.init(allocator);
+    defer control_plane.deinit();
+
+    const ensured = try control_plane.ensureNode("edge-global-node", "ws://127.0.0.1:18891/v2/fs", 60_000);
+    defer allocator.free(ensured);
+    var ensured_parsed = try std.json.parseFromSlice(std.json.Value, allocator, ensured, .{});
+    defer ensured_parsed.deinit();
+    if (ensured_parsed.value != .object) return error.TestExpectedResponse;
+    const node_id = ensured_parsed.value.object.get("node_id") orelse return error.TestExpectedResponse;
+    if (node_id != .string) return error.TestExpectedResponse;
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "default",
+        .{
+            .agents_dir = ".does-not-exist",
+            .projects_dir = ".does-not-exist",
+            .control_plane = &control_plane,
+        },
+    );
+    defer session.deinit();
+
+    const nodes_root = session.lookupChild(session.root_id, "nodes") orelse return error.TestExpectedResponse;
+    const discovered_node = session.lookupChild(nodes_root, node_id.string) orelse return error.TestExpectedResponse;
+    const discovered_status_id = session.lookupChild(discovered_node, "STATUS.json") orelse return error.TestExpectedResponse;
+    const discovered_status = session.nodes.get(discovered_status_id) orelse return error.TestExpectedResponse;
+    const discovered_fs = session.lookupChild(discovered_node, "fs");
+
+    const projects_root = session.lookupChild(session.root_id, "projects") orelse return error.TestExpectedResponse;
+    const system_project = session.lookupChild(projects_root, "system") orelse return error.TestExpectedResponse;
+    const system_project_nodes = session.lookupChild(system_project, "nodes") orelse return error.TestExpectedResponse;
+    const system_project_node_link = session.lookupChild(system_project_nodes, node_id.string);
+
+    try std.testing.expect(discovered_fs != null);
+    try std.testing.expect(std.mem.indexOf(u8, discovered_status.content, "\"source\":\"control_plane\"") != null);
+    try std.testing.expect(system_project_node_link == null);
 }

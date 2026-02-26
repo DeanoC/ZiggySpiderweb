@@ -1,8 +1,11 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const fs_node_server = @import("fs_node_server.zig");
+const fs_node_service = @import("fs_node_service.zig");
 const fs_node_ops = @import("fs_node_ops.zig");
+const fs_protocol = @import("fs_protocol.zig");
 const node_capability_providers = @import("node_capability_providers.zig");
+const unified = @import("ziggy-spider-protocol").unified;
 
 const default_state_path = ".spiderweb-fs-node-state.json";
 const default_node_name = "spiderweb-fs-node";
@@ -11,6 +14,8 @@ const default_control_backoff_max_ms: u64 = 60_000;
 const default_lease_ttl_ms: u64 = 15 * 60 * 1000;
 const default_lease_refresh_interval_ms: u64 = 60 * 1000;
 const control_reply_timeout_ms: i32 = 45_000;
+const fsrpc_node_protocol_version = "unified-v2-fs";
+const fsrpc_node_proto_id: i64 = 2;
 
 const PairMode = enum {
     invite,
@@ -365,6 +370,7 @@ pub fn main() !void {
     defer service_registry.deinit();
 
     if (control_url) |control_url_value| {
+        const pairing_fs_url = if (advertised_fs_url != null) effective_fs_url else "";
         if (control_auth_token == null) {
             const from_env = std.process.getEnvVarOwned(allocator, "SPIDERWEB_AUTH_TOKEN") catch |err| switch (err) {
                 error.EnvironmentVariableNotFound => null,
@@ -391,7 +397,7 @@ pub fn main() !void {
                 .invite_token = invite_token,
                 .operator_token = operator_token,
                 .node_name = node_name,
-                .fs_url = effective_fs_url,
+                .fs_url = pairing_fs_url,
                 .lease_ttl_ms = lease_ttl_ms,
                 .state_path = state_path,
                 .reconnect_backoff_ms = reconnect_backoff_ms,
@@ -436,6 +442,27 @@ pub fn main() !void {
             std.log.warn("initial node service catalog upsert failed: {s}", .{@errorName(err)});
         };
 
+        const routed_fs_url = try buildControlRoutedFsUrl(
+            allocator,
+            control_url_value,
+            state.node_id.?,
+        );
+        defer allocator.free(routed_fs_url);
+
+        refreshNodeLeaseOnce(
+            allocator,
+            .{
+                .url = control_url_value,
+                .auth_token = control_auth_token,
+            },
+            state_path,
+            routed_fs_url,
+            &service_registry,
+            lease_ttl_ms,
+        ) catch |err| {
+            std.log.warn("initial node lease refresh failed: {s}", .{@errorName(err)});
+        };
+
         var refresh_ctx = try allocator.create(LeaseRefreshContext);
         defer allocator.destroy(refresh_ctx);
         refresh_ctx.* = try LeaseRefreshContext.init(
@@ -445,7 +472,7 @@ pub fn main() !void {
                 .auth_token = control_auth_token,
             },
             state_path,
-            effective_fs_url,
+            routed_fs_url,
             &service_registry,
             lease_ttl_ms,
             refresh_interval_ms,
@@ -460,9 +487,9 @@ pub fn main() !void {
             refresh_thread.join();
         }
 
-        std.log.info("Starting spiderweb-fs-node on {s}:{d}", .{ bind_addr, port });
+        std.log.info("Starting spiderweb-fs-node control tunnel", .{});
         std.log.info("Control pairing enabled via {s} ({s})", .{ control_url_value, @tagName(pair_mode) });
-        std.log.info("Advertised FS URL: {s}", .{effective_fs_url});
+        std.log.info("Advertised routed FS URL: {s}", .{routed_fs_url});
         if (exports.items.len == 0) {
             std.log.info("No exports configured via CLI; using default export name='work' path='.' rw", .{});
         } else {
@@ -471,7 +498,17 @@ pub fn main() !void {
             }
         }
 
-        try fs_node_server.run(allocator, bind_addr, port, exports.items, auth_token);
+        try runControlRoutedNodeService(
+            allocator,
+            .{
+                .url = control_url_value,
+                .auth_token = control_auth_token,
+            },
+            exports.items,
+            state_path,
+            reconnect_backoff_ms,
+            reconnect_backoff_max_ms,
+        );
         return;
     }
 
@@ -877,6 +914,232 @@ fn tryApplyLeaseRefresh(
     try saveNodePairState(allocator, state_path, state);
 }
 
+fn buildControlRoutedFsUrl(
+    allocator: std.mem.Allocator,
+    control_url: []const u8,
+    node_id: []const u8,
+) ![]u8 {
+    const parsed = try parseWsUrlWithDefaultPath(control_url, "/");
+    return std.fmt.allocPrint(
+        allocator,
+        "ws://{s}:{d}/v2/fs/node/{s}",
+        .{ parsed.host, parsed.port, node_id },
+    );
+}
+
+fn refreshNodeLeaseOnce(
+    allocator: std.mem.Allocator,
+    connect: ControlConnectOptions,
+    state_path: []const u8,
+    fs_url: []const u8,
+    service_registry: *const node_capability_providers.Registry,
+    lease_ttl_ms: u64,
+) !void {
+    var state = try loadNodePairState(allocator, state_path);
+    defer state.deinit(allocator);
+    if (!state.isPaired()) return error.MissingField;
+    const node_id = state.node_id orelse return error.MissingField;
+    const node_secret = state.node_secret orelse return error.MissingField;
+
+    const escaped_node_id = try jsonEscape(allocator, node_id);
+    defer allocator.free(escaped_node_id);
+    const escaped_node_secret = try jsonEscape(allocator, node_secret);
+    defer allocator.free(escaped_node_secret);
+    const escaped_fs_url = try jsonEscape(allocator, fs_url);
+    defer allocator.free(escaped_fs_url);
+    const payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"node_id\":\"{s}\",\"node_secret\":\"{s}\",\"fs_url\":\"{s}\",\"lease_ttl_ms\":{d}}}",
+        .{ escaped_node_id, escaped_node_secret, escaped_fs_url, lease_ttl_ms },
+    );
+    defer allocator.free(payload);
+
+    var result = try requestControlPayload(
+        allocator,
+        connect,
+        "control.node_lease_refresh",
+        payload,
+    );
+    defer result.deinit(allocator);
+    switch (result) {
+        .payload_json => |payload_json| {
+            var joined = try parseNodeJoinPayload(allocator, payload_json);
+            errdefer joined.deinit(allocator);
+            try tryApplyLeaseRefresh(allocator, state_path, &state, joined);
+            try upsertNodeServiceCatalog(allocator, connect, service_registry, &state);
+        },
+        .remote_error => |remote| {
+            std.log.warn("initial lease refresh rejected: code={s} message={s}", .{ remote.code, remote.message });
+            return error.ControlRequestFailed;
+        },
+    }
+}
+
+fn runControlRoutedNodeService(
+    allocator: std.mem.Allocator,
+    connect: ControlConnectOptions,
+    export_specs: []const fs_node_ops.ExportSpec,
+    state_path: []const u8,
+    reconnect_backoff_ms: u64,
+    reconnect_backoff_max_ms: u64,
+) !void {
+    var service = try fs_node_service.NodeService.init(allocator, export_specs);
+    defer service.deinit();
+
+    var attempts: u32 = 0;
+    while (true) {
+        var state = loadNodePairState(allocator, state_path) catch |state_err| {
+            const wait_ms = computeBackoff(reconnect_backoff_ms, reconnect_backoff_max_ms, attempts);
+            attempts +%= 1;
+            std.log.warn("control tunnel: failed to read node state: {s}; retrying in {d} ms", .{ @errorName(state_err), wait_ms });
+            std.Thread.sleep(wait_ms * std.time.ns_per_ms);
+            continue;
+        };
+        defer state.deinit(allocator);
+        if (!state.isPaired()) return error.PairingFailed;
+        const node_id = state.node_id orelse return error.MissingField;
+        const node_secret = state.node_secret orelse return error.MissingField;
+
+        const parsed_url = parseWsUrlWithDefaultPath(connect.url, "/") catch |url_err| {
+            const wait_ms = computeBackoff(reconnect_backoff_ms, reconnect_backoff_max_ms, attempts);
+            attempts +%= 1;
+            std.log.warn("control tunnel: invalid control URL: {s}; retrying in {d} ms", .{ @errorName(url_err), wait_ms });
+            std.Thread.sleep(wait_ms * std.time.ns_per_ms);
+            continue;
+        };
+
+        var stream = std.net.tcpConnectToHost(allocator, parsed_url.host, parsed_url.port) catch |conn_err| {
+            const wait_ms = computeBackoff(reconnect_backoff_ms, reconnect_backoff_max_ms, attempts);
+            attempts +%= 1;
+            std.log.warn("control tunnel: connect failed: {s}; retrying in {d} ms", .{ @errorName(conn_err), wait_ms });
+            std.Thread.sleep(wait_ms * std.time.ns_per_ms);
+            continue;
+        };
+        defer stream.close();
+
+        performClientHandshake(
+            allocator,
+            &stream,
+            parsed_url.host,
+            parsed_url.port,
+            "/v2/node",
+            connect.auth_token,
+        ) catch |hs_err| {
+            const wait_ms = computeBackoff(reconnect_backoff_ms, reconnect_backoff_max_ms, attempts);
+            attempts +%= 1;
+            std.log.warn("control tunnel: websocket handshake failed: {s}; retrying in {d} ms", .{ @errorName(hs_err), wait_ms });
+            std.Thread.sleep(wait_ms * std.time.ns_per_ms);
+            continue;
+        };
+
+        negotiateNodeTunnelHello(allocator, &stream, node_id, node_secret) catch |hello_err| {
+            const wait_ms = computeBackoff(reconnect_backoff_ms, reconnect_backoff_max_ms, attempts);
+            attempts +%= 1;
+            std.log.warn("control tunnel: fs hello failed: {s}; retrying in {d} ms", .{ @errorName(hello_err), wait_ms });
+            std.Thread.sleep(wait_ms * std.time.ns_per_ms);
+            continue;
+        };
+
+        attempts = 0;
+        std.log.info("control tunnel established for node {s}", .{node_id});
+
+        while (true) {
+            var frame = readServerFrame(allocator, &stream, 4 * 1024 * 1024) catch |read_err| {
+                std.log.warn("control tunnel disconnected: {s}", .{@errorName(read_err)});
+                break;
+            };
+            defer frame.deinit(allocator);
+
+            switch (frame.opcode) {
+                0x1 => {
+                    var handled = service.handleRequestJsonWithEvents(frame.payload) catch |handle_err| blk: {
+                        const fallback = try unified.buildFsrpcFsError(
+                            allocator,
+                            null,
+                            fs_protocol.Errno.EIO,
+                            @errorName(handle_err),
+                        );
+                        break :blk fs_node_service.NodeService.HandledRequest{
+                            .response_json = fallback,
+                            .events = try allocator.alloc(fs_protocol.InvalidationEvent, 0),
+                        };
+                    };
+                    defer handled.deinit(allocator);
+
+                    for (handled.events) |event| {
+                        const event_json = try fs_node_service.buildInvalidationEventJson(allocator, event);
+                        defer allocator.free(event_json);
+                        try writeClientTextFrameMasked(allocator, &stream, event_json);
+                    }
+                    try writeClientTextFrameMasked(allocator, &stream, handled.response_json);
+                },
+                0x8 => {
+                    _ = writeClientFrameMasked(allocator, &stream, frame.payload, 0x8) catch {};
+                    break;
+                },
+                0x9 => {
+                    try writeClientPongFrameMasked(allocator, &stream, frame.payload);
+                },
+                0xA => {},
+                else => {},
+            }
+        }
+
+        const wait_ms = computeBackoff(reconnect_backoff_ms, reconnect_backoff_max_ms, attempts);
+        attempts +%= 1;
+        std.log.info("control tunnel reconnect in {d} ms", .{wait_ms});
+        std.Thread.sleep(wait_ms * std.time.ns_per_ms);
+    }
+}
+
+fn negotiateNodeTunnelHello(
+    allocator: std.mem.Allocator,
+    stream: *std.net.Stream,
+    node_id: []const u8,
+    node_secret: []const u8,
+) !void {
+    const escaped_node_id = try jsonEscape(allocator, node_id);
+    defer allocator.free(escaped_node_id);
+    const escaped_node_secret = try jsonEscape(allocator, node_secret);
+    defer allocator.free(escaped_node_secret);
+    const hello_request = try std.fmt.allocPrint(
+        allocator,
+        "{{\"channel\":\"acheron\",\"type\":\"acheron.t_fs_hello\",\"tag\":1,\"payload\":{{\"protocol\":\"{s}\",\"proto\":{d},\"node_id\":\"{s}\",\"node_secret\":\"{s}\"}}}}",
+        .{ fsrpc_node_protocol_version, fsrpc_node_proto_id, escaped_node_id, escaped_node_secret },
+    );
+    defer allocator.free(hello_request);
+
+    try writeClientTextFrameMasked(allocator, stream, hello_request);
+
+    const deadline_ms = std.time.milliTimestamp() + @as(i64, control_reply_timeout_ms);
+    while (true) {
+        const now_ms = std.time.milliTimestamp();
+        if (now_ms >= deadline_ms) return error.ControlRequestTimeout;
+        const remaining_i64 = deadline_ms - now_ms;
+        const remaining_ms: i32 = @intCast(@min(remaining_i64, @as(i64, std.math.maxInt(i32))));
+        if (!try waitReadable(stream, remaining_ms)) return error.ControlRequestTimeout;
+
+        var frame = try readServerFrame(allocator, stream, 4 * 1024 * 1024);
+        defer frame.deinit(allocator);
+        switch (frame.opcode) {
+            0x1 => {
+                var parsed = try unified.parseMessage(allocator, frame.payload);
+                defer parsed.deinit(allocator);
+                if (parsed.channel != .acheron) continue;
+                if (parsed.tag == null or parsed.tag.? != 1) continue;
+                const msg_type = parsed.acheron_type orelse continue;
+                if (msg_type == .fs_r_hello) return;
+                if (msg_type == .fs_err) return error.ControlRequestFailed;
+                continue;
+            },
+            0x8 => return error.ConnectionClosed,
+            0x9 => try writeClientPongFrameMasked(allocator, stream, frame.payload),
+            0xA => {},
+            else => return error.InvalidFrameOpcode,
+        }
+    }
+}
+
 fn computeBackoff(base_ms: u64, max_ms: u64, attempt: u32) u64 {
     const capped_attempt: u6 = @intCast(@min(attempt, 20));
     const shifted = base_ms << capped_attempt;
@@ -1200,20 +1463,20 @@ fn performClientHandshake(
     var encoded_nonce: [std.base64.standard.Encoder.calcSize(nonce.len)]u8 = undefined;
     const key = std.base64.standard.Encoder.encode(&encoded_nonce, &nonce);
     const auth_line = if (auth_token) |token|
-        try std.fmt.allocPrint(allocator, "Authorization: Bearer {s}\\r\\n", .{token})
+        try std.fmt.allocPrint(allocator, "Authorization: Bearer {s}\r\n", .{token})
     else
         try allocator.dupe(u8, "");
     defer allocator.free(auth_line);
 
     const request = try std.fmt.allocPrint(
         allocator,
-        "GET {s} HTTP/1.1\\r\\n" ++
-            "Host: {s}:{d}\\r\\n" ++
-            "Upgrade: websocket\\r\\n" ++
-            "Connection: Upgrade\\r\\n" ++
-            "Sec-WebSocket-Version: 13\\r\\n" ++
-            "Sec-WebSocket-Key: {s}\\r\\n" ++
-            "{s}\\r\\n",
+        "GET {s} HTTP/1.1\r\n" ++
+            "Host: {s}:{d}\r\n" ++
+            "Upgrade: websocket\r\n" ++
+            "Connection: Upgrade\r\n" ++
+            "Sec-WebSocket-Version: 13\r\n" ++
+            "Sec-WebSocket-Key: {s}\r\n" ++
+            "{s}\r\n",
         .{ path, host, port, key, auth_line },
     );
     defer allocator.free(request);
@@ -1222,7 +1485,7 @@ fn performClientHandshake(
 
     const response = try readHttpResponse(allocator, stream, 8 * 1024);
     defer allocator.free(response);
-    if (std.mem.indexOf(u8, response, " 101 ") == null and std.mem.indexOf(u8, response, " 101\\r\\n") == null) {
+    if (std.mem.indexOf(u8, response, " 101 ") == null and std.mem.indexOf(u8, response, " 101\r\n") == null) {
         return error.HandshakeRejected;
     }
 }
@@ -1236,7 +1499,7 @@ fn readHttpResponse(allocator: std.mem.Allocator, stream: *std.net.Stream, max_b
         const n = try stream.read(&chunk);
         if (n == 0) return error.ConnectionClosed;
         try out.appendSlice(allocator, chunk[0..n]);
-        if (std.mem.indexOf(u8, out.items, "\\r\\n\\r\\n") != null) {
+        if (std.mem.indexOf(u8, out.items, "\r\n\r\n") != null) {
             return out.toOwnedSlice(allocator);
         }
     }

@@ -54,6 +54,7 @@ const control_protocol_version = "unified-v2";
 const fsrpc_runtime_protocol_version = "acheron-1";
 const fsrpc_node_protocol_version = "unified-v2-fs";
 const fsrpc_node_proto_id: i64 = 2;
+const node_tunnel_reply_timeout_ms: i32 = 45_000;
 const min_connection_worker_threads: usize = 16;
 const runtime_warmup_wait_timeout_ms: i64 = 12_000;
 const runtime_warmup_stale_timeout_ms: i64 = 30_000;
@@ -497,6 +498,389 @@ const FsConnectionHub = struct {
             conn.allow_invalidations.store(false, .release);
             return;
         }
+    }
+};
+
+const NodeTunnelPendingRequest = struct {
+    mutex: std.Thread.Mutex = .{},
+    cond: std.Thread.Condition = .{},
+    done: bool = false,
+    failed: bool = false,
+    response_payload: ?[]u8 = null,
+
+    fn deinit(self: *NodeTunnelPendingRequest, allocator: std.mem.Allocator) void {
+        if (self.response_payload) |value| allocator.free(value);
+        self.* = undefined;
+    }
+};
+
+const NodeTunnelClient = struct {
+    id: u64,
+    stream: *std.net.Stream,
+    write_mutex: *std.Thread.Mutex,
+    allow_invalidations: bool = false,
+};
+
+const NodeTunnelEntry = struct {
+    stream: ?*std.net.Stream = null,
+    write_mutex: ?*std.Thread.Mutex = null,
+    generation: u64 = 0,
+    next_upstream_tag: u32 = 1,
+    next_client_id: u64 = 1,
+    pending: std.AutoHashMapUnmanaged(u32, *NodeTunnelPendingRequest) = .{},
+    clients: std.ArrayListUnmanaged(NodeTunnelClient) = .{},
+
+    fn deinit(self: *NodeTunnelEntry, allocator: std.mem.Allocator) void {
+        var pending_it = self.pending.iterator();
+        while (pending_it.next()) |item| {
+            var pending = item.value_ptr.*;
+            pending.deinit(allocator);
+            allocator.destroy(pending);
+        }
+        self.pending.deinit(allocator);
+        self.clients.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+const NodeTunnelAttachment = struct {
+    node_id: []u8,
+    generation: u64,
+
+    fn deinit(self: *NodeTunnelAttachment, allocator: std.mem.Allocator) void {
+        allocator.free(self.node_id);
+        self.* = undefined;
+    }
+};
+
+const NodeTunnelRegistry = struct {
+    allocator: std.mem.Allocator,
+    mutex: std.Thread.Mutex = .{},
+    tunnels: std.StringHashMapUnmanaged(*NodeTunnelEntry) = .{},
+
+    fn deinit(self: *NodeTunnelRegistry) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        var it = self.tunnels.iterator();
+        while (it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            var tunnel = entry.value_ptr.*;
+            tunnel.deinit(self.allocator);
+            self.allocator.destroy(tunnel);
+        }
+        self.tunnels.deinit(self.allocator);
+    }
+
+    fn attachTunnel(
+        self: *NodeTunnelRegistry,
+        node_id: []const u8,
+        stream: *std.net.Stream,
+        write_mutex: *std.Thread.Mutex,
+    ) !NodeTunnelAttachment {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const tunnel = try self.getOrCreateTunnelLocked(node_id);
+        if (tunnel.stream) |previous_stream| {
+            if (previous_stream != stream) {
+                previous_stream.close();
+            }
+            self.failAllPendingLocked(tunnel);
+        }
+        tunnel.stream = stream;
+        tunnel.write_mutex = write_mutex;
+        tunnel.generation +%= 1;
+        if (tunnel.generation == 0) tunnel.generation = 1;
+        return .{
+            .node_id = try self.allocator.dupe(u8, node_id),
+            .generation = tunnel.generation,
+        };
+    }
+
+    fn detachTunnel(self: *NodeTunnelRegistry, node_id: []const u8, generation: u64) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const tunnel = self.tunnels.get(node_id) orelse return;
+        if (tunnel.generation != generation) return;
+        tunnel.stream = null;
+        tunnel.write_mutex = null;
+        self.failAllPendingLocked(tunnel);
+        self.removeTunnelIfUnusedLocked(node_id, tunnel);
+    }
+
+    fn registerClient(
+        self: *NodeTunnelRegistry,
+        node_id: []const u8,
+        stream: *std.net.Stream,
+        write_mutex: *std.Thread.Mutex,
+        allow_invalidations: bool,
+    ) !u64 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const tunnel = self.tunnels.get(node_id) orelse return error.NodeTunnelUnavailable;
+        if (tunnel.stream == null or tunnel.write_mutex == null) return error.NodeTunnelUnavailable;
+
+        const client_id = tunnel.next_client_id;
+        tunnel.next_client_id +%= 1;
+        if (tunnel.next_client_id == 0) tunnel.next_client_id = 1;
+        try tunnel.clients.append(self.allocator, .{
+            .id = client_id,
+            .stream = stream,
+            .write_mutex = write_mutex,
+            .allow_invalidations = allow_invalidations,
+        });
+        return client_id;
+    }
+
+    fn updateClientInvalidations(
+        self: *NodeTunnelRegistry,
+        node_id: []const u8,
+        client_id: u64,
+        allow_invalidations: bool,
+    ) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const tunnel = self.tunnels.get(node_id) orelse return;
+        for (tunnel.clients.items) |*client| {
+            if (client.id != client_id) continue;
+            client.allow_invalidations = allow_invalidations;
+            return;
+        }
+    }
+
+    fn unregisterClient(self: *NodeTunnelRegistry, node_id: []const u8, client_id: u64) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const tunnel = self.tunnels.get(node_id) orelse return;
+        for (tunnel.clients.items, 0..) |client, idx| {
+            if (client.id != client_id) continue;
+            _ = tunnel.clients.swapRemove(idx);
+            break;
+        }
+        self.removeTunnelIfUnusedLocked(node_id, tunnel);
+    }
+
+    fn relayRequest(
+        self: *NodeTunnelRegistry,
+        node_id: []const u8,
+        client_tag: u32,
+        request_payload: []const u8,
+    ) ![]u8 {
+        var pending = try self.allocator.create(NodeTunnelPendingRequest);
+        pending.* = .{};
+        defer {
+            pending.deinit(self.allocator);
+            self.allocator.destroy(pending);
+        }
+
+        var upstream_tag: u32 = 0;
+        var stream: ?*std.net.Stream = null;
+        var stream_write_mutex: ?*std.Thread.Mutex = null;
+        var generation: u64 = 0;
+
+        self.mutex.lock();
+        {
+            const tunnel = self.tunnels.get(node_id) orelse {
+                self.mutex.unlock();
+                return error.NodeTunnelUnavailable;
+            };
+            if (tunnel.stream == null or tunnel.write_mutex == null) {
+                self.mutex.unlock();
+                return error.NodeTunnelUnavailable;
+            }
+
+            upstream_tag = self.nextUpstreamTagLocked(tunnel);
+            try tunnel.pending.put(self.allocator, upstream_tag, pending);
+            stream = tunnel.stream.?;
+            stream_write_mutex = tunnel.write_mutex.?;
+            generation = tunnel.generation;
+        }
+        self.mutex.unlock();
+
+        const rewritten = rewriteAcheronTag(self.allocator, request_payload, upstream_tag) catch |err| {
+            self.mutex.lock();
+            if (self.tunnels.get(node_id)) |tunnel| {
+                if (tunnel.generation == generation) {
+                    _ = tunnel.pending.remove(upstream_tag);
+                }
+            }
+            self.mutex.unlock();
+            return err;
+        };
+        defer self.allocator.free(rewritten);
+
+        stream_write_mutex.?.lock();
+        const write_result = websocket_transport.writeFrame(stream.?, rewritten, .text);
+        stream_write_mutex.?.unlock();
+        if (write_result) |_| {} else |err| {
+            self.mutex.lock();
+            if (self.tunnels.get(node_id)) |tunnel| {
+                if (tunnel.generation == generation) {
+                    _ = tunnel.pending.remove(upstream_tag);
+                    tunnel.stream = null;
+                    tunnel.write_mutex = null;
+                    self.failAllPendingLocked(tunnel);
+                    self.removeTunnelIfUnusedLocked(node_id, tunnel);
+                }
+            }
+            self.mutex.unlock();
+            return err;
+        }
+
+        const deadline_ns: i128 = std.time.nanoTimestamp() + @as(i128, @intCast(node_tunnel_reply_timeout_ms)) * std.time.ns_per_ms;
+        pending.mutex.lock();
+        while (!pending.done) {
+            const now_ns = std.time.nanoTimestamp();
+            if (now_ns >= deadline_ns) {
+                pending.failed = true;
+                pending.done = true;
+                break;
+            }
+            const remaining_ns: u64 = @intCast(deadline_ns - now_ns);
+            pending.cond.timedWait(&pending.mutex, remaining_ns) catch |wait_err| switch (wait_err) {
+                error.Timeout => continue,
+            };
+        }
+        const failed = pending.failed;
+        const response_payload = pending.response_payload;
+        pending.response_payload = null;
+        pending.mutex.unlock();
+
+        if (failed or response_payload == null) {
+            self.mutex.lock();
+            if (self.tunnels.get(node_id)) |tunnel| {
+                _ = tunnel.pending.remove(upstream_tag);
+            }
+            self.mutex.unlock();
+            return error.NodeTunnelUnavailable;
+        }
+
+        defer self.allocator.free(response_payload.?);
+        const response_rewritten = try rewriteAcheronTag(self.allocator, response_payload.?, client_tag);
+        return response_rewritten;
+    }
+
+    fn dispatchTunnelFrame(
+        self: *NodeTunnelRegistry,
+        node_id: []const u8,
+        generation: u64,
+        payload: []const u8,
+    ) void {
+        var parsed = unified.parseMessage(self.allocator, payload) catch return;
+        defer parsed.deinit(self.allocator);
+        if (parsed.channel != .acheron) return;
+        const frame_type = parsed.acheron_type orelse return;
+
+        if (frame_type == .fs_evt_inval or frame_type == .fs_evt_inval_dir) {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+
+            const tunnel = self.tunnels.get(node_id) orelse return;
+            if (tunnel.generation != generation) return;
+            var idx: usize = 0;
+            while (idx < tunnel.clients.items.len) {
+                const client = tunnel.clients.items[idx];
+                if (!client.allow_invalidations) {
+                    idx += 1;
+                    continue;
+                }
+                client.write_mutex.lock();
+                const write_result = websocket_transport.writeFrame(client.stream, payload, .text);
+                client.write_mutex.unlock();
+                if (write_result) |_| {} else |_| {
+                    _ = tunnel.clients.swapRemove(idx);
+                    continue;
+                }
+                idx += 1;
+            }
+            return;
+        }
+
+        const upstream_tag = parsed.tag orelse return;
+        var pending: ?*NodeTunnelPendingRequest = null;
+        self.mutex.lock();
+        if (self.tunnels.get(node_id)) |tunnel| {
+            if (tunnel.generation == generation) {
+                if (tunnel.pending.fetchRemove(upstream_tag)) |removed| {
+                    pending = removed.value;
+                }
+            }
+        }
+        self.mutex.unlock();
+
+        if (pending) |pending_req| {
+            const copy = self.allocator.dupe(u8, payload) catch null;
+            pending_req.mutex.lock();
+            if (copy) |value| {
+                pending_req.response_payload = value;
+                pending_req.failed = false;
+            } else {
+                pending_req.failed = true;
+            }
+            pending_req.done = true;
+            pending_req.cond.signal();
+            pending_req.mutex.unlock();
+        }
+    }
+
+    fn getOrCreateTunnelLocked(self: *NodeTunnelRegistry, node_id: []const u8) !*NodeTunnelEntry {
+        if (self.tunnels.get(node_id)) |existing| return existing;
+        const key = try self.allocator.dupe(u8, node_id);
+        errdefer self.allocator.free(key);
+        const tunnel = try self.allocator.create(NodeTunnelEntry);
+        errdefer self.allocator.destroy(tunnel);
+        tunnel.* = .{};
+        try self.tunnels.put(self.allocator, key, tunnel);
+        return tunnel;
+    }
+
+    fn removeTunnelIfUnusedLocked(
+        self: *NodeTunnelRegistry,
+        node_id: []const u8,
+        tunnel: *NodeTunnelEntry,
+    ) void {
+        if (tunnel.stream != null) return;
+        if (tunnel.pending.count() > 0) return;
+        if (tunnel.clients.items.len > 0) return;
+
+        if (self.tunnels.fetchRemove(node_id)) |removed| {
+            self.allocator.free(removed.key);
+            var removed_tunnel = removed.value;
+            removed_tunnel.deinit(self.allocator);
+            self.allocator.destroy(removed_tunnel);
+        }
+    }
+
+    fn failAllPendingLocked(self: *NodeTunnelRegistry, tunnel: *NodeTunnelEntry) void {
+        _ = self;
+        var it = tunnel.pending.iterator();
+        while (it.next()) |entry| {
+            const pending = entry.value_ptr.*;
+            pending.mutex.lock();
+            pending.failed = true;
+            pending.done = true;
+            pending.cond.signal();
+            pending.mutex.unlock();
+        }
+        tunnel.pending.clearRetainingCapacity();
+    }
+
+    fn nextUpstreamTagLocked(self: *NodeTunnelRegistry, tunnel: *NodeTunnelEntry) u32 {
+        _ = self;
+        var attempts: u64 = 0;
+        while (attempts < std.math.maxInt(u32)) : (attempts += 1) {
+            const candidate = tunnel.next_upstream_tag;
+            tunnel.next_upstream_tag +%= 1;
+            if (tunnel.next_upstream_tag == 0) tunnel.next_upstream_tag = 1;
+            if (candidate == 0) continue;
+            if (!tunnel.pending.contains(candidate)) return candidate;
+        }
+        return 1;
     }
 };
 
@@ -958,6 +1342,500 @@ fn handleLocalFsConnection(
             },
         }
     }
+}
+
+const NodeTunnelHello = struct {
+    node_id: []u8,
+    node_secret: []u8,
+
+    fn deinit(self: *NodeTunnelHello, allocator: std.mem.Allocator) void {
+        allocator.free(self.node_id);
+        allocator.free(self.node_secret);
+        self.* = undefined;
+    }
+};
+
+fn parseNodeTunnelHelloPayload(
+    allocator: std.mem.Allocator,
+    payload_json: ?[]const u8,
+) !NodeTunnelHello {
+    _ = try validateFsNodeHelloPayload(allocator, payload_json, null);
+    const raw = payload_json orelse return error.MissingField;
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidType;
+    const node_id_value = parsed.value.object.get("node_id") orelse return error.MissingField;
+    if (node_id_value != .string or !isValidNodeIdentifier(node_id_value.string)) return error.InvalidPayload;
+    const node_secret_value = parsed.value.object.get("node_secret") orelse return error.MissingField;
+    if (node_secret_value != .string or node_secret_value.string.len == 0) return error.InvalidPayload;
+
+    return .{
+        .node_id = try allocator.dupe(u8, node_id_value.string),
+        .node_secret = try allocator.dupe(u8, node_secret_value.string),
+    };
+}
+
+fn parseFsHelloAuthToken(allocator: std.mem.Allocator, payload_json: ?[]const u8) !?[]u8 {
+    const raw = payload_json orelse return null;
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidType;
+    const auth_value = parsed.value.object.get("auth_token") orelse return null;
+    if (auth_value != .string or auth_value.string.len == 0) return null;
+    const copy = try allocator.dupe(u8, auth_value.string);
+    return @as(?[]u8, copy);
+}
+
+fn controlNodeErrorToErrno(err: anyerror) i32 {
+    return switch (err) {
+        fs_control_plane.ControlPlaneError.NodeNotFound => fs_protocol.Errno.ENOENT,
+        fs_control_plane.ControlPlaneError.NodeAuthFailed => fs_protocol.Errno.EACCES,
+        else => fs_protocol.Errno.EIO,
+    };
+}
+
+fn handleNodeTunnelConnection(
+    allocator: std.mem.Allocator,
+    runtime_registry: *AgentRuntimeRegistry,
+    stream: *std.net.Stream,
+) !void {
+    var attachment: ?NodeTunnelAttachment = null;
+    defer if (attachment) |*attached| {
+        runtime_registry.node_tunnels.detachTunnel(attached.node_id, attached.generation);
+        attached.deinit(allocator);
+    };
+    var connection_write_mutex: std.Thread.Mutex = .{};
+
+    while (true) {
+        var frame = websocket_transport.readFrame(
+            allocator,
+            stream,
+            websocket_transport.default_max_ws_frame_payload_bytes,
+        ) catch |err| switch (err) {
+            error.EndOfStream, websocket_transport.Error.ConnectionClosed => return,
+            else => return err,
+        };
+        defer frame.deinit(allocator);
+
+        switch (frame.opcode) {
+            0x1 => {
+                var parsed = unified.parseMessage(allocator, frame.payload) catch |err| {
+                    const response = try unified.buildFsrpcFsError(
+                        allocator,
+                        null,
+                        fs_protocol.Errno.EINVAL,
+                        @errorName(err),
+                    );
+                    defer allocator.free(response);
+                    try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                    try writeFrameLocked(stream, &connection_write_mutex, "", .close);
+                    return;
+                };
+                defer parsed.deinit(allocator);
+
+                if (attachment == null) {
+                    if (parsed.channel != .acheron or parsed.acheron_type != .fs_t_hello) {
+                        const response = try unified.buildFsrpcFsError(
+                            allocator,
+                            parsed.tag,
+                            fs_protocol.Errno.EINVAL,
+                            "acheron.t_fs_hello must be negotiated first",
+                        );
+                        defer allocator.free(response);
+                        try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                        try writeFrameLocked(stream, &connection_write_mutex, "", .close);
+                        return;
+                    }
+
+                    var hello = parseNodeTunnelHelloPayload(allocator, parsed.payload_json) catch |err| {
+                        const response = try unified.buildFsrpcFsError(
+                            allocator,
+                            parsed.tag,
+                            fs_protocol.Errno.EINVAL,
+                            @errorName(err),
+                        );
+                        defer allocator.free(response);
+                        try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                        try writeFrameLocked(stream, &connection_write_mutex, "", .close);
+                        return;
+                    };
+                    defer hello.deinit(allocator);
+
+                    runtime_registry.control_plane.authenticateNodeSession(hello.node_id, hello.node_secret) catch |auth_err| {
+                        const response = try unified.buildFsrpcFsError(
+                            allocator,
+                            parsed.tag,
+                            controlNodeErrorToErrno(auth_err),
+                            @errorName(auth_err),
+                        );
+                        defer allocator.free(response);
+                        try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                        try writeFrameLocked(stream, &connection_write_mutex, "", .close);
+                        return;
+                    };
+
+                    attachment = try runtime_registry.node_tunnels.attachTunnel(
+                        hello.node_id,
+                        stream,
+                        &connection_write_mutex,
+                    );
+
+                    const ack_payload = try std.fmt.allocPrint(
+                        allocator,
+                        "{{\"protocol\":\"{s}\",\"proto\":{d},\"node_id\":\"{s}\"}}",
+                        .{ fsrpc_node_protocol_version, fsrpc_node_proto_id, attachment.?.node_id },
+                    );
+                    defer allocator.free(ack_payload);
+                    const response = try unified.buildFsrpcResponse(
+                        allocator,
+                        .fs_r_hello,
+                        parsed.tag,
+                        ack_payload,
+                    );
+                    defer allocator.free(response);
+                    try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                    continue;
+                }
+
+                if (parsed.channel != .acheron) continue;
+                if (parsed.acheron_type == .fs_t_hello) {
+                    var hello = parseNodeTunnelHelloPayload(allocator, parsed.payload_json) catch |err| {
+                        const response = try unified.buildFsrpcFsError(
+                            allocator,
+                            parsed.tag,
+                            fs_protocol.Errno.EINVAL,
+                            @errorName(err),
+                        );
+                        defer allocator.free(response);
+                        try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                        try writeFrameLocked(stream, &connection_write_mutex, "", .close);
+                        return;
+                    };
+                    defer hello.deinit(allocator);
+                    if (!std.mem.eql(u8, hello.node_id, attachment.?.node_id)) {
+                        const response = try unified.buildFsrpcFsError(
+                            allocator,
+                            parsed.tag,
+                            fs_protocol.Errno.EACCES,
+                            "node_id mismatch for active tunnel",
+                        );
+                        defer allocator.free(response);
+                        try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                        try writeFrameLocked(stream, &connection_write_mutex, "", .close);
+                        return;
+                    }
+                    runtime_registry.control_plane.authenticateNodeSession(hello.node_id, hello.node_secret) catch |auth_err| {
+                        const response = try unified.buildFsrpcFsError(
+                            allocator,
+                            parsed.tag,
+                            controlNodeErrorToErrno(auth_err),
+                            @errorName(auth_err),
+                        );
+                        defer allocator.free(response);
+                        try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                        try writeFrameLocked(stream, &connection_write_mutex, "", .close);
+                        return;
+                    };
+                    const ack_payload = "{\"protocol\":\"unified-v2-fs\",\"proto\":2}";
+                    const response = try unified.buildFsrpcResponse(
+                        allocator,
+                        .fs_r_hello,
+                        parsed.tag,
+                        ack_payload,
+                    );
+                    defer allocator.free(response);
+                    try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                    continue;
+                }
+
+                runtime_registry.node_tunnels.dispatchTunnelFrame(
+                    attachment.?.node_id,
+                    attachment.?.generation,
+                    frame.payload,
+                );
+            },
+            0x8 => {
+                try writeFrameLocked(stream, &connection_write_mutex, "", .close);
+                return;
+            },
+            0x9 => {
+                try writeFrameLocked(stream, &connection_write_mutex, frame.payload, .pong);
+            },
+            0xA => {},
+            else => {
+                const response = try unified.buildFsrpcFsError(
+                    allocator,
+                    null,
+                    fs_protocol.Errno.EINVAL,
+                    "unsupported websocket opcode",
+                );
+                defer allocator.free(response);
+                try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+            },
+        }
+    }
+}
+
+fn handleRoutedNodeFsConnection(
+    allocator: std.mem.Allocator,
+    runtime_registry: *AgentRuntimeRegistry,
+    node_id: []const u8,
+    stream: *std.net.Stream,
+) !void {
+    var connection_write_mutex: std.Thread.Mutex = .{};
+    var fsrpc_negotiated = false;
+    var connection_client_id: ?u64 = null;
+    defer if (connection_client_id) |client_id| {
+        runtime_registry.node_tunnels.unregisterClient(node_id, client_id);
+    };
+
+    while (true) {
+        var frame = websocket_transport.readFrame(
+            allocator,
+            stream,
+            websocket_transport.default_max_ws_frame_payload_bytes,
+        ) catch |err| switch (err) {
+            error.EndOfStream, websocket_transport.Error.ConnectionClosed => return,
+            else => return err,
+        };
+        defer frame.deinit(allocator);
+
+        switch (frame.opcode) {
+            0x1 => {
+                var parsed = unified.parseMessage(allocator, frame.payload) catch |err| {
+                    const response = try unified.buildFsrpcFsError(
+                        allocator,
+                        null,
+                        fs_protocol.Errno.EINVAL,
+                        @errorName(err),
+                    );
+                    defer allocator.free(response);
+                    try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                    try writeFrameLocked(stream, &connection_write_mutex, "", .close);
+                    return;
+                };
+                defer parsed.deinit(allocator);
+
+                if (parsed.channel != .acheron) {
+                    const response = try unified.buildFsrpcFsError(
+                        allocator,
+                        parsed.tag,
+                        fs_protocol.Errno.EINVAL,
+                        "wrong websocket endpoint: use / for control protocol",
+                    );
+                    defer allocator.free(response);
+                    try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                    try writeFrameLocked(stream, &connection_write_mutex, "", .close);
+                    return;
+                }
+
+                const fsrpc_type = parsed.acheron_type orelse {
+                    const response = try unified.buildFsrpcFsError(
+                        allocator,
+                        parsed.tag,
+                        fs_protocol.Errno.EINVAL,
+                        "missing fsrpc message type",
+                    );
+                    defer allocator.free(response);
+                    try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                    continue;
+                };
+                const client_tag = parsed.tag orelse {
+                    const response = try unified.buildFsrpcFsError(
+                        allocator,
+                        null,
+                        fs_protocol.Errno.EINVAL,
+                        "missing request tag",
+                    );
+                    defer allocator.free(response);
+                    try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                    continue;
+                };
+
+                if (!fsrpc_negotiated) {
+                    if (fsrpc_type != .fs_t_hello) {
+                        const response = try unified.buildFsrpcFsError(
+                            allocator,
+                            parsed.tag,
+                            fs_protocol.Errno.EINVAL,
+                            "acheron.t_fs_hello must be negotiated first",
+                        );
+                        defer allocator.free(response);
+                        try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                        try writeFrameLocked(stream, &connection_write_mutex, "", .close);
+                        return;
+                    }
+                    const hello_opts = validateFsNodeHelloPayload(allocator, parsed.payload_json, null) catch |err| {
+                        const response = try unified.buildFsrpcFsError(
+                            allocator,
+                            parsed.tag,
+                            fs_protocol.Errno.EINVAL,
+                            @errorName(err),
+                        );
+                        defer allocator.free(response);
+                        try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                        try writeFrameLocked(stream, &connection_write_mutex, "", .close);
+                        return;
+                    };
+                    const auth_token = parseFsHelloAuthToken(allocator, parsed.payload_json) catch |err| {
+                        const response = try unified.buildFsrpcFsError(
+                            allocator,
+                            parsed.tag,
+                            fs_protocol.Errno.EINVAL,
+                            @errorName(err),
+                        );
+                        defer allocator.free(response);
+                        try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                        try writeFrameLocked(stream, &connection_write_mutex, "", .close);
+                        return;
+                    };
+                    defer if (auth_token) |token| allocator.free(token);
+                    if (auth_token == null) {
+                        const response = try unified.buildFsrpcFsError(
+                            allocator,
+                            parsed.tag,
+                            fs_protocol.Errno.EACCES,
+                            "missing auth_token in fs hello payload",
+                        );
+                        defer allocator.free(response);
+                        try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                        try writeFrameLocked(stream, &connection_write_mutex, "", .close);
+                        return;
+                    }
+                    runtime_registry.control_plane.authenticateNodeSession(node_id, auth_token.?) catch |auth_err| {
+                        const response = try unified.buildFsrpcFsError(
+                            allocator,
+                            parsed.tag,
+                            controlNodeErrorToErrno(auth_err),
+                            @errorName(auth_err),
+                        );
+                        defer allocator.free(response);
+                        try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                        try writeFrameLocked(stream, &connection_write_mutex, "", .close);
+                        return;
+                    };
+
+                    connection_client_id = runtime_registry.node_tunnels.registerClient(
+                        node_id,
+                        stream,
+                        &connection_write_mutex,
+                        hello_opts.allow_invalidations,
+                    ) catch {
+                        const response = try unified.buildFsrpcFsError(
+                            allocator,
+                            parsed.tag,
+                            fs_protocol.Errno.EIO,
+                            "node tunnel is unavailable",
+                        );
+                        defer allocator.free(response);
+                        try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                        try writeFrameLocked(stream, &connection_write_mutex, "", .close);
+                        return;
+                    };
+                    fsrpc_negotiated = true;
+                } else if (fsrpc_type == .fs_t_hello) {
+                    const hello_opts = validateFsNodeHelloPayload(allocator, parsed.payload_json, null) catch |err| {
+                        const response = try unified.buildFsrpcFsError(
+                            allocator,
+                            parsed.tag,
+                            fs_protocol.Errno.EINVAL,
+                            @errorName(err),
+                        );
+                        defer allocator.free(response);
+                        try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                        try writeFrameLocked(stream, &connection_write_mutex, "", .close);
+                        return;
+                    };
+                    if (connection_client_id) |client_id| {
+                        runtime_registry.node_tunnels.updateClientInvalidations(
+                            node_id,
+                            client_id,
+                            hello_opts.allow_invalidations,
+                        );
+                    }
+                }
+
+                const relayed_response = runtime_registry.node_tunnels.relayRequest(
+                    node_id,
+                    client_tag,
+                    frame.payload,
+                ) catch |relay_err| {
+                    const response = try unified.buildFsrpcFsError(
+                        allocator,
+                        parsed.tag,
+                        fs_protocol.Errno.EIO,
+                        @errorName(relay_err),
+                    );
+                    defer allocator.free(response);
+                    try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                    continue;
+                };
+                defer allocator.free(relayed_response);
+                try writeFrameLocked(stream, &connection_write_mutex, relayed_response, .text);
+            },
+            0x8 => {
+                try writeFrameLocked(stream, &connection_write_mutex, "", .close);
+                return;
+            },
+            0x9 => {
+                try writeFrameLocked(stream, &connection_write_mutex, frame.payload, .pong);
+            },
+            0xA => {},
+            else => {
+                const response = try unified.buildFsrpcFsError(
+                    allocator,
+                    null,
+                    fs_protocol.Errno.EINVAL,
+                    "unsupported websocket opcode",
+                );
+                defer allocator.free(response);
+                try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+            },
+        }
+    }
+}
+
+fn stripWsPathQuery(path: []const u8) []const u8 {
+    const query_idx = std.mem.indexOfScalar(u8, path, '?') orelse return path;
+    return path[0..query_idx];
+}
+
+fn isNodeTunnelPath(path: []const u8) bool {
+    const normalized = stripWsPathQuery(path);
+    return std.mem.eql(u8, normalized, "/v2/node") or std.mem.eql(u8, normalized, "/v2/node/");
+}
+
+fn parseNodeFsRoute(path: []const u8) ?[]const u8 {
+    const normalized = stripWsPathQuery(path);
+    const prefix = "/v2/fs/node/";
+    if (!std.mem.startsWith(u8, normalized, prefix)) return null;
+    const node_id = normalized[prefix.len..];
+    if (!isValidNodeIdentifier(node_id)) return null;
+    return node_id;
+}
+
+fn isValidNodeIdentifier(node_id: []const u8) bool {
+    if (node_id.len == 0 or node_id.len > 128) return false;
+    for (node_id) |char| {
+        if (std.ascii.isAlphanumeric(char)) continue;
+        if (char == '_' or char == '-' or char == '.') continue;
+        return false;
+    }
+    return true;
+}
+
+fn rewriteAcheronTag(
+    allocator: std.mem.Allocator,
+    raw_json: []const u8,
+    next_tag: u32,
+) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw_json, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidPayload;
+    const channel_val = parsed.value.object.get("channel") orelse return error.MissingField;
+    if (channel_val != .string or !std.mem.eql(u8, channel_val.string, "acheron")) return error.InvalidPayload;
+    try parsed.value.object.put("tag", .{ .integer = @as(i64, next_tag) });
+    return std.fmt.allocPrint(allocator, "{f}", .{std.json.fmt(parsed.value, .{})});
 }
 
 fn localFsHeartbeatThreadMain(local_node: *LocalFsNode, control_plane: *fs_control_plane.ControlPlane) void {
@@ -1483,6 +2361,7 @@ const AgentRuntimeRegistry = struct {
     control_project_scope_token: ?[]u8 = null,
     control_node_scope_token: ?[]u8 = null,
     local_fs_node: ?*LocalFsNode = null,
+    node_tunnels: NodeTunnelRegistry,
     workspace_url: ?[]u8 = null,
     mutex: std.Thread.Mutex = .{},
     by_agent: std.StringHashMapUnmanaged(AgentRuntimeEntry) = .{},
@@ -1569,6 +2448,7 @@ const AgentRuntimeRegistry = struct {
             .control_operator_token = operator_token,
             .control_project_scope_token = project_scope_token,
             .control_node_scope_token = node_scope_token,
+            .node_tunnels = .{ .allocator = allocator },
         };
     }
 
@@ -1627,6 +2507,7 @@ const AgentRuntimeRegistry = struct {
             self.allocator.free(value);
             self.workspace_url = null;
         }
+        self.node_tunnels.deinit();
         self.audit_records_mutex.lock();
         for (self.audit_records.items) |*record| record.deinit(self.allocator);
         self.audit_records.deinit(self.allocator);
@@ -3131,10 +4012,29 @@ fn handleWebSocketConnection(
         return;
     }
 
-    _ = resolveAgentIdFromConnectionPath(handshake.path, runtime_registry.default_agent_id) orelse {
-        try sendWebSocketErrorAndClose(allocator, stream, .invalid_envelope, "invalid websocket path");
+    if (isNodeTunnelPath(handshake.path)) {
+        try handleNodeTunnelConnection(allocator, runtime_registry, stream);
         return;
-    };
+    }
+
+    const maybe_node_fs_route = parseNodeFsRoute(handshake.path);
+
+    if (maybe_node_fs_route == null) {
+        _ = resolveAgentIdFromConnectionPath(handshake.path, runtime_registry.default_agent_id) orelse {
+            try sendWebSocketErrorAndClose(allocator, stream, .invalid_envelope, "invalid websocket path");
+            return;
+        };
+    }
+
+    if (maybe_node_fs_route) |node_id| {
+        try handleRoutedNodeFsConnection(
+            allocator,
+            runtime_registry,
+            node_id,
+            stream,
+        );
+        return;
+    }
 
     const principal = runtime_registry.authenticateConnection(handshake.authorization) orelse {
         try sendWebSocketErrorAndClose(allocator, stream, .provider_auth_failed, "forbidden");
@@ -6868,12 +7768,12 @@ test "server_piai: extract project payload helpers parse id and token" {
 
 test "server_piai: validateFsNodeHelloPayload enforces optional auth_token" {
     const allocator = std.testing.allocator;
-    try validateFsNodeHelloPayload(
+    _ = try validateFsNodeHelloPayload(
         allocator,
         "{\"protocol\":\"unified-v2-fs\",\"proto\":2}",
         null,
     );
-    try validateFsNodeHelloPayload(
+    _ = try validateFsNodeHelloPayload(
         allocator,
         "{\"protocol\":\"unified-v2-fs\",\"proto\":2,\"auth_token\":\"secret\"}",
         "secret",
@@ -6894,6 +7794,24 @@ test "server_piai: validateFsNodeHelloPayload enforces optional auth_token" {
             "secret",
         ),
     );
+}
+
+test "server_piai: node fs route parser extracts node id" {
+    const route = parseNodeFsRoute("/v2/fs/node/node-17") orelse return error.TestExpectedResponse;
+    try std.testing.expectEqualStrings("node-17", route);
+    const route_q = parseNodeFsRoute("/v2/fs/node/node_17?session=a") orelse return error.TestExpectedResponse;
+    try std.testing.expectEqualStrings("node_17", route_q);
+    try std.testing.expect(parseNodeFsRoute("/v2/fs/node/") == null);
+    try std.testing.expect(parseNodeFsRoute("/v2/fs/node/node:bad") == null);
+}
+
+test "server_piai: rewriteAcheronTag rewrites top-level tag" {
+    const allocator = std.testing.allocator;
+    const raw = "{\"channel\":\"acheron\",\"type\":\"acheron.t_fs_lookup\",\"tag\":7,\"payload\":{\"name\":\"a\"}}";
+    const rewritten = try rewriteAcheronTag(allocator, raw, 99);
+    defer allocator.free(rewritten);
+    try std.testing.expect(std.mem.indexOf(u8, rewritten, "\"tag\":99") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rewritten, "\"type\":\"acheron.t_fs_lookup\"") != null);
 }
 
 test "server_piai: agent id validation allows safe identifiers only" {
