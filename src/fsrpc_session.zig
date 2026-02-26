@@ -554,7 +554,7 @@ pub const Session = struct {
         try self.addDirectoryDescriptors(
             project_meta_dir,
             "Project Metadata",
-            "{\"kind\":\"metadata\",\"files\":[\"topology.json\",\"workspace_status.json\",\"mounts.json\",\"desired_mounts.json\",\"actual_mounts.json\",\"drift.json\",\"availability.json\"]}",
+            "{\"kind\":\"metadata\",\"files\":[\"topology.json\",\"workspace_status.json\",\"mounts.json\",\"desired_mounts.json\",\"actual_mounts.json\",\"drift.json\",\"reconcile.json\",\"availability.json\"]}",
             "{\"read\":true,\"write\":false}",
             "Project topology and availability metadata.",
         );
@@ -650,6 +650,12 @@ pub const Session = struct {
             } else {
                 _ = try self.addFile(project_meta_dir, "drift.json", "{\"count\":0,\"items\":[]}", false, .none);
             }
+            if (try self.extractWorkspaceReconcile(status_json)) |reconcile_json| {
+                defer self.allocator.free(reconcile_json);
+                _ = try self.addFile(project_meta_dir, "reconcile.json", reconcile_json, false, .none);
+            } else {
+                _ = try self.addFile(project_meta_dir, "reconcile.json", "{\"reconcile_state\":\"unknown\",\"last_reconcile_ms\":0,\"last_success_ms\":0,\"last_error\":null,\"queue_depth\":0}", false, .none);
+            }
             if (try self.extractWorkspaceAvailability(status_json)) |availability_json| {
                 defer self.allocator.free(availability_json);
                 _ = try self.addFile(project_meta_dir, "availability.json", availability_json, false, .none);
@@ -666,6 +672,7 @@ pub const Session = struct {
         _ = try self.addFile(project_meta_dir, "desired_mounts.json", "[]", false, .none);
         _ = try self.addFile(project_meta_dir, "actual_mounts.json", "[]", false, .none);
         _ = try self.addFile(project_meta_dir, "drift.json", "{\"count\":0,\"items\":[]}", false, .none);
+        _ = try self.addFile(project_meta_dir, "reconcile.json", "{\"reconcile_state\":\"unknown\",\"last_reconcile_ms\":0,\"last_success_ms\":0,\"last_error\":null,\"queue_depth\":0}", false, .none);
         _ = try self.addFile(project_meta_dir, "availability.json", "{\"mounts_total\":0,\"online\":0,\"degraded\":0,\"missing\":0}", false, .none);
     }
 
@@ -1071,6 +1078,51 @@ pub const Session = struct {
         const drift_value = parsed.value.object.get("drift") orelse return null;
         if (drift_value != .object) return null;
         const rendered = try std.fmt.allocPrint(self.allocator, "{f}", .{std.json.fmt(drift_value, .{})});
+        return rendered;
+    }
+
+    fn extractWorkspaceReconcile(self: *Session, workspace_status_json: []const u8) !?[]u8 {
+        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, workspace_status_json, .{}) catch return null;
+        defer parsed.deinit();
+        if (parsed.value != .object) return null;
+
+        const reconcile_state = blk: {
+            if (parsed.value.object.get("reconcile_state")) |value| {
+                if (value == .string and value.string.len > 0) break :blk value.string;
+            }
+            break :blk "unknown";
+        };
+        const last_reconcile_ms: i64 = blk: {
+            if (parsed.value.object.get("last_reconcile_ms")) |value| {
+                if (value == .integer) break :blk value.integer;
+            }
+            break :blk 0;
+        };
+        const last_success_ms: i64 = blk: {
+            if (parsed.value.object.get("last_success_ms")) |value| {
+                if (value == .integer) break :blk value.integer;
+            }
+            break :blk 0;
+        };
+        const queue_depth: i64 = blk: {
+            if (parsed.value.object.get("queue_depth")) |value| {
+                if (value == .integer and value.integer >= 0) break :blk value.integer;
+            }
+            break :blk 0;
+        };
+        const last_error_json = if (parsed.value.object.get("last_error")) |value|
+            try std.fmt.allocPrint(self.allocator, "{f}", .{std.json.fmt(value, .{})})
+        else
+            try self.allocator.dupe(u8, "null");
+        defer self.allocator.free(last_error_json);
+        const escaped_state = try unified.jsonEscape(self.allocator, reconcile_state);
+        defer self.allocator.free(escaped_state);
+
+        const rendered = try std.fmt.allocPrint(
+            self.allocator,
+            "{{\"reconcile_state\":\"{s}\",\"last_reconcile_ms\":{d},\"last_success_ms\":{d},\"last_error\":{s},\"queue_depth\":{d}}}",
+            .{ escaped_state, last_reconcile_ms, last_success_ms, last_error_json, queue_depth },
+        );
         return rendered;
     }
 
@@ -2203,6 +2255,7 @@ test "fsrpc_session: project meta includes control-plane workspace status" {
     const desired_mounts_id = session.lookupChild(meta_node, "desired_mounts.json") orelse return error.TestExpectedResponse;
     const actual_mounts_id = session.lookupChild(meta_node, "actual_mounts.json") orelse return error.TestExpectedResponse;
     const drift_id = session.lookupChild(meta_node, "drift.json") orelse return error.TestExpectedResponse;
+    const reconcile_id = session.lookupChild(meta_node, "reconcile.json") orelse return error.TestExpectedResponse;
     const availability_id = session.lookupChild(meta_node, "availability.json") orelse return error.TestExpectedResponse;
 
     const project_fs_schema = session.nodes.get(project_fs_schema_id) orelse return error.TestExpectedResponse;
@@ -2215,6 +2268,7 @@ test "fsrpc_session: project meta includes control-plane workspace status" {
     const desired_mounts_node = session.nodes.get(desired_mounts_id) orelse return error.TestExpectedResponse;
     const actual_mounts_node = session.nodes.get(actual_mounts_id) orelse return error.TestExpectedResponse;
     const drift_node = session.nodes.get(drift_id) orelse return error.TestExpectedResponse;
+    const reconcile_node = session.nodes.get(reconcile_id) orelse return error.TestExpectedResponse;
     const availability_node = session.nodes.get(availability_id) orelse return error.TestExpectedResponse;
 
     try std.testing.expect(std.mem.indexOf(u8, project_fs_schema.content, "\"kind\":\"collection\"") != null);
@@ -2223,6 +2277,7 @@ test "fsrpc_session: project meta includes control-plane workspace status" {
     try std.testing.expect(std.mem.indexOf(u8, meta_schema.content, "\"desired_mounts.json\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, meta_schema.content, "\"actual_mounts.json\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, meta_schema.content, "\"drift.json\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, meta_schema.content, "\"reconcile.json\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, mount_link_node.content, "/nodes/") != null);
     try std.testing.expect(std.mem.indexOf(u8, mount_link_node.content, "/fs") != null);
     try std.testing.expect(std.mem.indexOf(u8, topology_node.content, "\"project_links\"") != null);
@@ -2232,6 +2287,8 @@ test "fsrpc_session: project meta includes control-plane workspace status" {
     try std.testing.expect(std.mem.indexOf(u8, desired_mounts_node.content, "\"mount_path\":\"/src\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, actual_mounts_node.content, "\"mount_path\":\"/src\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, drift_node.content, "\"count\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, reconcile_node.content, "\"reconcile_state\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, reconcile_node.content, "\"queue_depth\":") != null);
     try std.testing.expect(std.mem.indexOf(u8, workspace_node.content, "\"state\":\"online\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, availability_node.content, "\"mounts_total\":1") != null);
 }
@@ -2450,16 +2507,19 @@ test "fsrpc_session: project workspace fallback is scoped to requested project" 
     const desired_mounts_id = session.lookupChild(meta_node, "desired_mounts.json") orelse return error.TestExpectedResponse;
     const actual_mounts_id = session.lookupChild(meta_node, "actual_mounts.json") orelse return error.TestExpectedResponse;
     const drift_id = session.lookupChild(meta_node, "drift.json") orelse return error.TestExpectedResponse;
+    const reconcile_id = session.lookupChild(meta_node, "reconcile.json") orelse return error.TestExpectedResponse;
     const workspace_node = session.nodes.get(workspace_id) orelse return error.TestExpectedResponse;
     const mounts_node = session.nodes.get(mounts_id) orelse return error.TestExpectedResponse;
     const desired_mounts_node = session.nodes.get(desired_mounts_id) orelse return error.TestExpectedResponse;
     const actual_mounts_node = session.nodes.get(actual_mounts_id) orelse return error.TestExpectedResponse;
     const drift_node = session.nodes.get(drift_id) orelse return error.TestExpectedResponse;
+    const reconcile_node = session.nodes.get(reconcile_id) orelse return error.TestExpectedResponse;
     try std.testing.expect(std.mem.indexOf(u8, workspace_node.content, "\"source\":\"policy\"") != null);
     try std.testing.expect(std.mem.eql(u8, mounts_node.content, "[]"));
     try std.testing.expect(std.mem.eql(u8, desired_mounts_node.content, "[]"));
     try std.testing.expect(std.mem.eql(u8, actual_mounts_node.content, "[]"));
     try std.testing.expect(std.mem.eql(u8, drift_node.content, "{\"count\":0,\"items\":[]}"));
+    try std.testing.expect(std.mem.eql(u8, reconcile_node.content, "{\"reconcile_state\":\"unknown\",\"last_reconcile_ms\":0,\"last_success_ms\":0,\"last_error\":null,\"queue_depth\":0}"));
     try std.testing.expect(std.mem.indexOf(u8, workspace_node.content, project_b_id.string) == null);
 }
 

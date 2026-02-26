@@ -102,6 +102,7 @@ Project metadata now includes:
 - `desired_mounts.json` (desired mount set from workspace status `desired_mounts`)
 - `actual_mounts.json` (resolved/selected mount set from workspace status `actual_mounts`)
 - `drift.json` (workspace drift summary from workspace status `drift`)
+- `reconcile.json` (workspace reconcile health from `reconcile_state`, timestamps, `last_error`, and `queue_depth`)
 - `availability.json` (extracted workspace availability rollup)
 
 Runtime uses project token (when bound) for workspace status lookup and falls back
