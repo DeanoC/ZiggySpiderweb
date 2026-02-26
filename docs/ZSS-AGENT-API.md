@@ -87,5 +87,33 @@ Available session operations today:
 - `control.session_resume`
 - `control.session_list`
 - `control.session_close`
+- `control.session_restore`
+- `control.session_history`
 
-These provide in-connection session switching/listing. Persistent "restore last active session with summary" remains planned work in `docs/plan-agent-discovery-restore.md`.
+### `control.session_restore`
+
+Request payload fields:
+- `agent_id` (optional): restrict restore to one agent
+
+Response payload:
+- `{"found":false}` when no persisted match exists
+- `{"found":true,"session":{...}}` when a persisted session exists
+
+Returned `session` fields:
+- `session_key`
+- `agent_id`
+- `project_id`
+- `last_active_ms`
+- `message_count`
+- `summary` (nullable)
+
+### `control.session_history`
+
+Request payload fields:
+- `agent_id` (optional): restrict history to one agent
+- `limit` (optional, default `10`, max `100`)
+
+Response payload:
+- `{"sessions":[ ... ]}` with newest-first persisted entries
+
+These operations now provide persisted session restore/history metadata across reconnects (per auth role token).

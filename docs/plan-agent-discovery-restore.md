@@ -216,7 +216,7 @@ zss session history --limit 5
 
 - [x] Client can list available agents
 - [x] Client can identify default agent
-- [ ] Client can restore last active session
+- [x] Client can restore last active session
 - [ ] Session history shows summaries
-- [ ] Works across client reconnects
+- [x] Works across client reconnects
 - [ ] Sessions properly archived after timeout

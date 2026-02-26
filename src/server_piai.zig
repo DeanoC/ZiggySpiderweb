@@ -1995,18 +1995,57 @@ const RememberedTarget = struct {
     }
 };
 
+const SessionHistoryEntry = struct {
+    session_key: []u8,
+    agent_id: []u8,
+    project_id: []u8,
+    last_active_ms: i64,
+    message_count: u64 = 0,
+    summary: ?[]u8 = null,
+
+    fn deinit(self: *SessionHistoryEntry, allocator: std.mem.Allocator) void {
+        allocator.free(self.session_key);
+        allocator.free(self.agent_id);
+        allocator.free(self.project_id);
+        if (self.summary) |value| allocator.free(value);
+        self.* = undefined;
+    }
+
+    fn cloneOwned(self: *const SessionHistoryEntry, allocator: std.mem.Allocator) !SessionHistoryEntry {
+        return .{
+            .session_key = try allocator.dupe(u8, self.session_key),
+            .agent_id = try allocator.dupe(u8, self.agent_id),
+            .project_id = try allocator.dupe(u8, self.project_id),
+            .last_active_ms = self.last_active_ms,
+            .message_count = self.message_count,
+            .summary = if (self.summary) |value| try allocator.dupe(u8, value) else null,
+        };
+    }
+};
+
 const AuthTokenStore = struct {
     const PersistedTarget = struct {
         agent_id: ?[]const u8 = null,
         project_id: ?[]const u8 = null,
     };
 
+    const PersistedSessionHistoryEntry = struct {
+        session_key: []const u8,
+        agent_id: []const u8,
+        project_id: []const u8,
+        last_active_ms: i64 = 0,
+        message_count: u64 = 0,
+        summary: ?[]const u8 = null,
+    };
+
     const Persisted = struct {
-        schema: u32 = 2,
+        schema: u32 = 3,
         admin_token: []const u8,
         user_token: []const u8,
         admin_last_target: ?PersistedTarget = null,
         user_last_target: ?PersistedTarget = null,
+        admin_session_history: ?[]PersistedSessionHistoryEntry = null,
+        user_session_history: ?[]PersistedSessionHistoryEntry = null,
         updated_at_ms: i64,
     };
 
@@ -2016,6 +2055,8 @@ const AuthTokenStore = struct {
     user_token: []u8,
     admin_last_target: ?RememberedTarget = null,
     user_last_target: ?RememberedTarget = null,
+    admin_session_history: std.ArrayListUnmanaged(SessionHistoryEntry) = .{},
+    user_session_history: std.ArrayListUnmanaged(SessionHistoryEntry) = .{},
     mutex: std.Thread.Mutex = .{},
 
     fn init(allocator: std.mem.Allocator, runtime_config: Config.RuntimeConfig) AuthTokenStore {
@@ -2034,6 +2075,10 @@ const AuthTokenStore = struct {
         self.allocator.free(self.user_token);
         if (self.admin_last_target) |*target| target.deinit(self.allocator);
         if (self.user_last_target) |*target| target.deinit(self.allocator);
+        for (self.admin_session_history.items) |*entry| entry.deinit(self.allocator);
+        self.admin_session_history.deinit(self.allocator);
+        for (self.user_session_history.items) |*entry| entry.deinit(self.allocator);
+        self.user_session_history.deinit(self.allocator);
         self.* = undefined;
     }
 
@@ -2140,6 +2185,119 @@ const AuthTokenStore = struct {
             return err;
         };
         if (previous) |*value| value.deinit(self.allocator);
+    }
+
+    fn recordSessionActivity(
+        self: *AuthTokenStore,
+        role: ConnectionRole,
+        session_key: []const u8,
+        agent_id: []const u8,
+        project_id: []const u8,
+        message_delta: u64,
+    ) !void {
+        const max_history_entries: usize = 10;
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const history = switch (role) {
+            .admin => &self.admin_session_history,
+            .user => &self.user_session_history,
+        };
+
+        const now_ms = std.time.milliTimestamp();
+        for (history.items) |*entry| {
+            if (std.mem.eql(u8, entry.session_key, session_key) and
+                std.mem.eql(u8, entry.agent_id, agent_id) and
+                std.mem.eql(u8, entry.project_id, project_id))
+            {
+                entry.last_active_ms = now_ms;
+                entry.message_count += message_delta;
+                self.sortSessionHistoryNewestFirst(history);
+                self.persistCurrentStateLocked() catch |err| {
+                    std.log.warn("failed to persist session history update: {s}", .{@errorName(err)});
+                };
+                return;
+            }
+        }
+
+        try history.append(self.allocator, .{
+            .session_key = try self.allocator.dupe(u8, session_key),
+            .agent_id = try self.allocator.dupe(u8, agent_id),
+            .project_id = try self.allocator.dupe(u8, project_id),
+            .last_active_ms = now_ms,
+            .message_count = message_delta,
+            .summary = null,
+        });
+        self.sortSessionHistoryNewestFirst(history);
+        while (history.items.len > max_history_entries) {
+            var removed = history.pop().?;
+            removed.deinit(self.allocator);
+        }
+        self.persistCurrentStateLocked() catch |err| {
+            std.log.warn("failed to persist session history append: {s}", .{@errorName(err)});
+        };
+    }
+
+    fn sessionHistoryOwned(
+        self: *AuthTokenStore,
+        role: ConnectionRole,
+        agent_id_filter: ?[]const u8,
+        limit: usize,
+    ) !std.ArrayListUnmanaged(SessionHistoryEntry) {
+        var out = std.ArrayListUnmanaged(SessionHistoryEntry){};
+        errdefer {
+            for (out.items) |*entry| entry.deinit(self.allocator);
+            out.deinit(self.allocator);
+        }
+
+        const effective_limit = if (limit == 0) @as(usize, 10) else limit;
+        const mutex = &self.mutex;
+        mutex.lock();
+        defer mutex.unlock();
+        const history = switch (role) {
+            .admin => &self.admin_session_history,
+            .user => &self.user_session_history,
+        };
+        for (history.items) |*entry| {
+            if (agent_id_filter) |filter| {
+                if (!std.mem.eql(u8, entry.agent_id, filter)) continue;
+            }
+            try out.append(self.allocator, try entry.cloneOwned(self.allocator));
+            if (out.items.len >= effective_limit) break;
+        }
+        return out;
+    }
+
+    fn latestSessionOwned(
+        self: *AuthTokenStore,
+        role: ConnectionRole,
+        agent_id_filter: ?[]const u8,
+    ) !?SessionHistoryEntry {
+        var history = try self.sessionHistoryOwned(role, agent_id_filter, 1);
+        errdefer {
+            for (history.items) |*entry| entry.deinit(self.allocator);
+            history.deinit(self.allocator);
+        }
+        if (history.items.len == 0) {
+            history.deinit(self.allocator);
+            return null;
+        }
+        const entry = history.orderedRemove(0);
+        history.deinit(self.allocator);
+        return entry;
+    }
+
+    fn sortSessionHistoryNewestFirst(self: *AuthTokenStore, history: *std.ArrayListUnmanaged(SessionHistoryEntry)) void {
+        _ = self;
+        var i: usize = 1;
+        while (i < history.items.len) : (i += 1) {
+            var j = i;
+            while (j > 0 and history.items[j - 1].last_active_ms < history.items[j].last_active_ms) : (j -= 1) {
+                const tmp = history.items[j - 1];
+                history.items[j - 1] = history.items[j];
+                history.items[j] = tmp;
+            }
+        }
     }
 
     fn statusJson(self: *const AuthTokenStore) ![]u8 {
@@ -2250,6 +2408,16 @@ const AuthTokenStore = struct {
         errdefer if (next_admin_target) |*target| target.deinit(self.allocator);
         var next_user_target = try copyPersistedTarget(self.allocator, parsed.value.user_last_target);
         errdefer if (next_user_target) |*target| target.deinit(self.allocator);
+        var next_admin_history = try copyPersistedSessionHistory(
+            self.allocator,
+            parsed.value.admin_session_history,
+        );
+        errdefer deinitSessionHistoryList(self.allocator, &next_admin_history);
+        var next_user_history = try copyPersistedSessionHistory(
+            self.allocator,
+            parsed.value.user_session_history,
+        );
+        errdefer deinitSessionHistoryList(self.allocator, &next_user_history);
 
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -2257,21 +2425,38 @@ const AuthTokenStore = struct {
         const previous_user = self.user_token;
         var previous_admin_target = self.admin_last_target;
         var previous_user_target = self.user_last_target;
+        var previous_admin_history = self.admin_session_history;
+        var previous_user_history = self.user_session_history;
         self.admin_token = next_admin;
         self.user_token = next_user;
         self.admin_last_target = next_admin_target;
         self.user_last_target = next_user_target;
+        self.admin_session_history = next_admin_history;
+        self.user_session_history = next_user_history;
         self.allocator.free(previous_admin);
         self.allocator.free(previous_user);
         if (previous_admin_target) |*target| target.deinit(self.allocator);
         if (previous_user_target) |*target| target.deinit(self.allocator);
+        deinitSessionHistoryList(self.allocator, &previous_admin_history);
+        deinitSessionHistoryList(self.allocator, &previous_user_history);
         return true;
     }
 
     fn persistCurrentStateLocked(self: *AuthTokenStore) !void {
         const path = self.path orelse return error.AuthTokenPathUnavailable;
+        const admin_history = try persistedSessionHistorySlice(
+            self.allocator,
+            self.admin_session_history.items,
+        );
+        defer if (admin_history) |value| self.allocator.free(value);
+        const user_history = try persistedSessionHistorySlice(
+            self.allocator,
+            self.user_session_history.items,
+        );
+        defer if (user_history) |value| self.allocator.free(value);
+
         const payload = Persisted{
-            .schema = 2,
+            .schema = 3,
             .admin_token = self.admin_token,
             .user_token = self.user_token,
             .admin_last_target = if (self.admin_last_target) |value| .{
@@ -2282,6 +2467,8 @@ const AuthTokenStore = struct {
                 .agent_id = value.agent_id,
                 .project_id = value.project_id,
             } else null,
+            .admin_session_history = admin_history,
+            .user_session_history = user_history,
             .updated_at_ms = std.time.milliTimestamp(),
         };
         const bytes = try std.json.Stringify.valueAlloc(self.allocator, payload, .{
@@ -2309,6 +2496,55 @@ const AuthTokenStore = struct {
             .agent_id = try allocator.dupe(u8, agent_id),
             .project_id = try allocator.dupe(u8, project_id),
         };
+    }
+
+    fn copyPersistedSessionHistory(
+        allocator: std.mem.Allocator,
+        persisted: ?[]PersistedSessionHistoryEntry,
+    ) !std.ArrayListUnmanaged(SessionHistoryEntry) {
+        var out = std.ArrayListUnmanaged(SessionHistoryEntry){};
+        errdefer deinitSessionHistoryList(allocator, &out);
+
+        const items = persisted orelse return out;
+        for (items) |entry| {
+            try out.append(allocator, .{
+                .session_key = try allocator.dupe(u8, entry.session_key),
+                .agent_id = try allocator.dupe(u8, entry.agent_id),
+                .project_id = try allocator.dupe(u8, entry.project_id),
+                .last_active_ms = entry.last_active_ms,
+                .message_count = entry.message_count,
+                .summary = if (entry.summary) |value| try allocator.dupe(u8, value) else null,
+            });
+        }
+        return out;
+    }
+
+    fn deinitSessionHistoryList(
+        allocator: std.mem.Allocator,
+        list: *std.ArrayListUnmanaged(SessionHistoryEntry),
+    ) void {
+        for (list.items) |*entry| entry.deinit(allocator);
+        list.deinit(allocator);
+        list.* = .{};
+    }
+
+    fn persistedSessionHistorySlice(
+        allocator: std.mem.Allocator,
+        entries: []const SessionHistoryEntry,
+    ) !?[]PersistedSessionHistoryEntry {
+        if (entries.len == 0) return null;
+        var out = try allocator.alloc(PersistedSessionHistoryEntry, entries.len);
+        for (entries, 0..) |entry, idx| {
+            out[idx] = .{
+                .session_key = entry.session_key,
+                .agent_id = entry.agent_id,
+                .project_id = entry.project_id,
+                .last_active_ms = entry.last_active_ms,
+                .message_count = entry.message_count,
+                .summary = entry.summary,
+            };
+        }
+        return out;
     }
 
     fn parseBearerToken(header_value: []const u8) ?[]const u8 {
@@ -2688,6 +2924,26 @@ const AgentRuntimeRegistry = struct {
         if (std.mem.eql(u8, concrete_project, system_project_id)) return;
         self.auth_tokens.setRememberedTarget(principal.role, agent_id, concrete_project) catch |err| {
             std.log.warn("failed to persist last target for {s}: {s}", .{ connectionRoleName(principal.role), @errorName(err) });
+        };
+    }
+
+    fn rememberPrincipalSession(
+        self: *AgentRuntimeRegistry,
+        principal: ConnectionPrincipal,
+        session_key: []const u8,
+        agent_id: []const u8,
+        project_id: ?[]const u8,
+    ) void {
+        const concrete_project = project_id orelse return;
+        if (std.mem.eql(u8, concrete_project, system_project_id)) return;
+        self.auth_tokens.recordSessionActivity(
+            principal.role,
+            session_key,
+            agent_id,
+            concrete_project,
+            0,
+        ) catch |err| {
+            std.log.warn("failed to persist session history for {s}: {s}", .{ connectionRoleName(principal.role), @errorName(err) });
         };
     }
 
@@ -4215,6 +4471,8 @@ fn handleWebSocketConnection(
                             control_type != .version and
                             control_type != .connect and
                             control_type != .session_attach and
+                            control_type != .session_restore and
+                            control_type != .session_history and
                             control_type != .agent_list and
                             control_type != .agent_get)
                         {
@@ -4772,6 +5030,12 @@ fn handleWebSocketConnection(
                                     active_binding.agent_id,
                                     active_binding.project_id,
                                 );
+                                runtime_registry.rememberPrincipalSession(
+                                    principal,
+                                    session_key,
+                                    active_binding.agent_id,
+                                    active_binding.project_id,
+                                );
                                 continue;
                             },
                             .session_status => {
@@ -4917,6 +5181,17 @@ fn handleWebSocketConnection(
                                 );
                                 defer allocator.free(response);
                                 try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                runtime_registry.rememberPrincipalTarget(
+                                    principal,
+                                    binding.agent_id,
+                                    binding.project_id,
+                                );
+                                runtime_registry.rememberPrincipalSession(
+                                    principal,
+                                    session_key,
+                                    binding.agent_id,
+                                    binding.project_id,
+                                );
                                 continue;
                             },
                             .session_list => {
@@ -4925,6 +5200,89 @@ fn handleWebSocketConnection(
                                 const response = try unified.buildControlAck(
                                     allocator,
                                     .session_list,
+                                    parsed.id,
+                                    payload_json,
+                                );
+                                defer allocator.free(response);
+                                try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                continue;
+                            },
+                            .session_restore => {
+                                var payload = try parseControlPayloadObject(allocator, parsed.payload_json);
+                                defer payload.deinit();
+                                if (payload.value != .object) {
+                                    const response = try unified.buildControlError(
+                                        allocator,
+                                        parsed.id,
+                                        "invalid_payload",
+                                        "session_restore payload must be an object",
+                                    );
+                                    defer allocator.free(response);
+                                    try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                    continue;
+                                }
+                                const agent_filter = getOptionalStringField(payload.value.object, "agent_id");
+                                var restored = try runtime_registry.auth_tokens.latestSessionOwned(principal.role, agent_filter);
+                                defer if (restored) |*entry| entry.deinit(allocator);
+
+                                const payload_json = try buildSessionRestorePayload(allocator, restored);
+                                defer allocator.free(payload_json);
+                                const response = try unified.buildControlAck(
+                                    allocator,
+                                    .session_restore,
+                                    parsed.id,
+                                    payload_json,
+                                );
+                                defer allocator.free(response);
+                                try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                continue;
+                            },
+                            .session_history => {
+                                var payload = try parseControlPayloadObject(allocator, parsed.payload_json);
+                                defer payload.deinit();
+                                if (payload.value != .object) {
+                                    const response = try unified.buildControlError(
+                                        allocator,
+                                        parsed.id,
+                                        "invalid_payload",
+                                        "session_history payload must be an object",
+                                    );
+                                    defer allocator.free(response);
+                                    try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                    continue;
+                                }
+                                const agent_filter = getOptionalStringField(payload.value.object, "agent_id");
+                                const limit = blk: {
+                                    const value = payload.value.object.get("limit") orelse break :blk @as(usize, 10);
+                                    if (value != .integer or value.integer < 0) {
+                                        const response = try unified.buildControlError(
+                                            allocator,
+                                            parsed.id,
+                                            "invalid_payload",
+                                            "limit must be a non-negative integer",
+                                        );
+                                        defer allocator.free(response);
+                                        try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                        continue;
+                                    }
+                                    if (value.integer > 100) break :blk @as(usize, 100);
+                                    break :blk @as(usize, @intCast(value.integer));
+                                };
+                                var history = try runtime_registry.auth_tokens.sessionHistoryOwned(
+                                    principal.role,
+                                    agent_filter,
+                                    limit,
+                                );
+                                defer {
+                                    for (history.items) |*entry| entry.deinit(allocator);
+                                    history.deinit(allocator);
+                                }
+
+                                const payload_json = try buildSessionHistoryPayload(allocator, history.items);
+                                defer allocator.free(payload_json);
+                                const response = try unified.buildControlAck(
+                                    allocator,
+                                    .session_history,
                                     parsed.id,
                                     payload_json,
                                 );
@@ -5824,6 +6182,65 @@ fn buildSessionListPayload(
     return out.toOwnedSlice(allocator);
 }
 
+fn appendSessionHistoryEntryJson(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    entry: SessionHistoryEntry,
+) !void {
+    const escaped_session = try unified.jsonEscape(allocator, entry.session_key);
+    defer allocator.free(escaped_session);
+    const escaped_agent = try unified.jsonEscape(allocator, entry.agent_id);
+    defer allocator.free(escaped_agent);
+    const escaped_project = try unified.jsonEscape(allocator, entry.project_id);
+    defer allocator.free(escaped_project);
+    const summary_json = if (entry.summary) |value| blk: {
+        const escaped_summary = try unified.jsonEscape(allocator, value);
+        defer allocator.free(escaped_summary);
+        break :blk try std.fmt.allocPrint(allocator, "\"{s}\"", .{escaped_summary});
+    } else try allocator.dupe(u8, "null");
+    defer allocator.free(summary_json);
+
+    try out.writer(allocator).print(
+        "{{\"session_key\":\"{s}\",\"agent_id\":\"{s}\",\"project_id\":\"{s}\",\"last_active_ms\":{d},\"message_count\":{d},\"summary\":{s}}}",
+        .{
+            escaped_session,
+            escaped_agent,
+            escaped_project,
+            entry.last_active_ms,
+            entry.message_count,
+            summary_json,
+        },
+    );
+}
+
+fn buildSessionRestorePayload(
+    allocator: std.mem.Allocator,
+    maybe_entry: ?SessionHistoryEntry,
+) ![]u8 {
+    if (maybe_entry == null) return allocator.dupe(u8, "{\"found\":false}");
+    var out = std.ArrayListUnmanaged(u8){};
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, "{\"found\":true,\"session\":");
+    try appendSessionHistoryEntryJson(allocator, &out, maybe_entry.?);
+    try out.append(allocator, '}');
+    return out.toOwnedSlice(allocator);
+}
+
+fn buildSessionHistoryPayload(
+    allocator: std.mem.Allocator,
+    history: []const SessionHistoryEntry,
+) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8){};
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, "{\"sessions\":[");
+    for (history, 0..) |entry, idx| {
+        if (idx != 0) try out.append(allocator, ',');
+        try appendSessionHistoryEntryJson(allocator, &out, entry);
+    }
+    try out.appendSlice(allocator, "]}");
+    return out.toOwnedSlice(allocator);
+}
+
 fn parseSessionKeyFromLegacyMessage(allocator: std.mem.Allocator, raw_json: []const u8) ?[]u8 {
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw_json, .{}) catch return null;
     defer parsed.deinit();
@@ -6620,10 +7037,16 @@ fn setAuthTokensForTests(
     allocator.free(runtime_registry.auth_tokens.user_token);
     if (runtime_registry.auth_tokens.admin_last_target) |*target| target.deinit(allocator);
     if (runtime_registry.auth_tokens.user_last_target) |*target| target.deinit(allocator);
+    for (runtime_registry.auth_tokens.admin_session_history.items) |*entry| entry.deinit(allocator);
+    runtime_registry.auth_tokens.admin_session_history.deinit(allocator);
+    for (runtime_registry.auth_tokens.user_session_history.items) |*entry| entry.deinit(allocator);
+    runtime_registry.auth_tokens.user_session_history.deinit(allocator);
     runtime_registry.auth_tokens.admin_token = try allocator.dupe(u8, admin_token);
     runtime_registry.auth_tokens.user_token = try allocator.dupe(u8, user_token);
     runtime_registry.auth_tokens.admin_last_target = null;
     runtime_registry.auth_tokens.user_last_target = null;
+    runtime_registry.auth_tokens.admin_session_history = .{};
+    runtime_registry.auth_tokens.user_session_history = .{};
 }
 
 fn seedUserRememberedTargetForTests(
@@ -7434,6 +7857,112 @@ test "server_piai: user connect is rejected when no remembered non-system target
     var close_reply = try readServerFrame(allocator, &user_client);
     defer close_reply.deinit(allocator);
     try std.testing.expectEqual(@as(u8, 0x8), close_reply.opcode);
+
+    try std.testing.expect(server_ctx.err_name == null);
+}
+
+test "server_piai: control.session_history and control.session_restore survive reconnect" {
+    const allocator = std.testing.allocator;
+    var runtime_registry = AgentRuntimeRegistry.init(allocator, .{
+        .ltm_directory = "",
+        .ltm_filename = "",
+    }, null);
+    defer runtime_registry.deinit();
+    try setAuthTokensForTests(&runtime_registry, "admin-secret", "user-secret");
+    try seedUserRememberedTargetForTests(&runtime_registry, runtime_registry.default_agent_id);
+    const remembered_target = runtime_registry.auth_tokens.user_last_target orelse return error.TestExpectedResult;
+    const remembered_project_id = remembered_target.project_id;
+
+    var listener = try (try std.net.Address.parseIp("127.0.0.1", 0)).listen(.{ .reuse_address = true });
+    defer listener.deinit();
+
+    var server_ctx = WsTestServerCtx{
+        .allocator = allocator,
+        .runtime_registry = &runtime_registry,
+        .listener = &listener,
+    };
+    defer server_ctx.deinit();
+
+    {
+        const server_thread = try std.Thread.spawn(.{}, runSingleWsConnection, .{&server_ctx});
+        defer server_thread.join();
+
+        var user_client = try std.net.tcpConnectToAddress(listener.listen_address);
+        defer user_client.close();
+        try performClientHandshakeWithBearerToken(allocator, &user_client, "/", "user-secret");
+
+        try writeClientTextFrameMasked(&user_client, "{\"channel\":\"control\",\"type\":\"control.version\",\"id\":\"history-version\",\"payload\":{\"protocol\":\"unified-v2\"}}");
+        var version_ack = try readServerFrame(allocator, &user_client);
+        defer version_ack.deinit(allocator);
+        try std.testing.expect(std.mem.indexOf(u8, version_ack.payload, "\"type\":\"control.version_ack\"") != null);
+
+        try writeClientTextFrameMasked(&user_client, "{\"channel\":\"control\",\"type\":\"control.connect\",\"id\":\"history-connect\"}");
+        var connect_ack = try readServerFrame(allocator, &user_client);
+        defer connect_ack.deinit(allocator);
+        try std.testing.expect(std.mem.indexOf(u8, connect_ack.payload, "\"type\":\"control.connect_ack\"") != null);
+
+        const attach_payload = try std.fmt.allocPrint(
+            allocator,
+            "{{\"channel\":\"control\",\"type\":\"control.session_attach\",\"id\":\"history-attach\",\"payload\":{{\"session_key\":\"work-1\",\"agent_id\":\"{s}\",\"project_id\":\"{s}\"}}}}",
+            .{ runtime_registry.default_agent_id, remembered_project_id },
+        );
+        defer allocator.free(attach_payload);
+        try writeClientTextFrameMasked(&user_client, attach_payload);
+        var attach_ack = try readServerFrame(allocator, &user_client);
+        defer attach_ack.deinit(allocator);
+        try std.testing.expect(std.mem.indexOf(u8, attach_ack.payload, "\"type\":\"control.session_attach\"") != null);
+
+        try writeClientTextFrameMasked(
+            &user_client,
+            "{\"channel\":\"control\",\"type\":\"control.session_history\",\"id\":\"history-list\",\"payload\":{\"limit\":5}}",
+        );
+        var history = try readServerFrame(allocator, &user_client);
+        defer history.deinit(allocator);
+        try std.testing.expect(std.mem.indexOf(u8, history.payload, "\"type\":\"control.session_history\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, history.payload, "\"session_key\":\"work-1\"") != null);
+
+        try websocket_transport.writeFrame(&user_client, "", .close);
+        var close_reply = try readServerFrame(allocator, &user_client);
+        defer close_reply.deinit(allocator);
+        try std.testing.expectEqual(@as(u8, 0x8), close_reply.opcode);
+    }
+
+    {
+        const server_thread = try std.Thread.spawn(.{}, runSingleWsConnection, .{&server_ctx});
+        defer server_thread.join();
+
+        var user_client = try std.net.tcpConnectToAddress(listener.listen_address);
+        defer user_client.close();
+        try performClientHandshakeWithBearerToken(allocator, &user_client, "/", "user-secret");
+
+        try writeClientTextFrameMasked(&user_client, "{\"channel\":\"control\",\"type\":\"control.version\",\"id\":\"restore-version\",\"payload\":{\"protocol\":\"unified-v2\"}}");
+        var version_ack = try readServerFrame(allocator, &user_client);
+        defer version_ack.deinit(allocator);
+        try std.testing.expect(std.mem.indexOf(u8, version_ack.payload, "\"type\":\"control.version_ack\"") != null);
+
+        try writeClientTextFrameMasked(&user_client, "{\"channel\":\"control\",\"type\":\"control.connect\",\"id\":\"restore-connect\"}");
+        var connect_ack = try readServerFrame(allocator, &user_client);
+        defer connect_ack.deinit(allocator);
+        try std.testing.expect(std.mem.indexOf(u8, connect_ack.payload, "\"type\":\"control.connect_ack\"") != null);
+
+        const restore_payload = try std.fmt.allocPrint(
+            allocator,
+            "{{\"channel\":\"control\",\"type\":\"control.session_restore\",\"id\":\"restore-last\",\"payload\":{{\"agent_id\":\"{s}\"}}}}",
+            .{runtime_registry.default_agent_id},
+        );
+        defer allocator.free(restore_payload);
+        try writeClientTextFrameMasked(&user_client, restore_payload);
+        var restore = try readServerFrame(allocator, &user_client);
+        defer restore.deinit(allocator);
+        try std.testing.expect(std.mem.indexOf(u8, restore.payload, "\"type\":\"control.session_restore\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, restore.payload, "\"found\":true") != null);
+        try std.testing.expect(std.mem.indexOf(u8, restore.payload, "\"session_key\":\"work-1\"") != null);
+
+        try websocket_transport.writeFrame(&user_client, "", .close);
+        var close_reply = try readServerFrame(allocator, &user_client);
+        defer close_reply.deinit(allocator);
+        try std.testing.expectEqual(@as(u8, 0x8), close_reply.opcode);
+    }
 
     try std.testing.expect(server_ctx.err_name == null);
 }
