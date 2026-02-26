@@ -685,6 +685,7 @@ fn cFlock(path_c: [*c]const u8, fi: ?*c.struct_fuse_file_info, op: c_int) callco
 
 const ParsedAttr = struct {
     id: u64,
+    kind_code: u8,
     mode: u32,
     nlink: u32,
     uid: u32,
@@ -747,9 +748,14 @@ fn parseAttr(allocator: std.mem.Allocator, json: []const u8) !ParsedAttr {
 }
 
 fn parseAttrFromObject(obj: std.json.ObjectMap) !ParsedAttr {
+    const raw_mode: u32 = @intCast(try readRequiredU64(obj, "m"));
+    const kind_code = parseOptionalKindCode(obj);
     return .{
         .id = try readRequiredU64(obj, "id"),
-        .mode = @intCast(try readRequiredU64(obj, "m")),
+        .kind_code = kind_code,
+        // Some remote nodes (notably Windows builds) may report mode=0 for root attrs.
+        // FUSE rejects zero mode with EIO, so synthesize a sane default from kind.
+        .mode = normalizeAttrMode(raw_mode, kind_code),
         .nlink = @intCast(try readRequiredU64(obj, "n")),
         .uid = @intCast(try readRequiredU64(obj, "u")),
         .gid = @intCast(try readRequiredU64(obj, "g")),
@@ -757,6 +763,21 @@ fn parseAttrFromObject(obj: std.json.ObjectMap) !ParsedAttr {
         .atime_ns = try readRequiredI64(obj, "at"),
         .mtime_ns = try readRequiredI64(obj, "mt"),
         .ctime_ns = try readRequiredI64(obj, "ct"),
+    };
+}
+
+fn parseOptionalKindCode(obj: std.json.ObjectMap) u8 {
+    const value = obj.get("k") orelse return 0;
+    if (value != .integer or value.integer < 0) return 0;
+    return @intCast(value.integer);
+}
+
+fn normalizeAttrMode(mode: u32, kind_code: u8) u32 {
+    if (mode != 0) return mode;
+    return switch (kind_code) {
+        2 => 0o040755,
+        1 => 0o100644,
+        else => 0o100644,
     };
 }
 
@@ -846,6 +867,22 @@ test "fs_fuse_adapter: parseAttr reads required fields" {
     try std.testing.expectEqual(@as(u64, 12), attr.id);
     try std.testing.expectEqual(@as(u32, 33188), attr.mode);
     try std.testing.expectEqual(@as(u64, 5), attr.size);
+}
+
+test "fs_fuse_adapter: parseAttr synthesizes mode when remote reports zero" {
+    const allocator = std.testing.allocator;
+
+    const dir_attr = try parseAttr(
+        allocator,
+        "{\"id\":7,\"k\":2,\"m\":0,\"n\":2,\"u\":0,\"g\":0,\"sz\":0,\"at\":0,\"mt\":0,\"ct\":0}",
+    );
+    try std.testing.expectEqual(@as(u32, 0o040755), dir_attr.mode);
+
+    const file_attr = try parseAttr(
+        allocator,
+        "{\"id\":8,\"k\":1,\"m\":0,\"n\":1,\"u\":0,\"g\":0,\"sz\":3,\"at\":0,\"mt\":0,\"ct\":0}",
+    );
+    try std.testing.expectEqual(@as(u32, 0o100644), file_attr.mode);
 }
 
 test "fs_fuse_adapter: parseStatfs reads required fields" {

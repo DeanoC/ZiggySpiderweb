@@ -326,12 +326,13 @@ pub const Router = struct {
     }
 
     pub fn getattr(self: *Router, path: []const u8) ![]u8 {
+        const normalized_path = normalizeRouterPath(path);
         self.drainPendingInvalidations();
-        if (std.mem.eql(u8, path, "/")) {
+        if (std.mem.eql(u8, normalized_path, "/")) {
             return self.allocator.dupe(u8, "{\"id\":1,\"k\":2,\"m\":16877,\"n\":2,\"u\":0,\"g\":0,\"sz\":0,\"at\":0,\"mt\":0,\"ct\":0,\"gen\":0}");
         }
-        if (self.isVirtualDirectoryPath(path)) {
-            const node_id = virtualDirNodeId(path);
+        if (self.isVirtualDirectoryPath(normalized_path)) {
+            const node_id = virtualDirNodeId(normalized_path);
             return std.fmt.allocPrint(
                 self.allocator,
                 "{{\"id\":{d},\"k\":2,\"m\":16877,\"n\":2,\"u\":0,\"g\":0,\"sz\":0,\"at\":0,\"mt\":0,\"ct\":0,\"gen\":0}}",
@@ -339,7 +340,7 @@ pub const Router = struct {
             );
         }
 
-        const node = try self.resolvePath(path, false, .read_data);
+        const node = try self.resolvePath(normalized_path, false, .read_data);
         const now = std.time.milliTimestamp();
         if (self.attr_cache.getFresh(.{ .endpoint_index = node.endpoint_index, .node_id = node.node_id }, now)) |cached| {
             return self.allocator.dupe(u8, cached);
@@ -356,11 +357,12 @@ pub const Router = struct {
     }
 
     pub fn readdir(self: *Router, path: []const u8, cookie: u64, max_entries: u32) ![]u8 {
+        const normalized_path = normalizeRouterPath(path);
         self.drainPendingInvalidations();
-        if (self.isVirtualDirectoryPath(path)) {
-            return self.buildVirtualDirectoryListing(path, cookie, max_entries);
+        if (self.isVirtualDirectoryPath(normalized_path)) {
+            return self.buildVirtualDirectoryListing(normalized_path, cookie, max_entries);
         }
-        const node = try self.resolvePath(path, false, .read_data);
+        const node = try self.resolvePath(normalized_path, false, .read_data);
         const cache_key = fs_cache.NodeKey{
             .endpoint_index = node.endpoint_index,
             .node_id = node.node_id,
@@ -897,12 +899,13 @@ pub const Router = struct {
         require_writable: bool,
         desired_op: fs_source_policy.Operation,
     ) !ResolvedNode {
-        if (path.len == 0 or path[0] != '/') return RouterError.InvalidPath;
+        const normalized_path = normalizeRouterPath(path);
+        if (normalized_path.len == 0 or normalized_path[0] != '/') return RouterError.InvalidPath;
 
         var matched_prefix_len: usize = 0;
         var saw_matching_endpoint = false;
         for (self.endpoints.items) |endpoint| {
-            if (matchPathToMount(path, endpoint.mount_path)) |matched| {
+            if (matchPathToMount(normalized_path, endpoint.mount_path)) |matched| {
                 saw_matching_endpoint = true;
                 if (matched.mount_path_len > matched_prefix_len) {
                     matched_prefix_len = matched.mount_path_len;
@@ -915,7 +918,7 @@ pub const Router = struct {
         var path_candidates = std.ArrayListUnmanaged(PathCandidate){};
         defer path_candidates.deinit(self.allocator);
         for (self.endpoints.items, 0..) |endpoint, endpoint_index| {
-            const matched = matchPathToMount(path, endpoint.mount_path) orelse continue;
+            const matched = matchPathToMount(normalized_path, endpoint.mount_path) orelse continue;
             if (matched.mount_path_len != matched_prefix_len) continue;
             try path_candidates.append(self.allocator, .{
                 .endpoint_index = endpoint_index,
@@ -992,7 +995,7 @@ pub const Router = struct {
                     self.failover_events_total +%= 1;
                     std.log.info(
                         "fs router failover path={s} selected endpoint={s} total={d}",
-                        .{ path, self.endpoints.items[endpoint_index].name, self.failover_events_total },
+                        .{ normalized_path, self.endpoints.items[endpoint_index].name, self.failover_events_total },
                     );
                 }
                 return resolved;
@@ -1156,7 +1159,7 @@ pub const Router = struct {
             };
         }
 
-        const response = endpoint.client.?.call(
+        var response = endpoint.client.?.call(
             op,
             node,
             handle,
@@ -1192,6 +1195,32 @@ pub const Router = struct {
             self.noteEndpointSuccess(endpoint_usize);
             return retried;
         };
+
+        if (!response.ok and shouldRetryEndpointErrnoAfterReconnect(op, response.err_no)) {
+            self.noteEndpointFailure(endpoint_usize);
+            self.reconnectEndpoint(endpoint_usize) catch |reconnect_err| {
+                if (isEndpointFailureError(reconnect_err)) {
+                    self.noteEndpointFailure(endpoint_usize);
+                }
+                self.drainPendingInvalidations();
+                return response;
+            };
+
+            response.deinit(self.allocator);
+            response = self.endpoints.items[endpoint_usize].client.?.call(
+                op,
+                node,
+                handle,
+                args_json,
+                handleClientEvent,
+                @ptrCast(&event_ctx),
+            ) catch |retry_err| {
+                if (isEndpointFailureError(retry_err)) {
+                    self.noteEndpointFailure(endpoint_usize);
+                }
+                return retry_err;
+            };
+        }
 
         self.drainPendingInvalidations();
         self.noteEndpointSuccess(endpoint_usize);
@@ -1514,24 +1543,26 @@ pub const Router = struct {
     }
 
     fn isVirtualDirectoryPath(self: *const Router, path: []const u8) bool {
-        if (path.len == 0 or path[0] != '/') return false;
+        const normalized_path = normalizeRouterPath(path);
+        if (normalized_path.len == 0 or normalized_path[0] != '/') return false;
 
         for (self.endpoints.items) |endpoint| {
-            if (std.mem.eql(u8, path, endpoint.mount_path)) return false;
+            if (std.mem.eql(u8, normalized_path, endpoint.mount_path)) return false;
         }
-        if (std.mem.eql(u8, path, "/")) return true;
+        if (std.mem.eql(u8, normalized_path, "/")) return true;
         for (self.endpoints.items) |endpoint| {
-            if (isStrictAncestorPath(path, endpoint.mount_path)) return true;
+            if (isStrictAncestorPath(normalized_path, endpoint.mount_path)) return true;
         }
         return false;
     }
 
     fn buildVirtualDirectoryListing(self: *Router, path: []const u8, cookie: u64, max_entries: u32) ![]u8 {
+        const normalized_path = normalizeRouterPath(path);
         var children = std.ArrayListUnmanaged([]const u8){};
         defer children.deinit(self.allocator);
 
         for (self.endpoints.items) |endpoint| {
-            const child = childSegmentForVirtualDir(path, endpoint.mount_path) orelse continue;
+            const child = childSegmentForVirtualDir(normalized_path, endpoint.mount_path) orelse continue;
             var exists = false;
             for (children.items) |seen| {
                 if (std.mem.eql(u8, seen, child)) {
@@ -1557,7 +1588,7 @@ pub const Router = struct {
 
             const escaped_name = try fs_protocol.jsonEscape(self.allocator, name);
             defer self.allocator.free(escaped_name);
-            const child_path = try joinPath(path, name, self.allocator);
+            const child_path = try joinPath(normalized_path, name, self.allocator);
             defer self.allocator.free(child_path);
             const node_id = virtualDirNodeId(child_path);
 
@@ -1577,58 +1608,74 @@ const MountMatch = struct {
 };
 
 fn matchPathToMount(path: []const u8, mount_path: []const u8) ?MountMatch {
-    if (path.len == 0 or path[0] != '/') return null;
-    if (mount_path.len == 0 or mount_path[0] != '/') return null;
+    const normalized_path = normalizeRouterPath(path);
+    const normalized_mount = normalizeRouterPath(mount_path);
+    if (normalized_path.len == 0 or normalized_path[0] != '/') return null;
+    if (normalized_mount.len == 0 or normalized_mount[0] != '/') return null;
 
-    if (std.mem.eql(u8, mount_path, "/")) {
-        if (std.mem.eql(u8, path, "/")) return .{ .mount_path_len = 1, .relative_path = "" };
-        var relative = path[1..];
+    if (std.mem.eql(u8, normalized_mount, "/")) {
+        if (std.mem.eql(u8, normalized_path, "/")) return .{ .mount_path_len = 1, .relative_path = "" };
+        var relative = normalized_path[1..];
         while (relative.len > 0 and relative[0] == '/') relative = relative[1..];
         return .{ .mount_path_len = 1, .relative_path = relative };
     }
 
-    if (!std.mem.startsWith(u8, path, mount_path)) return null;
-    if (path.len == mount_path.len) {
+    if (!std.mem.startsWith(u8, normalized_path, normalized_mount)) return null;
+    if (normalized_path.len == normalized_mount.len) {
         return .{
-            .mount_path_len = mount_path.len,
+            .mount_path_len = normalized_mount.len,
             .relative_path = "",
         };
     }
-    if (path[mount_path.len] != '/') return null;
+    if (normalized_path[normalized_mount.len] != '/') return null;
 
-    var relative = path[mount_path.len + 1 ..];
+    var relative = normalized_path[normalized_mount.len + 1 ..];
     while (relative.len > 0 and relative[0] == '/') relative = relative[1..];
     return .{
-        .mount_path_len = mount_path.len,
+        .mount_path_len = normalized_mount.len,
         .relative_path = relative,
     };
 }
 
 fn isStrictAncestorPath(ancestor: []const u8, descendant: []const u8) bool {
-    if (ancestor.len == 0 or descendant.len == 0) return false;
-    if (!std.mem.startsWith(u8, descendant, ancestor)) return false;
-    if (ancestor.len >= descendant.len) return false;
-    if (std.mem.eql(u8, ancestor, "/")) return true;
-    return descendant[ancestor.len] == '/';
+    const normalized_ancestor = normalizeRouterPath(ancestor);
+    const normalized_descendant = normalizeRouterPath(descendant);
+    if (normalized_ancestor.len == 0 or normalized_descendant.len == 0) return false;
+    if (!std.mem.startsWith(u8, normalized_descendant, normalized_ancestor)) return false;
+    if (normalized_ancestor.len >= normalized_descendant.len) return false;
+    if (std.mem.eql(u8, normalized_ancestor, "/")) return true;
+    return normalized_descendant[normalized_ancestor.len] == '/';
 }
 
 fn childSegmentForVirtualDir(path: []const u8, mount_path: []const u8) ?[]const u8 {
-    if (std.mem.eql(u8, path, mount_path)) return null;
-    if (!isStrictAncestorPath(path, mount_path)) return null;
+    const normalized_path = normalizeRouterPath(path);
+    const normalized_mount = normalizeRouterPath(mount_path);
+    if (std.mem.eql(u8, normalized_path, normalized_mount)) return null;
+    if (!isStrictAncestorPath(normalized_path, normalized_mount)) return null;
 
-    const remainder = if (std.mem.eql(u8, path, "/"))
-        mount_path[1..]
+    const remainder = if (std.mem.eql(u8, normalized_path, "/"))
+        normalized_mount[1..]
     else
-        mount_path[path.len + 1 ..];
+        normalized_mount[normalized_path.len + 1 ..];
     if (remainder.len == 0) return null;
     const slash = std.mem.indexOfScalar(u8, remainder, '/') orelse remainder.len;
     if (slash == 0) return null;
     return remainder[0..slash];
 }
 
+fn normalizeRouterPath(path: []const u8) []const u8 {
+    if (path.len <= 1) return path;
+    var end = path.len;
+    while (end > 1 and path[end - 1] == '/') : (end -= 1) {}
+    return path[0..end];
+}
+
 fn virtualDirNodeId(path: []const u8) u64 {
+    // Keep synthetic inode ids positive and <= maxInt(i64) so downstream JSON parsing
+    // in FUSE adapters (which use signed integer JSON values) never overflows.
     const hashed = std.hash.Wyhash.hash(0x5350_5756_4449_5231, path);
-    return if (hashed == 0) 1 else hashed;
+    const normalized = (hashed & 0x3fff_ffff_ffff_ffff) | 0x4000_0000_0000_0000;
+    return if (normalized == 1) 2 else normalized;
 }
 
 fn optionalSliceEql(left: ?[]const u8, right: ?[]const u8) bool {
@@ -1670,6 +1717,33 @@ fn isEndpointFailureError(err: anyerror) bool {
         error.TimedOut,
         error.NetworkUnreachable,
         error.HostUnreachable,
+        => true,
+        else => false,
+    };
+}
+
+fn shouldRetryEndpointErrnoAfterReconnect(op: fs_protocol.Op, err_no: i32) bool {
+    if (!isIdempotentEndpointOp(op)) return false;
+    return switch (err_no) {
+        fs_protocol.Errno.EIO,
+        fs_protocol.Errno.ETIMEDOUT,
+        fs_protocol.Errno.EAGAIN,
+        fs_protocol.Errno.EBADF,
+        => true,
+        else => false,
+    };
+}
+
+fn isIdempotentEndpointOp(op: fs_protocol.Op) bool {
+    return switch (op) {
+        .LOOKUP,
+        .GETATTR,
+        .READDIRP,
+        .OPEN,
+        .READ,
+        .GETXATTR,
+        .LISTXATTR,
+        .STATFS,
         => true,
         else => false,
     };
@@ -2170,6 +2244,12 @@ test "fs_router: childSegmentForVirtualDir returns next mount component" {
     try std.testing.expect(childSegmentForVirtualDir("/project/src", "/project/src") == null);
 }
 
+test "fs_router: virtualDirNodeId stays within signed integer range" {
+    const node_id = virtualDirNodeId("/agents");
+    try std.testing.expect(node_id > 0);
+    try std.testing.expect(node_id <= std.math.maxInt(i64));
+}
+
 test "fs_router: virtual directory listing reflects mount prefixes" {
     const allocator = std.testing.allocator;
     var router = try Router.init(allocator, &[_]EndpointConfig{});
@@ -2209,6 +2289,53 @@ test "fs_router: virtual directory listing reflects mount prefixes" {
     const project_attr = try router.getattr("/project");
     defer allocator.free(project_attr);
     try std.testing.expect(std.mem.indexOf(u8, project_attr, "\"k\":2") != null);
+}
+
+test "fs_router: virtual directories handle trailing slashes" {
+    const allocator = std.testing.allocator;
+    var router = try Router.init(allocator, &[_]EndpointConfig{});
+    defer router.deinit();
+
+    const now = std.time.milliTimestamp();
+    try router.endpoints.append(allocator, .{
+        .name = try allocator.dupe(u8, "caps-node"),
+        .url = try allocator.dupe(u8, "ws://127.0.0.1:65535/v2/fs"),
+        .export_name = null,
+        .mount_path = try allocator.dupe(u8, "/agents/self/capabilities"),
+        .root_node_id = 10,
+        .export_read_only = false,
+        .caps_case_sensitive = true,
+        .healthy = true,
+        .last_health_check_ms = now,
+        .last_success_ms = now,
+    });
+    try router.endpoints.append(allocator, .{
+        .name = try allocator.dupe(u8, "meta-node"),
+        .url = try allocator.dupe(u8, "ws://127.0.0.1:65534/v2/fs"),
+        .export_name = null,
+        .mount_path = try allocator.dupe(u8, "/projects/system/meta"),
+        .root_node_id = 20,
+        .export_read_only = false,
+        .caps_case_sensitive = true,
+        .healthy = true,
+        .last_health_check_ms = now,
+        .last_success_ms = now,
+    });
+
+    try std.testing.expect(router.isVirtualDirectoryPath("/agents/"));
+    try std.testing.expect(router.isVirtualDirectoryPath("/projects/"));
+
+    const agents_attr = try router.getattr("/agents/");
+    defer allocator.free(agents_attr);
+    try std.testing.expect(std.mem.indexOf(u8, agents_attr, "\"k\":2") != null);
+
+    const agents_listing = try router.readdir("/agents/", 0, 100);
+    defer allocator.free(agents_listing);
+    try std.testing.expect(std.mem.indexOf(u8, agents_listing, "\"name\":\"self\"") != null);
+
+    const projects_listing = try router.readdir("/projects/", 0, 100);
+    defer allocator.free(projects_listing);
+    try std.testing.expect(std.mem.indexOf(u8, projects_listing, "\"name\":\"system\"") != null);
 }
 
 test "fs_router: root path is not virtual when an endpoint is mounted at slash" {
@@ -2346,6 +2473,14 @@ test "fs_router: mapErrno covers xattr and lock errnos" {
     try std.testing.expect(mapErrno(fs_protocol.Errno.EAGAIN) == RouterError.WouldBlock);
     try std.testing.expect(mapErrno(fs_protocol.Errno.ERANGE) == RouterError.Range);
     try std.testing.expect(mapErrno(fs_protocol.Errno.ENOSYS) == RouterError.OperationNotSupported);
+}
+
+test "fs_router: response retry policy only retries idempotent operations" {
+    try std.testing.expect(shouldRetryEndpointErrnoAfterReconnect(.READ, fs_protocol.Errno.EIO));
+    try std.testing.expect(shouldRetryEndpointErrnoAfterReconnect(.GETATTR, fs_protocol.Errno.ETIMEDOUT));
+    try std.testing.expect(!shouldRetryEndpointErrnoAfterReconnect(.WRITE, fs_protocol.Errno.EIO));
+    try std.testing.expect(!shouldRetryEndpointErrnoAfterReconnect(.RENAME, fs_protocol.Errno.EIO));
+    try std.testing.expect(!shouldRetryEndpointErrnoAfterReconnect(.READ, fs_protocol.Errno.ENOENT));
 }
 
 test "fs_router: endpointRoutingScore prefers healthy endpoints with recent success" {

@@ -670,7 +670,7 @@ pub const Session = struct {
         try self.addDirectoryDescriptors(
             meta_root,
             "Meta",
-            "{\"kind\":\"meta\",\"entries\":[\"protocol.json\",\"view.json\"]}",
+            "{\"kind\":\"meta\",\"entries\":[\"protocol.json\",\"view.json\",\"workspace_status.json\",\"workspace_availability.json\",\"workspace_health.json\",\"workspace_alerts.json\"]}",
             "{\"read\":true,\"write\":false}",
             "Protocol and effective view metadata.",
         );
@@ -691,6 +691,34 @@ pub const Session = struct {
         );
         defer self.allocator.free(view_json);
         _ = try self.addFile(meta_root, "view.json", view_json, false, .none);
+        if (workspace_status_json) |status_json| {
+            _ = try self.addFile(meta_root, "workspace_status.json", status_json, false, .none);
+            if (try self.extractWorkspaceAvailability(status_json)) |availability_json| {
+                defer self.allocator.free(availability_json);
+                _ = try self.addFile(meta_root, "workspace_availability.json", availability_json, false, .none);
+            } else {
+                _ = try self.addFile(meta_root, "workspace_availability.json", "{\"mounts_total\":0,\"online\":0,\"degraded\":0,\"missing\":0}", false, .none);
+            }
+            if (try self.extractWorkspaceHealth(status_json)) |health_json| {
+                defer self.allocator.free(health_json);
+                _ = try self.addFile(meta_root, "workspace_health.json", health_json, false, .none);
+            } else {
+                _ = try self.addFile(meta_root, "workspace_health.json", "{\"state\":\"unknown\",\"availability\":{\"mounts_total\":0,\"online\":0,\"degraded\":0,\"missing\":0},\"drift_count\":0,\"reconcile_state\":\"unknown\",\"queue_depth\":0}", false, .none);
+            }
+            if (try self.extractWorkspaceAlerts(status_json)) |alerts_json| {
+                defer self.allocator.free(alerts_json);
+                _ = try self.addFile(meta_root, "workspace_alerts.json", alerts_json, false, .none);
+            } else {
+                _ = try self.addFile(meta_root, "workspace_alerts.json", "[]", false, .none);
+            }
+        } else {
+            const fallback_status = try self.buildFallbackWorkspaceStatusJson(policy);
+            defer self.allocator.free(fallback_status);
+            _ = try self.addFile(meta_root, "workspace_status.json", fallback_status, false, .none);
+            _ = try self.addFile(meta_root, "workspace_availability.json", "{\"mounts_total\":0,\"online\":0,\"degraded\":0,\"missing\":0}", false, .none);
+            _ = try self.addFile(meta_root, "workspace_health.json", "{\"state\":\"unknown\",\"availability\":{\"mounts_total\":0,\"online\":0,\"degraded\":0,\"missing\":0},\"drift_count\":0,\"reconcile_state\":\"unknown\",\"queue_depth\":0}", false, .none);
+            _ = try self.addFile(meta_root, "workspace_alerts.json", "[]", false, .none);
+        }
     }
 
     fn addProjectMetaFiles(
@@ -3437,6 +3465,12 @@ test "fsrpc_session: project meta includes control-plane workspace status" {
     const project_agents_caps_id = session.lookupChild(project_agents_node, "CAPS.json") orelse return error.TestExpectedResponse;
     const meta_node = session.lookupChild(project_node, "meta") orelse return error.TestExpectedResponse;
     const meta_schema_id = session.lookupChild(meta_node, "SCHEMA.json") orelse return error.TestExpectedResponse;
+    const root_meta_node = session.lookupChild(session.root_id, "meta") orelse return error.TestExpectedResponse;
+    const root_meta_schema_id = session.lookupChild(root_meta_node, "SCHEMA.json") orelse return error.TestExpectedResponse;
+    const root_workspace_status_id = session.lookupChild(root_meta_node, "workspace_status.json") orelse return error.TestExpectedResponse;
+    const root_workspace_availability_id = session.lookupChild(root_meta_node, "workspace_availability.json") orelse return error.TestExpectedResponse;
+    const root_workspace_health_id = session.lookupChild(root_meta_node, "workspace_health.json") orelse return error.TestExpectedResponse;
+    const root_workspace_alerts_id = session.lookupChild(root_meta_node, "workspace_alerts.json") orelse return error.TestExpectedResponse;
     const mount_link_id = session.lookupChild(project_fs_node, "mount::src") orelse return error.TestExpectedResponse;
     const node_link_id = session.lookupChild(project_nodes_node, node_id.string) orelse return error.TestExpectedResponse;
     const topology_id = session.lookupChild(meta_node, "topology.json") orelse return error.TestExpectedResponse;
@@ -3460,6 +3494,11 @@ test "fsrpc_session: project meta includes control-plane workspace status" {
     const project_nodes_schema = session.nodes.get(project_nodes_schema_id) orelse return error.TestExpectedResponse;
     const project_agents_caps = session.nodes.get(project_agents_caps_id) orelse return error.TestExpectedResponse;
     const meta_schema = session.nodes.get(meta_schema_id) orelse return error.TestExpectedResponse;
+    const root_meta_schema = session.nodes.get(root_meta_schema_id) orelse return error.TestExpectedResponse;
+    const root_workspace_status_node = session.nodes.get(root_workspace_status_id) orelse return error.TestExpectedResponse;
+    const root_workspace_availability_node = session.nodes.get(root_workspace_availability_id) orelse return error.TestExpectedResponse;
+    const root_workspace_health_node = session.nodes.get(root_workspace_health_id) orelse return error.TestExpectedResponse;
+    const root_workspace_alerts_node = session.nodes.get(root_workspace_alerts_id) orelse return error.TestExpectedResponse;
     const mount_link_node = session.nodes.get(mount_link_id) orelse return error.TestExpectedResponse;
     const node_link_node = session.nodes.get(node_link_id) orelse return error.TestExpectedResponse;
     const topology_node = session.nodes.get(topology_id) orelse return error.TestExpectedResponse;
@@ -3495,6 +3534,14 @@ test "fsrpc_session: project meta includes control-plane workspace status" {
     try std.testing.expect(std.mem.indexOf(u8, meta_schema.content, "\"drift.json\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, meta_schema.content, "\"reconcile.json\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, meta_schema.content, "\"health.json\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, root_meta_schema.content, "\"workspace_status.json\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, root_meta_schema.content, "\"workspace_availability.json\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, root_meta_schema.content, "\"workspace_health.json\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, root_meta_schema.content, "\"workspace_alerts.json\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, root_workspace_status_node.content, "\"project_id\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, root_workspace_availability_node.content, "\"mounts_total\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, root_workspace_health_node.content, "\"state\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, root_workspace_alerts_node.content, "[") != null);
     try std.testing.expect(std.mem.indexOf(u8, mount_link_node.content, "/nodes/") != null);
     try std.testing.expect(std.mem.indexOf(u8, mount_link_node.content, "/fs") != null);
     try std.testing.expect(std.mem.indexOf(u8, node_link_node.content, "/nodes/") != null);

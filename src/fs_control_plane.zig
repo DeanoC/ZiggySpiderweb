@@ -418,31 +418,40 @@ pub const ControlPlane = struct {
             try normalized_paths.append(self.allocator, normalized);
         }
 
-        var unchanged = project.mounts.items.len == mount_specs.len;
-        if (unchanged) {
-            for (project.mounts.items, 0..) |existing, idx| {
-                const expected_path = normalized_paths.items[idx];
-                const expected_export = mount_specs[idx].export_name;
-                if (!std.mem.eql(u8, existing.mount_path, expected_path) or
-                    !std.mem.eql(u8, existing.node_id, node_id) or
-                    !std.mem.eql(u8, existing.export_name, expected_export))
-                {
-                    unchanged = false;
-                    break;
+        var changed = false;
+        for (mount_specs, 0..) |spec, idx| {
+            const normalized = normalized_paths.items[idx];
+            var existing_for_node: ?usize = null;
+
+            var mount_idx: usize = 0;
+            while (mount_idx < project.mounts.items.len) : (mount_idx += 1) {
+                const existing = project.mounts.items[mount_idx];
+                if (mountPathsOverlap(existing.mount_path, normalized) and !std.mem.eql(u8, existing.mount_path, normalized)) {
+                    return ControlPlaneError.MountConflict;
+                }
+                if (std.mem.eql(u8, existing.mount_path, normalized) and std.mem.eql(u8, existing.node_id, node_id)) {
+                    existing_for_node = mount_idx;
                 }
             }
-        }
-        if (unchanged) return;
 
-        for (project.mounts.items) |*mount| mount.deinit(self.allocator);
-        project.mounts.clearRetainingCapacity();
-        for (mount_specs, 0..) |spec, idx| {
-            try project.mounts.append(self.allocator, .{
-                .mount_path = try self.allocator.dupe(u8, normalized_paths.items[idx]),
-                .node_id = try self.allocator.dupe(u8, node_id),
-                .export_name = try self.allocator.dupe(u8, spec.export_name),
-            });
+            if (existing_for_node) |existing_idx| {
+                var existing_mount = &project.mounts.items[existing_idx];
+                if (!std.mem.eql(u8, existing_mount.export_name, spec.export_name)) {
+                    self.allocator.free(existing_mount.export_name);
+                    existing_mount.export_name = try self.allocator.dupe(u8, spec.export_name);
+                    changed = true;
+                }
+            } else {
+                try project.mounts.append(self.allocator, .{
+                    .mount_path = try self.allocator.dupe(u8, normalized),
+                    .node_id = try self.allocator.dupe(u8, node_id),
+                    .export_name = try self.allocator.dupe(u8, spec.export_name),
+                });
+                changed = true;
+            }
         }
+
+        if (!changed) return;
         project.updated_at_ms = now_ms;
         self.mount_sets_total +%= 1;
         self.persistSnapshotBestEffortLocked();
@@ -1251,7 +1260,7 @@ pub const ControlPlane = struct {
 
         if (!self.nodes.contains(node_id)) return ControlPlaneError.NodeNotFound;
         const project = self.projects.getPtr(project_id) orelse return ControlPlaneError.ProjectNotFound;
-        if (project.kind == .spider_web_builtin) return ControlPlaneError.ProjectProtected;
+        if (project.kind == .spider_web_builtin and !is_admin) return ControlPlaneError.ProjectProtected;
         try requireProjectAccessToken(project, project_token, is_admin);
 
         const mount_path = try normalizeMountPath(self.allocator, mount_path_raw);
@@ -1310,7 +1319,7 @@ pub const ControlPlane = struct {
         defer self.allocator.free(mount_path);
 
         const project = self.projects.getPtr(project_id) orelse return ControlPlaneError.ProjectNotFound;
-        if (project.kind == .spider_web_builtin) return ControlPlaneError.ProjectProtected;
+        if (project.kind == .spider_web_builtin and !is_admin) return ControlPlaneError.ProjectProtected;
         try requireProjectAccessToken(project, project_token, is_admin);
         var removed_count: u32 = 0;
         var i: usize = 0;
@@ -3928,18 +3937,104 @@ test "fs_control_plane: builtin system mounts support namespace topology" {
 
     const mounts = [_]SpiderWebMountSpec{
         .{ .mount_path = "/meta", .export_name = "meta" },
-        .{ .mount_path = "/capabilities", .export_name = "capabilities" },
-        .{ .mount_path = "/jobs", .export_name = "jobs" },
-        .{ .mount_path = "/workspace", .export_name = "workspace" },
+        .{ .mount_path = "/agents/self/capabilities", .export_name = "capabilities" },
+        .{ .mount_path = "/agents/self/jobs", .export_name = "jobs" },
+        .{ .mount_path = "/nodes/local/fs", .export_name = "workspace" },
+        .{ .mount_path = "/projects/system/meta", .export_name = "meta" },
+        .{ .mount_path = "/projects/system/agents/self/capabilities", .export_name = "capabilities" },
+        .{ .mount_path = "/projects/system/agents/self/jobs", .export_name = "jobs" },
+        .{ .mount_path = "/projects/system/nodes/local/fs", .export_name = "workspace" },
+        .{ .mount_path = "/projects/system/fs/local::fs", .export_name = "workspace" },
     };
     try plane.ensureSpiderWebMounts(node_id, &mounts);
 
     const status = try plane.workspaceStatus("mother", "{\"project_id\":\"system\"}");
     defer allocator.free(status);
     try std.testing.expect(std.mem.indexOf(u8, status, "\"mount_path\":\"/meta\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, status, "\"mount_path\":\"/capabilities\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, status, "\"mount_path\":\"/jobs\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status, "\"mount_path\":\"/agents/self/capabilities\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status, "\"mount_path\":\"/agents/self/jobs\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status, "\"mount_path\":\"/nodes/local/fs\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status, "\"mount_path\":\"/projects/system/meta\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status, "\"mount_path\":\"/projects/system/agents/self/capabilities\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status, "\"mount_path\":\"/projects/system/agents/self/jobs\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status, "\"mount_path\":\"/projects/system/nodes/local/fs\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status, "\"mount_path\":\"/projects/system/fs/local::fs\"") != null);
+}
+
+test "fs_control_plane: admin can set and remove builtin system mounts" {
+    const allocator = std.testing.allocator;
+    var plane = ControlPlane.init(allocator);
+    defer plane.deinit();
+
+    const local_joined = try plane.ensureNode("spiderweb-local", "ws://127.0.0.1:18891/v2/fs", 60_000);
+    defer allocator.free(local_joined);
+    var local_parsed = try std.json.parseFromSlice(std.json.Value, allocator, local_joined, .{});
+    defer local_parsed.deinit();
+    const local_node_id = local_parsed.value.object.get("node_id").?.string;
+    try plane.ensureSpiderWebMount(local_node_id, "system-root");
+
+    const remote_joined = try plane.ensureNode("clawz", "ws://100.101.192.123:18790/v2/fs/node/node-3", 60_000);
+    defer allocator.free(remote_joined);
+    var remote_parsed = try std.json.parseFromSlice(std.json.Value, allocator, remote_joined, .{});
+    defer remote_parsed.deinit();
+    const remote_node_id = remote_parsed.value.object.get("node_id").?.string;
+
+    const set_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"project_id\":\"system\",\"node_id\":\"{s}\",\"export_name\":\"work\",\"mount_path\":\"/nodes/clawz/fs\"}}",
+        .{remote_node_id},
+    );
+    defer allocator.free(set_req);
+    const set_json = try plane.setProjectMountWithRole(set_req, true);
+    defer allocator.free(set_json);
+    try std.testing.expect(std.mem.indexOf(u8, set_json, "\"mount_path\":\"/nodes/clawz/fs\"") != null);
+
+    const remove_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"project_id\":\"system\",\"mount_path\":\"/nodes/clawz/fs\",\"node_id\":\"{s}\",\"export_name\":\"work\"}}",
+        .{remote_node_id},
+    );
+    defer allocator.free(remove_req);
+    const remove_json = try plane.removeProjectMountWithRole(remove_req, true);
+    defer allocator.free(remove_json);
+    try std.testing.expect(std.mem.indexOf(u8, remove_json, "\"mount_path\":\"/nodes/clawz/fs\"") == null);
+}
+
+test "fs_control_plane: ensureSpiderWebMounts preserves extra builtin mounts" {
+    const allocator = std.testing.allocator;
+    var plane = ControlPlane.init(allocator);
+    defer plane.deinit();
+
+    const local_joined = try plane.ensureNode("spiderweb-local", "ws://127.0.0.1:18891/v2/fs", 60_000);
+    defer allocator.free(local_joined);
+    var local_parsed = try std.json.parseFromSlice(std.json.Value, allocator, local_joined, .{});
+    defer local_parsed.deinit();
+    const local_node_id = local_parsed.value.object.get("node_id").?.string;
+    try plane.ensureSpiderWebMount(local_node_id, "system-root");
+
+    const remote_joined = try plane.ensureNode("clawz", "ws://100.101.192.123:18790/v2/fs/node/node-3", 60_000);
+    defer allocator.free(remote_joined);
+    var remote_parsed = try std.json.parseFromSlice(std.json.Value, allocator, remote_joined, .{});
+    defer remote_parsed.deinit();
+    const remote_node_id = remote_parsed.value.object.get("node_id").?.string;
+
+    const set_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"project_id\":\"system\",\"node_id\":\"{s}\",\"export_name\":\"work\",\"mount_path\":\"/nodes/clawz/fs\"}}",
+        .{remote_node_id},
+    );
+    defer allocator.free(set_req);
+    const set_json = try plane.setProjectMountWithRole(set_req, true);
+    defer allocator.free(set_json);
+    try std.testing.expect(std.mem.indexOf(u8, set_json, "\"mount_path\":\"/nodes/clawz/fs\"") != null);
+
+    // Re-ensuring local mount specs should not wipe additional admin-managed mounts.
+    try plane.ensureSpiderWebMount(local_node_id, "system-root");
+
+    const status = try plane.workspaceStatus("mother", "{\"project_id\":\"system\"}");
+    defer allocator.free(status);
     try std.testing.expect(std.mem.indexOf(u8, status, "\"mount_path\":\"/workspace\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status, "\"mount_path\":\"/nodes/clawz/fs\"") != null);
 }
 
 test "fs_control_plane: invite join lease flow works" {

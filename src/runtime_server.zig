@@ -2270,6 +2270,14 @@ pub const RuntimeServer = struct {
                 defer self.allocator.free(task_goal_for_turn);
                 const task_goal_for_turn_safe = try self.normalizeProviderUtf8(task_goal_for_turn);
                 defer self.allocator.free(task_goal_for_turn_safe);
+                const runtime_state_for_turn = try self.compactRuntimeStateForProviderRequest(
+                    selected_model.context_window,
+                    provider_instructions_safe,
+                    task_goal_for_turn_safe,
+                    active_memory_prompt_safe,
+                    tool_context_token_estimate,
+                );
+                defer self.allocator.free(runtime_state_for_turn);
                 const provider_turn_input = try std.fmt.allocPrint(
                     self.allocator,
                     \\Current user request (Task Goal):
@@ -2283,7 +2291,7 @@ pub const RuntimeServer = struct {
                     \\It is NOT a user-uploaded snapshot.
                     \\Do not claim the user sent this state.
                 ,
-                    .{ task_goal_for_turn_safe, active_memory_prompt_safe },
+                    .{ task_goal_for_turn_safe, runtime_state_for_turn },
                 );
                 defer self.allocator.free(provider_turn_input);
                 const messages = [_]ziggy_piai.types.Message{
@@ -3174,6 +3182,58 @@ pub const RuntimeServer = struct {
         }
 
         return out.toOwnedSlice(self.allocator);
+    }
+
+    fn compactRuntimeStateForProviderRequest(
+        self: *RuntimeServer,
+        context_window: u32,
+        provider_instructions: []const u8,
+        task_goal: []const u8,
+        runtime_state: []const u8,
+        tool_context_token_estimate: usize,
+    ) ![]u8 {
+        const context_limit = @as(usize, context_window);
+        if (context_limit == 0) return self.allocator.dupe(u8, runtime_state);
+
+        // Reserve room for protocol framing and model-side tokenization variance.
+        const safety_tokens: usize = 1024;
+        const fixed_tokens = estimateTokenCount(provider_instructions) +
+            estimateTokenCount(task_goal) +
+            tool_context_token_estimate +
+            safety_tokens;
+        if (fixed_tokens >= context_limit) return self.allocator.dupe(u8, "<runtime_state_truncated reason=\"context_budget_exhausted\"/>");
+
+        const max_runtime_tokens = context_limit - fixed_tokens;
+        const runtime_tokens = estimateTokenCount(runtime_state);
+        if (runtime_tokens <= max_runtime_tokens) return self.allocator.dupe(u8, runtime_state);
+
+        const max_runtime_bytes = @max(@as(usize, 512), max_runtime_tokens * 4);
+        if (runtime_state.len <= max_runtime_bytes) return self.allocator.dupe(u8, runtime_state);
+
+        const kept_bytes_target = @max(@as(usize, 256), max_runtime_bytes - 256);
+        const head_bytes = kept_bytes_target / 2;
+        const tail_bytes = kept_bytes_target - head_bytes;
+
+        const head = runtime_state[0..@min(head_bytes, runtime_state.len)];
+        const tail_start = runtime_state.len - @min(tail_bytes, runtime_state.len);
+        const tail = runtime_state[tail_start..];
+
+        const compacted = try std.fmt.allocPrint(
+            self.allocator,
+            "<runtime_state_truncated original_bytes=\"{d}\" kept_bytes=\"{d}\" reason=\"context_budget\">\n{s}\n\n...[truncated {d} bytes]...\n\n{s}\n</runtime_state_truncated>",
+            .{
+                runtime_state.len,
+                head.len + tail.len,
+                head,
+                runtime_state.len - (head.len + tail.len),
+                tail,
+            },
+        );
+        std.log.warn(
+            "provider runtime_state compacted for context budget: kept={d}/{d} bytes (window={d})",
+            .{ head.len + tail.len, runtime_state.len, context_window },
+        );
+        return compacted;
     }
 
     fn estimateProviderToolContextTokens(tools: []const ziggy_piai.types.Tool) usize {
@@ -6015,6 +6075,46 @@ test "runtime_server: provider instructions include dynamic info board without p
     for (snapshot) |item| {
         try std.testing.expect(std.mem.indexOf(u8, item.content_json, "Dynamic Info Board") == null);
     }
+}
+
+test "runtime_server: compactRuntimeStateForProviderRequest preserves state when budget allows" {
+    const allocator = std.testing.allocator;
+    const server = try RuntimeServer.create(allocator, "agent-test", .{ .ltm_directory = "", .ltm_filename = "" });
+    defer server.destroy();
+
+    const state = "small-runtime-state";
+    const compacted = try server.compactRuntimeStateForProviderRequest(
+        32_000,
+        "system prompt",
+        "task goal",
+        state,
+        128,
+    );
+    defer allocator.free(compacted);
+
+    try std.testing.expectEqualStrings(state, compacted);
+}
+
+test "runtime_server: compactRuntimeStateForProviderRequest truncates oversized state" {
+    const allocator = std.testing.allocator;
+    const server = try RuntimeServer.create(allocator, "agent-test", .{ .ltm_directory = "", .ltm_filename = "" });
+    defer server.destroy();
+
+    const large_state = try allocator.alloc(u8, 64 * 1024);
+    defer allocator.free(large_state);
+    @memset(large_state, 'x');
+
+    const compacted = try server.compactRuntimeStateForProviderRequest(
+        4_096,
+        "system prompt",
+        "task goal",
+        large_state,
+        256,
+    );
+    defer allocator.free(compacted);
+
+    try std.testing.expect(compacted.len < large_state.len);
+    try std.testing.expect(std.mem.indexOf(u8, compacted, "<runtime_state_truncated") != null);
 }
 
 test "runtime_server: wait_for tool schema includes events items" {

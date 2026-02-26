@@ -43,9 +43,14 @@ const local_node_meta_export_name = "system-meta";
 const local_node_capabilities_export_name = "system-capabilities";
 const local_node_jobs_export_name = "system-jobs";
 const local_node_mount_meta = "/meta";
-const local_node_mount_capabilities = "/capabilities";
-const local_node_mount_jobs = "/jobs";
-const local_node_mount_workspace = "/workspace";
+const local_node_mount_agents_self_capabilities = "/agents/self/capabilities";
+const local_node_mount_agents_self_jobs = "/agents/self/jobs";
+const local_node_mount_nodes_local_fs = "/nodes/local/fs";
+const local_node_mount_projects_system_meta = "/projects/" ++ system_project_id ++ "/meta";
+const local_node_mount_projects_system_agents_self_capabilities = "/projects/" ++ system_project_id ++ "/agents/self/capabilities";
+const local_node_mount_projects_system_agents_self_jobs = "/projects/" ++ system_project_id ++ "/agents/self/jobs";
+const local_node_mount_projects_system_nodes_local_fs = "/projects/" ++ system_project_id ++ "/nodes/local/fs";
+const local_node_mount_projects_system_fs_local = "/projects/" ++ system_project_id ++ "/fs/local::fs";
 const control_operator_token_env = "SPIDERWEB_CONTROL_OPERATOR_TOKEN";
 const control_project_scope_token_env = "SPIDERWEB_CONTROL_PROJECT_SCOPE_TOKEN";
 const control_node_scope_token_env = "SPIDERWEB_CONTROL_NODE_SCOPE_TOKEN";
@@ -3739,9 +3744,14 @@ const AgentRuntimeRegistry = struct {
         };
         const mount_specs = [_]fs_control_plane.SpiderWebMountSpec{
             .{ .mount_path = local_node_mount_meta, .export_name = local_node_meta_export_name },
-            .{ .mount_path = local_node_mount_capabilities, .export_name = local_node_capabilities_export_name },
-            .{ .mount_path = local_node_mount_jobs, .export_name = local_node_jobs_export_name },
-            .{ .mount_path = local_node_mount_workspace, .export_name = workspace_export_name },
+            .{ .mount_path = local_node_mount_agents_self_capabilities, .export_name = local_node_capabilities_export_name },
+            .{ .mount_path = local_node_mount_agents_self_jobs, .export_name = local_node_jobs_export_name },
+            .{ .mount_path = local_node_mount_nodes_local_fs, .export_name = workspace_export_name },
+            .{ .mount_path = local_node_mount_projects_system_meta, .export_name = local_node_meta_export_name },
+            .{ .mount_path = local_node_mount_projects_system_agents_self_capabilities, .export_name = local_node_capabilities_export_name },
+            .{ .mount_path = local_node_mount_projects_system_agents_self_jobs, .export_name = local_node_jobs_export_name },
+            .{ .mount_path = local_node_mount_projects_system_nodes_local_fs, .export_name = workspace_export_name },
+            .{ .mount_path = local_node_mount_projects_system_fs_local, .export_name = workspace_export_name },
         };
 
         const local_node = try LocalFsNode.create(

@@ -7,7 +7,7 @@ const max_ipc_line_bytes: usize = 16 * 1024 * 1024;
 const mount_startup_timeout_ms: u64 = 15_000;
 const mount_poll_interval_ms: u64 = 100;
 const sandbox_namespace_root = "/underworld";
-const sandbox_workspace_path = "/underworld/workspace";
+const sandbox_home_path = "/underworld";
 
 pub const Options = struct {
     allocator: std.mem.Allocator,
@@ -289,6 +289,13 @@ pub const SandboxRuntime = struct {
                         std.fmt.allocPrint(allocator, "sandbox mount/runtime restart failed: {s}", .{@errorName(restart_err)}) catch null,
                     );
                 };
+                if (attempt + 1 < 2 and shouldRetryToolRequestAfterRestart(tool_name)) {
+                    std.log.warn(
+                        "sandbox tool retry after mount/runtime restart: tool={s}",
+                        .{tool_name},
+                    );
+                    continue :request_attempt_loop;
+                }
                 return toolBridgeFailure(allocator, "sandbox runtime restarted after tool failure; request was not retried");
             }
             return parsed_result;
@@ -407,6 +414,13 @@ fn shouldRestartOnToolFailure(result: tool_registry.ToolExecutionResult) bool {
     };
 }
 
+fn shouldRetryToolRequestAfterRestart(tool_name: []const u8) bool {
+    // Retry only idempotent read/query tools after reconnecting the workspace.
+    return std.mem.eql(u8, tool_name, "file_read") or
+        std.mem.eql(u8, tool_name, "file_list") or
+        std.mem.eql(u8, tool_name, "search_code");
+}
+
 fn containsAnyIgnoreCase(haystack: []const u8, needles: []const []const u8) bool {
     for (needles) |needle| {
         if (std.ascii.indexOfIgnoreCase(haystack, needle) != null) return true;
@@ -454,7 +468,6 @@ fn cleanupStaleAgentMounts(
     }
 }
 
-
 fn resolveWorkspaceBindSourcePath(
     allocator: std.mem.Allocator,
     workspace_mount_path: []const u8,
@@ -480,6 +493,14 @@ fn buildToolRequestLine(allocator: std.mem.Allocator, tool_name: []const u8, arg
         "{{\"tool\":{s},\"args_json\":{s}}}",
         .{ escaped_tool_name, escaped_args },
     );
+}
+
+test "sandbox_runtime: retry after restart only for safe read tools" {
+    try std.testing.expect(shouldRetryToolRequestAfterRestart("file_read"));
+    try std.testing.expect(shouldRetryToolRequestAfterRestart("file_list"));
+    try std.testing.expect(shouldRetryToolRequestAfterRestart("search_code"));
+    try std.testing.expect(!shouldRetryToolRequestAfterRestart("file_write"));
+    try std.testing.expect(!shouldRetryToolRequestAfterRestart("shell_exec"));
 }
 
 fn parseToolResponseLine(allocator: std.mem.Allocator, line: []const u8) !tool_registry.ToolExecutionResult {
@@ -637,7 +658,7 @@ fn spawnSandboxChild(
     try args.append(allocator, sandbox_namespace_root);
     try args.append(allocator, "--setenv");
     try args.append(allocator, "HOME");
-    try args.append(allocator, sandbox_workspace_path);
+    try args.append(allocator, sandbox_home_path);
     try args.append(allocator, "--setenv");
     try args.append(allocator, "PATH");
     try args.append(allocator, "/usr/bin:/bin");
