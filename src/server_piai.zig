@@ -2226,7 +2226,11 @@ const AuthTokenStore = struct {
             .project_id = try self.allocator.dupe(u8, project_id),
             .last_active_ms = now_ms,
             .message_count = message_delta,
-            .summary = null,
+            .summary = try std.fmt.allocPrint(
+                self.allocator,
+                "{s} @ {s}",
+                .{ agent_id, project_id },
+            ),
         });
         self.sortSessionHistoryNewestFirst(history);
         while (history.items.len > max_history_entries) {
@@ -5767,6 +5771,17 @@ fn handleWebSocketConnection(
                             try writeFrameLocked(stream, &connection_write_mutex, response, .text);
                             continue;
                         };
+                        if (fsrpc_type == .t_write and target_binding.project_id != null) {
+                            runtime_registry.auth_tokens.recordSessionActivity(
+                                principal.role,
+                                target_session_key,
+                                target_binding.agent_id,
+                                target_binding.project_id.?,
+                                1,
+                            ) catch |history_err| {
+                                std.log.warn("session activity update failed: {s}", .{@errorName(history_err)});
+                            };
+                        }
                         var attach_state = runtime_registry.runtimeAttachSnapshot(
                             target_binding.agent_id,
                             target_binding.project_id,
