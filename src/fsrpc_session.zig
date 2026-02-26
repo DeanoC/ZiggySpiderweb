@@ -1316,6 +1316,8 @@ pub const Session = struct {
         var workspace_mount_links: usize = 0;
         var workspace_node_links: usize = 0;
         var reconcile_state: []const u8 = "unknown";
+        var reconcile_state_owned: ?[]u8 = null;
+        defer if (reconcile_state_owned) |owned| self.allocator.free(owned);
         var queue_depth: i64 = 0;
         var health_state: []const u8 = "unknown";
 
@@ -1325,7 +1327,10 @@ pub const Session = struct {
                 defer status_parsed.deinit();
                 if (status_parsed.value == .object) {
                     if (status_parsed.value.object.get("reconcile_state")) |value| {
-                        if (value == .string and value.string.len > 0) reconcile_state = value.string;
+                        if (value == .string and value.string.len > 0) {
+                            reconcile_state_owned = try self.allocator.dupe(u8, value.string);
+                            reconcile_state = reconcile_state_owned.?;
+                        }
                     }
                     if (status_parsed.value.object.get("queue_depth")) |value| {
                         if (value == .integer and value.integer >= 0) queue_depth = value.integer;
