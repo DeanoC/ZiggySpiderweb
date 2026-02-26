@@ -562,7 +562,7 @@ pub const Session = struct {
         try self.addDirectoryDescriptors(
             project_meta_dir,
             "Project Metadata",
-            "{\"kind\":\"metadata\",\"files\":[\"topology.json\",\"nodes.json\",\"sources.json\",\"workspace_status.json\",\"mounts.json\",\"desired_mounts.json\",\"actual_mounts.json\",\"drift.json\",\"reconcile.json\",\"availability.json\",\"health.json\"]}",
+            "{\"kind\":\"metadata\",\"files\":[\"topology.json\",\"nodes.json\",\"agents.json\",\"sources.json\",\"workspace_status.json\",\"mounts.json\",\"desired_mounts.json\",\"actual_mounts.json\",\"drift.json\",\"reconcile.json\",\"availability.json\",\"health.json\"]}",
             "{\"read\":true,\"write\":false}",
             "Project topology and availability metadata.",
         );
@@ -644,6 +644,9 @@ pub const Session = struct {
         const topology_json = try self.buildProjectTopologyJson(policy);
         defer self.allocator.free(topology_json);
         _ = try self.addFile(project_meta_dir, "topology.json", topology_json, false, .none);
+        const agents_json = try self.buildProjectAgentsJson(policy);
+        defer self.allocator.free(agents_json);
+        _ = try self.addFile(project_meta_dir, "agents.json", agents_json, false, .none);
 
         if (workspace_status_json) |status_json| {
             var nodes_from_workspace = false;
@@ -1084,6 +1087,28 @@ pub const Session = struct {
             try out.writer(self.allocator).print(
                 "{{\"node_id\":\"{s}\",\"state\":\"unknown\",\"mounts\":0}}",
                 .{escaped_node_id},
+            );
+        }
+        try out.appendSlice(self.allocator, "]");
+        return out.toOwnedSlice(self.allocator);
+    }
+
+    fn buildProjectAgentsJson(self: *Session, policy: world_policy.Policy) ![]u8 {
+        var out = std.ArrayListUnmanaged(u8){};
+        errdefer out.deinit(self.allocator);
+        try out.appendSlice(self.allocator, "[");
+        try out.appendSlice(self.allocator, "{\"name\":\"self\",\"target\":\"/agents/self\",\"kind\":\"self\"}");
+        for (policy.visible_agents.items) |agent_name| {
+            if (std.mem.eql(u8, agent_name, "self")) continue;
+            const escaped_agent_name = try unified.jsonEscape(self.allocator, agent_name);
+            defer self.allocator.free(escaped_agent_name);
+            const target = try std.fmt.allocPrint(self.allocator, "/agents/{s}", .{agent_name});
+            defer self.allocator.free(target);
+            const escaped_target = try unified.jsonEscape(self.allocator, target);
+            defer self.allocator.free(escaped_target);
+            try out.writer(self.allocator).print(
+                ",{{\"name\":\"{s}\",\"target\":\"{s}\",\"kind\":\"visible\"}}",
+                .{ escaped_agent_name, escaped_target },
             );
         }
         try out.appendSlice(self.allocator, "]");
@@ -2529,6 +2554,7 @@ test "fsrpc_session: project meta includes control-plane workspace status" {
     const node_link_id = session.lookupChild(project_nodes_node, node_id.string) orelse return error.TestExpectedResponse;
     const topology_id = session.lookupChild(meta_node, "topology.json") orelse return error.TestExpectedResponse;
     const nodes_meta_id = session.lookupChild(meta_node, "nodes.json") orelse return error.TestExpectedResponse;
+    const agents_meta_id = session.lookupChild(meta_node, "agents.json") orelse return error.TestExpectedResponse;
     const sources_id = session.lookupChild(meta_node, "sources.json") orelse return error.TestExpectedResponse;
     const workspace_id = session.lookupChild(meta_node, "workspace_status.json") orelse return error.TestExpectedResponse;
     const mounts_id = session.lookupChild(meta_node, "mounts.json") orelse return error.TestExpectedResponse;
@@ -2547,6 +2573,7 @@ test "fsrpc_session: project meta includes control-plane workspace status" {
     const node_link_node = session.nodes.get(node_link_id) orelse return error.TestExpectedResponse;
     const topology_node = session.nodes.get(topology_id) orelse return error.TestExpectedResponse;
     const nodes_meta_node = session.nodes.get(nodes_meta_id) orelse return error.TestExpectedResponse;
+    const agents_meta_node = session.nodes.get(agents_meta_id) orelse return error.TestExpectedResponse;
     const sources_node = session.nodes.get(sources_id) orelse return error.TestExpectedResponse;
     const workspace_node = session.nodes.get(workspace_id) orelse return error.TestExpectedResponse;
     const mounts_node = session.nodes.get(mounts_id) orelse return error.TestExpectedResponse;
@@ -2562,6 +2589,7 @@ test "fsrpc_session: project meta includes control-plane workspace status" {
     try std.testing.expect(std.mem.indexOf(u8, project_agents_caps.content, "\"read\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, meta_schema.content, "\"workspace_status.json\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, meta_schema.content, "\"nodes.json\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, meta_schema.content, "\"agents.json\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, meta_schema.content, "\"sources.json\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, meta_schema.content, "\"desired_mounts.json\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, meta_schema.content, "\"actual_mounts.json\"") != null);
@@ -2578,6 +2606,10 @@ test "fsrpc_session: project meta includes control-plane workspace status" {
     try std.testing.expect(std.mem.indexOf(u8, nodes_meta_node.content, node_id.string) != null);
     try std.testing.expect(std.mem.indexOf(u8, nodes_meta_node.content, "\"state\":\"online\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, nodes_meta_node.content, "\"mounts\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, agents_meta_node.content, "\"name\":\"self\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, agents_meta_node.content, "\"target\":\"/agents/self\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, agents_meta_node.content, "\"name\":\"default\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, agents_meta_node.content, "\"target\":\"/agents/default\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, sources_node.content, "\"workspace_status\":\"control_plane\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, sources_node.content, "\"project_fs\":\"workspace_mounts\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, sources_node.content, "\"project_nodes\":\"workspace_mounts\"") != null);
@@ -2811,6 +2843,7 @@ test "fsrpc_session: project workspace fallback is scoped to requested project" 
 
     const meta_node = session.lookupChild(project_node, "meta") orelse return error.TestExpectedResponse;
     const nodes_meta_id = session.lookupChild(meta_node, "nodes.json") orelse return error.TestExpectedResponse;
+    const agents_meta_id = session.lookupChild(meta_node, "agents.json") orelse return error.TestExpectedResponse;
     const sources_id = session.lookupChild(meta_node, "sources.json") orelse return error.TestExpectedResponse;
     const workspace_id = session.lookupChild(meta_node, "workspace_status.json") orelse return error.TestExpectedResponse;
     const mounts_id = session.lookupChild(meta_node, "mounts.json") orelse return error.TestExpectedResponse;
@@ -2820,6 +2853,7 @@ test "fsrpc_session: project workspace fallback is scoped to requested project" 
     const reconcile_id = session.lookupChild(meta_node, "reconcile.json") orelse return error.TestExpectedResponse;
     const health_id = session.lookupChild(meta_node, "health.json") orelse return error.TestExpectedResponse;
     const nodes_meta_node = session.nodes.get(nodes_meta_id) orelse return error.TestExpectedResponse;
+    const agents_meta_node = session.nodes.get(agents_meta_id) orelse return error.TestExpectedResponse;
     const sources_node = session.nodes.get(sources_id) orelse return error.TestExpectedResponse;
     const workspace_node = session.nodes.get(workspace_id) orelse return error.TestExpectedResponse;
     const mounts_node = session.nodes.get(mounts_id) orelse return error.TestExpectedResponse;
@@ -2831,6 +2865,10 @@ test "fsrpc_session: project workspace fallback is scoped to requested project" 
     try std.testing.expect(std.mem.indexOf(u8, nodes_meta_node.content, "\"node_id\":\"local\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, nodes_meta_node.content, "\"state\":\"unknown\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, nodes_meta_node.content, node_id.string) == null);
+    try std.testing.expect(std.mem.indexOf(u8, agents_meta_node.content, "\"name\":\"self\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, agents_meta_node.content, "\"target\":\"/agents/self\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, agents_meta_node.content, "\"name\":\"default\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, agents_meta_node.content, "\"target\":\"/agents/default\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, sources_node.content, "\"workspace_status\":\"policy\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, sources_node.content, "\"project_fs\":\"policy_links\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, sources_node.content, "\"project_nodes\":\"policy_nodes\"") != null);
