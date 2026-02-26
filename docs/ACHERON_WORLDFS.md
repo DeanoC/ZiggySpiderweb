@@ -31,9 +31,10 @@ Major directories include:
 Node-level service capability metadata is managed via control-plane service catalog
 operations and rendered into `/nodes/<node_id>/services/*`.
 
-Current runtime behavior seeds `/nodes/<node_id>/services/*` from policy node resources
-(`fs`, `camera`, `screen`, `user`, `terminal-*`) with per-service `SCHEMA.json`,
-`CAPS.json`, and `STATUS.json`.
+Current runtime behavior prefers `control.node_service_get` catalog data when available,
+and falls back to policy node resources (`fs`, `camera`, `screen`, `user`, `terminal-*`)
+for `/nodes/<node_id>/services/*`, with per-service `SCHEMA.json`, `CAPS.json`,
+and `STATUS.json`.
 
 ## Chat and Jobs
 

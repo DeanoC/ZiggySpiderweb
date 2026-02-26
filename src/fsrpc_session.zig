@@ -4,6 +4,7 @@ const runtime_server_mod = @import("runtime_server.zig");
 const runtime_handle_mod = @import("runtime_handle.zig");
 const chat_job_index = @import("chat_job_index.zig");
 const world_policy = @import("world_policy.zig");
+const fs_control_plane = @import("fs_control_plane.zig");
 
 const NodeKind = enum {
     dir,
@@ -53,6 +54,7 @@ pub const Session = struct {
         project_id: ?[]const u8 = null,
         agents_dir: []const u8 = "agents",
         projects_dir: []const u8 = "projects",
+        control_plane: ?*fs_control_plane.ControlPlane = null,
     };
 
     allocator: std.mem.Allocator,
@@ -62,6 +64,7 @@ pub const Session = struct {
     project_id: ?[]u8 = null,
     agents_dir: []u8,
     projects_dir: []u8,
+    control_plane: ?*fs_control_plane.ControlPlane = null,
 
     nodes: std.AutoHashMapUnmanaged(u32, Node) = .{},
     fids: std.AutoHashMapUnmanaged(u32, FidState) = .{},
@@ -112,6 +115,7 @@ pub const Session = struct {
             .project_id = owned_project,
             .agents_dir = owned_agents_dir,
             .projects_dir = owned_projects_dir,
+            .control_plane = options.control_plane,
         };
         try self.seedNamespace();
         return self;
@@ -146,6 +150,7 @@ pub const Session = struct {
                 .project_id = self.project_id,
                 .agents_dir = self.agents_dir,
                 .projects_dir = self.projects_dir,
+                .control_plane = self.control_plane,
             },
         );
     }
@@ -639,29 +644,45 @@ pub const Session = struct {
             "Node service descriptors. This view is generated from current world policy.",
         );
 
+        if (try self.loadNodeServicesFromControlPlane(node.id)) |catalog_value| {
+            var catalog = catalog_value;
+            defer catalog.deinit(self.allocator);
+            for (catalog.items.items) |service| {
+                try self.addNodeServiceEntry(
+                    services_root,
+                    service.service_id,
+                    service.kind,
+                    service.state,
+                    service.endpoint,
+                    service.caps_json,
+                );
+            }
+            return;
+        }
+
         if (node.resources.fs) {
             const caps = "{\"rw\":true}";
             const endpoint = try std.fmt.allocPrint(self.allocator, "/nodes/{s}/fs", .{node.id});
             defer self.allocator.free(endpoint);
-            try self.addNodeServiceEntry(services_root, "fs", "fs", endpoint, caps);
+            try self.addNodeServiceEntry(services_root, "fs", "fs", "online", endpoint, caps);
         }
         if (node.resources.camera) {
             const caps = "{\"still\":true}";
             const endpoint = try std.fmt.allocPrint(self.allocator, "/nodes/{s}/camera", .{node.id});
             defer self.allocator.free(endpoint);
-            try self.addNodeServiceEntry(services_root, "camera", "camera", endpoint, caps);
+            try self.addNodeServiceEntry(services_root, "camera", "camera", "online", endpoint, caps);
         }
         if (node.resources.screen) {
             const caps = "{\"capture\":true}";
             const endpoint = try std.fmt.allocPrint(self.allocator, "/nodes/{s}/screen", .{node.id});
             defer self.allocator.free(endpoint);
-            try self.addNodeServiceEntry(services_root, "screen", "screen", endpoint, caps);
+            try self.addNodeServiceEntry(services_root, "screen", "screen", "online", endpoint, caps);
         }
         if (node.resources.user) {
             const caps = "{\"interaction\":true}";
             const endpoint = try std.fmt.allocPrint(self.allocator, "/nodes/{s}/user", .{node.id});
             defer self.allocator.free(endpoint);
-            try self.addNodeServiceEntry(services_root, "user", "user", endpoint, caps);
+            try self.addNodeServiceEntry(services_root, "user", "user", "online", endpoint, caps);
         }
 
         for (node.terminals.items) |terminal_id| {
@@ -677,8 +698,112 @@ pub const Session = struct {
                 .{escaped_terminal_id},
             );
             defer self.allocator.free(caps);
-            try self.addNodeServiceEntry(services_root, service_id, "terminal", endpoint, caps);
+            try self.addNodeServiceEntry(services_root, service_id, "terminal", "online", endpoint, caps);
         }
+    }
+
+    const NodeServiceCatalog = struct {
+        const Entry = struct {
+            service_id: []u8,
+            kind: []u8,
+            state: []u8,
+            endpoint: []u8,
+            caps_json: []u8,
+
+            fn deinit(self: *Entry, allocator: std.mem.Allocator) void {
+                allocator.free(self.service_id);
+                allocator.free(self.kind);
+                allocator.free(self.state);
+                allocator.free(self.endpoint);
+                allocator.free(self.caps_json);
+                self.* = undefined;
+            }
+        };
+
+        items: std.ArrayListUnmanaged(Entry) = .{},
+
+        fn deinit(self: *NodeServiceCatalog, allocator: std.mem.Allocator) void {
+            for (self.items.items) |*item| item.deinit(allocator);
+            self.items.deinit(allocator);
+            self.* = undefined;
+        }
+    };
+
+    fn loadNodeServicesFromControlPlane(self: *Session, node_id: []const u8) !?NodeServiceCatalog {
+        const plane = self.control_plane orelse return null;
+        const escaped_node_id = try unified.jsonEscape(self.allocator, node_id);
+        defer self.allocator.free(escaped_node_id);
+        const request_json = try std.fmt.allocPrint(
+            self.allocator,
+            "{{\"node_id\":\"{s}\"}}",
+            .{escaped_node_id},
+        );
+        defer self.allocator.free(request_json);
+
+        const response_json = plane.nodeServiceGet(request_json) catch return null;
+        defer self.allocator.free(response_json);
+
+        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, response_json, .{}) catch return null;
+        defer parsed.deinit();
+        if (parsed.value != .object) return null;
+        const services_val = parsed.value.object.get("services") orelse return null;
+        if (services_val != .array or services_val.array.items.len == 0) return null;
+
+        var catalog = NodeServiceCatalog{};
+        errdefer catalog.deinit(self.allocator);
+
+        for (services_val.array.items) |item| {
+            if (item != .object) continue;
+            const service_id_val = item.object.get("service_id") orelse continue;
+            if (service_id_val != .string or service_id_val.string.len == 0) continue;
+            const kind_val = item.object.get("kind") orelse continue;
+            if (kind_val != .string or kind_val.string.len == 0) continue;
+            const state_val = item.object.get("state");
+            const state = if (state_val) |value|
+                if (value == .string and value.string.len > 0) value.string else "unknown"
+            else
+                "unknown";
+
+            const endpoint = blk: {
+                if (item.object.get("endpoints")) |raw| {
+                    if (raw == .array) {
+                        for (raw.array.items) |candidate| {
+                            if (candidate != .string or candidate.string.len == 0) continue;
+                            break :blk candidate.string;
+                        }
+                    }
+                }
+                break :blk "";
+            };
+            const resolved_endpoint = if (endpoint.len > 0)
+                try self.allocator.dupe(u8, endpoint)
+            else
+                try std.fmt.allocPrint(self.allocator, "/nodes/{s}/{s}", .{ node_id, service_id_val.string });
+            errdefer self.allocator.free(resolved_endpoint);
+
+            const caps_json = if (item.object.get("capabilities")) |caps|
+                if (caps == .object)
+                    try std.fmt.allocPrint(self.allocator, "{f}", .{std.json.fmt(caps, .{})})
+                else
+                    try self.allocator.dupe(u8, "{}")
+            else
+                try self.allocator.dupe(u8, "{}");
+            errdefer self.allocator.free(caps_json);
+
+            try catalog.items.append(self.allocator, .{
+                .service_id = try self.allocator.dupe(u8, service_id_val.string),
+                .kind = try self.allocator.dupe(u8, kind_val.string),
+                .state = try self.allocator.dupe(u8, state),
+                .endpoint = resolved_endpoint,
+                .caps_json = caps_json,
+            });
+        }
+
+        if (catalog.items.items.len == 0) {
+            catalog.deinit(self.allocator);
+            return null;
+        }
+        return catalog;
     }
 
     fn addNodeServiceEntry(
@@ -686,6 +811,7 @@ pub const Session = struct {
         services_root: u32,
         service_id: []const u8,
         kind: []const u8,
+        state: []const u8,
         endpoint: []const u8,
         caps_json: []const u8,
     ) !void {
@@ -695,6 +821,8 @@ pub const Session = struct {
         defer self.allocator.free(escaped_service_id);
         const escaped_kind = try unified.jsonEscape(self.allocator, kind);
         defer self.allocator.free(escaped_kind);
+        const escaped_state = try unified.jsonEscape(self.allocator, state);
+        defer self.allocator.free(escaped_state);
         const escaped_endpoint = try unified.jsonEscape(self.allocator, endpoint);
         defer self.allocator.free(escaped_endpoint);
 
@@ -716,8 +844,8 @@ pub const Session = struct {
 
         const status = try std.fmt.allocPrint(
             self.allocator,
-            "{{\"service_id\":\"{s}\",\"kind\":\"{s}\",\"state\":\"online\",\"endpoint\":\"{s}\"}}",
-            .{ escaped_service_id, escaped_kind, escaped_endpoint },
+            "{{\"service_id\":\"{s}\",\"kind\":\"{s}\",\"state\":\"{s}\",\"endpoint\":\"{s}\"}}",
+            .{ escaped_service_id, escaped_kind, escaped_state, escaped_endpoint },
         );
         defer self.allocator.free(status);
         _ = try self.addFile(service_dir, "STATUS.json", status, false, .none);
@@ -1149,4 +1277,95 @@ test "fsrpc_session: node services namespace exposes service descriptors" {
     try std.testing.expect(std.mem.indexOf(u8, fs_status_node.content, "/nodes/local/fs") != null);
     try std.testing.expect(std.mem.indexOf(u8, fs_caps_node.content, "\"rw\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, terminal_caps_node.content, "\"terminal_id\":\"1\"") != null);
+}
+
+test "fsrpc_session: node services namespace prefers control-plane catalog" {
+    const allocator = std.testing.allocator;
+
+    var control_plane = fs_control_plane.ControlPlane.init(allocator);
+    defer control_plane.deinit();
+
+    const ensured = try control_plane.ensureNode("edge-a", "ws://127.0.0.1:18891/v2/fs", 60_000);
+    defer allocator.free(ensured);
+    var ensured_parsed = try std.json.parseFromSlice(std.json.Value, allocator, ensured, .{});
+    defer ensured_parsed.deinit();
+    if (ensured_parsed.value != .object) return error.TestExpectedResponse;
+    const node_id = ensured_parsed.value.object.get("node_id") orelse return error.TestExpectedResponse;
+    if (node_id != .string) return error.TestExpectedResponse;
+    const node_secret = ensured_parsed.value.object.get("node_secret") orelse return error.TestExpectedResponse;
+    if (node_secret != .string) return error.TestExpectedResponse;
+
+    const escaped_node_id = try unified.jsonEscape(allocator, node_id.string);
+    defer allocator.free(escaped_node_id);
+    const escaped_node_secret = try unified.jsonEscape(allocator, node_secret.string);
+    defer allocator.free(escaped_node_secret);
+    const upsert_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"node_id\":\"{s}\",\"node_secret\":\"{s}\",\"services\":[{{\"service_id\":\"terminal-9\",\"kind\":\"terminal\",\"version\":\"1\",\"state\":\"degraded\",\"endpoints\":[\"/nodes/{s}/terminal/9\"],\"capabilities\":{{\"pty\":true,\"terminal_id\":\"9\"}}}}]}}",
+        .{ escaped_node_id, escaped_node_secret, escaped_node_id },
+    );
+    defer allocator.free(upsert_req);
+    const upserted = try control_plane.nodeServiceUpsert(upsert_req);
+    defer allocator.free(upserted);
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const root = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+    const agents_dir = try std.fmt.allocPrint(allocator, "{s}/agents", .{root});
+    defer allocator.free(agents_dir);
+    const projects_dir = try std.fmt.allocPrint(allocator, "{s}/projects", .{root});
+    defer allocator.free(projects_dir);
+    const agent_policy_dir = try std.fmt.allocPrint(allocator, "{s}/default", .{agents_dir});
+    defer allocator.free(agent_policy_dir);
+    const project_dir = try std.fmt.allocPrint(allocator, "{s}/proj-test", .{projects_dir});
+    defer allocator.free(project_dir);
+    try std.fs.cwd().makePath(agent_policy_dir);
+    try std.fs.cwd().makePath(project_dir);
+
+    const agent_policy_path = try std.fmt.allocPrint(allocator, "{s}/agent_policy.json", .{agent_policy_dir});
+    defer allocator.free(agent_policy_path);
+    const agent_policy_json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"project_id\":\"proj-test\",\"nodes\":[{{\"id\":\"{s}\",\"resources\":{{\"fs\":false,\"camera\":false,\"screen\":false,\"user\":false}},\"terminals\":[]}}],\"visible_agents\":[\"default\"],\"project_links\":[]}}",
+        .{escaped_node_id},
+    );
+    defer allocator.free(agent_policy_json);
+    try std.fs.cwd().writeFile(.{
+        .sub_path = agent_policy_path,
+        .data = agent_policy_json,
+    });
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "default",
+        .{
+            .project_id = "proj-test",
+            .agents_dir = agents_dir,
+            .projects_dir = projects_dir,
+            .control_plane = &control_plane,
+        },
+    );
+    defer session.deinit();
+
+    const nodes_root = session.lookupChild(session.root_id, "nodes") orelse return error.TestExpectedResponse;
+    const node_dir = session.lookupChild(nodes_root, node_id.string) orelse return error.TestExpectedResponse;
+    const services_root = session.lookupChild(node_dir, "services") orelse return error.TestExpectedResponse;
+    const terminal = session.lookupChild(services_root, "terminal-9") orelse return error.TestExpectedResponse;
+    const status_id = session.lookupChild(terminal, "STATUS.json") orelse return error.TestExpectedResponse;
+    const status_node = session.nodes.get(status_id) orelse return error.TestExpectedResponse;
+    const caps_id = session.lookupChild(terminal, "CAPS.json") orelse return error.TestExpectedResponse;
+    const caps_node = session.nodes.get(caps_id) orelse return error.TestExpectedResponse;
+
+    try std.testing.expect(std.mem.indexOf(u8, status_node.content, "\"state\":\"degraded\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status_node.content, "/nodes/") != null);
+    try std.testing.expect(std.mem.indexOf(u8, caps_node.content, "\"terminal_id\":\"9\"") != null);
 }
