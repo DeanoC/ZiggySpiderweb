@@ -103,6 +103,7 @@ Project metadata now includes:
 
 - `topology.json` (policy-derived node + link view)
 - `nodes.json` (project node membership summary with per-node selected-mount state and count)
+- `sources.json` (provenance for project FS/nodes/meta views: control-plane workspace vs policy fallback)
 - `workspace_status.json` (live `control.workspace_status` when available)
 - `mounts.json` (selected mount entries from workspace status `mounts`)
 - `desired_mounts.json` (desired mount set from workspace status `desired_mounts`)
