@@ -36,6 +36,14 @@ and falls back to policy node resources (`fs`, `camera`, `screen`, `user`, `term
 for `/nodes/<node_id>/services/*`, with per-service `SCHEMA.json`, `CAPS.json`,
 and `STATUS.json`.
 
+When project workspace mounts reference nodes not present in policy, runtime creates
+discovered `/nodes/<node_id>` entries so project FS links always resolve.
+
+Node directories also expose:
+
+- `STATUS.json` (node-level availability/status)
+- `NODE.json` (raw `control.get_node` payload when available)
+
 ## Chat and Jobs
 
 - Chat input path: `/agents/self/chat/control/input`
@@ -53,15 +61,35 @@ Project links are exposed under:
 
 - `/projects/<project_id>/fs/`
 - `/projects/<project_id>/agents/`
+- `/projects/<project_id>/meta/`
 
 `/projects/<project_id>/fs/<name>` entries are logical link files with target paths like:
 
 `/nodes/<node_id>/<resource>`
 
+Current runtime behavior prefers live `control.workspace_status` selected mounts for
+project FS links, using names derived from mount paths:
+
+- `/src` -> `mount::src`
+- `/docs/api` -> `mount::docs::api`
+- `/` -> `mount::root`
+
+When workspace status is unavailable, project FS links fall back to policy
+`project_links`.
+
 Workspace status payloads include mount auth token redaction by role:
 
 - non-primary agents: `"fs_auth_token": null`
 - primary/system (`mother`) agent: token included
+
+Project metadata now includes:
+
+- `topology.json` (policy-derived node + link view)
+- `workspace_status.json` (live `control.workspace_status` when available)
+- `availability.json` (extracted workspace availability rollup)
+
+Runtime uses project token (when bound) for workspace status lookup and falls back
+to policy-derived placeholder status if control-plane status is unavailable.
 
 ## Policy Files
 

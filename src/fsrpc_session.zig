@@ -52,6 +52,7 @@ const FidState = struct {
 pub const Session = struct {
     pub const NamespaceOptions = struct {
         project_id: ?[]const u8 = null,
+        project_token: ?[]const u8 = null,
         agents_dir: []const u8 = "agents",
         projects_dir: []const u8 = "projects",
         control_plane: ?*fs_control_plane.ControlPlane = null,
@@ -62,6 +63,7 @@ pub const Session = struct {
     job_index: *chat_job_index.ChatJobIndex,
     agent_id: []u8,
     project_id: ?[]u8 = null,
+    project_token: ?[]u8 = null,
     agents_dir: []u8,
     projects_dir: []u8,
     control_plane: ?*fs_control_plane.ControlPlane = null,
@@ -100,6 +102,11 @@ pub const Session = struct {
         else
             null;
         errdefer if (owned_project) |value| allocator.free(value);
+        const owned_project_token = if (options.project_token) |value|
+            try allocator.dupe(u8, value)
+        else
+            null;
+        errdefer if (owned_project_token) |value| allocator.free(value);
         const owned_agents_dir = try allocator.dupe(u8, options.agents_dir);
         errdefer allocator.free(owned_agents_dir);
         const owned_projects_dir = try allocator.dupe(u8, options.projects_dir);
@@ -113,6 +120,7 @@ pub const Session = struct {
             .job_index = job_index,
             .agent_id = owned_agent,
             .project_id = owned_project,
+            .project_token = owned_project_token,
             .agents_dir = owned_agents_dir,
             .projects_dir = owned_projects_dir,
             .control_plane = options.control_plane,
@@ -132,6 +140,7 @@ pub const Session = struct {
         self.fids.deinit(self.allocator);
         self.allocator.free(self.agent_id);
         if (self.project_id) |value| self.allocator.free(value);
+        if (self.project_token) |value| self.allocator.free(value);
         self.allocator.free(self.agents_dir);
         self.allocator.free(self.projects_dir);
         self.runtime_handle.release();
@@ -148,6 +157,7 @@ pub const Session = struct {
             agent_id,
             .{
                 .project_id = self.project_id,
+                .project_token = self.project_token,
                 .agents_dir = self.agents_dir,
                 .projects_dir = self.projects_dir,
                 .control_plane = self.control_plane,
@@ -459,41 +469,7 @@ pub const Session = struct {
             "Project-centric cross-node and agent views.",
         );
 
-        for (policy.nodes.items) |node| {
-            const node_dir = try self.addDir(nodes_root, node.id, false);
-            const node_schema = "{\"kind\":\"node\",\"children\":[\"services\",\"fs\",\"camera\",\"screen\",\"user\",\"terminal\"]}";
-            const node_caps = try std.fmt.allocPrint(
-                self.allocator,
-                "{{\"fs\":{s},\"camera\":{s},\"screen\":{s},\"user\":{s},\"terminal\":{s}}}",
-                .{
-                    if (node.resources.fs) "true" else "false",
-                    if (node.resources.camera) "true" else "false",
-                    if (node.resources.screen) "true" else "false",
-                    if (node.resources.user) "true" else "false",
-                    if (node.terminals.items.len > 0) "true" else "false",
-                },
-            );
-            defer self.allocator.free(node_caps);
-            try self.addDirectoryDescriptors(
-                node_dir,
-                "Node Endpoint",
-                node_schema,
-                node_caps,
-                "Node resource roots. Entries may be unavailable based on policy.",
-            );
-            try self.addNodeServices(node_dir, node);
-
-            if (node.resources.fs) _ = try self.addDir(node_dir, "fs", false);
-            if (node.resources.camera) _ = try self.addDir(node_dir, "camera", false);
-            if (node.resources.screen) _ = try self.addDir(node_dir, "screen", false);
-            if (node.resources.user) _ = try self.addDir(node_dir, "user", false);
-            if (node.terminals.items.len > 0) {
-                const terminal_root = try self.addDir(node_dir, "terminal", false);
-                for (node.terminals.items) |terminal_id| {
-                    _ = try self.addDir(terminal_root, terminal_id, false);
-                }
-            }
-        }
+        for (policy.nodes.items) |node| try self.addNodeDirectory(nodes_root, node, false);
 
         const self_agent_dir = try self.addDir(agents_root, "self", false);
         const chat = try self.addDir(self_agent_dir, "chat", false);
@@ -562,11 +538,13 @@ pub const Session = struct {
             "Project-composed world view.",
         );
 
-        for (policy.project_links.items) |link| {
-            const target = try std.fmt.allocPrint(self.allocator, "/nodes/{s}/{s}\n", .{ link.node_id, link.resource });
-            defer self.allocator.free(target);
-            _ = try self.addFile(project_fs_dir, link.name, target, false, .none);
-        }
+        const workspace_status_json = try self.loadProjectWorkspaceStatus(policy.project_id);
+        defer if (workspace_status_json) |value| self.allocator.free(value);
+        const loaded_live_mounts = if (workspace_status_json) |json|
+            try self.addProjectFsLinksFromWorkspaceStatus(project_fs_dir, nodes_root, json)
+        else
+            false;
+        if (!loaded_live_mounts) try self.addProjectFsLinksFromPolicy(project_fs_dir, policy);
 
         _ = try self.addFile(project_agents_dir, "self", "/agents/self\n", false, .none);
         for (policy.visible_agents.items) |agent_name| {
@@ -576,7 +554,7 @@ pub const Session = struct {
             _ = try self.addFile(project_agents_dir, agent_name, target, false, .none);
         }
 
-        _ = try self.addFile(project_meta_dir, "README.md", "Project metadata and link topology.\n", false, .none);
+        try self.addProjectMetaFiles(project_meta_dir, policy, workspace_status_json);
 
         if (debug_root) |dir_id| {
             try self.addDirectoryDescriptors(
@@ -615,6 +593,262 @@ pub const Session = struct {
         _ = try self.addFile(meta_root, "view.json", view_json, false, .none);
     }
 
+    fn addProjectMetaFiles(
+        self: *Session,
+        project_meta_dir: u32,
+        policy: world_policy.Policy,
+        workspace_status_json: ?[]const u8,
+    ) !void {
+        _ = try self.addFile(project_meta_dir, "README.md", "Project metadata and link topology.\n", false, .none);
+
+        const topology_json = try self.buildProjectTopologyJson(policy);
+        defer self.allocator.free(topology_json);
+        _ = try self.addFile(project_meta_dir, "topology.json", topology_json, false, .none);
+
+        if (workspace_status_json) |status_json| {
+            _ = try self.addFile(project_meta_dir, "workspace_status.json", status_json, false, .none);
+            if (try self.extractWorkspaceAvailability(status_json)) |availability_json| {
+                defer self.allocator.free(availability_json);
+                _ = try self.addFile(project_meta_dir, "availability.json", availability_json, false, .none);
+            }
+            return;
+        }
+
+        const fallback_status = try self.buildFallbackWorkspaceStatusJson(policy);
+        defer self.allocator.free(fallback_status);
+        _ = try self.addFile(project_meta_dir, "workspace_status.json", fallback_status, false, .none);
+        _ = try self.addFile(project_meta_dir, "availability.json", "{\"mounts_total\":0,\"online\":0,\"degraded\":0,\"missing\":0}", false, .none);
+    }
+
+    fn addProjectFsLinksFromPolicy(
+        self: *Session,
+        project_fs_dir: u32,
+        policy: world_policy.Policy,
+    ) !void {
+        for (policy.project_links.items) |link| {
+            const target = try std.fmt.allocPrint(self.allocator, "/nodes/{s}/{s}\n", .{ link.node_id, link.resource });
+            defer self.allocator.free(target);
+            _ = try self.addFile(project_fs_dir, link.name, target, false, .none);
+        }
+    }
+
+    fn addProjectFsLinksFromWorkspaceStatus(
+        self: *Session,
+        project_fs_dir: u32,
+        nodes_root: u32,
+        workspace_status_json: []const u8,
+    ) !bool {
+        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, workspace_status_json, .{}) catch return false;
+        defer parsed.deinit();
+        if (parsed.value != .object) return false;
+        const mounts_value = parsed.value.object.get("mounts") orelse return false;
+        if (mounts_value != .array or mounts_value.array.items.len == 0) return false;
+
+        var added = false;
+        for (mounts_value.array.items) |mount_value| {
+            if (mount_value != .object) continue;
+            const node_id_value = mount_value.object.get("node_id") orelse continue;
+            if (node_id_value != .string or node_id_value.string.len == 0) continue;
+            const mount_path_value = mount_value.object.get("mount_path") orelse continue;
+            if (mount_path_value != .string or mount_path_value.string.len == 0) continue;
+
+            try self.ensureWorkspaceNodeForProjectMount(nodes_root, node_id_value.string);
+            const link_name = try projectMountPathToLinkName(self.allocator, mount_path_value.string);
+            defer self.allocator.free(link_name);
+            if (self.lookupChild(project_fs_dir, link_name) != null) continue;
+
+            const target = try std.fmt.allocPrint(self.allocator, "/nodes/{s}/fs\n", .{node_id_value.string});
+            defer self.allocator.free(target);
+            _ = try self.addFile(project_fs_dir, link_name, target, false, .none);
+            added = true;
+        }
+        return added;
+    }
+
+    fn ensureWorkspaceNodeForProjectMount(
+        self: *Session,
+        nodes_root: u32,
+        node_id: []const u8,
+    ) !void {
+        if (self.lookupChild(nodes_root, node_id)) |node_dir| {
+            if (self.lookupChild(node_dir, "fs") == null) {
+                _ = try self.addDir(node_dir, "fs", false);
+            }
+            return;
+        }
+
+        var discovered = world_policy.NodePolicy{
+            .id = try self.allocator.dupe(u8, node_id),
+            .resources = .{
+                .fs = true,
+                .camera = false,
+                .screen = false,
+                .user = false,
+            },
+        };
+        defer {
+            self.allocator.free(discovered.id);
+            for (discovered.terminals.items) |terminal_id| self.allocator.free(terminal_id);
+            discovered.terminals.deinit(self.allocator);
+        }
+        try self.addNodeDirectory(nodes_root, discovered, true);
+    }
+
+    fn addNodeDirectory(
+        self: *Session,
+        nodes_root: u32,
+        node: world_policy.NodePolicy,
+        discovered_from_workspace: bool,
+    ) !void {
+        const node_dir = try self.addDir(nodes_root, node.id, false);
+        const node_schema = "{\"kind\":\"node\",\"children\":[\"services\",\"fs\",\"camera\",\"screen\",\"user\",\"terminal\"]}";
+        const node_caps = try std.fmt.allocPrint(
+            self.allocator,
+            "{{\"fs\":{s},\"camera\":{s},\"screen\":{s},\"user\":{s},\"terminal\":{s}}}",
+            .{
+                if (node.resources.fs) "true" else "false",
+                if (node.resources.camera) "true" else "false",
+                if (node.resources.screen) "true" else "false",
+                if (node.resources.user) "true" else "false",
+                if (node.terminals.items.len > 0) "true" else "false",
+            },
+        );
+        defer self.allocator.free(node_caps);
+        try self.addDirectoryDescriptors(
+            node_dir,
+            "Node Endpoint",
+            node_schema,
+            node_caps,
+            if (discovered_from_workspace)
+                "Node discovered from live project workspace mounts."
+            else
+                "Node resource roots. Entries may be unavailable based on policy.",
+        );
+        try self.addNodeRuntimeMetadataFiles(node_dir, node.id, discovered_from_workspace);
+        try self.addNodeServices(node_dir, node);
+
+        if (node.resources.fs) _ = try self.addDir(node_dir, "fs", false);
+        if (node.resources.camera) _ = try self.addDir(node_dir, "camera", false);
+        if (node.resources.screen) _ = try self.addDir(node_dir, "screen", false);
+        if (node.resources.user) _ = try self.addDir(node_dir, "user", false);
+        if (node.terminals.items.len > 0) {
+            const terminal_root = try self.addDir(node_dir, "terminal", false);
+            for (node.terminals.items) |terminal_id| {
+                _ = try self.addDir(terminal_root, terminal_id, false);
+            }
+        }
+    }
+
+    fn addNodeRuntimeMetadataFiles(
+        self: *Session,
+        node_dir: u32,
+        node_id: []const u8,
+        discovered_from_workspace: bool,
+    ) !void {
+        if (try self.loadNodeControlPayload(node_id)) |node_payload_json| {
+            defer self.allocator.free(node_payload_json);
+            _ = try self.addFile(node_dir, "NODE.json", node_payload_json, false, .none);
+            if (try self.buildNodeStatusFromControlPayload(node_id, node_payload_json)) |status_json| {
+                defer self.allocator.free(status_json);
+                _ = try self.addFile(node_dir, "STATUS.json", status_json, false, .none);
+                return;
+            }
+        }
+
+        const fallback_status = try self.buildFallbackNodeStatusJson(node_id, discovered_from_workspace);
+        defer self.allocator.free(fallback_status);
+        _ = try self.addFile(node_dir, "STATUS.json", fallback_status, false, .none);
+    }
+
+    fn loadNodeControlPayload(self: *Session, node_id: []const u8) !?[]u8 {
+        const plane = self.control_plane orelse return null;
+        const escaped_node_id = try unified.jsonEscape(self.allocator, node_id);
+        defer self.allocator.free(escaped_node_id);
+        const request_json = try std.fmt.allocPrint(
+            self.allocator,
+            "{{\"node_id\":\"{s}\"}}",
+            .{escaped_node_id},
+        );
+        defer self.allocator.free(request_json);
+        return plane.getNode(request_json) catch null;
+    }
+
+    fn buildNodeStatusFromControlPayload(
+        self: *Session,
+        node_id: []const u8,
+        node_payload_json: []const u8,
+    ) !?[]u8 {
+        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, node_payload_json, .{}) catch return null;
+        defer parsed.deinit();
+        if (parsed.value != .object) return null;
+        const node_value = parsed.value.object.get("node") orelse return null;
+        if (node_value != .object) return null;
+
+        const node_name = if (node_value.object.get("node_name")) |value|
+            if (value == .string and value.string.len > 0) value.string else node_id
+        else
+            node_id;
+        const fs_url = if (node_value.object.get("fs_url")) |value|
+            if (value == .string) value.string else ""
+        else
+            "";
+        const lease_expires_at_ms = if (node_value.object.get("lease_expires_at_ms")) |value|
+            if (value == .integer) value.integer else @as(i64, 0)
+        else
+            0;
+        const last_seen_ms = if (node_value.object.get("last_seen_ms")) |value|
+            if (value == .integer) value.integer else @as(i64, 0)
+        else
+            0;
+        const joined_at_ms = if (node_value.object.get("joined_at_ms")) |value|
+            if (value == .integer) value.integer else @as(i64, 0)
+        else
+            0;
+
+        const online = lease_expires_at_ms > std.time.milliTimestamp();
+        const escaped_node_id = try unified.jsonEscape(self.allocator, node_id);
+        defer self.allocator.free(escaped_node_id);
+        const escaped_node_name = try unified.jsonEscape(self.allocator, node_name);
+        defer self.allocator.free(escaped_node_name);
+        const escaped_fs_url = try unified.jsonEscape(self.allocator, fs_url);
+        defer self.allocator.free(escaped_fs_url);
+
+        const status_json = try std.fmt.allocPrint(
+            self.allocator,
+            "{{\"node_id\":\"{s}\",\"node_name\":\"{s}\",\"state\":\"{s}\",\"online\":{s},\"lease_expires_at_ms\":{d},\"last_seen_ms\":{d},\"joined_at_ms\":{d},\"fs_url\":\"{s}\",\"source\":\"control_plane\"}}",
+            .{
+                escaped_node_id,
+                escaped_node_name,
+                if (online) "online" else "degraded",
+                if (online) "true" else "false",
+                lease_expires_at_ms,
+                last_seen_ms,
+                joined_at_ms,
+                escaped_fs_url,
+            },
+        );
+        return status_json;
+    }
+
+    fn buildFallbackNodeStatusJson(
+        self: *Session,
+        node_id: []const u8,
+        discovered_from_workspace: bool,
+    ) ![]u8 {
+        const escaped_node_id = try unified.jsonEscape(self.allocator, node_id);
+        defer self.allocator.free(escaped_node_id);
+        return std.fmt.allocPrint(
+            self.allocator,
+            "{{\"node_id\":\"{s}\",\"state\":\"{s}\",\"online\":{s},\"source\":\"{s}\"}}",
+            .{
+                escaped_node_id,
+                if (discovered_from_workspace) "unknown" else "configured",
+                if (discovered_from_workspace) "false" else "true",
+                if (discovered_from_workspace) "workspace_discovery" else "policy",
+            },
+        );
+    }
+
     fn addDirectoryDescriptors(
         self: *Session,
         dir_id: u32,
@@ -634,6 +868,111 @@ pub const Session = struct {
         _ = try self.addFile(dir_id, "CAPS.json", caps_json, false, .none);
     }
 
+    fn buildProjectTopologyJson(self: *Session, policy: world_policy.Policy) ![]u8 {
+        const escaped_project = try unified.jsonEscape(self.allocator, policy.project_id);
+        defer self.allocator.free(escaped_project);
+        const escaped_agent = try unified.jsonEscape(self.allocator, self.agent_id);
+        defer self.allocator.free(escaped_agent);
+
+        var out = std.ArrayListUnmanaged(u8){};
+        errdefer out.deinit(self.allocator);
+        try out.writer(self.allocator).print(
+            "{{\"project_id\":\"{s}\",\"agent_id\":\"{s}\",\"nodes\":[",
+            .{ escaped_project, escaped_agent },
+        );
+        for (policy.nodes.items, 0..) |node, idx| {
+            if (idx != 0) try out.append(self.allocator, ',');
+            const escaped_node_id = try unified.jsonEscape(self.allocator, node.id);
+            defer self.allocator.free(escaped_node_id);
+            try out.writer(self.allocator).print(
+                "{{\"id\":\"{s}\",\"resources\":{{\"fs\":{s},\"camera\":{s},\"screen\":{s},\"user\":{s}}},\"terminals\":[",
+                .{
+                    escaped_node_id,
+                    if (node.resources.fs) "true" else "false",
+                    if (node.resources.camera) "true" else "false",
+                    if (node.resources.screen) "true" else "false",
+                    if (node.resources.user) "true" else "false",
+                },
+            );
+            for (node.terminals.items, 0..) |terminal_id, term_idx| {
+                if (term_idx != 0) try out.append(self.allocator, ',');
+                const escaped_terminal = try unified.jsonEscape(self.allocator, terminal_id);
+                defer self.allocator.free(escaped_terminal);
+                try out.writer(self.allocator).print("\"{s}\"", .{escaped_terminal});
+            }
+            try out.appendSlice(self.allocator, "]}");
+        }
+        try out.appendSlice(self.allocator, "],\"project_links\":[");
+        for (policy.project_links.items, 0..) |link, idx| {
+            if (idx != 0) try out.append(self.allocator, ',');
+            const target = try std.fmt.allocPrint(self.allocator, "/nodes/{s}/{s}", .{ link.node_id, link.resource });
+            defer self.allocator.free(target);
+            const escaped_name = try unified.jsonEscape(self.allocator, link.name);
+            defer self.allocator.free(escaped_name);
+            const escaped_node_id = try unified.jsonEscape(self.allocator, link.node_id);
+            defer self.allocator.free(escaped_node_id);
+            const escaped_resource = try unified.jsonEscape(self.allocator, link.resource);
+            defer self.allocator.free(escaped_resource);
+            const escaped_target = try unified.jsonEscape(self.allocator, target);
+            defer self.allocator.free(escaped_target);
+            try out.writer(self.allocator).print(
+                "{{\"name\":\"{s}\",\"node_id\":\"{s}\",\"resource\":\"{s}\",\"target\":\"{s}\"}}",
+                .{ escaped_name, escaped_node_id, escaped_resource, escaped_target },
+            );
+        }
+        try out.appendSlice(self.allocator, "]}");
+        return out.toOwnedSlice(self.allocator);
+    }
+
+    fn loadProjectWorkspaceStatus(self: *Session, project_id: []const u8) !?[]u8 {
+        const plane = self.control_plane orelse return null;
+        const escaped_project_id = try unified.jsonEscape(self.allocator, project_id);
+        defer self.allocator.free(escaped_project_id);
+        const request_json = if (self.project_token) |token| blk: {
+            const escaped_token = try unified.jsonEscape(self.allocator, token);
+            defer self.allocator.free(escaped_token);
+            break :blk try std.fmt.allocPrint(
+                self.allocator,
+                "{{\"project_id\":\"{s}\",\"project_token\":\"{s}\"}}",
+                .{ escaped_project_id, escaped_token },
+            );
+        } else try std.fmt.allocPrint(
+            self.allocator,
+            "{{\"project_id\":\"{s}\"}}",
+            .{escaped_project_id},
+        );
+        defer self.allocator.free(request_json);
+
+        if (plane.workspaceStatus(self.agent_id, request_json)) |status_json| {
+            return status_json;
+        } else |_| {
+            return plane.workspaceStatus(self.agent_id, null) catch null;
+        }
+    }
+
+    fn extractWorkspaceAvailability(self: *Session, workspace_status_json: []const u8) !?[]u8 {
+        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, workspace_status_json, .{}) catch return null;
+        defer parsed.deinit();
+        if (parsed.value != .object) return null;
+        const availability_value = parsed.value.object.get("availability") orelse return null;
+        if (availability_value != .object) return null;
+        const rendered = try std.fmt.allocPrint(self.allocator, "{f}", .{std.json.fmt(availability_value, .{})});
+        return rendered;
+    }
+
+    fn buildFallbackWorkspaceStatusJson(self: *Session, policy: world_policy.Policy) ![]u8 {
+        const escaped_agent = try unified.jsonEscape(self.allocator, self.agent_id);
+        defer self.allocator.free(escaped_agent);
+        const escaped_project = try unified.jsonEscape(self.allocator, policy.project_id);
+        defer self.allocator.free(escaped_project);
+
+        return std.fmt.allocPrint(
+            self.allocator,
+            "{{\"agent_id\":\"{s}\",\"project_id\":\"{s}\",\"source\":\"policy\",\"workspace_root\":null,\"mounts\":[],\"desired_mounts\":[],\"actual_mounts\":[],\"drift\":{{\"count\":0,\"items\":[]}},\"availability\":{{\"mounts_total\":0,\"online\":0,\"degraded\":0,\"missing\":0}},\"reconcile_state\":\"unknown\",\"last_reconcile_ms\":0,\"last_success_ms\":0,\"last_error\":null,\"queue_depth\":0}}",
+            .{ escaped_agent, escaped_project },
+        );
+    }
+
     fn addNodeServices(self: *Session, node_dir: u32, node: world_policy.NodePolicy) !void {
         const services_root = try self.addDir(node_dir, "services", false);
         try self.addDirectoryDescriptors(
@@ -641,7 +980,7 @@ pub const Session = struct {
             "Node Services",
             "{\"kind\":\"collection\",\"entries\":\"service_id\",\"shape\":\"/nodes/<node_id>/services/<service_id>/{SCHEMA.json,STATUS.json,CAPS.json}\"}",
             "{\"read\":true,\"write\":false}",
-            "Node service descriptors. This view is generated from current world policy.",
+            "Node service descriptors. This view prefers control-plane catalog data and falls back to policy.",
         );
 
         if (try self.loadNodeServicesFromControlPlane(node.id)) |catalog_value| {
@@ -834,7 +1173,7 @@ pub const Session = struct {
         defer self.allocator.free(schema);
         const readme = try std.fmt.allocPrint(
             self.allocator,
-            "# Service `{s}`\n\nPolicy-derived service metadata.\n",
+            "# Service `{s}`\n\nService metadata for this node capability.\n",
             .{service_id},
         );
         defer self.allocator.free(readme);
@@ -1158,6 +1497,29 @@ fn nodeMode(node: Node) u32 {
     };
 }
 
+fn projectMountPathToLinkName(allocator: std.mem.Allocator, mount_path: []const u8) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8){};
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, "mount::");
+
+    const trimmed = std.mem.trim(u8, mount_path, "/");
+    if (trimmed.len == 0) {
+        try out.appendSlice(allocator, "root");
+        return out.toOwnedSlice(allocator);
+    }
+
+    var part_it = std.mem.tokenizeScalar(u8, trimmed, '/');
+    var first = true;
+    while (part_it.next()) |part| {
+        if (part.len == 0) continue;
+        if (!first) try out.appendSlice(allocator, "::");
+        first = false;
+        try out.appendSlice(allocator, part);
+    }
+    if (first) try out.appendSlice(allocator, "root");
+    return out.toOwnedSlice(allocator);
+}
+
 test "fsrpc_session: attach walk open read capability help" {
     const allocator = std.testing.allocator;
 
@@ -1261,6 +1623,7 @@ test "fsrpc_session: node services namespace exposes service descriptors" {
 
     const nodes_root = session.lookupChild(session.root_id, "nodes") orelse return error.TestExpectedResponse;
     const local_node = session.lookupChild(nodes_root, "local") orelse return error.TestExpectedResponse;
+    const node_status = session.lookupChild(local_node, "STATUS.json") orelse return error.TestExpectedResponse;
     const services_root = session.lookupChild(local_node, "services") orelse return error.TestExpectedResponse;
     const fs_service = session.lookupChild(services_root, "fs") orelse return error.TestExpectedResponse;
     const terminal_service = session.lookupChild(services_root, "terminal-1") orelse return error.TestExpectedResponse;
@@ -1272,7 +1635,9 @@ test "fsrpc_session: node services namespace exposes service descriptors" {
     const fs_status_node = session.nodes.get(fs_status) orelse return error.TestExpectedResponse;
     const fs_caps_node = session.nodes.get(fs_caps) orelse return error.TestExpectedResponse;
     const terminal_caps_node = session.nodes.get(terminal_caps) orelse return error.TestExpectedResponse;
+    const node_status_node = session.nodes.get(node_status) orelse return error.TestExpectedResponse;
 
+    try std.testing.expect(std.mem.indexOf(u8, node_status_node.content, "\"state\":\"configured\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, fs_status_node.content, "\"state\":\"online\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, fs_status_node.content, "/nodes/local/fs") != null);
     try std.testing.expect(std.mem.indexOf(u8, fs_caps_node.content, "\"rw\":true") != null);
@@ -1368,4 +1733,221 @@ test "fsrpc_session: node services namespace prefers control-plane catalog" {
     try std.testing.expect(std.mem.indexOf(u8, status_node.content, "\"state\":\"degraded\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, status_node.content, "/nodes/") != null);
     try std.testing.expect(std.mem.indexOf(u8, caps_node.content, "\"terminal_id\":\"9\"") != null);
+}
+
+test "fsrpc_session: project meta includes control-plane workspace status" {
+    const allocator = std.testing.allocator;
+
+    var control_plane = fs_control_plane.ControlPlane.init(allocator);
+    defer control_plane.deinit();
+
+    const ensured = try control_plane.ensureNode("edge-meta", "ws://127.0.0.1:18891/v2/fs", 60_000);
+    defer allocator.free(ensured);
+    var ensured_parsed = try std.json.parseFromSlice(std.json.Value, allocator, ensured, .{});
+    defer ensured_parsed.deinit();
+    if (ensured_parsed.value != .object) return error.TestExpectedResponse;
+    const node_id = ensured_parsed.value.object.get("node_id") orelse return error.TestExpectedResponse;
+    if (node_id != .string) return error.TestExpectedResponse;
+
+    const created_project = try control_plane.createProject("{\"name\":\"MetaWorldFS\"}");
+    defer allocator.free(created_project);
+    var project_parsed = try std.json.parseFromSlice(std.json.Value, allocator, created_project, .{});
+    defer project_parsed.deinit();
+    if (project_parsed.value != .object) return error.TestExpectedResponse;
+    const project_id = project_parsed.value.object.get("project_id") orelse return error.TestExpectedResponse;
+    if (project_id != .string) return error.TestExpectedResponse;
+    const project_token = project_parsed.value.object.get("project_token") orelse return error.TestExpectedResponse;
+    if (project_token != .string) return error.TestExpectedResponse;
+
+    const escaped_project_id = try unified.jsonEscape(allocator, project_id.string);
+    defer allocator.free(escaped_project_id);
+    const escaped_project_token = try unified.jsonEscape(allocator, project_token.string);
+    defer allocator.free(escaped_project_token);
+    const escaped_node_id = try unified.jsonEscape(allocator, node_id.string);
+    defer allocator.free(escaped_node_id);
+
+    const mount_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"project_id\":\"{s}\",\"project_token\":\"{s}\",\"node_id\":\"{s}\",\"export_name\":\"work\",\"mount_path\":\"/src\"}}",
+        .{ escaped_project_id, escaped_project_token, escaped_node_id },
+    );
+    defer allocator.free(mount_req);
+    const mounted = try control_plane.setProjectMount(mount_req);
+    defer allocator.free(mounted);
+
+    const up_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"project_id\":\"{s}\",\"project_token\":\"{s}\"}}",
+        .{ escaped_project_id, escaped_project_token },
+    );
+    defer allocator.free(up_req);
+    const up = try control_plane.projectUp("default", up_req);
+    defer allocator.free(up);
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const root = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+    const agents_dir = try std.fmt.allocPrint(allocator, "{s}/agents", .{root});
+    defer allocator.free(agents_dir);
+    const projects_dir = try std.fmt.allocPrint(allocator, "{s}/projects", .{root});
+    defer allocator.free(projects_dir);
+    const agent_policy_dir = try std.fmt.allocPrint(allocator, "{s}/default", .{agents_dir});
+    defer allocator.free(agent_policy_dir);
+    const project_dir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ projects_dir, project_id.string });
+    defer allocator.free(project_dir);
+    try std.fs.cwd().makePath(agent_policy_dir);
+    try std.fs.cwd().makePath(project_dir);
+
+    const agent_policy_path = try std.fmt.allocPrint(allocator, "{s}/agent_policy.json", .{agent_policy_dir});
+    defer allocator.free(agent_policy_path);
+    const agent_policy_json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"project_id\":\"{s}\",\"nodes\":[{{\"id\":\"{s}\",\"resources\":{{\"fs\":true,\"camera\":false,\"screen\":false,\"user\":false}},\"terminals\":[]}}],\"visible_agents\":[\"default\"],\"project_links\":[{{\"name\":\"{s}::fs\",\"node_id\":\"{s}\",\"resource\":\"fs\"}}]}}",
+        .{ escaped_project_id, escaped_node_id, escaped_node_id, escaped_node_id },
+    );
+    defer allocator.free(agent_policy_json);
+    try std.fs.cwd().writeFile(.{
+        .sub_path = agent_policy_path,
+        .data = agent_policy_json,
+    });
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "default",
+        .{
+            .project_id = project_id.string,
+            .project_token = project_token.string,
+            .agents_dir = agents_dir,
+            .projects_dir = projects_dir,
+            .control_plane = &control_plane,
+        },
+    );
+    defer session.deinit();
+
+    const projects_root = session.lookupChild(session.root_id, "projects") orelse return error.TestExpectedResponse;
+    const project_node = session.lookupChild(projects_root, project_id.string) orelse return error.TestExpectedResponse;
+    const project_fs_node = session.lookupChild(project_node, "fs") orelse return error.TestExpectedResponse;
+    const meta_node = session.lookupChild(project_node, "meta") orelse return error.TestExpectedResponse;
+    const mount_link_id = session.lookupChild(project_fs_node, "mount::src") orelse return error.TestExpectedResponse;
+    const topology_id = session.lookupChild(meta_node, "topology.json") orelse return error.TestExpectedResponse;
+    const workspace_id = session.lookupChild(meta_node, "workspace_status.json") orelse return error.TestExpectedResponse;
+    const availability_id = session.lookupChild(meta_node, "availability.json") orelse return error.TestExpectedResponse;
+
+    const mount_link_node = session.nodes.get(mount_link_id) orelse return error.TestExpectedResponse;
+    const topology_node = session.nodes.get(topology_id) orelse return error.TestExpectedResponse;
+    const workspace_node = session.nodes.get(workspace_id) orelse return error.TestExpectedResponse;
+    const availability_node = session.nodes.get(availability_id) orelse return error.TestExpectedResponse;
+
+    try std.testing.expect(std.mem.indexOf(u8, mount_link_node.content, "/nodes/") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mount_link_node.content, "/fs") != null);
+    try std.testing.expect(std.mem.indexOf(u8, topology_node.content, "\"project_links\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, topology_node.content, node_id.string) != null);
+    try std.testing.expect(std.mem.indexOf(u8, workspace_node.content, "\"mount_path\":\"/src\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, workspace_node.content, "\"state\":\"online\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, availability_node.content, "\"mounts_total\":1") != null);
+}
+
+test "fsrpc_session: project workspace mount nodes are discovered outside policy" {
+    const allocator = std.testing.allocator;
+
+    var control_plane = fs_control_plane.ControlPlane.init(allocator);
+    defer control_plane.deinit();
+
+    const ensured = try control_plane.ensureNode("edge-discovered", "ws://127.0.0.1:18891/v2/fs", 60_000);
+    defer allocator.free(ensured);
+    var ensured_parsed = try std.json.parseFromSlice(std.json.Value, allocator, ensured, .{});
+    defer ensured_parsed.deinit();
+    if (ensured_parsed.value != .object) return error.TestExpectedResponse;
+    const node_id = ensured_parsed.value.object.get("node_id") orelse return error.TestExpectedResponse;
+    if (node_id != .string) return error.TestExpectedResponse;
+
+    const created_project = try control_plane.createProject("{\"name\":\"DiscoveredNodeProject\"}");
+    defer allocator.free(created_project);
+    var project_parsed = try std.json.parseFromSlice(std.json.Value, allocator, created_project, .{});
+    defer project_parsed.deinit();
+    if (project_parsed.value != .object) return error.TestExpectedResponse;
+    const project_id = project_parsed.value.object.get("project_id") orelse return error.TestExpectedResponse;
+    if (project_id != .string) return error.TestExpectedResponse;
+    const project_token = project_parsed.value.object.get("project_token") orelse return error.TestExpectedResponse;
+    if (project_token != .string) return error.TestExpectedResponse;
+
+    const escaped_project_id = try unified.jsonEscape(allocator, project_id.string);
+    defer allocator.free(escaped_project_id);
+    const escaped_project_token = try unified.jsonEscape(allocator, project_token.string);
+    defer allocator.free(escaped_project_token);
+    const escaped_node_id = try unified.jsonEscape(allocator, node_id.string);
+    defer allocator.free(escaped_node_id);
+
+    const mount_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"project_id\":\"{s}\",\"project_token\":\"{s}\",\"node_id\":\"{s}\",\"export_name\":\"work\",\"mount_path\":\"/code\"}}",
+        .{ escaped_project_id, escaped_project_token, escaped_node_id },
+    );
+    defer allocator.free(mount_req);
+    const mounted = try control_plane.setProjectMount(mount_req);
+    defer allocator.free(mounted);
+
+    const up_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"project_id\":\"{s}\",\"project_token\":\"{s}\"}}",
+        .{ escaped_project_id, escaped_project_token },
+    );
+    defer allocator.free(up_req);
+    const up = try control_plane.projectUp("default", up_req);
+    defer allocator.free(up);
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "default",
+        .{
+            .project_id = project_id.string,
+            .project_token = project_token.string,
+            .agents_dir = ".does-not-exist",
+            .projects_dir = ".does-not-exist",
+            .control_plane = &control_plane,
+        },
+    );
+    defer session.deinit();
+
+    const nodes_root = session.lookupChild(session.root_id, "nodes") orelse return error.TestExpectedResponse;
+    const discovered_node_dir = session.lookupChild(nodes_root, node_id.string) orelse return error.TestExpectedResponse;
+    const discovered_fs = session.lookupChild(discovered_node_dir, "fs") orelse return error.TestExpectedResponse;
+    _ = discovered_fs;
+    const discovered_readme_id = session.lookupChild(discovered_node_dir, "README.md") orelse return error.TestExpectedResponse;
+    const discovered_status_id = session.lookupChild(discovered_node_dir, "STATUS.json") orelse return error.TestExpectedResponse;
+    const discovered_node_meta_id = session.lookupChild(discovered_node_dir, "NODE.json") orelse return error.TestExpectedResponse;
+    const discovered_readme = session.nodes.get(discovered_readme_id) orelse return error.TestExpectedResponse;
+    const discovered_status = session.nodes.get(discovered_status_id) orelse return error.TestExpectedResponse;
+    const discovered_node_meta = session.nodes.get(discovered_node_meta_id) orelse return error.TestExpectedResponse;
+
+    const projects_root = session.lookupChild(session.root_id, "projects") orelse return error.TestExpectedResponse;
+    const project_node = session.lookupChild(projects_root, project_id.string) orelse return error.TestExpectedResponse;
+    const project_fs_node = session.lookupChild(project_node, "fs") orelse return error.TestExpectedResponse;
+    const mount_link_id = session.lookupChild(project_fs_node, "mount::code") orelse return error.TestExpectedResponse;
+    const mount_link_node = session.nodes.get(mount_link_id) orelse return error.TestExpectedResponse;
+
+    try std.testing.expect(std.mem.indexOf(u8, discovered_readme.content, "discovered from live project workspace mounts") != null);
+    try std.testing.expect(std.mem.indexOf(u8, discovered_status.content, "\"state\":\"online\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, discovered_status.content, "\"source\":\"control_plane\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, discovered_node_meta.content, "\"node\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, discovered_node_meta.content, node_id.string) != null);
+    try std.testing.expect(std.mem.indexOf(u8, mount_link_node.content, "/nodes/") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mount_link_node.content, "/fs") != null);
 }

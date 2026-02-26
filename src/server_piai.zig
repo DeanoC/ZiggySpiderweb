@@ -4100,6 +4100,7 @@ fn handleWebSocketConnection(
                                             main_binding.agent_id,
                                             .{
                                                 .project_id = main_binding.project_id,
+                                                .project_token = main_binding.project_token,
                                                 .agents_dir = runtime_registry.runtime_config.agents_dir,
                                                 .projects_dir = "projects",
                                                 .control_plane = &runtime_registry.control_plane,
@@ -4575,6 +4576,7 @@ fn handleWebSocketConnection(
                                 target_binding.agent_id,
                                 .{
                                     .project_id = target_binding.project_id,
+                                    .project_token = target_binding.project_token,
                                     .agents_dir = runtime_registry.runtime_config.agents_dir,
                                     .projects_dir = "projects",
                                     .control_plane = &runtime_registry.control_plane,
@@ -4593,6 +4595,7 @@ fn handleWebSocketConnection(
                                     target_binding.agent_id,
                                     .{
                                         .project_id = target_binding.project_id,
+                                        .project_token = target_binding.project_token,
                                         .agents_dir = runtime_registry.runtime_config.agents_dir,
                                         .projects_dir = "projects",
                                         .control_plane = &runtime_registry.control_plane,
