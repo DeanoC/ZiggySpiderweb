@@ -528,12 +528,13 @@ pub const Session = struct {
 
         const project_dir = try self.addDir(projects_root, policy.project_id, false);
         const project_fs_dir = try self.addDir(project_dir, "fs", false);
+        const project_nodes_dir = try self.addDir(project_dir, "nodes", false);
         const project_agents_dir = try self.addDir(project_dir, "agents", false);
         const project_meta_dir = try self.addDir(project_dir, "meta", false);
         try self.addDirectoryDescriptors(
             project_dir,
             "Project",
-            "{\"kind\":\"project\",\"children\":[\"fs\",\"agents\",\"meta\"]}",
+            "{\"kind\":\"project\",\"children\":[\"fs\",\"nodes\",\"agents\",\"meta\"]}",
             "{\"read\":true,\"write\":false}",
             "Project-composed world view.",
         );
@@ -543,6 +544,13 @@ pub const Session = struct {
             "{\"kind\":\"collection\",\"entries\":\"mount links\",\"source\":\"control.workspace_status mounts\"}",
             "{\"read\":true,\"write\":false}",
             "Mount links for the active project workspace view.",
+        );
+        try self.addDirectoryDescriptors(
+            project_nodes_dir,
+            "Project Nodes",
+            "{\"kind\":\"collection\",\"entries\":\"node links\",\"source\":\"control.workspace_status selected mounts\"}",
+            "{\"read\":true,\"write\":false}",
+            "Node links for the active project workspace view.",
         );
         try self.addDirectoryDescriptors(
             project_agents_dir,
@@ -566,6 +574,11 @@ pub const Session = struct {
         else
             false;
         if (!loaded_live_mounts) try self.addProjectFsLinksFromPolicy(project_fs_dir, policy);
+        const loaded_live_nodes = if (workspace_status_json) |json|
+            try self.addProjectNodeLinksFromWorkspaceStatus(project_nodes_dir, json)
+        else
+            false;
+        if (!loaded_live_nodes) try self.addProjectNodeLinksFromPolicy(project_nodes_dir, policy);
 
         _ = try self.addFile(project_agents_dir, "self", "/agents/self\n", false, .none);
         for (policy.visible_agents.items) |agent_name| {
@@ -723,6 +736,44 @@ pub const Session = struct {
             const target = try std.fmt.allocPrint(self.allocator, "/nodes/{s}/fs\n", .{node_id_value.string});
             defer self.allocator.free(target);
             _ = try self.addFile(project_fs_dir, link_name, target, false, .none);
+            added = true;
+        }
+        return added;
+    }
+
+    fn addProjectNodeLinksFromPolicy(
+        self: *Session,
+        project_nodes_dir: u32,
+        policy: world_policy.Policy,
+    ) !void {
+        for (policy.nodes.items) |node| {
+            if (self.lookupChild(project_nodes_dir, node.id) != null) continue;
+            const target = try std.fmt.allocPrint(self.allocator, "/nodes/{s}\n", .{node.id});
+            defer self.allocator.free(target);
+            _ = try self.addFile(project_nodes_dir, node.id, target, false, .none);
+        }
+    }
+
+    fn addProjectNodeLinksFromWorkspaceStatus(
+        self: *Session,
+        project_nodes_dir: u32,
+        workspace_status_json: []const u8,
+    ) !bool {
+        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, workspace_status_json, .{}) catch return false;
+        defer parsed.deinit();
+        if (parsed.value != .object) return false;
+        const mounts_value = parsed.value.object.get("mounts") orelse return false;
+        if (mounts_value != .array or mounts_value.array.items.len == 0) return false;
+
+        var added = false;
+        for (mounts_value.array.items) |mount_value| {
+            if (mount_value != .object) continue;
+            const node_id_value = mount_value.object.get("node_id") orelse continue;
+            if (node_id_value != .string or node_id_value.string.len == 0) continue;
+            if (self.lookupChild(project_nodes_dir, node_id_value.string) != null) continue;
+            const target = try std.fmt.allocPrint(self.allocator, "/nodes/{s}\n", .{node_id_value.string});
+            defer self.allocator.free(target);
+            _ = try self.addFile(project_nodes_dir, node_id_value.string, target, false, .none);
             added = true;
         }
         return added;
@@ -2319,12 +2370,15 @@ test "fsrpc_session: project meta includes control-plane workspace status" {
     const projects_root = session.lookupChild(session.root_id, "projects") orelse return error.TestExpectedResponse;
     const project_node = session.lookupChild(projects_root, project_id.string) orelse return error.TestExpectedResponse;
     const project_fs_node = session.lookupChild(project_node, "fs") orelse return error.TestExpectedResponse;
+    const project_nodes_node = session.lookupChild(project_node, "nodes") orelse return error.TestExpectedResponse;
     const project_fs_schema_id = session.lookupChild(project_fs_node, "SCHEMA.json") orelse return error.TestExpectedResponse;
+    const project_nodes_schema_id = session.lookupChild(project_nodes_node, "SCHEMA.json") orelse return error.TestExpectedResponse;
     const project_agents_node = session.lookupChild(project_node, "agents") orelse return error.TestExpectedResponse;
     const project_agents_caps_id = session.lookupChild(project_agents_node, "CAPS.json") orelse return error.TestExpectedResponse;
     const meta_node = session.lookupChild(project_node, "meta") orelse return error.TestExpectedResponse;
     const meta_schema_id = session.lookupChild(meta_node, "SCHEMA.json") orelse return error.TestExpectedResponse;
     const mount_link_id = session.lookupChild(project_fs_node, "mount::src") orelse return error.TestExpectedResponse;
+    const node_link_id = session.lookupChild(project_nodes_node, node_id.string) orelse return error.TestExpectedResponse;
     const topology_id = session.lookupChild(meta_node, "topology.json") orelse return error.TestExpectedResponse;
     const workspace_id = session.lookupChild(meta_node, "workspace_status.json") orelse return error.TestExpectedResponse;
     const mounts_id = session.lookupChild(meta_node, "mounts.json") orelse return error.TestExpectedResponse;
@@ -2336,9 +2390,11 @@ test "fsrpc_session: project meta includes control-plane workspace status" {
     const health_id = session.lookupChild(meta_node, "health.json") orelse return error.TestExpectedResponse;
 
     const project_fs_schema = session.nodes.get(project_fs_schema_id) orelse return error.TestExpectedResponse;
+    const project_nodes_schema = session.nodes.get(project_nodes_schema_id) orelse return error.TestExpectedResponse;
     const project_agents_caps = session.nodes.get(project_agents_caps_id) orelse return error.TestExpectedResponse;
     const meta_schema = session.nodes.get(meta_schema_id) orelse return error.TestExpectedResponse;
     const mount_link_node = session.nodes.get(mount_link_id) orelse return error.TestExpectedResponse;
+    const node_link_node = session.nodes.get(node_link_id) orelse return error.TestExpectedResponse;
     const topology_node = session.nodes.get(topology_id) orelse return error.TestExpectedResponse;
     const workspace_node = session.nodes.get(workspace_id) orelse return error.TestExpectedResponse;
     const mounts_node = session.nodes.get(mounts_id) orelse return error.TestExpectedResponse;
@@ -2350,6 +2406,7 @@ test "fsrpc_session: project meta includes control-plane workspace status" {
     const health_node = session.nodes.get(health_id) orelse return error.TestExpectedResponse;
 
     try std.testing.expect(std.mem.indexOf(u8, project_fs_schema.content, "\"kind\":\"collection\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, project_nodes_schema.content, "\"kind\":\"collection\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, project_agents_caps.content, "\"read\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, meta_schema.content, "\"workspace_status.json\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, meta_schema.content, "\"desired_mounts.json\"") != null);
@@ -2359,6 +2416,8 @@ test "fsrpc_session: project meta includes control-plane workspace status" {
     try std.testing.expect(std.mem.indexOf(u8, meta_schema.content, "\"health.json\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, mount_link_node.content, "/nodes/") != null);
     try std.testing.expect(std.mem.indexOf(u8, mount_link_node.content, "/fs") != null);
+    try std.testing.expect(std.mem.indexOf(u8, node_link_node.content, "/nodes/") != null);
+    try std.testing.expect(std.mem.indexOf(u8, node_link_node.content, node_id.string) != null);
     try std.testing.expect(std.mem.indexOf(u8, topology_node.content, "\"project_links\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, topology_node.content, node_id.string) != null);
     try std.testing.expect(std.mem.indexOf(u8, workspace_node.content, "\"mount_path\":\"/src\"") != null);
@@ -2580,8 +2639,13 @@ test "fsrpc_session: project workspace fallback is scoped to requested project" 
     const projects_root = session.lookupChild(session.root_id, "projects") orelse return error.TestExpectedResponse;
     const project_node = session.lookupChild(projects_root, project_a_id.string) orelse return error.TestExpectedResponse;
     const project_fs_node = session.lookupChild(project_node, "fs") orelse return error.TestExpectedResponse;
+    const project_nodes_node = session.lookupChild(project_node, "nodes") orelse return error.TestExpectedResponse;
     const leaked_mount_link = session.lookupChild(project_fs_node, "mount::leak");
     try std.testing.expect(leaked_mount_link == null);
+    const local_node_link = session.lookupChild(project_nodes_node, "local") orelse return error.TestExpectedResponse;
+    _ = local_node_link;
+    const leaked_node_link = session.lookupChild(project_nodes_node, node_id.string);
+    try std.testing.expect(leaked_node_link == null);
 
     const meta_node = session.lookupChild(project_node, "meta") orelse return error.TestExpectedResponse;
     const workspace_id = session.lookupChild(meta_node, "workspace_status.json") orelse return error.TestExpectedResponse;

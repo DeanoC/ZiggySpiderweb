@@ -69,6 +69,7 @@ Node directories also expose:
 Project links are exposed under:
 
 - `/projects/<project_id>/fs/`
+- `/projects/<project_id>/nodes/`
 - `/projects/<project_id>/agents/`
 - `/projects/<project_id>/meta/`
 
@@ -78,6 +79,10 @@ Each of these project subdirectories is self-describing with `README.md`,
 `/projects/<project_id>/fs/<name>` entries are logical link files with target paths like:
 
 `/nodes/<node_id>/<resource>`
+
+`/projects/<project_id>/nodes/<node_id>` entries are logical link files with targets:
+
+`/nodes/<node_id>`
 
 Current runtime behavior prefers live `control.workspace_status` selected mounts for
 project FS links, using names derived from mount paths:
