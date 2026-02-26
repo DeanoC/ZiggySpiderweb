@@ -76,6 +76,65 @@ This removes everything but backs up config to `/root/spiderweb-config-backup-*/
 
 This performs a full local + system cleanup for fresh-install testing and requires two separate confirmations before any cleanup starts.
 
+## Acheron Smoke Check
+
+Run a preflight check that validates the active workspace topology before starting runtime workloads:
+
+```bash
+./scripts/acheron-smoke.sh
+```
+
+Optional environment overrides:
+
+```bash
+SPIDERWEB_URL=ws://127.0.0.1:18790/ \
+SPIDERWEB_PROJECT_ID=system \
+SPIDERWEB_AUTH_TOKEN=sw-admin-... \
+EXPECTED_NODES=node-1,node-3 \
+./scripts/acheron-smoke.sh
+```
+
+More smoke options:
+
+```bash
+SPIDERWEB_AUTH_TOKEN_FILE="$HOME/.local/share/ziggy-spiderweb/.spiderweb-ltm/auth_tokens.json" \
+SMOKE_TIMEOUT_SEC=20 \
+SMOKE_FAIL_ON_DEGRADED=0 \
+./scripts/acheron-smoke.sh
+```
+
+What it checks:
+- `control.workspace_status` returns a valid payload
+- workspace availability is not degraded/missing (unless `SMOKE_FAIL_ON_DEGRADED=0`)
+- every active mount path is readable through `spiderweb-fs-mount`
+- expected node IDs (if provided) are present in active mounts
+
+## Acheron Chaos Restart Check
+
+Run active read/list probes while restarting the user service mid-run:
+
+```bash
+./scripts/acheron-chaos-restart.sh
+```
+
+Optional overrides:
+
+```bash
+SPIDERWEB_SERVICE=spiderweb.service \
+SPIDERWEB_PROJECT_ID=system \
+CHAOS_ITERATIONS=40 \
+CHAOS_RESTART_AT=12 \
+CHAOS_INTERVAL_MS=500 \
+CHAOS_LIST_PATH=/nodes \
+CHAOS_ATTR_PATH=/nodes \
+./scripts/acheron-chaos-restart.sh
+```
+
+What it checks:
+- repeated `readdir` and `getattr` operations during a forced service restart
+- at least one successful probe before restart
+- at least three successful probes after restart (recovery validated)
+
 ## Environment Variables
 
 | Variable | Default | Description |
