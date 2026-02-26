@@ -1,5 +1,6 @@
 const std = @import("std");
 const ltm_store = @import("ziggy-memory-store").ltm_store;
+const node_service_catalog = @import("node_service_catalog.zig");
 
 const persistence_base_id = "spiderweb:control-plane:state";
 const persistence_kind = "control_plane_state_v1";
@@ -15,6 +16,9 @@ const spider_web_project_kind_name = "system_builtin";
 const normal_project_kind_name = "normal";
 const default_primary_agent_id = "mother";
 const default_spider_web_root = "/";
+const default_platform_os = "unknown";
+const default_platform_arch = "unknown";
+const default_platform_runtime_kind = "unknown";
 
 const ProjectKind = enum {
     normal,
@@ -29,12 +33,24 @@ pub const ControlPlaneError = error{
     InviteRedeemed,
     NodeNotFound,
     NodeAuthFailed,
+    PendingJoinNotFound,
     ProjectNotFound,
     ProjectAuthFailed,
     ProjectProtected,
     ProjectAssignmentForbidden,
     MountConflict,
     MountNotFound,
+};
+
+const NodeLabel = struct {
+    key: []u8,
+    value: []u8,
+
+    fn deinit(self: *NodeLabel, allocator: std.mem.Allocator) void {
+        allocator.free(self.key);
+        allocator.free(self.value);
+        self.* = undefined;
+    }
 };
 
 pub const SpiderWebMountSpec = struct {
@@ -62,6 +78,11 @@ const Node = struct {
     fs_url: []u8,
     secret: []u8,
     lease_token: []u8,
+    platform_os: []u8,
+    platform_arch: []u8,
+    platform_runtime_kind: []u8,
+    labels: std.ArrayListUnmanaged(NodeLabel) = .{},
+    services: std.ArrayListUnmanaged(node_service_catalog.ServiceDescriptor) = .{},
     joined_at_ms: i64,
     last_seen_ms: i64,
     lease_expires_at_ms: i64,
@@ -72,6 +93,32 @@ const Node = struct {
         allocator.free(self.fs_url);
         allocator.free(self.secret);
         allocator.free(self.lease_token);
+        allocator.free(self.platform_os);
+        allocator.free(self.platform_arch);
+        allocator.free(self.platform_runtime_kind);
+        for (self.labels.items) |*label| label.deinit(allocator);
+        self.labels.deinit(allocator);
+        node_service_catalog.deinitServices(allocator, &self.services);
+        self.* = undefined;
+    }
+};
+
+const PendingJoin = struct {
+    id: []u8,
+    node_name: []u8,
+    fs_url: []u8,
+    platform_os: []u8,
+    platform_arch: []u8,
+    platform_runtime_kind: []u8,
+    requested_at_ms: i64,
+
+    fn deinit(self: *PendingJoin, allocator: std.mem.Allocator) void {
+        allocator.free(self.id);
+        allocator.free(self.node_name);
+        allocator.free(self.fs_url);
+        allocator.free(self.platform_os);
+        allocator.free(self.platform_arch);
+        allocator.free(self.platform_runtime_kind);
         self.* = undefined;
     }
 };
@@ -141,11 +188,13 @@ pub const ControlPlane = struct {
 
     invites: std.StringHashMapUnmanaged(Invite) = .{},
     nodes: std.StringHashMapUnmanaged(Node) = .{},
+    pending_joins: std.StringHashMapUnmanaged(PendingJoin) = .{},
     projects: std.StringHashMapUnmanaged(Project) = .{},
     active_project_by_agent: std.StringHashMapUnmanaged([]u8) = .{},
 
     next_invite_id: u64 = 1,
     next_node_id: u64 = 1,
+    next_pending_join_id: u64 = 1,
     next_project_id: u64 = 1,
 
     invites_created_total: u64 = 0,
@@ -414,6 +463,11 @@ pub const ControlPlane = struct {
         self.nodes.deinit(self.allocator);
         self.nodes = .{};
 
+        var pending_it = self.pending_joins.valueIterator();
+        while (pending_it.next()) |pending| pending.deinit(self.allocator);
+        self.pending_joins.deinit(self.allocator);
+        self.pending_joins = .{};
+
         var project_it = self.projects.valueIterator();
         while (project_it.next()) |project| project.deinit(self.allocator);
         self.projects.deinit(self.allocator);
@@ -442,6 +496,7 @@ pub const ControlPlane = struct {
         self.project_token_revokes_total = 0;
         self.project_activations_total = 0;
         self.lease_reap_nodes_total = 0;
+        self.next_pending_join_id = 1;
 
         if (self.reconcile_last_error) |value| {
             self.allocator.free(value);
@@ -499,6 +554,194 @@ pub const ControlPlane = struct {
         );
     }
 
+    pub fn nodeJoinRequest(self: *ControlPlane, payload_json: ?[]const u8) ![]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        _ = self.reapExpiredLeasesLocked(std.time.milliTimestamp());
+
+        var payload = try parsePayload(self.allocator, payload_json);
+        defer payload.deinit();
+        const obj = payload.value.object;
+
+        const node_name_raw = getOptionalString(obj, "node_name");
+        const fs_url_raw = getOptionalString(obj, "fs_url") orelse "";
+        if (node_name_raw) |name| try validateIdentifier(name, 128);
+        if (fs_url_raw.len > 0) try validateFsUrl(fs_url_raw);
+        var platform = parsePlatformFromPayloadValue(self.allocator, obj.get("platform")) catch return ControlPlaneError.InvalidPayload;
+        defer platform.deinit(self.allocator);
+
+        const request_id = try makeSequentialId(self.allocator, "pending-join", &self.next_pending_join_id);
+        errdefer self.allocator.free(request_id);
+        const node_name = if (node_name_raw) |value|
+            try self.allocator.dupe(u8, value)
+        else
+            try self.allocator.dupe(u8, request_id);
+        errdefer self.allocator.free(node_name);
+
+        const pending = PendingJoin{
+            .id = request_id,
+            .node_name = node_name,
+            .fs_url = try self.allocator.dupe(u8, fs_url_raw),
+            .platform_os = try self.allocator.dupe(u8, platform.os),
+            .platform_arch = try self.allocator.dupe(u8, platform.arch),
+            .platform_runtime_kind = try self.allocator.dupe(u8, platform.runtime_kind),
+            .requested_at_ms = std.time.milliTimestamp(),
+        };
+        errdefer {
+            self.allocator.free(pending.fs_url);
+            self.allocator.free(pending.platform_os);
+            self.allocator.free(pending.platform_arch);
+            self.allocator.free(pending.platform_runtime_kind);
+        }
+        try self.pending_joins.put(self.allocator, pending.id, pending);
+        self.persistSnapshotBestEffortLocked();
+
+        return appendPendingJoinJsonAlloc(self.allocator, pending);
+    }
+
+    pub fn listPendingNodeJoins(self: *ControlPlane, payload_json: ?[]const u8) ![]u8 {
+        _ = payload_json;
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        _ = self.reapExpiredLeasesLocked(std.time.milliTimestamp());
+
+        var out = std.ArrayListUnmanaged(u8){};
+        defer out.deinit(self.allocator);
+        try out.appendSlice(self.allocator, "{\"pending\":[");
+        var first = true;
+        var pending_it = self.pending_joins.valueIterator();
+        while (pending_it.next()) |pending| {
+            if (!first) try out.append(self.allocator, ',');
+            first = false;
+            const item = try appendPendingJoinJsonAlloc(self.allocator, pending.*);
+            defer self.allocator.free(item);
+            try out.appendSlice(self.allocator, item);
+        }
+        try out.appendSlice(self.allocator, "]}");
+        return out.toOwnedSlice(self.allocator);
+    }
+
+    pub fn approvePendingNodeJoin(self: *ControlPlane, payload_json: ?[]const u8) ![]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        _ = self.reapExpiredLeasesLocked(std.time.milliTimestamp());
+
+        var payload = try parsePayload(self.allocator, payload_json);
+        defer payload.deinit();
+        const obj = payload.value.object;
+
+        const request_id = getRequiredString(obj, "request_id") catch return ControlPlaneError.MissingField;
+        try validateIdentifier(request_id, 128);
+        const lease_ttl_ms = getOptionalUnsigned(obj, "lease_ttl_ms", 15 * 60 * 1000) catch return ControlPlaneError.InvalidPayload;
+
+        const removed = self.pending_joins.fetchRemove(request_id) orelse return ControlPlaneError.PendingJoinNotFound;
+        var pending = removed.value;
+        defer pending.deinit(self.allocator);
+
+        const now = std.time.milliTimestamp();
+        const node_id = try makeSequentialId(self.allocator, "node", &self.next_node_id);
+        errdefer self.allocator.free(node_id);
+
+        const node = Node{
+            .id = node_id,
+            .name = try self.allocator.dupe(u8, pending.node_name),
+            .fs_url = try self.allocator.dupe(u8, pending.fs_url),
+            .secret = try makeToken(self.allocator, "secret"),
+            .lease_token = try makeToken(self.allocator, "lease"),
+            .platform_os = try self.allocator.dupe(u8, pending.platform_os),
+            .platform_arch = try self.allocator.dupe(u8, pending.platform_arch),
+            .platform_runtime_kind = try self.allocator.dupe(u8, pending.platform_runtime_kind),
+            .joined_at_ms = now,
+            .last_seen_ms = now,
+            .lease_expires_at_ms = now + @as(i64, @intCast(lease_ttl_ms)),
+        };
+        errdefer {
+            self.allocator.free(node.name);
+            self.allocator.free(node.fs_url);
+            self.allocator.free(node.secret);
+            self.allocator.free(node.lease_token);
+            self.allocator.free(node.platform_os);
+            self.allocator.free(node.platform_arch);
+            self.allocator.free(node.platform_runtime_kind);
+        }
+        try self.nodes.put(self.allocator, node.id, node);
+        self.node_joins_total +%= 1;
+        self.persistSnapshotBestEffortLocked();
+        std.log.info("control-plane pending join approved: request={s} node={s}", .{ request_id, node.id });
+        return self.renderNodeJoinPayload(node.id);
+    }
+
+    pub fn denyPendingNodeJoin(self: *ControlPlane, payload_json: ?[]const u8) ![]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        _ = self.reapExpiredLeasesLocked(std.time.milliTimestamp());
+
+        var payload = try parsePayload(self.allocator, payload_json);
+        defer payload.deinit();
+        const obj = payload.value.object;
+
+        const request_id = getRequiredString(obj, "request_id") catch return ControlPlaneError.MissingField;
+        try validateIdentifier(request_id, 128);
+        const removed = self.pending_joins.fetchRemove(request_id) orelse return ControlPlaneError.PendingJoinNotFound;
+        var pending = removed.value;
+        pending.deinit(self.allocator);
+
+        self.persistSnapshotBestEffortLocked();
+        const escaped_request = try jsonEscape(self.allocator, request_id);
+        defer self.allocator.free(escaped_request);
+        return std.fmt.allocPrint(
+            self.allocator,
+            "{{\"denied\":true,\"request_id\":\"{s}\"}}",
+            .{escaped_request},
+        );
+    }
+
+    pub fn nodeServiceUpsert(self: *ControlPlane, payload_json: ?[]const u8) ![]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        _ = self.reapExpiredLeasesLocked(std.time.milliTimestamp());
+
+        var payload = try parsePayload(self.allocator, payload_json);
+        defer payload.deinit();
+        const obj = payload.value.object;
+
+        const node_id = getRequiredString(obj, "node_id") catch return ControlPlaneError.MissingField;
+        const node_secret = getRequiredString(obj, "node_secret") catch return ControlPlaneError.MissingField;
+        try validateIdentifier(node_id, 128);
+        try validateSecretToken(node_secret, 256);
+
+        const node = self.nodes.getPtr(node_id) orelse return ControlPlaneError.NodeNotFound;
+        if (!std.mem.eql(u8, node.secret, node_secret)) return ControlPlaneError.NodeAuthFailed;
+
+        if (obj.get("platform")) |platform_value| {
+            applyPlatformUpdateFromValue(self.allocator, node, platform_value) catch return ControlPlaneError.InvalidPayload;
+        }
+        if (obj.get("labels")) |labels_value| {
+            replaceNodeLabelsFromValue(self.allocator, &node.labels, labels_value) catch return ControlPlaneError.InvalidPayload;
+        }
+        if (obj.get("services")) |services_value| {
+            node_service_catalog.replaceServicesFromJsonValue(self.allocator, &node.services, services_value) catch return ControlPlaneError.InvalidPayload;
+        }
+
+        self.persistSnapshotBestEffortLocked();
+        return self.renderNodeServicePayload(node_id);
+    }
+
+    pub fn nodeServiceGet(self: *ControlPlane, payload_json: ?[]const u8) ![]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        _ = self.reapExpiredLeasesLocked(std.time.milliTimestamp());
+
+        var payload = try parsePayload(self.allocator, payload_json);
+        defer payload.deinit();
+        const obj = payload.value.object;
+
+        const node_id = getRequiredString(obj, "node_id") catch return ControlPlaneError.MissingField;
+        try validateIdentifier(node_id, 128);
+        _ = self.nodes.get(node_id) orelse return ControlPlaneError.NodeNotFound;
+        return self.renderNodeServicePayload(node_id);
+    }
+
     pub fn nodeJoin(self: *ControlPlane, payload_json: ?[]const u8) ![]u8 {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -543,6 +786,12 @@ pub const ControlPlane = struct {
         errdefer self.allocator.free(node_secret);
         const lease_token = try makeToken(self.allocator, "lease");
         errdefer self.allocator.free(lease_token);
+        const platform_os = try self.allocator.dupe(u8, default_platform_os);
+        errdefer self.allocator.free(platform_os);
+        const platform_arch = try self.allocator.dupe(u8, default_platform_arch);
+        errdefer self.allocator.free(platform_arch);
+        const platform_runtime_kind = try self.allocator.dupe(u8, default_platform_runtime_kind);
+        errdefer self.allocator.free(platform_runtime_kind);
 
         const node = Node{
             .id = node_id,
@@ -550,6 +799,9 @@ pub const ControlPlane = struct {
             .fs_url = fs_url,
             .secret = node_secret,
             .lease_token = lease_token,
+            .platform_os = platform_os,
+            .platform_arch = platform_arch,
+            .platform_runtime_kind = platform_runtime_kind,
             .joined_at_ms = now,
             .last_seen_ms = now,
             .lease_expires_at_ms = now + @as(i64, @intCast(lease_ttl_ms)),
@@ -643,6 +895,9 @@ pub const ControlPlane = struct {
             .fs_url = try self.allocator.dupe(u8, fs_url),
             .secret = try makeToken(self.allocator, "secret"),
             .lease_token = try makeToken(self.allocator, "lease"),
+            .platform_os = try self.allocator.dupe(u8, default_platform_os),
+            .platform_arch = try self.allocator.dupe(u8, default_platform_arch),
+            .platform_runtime_kind = try self.allocator.dupe(u8, default_platform_runtime_kind),
             .joined_at_ms = now,
             .last_seen_ms = now,
             .lease_expires_at_ms = now + @as(i64, @intCast(lease_ttl_ms)),
@@ -652,6 +907,9 @@ pub const ControlPlane = struct {
             self.allocator.free(node.fs_url);
             self.allocator.free(node.secret);
             self.allocator.free(node.lease_token);
+            self.allocator.free(node.platform_os);
+            self.allocator.free(node.platform_arch);
+            self.allocator.free(node.platform_runtime_kind);
         }
         try self.nodes.put(self.allocator, node.id, node);
         self.nodes_ensured_total +%= 1;
@@ -1632,7 +1890,13 @@ pub const ControlPlane = struct {
             "{{\"agent_id\":\"{s}\",\"project_id\":\"{s}\",\"workspace_root\":\"{s}\"",
             .{ escaped_agent, escaped_project, escaped_root },
         );
-        const topology = try self.appendWorkspaceTopologyJsonLocked(&out, project, now_ms, null);
+        const topology = try self.appendWorkspaceTopologyJsonLocked(
+            &out,
+            project,
+            now_ms,
+            null,
+            self.isPrimaryAgent(agent_id),
+        );
         try out.writer(self.allocator).print(
             ",\"reconcile_state\":\"{s}\",\"last_reconcile_ms\":{d},\"last_success_ms\":{d},\"last_error\":{s},\"queue_depth\":{d}}}",
             .{
@@ -1652,6 +1916,7 @@ pub const ControlPlane = struct {
         project: Project,
         now_ms: i64,
         failed_ops: ?*std.ArrayListUnmanaged([]u8),
+        include_node_secrets: bool,
     ) !ReconcileProjectSummary {
         var first_by_path = std.StringHashMapUnmanaged(usize){};
         defer first_by_path.deinit(self.allocator);
@@ -1678,7 +1943,7 @@ pub const ControlPlane = struct {
             if (selected_idx != idx) continue;
             if (!first) try out.append(self.allocator, ',');
             first = false;
-            try appendWorkspaceMountJson(self.allocator, out, mount, self.nodes.get(mount.node_id));
+            try appendWorkspaceMountJson(self.allocator, out, mount, self.nodes.get(mount.node_id), include_node_secrets);
         }
         try out.appendSlice(self.allocator, "],\"desired_mounts\":[");
 
@@ -1686,7 +1951,7 @@ pub const ControlPlane = struct {
         for (project.mounts.items) |mount| {
             if (!first) try out.append(self.allocator, ',');
             first = false;
-            try appendWorkspaceMountJson(self.allocator, out, mount, self.nodes.get(mount.node_id));
+            try appendWorkspaceMountJson(self.allocator, out, mount, self.nodes.get(mount.node_id), include_node_secrets);
         }
         try out.appendSlice(self.allocator, "],\"actual_mounts\":[");
 
@@ -1696,7 +1961,7 @@ pub const ControlPlane = struct {
             if (selected_idx != idx) continue;
             if (!first) try out.append(self.allocator, ',');
             first = false;
-            try appendWorkspaceMountJson(self.allocator, out, mount, self.nodes.get(mount.node_id));
+            try appendWorkspaceMountJson(self.allocator, out, mount, self.nodes.get(mount.node_id), include_node_secrets);
         }
         try out.appendSlice(self.allocator, "],\"drift\":{\"count\":");
 
@@ -1820,6 +2085,7 @@ pub const ControlPlane = struct {
             project,
             now_ms,
             failed_ops,
+            false,
         );
     }
 
@@ -2048,12 +2314,70 @@ pub const ControlPlane = struct {
         defer self.allocator.free(escaped_secret);
         const escaped_lease = try jsonEscape(self.allocator, node.lease_token);
         defer self.allocator.free(escaped_lease);
+        const escaped_platform_os = try jsonEscape(self.allocator, node.platform_os);
+        defer self.allocator.free(escaped_platform_os);
+        const escaped_platform_arch = try jsonEscape(self.allocator, node.platform_arch);
+        defer self.allocator.free(escaped_platform_arch);
+        const escaped_platform_runtime = try jsonEscape(self.allocator, node.platform_runtime_kind);
+        defer self.allocator.free(escaped_platform_runtime);
 
         return std.fmt.allocPrint(
             self.allocator,
-            "{{\"node_id\":\"{s}\",\"node_name\":\"{s}\",\"fs_url\":\"{s}\",\"node_secret\":\"{s}\",\"lease_token\":\"{s}\",\"lease_expires_at_ms\":{d}}}",
-            .{ escaped_id, escaped_name, escaped_url, escaped_secret, escaped_lease, node.lease_expires_at_ms },
+            "{{\"node_id\":\"{s}\",\"node_name\":\"{s}\",\"fs_url\":\"{s}\",\"node_secret\":\"{s}\",\"lease_token\":\"{s}\",\"platform\":{{\"os\":\"{s}\",\"arch\":\"{s}\",\"runtime_kind\":\"{s}\"}},\"lease_expires_at_ms\":{d}}}",
+            .{
+                escaped_id,
+                escaped_name,
+                escaped_url,
+                escaped_secret,
+                escaped_lease,
+                escaped_platform_os,
+                escaped_platform_arch,
+                escaped_platform_runtime,
+                node.lease_expires_at_ms,
+            },
         );
+    }
+
+    fn renderNodeServicePayload(self: *ControlPlane, node_id: []const u8) ![]u8 {
+        const node = self.nodes.get(node_id) orelse return ControlPlaneError.NodeNotFound;
+        const escaped_id = try jsonEscape(self.allocator, node.id);
+        defer self.allocator.free(escaped_id);
+        const escaped_name = try jsonEscape(self.allocator, node.name);
+        defer self.allocator.free(escaped_name);
+        const escaped_platform_os = try jsonEscape(self.allocator, node.platform_os);
+        defer self.allocator.free(escaped_platform_os);
+        const escaped_platform_arch = try jsonEscape(self.allocator, node.platform_arch);
+        defer self.allocator.free(escaped_platform_arch);
+        const escaped_platform_runtime = try jsonEscape(self.allocator, node.platform_runtime_kind);
+        defer self.allocator.free(escaped_platform_runtime);
+
+        var out = std.ArrayListUnmanaged(u8){};
+        defer out.deinit(self.allocator);
+        try out.writer(self.allocator).print(
+            "{{\"node_id\":\"{s}\",\"node_name\":\"{s}\",\"platform\":{{\"os\":\"{s}\",\"arch\":\"{s}\",\"runtime_kind\":\"{s}\"}},\"labels\":{{",
+            .{
+                escaped_id,
+                escaped_name,
+                escaped_platform_os,
+                escaped_platform_arch,
+                escaped_platform_runtime,
+            },
+        );
+        for (node.labels.items, 0..) |label, idx| {
+            if (idx != 0) try out.append(self.allocator, ',');
+            const escaped_key = try jsonEscape(self.allocator, label.key);
+            defer self.allocator.free(escaped_key);
+            const escaped_value = try jsonEscape(self.allocator, label.value);
+            defer self.allocator.free(escaped_value);
+            try out.writer(self.allocator).print("\"{s}\":\"{s}\"", .{ escaped_key, escaped_value });
+        }
+        try out.appendSlice(self.allocator, "},\"services\":[");
+        for (node.services.items, 0..) |service, idx| {
+            if (idx != 0) try out.append(self.allocator, ',');
+            try node_service_catalog.appendServiceJson(self.allocator, &out, service);
+        }
+        try out.appendSlice(self.allocator, "]}");
+        return out.toOwnedSlice(self.allocator);
     }
 
     fn persistSnapshotBestEffortLocked(self: *ControlPlane) void {
@@ -2105,10 +2429,11 @@ pub const ControlPlane = struct {
         errdefer out.deinit(self.allocator);
 
         try out.writer(self.allocator).print(
-            "{{\"schema\":1,\"next\":{{\"invite_id\":{d},\"node_id\":{d},\"project_id\":{d}}},\"metrics\":{{\"invites_created_total\":{d},\"invites_redeemed_total\":{d},\"node_joins_total\":{d},\"node_lease_refresh_total\":{d},\"nodes_ensured_total\":{d},\"node_deletes_total\":{d},\"project_creates_total\":{d},\"project_updates_total\":{d},\"project_deletes_total\":{d},\"project_token_rotates_total\":{d},\"project_token_revokes_total\":{d},\"mount_sets_total\":{d},\"mount_removes_total\":{d},\"project_activations_total\":{d},\"lease_reap_nodes_total\":{d}}},\"invites\":[",
+            "{{\"schema\":1,\"next\":{{\"invite_id\":{d},\"node_id\":{d},\"pending_join_id\":{d},\"project_id\":{d}}},\"metrics\":{{\"invites_created_total\":{d},\"invites_redeemed_total\":{d},\"node_joins_total\":{d},\"node_lease_refresh_total\":{d},\"nodes_ensured_total\":{d},\"node_deletes_total\":{d},\"project_creates_total\":{d},\"project_updates_total\":{d},\"project_deletes_total\":{d},\"project_token_rotates_total\":{d},\"project_token_revokes_total\":{d},\"mount_sets_total\":{d},\"mount_removes_total\":{d},\"project_activations_total\":{d},\"lease_reap_nodes_total\":{d}}},\"invites\":[",
             .{
                 self.next_invite_id,
                 self.next_node_id,
+                self.next_pending_join_id,
                 self.next_project_id,
                 self.invites_created_total,
                 self.invites_redeemed_total,
@@ -2167,18 +2492,73 @@ pub const ControlPlane = struct {
             defer self.allocator.free(escaped_secret);
             const escaped_lease = try jsonEscape(self.allocator, node.lease_token);
             defer self.allocator.free(escaped_lease);
+            const escaped_platform_os = try jsonEscape(self.allocator, node.platform_os);
+            defer self.allocator.free(escaped_platform_os);
+            const escaped_platform_arch = try jsonEscape(self.allocator, node.platform_arch);
+            defer self.allocator.free(escaped_platform_arch);
+            const escaped_platform_runtime = try jsonEscape(self.allocator, node.platform_runtime_kind);
+            defer self.allocator.free(escaped_platform_runtime);
 
             try out.writer(self.allocator).print(
-                "{{\"id\":\"{s}\",\"name\":\"{s}\",\"fs_url\":\"{s}\",\"secret\":\"{s}\",\"lease_token\":\"{s}\",\"joined_at_ms\":{d},\"last_seen_ms\":{d},\"lease_expires_at_ms\":{d}}}",
+                "{{\"id\":\"{s}\",\"name\":\"{s}\",\"fs_url\":\"{s}\",\"secret\":\"{s}\",\"lease_token\":\"{s}\",\"platform\":{{\"os\":\"{s}\",\"arch\":\"{s}\",\"runtime_kind\":\"{s}\"}},\"labels\":{{",
                 .{
                     escaped_id,
                     escaped_name,
                     escaped_url,
                     escaped_secret,
                     escaped_lease,
-                    node.joined_at_ms,
-                    node.last_seen_ms,
-                    node.lease_expires_at_ms,
+                    escaped_platform_os,
+                    escaped_platform_arch,
+                    escaped_platform_runtime,
+                },
+            );
+            for (node.labels.items, 0..) |label, idx| {
+                if (idx != 0) try out.append(self.allocator, ',');
+                const escaped_key = try jsonEscape(self.allocator, label.key);
+                defer self.allocator.free(escaped_key);
+                const escaped_value = try jsonEscape(self.allocator, label.value);
+                defer self.allocator.free(escaped_value);
+                try out.writer(self.allocator).print("\"{s}\":\"{s}\"", .{ escaped_key, escaped_value });
+            }
+            try out.appendSlice(self.allocator, "},\"services\":[");
+            for (node.services.items, 0..) |service, idx| {
+                if (idx != 0) try out.append(self.allocator, ',');
+                try node_service_catalog.appendServiceJson(self.allocator, &out, service);
+            }
+            try out.writer(self.allocator).print(
+                "],\"joined_at_ms\":{d},\"last_seen_ms\":{d},\"lease_expires_at_ms\":{d}}}",
+                .{ node.joined_at_ms, node.last_seen_ms, node.lease_expires_at_ms },
+            );
+        }
+
+        try out.appendSlice(self.allocator, "],\"pending_joins\":[");
+        first = true;
+        var pending_it = self.pending_joins.valueIterator();
+        while (pending_it.next()) |pending| {
+            if (!first) try out.append(self.allocator, ',');
+            first = false;
+            const escaped_id = try jsonEscape(self.allocator, pending.id);
+            defer self.allocator.free(escaped_id);
+            const escaped_name = try jsonEscape(self.allocator, pending.node_name);
+            defer self.allocator.free(escaped_name);
+            const escaped_url = try jsonEscape(self.allocator, pending.fs_url);
+            defer self.allocator.free(escaped_url);
+            const escaped_platform_os = try jsonEscape(self.allocator, pending.platform_os);
+            defer self.allocator.free(escaped_platform_os);
+            const escaped_platform_arch = try jsonEscape(self.allocator, pending.platform_arch);
+            defer self.allocator.free(escaped_platform_arch);
+            const escaped_platform_runtime = try jsonEscape(self.allocator, pending.platform_runtime_kind);
+            defer self.allocator.free(escaped_platform_runtime);
+            try out.writer(self.allocator).print(
+                "{{\"id\":\"{s}\",\"node_name\":\"{s}\",\"fs_url\":\"{s}\",\"platform\":{{\"os\":\"{s}\",\"arch\":\"{s}\",\"runtime_kind\":\"{s}\"}},\"requested_at_ms\":{d}}}",
+                .{
+                    escaped_id,
+                    escaped_name,
+                    escaped_url,
+                    escaped_platform_os,
+                    escaped_platform_arch,
+                    escaped_platform_runtime,
+                    pending.requested_at_ms,
                 },
             );
         }
@@ -2262,16 +2642,19 @@ pub const ControlPlane = struct {
         self.clearState();
         self.next_invite_id = 1;
         self.next_node_id = 1;
+        self.next_pending_join_id = 1;
         self.next_project_id = 1;
 
         if (root.get("next")) |next_val| {
             if (next_val != .object) return error.InvalidSnapshot;
             self.next_invite_id = try getOptionalU64(next_val.object, "invite_id", 1);
             self.next_node_id = try getOptionalU64(next_val.object, "node_id", 1);
+            self.next_pending_join_id = try getOptionalU64(next_val.object, "pending_join_id", 1);
             self.next_project_id = try getOptionalU64(next_val.object, "project_id", 1);
         } else {
             self.next_invite_id = try getOptionalU64(root, "next_invite_id", 1);
             self.next_node_id = try getOptionalU64(root, "next_node_id", 1);
+            self.next_pending_join_id = try getOptionalU64(root, "next_pending_join_id", 1);
             self.next_project_id = try getOptionalU64(root, "next_project_id", 1);
         }
 
@@ -2325,13 +2708,77 @@ pub const ControlPlane = struct {
                     .fs_url = fs_url,
                     .secret = try dupeRequiredString(self.allocator, item.object, "secret"),
                     .lease_token = try dupeRequiredString(self.allocator, item.object, "lease_token"),
+                    .platform_os = if (item.object.get("platform")) |platform_val| blk: {
+                        if (platform_val != .object) return error.InvalidSnapshot;
+                        const os_val = platform_val.object.get("os") orelse return error.InvalidSnapshot;
+                        if (os_val != .string or os_val.string.len == 0) return error.InvalidSnapshot;
+                        break :blk try self.allocator.dupe(u8, os_val.string);
+                    } else try self.allocator.dupe(u8, default_platform_os),
+                    .platform_arch = if (item.object.get("platform")) |platform_val| blk: {
+                        if (platform_val != .object) return error.InvalidSnapshot;
+                        const arch_val = platform_val.object.get("arch") orelse return error.InvalidSnapshot;
+                        if (arch_val != .string or arch_val.string.len == 0) return error.InvalidSnapshot;
+                        break :blk try self.allocator.dupe(u8, arch_val.string);
+                    } else try self.allocator.dupe(u8, default_platform_arch),
+                    .platform_runtime_kind = if (item.object.get("platform")) |platform_val| blk: {
+                        if (platform_val != .object) return error.InvalidSnapshot;
+                        const runtime_val = platform_val.object.get("runtime_kind") orelse return error.InvalidSnapshot;
+                        if (runtime_val != .string or runtime_val.string.len == 0) return error.InvalidSnapshot;
+                        break :blk try self.allocator.dupe(u8, runtime_val.string);
+                    } else try self.allocator.dupe(u8, default_platform_runtime_kind),
                     .joined_at_ms = try getRequiredI64(item.object, "joined_at_ms"),
                     .last_seen_ms = try getRequiredI64(item.object, "last_seen_ms"),
                     .lease_expires_at_ms = try getRequiredI64(item.object, "lease_expires_at_ms"),
                 };
                 errdefer node.deinit(self.allocator);
+                if (item.object.get("labels")) |labels_val| {
+                    replaceNodeLabelsFromValue(self.allocator, &node.labels, labels_val) catch return error.InvalidSnapshot;
+                }
+                if (item.object.get("services")) |services_val| {
+                    node_service_catalog.replaceServicesFromJsonValue(self.allocator, &node.services, services_val) catch return error.InvalidSnapshot;
+                }
                 if (self.nodes.contains(node.id)) return error.InvalidSnapshot;
                 try self.nodes.put(self.allocator, node.id, node);
+            }
+        }
+
+        if (root.get("pending_joins")) |pending_val| {
+            if (pending_val != .array) return error.InvalidSnapshot;
+            for (pending_val.array.items) |item| {
+                if (item != .object) return error.InvalidSnapshot;
+                const fs_url = if (item.object.get("fs_url")) |url_val| blk: {
+                    if (url_val != .string) return error.InvalidSnapshot;
+                    break :blk try self.allocator.dupe(u8, url_val.string);
+                } else try self.allocator.dupe(u8, "");
+
+                const platform_val = item.object.get("platform");
+                var pending = PendingJoin{
+                    .id = try dupeRequiredString(self.allocator, item.object, "id"),
+                    .node_name = try dupeRequiredString(self.allocator, item.object, "node_name"),
+                    .fs_url = fs_url,
+                    .platform_os = if (platform_val) |value| blk: {
+                        if (value != .object) return error.InvalidSnapshot;
+                        const os_val = value.object.get("os") orelse return error.InvalidSnapshot;
+                        if (os_val != .string or os_val.string.len == 0) return error.InvalidSnapshot;
+                        break :blk try self.allocator.dupe(u8, os_val.string);
+                    } else try self.allocator.dupe(u8, default_platform_os),
+                    .platform_arch = if (platform_val) |value| blk: {
+                        if (value != .object) return error.InvalidSnapshot;
+                        const arch_val = value.object.get("arch") orelse return error.InvalidSnapshot;
+                        if (arch_val != .string or arch_val.string.len == 0) return error.InvalidSnapshot;
+                        break :blk try self.allocator.dupe(u8, arch_val.string);
+                    } else try self.allocator.dupe(u8, default_platform_arch),
+                    .platform_runtime_kind = if (platform_val) |value| blk: {
+                        if (value != .object) return error.InvalidSnapshot;
+                        const runtime_val = value.object.get("runtime_kind") orelse return error.InvalidSnapshot;
+                        if (runtime_val != .string or runtime_val.string.len == 0) return error.InvalidSnapshot;
+                        break :blk try self.allocator.dupe(u8, runtime_val.string);
+                    } else try self.allocator.dupe(u8, default_platform_runtime_kind),
+                    .requested_at_ms = try getRequiredI64(item.object, "requested_at_ms"),
+                };
+                errdefer pending.deinit(self.allocator);
+                if (self.pending_joins.contains(pending.id)) return error.InvalidSnapshot;
+                try self.pending_joins.put(self.allocator, pending.id, pending);
             }
         }
 
@@ -2445,6 +2892,141 @@ fn getOptionalBool(obj: std.json.ObjectMap, name: []const u8, default_value: boo
     return value.bool;
 }
 
+const PlatformPayload = struct {
+    os: []u8,
+    arch: []u8,
+    runtime_kind: []u8,
+
+    fn deinit(self: *PlatformPayload, allocator: std.mem.Allocator) void {
+        allocator.free(self.os);
+        allocator.free(self.arch);
+        allocator.free(self.runtime_kind);
+        self.* = undefined;
+    }
+};
+
+fn parsePlatformFromPayloadValue(
+    allocator: std.mem.Allocator,
+    raw_value: ?std.json.Value,
+) !PlatformPayload {
+    var out = PlatformPayload{
+        .os = try allocator.dupe(u8, default_platform_os),
+        .arch = try allocator.dupe(u8, default_platform_arch),
+        .runtime_kind = try allocator.dupe(u8, default_platform_runtime_kind),
+    };
+    errdefer out.deinit(allocator);
+
+    const raw = raw_value orelse return out;
+    if (raw != .object) return ControlPlaneError.InvalidPayload;
+
+    if (raw.object.get("os")) |value| {
+        if (value != .string or value.string.len == 0) return ControlPlaneError.InvalidPayload;
+        try validateIdentifier(value.string, 64);
+        allocator.free(out.os);
+        out.os = try allocator.dupe(u8, value.string);
+    }
+    if (raw.object.get("arch")) |value| {
+        if (value != .string or value.string.len == 0) return ControlPlaneError.InvalidPayload;
+        try validateIdentifier(value.string, 64);
+        allocator.free(out.arch);
+        out.arch = try allocator.dupe(u8, value.string);
+    }
+    if (raw.object.get("runtime_kind")) |value| {
+        if (value != .string or value.string.len == 0) return ControlPlaneError.InvalidPayload;
+        try validateIdentifier(value.string, 64);
+        allocator.free(out.runtime_kind);
+        out.runtime_kind = try allocator.dupe(u8, value.string);
+    }
+
+    return out;
+}
+
+fn applyPlatformUpdateFromValue(
+    allocator: std.mem.Allocator,
+    node: *Node,
+    raw: std.json.Value,
+) !void {
+    if (raw != .object) return ControlPlaneError.InvalidPayload;
+
+    if (raw.object.get("os")) |value| {
+        if (value != .string or value.string.len == 0) return ControlPlaneError.InvalidPayload;
+        try validateIdentifier(value.string, 64);
+        allocator.free(node.platform_os);
+        node.platform_os = try allocator.dupe(u8, value.string);
+    }
+    if (raw.object.get("arch")) |value| {
+        if (value != .string or value.string.len == 0) return ControlPlaneError.InvalidPayload;
+        try validateIdentifier(value.string, 64);
+        allocator.free(node.platform_arch);
+        node.platform_arch = try allocator.dupe(u8, value.string);
+    }
+    if (raw.object.get("runtime_kind")) |value| {
+        if (value != .string or value.string.len == 0) return ControlPlaneError.InvalidPayload;
+        try validateIdentifier(value.string, 64);
+        allocator.free(node.platform_runtime_kind);
+        node.platform_runtime_kind = try allocator.dupe(u8, value.string);
+    }
+}
+
+fn replaceNodeLabelsFromValue(
+    allocator: std.mem.Allocator,
+    labels: *std.ArrayListUnmanaged(NodeLabel),
+    raw: std.json.Value,
+) !void {
+    if (raw != .object) return ControlPlaneError.InvalidPayload;
+
+    var next = std.ArrayListUnmanaged(NodeLabel){};
+    errdefer {
+        for (next.items) |*label| label.deinit(allocator);
+        next.deinit(allocator);
+    }
+
+    var it = raw.object.iterator();
+    while (it.next()) |entry| {
+        try validateIdentifier(entry.key_ptr.*, 128);
+        if (entry.value_ptr.* != .string) return ControlPlaneError.InvalidPayload;
+        try validateDisplayStringAllowEmpty(entry.value_ptr.*.string, 512);
+        var label = NodeLabel{
+            .key = try allocator.dupe(u8, entry.key_ptr.*),
+            .value = try allocator.dupe(u8, entry.value_ptr.*.string),
+        };
+        errdefer label.deinit(allocator);
+        try next.append(allocator, label);
+    }
+
+    for (labels.items) |*label| label.deinit(allocator);
+    labels.deinit(allocator);
+    labels.* = next;
+}
+
+fn appendPendingJoinJsonAlloc(allocator: std.mem.Allocator, pending: PendingJoin) ![]u8 {
+    const escaped_id = try jsonEscape(allocator, pending.id);
+    defer allocator.free(escaped_id);
+    const escaped_name = try jsonEscape(allocator, pending.node_name);
+    defer allocator.free(escaped_name);
+    const escaped_url = try jsonEscape(allocator, pending.fs_url);
+    defer allocator.free(escaped_url);
+    const escaped_platform_os = try jsonEscape(allocator, pending.platform_os);
+    defer allocator.free(escaped_platform_os);
+    const escaped_platform_arch = try jsonEscape(allocator, pending.platform_arch);
+    defer allocator.free(escaped_platform_arch);
+    const escaped_platform_runtime = try jsonEscape(allocator, pending.platform_runtime_kind);
+    defer allocator.free(escaped_platform_runtime);
+    return std.fmt.allocPrint(
+        allocator,
+        "{{\"request_id\":\"{s}\",\"node_name\":\"{s}\",\"fs_url\":\"{s}\",\"platform\":{{\"os\":\"{s}\",\"arch\":\"{s}\",\"runtime_kind\":\"{s}\"}},\"requested_at_ms\":{d}}}",
+        .{
+            escaped_id,
+            escaped_name,
+            escaped_url,
+            escaped_platform_os,
+            escaped_platform_arch,
+            escaped_platform_runtime,
+            pending.requested_at_ms,
+        },
+    );
+}
+
 fn getOptionalU64(obj: std.json.ObjectMap, name: []const u8, default_value: u64) !u64 {
     const value = obj.get(name) orelse return default_value;
     if (value != .integer or value.integer < 0) return error.InvalidSnapshot;
@@ -2499,9 +3081,26 @@ fn appendNodeJson(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8)
     defer allocator.free(escaped_name);
     const escaped_url = try jsonEscape(allocator, node.fs_url);
     defer allocator.free(escaped_url);
+    const escaped_platform_os = try jsonEscape(allocator, node.platform_os);
+    defer allocator.free(escaped_platform_os);
+    const escaped_platform_arch = try jsonEscape(allocator, node.platform_arch);
+    defer allocator.free(escaped_platform_arch);
+    const escaped_platform_runtime = try jsonEscape(allocator, node.platform_runtime_kind);
+    defer allocator.free(escaped_platform_runtime);
     try out.writer(allocator).print(
-        "{{\"node_id\":\"{s}\",\"node_name\":\"{s}\",\"fs_url\":\"{s}\",\"joined_at_ms\":{d},\"last_seen_ms\":{d},\"lease_expires_at_ms\":{d}}}",
-        .{ escaped_id, escaped_name, escaped_url, node.joined_at_ms, node.last_seen_ms, node.lease_expires_at_ms },
+        "{{\"node_id\":\"{s}\",\"node_name\":\"{s}\",\"fs_url\":\"{s}\",\"platform\":{{\"os\":\"{s}\",\"arch\":\"{s}\",\"runtime_kind\":\"{s}\"}},\"service_count\":{d},\"joined_at_ms\":{d},\"last_seen_ms\":{d},\"lease_expires_at_ms\":{d}}}",
+        .{
+            escaped_id,
+            escaped_name,
+            escaped_url,
+            escaped_platform_os,
+            escaped_platform_arch,
+            escaped_platform_runtime,
+            node.services.items.len,
+            node.joined_at_ms,
+            node.last_seen_ms,
+            node.lease_expires_at_ms,
+        },
     );
 }
 
@@ -2545,6 +3144,7 @@ fn appendWorkspaceMountJson(
     out: *std.ArrayListUnmanaged(u8),
     mount: ProjectMount,
     node: ?Node,
+    include_node_secrets: bool,
 ) !void {
     const escaped_path = try jsonEscape(allocator, mount.mount_path);
     defer allocator.free(escaped_path);
@@ -2558,18 +3158,22 @@ fn appendWorkspaceMountJson(
         defer allocator.free(escaped_name);
         const escaped_url = try jsonEscape(allocator, resolved.fs_url);
         defer allocator.free(escaped_url);
-        const escaped_auth = try jsonEscape(allocator, resolved.secret);
-        defer allocator.free(escaped_auth);
+        const auth_json = if (include_node_secrets) blk: {
+            const escaped_auth = try jsonEscape(allocator, resolved.secret);
+            defer allocator.free(escaped_auth);
+            break :blk try std.fmt.allocPrint(allocator, "\"{s}\"", .{escaped_auth});
+        } else try allocator.dupe(u8, "null");
+        defer allocator.free(auth_json);
         const online = resolved.lease_expires_at_ms > std.time.milliTimestamp();
         try out.writer(allocator).print(
-            "{{\"mount_path\":\"{s}\",\"node_id\":\"{s}\",\"export_name\":\"{s}\",\"node_name\":\"{s}\",\"fs_url\":\"{s}\",\"fs_auth_token\":\"{s}\",\"online\":{s}}}",
+            "{{\"mount_path\":\"{s}\",\"node_id\":\"{s}\",\"export_name\":\"{s}\",\"node_name\":\"{s}\",\"fs_url\":\"{s}\",\"fs_auth_token\":{s},\"online\":{s}}}",
             .{
                 escaped_path,
                 escaped_node,
                 escaped_export,
                 escaped_name,
                 escaped_url,
-                escaped_auth,
+                auth_json,
                 if (online) "true" else "false",
             },
         );
@@ -3576,7 +4180,11 @@ test "fs_control_plane: workspaceStatus supports explicit project selection" {
     defer allocator.free(selected);
     try std.testing.expect(std.mem.indexOf(u8, selected, project_id) != null);
     try std.testing.expect(std.mem.indexOf(u8, selected, "\"mount_path\":\"/src\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, selected, "\"fs_auth_token\":\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, selected, "\"fs_auth_token\":null") != null);
+
+    const selected_primary = try plane.workspaceStatus("mother", selected_req);
+    defer allocator.free(selected_primary);
+    try std.testing.expect(std.mem.indexOf(u8, selected_primary, "\"fs_auth_token\":\"") != null);
 
     const selected_without_token = try std.fmt.allocPrint(
         allocator,
@@ -3593,6 +4201,106 @@ test "fs_control_plane: workspaceStatus supports explicit project selection" {
         ControlPlaneError.ProjectNotFound,
         plane.workspaceStatus("agent-selector", "{\"project_id\":\"proj-missing\"}"),
     );
+}
+
+test "fs_control_plane: pending join request list approve and deny flow works" {
+    const allocator = std.testing.allocator;
+    var plane = ControlPlane.init(allocator);
+    defer plane.deinit();
+
+    const request_json = try plane.nodeJoinRequest(
+        "{\"node_name\":\"delta\",\"fs_url\":\"ws://127.0.0.1:19891/v2/fs\",\"platform\":{\"os\":\"linux\",\"arch\":\"amd64\",\"runtime_kind\":\"native\"}}",
+    );
+    defer allocator.free(request_json);
+    var request = try std.json.parseFromSlice(std.json.Value, allocator, request_json, .{});
+    defer request.deinit();
+    const request_id = request.value.object.get("request_id").?.string;
+
+    const listed = try plane.listPendingNodeJoins("{}");
+    defer allocator.free(listed);
+    try std.testing.expect(std.mem.indexOf(u8, listed, request_id) != null);
+
+    const approve_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"request_id\":\"{s}\"}}",
+        .{request_id},
+    );
+    defer allocator.free(approve_req);
+    const approved = try plane.approvePendingNodeJoin(approve_req);
+    defer allocator.free(approved);
+    try std.testing.expect(std.mem.indexOf(u8, approved, "\"node_name\":\"delta\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, approved, "\"runtime_kind\":\"native\"") != null);
+
+    const listed_after = try plane.listPendingNodeJoins("{}");
+    defer allocator.free(listed_after);
+    try std.testing.expect(std.mem.indexOf(u8, listed_after, "\"pending\":[]") != null);
+
+    const request2_json = try plane.nodeJoinRequest(
+        "{\"node_name\":\"epsilon\",\"fs_url\":\"ws://127.0.0.1:19892/v2/fs\"}",
+    );
+    defer allocator.free(request2_json);
+    var request2 = try std.json.parseFromSlice(std.json.Value, allocator, request2_json, .{});
+    defer request2.deinit();
+    const request2_id = request2.value.object.get("request_id").?.string;
+
+    const deny_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"request_id\":\"{s}\"}}",
+        .{request2_id},
+    );
+    defer allocator.free(deny_req);
+    const denied = try plane.denyPendingNodeJoin(deny_req);
+    defer allocator.free(denied);
+    try std.testing.expect(std.mem.indexOf(u8, denied, "\"denied\":true") != null);
+
+    try std.testing.expectError(
+        ControlPlaneError.PendingJoinNotFound,
+        plane.denyPendingNodeJoin(deny_req),
+    );
+}
+
+test "fs_control_plane: node service upsert and get stores catalog metadata" {
+    const allocator = std.testing.allocator;
+    var plane = ControlPlane.init(allocator);
+    defer plane.deinit();
+
+    const invite_json = try plane.createNodeInvite(null);
+    defer allocator.free(invite_json);
+    var invite = try std.json.parseFromSlice(std.json.Value, allocator, invite_json, .{});
+    defer invite.deinit();
+    const invite_token = invite.value.object.get("invite_token").?.string;
+
+    const join_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"invite_token\":\"{s}\",\"node_name\":\"svc-node\",\"fs_url\":\"ws://127.0.0.1:18891/v2/fs\"}}",
+        .{invite_token},
+    );
+    defer allocator.free(join_req);
+    const join_json = try plane.nodeJoin(join_req);
+    defer allocator.free(join_json);
+    var join = try std.json.parseFromSlice(std.json.Value, allocator, join_json, .{});
+    defer join.deinit();
+    const node_id = join.value.object.get("node_id").?.string;
+    const node_secret = join.value.object.get("node_secret").?.string;
+
+    const upsert_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"node_id\":\"{s}\",\"node_secret\":\"{s}\",\"platform\":{{\"os\":\"linux\",\"arch\":\"amd64\",\"runtime_kind\":\"native\"}},\"labels\":{{\"site\":\"home-lab\",\"tier\":\"edge\"}},\"services\":[{{\"service_id\":\"camera\",\"kind\":\"camera\",\"version\":\"1\",\"state\":\"online\",\"endpoints\":[\"/nodes/svc-node/camera\"],\"capabilities\":{{\"still\":true}}}},{{\"service_id\":\"terminal\",\"kind\":\"terminal\",\"version\":\"1\",\"state\":\"degraded\",\"endpoints\":[\"/nodes/svc-node/terminal/1\"],\"capabilities\":{{\"pty\":true}}}}]}}",
+        .{ node_id, node_secret },
+    );
+    defer allocator.free(upsert_req);
+    const upserted = try plane.nodeServiceUpsert(upsert_req);
+    defer allocator.free(upserted);
+    try std.testing.expect(std.mem.indexOf(u8, upserted, "\"service_id\":\"camera\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, upserted, "\"site\":\"home-lab\"") != null);
+
+    const get_req = try std.fmt.allocPrint(allocator, "{{\"node_id\":\"{s}\"}}", .{node_id});
+    defer allocator.free(get_req);
+    const fetched = try plane.nodeServiceGet(get_req);
+    defer allocator.free(fetched);
+    try std.testing.expect(std.mem.indexOf(u8, fetched, "\"runtime_kind\":\"native\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fetched, "\"service_id\":\"terminal\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fetched, "\"state\":\"degraded\"") != null);
 }
 
 test "fs_control_plane: projectUp requires project_token for existing non-builtin project" {

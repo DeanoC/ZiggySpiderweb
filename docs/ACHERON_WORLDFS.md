@@ -7,6 +7,13 @@ This document defines the agent-visible runtime namespace for Acheron sessions.
 ```
 /
 ├── nodes/
+│   └── <node_id>/
+│       ├── services/
+│       │   └── <service_id>/
+│       │       ├── SCHEMA.json
+│       │       ├── STATUS.json
+│       │       └── CAPS.json
+│       └── README.md
 ├── agents/
 │   └── self/
 ├── projects/
@@ -20,6 +27,9 @@ Major directories include:
 - `README.md` (human + agent instructions)
 - `SCHEMA.json` (shape contract)
 - `CAPS.json` (capability contract)
+
+Node-level service capability metadata is managed via control-plane service catalog
+operations and rendered into `/nodes/<node_id>/services/*`.
 
 ## Chat and Jobs
 
@@ -42,6 +52,11 @@ Project links are exposed under:
 `/projects/<project_id>/fs/<name>` entries are logical link files with target paths like:
 
 `/nodes/<node_id>/<resource>`
+
+Workspace status payloads include mount auth token redaction by role:
+
+- non-primary agents: `"fs_auth_token": null`
+- primary/system (`mother`) agent: token included
 
 ## Policy Files
 
