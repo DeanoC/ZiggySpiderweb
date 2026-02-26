@@ -99,3 +99,31 @@ Response payload:
 - Approval queue operations require operator-scope auth token if configured.
 - `control.node_join_request` is intentionally non-admin to allow unpaired join proposals.
 
+## Node Daemon Loop (`spiderweb-fs-node`)
+
+`spiderweb-fs-node` can now run as a pairing/lease daemon when `--control-url` is set.
+
+Behavior:
+
+- Loads persisted node state from `--state-file` (default `.spiderweb-fs-node-state.json`).
+- If not paired:
+  - `--pair-mode invite`: calls `control.node_join` using `--invite-token`.
+  - `--pair-mode request`: calls `control.node_join_request`, then retries `control.node_join_approve`.
+- Once paired, uses `node_secret` as FS session auth token (unless `--auth-token` is explicitly provided).
+- Runs a background lease refresh loop via `control.node_lease_refresh`.
+- Persists updated lease fields (`lease_token`, `lease_expires_at_ms`) after each successful refresh.
+- Uses reconnect backoff for both pairing retries and lease refresh failures.
+
+Key flags:
+
+- `--control-url <ws://host:port/>`
+- `--control-auth-token <token>` (or `SPIDERWEB_AUTH_TOKEN`)
+- `--pair-mode invite|request`
+- `--invite-token <token>` (required for invite mode)
+- `--node-name <name>`
+- `--fs-url <ws://host:port/v2/fs>` (advertised node URL)
+- `--state-file <path>`
+- `--lease-ttl-ms <ms>`
+- `--refresh-interval-ms <ms>`
+- `--reconnect-backoff-ms <ms>`
+- `--reconnect-backoff-max-ms <ms>`

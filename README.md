@@ -244,6 +244,22 @@ Two new binaries provide the distributed filesystem protocol from `design_docs/F
 # Start a node server exporting the current directory as RW
 ./zig-out/bin/spiderweb-fs-node --export work=.:rw
 
+# Run as a paired node daemon (invite flow) and keep lease refreshed
+./zig-out/bin/spiderweb-fs-node \
+  --export work=.:rw \
+  --control-url ws://127.0.0.1:18790/ \
+  --pair-mode invite \
+  --invite-token invite-abc123 \
+  --node-name clawz \
+  --fs-url ws://10.0.0.8:18891/v2/fs
+
+# Run request/approval pairing flow (creates pending request, then retries approval)
+./zig-out/bin/spiderweb-fs-node \
+  --export work=.:rw \
+  --control-url ws://127.0.0.1:18790/ \
+  --pair-mode request \
+  --node-name edge-1
+
 # List root entries through the mount/router client
 ./zig-out/bin/spiderweb-fs-mount \
   --endpoint a=ws://127.0.0.1:18891/v2/fs#work@/src \
@@ -311,6 +327,11 @@ Notes:
   - `SPIDERWEB_LOCAL_NODE_EXPORT_RO` (optional boolean)
   - `SPIDERWEB_LOCAL_NODE_NAME`, `SPIDERWEB_LOCAL_NODE_FS_URL`, `SPIDERWEB_LOCAL_NODE_LEASE_TTL_MS`, `SPIDERWEB_LOCAL_NODE_HEARTBEAT_MS` (optional registration/lease settings)
 - External `spiderweb-fs-node` can enforce session auth on `/v2/fs` using `--auth-token` (or `SPIDERWEB_FS_NODE_AUTH_TOKEN`).
+- External `spiderweb-fs-node` now supports control-plane daemon mode (`--control-url`) with:
+  - pairing via `--pair-mode invite --invite-token <token>` or `--pair-mode request`
+  - persisted node credentials/state (`--state-file`, default `.spiderweb-fs-node-state.json`)
+  - background lease refresh with reconnect backoff (`--refresh-interval-ms`, `--reconnect-backoff-ms`, `--reconnect-backoff-max-ms`)
+  - `--control-auth-token` (or `SPIDERWEB_AUTH_TOKEN`) for control websocket auth
 - Node/server now emits `acheron.e_fs_inval` / `acheron.e_fs_inval_dir` invalidations and router caches are invalidated on receipt.
 - Node/server now broadcasts mutation invalidations to other connected FS clients (server-push fanout).
 - Node/server uses a native Linux `inotify` watcher when available, with scanner fallback for out-of-band local FS invalidations.
