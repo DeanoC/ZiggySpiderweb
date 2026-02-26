@@ -79,3 +79,19 @@ Response fields:
 - `endpoints` must be absolute-style paths.
 - `capabilities` must be a JSON object.
 
+## `spiderweb-fs-node` Provider Mapping
+
+When `spiderweb-fs-node` runs in control daemon mode (`--control-url`), it auto-upserts service metadata:
+
+- FS provider (enabled by default):
+  - `service_id`: `fs`
+  - `kind`: `fs`
+  - endpoint: `/nodes/<node_id>/fs`
+  - capabilities: `rw`, `export_count`
+- Terminal provider (repeat `--terminal-id <id>`):
+  - `service_id`: `terminal-<id>`
+  - `kind`: `terminal`
+  - endpoint: `/nodes/<node_id>/terminal/<id>`
+  - capabilities: `pty=true`, `terminal_id`
+
+Use `--no-fs-service` to disable FS service advertisement and `--label <key=value>` to attach node labels.

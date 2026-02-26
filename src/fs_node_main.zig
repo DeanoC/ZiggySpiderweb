@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const fs_node_server = @import("fs_node_server.zig");
 const fs_node_ops = @import("fs_node_ops.zig");
+const node_capability_providers = @import("node_capability_providers.zig");
 
 const default_state_path = ".spiderweb-fs-node-state.json";
 const default_node_name = "spiderweb-fs-node";
@@ -153,6 +154,7 @@ const LeaseRefreshContext = struct {
     connect: ControlConnectOptions,
     state_path: []u8,
     fs_url: []u8,
+    service_registry: node_capability_providers.Registry,
     lease_ttl_ms: u64,
     refresh_interval_ms: u64,
     reconnect_backoff_ms: u64,
@@ -165,6 +167,7 @@ const LeaseRefreshContext = struct {
         connect: ControlConnectOptions,
         state_path: []const u8,
         fs_url: []const u8,
+        service_registry: *const node_capability_providers.Registry,
         lease_ttl_ms: u64,
         refresh_interval_ms: u64,
         reconnect_backoff_ms: u64,
@@ -178,6 +181,7 @@ const LeaseRefreshContext = struct {
             },
             .state_path = try allocator.dupe(u8, state_path),
             .fs_url = try allocator.dupe(u8, fs_url),
+            .service_registry = try service_registry.clone(allocator),
             .lease_ttl_ms = lease_ttl_ms,
             .refresh_interval_ms = refresh_interval_ms,
             .reconnect_backoff_ms = reconnect_backoff_ms,
@@ -190,6 +194,7 @@ const LeaseRefreshContext = struct {
         if (self.connect.auth_token) |value| self.allocator.free(value);
         self.allocator.free(self.state_path);
         self.allocator.free(self.fs_url);
+        self.service_registry.deinit();
         self.* = undefined;
     }
 
@@ -246,6 +251,11 @@ pub fn main() !void {
     var refresh_interval_ms: u64 = default_lease_refresh_interval_ms;
     var reconnect_backoff_ms: u64 = default_control_backoff_ms;
     var reconnect_backoff_max_ms: u64 = default_control_backoff_max_ms;
+    var enable_fs_service = true;
+    var terminal_ids = std.ArrayListUnmanaged([]const u8){};
+    defer terminal_ids.deinit(allocator);
+    var service_labels = std.ArrayListUnmanaged(node_capability_providers.NodeLabelArg){};
+    defer service_labels.deinit(allocator);
 
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -316,6 +326,16 @@ pub fn main() !void {
             i += 1;
             if (i >= args.len) return error.InvalidArguments;
             reconnect_backoff_max_ms = try std.fmt.parseInt(u64, args[i], 10);
+        } else if (std.mem.eql(u8, arg, "--no-fs-service")) {
+            enable_fs_service = false;
+        } else if (std.mem.eql(u8, arg, "--terminal-id")) {
+            i += 1;
+            if (i >= args.len) return error.InvalidArguments;
+            try terminal_ids.append(allocator, args[i]);
+        } else if (std.mem.eql(u8, arg, "--label")) {
+            i += 1;
+            if (i >= args.len) return error.InvalidArguments;
+            try service_labels.append(allocator, try parseLabelArg(args[i]));
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             try printHelp();
             return;
@@ -335,6 +355,14 @@ pub fn main() !void {
     else
         try std.fmt.allocPrint(allocator, "ws://{s}:{d}/v2/fs", .{ bind_addr, port });
     defer if (advertised_fs_url == null) allocator.free(effective_fs_url);
+
+    var service_registry = try node_capability_providers.Registry.init(allocator, .{
+        .enable_fs_service = enable_fs_service,
+        .export_specs = exports.items,
+        .terminal_ids = terminal_ids.items,
+        .labels = service_labels.items,
+    });
+    defer service_registry.deinit();
 
     if (control_url) |control_url_value| {
         if (control_auth_token == null) {
@@ -396,6 +424,18 @@ pub fn main() !void {
             }
         }
 
+        upsertNodeServiceCatalog(
+            allocator,
+            .{
+                .url = control_url_value,
+                .auth_token = control_auth_token,
+            },
+            &service_registry,
+            &state,
+        ) catch |err| {
+            std.log.warn("initial node service catalog upsert failed: {s}", .{@errorName(err)});
+        };
+
         var refresh_ctx = try allocator.create(LeaseRefreshContext);
         defer allocator.destroy(refresh_ctx);
         refresh_ctx.* = try LeaseRefreshContext.init(
@@ -406,6 +446,7 @@ pub fn main() !void {
             },
             state_path,
             effective_fs_url,
+            &service_registry,
             lease_ttl_ms,
             refresh_interval_ms,
             reconnect_backoff_ms,
@@ -467,6 +508,50 @@ fn parsePairMode(raw: []const u8) ?PairMode {
     if (std.mem.eql(u8, raw, "invite")) return .invite;
     if (std.mem.eql(u8, raw, "request")) return .request;
     return null;
+}
+
+fn parseLabelArg(raw: []const u8) !node_capability_providers.NodeLabelArg {
+    const eq_idx = std.mem.indexOfScalar(u8, raw, '=') orelse return error.InvalidArguments;
+    if (eq_idx == 0 or eq_idx + 1 >= raw.len) return error.InvalidArguments;
+    return .{
+        .key = raw[0..eq_idx],
+        .value = raw[eq_idx + 1 ..],
+    };
+}
+
+fn upsertNodeServiceCatalog(
+    allocator: std.mem.Allocator,
+    connect: ControlConnectOptions,
+    service_registry: *const node_capability_providers.Registry,
+    state: *const NodePairState,
+) !void {
+    const node_id = state.node_id orelse return error.MissingField;
+    const node_secret = state.node_secret orelse return error.MissingField;
+    const payload = try service_registry.buildServiceUpsertPayload(
+        allocator,
+        node_id,
+        node_secret,
+        @tagName(builtin.os.tag),
+        @tagName(builtin.cpu.arch),
+        "native",
+    );
+    defer allocator.free(payload);
+
+    var result = try requestControlPayload(
+        allocator,
+        connect,
+        "control.node_service_upsert",
+        payload,
+    );
+    defer result.deinit(allocator);
+
+    switch (result) {
+        .payload_json => {},
+        .remote_error => |remote| {
+            std.log.warn("node service upsert rejected: code={s} message={s}", .{ remote.code, remote.message });
+            return error.ControlRequestFailed;
+        },
+    }
 }
 
 fn pairNodeUntilCredentials(
@@ -746,6 +831,14 @@ fn leaseRefreshThreadMain(ctx: *LeaseRefreshContext) void {
                 };
 
                 failures = 0;
+                upsertNodeServiceCatalog(
+                    ctx.allocator,
+                    ctx.connect,
+                    &ctx.service_registry,
+                    &state,
+                ) catch |err| {
+                    std.log.warn("lease refresh: service catalog upsert failed: {s}", .{@errorName(err)});
+                };
                 std.log.debug("node lease refreshed: node={s} lease_expires_at_ms={d}", .{ state.node_id.?, state.lease_expires_at_ms });
             },
             .remote_error => |remote| {
@@ -1339,7 +1432,8 @@ fn printHelp() !void {
         \\  spiderweb-fs-node [--bind <addr>] [--port <port>] [--export <name>=<path>[:ro|:rw][:cred=<handle>]] [--auth-token <token>]
         \\                    [--control-url <ws-url> [--control-auth-token <token>] [--pair-mode <invite|request>] [--invite-token <token>]
         \\                     [--operator-token <token>] [--node-name <name>] [--fs-url <ws-url>] [--state-file <path>]
-        \\                     [--lease-ttl-ms <ms>] [--refresh-interval-ms <ms>] [--reconnect-backoff-ms <ms>] [--reconnect-backoff-max-ms <ms>]]
+        \\                     [--lease-ttl-ms <ms>] [--refresh-interval-ms <ms>] [--reconnect-backoff-ms <ms>] [--reconnect-backoff-max-ms <ms>]
+        \\                     [--no-fs-service] [--terminal-id <id>] [--label <key=value>]]
         \\
         \\Examples:
         \\  spiderweb-fs-node --export work=.:rw
@@ -1348,6 +1442,7 @@ fn printHelp() !void {
         \\  spiderweb-fs-node --auth-token my-node-session-token
         \\  spiderweb-fs-node --control-url ws://127.0.0.1:18790/ --pair-mode invite --invite-token invite-abc --node-name clawz --fs-url ws://10.0.0.8:18891/v2/fs
         \\  spiderweb-fs-node --control-url ws://127.0.0.1:18790/ --pair-mode request --node-name edge-1 --state-file ./node-state.json
+        \\  spiderweb-fs-node --control-url ws://127.0.0.1:18790/ --pair-mode request --terminal-id 1 --terminal-id 2 --label site=hq --label tier=edge
         \\  (control auth token can come from SPIDERWEB_AUTH_TOKEN when --control-url is used)
         \\  (standalone fs auth token can come from SPIDERWEB_FS_NODE_AUTH_TOKEN when --control-url is not used)
         \\
@@ -1359,6 +1454,14 @@ test "fs_node_main: parsePairMode accepts invite and request" {
     try std.testing.expect(parsePairMode("invite").? == .invite);
     try std.testing.expect(parsePairMode("request").? == .request);
     try std.testing.expect(parsePairMode("other") == null);
+}
+
+test "fs_node_main: parseLabelArg validates key-value format" {
+    const parsed = try parseLabelArg("site=home-lab");
+    try std.testing.expectEqualStrings("site", parsed.key);
+    try std.testing.expectEqualStrings("home-lab", parsed.value);
+    try std.testing.expectError(error.InvalidArguments, parseLabelArg("missing"));
+    try std.testing.expectError(error.InvalidArguments, parseLabelArg("=empty"));
 }
 
 test "fs_node_main: node pair state save/load roundtrip" {

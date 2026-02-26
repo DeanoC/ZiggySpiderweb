@@ -111,6 +111,10 @@ Behavior:
   - `--pair-mode request`: calls `control.node_join_request`, then retries `control.node_join_approve`.
 - Once paired, uses `node_secret` as FS session auth token (unless `--auth-token` is explicitly provided).
 - Runs a background lease refresh loop via `control.node_lease_refresh`.
+- Publishes node capability/service metadata via `control.node_service_upsert`:
+  - FS provider enabled by default.
+  - terminal providers from `--terminal-id`.
+  - labels from `--label`.
 - Persists updated lease fields (`lease_token`, `lease_expires_at_ms`) after each successful refresh.
 - Uses reconnect backoff for both pairing retries and lease refresh failures.
 
@@ -127,3 +131,6 @@ Key flags:
 - `--refresh-interval-ms <ms>`
 - `--reconnect-backoff-ms <ms>`
 - `--reconnect-backoff-max-ms <ms>`
+- `--no-fs-service` (disable default FS service advertisement)
+- `--terminal-id <id>` (repeatable)
+- `--label <key=value>` (repeatable)
