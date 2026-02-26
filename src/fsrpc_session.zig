@@ -537,6 +537,27 @@ pub const Session = struct {
             "{\"read\":true,\"write\":false}",
             "Project-composed world view.",
         );
+        try self.addDirectoryDescriptors(
+            project_fs_dir,
+            "Project Mounts",
+            "{\"kind\":\"collection\",\"entries\":\"mount links\",\"source\":\"control.workspace_status mounts\"}",
+            "{\"read\":true,\"write\":false}",
+            "Mount links for the active project workspace view.",
+        );
+        try self.addDirectoryDescriptors(
+            project_agents_dir,
+            "Project Agents",
+            "{\"kind\":\"collection\",\"entries\":\"agent links\",\"self\":\"/agents/self\"}",
+            "{\"read\":true,\"write\":false}",
+            "Agent links visible within this project context.",
+        );
+        try self.addDirectoryDescriptors(
+            project_meta_dir,
+            "Project Metadata",
+            "{\"kind\":\"metadata\",\"files\":[\"topology.json\",\"workspace_status.json\",\"mounts.json\",\"availability.json\"]}",
+            "{\"read\":true,\"write\":false}",
+            "Project topology and availability metadata.",
+        );
 
         const workspace_status_json = try self.loadProjectWorkspaceStatus(policy.project_id);
         defer if (workspace_status_json) |value| self.allocator.free(value);
@@ -599,8 +620,6 @@ pub const Session = struct {
         policy: world_policy.Policy,
         workspace_status_json: ?[]const u8,
     ) !void {
-        _ = try self.addFile(project_meta_dir, "README.md", "Project metadata and link topology.\n", false, .none);
-
         const topology_json = try self.buildProjectTopologyJson(policy);
         defer self.allocator.free(topology_json);
         _ = try self.addFile(project_meta_dir, "topology.json", topology_json, false, .none);
@@ -2119,19 +2138,29 @@ test "fsrpc_session: project meta includes control-plane workspace status" {
     const projects_root = session.lookupChild(session.root_id, "projects") orelse return error.TestExpectedResponse;
     const project_node = session.lookupChild(projects_root, project_id.string) orelse return error.TestExpectedResponse;
     const project_fs_node = session.lookupChild(project_node, "fs") orelse return error.TestExpectedResponse;
+    const project_fs_schema_id = session.lookupChild(project_fs_node, "SCHEMA.json") orelse return error.TestExpectedResponse;
+    const project_agents_node = session.lookupChild(project_node, "agents") orelse return error.TestExpectedResponse;
+    const project_agents_caps_id = session.lookupChild(project_agents_node, "CAPS.json") orelse return error.TestExpectedResponse;
     const meta_node = session.lookupChild(project_node, "meta") orelse return error.TestExpectedResponse;
+    const meta_schema_id = session.lookupChild(meta_node, "SCHEMA.json") orelse return error.TestExpectedResponse;
     const mount_link_id = session.lookupChild(project_fs_node, "mount::src") orelse return error.TestExpectedResponse;
     const topology_id = session.lookupChild(meta_node, "topology.json") orelse return error.TestExpectedResponse;
     const workspace_id = session.lookupChild(meta_node, "workspace_status.json") orelse return error.TestExpectedResponse;
     const mounts_id = session.lookupChild(meta_node, "mounts.json") orelse return error.TestExpectedResponse;
     const availability_id = session.lookupChild(meta_node, "availability.json") orelse return error.TestExpectedResponse;
 
+    const project_fs_schema = session.nodes.get(project_fs_schema_id) orelse return error.TestExpectedResponse;
+    const project_agents_caps = session.nodes.get(project_agents_caps_id) orelse return error.TestExpectedResponse;
+    const meta_schema = session.nodes.get(meta_schema_id) orelse return error.TestExpectedResponse;
     const mount_link_node = session.nodes.get(mount_link_id) orelse return error.TestExpectedResponse;
     const topology_node = session.nodes.get(topology_id) orelse return error.TestExpectedResponse;
     const workspace_node = session.nodes.get(workspace_id) orelse return error.TestExpectedResponse;
     const mounts_node = session.nodes.get(mounts_id) orelse return error.TestExpectedResponse;
     const availability_node = session.nodes.get(availability_id) orelse return error.TestExpectedResponse;
 
+    try std.testing.expect(std.mem.indexOf(u8, project_fs_schema.content, "\"kind\":\"collection\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, project_agents_caps.content, "\"read\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, meta_schema.content, "\"workspace_status.json\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, mount_link_node.content, "/nodes/") != null);
     try std.testing.expect(std.mem.indexOf(u8, mount_link_node.content, "/fs") != null);
     try std.testing.expect(std.mem.indexOf(u8, topology_node.content, "\"project_links\"") != null);

@@ -72,6 +72,9 @@ Project links are exposed under:
 - `/projects/<project_id>/agents/`
 - `/projects/<project_id>/meta/`
 
+Each of these project subdirectories is self-describing with `README.md`,
+`SCHEMA.json`, and `CAPS.json`.
+
 `/projects/<project_id>/fs/<name>` entries are logical link files with target paths like:
 
 `/nodes/<node_id>/<resource>`
