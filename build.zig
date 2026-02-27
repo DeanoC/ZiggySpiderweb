@@ -15,6 +15,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     const ziggy_spider_protocol_module = ziggy_spider_protocol_dep.module("ziggy-spider-protocol");
+    const spiderweb_node_module = ziggy_spider_protocol_dep.module("spiderweb_node");
     const ziggy_memory_store_dep = b.dependency("ziggy_memory_store", .{
         .target = target,
         .optimize = optimize,
@@ -237,6 +238,7 @@ pub fn build(b: *std.Build) void {
     test_mod.addImport("ziggy-piai", ziggy_piai_module);
     test_mod.addImport("agent_config", agent_config_mod);
     test_mod.addImport("ziggy-spider-protocol", ziggy_spider_protocol_module);
+    test_mod.addImport("spiderweb_node", spiderweb_node_module);
     test_mod.addImport("ziggy-memory-store", ziggy_memory_store_module);
     test_mod.addImport("ziggy-tool-runtime", ziggy_tool_runtime_module);
     test_mod.addImport("ziggy-runtime-hooks", ziggy_runtime_hooks_module);

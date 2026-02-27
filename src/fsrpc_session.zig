@@ -4812,3 +4812,226 @@ test "fsrpc_session: global nodes directory discovers late control-plane nodes o
     const nodes_root = session.lookupChild(session.root_id, "nodes") orelse return error.TestExpectedResponse;
     try std.testing.expect(session.lookupChild(nodes_root, node_id.string) != null);
 }
+
+test "fsrpc_session: pairing catalog visibility and node invoke integration flow" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const spiderweb_node = @import("spiderweb_node");
+
+    var control_plane = fs_control_plane.ControlPlane.init(allocator);
+    defer control_plane.deinit();
+
+    const ensured = try control_plane.ensureNode("edge-integration", "ws://127.0.0.1:18891/v2/fs", 60_000);
+    defer allocator.free(ensured);
+    var ensured_parsed = try std.json.parseFromSlice(std.json.Value, allocator, ensured, .{});
+    defer ensured_parsed.deinit();
+    if (ensured_parsed.value != .object) return error.TestExpectedResponse;
+    const node_id = ensured_parsed.value.object.get("node_id") orelse return error.TestExpectedResponse;
+    if (node_id != .string) return error.TestExpectedResponse;
+    const node_secret = ensured_parsed.value.object.get("node_secret") orelse return error.TestExpectedResponse;
+    if (node_secret != .string) return error.TestExpectedResponse;
+
+    const escaped_node_id = try unified.jsonEscape(allocator, node_id.string);
+    defer allocator.free(escaped_node_id);
+    const escaped_node_secret = try unified.jsonEscape(allocator, node_secret.string);
+    defer allocator.free(escaped_node_secret);
+    const upsert_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"node_id\":\"{s}\",\"node_secret\":\"{s}\",\"services\":[{{\"service_id\":\"echo-main\",\"kind\":\"utility\",\"version\":\"1\",\"state\":\"online\",\"endpoints\":[\"/nodes/{s}/echo\"],\"capabilities\":{{\"invoke\":true}},\"mounts\":[{{\"mount_id\":\"echo-main\",\"mount_path\":\"/nodes/{s}/echo\",\"state\":\"online\"}}],\"ops\":{{\"model\":\"namespace\",\"style\":\"plan9\"}},\"runtime\":{{\"type\":\"native_proc\",\"abi\":\"namespace-driver-v1\"}},\"permissions\":{{\"default\":\"deny-by-default\",\"allow_roles\":[\"admin\",\"user\"]}},\"schema\":{{\"model\":\"namespace-service-v1\"}},\"help_md\":\"Echo integration service\"}}]}}",
+        .{ escaped_node_id, escaped_node_secret, escaped_node_id, escaped_node_id },
+    );
+    defer allocator.free(upsert_req);
+    const upserted = try control_plane.nodeServiceUpsert(upsert_req);
+    defer allocator.free(upserted);
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "default",
+        .{
+            .control_plane = &control_plane,
+            .agents_dir = ".does-not-exist",
+            .projects_dir = ".does-not-exist",
+            .is_admin = false,
+        },
+    );
+    defer session.deinit();
+
+    const nodes_root = session.lookupChild(session.root_id, "nodes") orelse return error.TestExpectedResponse;
+    const node_dir = session.lookupChild(nodes_root, node_id.string) orelse return error.TestExpectedResponse;
+    const services_root = session.lookupChild(node_dir, "services") orelse return error.TestExpectedResponse;
+    const echo_service = session.lookupChild(services_root, "echo-main") orelse return error.TestExpectedResponse;
+    _ = echo_service;
+    const echo_root = session.lookupChild(node_dir, "echo") orelse return error.TestExpectedResponse;
+    _ = echo_root;
+
+    var node_service = try spiderweb_node.fs_node_service.NodeService.init(
+        allocator,
+        &[_]spiderweb_node.fs_node_ops.ExportSpec{
+            .{
+                .name = "svc-echo-main",
+                .path = "service:echo-main",
+                .source_kind = .namespace,
+                .source_id = "service:echo-main",
+                .ro = false,
+                .namespace_service = .{
+                    .service_id = "echo-main",
+                    .runtime_kind = .native_proc,
+                    .executable_path = "/bin/cat",
+                    .args = &.{},
+                    .timeout_ms = 10_000,
+                },
+            },
+        },
+    );
+    defer node_service.deinit();
+
+    var exports_res = try node_service.handleRequestJsonWithEvents(
+        "{\"channel\":\"acheron\",\"type\":\"acheron.t_fs_exports\",\"tag\":1,\"payload\":{}}",
+    );
+    defer exports_res.deinit(allocator);
+    var exports_parsed = try std.json.parseFromSlice(std.json.Value, allocator, exports_res.response_json, .{});
+    defer exports_parsed.deinit();
+    const root_id = exports_parsed.value.object.get("payload").?.object.get("exports").?.array.items[0].object.get("root").?.integer;
+
+    const control_lookup_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"channel\":\"acheron\",\"type\":\"acheron.t_fs_lookup\",\"tag\":2,\"node\":{d},\"payload\":{{\"name\":\"control\"}}}}",
+        .{root_id},
+    );
+    defer allocator.free(control_lookup_req);
+    var control_lookup_res = try node_service.handleRequestJsonWithEvents(control_lookup_req);
+    defer control_lookup_res.deinit(allocator);
+    var control_lookup_parsed = try std.json.parseFromSlice(std.json.Value, allocator, control_lookup_res.response_json, .{});
+    defer control_lookup_parsed.deinit();
+    const control_id = control_lookup_parsed.value.object.get("payload").?.object.get("attr").?.object.get("id").?.integer;
+
+    const invoke_lookup_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"channel\":\"acheron\",\"type\":\"acheron.t_fs_lookup\",\"tag\":3,\"node\":{d},\"payload\":{{\"name\":\"invoke.json\"}}}}",
+        .{control_id},
+    );
+    defer allocator.free(invoke_lookup_req);
+    var invoke_lookup_res = try node_service.handleRequestJsonWithEvents(invoke_lookup_req);
+    defer invoke_lookup_res.deinit(allocator);
+    var invoke_lookup_parsed = try std.json.parseFromSlice(std.json.Value, allocator, invoke_lookup_res.response_json, .{});
+    defer invoke_lookup_parsed.deinit();
+    const invoke_id = invoke_lookup_parsed.value.object.get("payload").?.object.get("attr").?.object.get("id").?.integer;
+
+    const open_invoke_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"channel\":\"acheron\",\"type\":\"acheron.t_fs_open\",\"tag\":4,\"node\":{d},\"payload\":{{\"flags\":2}}}}",
+        .{invoke_id},
+    );
+    defer allocator.free(open_invoke_req);
+    var open_invoke_res = try node_service.handleRequestJsonWithEvents(open_invoke_req);
+    defer open_invoke_res.deinit(allocator);
+    var open_invoke_parsed = try std.json.parseFromSlice(std.json.Value, allocator, open_invoke_res.response_json, .{});
+    defer open_invoke_parsed.deinit();
+    const invoke_handle = open_invoke_parsed.value.object.get("payload").?.object.get("h").?.integer;
+
+    const payload_json = "{\"ping\":\"pong\"}";
+    const payload_b64_len = std.base64.standard.Encoder.calcSize(payload_json.len);
+    const payload_b64 = try allocator.alloc(u8, payload_b64_len);
+    defer allocator.free(payload_b64);
+    _ = std.base64.standard.Encoder.encode(payload_b64, payload_json);
+    const write_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"channel\":\"acheron\",\"type\":\"acheron.t_fs_write\",\"tag\":5,\"h\":{d},\"payload\":{{\"off\":0,\"data_b64\":\"{s}\"}}}}",
+        .{ invoke_handle, payload_b64 },
+    );
+    defer allocator.free(write_req);
+    var write_res = try node_service.handleRequestJsonWithEvents(write_req);
+    defer write_res.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, write_res.response_json, "\"ok\":true") != null);
+
+    const result_lookup_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"channel\":\"acheron\",\"type\":\"acheron.t_fs_lookup\",\"tag\":6,\"node\":{d},\"payload\":{{\"name\":\"result.json\"}}}}",
+        .{root_id},
+    );
+    defer allocator.free(result_lookup_req);
+    var result_lookup_res = try node_service.handleRequestJsonWithEvents(result_lookup_req);
+    defer result_lookup_res.deinit(allocator);
+    var result_lookup_parsed = try std.json.parseFromSlice(std.json.Value, allocator, result_lookup_res.response_json, .{});
+    defer result_lookup_parsed.deinit();
+    const result_id = result_lookup_parsed.value.object.get("payload").?.object.get("attr").?.object.get("id").?.integer;
+
+    const open_result_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"channel\":\"acheron\",\"type\":\"acheron.t_fs_open\",\"tag\":7,\"node\":{d},\"payload\":{{\"flags\":0}}}}",
+        .{result_id},
+    );
+    defer allocator.free(open_result_req);
+    var open_result_res = try node_service.handleRequestJsonWithEvents(open_result_req);
+    defer open_result_res.deinit(allocator);
+    var open_result_parsed = try std.json.parseFromSlice(std.json.Value, allocator, open_result_res.response_json, .{});
+    defer open_result_parsed.deinit();
+    const result_handle = open_result_parsed.value.object.get("payload").?.object.get("h").?.integer;
+
+    const read_result_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"channel\":\"acheron\",\"type\":\"acheron.t_fs_read\",\"tag\":8,\"h\":{d},\"payload\":{{\"off\":0,\"len\":4096}}}}",
+        .{result_handle},
+    );
+    defer allocator.free(read_result_req);
+    var read_result_res = try node_service.handleRequestJsonWithEvents(read_result_req);
+    defer read_result_res.deinit(allocator);
+    var read_result_parsed = try std.json.parseFromSlice(std.json.Value, allocator, read_result_res.response_json, .{});
+    defer read_result_parsed.deinit();
+    const result_data_b64 = read_result_parsed.value.object.get("payload").?.object.get("data_b64").?.string;
+    const result_len = std.base64.standard.Decoder.calcSizeForSlice(result_data_b64) catch return error.TestExpectedResponse;
+    const result_decoded = try allocator.alloc(u8, result_len);
+    defer allocator.free(result_decoded);
+    _ = std.base64.standard.Decoder.decode(result_decoded, result_data_b64) catch return error.TestExpectedResponse;
+    try std.testing.expect(std.mem.indexOf(u8, result_decoded, "\"ping\":\"pong\"") != null);
+
+    const status_lookup_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"channel\":\"acheron\",\"type\":\"acheron.t_fs_lookup\",\"tag\":9,\"node\":{d},\"payload\":{{\"name\":\"status.json\"}}}}",
+        .{root_id},
+    );
+    defer allocator.free(status_lookup_req);
+    var status_lookup_res = try node_service.handleRequestJsonWithEvents(status_lookup_req);
+    defer status_lookup_res.deinit(allocator);
+    var status_lookup_parsed = try std.json.parseFromSlice(std.json.Value, allocator, status_lookup_res.response_json, .{});
+    defer status_lookup_parsed.deinit();
+    const status_id = status_lookup_parsed.value.object.get("payload").?.object.get("attr").?.object.get("id").?.integer;
+
+    const open_status_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"channel\":\"acheron\",\"type\":\"acheron.t_fs_open\",\"tag\":10,\"node\":{d},\"payload\":{{\"flags\":0}}}}",
+        .{status_id},
+    );
+    defer allocator.free(open_status_req);
+    var open_status_res = try node_service.handleRequestJsonWithEvents(open_status_req);
+    defer open_status_res.deinit(allocator);
+    var open_status_parsed = try std.json.parseFromSlice(std.json.Value, allocator, open_status_res.response_json, .{});
+    defer open_status_parsed.deinit();
+    const status_handle = open_status_parsed.value.object.get("payload").?.object.get("h").?.integer;
+
+    const read_status_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"channel\":\"acheron\",\"type\":\"acheron.t_fs_read\",\"tag\":11,\"h\":{d},\"payload\":{{\"off\":0,\"len\":4096}}}}",
+        .{status_handle},
+    );
+    defer allocator.free(read_status_req);
+    var read_status_res = try node_service.handleRequestJsonWithEvents(read_status_req);
+    defer read_status_res.deinit(allocator);
+    var read_status_parsed = try std.json.parseFromSlice(std.json.Value, allocator, read_status_res.response_json, .{});
+    defer read_status_parsed.deinit();
+    const status_data_b64 = read_status_parsed.value.object.get("payload").?.object.get("data_b64").?.string;
+    const status_len = std.base64.standard.Decoder.calcSizeForSlice(status_data_b64) catch return error.TestExpectedResponse;
+    const status_decoded = try allocator.alloc(u8, status_len);
+    defer allocator.free(status_decoded);
+    _ = std.base64.standard.Decoder.decode(status_decoded, status_data_b64) catch return error.TestExpectedResponse;
+    try std.testing.expect(std.mem.indexOf(u8, status_decoded, "\"state\":\"ok\"") != null);
+}
