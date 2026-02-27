@@ -26,6 +26,11 @@ const SpecialKind = enum {
     pairing_deny,
     pairing_invites_refresh,
     pairing_invites_create,
+    terminal_v2_invoke,
+    terminal_v2_create,
+    terminal_v2_resume,
+    terminal_v2_close,
+    terminal_v2_exec,
 };
 
 const default_wait_timeout_ms: i64 = 60_000;
@@ -143,6 +148,33 @@ const PairingAction = enum {
     invites_create,
 };
 
+const TerminalInvokeOp = enum {
+    exec,
+    create_session,
+    resume_session,
+    close_session,
+};
+
+const TerminalSession = struct {
+    label: ?[]u8 = null,
+    cwd: ?[]u8 = null,
+    created_at_ms: i64 = 0,
+    updated_at_ms: i64 = 0,
+    last_exec_at_ms: i64 = 0,
+    closed_at_ms: i64 = 0,
+    exec_count: u64 = 0,
+
+    fn deinit(self: *TerminalSession, allocator: std.mem.Allocator) void {
+        if (self.label) |value| allocator.free(value);
+        if (self.cwd) |value| allocator.free(value);
+        self.* = undefined;
+    }
+
+    fn isClosed(self: TerminalSession) bool {
+        return self.closed_at_ms != 0;
+    }
+};
+
 const Node = struct {
     id: u32,
     parent: ?u32,
@@ -207,9 +239,16 @@ pub const Session = struct {
     pairing_invites_active_id: u32 = 0,
     pairing_invites_last_result_id: u32 = 0,
     pairing_invites_last_error_id: u32 = 0,
+    terminal_status_id: u32 = 0,
+    terminal_result_id: u32 = 0,
+    terminal_sessions_id: u32 = 0,
+    terminal_current_id: u32 = 0,
     wait_sources: std.ArrayListUnmanaged(WaitSource) = .{},
     wait_timeout_ms: i64 = default_wait_timeout_ms,
     wait_event_seq: u64 = 1,
+    terminal_sessions: std.StringHashMapUnmanaged(TerminalSession) = .{},
+    current_terminal_session_id: ?[]u8 = null,
+    next_terminal_session_seq: u64 = 1,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -265,6 +304,7 @@ pub const Session = struct {
     pub fn deinit(self: *Session) void {
         self.clearWaitSources();
         self.clearPendingDebugFrames();
+        self.clearTerminalSessions();
         var it = self.nodes.iterator();
         while (it.next()) |entry| {
             var node = entry.value_ptr.*;
@@ -588,6 +628,132 @@ pub const Session = struct {
             },
             .pairing_invites_create => {
                 const outcome = try self.handlePairingControlWrite(.invites_create, data);
+                written = outcome.written;
+            },
+            .terminal_v2_invoke => {
+                const outcome = self.handleTerminalV2InvokeWrite(state.node_id, data) catch |err| switch (err) {
+                    error.InvalidPayload => {
+                        return unified.buildFsrpcError(
+                            self.allocator,
+                            msg.tag,
+                            "invalid",
+                            "terminal invoke payload must include op=create|resume|close|exec or exec command fields",
+                        );
+                    },
+                    error.TerminalSessionNotFound => {
+                        return unified.buildFsrpcError(
+                            self.allocator,
+                            msg.tag,
+                            "enoent",
+                            "terminal session not found",
+                        );
+                    },
+                    error.TerminalSessionClosed => {
+                        return unified.buildFsrpcError(
+                            self.allocator,
+                            msg.tag,
+                            "eperm",
+                            "terminal session is closed",
+                        );
+                    },
+                    else => return err,
+                };
+                written = outcome.written;
+            },
+            .terminal_v2_create => {
+                const outcome = self.handleTerminalV2CreateWrite(state.node_id, data) catch |err| switch (err) {
+                    error.InvalidPayload => {
+                        return unified.buildFsrpcError(
+                            self.allocator,
+                            msg.tag,
+                            "invalid",
+                            "terminal create payload must be a JSON object with optional session_id/label/cwd",
+                        );
+                    },
+                    else => return err,
+                };
+                written = outcome.written;
+            },
+            .terminal_v2_resume => {
+                const outcome = self.handleTerminalV2ResumeWrite(state.node_id, data) catch |err| switch (err) {
+                    error.InvalidPayload => {
+                        return unified.buildFsrpcError(
+                            self.allocator,
+                            msg.tag,
+                            "invalid",
+                            "terminal resume payload must include session_id",
+                        );
+                    },
+                    error.TerminalSessionNotFound => {
+                        return unified.buildFsrpcError(
+                            self.allocator,
+                            msg.tag,
+                            "enoent",
+                            "terminal session not found",
+                        );
+                    },
+                    error.TerminalSessionClosed => {
+                        return unified.buildFsrpcError(
+                            self.allocator,
+                            msg.tag,
+                            "eperm",
+                            "terminal session is closed",
+                        );
+                    },
+                    else => return err,
+                };
+                written = outcome.written;
+            },
+            .terminal_v2_close => {
+                const outcome = self.handleTerminalV2CloseWrite(state.node_id, data) catch |err| switch (err) {
+                    error.InvalidPayload => {
+                        return unified.buildFsrpcError(
+                            self.allocator,
+                            msg.tag,
+                            "invalid",
+                            "terminal close payload must include session_id or use an active session",
+                        );
+                    },
+                    error.TerminalSessionNotFound => {
+                        return unified.buildFsrpcError(
+                            self.allocator,
+                            msg.tag,
+                            "enoent",
+                            "terminal session not found",
+                        );
+                    },
+                    else => return err,
+                };
+                written = outcome.written;
+            },
+            .terminal_v2_exec => {
+                const outcome = self.handleTerminalV2ExecWrite(state.node_id, data) catch |err| switch (err) {
+                    error.InvalidPayload => {
+                        return unified.buildFsrpcError(
+                            self.allocator,
+                            msg.tag,
+                            "invalid",
+                            "terminal exec payload must include command or argv (optional session_id/cwd)",
+                        );
+                    },
+                    error.TerminalSessionNotFound => {
+                        return unified.buildFsrpcError(
+                            self.allocator,
+                            msg.tag,
+                            "enoent",
+                            "terminal session not found",
+                        );
+                    },
+                    error.TerminalSessionClosed => {
+                        return unified.buildFsrpcError(
+                            self.allocator,
+                            msg.tag,
+                            "eperm",
+                            "terminal session is closed",
+                        );
+                    },
+                    else => return err,
+                };
                 written = outcome.written;
             },
             else => {
@@ -1718,21 +1884,21 @@ pub const Session = struct {
         try self.addDirectoryDescriptors(
             terminal_dir,
             "Terminal",
-            "{\"kind\":\"service\",\"service_id\":\"terminal\",\"shape\":\"/agents/self/terminal/{README.md,SCHEMA.json,CAPS.json,OPS.json,RUNTIME.json,PERMISSIONS.json,STATUS.json,status.json,result.json,control/*}\"}",
-            "{\"invoke\":true,\"operations\":[\"shell_exec\"],\"discoverable\":true,\"interactive\":false}",
-            "First-class terminal namespace. Write command payloads to control/exec.json (or invoke.json), then read status.json/result.json.",
+            "{\"kind\":\"service\",\"service_id\":\"terminal-v2\",\"shape\":\"/agents/self/terminal/{README.md,SCHEMA.json,CAPS.json,OPS.json,RUNTIME.json,PERMISSIONS.json,STATUS.json,status.json,result.json,sessions.json,current.json,control/*}\"}",
+            "{\"invoke\":true,\"operations\":[\"terminal_session_create\",\"terminal_session_resume\",\"terminal_session_close\",\"shell_exec\"],\"discoverable\":true,\"interactive\":true,\"sessionized\":true}",
+            "Sessionized terminal namespace. Create/resume/close sessions via control/*.json and execute commands via control/exec.json (or invoke.json).",
         );
         _ = try self.addFile(
             terminal_dir,
             "OPS.json",
-            "{\"model\":\"tool_bridge\",\"invoke\":\"control/invoke.json\",\"transport\":\"runtime-tool\",\"paths\":{\"exec\":\"control/exec.json\"},\"operations\":{\"exec\":\"shell_exec\"}}",
+            "{\"model\":\"tool_bridge\",\"invoke\":\"control/invoke.json\",\"transport\":\"runtime-tool\",\"paths\":{\"create\":\"control/create.json\",\"resume\":\"control/resume.json\",\"close\":\"control/close.json\",\"exec\":\"control/exec.json\"},\"operations\":{\"create\":\"terminal_session_create\",\"resume\":\"terminal_session_resume\",\"close\":\"terminal_session_close\",\"exec\":\"shell_exec\"}}",
             false,
             .none,
         );
         _ = try self.addFile(
             terminal_dir,
             "RUNTIME.json",
-            "{\"type\":\"runtime_tool\",\"tool\":\"shell_exec\"}",
+            "{\"type\":\"runtime_tool\",\"tool\":\"shell_exec\",\"session_model\":\"terminal-v2\"}",
             false,
             .none,
         );
@@ -1746,21 +1912,35 @@ pub const Session = struct {
         _ = try self.addFile(
             terminal_dir,
             "STATUS.json",
-            "{\"service_id\":\"terminal\",\"state\":\"namespace\",\"has_invoke\":true}",
+            "{\"service_id\":\"terminal-v2\",\"state\":\"namespace\",\"has_invoke\":true,\"sessionized\":true}",
             false,
             .none,
         );
-        _ = try self.addFile(
+        self.terminal_status_id = try self.addFile(
             terminal_dir,
             "status.json",
-            "{\"state\":\"idle\",\"tool\":null,\"updated_at_ms\":0,\"error\":null}",
+            "{\"state\":\"idle\",\"tool\":null,\"session_id\":null,\"updated_at_ms\":0,\"error\":null}",
             false,
             .none,
         );
-        _ = try self.addFile(
+        self.terminal_result_id = try self.addFile(
             terminal_dir,
             "result.json",
             "{\"ok\":false,\"result\":null,\"error\":null}",
+            false,
+            .none,
+        );
+        self.terminal_sessions_id = try self.addFile(
+            terminal_dir,
+            "sessions.json",
+            "{\"sessions\":[]}",
+            false,
+            .none,
+        );
+        self.terminal_current_id = try self.addFile(
+            terminal_dir,
+            "current.json",
+            "{\"session\":null}",
             false,
             .none,
         );
@@ -1769,12 +1949,472 @@ pub const Session = struct {
         _ = try self.addFile(
             control_dir,
             "README.md",
-            "Write command payloads to exec.json (or explicit envelopes to invoke.json). Read result.json and status.json.\n",
+            "Write create/resume/close/exec payloads to control/*.json. invoke.json accepts op=create|resume|close|exec envelopes.\n",
             false,
             .none,
         );
-        _ = try self.addFile(control_dir, "invoke.json", "", true, .agent_contract_invoke);
-        _ = try self.addFile(control_dir, "exec.json", "", true, .agent_contract_invoke);
+        _ = try self.addFile(control_dir, "invoke.json", "", true, .terminal_v2_invoke);
+        _ = try self.addFile(control_dir, "create.json", "", true, .terminal_v2_create);
+        _ = try self.addFile(control_dir, "resume.json", "", true, .terminal_v2_resume);
+        _ = try self.addFile(control_dir, "close.json", "", true, .terminal_v2_close);
+        _ = try self.addFile(control_dir, "exec.json", "", true, .terminal_v2_exec);
+    }
+
+    fn handleTerminalV2InvokeWrite(self: *Session, invoke_node_id: u32, raw_input: []const u8) !WriteOutcome {
+        const input = std.mem.trim(u8, raw_input, " \t\r\n");
+        if (input.len == 0) return error.InvalidPayload;
+        try self.setFileContent(invoke_node_id, input);
+
+        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, input, .{}) catch return error.InvalidPayload;
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidPayload;
+        const obj = parsed.value.object;
+
+        const op = self.terminalInvokeOperationFromPayload(obj) orelse return error.InvalidPayload;
+
+        const operation_payload = blk: {
+            if (obj.get("arguments")) |value| break :blk try self.renderJsonValue(value);
+            if (obj.get("args")) |value| break :blk try self.renderJsonValue(value);
+            break :blk try self.allocator.dupe(u8, input);
+        };
+        defer self.allocator.free(operation_payload);
+
+        return switch (op) {
+            .create_session => self.terminalV2Create(operation_payload),
+            .resume_session => self.terminalV2Resume(operation_payload),
+            .close_session => self.terminalV2Close(operation_payload),
+            .exec => self.terminalV2Exec(operation_payload),
+        };
+    }
+
+    fn handleTerminalV2CreateWrite(self: *Session, create_node_id: u32, raw_input: []const u8) !WriteOutcome {
+        const input = std.mem.trim(u8, raw_input, " \t\r\n");
+        const payload = if (input.len == 0) "{}" else input;
+        try self.setFileContent(create_node_id, payload);
+        return self.terminalV2Create(payload);
+    }
+
+    fn handleTerminalV2ResumeWrite(self: *Session, resume_node_id: u32, raw_input: []const u8) !WriteOutcome {
+        const input = std.mem.trim(u8, raw_input, " \t\r\n");
+        if (input.len == 0) return error.InvalidPayload;
+        try self.setFileContent(resume_node_id, input);
+        return self.terminalV2Resume(input);
+    }
+
+    fn handleTerminalV2CloseWrite(self: *Session, close_node_id: u32, raw_input: []const u8) !WriteOutcome {
+        const input = std.mem.trim(u8, raw_input, " \t\r\n");
+        const payload = if (input.len == 0) "{}" else input;
+        try self.setFileContent(close_node_id, payload);
+        return self.terminalV2Close(payload);
+    }
+
+    fn handleTerminalV2ExecWrite(self: *Session, exec_node_id: u32, raw_input: []const u8) !WriteOutcome {
+        const input = std.mem.trim(u8, raw_input, " \t\r\n");
+        if (input.len == 0) return error.InvalidPayload;
+        try self.setFileContent(exec_node_id, input);
+        return self.terminalV2Exec(input);
+    }
+
+    fn terminalV2Create(self: *Session, payload: []const u8) !WriteOutcome {
+        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, payload, .{}) catch return error.InvalidPayload;
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidPayload;
+        const obj = parsed.value.object;
+
+        const maybe_session_id = try jsonObjectOptionalString(obj, "session_id");
+        const label = try jsonObjectOptionalString(obj, "label");
+        const cwd = try jsonObjectOptionalString(obj, "cwd");
+
+        const session_id_owned = if (maybe_session_id) |value|
+            try self.allocator.dupe(u8, value)
+        else
+            try self.generateTerminalSessionId();
+        errdefer self.allocator.free(session_id_owned);
+        if (self.terminal_sessions.contains(session_id_owned)) return error.InvalidPayload;
+
+        var session = TerminalSession{
+            .label = if (label) |value| try self.allocator.dupe(u8, value) else null,
+            .cwd = if (cwd) |value| try self.allocator.dupe(u8, value) else null,
+            .created_at_ms = std.time.milliTimestamp(),
+            .updated_at_ms = std.time.milliTimestamp(),
+        };
+        errdefer session.deinit(self.allocator);
+
+        try self.terminal_sessions.putNoClobber(self.allocator, session_id_owned, session);
+        try self.setCurrentTerminalSession(session_id_owned);
+        try self.refreshTerminalV2StateFiles();
+        try self.updateTerminalV2StatusAndResult("done", "terminal_session_create", session_id_owned, null, "create", "{\"state\":\"open\"}");
+        return .{ .written = payload.len };
+    }
+
+    fn terminalV2Resume(self: *Session, payload: []const u8) !WriteOutcome {
+        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, payload, .{}) catch return error.InvalidPayload;
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidPayload;
+        const obj = parsed.value.object;
+        const session_id = (try jsonObjectOptionalString(obj, "session_id")) orelse return error.InvalidPayload;
+        var session = self.terminal_sessions.getPtr(session_id) orelse return error.TerminalSessionNotFound;
+        if (session.isClosed()) return error.TerminalSessionClosed;
+
+        session.updated_at_ms = std.time.milliTimestamp();
+        try self.setCurrentTerminalSession(session_id);
+        try self.refreshTerminalV2StateFiles();
+        try self.updateTerminalV2StatusAndResult("done", "terminal_session_resume", session_id, null, "resume", "{\"state\":\"open\"}");
+        return .{ .written = payload.len };
+    }
+
+    fn terminalV2Close(self: *Session, payload: []const u8) !WriteOutcome {
+        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, payload, .{}) catch return error.InvalidPayload;
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidPayload;
+        const obj = parsed.value.object;
+        const selected_id = blk: {
+            if (try jsonObjectOptionalString(obj, "session_id")) |value| break :blk value;
+            if (self.current_terminal_session_id) |value| break :blk value;
+            break :blk null;
+        } orelse return error.InvalidPayload;
+
+        var session = self.terminal_sessions.getPtr(selected_id) orelse return error.TerminalSessionNotFound;
+        const now_ms = std.time.milliTimestamp();
+        session.closed_at_ms = now_ms;
+        session.updated_at_ms = now_ms;
+        if (self.current_terminal_session_id) |current| {
+            if (std.mem.eql(u8, current, selected_id)) try self.setCurrentTerminalSession(null);
+        }
+        try self.refreshTerminalV2StateFiles();
+        try self.updateTerminalV2StatusAndResult("done", "terminal_session_close", selected_id, null, "close", "{\"state\":\"closed\"}");
+        return .{ .written = payload.len };
+    }
+
+    fn terminalV2Exec(self: *Session, payload: []const u8) !WriteOutcome {
+        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, payload, .{}) catch return error.InvalidPayload;
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidPayload;
+        const obj = parsed.value.object;
+
+        const explicit_session_id = try jsonObjectOptionalString(obj, "session_id");
+        var selected_session_id: ?[]const u8 = explicit_session_id;
+        if (selected_session_id == null) selected_session_id = self.current_terminal_session_id;
+
+        var session_ptr: ?*TerminalSession = null;
+        if (selected_session_id) |session_id| {
+            session_ptr = self.terminal_sessions.getPtr(session_id) orelse return error.TerminalSessionNotFound;
+            if (session_ptr.?.isClosed()) return error.TerminalSessionClosed;
+        }
+
+        const args_json = try self.buildTerminalExecArgsJson(obj, if (session_ptr) |session| session.cwd else null);
+        defer self.allocator.free(args_json);
+
+        const running_status = try self.buildTerminalV2StatusJson("running", "shell_exec", selected_session_id, null);
+        defer self.allocator.free(running_status);
+        try self.setFileContent(self.terminal_status_id, running_status);
+
+        const result_payload = try self.executeAgentContractToolCall("shell_exec", args_json);
+        defer self.allocator.free(result_payload);
+        var failed = false;
+        var failure_message: ?[]u8 = null;
+        defer if (failure_message) |value| self.allocator.free(value);
+        if (try self.extractErrorMessageFromToolPayload(result_payload)) |message| {
+            failed = true;
+            failure_message = message;
+        }
+
+        if (session_ptr) |session| {
+            const now_ms = std.time.milliTimestamp();
+            session.updated_at_ms = now_ms;
+            session.last_exec_at_ms = now_ms;
+            session.exec_count +%= 1;
+            if (try jsonObjectOptionalString(obj, "cwd")) |next_cwd| {
+                if (session.cwd) |old| self.allocator.free(old);
+                session.cwd = try self.allocator.dupe(u8, next_cwd);
+            }
+            if (selected_session_id) |active_id| try self.setCurrentTerminalSession(active_id);
+        }
+        try self.refreshTerminalV2StateFiles();
+
+        if (failed) {
+            try self.updateTerminalV2StatusAndResult(
+                "failed",
+                "shell_exec",
+                selected_session_id,
+                failure_message.?,
+                "exec",
+                result_payload,
+            );
+        } else {
+            try self.updateTerminalV2StatusAndResult(
+                "done",
+                "shell_exec",
+                selected_session_id,
+                null,
+                "exec",
+                result_payload,
+            );
+        }
+        return .{ .written = payload.len };
+    }
+
+    fn buildTerminalExecArgsJson(
+        self: *Session,
+        obj: std.json.ObjectMap,
+        session_cwd: ?[]const u8,
+    ) ![]u8 {
+        var out = std.ArrayListUnmanaged(u8){};
+        errdefer out.deinit(self.allocator);
+        try out.append(self.allocator, '{');
+        var first = true;
+        var has_command = false;
+        var has_argv = false;
+        var has_cwd = false;
+
+        var it = obj.iterator();
+        while (it.next()) |entry| {
+            const key = entry.key_ptr.*;
+            if (std.mem.eql(u8, key, "session_id") or
+                std.mem.eql(u8, key, "op") or
+                std.mem.eql(u8, key, "operation") or
+                std.mem.eql(u8, key, "tool") or
+                std.mem.eql(u8, key, "tool_name") or
+                std.mem.eql(u8, key, "arguments") or
+                std.mem.eql(u8, key, "args"))
+            {
+                continue;
+            }
+            if (std.mem.eql(u8, key, "command")) has_command = true;
+            if (std.mem.eql(u8, key, "argv")) has_argv = true;
+            if (std.mem.eql(u8, key, "cwd")) has_cwd = true;
+
+            if (!first) try out.append(self.allocator, ',');
+            first = false;
+            const escaped_key = try unified.jsonEscape(self.allocator, key);
+            defer self.allocator.free(escaped_key);
+            const value_json = try self.renderJsonValue(entry.value_ptr.*);
+            defer self.allocator.free(value_json);
+            try out.writer(self.allocator).print("\"{s}\":{s}", .{ escaped_key, value_json });
+        }
+
+        if (!has_cwd and session_cwd != null) {
+            if (!first) try out.append(self.allocator, ',');
+            const escaped_cwd = try unified.jsonEscape(self.allocator, session_cwd.?);
+            defer self.allocator.free(escaped_cwd);
+            try out.writer(self.allocator).print("\"cwd\":\"{s}\"", .{escaped_cwd});
+        }
+        try out.append(self.allocator, '}');
+        if (!has_command and !has_argv) return error.InvalidPayload;
+        return out.toOwnedSlice(self.allocator);
+    }
+
+    fn terminalInvokeOperationFromPayload(self: *Session, obj: std.json.ObjectMap) ?TerminalInvokeOp {
+        _ = self;
+        if (obj.get("op")) |value| {
+            if (value == .string) return parseTerminalInvokeOp(value.string);
+        }
+        if (obj.get("operation")) |value| {
+            if (value == .string) return parseTerminalInvokeOp(value.string);
+        }
+        if (obj.get("tool_name")) |value| {
+            if (value == .string and std.mem.eql(u8, value.string, "shell_exec")) return .exec;
+        }
+        if (obj.get("tool")) |value| {
+            if (value == .string and std.mem.eql(u8, value.string, "shell_exec")) return .exec;
+        }
+        if (obj.get("command") != null or obj.get("argv") != null) return .exec;
+        if (obj.get("arguments")) |value| {
+            if (value == .object) {
+                if (value.object.get("command") != null or value.object.get("argv") != null) return .exec;
+            }
+        }
+        if (obj.get("args")) |value| {
+            if (value == .object) {
+                if (value.object.get("command") != null or value.object.get("argv") != null) return .exec;
+            }
+        }
+        return null;
+    }
+
+    fn updateTerminalV2StatusAndResult(
+        self: *Session,
+        state: []const u8,
+        tool_name: []const u8,
+        session_id: ?[]const u8,
+        error_message: ?[]const u8,
+        operation: []const u8,
+        result_json: []const u8,
+    ) !void {
+        const status = try self.buildTerminalV2StatusJson(state, tool_name, session_id, error_message);
+        defer self.allocator.free(status);
+        try self.setFileContent(self.terminal_status_id, status);
+
+        const result = try self.buildTerminalV2ResultEnvelope(operation, session_id, error_message == null, result_json, error_message);
+        defer self.allocator.free(result);
+        try self.setFileContent(self.terminal_result_id, result);
+    }
+
+    fn buildTerminalV2StatusJson(
+        self: *Session,
+        state: []const u8,
+        tool_name: []const u8,
+        session_id: ?[]const u8,
+        error_message: ?[]const u8,
+    ) ![]u8 {
+        const escaped_state = try unified.jsonEscape(self.allocator, state);
+        defer self.allocator.free(escaped_state);
+        const escaped_tool = try unified.jsonEscape(self.allocator, tool_name);
+        defer self.allocator.free(escaped_tool);
+        const session_json = if (session_id) |value| blk: {
+            const escaped = try unified.jsonEscape(self.allocator, value);
+            defer self.allocator.free(escaped);
+            break :blk try std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped});
+        } else try self.allocator.dupe(u8, "null");
+        defer self.allocator.free(session_json);
+        const error_json = if (error_message) |value| blk: {
+            const escaped = try unified.jsonEscape(self.allocator, value);
+            defer self.allocator.free(escaped);
+            break :blk try std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped});
+        } else try self.allocator.dupe(u8, "null");
+        defer self.allocator.free(error_json);
+
+        return std.fmt.allocPrint(
+            self.allocator,
+            "{{\"state\":\"{s}\",\"tool\":\"{s}\",\"session_id\":{s},\"updated_at_ms\":{d},\"error\":{s}}}",
+            .{ escaped_state, escaped_tool, session_json, std.time.milliTimestamp(), error_json },
+        );
+    }
+
+    fn buildTerminalV2ResultEnvelope(
+        self: *Session,
+        operation: []const u8,
+        session_id: ?[]const u8,
+        ok: bool,
+        result_json: []const u8,
+        error_message: ?[]const u8,
+    ) ![]u8 {
+        const escaped_op = try unified.jsonEscape(self.allocator, operation);
+        defer self.allocator.free(escaped_op);
+        const session_json = if (session_id) |value| blk: {
+            const escaped = try unified.jsonEscape(self.allocator, value);
+            defer self.allocator.free(escaped);
+            break :blk try std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped});
+        } else try self.allocator.dupe(u8, "null");
+        defer self.allocator.free(session_json);
+
+        const error_json = if (error_message) |message| blk: {
+            const escaped = try unified.jsonEscape(self.allocator, message);
+            defer self.allocator.free(escaped);
+            break :blk try std.fmt.allocPrint(
+                self.allocator,
+                "{{\"code\":\"terminal_v2\",\"message\":\"{s}\"}}",
+                .{escaped},
+            );
+        } else try self.allocator.dupe(u8, "null");
+        defer self.allocator.free(error_json);
+
+        return std.fmt.allocPrint(
+            self.allocator,
+            "{{\"ok\":{s},\"operation\":\"{s}\",\"session_id\":{s},\"result\":{s},\"error\":{s}}}",
+            .{
+                if (ok) "true" else "false",
+                escaped_op,
+                session_json,
+                result_json,
+                error_json,
+            },
+        );
+    }
+
+    fn refreshTerminalV2StateFiles(self: *Session) !void {
+        if (self.terminal_sessions_id == 0 or self.terminal_current_id == 0) return;
+        const sessions_json = try self.buildTerminalSessionsJson();
+        defer self.allocator.free(sessions_json);
+        try self.setFileContent(self.terminal_sessions_id, sessions_json);
+
+        const current_json = try self.buildTerminalCurrentJson();
+        defer self.allocator.free(current_json);
+        try self.setFileContent(self.terminal_current_id, current_json);
+    }
+
+    fn buildTerminalSessionsJson(self: *Session) ![]u8 {
+        var out = std.ArrayListUnmanaged(u8){};
+        errdefer out.deinit(self.allocator);
+        try out.appendSlice(self.allocator, "{\"sessions\":[");
+        var first = true;
+        var it = self.terminal_sessions.iterator();
+        while (it.next()) |entry| {
+            if (!first) try out.append(self.allocator, ',');
+            first = false;
+            const session_id = entry.key_ptr.*;
+            const session = entry.value_ptr.*;
+            const escaped_id = try unified.jsonEscape(self.allocator, session_id);
+            defer self.allocator.free(escaped_id);
+            const state = if (session.isClosed()) "closed" else "open";
+            const escaped_state = try unified.jsonEscape(self.allocator, state);
+            defer self.allocator.free(escaped_state);
+            const label_json = if (session.label) |value| blk: {
+                const escaped = try unified.jsonEscape(self.allocator, value);
+                defer self.allocator.free(escaped);
+                break :blk try std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped});
+            } else try self.allocator.dupe(u8, "null");
+            defer self.allocator.free(label_json);
+            const cwd_json = if (session.cwd) |value| blk: {
+                const escaped = try unified.jsonEscape(self.allocator, value);
+                defer self.allocator.free(escaped);
+                break :blk try std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped});
+            } else try self.allocator.dupe(u8, "null");
+            defer self.allocator.free(cwd_json);
+            try out.writer(self.allocator).print(
+                "{{\"session_id\":\"{s}\",\"state\":\"{s}\",\"label\":{s},\"cwd\":{s},\"created_at_ms\":{d},\"updated_at_ms\":{d},\"last_exec_at_ms\":{d},\"closed_at_ms\":{d},\"exec_count\":{d}}}",
+                .{
+                    escaped_id,
+                    escaped_state,
+                    label_json,
+                    cwd_json,
+                    session.created_at_ms,
+                    session.updated_at_ms,
+                    session.last_exec_at_ms,
+                    session.closed_at_ms,
+                    session.exec_count,
+                },
+            );
+        }
+        try out.appendSlice(self.allocator, "]}");
+        return out.toOwnedSlice(self.allocator);
+    }
+
+    fn buildTerminalCurrentJson(self: *Session) ![]u8 {
+        if (self.current_terminal_session_id == null) return self.allocator.dupe(u8, "{\"session\":null}");
+        const session_id = self.current_terminal_session_id.?;
+        const session = self.terminal_sessions.get(session_id) orelse return self.allocator.dupe(u8, "{\"session\":null}");
+        const escaped_id = try unified.jsonEscape(self.allocator, session_id);
+        defer self.allocator.free(escaped_id);
+        const state = if (session.isClosed()) "closed" else "open";
+        const escaped_state = try unified.jsonEscape(self.allocator, state);
+        defer self.allocator.free(escaped_state);
+        const cwd_json = if (session.cwd) |value| blk: {
+            const escaped = try unified.jsonEscape(self.allocator, value);
+            defer self.allocator.free(escaped);
+            break :blk try std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped});
+        } else try self.allocator.dupe(u8, "null");
+        defer self.allocator.free(cwd_json);
+        return std.fmt.allocPrint(
+            self.allocator,
+            "{{\"session\":{{\"session_id\":\"{s}\",\"state\":\"{s}\",\"cwd\":{s},\"updated_at_ms\":{d}}}}}",
+            .{ escaped_id, escaped_state, cwd_json, session.updated_at_ms },
+        );
+    }
+
+    fn setCurrentTerminalSession(self: *Session, session_id: ?[]const u8) !void {
+        if (self.current_terminal_session_id) |existing| self.allocator.free(existing);
+        self.current_terminal_session_id = if (session_id) |value|
+            try self.allocator.dupe(u8, value)
+        else
+            null;
+    }
+
+    fn generateTerminalSessionId(self: *Session) ![]u8 {
+        const id = try std.fmt.allocPrint(self.allocator, "term-{d}", .{self.next_terminal_session_seq});
+        self.next_terminal_session_seq +%= 1;
+        if (self.next_terminal_session_seq == 0) self.next_terminal_session_seq = 1;
+        return id;
     }
 
     fn buildProjectTopologyJson(self: *Session, policy: world_policy.Policy) ![]u8 {
@@ -4521,6 +5161,19 @@ pub const Session = struct {
         return invoke_value == .bool and invoke_value.bool;
     }
 
+    fn clearTerminalSessions(self: *Session) void {
+        if (self.current_terminal_session_id) |value| self.allocator.free(value);
+        self.current_terminal_session_id = null;
+        var it = self.terminal_sessions.iterator();
+        while (it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            var session = entry.value_ptr.*;
+            session.deinit(self.allocator);
+        }
+        self.terminal_sessions.deinit(self.allocator);
+        self.terminal_sessions = .{};
+    }
+
     fn clearPendingDebugFrames(self: *Session) void {
         for (self.pending_debug_frames.items) |payload| self.allocator.free(payload);
         self.pending_debug_frames.deinit(self.allocator);
@@ -4547,6 +5200,23 @@ fn isWorldAbsolutePath(path: []const u8) bool {
         std.mem.startsWith(u8, path, "/projects/") or
         std.mem.startsWith(u8, path, "/debug/") or
         std.mem.startsWith(u8, path, "/meta/");
+}
+
+fn parseTerminalInvokeOp(raw: []const u8) ?TerminalInvokeOp {
+    if (std.mem.eql(u8, raw, "exec")) return .exec;
+    if (std.mem.eql(u8, raw, "create")) return .create_session;
+    if (std.mem.eql(u8, raw, "resume")) return .resume_session;
+    if (std.mem.eql(u8, raw, "close")) return .close_session;
+    return null;
+}
+
+fn jsonObjectOptionalString(obj: std.json.ObjectMap, key: []const u8) !?[]const u8 {
+    if (obj.get(key)) |value| {
+        if (value == .null) return null;
+        if (value != .string) return error.InvalidPayload;
+        return value.string;
+    }
+    return null;
 }
 
 fn kindName(kind: NodeKind) []const u8 {
@@ -5694,6 +6364,164 @@ test "fsrpc_session: first-class terminal namespace operation file maps to runti
     );
     defer allocator.free(result_payload);
     try std.testing.expect(std.mem.indexOf(u8, result_payload, "terminal-namespace") != null);
+}
+
+test "fsrpc_session: terminal-v2 session lifecycle updates current and sessions state" {
+    const allocator = std.testing.allocator;
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.init(allocator, runtime_handle, &job_index, "default");
+    defer session.deinit();
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        300,
+        301,
+        &.{ "agents", "self", "terminal", "control", "create.json" },
+        "{\"session_id\":\"build\",\"cwd\":\".\"}",
+        920,
+    );
+
+    const current_after_create = try protocolReadFile(
+        &session,
+        allocator,
+        302,
+        303,
+        &.{ "agents", "self", "terminal", "current.json" },
+        921,
+    );
+    defer allocator.free(current_after_create);
+    try std.testing.expect(std.mem.indexOf(u8, current_after_create, "\"session_id\":\"build\"") != null);
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        304,
+        305,
+        &.{ "agents", "self", "terminal", "control", "exec.json" },
+        "{\"session_id\":\"build\",\"command\":\"echo terminal-v2\"}",
+        922,
+    );
+
+    const status_payload = try protocolReadFile(
+        &session,
+        allocator,
+        306,
+        307,
+        &.{ "agents", "self", "terminal", "status.json" },
+        923,
+    );
+    defer allocator.free(status_payload);
+    try std.testing.expect(std.mem.indexOf(u8, status_payload, "\"state\":\"done\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status_payload, "\"session_id\":\"build\"") != null);
+
+    const result_payload = try protocolReadFile(
+        &session,
+        allocator,
+        308,
+        309,
+        &.{ "agents", "self", "terminal", "result.json" },
+        924,
+    );
+    defer allocator.free(result_payload);
+    try std.testing.expect(std.mem.indexOf(u8, result_payload, "terminal-v2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result_payload, "\"operation\":\"exec\"") != null);
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        310,
+        311,
+        &.{ "agents", "self", "terminal", "control", "close.json" },
+        "{\"session_id\":\"build\"}",
+        925,
+    );
+
+    const current_after_close = try protocolReadFile(
+        &session,
+        allocator,
+        312,
+        313,
+        &.{ "agents", "self", "terminal", "current.json" },
+        926,
+    );
+    defer allocator.free(current_after_close);
+    try std.testing.expect(std.mem.indexOf(u8, current_after_close, "\"session\":null") != null);
+
+    const sessions_payload = try protocolReadFile(
+        &session,
+        allocator,
+        314,
+        315,
+        &.{ "agents", "self", "terminal", "sessions.json" },
+        927,
+    );
+    defer allocator.free(sessions_payload);
+    try std.testing.expect(std.mem.indexOf(u8, sessions_payload, "\"session_id\":\"build\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sessions_payload, "\"state\":\"closed\"") != null);
+}
+
+test "fsrpc_session: terminal-v2 invoke envelope routes create and exec operations" {
+    const allocator = std.testing.allocator;
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.init(allocator, runtime_handle, &job_index, "default");
+    defer session.deinit();
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        316,
+        317,
+        &.{ "agents", "self", "terminal", "control", "invoke.json" },
+        "{\"op\":\"create\",\"arguments\":{\"session_id\":\"inv\"}}",
+        928,
+    );
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        318,
+        319,
+        &.{ "agents", "self", "terminal", "control", "invoke.json" },
+        "{\"op\":\"exec\",\"arguments\":{\"session_id\":\"inv\",\"command\":\"echo invoke-v2\"}}",
+        929,
+    );
+
+    const status_payload = try protocolReadFile(
+        &session,
+        allocator,
+        320,
+        321,
+        &.{ "agents", "self", "terminal", "status.json" },
+        930,
+    );
+    defer allocator.free(status_payload);
+    try std.testing.expect(std.mem.indexOf(u8, status_payload, "\"state\":\"done\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status_payload, "\"session_id\":\"inv\"") != null);
+
+    const result_payload = try protocolReadFile(
+        &session,
+        allocator,
+        322,
+        323,
+        &.{ "agents", "self", "terminal", "result.json" },
+        931,
+    );
+    defer allocator.free(result_payload);
+    try std.testing.expect(std.mem.indexOf(u8, result_payload, "\"operation\":\"exec\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result_payload, "invoke-v2") != null);
 }
 
 test "fsrpc_session: first-class memory namespace enforces operation tool mapping" {
