@@ -59,6 +59,10 @@ Status: completed
 
 - WorldFS service projection now enforces service `permissions` for non-admin
   sessions, with explicit admin bypass.
+- WorldFS service projection now also enforces project action policy for
+  `invoke` (`access_policy.actions.invoke` + per-agent overrides), so service
+  visibility can be denied per project/agent even when service permissions
+  would otherwise allow it.
 - `allow_roles` and `default` permission fields are honored for visibility
   decisions in `/nodes/<id>/services/*` and derived node roots.
 - Built-in FS/terminal provider metadata now includes

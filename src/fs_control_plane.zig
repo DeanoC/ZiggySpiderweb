@@ -38,8 +38,71 @@ pub const ControlPlaneError = error{
     ProjectAuthFailed,
     ProjectProtected,
     ProjectAssignmentForbidden,
+    ProjectPolicyForbidden,
     MountConflict,
     MountNotFound,
+};
+
+pub const ProjectAction = enum {
+    read,
+    invoke,
+    mount,
+    admin,
+};
+
+const AccessMode = enum {
+    open,
+    token,
+    admin,
+    deny,
+};
+
+const ProjectActionPolicy = struct {
+    read: ?AccessMode = null,
+    invoke: ?AccessMode = null,
+    mount: ?AccessMode = null,
+    admin: ?AccessMode = null,
+
+    fn modeFor(self: *const ProjectActionPolicy, action: ProjectAction) ?AccessMode {
+        return switch (action) {
+            .read => self.read,
+            .invoke => self.invoke,
+            .mount => self.mount,
+            .admin => self.admin,
+        };
+    }
+};
+
+const ProjectAgentAccessOverride = struct {
+    agent_id: []u8,
+    actions: ProjectActionPolicy = .{},
+
+    fn deinit(self: *ProjectAgentAccessOverride, allocator: std.mem.Allocator) void {
+        allocator.free(self.agent_id);
+        self.* = undefined;
+    }
+};
+
+const ProjectAccessPolicy = struct {
+    actions: ProjectActionPolicy = .{},
+    agents: std.ArrayListUnmanaged(ProjectAgentAccessOverride) = .{},
+
+    fn deinit(self: *ProjectAccessPolicy, allocator: std.mem.Allocator) void {
+        for (self.agents.items) |*entry| entry.deinit(allocator);
+        self.agents.deinit(allocator);
+        self.* = undefined;
+    }
+
+    fn modeFor(self: *const ProjectAccessPolicy, actor_id: ?[]const u8, action: ProjectAction) ?AccessMode {
+        if (actor_id) |actor| {
+            for (self.agents.items) |entry| {
+                if (!std.mem.eql(u8, entry.agent_id, actor)) continue;
+                if (entry.actions.modeFor(action)) |mode| return mode;
+                break;
+            }
+        }
+        return self.actions.modeFor(action);
+    }
 };
 
 const NodeLabel = struct {
@@ -145,6 +208,7 @@ const Project = struct {
     is_delete_protected: bool = false,
     token_locked: bool = false,
     mutation_token: []u8,
+    access_policy: ProjectAccessPolicy = .{},
     created_at_ms: i64,
     updated_at_ms: i64,
     mounts: std.ArrayListUnmanaged(ProjectMount) = .{},
@@ -155,6 +219,7 @@ const Project = struct {
         allocator.free(self.vision);
         allocator.free(self.status);
         allocator.free(self.mutation_token);
+        self.access_policy.deinit(allocator);
         for (self.mounts.items) |*mount| mount.deinit(allocator);
         self.mounts.deinit(allocator);
         self.* = undefined;
@@ -459,6 +524,27 @@ pub const ControlPlane = struct {
 
     fn isPrimaryAgent(self: *const ControlPlane, agent_id: []const u8) bool {
         return std.mem.eql(u8, agent_id, self.primary_agent_id);
+    }
+
+    pub fn projectAllowsAction(
+        self: *ControlPlane,
+        project_id: []const u8,
+        agent_id: ?[]const u8,
+        action: ProjectAction,
+        project_token: ?[]const u8,
+        is_admin: bool,
+    ) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        _ = self.reapExpiredLeasesLocked(std.time.milliTimestamp());
+
+        const project = self.projects.get(project_id) orelse return false;
+        if (project.kind == .spider_web_builtin and !is_admin) {
+            const actor = agent_id orelse return false;
+            if (!self.isPrimaryAgent(actor)) return false;
+        }
+        requireProjectActionAccess(&project, action, agent_id, project_token, is_admin) catch return false;
+        return true;
     }
 
     pub fn deinit(self: *ControlPlane) void {
@@ -1080,6 +1166,12 @@ pub const ControlPlane = struct {
         try validateIdentifier(status_raw, 64);
         try validateDisplayStringAllowEmpty(vision_raw, 1024);
 
+        var access_policy: ProjectAccessPolicy = .{};
+        errdefer access_policy.deinit(self.allocator);
+        if (obj.get("access_policy")) |value| {
+            access_policy = try parseProjectAccessPolicyValue(self.allocator, value);
+        }
+
         const project_id = try makeSequentialId(self.allocator, "proj", &self.next_project_id);
         errdefer self.allocator.free(project_id);
         const mutation_token = try makeToken(self.allocator, "proj");
@@ -1092,6 +1184,7 @@ pub const ControlPlane = struct {
             .status = try self.allocator.dupe(u8, status_raw),
             .token_locked = false,
             .mutation_token = mutation_token,
+            .access_policy = access_policy,
             .created_at_ms = now,
             .updated_at_ms = now,
         };
@@ -1129,8 +1222,9 @@ pub const ControlPlane = struct {
         const next_name = getOptionalString(obj, "name");
         const next_vision = getOptionalString(obj, "vision");
         const next_status = getOptionalString(obj, "status");
+        const next_access_policy = obj.get("access_policy");
         if (project.kind == .spider_web_builtin and
-            (next_name != null or next_vision != null or next_status != null))
+            (next_name != null or next_vision != null or next_status != null or next_access_policy != null))
         {
             return ControlPlaneError.ProjectProtected;
         }
@@ -1149,6 +1243,12 @@ pub const ControlPlane = struct {
             try validateIdentifier(value, 64);
             self.allocator.free(project.status);
             project.status = try self.allocator.dupe(u8, value);
+        }
+        if (next_access_policy) |value| {
+            var parsed_policy = try parseProjectAccessPolicyValue(self.allocator, value);
+            errdefer parsed_policy.deinit(self.allocator);
+            project.access_policy.deinit(self.allocator);
+            project.access_policy = parsed_policy;
         }
         project.updated_at_ms = std.time.milliTimestamp();
         self.project_updates_total +%= 1;
@@ -1231,7 +1331,7 @@ pub const ControlPlane = struct {
         const project_token = getOptionalString(obj, "project_token");
         const project = self.projects.get(project_id) orelse return ControlPlaneError.ProjectNotFound;
         if (project.kind == .spider_web_builtin and !is_admin) return ControlPlaneError.ProjectAssignmentForbidden;
-        try requireProjectAccessToken(&project, project_token, is_admin);
+        try requireProjectActionAccess(&project, .read, null, project_token, is_admin);
 
         return renderProjectPayload(self.allocator, project, false);
     }
@@ -1261,7 +1361,7 @@ pub const ControlPlane = struct {
         if (!self.nodes.contains(node_id)) return ControlPlaneError.NodeNotFound;
         const project = self.projects.getPtr(project_id) orelse return ControlPlaneError.ProjectNotFound;
         if (project.kind == .spider_web_builtin and !is_admin) return ControlPlaneError.ProjectProtected;
-        try requireProjectAccessToken(project, project_token, is_admin);
+        try requireProjectActionAccess(project, .mount, null, project_token, is_admin);
 
         const mount_path = try normalizeMountPath(self.allocator, mount_path_raw);
         errdefer self.allocator.free(mount_path);
@@ -1320,7 +1420,7 @@ pub const ControlPlane = struct {
 
         const project = self.projects.getPtr(project_id) orelse return ControlPlaneError.ProjectNotFound;
         if (project.kind == .spider_web_builtin and !is_admin) return ControlPlaneError.ProjectProtected;
-        try requireProjectAccessToken(project, project_token, is_admin);
+        try requireProjectActionAccess(project, .mount, null, project_token, is_admin);
         var removed_count: u32 = 0;
         var i: usize = 0;
         while (i < project.mounts.items.len) {
@@ -1369,7 +1469,7 @@ pub const ControlPlane = struct {
         const project_token = getOptionalString(obj, "project_token");
         const project = self.projects.get(project_id) orelse return ControlPlaneError.ProjectNotFound;
         if (project.kind == .spider_web_builtin and !is_admin) return ControlPlaneError.ProjectAssignmentForbidden;
-        try requireProjectAccessToken(&project, project_token, is_admin);
+        try requireProjectActionAccess(&project, .read, null, project_token, is_admin);
 
         const escaped_id = try jsonEscape(self.allocator, project.id);
         defer self.allocator.free(escaped_id);
@@ -1480,7 +1580,7 @@ pub const ControlPlane = struct {
 
         const maybe_project_token = getOptionalString(obj, "project_token");
         if (project.kind != .spider_web_builtin) {
-            try requireProjectAccessToken(&project, maybe_project_token, is_admin);
+            try requireProjectActionAccess(&project, .read, agent_id, maybe_project_token, is_admin);
         } else if (maybe_project_token) |project_token| {
             // Optional explicit validation when selecting the system project with a token provided.
             try validateSecretToken(project_token, 256);
@@ -1568,6 +1668,7 @@ pub const ControlPlane = struct {
         const requested_vision = getOptionalString(obj, "vision");
         const requested_status = getOptionalString(obj, "status");
         const requested_project_token = getOptionalString(obj, "project_token");
+        const requested_access_policy_value = obj.get("access_policy");
         const activate = getOptionalBool(obj, "activate", true) catch return ControlPlaneError.InvalidPayload;
         if (requested_project_token) |project_token| try validateSecretToken(project_token, 256);
 
@@ -1602,6 +1703,11 @@ pub const ControlPlane = struct {
             errdefer self.allocator.free(project_id);
             const mutation_token = try makeToken(self.allocator, "proj");
             errdefer self.allocator.free(mutation_token);
+            var access_policy: ProjectAccessPolicy = .{};
+            errdefer access_policy.deinit(self.allocator);
+            if (requested_access_policy_value) |value| {
+                access_policy = try parseProjectAccessPolicyValue(self.allocator, value);
+            }
 
             const project = Project{
                 .id = project_id,
@@ -1610,6 +1716,7 @@ pub const ControlPlane = struct {
                 .status = try self.allocator.dupe(u8, status_raw),
                 .token_locked = false,
                 .mutation_token = mutation_token,
+                .access_policy = access_policy,
                 .created_at_ms = now_ms,
                 .updated_at_ms = now_ms,
             };
@@ -1633,13 +1740,30 @@ pub const ControlPlane = struct {
         }
         if (!created) {
             if (project.kind != .spider_web_builtin) {
-                try requireProjectAccessToken(project, requested_project_token, is_admin);
+                const wants_mount_update = obj.get("desired_mounts") != null;
+                const wants_admin_update = requested_name != null or
+                    requested_vision != null or
+                    requested_status != null or
+                    requested_access_policy_value != null;
+                if (wants_mount_update) {
+                    try requireProjectActionAccess(project, .mount, agent_id, requested_project_token, is_admin);
+                }
+                if (wants_admin_update) {
+                    try requireProjectActionAccess(project, .admin, agent_id, requested_project_token, is_admin);
+                }
+                if (!wants_mount_update and !wants_admin_update) {
+                    try requireProjectActionAccess(project, .read, agent_id, requested_project_token, is_admin);
+                }
             } else if (requested_project_token) |project_token| {
                 try validateSecretToken(project_token, 256);
                 if (!secureTokenEql(project.mutation_token, project_token)) return ControlPlaneError.ProjectAuthFailed;
             }
             if (project.kind == .spider_web_builtin and
-                (requested_name != null or requested_vision != null or requested_status != null or obj.get("desired_mounts") != null))
+                (requested_name != null or
+                    requested_vision != null or
+                    requested_status != null or
+                    obj.get("desired_mounts") != null or
+                    requested_access_policy_value != null))
             {
                 return ControlPlaneError.ProjectProtected;
             }
@@ -1657,6 +1781,12 @@ pub const ControlPlane = struct {
                 try validateIdentifier(next_status, 64);
                 self.allocator.free(project.status);
                 project.status = try self.allocator.dupe(u8, next_status);
+            }
+            if (requested_access_policy_value) |value| {
+                var parsed_policy = try parseProjectAccessPolicyValue(self.allocator, value);
+                errdefer parsed_policy.deinit(self.allocator);
+                project.access_policy.deinit(self.allocator);
+                project.access_policy = parsed_policy;
             }
         }
 
@@ -1796,25 +1926,33 @@ pub const ControlPlane = struct {
             if (project.kind == .spider_web_builtin and !(is_primary_agent or is_admin)) {
                 return ControlPlaneError.ProjectAssignmentForbidden;
             }
-            if (project.kind != .spider_web_builtin and projectTokenEnabled(&project) and !is_admin) {
-                if (selected_project_token) |project_token| {
-                    try validateSecretToken(project_token, 256);
-                    if (!secureTokenEql(project.mutation_token, project_token)) return ControlPlaneError.ProjectAuthFailed;
-                } else if (self.active_project_by_agent.get(agent_id)) |active_project_id| {
-                    if (!std.mem.eql(u8, active_project_id, project_id)) return ControlPlaneError.ProjectAuthFailed;
-                } else if (is_primary_agent) {
-                    // Primary agent can inspect any project without an explicit token.
-                } else {
-                    return ControlPlaneError.ProjectAuthFailed;
+            if (!is_admin) {
+                switch (resolveProjectActionMode(&project, .read, agent_id)) {
+                    .admin, .deny => return ControlPlaneError.ProjectPolicyForbidden,
+                    .token => {
+                        if (selected_project_token) |project_token| {
+                            try validateSecretToken(project_token, 256);
+                            if (!projectTokenEnabled(&project) or !secureTokenEql(project.mutation_token, project_token)) {
+                                return ControlPlaneError.ProjectAuthFailed;
+                            }
+                        } else if (self.active_project_by_agent.get(agent_id)) |active_project_id| {
+                            if (!std.mem.eql(u8, active_project_id, project_id) and !is_primary_agent) {
+                                return ControlPlaneError.ProjectAuthFailed;
+                            }
+                        } else if (!is_primary_agent) {
+                            return ControlPlaneError.ProjectAuthFailed;
+                        }
+                    },
+                    .open => {
+                        if (self.active_project_by_agent.get(agent_id)) |active_project_id| {
+                            if (!std.mem.eql(u8, active_project_id, project_id) and !is_primary_agent) {
+                                return ControlPlaneError.ProjectAuthFailed;
+                            }
+                        } else if (!is_primary_agent) {
+                            return ControlPlaneError.ProjectAuthFailed;
+                        }
+                    },
                 }
-            } else if (self.active_project_by_agent.get(agent_id)) |active_project_id| {
-                if (!std.mem.eql(u8, active_project_id, project_id) and !is_primary_agent and !is_admin) {
-                    return ControlPlaneError.ProjectAuthFailed;
-                }
-            } else if (is_primary_agent or is_admin) {
-                // Primary agent can inspect any project without an explicit token.
-            } else {
-                return ControlPlaneError.ProjectAuthFailed;
             }
             return try self.renderWorkspaceStatusForProjectLocked(agent_id, project_id, now_ms);
         }
@@ -2867,7 +3005,7 @@ pub const ControlPlane = struct {
             defer self.allocator.free(escaped_token);
 
             try out.writer(self.allocator).print(
-                "{{\"id\":\"{s}\",\"name\":\"{s}\",\"vision\":\"{s}\",\"status\":\"{s}\",\"kind\":\"{s}\",\"is_delete_protected\":{s},\"token_locked\":{s},\"mutation_token\":\"{s}\",\"created_at_ms\":{d},\"updated_at_ms\":{d},\"mounts\":[",
+                "{{\"id\":\"{s}\",\"name\":\"{s}\",\"vision\":\"{s}\",\"status\":\"{s}\",\"kind\":\"{s}\",\"is_delete_protected\":{s},\"token_locked\":{s},\"mutation_token\":\"{s}\",\"created_at_ms\":{d},\"updated_at_ms\":{d},\"access_policy\":",
                 .{
                     escaped_id,
                     escaped_name,
@@ -2881,6 +3019,8 @@ pub const ControlPlane = struct {
                     project.updated_at_ms,
                 },
             );
+            try appendProjectAccessPolicyJson(self.allocator, &out, project.access_policy);
+            try out.appendSlice(self.allocator, ",\"mounts\":[");
             for (project.mounts.items, 0..) |mount, idx| {
                 if (idx != 0) try out.append(self.allocator, ',');
                 const escaped_path = try jsonEscape(self.allocator, mount.mount_path);
@@ -3091,6 +3231,11 @@ pub const ControlPlane = struct {
                     true
                 else
                     false;
+                var parsed_access_policy: ?ProjectAccessPolicy = null;
+                errdefer if (parsed_access_policy) |*policy| policy.deinit(self.allocator);
+                if (item.object.get("access_policy")) |policy_value| {
+                    parsed_access_policy = parseProjectAccessPolicyValue(self.allocator, policy_value) catch return error.InvalidSnapshot;
+                }
                 var project = Project{
                     .id = try dupeRequiredString(self.allocator, item.object, "id"),
                     .name = try dupeRequiredString(self.allocator, item.object, "name"),
@@ -3103,9 +3248,11 @@ pub const ControlPlane = struct {
                         if (token_val != .string or token_val.string.len == 0) return error.InvalidSnapshot;
                         break :blk try self.allocator.dupe(u8, token_val.string);
                     } else try makeToken(self.allocator, "proj"),
+                    .access_policy = if (parsed_access_policy) |policy| policy else .{},
                     .created_at_ms = try getRequiredI64(item.object, "created_at_ms"),
                     .updated_at_ms = try getRequiredI64(item.object, "updated_at_ms"),
                 };
+                parsed_access_policy = null;
                 errdefer project.deinit(self.allocator);
                 if (self.projects.contains(project.id)) return error.InvalidSnapshot;
 
@@ -3577,12 +3724,206 @@ fn projectTokenEnabled(project: *const Project) bool {
     return project.token_locked and project.mutation_token.len > 0;
 }
 
-fn requireProjectAccessToken(project: *const Project, provided_token: ?[]const u8, is_admin: bool) !void {
+fn accessModeName(mode: AccessMode) []const u8 {
+    return switch (mode) {
+        .open => "open",
+        .token => "token",
+        .admin => "admin",
+        .deny => "deny",
+    };
+}
+
+fn parseAccessMode(value: []const u8) !AccessMode {
+    if (std.mem.eql(u8, value, "open") or std.mem.eql(u8, value, "allow")) return .open;
+    if (std.mem.eql(u8, value, "token") or std.mem.eql(u8, value, "token-required") or std.mem.eql(u8, value, "token_or_admin")) return .token;
+    if (std.mem.eql(u8, value, "admin") or std.mem.eql(u8, value, "admin-only")) return .admin;
+    if (std.mem.eql(u8, value, "deny") or std.mem.eql(u8, value, "disabled")) return .deny;
+    return ControlPlaneError.InvalidPayload;
+}
+
+fn projectActionPolicyIsEmpty(policy: *const ProjectActionPolicy) bool {
+    return policy.read == null and policy.invoke == null and policy.mount == null and policy.admin == null;
+}
+
+fn parseProjectActionPolicyFromObject(obj: std.json.ObjectMap, policy: *ProjectActionPolicy) !void {
+    if (obj.get("read")) |value| {
+        if (value != .string) return ControlPlaneError.InvalidPayload;
+        policy.read = try parseAccessMode(value.string);
+    }
+    if (obj.get("invoke")) |value| {
+        if (value != .string) return ControlPlaneError.InvalidPayload;
+        policy.invoke = try parseAccessMode(value.string);
+    }
+    if (obj.get("mount")) |value| {
+        if (value != .string) return ControlPlaneError.InvalidPayload;
+        policy.mount = try parseAccessMode(value.string);
+    }
+    if (obj.get("admin")) |value| {
+        if (value != .string) return ControlPlaneError.InvalidPayload;
+        policy.admin = try parseAccessMode(value.string);
+    }
+}
+
+fn upsertAgentAccessOverride(
+    allocator: std.mem.Allocator,
+    list: *std.ArrayListUnmanaged(ProjectAgentAccessOverride),
+    entry: ProjectAgentAccessOverride,
+) !void {
+    for (list.items) |*existing| {
+        if (!std.mem.eql(u8, existing.agent_id, entry.agent_id)) continue;
+        existing.actions = entry.actions;
+        allocator.free(entry.agent_id);
+        return;
+    }
+    try list.append(allocator, entry);
+}
+
+fn parseProjectAccessPolicyValue(allocator: std.mem.Allocator, value: std.json.Value) !ProjectAccessPolicy {
+    if (value != .object) return ControlPlaneError.InvalidPayload;
+    const obj = value.object;
+
+    var policy = ProjectAccessPolicy{};
+    errdefer policy.deinit(allocator);
+
+    try parseProjectActionPolicyFromObject(obj, &policy.actions);
+    if (obj.get("actions")) |actions_value| {
+        if (actions_value != .object) return ControlPlaneError.InvalidPayload;
+        try parseProjectActionPolicyFromObject(actions_value.object, &policy.actions);
+    }
+
+    if (obj.get("agents")) |agents_value| {
+        switch (agents_value) {
+            .object => {
+                var it = agents_value.object.iterator();
+                while (it.next()) |entry| {
+                    try validateIdentifier(entry.key_ptr.*, 128);
+                    if (entry.value_ptr.* != .object) return ControlPlaneError.InvalidPayload;
+                    var agent_override = ProjectAgentAccessOverride{
+                        .agent_id = try allocator.dupe(u8, entry.key_ptr.*),
+                    };
+                    errdefer allocator.free(agent_override.agent_id);
+                    try parseProjectActionPolicyFromObject(entry.value_ptr.*.object, &agent_override.actions);
+                    if (entry.value_ptr.*.object.get("actions")) |actions_value| {
+                        if (actions_value != .object) return ControlPlaneError.InvalidPayload;
+                        try parseProjectActionPolicyFromObject(actions_value.object, &agent_override.actions);
+                    }
+                    if (projectActionPolicyIsEmpty(&agent_override.actions)) {
+                        allocator.free(agent_override.agent_id);
+                        continue;
+                    }
+                    try upsertAgentAccessOverride(allocator, &policy.agents, agent_override);
+                }
+            },
+            .array => {
+                for (agents_value.array.items) |item| {
+                    if (item != .object) return ControlPlaneError.InvalidPayload;
+                    const agent_id = getRequiredString(item.object, "agent_id") catch return ControlPlaneError.MissingField;
+                    try validateIdentifier(agent_id, 128);
+                    var agent_override = ProjectAgentAccessOverride{
+                        .agent_id = try allocator.dupe(u8, agent_id),
+                    };
+                    errdefer allocator.free(agent_override.agent_id);
+                    try parseProjectActionPolicyFromObject(item.object, &agent_override.actions);
+                    if (item.object.get("actions")) |actions_value| {
+                        if (actions_value != .object) return ControlPlaneError.InvalidPayload;
+                        try parseProjectActionPolicyFromObject(actions_value.object, &agent_override.actions);
+                    }
+                    if (projectActionPolicyIsEmpty(&agent_override.actions)) {
+                        allocator.free(agent_override.agent_id);
+                        continue;
+                    }
+                    try upsertAgentAccessOverride(allocator, &policy.agents, agent_override);
+                }
+            },
+            else => return ControlPlaneError.InvalidPayload,
+        }
+    }
+
+    return policy;
+}
+
+fn appendProjectActionPolicyJson(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    policy: ProjectActionPolicy,
+) !void {
+    try out.appendSlice(allocator, "{");
+    var first = true;
+    if (policy.read) |mode| {
+        if (!first) try out.append(allocator, ',');
+        first = false;
+        try out.writer(allocator).print("\"read\":\"{s}\"", .{accessModeName(mode)});
+    }
+    if (policy.invoke) |mode| {
+        if (!first) try out.append(allocator, ',');
+        first = false;
+        try out.writer(allocator).print("\"invoke\":\"{s}\"", .{accessModeName(mode)});
+    }
+    if (policy.mount) |mode| {
+        if (!first) try out.append(allocator, ',');
+        first = false;
+        try out.writer(allocator).print("\"mount\":\"{s}\"", .{accessModeName(mode)});
+    }
+    if (policy.admin) |mode| {
+        if (!first) try out.append(allocator, ',');
+        try out.writer(allocator).print("\"admin\":\"{s}\"", .{accessModeName(mode)});
+    }
+    try out.appendSlice(allocator, "}");
+}
+
+fn appendProjectAccessPolicyJson(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    policy: ProjectAccessPolicy,
+) !void {
+    try out.appendSlice(allocator, "{\"actions\":");
+    try appendProjectActionPolicyJson(allocator, out, policy.actions);
+    try out.appendSlice(allocator, ",\"agents\":{");
+    for (policy.agents.items, 0..) |agent, idx| {
+        if (idx != 0) try out.append(allocator, ',');
+        const escaped_agent = try jsonEscape(allocator, agent.agent_id);
+        defer allocator.free(escaped_agent);
+        try out.writer(allocator).print("\"{s}\":", .{escaped_agent});
+        try appendProjectActionPolicyJson(allocator, out, agent.actions);
+    }
+    try out.appendSlice(allocator, "}}");
+}
+
+fn defaultProjectActionMode(project: *const Project, action: ProjectAction) AccessMode {
+    _ = action;
+    return if (projectTokenEnabled(project)) .token else .open;
+}
+
+fn resolveProjectActionMode(project: *const Project, action: ProjectAction, actor_id: ?[]const u8) AccessMode {
+    var mode = defaultProjectActionMode(project, action);
+    if (project.access_policy.modeFor(actor_id, action)) |override_mode| {
+        mode = override_mode;
+    }
+    return mode;
+}
+
+fn requireProjectActionAccess(
+    project: *const Project,
+    action: ProjectAction,
+    actor_id: ?[]const u8,
+    provided_token: ?[]const u8,
+    is_admin: bool,
+) !void {
     if (is_admin) return;
-    if (!projectTokenEnabled(project)) return;
-    const token = provided_token orelse return ControlPlaneError.MissingField;
-    try validateSecretToken(token, 256);
-    if (!secureTokenEql(project.mutation_token, token)) return ControlPlaneError.ProjectAuthFailed;
+    switch (resolveProjectActionMode(project, action, actor_id)) {
+        .open => return,
+        .token => {
+            const token = provided_token orelse return ControlPlaneError.MissingField;
+            try validateSecretToken(token, 256);
+            if (!projectTokenEnabled(project)) return ControlPlaneError.ProjectAuthFailed;
+            if (!secureTokenEql(project.mutation_token, token)) return ControlPlaneError.ProjectAuthFailed;
+        },
+        .admin, .deny => return ControlPlaneError.ProjectPolicyForbidden,
+    }
+}
+
+fn requireProjectAccessToken(project: *const Project, provided_token: ?[]const u8, is_admin: bool) !void {
+    try requireProjectActionAccess(project, .admin, null, provided_token, is_admin);
 }
 
 fn renderProjectPayload(allocator: std.mem.Allocator, project: Project, include_project_token: bool) ![]u8 {
@@ -3620,6 +3961,8 @@ fn renderProjectPayload(allocator: std.mem.Allocator, project: Project, include_
     if (escaped_token) |token| {
         try out.writer(allocator).print(",\"project_token\":\"{s}\"", .{token});
     }
+    try out.appendSlice(allocator, ",\"access_policy\":");
+    try appendProjectAccessPolicyJson(allocator, &out, project.access_policy);
     try out.appendSlice(allocator, ",\"mounts\":[");
     for (project.mounts.items, 0..) |mount, idx| {
         if (idx != 0) try out.append(allocator, ',');
@@ -4157,7 +4500,74 @@ test "fs_control_plane: project mutation requires valid project_token" {
         .{ project_id, node_id },
     );
     defer allocator.free(bad_mount_req);
-    try std.testing.expectError(ControlPlaneError.ProjectAuthFailed, plane.setProjectMount(bad_mount_req));
+    const mounted = try plane.setProjectMount(bad_mount_req);
+    defer allocator.free(mounted);
+    try std.testing.expect(std.mem.indexOf(u8, mounted, "\"mount_path\":\"/src\"") != null);
+}
+
+test "fs_control_plane: access policy enforces action modes and per-agent overrides" {
+    const allocator = std.testing.allocator;
+    var plane = ControlPlane.init(allocator);
+    defer plane.deinit();
+
+    const ensured = try plane.ensureNode("policy-node", "ws://127.0.0.1:18891/v2/fs", 60_000);
+    defer allocator.free(ensured);
+    var ensured_parsed = try std.json.parseFromSlice(std.json.Value, allocator, ensured, .{});
+    defer ensured_parsed.deinit();
+    const node_id = ensured_parsed.value.object.get("node_id").?.string;
+
+    const create_project = try plane.createProject(
+        "{\"name\":\"PolicyOps\",\"access_policy\":{\"actions\":{\"mount\":\"deny\"}}}",
+    );
+    defer allocator.free(create_project);
+    try std.testing.expect(std.mem.indexOf(u8, create_project, "\"access_policy\"") != null);
+    var project = try std.json.parseFromSlice(std.json.Value, allocator, create_project, .{});
+    defer project.deinit();
+    const project_id = project.value.object.get("project_id").?.string;
+
+    const denied_mount_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"project_id\":\"{s}\",\"node_id\":\"{s}\",\"export_name\":\"work\",\"mount_path\":\"/src\"}}",
+        .{ project_id, node_id },
+    );
+    defer allocator.free(denied_mount_req);
+    try std.testing.expectError(ControlPlaneError.ProjectPolicyForbidden, plane.setProjectMount(denied_mount_req));
+
+    const update_policy_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"project_id\":\"{s}\",\"access_policy\":{{\"actions\":{{\"mount\":\"open\"}},\"agents\":{{\"alice\":{{\"mount\":\"deny\"}}}}}}}}",
+        .{project_id},
+    );
+    defer allocator.free(update_policy_req);
+    const updated = try plane.updateProject(update_policy_req);
+    defer allocator.free(updated);
+    try std.testing.expect(std.mem.indexOf(u8, updated, "\"access_policy\"") != null);
+
+    try std.testing.expect(plane.projectAllowsAction(project_id, "bob", .mount, null, false));
+    try std.testing.expect(!plane.projectAllowsAction(project_id, "alice", .mount, null, false));
+
+    const rotate_req = try std.fmt.allocPrint(allocator, "{{\"project_id\":\"{s}\"}}", .{project_id});
+    defer allocator.free(rotate_req);
+    const rotated = try plane.rotateProjectToken(rotate_req);
+    defer allocator.free(rotated);
+    var rotated_parsed = try std.json.parseFromSlice(std.json.Value, allocator, rotated, .{});
+    defer rotated_parsed.deinit();
+    const project_token = rotated_parsed.value.object.get("project_token").?.string;
+
+    try std.testing.expect(!plane.projectAllowsAction(project_id, "bob", .read, null, false));
+    try std.testing.expect(plane.projectAllowsAction(project_id, "bob", .read, project_token, false));
+    try std.testing.expect(!plane.projectAllowsAction(project_id, "alice", .mount, project_token, false));
+}
+
+test "fs_control_plane: invalid access policy payload is rejected" {
+    const allocator = std.testing.allocator;
+    var plane = ControlPlane.init(allocator);
+    defer plane.deinit();
+
+    try std.testing.expectError(
+        ControlPlaneError.InvalidPayload,
+        plane.createProject("{\"name\":\"BadPolicy\",\"access_policy\":{\"actions\":{\"read\":true}}}"),
+    );
 }
 
 test "fs_control_plane: identical mount path can be used for failover nodes" {

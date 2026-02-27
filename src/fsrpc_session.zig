@@ -2036,7 +2036,14 @@ pub const Session = struct {
         return id;
     }
 
+    fn projectAllowsAction(self: *Session, action: fs_control_plane.ProjectAction) bool {
+        const plane = self.control_plane orelse return true;
+        const project_id = self.project_id orelse return true;
+        return plane.projectAllowsAction(project_id, self.agent_id, action, self.project_token, self.is_admin);
+    }
+
     fn canAccessServiceWithPermissions(self: *Session, permissions_json: []const u8) bool {
+        if (!self.projectAllowsAction(.invoke)) return false;
         if (self.is_admin) return true;
         if (permissions_json.len == 0) return true;
 
@@ -4663,6 +4670,94 @@ test "fsrpc_session: service permissions enforce deny-by-default with admin bypa
     const admin_services_root = admin_session.lookupChild(admin_node_dir, "services") orelse return error.TestExpectedResponse;
     try std.testing.expect(admin_session.lookupChild(admin_services_root, "secure-main") != null);
     try std.testing.expect(admin_session.lookupChild(admin_node_dir, "secure") != null);
+}
+
+test "fsrpc_session: project access policy gates invoke visibility per agent" {
+    const allocator = std.testing.allocator;
+
+    var control_plane = fs_control_plane.ControlPlane.init(allocator);
+    defer control_plane.deinit();
+
+    const ensured = try control_plane.ensureNode("edge-policy-invoke", "ws://127.0.0.1:18891/v2/fs", 60_000);
+    defer allocator.free(ensured);
+    var ensured_parsed = try std.json.parseFromSlice(std.json.Value, allocator, ensured, .{});
+    defer ensured_parsed.deinit();
+    if (ensured_parsed.value != .object) return error.TestExpectedResponse;
+    const node_id = ensured_parsed.value.object.get("node_id") orelse return error.TestExpectedResponse;
+    if (node_id != .string) return error.TestExpectedResponse;
+    const node_secret = ensured_parsed.value.object.get("node_secret") orelse return error.TestExpectedResponse;
+    if (node_secret != .string) return error.TestExpectedResponse;
+
+    const escaped_node_id = try unified.jsonEscape(allocator, node_id.string);
+    defer allocator.free(escaped_node_id);
+    const escaped_node_secret = try unified.jsonEscape(allocator, node_secret.string);
+    defer allocator.free(escaped_node_secret);
+    const upsert_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"node_id\":\"{s}\",\"node_secret\":\"{s}\",\"services\":[{{\"service_id\":\"tool-main\",\"kind\":\"tool\",\"version\":\"1\",\"state\":\"online\",\"endpoints\":[\"/nodes/{s}/tool/main\"],\"capabilities\":{{\"invoke\":true}},\"mounts\":[{{\"mount_id\":\"tool-main\",\"mount_path\":\"/nodes/{s}/tool/main\",\"state\":\"online\"}}],\"ops\":{{\"model\":\"namespace\"}},\"runtime\":{{\"type\":\"native_proc\"}},\"permissions\":{{\"default\":\"allow-by-default\",\"allow_roles\":[\"admin\",\"user\"]}},\"schema\":{{\"model\":\"namespace-service-v1\"}},\"help_md\":\"Policy-gated invoke service\"}}]}}",
+        .{ escaped_node_id, escaped_node_secret, escaped_node_id, escaped_node_id },
+    );
+    defer allocator.free(upsert_req);
+    const upserted = try control_plane.nodeServiceUpsert(upsert_req);
+    defer allocator.free(upserted);
+
+    const project_json = try control_plane.createProject(
+        "{\"name\":\"InvokePolicy\",\"access_policy\":{\"actions\":{\"invoke\":\"open\"},\"agents\":{\"default\":{\"invoke\":\"deny\"},\"worker\":{\"invoke\":\"open\"}}}}",
+    );
+    defer allocator.free(project_json);
+    var project_parsed = try std.json.parseFromSlice(std.json.Value, allocator, project_json, .{});
+    defer project_parsed.deinit();
+    if (project_parsed.value != .object) return error.TestExpectedResponse;
+    const project_id = project_parsed.value.object.get("project_id") orelse return error.TestExpectedResponse;
+    if (project_id != .string) return error.TestExpectedResponse;
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var default_session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "default",
+        .{
+            .project_id = project_id.string,
+            .control_plane = &control_plane,
+            .agents_dir = ".does-not-exist",
+            .projects_dir = ".does-not-exist",
+            .is_admin = false,
+        },
+    );
+    defer default_session.deinit();
+
+    const default_nodes_root = default_session.lookupChild(default_session.root_id, "nodes") orelse return error.TestExpectedResponse;
+    const default_node_dir = default_session.lookupChild(default_nodes_root, node_id.string) orelse return error.TestExpectedResponse;
+    const default_services_root = default_session.lookupChild(default_node_dir, "services") orelse return error.TestExpectedResponse;
+    try std.testing.expect(default_session.lookupChild(default_services_root, "tool-main") == null);
+    try std.testing.expect(default_session.lookupChild(default_node_dir, "tool") == null);
+
+    var worker_session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "worker",
+        .{
+            .project_id = project_id.string,
+            .control_plane = &control_plane,
+            .agents_dir = ".does-not-exist",
+            .projects_dir = ".does-not-exist",
+            .is_admin = false,
+        },
+    );
+    defer worker_session.deinit();
+
+    const worker_nodes_root = worker_session.lookupChild(worker_session.root_id, "nodes") orelse return error.TestExpectedResponse;
+    const worker_node_dir = worker_session.lookupChild(worker_nodes_root, node_id.string) orelse return error.TestExpectedResponse;
+    const worker_services_root = worker_session.lookupChild(worker_node_dir, "services") orelse return error.TestExpectedResponse;
+    try std.testing.expect(worker_session.lookupChild(worker_services_root, "tool-main") != null);
+    try std.testing.expect(worker_session.lookupChild(worker_node_dir, "tool") != null);
 }
 
 test "fsrpc_session: control-plane registered nodes appear under global nodes namespace" {

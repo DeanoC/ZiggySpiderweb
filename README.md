@@ -327,7 +327,13 @@ Notes:
   - project-scoped delta events: `control.workspace_topology_delta` (applied directly when `--project-id` is set)
   - availability rollup events: `control.workspace_availability` (emitted when node/project availability transitions)
   - polling fallback remains enabled.
-- Control-plane project mutations (`project_update`, `project_delete`, `project_mount_set`, `project_mount_remove`, `project_activate`) require a `project_token` returned by `control.project_create`.
+- Project token protection is optional:
+  - when `token_locked=false` (default on new projects), project actions are open to authenticated users
+  - when `token_locked=true`, project actions require `project_token` (admin bypasses)
+- Project action policy can be configured per project (and per agent override) with `access_policy` on `control.project_create`, `control.project_update`, or `control.project_up`:
+  - actions: `read`, `invoke`, `mount`, `admin`
+  - modes: `open`, `token`, `admin`, `deny`
+  - shape: `{"access_policy":{"actions":{"invoke":"token"},"agents":{"mother":{"admin":"open"}}}}`
 - Project token lifecycle control ops are available: `control.project_token_rotate` and `control.project_token_revoke`.
 - `control.ping`/`control.pong` is now a lightweight liveness probe (`payload: {}`), and metrics moved to `control.metrics`.
 - Control clients must negotiate `control.version` (`{"protocol":"unified-v2"}`) before other control operations.

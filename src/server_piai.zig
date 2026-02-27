@@ -6858,6 +6858,7 @@ fn controlPlaneErrorCode(err: anyerror) []const u8 {
         fs_control_plane.ControlPlaneError.ProjectAuthFailed => "project_auth_failed",
         fs_control_plane.ControlPlaneError.ProjectProtected => "project_protected",
         fs_control_plane.ControlPlaneError.ProjectAssignmentForbidden => "project_assignment_forbidden",
+        fs_control_plane.ControlPlaneError.ProjectPolicyForbidden => "project_policy_forbidden",
         fs_control_plane.ControlPlaneError.MountConflict => "mount_conflict",
         fs_control_plane.ControlPlaneError.MountNotFound => "mount_not_found",
         else => "control_plane_error",
