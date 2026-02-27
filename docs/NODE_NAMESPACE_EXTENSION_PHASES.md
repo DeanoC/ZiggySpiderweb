@@ -72,11 +72,29 @@ Status: completed
 - Added/updated tests across protocol and server repos for runtime export
   building, reset control behavior, permission enforcement, and admin bypass.
 
+## Phase 6 - Runtime Reload + Host Contract + Multi-Node Harness
+
+Status: completed
+
+- Control-tunnel nodes now support manifest hot reload without process restart:
+  - periodic manifest reconciliation (`--manifest-reload-interval-ms`)
+  - service namespace reload (add/remove/update) with runtime state carryover
+  - service catalog re-upsert after reload
+- Runtime-state persistence remains durable across reconnects/restarts via
+  `<state-file>.runtime-services.json`.
+- Lease refresh now uses a shared, mutable service registry snapshot, preventing
+  stale catalog overwrites after manifest changes.
+- Added runtime host abstraction metadata (`HOST.json`) in namespace service
+  roots, exposing a shared host contract for static/native/wasm drivers.
+- Added multi-node runtime harness script + runbook:
+  - `scripts/acheron-multi-node-runtime.sh`
+  - `docs/MULTI_NODE_RUNTIME_HARNESS.md`
+
 ## Next Backlog
 
-- Implement `native_inproc` loader execution against a stable symbol ABI.
-- Implement WASM host execution path (`runtime.type = wasm`) for the same
-  namespace control surface.
-- Add per-service process lifecycle supervision (timeouts, restart policy,
-  crash counters, health probes).
-- Add hot-reload for manifest/runtime changes without full node restart.
+- Add node-service event stream for manifest reload deltas over control channel
+  (subscribe/push instead of polling).
+- Add full runtime-manager driver bindings so supervision thread can perform
+  active process/plugin health probes for live namespace drivers.
+- Add GUI workflow for manifest/service diff visibility and per-service reload
+  diagnostics.

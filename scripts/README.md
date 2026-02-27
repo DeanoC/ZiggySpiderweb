@@ -135,6 +135,25 @@ What it checks:
 - at least one successful probe before restart
 - at least three successful probes after restart (recovery validated)
 
+## Multi-Node Runtime Harness
+
+Run end-to-end checks across multiple nodes (including reconnect + persistence marker):
+
+```bash
+SPIDERWEB_URL=ws://127.0.0.1:18790/ \
+SPIDERWEB_AUTH_TOKEN=sw-admin-... \
+EXPECTED_NODES=node-1,node-2 \
+EXPECTED_SERVICES=echo-main \
+RECONNECT_NODE_ID=node-2 \
+PERSISTENCE_NODE_ID=node-2 \
+PERSISTENCE_SERVICE_ID=echo-main \
+./scripts/acheron-multi-node-runtime.sh
+```
+
+Companion runbook (Linux + Windows node setup):
+
+- `docs/MULTI_NODE_RUNTIME_HARNESS.md`
+
 ## Environment Variables
 
 | Variable | Default | Description |
