@@ -29,6 +29,8 @@ const debug_stream_archive_suffix = ".ndjson";
 const debug_stream_archive_suffix_gz = ".ndjson.gz";
 const debug_stream_rotate_max_bytes: u64 = 8 * 1024 * 1024;
 const debug_stream_archive_keep: usize = 8;
+const node_service_event_log_filename = "node-service-events.ndjson";
+const node_service_event_history_max_default: usize = 1024;
 const local_node_export_path_env = "SPIDERWEB_LOCAL_NODE_EXPORT_PATH";
 const local_node_export_name_env = "SPIDERWEB_LOCAL_NODE_EXPORT_NAME";
 const local_node_export_ro_env = "SPIDERWEB_LOCAL_NODE_EXPORT_RO";
@@ -55,6 +57,10 @@ const local_node_mount_projects_system_fs_local = "/projects/" ++ system_project
 const control_operator_token_env = "SPIDERWEB_CONTROL_OPERATOR_TOKEN";
 const control_project_scope_token_env = "SPIDERWEB_CONTROL_PROJECT_SCOPE_TOKEN";
 const control_node_scope_token_env = "SPIDERWEB_CONTROL_NODE_SCOPE_TOKEN";
+const node_service_watch_allow_admin_env = "SPIDERWEB_NODE_SERVICE_WATCH_ALLOW_ADMIN";
+const node_service_watch_allow_user_env = "SPIDERWEB_NODE_SERVICE_WATCH_ALLOW_USER";
+const node_service_watch_replay_max_env = "SPIDERWEB_NODE_SERVICE_WATCH_REPLAY_MAX";
+const node_service_event_history_max_env = "SPIDERWEB_NODE_SERVICE_EVENT_HISTORY_MAX";
 const metrics_port_env = "SPIDERWEB_METRICS_PORT";
 const control_protocol_version = "unified-v2";
 const fsrpc_runtime_protocol_version = "acheron-1";
@@ -421,6 +427,21 @@ fn parseOptionalEnvOwned(allocator: std.mem.Allocator, name: []const u8) ?[]u8 {
     const trimmed = std.mem.trim(u8, raw, " \t\r\n");
     if (trimmed.len == 0) return null;
     return allocator.dupe(u8, trimmed) catch null;
+}
+
+fn initNodeServiceEventLogPath(
+    allocator: std.mem.Allocator,
+    ltm_directory: []const u8,
+) !?[]u8 {
+    const base = std.mem.trim(u8, ltm_directory, " \t\r\n");
+    if (base.len == 0) return null;
+    try ensureDirectoryExists(base);
+    const path = try std.fs.path.join(allocator, &.{ base, node_service_event_log_filename });
+    errdefer allocator.free(path);
+    var file = try openOrCreateAppendFile(path);
+    defer file.close();
+    try file.seekFromEnd(0);
+    return path;
 }
 
 const FsHubConnection = struct {
@@ -894,6 +915,47 @@ const ControlTopologySubscriber = struct {
     id: u64,
     stream: *std.net.Stream,
     write_mutex: *std.Thread.Mutex,
+};
+
+const NodeServiceSubscriber = struct {
+    id: u64,
+    stream: *std.net.Stream,
+    write_mutex: *std.Thread.Mutex,
+    node_id_filter: ?[]u8 = null,
+    role: ConnectionRole = .admin,
+    agent_id: ?[]u8 = null,
+    project_id: ?[]u8 = null,
+    project_token: ?[]u8 = null,
+
+    fn deinit(self: *NodeServiceSubscriber, allocator: std.mem.Allocator) void {
+        if (self.node_id_filter) |value| allocator.free(value);
+        if (self.agent_id) |value| allocator.free(value);
+        if (self.project_id) |value| allocator.free(value);
+        if (self.project_token) |value| allocator.free(value);
+        self.* = undefined;
+    }
+};
+
+const NodeServiceEventRecord = struct {
+    timestamp_ms: i64,
+    node_id: ?[]u8 = null,
+    payload_json: []u8,
+
+    fn deinit(self: *NodeServiceEventRecord, allocator: std.mem.Allocator) void {
+        if (self.node_id) |value| allocator.free(value);
+        allocator.free(self.payload_json);
+        self.* = undefined;
+    }
+};
+
+const NodeServiceWatchRequest = struct {
+    node_id: ?[]u8 = null,
+    replay_limit: usize = 25,
+
+    fn deinit(self: *NodeServiceWatchRequest, allocator: std.mem.Allocator) void {
+        if (self.node_id) |value| allocator.free(value);
+        self.* = undefined;
+    }
 };
 
 const ControlMutationScope = enum {
@@ -2649,6 +2711,16 @@ const AgentRuntimeRegistry = struct {
     topology_subscribers_mutex: std.Thread.Mutex = .{},
     topology_subscribers: std.ArrayListUnmanaged(ControlTopologySubscriber) = .{},
     next_topology_subscriber_id: u64 = 1,
+    node_service_subscribers_mutex: std.Thread.Mutex = .{},
+    node_service_subscribers: std.ArrayListUnmanaged(NodeServiceSubscriber) = .{},
+    next_node_service_subscriber_id: u64 = 1,
+    node_service_watch_allow_admin: bool = true,
+    node_service_watch_allow_user: bool = false,
+    node_service_watch_replay_max: usize = 250,
+    node_service_event_history_mutex: std.Thread.Mutex = .{},
+    node_service_event_history: std.ArrayListUnmanaged(NodeServiceEventRecord) = .{},
+    node_service_event_history_max: usize = node_service_event_history_max_default,
+    node_service_event_log_path: ?[]u8 = null,
     audit_records_mutex: std.Thread.Mutex = .{},
     audit_records: std.ArrayListUnmanaged(AuditRecord) = .{},
     next_audit_record_id: u64 = 1,
@@ -2698,8 +2770,22 @@ const AgentRuntimeRegistry = struct {
         if (node_scope_token != null) {
             std.log.info("control-plane node-scope token enabled via {s}", .{control_node_scope_token_env});
         }
+        const watch_allow_admin = parseBoolEnv(allocator, node_service_watch_allow_admin_env, true);
+        const watch_allow_user = parseBoolEnv(allocator, node_service_watch_allow_user_env, false);
+        const replay_max_raw = parseUnsignedEnv(allocator, node_service_watch_replay_max_env, 250);
+        const replay_max: usize = @intCast(@max(@as(u64, 1), @min(replay_max_raw, 10_000)));
+        const history_max_raw = parseUnsignedEnv(
+            allocator,
+            node_service_event_history_max_env,
+            @as(u64, node_service_event_history_max_default),
+        );
+        const history_max: usize = @intCast(@max(@as(u64, 64), @min(history_max_raw, 20_000)));
+        const event_log_path = initNodeServiceEventLogPath(allocator, runtime_config.ltm_directory) catch |err| blk: {
+            std.log.warn("node service event persistence disabled: {s}", .{@errorName(err)});
+            break :blk null;
+        };
 
-        return .{
+        var registry: AgentRuntimeRegistry = .{
             .allocator = allocator,
             .runtime_config = runtime_config,
             .provider_config = provider_config,
@@ -2723,8 +2809,17 @@ const AgentRuntimeRegistry = struct {
             .control_operator_token = operator_token,
             .control_project_scope_token = project_scope_token,
             .control_node_scope_token = node_scope_token,
+            .node_service_watch_allow_admin = watch_allow_admin,
+            .node_service_watch_allow_user = watch_allow_user,
+            .node_service_watch_replay_max = replay_max,
+            .node_service_event_history_max = history_max,
+            .node_service_event_log_path = event_log_path,
             .node_tunnels = .{ .allocator = allocator },
         };
+        registry.loadNodeServiceEventHistory() catch |err| {
+            std.log.warn("failed to load node service event history: {s}", .{@errorName(err)});
+        };
+        return registry;
     }
 
     fn deinit(self: *AgentRuntimeRegistry) void {
@@ -2762,6 +2857,7 @@ const AgentRuntimeRegistry = struct {
         self.runtime_warmups = .{};
         self.runtime_warmups_mutex.unlock();
         self.clearTopologySubscribers();
+        self.clearNodeServiceSubscribers();
         if (self.local_fs_node) |local_fs_node| {
             local_fs_node.deinit(&self.control_plane);
             self.local_fs_node = null;
@@ -2781,6 +2877,11 @@ const AgentRuntimeRegistry = struct {
         if (self.workspace_url) |value| {
             self.allocator.free(value);
             self.workspace_url = null;
+        }
+        self.clearNodeServiceEventHistory();
+        if (self.node_service_event_log_path) |path| {
+            self.allocator.free(path);
+            self.node_service_event_log_path = null;
         }
         self.node_tunnels.deinit();
         self.audit_records_mutex.lock();
@@ -3824,6 +3925,341 @@ const AgentRuntimeRegistry = struct {
         }
     }
 
+    fn clearNodeServiceSubscribers(self: *AgentRuntimeRegistry) void {
+        self.node_service_subscribers_mutex.lock();
+        defer self.node_service_subscribers_mutex.unlock();
+        for (self.node_service_subscribers.items) |*subscriber| {
+            subscriber.deinit(self.allocator);
+        }
+        self.node_service_subscribers.deinit(self.allocator);
+        self.node_service_subscribers = .{};
+        self.next_node_service_subscriber_id = 1;
+    }
+
+    fn registerNodeServiceSubscriber(
+        self: *AgentRuntimeRegistry,
+        stream: *std.net.Stream,
+        write_mutex: *std.Thread.Mutex,
+        node_id_filter: ?[]const u8,
+        role: ConnectionRole,
+        agent_id: ?[]const u8,
+        project_id: ?[]const u8,
+        project_token: ?[]const u8,
+    ) !u64 {
+        self.node_service_subscribers_mutex.lock();
+        defer self.node_service_subscribers_mutex.unlock();
+        const id = self.next_node_service_subscriber_id;
+        self.next_node_service_subscriber_id +%= 1;
+        if (self.next_node_service_subscriber_id == 0) self.next_node_service_subscriber_id = 1;
+        const filter_copy = if (node_id_filter) |value|
+            try self.allocator.dupe(u8, value)
+        else
+            null;
+        errdefer if (filter_copy) |value| self.allocator.free(value);
+        const agent_copy = if (agent_id) |value|
+            try self.allocator.dupe(u8, value)
+        else
+            null;
+        errdefer if (agent_copy) |value| self.allocator.free(value);
+        const project_copy = if (project_id) |value|
+            try self.allocator.dupe(u8, value)
+        else
+            null;
+        errdefer if (project_copy) |value| self.allocator.free(value);
+        const project_token_copy = if (project_token) |value|
+            try self.allocator.dupe(u8, value)
+        else
+            null;
+        errdefer if (project_token_copy) |value| self.allocator.free(value);
+        try self.node_service_subscribers.append(self.allocator, .{
+            .id = id,
+            .stream = stream,
+            .write_mutex = write_mutex,
+            .node_id_filter = filter_copy,
+            .role = role,
+            .agent_id = agent_copy,
+            .project_id = project_copy,
+            .project_token = project_token_copy,
+        });
+        return id;
+    }
+
+    fn unregisterNodeServiceSubscriber(self: *AgentRuntimeRegistry, subscriber_id: u64) void {
+        self.node_service_subscribers_mutex.lock();
+        defer self.node_service_subscribers_mutex.unlock();
+        var idx: usize = 0;
+        while (idx < self.node_service_subscribers.items.len) : (idx += 1) {
+            if (self.node_service_subscribers.items[idx].id != subscriber_id) continue;
+            var removed = self.node_service_subscribers.swapRemove(idx);
+            removed.deinit(self.allocator);
+            return;
+        }
+    }
+
+    fn isNodeServiceWatchAllowedForRole(self: *AgentRuntimeRegistry, role: ConnectionRole) bool {
+        return switch (role) {
+            .admin => self.node_service_watch_allow_admin,
+            .user => self.node_service_watch_allow_user,
+        };
+    }
+
+    fn nodeServiceEventVisibleToContext(
+        self: *AgentRuntimeRegistry,
+        role: ConnectionRole,
+        agent_id: ?[]const u8,
+        project_id: ?[]const u8,
+        project_token: ?[]const u8,
+        node_id_filter: ?[]const u8,
+        event_node_id: ?[]const u8,
+    ) bool {
+        if (node_id_filter) |filter| {
+            const concrete_event_node_id = event_node_id orelse return false;
+            if (!std.mem.eql(u8, filter, concrete_event_node_id)) return false;
+        }
+
+        if (role == .admin) return true;
+
+        const concrete_project_id = project_id orelse return false;
+        const concrete_agent_id = agent_id orelse return false;
+        const concrete_event_node_id = event_node_id orelse return false;
+        return self.control_plane.projectAllowsNodeServiceEvent(
+            concrete_project_id,
+            concrete_agent_id,
+            project_token,
+            concrete_event_node_id,
+            false,
+        );
+    }
+
+    fn clearNodeServiceEventHistory(self: *AgentRuntimeRegistry) void {
+        self.node_service_event_history_mutex.lock();
+        defer self.node_service_event_history_mutex.unlock();
+        for (self.node_service_event_history.items) |*record| {
+            record.deinit(self.allocator);
+        }
+        self.node_service_event_history.deinit(self.allocator);
+        self.node_service_event_history = .{};
+    }
+
+    fn appendNodeServiceEventHistoryRecord(
+        self: *AgentRuntimeRegistry,
+        record: NodeServiceEventRecord,
+    ) void {
+        self.node_service_event_history_mutex.lock();
+        defer self.node_service_event_history_mutex.unlock();
+        while (self.node_service_event_history.items.len >= self.node_service_event_history_max and
+            self.node_service_event_history.items.len > 0)
+        {
+            var dropped = self.node_service_event_history.orderedRemove(0);
+            dropped.deinit(self.allocator);
+        }
+        self.node_service_event_history.append(self.allocator, record) catch {
+            var cleanup = record;
+            cleanup.deinit(self.allocator);
+        };
+    }
+
+    fn persistNodeServiceEventRecord(
+        self: *AgentRuntimeRegistry,
+        timestamp_ms: i64,
+        node_id: ?[]const u8,
+        payload_json: []const u8,
+    ) void {
+        const path = self.node_service_event_log_path orelse return;
+        const escaped_payload = unified.jsonEscape(self.allocator, payload_json) catch return;
+        defer self.allocator.free(escaped_payload);
+        const line = if (node_id) |value| blk: {
+            const escaped_node = unified.jsonEscape(self.allocator, value) catch return;
+            defer self.allocator.free(escaped_node);
+            break :blk std.fmt.allocPrint(
+                self.allocator,
+                "{{\"timestamp_ms\":{d},\"node_id\":\"{s}\",\"payload_json\":\"{s}\"}}\n",
+                .{ timestamp_ms, escaped_node, escaped_payload },
+            ) catch return;
+        } else std.fmt.allocPrint(
+            self.allocator,
+            "{{\"timestamp_ms\":{d},\"node_id\":null,\"payload_json\":\"{s}\"}}\n",
+            .{ timestamp_ms, escaped_payload },
+        ) catch return;
+        defer self.allocator.free(line);
+
+        var file = openOrCreateAppendFile(path) catch |err| {
+            std.log.warn("failed opening node service event log {s}: {s}", .{ path, @errorName(err) });
+            return;
+        };
+        defer file.close();
+        file.seekFromEnd(0) catch |err| {
+            std.log.warn("failed seeking node service event log {s}: {s}", .{ path, @errorName(err) });
+            return;
+        };
+        file.writeAll(line) catch |err| {
+            std.log.warn("failed appending node service event log {s}: {s}", .{ path, @errorName(err) });
+        };
+    }
+
+    fn recordNodeServiceEvent(
+        self: *AgentRuntimeRegistry,
+        node_id: ?[]const u8,
+        payload_json: []const u8,
+    ) void {
+        const timestamp_ms = std.time.milliTimestamp();
+        const payload_copy = self.allocator.dupe(u8, payload_json) catch return;
+        const node_copy = if (node_id) |value|
+            self.allocator.dupe(u8, value) catch {
+                self.allocator.free(payload_copy);
+                return;
+            }
+        else
+            null;
+        self.appendNodeServiceEventHistoryRecord(.{
+            .timestamp_ms = timestamp_ms,
+            .node_id = node_copy,
+            .payload_json = payload_copy,
+        });
+        self.persistNodeServiceEventRecord(timestamp_ms, node_id, payload_json);
+    }
+
+    fn loadNodeServiceEventHistory(self: *AgentRuntimeRegistry) !void {
+        const path = self.node_service_event_log_path orelse return;
+        const raw = std.fs.cwd().readFileAlloc(self.allocator, path, 16 * 1024 * 1024) catch |err| switch (err) {
+            error.FileNotFound => return,
+            else => return err,
+        };
+        defer self.allocator.free(raw);
+
+        var lines = std.mem.splitScalar(u8, raw, '\n');
+        while (lines.next()) |line_raw| {
+            const line = std.mem.trim(u8, line_raw, " \t\r");
+            if (line.len == 0) continue;
+
+            var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, line, .{}) catch continue;
+            defer parsed.deinit();
+            if (parsed.value != .object) continue;
+            const obj = parsed.value.object;
+            const payload_value = obj.get("payload_json") orelse continue;
+            if (payload_value != .string or payload_value.string.len == 0) continue;
+            const timestamp_ms = if (obj.get("timestamp_ms")) |value| switch (value) {
+                .integer => value.integer,
+                else => std.time.milliTimestamp(),
+            } else std.time.milliTimestamp();
+
+            var node_copy: ?[]u8 = null;
+            if (obj.get("node_id")) |value| {
+                if (value == .string and isValidNodeIdentifier(value.string)) {
+                    node_copy = self.allocator.dupe(u8, value.string) catch null;
+                }
+            }
+
+            const payload_copy = self.allocator.dupe(u8, payload_value.string) catch {
+                if (node_copy) |value| self.allocator.free(value);
+                continue;
+            };
+            self.appendNodeServiceEventHistoryRecord(.{
+                .timestamp_ms = timestamp_ms,
+                .node_id = node_copy,
+                .payload_json = payload_copy,
+            });
+        }
+    }
+
+    fn replayNodeServiceEvents(
+        self: *AgentRuntimeRegistry,
+        stream: *std.net.Stream,
+        write_mutex: *std.Thread.Mutex,
+        role: ConnectionRole,
+        agent_id: ?[]const u8,
+        project_id: ?[]const u8,
+        project_token: ?[]const u8,
+        node_id_filter: ?[]const u8,
+        replay_limit: usize,
+    ) !usize {
+        if (replay_limit == 0) return 0;
+
+        var replay_payloads = std.ArrayListUnmanaged([]u8){};
+        defer {
+            for (replay_payloads.items) |payload| self.allocator.free(payload);
+            replay_payloads.deinit(self.allocator);
+        }
+
+        {
+            self.node_service_event_history_mutex.lock();
+            defer self.node_service_event_history_mutex.unlock();
+            var idx = self.node_service_event_history.items.len;
+            while (idx > 0 and replay_payloads.items.len < replay_limit) {
+                idx -= 1;
+                const record = self.node_service_event_history.items[idx];
+                if (!self.nodeServiceEventVisibleToContext(
+                    role,
+                    agent_id,
+                    project_id,
+                    project_token,
+                    node_id_filter,
+                    record.node_id,
+                )) continue;
+                try replay_payloads.append(self.allocator, try self.allocator.dupe(u8, record.payload_json));
+            }
+        }
+
+        var sent: usize = 0;
+        var replay_idx = replay_payloads.items.len;
+        while (replay_idx > 0) {
+            replay_idx -= 1;
+            const frame_json = try unified.buildControlAck(
+                self.allocator,
+                .node_service_event,
+                null,
+                replay_payloads.items[replay_idx],
+            );
+            defer self.allocator.free(frame_json);
+            try writeFrameLocked(stream, write_mutex, frame_json, .text);
+            sent += 1;
+        }
+        return sent;
+    }
+
+    fn emitNodeServiceEvent(
+        self: *AgentRuntimeRegistry,
+        node_id: ?[]const u8,
+        payload_json: []const u8,
+    ) void {
+        self.recordNodeServiceEvent(node_id, payload_json);
+        const event_json = unified.buildControlAck(
+            self.allocator,
+            .node_service_event,
+            null,
+            payload_json,
+        ) catch return;
+        defer self.allocator.free(event_json);
+
+        self.node_service_subscribers_mutex.lock();
+        defer self.node_service_subscribers_mutex.unlock();
+
+        var idx: usize = 0;
+        while (idx < self.node_service_subscribers.items.len) {
+            const subscriber = &self.node_service_subscribers.items[idx];
+            if (!self.nodeServiceEventVisibleToContext(
+                subscriber.role,
+                subscriber.agent_id,
+                subscriber.project_id,
+                subscriber.project_token,
+                subscriber.node_id_filter,
+                node_id,
+            )) {
+                idx += 1;
+                continue;
+            }
+            subscriber.write_mutex.lock();
+            const write_result = websocket_transport.writeFrame(subscriber.stream, event_json, .text);
+            subscriber.write_mutex.unlock();
+            if (write_result) |_| {
+                idx += 1;
+            } else |_| {
+                var removed = self.node_service_subscribers.swapRemove(idx);
+                removed.deinit(self.allocator);
+            }
+        }
+    }
+
     fn emitWorkspaceTopologyChanged(self: *AgentRuntimeRegistry, reason: []const u8) void {
         const escaped_reason = unified.jsonEscape(self.allocator, reason) catch return;
         defer self.allocator.free(escaped_reason);
@@ -4433,6 +4869,10 @@ fn handleWebSocketConnection(
     var topology_subscriber_id: ?u64 = null;
     defer if (topology_subscriber_id) |subscriber_id| {
         runtime_registry.unregisterTopologySubscriber(subscriber_id);
+    };
+    var node_service_subscriber_id: ?u64 = null;
+    defer if (node_service_subscriber_id) |subscriber_id| {
+        runtime_registry.unregisterNodeServiceSubscriber(subscriber_id);
     };
 
     while (true) {
@@ -5485,6 +5925,161 @@ fn handleWebSocketConnection(
                                 try writeFrameLocked(stream, &connection_write_mutex, response, .text);
                                 continue;
                             },
+                            .node_service_watch => {
+                                if (!runtime_registry.isNodeServiceWatchAllowedForRole(principal.role)) {
+                                    const role_name = connectionRoleName(principal.role);
+                                    const response = try unified.buildControlError(
+                                        allocator,
+                                        parsed.id,
+                                        "forbidden",
+                                        if (principal.role == .admin)
+                                            "node service watch is disabled for admin role"
+                                        else
+                                            "node service watch is disabled for user role",
+                                    );
+                                    defer allocator.free(response);
+                                    try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                    runtime_registry.appendSecurityAuditAndDebug(
+                                        (session_bindings.get(active_session_key) orelse return error.InvalidState).agent_id,
+                                        .node_service_watch,
+                                        principal.role,
+                                        parsed.correlation_id orelse parsed.id,
+                                        "watch_role_forbidden",
+                                        false,
+                                        "forbidden",
+                                        role_name,
+                                    );
+                                    continue;
+                                }
+                                var watch_request = parseNodeServiceWatchRequest(allocator, parsed.payload_json) catch |err| {
+                                    const response = try unified.buildControlError(
+                                        allocator,
+                                        parsed.id,
+                                        if (err == error.MissingField) "missing_field" else "invalid_payload",
+                                        @errorName(err),
+                                    );
+                                    defer allocator.free(response);
+                                    try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                    continue;
+                                };
+                                defer watch_request.deinit(allocator);
+
+                                const active_binding = session_bindings.get(active_session_key) orelse return error.InvalidState;
+                                const watch_agent_id = active_binding.agent_id;
+                                const watch_project_id = active_binding.project_id;
+                                const watch_project_token = active_binding.project_token;
+
+                                if (principal.role == .user) {
+                                    const concrete_project_id = watch_project_id orelse {
+                                        const response = try unified.buildControlError(
+                                            allocator,
+                                            parsed.id,
+                                            "forbidden",
+                                            "watch requires a project-scoped session binding",
+                                        );
+                                        defer allocator.free(response);
+                                        try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                        continue;
+                                    };
+                                    if (!runtime_registry.control_plane.projectAllowsAction(
+                                        concrete_project_id,
+                                        watch_agent_id,
+                                        .observe,
+                                        watch_project_token,
+                                        false,
+                                    )) {
+                                        const response = try unified.buildControlError(
+                                            allocator,
+                                            parsed.id,
+                                            "forbidden",
+                                            "observe access denied for active project",
+                                        );
+                                        defer allocator.free(response);
+                                        try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                        continue;
+                                    }
+                                }
+
+                                if (node_service_subscriber_id) |subscriber_id| {
+                                    runtime_registry.unregisterNodeServiceSubscriber(subscriber_id);
+                                    node_service_subscriber_id = null;
+                                }
+                                node_service_subscriber_id = try runtime_registry.registerNodeServiceSubscriber(
+                                    stream,
+                                    &connection_write_mutex,
+                                    watch_request.node_id,
+                                    principal.role,
+                                    watch_agent_id,
+                                    watch_project_id,
+                                    watch_project_token,
+                                );
+
+                                const bounded_replay_limit = @min(watch_request.replay_limit, runtime_registry.node_service_watch_replay_max);
+                                const replayed_count = runtime_registry.replayNodeServiceEvents(
+                                    stream,
+                                    &connection_write_mutex,
+                                    principal.role,
+                                    watch_agent_id,
+                                    watch_project_id,
+                                    watch_project_token,
+                                    watch_request.node_id,
+                                    bounded_replay_limit,
+                                ) catch |err| {
+                                    if (node_service_subscriber_id) |subscriber_id| {
+                                        runtime_registry.unregisterNodeServiceSubscriber(subscriber_id);
+                                        node_service_subscriber_id = null;
+                                    }
+                                    const response = try unified.buildControlError(
+                                        allocator,
+                                        parsed.id,
+                                        "execution_failed",
+                                        @errorName(err),
+                                    );
+                                    defer allocator.free(response);
+                                    try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                    continue;
+                                };
+
+                                const payload_json = if (watch_request.node_id) |value| blk: {
+                                    const escaped_node = try unified.jsonEscape(allocator, value);
+                                    defer allocator.free(escaped_node);
+                                    break :blk try std.fmt.allocPrint(
+                                        allocator,
+                                        "{{\"enabled\":true,\"node_id\":\"{s}\",\"replay_limit\":{d},\"replayed\":{d}}}",
+                                        .{ escaped_node, bounded_replay_limit, replayed_count },
+                                    );
+                                } else try std.fmt.allocPrint(
+                                    allocator,
+                                    "{{\"enabled\":true,\"replay_limit\":{d},\"replayed\":{d}}}",
+                                    .{ bounded_replay_limit, replayed_count },
+                                );
+                                defer allocator.free(payload_json);
+
+                                const response = try unified.buildControlAck(
+                                    allocator,
+                                    .node_service_watch,
+                                    parsed.id,
+                                    payload_json,
+                                );
+                                defer allocator.free(response);
+                                try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                continue;
+                            },
+                            .node_service_unwatch => {
+                                if (node_service_subscriber_id) |subscriber_id| {
+                                    runtime_registry.unregisterNodeServiceSubscriber(subscriber_id);
+                                    node_service_subscriber_id = null;
+                                }
+                                const response = try unified.buildControlAck(
+                                    allocator,
+                                    .node_service_unwatch,
+                                    parsed.id,
+                                    "{\"enabled\":false}",
+                                );
+                                defer allocator.free(response);
+                                try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                continue;
+                            },
                             .debug_subscribe, .debug_unsubscribe => {
                                 debug_stream_enabled = control_type == .debug_subscribe;
                                 if (fsrpc) |*session| {
@@ -5664,6 +6259,14 @@ fn handleWebSocketConnection(
                                 );
                                 defer allocator.free(response);
                                 try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                if (control_type == .node_service_upsert) {
+                                    const event_node_id = extractNodeIdFromControlPayload(allocator, payload_json) catch null;
+                                    defer if (event_node_id) |value| allocator.free(value);
+                                    runtime_registry.emitNodeServiceEvent(
+                                        if (event_node_id) |value| value else null,
+                                        payload_json,
+                                    );
+                                }
                                 const availability_after = runtime_registry.control_plane.availabilitySnapshot();
                                 const topology_mutation = isWorkspaceTopologyMutation(control_type);
                                 const availability_changed = !fs_control_plane.ControlPlane.AvailabilitySnapshot.eql(
@@ -6616,6 +7219,40 @@ fn appendAvailabilitySnapshotJson(
     try out.appendSlice(allocator, "},\"project_mount_digest\":");
     try out.writer(allocator).print("{d}", .{snapshot.project_mount_digest});
     try out.appendSlice(allocator, "}");
+}
+
+fn parseNodeServiceWatchRequest(
+    allocator: std.mem.Allocator,
+    payload_json: ?[]const u8,
+) !NodeServiceWatchRequest {
+    if (payload_json == null) return .{};
+    const raw = payload_json.?;
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidPayload;
+
+    var request = NodeServiceWatchRequest{};
+    if (parsed.value.object.get("node_id")) |node_id| {
+        if (node_id != .string or !isValidNodeIdentifier(node_id.string)) return error.InvalidPayload;
+        request.node_id = try allocator.dupe(u8, node_id.string);
+    }
+    errdefer request.deinit(allocator);
+
+    if (parsed.value.object.get("replay_limit")) |replay_limit| {
+        if (replay_limit != .integer or replay_limit.integer < 0) return error.InvalidPayload;
+        request.replay_limit = @intCast(replay_limit.integer);
+    }
+    return request;
+}
+
+fn extractNodeIdFromControlPayload(allocator: std.mem.Allocator, payload_json: []const u8) !?[]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload_json, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const node_id = parsed.value.object.get("node_id") orelse return null;
+    if (node_id != .string or !isValidNodeIdentifier(node_id.string)) return null;
+    const copy = try allocator.dupe(u8, node_id.string);
+    return @as(?[]u8, copy);
 }
 
 fn extractProjectIdFromControlPayload(allocator: std.mem.Allocator, payload_json: []const u8) !?[]u8 {
@@ -8352,6 +8989,127 @@ test "server_piai: workspace availability changes are pushed to debug subscriber
     try std.testing.expect(server_ctx.err_name == null);
 }
 
+test "server_piai: node service upserts are pushed to node service watchers" {
+    const allocator = std.testing.allocator;
+    var runtime_registry = AgentRuntimeRegistry.init(allocator, .{
+        .ltm_directory = "",
+        .ltm_filename = "",
+    }, null);
+    defer runtime_registry.deinit();
+    try setAuthTokensForTests(&runtime_registry, "admin-secret", "user-secret");
+
+    var listener = try (try std.net.Address.parseIp("127.0.0.1", 0)).listen(.{ .reuse_address = true });
+    defer listener.deinit();
+
+    var server_ctx = WsTestServerCtx{
+        .allocator = allocator,
+        .runtime_registry = &runtime_registry,
+        .listener = &listener,
+    };
+    defer server_ctx.deinit();
+
+    const sub_server_thread = try std.Thread.spawn(.{}, runSingleWsConnection, .{&server_ctx});
+    defer sub_server_thread.join();
+    const mut_server_thread = try std.Thread.spawn(.{}, runSingleWsConnection, .{&server_ctx});
+    defer mut_server_thread.join();
+
+    var subscriber = try std.net.tcpConnectToAddress(listener.listen_address);
+    defer subscriber.close();
+    try performClientHandshakeWithBearerToken(allocator, &subscriber, "/", "admin-secret");
+    try writeClientTextFrameMasked(&subscriber, "{\"channel\":\"control\",\"type\":\"control.version\",\"id\":\"sub-version\",\"payload\":{\"protocol\":\"unified-v2\"}}");
+    var sub_version_ack = try readServerFrame(allocator, &subscriber);
+    defer sub_version_ack.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, sub_version_ack.payload, "\"type\":\"control.version_ack\"") != null);
+    try writeClientTextFrameMasked(&subscriber, "{\"channel\":\"control\",\"type\":\"control.connect\",\"id\":\"sub-connect\"}");
+    var sub_connect_ack = try readServerFrame(allocator, &subscriber);
+    defer sub_connect_ack.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, sub_connect_ack.payload, "\"type\":\"control.connect_ack\"") != null);
+
+    try writeClientTextFrameMasked(&subscriber, "{\"channel\":\"control\",\"type\":\"control.node_service_watch\",\"id\":\"sub-watch\",\"payload\":{}}");
+    var sub_watch_ack = try readServerFrame(allocator, &subscriber);
+    defer sub_watch_ack.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, sub_watch_ack.payload, "\"type\":\"control.node_service_watch\"") != null);
+
+    var mutator = try std.net.tcpConnectToAddress(listener.listen_address);
+    defer mutator.close();
+    try performClientHandshakeWithBearerToken(allocator, &mutator, "/", "admin-secret");
+    try writeClientTextFrameMasked(&mutator, "{\"channel\":\"control\",\"type\":\"control.version\",\"id\":\"mut-version\",\"payload\":{\"protocol\":\"unified-v2\"}}");
+    var mut_version_ack = try readServerFrame(allocator, &mutator);
+    defer mut_version_ack.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, mut_version_ack.payload, "\"type\":\"control.version_ack\"") != null);
+    try writeClientTextFrameMasked(&mutator, "{\"channel\":\"control\",\"type\":\"control.connect\",\"id\":\"mut-connect\"}");
+    var mut_connect_ack = try readServerFrame(allocator, &mutator);
+    defer mut_connect_ack.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, mut_connect_ack.payload, "\"type\":\"control.connect_ack\"") != null);
+
+    try writeClientTextFrameMasked(
+        &mutator,
+        "{\"channel\":\"control\",\"type\":\"control.node_invite_create\",\"id\":\"mut-invite\"}",
+    );
+    var invite_created = try readServerFrame(allocator, &mutator);
+    defer invite_created.deinit(allocator);
+    var invite_json = try std.json.parseFromSlice(std.json.Value, allocator, invite_created.payload, .{});
+    defer invite_json.deinit();
+    const invite_payload = invite_json.value.object.get("payload") orelse return error.TestExpectedResponse;
+    if (invite_payload != .object) return error.TestExpectedResponse;
+    const invite_token_val = invite_payload.object.get("invite_token") orelse return error.TestExpectedResponse;
+    if (invite_token_val != .string) return error.TestExpectedResponse;
+    const escaped_invite_token = try unified.jsonEscape(allocator, invite_token_val.string);
+    defer allocator.free(escaped_invite_token);
+
+    const join_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"channel\":\"control\",\"type\":\"control.node_join\",\"id\":\"mut-join\",\"payload\":{{\"invite_token\":\"{s}\",\"node_name\":\"service-node\",\"fs_url\":\"ws://127.0.0.1:18891/v2/fs\"}}}}",
+        .{escaped_invite_token},
+    );
+    defer allocator.free(join_req);
+    try writeClientTextFrameMasked(&mutator, join_req);
+    var joined = try readServerFrame(allocator, &mutator);
+    defer joined.deinit(allocator);
+
+    var join_json = try std.json.parseFromSlice(std.json.Value, allocator, joined.payload, .{});
+    defer join_json.deinit();
+    const join_payload = join_json.value.object.get("payload") orelse return error.TestExpectedResponse;
+    if (join_payload != .object) return error.TestExpectedResponse;
+    const node_id_val = join_payload.object.get("node_id") orelse return error.TestExpectedResponse;
+    const node_secret_val = join_payload.object.get("node_secret") orelse return error.TestExpectedResponse;
+    if (node_id_val != .string or node_secret_val != .string) return error.TestExpectedResponse;
+    const escaped_node_id = try unified.jsonEscape(allocator, node_id_val.string);
+    defer allocator.free(escaped_node_id);
+    const escaped_node_secret = try unified.jsonEscape(allocator, node_secret_val.string);
+    defer allocator.free(escaped_node_secret);
+
+    const upsert_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"channel\":\"control\",\"type\":\"control.node_service_upsert\",\"id\":\"mut-upsert\",\"payload\":{{\"node_id\":\"{s}\",\"node_secret\":\"{s}\",\"services\":[{{\"service_id\":\"camera\",\"kind\":\"camera\",\"version\":\"1\",\"state\":\"online\",\"endpoints\":[\"/nodes/service-node/camera\"],\"capabilities\":{{\"still\":true}}}}]}}}}",
+        .{ escaped_node_id, escaped_node_secret },
+    );
+    defer allocator.free(upsert_req);
+    try writeClientTextFrameMasked(&mutator, upsert_req);
+    var upsert_ack = try readServerFrame(allocator, &mutator);
+    defer upsert_ack.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, upsert_ack.payload, "\"type\":\"control.node_service_upsert\"") != null);
+
+    var pushed_event = try readServerFrame(allocator, &subscriber);
+    defer pushed_event.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, pushed_event.payload, "\"type\":\"control.node_service_event\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pushed_event.payload, "\"node_id\":\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pushed_event.payload, "\"service_delta\":{\"changed\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pushed_event.payload, "\"added\":[") != null);
+
+    try websocket_transport.writeFrame(&mutator, "", .close);
+    var mut_close = try readServerFrame(allocator, &mutator);
+    defer mut_close.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0x8), mut_close.opcode);
+
+    try websocket_transport.writeFrame(&subscriber, "", .close);
+    var sub_close = try readServerFrame(allocator, &subscriber);
+    defer sub_close.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0x8), sub_close.opcode);
+
+    try std.testing.expect(server_ctx.err_name == null);
+}
+
 test "server_piai: base path routes all connections to default runtime" {
     const allocator = std.testing.allocator;
     var runtime_registry = AgentRuntimeRegistry.init(allocator, .{
@@ -8571,6 +9329,100 @@ test "server_piai: extract project payload helpers parse id and token" {
 
     const token_missing = try extractProjectTokenFromControlPayload(allocator, "{\"project_id\":\"proj-7\"}");
     try std.testing.expect(token_missing == null);
+}
+
+test "server_piai: extract node id helper parses valid payload" {
+    const allocator = std.testing.allocator;
+    const payload = "{\"node_id\":\"node-7\",\"service_delta\":{\"changed\":true}}";
+    const node_id = try extractNodeIdFromControlPayload(allocator, payload);
+    defer if (node_id) |value| allocator.free(value);
+    try std.testing.expect(node_id != null);
+    try std.testing.expectEqualStrings("node-7", node_id.?);
+
+    const missing = try extractNodeIdFromControlPayload(allocator, "{\"service_delta\":{}}");
+    try std.testing.expect(missing == null);
+}
+
+test "server_piai: parse node service watch request supports filters and replay limit" {
+    const allocator = std.testing.allocator;
+    var request = try parseNodeServiceWatchRequest(allocator, "{\"node_id\":\"node-7\",\"replay_limit\":42}");
+    defer request.deinit(allocator);
+    try std.testing.expect(request.node_id != null);
+    try std.testing.expectEqualStrings("node-7", request.node_id.?);
+    try std.testing.expectEqual(@as(usize, 42), request.replay_limit);
+
+    var default_request = try parseNodeServiceWatchRequest(allocator, null);
+    defer default_request.deinit(allocator);
+    try std.testing.expect(default_request.node_id == null);
+    try std.testing.expectEqual(@as(usize, 25), default_request.replay_limit);
+
+    try std.testing.expectError(
+        error.InvalidPayload,
+        parseNodeServiceWatchRequest(allocator, "{\"node_id\":\"bad/node\"}"),
+    );
+    try std.testing.expectError(
+        error.InvalidPayload,
+        parseNodeServiceWatchRequest(allocator, "{\"replay_limit\":-1}"),
+    );
+}
+
+test "server_piai: user node service visibility is project mounted-node scoped" {
+    const allocator = std.testing.allocator;
+    var runtime_registry = AgentRuntimeRegistry.init(allocator, .{
+        .ltm_directory = "",
+        .ltm_filename = "",
+    }, null);
+    defer runtime_registry.deinit();
+
+    const join_payload = try runtime_registry.control_plane.ensureNode("node-a", "ws://127.0.0.1:18891/v2/fs", 60_000);
+    defer allocator.free(join_payload);
+    const node_registration = try parseNodeRegistrationFromJoinPayload(allocator, join_payload);
+    defer {
+        allocator.free(node_registration.node_id);
+        allocator.free(node_registration.node_secret);
+    }
+
+    const project_created = try runtime_registry.control_plane.createProject(
+        "{\"name\":\"ScopedProject\",\"access_policy\":{\"actions\":{\"observe\":\"open\"}}}",
+    );
+    defer allocator.free(project_created);
+    const project_id = try extractProjectIdFromControlPayload(allocator, project_created);
+    defer if (project_id) |value| allocator.free(value);
+    try std.testing.expect(project_id != null);
+
+    const mount_payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"project_id\":\"{s}\",\"mount_path\":\"/nodes/node-a/fs\",\"node_id\":\"{s}\",\"export_name\":\"fs\"}}",
+        .{ project_id.?, node_registration.node_id },
+    );
+    defer allocator.free(mount_payload);
+    const mount_result = try runtime_registry.control_plane.setProjectMountWithRole(mount_payload, false);
+    defer allocator.free(mount_result);
+
+    try std.testing.expect(runtime_registry.nodeServiceEventVisibleToContext(
+        .user,
+        "bob",
+        project_id.?,
+        null,
+        null,
+        node_registration.node_id,
+    ));
+    try std.testing.expect(!runtime_registry.nodeServiceEventVisibleToContext(
+        .user,
+        "bob",
+        project_id.?,
+        null,
+        null,
+        "node-missing",
+    ));
+    try std.testing.expect(!runtime_registry.nodeServiceEventVisibleToContext(
+        .user,
+        "bob",
+        project_id.?,
+        null,
+        "node-other",
+        node_registration.node_id,
+    ));
 }
 
 test "server_piai: validateFsNodeHelloPayload enforces optional auth_token" {

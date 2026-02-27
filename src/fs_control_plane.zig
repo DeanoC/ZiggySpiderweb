@@ -45,6 +45,7 @@ pub const ControlPlaneError = error{
 
 pub const ProjectAction = enum {
     read,
+    observe,
     invoke,
     mount,
     admin,
@@ -59,6 +60,7 @@ const AccessMode = enum {
 
 const ProjectActionPolicy = struct {
     read: ?AccessMode = null,
+    observe: ?AccessMode = null,
     invoke: ?AccessMode = null,
     mount: ?AccessMode = null,
     admin: ?AccessMode = null,
@@ -66,6 +68,7 @@ const ProjectActionPolicy = struct {
     fn modeFor(self: *const ProjectActionPolicy, action: ProjectAction) ?AccessMode {
         return switch (action) {
             .read => self.read,
+            .observe => self.observe,
             .invoke => self.invoke,
             .mount => self.mount,
             .admin => self.admin,
@@ -162,6 +165,18 @@ const Node = struct {
         for (self.labels.items) |*label| label.deinit(allocator);
         self.labels.deinit(allocator);
         node_service_catalog.deinitServices(allocator, &self.services);
+        self.* = undefined;
+    }
+};
+
+const NodeServiceDigest = struct {
+    service_id: []u8,
+    version: []u8,
+    digest: u64,
+
+    fn deinit(self: *NodeServiceDigest, allocator: std.mem.Allocator) void {
+        allocator.free(self.service_id);
+        allocator.free(self.version);
         self.* = undefined;
     }
 };
@@ -547,6 +562,31 @@ pub const ControlPlane = struct {
         return true;
     }
 
+    pub fn projectAllowsNodeServiceEvent(
+        self: *ControlPlane,
+        project_id: []const u8,
+        agent_id: ?[]const u8,
+        project_token: ?[]const u8,
+        node_id: []const u8,
+        is_admin: bool,
+    ) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        _ = self.reapExpiredLeasesLocked(std.time.milliTimestamp());
+
+        const project = self.projects.get(project_id) orelse return false;
+        if (project.kind == .spider_web_builtin and !is_admin) {
+            const actor = agent_id orelse return false;
+            if (!self.isPrimaryAgent(actor)) return false;
+        }
+        requireProjectActionAccess(&project, .observe, agent_id, project_token, is_admin) catch return false;
+
+        for (project.mounts.items) |mount| {
+            if (std.mem.eql(u8, mount.node_id, node_id)) return true;
+        }
+        return false;
+    }
+
     pub fn deinit(self: *ControlPlane) void {
         self.clearState();
 
@@ -862,6 +902,10 @@ pub const ControlPlane = struct {
         const node = self.nodes.getPtr(node_id) orelse return ControlPlaneError.NodeNotFound;
         if (!std.mem.eql(u8, node.secret, node_secret)) return ControlPlaneError.NodeAuthFailed;
 
+        var previous = std.ArrayListUnmanaged(NodeServiceDigest){};
+        defer deinitNodeServiceDigests(self.allocator, &previous);
+        try snapshotNodeServiceDigests(self.allocator, node.services.items, &previous);
+
         if (obj.get("platform")) |platform_value| {
             applyPlatformUpdateFromValue(self.allocator, node, platform_value) catch return ControlPlaneError.InvalidPayload;
         }
@@ -872,8 +916,14 @@ pub const ControlPlane = struct {
             node_service_catalog.replaceServicesFromJsonValue(self.allocator, &node.services, services_value) catch return ControlPlaneError.InvalidPayload;
         }
 
+        var current = std.ArrayListUnmanaged(NodeServiceDigest){};
+        defer deinitNodeServiceDigests(self.allocator, &current);
+        try snapshotNodeServiceDigests(self.allocator, node.services.items, &current);
+        const delta_json = try renderNodeServiceDeltaJson(self.allocator, &previous, &current);
+        defer self.allocator.free(delta_json);
+
         self.persistSnapshotBestEffortLocked();
-        return self.renderNodeServicePayload(node_id);
+        return self.renderNodeServicePayload(node_id, delta_json);
     }
 
     pub fn nodeServiceGet(self: *ControlPlane, payload_json: ?[]const u8) ![]u8 {
@@ -888,7 +938,7 @@ pub const ControlPlane = struct {
         const node_id = getRequiredString(obj, "node_id") catch return ControlPlaneError.MissingField;
         try validateIdentifier(node_id, 128);
         _ = self.nodes.get(node_id) orelse return ControlPlaneError.NodeNotFound;
-        return self.renderNodeServicePayload(node_id);
+        return self.renderNodeServicePayload(node_id, null);
     }
 
     pub fn nodeJoin(self: *ControlPlane, payload_json: ?[]const u8) ![]u8 {
@@ -2759,7 +2809,7 @@ pub const ControlPlane = struct {
         );
     }
 
-    fn renderNodeServicePayload(self: *ControlPlane, node_id: []const u8) ![]u8 {
+    fn renderNodeServicePayload(self: *ControlPlane, node_id: []const u8, delta_json: ?[]const u8) ![]u8 {
         const node = self.nodes.get(node_id) orelse return ControlPlaneError.NodeNotFound;
         const escaped_id = try jsonEscape(self.allocator, node.id);
         defer self.allocator.free(escaped_id);
@@ -2797,8 +2847,156 @@ pub const ControlPlane = struct {
             if (idx != 0) try out.append(self.allocator, ',');
             try node_service_catalog.appendServiceJson(self.allocator, &out, service);
         }
-        try out.appendSlice(self.allocator, "]}");
+        try out.append(self.allocator, ']');
+        if (delta_json) |delta| {
+            try out.appendSlice(self.allocator, ",\"service_delta\":");
+            try out.appendSlice(self.allocator, delta);
+        }
+        try out.append(self.allocator, '}');
         return out.toOwnedSlice(self.allocator);
+    }
+
+    fn snapshotNodeServiceDigests(
+        allocator: std.mem.Allocator,
+        services: []const node_service_catalog.ServiceDescriptor,
+        out: *std.ArrayListUnmanaged(NodeServiceDigest),
+    ) !void {
+        for (services) |service| {
+            const service_id = try allocator.dupe(u8, service.service_id);
+            errdefer allocator.free(service_id);
+            const version = try allocator.dupe(u8, service.version);
+            errdefer allocator.free(version);
+            try out.append(allocator, .{
+                .service_id = service_id,
+                .version = version,
+                .digest = node_service_catalog.serviceDigest64(service),
+            });
+        }
+    }
+
+    fn deinitNodeServiceDigests(
+        allocator: std.mem.Allocator,
+        digests: *std.ArrayListUnmanaged(NodeServiceDigest),
+    ) void {
+        for (digests.items) |*entry| entry.deinit(allocator);
+        digests.deinit(allocator);
+        digests.* = .{};
+    }
+
+    fn renderNodeServiceDeltaJson(
+        allocator: std.mem.Allocator,
+        previous: *const std.ArrayListUnmanaged(NodeServiceDigest),
+        current: *const std.ArrayListUnmanaged(NodeServiceDigest),
+    ) ![]u8 {
+        var previous_index = std.StringHashMapUnmanaged(usize){};
+        defer previous_index.deinit(allocator);
+
+        for (previous.items, 0..) |entry, idx| {
+            try previous_index.put(allocator, entry.service_id, idx);
+        }
+
+        const seen_previous = try allocator.alloc(bool, previous.items.len);
+        defer allocator.free(seen_previous);
+        @memset(seen_previous, false);
+
+        var changed = false;
+        for (current.items) |entry| {
+            if (previous_index.get(entry.service_id)) |idx| {
+                seen_previous[idx] = true;
+                const before = previous.items[idx];
+                if (before.digest != entry.digest) changed = true;
+            } else {
+                changed = true;
+            }
+        }
+        for (seen_previous) |seen| {
+            if (!seen) {
+                changed = true;
+                break;
+            }
+        }
+
+        var out = std.ArrayListUnmanaged(u8){};
+        defer out.deinit(allocator);
+        try out.appendSlice(allocator, "{\"changed\":");
+        try out.appendSlice(allocator, if (changed) "true" else "false");
+        try out.appendSlice(allocator, ",\"timestamp_ms\":");
+        try out.writer(allocator).print("{d}", .{std.time.milliTimestamp()});
+
+        try out.appendSlice(allocator, ",\"added\":[");
+        var first_added = true;
+        for (current.items) |entry| {
+            if (previous_index.contains(entry.service_id)) continue;
+            if (!first_added) try out.append(allocator, ',');
+            first_added = false;
+            try appendNodeServiceDigestJson(allocator, &out, entry.service_id, entry.version, entry.digest);
+        }
+        try out.appendSlice(allocator, "],\"updated\":[");
+        var first_updated = true;
+        for (current.items) |entry| {
+            const prev_idx = previous_index.get(entry.service_id) orelse continue;
+            const before = previous.items[prev_idx];
+            if (before.digest == entry.digest) continue;
+            if (!first_updated) try out.append(allocator, ',');
+            first_updated = false;
+            try appendNodeServiceUpdateJson(
+                allocator,
+                &out,
+                entry.service_id,
+                entry.version,
+                entry.digest,
+                before.version,
+                before.digest,
+            );
+        }
+        try out.appendSlice(allocator, "],\"removed\":[");
+        var first_removed = true;
+        for (previous.items, 0..) |entry, idx| {
+            if (seen_previous[idx]) continue;
+            if (!first_removed) try out.append(allocator, ',');
+            first_removed = false;
+            try appendNodeServiceDigestJson(allocator, &out, entry.service_id, entry.version, entry.digest);
+        }
+        try out.appendSlice(allocator, "]}");
+        return out.toOwnedSlice(allocator);
+    }
+
+    fn appendNodeServiceDigestJson(
+        allocator: std.mem.Allocator,
+        out: *std.ArrayListUnmanaged(u8),
+        service_id: []const u8,
+        version: []const u8,
+        digest: u64,
+    ) !void {
+        const escaped_service = try jsonEscape(allocator, service_id);
+        defer allocator.free(escaped_service);
+        const escaped_version = try jsonEscape(allocator, version);
+        defer allocator.free(escaped_version);
+        try out.writer(allocator).print(
+            "{{\"service_id\":\"{s}\",\"version\":\"{s}\",\"hash\":\"0x{x:0>16}\"}}",
+            .{ escaped_service, escaped_version, digest },
+        );
+    }
+
+    fn appendNodeServiceUpdateJson(
+        allocator: std.mem.Allocator,
+        out: *std.ArrayListUnmanaged(u8),
+        service_id: []const u8,
+        version: []const u8,
+        digest: u64,
+        previous_version: []const u8,
+        previous_digest: u64,
+    ) !void {
+        const escaped_service = try jsonEscape(allocator, service_id);
+        defer allocator.free(escaped_service);
+        const escaped_version = try jsonEscape(allocator, version);
+        defer allocator.free(escaped_version);
+        const escaped_previous_version = try jsonEscape(allocator, previous_version);
+        defer allocator.free(escaped_previous_version);
+        try out.writer(allocator).print(
+            "{{\"service_id\":\"{s}\",\"version\":\"{s}\",\"hash\":\"0x{x:0>16}\",\"previous_version\":\"{s}\",\"previous_hash\":\"0x{x:0>16}\"}}",
+            .{ escaped_service, escaped_version, digest, escaped_previous_version, previous_digest },
+        );
     }
 
     fn persistSnapshotBestEffortLocked(self: *ControlPlane) void {
@@ -3742,13 +3940,21 @@ fn parseAccessMode(value: []const u8) !AccessMode {
 }
 
 fn projectActionPolicyIsEmpty(policy: *const ProjectActionPolicy) bool {
-    return policy.read == null and policy.invoke == null and policy.mount == null and policy.admin == null;
+    return policy.read == null and policy.observe == null and policy.invoke == null and policy.mount == null and policy.admin == null;
 }
 
 fn parseProjectActionPolicyFromObject(obj: std.json.ObjectMap, policy: *ProjectActionPolicy) !void {
     if (obj.get("read")) |value| {
         if (value != .string) return ControlPlaneError.InvalidPayload;
         policy.read = try parseAccessMode(value.string);
+    }
+    if (obj.get("observe")) |value| {
+        if (value != .string) return ControlPlaneError.InvalidPayload;
+        policy.observe = try parseAccessMode(value.string);
+    } else if (obj.get("watch")) |value| {
+        // `watch` is accepted as a legacy alias for `observe`.
+        if (value != .string) return ControlPlaneError.InvalidPayload;
+        policy.observe = try parseAccessMode(value.string);
     }
     if (obj.get("invoke")) |value| {
         if (value != .string) return ControlPlaneError.InvalidPayload;
@@ -3853,6 +4059,11 @@ fn appendProjectActionPolicyJson(
         if (!first) try out.append(allocator, ',');
         first = false;
         try out.writer(allocator).print("\"read\":\"{s}\"", .{accessModeName(mode)});
+    }
+    if (policy.observe) |mode| {
+        if (!first) try out.append(allocator, ',');
+        first = false;
+        try out.writer(allocator).print("\"observe\":\"{s}\"", .{accessModeName(mode)});
     }
     if (policy.invoke) |mode| {
         if (!first) try out.append(allocator, ',');
@@ -4535,7 +4746,7 @@ test "fs_control_plane: access policy enforces action modes and per-agent overri
 
     const update_policy_req = try std.fmt.allocPrint(
         allocator,
-        "{{\"project_id\":\"{s}\",\"access_policy\":{{\"actions\":{{\"mount\":\"open\"}},\"agents\":{{\"alice\":{{\"mount\":\"deny\"}}}}}}}}",
+        "{{\"project_id\":\"{s}\",\"access_policy\":{{\"actions\":{{\"mount\":\"open\",\"observe\":\"open\"}},\"agents\":{{\"alice\":{{\"mount\":\"deny\",\"observe\":\"deny\"}}}}}}}}",
         .{project_id},
     );
     defer allocator.free(update_policy_req);
@@ -4545,6 +4756,19 @@ test "fs_control_plane: access policy enforces action modes and per-agent overri
 
     try std.testing.expect(plane.projectAllowsAction(project_id, "bob", .mount, null, false));
     try std.testing.expect(!plane.projectAllowsAction(project_id, "alice", .mount, null, false));
+    try std.testing.expect(plane.projectAllowsAction(project_id, "bob", .observe, null, false));
+    try std.testing.expect(!plane.projectAllowsAction(project_id, "alice", .observe, null, false));
+
+    const mounted_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"project_id\":\"{s}\",\"node_id\":\"{s}\",\"export_name\":\"work\",\"mount_path\":\"/src\"}}",
+        .{ project_id, node_id },
+    );
+    defer allocator.free(mounted_req);
+    const mounted_json = try plane.setProjectMount(mounted_req);
+    defer allocator.free(mounted_json);
+    try std.testing.expect(plane.projectAllowsNodeServiceEvent(project_id, "bob", null, node_id, false));
+    try std.testing.expect(!plane.projectAllowsNodeServiceEvent(project_id, "alice", null, node_id, false));
 
     const rotate_req = try std.fmt.allocPrint(allocator, "{{\"project_id\":\"{s}\"}}", .{project_id});
     defer allocator.free(rotate_req);
@@ -4556,7 +4780,11 @@ test "fs_control_plane: access policy enforces action modes and per-agent overri
 
     try std.testing.expect(!plane.projectAllowsAction(project_id, "bob", .read, null, false));
     try std.testing.expect(plane.projectAllowsAction(project_id, "bob", .read, project_token, false));
+    try std.testing.expect(!plane.projectAllowsAction(project_id, "bob", .observe, null, false));
+    try std.testing.expect(plane.projectAllowsAction(project_id, "bob", .observe, project_token, false));
     try std.testing.expect(!plane.projectAllowsAction(project_id, "alice", .mount, project_token, false));
+    try std.testing.expect(plane.projectAllowsNodeServiceEvent(project_id, "bob", project_token, node_id, false));
+    try std.testing.expect(!plane.projectAllowsNodeServiceEvent(project_id, "bob", null, node_id, false));
 }
 
 test "fs_control_plane: invalid access policy payload is rejected" {
@@ -5228,6 +5456,10 @@ test "fs_control_plane: node service upsert and get stores catalog metadata" {
     defer allocator.free(upserted);
     try std.testing.expect(std.mem.indexOf(u8, upserted, "\"service_id\":\"camera\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, upserted, "\"site\":\"home-lab\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, upserted, "\"service_delta\":{\"changed\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, upserted, "\"added\":[") != null);
+    try std.testing.expect(std.mem.indexOf(u8, upserted, "\"updated\":[") != null);
+    try std.testing.expect(std.mem.indexOf(u8, upserted, "\"removed\":[") != null);
 
     const get_req = try std.fmt.allocPrint(allocator, "{{\"node_id\":\"{s}\"}}", .{node_id});
     defer allocator.free(get_req);
@@ -5236,6 +5468,50 @@ test "fs_control_plane: node service upsert and get stores catalog metadata" {
     try std.testing.expect(std.mem.indexOf(u8, fetched, "\"runtime_kind\":\"native\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, fetched, "\"service_id\":\"terminal\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, fetched, "\"state\":\"degraded\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fetched, "\"service_delta\"") == null);
+}
+
+test "fs_control_plane: node service upsert reports unchanged catalog delta" {
+    const allocator = std.testing.allocator;
+    var plane = ControlPlane.init(allocator);
+    defer plane.deinit();
+
+    const invite_json = try plane.createNodeInvite(null);
+    defer allocator.free(invite_json);
+    var invite = try std.json.parseFromSlice(std.json.Value, allocator, invite_json, .{});
+    defer invite.deinit();
+    const invite_token = invite.value.object.get("invite_token").?.string;
+
+    const join_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"invite_token\":\"{s}\",\"node_name\":\"svc-node\",\"fs_url\":\"ws://127.0.0.1:18891/v2/fs\"}}",
+        .{invite_token},
+    );
+    defer allocator.free(join_req);
+    const join_json = try plane.nodeJoin(join_req);
+    defer allocator.free(join_json);
+    var join = try std.json.parseFromSlice(std.json.Value, allocator, join_json, .{});
+    defer join.deinit();
+    const node_id = join.value.object.get("node_id").?.string;
+    const node_secret = join.value.object.get("node_secret").?.string;
+
+    const upsert_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"node_id\":\"{s}\",\"node_secret\":\"{s}\",\"services\":[{{\"service_id\":\"camera\",\"kind\":\"camera\",\"version\":\"1\",\"state\":\"online\",\"endpoints\":[\"/nodes/svc-node/camera\"],\"capabilities\":{{\"still\":true}}}}]}}",
+        .{ node_id, node_secret },
+    );
+    defer allocator.free(upsert_req);
+
+    const first = try plane.nodeServiceUpsert(upsert_req);
+    defer allocator.free(first);
+    try std.testing.expect(std.mem.indexOf(u8, first, "\"service_delta\":{\"changed\":true") != null);
+
+    const second = try plane.nodeServiceUpsert(upsert_req);
+    defer allocator.free(second);
+    try std.testing.expect(std.mem.indexOf(u8, second, "\"service_delta\":{\"changed\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, second, "\"added\":[]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, second, "\"updated\":[]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, second, "\"removed\":[]") != null);
 }
 
 test "fs_control_plane: projectUp requires project_token for existing non-builtin project" {

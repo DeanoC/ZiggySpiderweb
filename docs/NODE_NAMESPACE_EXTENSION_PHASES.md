@@ -90,11 +90,59 @@ Status: completed
   - `scripts/acheron-multi-node-runtime.sh`
   - `docs/MULTI_NODE_RUNTIME_HARNESS.md`
 
+## Phase 7 - Node Service Event Stream + GUI Diagnostics
+
+Status: completed
+
+- Added control-channel node service subscription flow:
+  - `control.node_service_watch`
+  - `control.node_service_unwatch`
+  - pushed `control.node_service_event` frames
+- `control.node_service_upsert` now computes and returns `service_delta`:
+  - `changed`
+  - `timestamp_ms`
+  - `added[]`, `updated[]`, `removed[]`
+  - per-entry digest hash + version metadata
+- Server now broadcasts node service events to active watchers (optional
+  `node_id` filter).
+- CLI now supports live watch mode:
+  - `zss node watch [node_id]`
+- GUI now handles `control.node_service_event` and surfaces the stream in Debug
+  diagnostics, including explicit node-service watch status.
+- Added/updated tests for:
+  - service delta generation
+  - node service watch push delivery
+  - payload helper extraction/parsing
+
+## Phase 8 - Scoped Watch Controls + Replay Persistence + Policy
+
+Status: completed
+
+- Server-side node service event stream now supports:
+  - persisted history in `<ltm>/node-service-events.ndjson`
+  - bounded in-memory replay ring for immediate watch replays
+  - `replay_limit` request option on `control.node_service_watch`
+- Watch delivery policy is now role and project aware:
+  - role gates:
+    - `SPIDERWEB_NODE_SERVICE_WATCH_ALLOW_ADMIN`
+    - `SPIDERWEB_NODE_SERVICE_WATCH_ALLOW_USER`
+  - per-user/project stream filtering based on mounted nodes and
+    `access_policy.actions.observe`
+- Added server-level helper/tests for:
+  - watch request parsing
+  - user visibility gating to mounted nodes
+- GUI Debug panel now includes:
+  - node watch filter input (`node_id`)
+  - replay limit input
+  - apply/unwatch controls
+  - quick jump action to `/nodes/<node_id>/fs` from selected
+    `control.node_service_event`
+
 ## Next Backlog
 
-- Add node-service event stream for manifest reload deltas over control channel
-  (subscribe/push instead of polling).
-- Add full runtime-manager driver bindings so supervision thread can perform
-  active process/plugin health probes for live namespace drivers.
-- Add GUI workflow for manifest/service diff visibility and per-service reload
-  diagnostics.
+- Add CLI flags for `node watch` replay controls (`--replay-limit`) to match
+  GUI/server capabilities.
+- Add event-log rotation/retention controls for
+  `node-service-events.ndjson` (parity with debug stream archive handling).
+- Add project-scoped watch UX in GUI (explicit project override preview and
+  policy explainers for denied streams).

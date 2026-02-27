@@ -36,6 +36,33 @@ pub const ServiceDescriptor = struct {
     }
 };
 
+pub fn serviceDigest64(service: ServiceDescriptor) u64 {
+    var hasher = std.hash.Wyhash.init(0);
+    hashField(&hasher, service.service_id);
+    hashField(&hasher, service.kind);
+    hashField(&hasher, service.version);
+    hashField(&hasher, service.state);
+    hashField(&hasher, service.capabilities_json);
+    hashField(&hasher, service.mounts_json);
+    hashField(&hasher, service.ops_json);
+    hashField(&hasher, service.runtime_json);
+    hashField(&hasher, service.permissions_json);
+    hashField(&hasher, service.schema_json);
+    if (service.help_md) |help| {
+        hasher.update(&.{1});
+        hashField(&hasher, help);
+    } else {
+        hasher.update(&.{0});
+    }
+    var endpoint_count_buf: [8]u8 = undefined;
+    std.mem.writeInt(u64, &endpoint_count_buf, @intCast(service.endpoints.items.len), .little);
+    hasher.update(&endpoint_count_buf);
+    for (service.endpoints.items) |endpoint| {
+        hashField(&hasher, endpoint);
+    }
+    return hasher.final();
+}
+
 pub fn deinitServices(
     allocator: std.mem.Allocator,
     services: *std.ArrayListUnmanaged(ServiceDescriptor),
@@ -260,6 +287,13 @@ fn jsonEscape(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
     }
 
     return out.toOwnedSlice(allocator);
+}
+
+fn hashField(hasher: *std.hash.Wyhash, value: []const u8) void {
+    var len_buf: [8]u8 = undefined;
+    std.mem.writeInt(u64, &len_buf, @intCast(value.len), .little);
+    hasher.update(&len_buf);
+    hasher.update(value);
 }
 
 test "node_service_catalog: parses and re-renders services array" {
