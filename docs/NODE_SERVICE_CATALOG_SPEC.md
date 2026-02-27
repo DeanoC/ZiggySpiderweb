@@ -117,6 +117,21 @@ Response fields:
   `mount_path` values.
 - `ops`, `runtime`, `permissions`, and `schema` must be JSON objects.
 
+## WorldFS Permission Projection
+
+`/nodes/<node_id>/services/*` visibility for non-admin sessions evaluates
+service `permissions` metadata:
+
+- `allow_roles` (`array<string>`, optional):
+  - when present, non-admin visibility requires `"user"` (or `"all"` / `"*"`)
+- `default` (`string`, optional):
+  - `"deny"` / `"deny-by-default"` hides the service for non-admin sessions
+    when no user role allow-list is present
+- `require_project_token` / `project_token_required` (`bool`, optional):
+  - when true, non-admin visibility requires a bound `project_token`
+
+Admin sessions bypass service permission filtering.
+
 ## `spiderweb-fs-node` Provider Mapping
 
 When `spiderweb-fs-node` runs in control daemon mode (`--control-url`), it auto-upserts service metadata:

@@ -5463,6 +5463,7 @@ fn handleWebSocketConnection(
                                                 .agents_dir = runtime_registry.runtime_config.agents_dir,
                                                 .projects_dir = "projects",
                                                 .control_plane = &runtime_registry.control_plane,
+                                                .is_admin = principal.role == .admin,
                                             },
                                         );
                                     }
@@ -5953,6 +5954,7 @@ fn handleWebSocketConnection(
                                     .agents_dir = runtime_registry.runtime_config.agents_dir,
                                     .projects_dir = "projects",
                                     .control_plane = &runtime_registry.control_plane,
+                                    .is_admin = principal.role == .admin,
                                 },
                             );
                             fsrpc.?.setDebugStreamEnabled(debug_stream_enabled);
@@ -5972,6 +5974,7 @@ fn handleWebSocketConnection(
                                         .agents_dir = runtime_registry.runtime_config.agents_dir,
                                         .projects_dir = "projects",
                                         .control_plane = &runtime_registry.control_plane,
+                                        .is_admin = principal.role == .admin,
                                     },
                                 );
                                 const next_bound_session_key = try allocator.dupe(u8, target_session_key);

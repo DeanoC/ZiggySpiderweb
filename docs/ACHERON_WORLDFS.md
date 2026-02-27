@@ -53,6 +53,9 @@ follow the same service view:
 Node-level `CAPS.json` uses the same effective service view.
 If a node advertises an explicit empty service catalog, runtime exposes no fallback
 policy roots for that node.
+For non-admin sessions, service visibility is filtered by each service
+`PERMISSIONS.json` policy (`allow_roles`, `default`, and token requirements).
+Admin sessions bypass this filter.
 
 For phase tracking and backlog, see `docs/NODE_NAMESPACE_EXTENSION_PHASES.md`.
 

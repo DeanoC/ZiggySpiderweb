@@ -69,6 +69,7 @@ pub const Session = struct {
         agents_dir: []const u8 = "agents",
         projects_dir: []const u8 = "projects",
         control_plane: ?*fs_control_plane.ControlPlane = null,
+        is_admin: bool = false,
     };
 
     allocator: std.mem.Allocator,
@@ -80,6 +81,7 @@ pub const Session = struct {
     agents_dir: []u8,
     projects_dir: []u8,
     control_plane: ?*fs_control_plane.ControlPlane = null,
+    is_admin: bool = false,
 
     nodes: std.AutoHashMapUnmanaged(u32, Node) = .{},
     fids: std.AutoHashMapUnmanaged(u32, FidState) = .{},
@@ -144,6 +146,7 @@ pub const Session = struct {
             .agents_dir = owned_agents_dir,
             .projects_dir = owned_projects_dir,
             .control_plane = options.control_plane,
+            .is_admin = options.is_admin,
         };
         try self.seedNamespace();
         return self;
@@ -181,6 +184,7 @@ pub const Session = struct {
                 .agents_dir = self.agents_dir,
                 .projects_dir = self.projects_dir,
                 .control_plane = self.control_plane,
+                .is_admin = self.is_admin,
             },
         );
     }
@@ -2032,6 +2036,49 @@ pub const Session = struct {
         return id;
     }
 
+    fn canAccessServiceWithPermissions(self: *Session, permissions_json: []const u8) bool {
+        if (self.is_admin) return true;
+        if (permissions_json.len == 0) return true;
+
+        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, permissions_json, .{}) catch return true;
+        defer parsed.deinit();
+        if (parsed.value != .object) return true;
+
+        const obj = parsed.value.object;
+
+        const require_project_token = blk: {
+            if (obj.get("require_project_token")) |value| {
+                if (value == .bool) break :blk value.bool;
+            }
+            if (obj.get("project_token_required")) |value| {
+                if (value == .bool) break :blk value.bool;
+            }
+            break :blk false;
+        };
+        if (require_project_token and self.project_token == null) return false;
+
+        if (obj.get("allow_roles")) |roles| {
+            if (roles == .array) {
+                for (roles.array.items) |role| {
+                    if (role != .string) continue;
+                    if (std.mem.eql(u8, role.string, "user")) return true;
+                    if (std.mem.eql(u8, role.string, "*")) return true;
+                    if (std.mem.eql(u8, role.string, "all")) return true;
+                }
+                return false;
+            }
+        }
+
+        if (obj.get("default")) |value| {
+            if (value == .string) {
+                if (std.mem.eql(u8, value.string, "deny-by-default")) return false;
+                if (std.mem.eql(u8, value.string, "deny")) return false;
+            }
+        }
+
+        return true;
+    }
+
     fn appendServiceIndexEntry(
         self: *Session,
         out: *std.ArrayListUnmanaged(u8),
@@ -2079,6 +2126,7 @@ pub const Session = struct {
                 var catalog = catalog_value;
                 defer catalog.deinit(self.allocator);
                 for (catalog.items.items) |service| {
+                    if (!self.canAccessServiceWithPermissions(service.permissions_json)) continue;
                     try self.addNodeServiceEntry(
                         services_root,
                         service.service_id,
@@ -2136,22 +2184,25 @@ pub const Session = struct {
             defer self.allocator.free(mounts);
             const endpoint = try std.fmt.allocPrint(self.allocator, "/nodes/{s}/fs", .{node.id});
             defer self.allocator.free(endpoint);
-            try self.addNodeServiceEntry(
-                services_root,
-                "fs",
-                "fs",
-                "online",
-                endpoint,
-                caps,
-                mounts,
-                "{\"model\":\"namespace\"}",
-                "{\"type\":\"builtin\"}",
-                "{\"scope\":\"project\"}",
-                "{\"model\":\"filesystem\"}",
-                "Project node filesystem export.",
-            );
-            try view.observe(self.allocator, node.id, "fs", "fs", endpoint, mounts);
-            try self.appendServiceIndexEntry(&services_index, &services_index_first, "fs", "fs", "online", endpoint);
+            const permissions = "{\"default\":\"allow-by-default\",\"allow_roles\":[\"admin\",\"user\"],\"scope\":\"project\"}";
+            if (self.canAccessServiceWithPermissions(permissions)) {
+                try self.addNodeServiceEntry(
+                    services_root,
+                    "fs",
+                    "fs",
+                    "online",
+                    endpoint,
+                    caps,
+                    mounts,
+                    "{\"model\":\"namespace\"}",
+                    "{\"type\":\"builtin\"}",
+                    permissions,
+                    "{\"model\":\"filesystem\"}",
+                    "Project node filesystem export.",
+                );
+                try view.observe(self.allocator, node.id, "fs", "fs", endpoint, mounts);
+                try self.appendServiceIndexEntry(&services_index, &services_index_first, "fs", "fs", "online", endpoint);
+            }
         }
         if (node.resources.camera) {
             const caps = "{\"still\":true}";
@@ -2163,22 +2214,25 @@ pub const Session = struct {
             defer self.allocator.free(mounts);
             const endpoint = try std.fmt.allocPrint(self.allocator, "/nodes/{s}/camera", .{node.id});
             defer self.allocator.free(endpoint);
-            try self.addNodeServiceEntry(
-                services_root,
-                "camera",
-                "camera",
-                "online",
-                endpoint,
-                caps,
-                mounts,
-                "{\"model\":\"namespace\"}",
-                "{\"type\":\"builtin\"}",
-                "{\"scope\":\"node\"}",
-                "{\"model\":\"camera\"}",
-                "Camera capture namespace.",
-            );
-            try view.observe(self.allocator, node.id, "camera", "camera", endpoint, mounts);
-            try self.appendServiceIndexEntry(&services_index, &services_index_first, "camera", "camera", "online", endpoint);
+            const permissions = "{\"default\":\"allow-by-default\",\"allow_roles\":[\"admin\",\"user\"],\"scope\":\"node\"}";
+            if (self.canAccessServiceWithPermissions(permissions)) {
+                try self.addNodeServiceEntry(
+                    services_root,
+                    "camera",
+                    "camera",
+                    "online",
+                    endpoint,
+                    caps,
+                    mounts,
+                    "{\"model\":\"namespace\"}",
+                    "{\"type\":\"builtin\"}",
+                    permissions,
+                    "{\"model\":\"camera\"}",
+                    "Camera capture namespace.",
+                );
+                try view.observe(self.allocator, node.id, "camera", "camera", endpoint, mounts);
+                try self.appendServiceIndexEntry(&services_index, &services_index_first, "camera", "camera", "online", endpoint);
+            }
         }
         if (node.resources.screen) {
             const caps = "{\"capture\":true}";
@@ -2190,22 +2244,25 @@ pub const Session = struct {
             defer self.allocator.free(mounts);
             const endpoint = try std.fmt.allocPrint(self.allocator, "/nodes/{s}/screen", .{node.id});
             defer self.allocator.free(endpoint);
-            try self.addNodeServiceEntry(
-                services_root,
-                "screen",
-                "screen",
-                "online",
-                endpoint,
-                caps,
-                mounts,
-                "{\"model\":\"namespace\"}",
-                "{\"type\":\"builtin\"}",
-                "{\"scope\":\"node\"}",
-                "{\"model\":\"screen\"}",
-                "Screen capture namespace.",
-            );
-            try view.observe(self.allocator, node.id, "screen", "screen", endpoint, mounts);
-            try self.appendServiceIndexEntry(&services_index, &services_index_first, "screen", "screen", "online", endpoint);
+            const permissions = "{\"default\":\"allow-by-default\",\"allow_roles\":[\"admin\",\"user\"],\"scope\":\"node\"}";
+            if (self.canAccessServiceWithPermissions(permissions)) {
+                try self.addNodeServiceEntry(
+                    services_root,
+                    "screen",
+                    "screen",
+                    "online",
+                    endpoint,
+                    caps,
+                    mounts,
+                    "{\"model\":\"namespace\"}",
+                    "{\"type\":\"builtin\"}",
+                    permissions,
+                    "{\"model\":\"screen\"}",
+                    "Screen capture namespace.",
+                );
+                try view.observe(self.allocator, node.id, "screen", "screen", endpoint, mounts);
+                try self.appendServiceIndexEntry(&services_index, &services_index_first, "screen", "screen", "online", endpoint);
+            }
         }
         if (node.resources.user) {
             const caps = "{\"interaction\":true}";
@@ -2217,22 +2274,25 @@ pub const Session = struct {
             defer self.allocator.free(mounts);
             const endpoint = try std.fmt.allocPrint(self.allocator, "/nodes/{s}/user", .{node.id});
             defer self.allocator.free(endpoint);
-            try self.addNodeServiceEntry(
-                services_root,
-                "user",
-                "user",
-                "online",
-                endpoint,
-                caps,
-                mounts,
-                "{\"model\":\"namespace\"}",
-                "{\"type\":\"builtin\"}",
-                "{\"scope\":\"node\"}",
-                "{\"model\":\"user\"}",
-                "User interaction namespace.",
-            );
-            try view.observe(self.allocator, node.id, "user", "user", endpoint, mounts);
-            try self.appendServiceIndexEntry(&services_index, &services_index_first, "user", "user", "online", endpoint);
+            const permissions = "{\"default\":\"allow-by-default\",\"allow_roles\":[\"admin\",\"user\"],\"scope\":\"node\"}";
+            if (self.canAccessServiceWithPermissions(permissions)) {
+                try self.addNodeServiceEntry(
+                    services_root,
+                    "user",
+                    "user",
+                    "online",
+                    endpoint,
+                    caps,
+                    mounts,
+                    "{\"model\":\"namespace\"}",
+                    "{\"type\":\"builtin\"}",
+                    permissions,
+                    "{\"model\":\"user\"}",
+                    "User interaction namespace.",
+                );
+                try view.observe(self.allocator, node.id, "user", "user", endpoint, mounts);
+                try self.appendServiceIndexEntry(&services_index, &services_index_first, "user", "user", "online", endpoint);
+            }
         }
 
         for (node.terminals.items) |terminal_id| {
@@ -2254,22 +2314,25 @@ pub const Session = struct {
                 .{ service_id, node.id, terminal_id },
             );
             defer self.allocator.free(mounts);
-            try self.addNodeServiceEntry(
-                services_root,
-                service_id,
-                "terminal",
-                "online",
-                endpoint,
-                caps,
-                mounts,
-                "{\"model\":\"namespace\"}",
-                "{\"type\":\"builtin\"}",
-                "{\"scope\":\"node\"}",
-                "{\"model\":\"terminal\"}",
-                "Interactive terminal namespace.",
-            );
-            try view.observe(self.allocator, node.id, "terminal", service_id, endpoint, mounts);
-            try self.appendServiceIndexEntry(&services_index, &services_index_first, service_id, "terminal", "online", endpoint);
+            const permissions = "{\"default\":\"allow-by-default\",\"allow_roles\":[\"admin\",\"user\"],\"scope\":\"node\"}";
+            if (self.canAccessServiceWithPermissions(permissions)) {
+                try self.addNodeServiceEntry(
+                    services_root,
+                    service_id,
+                    "terminal",
+                    "online",
+                    endpoint,
+                    caps,
+                    mounts,
+                    "{\"model\":\"namespace\"}",
+                    "{\"type\":\"builtin\"}",
+                    permissions,
+                    "{\"model\":\"terminal\"}",
+                    "Interactive terminal namespace.",
+                );
+                try view.observe(self.allocator, node.id, "terminal", service_id, endpoint, mounts);
+                try self.appendServiceIndexEntry(&services_index, &services_index_first, service_id, "terminal", "online", endpoint);
+            }
         }
 
         try services_index.append(self.allocator, ']');
@@ -4417,7 +4480,7 @@ test "fsrpc_session: control-plane mounts expose custom node roots and metadata 
     defer allocator.free(escaped_node_secret);
     const upsert_req = try std.fmt.allocPrint(
         allocator,
-        "{{\"node_id\":\"{s}\",\"node_secret\":\"{s}\",\"services\":[{{\"service_id\":\"gdrive-main\",\"kind\":\"gdrive\",\"version\":\"1\",\"state\":\"online\",\"endpoints\":[\"/nodes/{s}/services/gdrive-main\"],\"capabilities\":{{\"provider\":\"google\"}},\"mounts\":[{{\"mount_id\":\"drive-main\",\"mount_path\":\"/nodes/{s}/drive/main\",\"state\":\"online\"}}],\"ops\":{{\"model\":\"namespace\"}},\"runtime\":{{\"type\":\"native_proc\"}},\"permissions\":{{\"default\":\"deny-by-default\"}},\"schema\":{{\"model\":\"namespace-mount\"}},\"help_md\":\"Google Drive namespace mount\"}}]}}",
+        "{{\"node_id\":\"{s}\",\"node_secret\":\"{s}\",\"services\":[{{\"service_id\":\"gdrive-main\",\"kind\":\"gdrive\",\"version\":\"1\",\"state\":\"online\",\"endpoints\":[\"/nodes/{s}/services/gdrive-main\"],\"capabilities\":{{\"provider\":\"google\"}},\"mounts\":[{{\"mount_id\":\"drive-main\",\"mount_path\":\"/nodes/{s}/drive/main\",\"state\":\"online\"}}],\"ops\":{{\"model\":\"namespace\"}},\"runtime\":{{\"type\":\"native_proc\"}},\"permissions\":{{\"default\":\"deny-by-default\",\"allow_roles\":[\"admin\",\"user\"]}},\"schema\":{{\"model\":\"namespace-mount\"}},\"help_md\":\"Google Drive namespace mount\"}}]}}",
         .{ escaped_node_id, escaped_node_secret, escaped_node_id, escaped_node_id },
     );
     defer allocator.free(upsert_req);
@@ -4494,6 +4557,112 @@ test "fsrpc_session: control-plane mounts expose custom node roots and metadata 
     try std.testing.expect(std.mem.indexOf(u8, runtime_node.content, "\"type\":\"native_proc\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, permissions_node.content, "\"deny-by-default\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, readme_node.content, "Google Drive namespace mount") != null);
+}
+
+test "fsrpc_session: service permissions enforce deny-by-default with admin bypass" {
+    const allocator = std.testing.allocator;
+
+    var control_plane = fs_control_plane.ControlPlane.init(allocator);
+    defer control_plane.deinit();
+
+    const ensured = try control_plane.ensureNode("edge-secure-service", "ws://127.0.0.1:18891/v2/fs", 60_000);
+    defer allocator.free(ensured);
+    var ensured_parsed = try std.json.parseFromSlice(std.json.Value, allocator, ensured, .{});
+    defer ensured_parsed.deinit();
+    if (ensured_parsed.value != .object) return error.TestExpectedResponse;
+    const node_id = ensured_parsed.value.object.get("node_id") orelse return error.TestExpectedResponse;
+    if (node_id != .string) return error.TestExpectedResponse;
+    const node_secret = ensured_parsed.value.object.get("node_secret") orelse return error.TestExpectedResponse;
+    if (node_secret != .string) return error.TestExpectedResponse;
+
+    const escaped_node_id = try unified.jsonEscape(allocator, node_id.string);
+    defer allocator.free(escaped_node_id);
+    const escaped_node_secret = try unified.jsonEscape(allocator, node_secret.string);
+    defer allocator.free(escaped_node_secret);
+    const upsert_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"node_id\":\"{s}\",\"node_secret\":\"{s}\",\"services\":[{{\"service_id\":\"secure-main\",\"kind\":\"secure\",\"version\":\"1\",\"state\":\"online\",\"endpoints\":[\"/nodes/{s}/secure/main\"],\"capabilities\":{{\"invoke\":true}},\"mounts\":[{{\"mount_id\":\"secure-main\",\"mount_path\":\"/nodes/{s}/secure/main\",\"state\":\"online\"}}],\"ops\":{{\"model\":\"namespace\"}},\"runtime\":{{\"type\":\"native_proc\"}},\"permissions\":{{\"default\":\"deny-by-default\"}},\"schema\":{{\"model\":\"namespace-mount\"}},\"help_md\":\"Secure namespace mount\"}}]}}",
+        .{ escaped_node_id, escaped_node_secret, escaped_node_id, escaped_node_id },
+    );
+    defer allocator.free(upsert_req);
+    const upserted = try control_plane.nodeServiceUpsert(upsert_req);
+    defer allocator.free(upserted);
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const root = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+    const agents_dir = try std.fmt.allocPrint(allocator, "{s}/agents", .{root});
+    defer allocator.free(agents_dir);
+    const projects_dir = try std.fmt.allocPrint(allocator, "{s}/projects", .{root});
+    defer allocator.free(projects_dir);
+    const agent_policy_dir = try std.fmt.allocPrint(allocator, "{s}/default", .{agents_dir});
+    defer allocator.free(agent_policy_dir);
+    const project_dir = try std.fmt.allocPrint(allocator, "{s}/proj-secure", .{projects_dir});
+    defer allocator.free(project_dir);
+    try std.fs.cwd().makePath(agent_policy_dir);
+    try std.fs.cwd().makePath(project_dir);
+
+    const agent_policy_path = try std.fmt.allocPrint(allocator, "{s}/agent_policy.json", .{agent_policy_dir});
+    defer allocator.free(agent_policy_path);
+    const agent_policy_json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"project_id\":\"proj-secure\",\"nodes\":[{{\"id\":\"{s}\",\"resources\":{{\"fs\":false,\"camera\":false,\"screen\":false,\"user\":false}},\"terminals\":[]}}],\"visible_agents\":[\"default\"],\"project_links\":[]}}",
+        .{escaped_node_id},
+    );
+    defer allocator.free(agent_policy_json);
+    try std.fs.cwd().writeFile(.{
+        .sub_path = agent_policy_path,
+        .data = agent_policy_json,
+    });
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var user_session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "default",
+        .{
+            .project_id = "proj-secure",
+            .agents_dir = agents_dir,
+            .projects_dir = projects_dir,
+            .control_plane = &control_plane,
+            .is_admin = false,
+        },
+    );
+    defer user_session.deinit();
+
+    const user_nodes_root = user_session.lookupChild(user_session.root_id, "nodes") orelse return error.TestExpectedResponse;
+    const user_node_dir = user_session.lookupChild(user_nodes_root, node_id.string) orelse return error.TestExpectedResponse;
+    const user_services_root = user_session.lookupChild(user_node_dir, "services") orelse return error.TestExpectedResponse;
+    try std.testing.expect(user_session.lookupChild(user_services_root, "secure-main") == null);
+    try std.testing.expect(user_session.lookupChild(user_node_dir, "secure") == null);
+
+    var admin_session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "default",
+        .{
+            .project_id = "proj-secure",
+            .agents_dir = agents_dir,
+            .projects_dir = projects_dir,
+            .control_plane = &control_plane,
+            .is_admin = true,
+        },
+    );
+    defer admin_session.deinit();
+
+    const admin_nodes_root = admin_session.lookupChild(admin_session.root_id, "nodes") orelse return error.TestExpectedResponse;
+    const admin_node_dir = admin_session.lookupChild(admin_nodes_root, node_id.string) orelse return error.TestExpectedResponse;
+    const admin_services_root = admin_session.lookupChild(admin_node_dir, "services") orelse return error.TestExpectedResponse;
+    try std.testing.expect(admin_session.lookupChild(admin_services_root, "secure-main") != null);
+    try std.testing.expect(admin_session.lookupChild(admin_node_dir, "secure") != null);
 }
 
 test "fsrpc_session: control-plane registered nodes appear under global nodes namespace" {
