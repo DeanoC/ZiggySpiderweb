@@ -5130,3 +5130,273 @@ test "fsrpc_session: pairing catalog visibility and node invoke integration flow
     _ = std.base64.standard.Decoder.decode(status_decoded, status_data_b64) catch return error.TestExpectedResponse;
     try std.testing.expect(std.mem.indexOf(u8, status_decoded, "\"state\":\"ok\"") != null);
 }
+
+test "fsrpc_session: multi-node discovery invoke supervision reconnect flow" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const spiderweb_node = @import("spiderweb_node");
+
+    var control_plane = fs_control_plane.ControlPlane.init(allocator);
+    defer control_plane.deinit();
+
+    const ensured_alpha = try control_plane.ensureNode("edge-alpha", "ws://127.0.0.1:18891/v2/fs", 60_000);
+    defer allocator.free(ensured_alpha);
+    var alpha_parsed = try std.json.parseFromSlice(std.json.Value, allocator, ensured_alpha, .{});
+    defer alpha_parsed.deinit();
+    if (alpha_parsed.value != .object) return error.TestExpectedResponse;
+    const alpha_node_id = alpha_parsed.value.object.get("node_id") orelse return error.TestExpectedResponse;
+    const alpha_node_secret = alpha_parsed.value.object.get("node_secret") orelse return error.TestExpectedResponse;
+    if (alpha_node_id != .string or alpha_node_secret != .string) return error.TestExpectedResponse;
+
+    const ensured_beta = try control_plane.ensureNode("edge-beta", "ws://127.0.0.1:18892/v2/fs", 60_000);
+    defer allocator.free(ensured_beta);
+    var beta_parsed = try std.json.parseFromSlice(std.json.Value, allocator, ensured_beta, .{});
+    defer beta_parsed.deinit();
+    if (beta_parsed.value != .object) return error.TestExpectedResponse;
+    const beta_node_id = beta_parsed.value.object.get("node_id") orelse return error.TestExpectedResponse;
+    const beta_node_secret = beta_parsed.value.object.get("node_secret") orelse return error.TestExpectedResponse;
+    if (beta_node_id != .string or beta_node_secret != .string) return error.TestExpectedResponse;
+
+    const escaped_alpha_id = try unified.jsonEscape(allocator, alpha_node_id.string);
+    defer allocator.free(escaped_alpha_id);
+    const escaped_alpha_secret = try unified.jsonEscape(allocator, alpha_node_secret.string);
+    defer allocator.free(escaped_alpha_secret);
+    const escaped_beta_id = try unified.jsonEscape(allocator, beta_node_id.string);
+    defer allocator.free(escaped_beta_id);
+    const escaped_beta_secret = try unified.jsonEscape(allocator, beta_node_secret.string);
+    defer allocator.free(escaped_beta_secret);
+
+    const alpha_upsert = try std.fmt.allocPrint(
+        allocator,
+        "{{\"node_id\":\"{s}\",\"node_secret\":\"{s}\",\"services\":[{{\"service_id\":\"echo-main\",\"kind\":\"utility\",\"version\":\"1\",\"state\":\"online\",\"endpoints\":[\"/nodes/{s}/echo\"],\"capabilities\":{{\"invoke\":true}},\"mounts\":[{{\"mount_id\":\"echo-main\",\"mount_path\":\"/nodes/{s}/echo\",\"state\":\"online\"}}],\"ops\":{{\"model\":\"namespace\",\"style\":\"plan9\"}},\"runtime\":{{\"type\":\"native_proc\",\"abi\":\"namespace-driver-v1\"}},\"permissions\":{{\"default\":\"deny-by-default\",\"allow_roles\":[\"admin\",\"user\"]}},\"schema\":{{\"model\":\"namespace-service-v1\"}},\"help_md\":\"Echo main service\"}}]}}",
+        .{ escaped_alpha_id, escaped_alpha_secret, escaped_alpha_id, escaped_alpha_id },
+    );
+    defer allocator.free(alpha_upsert);
+    const alpha_upserted = try control_plane.nodeServiceUpsert(alpha_upsert);
+    defer allocator.free(alpha_upserted);
+
+    const beta_upsert = try std.fmt.allocPrint(
+        allocator,
+        "{{\"node_id\":\"{s}\",\"node_secret\":\"{s}\",\"services\":[{{\"service_id\":\"fail-main\",\"kind\":\"utility\",\"version\":\"1\",\"state\":\"online\",\"endpoints\":[\"/nodes/{s}/fail\"],\"capabilities\":{{\"invoke\":true,\"supervision\":true}},\"mounts\":[{{\"mount_id\":\"fail-main\",\"mount_path\":\"/nodes/{s}/fail\",\"state\":\"online\"}}],\"ops\":{{\"model\":\"namespace\",\"style\":\"plan9\"}},\"runtime\":{{\"type\":\"native_proc\",\"abi\":\"namespace-driver-v1\"}},\"permissions\":{{\"default\":\"deny-by-default\",\"allow_roles\":[\"admin\",\"user\"]}},\"schema\":{{\"model\":\"namespace-service-v1\"}},\"help_md\":\"Failing service\"}}]}}",
+        .{ escaped_beta_id, escaped_beta_secret, escaped_beta_id, escaped_beta_id },
+    );
+    defer allocator.free(beta_upsert);
+    const beta_upserted = try control_plane.nodeServiceUpsert(beta_upsert);
+    defer allocator.free(beta_upserted);
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var discovered_session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "default",
+        .{
+            .control_plane = &control_plane,
+            .agents_dir = ".does-not-exist",
+            .projects_dir = ".does-not-exist",
+            .is_admin = false,
+        },
+    );
+    defer discovered_session.deinit();
+
+    const nodes_root = discovered_session.lookupChild(discovered_session.root_id, "nodes") orelse return error.TestExpectedResponse;
+    const alpha_dir = discovered_session.lookupChild(nodes_root, alpha_node_id.string) orelse return error.TestExpectedResponse;
+    const beta_dir = discovered_session.lookupChild(nodes_root, beta_node_id.string) orelse return error.TestExpectedResponse;
+    const alpha_services = discovered_session.lookupChild(alpha_dir, "services") orelse return error.TestExpectedResponse;
+    const beta_services = discovered_session.lookupChild(beta_dir, "services") orelse return error.TestExpectedResponse;
+    try std.testing.expect(discovered_session.lookupChild(alpha_services, "echo-main") != null);
+    try std.testing.expect(discovered_session.lookupChild(beta_services, "fail-main") != null);
+
+    var node_service = try spiderweb_node.fs_node_service.NodeService.init(
+        allocator,
+        &[_]spiderweb_node.fs_node_ops.ExportSpec{
+            .{
+                .name = "svc-fail-main",
+                .path = "service:fail-main",
+                .source_kind = .namespace,
+                .source_id = "service:fail-main",
+                .ro = false,
+                .namespace_service = .{
+                    .service_id = "fail-main",
+                    .runtime_kind = .native_proc,
+                    .executable_path = "sh",
+                    .args = &.{ "-lc", "exit 9" },
+                    .timeout_ms = 2_000,
+                },
+            },
+        },
+    );
+    defer node_service.deinit();
+
+    var exports_res = try node_service.handleRequestJsonWithEvents(
+        "{\"channel\":\"acheron\",\"type\":\"acheron.t_fs_exports\",\"tag\":1,\"payload\":{}}",
+    );
+    defer exports_res.deinit(allocator);
+    var exports_parsed = try std.json.parseFromSlice(std.json.Value, allocator, exports_res.response_json, .{});
+    defer exports_parsed.deinit();
+    const root_id = exports_parsed.value.object.get("payload").?.object.get("exports").?.array.items[0].object.get("root").?.integer;
+
+    const config_lookup_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"channel\":\"acheron\",\"type\":\"acheron.t_fs_lookup\",\"tag\":2,\"node\":{d},\"payload\":{{\"name\":\"config.json\"}}}}",
+        .{root_id},
+    );
+    defer allocator.free(config_lookup_req);
+    var config_lookup_res = try node_service.handleRequestJsonWithEvents(config_lookup_req);
+    defer config_lookup_res.deinit(allocator);
+    var config_lookup_parsed = try std.json.parseFromSlice(std.json.Value, allocator, config_lookup_res.response_json, .{});
+    defer config_lookup_parsed.deinit();
+    const config_id = config_lookup_parsed.value.object.get("payload").?.object.get("attr").?.object.get("id").?.integer;
+
+    const open_config_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"channel\":\"acheron\",\"type\":\"acheron.t_fs_open\",\"tag\":3,\"node\":{d},\"payload\":{{\"flags\":2}}}}",
+        .{config_id},
+    );
+    defer allocator.free(open_config_req);
+    var open_config_res = try node_service.handleRequestJsonWithEvents(open_config_req);
+    defer open_config_res.deinit(allocator);
+    var open_config_parsed = try std.json.parseFromSlice(std.json.Value, allocator, open_config_res.response_json, .{});
+    defer open_config_parsed.deinit();
+    const config_handle = open_config_parsed.value.object.get("payload").?.object.get("h").?.integer;
+
+    const config_payload = "{\"supervision\":{\"cooldown_ms\":60000,\"auto_disable_on_threshold\":false}}";
+    const config_b64_len = std.base64.standard.Encoder.calcSize(config_payload.len);
+    const config_b64 = try allocator.alloc(u8, config_b64_len);
+    defer allocator.free(config_b64);
+    _ = std.base64.standard.Encoder.encode(config_b64, config_payload);
+    const config_write_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"channel\":\"acheron\",\"type\":\"acheron.t_fs_write\",\"tag\":4,\"h\":{d},\"payload\":{{\"off\":0,\"data_b64\":\"{s}\"}}}}",
+        .{ config_handle, config_b64 },
+    );
+    defer allocator.free(config_write_req);
+    var config_write_res = try node_service.handleRequestJsonWithEvents(config_write_req);
+    defer config_write_res.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, config_write_res.response_json, "\"ok\":true") != null);
+
+    const control_lookup_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"channel\":\"acheron\",\"type\":\"acheron.t_fs_lookup\",\"tag\":5,\"node\":{d},\"payload\":{{\"name\":\"control\"}}}}",
+        .{root_id},
+    );
+    defer allocator.free(control_lookup_req);
+    var control_lookup_res = try node_service.handleRequestJsonWithEvents(control_lookup_req);
+    defer control_lookup_res.deinit(allocator);
+    var control_lookup_parsed = try std.json.parseFromSlice(std.json.Value, allocator, control_lookup_res.response_json, .{});
+    defer control_lookup_parsed.deinit();
+    const control_id = control_lookup_parsed.value.object.get("payload").?.object.get("attr").?.object.get("id").?.integer;
+
+    const invoke_lookup_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"channel\":\"acheron\",\"type\":\"acheron.t_fs_lookup\",\"tag\":6,\"node\":{d},\"payload\":{{\"name\":\"invoke.json\"}}}}",
+        .{control_id},
+    );
+    defer allocator.free(invoke_lookup_req);
+    var invoke_lookup_res = try node_service.handleRequestJsonWithEvents(invoke_lookup_req);
+    defer invoke_lookup_res.deinit(allocator);
+    var invoke_lookup_parsed = try std.json.parseFromSlice(std.json.Value, allocator, invoke_lookup_res.response_json, .{});
+    defer invoke_lookup_parsed.deinit();
+    const invoke_id = invoke_lookup_parsed.value.object.get("payload").?.object.get("attr").?.object.get("id").?.integer;
+
+    const open_invoke_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"channel\":\"acheron\",\"type\":\"acheron.t_fs_open\",\"tag\":7,\"node\":{d},\"payload\":{{\"flags\":2}}}}",
+        .{invoke_id},
+    );
+    defer allocator.free(open_invoke_req);
+    var open_invoke_res = try node_service.handleRequestJsonWithEvents(open_invoke_req);
+    defer open_invoke_res.deinit(allocator);
+    var open_invoke_parsed = try std.json.parseFromSlice(std.json.Value, allocator, open_invoke_res.response_json, .{});
+    defer open_invoke_parsed.deinit();
+    const invoke_handle = open_invoke_parsed.value.object.get("payload").?.object.get("h").?.integer;
+
+    const invoke_payload = "{}";
+    const invoke_b64_len = std.base64.standard.Encoder.calcSize(invoke_payload.len);
+    const invoke_b64 = try allocator.alloc(u8, invoke_b64_len);
+    defer allocator.free(invoke_b64);
+    _ = std.base64.standard.Encoder.encode(invoke_b64, invoke_payload);
+
+    const invoke_write_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"channel\":\"acheron\",\"type\":\"acheron.t_fs_write\",\"tag\":8,\"h\":{d},\"payload\":{{\"off\":0,\"data_b64\":\"{s}\"}}}}",
+        .{ invoke_handle, invoke_b64 },
+    );
+    defer allocator.free(invoke_write_req);
+    var invoke_write_res = try node_service.handleRequestJsonWithEvents(invoke_write_req);
+    defer invoke_write_res.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, invoke_write_res.response_json, "\"ok\":true") != null);
+
+    const invoke_retry_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"channel\":\"acheron\",\"type\":\"acheron.t_fs_write\",\"tag\":9,\"h\":{d},\"payload\":{{\"off\":0,\"data_b64\":\"{s}\"}}}}",
+        .{ invoke_handle, invoke_b64 },
+    );
+    defer allocator.free(invoke_retry_req);
+    var invoke_retry_res = try node_service.handleRequestJsonWithEvents(invoke_retry_req);
+    defer invoke_retry_res.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, invoke_retry_res.response_json, "\"ok\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, invoke_retry_res.response_json, "\"errno\":11") != null);
+
+    const stale_now = std.time.milliTimestamp();
+    control_plane.mutex.lock();
+    if (control_plane.nodes.getPtr(beta_node_id.string)) |node| {
+        node.lease_expires_at_ms = stale_now - 1_000;
+    }
+    control_plane.mutex.unlock();
+
+    var degraded_session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "default",
+        .{
+            .control_plane = &control_plane,
+            .agents_dir = ".does-not-exist",
+            .projects_dir = ".does-not-exist",
+            .is_admin = false,
+        },
+    );
+    defer degraded_session.deinit();
+
+    const degraded_nodes_root = degraded_session.lookupChild(degraded_session.root_id, "nodes") orelse return error.TestExpectedResponse;
+    const degraded_beta_dir = degraded_session.lookupChild(degraded_nodes_root, beta_node_id.string) orelse return error.TestExpectedResponse;
+    const degraded_status_id = degraded_session.lookupChild(degraded_beta_dir, "STATUS.json") orelse return error.TestExpectedResponse;
+    const degraded_status_node = degraded_session.nodes.get(degraded_status_id) orelse return error.TestExpectedResponse;
+    try std.testing.expect(std.mem.indexOf(u8, degraded_status_node.content, "\"state\":\"degraded\"") != null);
+
+    const refresh_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"node_id\":\"{s}\",\"node_secret\":\"{s}\",\"fs_url\":\"ws://127.0.0.1:18892/v2/fs\",\"lease_ttl_ms\":60000}}",
+        .{ escaped_beta_id, escaped_beta_secret },
+    );
+    defer allocator.free(refresh_req);
+    const refresh_res = try control_plane.refreshNodeLease(refresh_req);
+    defer allocator.free(refresh_res);
+
+    var recovered_session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "default",
+        .{
+            .control_plane = &control_plane,
+            .agents_dir = ".does-not-exist",
+            .projects_dir = ".does-not-exist",
+            .is_admin = false,
+        },
+    );
+    defer recovered_session.deinit();
+
+    const recovered_nodes_root = recovered_session.lookupChild(recovered_session.root_id, "nodes") orelse return error.TestExpectedResponse;
+    const recovered_beta_dir = recovered_session.lookupChild(recovered_nodes_root, beta_node_id.string) orelse return error.TestExpectedResponse;
+    const recovered_status_id = recovered_session.lookupChild(recovered_beta_dir, "STATUS.json") orelse return error.TestExpectedResponse;
+    const recovered_status_node = recovered_session.nodes.get(recovered_status_id) orelse return error.TestExpectedResponse;
+    try std.testing.expect(std.mem.indexOf(u8, recovered_status_node.content, "\"state\":\"online\"") != null);
+}
