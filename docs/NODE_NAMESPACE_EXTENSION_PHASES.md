@@ -138,11 +138,25 @@ Status: completed
   - quick jump action to `/nodes/<node_id>/fs` from selected
     `control.node_service_event`
 
+## Phase 9 - Watch UX + Retention Parity
+
+Status: completed
+
+- CLI now supports replay controls for node watch:
+  - `zss node watch [node_id] [--replay-limit <n>]`
+  - `--replay-limit=<n>` alternate form
+- Node service event log now supports rotation/retention controls:
+  - `SPIDERWEB_NODE_SERVICE_EVENT_LOG_ROTATE_MAX_BYTES`
+  - `SPIDERWEB_NODE_SERVICE_EVENT_LOG_ARCHIVE_KEEP`
+  - gzip compression when available (same runtime behavior as debug archives)
+- GUI debug panel now exposes project-scope watch preview and policy denial
+  hints for watch failures, alongside scoped filter/replay controls.
+
 ## Next Backlog
 
-- Add CLI flags for `node watch` replay controls (`--replay-limit`) to match
-  GUI/server capabilities.
-- Add event-log rotation/retention controls for
-  `node-service-events.ndjson` (parity with debug stream archive handling).
-- Add project-scoped watch UX in GUI (explicit project override preview and
-  policy explainers for denied streams).
+- Add server-side metrics for node service watch fanout/replay throughput and
+  retained event window coverage.
+- Add runtime-manager driver bindings so supervision can perform active
+  process/plugin health probes for live namespace drivers.
+- Add GUI workflow for manifest/service diff visibility and per-service reload
+  diagnostics.

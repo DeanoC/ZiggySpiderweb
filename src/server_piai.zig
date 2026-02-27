@@ -30,6 +30,7 @@ const debug_stream_archive_suffix_gz = ".ndjson.gz";
 const debug_stream_rotate_max_bytes: u64 = 8 * 1024 * 1024;
 const debug_stream_archive_keep: usize = 8;
 const node_service_event_log_filename = "node-service-events.ndjson";
+const node_service_event_archive_prefix = "node-service-events-";
 const node_service_event_history_max_default: usize = 1024;
 const local_node_export_path_env = "SPIDERWEB_LOCAL_NODE_EXPORT_PATH";
 const local_node_export_name_env = "SPIDERWEB_LOCAL_NODE_EXPORT_NAME";
@@ -61,6 +62,8 @@ const node_service_watch_allow_admin_env = "SPIDERWEB_NODE_SERVICE_WATCH_ALLOW_A
 const node_service_watch_allow_user_env = "SPIDERWEB_NODE_SERVICE_WATCH_ALLOW_USER";
 const node_service_watch_replay_max_env = "SPIDERWEB_NODE_SERVICE_WATCH_REPLAY_MAX";
 const node_service_event_history_max_env = "SPIDERWEB_NODE_SERVICE_EVENT_HISTORY_MAX";
+const node_service_event_log_rotate_max_bytes_env = "SPIDERWEB_NODE_SERVICE_EVENT_LOG_ROTATE_MAX_BYTES";
+const node_service_event_log_archive_keep_env = "SPIDERWEB_NODE_SERVICE_EVENT_LOG_ARCHIVE_KEEP";
 const metrics_port_env = "SPIDERWEB_METRICS_PORT";
 const control_protocol_version = "unified-v2";
 const fsrpc_runtime_protocol_version = "acheron-1";
@@ -265,9 +268,9 @@ const ArchiveCandidate = struct {
     timestamp_ms: u64,
 };
 
-fn parseArchiveTimestamp(name: []const u8) ?u64 {
-    if (!std.mem.startsWith(u8, name, debug_stream_archive_prefix)) return null;
-    var tail = name[debug_stream_archive_prefix.len..];
+fn parseArchiveTimestampWithPrefix(name: []const u8, prefix: []const u8) ?u64 {
+    if (!std.mem.startsWith(u8, name, prefix)) return null;
+    var tail = name[prefix.len..];
 
     if (std.mem.endsWith(u8, tail, debug_stream_archive_suffix_gz)) {
         tail = tail[0 .. tail.len - debug_stream_archive_suffix_gz.len];
@@ -282,6 +285,10 @@ fn parseArchiveTimestamp(name: []const u8) ?u64 {
     const numeric = if (dash_idx) |idx| tail[0..idx] else tail;
     if (numeric.len == 0) return null;
     return std.fmt.parseUnsigned(u64, numeric, 10) catch null;
+}
+
+fn parseArchiveTimestamp(name: []const u8) ?u64 {
+    return parseArchiveTimestampWithPrefix(name, debug_stream_archive_prefix);
 }
 
 fn commandExists(allocator: std.mem.Allocator, command: []const u8) bool {
@@ -360,6 +367,103 @@ fn pathExists(path: []const u8) bool {
     }
     std.fs.cwd().access(path, .{}) catch return false;
     return true;
+}
+
+fn allocateArchivePathWithPrefix(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    prefix: []const u8,
+) ![]u8 {
+    const now_ms_signed = std.time.milliTimestamp();
+    const now_ms: u64 = if (now_ms_signed < 0) 0 else @intCast(now_ms_signed);
+    const parent = std.fs.path.dirname(path) orelse ".";
+
+    var attempt: usize = 0;
+    while (attempt < 256) : (attempt += 1) {
+        const name = if (attempt == 0)
+            try std.fmt.allocPrint(allocator, "{s}{d}{s}", .{
+                prefix,
+                now_ms,
+                debug_stream_archive_suffix,
+            })
+        else
+            try std.fmt.allocPrint(allocator, "{s}{d}-{d}{s}", .{
+                prefix,
+                now_ms,
+                attempt,
+                debug_stream_archive_suffix,
+            });
+        defer allocator.free(name);
+
+        const candidate = try std.fs.path.join(allocator, &.{ parent, name });
+        if (!pathExists(candidate)) return candidate;
+        allocator.free(candidate);
+    }
+    return error.PathAlreadyExists;
+}
+
+fn compressArchiveGzip(allocator: std.mem.Allocator, archive_path: []const u8) !void {
+    const result = try std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &.{ "gzip", "-f", archive_path },
+        .max_output_bytes = 16 * 1024,
+    });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    switch (result.term) {
+        .Exited => |code| if (code != 0) return error.ProcessFailed,
+        else => return error.ProcessFailed,
+    }
+}
+
+fn pruneArchivesWithPrefix(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    prefix: []const u8,
+    keep: usize,
+) !void {
+    if (keep == 0) return;
+    const parent = std.fs.path.dirname(path) orelse ".";
+    var dir = if (std.fs.path.isAbsolute(parent))
+        try std.fs.openDirAbsolute(parent, .{ .iterate = true })
+    else
+        try std.fs.cwd().openDir(parent, .{ .iterate = true });
+    defer dir.close();
+
+    var candidates = std.ArrayListUnmanaged(ArchiveCandidate){};
+    defer {
+        for (candidates.items) |entry| allocator.free(entry.name);
+        candidates.deinit(allocator);
+    }
+
+    var it = dir.iterate();
+    while (try it.next()) |entry| {
+        if (entry.kind != .file) continue;
+        const ts = parseArchiveTimestampWithPrefix(entry.name, prefix) orelse continue;
+        try candidates.append(allocator, .{
+            .name = try allocator.dupe(u8, entry.name),
+            .timestamp_ms = ts,
+        });
+    }
+
+    while (candidates.items.len > keep) {
+        var oldest_idx: usize = 0;
+        var oldest_ts = candidates.items[0].timestamp_ms;
+        var i: usize = 1;
+        while (i < candidates.items.len) : (i += 1) {
+            if (candidates.items[i].timestamp_ms < oldest_ts) {
+                oldest_ts = candidates.items[i].timestamp_ms;
+                oldest_idx = i;
+            }
+        }
+
+        const oldest = candidates.orderedRemove(oldest_idx);
+        dir.deleteFile(oldest.name) catch |err| {
+            std.log.warn("Failed deleting old archive {s}: {s}", .{ oldest.name, @errorName(err) });
+        };
+        allocator.free(oldest.name);
+    }
 }
 
 fn parseBoolEnv(allocator: std.mem.Allocator, name: []const u8, default_value: bool) bool {
@@ -2721,6 +2825,9 @@ const AgentRuntimeRegistry = struct {
     node_service_event_history: std.ArrayListUnmanaged(NodeServiceEventRecord) = .{},
     node_service_event_history_max: usize = node_service_event_history_max_default,
     node_service_event_log_path: ?[]u8 = null,
+    node_service_event_log_rotate_max_bytes: u64 = 4 * 1024 * 1024,
+    node_service_event_log_archive_keep: usize = 8,
+    node_service_event_log_gzip_available: bool = false,
     audit_records_mutex: std.Thread.Mutex = .{},
     audit_records: std.ArrayListUnmanaged(AuditRecord) = .{},
     next_audit_record_id: u64 = 1,
@@ -2780,10 +2887,25 @@ const AgentRuntimeRegistry = struct {
             @as(u64, node_service_event_history_max_default),
         );
         const history_max: usize = @intCast(@max(@as(u64, 64), @min(history_max_raw, 20_000)));
+        const event_rotate_max_bytes = parseUnsignedEnv(
+            allocator,
+            node_service_event_log_rotate_max_bytes_env,
+            8 * 1024 * 1024,
+        );
+        const event_archive_keep_raw = parseUnsignedEnv(
+            allocator,
+            node_service_event_log_archive_keep_env,
+            8,
+        );
+        const event_archive_keep: usize = @intCast(@min(event_archive_keep_raw, 64));
         const event_log_path = initNodeServiceEventLogPath(allocator, runtime_config.ltm_directory) catch |err| blk: {
             std.log.warn("node service event persistence disabled: {s}", .{@errorName(err)});
             break :blk null;
         };
+        const event_log_gzip_available = if (event_log_path != null)
+            commandExists(allocator, "gzip")
+        else
+            false;
 
         var registry: AgentRuntimeRegistry = .{
             .allocator = allocator,
@@ -2814,6 +2936,9 @@ const AgentRuntimeRegistry = struct {
             .node_service_watch_replay_max = replay_max,
             .node_service_event_history_max = history_max,
             .node_service_event_log_path = event_log_path,
+            .node_service_event_log_rotate_max_bytes = event_rotate_max_bytes,
+            .node_service_event_log_archive_keep = event_archive_keep,
+            .node_service_event_log_gzip_available = event_log_gzip_available,
             .node_tunnels = .{ .allocator = allocator },
         };
         registry.loadNodeServiceEventHistory() catch |err| {
@@ -4094,6 +4219,70 @@ const AgentRuntimeRegistry = struct {
         };
         file.writeAll(line) catch |err| {
             std.log.warn("failed appending node service event log {s}: {s}", .{ path, @errorName(err) });
+        };
+        self.maybeRotateNodeServiceEventLog();
+    }
+
+    fn maybeRotateNodeServiceEventLog(self: *AgentRuntimeRegistry) void {
+        const path = self.node_service_event_log_path orelse return;
+        if (self.node_service_event_log_rotate_max_bytes == 0) return;
+
+        const size = fileSize(path) catch |err| switch (err) {
+            error.FileNotFound => return,
+            else => {
+                std.log.warn("failed reading node service event log size for {s}: {s}", .{ path, @errorName(err) });
+                return;
+            },
+        };
+        if (size <= self.node_service_event_log_rotate_max_bytes) return;
+
+        const archive_path = allocateArchivePathWithPrefix(
+            self.allocator,
+            path,
+            node_service_event_archive_prefix,
+        ) catch |err| {
+            std.log.warn("failed creating node service archive path for {s}: {s}", .{ path, @errorName(err) });
+            return;
+        };
+        defer self.allocator.free(archive_path);
+
+        renamePath(path, archive_path) catch |err| {
+            std.log.warn("failed rotating node service event log {s} -> {s}: {s}", .{
+                path,
+                archive_path,
+                @errorName(err),
+            });
+            return;
+        };
+
+        if (self.node_service_event_log_gzip_available) {
+            compressArchiveGzip(self.allocator, archive_path) catch |err| {
+                std.log.warn("failed to gzip node service archive {s}: {s}", .{
+                    archive_path,
+                    @errorName(err),
+                });
+            };
+        }
+
+        pruneArchivesWithPrefix(
+            self.allocator,
+            path,
+            node_service_event_archive_prefix,
+            self.node_service_event_log_archive_keep,
+        ) catch |err| {
+            std.log.warn("failed pruning node service archives for {s}: {s}", .{
+                path,
+                @errorName(err),
+            });
+        };
+
+        var file = openOrCreateAppendFile(path) catch |err| {
+            std.log.warn("failed recreating node service event log {s}: {s}", .{ path, @errorName(err) });
+            return;
+        };
+        defer file.close();
+        file.seekFromEnd(0) catch |err| {
+            std.log.warn("failed finalizing node service event log {s}: {s}", .{ path, @errorName(err) });
         };
     }
 
