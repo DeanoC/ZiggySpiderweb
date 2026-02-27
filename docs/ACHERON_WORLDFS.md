@@ -160,12 +160,17 @@ First-class terminal namespace flow:
    - `/agents/self/terminal/control/create.json`
    - `/agents/self/terminal/control/resume.json`
    - `/agents/self/terminal/control/close.json`
+   - `/agents/self/terminal/control/write.json`
+   - `/agents/self/terminal/control/read.json`
+   - `/agents/self/terminal/control/resize.json`
    - `/agents/self/terminal/control/exec.json`
    - `/agents/self/terminal/control/invoke.json` (generic tool call envelope)
 2. Read runtime status:
    - `/agents/self/terminal/status.json`
 3. Read tool result payload:
    - `/agents/self/terminal/result.json`
+   - `write` returns `{"written":<bytes>}`
+   - `read` and session `exec` return `{"n":<bytes>,"data_b64":"...","eof":<bool>}`
 4. Inspect session state:
    - `/agents/self/terminal/sessions.json`
    - `/agents/self/terminal/current.json`
