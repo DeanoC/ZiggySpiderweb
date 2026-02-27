@@ -4330,20 +4330,29 @@ pub const Session = struct {
     ) !?[]u8 {
         if (!self.serviceCapsInvoke(service_dir_id)) return null;
 
+        const invoke_target = try self.resolveNodeServiceInvokeTarget(service_dir_id);
+        defer self.allocator.free(invoke_target);
+
+        if (isWorldAbsolutePath(invoke_target)) {
+            return try self.allocator.dupe(u8, invoke_target);
+        }
+        const invoke_suffix = std.mem.trimLeft(u8, invoke_target, "/");
+        if (invoke_suffix.len == 0) return null;
+
         if (try self.firstServiceMountPath(service_dir_id)) |mount_path| {
             defer self.allocator.free(mount_path);
-            return try self.pathWithInvokeSuffix(mount_path);
+            return try self.pathWithInvokeTarget(mount_path, invoke_suffix);
         }
 
         if (try self.serviceEndpointPath(service_dir_id)) |endpoint_path| {
             defer self.allocator.free(endpoint_path);
-            return try self.pathWithInvokeSuffix(endpoint_path);
+            return try self.pathWithInvokeTarget(endpoint_path, invoke_suffix);
         }
 
         return try std.fmt.allocPrint(
             self.allocator,
-            "/nodes/{s}/services/{s}/control/invoke.json",
-            .{ node_id, service_id },
+            "/nodes/{s}/services/{s}/{s}",
+            .{ node_id, service_id, invoke_suffix },
         );
     }
 
@@ -4354,6 +4363,49 @@ pub const Session = struct {
             return self.allocator.dupe(u8, trimmed);
         }
         return std.fmt.allocPrint(self.allocator, "{s}/control/invoke.json", .{trimmed});
+    }
+
+    fn pathWithInvokeTarget(self: *Session, base_path: []const u8, invoke_suffix: []const u8) ![]u8 {
+        const base_trimmed = std.mem.trimRight(u8, base_path, "/");
+        if (invoke_suffix.len == 0) return self.allocator.dupe(u8, base_trimmed);
+        if (base_trimmed.len == 0) {
+            return std.fmt.allocPrint(self.allocator, "/{s}", .{invoke_suffix});
+        }
+        return std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ base_trimmed, invoke_suffix });
+    }
+
+    fn resolveNodeServiceInvokeTarget(self: *Session, service_dir_id: u32) ![]u8 {
+        const default_target = "/control/invoke.json";
+        const ops_id = self.lookupChild(service_dir_id, "OPS.json") orelse return self.allocator.dupe(u8, default_target);
+        const ops_node = self.nodes.get(ops_id) orelse return self.allocator.dupe(u8, default_target);
+
+        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, ops_node.content, .{}) catch return self.allocator.dupe(u8, default_target);
+        defer parsed.deinit();
+        if (parsed.value != .object) return self.allocator.dupe(u8, default_target);
+
+        const candidate = blk: {
+            if (parsed.value.object.get("invoke")) |invoke_value| {
+                if (invoke_value == .string and invoke_value.string.len > 0) {
+                    break :blk invoke_value.string;
+                }
+            }
+            if (parsed.value.object.get("paths")) |paths_value| {
+                if (paths_value == .object) {
+                    if (paths_value.object.get("invoke")) |invoke_value| {
+                        if (invoke_value == .string and invoke_value.string.len > 0) {
+                            break :blk invoke_value.string;
+                        }
+                    }
+                }
+            }
+            break :blk null;
+        };
+
+        if (candidate) |value| {
+            const trimmed = std.mem.trim(u8, value, " \t\r\n");
+            if (trimmed.len > 0) return self.allocator.dupe(u8, trimmed);
+        }
+        return self.allocator.dupe(u8, default_target);
     }
 
     fn firstServiceMountPath(self: *Session, service_dir_id: u32) !?[]u8 {
@@ -4411,6 +4463,14 @@ fn jobStateLabel(state: chat_job_index.JobState) []const u8 {
         .done => "done",
         .failed => "failed",
     };
+}
+
+fn isWorldAbsolutePath(path: []const u8) bool {
+    return std.mem.startsWith(u8, path, "/nodes/") or
+        std.mem.startsWith(u8, path, "/agents/") or
+        std.mem.startsWith(u8, path, "/projects/") or
+        std.mem.startsWith(u8, path, "/debug/") or
+        std.mem.startsWith(u8, path, "/meta/");
 }
 
 fn kindName(kind: NodeKind) []const u8 {
@@ -6984,6 +7044,107 @@ test "fsrpc_session: project access policy gates invoke visibility per agent" {
     try std.testing.expect(std.mem.indexOf(u8, worker_index_payload, "\"service_id\":\"tool-main\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, worker_index_payload, "\"has_invoke\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, worker_index_payload, expected_invoke_path) != null);
+}
+
+test "fsrpc_session: node service invoke path uses OPS metadata with safe fallback" {
+    const allocator = std.testing.allocator;
+
+    var control_plane = fs_control_plane.ControlPlane.init(allocator);
+    defer control_plane.deinit();
+
+    const ensured = try control_plane.ensureNode("edge-ops-invoke", "ws://127.0.0.1:18891/v2/fs", 60_000);
+    defer allocator.free(ensured);
+    var ensured_parsed = try std.json.parseFromSlice(std.json.Value, allocator, ensured, .{});
+    defer ensured_parsed.deinit();
+    if (ensured_parsed.value != .object) return error.TestExpectedResponse;
+    const node_id = ensured_parsed.value.object.get("node_id") orelse return error.TestExpectedResponse;
+    if (node_id != .string) return error.TestExpectedResponse;
+    const node_secret = ensured_parsed.value.object.get("node_secret") orelse return error.TestExpectedResponse;
+    if (node_secret != .string) return error.TestExpectedResponse;
+
+    const escaped_node_id = try unified.jsonEscape(allocator, node_id.string);
+    defer allocator.free(escaped_node_id);
+    const escaped_node_secret = try unified.jsonEscape(allocator, node_secret.string);
+    defer allocator.free(escaped_node_secret);
+    const upsert_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"node_id\":\"{s}\",\"node_secret\":\"{s}\",\"services\":[" ++
+            "{{\"service_id\":\"tool-rel\",\"kind\":\"tool\",\"version\":\"1\",\"state\":\"online\",\"endpoints\":[\"/nodes/{s}/tool/rel\"],\"capabilities\":{{\"invoke\":true}},\"mounts\":[{{\"mount_id\":\"tool-rel\",\"mount_path\":\"/nodes/{s}/tool/rel\",\"state\":\"online\"}}],\"ops\":{{\"model\":\"namespace\",\"invoke\":\"control/run.json\"}},\"runtime\":{{\"type\":\"native_proc\"}},\"permissions\":{{\"default\":\"allow-by-default\",\"allow_roles\":[\"admin\",\"user\"]}},\"schema\":{{\"model\":\"namespace-service-v1\"}},\"help_md\":\"Relative invoke target\"}}," ++
+            "{{\"service_id\":\"tool-abs\",\"kind\":\"tool\",\"version\":\"1\",\"state\":\"online\",\"endpoints\":[\"/nodes/{s}/tool/abs\"],\"capabilities\":{{\"invoke\":true}},\"mounts\":[{{\"mount_id\":\"tool-abs\",\"mount_path\":\"/nodes/{s}/tool/abs\",\"state\":\"online\"}}],\"ops\":{{\"model\":\"namespace\",\"invoke\":\"/nodes/{s}/tool/abs/custom/exec.json\"}},\"runtime\":{{\"type\":\"native_proc\"}},\"permissions\":{{\"default\":\"allow-by-default\",\"allow_roles\":[\"admin\",\"user\"]}},\"schema\":{{\"model\":\"namespace-service-v1\"}},\"help_md\":\"Absolute invoke target\"}}," ++
+            "{{\"service_id\":\"tool-fallback\",\"kind\":\"tool\",\"version\":\"1\",\"state\":\"online\",\"endpoints\":[\"/nodes/{s}/tool/fallback\"],\"capabilities\":{{\"invoke\":true}},\"mounts\":[{{\"mount_id\":\"tool-fallback\",\"mount_path\":\"/nodes/{s}/tool/fallback\",\"state\":\"online\"}}],\"ops\":{{\"model\":\"namespace\",\"invoke\":123}},\"runtime\":{{\"type\":\"native_proc\"}},\"permissions\":{{\"default\":\"allow-by-default\",\"allow_roles\":[\"admin\",\"user\"]}},\"schema\":{{\"model\":\"namespace-service-v1\"}},\"help_md\":\"Fallback invoke target\"}}" ++
+            "]}}",
+        .{
+            escaped_node_id,
+            escaped_node_secret,
+            escaped_node_id,
+            escaped_node_id,
+            escaped_node_id,
+            escaped_node_id,
+            escaped_node_id,
+            escaped_node_id,
+            escaped_node_id,
+            escaped_node_id,
+        },
+    );
+    defer allocator.free(upsert_req);
+    const upserted = try control_plane.nodeServiceUpsert(upsert_req);
+    defer allocator.free(upserted);
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "default",
+        .{
+            .control_plane = &control_plane,
+            .agents_dir = ".does-not-exist",
+            .projects_dir = ".does-not-exist",
+            .is_admin = false,
+        },
+    );
+    defer session.deinit();
+
+    const index_payload = try protocolReadFile(
+        &session,
+        allocator,
+        224,
+        225,
+        &.{ "agents", "self", "services", "SERVICES.json" },
+        850,
+    );
+    defer allocator.free(index_payload);
+
+    const expected_rel = try std.fmt.allocPrint(
+        allocator,
+        "\"invoke_path\":\"/nodes/{s}/tool/rel/control/run.json\"",
+        .{node_id.string},
+    );
+    defer allocator.free(expected_rel);
+    const expected_abs = try std.fmt.allocPrint(
+        allocator,
+        "\"invoke_path\":\"/nodes/{s}/tool/abs/custom/exec.json\"",
+        .{node_id.string},
+    );
+    defer allocator.free(expected_abs);
+    const expected_fallback = try std.fmt.allocPrint(
+        allocator,
+        "\"invoke_path\":\"/nodes/{s}/tool/fallback/control/invoke.json\"",
+        .{node_id.string},
+    );
+    defer allocator.free(expected_fallback);
+
+    try std.testing.expect(std.mem.indexOf(u8, index_payload, "\"service_id\":\"tool-rel\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_payload, expected_rel) != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_payload, "\"service_id\":\"tool-abs\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_payload, expected_abs) != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_payload, "\"service_id\":\"tool-fallback\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_payload, expected_fallback) != null);
 }
 
 test "fsrpc_session: control-plane registered nodes appear under global nodes namespace" {

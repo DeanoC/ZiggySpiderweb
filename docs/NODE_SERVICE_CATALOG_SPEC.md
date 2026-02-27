@@ -35,6 +35,11 @@ Each service entry:
   - `mount_path` (`string`, required, absolute path)
   - `state` (`string`, optional; defaults to service state)
 - `ops` (`object`, optional, default `{}`)
+  - `invoke` (`string`, optional):
+    - invoke target used for `invoke_path` discovery in `/agents/self/services/SERVICES.json`
+    - world-absolute (for example `/nodes/<node_id>/tool/main/custom/exec.json`) or service-relative (for example `control/invoke.json`)
+  - `paths.invoke` (`string`, optional):
+    - alias for `invoke` when grouping operation paths under `paths`
 - `runtime` (`object`, optional, default `{}`)
 - `permissions` (`object`, optional, default `{}`)
 - `schema` (`object`, optional, default `{}`)
@@ -116,6 +121,8 @@ Response fields:
 - `mounts`, when present, must be an array of objects with absolute
   `mount_path` values.
 - `ops`, `runtime`, `permissions`, and `schema` must be JSON objects.
+- `ops.invoke` / `ops.paths.invoke`, when provided, must be strings to override
+  `invoke_path` projection; invalid types fall back to `/control/invoke.json`.
 
 ## WorldFS Permission Projection
 

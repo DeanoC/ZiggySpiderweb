@@ -99,9 +99,11 @@ Node directories also expose:
 Use `service_path` to inspect each service descriptor (`SCHEMA.json`, `CAPS.json`,
 `MOUNTS.json`, `OPS.json`, `PERMISSIONS.json`, `README.md`).
 Use `invoke_path` only when `has_invoke` is true.
-For node services with `CAPS.invoke=true`, runtime now derives `invoke_path` from
-mounted service roots (for example `/nodes/<node>/tool/main/control/invoke.json`)
-instead of metadata-only paths.
+For node services with `CAPS.invoke=true`, runtime derives `invoke_path` using:
+- `OPS.json` `invoke` (or `paths.invoke`) when present
+  - world-absolute targets are used as-is
+  - service-relative targets are resolved from mount/endpoint roots
+- fallback: `/control/invoke.json` relative to mount/endpoint roots
 
 `/agents/self/services/contracts/` currently seeds baseline contracts for:
 
