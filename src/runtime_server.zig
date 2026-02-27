@@ -88,6 +88,19 @@ const RunStepMeta = struct {
     task_complete: bool = false,
 };
 
+const ControlToolCallRequest = struct {
+    brain_name: []u8,
+    tool_name: []u8,
+    arguments_json: []u8,
+
+    fn deinit(self: *ControlToolCallRequest, allocator: std.mem.Allocator) void {
+        allocator.free(self.brain_name);
+        allocator.free(self.tool_name);
+        allocator.free(self.arguments_json);
+        self.* = undefined;
+    }
+};
+
 const ProviderToolNameMapEntry = struct {
     provider_name: []u8,
     runtime_name: []const u8,
@@ -1138,12 +1151,103 @@ pub const RuntimeServer = struct {
             return self.handleChat(job, request_id, goal, null, null);
         }
 
+        if (std.mem.eql(u8, control_action, "tool.call")) {
+            const payload = content orelse return self.wrapSingleFrame(try protocol.buildErrorWithCode(
+                self.allocator,
+                request_id,
+                .missing_content,
+                "agent.control tool.call requires content",
+            ));
+            return self.handleControlToolCall(job, request_id, payload);
+        }
+
         return self.wrapSingleFrame(try protocol.buildErrorWithCode(
             self.allocator,
             request_id,
             .unsupported_message_type,
             "unsupported agent.control action in chat-only mode",
         ));
+    }
+
+    fn handleControlToolCall(
+        self: *RuntimeServer,
+        job: *RuntimeQueueJob,
+        request_id: []const u8,
+        content: []const u8,
+    ) ![][]u8 {
+        var request = self.parseControlToolCallPayload(content) catch {
+            return self.wrapSingleFrame(try protocol.buildErrorWithCode(
+                self.allocator,
+                request_id,
+                .invalid_envelope,
+                "tool.call content must include tool_name and optional brain/arguments",
+            ));
+        };
+        defer request.deinit(self.allocator);
+
+        self.runtime.queueToolUse(request.brain_name, request.tool_name, request.arguments_json) catch |err| {
+            return self.wrapRuntimeErrorResponse(request_id, err, job.emit_debug);
+        };
+
+        var tool_payloads = std.ArrayListUnmanaged([]u8){};
+        defer {
+            for (tool_payloads.items) |payload| self.allocator.free(payload);
+            tool_payloads.deinit(self.allocator);
+        }
+
+        self.runPendingTicks(job, null, &tool_payloads) catch |err| {
+            return self.wrapRuntimeErrorResponse(request_id, err, job.emit_debug);
+        };
+
+        if (tool_payloads.items.len == 0) {
+            return self.wrapSingleFrame(try protocol.buildErrorWithCode(
+                self.allocator,
+                request_id,
+                .execution_failed,
+                "tool.call produced no tool results",
+            ));
+        }
+
+        const payload = tool_payloads.items[tool_payloads.items.len - 1];
+        return self.wrapSingleFrame(try protocol.buildSessionReceive(self.allocator, request_id, payload));
+    }
+
+    fn parseControlToolCallPayload(self: *RuntimeServer, content: []const u8) !ControlToolCallRequest {
+        const trimmed = std.mem.trim(u8, content, " \t\r\n");
+        if (trimmed.len == 0) return error.InvalidPayload;
+
+        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, trimmed, .{}) catch return error.InvalidPayload;
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidPayload;
+        const obj = parsed.value.object;
+
+        const tool_name = blk: {
+            if (obj.get("tool_name")) |value| {
+                if (value == .string and value.string.len > 0) break :blk value.string;
+            }
+            if (obj.get("tool")) |value| {
+                if (value == .string and value.string.len > 0) break :blk value.string;
+            }
+            return error.InvalidPayload;
+        };
+        const brain_name = blk: {
+            if (obj.get("brain")) |value| {
+                if (value == .string and value.string.len > 0) break :blk value.string;
+            }
+            break :blk DEFAULT_BRAIN;
+        };
+        const args_json = if (obj.get("arguments")) |value|
+            try std.fmt.allocPrint(self.allocator, "{f}", .{std.json.fmt(value, .{})})
+        else if (obj.get("args")) |value|
+            try std.fmt.allocPrint(self.allocator, "{f}", .{std.json.fmt(value, .{})})
+        else
+            try self.allocator.dupe(u8, "{}");
+
+        return .{
+            .brain_name = try self.allocator.dupe(u8, brain_name),
+            .tool_name = try self.allocator.dupe(u8, tool_name),
+            .arguments_json = args_json,
+        };
     }
 
     fn handleRunStart(
@@ -7404,6 +7508,31 @@ test "runtime_server: runPendingTicks failure clears stale outbound queue" {
         try std.testing.expect(std.mem.indexOf(u8, response, "\"code\":\"queue_saturated\"") != null);
         try std.testing.expectEqual(@as(usize, 0), server.runtime.outbound_messages.items.len);
     }
+}
+
+test "runtime_server: agent.control tool.call executes runtime tool and returns payload" {
+    const allocator = std.testing.allocator;
+    const server = try RuntimeServer.create(allocator, "agent-test", .{
+        .ltm_directory = "",
+        .ltm_filename = "",
+    });
+    defer server.destroy();
+
+    const request =
+        "{\"id\":\"req-tool-call\",\"type\":\"agent.control\",\"action\":\"tool.call\",\"content\":\"{\\\"tool_name\\\":\\\"memory_create\\\",\\\"arguments\\\":{\\\"name\\\":\\\"control-note\\\",\\\"kind\\\":\\\"note\\\",\\\"content\\\":{\\\"text\\\":\\\"hello\\\"}}}\"}";
+    const response = try server.handleMessage(request);
+    defer allocator.free(response);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.TestExpectedResponse;
+    const type_value = parsed.value.object.get("type") orelse return error.TestExpectedResponse;
+    if (type_value != .string) return error.TestExpectedResponse;
+    try std.testing.expectEqualStrings("session.receive", type_value.string);
+    const content_value = parsed.value.object.get("content") orelse return error.TestExpectedResponse;
+    if (content_value != .string) return error.TestExpectedResponse;
+    try std.testing.expect(std.mem.indexOf(u8, content_value.string, "\"mem_id\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content_value.string, "\"name\":\"control-note\"") != null);
 }
 
 test "runtime_server: non-chat agent.control actions are unsupported" {

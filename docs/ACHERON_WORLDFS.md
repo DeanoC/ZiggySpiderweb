@@ -22,6 +22,15 @@ This document defines the agent-visible runtime namespace for Acheron sessions.
 │       └── README.md
 ├── agents/
 │   └── self/
+│       ├── chat/
+│       ├── jobs/
+│       ├── events/
+│       ├── memory/
+│       └── services/
+│           ├── SERVICES.json
+│           └── contracts/
+│               ├── memory/
+│               └── web_search/
 ├── projects/
 │   └── <project_id>/
 ├── meta/
@@ -69,14 +78,90 @@ Node directories also expose:
 
 ## Chat and Jobs
 
+- Service discovery index path: `/agents/self/services/SERVICES.json`
 - Chat input path: `/agents/self/chat/control/input`
 - Job status path: `/agents/self/jobs/<job_id>/status.json`
 - Job result path: `/agents/self/jobs/<job_id>/result.txt`
+- Event wait config path: `/agents/self/events/control/wait.json`
+- Event wait next path: `/agents/self/events/next.json`
+- First-class memory service path: `/agents/self/memory`
+- First-class web search service path: `/agents/self/web_search`
+
+`/agents/self/services/SERVICES.json` entries include:
+
+- `node_id`
+- `service_id`
+- `service_path`
+- `invoke_path`
+- `has_invoke`
+- `scope` (`node`, `agent_contract`, or `agent_namespace`)
+
+Use `service_path` to inspect each service descriptor (`SCHEMA.json`, `CAPS.json`,
+`MOUNTS.json`, `OPS.json`, `PERMISSIONS.json`, `README.md`).
+Use `invoke_path` only when `has_invoke` is true.
+For node services with `CAPS.invoke=true`, runtime now derives `invoke_path` from
+mounted service roots (for example `/nodes/<node>/tool/main/control/invoke.json`)
+instead of metadata-only paths.
+
+`/agents/self/services/contracts/` currently seeds baseline contracts for:
+
+- `memory`
+- `web_search`
+
+Contract service invoke flow:
+
+1. Write invoke payload JSON to:
+   - `/agents/self/services/contracts/<service_id>/control/invoke.json`
+2. Read runtime status:
+   - `/agents/self/services/contracts/<service_id>/status.json`
+3. Read tool result payload:
+   - `/agents/self/services/contracts/<service_id>/result.json`
+
+Invoke payload shape:
+`{"tool_name":"memory_create","arguments":{...}}`
+(`tool` and `args` aliases are also accepted.)
+
+First-class memory namespace flow:
+
+1. Write operation payload JSON to one of:
+   - `/agents/self/memory/control/create.json`
+   - `/agents/self/memory/control/load.json`
+   - `/agents/self/memory/control/versions.json`
+   - `/agents/self/memory/control/mutate.json`
+   - `/agents/self/memory/control/evict.json`
+   - `/agents/self/memory/control/search.json`
+   - `/agents/self/memory/control/invoke.json` (generic tool call envelope)
+2. Read runtime status:
+   - `/agents/self/memory/status.json`
+3. Read tool result payload:
+   - `/agents/self/memory/result.json`
+
+First-class web search namespace flow:
+
+1. Write search payload JSON to one of:
+   - `/agents/self/web_search/control/search.json`
+   - `/agents/self/web_search/control/invoke.json` (generic tool call envelope)
+2. Read runtime status:
+   - `/agents/self/web_search/status.json`
+3. Read tool result payload:
+   - `/agents/self/web_search/result.json`
 
 `acheron.t_write` responses for chat include:
 
 - `job`
 - `result_path` (now `/agents/self/jobs/<job>/result.txt`)
+
+Event wait flow:
+
+1. Write selector JSON to `/agents/self/events/control/wait.json`:
+   `{"paths":["/agents/self/chat/control/input"],"timeout_ms":60000}`
+2. Read `/agents/self/events/next.json` to block until the first matching event.
+
+Single-event waits may also use a direct blocking read on that endpoint when
+the endpoint supports blocking behavior.
+Current implementation supports blocking reads on:
+- `/agents/self/jobs/<job_id>/status.json`
+- `/agents/self/jobs/<job_id>/result.txt`
 
 ## Debug Pairing Queue
 

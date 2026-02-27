@@ -346,6 +346,8 @@ Notes:
   - `GET /readyz` returns readiness
   - `GET /metrics` returns Prometheus text format
   - `GET /metrics.json` returns control-plane metrics JSON
+  - node-service watch alert thresholds/dashboard guidance:
+    - `docs/NODE_SERVICE_WATCH_ALERTING.md`
 - `spiderweb-control` CLI negotiates `control.version` + `control.connect` and executes a single control op for scripting/debug use.
 - Spiderweb can host a local in-process `/v2/fs` node (same protocol as external nodes) with:
   - `SPIDERWEB_LOCAL_NODE_EXPORT_PATH` (required to enable)

@@ -37,6 +37,9 @@ Rules:
 - Prefer tool execution over narration.
 - Emit exactly one tool call per `action:"act"` step.
 - If you need to wait on specific events, use `tool_calls` with `wait_for`.
+- For filesystem-native waits in Acheron, prefer:
+  - write selector JSON to `/agents/self/events/control/wait.json`
+  - read `/agents/self/events/next.json` to wait for first matching event
 - Do not output a planning preamble without `tool_calls` (for example "I'll do that now"). Emit the `action:"act"` call in the same response.
 - `stop_reason: "stop"` only ends one provider pass. It is not completion of the task or loop.
 - Never rely on provider `stop_reason` semantics for loop control.
@@ -94,6 +97,54 @@ Use only these names and argument fields.
   - required: `command`
   - optional: `timeout_ms`, `cwd`
   - use only when `file_list`, `file_read`, `file_write`, or `search_code` cannot satisfy the need
+
+### Acheron Event Wait Paths
+- Configure multi-source wait:
+  - path: `/agents/self/events/control/wait.json`
+  - payload shape: `{"paths":["/agents/self/chat/control/input","/agents/self/jobs/<job-id>/status.json"],"timeout_ms":60000}`
+- Read next matching event:
+  - path: `/agents/self/events/next.json`
+  - behavior: blocks until event or timeout
+- Single-source blocking read is valid for:
+  - `/agents/self/jobs/<job-id>/status.json`
+  - `/agents/self/jobs/<job-id>/result.txt`
+
+### Acheron Service Discovery Paths
+- Discover available services:
+  - path: `/agents/self/services/SERVICES.json`
+  - each entry includes:
+    - `node_id`
+    - `service_id`
+    - `service_path`
+    - `invoke_path`
+    - `has_invoke`
+    - `scope` (`node`, `agent_contract`, or `agent_namespace`)
+- Inspect service contract files via `service_path`:
+  - `SCHEMA.json`
+  - `CAPS.json`
+  - `MOUNTS.json`
+  - `OPS.json`
+  - `PERMISSIONS.json`
+  - `README.md`
+- Only call an invoke endpoint when `has_invoke` is true.
+- Baseline contract services are under `/agents/self/services/contracts/`:
+  - `memory`
+  - `web_search`
+- Contract invoke payload shape:
+  - `{"tool_name":"<runtime_tool>","arguments":{...}}`
+  - aliases: `tool`, `args`
+- Contract runtime files:
+  - `control/invoke.json` (write request)
+  - `status.json` (execution state)
+  - `result.json` (tool payload JSON)
+- First-class memory namespace:
+  - path: `/agents/self/memory`
+  - operation files under `/agents/self/memory/control/*.json`
+  - runtime files: `/agents/self/memory/status.json`, `/agents/self/memory/result.json`
+- First-class web search namespace:
+  - path: `/agents/self/web_search`
+  - operation files: `/agents/self/web_search/control/search.json`, `/agents/self/web_search/control/invoke.json`
+  - runtime files: `/agents/self/web_search/status.json`, `/agents/self/web_search/result.json`
 
 ## Memory Model
 - LTM is durable and versioned.

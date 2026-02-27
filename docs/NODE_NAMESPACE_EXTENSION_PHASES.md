@@ -188,9 +188,20 @@ Status: completed
   (`state`, `enabled`, `running`, failure counters, transition/healthy
   timestamps, and `last_error`) alongside service delta summaries.
 
+## Phase 12 - Watch Telemetry Alerting Guidance
+
+Status: completed
+
+- Added node-service watch alerting/dashboard runbook:
+  - `docs/NODE_SERVICE_WATCH_ALERTING.md`
+- Documented threshold recommendations for:
+  - fanout drops and drop ratio
+  - replay send deficit
+  - retention saturation/window shrink
+  - subscriber surge detection
+- Documented metric mapping parity between `control.metrics` JSON fields and
+  Prometheus metric names exposed via HTTP metrics endpoints.
+
 ## Next Backlog
 
-- Add alerting/dashboard guidance for node-service watch telemetry
-  (`/metrics` and `control.metrics`) with threshold recommendations.
-- Add GUI controls to diff any two historical node-service events and export
-  the diff snapshot for incident/debug reports.
+- No open items in this phase track.
