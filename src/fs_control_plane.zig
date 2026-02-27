@@ -1915,7 +1915,13 @@ pub const ControlPlane = struct {
         _ = try self.runReconcileCycleLocked(now_ms, false);
         self.persistSnapshotBestEffortLocked();
 
-        const workspace_json = try self.renderWorkspaceStatusForProjectLocked(agent_id, project.id, now_ms);
+        const workspace_json = try self.renderWorkspaceStatusForProjectLocked(
+            agent_id,
+            project.id,
+            null,
+            is_admin,
+            now_ms,
+        );
         defer self.allocator.free(workspace_json);
         const escaped_project = try jsonEscape(self.allocator, project.id);
         defer self.allocator.free(escaped_project);
@@ -2004,7 +2010,13 @@ pub const ControlPlane = struct {
                     },
                 }
             }
-            return try self.renderWorkspaceStatusForProjectLocked(agent_id, project_id, now_ms);
+            return try self.renderWorkspaceStatusForProjectLocked(
+                agent_id,
+                project_id,
+                selected_project_token,
+                is_admin,
+                now_ms,
+            );
         }
         if (self.active_project_by_agent.get(agent_id)) |active_project_id| {
             if (active_project_id.len > 0) {
@@ -2014,7 +2026,13 @@ pub const ControlPlane = struct {
                         self.active_project_by_agent.getPtr(agent_id).?.* = try self.allocator.dupe(u8, "");
                         self.persistSnapshotBestEffortLocked();
                     } else {
-                        return try self.renderWorkspaceStatusForProjectLocked(agent_id, active_project_id, now_ms);
+                        return try self.renderWorkspaceStatusForProjectLocked(
+                            agent_id,
+                            active_project_id,
+                            null,
+                            is_admin,
+                            now_ms,
+                        );
                     }
                 }
             }
@@ -2206,6 +2224,8 @@ pub const ControlPlane = struct {
         self: *ControlPlane,
         agent_id: []const u8,
         project_id: []const u8,
+        project_token: ?[]const u8,
+        is_admin: bool,
         now_ms: i64,
     ) ![]u8 {
         const project = self.projects.get(project_id) orelse return ControlPlaneError.ProjectNotFound;
@@ -2236,6 +2256,9 @@ pub const ControlPlane = struct {
             now_ms,
             null,
             self.isPrimaryAgent(agent_id),
+            agent_id,
+            project_token,
+            is_admin,
         );
         try out.appendSlice(self.allocator, ",\"availability\":");
         try appendWorkspaceAvailabilityJson(self.allocator, &out, topology);
@@ -2259,13 +2282,29 @@ pub const ControlPlane = struct {
         now_ms: i64,
         failed_ops: ?*std.ArrayListUnmanaged([]u8),
         include_node_secrets: bool,
+        actor_id: ?[]const u8,
+        actor_project_token: ?[]const u8,
+        actor_is_admin: bool,
     ) !ReconcileProjectSummary {
+        const visible_mounts = try self.allocator.alloc(bool, project.mounts.items.len);
+        defer self.allocator.free(visible_mounts);
+        for (project.mounts.items, 0..) |mount, idx| {
+            visible_mounts[idx] = self.workspaceMountVisibleForActorLocked(
+                project,
+                mount,
+                actor_id,
+                actor_project_token,
+                actor_is_admin,
+            );
+        }
+
         var first_by_path = std.StringHashMapUnmanaged(usize){};
         defer first_by_path.deinit(self.allocator);
         var selected_by_path = std.StringHashMapUnmanaged(usize){};
         defer selected_by_path.deinit(self.allocator);
 
         for (project.mounts.items, 0..) |mount, idx| {
+            if (!visible_mounts[idx]) continue;
             if (!first_by_path.contains(mount.mount_path)) {
                 try first_by_path.put(self.allocator, mount.mount_path, idx);
             }
@@ -2279,6 +2318,7 @@ pub const ControlPlane = struct {
         }
         var summary = ReconcileProjectSummary{};
         for (project.mounts.items, 0..) |mount, idx| {
+            if (!visible_mounts[idx]) continue;
             const selected_idx = selected_by_path.get(mount.mount_path) orelse continue;
             if (selected_idx != idx) continue;
             summary.mounts_total +%= 1;
@@ -2293,6 +2333,7 @@ pub const ControlPlane = struct {
         try out.appendSlice(self.allocator, ",\"mounts\":[");
         var first = true;
         for (project.mounts.items, 0..) |mount, idx| {
+            if (!visible_mounts[idx]) continue;
             const selected_idx = selected_by_path.get(mount.mount_path) orelse continue;
             if (selected_idx != idx) continue;
             if (!first) try out.append(self.allocator, ',');
@@ -2302,7 +2343,8 @@ pub const ControlPlane = struct {
         try out.appendSlice(self.allocator, "],\"desired_mounts\":[");
 
         first = true;
-        for (project.mounts.items) |mount| {
+        for (project.mounts.items, 0..) |mount, idx| {
+            if (!visible_mounts[idx]) continue;
             if (!first) try out.append(self.allocator, ',');
             first = false;
             try appendWorkspaceMountJson(self.allocator, out, mount, self.nodes.get(mount.node_id), include_node_secrets, now_ms);
@@ -2311,6 +2353,7 @@ pub const ControlPlane = struct {
 
         first = true;
         for (project.mounts.items, 0..) |mount, idx| {
+            if (!visible_mounts[idx]) continue;
             const selected_idx = selected_by_path.get(mount.mount_path) orelse continue;
             if (selected_idx != idx) continue;
             if (!first) try out.append(self.allocator, ',');
@@ -2323,6 +2366,7 @@ pub const ControlPlane = struct {
         defer drift_items.deinit(self.allocator);
         var first_drift = true;
         for (project.mounts.items, 0..) |mount, idx| {
+            if (!visible_mounts[idx]) continue;
             const first_idx = first_by_path.get(mount.mount_path) orelse continue;
             if (first_idx != idx) continue;
 
@@ -2453,7 +2497,39 @@ pub const ControlPlane = struct {
             now_ms,
             failed_ops,
             false,
+            null,
+            null,
+            true,
         );
+    }
+
+    fn workspaceMountVisibleForActorLocked(
+        self: *ControlPlane,
+        project: Project,
+        mount: ProjectMount,
+        actor_id: ?[]const u8,
+        actor_project_token: ?[]const u8,
+        actor_is_admin: bool,
+    ) bool {
+        if (actor_id == null) return true;
+        if (actor_is_admin) return true;
+
+        const node = self.nodes.get(mount.node_id) orelse return true;
+        var matched_invoke_service = false;
+        for (node.services.items) |service| {
+            if (!serviceHasInvokePath(self.allocator, service)) continue;
+            if (!serviceMountIncludesPath(self.allocator, service, mount.mount_path)) continue;
+            matched_invoke_service = true;
+            if (!servicePermissionsAllowActor(
+                self.allocator,
+                service.permissions_json,
+                actor_project_token != null,
+                false,
+            )) return false;
+        }
+        if (!matched_invoke_service) return true;
+        requireProjectActionAccess(&project, .invoke, actor_id, actor_project_token, false) catch return false;
+        return true;
     }
 
     pub fn metricsJson(self: *ControlPlane) ![]u8 {
@@ -3805,6 +3881,107 @@ fn hashMountAvailabilityItem(mount: ProjectMount, state_rank: u8) u64 {
     return hasher.final();
 }
 
+fn serviceHasInvokePath(allocator: std.mem.Allocator, service: node_service_catalog.ServiceDescriptor) bool {
+    var caps_parsed = std.json.parseFromSlice(std.json.Value, allocator, service.capabilities_json, .{}) catch null;
+    if (caps_parsed) |*parsed| {
+        defer parsed.deinit();
+        if (parsed.value == .object) {
+            if (parsed.value.object.get("invoke")) |invoke_value| {
+                if (invoke_value == .bool and invoke_value.bool) return true;
+            }
+        }
+    }
+
+    var ops_parsed = std.json.parseFromSlice(std.json.Value, allocator, service.ops_json, .{}) catch null;
+    if (ops_parsed) |*parsed| {
+        defer parsed.deinit();
+        if (parsed.value == .object) {
+            if (parsed.value.object.get("invoke")) |invoke_value| {
+                if (invoke_value == .string and std.mem.trim(u8, invoke_value.string, " \t\r\n").len > 0) return true;
+            }
+            if (parsed.value.object.get("paths")) |paths_value| {
+                if (paths_value == .object) {
+                    if (paths_value.object.get("invoke")) |invoke_value| {
+                        if (invoke_value == .string and std.mem.trim(u8, invoke_value.string, " \t\r\n").len > 0) return true;
+                    }
+                }
+            }
+        }
+    }
+    return false;
+}
+
+fn serviceMountIncludesPath(
+    allocator: std.mem.Allocator,
+    service: node_service_catalog.ServiceDescriptor,
+    mount_path: []const u8,
+) bool {
+    var mounts_parsed = std.json.parseFromSlice(std.json.Value, allocator, service.mounts_json, .{}) catch null;
+    if (mounts_parsed) |*parsed| {
+        defer parsed.deinit();
+        if (parsed.value == .array) {
+            for (parsed.value.array.items) |mount_value| {
+                if (mount_value != .object) continue;
+                const mount_path_value = mount_value.object.get("mount_path") orelse continue;
+                if (mount_path_value != .string) continue;
+                if (std.mem.eql(u8, mount_path_value.string, mount_path)) return true;
+            }
+        }
+    }
+
+    for (service.endpoints.items) |endpoint| {
+        if (std.mem.eql(u8, endpoint, mount_path)) return true;
+    }
+    return false;
+}
+
+fn servicePermissionsAllowActor(
+    allocator: std.mem.Allocator,
+    permissions_json: []const u8,
+    has_project_token: bool,
+    is_admin: bool,
+) bool {
+    if (is_admin) return true;
+    if (permissions_json.len == 0) return true;
+
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, permissions_json, .{}) catch return true;
+    defer parsed.deinit();
+    if (parsed.value != .object) return true;
+    const obj = parsed.value.object;
+
+    const require_project_token = blk: {
+        if (obj.get("require_project_token")) |value| {
+            if (value == .bool) break :blk value.bool;
+        }
+        if (obj.get("project_token_required")) |value| {
+            if (value == .bool) break :blk value.bool;
+        }
+        break :blk false;
+    };
+    if (require_project_token and !has_project_token) return false;
+
+    if (obj.get("allow_roles")) |roles| {
+        if (roles == .array) {
+            for (roles.array.items) |role| {
+                if (role != .string) continue;
+                if (std.mem.eql(u8, role.string, "user")) return true;
+                if (std.mem.eql(u8, role.string, "all")) return true;
+                if (std.mem.eql(u8, role.string, "*")) return true;
+            }
+            return false;
+        }
+    }
+
+    if (obj.get("default")) |value| {
+        if (value == .string) {
+            if (std.mem.eql(u8, value.string, "deny")) return false;
+            if (std.mem.eql(u8, value.string, "deny-by-default")) return false;
+        }
+    }
+
+    return true;
+}
+
 fn appendWorkspaceMountJson(
     allocator: std.mem.Allocator,
     out: *std.ArrayListUnmanaged(u8),
@@ -4785,6 +4962,83 @@ test "fs_control_plane: access policy enforces action modes and per-agent overri
     try std.testing.expect(!plane.projectAllowsAction(project_id, "alice", .mount, project_token, false));
     try std.testing.expect(plane.projectAllowsNodeServiceEvent(project_id, "bob", project_token, node_id, false));
     try std.testing.expect(!plane.projectAllowsNodeServiceEvent(project_id, "bob", null, node_id, false));
+}
+
+test "fs_control_plane: workspace status filters invoke service mounts when invoke is denied" {
+    const allocator = std.testing.allocator;
+    var plane = ControlPlane.init(allocator);
+    defer plane.deinit();
+
+    const ensured = try plane.ensureNode("workspace-invoke-node", "ws://127.0.0.1:18891/v2/fs", 60_000);
+    defer allocator.free(ensured);
+    var ensured_parsed = try std.json.parseFromSlice(std.json.Value, allocator, ensured, .{});
+    defer ensured_parsed.deinit();
+    if (ensured_parsed.value != .object) return error.TestExpectedResponse;
+    const node_id = ensured_parsed.value.object.get("node_id").?.string;
+    const node_secret = ensured_parsed.value.object.get("node_secret").?.string;
+
+    const escaped_node_id = try jsonEscape(allocator, node_id);
+    defer allocator.free(escaped_node_id);
+    const escaped_node_secret = try jsonEscape(allocator, node_secret);
+    defer allocator.free(escaped_node_secret);
+    const upsert_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"node_id\":\"{s}\",\"node_secret\":\"{s}\",\"services\":[" ++
+            "{{\"service_id\":\"fs-main\",\"kind\":\"fs\",\"version\":\"1\",\"state\":\"online\",\"endpoints\":[\"/nodes/{s}/fs\"],\"capabilities\":{{\"rw\":true}},\"mounts\":[{{\"mount_id\":\"fs-main\",\"mount_path\":\"/nodes/{s}/fs\",\"state\":\"online\"}}],\"ops\":{{\"model\":\"namespace\"}},\"runtime\":{{\"type\":\"native_proc\"}},\"permissions\":{{\"default\":\"allow-by-default\",\"allow_roles\":[\"user\"]}},\"schema\":{{\"model\":\"namespace-service-v1\"}}}}," ++
+            "{{\"service_id\":\"tool-main\",\"kind\":\"tool\",\"version\":\"1\",\"state\":\"online\",\"endpoints\":[\"/nodes/{s}/tool/main\"],\"capabilities\":{{\"invoke\":true}},\"mounts\":[{{\"mount_id\":\"tool-main\",\"mount_path\":\"/nodes/{s}/tool/main\",\"state\":\"online\"}}],\"ops\":{{\"model\":\"namespace\",\"invoke\":\"control/invoke.json\"}},\"runtime\":{{\"type\":\"native_proc\"}},\"permissions\":{{\"default\":\"allow-by-default\",\"allow_roles\":[\"user\"]}},\"schema\":{{\"model\":\"namespace-service-v1\"}}}}" ++
+            "]}}",
+        .{
+            escaped_node_id,
+            escaped_node_secret,
+            escaped_node_id,
+            escaped_node_id,
+            escaped_node_id,
+            escaped_node_id,
+        },
+    );
+    defer allocator.free(upsert_req);
+    const upserted = try plane.nodeServiceUpsert(upsert_req);
+    defer allocator.free(upserted);
+
+    const project_json = try plane.createProject(
+        "{\"name\":\"InvokeFilteredWorkspace\",\"access_policy\":{\"actions\":{\"invoke\":\"open\"},\"agents\":{\"mother\":{\"invoke\":\"deny\"}}}}",
+    );
+    defer allocator.free(project_json);
+    var project_parsed = try std.json.parseFromSlice(std.json.Value, allocator, project_json, .{});
+    defer project_parsed.deinit();
+    if (project_parsed.value != .object) return error.TestExpectedResponse;
+    const project_id = project_parsed.value.object.get("project_id").?.string;
+
+    const mount_fs_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"project_id\":\"{s}\",\"node_id\":\"{s}\",\"export_name\":\"fs-main\",\"mount_path\":\"/nodes/{s}/fs\"}}",
+        .{ project_id, node_id, node_id },
+    );
+    defer allocator.free(mount_fs_req);
+    const mount_fs = try plane.setProjectMount(mount_fs_req);
+    defer allocator.free(mount_fs);
+
+    const mount_tool_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"project_id\":\"{s}\",\"node_id\":\"{s}\",\"export_name\":\"tool-main\",\"mount_path\":\"/nodes/{s}/tool/main\"}}",
+        .{ project_id, node_id, node_id },
+    );
+    defer allocator.free(mount_tool_req);
+    const mount_tool = try plane.setProjectMount(mount_tool_req);
+    defer allocator.free(mount_tool);
+
+    const selected_req = try std.fmt.allocPrint(allocator, "{{\"project_id\":\"{s}\"}}", .{project_id});
+    defer allocator.free(selected_req);
+
+    const user_status = try plane.workspaceStatus("mother", selected_req);
+    defer allocator.free(user_status);
+    try std.testing.expect(std.mem.indexOf(u8, user_status, "\"mount_path\":\"/nodes/") != null);
+    try std.testing.expect(std.mem.indexOf(u8, user_status, "/fs\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, user_status, "/tool/main\"") == null);
+
+    const admin_status = try plane.workspaceStatusWithRole("mother", selected_req, true);
+    defer allocator.free(admin_status);
+    try std.testing.expect(std.mem.indexOf(u8, admin_status, "/tool/main\"") != null);
 }
 
 test "fs_control_plane: invalid access policy payload is rejected" {

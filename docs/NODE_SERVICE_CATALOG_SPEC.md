@@ -139,6 +139,19 @@ service `permissions` metadata:
 
 Admin sessions bypass service permission filtering.
 
+## Workspace Mount Gating
+
+`control.workspace_status` now applies the same invoke-policy checks to mount
+projection for non-admin actors:
+
+- if a mount maps to an invoke-capable service (`capabilities.invoke=true` or
+  `ops.invoke` / `ops.paths.invoke` present), the mount is omitted unless:
+  - project access policy allows `invoke` for the actor
+  - service `permissions` allow the actor (including project-token requirements)
+
+This prevents invoke execution via mounted paths when invoke access is denied,
+not just service discovery/index visibility.
+
 ## `spiderweb-fs-node` Provider Mapping
 
 When `spiderweb-fs-node` runs in control daemon mode (`--control-url`), it auto-upserts service metadata:

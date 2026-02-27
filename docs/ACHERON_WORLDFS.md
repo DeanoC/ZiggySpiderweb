@@ -105,6 +105,10 @@ For node services with `CAPS.invoke=true`, runtime derives `invoke_path` using:
   - service-relative targets are resolved from mount/endpoint roots
 - fallback: `/control/invoke.json` relative to mount/endpoint roots
 
+Workspace mount projection now applies the same invoke policy checks for
+non-admin sessions: invoke-capable service mounts are omitted when project
+`invoke` access or service `PERMISSIONS.json` deny invoke access.
+
 `/agents/self/services/contracts/` currently seeds baseline contracts for:
 
 - `memory`
