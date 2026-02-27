@@ -75,12 +75,12 @@ Each service entry:
       "help_md": "Camera namespace driver"
     },
     {
-      "service_id": "terminal",
+      "service_id": "terminal-1",
       "kind": "terminal",
       "version": "1",
       "state": "degraded",
       "endpoints": ["/nodes/node-2/terminal/1"],
-      "capabilities": { "pty": true },
+      "capabilities": { "pty": true, "terminal_id": "1", "invoke": true },
       "mounts": [
         {
           "mount_id": "terminal-1",
@@ -88,11 +88,11 @@ Each service entry:
           "state": "degraded"
         }
       ],
-      "ops": { "model": "namespace", "style": "plan9", "interactive": true },
-      "runtime": { "type": "builtin", "abi": "namespace-driver-v1" },
+      "ops": { "model": "namespace", "style": "plan9", "interactive": true, "invoke": "control/invoke.json", "paths": { "exec": "control/invoke.json" } },
+      "runtime": { "type": "native_proc", "abi": "namespace-driver-v1", "entry": "internal-terminal-invoke" },
       "permissions": { "default": "deny-by-default", "device": "terminal" },
-      "schema": { "model": "namespace-mount" },
-      "help_md": "Builtin terminal namespace driver"
+      "schema": { "model": "namespace-service-v1" },
+      "help_md": "Terminal namespace driver"
     }
   ]
 }
@@ -166,7 +166,9 @@ When `spiderweb-fs-node` runs in control daemon mode (`--control-url`), it auto-
   - `service_id`: `terminal-<id>`
   - `kind`: `terminal`
   - endpoint: `/nodes/<node_id>/terminal/<id>`
-  - capabilities: `pty=true`, `terminal_id`
+  - capabilities: `pty=true`, `terminal_id`, `invoke=true`
+  - ops: `invoke=control/invoke.json` (`paths.exec` alias)
+  - runtime: `native_proc` (`entry=internal-terminal-invoke`)
   - mounts: `/nodes/<node_id>/terminal/<id>`
 - Extra namespace services (from `--service-manifest` / `--services-dir`):
   - appended to the upsert payload after built-in providers

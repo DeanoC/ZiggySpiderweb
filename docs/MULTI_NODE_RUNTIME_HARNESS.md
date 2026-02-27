@@ -27,6 +27,7 @@ Run a Linux node with manifests enabled (example):
 ```bash
 ./zig-out/bin/spiderweb-fs-node \
   --export "work=.:rw" \
+  --terminal-id "1" \
   --control-url "ws://<server>:18790/" \
   --control-auth-token "<admin-token>" \
   --pair-mode request \
@@ -53,6 +54,7 @@ On Windows (PowerShell):
 ```powershell
 .\spiderweb-fs-node.exe `
   --export "work=D:\Projects:rw" `
+  --terminal-id "1" `
   --control-url "ws://<server>:18790/" `
   --control-auth-token "<admin-token>" `
   --pair-mode invite `
@@ -69,7 +71,7 @@ Run from `ZiggySpiderweb`:
 SPIDERWEB_URL=ws://127.0.0.1:18790/ \
 SPIDERWEB_AUTH_TOKEN=sw-admin-... \
 EXPECTED_NODES=node-1,node-2 \
-EXPECTED_SERVICES=echo-main \
+EXPECTED_SERVICES=echo-main,terminal-1 \
 RECONNECT_NODE_ID=node-2 \
 PERSISTENCE_NODE_ID=node-2 \
 PERSISTENCE_SERVICE_ID=echo-main \
@@ -108,4 +110,3 @@ Start `zss-gui`, connect to server URL, and verify:
 - service mounts are visible under `/nodes/<node>/...`
 - runtime files render in filesystem panel (`control/*`, `health.json`, `status.json`)
 - runtime actions (enable/disable/restart/invoke/config-set) are available
-

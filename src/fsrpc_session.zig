@@ -757,6 +757,8 @@ pub const Session = struct {
         try self.seedAgentMemoryNamespace(memory_dir);
         const web_search_dir = try self.addDir(self_agent_dir, "web_search", false);
         try self.seedAgentWebSearchNamespace(web_search_dir);
+        const terminal_dir = try self.addDir(self_agent_dir, "terminal", false);
+        try self.seedAgentTerminalNamespace(terminal_dir);
 
         self.jobs_root_id = try self.addDir(self_agent_dir, "jobs", false);
         try self.addDirectoryDescriptors(
@@ -1522,6 +1524,17 @@ pub const Session = struct {
             "{\"default\":\"allow-by-default\",\"allow_roles\":[\"admin\",\"user\"],\"scope\":\"agent\"}",
             "Web search tool bridge. Write JSON to control/invoke.json and read result.json/status.json.",
         );
+        try self.addAgentServiceContract(
+            contracts_dir,
+            "terminal",
+            "Terminal Service Contract",
+            "{\"model\":\"acheron.service.contract.v1\",\"service\":\"terminal\",\"input\":{\"command\":\"string\",\"cwd\":\"string?\",\"timeout_ms\":\"u64?\",\"max_output_bytes\":\"u64?\"},\"output\":{\"ok\":\"bool\",\"exit_code\":\"i32\",\"stdout\":\"string\",\"stderr\":\"string\"}}",
+            "{\"contract_only\":true,\"invoke\":true,\"operations\":[\"shell_exec\"],\"interactive\":false}",
+            "{\"model\":\"tool_bridge\",\"invoke\":\"control/invoke.json\",\"transport\":\"runtime-tool\",\"operations\":{\"exec\":\"shell_exec\"}}",
+            "{\"type\":\"runtime_tool\",\"tool\":\"shell_exec\"}",
+            "{\"default\":\"allow-by-default\",\"allow_roles\":[\"admin\",\"user\"],\"scope\":\"agent\"}",
+            "Terminal command bridge. Write shell command payloads to control/invoke.json.",
+        );
     }
 
     fn addAgentServiceContract(
@@ -1699,6 +1712,69 @@ pub const Session = struct {
         );
         _ = try self.addFile(control_dir, "invoke.json", "", true, .agent_contract_invoke);
         _ = try self.addFile(control_dir, "search.json", "", true, .agent_contract_invoke);
+    }
+
+    fn seedAgentTerminalNamespace(self: *Session, terminal_dir: u32) !void {
+        try self.addDirectoryDescriptors(
+            terminal_dir,
+            "Terminal",
+            "{\"kind\":\"service\",\"service_id\":\"terminal\",\"shape\":\"/agents/self/terminal/{README.md,SCHEMA.json,CAPS.json,OPS.json,RUNTIME.json,PERMISSIONS.json,STATUS.json,status.json,result.json,control/*}\"}",
+            "{\"invoke\":true,\"operations\":[\"shell_exec\"],\"discoverable\":true,\"interactive\":false}",
+            "First-class terminal namespace. Write command payloads to control/exec.json (or invoke.json), then read status.json/result.json.",
+        );
+        _ = try self.addFile(
+            terminal_dir,
+            "OPS.json",
+            "{\"model\":\"tool_bridge\",\"invoke\":\"control/invoke.json\",\"transport\":\"runtime-tool\",\"paths\":{\"exec\":\"control/exec.json\"},\"operations\":{\"exec\":\"shell_exec\"}}",
+            false,
+            .none,
+        );
+        _ = try self.addFile(
+            terminal_dir,
+            "RUNTIME.json",
+            "{\"type\":\"runtime_tool\",\"tool\":\"shell_exec\"}",
+            false,
+            .none,
+        );
+        _ = try self.addFile(
+            terminal_dir,
+            "PERMISSIONS.json",
+            "{\"default\":\"allow-by-default\",\"allow_roles\":[\"admin\",\"user\"],\"scope\":\"agent\"}",
+            false,
+            .none,
+        );
+        _ = try self.addFile(
+            terminal_dir,
+            "STATUS.json",
+            "{\"service_id\":\"terminal\",\"state\":\"namespace\",\"has_invoke\":true}",
+            false,
+            .none,
+        );
+        _ = try self.addFile(
+            terminal_dir,
+            "status.json",
+            "{\"state\":\"idle\",\"tool\":null,\"updated_at_ms\":0,\"error\":null}",
+            false,
+            .none,
+        );
+        _ = try self.addFile(
+            terminal_dir,
+            "result.json",
+            "{\"ok\":false,\"result\":null,\"error\":null}",
+            false,
+            .none,
+        );
+
+        const control_dir = try self.addDir(terminal_dir, "control", false);
+        _ = try self.addFile(
+            control_dir,
+            "README.md",
+            "Write command payloads to exec.json (or explicit envelopes to invoke.json). Read result.json and status.json.\n",
+            false,
+            .none,
+        );
+        _ = try self.addFile(control_dir, "invoke.json", "", true, .agent_contract_invoke);
+        _ = try self.addFile(control_dir, "exec.json", "", true, .agent_contract_invoke);
     }
 
     fn buildProjectTopologyJson(self: *Session, policy: world_policy.Policy) ![]u8 {
@@ -4291,7 +4367,7 @@ pub const Session = struct {
     ) !void {
         const agents_root = self.lookupChild(self.root_id, "agents") orelse return;
         const self_agent_dir = self.lookupChild(agents_root, "self") orelse return;
-        const namespace_services = [_][]const u8{ "memory", "web_search" };
+        const namespace_services = [_][]const u8{ "memory", "web_search", "terminal" };
         for (namespace_services) |service_id| {
             const service_dir_id = self.lookupChild(self_agent_dir, service_id) orelse continue;
             const service_dir = self.nodes.get(service_dir_id) orelse continue;
@@ -5319,7 +5395,7 @@ test "fsrpc_session: protocol read exposes agent services discovery index" {
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"service_path\":\"/nodes/local/services/fs\"") != null);
 }
 
-test "fsrpc_session: agent services index includes memory and web_search contracts" {
+test "fsrpc_session: agent services index includes memory, web_search, and terminal contracts" {
     const allocator = std.testing.allocator;
 
     const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
@@ -5343,7 +5419,9 @@ test "fsrpc_session: agent services index includes memory and web_search contrac
 
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"service_id\":\"memory\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"service_id\":\"web_search\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"service_id\":\"terminal\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"service_path\":\"/agents/self/services/contracts/memory\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"service_path\":\"/agents/self/services/contracts/terminal\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"scope\":\"agent_contract\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"invoke_path\":\"/agents/self/services/contracts/memory/control/invoke.json\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"has_invoke\":true") != null);
@@ -5451,6 +5529,33 @@ test "fsrpc_session: agent services index includes first-class web_search namesp
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"invoke_path\":\"/agents/self/web_search/control/invoke.json\"") != null);
 }
 
+test "fsrpc_session: agent services index includes first-class terminal namespace entry" {
+    const allocator = std.testing.allocator;
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.init(allocator, runtime_handle, &job_index, "default");
+    defer session.deinit();
+
+    const payload = try protocolReadFile(
+        &session,
+        allocator,
+        232,
+        233,
+        &.{ "agents", "self", "services", "SERVICES.json" },
+        905,
+    );
+    defer allocator.free(payload);
+
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"scope\":\"agent_namespace\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"service_path\":\"/agents/self/terminal\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"invoke_path\":\"/agents/self/terminal/control/invoke.json\"") != null);
+}
+
 test "fsrpc_session: first-class memory namespace operation file maps to runtime tool" {
     const allocator = std.testing.allocator;
 
@@ -5544,6 +5649,51 @@ test "fsrpc_session: first-class web_search namespace operation file maps to run
     defer allocator.free(result_payload);
     try std.testing.expect(result_payload.len > 2);
     try std.testing.expect(result_payload[0] == '{');
+}
+
+test "fsrpc_session: first-class terminal namespace operation file maps to runtime tool" {
+    const allocator = std.testing.allocator;
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.init(allocator, runtime_handle, &job_index, "default");
+    defer session.deinit();
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        234,
+        235,
+        &.{ "agents", "self", "terminal", "control", "exec.json" },
+        "{\"command\":\"echo terminal-namespace\"}",
+        906,
+    );
+
+    const status_payload = try protocolReadFile(
+        &session,
+        allocator,
+        236,
+        237,
+        &.{ "agents", "self", "terminal", "status.json" },
+        907,
+    );
+    defer allocator.free(status_payload);
+    try std.testing.expect(std.mem.indexOf(u8, status_payload, "\"tool\":\"shell_exec\"") != null);
+
+    const result_payload = try protocolReadFile(
+        &session,
+        allocator,
+        238,
+        239,
+        &.{ "agents", "self", "terminal", "result.json" },
+        908,
+    );
+    defer allocator.free(result_payload);
+    try std.testing.expect(std.mem.indexOf(u8, result_payload, "terminal-namespace") != null);
 }
 
 test "fsrpc_session: first-class memory namespace enforces operation tool mapping" {

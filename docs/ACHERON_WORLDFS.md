@@ -86,6 +86,7 @@ Node directories also expose:
 - Event wait next path: `/agents/self/events/next.json`
 - First-class memory service path: `/agents/self/memory`
 - First-class web search service path: `/agents/self/web_search`
+- First-class terminal service path: `/agents/self/terminal`
 
 `/agents/self/services/SERVICES.json` entries include:
 
@@ -113,6 +114,7 @@ non-admin sessions: invoke-capable service mounts are omitted when project
 
 - `memory`
 - `web_search`
+- `terminal`
 
 Contract service invoke flow:
 
@@ -151,6 +153,16 @@ First-class web search namespace flow:
    - `/agents/self/web_search/status.json`
 3. Read tool result payload:
    - `/agents/self/web_search/result.json`
+
+First-class terminal namespace flow:
+
+1. Write command payload JSON to one of:
+   - `/agents/self/terminal/control/exec.json`
+   - `/agents/self/terminal/control/invoke.json` (generic tool call envelope)
+2. Read runtime status:
+   - `/agents/self/terminal/status.json`
+3. Read tool result payload:
+   - `/agents/self/terminal/result.json`
 
 `acheron.t_write` responses for chat include:
 
