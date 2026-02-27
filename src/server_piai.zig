@@ -1062,6 +1062,24 @@ const NodeServiceWatchRequest = struct {
     }
 };
 
+const NodeServiceWatchMetricsSnapshot = struct {
+    subscribers_current: usize = 0,
+    subscribers_peak: usize = 0,
+    replay_requests_total: u64 = 0,
+    replay_attempted_total: u64 = 0,
+    replay_sent_total: u64 = 0,
+    replay_bytes_total: u64 = 0,
+    fanout_events_total: u64 = 0,
+    fanout_attempted_total: u64 = 0,
+    fanout_sent_total: u64 = 0,
+    fanout_dropped_total: u64 = 0,
+    retained_events: usize = 0,
+    retained_capacity: usize = 0,
+    retained_oldest_ms: ?i64 = null,
+    retained_newest_ms: ?i64 = null,
+    retained_window_ms: u64 = 0,
+};
+
 const ControlMutationScope = enum {
     none,
     node,
@@ -2828,6 +2846,16 @@ const AgentRuntimeRegistry = struct {
     node_service_event_log_rotate_max_bytes: u64 = 4 * 1024 * 1024,
     node_service_event_log_archive_keep: usize = 8,
     node_service_event_log_gzip_available: bool = false,
+    node_service_watch_metrics_mutex: std.Thread.Mutex = .{},
+    node_service_watch_subscribers_peak: usize = 0,
+    node_service_watch_replay_requests_total: u64 = 0,
+    node_service_watch_replay_attempted_total: u64 = 0,
+    node_service_watch_replay_sent_total: u64 = 0,
+    node_service_watch_replay_bytes_total: u64 = 0,
+    node_service_watch_fanout_events_total: u64 = 0,
+    node_service_watch_fanout_attempted_total: u64 = 0,
+    node_service_watch_fanout_sent_total: u64 = 0,
+    node_service_watch_fanout_dropped_total: u64 = 0,
     audit_records_mutex: std.Thread.Mutex = .{},
     audit_records: std.ArrayListUnmanaged(AuditRecord) = .{},
     next_audit_record_id: u64 = 1,
@@ -4106,6 +4134,12 @@ const AgentRuntimeRegistry = struct {
             .project_id = project_copy,
             .project_token = project_token_copy,
         });
+        self.node_service_watch_metrics_mutex.lock();
+        const next_count = self.node_service_subscribers.items.len;
+        if (next_count > self.node_service_watch_subscribers_peak) {
+            self.node_service_watch_subscribers_peak = next_count;
+        }
+        self.node_service_watch_metrics_mutex.unlock();
         return id;
     }
 
@@ -4351,6 +4385,184 @@ const AgentRuntimeRegistry = struct {
         }
     }
 
+    fn recordNodeServiceReplayMetrics(
+        self: *AgentRuntimeRegistry,
+        attempted: usize,
+        sent: usize,
+        bytes: usize,
+    ) void {
+        self.node_service_watch_metrics_mutex.lock();
+        defer self.node_service_watch_metrics_mutex.unlock();
+        self.node_service_watch_replay_requests_total +%= 1;
+        self.node_service_watch_replay_attempted_total +%= @intCast(attempted);
+        self.node_service_watch_replay_sent_total +%= @intCast(sent);
+        self.node_service_watch_replay_bytes_total +%= @intCast(bytes);
+    }
+
+    fn recordNodeServiceFanoutMetrics(
+        self: *AgentRuntimeRegistry,
+        attempts: usize,
+        sent: usize,
+        dropped: usize,
+    ) void {
+        self.node_service_watch_metrics_mutex.lock();
+        defer self.node_service_watch_metrics_mutex.unlock();
+        self.node_service_watch_fanout_events_total +%= 1;
+        self.node_service_watch_fanout_attempted_total +%= @intCast(attempts);
+        self.node_service_watch_fanout_sent_total +%= @intCast(sent);
+        self.node_service_watch_fanout_dropped_total +%= @intCast(dropped);
+    }
+
+    fn snapshotNodeServiceWatchMetrics(self: *AgentRuntimeRegistry) NodeServiceWatchMetricsSnapshot {
+        var snapshot = NodeServiceWatchMetricsSnapshot{};
+
+        self.node_service_subscribers_mutex.lock();
+        snapshot.subscribers_current = self.node_service_subscribers.items.len;
+        self.node_service_subscribers_mutex.unlock();
+
+        self.node_service_event_history_mutex.lock();
+        snapshot.retained_events = self.node_service_event_history.items.len;
+        snapshot.retained_capacity = self.node_service_event_history_max;
+        if (self.node_service_event_history.items.len > 0) {
+            snapshot.retained_oldest_ms = self.node_service_event_history.items[0].timestamp_ms;
+            snapshot.retained_newest_ms = self.node_service_event_history.items[self.node_service_event_history.items.len - 1].timestamp_ms;
+            const oldest = snapshot.retained_oldest_ms.?;
+            const newest = snapshot.retained_newest_ms.?;
+            if (newest >= oldest) {
+                snapshot.retained_window_ms = @intCast(newest - oldest);
+            }
+        }
+        self.node_service_event_history_mutex.unlock();
+
+        self.node_service_watch_metrics_mutex.lock();
+        snapshot.subscribers_peak = self.node_service_watch_subscribers_peak;
+        snapshot.replay_requests_total = self.node_service_watch_replay_requests_total;
+        snapshot.replay_attempted_total = self.node_service_watch_replay_attempted_total;
+        snapshot.replay_sent_total = self.node_service_watch_replay_sent_total;
+        snapshot.replay_bytes_total = self.node_service_watch_replay_bytes_total;
+        snapshot.fanout_events_total = self.node_service_watch_fanout_events_total;
+        snapshot.fanout_attempted_total = self.node_service_watch_fanout_attempted_total;
+        snapshot.fanout_sent_total = self.node_service_watch_fanout_sent_total;
+        snapshot.fanout_dropped_total = self.node_service_watch_fanout_dropped_total;
+        self.node_service_watch_metrics_mutex.unlock();
+
+        return snapshot;
+    }
+
+    fn appendNodeServiceWatchMetricsJson(
+        self: *AgentRuntimeRegistry,
+        out: *std.ArrayListUnmanaged(u8),
+        snapshot: NodeServiceWatchMetricsSnapshot,
+    ) !void {
+        try out.writer(self.allocator).print(
+            "{{\"subscribers\":{{\"current\":{d},\"peak\":{d}}},\"replay\":{{\"requests_total\":{d},\"attempted_total\":{d},\"sent_total\":{d},\"bytes_total\":{d}}},\"fanout\":{{\"events_total\":{d},\"attempted_total\":{d},\"sent_total\":{d},\"dropped_total\":{d}}},\"retained\":{{\"events\":{d},\"capacity\":{d},\"oldest_ms\":",
+            .{
+                snapshot.subscribers_current,
+                snapshot.subscribers_peak,
+                snapshot.replay_requests_total,
+                snapshot.replay_attempted_total,
+                snapshot.replay_sent_total,
+                snapshot.replay_bytes_total,
+                snapshot.fanout_events_total,
+                snapshot.fanout_attempted_total,
+                snapshot.fanout_sent_total,
+                snapshot.fanout_dropped_total,
+                snapshot.retained_events,
+                snapshot.retained_capacity,
+            },
+        );
+        if (snapshot.retained_oldest_ms) |value| {
+            try out.writer(self.allocator).print("{d}", .{value});
+        } else {
+            try out.appendSlice(self.allocator, "null");
+        }
+        try out.appendSlice(self.allocator, ",\"newest_ms\":");
+        if (snapshot.retained_newest_ms) |value| {
+            try out.writer(self.allocator).print("{d}", .{value});
+        } else {
+            try out.appendSlice(self.allocator, "null");
+        }
+        try out.writer(self.allocator).print(",\"window_ms\":{d}}}", .{snapshot.retained_window_ms});
+    }
+
+    fn metricsJson(self: *AgentRuntimeRegistry) ![]u8 {
+        const base = try self.control_plane.metricsJson();
+        defer self.allocator.free(base);
+
+        const snapshot = self.snapshotNodeServiceWatchMetrics();
+        const trimmed = std.mem.trimRight(u8, base, " \t\r\n");
+        if (trimmed.len == 0 or trimmed[trimmed.len - 1] != '}') {
+            return self.allocator.dupe(u8, base);
+        }
+
+        var out = std.ArrayListUnmanaged(u8){};
+        errdefer out.deinit(self.allocator);
+        try out.appendSlice(self.allocator, trimmed[0 .. trimmed.len - 1]);
+        try out.appendSlice(self.allocator, ",\"node_service_watch\":");
+        try self.appendNodeServiceWatchMetricsJson(&out, snapshot);
+        try out.append(self.allocator, '}');
+        return out.toOwnedSlice(self.allocator);
+    }
+
+    fn metricsPrometheus(self: *AgentRuntimeRegistry) ![]u8 {
+        const base = try self.control_plane.metricsPrometheus();
+        defer self.allocator.free(base);
+
+        const snapshot = self.snapshotNodeServiceWatchMetrics();
+        var out = std.ArrayListUnmanaged(u8){};
+        errdefer out.deinit(self.allocator);
+        try out.appendSlice(self.allocator, base);
+        if (out.items.len > 0 and out.items[out.items.len - 1] != '\n') {
+            try out.append(self.allocator, '\n');
+        }
+        try out.writer(self.allocator).print(
+            \\# TYPE spiderweb_node_service_watch_subscribers gauge
+            \\spiderweb_node_service_watch_subscribers {d}
+            \\# TYPE spiderweb_node_service_watch_subscribers_peak gauge
+            \\spiderweb_node_service_watch_subscribers_peak {d}
+            \\# TYPE spiderweb_node_service_watch_replay_requests_total counter
+            \\spiderweb_node_service_watch_replay_requests_total {d}
+            \\# TYPE spiderweb_node_service_watch_replay_attempted_total counter
+            \\spiderweb_node_service_watch_replay_attempted_total {d}
+            \\# TYPE spiderweb_node_service_watch_replay_sent_total counter
+            \\spiderweb_node_service_watch_replay_sent_total {d}
+            \\# TYPE spiderweb_node_service_watch_replay_bytes_total counter
+            \\spiderweb_node_service_watch_replay_bytes_total {d}
+            \\# TYPE spiderweb_node_service_watch_fanout_events_total counter
+            \\spiderweb_node_service_watch_fanout_events_total {d}
+            \\# TYPE spiderweb_node_service_watch_fanout_attempted_total counter
+            \\spiderweb_node_service_watch_fanout_attempted_total {d}
+            \\# TYPE spiderweb_node_service_watch_fanout_sent_total counter
+            \\spiderweb_node_service_watch_fanout_sent_total {d}
+            \\# TYPE spiderweb_node_service_watch_fanout_dropped_total counter
+            \\spiderweb_node_service_watch_fanout_dropped_total {d}
+            \\# TYPE spiderweb_node_service_watch_retained_events gauge
+            \\spiderweb_node_service_watch_retained_events {d}
+            \\# TYPE spiderweb_node_service_watch_retained_capacity gauge
+            \\spiderweb_node_service_watch_retained_capacity {d}
+            \\# TYPE spiderweb_node_service_watch_retained_window_ms gauge
+            \\spiderweb_node_service_watch_retained_window_ms {d}
+            \\
+        ,
+            .{
+                snapshot.subscribers_current,
+                snapshot.subscribers_peak,
+                snapshot.replay_requests_total,
+                snapshot.replay_attempted_total,
+                snapshot.replay_sent_total,
+                snapshot.replay_bytes_total,
+                snapshot.fanout_events_total,
+                snapshot.fanout_attempted_total,
+                snapshot.fanout_sent_total,
+                snapshot.fanout_dropped_total,
+                snapshot.retained_events,
+                snapshot.retained_capacity,
+                snapshot.retained_window_ms,
+            },
+        );
+        return out.toOwnedSlice(self.allocator);
+    }
+
     fn replayNodeServiceEvents(
         self: *AgentRuntimeRegistry,
         stream: *std.net.Stream,
@@ -4362,6 +4574,10 @@ const AgentRuntimeRegistry = struct {
         node_id_filter: ?[]const u8,
         replay_limit: usize,
     ) !usize {
+        var replay_attempted: usize = 0;
+        var replay_sent: usize = 0;
+        var replay_bytes: usize = 0;
+        defer self.recordNodeServiceReplayMetrics(replay_attempted, replay_sent, replay_bytes);
         if (replay_limit == 0) return 0;
 
         var replay_payloads = std.ArrayListUnmanaged([]u8){};
@@ -4400,8 +4616,11 @@ const AgentRuntimeRegistry = struct {
                 replay_payloads.items[replay_idx],
             );
             defer self.allocator.free(frame_json);
+            replay_attempted += 1;
             try writeFrameLocked(stream, write_mutex, frame_json, .text);
             sent += 1;
+            replay_sent += 1;
+            replay_bytes += replay_payloads.items[replay_idx].len;
         }
         return sent;
     }
@@ -4423,6 +4642,9 @@ const AgentRuntimeRegistry = struct {
         self.node_service_subscribers_mutex.lock();
         defer self.node_service_subscribers_mutex.unlock();
 
+        var fanout_attempts: usize = 0;
+        var fanout_sent: usize = 0;
+        var fanout_dropped: usize = 0;
         var idx: usize = 0;
         while (idx < self.node_service_subscribers.items.len) {
             const subscriber = &self.node_service_subscribers.items[idx];
@@ -4437,16 +4659,20 @@ const AgentRuntimeRegistry = struct {
                 idx += 1;
                 continue;
             }
+            fanout_attempts += 1;
             subscriber.write_mutex.lock();
             const write_result = websocket_transport.writeFrame(subscriber.stream, event_json, .text);
             subscriber.write_mutex.unlock();
             if (write_result) |_| {
+                fanout_sent += 1;
                 idx += 1;
             } else |_| {
+                fanout_dropped += 1;
                 var removed = self.node_service_subscribers.swapRemove(idx);
                 removed.deinit(self.allocator);
             }
         }
+        self.recordNodeServiceFanoutMetrics(fanout_attempts, fanout_sent, fanout_dropped);
     }
 
     fn emitWorkspaceTopologyChanged(self: *AgentRuntimeRegistry, reason: []const u8) void {
@@ -5253,7 +5479,7 @@ fn handleWebSocketConnection(
                                     try writeFrameLocked(stream, &connection_write_mutex, response, .text);
                                     continue;
                                 }
-                                const payload = try runtime_registry.control_plane.metricsJson();
+                                const payload = try runtime_registry.metricsJson();
                                 defer allocator.free(payload);
                                 const response = try unified.buildControlAck(
                                     allocator,
@@ -7807,7 +8033,7 @@ fn handleMetricsHttpConnection(
     }
 
     if (std.mem.eql(u8, request_path, "/metrics")) {
-        const body = runtime_registry.control_plane.metricsPrometheus() catch |err| {
+        const body = runtime_registry.metricsPrometheus() catch |err| {
             const err_msg = try std.fmt.allocPrint(allocator, "metrics formatter error: {s}\n", .{@errorName(err)});
             defer allocator.free(err_msg);
             try writeHttpStatus(stream, "500 Internal Server Error", "text/plain; charset=utf-8", err_msg);
@@ -7823,7 +8049,7 @@ fn handleMetricsHttpConnection(
         return;
     }
 
-    const json_body = runtime_registry.control_plane.metricsJson() catch |err| {
+    const json_body = runtime_registry.metricsJson() catch |err| {
         const err_msg = try std.fmt.allocPrint(allocator, "{{\"error\":\"{s}\"}}\n", .{@errorName(err)});
         defer allocator.free(err_msg);
         try writeHttpStatus(stream, "500 Internal Server Error", "application/json", err_msg);
@@ -8272,6 +8498,7 @@ test "server_piai: base websocket path handles unified control/acheron chat flow
     try std.testing.expect(std.mem.indexOf(u8, metrics.payload, "\"type\":\"control.metrics\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, metrics.payload, "\"nodes\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, metrics.payload, "\"projects\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, metrics.payload, "\"node_service_watch\"") != null);
 
     try writeClientTextFrameMasked(&client, "{\"channel\":\"control\",\"type\":\"control.debug_subscribe\",\"id\":\"req-debug-sub\"}");
     var debug_sub = try readServerFrame(allocator, &client);
@@ -9500,6 +9727,27 @@ test "server_piai: parseHttpRequestPath parses GET line" {
 test "server_piai: stripHttpRequestTargetQuery removes query string" {
     try std.testing.expectEqualStrings("/metrics", stripHttpRequestTargetQuery("/metrics?format=json"));
     try std.testing.expectEqualStrings("/readyz", stripHttpRequestTargetQuery("/readyz"));
+}
+
+test "server_piai: metrics include node service watch telemetry" {
+    const allocator = std.testing.allocator;
+    var runtime_registry = AgentRuntimeRegistry.init(allocator, .{
+        .ltm_directory = "",
+        .ltm_filename = "",
+    }, null);
+    defer runtime_registry.deinit();
+
+    const metrics_json = try runtime_registry.metricsJson();
+    defer allocator.free(metrics_json);
+    try std.testing.expect(std.mem.indexOf(u8, metrics_json, "\"node_service_watch\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, metrics_json, "\"replay\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, metrics_json, "\"fanout\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, metrics_json, "\"retained\"") != null);
+
+    const metrics_prom = try runtime_registry.metricsPrometheus();
+    defer allocator.free(metrics_prom);
+    try std.testing.expect(std.mem.indexOf(u8, metrics_prom, "spiderweb_node_service_watch_replay_requests_total") != null);
+    try std.testing.expect(std.mem.indexOf(u8, metrics_prom, "spiderweb_node_service_watch_fanout_events_total") != null);
 }
 
 test "server_piai: extract project payload helpers parse id and token" {

@@ -152,11 +152,31 @@ Status: completed
 - GUI debug panel now exposes project-scope watch preview and policy denial
   hints for watch failures, alongside scoped filter/replay controls.
 
+## Phase 10 - Runtime Probe Telemetry + Reload Diff UX
+
+Status: completed
+
+- Server metrics now include node-service watch telemetry in both
+  `control.metrics` and HTTP metrics endpoints:
+  - fanout totals (events/attempts/sent/dropped)
+  - replay totals (requests/attempted/sent/bytes)
+  - retained event window coverage (events/capacity/oldest/newest/window_ms)
+- Control-tunnel node runtime now overlays active runtime-manager probe state
+  into extra-service catalog JSON before upsert:
+  - top-level and mount `state` sync from supervision state
+  - `runtime.supervision_status` export with live counters/flags
+  - periodic probe-state catalog sync/upsert while tunnel is active
+- GUI Debug panel now includes manifest/service diff diagnostics for
+  `control.node_service_event` payloads:
+  - latest observed delta summary
+  - selected-event per-service change listing (`added`/`updated`/`removed`)
+  - digest/version transition details for reload troubleshooting
+
 ## Next Backlog
 
-- Add server-side metrics for node service watch fanout/replay throughput and
-  retained event window coverage.
-- Add runtime-manager driver bindings so supervision can perform active
-  process/plugin health probes for live namespace drivers.
-- Add GUI workflow for manifest/service diff visibility and per-service reload
-  diagnostics.
+- Add alerting/dashboard guidance for node-service watch telemetry
+  (`/metrics` and `control.metrics`) with threshold recommendations.
+- Add per-driver health detail plumbing (last error reason + transition
+  timestamps) from runtime manager into service catalog metadata.
+- Add GUI controls to diff any two historical node-service events and export
+  the diff snapshot for incident/debug reports.
