@@ -172,11 +172,25 @@ Status: completed
   - selected-event per-service change listing (`added`/`updated`/`removed`)
   - digest/version transition details for reload troubleshooting
 
+## Phase 11 - Runtime Health Detail Plumbing + Recovery Signals
+
+Status: completed
+
+- Runtime manager now tracks richer runtime supervision state:
+  - `last_error` detail
+  - `last_transition_ms`
+  - `last_healthy_ms`
+- Control-tunnel service catalog overlay now exports these fields under
+  `runtime.supervision_status` for live service descriptors.
+- Overlay churn is now transition-driven (no constant timestamp-only updates),
+  with tests covering degrade -> recover transitions.
+- GUI diagnostics now surface runtime supervision state for changed services
+  (`state`, `enabled`, `running`, failure counters, transition/healthy
+  timestamps, and `last_error`) alongside service delta summaries.
+
 ## Next Backlog
 
 - Add alerting/dashboard guidance for node-service watch telemetry
   (`/metrics` and `control.metrics`) with threshold recommendations.
-- Add per-driver health detail plumbing (last error reason + transition
-  timestamps) from runtime manager into service catalog metadata.
 - Add GUI controls to diff any two historical node-service events and export
   the diff snapshot for incident/debug reports.
