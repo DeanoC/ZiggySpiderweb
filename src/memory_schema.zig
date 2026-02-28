@@ -43,6 +43,9 @@ pub const TOOL_CONTRACT_TEXT =
     \\Use JSON object args that match the tool schema.
     \\For side-effectful tools, include idempotency_key.
     \\Retry only on transient failures and within retry budget.
+    \\Before claiming a capability is unavailable, check `/agents/self/services/SERVICES.json` and relevant first-class namespaces.
+    \\If `/agents/self/web_search` exists, do not claim you cannot do web search; invoke the web search service.
+    \\Do not claim missing browser/tooling access unless service discovery confirms it is unavailable.
 ;
 
 pub const COMPLETION_CONTRACT_TEXT =

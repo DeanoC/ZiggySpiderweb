@@ -246,12 +246,12 @@ fn handleConnection(ctx: *ConnectionContext) !void {
                 defer parsed.deinit(ctx.allocator);
 
                 if (!fsrpc_negotiated) {
-                    if (parsed.channel != .fsrpc or parsed.fsrpc_type != .fs_t_hello) {
+                    if (parsed.channel != .acheron or parsed.acheron_type != .fs_t_hello) {
                         const response = try unified.buildFsrpcFsError(
                             ctx.allocator,
                             parsed.tag,
                             fs_protocol.Errno.EINVAL,
-                            "fsrpc.t_fs_hello must be negotiated first",
+                            "acheron.t_fs_hello must be negotiated first",
                         );
                         defer ctx.allocator.free(response);
                         try writeConnectionFrameMaybe(connection, &ctx.stream, &connection_write_mutex, response, .text);
@@ -272,7 +272,7 @@ fn handleConnection(ctx: *ConnectionContext) !void {
                     };
                     connection = try ctx.hub.register(&ctx.stream);
                     fsrpc_negotiated = true;
-                } else if (parsed.fsrpc_type == .fs_t_hello) {
+                } else if (parsed.acheron_type == .fs_t_hello) {
                     validateFsNodeHelloPayload(ctx.allocator, parsed.payload_json, ctx.required_auth_token) catch |err| {
                         const response = try unified.buildFsrpcFsError(
                             ctx.allocator,

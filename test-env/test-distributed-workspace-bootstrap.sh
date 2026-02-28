@@ -222,8 +222,8 @@ WORKSPACE_MOUNTS_JSON="$(json_query "$PROJECT_UP_RESP" "payload.workspace.mounts
 WORKSPACE_DESIRED_JSON="$(json_query "$PROJECT_UP_RESP" "payload.workspace.desired_mounts")"
 WORKSPACE_ACTUAL_JSON="$(json_query "$PROJECT_UP_RESP" "payload.workspace.actual_mounts")"
 
-if [[ -z "$PROJECT_ID" || -z "$PROJECT_TOKEN" ]]; then
-    log_fail "project_up response missing project id/token"
+if [[ -z "$PROJECT_ID" ]]; then
+    log_fail "project_up response missing project id"
     echo "$PROJECT_UP_RESP"
     exit 1
 fi

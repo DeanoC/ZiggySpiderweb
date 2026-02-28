@@ -1,6 +1,6 @@
 # ZiggySpiderweb Test Environment Makefile
 
-.PHONY: help build up down shell test wipe logs status test-embed-multi-service test-distributed-workspace test-distributed-workspace-bootstrap test-distributed-workspace-drift test-distributed-workspace-matrix test-distributed-workspace-encrypted test-distributed-workspace-operator-token test-distributed-soak-chaos
+.PHONY: help build up down shell test wipe logs status test-embed-multi-service test-distributed-workspace test-distributed-workspace-bootstrap test-distributed-workspace-drift test-distributed-workspace-matrix test-distributed-workspace-encrypted test-distributed-workspace-operator-token test-distributed-soak-chaos test-unified-v2-protocol
 
 help: ## Show this help message
 	@echo "ZiggySpiderweb Test Environment"
@@ -69,3 +69,6 @@ test-distributed-workspace-operator-token: ## Run distributed workspace test wit
 
 test-distributed-soak-chaos: ## Run long-running distributed workspace soak/chaos suite
 	@bash ./test-distributed-soak-chaos.sh
+
+test-unified-v2-protocol: ## Run unified v2 protocol negotiation/auth validation suite
+	@bash ./test-unified-v2-protocol.sh

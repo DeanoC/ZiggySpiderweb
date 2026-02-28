@@ -244,6 +244,33 @@ Two new binaries provide the distributed filesystem protocol from `design_docs/F
 # Start a node server exporting the current directory as RW
 ./zig-out/bin/spiderweb-fs-node --export work=.:rw
 
+# Run as a paired node daemon (invite flow) and keep lease refreshed
+./zig-out/bin/spiderweb-fs-node \
+  --export work=.:rw \
+  --control-url ws://127.0.0.1:18790/ \
+  --pair-mode invite \
+  --invite-token invite-abc123 \
+  --node-name clawz \
+  --fs-url ws://10.0.0.8:18891/v2/fs
+
+# Run request/approval pairing flow (creates pending request, then retries approval)
+./zig-out/bin/spiderweb-fs-node \
+  --export work=.:rw \
+  --control-url ws://127.0.0.1:18790/ \
+  --pair-mode request \
+  --node-name edge-1
+
+# Advertise terminal services + labels to node service catalog
+./zig-out/bin/spiderweb-fs-node \
+  --export work=.:rw \
+  --control-url ws://127.0.0.1:18790/ \
+  --pair-mode request \
+  --node-name edge-1 \
+  --terminal-id 1 \
+  --terminal-id 2 \
+  --label site=hq \
+  --label tier=edge
+
 # List root entries through the mount/router client
 ./zig-out/bin/spiderweb-fs-mount \
   --endpoint a=ws://127.0.0.1:18891/v2/fs#work@/src \
@@ -280,23 +307,38 @@ Two new binaries provide the distributed filesystem protocol from `design_docs/F
 ```
 
 Notes:
-- Transport is unified v2 WebSocket JSON using `channel=fsrpc` and `type=fsrpc.t_fs_*` / `fsrpc.r_fs_*` / `fsrpc.e_fs_*` / `fsrpc.err_fs`.
+- Transport is unified v2 WebSocket JSON using `channel=acheron` and `type=acheron.t_fs_*` / `acheron.r_fs_*` / `acheron.e_fs_*` / `acheron.err_fs`.
 - JSON READ/WRITE payloads use `data_b64` for file bytes.
 - `mount` is now wired through libfuse3 at runtime (loads `libfuse3.so.3` and uses `fusermount3`).
 - Router health checks each endpoint and fails over within a shared mount-path group.
 - `spiderweb-fs-mount status` now includes top-level router metrics, including `failover_events_total`.
 - `spiderweb-fs-mount mount` can run a workspace sync loop (`--workspace-sync-interval-ms`) that periodically reconciles endpoint topology from `control.workspace_status`.
 - `spiderweb-fs-mount` supports `--project-id <id> [--project-token <token>]` to fetch/sync mounts for a specific project instead of the active agent binding.
+- `control.workspace_status` mount entries include:
+  - `online` (`bool`) for quick health checks
+  - `state` (`online`, `degraded`, `missing`) for deterministic availability reasoning
+- `control.workspace_status` also includes a top-level `availability` rollup:
+  - `mounts_total`, `online`, `degraded`, `missing`
+- Control-plane mount selection for a shared `mount_path` is availability-aware and deterministic:
+  - rank: `online` > `degraded` (lease expired) > `missing` node
+  - tie-break: latest `lease_expires_at_ms`
 - Workspace sync listens for push topology events via `control.debug_subscribe`:
   - full-refresh events: `control.workspace_topology`
   - project-scoped delta events: `control.workspace_topology_delta` (applied directly when `--project-id` is set)
+  - availability rollup events: `control.workspace_availability` (emitted when node/project availability transitions)
   - polling fallback remains enabled.
-- Control-plane project mutations (`project_update`, `project_delete`, `project_mount_set`, `project_mount_remove`, `project_activate`) require a `project_token` returned by `control.project_create`.
+- Project token protection is optional:
+  - when `token_locked=false` (default on new projects), project actions are open to authenticated users
+  - when `token_locked=true`, project actions require `project_token` (admin bypasses)
+- Project action policy can be configured per project (and per agent override) with `access_policy` on `control.project_create`, `control.project_update`, or `control.project_up`:
+  - actions: `read`, `invoke`, `mount`, `admin`
+  - modes: `open`, `token`, `admin`, `deny`
+  - shape: `{"access_policy":{"actions":{"invoke":"token"},"agents":{"mother":{"admin":"open"}}}}`
 - Project token lifecycle control ops are available: `control.project_token_rotate` and `control.project_token_revoke`.
 - `control.ping`/`control.pong` is now a lightweight liveness probe (`payload: {}`), and metrics moved to `control.metrics`.
 - Control clients must negotiate `control.version` (`{"protocol":"unified-v2"}`) before other control operations.
-- Runtime fsrpc clients must negotiate `fsrpc.t_version` first (`"version":"styx-lite-1"`).
-- FS node/router sessions must negotiate `fsrpc.t_fs_hello` first with payload `{"protocol":"unified-v2-fs","proto":2}`; `auth_token` is optional and enforced when node session auth is enabled.
+- Runtime Acheron clients must negotiate `acheron.t_version` first (`"version":"acheron-1"`).
+- FS node/router sessions must negotiate `acheron.t_fs_hello` first with payload `{"protocol":"unified-v2-fs","proto":2}`; `auth_token` is optional and enforced when node session auth is enabled.
 - Optional control mutation gate: set `SPIDERWEB_CONTROL_OPERATOR_TOKEN`; protected mutations require matching `payload.operator_token`.
 - Optional encrypted control-plane state snapshots: set `SPIDERWEB_CONTROL_STATE_KEY_HEX` to a 64-char AES-256 key (hex).
 - Optional HTTP observability endpoint: set `SPIDERWEB_METRICS_PORT`; then:
@@ -304,6 +346,8 @@ Notes:
   - `GET /readyz` returns readiness
   - `GET /metrics` returns Prometheus text format
   - `GET /metrics.json` returns control-plane metrics JSON
+  - node-service watch alert thresholds/dashboard guidance:
+    - `docs/NODE_SERVICE_WATCH_ALERTING.md`
 - `spiderweb-control` CLI negotiates `control.version` + `control.connect` and executes a single control op for scripting/debug use.
 - Spiderweb can host a local in-process `/v2/fs` node (same protocol as external nodes) with:
   - `SPIDERWEB_LOCAL_NODE_EXPORT_PATH` (required to enable)
@@ -311,7 +355,16 @@ Notes:
   - `SPIDERWEB_LOCAL_NODE_EXPORT_RO` (optional boolean)
   - `SPIDERWEB_LOCAL_NODE_NAME`, `SPIDERWEB_LOCAL_NODE_FS_URL`, `SPIDERWEB_LOCAL_NODE_LEASE_TTL_MS`, `SPIDERWEB_LOCAL_NODE_HEARTBEAT_MS` (optional registration/lease settings)
 - External `spiderweb-fs-node` can enforce session auth on `/v2/fs` using `--auth-token` (or `SPIDERWEB_FS_NODE_AUTH_TOKEN`).
-- Node/server now emits `fsrpc.e_fs_inval` / `fsrpc.e_fs_inval_dir` invalidations and router caches are invalidated on receipt.
+- External `spiderweb-fs-node` now supports control-plane daemon mode (`--control-url`) with:
+  - pairing via `--pair-mode invite --invite-token <token>` or `--pair-mode request`
+  - persisted node credentials/state (`--state-file`, default `.spiderweb-fs-node-state.json`)
+  - background lease refresh with reconnect backoff (`--refresh-interval-ms`, `--reconnect-backoff-ms`, `--reconnect-backoff-max-ms`)
+  - `--control-auth-token` (or `SPIDERWEB_AUTH_TOKEN`) for control websocket auth
+  - modular service catalog advertisement via `control.node_service_upsert`:
+    - FS provider enabled by default (disable with `--no-fs-service`)
+    - terminal providers via repeated `--terminal-id <id>`
+    - node labels via repeated `--label <key=value>`
+- Node/server now emits `acheron.e_fs_inval` / `acheron.e_fs_inval_dir` invalidations and router caches are invalidated on receipt.
 - Node/server now broadcasts mutation invalidations to other connected FS clients (server-push fanout).
 - Node/server uses a native Linux `inotify` watcher when available, with scanner fallback for out-of-band local FS invalidations.
 - Router now keeps a background event-pump websocket per endpoint so idle mounts can ingest pushed invalidations.
@@ -347,7 +400,7 @@ var service = try fs.NodeService.init(allocator, &[_]fs.ExportSpec{
 });
 defer service.deinit();
 
-const response = try service.handleRequestJson("{\"channel\":\"fsrpc\",\"type\":\"fsrpc.t_fs_hello\",\"tag\":1,\"payload\":{\"protocol\":\"unified-v2-fs\",\"proto\":2}}");
+const response = try service.handleRequestJson("{\"channel\":\"acheron\",\"type\":\"acheron.t_fs_hello\",\"tag\":1,\"payload\":{\"protocol\":\"unified-v2-fs\",\"proto\":2}}");
 defer allocator.free(response);
 ```
 

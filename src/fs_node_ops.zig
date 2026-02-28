@@ -21,13 +21,13 @@ const gdrive_spool_file_prefix: []const u8 = "spiderweb-gdrive-spool-";
 const gdrive_spool_file_suffix: []const u8 = ".tmp";
 const gdrive_spool_default_limit_bytes: u64 = 512 * 1024 * 1024;
 const namespace_protocol_json =
-    "{\"channel\":\"fsrpc\",\"version\":\"styx-lite-1\",\"ops\":[\"t_version\",\"t_attach\",\"t_walk\",\"t_open\",\"t_read\",\"t_write\",\"t_stat\",\"t_clunk\",\"t_flush\"]}";
+    "{\"channel\":\"acheron\",\"version\":\"acheron-1\",\"ops\":[\"t_version\",\"t_attach\",\"t_walk\",\"t_open\",\"t_read\",\"t_write\",\"t_stat\",\"t_clunk\",\"t_flush\"]}";
 const namespace_chat_help_md =
     "# Chat Capability\n\n" ++
     "Write UTF-8 text to `control/input` to create a chat job.\n" ++
-    "Read `/jobs/<job-id>/result.txt` for assistant output.\n";
+    "Read `/agents/self/jobs/<job-id>/result.txt` for assistant output.\n";
 const namespace_chat_schema_json =
-    "{\"name\":\"chat\",\"input\":\"control/input\",\"jobs\":\"/jobs\",\"result\":\"result.txt\"}";
+    "{\"name\":\"chat\",\"input\":\"control/input\",\"jobs\":\"/agents/self/jobs\",\"result\":\"result.txt\"}";
 const namespace_chat_meta_json =
     "{\"name\":\"chat\",\"version\":\"1\",\"agent_id\":\"system\",\"cost_hint\":\"provider-dependent\",\"latency_hint\":\"seconds\"}";
 
@@ -664,7 +664,7 @@ pub const NodeOps = struct {
             _ = try self.namespaceCreateNode(export_index, &ns, chat_dir, "schema.json", .file, false, namespace_chat_schema_json);
             _ = try self.namespaceCreateNode(export_index, &ns, chat_dir, "meta.json", .file, false, namespace_chat_meta_json);
             const examples_dir = try self.namespaceCreateNode(export_index, &ns, chat_dir, "examples", .dir, false, "");
-            _ = try self.namespaceCreateNode(export_index, &ns, examples_dir, "send.txt", .file, false, "hello from fsrpc chat");
+            _ = try self.namespaceCreateNode(export_index, &ns, examples_dir, "send.txt", .file, false, "hello from acheron chat");
             const control_dir = try self.namespaceCreateNode(export_index, &ns, chat_dir, "control", .dir, true, "");
             _ = try self.namespaceCreateNode(export_index, &ns, control_dir, "input", .file, true, "");
         }

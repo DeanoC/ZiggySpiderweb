@@ -214,9 +214,9 @@ zss session history --limit 5
 
 ## Success Criteria
 
-- [ ] Client can list available agents
-- [ ] Client can identify default agent
-- [ ] Client can restore last active session
-- [ ] Session history shows summaries
-- [ ] Works across client reconnects
-- [ ] Sessions properly archived after timeout
+- [x] Client can list available agents
+- [x] Client can identify default agent
+- [x] Client can restore last active session
+- [x] Session history shows summaries
+- [x] Works across client reconnects
+- [x] Sessions properly archived after timeout

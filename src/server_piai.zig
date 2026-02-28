@@ -15,6 +15,7 @@ const fs_protocol = @import("fs_protocol.zig");
 const fs_node_ops = @import("fs_node_ops.zig");
 const fs_node_service = @import("fs_node_service.zig");
 const fs_watch_runtime = @import("fs_watch_runtime.zig");
+const agent_registry_mod = @import("agent_registry.zig");
 const unified = @import("ziggy-spider-protocol").unified;
 
 pub const RuntimeServer = runtime_server_mod.RuntimeServer;
@@ -28,6 +29,9 @@ const debug_stream_archive_suffix = ".ndjson";
 const debug_stream_archive_suffix_gz = ".ndjson.gz";
 const debug_stream_rotate_max_bytes: u64 = 8 * 1024 * 1024;
 const debug_stream_archive_keep: usize = 8;
+const node_service_event_log_filename = "node-service-events.ndjson";
+const node_service_event_archive_prefix = "node-service-events-";
+const node_service_event_history_max_default: usize = 1024;
 const local_node_export_path_env = "SPIDERWEB_LOCAL_NODE_EXPORT_PATH";
 const local_node_export_name_env = "SPIDERWEB_LOCAL_NODE_EXPORT_NAME";
 const local_node_export_ro_env = "SPIDERWEB_LOCAL_NODE_EXPORT_RO";
@@ -43,17 +47,29 @@ const local_node_meta_export_name = "system-meta";
 const local_node_capabilities_export_name = "system-capabilities";
 const local_node_jobs_export_name = "system-jobs";
 const local_node_mount_meta = "/meta";
-const local_node_mount_capabilities = "/capabilities";
-const local_node_mount_jobs = "/jobs";
-const local_node_mount_workspace = "/workspace";
+const local_node_mount_agents_self_capabilities = "/agents/self/capabilities";
+const local_node_mount_agents_self_jobs = "/agents/self/jobs";
+const local_node_mount_nodes_local_fs = "/nodes/local/fs";
+const local_node_mount_projects_system_meta = "/projects/" ++ system_project_id ++ "/meta";
+const local_node_mount_projects_system_agents_self_capabilities = "/projects/" ++ system_project_id ++ "/agents/self/capabilities";
+const local_node_mount_projects_system_agents_self_jobs = "/projects/" ++ system_project_id ++ "/agents/self/jobs";
+const local_node_mount_projects_system_nodes_local_fs = "/projects/" ++ system_project_id ++ "/nodes/local/fs";
+const local_node_mount_projects_system_fs_local = "/projects/" ++ system_project_id ++ "/fs/local::fs";
 const control_operator_token_env = "SPIDERWEB_CONTROL_OPERATOR_TOKEN";
 const control_project_scope_token_env = "SPIDERWEB_CONTROL_PROJECT_SCOPE_TOKEN";
 const control_node_scope_token_env = "SPIDERWEB_CONTROL_NODE_SCOPE_TOKEN";
+const node_service_watch_allow_admin_env = "SPIDERWEB_NODE_SERVICE_WATCH_ALLOW_ADMIN";
+const node_service_watch_allow_user_env = "SPIDERWEB_NODE_SERVICE_WATCH_ALLOW_USER";
+const node_service_watch_replay_max_env = "SPIDERWEB_NODE_SERVICE_WATCH_REPLAY_MAX";
+const node_service_event_history_max_env = "SPIDERWEB_NODE_SERVICE_EVENT_HISTORY_MAX";
+const node_service_event_log_rotate_max_bytes_env = "SPIDERWEB_NODE_SERVICE_EVENT_LOG_ROTATE_MAX_BYTES";
+const node_service_event_log_archive_keep_env = "SPIDERWEB_NODE_SERVICE_EVENT_LOG_ARCHIVE_KEEP";
 const metrics_port_env = "SPIDERWEB_METRICS_PORT";
 const control_protocol_version = "unified-v2";
-const fsrpc_runtime_protocol_version = "styx-lite-1";
+const fsrpc_runtime_protocol_version = "acheron-1";
 const fsrpc_node_protocol_version = "unified-v2-fs";
 const fsrpc_node_proto_id: i64 = 2;
+const node_tunnel_reply_timeout_ms: i32 = 45_000;
 const min_connection_worker_threads: usize = 16;
 const runtime_warmup_wait_timeout_ms: i64 = 12_000;
 const runtime_warmup_stale_timeout_ms: i64 = 30_000;
@@ -252,9 +268,9 @@ const ArchiveCandidate = struct {
     timestamp_ms: u64,
 };
 
-fn parseArchiveTimestamp(name: []const u8) ?u64 {
-    if (!std.mem.startsWith(u8, name, debug_stream_archive_prefix)) return null;
-    var tail = name[debug_stream_archive_prefix.len..];
+fn parseArchiveTimestampWithPrefix(name: []const u8, prefix: []const u8) ?u64 {
+    if (!std.mem.startsWith(u8, name, prefix)) return null;
+    var tail = name[prefix.len..];
 
     if (std.mem.endsWith(u8, tail, debug_stream_archive_suffix_gz)) {
         tail = tail[0 .. tail.len - debug_stream_archive_suffix_gz.len];
@@ -269,6 +285,10 @@ fn parseArchiveTimestamp(name: []const u8) ?u64 {
     const numeric = if (dash_idx) |idx| tail[0..idx] else tail;
     if (numeric.len == 0) return null;
     return std.fmt.parseUnsigned(u64, numeric, 10) catch null;
+}
+
+fn parseArchiveTimestamp(name: []const u8) ?u64 {
+    return parseArchiveTimestampWithPrefix(name, debug_stream_archive_prefix);
 }
 
 fn commandExists(allocator: std.mem.Allocator, command: []const u8) bool {
@@ -349,6 +369,103 @@ fn pathExists(path: []const u8) bool {
     return true;
 }
 
+fn allocateArchivePathWithPrefix(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    prefix: []const u8,
+) ![]u8 {
+    const now_ms_signed = std.time.milliTimestamp();
+    const now_ms: u64 = if (now_ms_signed < 0) 0 else @intCast(now_ms_signed);
+    const parent = std.fs.path.dirname(path) orelse ".";
+
+    var attempt: usize = 0;
+    while (attempt < 256) : (attempt += 1) {
+        const name = if (attempt == 0)
+            try std.fmt.allocPrint(allocator, "{s}{d}{s}", .{
+                prefix,
+                now_ms,
+                debug_stream_archive_suffix,
+            })
+        else
+            try std.fmt.allocPrint(allocator, "{s}{d}-{d}{s}", .{
+                prefix,
+                now_ms,
+                attempt,
+                debug_stream_archive_suffix,
+            });
+        defer allocator.free(name);
+
+        const candidate = try std.fs.path.join(allocator, &.{ parent, name });
+        if (!pathExists(candidate)) return candidate;
+        allocator.free(candidate);
+    }
+    return error.PathAlreadyExists;
+}
+
+fn compressArchiveGzip(allocator: std.mem.Allocator, archive_path: []const u8) !void {
+    const result = try std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &.{ "gzip", "-f", archive_path },
+        .max_output_bytes = 16 * 1024,
+    });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    switch (result.term) {
+        .Exited => |code| if (code != 0) return error.ProcessFailed,
+        else => return error.ProcessFailed,
+    }
+}
+
+fn pruneArchivesWithPrefix(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    prefix: []const u8,
+    keep: usize,
+) !void {
+    if (keep == 0) return;
+    const parent = std.fs.path.dirname(path) orelse ".";
+    var dir = if (std.fs.path.isAbsolute(parent))
+        try std.fs.openDirAbsolute(parent, .{ .iterate = true })
+    else
+        try std.fs.cwd().openDir(parent, .{ .iterate = true });
+    defer dir.close();
+
+    var candidates = std.ArrayListUnmanaged(ArchiveCandidate){};
+    defer {
+        for (candidates.items) |entry| allocator.free(entry.name);
+        candidates.deinit(allocator);
+    }
+
+    var it = dir.iterate();
+    while (try it.next()) |entry| {
+        if (entry.kind != .file) continue;
+        const ts = parseArchiveTimestampWithPrefix(entry.name, prefix) orelse continue;
+        try candidates.append(allocator, .{
+            .name = try allocator.dupe(u8, entry.name),
+            .timestamp_ms = ts,
+        });
+    }
+
+    while (candidates.items.len > keep) {
+        var oldest_idx: usize = 0;
+        var oldest_ts = candidates.items[0].timestamp_ms;
+        var i: usize = 1;
+        while (i < candidates.items.len) : (i += 1) {
+            if (candidates.items[i].timestamp_ms < oldest_ts) {
+                oldest_ts = candidates.items[i].timestamp_ms;
+                oldest_idx = i;
+            }
+        }
+
+        const oldest = candidates.orderedRemove(oldest_idx);
+        dir.deleteFile(oldest.name) catch |err| {
+            std.log.warn("Failed deleting old archive {s}: {s}", .{ oldest.name, @errorName(err) });
+        };
+        allocator.free(oldest.name);
+    }
+}
+
 fn parseBoolEnv(allocator: std.mem.Allocator, name: []const u8, default_value: bool) bool {
     const raw = std.process.getEnvVarOwned(allocator, name) catch return default_value;
     defer allocator.free(raw);
@@ -414,6 +531,21 @@ fn parseOptionalEnvOwned(allocator: std.mem.Allocator, name: []const u8) ?[]u8 {
     const trimmed = std.mem.trim(u8, raw, " \t\r\n");
     if (trimmed.len == 0) return null;
     return allocator.dupe(u8, trimmed) catch null;
+}
+
+fn initNodeServiceEventLogPath(
+    allocator: std.mem.Allocator,
+    ltm_directory: []const u8,
+) !?[]u8 {
+    const base = std.mem.trim(u8, ltm_directory, " \t\r\n");
+    if (base.len == 0) return null;
+    try ensureDirectoryExists(base);
+    const path = try std.fs.path.join(allocator, &.{ base, node_service_event_log_filename });
+    errdefer allocator.free(path);
+    var file = try openOrCreateAppendFile(path);
+    defer file.close();
+    try file.seekFromEnd(0);
+    return path;
 }
 
 const FsHubConnection = struct {
@@ -500,10 +632,452 @@ const FsConnectionHub = struct {
     }
 };
 
+const NodeTunnelPendingRequest = struct {
+    mutex: std.Thread.Mutex = .{},
+    cond: std.Thread.Condition = .{},
+    done: bool = false,
+    failed: bool = false,
+    response_payload: ?[]u8 = null,
+
+    fn deinit(self: *NodeTunnelPendingRequest, allocator: std.mem.Allocator) void {
+        if (self.response_payload) |value| allocator.free(value);
+        self.* = undefined;
+    }
+};
+
+const NodeTunnelClient = struct {
+    id: u64,
+    stream: *std.net.Stream,
+    write_mutex: *std.Thread.Mutex,
+    allow_invalidations: bool = false,
+};
+
+const NodeTunnelEntry = struct {
+    stream: ?*std.net.Stream = null,
+    write_mutex: ?*std.Thread.Mutex = null,
+    generation: u64 = 0,
+    next_upstream_tag: u32 = 1,
+    next_client_id: u64 = 1,
+    pending: std.AutoHashMapUnmanaged(u32, *NodeTunnelPendingRequest) = .{},
+    clients: std.ArrayListUnmanaged(NodeTunnelClient) = .{},
+
+    fn deinit(self: *NodeTunnelEntry, allocator: std.mem.Allocator) void {
+        var pending_it = self.pending.iterator();
+        while (pending_it.next()) |item| {
+            var pending = item.value_ptr.*;
+            pending.deinit(allocator);
+            allocator.destroy(pending);
+        }
+        self.pending.deinit(allocator);
+        self.clients.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+const NodeTunnelAttachment = struct {
+    node_id: []u8,
+    generation: u64,
+
+    fn deinit(self: *NodeTunnelAttachment, allocator: std.mem.Allocator) void {
+        allocator.free(self.node_id);
+        self.* = undefined;
+    }
+};
+
+const NodeTunnelRegistry = struct {
+    allocator: std.mem.Allocator,
+    mutex: std.Thread.Mutex = .{},
+    tunnels: std.StringHashMapUnmanaged(*NodeTunnelEntry) = .{},
+
+    fn deinit(self: *NodeTunnelRegistry) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        var it = self.tunnels.iterator();
+        while (it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            var tunnel = entry.value_ptr.*;
+            tunnel.deinit(self.allocator);
+            self.allocator.destroy(tunnel);
+        }
+        self.tunnels.deinit(self.allocator);
+    }
+
+    fn attachTunnel(
+        self: *NodeTunnelRegistry,
+        node_id: []const u8,
+        stream: *std.net.Stream,
+        write_mutex: *std.Thread.Mutex,
+    ) !NodeTunnelAttachment {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const tunnel = try self.getOrCreateTunnelLocked(node_id);
+        if (tunnel.stream) |previous_stream| {
+            if (previous_stream != stream) {
+                previous_stream.close();
+            }
+            self.failAllPendingLocked(tunnel);
+        }
+        tunnel.stream = stream;
+        tunnel.write_mutex = write_mutex;
+        tunnel.generation +%= 1;
+        if (tunnel.generation == 0) tunnel.generation = 1;
+        return .{
+            .node_id = try self.allocator.dupe(u8, node_id),
+            .generation = tunnel.generation,
+        };
+    }
+
+    fn detachTunnel(self: *NodeTunnelRegistry, node_id: []const u8, generation: u64) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const tunnel = self.tunnels.get(node_id) orelse return;
+        if (tunnel.generation != generation) return;
+        tunnel.stream = null;
+        tunnel.write_mutex = null;
+        self.failAllPendingLocked(tunnel);
+        self.removeTunnelIfUnusedLocked(node_id, tunnel);
+    }
+
+    fn registerClient(
+        self: *NodeTunnelRegistry,
+        node_id: []const u8,
+        stream: *std.net.Stream,
+        write_mutex: *std.Thread.Mutex,
+        allow_invalidations: bool,
+    ) !u64 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const tunnel = self.tunnels.get(node_id) orelse return error.NodeTunnelUnavailable;
+        if (tunnel.stream == null or tunnel.write_mutex == null) return error.NodeTunnelUnavailable;
+
+        const client_id = tunnel.next_client_id;
+        tunnel.next_client_id +%= 1;
+        if (tunnel.next_client_id == 0) tunnel.next_client_id = 1;
+        try tunnel.clients.append(self.allocator, .{
+            .id = client_id,
+            .stream = stream,
+            .write_mutex = write_mutex,
+            .allow_invalidations = allow_invalidations,
+        });
+        return client_id;
+    }
+
+    fn updateClientInvalidations(
+        self: *NodeTunnelRegistry,
+        node_id: []const u8,
+        client_id: u64,
+        allow_invalidations: bool,
+    ) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const tunnel = self.tunnels.get(node_id) orelse return;
+        for (tunnel.clients.items) |*client| {
+            if (client.id != client_id) continue;
+            client.allow_invalidations = allow_invalidations;
+            return;
+        }
+    }
+
+    fn unregisterClient(self: *NodeTunnelRegistry, node_id: []const u8, client_id: u64) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const tunnel = self.tunnels.get(node_id) orelse return;
+        for (tunnel.clients.items, 0..) |client, idx| {
+            if (client.id != client_id) continue;
+            _ = tunnel.clients.swapRemove(idx);
+            break;
+        }
+        self.removeTunnelIfUnusedLocked(node_id, tunnel);
+    }
+
+    fn relayRequest(
+        self: *NodeTunnelRegistry,
+        node_id: []const u8,
+        client_tag: u32,
+        request_payload: []const u8,
+    ) ![]u8 {
+        var pending = try self.allocator.create(NodeTunnelPendingRequest);
+        pending.* = .{};
+        defer {
+            pending.deinit(self.allocator);
+            self.allocator.destroy(pending);
+        }
+
+        var upstream_tag: u32 = 0;
+        var stream: ?*std.net.Stream = null;
+        var stream_write_mutex: ?*std.Thread.Mutex = null;
+        var generation: u64 = 0;
+
+        self.mutex.lock();
+        {
+            const tunnel = self.tunnels.get(node_id) orelse {
+                self.mutex.unlock();
+                return error.NodeTunnelUnavailable;
+            };
+            if (tunnel.stream == null or tunnel.write_mutex == null) {
+                self.mutex.unlock();
+                return error.NodeTunnelUnavailable;
+            }
+
+            upstream_tag = self.nextUpstreamTagLocked(tunnel);
+            try tunnel.pending.put(self.allocator, upstream_tag, pending);
+            stream = tunnel.stream.?;
+            stream_write_mutex = tunnel.write_mutex.?;
+            generation = tunnel.generation;
+        }
+        self.mutex.unlock();
+
+        const rewritten = rewriteAcheronTag(self.allocator, request_payload, upstream_tag) catch |err| {
+            self.mutex.lock();
+            if (self.tunnels.get(node_id)) |tunnel| {
+                if (tunnel.generation == generation) {
+                    _ = tunnel.pending.remove(upstream_tag);
+                }
+            }
+            self.mutex.unlock();
+            return err;
+        };
+        defer self.allocator.free(rewritten);
+
+        stream_write_mutex.?.lock();
+        const write_result = websocket_transport.writeFrame(stream.?, rewritten, .text);
+        stream_write_mutex.?.unlock();
+        if (write_result) |_| {} else |err| {
+            self.mutex.lock();
+            if (self.tunnels.get(node_id)) |tunnel| {
+                if (tunnel.generation == generation) {
+                    _ = tunnel.pending.remove(upstream_tag);
+                    tunnel.stream = null;
+                    tunnel.write_mutex = null;
+                    self.failAllPendingLocked(tunnel);
+                    self.removeTunnelIfUnusedLocked(node_id, tunnel);
+                }
+            }
+            self.mutex.unlock();
+            return err;
+        }
+
+        const deadline_ns: i128 = std.time.nanoTimestamp() + @as(i128, @intCast(node_tunnel_reply_timeout_ms)) * std.time.ns_per_ms;
+        pending.mutex.lock();
+        while (!pending.done) {
+            const now_ns = std.time.nanoTimestamp();
+            if (now_ns >= deadline_ns) {
+                pending.failed = true;
+                pending.done = true;
+                break;
+            }
+            const remaining_ns: u64 = @intCast(deadline_ns - now_ns);
+            pending.cond.timedWait(&pending.mutex, remaining_ns) catch |wait_err| switch (wait_err) {
+                error.Timeout => continue,
+            };
+        }
+        const failed = pending.failed;
+        const response_payload = pending.response_payload;
+        pending.response_payload = null;
+        pending.mutex.unlock();
+
+        if (failed or response_payload == null) {
+            self.mutex.lock();
+            if (self.tunnels.get(node_id)) |tunnel| {
+                _ = tunnel.pending.remove(upstream_tag);
+            }
+            self.mutex.unlock();
+            return error.NodeTunnelUnavailable;
+        }
+
+        defer self.allocator.free(response_payload.?);
+        const response_rewritten = try rewriteAcheronTag(self.allocator, response_payload.?, client_tag);
+        return response_rewritten;
+    }
+
+    fn dispatchTunnelFrame(
+        self: *NodeTunnelRegistry,
+        node_id: []const u8,
+        generation: u64,
+        payload: []const u8,
+    ) void {
+        var parsed = unified.parseMessage(self.allocator, payload) catch return;
+        defer parsed.deinit(self.allocator);
+        if (parsed.channel != .acheron) return;
+        const frame_type = parsed.acheron_type orelse return;
+
+        if (frame_type == .fs_evt_inval or frame_type == .fs_evt_inval_dir) {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+
+            const tunnel = self.tunnels.get(node_id) orelse return;
+            if (tunnel.generation != generation) return;
+            var idx: usize = 0;
+            while (idx < tunnel.clients.items.len) {
+                const client = tunnel.clients.items[idx];
+                if (!client.allow_invalidations) {
+                    idx += 1;
+                    continue;
+                }
+                client.write_mutex.lock();
+                const write_result = websocket_transport.writeFrame(client.stream, payload, .text);
+                client.write_mutex.unlock();
+                if (write_result) |_| {} else |_| {
+                    _ = tunnel.clients.swapRemove(idx);
+                    continue;
+                }
+                idx += 1;
+            }
+            return;
+        }
+
+        const upstream_tag = parsed.tag orelse return;
+        var pending: ?*NodeTunnelPendingRequest = null;
+        self.mutex.lock();
+        if (self.tunnels.get(node_id)) |tunnel| {
+            if (tunnel.generation == generation) {
+                if (tunnel.pending.fetchRemove(upstream_tag)) |removed| {
+                    pending = removed.value;
+                }
+            }
+        }
+        self.mutex.unlock();
+
+        if (pending) |pending_req| {
+            const copy = self.allocator.dupe(u8, payload) catch null;
+            pending_req.mutex.lock();
+            if (copy) |value| {
+                pending_req.response_payload = value;
+                pending_req.failed = false;
+            } else {
+                pending_req.failed = true;
+            }
+            pending_req.done = true;
+            pending_req.cond.signal();
+            pending_req.mutex.unlock();
+        }
+    }
+
+    fn getOrCreateTunnelLocked(self: *NodeTunnelRegistry, node_id: []const u8) !*NodeTunnelEntry {
+        if (self.tunnels.get(node_id)) |existing| return existing;
+        const key = try self.allocator.dupe(u8, node_id);
+        errdefer self.allocator.free(key);
+        const tunnel = try self.allocator.create(NodeTunnelEntry);
+        errdefer self.allocator.destroy(tunnel);
+        tunnel.* = .{};
+        try self.tunnels.put(self.allocator, key, tunnel);
+        return tunnel;
+    }
+
+    fn removeTunnelIfUnusedLocked(
+        self: *NodeTunnelRegistry,
+        node_id: []const u8,
+        tunnel: *NodeTunnelEntry,
+    ) void {
+        if (tunnel.stream != null) return;
+        if (tunnel.pending.count() > 0) return;
+        if (tunnel.clients.items.len > 0) return;
+
+        if (self.tunnels.fetchRemove(node_id)) |removed| {
+            self.allocator.free(removed.key);
+            var removed_tunnel = removed.value;
+            removed_tunnel.deinit(self.allocator);
+            self.allocator.destroy(removed_tunnel);
+        }
+    }
+
+    fn failAllPendingLocked(self: *NodeTunnelRegistry, tunnel: *NodeTunnelEntry) void {
+        _ = self;
+        var it = tunnel.pending.iterator();
+        while (it.next()) |entry| {
+            const pending = entry.value_ptr.*;
+            pending.mutex.lock();
+            pending.failed = true;
+            pending.done = true;
+            pending.cond.signal();
+            pending.mutex.unlock();
+        }
+        tunnel.pending.clearRetainingCapacity();
+    }
+
+    fn nextUpstreamTagLocked(self: *NodeTunnelRegistry, tunnel: *NodeTunnelEntry) u32 {
+        _ = self;
+        var attempts: u64 = 0;
+        while (attempts < std.math.maxInt(u32)) : (attempts += 1) {
+            const candidate = tunnel.next_upstream_tag;
+            tunnel.next_upstream_tag +%= 1;
+            if (tunnel.next_upstream_tag == 0) tunnel.next_upstream_tag = 1;
+            if (candidate == 0) continue;
+            if (!tunnel.pending.contains(candidate)) return candidate;
+        }
+        return 1;
+    }
+};
+
 const ControlTopologySubscriber = struct {
     id: u64,
     stream: *std.net.Stream,
     write_mutex: *std.Thread.Mutex,
+};
+
+const NodeServiceSubscriber = struct {
+    id: u64,
+    stream: *std.net.Stream,
+    write_mutex: *std.Thread.Mutex,
+    node_id_filter: ?[]u8 = null,
+    role: ConnectionRole = .admin,
+    agent_id: ?[]u8 = null,
+    project_id: ?[]u8 = null,
+    project_token: ?[]u8 = null,
+
+    fn deinit(self: *NodeServiceSubscriber, allocator: std.mem.Allocator) void {
+        if (self.node_id_filter) |value| allocator.free(value);
+        if (self.agent_id) |value| allocator.free(value);
+        if (self.project_id) |value| allocator.free(value);
+        if (self.project_token) |value| allocator.free(value);
+        self.* = undefined;
+    }
+};
+
+const NodeServiceEventRecord = struct {
+    timestamp_ms: i64,
+    node_id: ?[]u8 = null,
+    payload_json: []u8,
+
+    fn deinit(self: *NodeServiceEventRecord, allocator: std.mem.Allocator) void {
+        if (self.node_id) |value| allocator.free(value);
+        allocator.free(self.payload_json);
+        self.* = undefined;
+    }
+};
+
+const NodeServiceWatchRequest = struct {
+    node_id: ?[]u8 = null,
+    replay_limit: usize = 25,
+
+    fn deinit(self: *NodeServiceWatchRequest, allocator: std.mem.Allocator) void {
+        if (self.node_id) |value| allocator.free(value);
+        self.* = undefined;
+    }
+};
+
+const NodeServiceWatchMetricsSnapshot = struct {
+    subscribers_current: usize = 0,
+    subscribers_peak: usize = 0,
+    replay_requests_total: u64 = 0,
+    replay_attempted_total: u64 = 0,
+    replay_sent_total: u64 = 0,
+    replay_bytes_total: u64 = 0,
+    fanout_events_total: u64 = 0,
+    fanout_attempted_total: u64 = 0,
+    fanout_sent_total: u64 = 0,
+    fanout_dropped_total: u64 = 0,
+    retained_events: usize = 0,
+    retained_capacity: usize = 0,
+    retained_oldest_ms: ?i64 = null,
+    retained_newest_ms: ?i64 = null,
+    retained_window_ms: u64 = 0,
 };
 
 const ControlMutationScope = enum {
@@ -850,12 +1424,12 @@ fn handleLocalFsConnection(
                         try writeFsHubFrameMaybe(connection, stream, &connection_write_mutex, "", .close);
                         return;
                     }
-                    if (parsed.channel != .fsrpc or parsed.fsrpc_type != .fs_t_hello) {
+                    if (parsed.channel != .acheron or parsed.acheron_type != .fs_t_hello) {
                         const response = try unified.buildFsrpcFsError(
                             allocator,
                             parsed.tag,
                             fs_protocol.Errno.EINVAL,
-                            "fsrpc.t_fs_hello must be negotiated first",
+                            "acheron.t_fs_hello must be negotiated first",
                         );
                         defer allocator.free(response);
                         try writeFsHubFrameMaybe(connection, stream, &connection_write_mutex, response, .text);
@@ -877,7 +1451,7 @@ fn handleLocalFsConnection(
                     hello_allow_invalidations = hello_opts.allow_invalidations;
                     fsrpc_negotiated = true;
                     register_after_response = true;
-                } else if (parsed.fsrpc_type == .fs_t_hello) {
+                } else if (parsed.acheron_type == .fs_t_hello) {
                     const hello_opts = validateFsNodeHelloPayload(allocator, parsed.payload_json, required_auth_token) catch |err| {
                         const response = try unified.buildFsrpcFsError(
                             allocator,
@@ -912,7 +1486,7 @@ fn handleLocalFsConnection(
                 };
                 defer handled.deinit(allocator);
                 if (connection) |live_connection| {
-                    if (parsed.fsrpc_type != .fs_t_hello) {
+                    if (parsed.acheron_type != .fs_t_hello) {
                         local_node.hub.disableInvalidations(live_connection.id);
                     }
                     for (handled.events) |event| {
@@ -958,6 +1532,500 @@ fn handleLocalFsConnection(
             },
         }
     }
+}
+
+const NodeTunnelHello = struct {
+    node_id: []u8,
+    node_secret: []u8,
+
+    fn deinit(self: *NodeTunnelHello, allocator: std.mem.Allocator) void {
+        allocator.free(self.node_id);
+        allocator.free(self.node_secret);
+        self.* = undefined;
+    }
+};
+
+fn parseNodeTunnelHelloPayload(
+    allocator: std.mem.Allocator,
+    payload_json: ?[]const u8,
+) !NodeTunnelHello {
+    _ = try validateFsNodeHelloPayload(allocator, payload_json, null);
+    const raw = payload_json orelse return error.MissingField;
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidType;
+    const node_id_value = parsed.value.object.get("node_id") orelse return error.MissingField;
+    if (node_id_value != .string or !isValidNodeIdentifier(node_id_value.string)) return error.InvalidPayload;
+    const node_secret_value = parsed.value.object.get("node_secret") orelse return error.MissingField;
+    if (node_secret_value != .string or node_secret_value.string.len == 0) return error.InvalidPayload;
+
+    return .{
+        .node_id = try allocator.dupe(u8, node_id_value.string),
+        .node_secret = try allocator.dupe(u8, node_secret_value.string),
+    };
+}
+
+fn parseFsHelloAuthToken(allocator: std.mem.Allocator, payload_json: ?[]const u8) !?[]u8 {
+    const raw = payload_json orelse return null;
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidType;
+    const auth_value = parsed.value.object.get("auth_token") orelse return null;
+    if (auth_value != .string or auth_value.string.len == 0) return null;
+    const copy = try allocator.dupe(u8, auth_value.string);
+    return @as(?[]u8, copy);
+}
+
+fn controlNodeErrorToErrno(err: anyerror) i32 {
+    return switch (err) {
+        fs_control_plane.ControlPlaneError.NodeNotFound => fs_protocol.Errno.ENOENT,
+        fs_control_plane.ControlPlaneError.NodeAuthFailed => fs_protocol.Errno.EACCES,
+        else => fs_protocol.Errno.EIO,
+    };
+}
+
+fn handleNodeTunnelConnection(
+    allocator: std.mem.Allocator,
+    runtime_registry: *AgentRuntimeRegistry,
+    stream: *std.net.Stream,
+) !void {
+    var attachment: ?NodeTunnelAttachment = null;
+    defer if (attachment) |*attached| {
+        runtime_registry.node_tunnels.detachTunnel(attached.node_id, attached.generation);
+        attached.deinit(allocator);
+    };
+    var connection_write_mutex: std.Thread.Mutex = .{};
+
+    while (true) {
+        var frame = websocket_transport.readFrame(
+            allocator,
+            stream,
+            websocket_transport.default_max_ws_frame_payload_bytes,
+        ) catch |err| switch (err) {
+            error.EndOfStream, websocket_transport.Error.ConnectionClosed => return,
+            else => return err,
+        };
+        defer frame.deinit(allocator);
+
+        switch (frame.opcode) {
+            0x1 => {
+                var parsed = unified.parseMessage(allocator, frame.payload) catch |err| {
+                    const response = try unified.buildFsrpcFsError(
+                        allocator,
+                        null,
+                        fs_protocol.Errno.EINVAL,
+                        @errorName(err),
+                    );
+                    defer allocator.free(response);
+                    try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                    try writeFrameLocked(stream, &connection_write_mutex, "", .close);
+                    return;
+                };
+                defer parsed.deinit(allocator);
+
+                if (attachment == null) {
+                    if (parsed.channel != .acheron or parsed.acheron_type != .fs_t_hello) {
+                        const response = try unified.buildFsrpcFsError(
+                            allocator,
+                            parsed.tag,
+                            fs_protocol.Errno.EINVAL,
+                            "acheron.t_fs_hello must be negotiated first",
+                        );
+                        defer allocator.free(response);
+                        try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                        try writeFrameLocked(stream, &connection_write_mutex, "", .close);
+                        return;
+                    }
+
+                    var hello = parseNodeTunnelHelloPayload(allocator, parsed.payload_json) catch |err| {
+                        const response = try unified.buildFsrpcFsError(
+                            allocator,
+                            parsed.tag,
+                            fs_protocol.Errno.EINVAL,
+                            @errorName(err),
+                        );
+                        defer allocator.free(response);
+                        try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                        try writeFrameLocked(stream, &connection_write_mutex, "", .close);
+                        return;
+                    };
+                    defer hello.deinit(allocator);
+
+                    runtime_registry.control_plane.authenticateNodeSession(hello.node_id, hello.node_secret) catch |auth_err| {
+                        const response = try unified.buildFsrpcFsError(
+                            allocator,
+                            parsed.tag,
+                            controlNodeErrorToErrno(auth_err),
+                            @errorName(auth_err),
+                        );
+                        defer allocator.free(response);
+                        try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                        try writeFrameLocked(stream, &connection_write_mutex, "", .close);
+                        return;
+                    };
+
+                    attachment = try runtime_registry.node_tunnels.attachTunnel(
+                        hello.node_id,
+                        stream,
+                        &connection_write_mutex,
+                    );
+
+                    const ack_payload = try std.fmt.allocPrint(
+                        allocator,
+                        "{{\"protocol\":\"{s}\",\"proto\":{d},\"node_id\":\"{s}\"}}",
+                        .{ fsrpc_node_protocol_version, fsrpc_node_proto_id, attachment.?.node_id },
+                    );
+                    defer allocator.free(ack_payload);
+                    const response = try unified.buildFsrpcResponse(
+                        allocator,
+                        .fs_r_hello,
+                        parsed.tag,
+                        ack_payload,
+                    );
+                    defer allocator.free(response);
+                    try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                    continue;
+                }
+
+                if (parsed.channel != .acheron) continue;
+                if (parsed.acheron_type == .fs_t_hello) {
+                    var hello = parseNodeTunnelHelloPayload(allocator, parsed.payload_json) catch |err| {
+                        const response = try unified.buildFsrpcFsError(
+                            allocator,
+                            parsed.tag,
+                            fs_protocol.Errno.EINVAL,
+                            @errorName(err),
+                        );
+                        defer allocator.free(response);
+                        try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                        try writeFrameLocked(stream, &connection_write_mutex, "", .close);
+                        return;
+                    };
+                    defer hello.deinit(allocator);
+                    if (!std.mem.eql(u8, hello.node_id, attachment.?.node_id)) {
+                        const response = try unified.buildFsrpcFsError(
+                            allocator,
+                            parsed.tag,
+                            fs_protocol.Errno.EACCES,
+                            "node_id mismatch for active tunnel",
+                        );
+                        defer allocator.free(response);
+                        try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                        try writeFrameLocked(stream, &connection_write_mutex, "", .close);
+                        return;
+                    }
+                    runtime_registry.control_plane.authenticateNodeSession(hello.node_id, hello.node_secret) catch |auth_err| {
+                        const response = try unified.buildFsrpcFsError(
+                            allocator,
+                            parsed.tag,
+                            controlNodeErrorToErrno(auth_err),
+                            @errorName(auth_err),
+                        );
+                        defer allocator.free(response);
+                        try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                        try writeFrameLocked(stream, &connection_write_mutex, "", .close);
+                        return;
+                    };
+                    const ack_payload = "{\"protocol\":\"unified-v2-fs\",\"proto\":2}";
+                    const response = try unified.buildFsrpcResponse(
+                        allocator,
+                        .fs_r_hello,
+                        parsed.tag,
+                        ack_payload,
+                    );
+                    defer allocator.free(response);
+                    try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                    continue;
+                }
+
+                runtime_registry.node_tunnels.dispatchTunnelFrame(
+                    attachment.?.node_id,
+                    attachment.?.generation,
+                    frame.payload,
+                );
+            },
+            0x8 => {
+                try writeFrameLocked(stream, &connection_write_mutex, "", .close);
+                return;
+            },
+            0x9 => {
+                try writeFrameLocked(stream, &connection_write_mutex, frame.payload, .pong);
+            },
+            0xA => {},
+            else => {
+                const response = try unified.buildFsrpcFsError(
+                    allocator,
+                    null,
+                    fs_protocol.Errno.EINVAL,
+                    "unsupported websocket opcode",
+                );
+                defer allocator.free(response);
+                try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+            },
+        }
+    }
+}
+
+fn handleRoutedNodeFsConnection(
+    allocator: std.mem.Allocator,
+    runtime_registry: *AgentRuntimeRegistry,
+    node_id: []const u8,
+    stream: *std.net.Stream,
+) !void {
+    var connection_write_mutex: std.Thread.Mutex = .{};
+    var fsrpc_negotiated = false;
+    var connection_client_id: ?u64 = null;
+    defer if (connection_client_id) |client_id| {
+        runtime_registry.node_tunnels.unregisterClient(node_id, client_id);
+    };
+
+    while (true) {
+        var frame = websocket_transport.readFrame(
+            allocator,
+            stream,
+            websocket_transport.default_max_ws_frame_payload_bytes,
+        ) catch |err| switch (err) {
+            error.EndOfStream, websocket_transport.Error.ConnectionClosed => return,
+            else => return err,
+        };
+        defer frame.deinit(allocator);
+
+        switch (frame.opcode) {
+            0x1 => {
+                var parsed = unified.parseMessage(allocator, frame.payload) catch |err| {
+                    const response = try unified.buildFsrpcFsError(
+                        allocator,
+                        null,
+                        fs_protocol.Errno.EINVAL,
+                        @errorName(err),
+                    );
+                    defer allocator.free(response);
+                    try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                    try writeFrameLocked(stream, &connection_write_mutex, "", .close);
+                    return;
+                };
+                defer parsed.deinit(allocator);
+
+                if (parsed.channel != .acheron) {
+                    const response = try unified.buildFsrpcFsError(
+                        allocator,
+                        parsed.tag,
+                        fs_protocol.Errno.EINVAL,
+                        "wrong websocket endpoint: use / for control protocol",
+                    );
+                    defer allocator.free(response);
+                    try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                    try writeFrameLocked(stream, &connection_write_mutex, "", .close);
+                    return;
+                }
+
+                const fsrpc_type = parsed.acheron_type orelse {
+                    const response = try unified.buildFsrpcFsError(
+                        allocator,
+                        parsed.tag,
+                        fs_protocol.Errno.EINVAL,
+                        "missing fsrpc message type",
+                    );
+                    defer allocator.free(response);
+                    try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                    continue;
+                };
+                const client_tag = parsed.tag orelse {
+                    const response = try unified.buildFsrpcFsError(
+                        allocator,
+                        null,
+                        fs_protocol.Errno.EINVAL,
+                        "missing request tag",
+                    );
+                    defer allocator.free(response);
+                    try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                    continue;
+                };
+
+                if (!fsrpc_negotiated) {
+                    if (fsrpc_type != .fs_t_hello) {
+                        const response = try unified.buildFsrpcFsError(
+                            allocator,
+                            parsed.tag,
+                            fs_protocol.Errno.EINVAL,
+                            "acheron.t_fs_hello must be negotiated first",
+                        );
+                        defer allocator.free(response);
+                        try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                        try writeFrameLocked(stream, &connection_write_mutex, "", .close);
+                        return;
+                    }
+                    const hello_opts = validateFsNodeHelloPayload(allocator, parsed.payload_json, null) catch |err| {
+                        const response = try unified.buildFsrpcFsError(
+                            allocator,
+                            parsed.tag,
+                            fs_protocol.Errno.EINVAL,
+                            @errorName(err),
+                        );
+                        defer allocator.free(response);
+                        try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                        try writeFrameLocked(stream, &connection_write_mutex, "", .close);
+                        return;
+                    };
+                    const auth_token = parseFsHelloAuthToken(allocator, parsed.payload_json) catch |err| {
+                        const response = try unified.buildFsrpcFsError(
+                            allocator,
+                            parsed.tag,
+                            fs_protocol.Errno.EINVAL,
+                            @errorName(err),
+                        );
+                        defer allocator.free(response);
+                        try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                        try writeFrameLocked(stream, &connection_write_mutex, "", .close);
+                        return;
+                    };
+                    defer if (auth_token) |token| allocator.free(token);
+                    if (auth_token == null) {
+                        const response = try unified.buildFsrpcFsError(
+                            allocator,
+                            parsed.tag,
+                            fs_protocol.Errno.EACCES,
+                            "missing auth_token in fs hello payload",
+                        );
+                        defer allocator.free(response);
+                        try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                        try writeFrameLocked(stream, &connection_write_mutex, "", .close);
+                        return;
+                    }
+                    runtime_registry.control_plane.authenticateNodeSession(node_id, auth_token.?) catch |auth_err| {
+                        const response = try unified.buildFsrpcFsError(
+                            allocator,
+                            parsed.tag,
+                            controlNodeErrorToErrno(auth_err),
+                            @errorName(auth_err),
+                        );
+                        defer allocator.free(response);
+                        try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                        try writeFrameLocked(stream, &connection_write_mutex, "", .close);
+                        return;
+                    };
+
+                    connection_client_id = runtime_registry.node_tunnels.registerClient(
+                        node_id,
+                        stream,
+                        &connection_write_mutex,
+                        hello_opts.allow_invalidations,
+                    ) catch {
+                        const response = try unified.buildFsrpcFsError(
+                            allocator,
+                            parsed.tag,
+                            fs_protocol.Errno.EIO,
+                            "node tunnel is unavailable",
+                        );
+                        defer allocator.free(response);
+                        try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                        try writeFrameLocked(stream, &connection_write_mutex, "", .close);
+                        return;
+                    };
+                    fsrpc_negotiated = true;
+                } else if (fsrpc_type == .fs_t_hello) {
+                    const hello_opts = validateFsNodeHelloPayload(allocator, parsed.payload_json, null) catch |err| {
+                        const response = try unified.buildFsrpcFsError(
+                            allocator,
+                            parsed.tag,
+                            fs_protocol.Errno.EINVAL,
+                            @errorName(err),
+                        );
+                        defer allocator.free(response);
+                        try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                        try writeFrameLocked(stream, &connection_write_mutex, "", .close);
+                        return;
+                    };
+                    if (connection_client_id) |client_id| {
+                        runtime_registry.node_tunnels.updateClientInvalidations(
+                            node_id,
+                            client_id,
+                            hello_opts.allow_invalidations,
+                        );
+                    }
+                }
+
+                const relayed_response = runtime_registry.node_tunnels.relayRequest(
+                    node_id,
+                    client_tag,
+                    frame.payload,
+                ) catch |relay_err| {
+                    const response = try unified.buildFsrpcFsError(
+                        allocator,
+                        parsed.tag,
+                        fs_protocol.Errno.EIO,
+                        @errorName(relay_err),
+                    );
+                    defer allocator.free(response);
+                    try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                    continue;
+                };
+                defer allocator.free(relayed_response);
+                try writeFrameLocked(stream, &connection_write_mutex, relayed_response, .text);
+            },
+            0x8 => {
+                try writeFrameLocked(stream, &connection_write_mutex, "", .close);
+                return;
+            },
+            0x9 => {
+                try writeFrameLocked(stream, &connection_write_mutex, frame.payload, .pong);
+            },
+            0xA => {},
+            else => {
+                const response = try unified.buildFsrpcFsError(
+                    allocator,
+                    null,
+                    fs_protocol.Errno.EINVAL,
+                    "unsupported websocket opcode",
+                );
+                defer allocator.free(response);
+                try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+            },
+        }
+    }
+}
+
+fn stripWsPathQuery(path: []const u8) []const u8 {
+    const query_idx = std.mem.indexOfScalar(u8, path, '?') orelse return path;
+    return path[0..query_idx];
+}
+
+fn isNodeTunnelPath(path: []const u8) bool {
+    const normalized = stripWsPathQuery(path);
+    return std.mem.eql(u8, normalized, "/v2/node") or std.mem.eql(u8, normalized, "/v2/node/");
+}
+
+fn parseNodeFsRoute(path: []const u8) ?[]const u8 {
+    const normalized = stripWsPathQuery(path);
+    const prefix = "/v2/fs/node/";
+    if (!std.mem.startsWith(u8, normalized, prefix)) return null;
+    const node_id = normalized[prefix.len..];
+    if (!isValidNodeIdentifier(node_id)) return null;
+    return node_id;
+}
+
+fn isValidNodeIdentifier(node_id: []const u8) bool {
+    if (node_id.len == 0 or node_id.len > 128) return false;
+    for (node_id) |char| {
+        if (std.ascii.isAlphanumeric(char)) continue;
+        if (char == '_' or char == '-' or char == '.') continue;
+        return false;
+    }
+    return true;
+}
+
+fn rewriteAcheronTag(
+    allocator: std.mem.Allocator,
+    raw_json: []const u8,
+    next_tag: u32,
+) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw_json, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidPayload;
+    const channel_val = parsed.value.object.get("channel") orelse return error.MissingField;
+    if (channel_val != .string or !std.mem.eql(u8, channel_val.string, "acheron")) return error.InvalidPayload;
+    try parsed.value.object.put("tag", .{ .integer = @as(i64, next_tag) });
+    return std.fmt.allocPrint(allocator, "{f}", .{std.json.fmt(parsed.value, .{})});
 }
 
 fn localFsHeartbeatThreadMain(local_node: *LocalFsNode, control_plane: *fs_control_plane.ControlPlane) void {
@@ -1111,18 +2179,57 @@ const RememberedTarget = struct {
     }
 };
 
+const SessionHistoryEntry = struct {
+    session_key: []u8,
+    agent_id: []u8,
+    project_id: []u8,
+    last_active_ms: i64,
+    message_count: u64 = 0,
+    summary: ?[]u8 = null,
+
+    fn deinit(self: *SessionHistoryEntry, allocator: std.mem.Allocator) void {
+        allocator.free(self.session_key);
+        allocator.free(self.agent_id);
+        allocator.free(self.project_id);
+        if (self.summary) |value| allocator.free(value);
+        self.* = undefined;
+    }
+
+    fn cloneOwned(self: *const SessionHistoryEntry, allocator: std.mem.Allocator) !SessionHistoryEntry {
+        return .{
+            .session_key = try allocator.dupe(u8, self.session_key),
+            .agent_id = try allocator.dupe(u8, self.agent_id),
+            .project_id = try allocator.dupe(u8, self.project_id),
+            .last_active_ms = self.last_active_ms,
+            .message_count = self.message_count,
+            .summary = if (self.summary) |value| try allocator.dupe(u8, value) else null,
+        };
+    }
+};
+
 const AuthTokenStore = struct {
     const PersistedTarget = struct {
         agent_id: ?[]const u8 = null,
         project_id: ?[]const u8 = null,
     };
 
+    const PersistedSessionHistoryEntry = struct {
+        session_key: []const u8,
+        agent_id: []const u8,
+        project_id: []const u8,
+        last_active_ms: i64 = 0,
+        message_count: u64 = 0,
+        summary: ?[]const u8 = null,
+    };
+
     const Persisted = struct {
-        schema: u32 = 2,
+        schema: u32 = 3,
         admin_token: []const u8,
         user_token: []const u8,
         admin_last_target: ?PersistedTarget = null,
         user_last_target: ?PersistedTarget = null,
+        admin_session_history: ?[]PersistedSessionHistoryEntry = null,
+        user_session_history: ?[]PersistedSessionHistoryEntry = null,
         updated_at_ms: i64,
     };
 
@@ -1132,6 +2239,8 @@ const AuthTokenStore = struct {
     user_token: []u8,
     admin_last_target: ?RememberedTarget = null,
     user_last_target: ?RememberedTarget = null,
+    admin_session_history: std.ArrayListUnmanaged(SessionHistoryEntry) = .{},
+    user_session_history: std.ArrayListUnmanaged(SessionHistoryEntry) = .{},
     mutex: std.Thread.Mutex = .{},
 
     fn init(allocator: std.mem.Allocator, runtime_config: Config.RuntimeConfig) AuthTokenStore {
@@ -1150,6 +2259,10 @@ const AuthTokenStore = struct {
         self.allocator.free(self.user_token);
         if (self.admin_last_target) |*target| target.deinit(self.allocator);
         if (self.user_last_target) |*target| target.deinit(self.allocator);
+        for (self.admin_session_history.items) |*entry| entry.deinit(self.allocator);
+        self.admin_session_history.deinit(self.allocator);
+        for (self.user_session_history.items) |*entry| entry.deinit(self.allocator);
+        self.user_session_history.deinit(self.allocator);
         self.* = undefined;
     }
 
@@ -1256,6 +2369,152 @@ const AuthTokenStore = struct {
             return err;
         };
         if (previous) |*value| value.deinit(self.allocator);
+    }
+
+    fn recordSessionActivity(
+        self: *AuthTokenStore,
+        role: ConnectionRole,
+        session_key: []const u8,
+        agent_id: []const u8,
+        project_id: []const u8,
+        message_delta: u64,
+    ) !void {
+        const max_history_entries: usize = 10;
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const history = switch (role) {
+            .admin => &self.admin_session_history,
+            .user => &self.user_session_history,
+        };
+
+        const now_ms = std.time.milliTimestamp();
+        _ = self.pruneExpiredSessionHistoryLocked(history, now_ms);
+        for (history.items) |*entry| {
+            if (std.mem.eql(u8, entry.session_key, session_key) and
+                std.mem.eql(u8, entry.agent_id, agent_id) and
+                std.mem.eql(u8, entry.project_id, project_id))
+            {
+                entry.last_active_ms = now_ms;
+                entry.message_count += message_delta;
+                self.sortSessionHistoryNewestFirst(history);
+                self.persistCurrentStateLocked() catch |err| {
+                    std.log.warn("failed to persist session history update: {s}", .{@errorName(err)});
+                };
+                return;
+            }
+        }
+
+        try history.append(self.allocator, .{
+            .session_key = try self.allocator.dupe(u8, session_key),
+            .agent_id = try self.allocator.dupe(u8, agent_id),
+            .project_id = try self.allocator.dupe(u8, project_id),
+            .last_active_ms = now_ms,
+            .message_count = message_delta,
+            .summary = try std.fmt.allocPrint(
+                self.allocator,
+                "{s} @ {s}",
+                .{ agent_id, project_id },
+            ),
+        });
+        self.sortSessionHistoryNewestFirst(history);
+        while (history.items.len > max_history_entries) {
+            var removed = history.pop().?;
+            removed.deinit(self.allocator);
+        }
+        self.persistCurrentStateLocked() catch |err| {
+            std.log.warn("failed to persist session history append: {s}", .{@errorName(err)});
+        };
+    }
+
+    fn sessionHistoryOwned(
+        self: *AuthTokenStore,
+        role: ConnectionRole,
+        agent_id_filter: ?[]const u8,
+        limit: usize,
+    ) !std.ArrayListUnmanaged(SessionHistoryEntry) {
+        var out = std.ArrayListUnmanaged(SessionHistoryEntry){};
+        errdefer {
+            for (out.items) |*entry| entry.deinit(self.allocator);
+            out.deinit(self.allocator);
+        }
+
+        const effective_limit = if (limit == 0) @as(usize, 10) else limit;
+        const mutex = &self.mutex;
+        mutex.lock();
+        defer mutex.unlock();
+        const history = switch (role) {
+            .admin => &self.admin_session_history,
+            .user => &self.user_session_history,
+        };
+        const now_ms = std.time.milliTimestamp();
+        const pruned = self.pruneExpiredSessionHistoryLocked(history, now_ms);
+        if (pruned) {
+            self.persistCurrentStateLocked() catch |err| {
+                std.log.warn("failed to persist pruned session history: {s}", .{@errorName(err)});
+            };
+        }
+        for (history.items) |*entry| {
+            if (agent_id_filter) |filter| {
+                if (!std.mem.eql(u8, entry.agent_id, filter)) continue;
+            }
+            try out.append(self.allocator, try entry.cloneOwned(self.allocator));
+            if (out.items.len >= effective_limit) break;
+        }
+        return out;
+    }
+
+    fn latestSessionOwned(
+        self: *AuthTokenStore,
+        role: ConnectionRole,
+        agent_id_filter: ?[]const u8,
+    ) !?SessionHistoryEntry {
+        var history = try self.sessionHistoryOwned(role, agent_id_filter, 1);
+        errdefer {
+            for (history.items) |*entry| entry.deinit(self.allocator);
+            history.deinit(self.allocator);
+        }
+        if (history.items.len == 0) {
+            history.deinit(self.allocator);
+            return null;
+        }
+        const entry = history.orderedRemove(0);
+        history.deinit(self.allocator);
+        return entry;
+    }
+
+    fn sortSessionHistoryNewestFirst(self: *AuthTokenStore, history: *std.ArrayListUnmanaged(SessionHistoryEntry)) void {
+        _ = self;
+        var i: usize = 1;
+        while (i < history.items.len) : (i += 1) {
+            var j = i;
+            while (j > 0 and history.items[j - 1].last_active_ms < history.items[j].last_active_ms) : (j -= 1) {
+                const tmp = history.items[j - 1];
+                history.items[j - 1] = history.items[j];
+                history.items[j] = tmp;
+            }
+        }
+    }
+
+    fn pruneExpiredSessionHistoryLocked(
+        self: *AuthTokenStore,
+        history: *std.ArrayListUnmanaged(SessionHistoryEntry),
+        now_ms: i64,
+    ) bool {
+        const max_age_ms: i64 = 24 * 60 * 60 * 1000;
+        var removed_any = false;
+        var idx: usize = 0;
+        while (idx < history.items.len) {
+            const age_ms = now_ms - history.items[idx].last_active_ms;
+            if (age_ms > max_age_ms) {
+                var removed = history.orderedRemove(idx);
+                removed.deinit(self.allocator);
+                removed_any = true;
+                continue;
+            }
+            idx += 1;
+        }
+        return removed_any;
     }
 
     fn statusJson(self: *const AuthTokenStore) ![]u8 {
@@ -1366,6 +2625,16 @@ const AuthTokenStore = struct {
         errdefer if (next_admin_target) |*target| target.deinit(self.allocator);
         var next_user_target = try copyPersistedTarget(self.allocator, parsed.value.user_last_target);
         errdefer if (next_user_target) |*target| target.deinit(self.allocator);
+        var next_admin_history = try copyPersistedSessionHistory(
+            self.allocator,
+            parsed.value.admin_session_history,
+        );
+        errdefer deinitSessionHistoryList(self.allocator, &next_admin_history);
+        var next_user_history = try copyPersistedSessionHistory(
+            self.allocator,
+            parsed.value.user_session_history,
+        );
+        errdefer deinitSessionHistoryList(self.allocator, &next_user_history);
 
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -1373,21 +2642,38 @@ const AuthTokenStore = struct {
         const previous_user = self.user_token;
         var previous_admin_target = self.admin_last_target;
         var previous_user_target = self.user_last_target;
+        var previous_admin_history = self.admin_session_history;
+        var previous_user_history = self.user_session_history;
         self.admin_token = next_admin;
         self.user_token = next_user;
         self.admin_last_target = next_admin_target;
         self.user_last_target = next_user_target;
+        self.admin_session_history = next_admin_history;
+        self.user_session_history = next_user_history;
         self.allocator.free(previous_admin);
         self.allocator.free(previous_user);
         if (previous_admin_target) |*target| target.deinit(self.allocator);
         if (previous_user_target) |*target| target.deinit(self.allocator);
+        deinitSessionHistoryList(self.allocator, &previous_admin_history);
+        deinitSessionHistoryList(self.allocator, &previous_user_history);
         return true;
     }
 
     fn persistCurrentStateLocked(self: *AuthTokenStore) !void {
         const path = self.path orelse return error.AuthTokenPathUnavailable;
+        const admin_history = try persistedSessionHistorySlice(
+            self.allocator,
+            self.admin_session_history.items,
+        );
+        defer if (admin_history) |value| self.allocator.free(value);
+        const user_history = try persistedSessionHistorySlice(
+            self.allocator,
+            self.user_session_history.items,
+        );
+        defer if (user_history) |value| self.allocator.free(value);
+
         const payload = Persisted{
-            .schema = 2,
+            .schema = 3,
             .admin_token = self.admin_token,
             .user_token = self.user_token,
             .admin_last_target = if (self.admin_last_target) |value| .{
@@ -1398,6 +2684,8 @@ const AuthTokenStore = struct {
                 .agent_id = value.agent_id,
                 .project_id = value.project_id,
             } else null,
+            .admin_session_history = admin_history,
+            .user_session_history = user_history,
             .updated_at_ms = std.time.milliTimestamp(),
         };
         const bytes = try std.json.Stringify.valueAlloc(self.allocator, payload, .{
@@ -1425,6 +2713,55 @@ const AuthTokenStore = struct {
             .agent_id = try allocator.dupe(u8, agent_id),
             .project_id = try allocator.dupe(u8, project_id),
         };
+    }
+
+    fn copyPersistedSessionHistory(
+        allocator: std.mem.Allocator,
+        persisted: ?[]PersistedSessionHistoryEntry,
+    ) !std.ArrayListUnmanaged(SessionHistoryEntry) {
+        var out = std.ArrayListUnmanaged(SessionHistoryEntry){};
+        errdefer deinitSessionHistoryList(allocator, &out);
+
+        const items = persisted orelse return out;
+        for (items) |entry| {
+            try out.append(allocator, .{
+                .session_key = try allocator.dupe(u8, entry.session_key),
+                .agent_id = try allocator.dupe(u8, entry.agent_id),
+                .project_id = try allocator.dupe(u8, entry.project_id),
+                .last_active_ms = entry.last_active_ms,
+                .message_count = entry.message_count,
+                .summary = if (entry.summary) |value| try allocator.dupe(u8, value) else null,
+            });
+        }
+        return out;
+    }
+
+    fn deinitSessionHistoryList(
+        allocator: std.mem.Allocator,
+        list: *std.ArrayListUnmanaged(SessionHistoryEntry),
+    ) void {
+        for (list.items) |*entry| entry.deinit(allocator);
+        list.deinit(allocator);
+        list.* = .{};
+    }
+
+    fn persistedSessionHistorySlice(
+        allocator: std.mem.Allocator,
+        entries: []const SessionHistoryEntry,
+    ) !?[]PersistedSessionHistoryEntry {
+        if (entries.len == 0) return null;
+        var out = try allocator.alloc(PersistedSessionHistoryEntry, entries.len);
+        for (entries, 0..) |entry, idx| {
+            out[idx] = .{
+                .session_key = entry.session_key,
+                .agent_id = entry.agent_id,
+                .project_id = entry.project_id,
+                .last_active_ms = entry.last_active_ms,
+                .message_count = entry.message_count,
+                .summary = entry.summary,
+            };
+        }
+        return out;
     }
 
     fn parseBearerToken(header_value: []const u8) ?[]const u8 {
@@ -1483,6 +2820,7 @@ const AgentRuntimeRegistry = struct {
     control_project_scope_token: ?[]u8 = null,
     control_node_scope_token: ?[]u8 = null,
     local_fs_node: ?*LocalFsNode = null,
+    node_tunnels: NodeTunnelRegistry,
     workspace_url: ?[]u8 = null,
     mutex: std.Thread.Mutex = .{},
     by_agent: std.StringHashMapUnmanaged(AgentRuntimeEntry) = .{},
@@ -1495,6 +2833,29 @@ const AgentRuntimeRegistry = struct {
     topology_subscribers_mutex: std.Thread.Mutex = .{},
     topology_subscribers: std.ArrayListUnmanaged(ControlTopologySubscriber) = .{},
     next_topology_subscriber_id: u64 = 1,
+    node_service_subscribers_mutex: std.Thread.Mutex = .{},
+    node_service_subscribers: std.ArrayListUnmanaged(NodeServiceSubscriber) = .{},
+    next_node_service_subscriber_id: u64 = 1,
+    node_service_watch_allow_admin: bool = true,
+    node_service_watch_allow_user: bool = false,
+    node_service_watch_replay_max: usize = 250,
+    node_service_event_history_mutex: std.Thread.Mutex = .{},
+    node_service_event_history: std.ArrayListUnmanaged(NodeServiceEventRecord) = .{},
+    node_service_event_history_max: usize = node_service_event_history_max_default,
+    node_service_event_log_path: ?[]u8 = null,
+    node_service_event_log_rotate_max_bytes: u64 = 4 * 1024 * 1024,
+    node_service_event_log_archive_keep: usize = 8,
+    node_service_event_log_gzip_available: bool = false,
+    node_service_watch_metrics_mutex: std.Thread.Mutex = .{},
+    node_service_watch_subscribers_peak: usize = 0,
+    node_service_watch_replay_requests_total: u64 = 0,
+    node_service_watch_replay_attempted_total: u64 = 0,
+    node_service_watch_replay_sent_total: u64 = 0,
+    node_service_watch_replay_bytes_total: u64 = 0,
+    node_service_watch_fanout_events_total: u64 = 0,
+    node_service_watch_fanout_attempted_total: u64 = 0,
+    node_service_watch_fanout_sent_total: u64 = 0,
+    node_service_watch_fanout_dropped_total: u64 = 0,
     audit_records_mutex: std.Thread.Mutex = .{},
     audit_records: std.ArrayListUnmanaged(AuditRecord) = .{},
     next_audit_record_id: u64 = 1,
@@ -1544,8 +2905,37 @@ const AgentRuntimeRegistry = struct {
         if (node_scope_token != null) {
             std.log.info("control-plane node-scope token enabled via {s}", .{control_node_scope_token_env});
         }
+        const watch_allow_admin = parseBoolEnv(allocator, node_service_watch_allow_admin_env, true);
+        const watch_allow_user = parseBoolEnv(allocator, node_service_watch_allow_user_env, false);
+        const replay_max_raw = parseUnsignedEnv(allocator, node_service_watch_replay_max_env, 250);
+        const replay_max: usize = @intCast(@max(@as(u64, 1), @min(replay_max_raw, 10_000)));
+        const history_max_raw = parseUnsignedEnv(
+            allocator,
+            node_service_event_history_max_env,
+            @as(u64, node_service_event_history_max_default),
+        );
+        const history_max: usize = @intCast(@max(@as(u64, 64), @min(history_max_raw, 20_000)));
+        const event_rotate_max_bytes = parseUnsignedEnv(
+            allocator,
+            node_service_event_log_rotate_max_bytes_env,
+            8 * 1024 * 1024,
+        );
+        const event_archive_keep_raw = parseUnsignedEnv(
+            allocator,
+            node_service_event_log_archive_keep_env,
+            8,
+        );
+        const event_archive_keep: usize = @intCast(@min(event_archive_keep_raw, 64));
+        const event_log_path = initNodeServiceEventLogPath(allocator, runtime_config.ltm_directory) catch |err| blk: {
+            std.log.warn("node service event persistence disabled: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        const event_log_gzip_available = if (event_log_path != null)
+            commandExists(allocator, "gzip")
+        else
+            false;
 
-        return .{
+        var registry: AgentRuntimeRegistry = .{
             .allocator = allocator,
             .runtime_config = runtime_config,
             .provider_config = provider_config,
@@ -1569,7 +2959,20 @@ const AgentRuntimeRegistry = struct {
             .control_operator_token = operator_token,
             .control_project_scope_token = project_scope_token,
             .control_node_scope_token = node_scope_token,
+            .node_service_watch_allow_admin = watch_allow_admin,
+            .node_service_watch_allow_user = watch_allow_user,
+            .node_service_watch_replay_max = replay_max,
+            .node_service_event_history_max = history_max,
+            .node_service_event_log_path = event_log_path,
+            .node_service_event_log_rotate_max_bytes = event_rotate_max_bytes,
+            .node_service_event_log_archive_keep = event_archive_keep,
+            .node_service_event_log_gzip_available = event_log_gzip_available,
+            .node_tunnels = .{ .allocator = allocator },
         };
+        registry.loadNodeServiceEventHistory() catch |err| {
+            std.log.warn("failed to load node service event history: {s}", .{@errorName(err)});
+        };
+        return registry;
     }
 
     fn deinit(self: *AgentRuntimeRegistry) void {
@@ -1607,6 +3010,7 @@ const AgentRuntimeRegistry = struct {
         self.runtime_warmups = .{};
         self.runtime_warmups_mutex.unlock();
         self.clearTopologySubscribers();
+        self.clearNodeServiceSubscribers();
         if (self.local_fs_node) |local_fs_node| {
             local_fs_node.deinit(&self.control_plane);
             self.local_fs_node = null;
@@ -1627,6 +3031,12 @@ const AgentRuntimeRegistry = struct {
             self.allocator.free(value);
             self.workspace_url = null;
         }
+        self.clearNodeServiceEventHistory();
+        if (self.node_service_event_log_path) |path| {
+            self.allocator.free(path);
+            self.node_service_event_log_path = null;
+        }
+        self.node_tunnels.deinit();
         self.audit_records_mutex.lock();
         for (self.audit_records.items) |*record| record.deinit(self.allocator);
         self.audit_records.deinit(self.allocator);
@@ -1645,6 +3055,57 @@ const AgentRuntimeRegistry = struct {
 
     fn authStatusJson(self: *AgentRuntimeRegistry) ![]u8 {
         return self.auth_tokens.statusJson();
+    }
+
+    fn listAgentsPayloadWithRole(self: *AgentRuntimeRegistry, is_admin: bool) ![]u8 {
+        _ = is_admin;
+        var registry = agent_registry_mod.AgentRegistry.init(
+            self.allocator,
+            ".",
+            self.runtime_config.agents_dir,
+            self.runtime_config.assets_dir,
+        );
+        defer registry.deinit();
+        try registry.scan();
+
+        var out = std.ArrayListUnmanaged(u8){};
+        errdefer out.deinit(self.allocator);
+        try out.appendSlice(self.allocator, "{\"agents\":[");
+        var first = true;
+        for (registry.listAgents()) |agent| {
+            if (!first) try out.append(self.allocator, ',');
+            first = false;
+            try appendAgentInfoJson(self.allocator, &out, agent);
+        }
+        try out.appendSlice(self.allocator, "]}");
+        return out.toOwnedSlice(self.allocator);
+    }
+
+    fn getAgentPayloadWithRole(
+        self: *AgentRuntimeRegistry,
+        payload_json: ?[]const u8,
+        is_admin: bool,
+    ) ![]u8 {
+        _ = is_admin;
+        const agent_id = try parseAgentIdFromPayload(self.allocator, payload_json);
+        defer self.allocator.free(agent_id);
+
+        var registry = agent_registry_mod.AgentRegistry.init(
+            self.allocator,
+            ".",
+            self.runtime_config.agents_dir,
+            self.runtime_config.assets_dir,
+        );
+        defer registry.deinit();
+        try registry.scan();
+
+        const agent = registry.getAgent(agent_id) orelse return error.AgentNotFound;
+        var out = std.ArrayListUnmanaged(u8){};
+        errdefer out.deinit(self.allocator);
+        try out.appendSlice(self.allocator, "{\"agent\":");
+        try appendAgentInfoJson(self.allocator, &out, agent.*);
+        try out.append(self.allocator, '}');
+        return out.toOwnedSlice(self.allocator);
     }
 
     fn getLocalFsNode(self: *AgentRuntimeRegistry) ?*LocalFsNode {
@@ -1750,6 +3211,26 @@ const AgentRuntimeRegistry = struct {
         if (std.mem.eql(u8, concrete_project, system_project_id)) return;
         self.auth_tokens.setRememberedTarget(principal.role, agent_id, concrete_project) catch |err| {
             std.log.warn("failed to persist last target for {s}: {s}", .{ connectionRoleName(principal.role), @errorName(err) });
+        };
+    }
+
+    fn rememberPrincipalSession(
+        self: *AgentRuntimeRegistry,
+        principal: ConnectionPrincipal,
+        session_key: []const u8,
+        agent_id: []const u8,
+        project_id: ?[]const u8,
+    ) void {
+        const concrete_project = project_id orelse return;
+        if (std.mem.eql(u8, concrete_project, system_project_id)) return;
+        self.auth_tokens.recordSessionActivity(
+            principal.role,
+            session_key,
+            agent_id,
+            concrete_project,
+            0,
+        ) catch |err| {
+            std.log.warn("failed to persist session history for {s}: {s}", .{ connectionRoleName(principal.role), @errorName(err) });
         };
     }
 
@@ -2386,6 +3867,7 @@ const AgentRuntimeRegistry = struct {
 
     fn maybeLogDebugFrame(self: *AgentRuntimeRegistry, agent_id: []const u8, payload: []const u8) void {
         self.debug_stream_sink.append(agent_id, payload);
+        self.control_plane.appendDebugStreamEvent(agent_id, payload);
     }
 
     fn appendAuditRecordName(
@@ -2597,6 +4079,603 @@ const AgentRuntimeRegistry = struct {
         }
     }
 
+    fn clearNodeServiceSubscribers(self: *AgentRuntimeRegistry) void {
+        self.node_service_subscribers_mutex.lock();
+        defer self.node_service_subscribers_mutex.unlock();
+        for (self.node_service_subscribers.items) |*subscriber| {
+            subscriber.deinit(self.allocator);
+        }
+        self.node_service_subscribers.deinit(self.allocator);
+        self.node_service_subscribers = .{};
+        self.next_node_service_subscriber_id = 1;
+    }
+
+    fn registerNodeServiceSubscriber(
+        self: *AgentRuntimeRegistry,
+        stream: *std.net.Stream,
+        write_mutex: *std.Thread.Mutex,
+        node_id_filter: ?[]const u8,
+        role: ConnectionRole,
+        agent_id: ?[]const u8,
+        project_id: ?[]const u8,
+        project_token: ?[]const u8,
+    ) !u64 {
+        self.node_service_subscribers_mutex.lock();
+        defer self.node_service_subscribers_mutex.unlock();
+        const id = self.next_node_service_subscriber_id;
+        self.next_node_service_subscriber_id +%= 1;
+        if (self.next_node_service_subscriber_id == 0) self.next_node_service_subscriber_id = 1;
+        const filter_copy = if (node_id_filter) |value|
+            try self.allocator.dupe(u8, value)
+        else
+            null;
+        errdefer if (filter_copy) |value| self.allocator.free(value);
+        const agent_copy = if (agent_id) |value|
+            try self.allocator.dupe(u8, value)
+        else
+            null;
+        errdefer if (agent_copy) |value| self.allocator.free(value);
+        const project_copy = if (project_id) |value|
+            try self.allocator.dupe(u8, value)
+        else
+            null;
+        errdefer if (project_copy) |value| self.allocator.free(value);
+        const project_token_copy = if (project_token) |value|
+            try self.allocator.dupe(u8, value)
+        else
+            null;
+        errdefer if (project_token_copy) |value| self.allocator.free(value);
+        try self.node_service_subscribers.append(self.allocator, .{
+            .id = id,
+            .stream = stream,
+            .write_mutex = write_mutex,
+            .node_id_filter = filter_copy,
+            .role = role,
+            .agent_id = agent_copy,
+            .project_id = project_copy,
+            .project_token = project_token_copy,
+        });
+        self.node_service_watch_metrics_mutex.lock();
+        const next_count = self.node_service_subscribers.items.len;
+        if (next_count > self.node_service_watch_subscribers_peak) {
+            self.node_service_watch_subscribers_peak = next_count;
+        }
+        self.node_service_watch_metrics_mutex.unlock();
+        return id;
+    }
+
+    fn unregisterNodeServiceSubscriber(self: *AgentRuntimeRegistry, subscriber_id: u64) void {
+        self.node_service_subscribers_mutex.lock();
+        defer self.node_service_subscribers_mutex.unlock();
+        var idx: usize = 0;
+        while (idx < self.node_service_subscribers.items.len) : (idx += 1) {
+            if (self.node_service_subscribers.items[idx].id != subscriber_id) continue;
+            var removed = self.node_service_subscribers.swapRemove(idx);
+            removed.deinit(self.allocator);
+            return;
+        }
+    }
+
+    fn isNodeServiceWatchAllowedForRole(self: *AgentRuntimeRegistry, role: ConnectionRole) bool {
+        return switch (role) {
+            .admin => self.node_service_watch_allow_admin,
+            .user => self.node_service_watch_allow_user,
+        };
+    }
+
+    fn nodeServiceEventVisibleToContext(
+        self: *AgentRuntimeRegistry,
+        role: ConnectionRole,
+        agent_id: ?[]const u8,
+        project_id: ?[]const u8,
+        project_token: ?[]const u8,
+        node_id_filter: ?[]const u8,
+        event_node_id: ?[]const u8,
+    ) bool {
+        if (node_id_filter) |filter| {
+            const concrete_event_node_id = event_node_id orelse return false;
+            if (!std.mem.eql(u8, filter, concrete_event_node_id)) return false;
+        }
+
+        if (role == .admin) return true;
+
+        const concrete_project_id = project_id orelse return false;
+        const concrete_agent_id = agent_id orelse return false;
+        const concrete_event_node_id = event_node_id orelse return false;
+        return self.control_plane.projectAllowsNodeServiceEvent(
+            concrete_project_id,
+            concrete_agent_id,
+            project_token,
+            concrete_event_node_id,
+            false,
+        );
+    }
+
+    fn clearNodeServiceEventHistory(self: *AgentRuntimeRegistry) void {
+        self.node_service_event_history_mutex.lock();
+        defer self.node_service_event_history_mutex.unlock();
+        for (self.node_service_event_history.items) |*record| {
+            record.deinit(self.allocator);
+        }
+        self.node_service_event_history.deinit(self.allocator);
+        self.node_service_event_history = .{};
+    }
+
+    fn appendNodeServiceEventHistoryRecord(
+        self: *AgentRuntimeRegistry,
+        record: NodeServiceEventRecord,
+    ) void {
+        self.node_service_event_history_mutex.lock();
+        defer self.node_service_event_history_mutex.unlock();
+        while (self.node_service_event_history.items.len >= self.node_service_event_history_max and
+            self.node_service_event_history.items.len > 0)
+        {
+            var dropped = self.node_service_event_history.orderedRemove(0);
+            dropped.deinit(self.allocator);
+        }
+        self.node_service_event_history.append(self.allocator, record) catch {
+            var cleanup = record;
+            cleanup.deinit(self.allocator);
+        };
+    }
+
+    fn persistNodeServiceEventRecord(
+        self: *AgentRuntimeRegistry,
+        timestamp_ms: i64,
+        node_id: ?[]const u8,
+        payload_json: []const u8,
+    ) void {
+        const path = self.node_service_event_log_path orelse return;
+        const escaped_payload = unified.jsonEscape(self.allocator, payload_json) catch return;
+        defer self.allocator.free(escaped_payload);
+        const line = if (node_id) |value| blk: {
+            const escaped_node = unified.jsonEscape(self.allocator, value) catch return;
+            defer self.allocator.free(escaped_node);
+            break :blk std.fmt.allocPrint(
+                self.allocator,
+                "{{\"timestamp_ms\":{d},\"node_id\":\"{s}\",\"payload_json\":\"{s}\"}}\n",
+                .{ timestamp_ms, escaped_node, escaped_payload },
+            ) catch return;
+        } else std.fmt.allocPrint(
+            self.allocator,
+            "{{\"timestamp_ms\":{d},\"node_id\":null,\"payload_json\":\"{s}\"}}\n",
+            .{ timestamp_ms, escaped_payload },
+        ) catch return;
+        defer self.allocator.free(line);
+
+        var file = openOrCreateAppendFile(path) catch |err| {
+            std.log.warn("failed opening node service event log {s}: {s}", .{ path, @errorName(err) });
+            return;
+        };
+        defer file.close();
+        file.seekFromEnd(0) catch |err| {
+            std.log.warn("failed seeking node service event log {s}: {s}", .{ path, @errorName(err) });
+            return;
+        };
+        file.writeAll(line) catch |err| {
+            std.log.warn("failed appending node service event log {s}: {s}", .{ path, @errorName(err) });
+        };
+        self.maybeRotateNodeServiceEventLog();
+    }
+
+    fn maybeRotateNodeServiceEventLog(self: *AgentRuntimeRegistry) void {
+        const path = self.node_service_event_log_path orelse return;
+        if (self.node_service_event_log_rotate_max_bytes == 0) return;
+
+        const size = fileSize(path) catch |err| switch (err) {
+            error.FileNotFound => return,
+            else => {
+                std.log.warn("failed reading node service event log size for {s}: {s}", .{ path, @errorName(err) });
+                return;
+            },
+        };
+        if (size <= self.node_service_event_log_rotate_max_bytes) return;
+
+        const archive_path = allocateArchivePathWithPrefix(
+            self.allocator,
+            path,
+            node_service_event_archive_prefix,
+        ) catch |err| {
+            std.log.warn("failed creating node service archive path for {s}: {s}", .{ path, @errorName(err) });
+            return;
+        };
+        defer self.allocator.free(archive_path);
+
+        renamePath(path, archive_path) catch |err| {
+            std.log.warn("failed rotating node service event log {s} -> {s}: {s}", .{
+                path,
+                archive_path,
+                @errorName(err),
+            });
+            return;
+        };
+
+        if (self.node_service_event_log_gzip_available) {
+            compressArchiveGzip(self.allocator, archive_path) catch |err| {
+                std.log.warn("failed to gzip node service archive {s}: {s}", .{
+                    archive_path,
+                    @errorName(err),
+                });
+            };
+        }
+
+        pruneArchivesWithPrefix(
+            self.allocator,
+            path,
+            node_service_event_archive_prefix,
+            self.node_service_event_log_archive_keep,
+        ) catch |err| {
+            std.log.warn("failed pruning node service archives for {s}: {s}", .{
+                path,
+                @errorName(err),
+            });
+        };
+
+        var file = openOrCreateAppendFile(path) catch |err| {
+            std.log.warn("failed recreating node service event log {s}: {s}", .{ path, @errorName(err) });
+            return;
+        };
+        defer file.close();
+        file.seekFromEnd(0) catch |err| {
+            std.log.warn("failed finalizing node service event log {s}: {s}", .{ path, @errorName(err) });
+        };
+    }
+
+    fn recordNodeServiceEvent(
+        self: *AgentRuntimeRegistry,
+        node_id: ?[]const u8,
+        payload_json: []const u8,
+    ) void {
+        const timestamp_ms = std.time.milliTimestamp();
+        const payload_copy = self.allocator.dupe(u8, payload_json) catch return;
+        const node_copy = if (node_id) |value|
+            self.allocator.dupe(u8, value) catch {
+                self.allocator.free(payload_copy);
+                return;
+            }
+        else
+            null;
+        self.appendNodeServiceEventHistoryRecord(.{
+            .timestamp_ms = timestamp_ms,
+            .node_id = node_copy,
+            .payload_json = payload_copy,
+        });
+        self.persistNodeServiceEventRecord(timestamp_ms, node_id, payload_json);
+    }
+
+    fn loadNodeServiceEventHistory(self: *AgentRuntimeRegistry) !void {
+        const path = self.node_service_event_log_path orelse return;
+        const raw = std.fs.cwd().readFileAlloc(self.allocator, path, 16 * 1024 * 1024) catch |err| switch (err) {
+            error.FileNotFound => return,
+            else => return err,
+        };
+        defer self.allocator.free(raw);
+
+        var lines = std.mem.splitScalar(u8, raw, '\n');
+        while (lines.next()) |line_raw| {
+            const line = std.mem.trim(u8, line_raw, " \t\r");
+            if (line.len == 0) continue;
+
+            var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, line, .{}) catch continue;
+            defer parsed.deinit();
+            if (parsed.value != .object) continue;
+            const obj = parsed.value.object;
+            const payload_value = obj.get("payload_json") orelse continue;
+            if (payload_value != .string or payload_value.string.len == 0) continue;
+            const timestamp_ms = if (obj.get("timestamp_ms")) |value| switch (value) {
+                .integer => value.integer,
+                else => std.time.milliTimestamp(),
+            } else std.time.milliTimestamp();
+
+            var node_copy: ?[]u8 = null;
+            if (obj.get("node_id")) |value| {
+                if (value == .string and isValidNodeIdentifier(value.string)) {
+                    node_copy = self.allocator.dupe(u8, value.string) catch null;
+                }
+            }
+
+            const payload_copy = self.allocator.dupe(u8, payload_value.string) catch {
+                if (node_copy) |value| self.allocator.free(value);
+                continue;
+            };
+            self.appendNodeServiceEventHistoryRecord(.{
+                .timestamp_ms = timestamp_ms,
+                .node_id = node_copy,
+                .payload_json = payload_copy,
+            });
+        }
+    }
+
+    fn recordNodeServiceReplayMetrics(
+        self: *AgentRuntimeRegistry,
+        attempted: usize,
+        sent: usize,
+        bytes: usize,
+    ) void {
+        self.node_service_watch_metrics_mutex.lock();
+        defer self.node_service_watch_metrics_mutex.unlock();
+        self.node_service_watch_replay_requests_total +%= 1;
+        self.node_service_watch_replay_attempted_total +%= @intCast(attempted);
+        self.node_service_watch_replay_sent_total +%= @intCast(sent);
+        self.node_service_watch_replay_bytes_total +%= @intCast(bytes);
+    }
+
+    fn recordNodeServiceFanoutMetrics(
+        self: *AgentRuntimeRegistry,
+        attempts: usize,
+        sent: usize,
+        dropped: usize,
+    ) void {
+        self.node_service_watch_metrics_mutex.lock();
+        defer self.node_service_watch_metrics_mutex.unlock();
+        self.node_service_watch_fanout_events_total +%= 1;
+        self.node_service_watch_fanout_attempted_total +%= @intCast(attempts);
+        self.node_service_watch_fanout_sent_total +%= @intCast(sent);
+        self.node_service_watch_fanout_dropped_total +%= @intCast(dropped);
+    }
+
+    fn snapshotNodeServiceWatchMetrics(self: *AgentRuntimeRegistry) NodeServiceWatchMetricsSnapshot {
+        var snapshot = NodeServiceWatchMetricsSnapshot{};
+
+        self.node_service_subscribers_mutex.lock();
+        snapshot.subscribers_current = self.node_service_subscribers.items.len;
+        self.node_service_subscribers_mutex.unlock();
+
+        self.node_service_event_history_mutex.lock();
+        snapshot.retained_events = self.node_service_event_history.items.len;
+        snapshot.retained_capacity = self.node_service_event_history_max;
+        if (self.node_service_event_history.items.len > 0) {
+            snapshot.retained_oldest_ms = self.node_service_event_history.items[0].timestamp_ms;
+            snapshot.retained_newest_ms = self.node_service_event_history.items[self.node_service_event_history.items.len - 1].timestamp_ms;
+            const oldest = snapshot.retained_oldest_ms.?;
+            const newest = snapshot.retained_newest_ms.?;
+            if (newest >= oldest) {
+                snapshot.retained_window_ms = @intCast(newest - oldest);
+            }
+        }
+        self.node_service_event_history_mutex.unlock();
+
+        self.node_service_watch_metrics_mutex.lock();
+        snapshot.subscribers_peak = self.node_service_watch_subscribers_peak;
+        snapshot.replay_requests_total = self.node_service_watch_replay_requests_total;
+        snapshot.replay_attempted_total = self.node_service_watch_replay_attempted_total;
+        snapshot.replay_sent_total = self.node_service_watch_replay_sent_total;
+        snapshot.replay_bytes_total = self.node_service_watch_replay_bytes_total;
+        snapshot.fanout_events_total = self.node_service_watch_fanout_events_total;
+        snapshot.fanout_attempted_total = self.node_service_watch_fanout_attempted_total;
+        snapshot.fanout_sent_total = self.node_service_watch_fanout_sent_total;
+        snapshot.fanout_dropped_total = self.node_service_watch_fanout_dropped_total;
+        self.node_service_watch_metrics_mutex.unlock();
+
+        return snapshot;
+    }
+
+    fn appendNodeServiceWatchMetricsJson(
+        self: *AgentRuntimeRegistry,
+        out: *std.ArrayListUnmanaged(u8),
+        snapshot: NodeServiceWatchMetricsSnapshot,
+    ) !void {
+        try out.writer(self.allocator).print(
+            "{{\"subscribers\":{{\"current\":{d},\"peak\":{d}}},\"replay\":{{\"requests_total\":{d},\"attempted_total\":{d},\"sent_total\":{d},\"bytes_total\":{d}}},\"fanout\":{{\"events_total\":{d},\"attempted_total\":{d},\"sent_total\":{d},\"dropped_total\":{d}}},\"retained\":{{\"events\":{d},\"capacity\":{d},\"oldest_ms\":",
+            .{
+                snapshot.subscribers_current,
+                snapshot.subscribers_peak,
+                snapshot.replay_requests_total,
+                snapshot.replay_attempted_total,
+                snapshot.replay_sent_total,
+                snapshot.replay_bytes_total,
+                snapshot.fanout_events_total,
+                snapshot.fanout_attempted_total,
+                snapshot.fanout_sent_total,
+                snapshot.fanout_dropped_total,
+                snapshot.retained_events,
+                snapshot.retained_capacity,
+            },
+        );
+        if (snapshot.retained_oldest_ms) |value| {
+            try out.writer(self.allocator).print("{d}", .{value});
+        } else {
+            try out.appendSlice(self.allocator, "null");
+        }
+        try out.appendSlice(self.allocator, ",\"newest_ms\":");
+        if (snapshot.retained_newest_ms) |value| {
+            try out.writer(self.allocator).print("{d}", .{value});
+        } else {
+            try out.appendSlice(self.allocator, "null");
+        }
+        try out.writer(self.allocator).print(",\"window_ms\":{d}}}", .{snapshot.retained_window_ms});
+    }
+
+    fn metricsJson(self: *AgentRuntimeRegistry) ![]u8 {
+        const base = try self.control_plane.metricsJson();
+        defer self.allocator.free(base);
+
+        const snapshot = self.snapshotNodeServiceWatchMetrics();
+        const trimmed = std.mem.trimRight(u8, base, " \t\r\n");
+        if (trimmed.len == 0 or trimmed[trimmed.len - 1] != '}') {
+            return self.allocator.dupe(u8, base);
+        }
+
+        var out = std.ArrayListUnmanaged(u8){};
+        errdefer out.deinit(self.allocator);
+        try out.appendSlice(self.allocator, trimmed[0 .. trimmed.len - 1]);
+        try out.appendSlice(self.allocator, ",\"node_service_watch\":");
+        try self.appendNodeServiceWatchMetricsJson(&out, snapshot);
+        try out.append(self.allocator, '}');
+        return out.toOwnedSlice(self.allocator);
+    }
+
+    fn metricsPrometheus(self: *AgentRuntimeRegistry) ![]u8 {
+        const base = try self.control_plane.metricsPrometheus();
+        defer self.allocator.free(base);
+
+        const snapshot = self.snapshotNodeServiceWatchMetrics();
+        var out = std.ArrayListUnmanaged(u8){};
+        errdefer out.deinit(self.allocator);
+        try out.appendSlice(self.allocator, base);
+        if (out.items.len > 0 and out.items[out.items.len - 1] != '\n') {
+            try out.append(self.allocator, '\n');
+        }
+        try out.writer(self.allocator).print(
+            \\# TYPE spiderweb_node_service_watch_subscribers gauge
+            \\spiderweb_node_service_watch_subscribers {d}
+            \\# TYPE spiderweb_node_service_watch_subscribers_peak gauge
+            \\spiderweb_node_service_watch_subscribers_peak {d}
+            \\# TYPE spiderweb_node_service_watch_replay_requests_total counter
+            \\spiderweb_node_service_watch_replay_requests_total {d}
+            \\# TYPE spiderweb_node_service_watch_replay_attempted_total counter
+            \\spiderweb_node_service_watch_replay_attempted_total {d}
+            \\# TYPE spiderweb_node_service_watch_replay_sent_total counter
+            \\spiderweb_node_service_watch_replay_sent_total {d}
+            \\# TYPE spiderweb_node_service_watch_replay_bytes_total counter
+            \\spiderweb_node_service_watch_replay_bytes_total {d}
+            \\# TYPE spiderweb_node_service_watch_fanout_events_total counter
+            \\spiderweb_node_service_watch_fanout_events_total {d}
+            \\# TYPE spiderweb_node_service_watch_fanout_attempted_total counter
+            \\spiderweb_node_service_watch_fanout_attempted_total {d}
+            \\# TYPE spiderweb_node_service_watch_fanout_sent_total counter
+            \\spiderweb_node_service_watch_fanout_sent_total {d}
+            \\# TYPE spiderweb_node_service_watch_fanout_dropped_total counter
+            \\spiderweb_node_service_watch_fanout_dropped_total {d}
+            \\# TYPE spiderweb_node_service_watch_retained_events gauge
+            \\spiderweb_node_service_watch_retained_events {d}
+            \\# TYPE spiderweb_node_service_watch_retained_capacity gauge
+            \\spiderweb_node_service_watch_retained_capacity {d}
+            \\# TYPE spiderweb_node_service_watch_retained_window_ms gauge
+            \\spiderweb_node_service_watch_retained_window_ms {d}
+            \\
+        ,
+            .{
+                snapshot.subscribers_current,
+                snapshot.subscribers_peak,
+                snapshot.replay_requests_total,
+                snapshot.replay_attempted_total,
+                snapshot.replay_sent_total,
+                snapshot.replay_bytes_total,
+                snapshot.fanout_events_total,
+                snapshot.fanout_attempted_total,
+                snapshot.fanout_sent_total,
+                snapshot.fanout_dropped_total,
+                snapshot.retained_events,
+                snapshot.retained_capacity,
+                snapshot.retained_window_ms,
+            },
+        );
+        return out.toOwnedSlice(self.allocator);
+    }
+
+    fn replayNodeServiceEvents(
+        self: *AgentRuntimeRegistry,
+        stream: *std.net.Stream,
+        write_mutex: *std.Thread.Mutex,
+        role: ConnectionRole,
+        agent_id: ?[]const u8,
+        project_id: ?[]const u8,
+        project_token: ?[]const u8,
+        node_id_filter: ?[]const u8,
+        replay_limit: usize,
+    ) !usize {
+        var replay_attempted: usize = 0;
+        var replay_sent: usize = 0;
+        var replay_bytes: usize = 0;
+        defer self.recordNodeServiceReplayMetrics(replay_attempted, replay_sent, replay_bytes);
+        if (replay_limit == 0) return 0;
+
+        var replay_payloads = std.ArrayListUnmanaged([]u8){};
+        defer {
+            for (replay_payloads.items) |payload| self.allocator.free(payload);
+            replay_payloads.deinit(self.allocator);
+        }
+
+        {
+            self.node_service_event_history_mutex.lock();
+            defer self.node_service_event_history_mutex.unlock();
+            var idx = self.node_service_event_history.items.len;
+            while (idx > 0 and replay_payloads.items.len < replay_limit) {
+                idx -= 1;
+                const record = self.node_service_event_history.items[idx];
+                if (!self.nodeServiceEventVisibleToContext(
+                    role,
+                    agent_id,
+                    project_id,
+                    project_token,
+                    node_id_filter,
+                    record.node_id,
+                )) continue;
+                try replay_payloads.append(self.allocator, try self.allocator.dupe(u8, record.payload_json));
+            }
+        }
+
+        var sent: usize = 0;
+        var replay_idx = replay_payloads.items.len;
+        while (replay_idx > 0) {
+            replay_idx -= 1;
+            const frame_json = try unified.buildControlAck(
+                self.allocator,
+                .node_service_event,
+                null,
+                replay_payloads.items[replay_idx],
+            );
+            defer self.allocator.free(frame_json);
+            replay_attempted += 1;
+            try writeFrameLocked(stream, write_mutex, frame_json, .text);
+            sent += 1;
+            replay_sent += 1;
+            replay_bytes += replay_payloads.items[replay_idx].len;
+        }
+        return sent;
+    }
+
+    fn emitNodeServiceEvent(
+        self: *AgentRuntimeRegistry,
+        node_id: ?[]const u8,
+        payload_json: []const u8,
+    ) void {
+        self.recordNodeServiceEvent(node_id, payload_json);
+        const event_json = unified.buildControlAck(
+            self.allocator,
+            .node_service_event,
+            null,
+            payload_json,
+        ) catch return;
+        defer self.allocator.free(event_json);
+
+        self.node_service_subscribers_mutex.lock();
+        defer self.node_service_subscribers_mutex.unlock();
+
+        var fanout_attempts: usize = 0;
+        var fanout_sent: usize = 0;
+        var fanout_dropped: usize = 0;
+        var idx: usize = 0;
+        while (idx < self.node_service_subscribers.items.len) {
+            const subscriber = &self.node_service_subscribers.items[idx];
+            if (!self.nodeServiceEventVisibleToContext(
+                subscriber.role,
+                subscriber.agent_id,
+                subscriber.project_id,
+                subscriber.project_token,
+                subscriber.node_id_filter,
+                node_id,
+            )) {
+                idx += 1;
+                continue;
+            }
+            fanout_attempts += 1;
+            subscriber.write_mutex.lock();
+            const write_result = websocket_transport.writeFrame(subscriber.stream, event_json, .text);
+            subscriber.write_mutex.unlock();
+            if (write_result) |_| {
+                fanout_sent += 1;
+                idx += 1;
+            } else |_| {
+                fanout_dropped += 1;
+                var removed = self.node_service_subscribers.swapRemove(idx);
+                removed.deinit(self.allocator);
+            }
+        }
+        self.recordNodeServiceFanoutMetrics(fanout_attempts, fanout_sent, fanout_dropped);
+    }
+
     fn emitWorkspaceTopologyChanged(self: *AgentRuntimeRegistry, reason: []const u8) void {
         const escaped_reason = unified.jsonEscape(self.allocator, reason) catch return;
         defer self.allocator.free(escaped_reason);
@@ -2668,6 +4747,31 @@ const AgentRuntimeRegistry = struct {
         defer self.allocator.free(payload_json);
 
         self.broadcastTopologyDebugEvent("control.workspace_topology_delta", payload_json);
+    }
+
+    fn emitWorkspaceAvailabilityRollupChanged(
+        self: *AgentRuntimeRegistry,
+        reason: []const u8,
+        before: fs_control_plane.ControlPlane.AvailabilitySnapshot,
+        after: fs_control_plane.ControlPlane.AvailabilitySnapshot,
+    ) void {
+        const escaped_reason = unified.jsonEscape(self.allocator, reason) catch return;
+        defer self.allocator.free(escaped_reason);
+        var payload = std.ArrayListUnmanaged(u8){};
+        defer payload.deinit(self.allocator);
+        payload.appendSlice(self.allocator, "{\"event\":\"workspace_availability_changed\",\"reason\":\"") catch return;
+        payload.appendSlice(self.allocator, escaped_reason) catch return;
+        payload.appendSlice(self.allocator, "\",\"before\":") catch return;
+        appendAvailabilitySnapshotJson(self.allocator, &payload, before) catch return;
+        payload.appendSlice(self.allocator, ",\"after\":") catch return;
+        appendAvailabilitySnapshotJson(self.allocator, &payload, after) catch return;
+        payload.appendSlice(self.allocator, ",\"ts_ms\":") catch return;
+        payload.writer(self.allocator).print("{d}", .{std.time.milliTimestamp()}) catch return;
+        payload.append(self.allocator, '}') catch return;
+
+        const payload_json = payload.toOwnedSlice(self.allocator) catch return;
+        defer self.allocator.free(payload_json);
+        self.broadcastTopologyDebugEvent("control.workspace_availability", payload_json);
     }
 
     fn broadcastTopologyDebugEvent(
@@ -2833,9 +4937,14 @@ const AgentRuntimeRegistry = struct {
         };
         const mount_specs = [_]fs_control_plane.SpiderWebMountSpec{
             .{ .mount_path = local_node_mount_meta, .export_name = local_node_meta_export_name },
-            .{ .mount_path = local_node_mount_capabilities, .export_name = local_node_capabilities_export_name },
-            .{ .mount_path = local_node_mount_jobs, .export_name = local_node_jobs_export_name },
-            .{ .mount_path = local_node_mount_workspace, .export_name = workspace_export_name },
+            .{ .mount_path = local_node_mount_agents_self_capabilities, .export_name = local_node_capabilities_export_name },
+            .{ .mount_path = local_node_mount_agents_self_jobs, .export_name = local_node_jobs_export_name },
+            .{ .mount_path = local_node_mount_nodes_local_fs, .export_name = workspace_export_name },
+            .{ .mount_path = local_node_mount_projects_system_meta, .export_name = local_node_meta_export_name },
+            .{ .mount_path = local_node_mount_projects_system_agents_self_capabilities, .export_name = local_node_capabilities_export_name },
+            .{ .mount_path = local_node_mount_projects_system_agents_self_jobs, .export_name = local_node_jobs_export_name },
+            .{ .mount_path = local_node_mount_projects_system_nodes_local_fs, .export_name = workspace_export_name },
+            .{ .mount_path = local_node_mount_projects_system_fs_local, .export_name = workspace_export_name },
         };
 
         const local_node = try LocalFsNode.create(
@@ -3106,10 +5215,29 @@ fn handleWebSocketConnection(
         return;
     }
 
-    _ = resolveAgentIdFromConnectionPath(handshake.path, runtime_registry.default_agent_id) orelse {
-        try sendWebSocketErrorAndClose(allocator, stream, .invalid_envelope, "invalid websocket path");
+    if (isNodeTunnelPath(handshake.path)) {
+        try handleNodeTunnelConnection(allocator, runtime_registry, stream);
         return;
-    };
+    }
+
+    const maybe_node_fs_route = parseNodeFsRoute(handshake.path);
+
+    if (maybe_node_fs_route == null) {
+        _ = resolveAgentIdFromConnectionPath(handshake.path, runtime_registry.default_agent_id) orelse {
+            try sendWebSocketErrorAndClose(allocator, stream, .invalid_envelope, "invalid websocket path");
+            return;
+        };
+    }
+
+    if (maybe_node_fs_route) |node_id| {
+        try handleRoutedNodeFsConnection(
+            allocator,
+            runtime_registry,
+            node_id,
+            stream,
+        );
+        return;
+    }
 
     const principal = runtime_registry.authenticateConnection(handshake.authorization) orelse {
         try sendWebSocketErrorAndClose(allocator, stream, .provider_auth_failed, "forbidden");
@@ -3150,13 +5278,12 @@ fn handleWebSocketConnection(
     defer if (fsrpc) |*session| session.deinit();
     var fsrpc_bound_session_key = try allocator.dupe(u8, "main");
     defer allocator.free(fsrpc_bound_session_key);
-    var debug_stream_enabled = false;
     var control_protocol_negotiated = false;
     var runtime_fsrpc_version_negotiated = false;
     var connection_write_mutex: std.Thread.Mutex = .{};
-    var topology_subscriber_id: ?u64 = null;
-    defer if (topology_subscriber_id) |subscriber_id| {
-        runtime_registry.unregisterTopologySubscriber(subscriber_id);
+    var node_service_subscriber_id: ?u64 = null;
+    defer if (node_service_subscriber_id) |subscriber_id| {
+        runtime_registry.unregisterNodeServiceSubscriber(subscriber_id);
     };
 
     while (true) {
@@ -3182,7 +5309,6 @@ fn handleWebSocketConnection(
                         &session_bindings,
                         active_session_key,
                         connect_gate_error,
-                        debug_stream_enabled,
                     )) {
                         continue;
                     }
@@ -3227,7 +5353,11 @@ fn handleWebSocketConnection(
                         if (connect_gate_error != null and
                             control_type != .version and
                             control_type != .connect and
-                            control_type != .session_attach)
+                            control_type != .session_attach and
+                            control_type != .session_restore and
+                            control_type != .session_history and
+                            control_type != .agent_list and
+                            control_type != .agent_get)
                         {
                             const gate = connect_gate_error.?;
                             const response = try unified.buildControlError(
@@ -3344,7 +5474,7 @@ fn handleWebSocketConnection(
                                     try writeFrameLocked(stream, &connection_write_mutex, response, .text);
                                     continue;
                                 }
-                                const payload = try runtime_registry.control_plane.metricsJson();
+                                const payload = try runtime_registry.metricsJson();
                                 defer allocator.free(payload);
                                 const response = try unified.buildControlAck(
                                     allocator,
@@ -3711,7 +5841,11 @@ fn handleWebSocketConnection(
                                 if (attach_project_id) |project_id| {
                                     const activate_payload = try buildProjectActivatePayload(allocator, project_id, attach_project_token);
                                     defer allocator.free(activate_payload);
-                                    _ = runtime_registry.control_plane.activateProject(attach_agent_id, activate_payload) catch |activate_err| {
+                                    _ = runtime_registry.control_plane.activateProjectWithRole(
+                                        attach_agent_id,
+                                        activate_payload,
+                                        principal.role == .admin,
+                                    ) catch |activate_err| {
                                         const response = try unified.buildControlError(
                                             allocator,
                                             parsed.id,
@@ -3776,6 +5910,12 @@ fn handleWebSocketConnection(
                                 connect_gate_error = null;
                                 runtime_registry.rememberPrincipalTarget(
                                     principal,
+                                    active_binding.agent_id,
+                                    active_binding.project_id,
+                                );
+                                runtime_registry.rememberPrincipalSession(
+                                    principal,
+                                    session_key,
                                     active_binding.agent_id,
                                     active_binding.project_id,
                                 );
@@ -3924,6 +6064,17 @@ fn handleWebSocketConnection(
                                 );
                                 defer allocator.free(response);
                                 try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                runtime_registry.rememberPrincipalTarget(
+                                    principal,
+                                    binding.agent_id,
+                                    binding.project_id,
+                                );
+                                runtime_registry.rememberPrincipalSession(
+                                    principal,
+                                    session_key,
+                                    binding.agent_id,
+                                    binding.project_id,
+                                );
                                 continue;
                             },
                             .session_list => {
@@ -3932,6 +6083,89 @@ fn handleWebSocketConnection(
                                 const response = try unified.buildControlAck(
                                     allocator,
                                     .session_list,
+                                    parsed.id,
+                                    payload_json,
+                                );
+                                defer allocator.free(response);
+                                try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                continue;
+                            },
+                            .session_restore => {
+                                var payload = try parseControlPayloadObject(allocator, parsed.payload_json);
+                                defer payload.deinit();
+                                if (payload.value != .object) {
+                                    const response = try unified.buildControlError(
+                                        allocator,
+                                        parsed.id,
+                                        "invalid_payload",
+                                        "session_restore payload must be an object",
+                                    );
+                                    defer allocator.free(response);
+                                    try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                    continue;
+                                }
+                                const agent_filter = getOptionalStringField(payload.value.object, "agent_id");
+                                var restored = try runtime_registry.auth_tokens.latestSessionOwned(principal.role, agent_filter);
+                                defer if (restored) |*entry| entry.deinit(allocator);
+
+                                const payload_json = try buildSessionRestorePayload(allocator, restored);
+                                defer allocator.free(payload_json);
+                                const response = try unified.buildControlAck(
+                                    allocator,
+                                    .session_restore,
+                                    parsed.id,
+                                    payload_json,
+                                );
+                                defer allocator.free(response);
+                                try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                continue;
+                            },
+                            .session_history => {
+                                var payload = try parseControlPayloadObject(allocator, parsed.payload_json);
+                                defer payload.deinit();
+                                if (payload.value != .object) {
+                                    const response = try unified.buildControlError(
+                                        allocator,
+                                        parsed.id,
+                                        "invalid_payload",
+                                        "session_history payload must be an object",
+                                    );
+                                    defer allocator.free(response);
+                                    try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                    continue;
+                                }
+                                const agent_filter = getOptionalStringField(payload.value.object, "agent_id");
+                                const limit = blk: {
+                                    const value = payload.value.object.get("limit") orelse break :blk @as(usize, 10);
+                                    if (value != .integer or value.integer < 0) {
+                                        const response = try unified.buildControlError(
+                                            allocator,
+                                            parsed.id,
+                                            "invalid_payload",
+                                            "limit must be a non-negative integer",
+                                        );
+                                        defer allocator.free(response);
+                                        try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                        continue;
+                                    }
+                                    if (value.integer > 100) break :blk @as(usize, 100);
+                                    break :blk @as(usize, @intCast(value.integer));
+                                };
+                                var history = try runtime_registry.auth_tokens.sessionHistoryOwned(
+                                    principal.role,
+                                    agent_filter,
+                                    limit,
+                                );
+                                defer {
+                                    for (history.items) |*entry| entry.deinit(allocator);
+                                    history.deinit(allocator);
+                                }
+
+                                const payload_json = try buildSessionHistoryPayload(allocator, history.items);
+                                defer allocator.free(payload_json);
+                                const response = try unified.buildControlAck(
+                                    allocator,
+                                    .session_history,
                                     parsed.id,
                                     payload_json,
                                 );
@@ -4070,7 +6304,18 @@ fn handleWebSocketConnection(
                                             else => return err,
                                         };
                                         defer main_runtime.release();
-                                        try session.setRuntimeBinding(main_runtime, main_binding.agent_id);
+                                        try session.setRuntimeBindingWithOptions(
+                                            main_runtime,
+                                            main_binding.agent_id,
+                                            .{
+                                                .project_id = main_binding.project_id,
+                                                .project_token = main_binding.project_token,
+                                                .agents_dir = runtime_registry.runtime_config.agents_dir,
+                                                .projects_dir = "projects",
+                                                .control_plane = &runtime_registry.control_plane,
+                                                .is_admin = principal.role == .admin,
+                                            },
+                                        );
                                     }
                                 }
 
@@ -4090,42 +6335,172 @@ fn handleWebSocketConnection(
                                 try writeFrameLocked(stream, &connection_write_mutex, response, .text);
                                 continue;
                             },
-                            .debug_subscribe, .debug_unsubscribe => {
-                                debug_stream_enabled = control_type == .debug_subscribe;
-                                if (fsrpc) |*session| {
-                                    session.setDebugStreamEnabled(debug_stream_enabled);
+                            .node_service_watch => {
+                                if (!runtime_registry.isNodeServiceWatchAllowedForRole(principal.role)) {
+                                    const role_name = connectionRoleName(principal.role);
+                                    const response = try unified.buildControlError(
+                                        allocator,
+                                        parsed.id,
+                                        "forbidden",
+                                        if (principal.role == .admin)
+                                            "node service watch is disabled for admin role"
+                                        else
+                                            "node service watch is disabled for user role",
+                                    );
+                                    defer allocator.free(response);
+                                    try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                    runtime_registry.appendSecurityAuditAndDebug(
+                                        (session_bindings.get(active_session_key) orelse return error.InvalidState).agent_id,
+                                        .node_service_watch,
+                                        principal.role,
+                                        parsed.correlation_id orelse parsed.id,
+                                        "watch_role_forbidden",
+                                        false,
+                                        "forbidden",
+                                        role_name,
+                                    );
+                                    continue;
                                 }
-                                if (debug_stream_enabled) {
-                                    if (topology_subscriber_id == null) {
-                                        topology_subscriber_id = try runtime_registry.registerTopologySubscriber(
-                                            stream,
-                                            &connection_write_mutex,
+                                var watch_request = parseNodeServiceWatchRequest(allocator, parsed.payload_json) catch |err| {
+                                    const response = try unified.buildControlError(
+                                        allocator,
+                                        parsed.id,
+                                        if (err == error.MissingField) "missing_field" else "invalid_payload",
+                                        @errorName(err),
+                                    );
+                                    defer allocator.free(response);
+                                    try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                    continue;
+                                };
+                                defer watch_request.deinit(allocator);
+
+                                const active_binding = session_bindings.get(active_session_key) orelse return error.InvalidState;
+                                const watch_agent_id = active_binding.agent_id;
+                                const watch_project_id = active_binding.project_id;
+                                const watch_project_token = active_binding.project_token;
+
+                                if (principal.role == .user) {
+                                    const concrete_project_id = watch_project_id orelse {
+                                        const response = try unified.buildControlError(
+                                            allocator,
+                                            parsed.id,
+                                            "forbidden",
+                                            "watch requires a project-scoped session binding",
                                         );
+                                        defer allocator.free(response);
+                                        try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                        continue;
+                                    };
+                                    if (!runtime_registry.control_plane.projectAllowsAction(
+                                        concrete_project_id,
+                                        watch_agent_id,
+                                        .observe,
+                                        watch_project_token,
+                                        false,
+                                    )) {
+                                        const response = try unified.buildControlError(
+                                            allocator,
+                                            parsed.id,
+                                            "forbidden",
+                                            "observe access denied for active project",
+                                        );
+                                        defer allocator.free(response);
+                                        try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                        continue;
                                     }
-                                } else if (topology_subscriber_id) |subscriber_id| {
-                                    runtime_registry.unregisterTopologySubscriber(subscriber_id);
-                                    topology_subscriber_id = null;
                                 }
-                                const request_id = parsed.id orelse "generated";
-                                const payload_json = if (debug_stream_enabled)
-                                    "{\"enabled\":true}"
-                                else
-                                    "{\"enabled\":false}";
-                                const ack = try protocol.buildDebugEvent(
+
+                                if (node_service_subscriber_id) |subscriber_id| {
+                                    runtime_registry.unregisterNodeServiceSubscriber(subscriber_id);
+                                    node_service_subscriber_id = null;
+                                }
+                                node_service_subscriber_id = try runtime_registry.registerNodeServiceSubscriber(
+                                    stream,
+                                    &connection_write_mutex,
+                                    watch_request.node_id,
+                                    principal.role,
+                                    watch_agent_id,
+                                    watch_project_id,
+                                    watch_project_token,
+                                );
+
+                                const bounded_replay_limit = @min(watch_request.replay_limit, runtime_registry.node_service_watch_replay_max);
+                                const replayed_count = runtime_registry.replayNodeServiceEvents(
+                                    stream,
+                                    &connection_write_mutex,
+                                    principal.role,
+                                    watch_agent_id,
+                                    watch_project_id,
+                                    watch_project_token,
+                                    watch_request.node_id,
+                                    bounded_replay_limit,
+                                ) catch |err| {
+                                    if (node_service_subscriber_id) |subscriber_id| {
+                                        runtime_registry.unregisterNodeServiceSubscriber(subscriber_id);
+                                        node_service_subscriber_id = null;
+                                    }
+                                    const response = try unified.buildControlError(
+                                        allocator,
+                                        parsed.id,
+                                        "execution_failed",
+                                        @errorName(err),
+                                    );
+                                    defer allocator.free(response);
+                                    try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                    continue;
+                                };
+
+                                const payload_json = if (watch_request.node_id) |value| blk: {
+                                    const escaped_node = try unified.jsonEscape(allocator, value);
+                                    defer allocator.free(escaped_node);
+                                    break :blk try std.fmt.allocPrint(
+                                        allocator,
+                                        "{{\"enabled\":true,\"node_id\":\"{s}\",\"replay_limit\":{d},\"replayed\":{d}}}",
+                                        .{ escaped_node, bounded_replay_limit, replayed_count },
+                                    );
+                                } else try std.fmt.allocPrint(
                                     allocator,
-                                    request_id,
-                                    "control.subscription",
+                                    "{{\"enabled\":true,\"replay_limit\":{d},\"replayed\":{d}}}",
+                                    .{ bounded_replay_limit, replayed_count },
+                                );
+                                defer allocator.free(payload_json);
+
+                                const response = try unified.buildControlAck(
+                                    allocator,
+                                    .node_service_watch,
+                                    parsed.id,
                                     payload_json,
                                 );
-                                defer allocator.free(ack);
-                                try writeFrameLocked(stream, &connection_write_mutex, ack, .text);
-                                const active_binding = session_bindings.get(active_session_key) orelse return error.InvalidState;
-                                runtime_registry.maybeLogDebugFrame(active_binding.agent_id, ack);
+                                defer allocator.free(response);
+                                try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                continue;
+                            },
+                            .node_service_unwatch => {
+                                if (node_service_subscriber_id) |subscriber_id| {
+                                    runtime_registry.unregisterNodeServiceSubscriber(subscriber_id);
+                                    node_service_subscriber_id = null;
+                                }
+                                const response = try unified.buildControlAck(
+                                    allocator,
+                                    .node_service_unwatch,
+                                    parsed.id,
+                                    "{\"enabled\":false}",
+                                );
+                                defer allocator.free(response);
+                                try writeFrameLocked(stream, &connection_write_mutex, response, .text);
                                 continue;
                             },
                             .node_invite_create,
+                            .node_join_request,
+                            .node_join_pending_list,
+                            .node_join_approve,
+                            .node_join_deny,
                             .node_join,
                             .node_lease_refresh,
+                            .node_service_upsert,
+                            .node_service_get,
+                            .agent_list,
+                            .agent_get,
                             .node_list,
                             .node_get,
                             .node_delete,
@@ -4210,10 +6585,12 @@ fn handleWebSocketConnection(
                                         continue;
                                     };
                                 }
+                                const availability_before = runtime_registry.control_plane.availabilitySnapshot();
                                 const payload_json = handleControlPlaneCommand(
                                     runtime_registry,
                                     control_type,
                                     control_agent_id,
+                                    principal.role == .admin,
                                     parsed.payload_json,
                                 ) catch |err| {
                                     const code = controlPlaneErrorCode(err);
@@ -4259,9 +6636,26 @@ fn handleWebSocketConnection(
                                 );
                                 defer allocator.free(response);
                                 try writeFrameLocked(stream, &connection_write_mutex, response, .text);
-                                if (isWorkspaceTopologyMutation(control_type)) {
+                                if (control_type == .node_service_upsert) {
+                                    const event_node_id = extractNodeIdFromControlPayload(allocator, payload_json) catch null;
+                                    defer if (event_node_id) |value| allocator.free(value);
+                                    runtime_registry.emitNodeServiceEvent(
+                                        if (event_node_id) |value| value else null,
+                                        payload_json,
+                                    );
+                                }
+                                const availability_after = runtime_registry.control_plane.availabilitySnapshot();
+                                const topology_mutation = isWorkspaceTopologyMutation(control_type);
+                                const availability_changed = !fs_control_plane.ControlPlane.AvailabilitySnapshot.eql(
+                                    availability_before,
+                                    availability_after,
+                                );
+                                if (topology_mutation or availability_changed) {
                                     runtime_registry.control_plane.requestReconcile();
-                                    const reason = unified.controlTypeName(control_type);
+                                    const reason = if (availability_changed and !topology_mutation)
+                                        "availability_changed"
+                                    else
+                                        unified.controlTypeName(control_type);
                                     runtime_registry.emitWorkspaceTopologyChanged(reason);
                                     runtime_registry.emitWorkspaceTopologyProjectDelta(
                                         control_agent_id,
@@ -4269,6 +6663,13 @@ fn handleWebSocketConnection(
                                         parsed.payload_json,
                                         payload_json,
                                     );
+                                    if (availability_changed) {
+                                        runtime_registry.emitWorkspaceAvailabilityRollupChanged(
+                                            reason,
+                                            availability_before,
+                                            availability_after,
+                                        );
+                                    }
                                 }
                                 continue;
                             },
@@ -4285,7 +6686,7 @@ fn handleWebSocketConnection(
                             },
                         }
                     },
-                    .fsrpc => {
+                    .acheron => {
                         if (connect_gate_error) |gate| {
                             const response = try unified.buildFsrpcError(
                                 allocator,
@@ -4297,7 +6698,7 @@ fn handleWebSocketConnection(
                             try writeFrameLocked(stream, &connection_write_mutex, response, .text);
                             continue;
                         }
-                        const fsrpc_type = parsed.fsrpc_type orelse {
+                        const fsrpc_type = parsed.acheron_type orelse {
                             const response = try unified.buildFsrpcError(
                                 allocator,
                                 parsed.tag,
@@ -4315,7 +6716,7 @@ fn handleWebSocketConnection(
                                     allocator,
                                     parsed.tag,
                                     "protocol_mismatch",
-                                    "fsrpc.t_version must be negotiated first",
+                                    "acheron.t_version must be negotiated first",
                                 );
                                 defer allocator.free(response);
                                 try writeFrameLocked(stream, &connection_write_mutex, response, .text);
@@ -4380,6 +6781,17 @@ fn handleWebSocketConnection(
                             try writeFrameLocked(stream, &connection_write_mutex, response, .text);
                             continue;
                         };
+                        if (fsrpc_type == .t_write and target_binding.project_id != null) {
+                            runtime_registry.auth_tokens.recordSessionActivity(
+                                principal.role,
+                                target_session_key,
+                                target_binding.agent_id,
+                                target_binding.project_id.?,
+                                1,
+                            ) catch |history_err| {
+                                std.log.warn("session activity update failed: {s}", .{@errorName(history_err)});
+                            };
+                        }
                         var attach_state = runtime_registry.runtimeAttachSnapshot(
                             target_binding.agent_id,
                             target_binding.project_id,
@@ -4511,8 +6923,20 @@ fn handleWebSocketConnection(
                         };
                         defer target_runtime.release();
                         if (fsrpc == null) {
-                            fsrpc = try fsrpc_session.Session.init(allocator, target_runtime, &runtime_registry.job_index, target_binding.agent_id);
-                            fsrpc.?.setDebugStreamEnabled(debug_stream_enabled);
+                            fsrpc = try fsrpc_session.Session.initWithOptions(
+                                allocator,
+                                target_runtime,
+                                &runtime_registry.job_index,
+                                target_binding.agent_id,
+                                .{
+                                    .project_id = target_binding.project_id,
+                                    .project_token = target_binding.project_token,
+                                    .agents_dir = runtime_registry.runtime_config.agents_dir,
+                                    .projects_dir = "projects",
+                                    .control_plane = &runtime_registry.control_plane,
+                                    .is_admin = principal.role == .admin,
+                                },
+                            );
                             const next_bound_session_key = try allocator.dupe(u8, target_session_key);
                             allocator.free(fsrpc_bound_session_key);
                             fsrpc_bound_session_key = next_bound_session_key;
@@ -4520,7 +6944,18 @@ fn handleWebSocketConnection(
                             const needs_rebind = !std.mem.eql(u8, fsrpc_bound_session_key, target_session_key) or
                                 !std.mem.eql(u8, fsrpc.?.agent_id, target_binding.agent_id);
                             if (needs_rebind) {
-                                try fsrpc.?.setRuntimeBinding(target_runtime, target_binding.agent_id);
+                                try fsrpc.?.setRuntimeBindingWithOptions(
+                                    target_runtime,
+                                    target_binding.agent_id,
+                                    .{
+                                        .project_id = target_binding.project_id,
+                                        .project_token = target_binding.project_token,
+                                        .agents_dir = runtime_registry.runtime_config.agents_dir,
+                                        .projects_dir = "projects",
+                                        .control_plane = &runtime_registry.control_plane,
+                                        .is_admin = principal.role == .admin,
+                                    },
+                                );
                                 const next_bound_session_key = try allocator.dupe(u8, target_session_key);
                                 allocator.free(fsrpc_bound_session_key);
                                 fsrpc_bound_session_key = next_bound_session_key;
@@ -4529,25 +6964,6 @@ fn handleWebSocketConnection(
                         const response = try fsrpc.?.handle(&parsed);
                         defer allocator.free(response);
                         try writeFrameLocked(stream, &connection_write_mutex, response, .text);
-
-                        const debug_frames = try fsrpc.?.drainPendingDebugFrames();
-                        if (debug_frames.len > 0) {
-                            defer allocator.free(debug_frames);
-                            var idx: usize = 0;
-                            while (idx < debug_frames.len) : (idx += 1) {
-                                const payload = debug_frames[idx];
-                                writeFrameLocked(stream, &connection_write_mutex, payload, .text) catch |err| {
-                                    allocator.free(payload);
-                                    var rest = idx + 1;
-                                    while (rest < debug_frames.len) : (rest += 1) {
-                                        allocator.free(debug_frames[rest]);
-                                    }
-                                    return err;
-                                };
-                                runtime_registry.maybeLogDebugFrame(target_binding.agent_id, payload);
-                                allocator.free(payload);
-                            }
-                        }
                         continue;
                     },
                 }
@@ -4773,6 +7189,65 @@ fn buildSessionListPayload(
     return out.toOwnedSlice(allocator);
 }
 
+fn appendSessionHistoryEntryJson(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    entry: SessionHistoryEntry,
+) !void {
+    const escaped_session = try unified.jsonEscape(allocator, entry.session_key);
+    defer allocator.free(escaped_session);
+    const escaped_agent = try unified.jsonEscape(allocator, entry.agent_id);
+    defer allocator.free(escaped_agent);
+    const escaped_project = try unified.jsonEscape(allocator, entry.project_id);
+    defer allocator.free(escaped_project);
+    const summary_json = if (entry.summary) |value| blk: {
+        const escaped_summary = try unified.jsonEscape(allocator, value);
+        defer allocator.free(escaped_summary);
+        break :blk try std.fmt.allocPrint(allocator, "\"{s}\"", .{escaped_summary});
+    } else try allocator.dupe(u8, "null");
+    defer allocator.free(summary_json);
+
+    try out.writer(allocator).print(
+        "{{\"session_key\":\"{s}\",\"agent_id\":\"{s}\",\"project_id\":\"{s}\",\"last_active_ms\":{d},\"message_count\":{d},\"summary\":{s}}}",
+        .{
+            escaped_session,
+            escaped_agent,
+            escaped_project,
+            entry.last_active_ms,
+            entry.message_count,
+            summary_json,
+        },
+    );
+}
+
+fn buildSessionRestorePayload(
+    allocator: std.mem.Allocator,
+    maybe_entry: ?SessionHistoryEntry,
+) ![]u8 {
+    if (maybe_entry == null) return allocator.dupe(u8, "{\"found\":false}");
+    var out = std.ArrayListUnmanaged(u8){};
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, "{\"found\":true,\"session\":");
+    try appendSessionHistoryEntryJson(allocator, &out, maybe_entry.?);
+    try out.append(allocator, '}');
+    return out.toOwnedSlice(allocator);
+}
+
+fn buildSessionHistoryPayload(
+    allocator: std.mem.Allocator,
+    history: []const SessionHistoryEntry,
+) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8){};
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, "{\"sessions\":[");
+    for (history, 0..) |entry, idx| {
+        if (idx != 0) try out.append(allocator, ',');
+        try appendSessionHistoryEntryJson(allocator, &out, entry);
+    }
+    try out.appendSlice(allocator, "]}");
+    return out.toOwnedSlice(allocator);
+}
+
 fn parseSessionKeyFromLegacyMessage(allocator: std.mem.Allocator, raw_json: []const u8) ?[]u8 {
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw_json, .{}) catch return null;
     defer parsed.deinit();
@@ -4824,7 +7299,6 @@ fn tryHandleLegacySessionSendFrame(
     session_bindings: *std.StringHashMapUnmanaged(SessionBinding),
     active_session_key: []const u8,
     connect_gate_error: ?AgentRuntimeRegistry.ConnectGateError,
-    emit_debug: bool,
 ) !bool {
     var legacy = protocol.parseMessage(allocator, raw_payload) catch return false;
     defer protocol.deinitParsedMessage(allocator, &legacy);
@@ -4951,7 +7425,7 @@ fn tryHandleLegacySessionSendFrame(
     };
     defer runtime_server.release();
 
-    const responses = runtime_server.handleMessageFramesWithDebug(raw_payload, emit_debug) catch |err| {
+    const responses = runtime_server.handleMessageFramesWithDebug(raw_payload, true) catch |err| {
         const response = try runtime_server.buildRuntimeErrorResponse(legacy.id orelse "generated", err);
         defer allocator.free(response);
         try writeFrameLocked(stream, write_mutex, response, .text);
@@ -4963,10 +7437,13 @@ fn tryHandleLegacySessionSendFrame(
     }
 
     for (responses) |item| {
+        if (std.mem.indexOf(u8, item, "\"type\":\"debug.event\"") != null) {
+            runtime_registry.maybeLogDebugFrame(binding.agent_id, item);
+            continue;
+        }
         const decorated = try decorateSessionReceiveFrame(allocator, item, session_key);
         defer allocator.free(decorated);
         try writeFrameLocked(stream, write_mutex, decorated, .text);
-        runtime_registry.maybeLogDebugFrame(binding.agent_id, decorated);
     }
     return true;
 }
@@ -4977,8 +7454,13 @@ fn isControlAdminOnly(control_type: unified.ControlType) bool {
         .auth_status,
         .auth_rotate,
         .node_invite_create,
+        .node_join_pending_list,
+        .node_join_approve,
+        .node_join_deny,
         .node_join,
         .node_lease_refresh,
+        .node_service_upsert,
+        .node_service_get,
         .node_list,
         .node_get,
         .node_delete,
@@ -5059,8 +7541,10 @@ fn writeFrameLocked(
 
 fn isWorkspaceTopologyMutation(control_type: unified.ControlType) bool {
     return switch (control_type) {
+        .node_join_request,
+        .node_join_approve,
+        .node_join_deny,
         .node_join,
-        .node_lease_refresh,
         .node_delete,
         .project_create,
         .project_update,
@@ -5072,6 +7556,62 @@ fn isWorkspaceTopologyMutation(control_type: unified.ControlType) bool {
         => true,
         else => false,
     };
+}
+
+fn appendAvailabilitySnapshotJson(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    snapshot: fs_control_plane.ControlPlane.AvailabilitySnapshot,
+) !void {
+    try out.appendSlice(allocator, "{\"nodes\":{\"online\":");
+    try out.writer(allocator).print("{d}", .{snapshot.nodes_online});
+    try out.appendSlice(allocator, ",\"total\":");
+    try out.writer(allocator).print("{d}", .{snapshot.nodes_total});
+    try out.appendSlice(allocator, "},\"mounts\":{\"online\":");
+    try out.writer(allocator).print("{d}", .{snapshot.mounts_online});
+    try out.appendSlice(allocator, ",\"degraded\":");
+    try out.writer(allocator).print("{d}", .{snapshot.mounts_degraded});
+    try out.appendSlice(allocator, ",\"missing\":");
+    try out.writer(allocator).print("{d}", .{snapshot.mounts_missing});
+    try out.appendSlice(allocator, ",\"total\":");
+    try out.writer(allocator).print("{d}", .{snapshot.mounts_total});
+    try out.appendSlice(allocator, "},\"project_mount_digest\":");
+    try out.writer(allocator).print("{d}", .{snapshot.project_mount_digest});
+    try out.appendSlice(allocator, "}");
+}
+
+fn parseNodeServiceWatchRequest(
+    allocator: std.mem.Allocator,
+    payload_json: ?[]const u8,
+) !NodeServiceWatchRequest {
+    if (payload_json == null) return .{};
+    const raw = payload_json.?;
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidPayload;
+
+    var request = NodeServiceWatchRequest{};
+    if (parsed.value.object.get("node_id")) |node_id| {
+        if (node_id != .string or !isValidNodeIdentifier(node_id.string)) return error.InvalidPayload;
+        request.node_id = try allocator.dupe(u8, node_id.string);
+    }
+    errdefer request.deinit(allocator);
+
+    if (parsed.value.object.get("replay_limit")) |replay_limit| {
+        if (replay_limit != .integer or replay_limit.integer < 0) return error.InvalidPayload;
+        request.replay_limit = @intCast(replay_limit.integer);
+    }
+    return request;
+}
+
+fn extractNodeIdFromControlPayload(allocator: std.mem.Allocator, payload_json: []const u8) !?[]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload_json, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const node_id = parsed.value.object.get("node_id") orelse return null;
+    if (node_id != .string or !isValidNodeIdentifier(node_id.string)) return null;
+    const copy = try allocator.dupe(u8, node_id.string);
+    return @as(?[]u8, copy);
 }
 
 fn extractProjectIdFromControlPayload(allocator: std.mem.Allocator, payload_json: []const u8) !?[]u8 {
@@ -5099,6 +7639,10 @@ fn controlMutationScope(control_type: unified.ControlType) ControlMutationScope 
         .node_invite_create,
         .node_delete,
         => .node,
+        .node_join_pending_list,
+        .node_join_approve,
+        .node_join_deny,
+        => .operator,
         .project_create,
         .project_update,
         .project_delete,
@@ -5258,29 +7802,38 @@ fn handleControlPlaneCommand(
     runtime_registry: *AgentRuntimeRegistry,
     control_type: unified.ControlType,
     agent_id: []const u8,
+    is_admin: bool,
     payload_json: ?[]const u8,
 ) ![]u8 {
     return switch (control_type) {
         .node_invite_create => runtime_registry.control_plane.createNodeInvite(payload_json),
+        .node_join_request => runtime_registry.control_plane.nodeJoinRequest(payload_json),
+        .node_join_pending_list => runtime_registry.control_plane.listPendingNodeJoins(payload_json),
+        .node_join_approve => runtime_registry.control_plane.approvePendingNodeJoin(payload_json),
+        .node_join_deny => runtime_registry.control_plane.denyPendingNodeJoin(payload_json),
         .node_join => runtime_registry.control_plane.nodeJoin(payload_json),
         .node_lease_refresh => runtime_registry.control_plane.refreshNodeLease(payload_json),
+        .node_service_upsert => runtime_registry.control_plane.nodeServiceUpsert(payload_json),
+        .node_service_get => runtime_registry.control_plane.nodeServiceGet(payload_json),
+        .agent_list => runtime_registry.listAgentsPayloadWithRole(is_admin),
+        .agent_get => runtime_registry.getAgentPayloadWithRole(payload_json, is_admin),
         .node_list => runtime_registry.control_plane.listNodes(),
         .node_get => runtime_registry.control_plane.getNode(payload_json),
         .node_delete => runtime_registry.control_plane.deleteNode(payload_json),
         .project_create => runtime_registry.control_plane.createProject(payload_json),
-        .project_update => runtime_registry.control_plane.updateProject(payload_json),
-        .project_delete => runtime_registry.control_plane.deleteProject(payload_json),
+        .project_update => runtime_registry.control_plane.updateProjectWithRole(payload_json, is_admin),
+        .project_delete => runtime_registry.control_plane.deleteProjectWithRole(payload_json, is_admin),
         .project_list => runtime_registry.control_plane.listProjects(),
-        .project_get => runtime_registry.control_plane.getProject(payload_json),
-        .project_mount_set => runtime_registry.control_plane.setProjectMount(payload_json),
-        .project_mount_remove => runtime_registry.control_plane.removeProjectMount(payload_json),
-        .project_mount_list => runtime_registry.control_plane.listProjectMounts(payload_json),
-        .project_token_rotate => runtime_registry.control_plane.rotateProjectToken(payload_json),
-        .project_token_revoke => runtime_registry.control_plane.revokeProjectToken(payload_json),
-        .project_activate => runtime_registry.control_plane.activateProject(agent_id, payload_json),
-        .workspace_status => runtime_registry.control_plane.workspaceStatus(agent_id, payload_json),
+        .project_get => runtime_registry.control_plane.getProjectWithRole(payload_json, is_admin),
+        .project_mount_set => runtime_registry.control_plane.setProjectMountWithRole(payload_json, is_admin),
+        .project_mount_remove => runtime_registry.control_plane.removeProjectMountWithRole(payload_json, is_admin),
+        .project_mount_list => runtime_registry.control_plane.listProjectMountsWithRole(payload_json, is_admin),
+        .project_token_rotate => runtime_registry.control_plane.rotateProjectTokenWithRole(payload_json, is_admin),
+        .project_token_revoke => runtime_registry.control_plane.revokeProjectTokenWithRole(payload_json, is_admin),
+        .project_activate => runtime_registry.control_plane.activateProjectWithRole(agent_id, payload_json, is_admin),
+        .workspace_status => runtime_registry.control_plane.workspaceStatusWithRole(agent_id, payload_json, is_admin),
         .reconcile_status => runtime_registry.control_plane.reconcileStatus(payload_json),
-        .project_up => runtime_registry.control_plane.projectUp(agent_id, payload_json),
+        .project_up => runtime_registry.control_plane.projectUpWithRole(agent_id, payload_json, is_admin),
         .audit_tail => runtime_registry.buildAuditTailPayload(payload_json),
         else => error.UnsupportedControlPlaneOperation,
     };
@@ -5294,15 +7847,71 @@ fn controlPlaneErrorCode(err: anyerror) []const u8 {
         fs_control_plane.ControlPlaneError.InviteExpired => "invite_expired",
         fs_control_plane.ControlPlaneError.InviteRedeemed => "invite_redeemed",
         fs_control_plane.ControlPlaneError.NodeNotFound => "node_not_found",
+        error.AgentNotFound => "agent_not_found",
         fs_control_plane.ControlPlaneError.NodeAuthFailed => "node_auth_failed",
+        fs_control_plane.ControlPlaneError.PendingJoinNotFound => "pending_join_not_found",
         fs_control_plane.ControlPlaneError.ProjectNotFound => "project_not_found",
         fs_control_plane.ControlPlaneError.ProjectAuthFailed => "project_auth_failed",
         fs_control_plane.ControlPlaneError.ProjectProtected => "project_protected",
         fs_control_plane.ControlPlaneError.ProjectAssignmentForbidden => "project_assignment_forbidden",
+        fs_control_plane.ControlPlaneError.ProjectPolicyForbidden => "project_policy_forbidden",
         fs_control_plane.ControlPlaneError.MountConflict => "mount_conflict",
         fs_control_plane.ControlPlaneError.MountNotFound => "mount_not_found",
         else => "control_plane_error",
     };
+}
+
+fn parseAgentIdFromPayload(allocator: std.mem.Allocator, payload_json: ?[]const u8) ![]u8 {
+    const raw = payload_json orelse return error.MissingField;
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidPayload;
+    const id_val = parsed.value.object.get("agent_id") orelse return error.MissingField;
+    if (id_val != .string or id_val.string.len == 0) return error.InvalidPayload;
+    return allocator.dupe(u8, id_val.string);
+}
+
+fn agentCapabilityName(value: agent_registry_mod.AgentCapability) []const u8 {
+    return switch (value) {
+        .chat => "chat",
+        .code => "code",
+        .plan => "plan",
+        .research => "research",
+    };
+}
+
+fn appendAgentInfoJson(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    agent: agent_registry_mod.AgentInfo,
+) !void {
+    const escaped_id = try unified.jsonEscape(allocator, agent.id);
+    defer allocator.free(escaped_id);
+    const escaped_name = try unified.jsonEscape(allocator, agent.name);
+    defer allocator.free(escaped_name);
+    const escaped_description = try unified.jsonEscape(allocator, agent.description);
+    defer allocator.free(escaped_description);
+
+    try out.writer(allocator).print(
+        "{{\"id\":\"{s}\",\"name\":\"{s}\",\"description\":\"{s}\",\"is_default\":{s},\"identity_loaded\":{s},\"needs_hatching\":{s},\"capabilities\":[",
+        .{
+            escaped_id,
+            escaped_name,
+            escaped_description,
+            if (agent.is_default) "true" else "false",
+            if (agent.identity_loaded) "true" else "false",
+            if (agent.needs_hatching) "true" else "false",
+        },
+    );
+
+    for (agent.capabilities.items, 0..) |capability, index| {
+        if (index > 0) try out.append(allocator, ',');
+        const escaped_capability = try unified.jsonEscape(allocator, agentCapabilityName(capability));
+        defer allocator.free(escaped_capability);
+        try out.writer(allocator).print("\"{s}\"", .{escaped_capability});
+    }
+
+    try out.appendSlice(allocator, "]}");
 }
 
 fn resolveAgentIdFromConnectionPath(path: []const u8, default_agent_id: []const u8) ?[]const u8 {
@@ -5368,7 +7977,7 @@ fn handleMetricsHttpConnection(
     }
 
     if (std.mem.eql(u8, request_path, "/metrics")) {
-        const body = runtime_registry.control_plane.metricsPrometheus() catch |err| {
+        const body = runtime_registry.metricsPrometheus() catch |err| {
             const err_msg = try std.fmt.allocPrint(allocator, "metrics formatter error: {s}\n", .{@errorName(err)});
             defer allocator.free(err_msg);
             try writeHttpStatus(stream, "500 Internal Server Error", "text/plain; charset=utf-8", err_msg);
@@ -5384,7 +7993,7 @@ fn handleMetricsHttpConnection(
         return;
     }
 
-    const json_body = runtime_registry.control_plane.metricsJson() catch |err| {
+    const json_body = runtime_registry.metricsJson() catch |err| {
         const err_msg = try std.fmt.allocPrint(allocator, "{{\"error\":\"{s}\"}}\n", .{@errorName(err)});
         defer allocator.free(err_msg);
         try writeHttpStatus(stream, "500 Internal Server Error", "application/json", err_msg);
@@ -5472,10 +8081,16 @@ fn setAuthTokensForTests(
     allocator.free(runtime_registry.auth_tokens.user_token);
     if (runtime_registry.auth_tokens.admin_last_target) |*target| target.deinit(allocator);
     if (runtime_registry.auth_tokens.user_last_target) |*target| target.deinit(allocator);
+    for (runtime_registry.auth_tokens.admin_session_history.items) |*entry| entry.deinit(allocator);
+    runtime_registry.auth_tokens.admin_session_history.deinit(allocator);
+    for (runtime_registry.auth_tokens.user_session_history.items) |*entry| entry.deinit(allocator);
+    runtime_registry.auth_tokens.user_session_history.deinit(allocator);
     runtime_registry.auth_tokens.admin_token = try allocator.dupe(u8, admin_token);
     runtime_registry.auth_tokens.user_token = try allocator.dupe(u8, user_token);
     runtime_registry.auth_tokens.admin_last_target = null;
     runtime_registry.auth_tokens.user_last_target = null;
+    runtime_registry.auth_tokens.admin_session_history = .{};
+    runtime_registry.auth_tokens.user_session_history = .{};
 }
 
 fn seedUserRememberedTargetForTests(
@@ -5680,15 +8295,15 @@ fn fsrpcConnectAndAttach(allocator: std.mem.Allocator, client: *std.net.Stream, 
     try std.testing.expect(std.mem.indexOf(u8, connect_ack.payload, "\"type\":\"control.connect_ack\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, connect_ack.payload, "\"ok\":true") != null);
 
-    try writeClientTextFrameMasked(client, "{\"channel\":\"fsrpc\",\"type\":\"fsrpc.t_version\",\"tag\":1,\"msize\":1048576,\"version\":\"styx-lite-1\"}");
+    try writeClientTextFrameMasked(client, "{\"channel\":\"acheron\",\"type\":\"acheron.t_version\",\"tag\":1,\"msize\":1048576,\"version\":\"acheron-1\"}");
     var version = try readServerFrame(allocator, client);
     defer version.deinit(allocator);
-    try std.testing.expect(std.mem.indexOf(u8, version.payload, "\"type\":\"fsrpc.r_version\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, version.payload, "\"type\":\"acheron.r_version\"") != null);
 
-    try writeClientTextFrameMasked(client, "{\"channel\":\"fsrpc\",\"type\":\"fsrpc.t_attach\",\"tag\":2,\"fid\":1}");
+    try writeClientTextFrameMasked(client, "{\"channel\":\"acheron\",\"type\":\"acheron.t_attach\",\"tag\":2,\"fid\":1}");
     var attach = try readServerFrame(allocator, client);
     defer attach.deinit(allocator);
-    try std.testing.expect(std.mem.indexOf(u8, attach.payload, "\"type\":\"fsrpc.r_attach\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, attach.payload, "\"type\":\"acheron.r_attach\"") != null);
 }
 
 fn fsrpcWriteChatInput(
@@ -5700,26 +8315,26 @@ fn fsrpcWriteChatInput(
     const encoded = try unified.encodeDataB64(allocator, content);
     defer allocator.free(encoded);
 
-    try writeClientTextFrameMasked(client, "{\"channel\":\"fsrpc\",\"type\":\"fsrpc.t_walk\",\"tag\":10,\"fid\":1,\"newfid\":2,\"path\":[\"capabilities\",\"chat\",\"control\",\"input\"]}");
+    try writeClientTextFrameMasked(client, "{\"channel\":\"acheron\",\"type\":\"acheron.t_walk\",\"tag\":10,\"fid\":1,\"newfid\":2,\"path\":[\"capabilities\",\"chat\",\"control\",\"input\"]}");
     var walk = try readServerFrameSkippingDebug(allocator, client, debug_events_seen);
     defer walk.deinit(allocator);
-    try std.testing.expect(std.mem.indexOf(u8, walk.payload, "\"type\":\"fsrpc.r_walk\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, walk.payload, "\"type\":\"acheron.r_walk\"") != null);
 
-    try writeClientTextFrameMasked(client, "{\"channel\":\"fsrpc\",\"type\":\"fsrpc.t_open\",\"tag\":11,\"fid\":2,\"mode\":\"rw\"}");
+    try writeClientTextFrameMasked(client, "{\"channel\":\"acheron\",\"type\":\"acheron.t_open\",\"tag\":11,\"fid\":2,\"mode\":\"rw\"}");
     var open = try readServerFrameSkippingDebug(allocator, client, debug_events_seen);
     defer open.deinit(allocator);
-    try std.testing.expect(std.mem.indexOf(u8, open.payload, "\"type\":\"fsrpc.r_open\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, open.payload, "\"type\":\"acheron.r_open\"") != null);
 
     const write_req = try std.fmt.allocPrint(
         allocator,
-        "{{\"channel\":\"fsrpc\",\"type\":\"fsrpc.t_write\",\"tag\":12,\"fid\":2,\"offset\":0,\"data_b64\":\"{s}\"}}",
+        "{{\"channel\":\"acheron\",\"type\":\"acheron.t_write\",\"tag\":12,\"fid\":2,\"offset\":0,\"data_b64\":\"{s}\"}}",
         .{encoded},
     );
     defer allocator.free(write_req);
     try writeClientTextFrameMasked(client, write_req);
     var write = try readServerFrameSkippingDebug(allocator, client, debug_events_seen);
     defer write.deinit(allocator);
-    try std.testing.expect(std.mem.indexOf(u8, write.payload, "\"type\":\"fsrpc.r_write\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, write.payload, "\"type\":\"acheron.r_write\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, write.payload, "\"job\":\"job-") != null);
 
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, write.payload, .{});
@@ -5731,10 +8346,10 @@ fn fsrpcWriteChatInput(
     if (job != .string) return error.TestExpectedResponse;
     const job_name = try allocator.dupe(u8, job.string);
 
-    try writeClientTextFrameMasked(client, "{\"channel\":\"fsrpc\",\"type\":\"fsrpc.t_clunk\",\"tag\":13,\"fid\":2}");
+    try writeClientTextFrameMasked(client, "{\"channel\":\"acheron\",\"type\":\"acheron.t_clunk\",\"tag\":13,\"fid\":2}");
     var clunk = try readServerFrameSkippingDebug(allocator, client, debug_events_seen);
     defer clunk.deinit(allocator);
-    try std.testing.expect(std.mem.indexOf(u8, clunk.payload, "\"type\":\"fsrpc.r_clunk\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, clunk.payload, "\"type\":\"acheron.r_clunk\"") != null);
 
     return job_name;
 }
@@ -5745,24 +8360,24 @@ fn fsrpcReadJobResult(allocator: std.mem.Allocator, client: *std.net.Stream, job
 
     const walk_req = try std.fmt.allocPrint(
         allocator,
-        "{{\"channel\":\"fsrpc\",\"type\":\"fsrpc.t_walk\",\"tag\":20,\"fid\":1,\"newfid\":3,\"path\":[\"jobs\",\"{s}\",\"result.txt\"]}}",
+        "{{\"channel\":\"acheron\",\"type\":\"acheron.t_walk\",\"tag\":20,\"fid\":1,\"newfid\":3,\"path\":[\"jobs\",\"{s}\",\"result.txt\"]}}",
         .{escaped_job},
     );
     defer allocator.free(walk_req);
     try writeClientTextFrameMasked(client, walk_req);
     var walk = try readServerFrameSkippingDebug(allocator, client, null);
     defer walk.deinit(allocator);
-    try std.testing.expect(std.mem.indexOf(u8, walk.payload, "\"type\":\"fsrpc.r_walk\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, walk.payload, "\"type\":\"acheron.r_walk\"") != null);
 
-    try writeClientTextFrameMasked(client, "{\"channel\":\"fsrpc\",\"type\":\"fsrpc.t_open\",\"tag\":21,\"fid\":3,\"mode\":\"r\"}");
+    try writeClientTextFrameMasked(client, "{\"channel\":\"acheron\",\"type\":\"acheron.t_open\",\"tag\":21,\"fid\":3,\"mode\":\"r\"}");
     var open = try readServerFrameSkippingDebug(allocator, client, null);
     defer open.deinit(allocator);
-    try std.testing.expect(std.mem.indexOf(u8, open.payload, "\"type\":\"fsrpc.r_open\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, open.payload, "\"type\":\"acheron.r_open\"") != null);
 
-    try writeClientTextFrameMasked(client, "{\"channel\":\"fsrpc\",\"type\":\"fsrpc.t_read\",\"tag\":22,\"fid\":3,\"offset\":0,\"count\":1048576}");
+    try writeClientTextFrameMasked(client, "{\"channel\":\"acheron\",\"type\":\"acheron.t_read\",\"tag\":22,\"fid\":3,\"offset\":0,\"count\":1048576}");
     var read = try readServerFrameSkippingDebug(allocator, client, null);
     defer read.deinit(allocator);
-    try std.testing.expect(std.mem.indexOf(u8, read.payload, "\"type\":\"fsrpc.r_read\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, read.payload, "\"type\":\"acheron.r_read\"") != null);
 
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, read.payload, .{});
     defer parsed.deinit();
@@ -5777,15 +8392,15 @@ fn fsrpcReadJobResult(allocator: std.mem.Allocator, client: *std.net.Stream, job
     errdefer allocator.free(decoded);
     _ = std.base64.standard.Decoder.decode(decoded, data_b64.string) catch return error.TestExpectedResponse;
 
-    try writeClientTextFrameMasked(client, "{\"channel\":\"fsrpc\",\"type\":\"fsrpc.t_clunk\",\"tag\":23,\"fid\":3}");
+    try writeClientTextFrameMasked(client, "{\"channel\":\"acheron\",\"type\":\"acheron.t_clunk\",\"tag\":23,\"fid\":3}");
     var clunk = try readServerFrameSkippingDebug(allocator, client, null);
     defer clunk.deinit(allocator);
-    try std.testing.expect(std.mem.indexOf(u8, clunk.payload, "\"type\":\"fsrpc.r_clunk\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, clunk.payload, "\"type\":\"acheron.r_clunk\"") != null);
 
     return decoded;
 }
 
-test "server_piai: base websocket path handles unified control/fsrpc chat flow and rejects legacy session.send" {
+test "server_piai: base websocket path handles unified control/acheron chat flow and rejects legacy session.send" {
     const allocator = std.testing.allocator;
     var runtime_registry = AgentRuntimeRegistry.init(allocator, .{
         .ltm_directory = "",
@@ -5827,25 +8442,22 @@ test "server_piai: base websocket path handles unified control/fsrpc chat flow a
     try std.testing.expect(std.mem.indexOf(u8, metrics.payload, "\"type\":\"control.metrics\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, metrics.payload, "\"nodes\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, metrics.payload, "\"projects\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, metrics.payload, "\"node_service_watch\"") != null);
 
     try writeClientTextFrameMasked(&client, "{\"channel\":\"control\",\"type\":\"control.debug_subscribe\",\"id\":\"req-debug-sub\"}");
     var debug_sub = try readServerFrame(allocator, &client);
     defer debug_sub.deinit(allocator);
-    try std.testing.expect(std.mem.indexOf(u8, debug_sub.payload, "\"type\":\"debug.event\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, debug_sub.payload, "\"category\":\"control.subscription\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, debug_sub.payload, "\"enabled\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, debug_sub.payload, "\"type\":\"control.error\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, debug_sub.payload, "\"code\":\"unsupported\"") != null);
 
-    var debug_events_seen: usize = 0;
-    const job_name = try fsrpcWriteChatInput(allocator, &client, "hello", &debug_events_seen);
+    const job_name = try fsrpcWriteChatInput(allocator, &client, "hello", null);
     defer allocator.free(job_name);
-    try std.testing.expect(debug_events_seen > 0);
 
     try writeClientTextFrameMasked(&client, "{\"channel\":\"control\",\"type\":\"control.debug_unsubscribe\",\"id\":\"req-debug-unsub\"}");
     var debug_unsub = try readServerFrame(allocator, &client);
     defer debug_unsub.deinit(allocator);
-    try std.testing.expect(std.mem.indexOf(u8, debug_unsub.payload, "\"type\":\"debug.event\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, debug_unsub.payload, "\"category\":\"control.subscription\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, debug_unsub.payload, "\"enabled\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, debug_unsub.payload, "\"type\":\"control.error\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, debug_unsub.payload, "\"code\":\"unsupported\"") != null);
 
     const result = try fsrpcReadJobResult(allocator, &client, job_name);
     defer allocator.free(result);
@@ -5864,6 +8476,108 @@ test "server_piai: base websocket path handles unified control/fsrpc chat flow a
     try std.testing.expectEqual(@as(u8, 0x8), close_reply.opcode);
 
     try std.testing.expect(server_ctx.err_name == null);
+}
+
+test "server_piai: control.agent_list and control.agent_get expose registry metadata" {
+    const allocator = std.testing.allocator;
+    const nonce = std.crypto.random.int(u64);
+    const root = try std.fmt.allocPrint(allocator, ".tmp-agent-registry-{d}", .{nonce});
+    defer allocator.free(root);
+    defer std.fs.cwd().deleteTree(root) catch {};
+    try std.fs.cwd().makePath(root);
+
+    const agents_dir = try std.fs.path.join(allocator, &.{ root, "agents" });
+    defer allocator.free(agents_dir);
+    try std.fs.cwd().makePath(agents_dir);
+
+    const mother_dir = try std.fs.path.join(allocator, &.{ agents_dir, "mother" });
+    defer allocator.free(mother_dir);
+    try std.fs.cwd().makePath(mother_dir);
+    const mother_json_path = try std.fs.path.join(allocator, &.{ mother_dir, "agent.json" });
+    defer allocator.free(mother_json_path);
+    try std.fs.cwd().writeFile(.{
+        .sub_path = mother_json_path,
+        .data =
+        \\{
+        \\  "name": "Mother",
+        \\  "description": "Primary orchestrator",
+        \\  "is_default": true,
+        \\  "capabilities": ["chat","plan"]
+        \\}
+        ,
+    });
+
+    const bob_dir = try std.fs.path.join(allocator, &.{ agents_dir, "bob" });
+    defer allocator.free(bob_dir);
+    try std.fs.cwd().makePath(bob_dir);
+    const bob_json_path = try std.fs.path.join(allocator, &.{ bob_dir, "agent.json" });
+    defer allocator.free(bob_json_path);
+    try std.fs.cwd().writeFile(.{
+        .sub_path = bob_json_path,
+        .data =
+        \\{
+        \\  "name": "Bob",
+        \\  "description": "Worker agent",
+        \\  "capabilities": ["chat","code"]
+        \\}
+        ,
+    });
+
+    var runtime_registry = AgentRuntimeRegistry.init(allocator, .{
+        .ltm_directory = "",
+        .ltm_filename = "",
+        .agents_dir = agents_dir,
+        .assets_dir = root,
+        .default_agent_id = "mother",
+    }, null);
+    defer runtime_registry.deinit();
+    try setAuthTokensForTests(&runtime_registry, "admin-secret", "user-secret");
+    try seedUserRememberedTargetForTests(&runtime_registry, "user-auth");
+
+    var listener = try (try std.net.Address.parseIp("127.0.0.1", 0)).listen(.{ .reuse_address = true });
+    defer listener.deinit();
+
+    var server_ctx = WsTestServerCtx{
+        .allocator = allocator,
+        .runtime_registry = &runtime_registry,
+        .listener = &listener,
+    };
+    defer server_ctx.deinit();
+
+    const server_thread = try std.Thread.spawn(.{}, runSingleWsConnection, .{&server_ctx});
+    defer server_thread.join();
+
+    var client = try std.net.tcpConnectToAddress(listener.listen_address);
+    defer client.close();
+    try performClientHandshakeWithBearerToken(allocator, &client, "/", "admin-secret");
+
+    try writeClientTextFrameMasked(&client, "{\"channel\":\"control\",\"type\":\"control.version\",\"id\":\"agent-version\",\"payload\":{\"protocol\":\"unified-v2\"}}");
+    var version_ack = try readServerFrame(allocator, &client);
+    defer version_ack.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, version_ack.payload, "\"type\":\"control.version_ack\"") != null);
+
+    try writeClientTextFrameMasked(&client, "{\"channel\":\"control\",\"type\":\"control.connect\",\"id\":\"agent-connect\"}");
+    var connect_ack = try readServerFrame(allocator, &client);
+    defer connect_ack.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, connect_ack.payload, "\"type\":\"control.connect_ack\"") != null);
+
+    try writeClientTextFrameMasked(&client, "{\"channel\":\"control\",\"type\":\"control.agent_list\",\"id\":\"agent-list\"}");
+    var list_reply = try readServerFrame(allocator, &client);
+    defer list_reply.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, list_reply.payload, "\"type\":\"control.agent_list\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, list_reply.payload, "\"id\":\"mother\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, list_reply.payload, "\"id\":\"bob\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, list_reply.payload, "\"capabilities\":[\"chat\",\"plan\"]") != null);
+
+    try writeClientTextFrameMasked(
+        &client,
+        "{\"channel\":\"control\",\"type\":\"control.agent_get\",\"id\":\"agent-get\",\"payload\":{\"agent_id\":\"bob\"}}",
+    );
+    var get_reply = try readServerFrame(allocator, &client);
+    defer get_reply.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, get_reply.payload, "\"type\":\"control.agent_get\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, get_reply.payload, "\"id\":\"bob\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, get_reply.payload, "\"name\":\"Bob\"") != null);
 }
 
 test "server_piai: operator token gate protects control mutations" {
@@ -5960,10 +8674,10 @@ test "server_piai: fsrpc fid state survives across frames for unchanged binding"
     try performClientHandshakeWithBearerToken(allocator, &client, "/", "admin-secret");
     try fsrpcConnectAndAttach(allocator, &client, "fid-survive");
 
-    try writeClientTextFrameMasked(&client, "{\"channel\":\"fsrpc\",\"type\":\"fsrpc.t_walk\",\"tag\":30,\"fid\":1,\"newfid\":2,\"path\":[\"capabilities\",\"chat\"]}");
+    try writeClientTextFrameMasked(&client, "{\"channel\":\"acheron\",\"type\":\"acheron.t_walk\",\"tag\":30,\"fid\":1,\"newfid\":2,\"path\":[\"capabilities\",\"chat\"]}");
     var walk = try readServerFrame(allocator, &client);
     defer walk.deinit(allocator);
-    try std.testing.expect(std.mem.indexOf(u8, walk.payload, "\"type\":\"fsrpc.r_walk\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, walk.payload, "\"type\":\"acheron.r_walk\"") != null);
 
     try websocket_transport.writeFrame(&client, "", .close);
     var close_reply = try readServerFrame(allocator, &client);
@@ -6188,6 +8902,112 @@ test "server_piai: user connect is rejected when no remembered non-system target
     try std.testing.expect(server_ctx.err_name == null);
 }
 
+test "server_piai: control.session_history and control.session_restore survive reconnect" {
+    const allocator = std.testing.allocator;
+    var runtime_registry = AgentRuntimeRegistry.init(allocator, .{
+        .ltm_directory = "",
+        .ltm_filename = "",
+    }, null);
+    defer runtime_registry.deinit();
+    try setAuthTokensForTests(&runtime_registry, "admin-secret", "user-secret");
+    try seedUserRememberedTargetForTests(&runtime_registry, runtime_registry.default_agent_id);
+    const remembered_target = runtime_registry.auth_tokens.user_last_target orelse return error.TestExpectedResult;
+    const remembered_project_id = remembered_target.project_id;
+
+    var listener = try (try std.net.Address.parseIp("127.0.0.1", 0)).listen(.{ .reuse_address = true });
+    defer listener.deinit();
+
+    var server_ctx = WsTestServerCtx{
+        .allocator = allocator,
+        .runtime_registry = &runtime_registry,
+        .listener = &listener,
+    };
+    defer server_ctx.deinit();
+
+    {
+        const server_thread = try std.Thread.spawn(.{}, runSingleWsConnection, .{&server_ctx});
+        defer server_thread.join();
+
+        var user_client = try std.net.tcpConnectToAddress(listener.listen_address);
+        defer user_client.close();
+        try performClientHandshakeWithBearerToken(allocator, &user_client, "/", "user-secret");
+
+        try writeClientTextFrameMasked(&user_client, "{\"channel\":\"control\",\"type\":\"control.version\",\"id\":\"history-version\",\"payload\":{\"protocol\":\"unified-v2\"}}");
+        var version_ack = try readServerFrame(allocator, &user_client);
+        defer version_ack.deinit(allocator);
+        try std.testing.expect(std.mem.indexOf(u8, version_ack.payload, "\"type\":\"control.version_ack\"") != null);
+
+        try writeClientTextFrameMasked(&user_client, "{\"channel\":\"control\",\"type\":\"control.connect\",\"id\":\"history-connect\"}");
+        var connect_ack = try readServerFrame(allocator, &user_client);
+        defer connect_ack.deinit(allocator);
+        try std.testing.expect(std.mem.indexOf(u8, connect_ack.payload, "\"type\":\"control.connect_ack\"") != null);
+
+        const attach_payload = try std.fmt.allocPrint(
+            allocator,
+            "{{\"channel\":\"control\",\"type\":\"control.session_attach\",\"id\":\"history-attach\",\"payload\":{{\"session_key\":\"work-1\",\"agent_id\":\"{s}\",\"project_id\":\"{s}\"}}}}",
+            .{ runtime_registry.default_agent_id, remembered_project_id },
+        );
+        defer allocator.free(attach_payload);
+        try writeClientTextFrameMasked(&user_client, attach_payload);
+        var attach_ack = try readServerFrame(allocator, &user_client);
+        defer attach_ack.deinit(allocator);
+        try std.testing.expect(std.mem.indexOf(u8, attach_ack.payload, "\"type\":\"control.session_attach\"") != null);
+
+        try writeClientTextFrameMasked(
+            &user_client,
+            "{\"channel\":\"control\",\"type\":\"control.session_history\",\"id\":\"history-list\",\"payload\":{\"limit\":5}}",
+        );
+        var history = try readServerFrame(allocator, &user_client);
+        defer history.deinit(allocator);
+        try std.testing.expect(std.mem.indexOf(u8, history.payload, "\"type\":\"control.session_history\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, history.payload, "\"session_key\":\"work-1\"") != null);
+
+        try websocket_transport.writeFrame(&user_client, "", .close);
+        var close_reply = try readServerFrame(allocator, &user_client);
+        defer close_reply.deinit(allocator);
+        try std.testing.expectEqual(@as(u8, 0x8), close_reply.opcode);
+    }
+
+    {
+        const server_thread = try std.Thread.spawn(.{}, runSingleWsConnection, .{&server_ctx});
+        defer server_thread.join();
+
+        var user_client = try std.net.tcpConnectToAddress(listener.listen_address);
+        defer user_client.close();
+        try performClientHandshakeWithBearerToken(allocator, &user_client, "/", "user-secret");
+
+        try writeClientTextFrameMasked(&user_client, "{\"channel\":\"control\",\"type\":\"control.version\",\"id\":\"restore-version\",\"payload\":{\"protocol\":\"unified-v2\"}}");
+        var version_ack = try readServerFrame(allocator, &user_client);
+        defer version_ack.deinit(allocator);
+        try std.testing.expect(std.mem.indexOf(u8, version_ack.payload, "\"type\":\"control.version_ack\"") != null);
+
+        try writeClientTextFrameMasked(&user_client, "{\"channel\":\"control\",\"type\":\"control.connect\",\"id\":\"restore-connect\"}");
+        var connect_ack = try readServerFrame(allocator, &user_client);
+        defer connect_ack.deinit(allocator);
+        try std.testing.expect(std.mem.indexOf(u8, connect_ack.payload, "\"type\":\"control.connect_ack\"") != null);
+
+        const restore_payload = try std.fmt.allocPrint(
+            allocator,
+            "{{\"channel\":\"control\",\"type\":\"control.session_restore\",\"id\":\"restore-last\",\"payload\":{{\"agent_id\":\"{s}\"}}}}",
+            .{runtime_registry.default_agent_id},
+        );
+        defer allocator.free(restore_payload);
+        try writeClientTextFrameMasked(&user_client, restore_payload);
+        var restore = try readServerFrame(allocator, &user_client);
+        defer restore.deinit(allocator);
+        try std.testing.expect(std.mem.indexOf(u8, restore.payload, "\"type\":\"control.session_restore\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, restore.payload, "\"found\":true") != null);
+        try std.testing.expect(std.mem.indexOf(u8, restore.payload, "\"session_key\":\"work-1\"") != null);
+
+        try websocket_transport.writeFrame(&user_client, "", .close);
+        var close_reply = try readServerFrame(allocator, &user_client);
+        defer close_reply.deinit(allocator);
+        try std.testing.expectEqual(@as(u8, 0x8), close_reply.opcode);
+    }
+
+    try std.testing.expect(server_ctx.err_name == null);
+}
+
 test "server_piai: control.auth_rotate reports storage_error when token persistence fails" {
     const allocator = std.testing.allocator;
     var runtime_registry = AgentRuntimeRegistry.init(allocator, .{
@@ -6321,7 +9141,60 @@ test "server_piai: session_attach rejects project changes while jobs are in-flig
     try std.testing.expect(server_ctx.err_name == null);
 }
 
-test "server_piai: workspace topology mutations are pushed to debug subscribers" {
+test "server_piai: debug subscription control operations are unsupported in acheron-native mode" {
+    const allocator = std.testing.allocator;
+    var runtime_registry = AgentRuntimeRegistry.init(allocator, .{
+        .ltm_directory = "",
+        .ltm_filename = "",
+    }, null);
+    defer runtime_registry.deinit();
+    try setAuthTokensForTests(&runtime_registry, "admin-secret", "user-secret");
+
+    var listener = try (try std.net.Address.parseIp("127.0.0.1", 0)).listen(.{ .reuse_address = true });
+    defer listener.deinit();
+
+    var server_ctx = WsTestServerCtx{
+        .allocator = allocator,
+        .runtime_registry = &runtime_registry,
+        .listener = &listener,
+    };
+    defer server_ctx.deinit();
+
+    const server_thread = try std.Thread.spawn(.{}, runSingleWsConnection, .{&server_ctx});
+    defer server_thread.join();
+
+    var client = try std.net.tcpConnectToAddress(listener.listen_address);
+    defer client.close();
+    try performClientHandshakeWithBearerToken(allocator, &client, "/", "admin-secret");
+    try writeClientTextFrameMasked(&client, "{\"channel\":\"control\",\"type\":\"control.version\",\"id\":\"ver\",\"payload\":{\"protocol\":\"unified-v2\"}}");
+    var version_ack = try readServerFrame(allocator, &client);
+    defer version_ack.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, version_ack.payload, "\"type\":\"control.version_ack\"") != null);
+    try writeClientTextFrameMasked(&client, "{\"channel\":\"control\",\"type\":\"control.connect\",\"id\":\"conn\"}");
+    var connect_ack = try readServerFrame(allocator, &client);
+    defer connect_ack.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, connect_ack.payload, "\"type\":\"control.connect_ack\"") != null);
+
+    try writeClientTextFrameMasked(&client, "{\"channel\":\"control\",\"type\":\"control.debug_subscribe\",\"id\":\"sub\"}");
+    var subscribe = try readServerFrame(allocator, &client);
+    defer subscribe.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, subscribe.payload, "\"type\":\"control.error\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, subscribe.payload, "\"code\":\"unsupported\"") != null);
+
+    try writeClientTextFrameMasked(&client, "{\"channel\":\"control\",\"type\":\"control.debug_unsubscribe\",\"id\":\"unsub\"}");
+    var unsubscribe = try readServerFrame(allocator, &client);
+    defer unsubscribe.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, unsubscribe.payload, "\"type\":\"control.error\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unsubscribe.payload, "\"code\":\"unsupported\"") != null);
+
+    try websocket_transport.writeFrame(&client, "", .close);
+    var close_reply = try readServerFrame(allocator, &client);
+    defer close_reply.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0x8), close_reply.opcode);
+    try std.testing.expect(server_ctx.err_name == null);
+}
+
+test "server_piai: node service upserts are pushed to node service watchers" {
     const allocator = std.testing.allocator;
     var runtime_registry = AgentRuntimeRegistry.init(allocator, .{
         .ltm_directory = "",
@@ -6357,11 +9230,10 @@ test "server_piai: workspace topology mutations are pushed to debug subscribers"
     defer sub_connect_ack.deinit(allocator);
     try std.testing.expect(std.mem.indexOf(u8, sub_connect_ack.payload, "\"type\":\"control.connect_ack\"") != null);
 
-    try writeClientTextFrameMasked(&subscriber, "{\"channel\":\"control\",\"type\":\"control.debug_subscribe\",\"id\":\"sub-debug\"}");
-    var sub_debug_ack = try readServerFrame(allocator, &subscriber);
-    defer sub_debug_ack.deinit(allocator);
-    try std.testing.expect(std.mem.indexOf(u8, sub_debug_ack.payload, "\"type\":\"debug.event\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, sub_debug_ack.payload, "\"category\":\"control.subscription\"") != null);
+    try writeClientTextFrameMasked(&subscriber, "{\"channel\":\"control\",\"type\":\"control.node_service_watch\",\"id\":\"sub-watch\",\"payload\":{}}");
+    var sub_watch_ack = try readServerFrame(allocator, &subscriber);
+    defer sub_watch_ack.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, sub_watch_ack.payload, "\"type\":\"control.node_service_watch\"") != null);
 
     var mutator = try std.net.tcpConnectToAddress(listener.listen_address);
     defer mutator.close();
@@ -6377,17 +9249,58 @@ test "server_piai: workspace topology mutations are pushed to debug subscribers"
 
     try writeClientTextFrameMasked(
         &mutator,
-        "{\"channel\":\"control\",\"type\":\"control.project_create\",\"id\":\"mut-project\",\"payload\":{\"name\":\"Topology Test\"}}",
+        "{\"channel\":\"control\",\"type\":\"control.node_invite_create\",\"id\":\"mut-invite\"}",
     );
-    var project_created = try readServerFrame(allocator, &mutator);
-    defer project_created.deinit(allocator);
-    try std.testing.expect(std.mem.indexOf(u8, project_created.payload, "\"type\":\"control.project_create\"") != null);
+    var invite_created = try readServerFrame(allocator, &mutator);
+    defer invite_created.deinit(allocator);
+    var invite_json = try std.json.parseFromSlice(std.json.Value, allocator, invite_created.payload, .{});
+    defer invite_json.deinit();
+    const invite_payload = invite_json.value.object.get("payload") orelse return error.TestExpectedResponse;
+    if (invite_payload != .object) return error.TestExpectedResponse;
+    const invite_token_val = invite_payload.object.get("invite_token") orelse return error.TestExpectedResponse;
+    if (invite_token_val != .string) return error.TestExpectedResponse;
+    const escaped_invite_token = try unified.jsonEscape(allocator, invite_token_val.string);
+    defer allocator.free(escaped_invite_token);
 
-    var pushed = try readServerFrame(allocator, &subscriber);
-    defer pushed.deinit(allocator);
-    try std.testing.expect(std.mem.indexOf(u8, pushed.payload, "\"type\":\"debug.event\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, pushed.payload, "\"category\":\"control.workspace_topology\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, pushed.payload, "workspace_topology_changed") != null);
+    const join_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"channel\":\"control\",\"type\":\"control.node_join\",\"id\":\"mut-join\",\"payload\":{{\"invite_token\":\"{s}\",\"node_name\":\"service-node\",\"fs_url\":\"ws://127.0.0.1:18891/v2/fs\"}}}}",
+        .{escaped_invite_token},
+    );
+    defer allocator.free(join_req);
+    try writeClientTextFrameMasked(&mutator, join_req);
+    var joined = try readServerFrame(allocator, &mutator);
+    defer joined.deinit(allocator);
+
+    var join_json = try std.json.parseFromSlice(std.json.Value, allocator, joined.payload, .{});
+    defer join_json.deinit();
+    const join_payload = join_json.value.object.get("payload") orelse return error.TestExpectedResponse;
+    if (join_payload != .object) return error.TestExpectedResponse;
+    const node_id_val = join_payload.object.get("node_id") orelse return error.TestExpectedResponse;
+    const node_secret_val = join_payload.object.get("node_secret") orelse return error.TestExpectedResponse;
+    if (node_id_val != .string or node_secret_val != .string) return error.TestExpectedResponse;
+    const escaped_node_id = try unified.jsonEscape(allocator, node_id_val.string);
+    defer allocator.free(escaped_node_id);
+    const escaped_node_secret = try unified.jsonEscape(allocator, node_secret_val.string);
+    defer allocator.free(escaped_node_secret);
+
+    const upsert_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"channel\":\"control\",\"type\":\"control.node_service_upsert\",\"id\":\"mut-upsert\",\"payload\":{{\"node_id\":\"{s}\",\"node_secret\":\"{s}\",\"services\":[{{\"service_id\":\"camera\",\"kind\":\"camera\",\"version\":\"1\",\"state\":\"online\",\"endpoints\":[\"/nodes/service-node/camera\"],\"capabilities\":{{\"still\":true}}}}]}}}}",
+        .{ escaped_node_id, escaped_node_secret },
+    );
+    defer allocator.free(upsert_req);
+    try writeClientTextFrameMasked(&mutator, upsert_req);
+    var upsert_ack = try readServerFrame(allocator, &mutator);
+    defer upsert_ack.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, upsert_ack.payload, "\"type\":\"control.node_service_upsert\"") != null);
+
+    var pushed_event = try readServerFrame(allocator, &subscriber);
+    defer pushed_event.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, pushed_event.payload, "\"type\":\"control.node_service_event\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pushed_event.payload, "\"node_id\":\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pushed_event.payload, "\"service_delta\":{\"changed\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pushed_event.payload, "\"added\":[") != null);
 
     try websocket_transport.writeFrame(&mutator, "", .close);
     var mut_close = try readServerFrame(allocator, &mutator);
@@ -6605,6 +9518,27 @@ test "server_piai: stripHttpRequestTargetQuery removes query string" {
     try std.testing.expectEqualStrings("/readyz", stripHttpRequestTargetQuery("/readyz"));
 }
 
+test "server_piai: metrics include node service watch telemetry" {
+    const allocator = std.testing.allocator;
+    var runtime_registry = AgentRuntimeRegistry.init(allocator, .{
+        .ltm_directory = "",
+        .ltm_filename = "",
+    }, null);
+    defer runtime_registry.deinit();
+
+    const metrics_json = try runtime_registry.metricsJson();
+    defer allocator.free(metrics_json);
+    try std.testing.expect(std.mem.indexOf(u8, metrics_json, "\"node_service_watch\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, metrics_json, "\"replay\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, metrics_json, "\"fanout\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, metrics_json, "\"retained\"") != null);
+
+    const metrics_prom = try runtime_registry.metricsPrometheus();
+    defer allocator.free(metrics_prom);
+    try std.testing.expect(std.mem.indexOf(u8, metrics_prom, "spiderweb_node_service_watch_replay_requests_total") != null);
+    try std.testing.expect(std.mem.indexOf(u8, metrics_prom, "spiderweb_node_service_watch_fanout_events_total") != null);
+}
+
 test "server_piai: extract project payload helpers parse id and token" {
     const allocator = std.testing.allocator;
     const payload = "{\"project_id\":\"proj-7\",\"project_token\":\"proj-token-7\"}";
@@ -6623,14 +9557,108 @@ test "server_piai: extract project payload helpers parse id and token" {
     try std.testing.expect(token_missing == null);
 }
 
+test "server_piai: extract node id helper parses valid payload" {
+    const allocator = std.testing.allocator;
+    const payload = "{\"node_id\":\"node-7\",\"service_delta\":{\"changed\":true}}";
+    const node_id = try extractNodeIdFromControlPayload(allocator, payload);
+    defer if (node_id) |value| allocator.free(value);
+    try std.testing.expect(node_id != null);
+    try std.testing.expectEqualStrings("node-7", node_id.?);
+
+    const missing = try extractNodeIdFromControlPayload(allocator, "{\"service_delta\":{}}");
+    try std.testing.expect(missing == null);
+}
+
+test "server_piai: parse node service watch request supports filters and replay limit" {
+    const allocator = std.testing.allocator;
+    var request = try parseNodeServiceWatchRequest(allocator, "{\"node_id\":\"node-7\",\"replay_limit\":42}");
+    defer request.deinit(allocator);
+    try std.testing.expect(request.node_id != null);
+    try std.testing.expectEqualStrings("node-7", request.node_id.?);
+    try std.testing.expectEqual(@as(usize, 42), request.replay_limit);
+
+    var default_request = try parseNodeServiceWatchRequest(allocator, null);
+    defer default_request.deinit(allocator);
+    try std.testing.expect(default_request.node_id == null);
+    try std.testing.expectEqual(@as(usize, 25), default_request.replay_limit);
+
+    try std.testing.expectError(
+        error.InvalidPayload,
+        parseNodeServiceWatchRequest(allocator, "{\"node_id\":\"bad/node\"}"),
+    );
+    try std.testing.expectError(
+        error.InvalidPayload,
+        parseNodeServiceWatchRequest(allocator, "{\"replay_limit\":-1}"),
+    );
+}
+
+test "server_piai: user node service visibility is project mounted-node scoped" {
+    const allocator = std.testing.allocator;
+    var runtime_registry = AgentRuntimeRegistry.init(allocator, .{
+        .ltm_directory = "",
+        .ltm_filename = "",
+    }, null);
+    defer runtime_registry.deinit();
+
+    const join_payload = try runtime_registry.control_plane.ensureNode("node-a", "ws://127.0.0.1:18891/v2/fs", 60_000);
+    defer allocator.free(join_payload);
+    const node_registration = try parseNodeRegistrationFromJoinPayload(allocator, join_payload);
+    defer {
+        allocator.free(node_registration.node_id);
+        allocator.free(node_registration.node_secret);
+    }
+
+    const project_created = try runtime_registry.control_plane.createProject(
+        "{\"name\":\"ScopedProject\",\"access_policy\":{\"actions\":{\"observe\":\"open\"}}}",
+    );
+    defer allocator.free(project_created);
+    const project_id = try extractProjectIdFromControlPayload(allocator, project_created);
+    defer if (project_id) |value| allocator.free(value);
+    try std.testing.expect(project_id != null);
+
+    const mount_payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"project_id\":\"{s}\",\"mount_path\":\"/nodes/node-a/fs\",\"node_id\":\"{s}\",\"export_name\":\"fs\"}}",
+        .{ project_id.?, node_registration.node_id },
+    );
+    defer allocator.free(mount_payload);
+    const mount_result = try runtime_registry.control_plane.setProjectMountWithRole(mount_payload, false);
+    defer allocator.free(mount_result);
+
+    try std.testing.expect(runtime_registry.nodeServiceEventVisibleToContext(
+        .user,
+        "bob",
+        project_id.?,
+        null,
+        null,
+        node_registration.node_id,
+    ));
+    try std.testing.expect(!runtime_registry.nodeServiceEventVisibleToContext(
+        .user,
+        "bob",
+        project_id.?,
+        null,
+        null,
+        "node-missing",
+    ));
+    try std.testing.expect(!runtime_registry.nodeServiceEventVisibleToContext(
+        .user,
+        "bob",
+        project_id.?,
+        null,
+        "node-other",
+        node_registration.node_id,
+    ));
+}
+
 test "server_piai: validateFsNodeHelloPayload enforces optional auth_token" {
     const allocator = std.testing.allocator;
-    try validateFsNodeHelloPayload(
+    _ = try validateFsNodeHelloPayload(
         allocator,
         "{\"protocol\":\"unified-v2-fs\",\"proto\":2}",
         null,
     );
-    try validateFsNodeHelloPayload(
+    _ = try validateFsNodeHelloPayload(
         allocator,
         "{\"protocol\":\"unified-v2-fs\",\"proto\":2,\"auth_token\":\"secret\"}",
         "secret",
@@ -6651,6 +9679,24 @@ test "server_piai: validateFsNodeHelloPayload enforces optional auth_token" {
             "secret",
         ),
     );
+}
+
+test "server_piai: node fs route parser extracts node id" {
+    const route = parseNodeFsRoute("/v2/fs/node/node-17") orelse return error.TestExpectedResponse;
+    try std.testing.expectEqualStrings("node-17", route);
+    const route_q = parseNodeFsRoute("/v2/fs/node/node_17?session=a") orelse return error.TestExpectedResponse;
+    try std.testing.expectEqualStrings("node_17", route_q);
+    try std.testing.expect(parseNodeFsRoute("/v2/fs/node/") == null);
+    try std.testing.expect(parseNodeFsRoute("/v2/fs/node/node:bad") == null);
+}
+
+test "server_piai: rewriteAcheronTag rewrites top-level tag" {
+    const allocator = std.testing.allocator;
+    const raw = "{\"channel\":\"acheron\",\"type\":\"acheron.t_fs_lookup\",\"tag\":7,\"payload\":{\"name\":\"a\"}}";
+    const rewritten = try rewriteAcheronTag(allocator, raw, 99);
+    defer allocator.free(rewritten);
+    try std.testing.expect(std.mem.indexOf(u8, rewritten, "\"tag\":99") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rewritten, "\"type\":\"acheron.t_fs_lookup\"") != null);
 }
 
 test "server_piai: agent id validation allows safe identifiers only" {

@@ -9,7 +9,7 @@ All notable changes to this project are documented in this file.
   - `channel` is required
   - `type` must match the selected channel namespace
   - legacy/implicit compatibility envelopes are rejected
-- Added protocol contract tests in `ZiggySpiderProtocol` for canonical v2 control/fsrpc naming and strict envelope validation.
+- Added protocol contract tests in `ZiggySpiderProtocol` for canonical v2 control/acheron naming and strict envelope validation.
 
 ### Control Plane, Projects, and Nodes
 - Local spiderweb filesystem node remains protocol-identical to external nodes and is surfaced as a standard project mount endpoint.
@@ -17,7 +17,7 @@ All notable changes to this project are documented in this file.
 - Added project-scoped topology delta push events (`control.workspace_topology_delta`) in addition to full refresh events (`control.workspace_topology`).
 
 ### Filesystem Routing and Auth
-- Added optional FS session auth on `/v2/fs` via `auth_token` in `fsrpc.t_fs_hello`.
+- Added optional FS session auth on `/v2/fs` via `auth_token` in `acheron.t_fs_hello`.
 - Added `spiderweb-fs-node --auth-token` and `SPIDERWEB_FS_NODE_AUTH_TOKEN` for auth enforcement on standalone nodes.
 - Router now propagates per-endpoint auth token during HELLO negotiation (initial + health probes + event pumps).
 

@@ -190,6 +190,9 @@ fn buildPayloadJson(
 
 fn isOperatorTokenProtectedMutation(op_type: []const u8) bool {
     return std.mem.eql(u8, op_type, "control.node_invite_create") or
+        std.mem.eql(u8, op_type, "control.node_join_pending_list") or
+        std.mem.eql(u8, op_type, "control.node_join_approve") or
+        std.mem.eql(u8, op_type, "control.node_join_deny") or
         std.mem.eql(u8, op_type, "control.node_delete") or
         std.mem.eql(u8, op_type, "control.project_create") or
         std.mem.eql(u8, op_type, "control.project_update") or
@@ -205,6 +208,7 @@ fn isOperatorTokenProtectedMutation(op_type: []const u8) bool {
 test "control_cli: operator token mutation whitelist includes project activate and up" {
     try std.testing.expect(isOperatorTokenProtectedMutation("control.project_activate"));
     try std.testing.expect(isOperatorTokenProtectedMutation("control.project_up"));
+    try std.testing.expect(isOperatorTokenProtectedMutation("control.node_join_approve"));
     try std.testing.expect(!isOperatorTokenProtectedMutation("control.workspace_status"));
 }
 

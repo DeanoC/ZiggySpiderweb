@@ -157,7 +157,7 @@ fn parseUnifiedFsrpcRequest(
     allocator: std.mem.Allocator,
     parsed: unified.ParsedMessage,
 ) !fs_protocol.ParsedRequest {
-    const msg_type = parsed.fsrpc_type orelse return error.UnsupportedType;
+    const msg_type = parsed.acheron_type orelse return error.UnsupportedType;
     const op = try fsOpFromFsrpcType(msg_type);
 
     const args_json = parsed.payload_json orelse "{}";
@@ -237,7 +237,7 @@ test "fs_node_service: hello request returns success envelope" {
     defer service.deinit();
 
     const response = try service.handleRequestJson(
-        "{\"channel\":\"fsrpc\",\"type\":\"fsrpc.t_fs_hello\",\"tag\":1,\"payload\":{}}",
+        "{\"channel\":\"acheron\",\"type\":\"acheron.t_fs_hello\",\"tag\":1,\"payload\":{}}",
     );
     defer allocator.free(response);
 
@@ -272,7 +272,7 @@ test "fs_node_service: mutating request queues invalidation events" {
     defer service.deinit();
 
     var exports_handled = try service.handleRequestJsonWithEvents(
-        "{\"channel\":\"fsrpc\",\"type\":\"fsrpc.t_fs_exports\",\"tag\":1,\"payload\":{}}",
+        "{\"channel\":\"acheron\",\"type\":\"acheron.t_fs_exports\",\"tag\":1,\"payload\":{}}",
     );
     defer exports_handled.deinit(allocator);
 
@@ -282,7 +282,7 @@ test "fs_node_service: mutating request queues invalidation events" {
 
     const mkdir_req = try std.fmt.allocPrint(
         allocator,
-        "{{\"channel\":\"fsrpc\",\"type\":\"fsrpc.t_fs_mkdir\",\"tag\":2,\"node\":{d},\"payload\":{{\"name\":\"evt-test\"}}}}",
+        "{{\"channel\":\"acheron\",\"type\":\"acheron.t_fs_mkdir\",\"tag\":2,\"node\":{d},\"payload\":{{\"name\":\"evt-test\"}}}}",
         .{root_id},
     );
     defer allocator.free(mkdir_req);
