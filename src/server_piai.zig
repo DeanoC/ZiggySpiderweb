@@ -3867,6 +3867,7 @@ const AgentRuntimeRegistry = struct {
 
     fn maybeLogDebugFrame(self: *AgentRuntimeRegistry, agent_id: []const u8, payload: []const u8) void {
         self.debug_stream_sink.append(agent_id, payload);
+        self.control_plane.appendDebugStreamEvent(agent_id, payload);
     }
 
     fn appendAuditRecordName(
@@ -7424,7 +7425,7 @@ fn tryHandleLegacySessionSendFrame(
     };
     defer runtime_server.release();
 
-    const responses = runtime_server.handleMessageFramesWithDebug(raw_payload, false) catch |err| {
+    const responses = runtime_server.handleMessageFramesWithDebug(raw_payload, true) catch |err| {
         const response = try runtime_server.buildRuntimeErrorResponse(legacy.id orelse "generated", err);
         defer allocator.free(response);
         try writeFrameLocked(stream, write_mutex, response, .text);
@@ -7436,10 +7437,13 @@ fn tryHandleLegacySessionSendFrame(
     }
 
     for (responses) |item| {
+        if (std.mem.indexOf(u8, item, "\"type\":\"debug.event\"") != null) {
+            runtime_registry.maybeLogDebugFrame(binding.agent_id, item);
+            continue;
+        }
         const decorated = try decorateSessionReceiveFrame(allocator, item, session_key);
         defer allocator.free(decorated);
         try writeFrameLocked(stream, write_mutex, decorated, .text);
-        runtime_registry.maybeLogDebugFrame(binding.agent_id, decorated);
     }
     return true;
 }

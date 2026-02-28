@@ -436,6 +436,9 @@ pub const Session = struct {
     }
 
     fn appendDebugStreamLogLine(self: *Session, line: []const u8) !void {
+        if (self.control_plane) |plane| {
+            plane.appendDebugStreamEvent(self.agent_id, line);
+        }
         if (self.debug_stream_log_id == 0) return;
         const node_ptr = self.nodes.getPtr(self.debug_stream_log_id) orelse return;
         if (node_ptr.kind != .file) return;
@@ -463,6 +466,14 @@ pub const Session = struct {
         const next = try self.allocator.dupe(u8, tail);
         self.allocator.free(node_ptr.content);
         node_ptr.content = next;
+    }
+
+    fn syncDebugStreamLogFromControlPlane(self: *Session) !void {
+        if (self.debug_stream_log_id == 0) return;
+        const plane = self.control_plane orelse return;
+        const snapshot = try plane.snapshotDebugStream(self.allocator, self.agent_id);
+        defer self.allocator.free(snapshot);
+        try self.setFileContent(self.debug_stream_log_id, snapshot);
     }
 
     pub fn handle(self: *Session, msg: *const unified.ParsedMessage) ![]u8 {
@@ -597,6 +608,9 @@ pub const Session = struct {
             },
             .file => blk: {
                 if (offset == 0) {
+                    if (state.node_id == self.debug_stream_log_id) {
+                        try self.syncDebugStreamLogFromControlPlane();
+                    }
                     switch (node.special) {
                         .job_status, .job_result => {
                             try self.waitForJobTerminalState(state.node_id);
