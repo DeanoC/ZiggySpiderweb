@@ -22,6 +22,7 @@ fi
 
 USER_PATHS=(
     "$TARGET_HOME/.config/systemd/user/spiderweb.service"
+    "$TARGET_HOME/.config/systemd/user/spiderweb.service.d"
     "$TARGET_HOME/.config/systemd/user/default.target.wants/spiderweb.service"
     "$TARGET_HOME/.config/spiderweb"
     "$TARGET_HOME/.cache/ziggy-spiderweb"
