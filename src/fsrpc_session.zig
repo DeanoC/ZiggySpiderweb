@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const unified = @import("ziggy-spider-protocol").unified;
+const protocol = @import("ziggy-spider-protocol").protocol;
 const runtime_server_mod = @import("runtime_server.zig");
 const runtime_handle_mod = @import("runtime_handle.zig");
 const chat_job_index = @import("chat_job_index.zig");
@@ -39,6 +40,7 @@ const SpecialKind = enum {
 
 const default_wait_timeout_ms: i64 = 60_000;
 const wait_poll_interval_ms: u64 = 100;
+const debug_stream_log_max_bytes: usize = 2 * 1024 * 1024;
 
 const WaitSourceKind = enum {
     chat_input,
@@ -256,9 +258,6 @@ pub const Session = struct {
 
     nodes: std.AutoHashMapUnmanaged(u32, Node) = .{},
     fids: std.AutoHashMapUnmanaged(u32, FidState) = .{},
-    pending_debug_frames: std.ArrayListUnmanaged([]u8) = .{},
-    debug_stream_enabled: bool = false,
-
     next_node_id: u32 = 1,
 
     root_id: u32 = 0,
@@ -267,6 +266,7 @@ pub const Session = struct {
     chat_input_id: u32 = 0,
     agent_services_index_id: u32 = 0,
     event_next_id: u32 = 0,
+    debug_stream_log_id: u32 = 0,
     pairing_pending_id: u32 = 0,
     pairing_last_result_id: u32 = 0,
     pairing_last_error_id: u32 = 0,
@@ -337,7 +337,6 @@ pub const Session = struct {
 
     pub fn deinit(self: *Session) void {
         self.clearWaitSources();
-        self.clearPendingDebugFrames();
         self.clearTerminalSessions();
         var it = self.nodes.iterator();
         while (it.next()) |entry| {
@@ -380,24 +379,90 @@ pub const Session = struct {
         agent_id: []const u8,
         options: NamespaceOptions,
     ) !void {
-        var rebound = try Session.initWithOptions(self.allocator, runtime_handle, self.job_index, agent_id, options);
-        rebound.debug_stream_enabled = self.debug_stream_enabled;
+        const rebound = try Session.initWithOptions(self.allocator, runtime_handle, self.job_index, agent_id, options);
 
         var previous = self.*;
         self.* = rebound;
         previous.deinit();
     }
 
-    pub fn setDebugStreamEnabled(self: *Session, enabled: bool) void {
-        self.debug_stream_enabled = enabled;
-        if (!enabled) self.clearPendingDebugFrames();
+    fn shouldEmitRuntimeDebugFrames(self: *const Session) bool {
+        return self.debug_stream_log_id != 0;
     }
 
-    pub fn drainPendingDebugFrames(self: *Session) ![][]u8 {
-        if (self.pending_debug_frames.items.len == 0) return &.{};
-        const owned = try self.pending_debug_frames.toOwnedSlice(self.allocator);
-        self.pending_debug_frames = .{};
-        return owned;
+    fn recordRuntimeFrameForDebug(self: *Session, request_id: []const u8, frame: []const u8) !void {
+        if (!self.shouldEmitRuntimeDebugFrames()) return;
+        const debug_frame = try self.normalizeRuntimeFrameToDebugEvent(request_id, frame);
+        defer self.allocator.free(debug_frame);
+
+        try self.appendDebugStreamLogLine(debug_frame);
+    }
+
+    fn normalizeRuntimeFrameToDebugEvent(self: *Session, request_id: []const u8, frame: []const u8) ![]u8 {
+        if (std.mem.indexOf(u8, frame, "\"type\":\"debug.event\"") != null) {
+            return self.allocator.dupe(u8, frame);
+        }
+
+        const escaped_request_id = try unified.jsonEscape(self.allocator, request_id);
+        defer self.allocator.free(escaped_request_id);
+
+        const frame_type_json = blk: {
+            var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, frame, .{}) catch {
+                break :blk try self.allocator.dupe(u8, "null");
+            };
+            defer parsed.deinit();
+            if (parsed.value != .object) break :blk try self.allocator.dupe(u8, "null");
+            const type_value = parsed.value.object.get("type") orelse break :blk try self.allocator.dupe(u8, "null");
+            if (type_value != .string) break :blk try self.allocator.dupe(u8, "null");
+            const escaped_type = try unified.jsonEscape(self.allocator, type_value.string);
+            defer self.allocator.free(escaped_type);
+            break :blk try std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped_type});
+        };
+        defer self.allocator.free(frame_type_json);
+
+        const payload_json = try std.fmt.allocPrint(
+            self.allocator,
+            "{{\"request_id\":\"{s}\",\"frame_type\":{s},\"frame\":{s}}}",
+            .{ escaped_request_id, frame_type_json, frame },
+        );
+        defer self.allocator.free(payload_json);
+
+        return protocol.buildDebugEvent(
+            self.allocator,
+            request_id,
+            "runtime.frame",
+            payload_json,
+        );
+    }
+
+    fn appendDebugStreamLogLine(self: *Session, line: []const u8) !void {
+        if (self.debug_stream_log_id == 0) return;
+        const node_ptr = self.nodes.getPtr(self.debug_stream_log_id) orelse return;
+        if (node_ptr.kind != .file) return;
+
+        var merged = std.ArrayListUnmanaged(u8){};
+        defer merged.deinit(self.allocator);
+        if (node_ptr.content.len > 0) {
+            try merged.appendSlice(self.allocator, node_ptr.content);
+            try merged.append(self.allocator, '\n');
+        }
+        try merged.appendSlice(self.allocator, line);
+
+        const tail = if (merged.items.len <= debug_stream_log_max_bytes) blk: {
+            break :blk merged.items;
+        } else blk: {
+            var start = merged.items.len - debug_stream_log_max_bytes;
+            if (start > 0) {
+                if (std.mem.indexOfScalarPos(u8, merged.items, start, '\n')) |nl| {
+                    start = nl + 1;
+                }
+            }
+            break :blk merged.items[start..];
+        };
+
+        const next = try self.allocator.dupe(u8, tail);
+        self.allocator.free(node_ptr.content);
+        node_ptr.content = next;
     }
 
     pub fn handle(self: *Session, msg: *const unified.ParsedMessage) ![]u8 {
@@ -1035,6 +1100,7 @@ pub const Session = struct {
             },
         );
         defer policy.deinit(self.allocator);
+        const show_debug = policy.show_debug or self.is_admin;
 
         self.root_id = try self.addDir(null, "/", false);
         const nodes_root = try self.addDir(self.root_id, "nodes", false);
@@ -1042,7 +1108,7 @@ pub const Session = struct {
         const agents_root = try self.addDir(self.root_id, "agents", false);
         const projects_root = try self.addDir(self.root_id, "projects", false);
         const meta_root = try self.addDir(self.root_id, "meta", false);
-        const debug_root: ?u32 = if (policy.show_debug)
+        const debug_root: ?u32 = if (show_debug)
             try self.addDir(self.root_id, "debug", false)
         else
             null;
@@ -1278,7 +1344,7 @@ pub const Session = struct {
                 "{\"read\":true,\"write\":false}",
                 "Privileged debug surface.",
             );
-            _ = try self.addFile(dir_id, "stream.log", "", false, .none);
+            self.debug_stream_log_id = try self.addFile(dir_id, "stream.log", "", false, .none);
             try self.addDebugPairingSurface(dir_id);
         }
 
@@ -1298,7 +1364,7 @@ pub const Session = struct {
             .{
                 escaped_agent,
                 escaped_project,
-                if (policy.show_debug) "true" else "false",
+                if (show_debug) "true" else "false",
                 policy.nodes.items.len,
                 policy.visible_agents.items.len,
                 policy.project_links.items.len,
@@ -3074,7 +3140,7 @@ pub const Session = struct {
                 escaped_project_id,
                 escaped_project_id,
                 escaped_project_id,
-                if (policy.show_debug) "\"/debug\"" else "null",
+                if (policy.show_debug or self.is_admin) "\"/debug\"" else "null",
             },
         );
     }
@@ -4701,7 +4767,7 @@ pub const Session = struct {
         defer if (failure_message_owned) |owned| self.allocator.free(owned);
 
         var responses: ?[][]u8 = null;
-        if (self.runtime_handle.handleMessageFramesWithDebug(runtime_req, self.debug_stream_enabled)) |frames| {
+        if (self.runtime_handle.handleMessageFramesWithDebug(runtime_req, self.shouldEmitRuntimeDebugFrames())) |frames| {
             responses = frames;
         } else |err| {
             failed = true;
@@ -4717,9 +4783,7 @@ pub const Session = struct {
             for (frames) |frame| {
                 try log_buf.appendSlice(self.allocator, frame);
                 try log_buf.append(self.allocator, '\n');
-                if (self.debug_stream_enabled and std.mem.indexOf(u8, frame, "\"type\":\"debug.event\"") != null) {
-                    try self.pending_debug_frames.append(self.allocator, try self.allocator.dupe(u8, frame));
-                }
+                try self.recordRuntimeFrameForDebug(job_name, frame);
 
                 const maybe = std.json.parseFromSlice(std.json.Value, self.allocator, frame, .{}) catch null;
                 if (maybe) |parsed| {
@@ -4917,7 +4981,7 @@ pub const Session = struct {
         defer self.allocator.free(runtime_req);
 
         var responses: ?[][]u8 = null;
-        if (self.runtime_handle.handleMessageFramesWithDebug(runtime_req, self.debug_stream_enabled)) |frames| {
+        if (self.runtime_handle.handleMessageFramesWithDebug(runtime_req, self.shouldEmitRuntimeDebugFrames())) |frames| {
             responses = frames;
         } else |err| {
             return self.buildContractInvokeFailureResultJson("runtime_error", @errorName(err));
@@ -4929,9 +4993,7 @@ pub const Session = struct {
 
         if (responses) |frames| {
             for (frames) |frame| {
-                if (self.debug_stream_enabled and std.mem.indexOf(u8, frame, "\"type\":\"debug.event\"") != null) {
-                    try self.pending_debug_frames.append(self.allocator, try self.allocator.dupe(u8, frame));
-                }
+                try self.recordRuntimeFrameForDebug(request_id, frame);
 
                 var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, frame, .{}) catch continue;
                 defer parsed.deinit();
@@ -5713,12 +5775,6 @@ pub const Session = struct {
         self.terminal_sessions.deinit(self.allocator);
         self.terminal_sessions = .{};
     }
-
-    fn clearPendingDebugFrames(self: *Session) void {
-        for (self.pending_debug_frames.items) |payload| self.allocator.free(payload);
-        self.pending_debug_frames.deinit(self.allocator);
-        self.pending_debug_frames = .{};
-    }
 };
 
 fn isTerminalJobState(state: chat_job_index.JobState) bool {
@@ -6128,6 +6184,44 @@ test "fsrpc_session: attach walk open read capability help" {
     const walk_res = try session.handle(&walk);
     defer allocator.free(walk_res);
     try std.testing.expect(std.mem.indexOf(u8, walk_res, "acheron.r_walk") != null);
+}
+
+test "fsrpc_session: admin debug stream logs runtime frames as synthetic debug events" {
+    const allocator = std.testing.allocator;
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "agent-debug-admin",
+        .{
+            .is_admin = true,
+        },
+    );
+    defer session.deinit();
+
+    try session.recordRuntimeFrameForDebug(
+        "req-1",
+        "{\"type\":\"session.receive\",\"content\":\"hello\"}",
+    );
+
+    const stream_log = try protocolReadFile(
+        &session,
+        allocator,
+        301,
+        302,
+        &.{ "debug", "stream.log" },
+        301,
+    );
+    defer allocator.free(stream_log);
+    try std.testing.expect(std.mem.indexOf(u8, stream_log, "\"category\":\"runtime.frame\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stream_log, "\"frame_type\":\"session.receive\"") != null);
 }
 
 test "fsrpc_session: events wait returns next completed chat job" {

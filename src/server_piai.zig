@@ -5277,14 +5277,9 @@ fn handleWebSocketConnection(
     defer if (fsrpc) |*session| session.deinit();
     var fsrpc_bound_session_key = try allocator.dupe(u8, "main");
     defer allocator.free(fsrpc_bound_session_key);
-    var debug_stream_enabled = false;
     var control_protocol_negotiated = false;
     var runtime_fsrpc_version_negotiated = false;
     var connection_write_mutex: std.Thread.Mutex = .{};
-    var topology_subscriber_id: ?u64 = null;
-    defer if (topology_subscriber_id) |subscriber_id| {
-        runtime_registry.unregisterTopologySubscriber(subscriber_id);
-    };
     var node_service_subscriber_id: ?u64 = null;
     defer if (node_service_subscriber_id) |subscriber_id| {
         runtime_registry.unregisterNodeServiceSubscriber(subscriber_id);
@@ -5313,7 +5308,6 @@ fn handleWebSocketConnection(
                         &session_bindings,
                         active_session_key,
                         connect_gate_error,
-                        debug_stream_enabled,
                     )) {
                         continue;
                     }
@@ -6495,39 +6489,6 @@ fn handleWebSocketConnection(
                                 try writeFrameLocked(stream, &connection_write_mutex, response, .text);
                                 continue;
                             },
-                            .debug_subscribe, .debug_unsubscribe => {
-                                debug_stream_enabled = control_type == .debug_subscribe;
-                                if (fsrpc) |*session| {
-                                    session.setDebugStreamEnabled(debug_stream_enabled);
-                                }
-                                if (debug_stream_enabled) {
-                                    if (topology_subscriber_id == null) {
-                                        topology_subscriber_id = try runtime_registry.registerTopologySubscriber(
-                                            stream,
-                                            &connection_write_mutex,
-                                        );
-                                    }
-                                } else if (topology_subscriber_id) |subscriber_id| {
-                                    runtime_registry.unregisterTopologySubscriber(subscriber_id);
-                                    topology_subscriber_id = null;
-                                }
-                                const request_id = parsed.id orelse "generated";
-                                const payload_json = if (debug_stream_enabled)
-                                    "{\"enabled\":true}"
-                                else
-                                    "{\"enabled\":false}";
-                                const ack = try protocol.buildDebugEvent(
-                                    allocator,
-                                    request_id,
-                                    "control.subscription",
-                                    payload_json,
-                                );
-                                defer allocator.free(ack);
-                                try writeFrameLocked(stream, &connection_write_mutex, ack, .text);
-                                const active_binding = session_bindings.get(active_session_key) orelse return error.InvalidState;
-                                runtime_registry.maybeLogDebugFrame(active_binding.agent_id, ack);
-                                continue;
-                            },
                             .node_invite_create,
                             .node_join_request,
                             .node_join_pending_list,
@@ -6975,7 +6936,6 @@ fn handleWebSocketConnection(
                                     .is_admin = principal.role == .admin,
                                 },
                             );
-                            fsrpc.?.setDebugStreamEnabled(debug_stream_enabled);
                             const next_bound_session_key = try allocator.dupe(u8, target_session_key);
                             allocator.free(fsrpc_bound_session_key);
                             fsrpc_bound_session_key = next_bound_session_key;
@@ -7003,25 +6963,6 @@ fn handleWebSocketConnection(
                         const response = try fsrpc.?.handle(&parsed);
                         defer allocator.free(response);
                         try writeFrameLocked(stream, &connection_write_mutex, response, .text);
-
-                        const debug_frames = try fsrpc.?.drainPendingDebugFrames();
-                        if (debug_frames.len > 0) {
-                            defer allocator.free(debug_frames);
-                            var idx: usize = 0;
-                            while (idx < debug_frames.len) : (idx += 1) {
-                                const payload = debug_frames[idx];
-                                writeFrameLocked(stream, &connection_write_mutex, payload, .text) catch |err| {
-                                    allocator.free(payload);
-                                    var rest = idx + 1;
-                                    while (rest < debug_frames.len) : (rest += 1) {
-                                        allocator.free(debug_frames[rest]);
-                                    }
-                                    return err;
-                                };
-                                runtime_registry.maybeLogDebugFrame(target_binding.agent_id, payload);
-                                allocator.free(payload);
-                            }
-                        }
                         continue;
                     },
                 }
@@ -7357,7 +7298,6 @@ fn tryHandleLegacySessionSendFrame(
     session_bindings: *std.StringHashMapUnmanaged(SessionBinding),
     active_session_key: []const u8,
     connect_gate_error: ?AgentRuntimeRegistry.ConnectGateError,
-    emit_debug: bool,
 ) !bool {
     var legacy = protocol.parseMessage(allocator, raw_payload) catch return false;
     defer protocol.deinitParsedMessage(allocator, &legacy);
@@ -7484,7 +7424,7 @@ fn tryHandleLegacySessionSendFrame(
     };
     defer runtime_server.release();
 
-    const responses = runtime_server.handleMessageFramesWithDebug(raw_payload, emit_debug) catch |err| {
+    const responses = runtime_server.handleMessageFramesWithDebug(raw_payload, false) catch |err| {
         const response = try runtime_server.buildRuntimeErrorResponse(legacy.id orelse "generated", err);
         defer allocator.free(response);
         try writeFrameLocked(stream, write_mutex, response, .text);
@@ -8503,21 +8443,17 @@ test "server_piai: base websocket path handles unified control/acheron chat flow
     try writeClientTextFrameMasked(&client, "{\"channel\":\"control\",\"type\":\"control.debug_subscribe\",\"id\":\"req-debug-sub\"}");
     var debug_sub = try readServerFrame(allocator, &client);
     defer debug_sub.deinit(allocator);
-    try std.testing.expect(std.mem.indexOf(u8, debug_sub.payload, "\"type\":\"debug.event\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, debug_sub.payload, "\"category\":\"control.subscription\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, debug_sub.payload, "\"enabled\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, debug_sub.payload, "\"type\":\"control.error\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, debug_sub.payload, "\"code\":\"unsupported\"") != null);
 
-    var debug_events_seen: usize = 0;
-    const job_name = try fsrpcWriteChatInput(allocator, &client, "hello", &debug_events_seen);
+    const job_name = try fsrpcWriteChatInput(allocator, &client, "hello", null);
     defer allocator.free(job_name);
-    try std.testing.expect(debug_events_seen > 0);
 
     try writeClientTextFrameMasked(&client, "{\"channel\":\"control\",\"type\":\"control.debug_unsubscribe\",\"id\":\"req-debug-unsub\"}");
     var debug_unsub = try readServerFrame(allocator, &client);
     defer debug_unsub.deinit(allocator);
-    try std.testing.expect(std.mem.indexOf(u8, debug_unsub.payload, "\"type\":\"debug.event\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, debug_unsub.payload, "\"category\":\"control.subscription\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, debug_unsub.payload, "\"enabled\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, debug_unsub.payload, "\"type\":\"control.error\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, debug_unsub.payload, "\"code\":\"unsupported\"") != null);
 
     const result = try fsrpcReadJobResult(allocator, &client, job_name);
     defer allocator.free(result);
@@ -9201,7 +9137,7 @@ test "server_piai: session_attach rejects project changes while jobs are in-flig
     try std.testing.expect(server_ctx.err_name == null);
 }
 
-test "server_piai: workspace topology mutations are pushed to debug subscribers" {
+test "server_piai: debug subscription control operations are unsupported in acheron-native mode" {
     const allocator = std.testing.allocator;
     var runtime_registry = AgentRuntimeRegistry.init(allocator, .{
         .ltm_directory = "",
@@ -9220,188 +9156,37 @@ test "server_piai: workspace topology mutations are pushed to debug subscribers"
     };
     defer server_ctx.deinit();
 
-    const sub_server_thread = try std.Thread.spawn(.{}, runSingleWsConnection, .{&server_ctx});
-    defer sub_server_thread.join();
-    const mut_server_thread = try std.Thread.spawn(.{}, runSingleWsConnection, .{&server_ctx});
-    defer mut_server_thread.join();
+    const server_thread = try std.Thread.spawn(.{}, runSingleWsConnection, .{&server_ctx});
+    defer server_thread.join();
 
-    var subscriber = try std.net.tcpConnectToAddress(listener.listen_address);
-    defer subscriber.close();
-    try performClientHandshakeWithBearerToken(allocator, &subscriber, "/", "admin-secret");
-    try writeClientTextFrameMasked(&subscriber, "{\"channel\":\"control\",\"type\":\"control.version\",\"id\":\"sub-version\",\"payload\":{\"protocol\":\"unified-v2\"}}");
-    var sub_version_ack = try readServerFrame(allocator, &subscriber);
-    defer sub_version_ack.deinit(allocator);
-    try std.testing.expect(std.mem.indexOf(u8, sub_version_ack.payload, "\"type\":\"control.version_ack\"") != null);
-    try writeClientTextFrameMasked(&subscriber, "{\"channel\":\"control\",\"type\":\"control.connect\",\"id\":\"sub-connect\"}");
-    var sub_connect_ack = try readServerFrame(allocator, &subscriber);
-    defer sub_connect_ack.deinit(allocator);
-    try std.testing.expect(std.mem.indexOf(u8, sub_connect_ack.payload, "\"type\":\"control.connect_ack\"") != null);
+    var client = try std.net.tcpConnectToAddress(listener.listen_address);
+    defer client.close();
+    try performClientHandshakeWithBearerToken(allocator, &client, "/", "admin-secret");
+    try writeClientTextFrameMasked(&client, "{\"channel\":\"control\",\"type\":\"control.version\",\"id\":\"ver\",\"payload\":{\"protocol\":\"unified-v2\"}}");
+    var version_ack = try readServerFrame(allocator, &client);
+    defer version_ack.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, version_ack.payload, "\"type\":\"control.version_ack\"") != null);
+    try writeClientTextFrameMasked(&client, "{\"channel\":\"control\",\"type\":\"control.connect\",\"id\":\"conn\"}");
+    var connect_ack = try readServerFrame(allocator, &client);
+    defer connect_ack.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, connect_ack.payload, "\"type\":\"control.connect_ack\"") != null);
 
-    try writeClientTextFrameMasked(&subscriber, "{\"channel\":\"control\",\"type\":\"control.debug_subscribe\",\"id\":\"sub-debug\"}");
-    var sub_debug_ack = try readServerFrame(allocator, &subscriber);
-    defer sub_debug_ack.deinit(allocator);
-    try std.testing.expect(std.mem.indexOf(u8, sub_debug_ack.payload, "\"type\":\"debug.event\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, sub_debug_ack.payload, "\"category\":\"control.subscription\"") != null);
+    try writeClientTextFrameMasked(&client, "{\"channel\":\"control\",\"type\":\"control.debug_subscribe\",\"id\":\"sub\"}");
+    var subscribe = try readServerFrame(allocator, &client);
+    defer subscribe.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, subscribe.payload, "\"type\":\"control.error\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, subscribe.payload, "\"code\":\"unsupported\"") != null);
 
-    var mutator = try std.net.tcpConnectToAddress(listener.listen_address);
-    defer mutator.close();
-    try performClientHandshakeWithBearerToken(allocator, &mutator, "/", "admin-secret");
-    try writeClientTextFrameMasked(&mutator, "{\"channel\":\"control\",\"type\":\"control.version\",\"id\":\"mut-version\",\"payload\":{\"protocol\":\"unified-v2\"}}");
-    var mut_version_ack = try readServerFrame(allocator, &mutator);
-    defer mut_version_ack.deinit(allocator);
-    try std.testing.expect(std.mem.indexOf(u8, mut_version_ack.payload, "\"type\":\"control.version_ack\"") != null);
-    try writeClientTextFrameMasked(&mutator, "{\"channel\":\"control\",\"type\":\"control.connect\",\"id\":\"mut-connect\"}");
-    var mut_connect_ack = try readServerFrame(allocator, &mutator);
-    defer mut_connect_ack.deinit(allocator);
-    try std.testing.expect(std.mem.indexOf(u8, mut_connect_ack.payload, "\"type\":\"control.connect_ack\"") != null);
+    try writeClientTextFrameMasked(&client, "{\"channel\":\"control\",\"type\":\"control.debug_unsubscribe\",\"id\":\"unsub\"}");
+    var unsubscribe = try readServerFrame(allocator, &client);
+    defer unsubscribe.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, unsubscribe.payload, "\"type\":\"control.error\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unsubscribe.payload, "\"code\":\"unsupported\"") != null);
 
-    try writeClientTextFrameMasked(
-        &mutator,
-        "{\"channel\":\"control\",\"type\":\"control.project_create\",\"id\":\"mut-project\",\"payload\":{\"name\":\"Topology Test\"}}",
-    );
-    var project_created = try readServerFrame(allocator, &mutator);
-    defer project_created.deinit(allocator);
-    try std.testing.expect(std.mem.indexOf(u8, project_created.payload, "\"type\":\"control.project_create\"") != null);
-
-    var pushed = try readServerFrame(allocator, &subscriber);
-    defer pushed.deinit(allocator);
-    try std.testing.expect(std.mem.indexOf(u8, pushed.payload, "\"type\":\"debug.event\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, pushed.payload, "\"category\":\"control.workspace_topology\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, pushed.payload, "workspace_topology_changed") != null);
-
-    try websocket_transport.writeFrame(&mutator, "", .close);
-    var mut_close = try readServerFrame(allocator, &mutator);
-    defer mut_close.deinit(allocator);
-    try std.testing.expectEqual(@as(u8, 0x8), mut_close.opcode);
-
-    try websocket_transport.writeFrame(&subscriber, "", .close);
-    var sub_close = try readServerFrame(allocator, &subscriber);
-    defer sub_close.deinit(allocator);
-    try std.testing.expectEqual(@as(u8, 0x8), sub_close.opcode);
-
-    try std.testing.expect(server_ctx.err_name == null);
-}
-
-test "server_piai: workspace availability changes are pushed to debug subscribers" {
-    const allocator = std.testing.allocator;
-    var runtime_registry = AgentRuntimeRegistry.init(allocator, .{
-        .ltm_directory = "",
-        .ltm_filename = "",
-    }, null);
-    defer runtime_registry.deinit();
-    try setAuthTokensForTests(&runtime_registry, "admin-secret", "user-secret");
-
-    var listener = try (try std.net.Address.parseIp("127.0.0.1", 0)).listen(.{ .reuse_address = true });
-    defer listener.deinit();
-
-    var server_ctx = WsTestServerCtx{
-        .allocator = allocator,
-        .runtime_registry = &runtime_registry,
-        .listener = &listener,
-    };
-    defer server_ctx.deinit();
-
-    const sub_server_thread = try std.Thread.spawn(.{}, runSingleWsConnection, .{&server_ctx});
-    defer sub_server_thread.join();
-    const mut_server_thread = try std.Thread.spawn(.{}, runSingleWsConnection, .{&server_ctx});
-    defer mut_server_thread.join();
-
-    var subscriber = try std.net.tcpConnectToAddress(listener.listen_address);
-    defer subscriber.close();
-    try performClientHandshakeWithBearerToken(allocator, &subscriber, "/", "admin-secret");
-    try writeClientTextFrameMasked(&subscriber, "{\"channel\":\"control\",\"type\":\"control.version\",\"id\":\"sub-version\",\"payload\":{\"protocol\":\"unified-v2\"}}");
-    var sub_version_ack = try readServerFrame(allocator, &subscriber);
-    defer sub_version_ack.deinit(allocator);
-    try std.testing.expect(std.mem.indexOf(u8, sub_version_ack.payload, "\"type\":\"control.version_ack\"") != null);
-    try writeClientTextFrameMasked(&subscriber, "{\"channel\":\"control\",\"type\":\"control.connect\",\"id\":\"sub-connect\"}");
-    var sub_connect_ack = try readServerFrame(allocator, &subscriber);
-    defer sub_connect_ack.deinit(allocator);
-    try std.testing.expect(std.mem.indexOf(u8, sub_connect_ack.payload, "\"type\":\"control.connect_ack\"") != null);
-
-    try writeClientTextFrameMasked(&subscriber, "{\"channel\":\"control\",\"type\":\"control.debug_subscribe\",\"id\":\"sub-debug\"}");
-    var sub_debug_ack = try readServerFrame(allocator, &subscriber);
-    defer sub_debug_ack.deinit(allocator);
-    try std.testing.expect(std.mem.indexOf(u8, sub_debug_ack.payload, "\"type\":\"debug.event\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, sub_debug_ack.payload, "\"category\":\"control.subscription\"") != null);
-
-    var mutator = try std.net.tcpConnectToAddress(listener.listen_address);
-    defer mutator.close();
-    try performClientHandshakeWithBearerToken(allocator, &mutator, "/", "admin-secret");
-    try writeClientTextFrameMasked(&mutator, "{\"channel\":\"control\",\"type\":\"control.version\",\"id\":\"mut-version\",\"payload\":{\"protocol\":\"unified-v2\"}}");
-    var mut_version_ack = try readServerFrame(allocator, &mutator);
-    defer mut_version_ack.deinit(allocator);
-    try std.testing.expect(std.mem.indexOf(u8, mut_version_ack.payload, "\"type\":\"control.version_ack\"") != null);
-    try writeClientTextFrameMasked(&mutator, "{\"channel\":\"control\",\"type\":\"control.connect\",\"id\":\"mut-connect\"}");
-    var mut_connect_ack = try readServerFrame(allocator, &mutator);
-    defer mut_connect_ack.deinit(allocator);
-    try std.testing.expect(std.mem.indexOf(u8, mut_connect_ack.payload, "\"type\":\"control.connect_ack\"") != null);
-
-    try writeClientTextFrameMasked(
-        &mutator,
-        "{\"channel\":\"control\",\"type\":\"control.node_invite_create\",\"id\":\"mut-invite\"}",
-    );
-    var invite_created = try readServerFrame(allocator, &mutator);
-    defer invite_created.deinit(allocator);
-    try std.testing.expect(std.mem.indexOf(u8, invite_created.payload, "\"type\":\"control.node_invite_create\"") != null);
-
-    var invite_json = try std.json.parseFromSlice(std.json.Value, allocator, invite_created.payload, .{});
-    defer invite_json.deinit();
-    const invite_payload = invite_json.value.object.get("payload") orelse return error.TestExpectedResponse;
-    if (invite_payload != .object) return error.TestExpectedResponse;
-    const invite_token_val = invite_payload.object.get("invite_token") orelse return error.TestExpectedResponse;
-    if (invite_token_val != .string) return error.TestExpectedResponse;
-    const escaped_invite_token = try unified.jsonEscape(allocator, invite_token_val.string);
-    defer allocator.free(escaped_invite_token);
-
-    const join_req = try std.fmt.allocPrint(
-        allocator,
-        "{{\"channel\":\"control\",\"type\":\"control.node_join\",\"id\":\"mut-join\",\"payload\":{{\"invite_token\":\"{s}\",\"node_name\":\"ephemeral\",\"fs_url\":\"ws://127.0.0.1:18891/v2/fs\",\"lease_ttl_ms\":1}}}}",
-        .{escaped_invite_token},
-    );
-    defer allocator.free(join_req);
-    try writeClientTextFrameMasked(&mutator, join_req);
-    var joined = try readServerFrame(allocator, &mutator);
-    defer joined.deinit(allocator);
-    try std.testing.expect(std.mem.indexOf(u8, joined.payload, "\"type\":\"control.node_join\"") != null);
-
-    var pushed_join_topology = try readServerFrame(allocator, &subscriber);
-    defer pushed_join_topology.deinit(allocator);
-    try std.testing.expect(std.mem.indexOf(u8, pushed_join_topology.payload, "\"category\":\"control.workspace_topology\"") != null);
-
-    var pushed_join_availability = try readServerFrame(allocator, &subscriber);
-    defer pushed_join_availability.deinit(allocator);
-    try std.testing.expect(std.mem.indexOf(u8, pushed_join_availability.payload, "\"category\":\"control.workspace_availability\"") != null);
-
-    std.Thread.sleep(10 * std.time.ns_per_ms);
-
-    try writeClientTextFrameMasked(
-        &mutator,
-        "{\"channel\":\"control\",\"type\":\"control.workspace_status\",\"id\":\"mut-status\",\"payload\":{}}",
-    );
-    var status = try readServerFrame(allocator, &mutator);
-    defer status.deinit(allocator);
-    try std.testing.expect(std.mem.indexOf(u8, status.payload, "\"type\":\"control.workspace_status\"") != null);
-
-    var pushed_reap_topology = try readServerFrame(allocator, &subscriber);
-    defer pushed_reap_topology.deinit(allocator);
-    try std.testing.expect(std.mem.indexOf(u8, pushed_reap_topology.payload, "\"category\":\"control.workspace_topology\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, pushed_reap_topology.payload, "availability_changed") != null);
-
-    var pushed_reap_availability = try readServerFrame(allocator, &subscriber);
-    defer pushed_reap_availability.deinit(allocator);
-    try std.testing.expect(std.mem.indexOf(u8, pushed_reap_availability.payload, "\"category\":\"control.workspace_availability\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, pushed_reap_availability.payload, "workspace_availability_changed") != null);
-
-    try websocket_transport.writeFrame(&mutator, "", .close);
-    var mut_close = try readServerFrame(allocator, &mutator);
-    defer mut_close.deinit(allocator);
-    try std.testing.expectEqual(@as(u8, 0x8), mut_close.opcode);
-
-    try websocket_transport.writeFrame(&subscriber, "", .close);
-    var sub_close = try readServerFrame(allocator, &subscriber);
-    defer sub_close.deinit(allocator);
-    try std.testing.expectEqual(@as(u8, 0x8), sub_close.opcode);
-
+    try websocket_transport.writeFrame(&client, "", .close);
+    var close_reply = try readServerFrame(allocator, &client);
+    defer close_reply.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0x8), close_reply.opcode);
     try std.testing.expect(server_ctx.err_name == null);
 }
 
