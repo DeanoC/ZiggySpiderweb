@@ -120,13 +120,16 @@ Use only these names and argument fields.
     - `has_invoke`
     - `scope` (`node`, `agent_contract`, or `agent_namespace`)
 - Inspect service contract files via `service_path`:
+  - `README.md`
   - `SCHEMA.json`
+  - `TEMPLATE.json`
   - `CAPS.json`
   - `MOUNTS.json`
   - `OPS.json`
   - `PERMISSIONS.json`
-  - `README.md`
 - Only call an invoke endpoint when `has_invoke` is true.
+- If no explicit payload is available, seed invoke payload from `TEMPLATE.json`
+  (or `template.json` fallback) before writing `control/invoke.json`.
 - Baseline contract services are under `/agents/self/services/contracts/`:
   - `memory`
   - `web_search`

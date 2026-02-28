@@ -31,7 +31,9 @@ When working through Acheron filesystem tools, use filesystem waits:
 When using node capabilities, discover them through:
 - `/agents/self/services/SERVICES.json`
 - For each entry, inspect `/nodes/<node_id>/services/<service_id>/` metadata files
+  - `README.md`, `SCHEMA.json`, `TEMPLATE.json`, `CAPS.json`, `OPS.json`, `PERMISSIONS.json`
 - Use `invoke_path` only when `has_invoke` is true
+  - If payload is unspecified, load `TEMPLATE.json` (or `template.json`) first and use it as invoke payload
 - Contract services live under `/agents/self/services/contracts/` (currently `memory` and `web_search`)
   - For contract services:
   - write `{"tool_name":"...","arguments":{...}}` to `control/invoke.json`

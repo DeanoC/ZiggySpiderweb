@@ -4964,6 +4964,41 @@ test "fs_control_plane: access policy enforces action modes and per-agent overri
     try std.testing.expect(!plane.projectAllowsNodeServiceEvent(project_id, "bob", null, node_id, false));
 }
 
+test "fs_control_plane: access policy action matrix honors token admin and per-agent override" {
+    const allocator = std.testing.allocator;
+    var plane = ControlPlane.init(allocator);
+    defer plane.deinit();
+
+    const project_json = try plane.createProject(
+        "{\"name\":\"PolicyMatrix\",\"access_policy\":{\"actions\":{\"read\":\"open\",\"observe\":\"token\",\"invoke\":\"admin\",\"mount\":\"deny\",\"admin\":\"token\"},\"agents\":{\"worker\":{\"invoke\":\"open\",\"mount\":\"token\"}}}}",
+    );
+    defer allocator.free(project_json);
+    var project = try std.json.parseFromSlice(std.json.Value, allocator, project_json, .{});
+    defer project.deinit();
+    const project_id = project.value.object.get("project_id").?.string;
+    const project_token = project.value.object.get("project_token").?.string;
+
+    try std.testing.expect(plane.projectAllowsAction(project_id, "bob", .read, null, false));
+    try std.testing.expect(!plane.projectAllowsAction(project_id, "bob", .observe, null, false));
+    try std.testing.expect(plane.projectAllowsAction(project_id, "bob", .observe, project_token, false));
+    try std.testing.expect(!plane.projectAllowsAction(project_id, "bob", .invoke, null, false));
+    try std.testing.expect(!plane.projectAllowsAction(project_id, "bob", .invoke, project_token, false));
+    try std.testing.expect(!plane.projectAllowsAction(project_id, "bob", .mount, null, false));
+    try std.testing.expect(!plane.projectAllowsAction(project_id, "bob", .mount, project_token, false));
+    try std.testing.expect(!plane.projectAllowsAction(project_id, "bob", .admin, null, false));
+    try std.testing.expect(plane.projectAllowsAction(project_id, "bob", .admin, project_token, false));
+
+    try std.testing.expect(plane.projectAllowsAction(project_id, "worker", .invoke, null, false));
+    try std.testing.expect(!plane.projectAllowsAction(project_id, "worker", .mount, null, false));
+    try std.testing.expect(plane.projectAllowsAction(project_id, "worker", .mount, project_token, false));
+
+    try std.testing.expect(plane.projectAllowsAction(project_id, "bob", .read, null, true));
+    try std.testing.expect(plane.projectAllowsAction(project_id, "bob", .observe, null, true));
+    try std.testing.expect(plane.projectAllowsAction(project_id, "bob", .invoke, null, true));
+    try std.testing.expect(plane.projectAllowsAction(project_id, "bob", .mount, null, true));
+    try std.testing.expect(plane.projectAllowsAction(project_id, "bob", .admin, null, true));
+}
+
 test "fs_control_plane: workspace status filters invoke service mounts when invoke is denied" {
     const allocator = std.testing.allocator;
     var plane = ControlPlane.init(allocator);

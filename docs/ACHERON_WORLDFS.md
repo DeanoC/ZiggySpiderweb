@@ -97,9 +97,11 @@ Node directories also expose:
 - `has_invoke`
 - `scope` (`node`, `agent_contract`, or `agent_namespace`)
 
-Use `service_path` to inspect each service descriptor (`SCHEMA.json`, `CAPS.json`,
-`MOUNTS.json`, `OPS.json`, `PERMISSIONS.json`, `README.md`).
+Use `service_path` to inspect each service descriptor (`README.md`, `SCHEMA.json`,
+`TEMPLATE.json`, `CAPS.json`, `MOUNTS.json`, `OPS.json`, `PERMISSIONS.json`).
 Use `invoke_path` only when `has_invoke` is true.
+If you do not already have a payload, read `TEMPLATE.json` (or `template.json`)
+to seed one before invoking.
 For node services with `CAPS.invoke=true`, runtime derives `invoke_path` using:
 - `OPS.json` `invoke` (or `paths.invoke`) when present
   - world-absolute targets are used as-is

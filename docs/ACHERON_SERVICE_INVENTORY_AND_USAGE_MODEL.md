@@ -63,12 +63,13 @@ Agents should resolve services in this order:
 1. Read `/agents/self/services/SERVICES.json` for stable index entries.
 2. For node-scoped work, inspect `/nodes/<node_id>/services/SERVICES.json`.
 3. Inspect service contract files before invoke:
+   - `README.md`
    - `SCHEMA.json`
+   - `TEMPLATE.json`
    - `CAPS.json`
    - `OPS.json`
    - `PERMISSIONS.json`
    - `STATUS.json`
-   - `README.md`
 4. Prefer services where `state=online`; use `degraded` only with fallback plan.
 
 ### 4.2 Invoke Contract (Namespace-first)
@@ -77,13 +78,15 @@ For every invoke-capable service:
 
 1. Resolve invoke target from `OPS.json` (`invoke` or `paths.invoke`), else use
    `control/invoke.json`.
-2. Write JSON payload to invoke file.
-3. Treat write success as acceptance, not completion.
-4. Read `status.json` and `result.json` (or service-documented equivalents).
-5. For long-running jobs, use event wait:
+2. If no payload exists yet, read `TEMPLATE.json` (or `template.json`) and use it
+   as the initial invoke payload.
+3. Write JSON payload to invoke file.
+4. Treat write success as acceptance, not completion.
+5. Read `status.json` and `result.json` (or service-documented equivalents).
+6. For long-running jobs, use event wait:
    - write selectors to `/agents/self/events/control/wait.json`
    - blocking read `/agents/self/events/next.json`
-6. For single known endpoint waits, blocking read on that endpoint is valid when
+7. For single known endpoint waits, blocking read on that endpoint is valid when
    endpoint supports it.
 
 ### 4.3 Retry and Fallback Rules
