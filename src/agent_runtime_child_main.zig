@@ -118,60 +118,6 @@ fn safeFileList(
     if (!isSafeRelativePath(path)) {
         return failResult(allocator, .permission_denied, "path must be relative and stay within workspace");
     }
-    const find_root = if (std.mem.eql(u8, path, "."))
-        allocator.dupe(u8, ".") catch return failResult(allocator, .execution_failed, "out of memory")
-    else
-        std.fmt.allocPrint(allocator, "./{s}", .{path}) catch return failResult(allocator, .execution_failed, "out of memory");
-    defer allocator.free(find_root);
-
-    const timeout_sec = @max(@divTrunc(file_list_timeout_ms + 999, 1000), 1);
-    const timeout_str = std.fmt.allocPrint(allocator, "{d}", .{timeout_sec}) catch {
-        return failResult(allocator, .execution_failed, "out of memory");
-    };
-    defer allocator.free(timeout_str);
-
-    const listing_result = if (recursive)
-        std.process.Child.run(.{
-            .allocator = allocator,
-            .argv = &[_][]const u8{
-                "timeout",
-                timeout_str,
-                "find",
-                find_root,
-                "-mindepth",
-                "1",
-                "-printf",
-                "%y\t%P\n",
-            },
-            .max_output_bytes = tool_executor.DEFAULT_MAX_OUTPUT_BYTES,
-        }) catch |err| return failResult(allocator, .execution_failed, @errorName(err))
-    else
-        std.process.Child.run(.{
-            .allocator = allocator,
-            .argv = &[_][]const u8{
-                "timeout",
-                timeout_str,
-                "find",
-                find_root,
-                "-mindepth",
-                "1",
-                "-maxdepth",
-                "1",
-                "-printf",
-                "%y\t%f\n",
-            },
-            .max_output_bytes = tool_executor.DEFAULT_MAX_OUTPUT_BYTES,
-        }) catch |err| return failResult(allocator, .execution_failed, @errorName(err));
-    defer allocator.free(listing_result.stdout);
-    defer allocator.free(listing_result.stderr);
-
-    if (findTimedOut(listing_result.term)) {
-        return failResult(
-            allocator,
-            .execution_failed,
-            "filesystem_unavailable: project mount unavailable (input/output error, file_list timed out)",
-        );
-    }
 
     var payload = std.ArrayListUnmanaged(u8){};
     errdefer payload.deinit(allocator);
@@ -183,60 +129,28 @@ fn safeFileList(
     var first = true;
     var count: usize = 0;
     var truncated = false;
-
-    var lines = std.mem.splitScalar(u8, listing_result.stdout, '\n');
-    while (lines.next()) |line| {
-        if (line.len == 0) continue;
-        const delim = std.mem.indexOfScalar(u8, line, '\t') orelse continue;
-        if (delim + 1 >= line.len) continue;
-        if (count >= effective_max) {
-            truncated = true;
-            break;
-        }
-
-        const name = line[delim + 1 ..];
-        if (name.len == 0) continue;
-        const kind = mapFindKind(line[0]);
-
-        if (!first) payload.append(allocator, ',') catch return failResult(allocator, .execution_failed, "out of memory");
-        first = false;
-        count += 1;
-
-        payload.appendSlice(allocator, "{\"name\":\"") catch return failResult(allocator, .execution_failed, "out of memory");
-        appendJsonEscaped(allocator, &payload, name) catch return failResult(allocator, .execution_failed, "out of memory");
-        payload.appendSlice(allocator, "\",\"type\":\"") catch return failResult(allocator, .execution_failed, "out of memory");
-        payload.appendSlice(allocator, kind) catch return failResult(allocator, .execution_failed, "out of memory");
-        payload.appendSlice(allocator, "\"}") catch return failResult(allocator, .execution_failed, "out of memory");
-    }
-
-    const listing_failed = switch (listing_result.term) {
-        .Exited => |code| code != 0,
-        else => true,
+    const start_ms = std.time.milliTimestamp();
+    var root_dir = std.fs.cwd().openDir(path, .{ .iterate = true }) catch |err| {
+        return failFileListFsError(allocator, err);
     };
-    if (listing_failed) {
-        const trimmed_stderr = std.mem.trim(u8, listing_result.stderr, " \t\r\n");
-        if (stderrIndicatesMountUnavailable(trimmed_stderr)) {
-            return failResult(
-                allocator,
-                .execution_failed,
-                "filesystem_unavailable: project mount unavailable (input/output error)",
-            );
-        }
-    }
-    if (listing_failed) truncated = true;
+    defer root_dir.close();
+    walkFileListDirectory(
+        allocator,
+        &payload,
+        &first,
+        &count,
+        &truncated,
+        &root_dir,
+        "",
+        recursive,
+        effective_max,
+        start_ms,
+    ) catch |err| {
+        return failFileListFsError(allocator, err);
+    };
 
     payload.appendSlice(allocator, "],\"truncated\":") catch return failResult(allocator, .execution_failed, "out of memory");
     payload.appendSlice(allocator, if (truncated) "true" else "false") catch return failResult(allocator, .execution_failed, "out of memory");
-
-    if (listing_failed) {
-        const trimmed_stderr = std.mem.trim(u8, listing_result.stderr, " \t\r\n");
-        if (trimmed_stderr.len > 0) {
-            const capped = trimmed_stderr[0..@min(trimmed_stderr.len, 512)];
-            payload.appendSlice(allocator, ",\"error\":\"") catch return failResult(allocator, .execution_failed, "out of memory");
-            appendJsonEscaped(allocator, &payload, capped) catch return failResult(allocator, .execution_failed, "out of memory");
-            payload.appendSlice(allocator, "\"") catch return failResult(allocator, .execution_failed, "out of memory");
-        }
-    }
 
     payload.append(allocator, '}') catch return failResult(allocator, .execution_failed, "out of memory");
     return .{
@@ -244,6 +158,103 @@ fn safeFileList(
             .payload_json = payload.toOwnedSlice(allocator) catch return failResult(allocator, .execution_failed, "out of memory"),
         },
     };
+}
+
+fn walkFileListDirectory(
+    allocator: std.mem.Allocator,
+    payload: *std.ArrayListUnmanaged(u8),
+    first: *bool,
+    count: *usize,
+    truncated: *bool,
+    dir: *std.fs.Dir,
+    prefix: []const u8,
+    recursive: bool,
+    max_entries: usize,
+    start_ms: i64,
+) anyerror!void {
+    var it = dir.iterate();
+    while (try it.next()) |entry| {
+        try checkFileListTimeout(start_ms);
+        if (entry.name.len == 0) continue;
+        if (count.* >= max_entries) {
+            truncated.* = true;
+            return;
+        }
+
+        const display_name = if (prefix.len == 0)
+            try allocator.dupe(u8, entry.name)
+        else
+            try std.fmt.allocPrint(allocator, "{s}/{s}", .{ prefix, entry.name });
+        defer allocator.free(display_name);
+
+        const kind = mapDirEntryKind(entry.kind);
+        try appendFileListEntry(allocator, payload, first, count, display_name, kind);
+
+        if (!recursive or entry.kind != .directory) continue;
+        if (count.* >= max_entries) {
+            truncated.* = true;
+            return;
+        }
+
+        var child = try dir.openDir(entry.name, .{ .iterate = true });
+        defer child.close();
+        try walkFileListDirectory(
+            allocator,
+            payload,
+            first,
+            count,
+            truncated,
+            &child,
+            display_name,
+            recursive,
+            max_entries,
+            start_ms,
+        );
+        if (truncated.*) return;
+    }
+}
+
+fn appendFileListEntry(
+    allocator: std.mem.Allocator,
+    payload: *std.ArrayListUnmanaged(u8),
+    first: *bool,
+    count: *usize,
+    name: []const u8,
+    kind: []const u8,
+) !void {
+    if (!first.*) try payload.append(allocator, ',');
+    first.* = false;
+    count.* += 1;
+
+    try payload.appendSlice(allocator, "{\"name\":\"");
+    try appendJsonEscaped(allocator, payload, name);
+    try payload.appendSlice(allocator, "\",\"type\":\"");
+    try payload.appendSlice(allocator, kind);
+    try payload.appendSlice(allocator, "\"}");
+}
+
+fn checkFileListTimeout(start_ms: i64) !void {
+    const now_ms = std.time.milliTimestamp();
+    if (now_ms - start_ms > @as(i64, @intCast(file_list_timeout_ms))) {
+        return error.FileListTimedOut;
+    }
+}
+
+fn failFileListFsError(
+    allocator: std.mem.Allocator,
+    err: anyerror,
+) tool_registry.ToolExecutionResult {
+    if (err == error.FileListTimedOut) {
+        return failResult(allocator, .timeout, "file_list timed out before completion");
+    }
+    if (isMountUnavailableErrorName(@errorName(err))) {
+        return failResult(
+            allocator,
+            .execution_failed,
+            "filesystem_unavailable: project mount unavailable (input/output error)",
+        );
+    }
+    return failResult(allocator, .execution_failed, @errorName(err));
 }
 
 fn failResult(
@@ -273,36 +284,35 @@ fn isSafeRelativePath(path: []const u8) bool {
     return true;
 }
 
-fn mapFindKind(raw: u8) []const u8 {
-    return switch (raw) {
-        'f' => "file",
-        'd' => "directory",
-        'l' => "symlink",
+fn mapDirEntryKind(kind: std.fs.Dir.Entry.Kind) []const u8 {
+    return switch (kind) {
+        .file => "file",
+        .directory => "directory",
+        .sym_link => "symlink",
         else => "other",
     };
 }
 
-fn findTimedOut(term: std.process.Child.Term) bool {
-    return switch (term) {
-        .Exited => |code| code == 124,
-        else => false,
-    };
-}
-
-fn stderrIndicatesMountUnavailable(stderr: []const u8) bool {
-    if (stderr.len == 0) return false;
+fn isMountUnavailableErrorName(error_name: []const u8) bool {
     const markers = [_][]const u8{
-        "input/output error",
-        "transport endpoint is not connected",
-        "stale file handle",
-        "no such device",
-        "connection reset",
-        "connection timed out",
+        "inputoutput",
+        "transportendpointisnotconnected",
+        "stalefilehandle",
+        "nodevice",
+        "connectionreset",
+        "connectiontimedout",
     };
     for (markers) |marker| {
-        if (std.ascii.indexOfIgnoreCase(stderr, marker) != null) return true;
+        if (std.ascii.indexOfIgnoreCase(error_name, marker) != null) return true;
     }
     return false;
+}
+
+test "agent_runtime_child_main: mount-unavailable error-name markers" {
+    try std.testing.expect(isMountUnavailableErrorName("InputOutput"));
+    try std.testing.expect(isMountUnavailableErrorName("StaleFileHandle"));
+    try std.testing.expect(isMountUnavailableErrorName("ConnectionTimedOut"));
+    try std.testing.expect(!isMountUnavailableErrorName("FileNotFound"));
 }
 
 fn appendJsonEscaped(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), value: []const u8) !void {

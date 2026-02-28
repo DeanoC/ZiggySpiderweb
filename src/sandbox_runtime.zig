@@ -398,19 +398,15 @@ fn isRecoverableBridgeError(err: anyerror) bool {
 fn shouldRestartOnToolFailure(result: tool_registry.ToolExecutionResult) bool {
     return switch (result) {
         .success => false,
-        .failure => |failure| blk: {
-            if (failure.code == .timeout) break :blk true;
-            break :blk containsAnyIgnoreCase(failure.message, &.{
-                "filesystem_unavailable",
-                "input/output error",
-                "transport endpoint is not connected",
-                "stale file handle",
-                "project mount unavailable",
-                "no such device",
-                "connection reset",
-                "command timed out",
-            });
-        },
+        .failure => |failure| containsAnyIgnoreCase(failure.message, &.{
+            "filesystem_unavailable",
+            "input/output error",
+            "transport endpoint is not connected",
+            "stale file handle",
+            "project mount unavailable",
+            "no such device",
+            "connection reset",
+        }),
     };
 }
 
@@ -501,6 +497,30 @@ test "sandbox_runtime: retry after restart only for safe read tools" {
     try std.testing.expect(shouldRetryToolRequestAfterRestart("search_code"));
     try std.testing.expect(!shouldRetryToolRequestAfterRestart("file_write"));
     try std.testing.expect(!shouldRetryToolRequestAfterRestart("shell_exec"));
+}
+
+test "sandbox_runtime: timeout failures do not trigger mount restart" {
+    var result = tool_registry.ToolExecutionResult{
+        .failure = .{
+            .code = .timeout,
+            .message = try std.testing.allocator.dupe(u8, "file_list timed out before completion"),
+        },
+    };
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expect(!shouldRestartOnToolFailure(result));
+}
+
+test "sandbox_runtime: filesystem unavailable failure triggers mount restart" {
+    var result = tool_registry.ToolExecutionResult{
+        .failure = .{
+            .code = .execution_failed,
+            .message = try std.testing.allocator.dupe(u8, "filesystem_unavailable: project mount unavailable (input/output error)"),
+        },
+    };
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expect(shouldRestartOnToolFailure(result));
 }
 
 fn parseToolResponseLine(allocator: std.mem.Allocator, line: []const u8) !tool_registry.ToolExecutionResult {
