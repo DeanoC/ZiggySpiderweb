@@ -154,6 +154,29 @@ Companion runbook (Linux + Windows node setup):
 
 - `docs/MULTI_NODE_RUNTIME_HARNESS.md`
 
+## Mother Bootstrap Provider Canary
+
+Run an end-to-end first-run bootstrap canary against a real provider:
+
+```bash
+./scripts/manual-mother-provider-canary.sh
+```
+
+What it validates:
+- Mother-only first connect (`bootstrap_only=true`)
+- provider-backed Mother chat response over Acheron
+- first project provisioning with `vision`
+- first non-system agent create + `HATCH.md` scaffold
+- successful `control.session_attach` to provisioned project/agent
+- bootstrap mode exit (`bootstrap_only=false`)
+
+Useful overrides:
+
+```bash
+KEEP_CANARY_DIR=1 ./scripts/manual-mother-provider-canary.sh
+CANARY_PROVIDER_NAME=openai CANARY_PROVIDER_MODEL=gpt-4o-mini ./scripts/manual-mother-provider-canary.sh
+```
+
 ## Environment Variables
 
 | Variable | Default | Description |

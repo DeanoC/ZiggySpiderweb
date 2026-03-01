@@ -161,6 +161,18 @@ pub fn readTemplate(allocator: std.mem.Allocator, runtime: *AgentRuntime, templa
     return std.fs.cwd().readFileAlloc(allocator, template_path, 1024 * 1024);
 }
 
+fn readIdentityTemplateForBrain(
+    allocator: std.mem.Allocator,
+    runtime: *AgentRuntime,
+    brain_name: []const u8,
+    template_name: []const u8,
+) ![]u8 {
+    if (try loadIdentityFile(allocator, runtime, brain_name, template_name)) |content| {
+        return content;
+    }
+    return readTemplate(allocator, runtime, template_name);
+}
+
 fn logTemplateLoadFailure(template_name: []const u8, err: anyerror, has_fallback_memory: bool) void {
     if (err == error.FileNotFound) {
         if (has_fallback_memory) {
@@ -188,7 +200,7 @@ fn ensureMemoryFromTemplate(
         // CORE.md is authoritative and write-protected by policy:
         // always synchronize LTM content with the current template file.
         if (std.mem.eql(u8, name, BASE_CORE_MEM_NAME)) {
-            const maybe_content = readTemplate(allocator, runtime, template_name) catch |err| blk: {
+            const maybe_content = readIdentityTemplateForBrain(allocator, runtime, brain_name, template_name) catch |err| blk: {
                 logTemplateLoadFailure(template_name, err, true);
                 break :blk null;
             };
@@ -267,7 +279,7 @@ fn ensureMemoryFromTemplate(
         return true;
     }
 
-    const content = readTemplate(allocator, runtime, template_name) catch |err| {
+    const content = readIdentityTemplateForBrain(allocator, runtime, brain_name, template_name) catch |err| {
         logTemplateLoadFailure(template_name, err, false);
         return false;
     };
@@ -350,11 +362,37 @@ pub fn injectRuntimeStatusHook(ctx: *HookContext, data: HookData) HookError!void
 /// Persist LTM after results (PostResults hook)
 pub fn persistLtmHook(ctx: *HookContext, data: HookData) HookError!void {
     const checkpoint = data.post_results;
-    _ = checkpoint;
+    const store = ctx.runtime.ltm_store orelse return;
 
-    // TODO: Implement actual persistence
-    // For now, just log
-    std.log.debug("PostResults: Persisting LTM for {s} tick {d}", .{ ctx.brain_name, ctx.tick });
+    const now_ms = std.time.milliTimestamp();
+    const base_id = std.fmt.allocPrint(
+        ctx.runtime.allocator,
+        "{s}:system_checkpoint:{s}",
+        .{ ctx.runtime.agent_id, ctx.brain_name },
+    ) catch return;
+    defer ctx.runtime.allocator.free(base_id);
+
+    const payload = std.fmt.allocPrint(
+        ctx.runtime.allocator,
+        "{{\"tick\":{d},\"checkpoint_tick\":{d},\"artifacts_count\":{d},\"created_at_ms\":{d}}}",
+        .{ ctx.tick, checkpoint.tick, checkpoint.artifacts_count, now_ms },
+    ) catch return;
+    defer ctx.runtime.allocator.free(payload);
+
+    _ = store.appendAt(base_id, "runtime_checkpoint", payload, now_ms) catch |err| {
+        std.log.warn("PostResults: checkpoint persist failed for {s}/{s}: {s}", .{
+            ctx.runtime.agent_id,
+            ctx.brain_name,
+            @errorName(err),
+        });
+        return;
+    };
+
+    std.log.debug("PostResults: persisted checkpoint for {s}/{s} tick {d}", .{
+        ctx.runtime.agent_id,
+        ctx.brain_name,
+        checkpoint.tick,
+    });
 }
 
 /// Log hook execution for debugging (PostObserve)
@@ -750,6 +788,105 @@ test "system_hooks: ensureIdentityMemories syncs CORE from template across resta
     const content = try unwrapJsonString(allocator, synced.content_json);
     defer allocator.free(content);
     try std.testing.expect(std.mem.eql(u8, content, core_v2));
+}
+
+test "system_hooks: ensureIdentityMemories prefers and syncs agent-local CORE" {
+    const allocator = std.testing.allocator;
+    const nonce = std.time.nanoTimestamp();
+    const root_dir = try std.fmt.allocPrint(allocator, ".tmp-system-hooks-local-core-{d}", .{nonce});
+    defer allocator.free(root_dir);
+    defer std.fs.cwd().deleteTree(root_dir) catch {};
+
+    const ltm_dir = try std.fs.path.join(allocator, &.{ root_dir, "ltm" });
+    defer allocator.free(ltm_dir);
+    const assets_dir = try std.fs.path.join(allocator, &.{ root_dir, "assets" });
+    defer allocator.free(assets_dir);
+    const agents_dir = try std.fs.path.join(allocator, &.{ root_dir, "agents" });
+    defer allocator.free(agents_dir);
+
+    try std.fs.cwd().makePath(ltm_dir);
+    try std.fs.cwd().makePath(assets_dir);
+    try std.fs.cwd().makePath(agents_dir);
+
+    const global_core =
+        \\# CORE.md
+        \\global-core
+    ;
+    const local_core_v1 =
+        \\# CORE.md
+        \\local-core-v1
+    ;
+    const local_core_v2 =
+        \\# CORE.md
+        \\local-core-v2
+    ;
+    const identity_template =
+        \\# identity
+        \\v1
+    ;
+
+    const core_template_path = try std.fs.path.join(allocator, &.{ assets_dir, "CORE.md" });
+    defer allocator.free(core_template_path);
+    try std.fs.cwd().writeFile(.{
+        .sub_path = core_template_path,
+        .data = global_core,
+    });
+
+    inline for (.{ "SOUL.md", "AGENT.md", "IDENTITY.md" }) |filename| {
+        const path = try std.fs.path.join(allocator, &.{ assets_dir, filename });
+        defer allocator.free(path);
+        try std.fs.cwd().writeFile(.{
+            .sub_path = path,
+            .data = identity_template,
+        });
+    }
+
+    const agent_id = "agent-system-hooks-local-core";
+    const agent_dir = try std.fs.path.join(allocator, &.{ agents_dir, agent_id });
+    defer allocator.free(agent_dir);
+    try std.fs.cwd().makePath(agent_dir);
+    const local_core_path = try std.fs.path.join(allocator, &.{ agent_dir, "CORE.md" });
+    defer allocator.free(local_core_path);
+    try std.fs.cwd().writeFile(.{
+        .sub_path = local_core_path,
+        .data = local_core_v1,
+    });
+
+    var cfg = Config.RuntimeConfig{};
+    cfg.assets_dir = assets_dir;
+    cfg.agents_dir = agents_dir;
+
+    var runtime = try AgentRuntime.initWithPersistence(allocator, agent_id, &.{}, ltm_dir, "runtime-memory.db", cfg);
+    defer runtime.deinit();
+
+    try ensureIdentityMemories(&runtime, "primary");
+
+    {
+        const synced_opt = try loadMemoryByName(&runtime, "primary", BASE_CORE_MEM_NAME);
+        try std.testing.expect(synced_opt != null);
+        var synced = synced_opt.?;
+        defer synced.deinit(allocator);
+        const content = try unwrapJsonString(allocator, synced.content_json);
+        defer allocator.free(content);
+        try std.testing.expect(std.mem.eql(u8, content, local_core_v1));
+    }
+
+    try std.fs.cwd().writeFile(.{
+        .sub_path = local_core_path,
+        .data = local_core_v2,
+    });
+    try ensureIdentityMemories(&runtime, "primary");
+
+    {
+        const synced_opt = try loadMemoryByName(&runtime, "primary", BASE_CORE_MEM_NAME);
+        try std.testing.expect(synced_opt != null);
+        var synced = synced_opt.?;
+        defer synced.deinit(allocator);
+        try std.testing.expectEqual(@as(usize, 2), synced.version orelse 0);
+        const content = try unwrapJsonString(allocator, synced.content_json);
+        defer allocator.free(content);
+        try std.testing.expect(std.mem.eql(u8, content, local_core_v2));
+    }
 }
 
 fn containsNamedMemory(items: []const memory.ActiveMemoryItem, name: []const u8) bool {

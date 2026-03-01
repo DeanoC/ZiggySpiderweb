@@ -38,7 +38,7 @@ This script will:
 2. Clone and build ZiggySpiderweb
 3. Prompt for AI provider and API key
 4. Configure secure credential storage
-5. Name your first agent
+5. Provision Mother system agent scaffold
 6. Start the server
 
 ### Manual Install
@@ -117,7 +117,8 @@ Runtime execution now uses a bounded request queue plus fixed runtime workers.
 
 Notes:
 - Older inflight-style runtime gating keys are no longer used.
-- Protocol input should use `session.send`; legacy `chat.send` is rejected.
+- Use unified v2 control + Acheron APIs (`control.version`, `control.connect`, `acheron.t_version`, `acheron.t_attach`).
+- Legacy websocket chat envelopes (`session.send`, `chat.send`) are rejected on the unified v2 gateway path.
 
 ### Debug Stream Log Files
 
@@ -145,11 +146,11 @@ Spiderweb now supports a run-oriented control path:
 - `agent.run.events`
 - `agent.run.list`
 
-`session.send` remains supported and acts as a compatibility shim for chat-style turns.
+Run/chat flows should use Acheron filesystem contract paths under `/agents/self/*` (for example chat input/control files and job status/result files).
 
 ### World Tools (Provider-Driven)
 
-World tools are executed through provider tool-calling during `session.send`.
+World tools are executed through provider tool-calling via Acheron job/chat flows.
 
 - Runtime supplies tool schemas to the configured provider.
 - Provider emits tool calls.
@@ -285,7 +286,7 @@ Two new binaries provide the distributed filesystem protocol from `design_docs/F
 ./zig-out/bin/spiderweb-fs-mount --endpoint a=ws://127.0.0.1:18891/v2/fs#work cat /a/README.md
 ./zig-out/bin/spiderweb-fs-mount --endpoint a=ws://127.0.0.1:18891/v2/fs#work write /a/.tmp-fs-test "hello"
 
-# Hydrate mounts from spiderweb control workspace_status (active project for default agent)
+# Hydrate mounts from spiderweb control workspace_status (active project for current attached agent/session)
 ./zig-out/bin/spiderweb-fs-mount \
   --workspace-url ws://127.0.0.1:18790/ \
   readdir /
@@ -330,6 +331,7 @@ Notes:
 - Project token protection is optional:
   - when `token_locked=false` (default on new projects), project actions are open to authenticated users
   - when `token_locked=true`, project actions require `project_token` (admin bypasses)
+- Project creation requires a non-empty `vision` field (`control.project_create` and new-project `control.project_up`).
 - Project action policy can be configured per project (and per agent override) with `access_policy` on `control.project_create`, `control.project_update`, or `control.project_up`:
   - actions: `read`, `invoke`, `mount`, `admin`
   - modes: `open`, `token`, `admin`, `deny`
@@ -420,7 +422,7 @@ Multi-service embedding example (FS + health + echo in one process):
 | WebSocket RFC 6455 | ✅ |
 | OpenClaw handshake | ✅ |
 | Session management | ✅ |
-| session.send/receive | ✅ |
+| Legacy session.send/receive envelopes on unified v2 gateway | ❌ (use control + Acheron) |
 | Conversation history | ✅ (per session) |
 | Streaming responses | ✅ |
 | Multi-provider | ✅ (16 models) |

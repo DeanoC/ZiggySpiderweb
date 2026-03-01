@@ -1,4 +1,5 @@
 const std = @import("std");
+const ltm_store = @import("ziggy-memory-store").ltm_store;
 const memory = @import("ziggy-memory-store").memory;
 const memid = @import("ziggy-memory-store").memid;
 const brain_context = @import("brain_context.zig");
@@ -287,6 +288,24 @@ pub const Engine = struct {
             if (value == .string) value.string else null
         else
             null;
+        const chat_reply_content = extractChatReplyContentForWorldTool(tool_name, args);
+        if (chat_reply_content) |reply| {
+            const synthetic_payload = try buildSyntheticChatReplyPayload(self.allocator, args, reply);
+            errdefer self.allocator.free(synthetic_payload);
+
+            if (tool_call_id) |call_id| {
+                var wrapped_buf = std.ArrayListUnmanaged(u8){};
+                defer wrapped_buf.deinit(self.allocator);
+                try wrapped_buf.appendSlice(self.allocator, "{\"tool_call_id\":\"");
+                try appendJsonEscaped(self.allocator, &wrapped_buf, call_id);
+                try wrapped_buf.appendSlice(self.allocator, "\",\"result\":");
+                try wrapped_buf.appendSlice(self.allocator, synthetic_payload);
+                try wrapped_buf.append(self.allocator, '}');
+                const wrapped = try wrapped_buf.toOwnedSlice(self.allocator);
+                return self.success(tool_name, wrapped);
+            }
+            return self.success(tool_name, synthetic_payload);
+        }
         var outcome = blk: {
             if (self.world_tool_dispatch_fn) |dispatch_fn| {
                 const dispatch_ctx = self.world_tool_dispatch_ctx orelse break :blk self.failureResult(
@@ -320,18 +339,24 @@ pub const Engine = struct {
 
         return switch (outcome) {
             .success => |ok| {
+                const success_payload = try decorateWorldToolSuccessPayload(
+                    self.allocator,
+                    ok.payload_json,
+                    chat_reply_content,
+                );
                 if (tool_call_id) |call_id| {
                     var wrapped_buf = std.ArrayListUnmanaged(u8){};
                     defer wrapped_buf.deinit(self.allocator);
+                    defer self.allocator.free(success_payload);
                     try wrapped_buf.appendSlice(self.allocator, "{\"tool_call_id\":\"");
                     try appendJsonEscaped(self.allocator, &wrapped_buf, call_id);
                     try wrapped_buf.appendSlice(self.allocator, "\",\"result\":");
-                    try wrapped_buf.appendSlice(self.allocator, ok.payload_json);
+                    try wrapped_buf.appendSlice(self.allocator, success_payload);
                     try wrapped_buf.append(self.allocator, '}');
                     const wrapped = try wrapped_buf.toOwnedSlice(self.allocator);
                     return self.success(tool_name, wrapped);
                 }
-                return self.success(tool_name, try self.allocator.dupe(u8, ok.payload_json));
+                return self.success(tool_name, success_payload);
             },
             .failure => |failure_info| {
                 if (tool_call_id) |call_id| {
@@ -354,6 +379,68 @@ pub const Engine = struct {
                 return self.failure(tool_name, @tagName(failure_info.code), failure_info.message);
             },
         };
+    }
+
+    fn extractChatReplyContentForWorldTool(
+        tool_name: []const u8,
+        args: std.json.ObjectMap,
+    ) ?[]const u8 {
+        if (!std.mem.eql(u8, tool_name, "file_write")) return null;
+        const path_value = args.get("path") orelse return null;
+        if (path_value != .string) return null;
+        if (!isChatReplyPath(path_value.string)) return null;
+        const content_value = args.get("content") orelse return null;
+        if (content_value != .string) return null;
+        const trimmed = std.mem.trim(u8, content_value.string, " \t\r\n");
+        if (trimmed.len == 0) return null;
+        return content_value.string;
+    }
+
+    fn isChatReplyPath(path: []const u8) bool {
+        const trimmed = std.mem.trim(u8, path, " \t\r\n");
+        if (trimmed.len == 0) return false;
+        const without_leading = std.mem.trimLeft(u8, trimmed, "/");
+        return std.mem.eql(u8, without_leading, "agents/self/chat/control/reply");
+    }
+
+    fn decorateWorldToolSuccessPayload(
+        allocator: std.mem.Allocator,
+        payload_json: []const u8,
+        chat_reply_content: ?[]const u8,
+    ) ![]u8 {
+        const reply = chat_reply_content orelse return allocator.dupe(u8, payload_json);
+        const escaped_reply = try appendJsonEscapedAlloc(allocator, reply);
+        defer allocator.free(escaped_reply);
+        return std.fmt.allocPrint(
+            allocator,
+            "{{\"result\":{s},\"chat_reply\":{{\"delivered\":true,\"content\":\"{s}\"}}}}",
+            .{ payload_json, escaped_reply },
+        );
+    }
+
+    fn appendJsonEscapedAlloc(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
+        var out = std.ArrayListUnmanaged(u8){};
+        errdefer out.deinit(allocator);
+        try appendJsonEscaped(allocator, &out, input);
+        return out.toOwnedSlice(allocator);
+    }
+
+    fn buildSyntheticChatReplyPayload(
+        allocator: std.mem.Allocator,
+        args: std.json.ObjectMap,
+        reply: []const u8,
+    ) ![]u8 {
+        const path_value = args.get("path") orelse return error.InvalidPayload;
+        if (path_value != .string) return error.InvalidPayload;
+        const escaped_path = try appendJsonEscapedAlloc(allocator, path_value.string);
+        defer allocator.free(escaped_path);
+        const escaped_reply = try appendJsonEscapedAlloc(allocator, reply);
+        defer allocator.free(escaped_reply);
+        return std.fmt.allocPrint(
+            allocator,
+            "{{\"result\":{{\"path\":\"{s}\",\"bytes_written\":{d},\"append\":false,\"ready\":true,\"wait_until_ready\":true}},\"chat_reply\":{{\"delivered\":true,\"content\":\"{s}\"}}}}",
+            .{ escaped_path, reply.len, escaped_reply },
+        );
     }
 
     fn failureResult(
@@ -543,28 +630,106 @@ pub const Engine = struct {
             return self.failure(tool_name, "invalid_args", "memory_search limit must be a non-negative integer");
         } orelse 25;
 
-        const found = self.runtime_memory.search(self.allocator, brain.brain_name, query, limit) catch |err| {
+        const found_active = self.runtime_memory.search(self.allocator, brain.brain_name, query, limit) catch |err| {
             return self.failure(tool_name, "execution_failed", @errorName(err));
         };
-        defer memory.deinitItems(self.allocator, found);
+        defer memory.deinitItems(self.allocator, found_active);
 
         var payload = std.ArrayListUnmanaged(u8){};
         defer payload.deinit(self.allocator);
+        var seen_mem_ids = std.StringHashMapUnmanaged(void){};
+        defer {
+            var key_it = seen_mem_ids.keyIterator();
+            while (key_it.next()) |key| self.allocator.free(key.*);
+            seen_mem_ids.deinit(self.allocator);
+        }
+        var emitted: usize = 0;
 
         try payload.appendSlice(self.allocator, "{\"results\":[");
-        for (found, 0..) |item, index| {
-            if (index > 0) try payload.append(self.allocator, ',');
-            const row = try std.fmt.allocPrint(
-                self.allocator,
-                "{{\"mem_id\":\"{s}\",\"version\":{d},\"kind\":\"{s}\",\"write_protected\":{},\"unevictable\":{}}}",
-                .{ item.mem_id, item.version orelse 0, item.kind, !item.mutable, item.unevictable },
+        for (found_active) |item| {
+            if (!try self.markSeenMemId(&seen_mem_ids, item.mem_id)) continue;
+            if (emitted > 0) try payload.append(self.allocator, ',');
+            try self.appendMemorySearchResultRow(
+                &payload,
+                item.mem_id,
+                item.version orelse 0,
+                item.kind,
+                !item.mutable,
+                item.unevictable,
             );
-            defer self.allocator.free(row);
-            try payload.appendSlice(self.allocator, row);
+            emitted += 1;
+            if (emitted >= limit) break;
         }
+
+        // Include persisted LTM records so memory_search still works after restart.
+        if (emitted < limit) {
+            if (self.runtime_memory.persisted_store) |store| {
+                const persisted_hits = store.search(self.allocator, query, @max(limit, 1) * 4) catch |err| {
+                    return self.failure(tool_name, "execution_failed", @errorName(err));
+                };
+                defer ltm_store.deinitRecords(self.allocator, persisted_hits);
+
+                for (persisted_hits) |record| {
+                    if (emitted >= limit) break;
+
+                    const parsed = parseBaseMemId(record.base_id) orelse continue;
+                    if (!std.mem.eql(u8, parsed.agent, self.runtime_memory.agent_id)) continue;
+                    if (!std.mem.eql(u8, parsed.brain, brain.brain_name)) continue;
+
+                    const concrete_mem_id = try (memid.MemId{
+                        .agent = parsed.agent,
+                        .brain = parsed.brain,
+                        .name = parsed.name,
+                        .version = record.version,
+                    }).format(self.allocator);
+                    defer self.allocator.free(concrete_mem_id);
+
+                    if (!try self.markSeenMemId(&seen_mem_ids, concrete_mem_id)) continue;
+                    if (emitted > 0) try payload.append(self.allocator, ',');
+                    try self.appendMemorySearchResultRow(
+                        &payload,
+                        concrete_mem_id,
+                        record.version,
+                        record.kind,
+                        false,
+                        false,
+                    );
+                    emitted += 1;
+                }
+            }
+        }
+
         try payload.appendSlice(self.allocator, "]}");
 
         return self.success(tool_name, try payload.toOwnedSlice(self.allocator));
+    }
+
+    fn appendMemorySearchResultRow(
+        self: *Engine,
+        payload: *std.ArrayListUnmanaged(u8),
+        mem_id: []const u8,
+        version: u64,
+        kind: []const u8,
+        write_protected: bool,
+        unevictable: bool,
+    ) !void {
+        try payload.appendSlice(self.allocator, "{\"mem_id\":\"");
+        try appendJsonEscaped(self.allocator, payload, mem_id);
+        try payload.appendSlice(self.allocator, "\",\"version\":");
+        try payload.writer(self.allocator).print("{d}", .{version});
+        try payload.appendSlice(self.allocator, ",\"kind\":\"");
+        try appendJsonEscaped(self.allocator, payload, kind);
+        try payload.appendSlice(self.allocator, "\",\"write_protected\":");
+        try payload.appendSlice(self.allocator, if (write_protected) "true" else "false");
+        try payload.appendSlice(self.allocator, ",\"unevictable\":");
+        try payload.appendSlice(self.allocator, if (unevictable) "true" else "false");
+        try payload.append(self.allocator, '}');
+    }
+
+    fn markSeenMemId(self: *Engine, seen: *std.StringHashMapUnmanaged(void), mem_id: []const u8) !bool {
+        if (seen.contains(mem_id)) return false;
+        try seen.put(self.allocator, try self.allocator.dupe(u8, mem_id), {});
+        return true;
     }
 
     fn execTalk(
@@ -891,6 +1056,26 @@ fn parseWaitEventType(raw: []const u8) ?event_bus.EventType {
     if (std.ascii.eqlIgnoreCase(raw, "time")) return .time;
     if (std.ascii.eqlIgnoreCase(raw, "hook")) return .hook;
     return null;
+}
+
+const BaseMemIdParts = struct {
+    agent: []const u8,
+    brain: []const u8,
+    name: []const u8,
+};
+
+fn parseBaseMemId(base_id: []const u8) ?BaseMemIdParts {
+    var parts = std.mem.splitScalar(u8, base_id, ':');
+    const agent = parts.next() orelse return null;
+    const brain = parts.next() orelse return null;
+    const name = parts.next() orelse return null;
+    if (parts.next() != null) return null;
+    if (agent.len == 0 or brain.len == 0 or name.len == 0) return null;
+    return .{
+        .agent = agent,
+        .brain = brain,
+        .name = name,
+    };
 }
 
 fn getRequiredString(args: std.json.ObjectMap, field: []const u8) ?[]const u8 {
@@ -1229,6 +1414,44 @@ test "brain_tools: memory_search returns matching mem_id set" {
     try std.testing.expect(results[0].success);
     try std.testing.expect(std.mem.indexOf(u8, results[0].payload_json, compile_item.mem_id) != null);
     try std.testing.expect(std.mem.indexOf(u8, results[0].payload_json, docs_item.mem_id) == null);
+}
+
+test "brain_tools: memory_search includes persisted matches after restart" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const root = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+    const ltm_dir = try std.fs.path.join(allocator, &.{ root, "ltm" });
+    defer allocator.free(ltm_dir);
+    try std.fs.cwd().makePath(ltm_dir);
+
+    var store = try ltm_store.VersionedMemStore.open(allocator, ltm_dir, "runtime-memory.db");
+    defer store.close();
+
+    {
+        var mem_writer = try memory.RuntimeMemory.initWithStore(allocator, "agentA", &store);
+        defer mem_writer.deinit();
+        var created = try mem_writer.create("primary", "persisted_compile", "note", "{\"text\":\"compile persisted\"}", false, false);
+        created.deinit(allocator);
+    }
+
+    var mem_reader = try memory.RuntimeMemory.initWithStore(allocator, "agentA", &store);
+    defer mem_reader.deinit();
+    var bus = event_bus.EventBus.init(allocator);
+    defer bus.deinit();
+    var brain = try brain_context.BrainContext.init(allocator, "primary");
+    defer brain.deinit();
+    try brain.queueToolUse("memory_search", "{\"query\":\"persisted_compile\",\"limit\":10}");
+
+    var engine = Engine.init(allocator, &mem_reader, &bus);
+    const results = try engine.executePending(&brain);
+    defer deinitResults(allocator, results);
+
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expect(results[0].success);
+    try std.testing.expect(std.mem.indexOf(u8, results[0].payload_json, "persisted_compile") != null);
 }
 
 test "brain_tools: talk_user emits user-targeted event" {

@@ -86,6 +86,7 @@ Node directories also expose:
 - Event wait next path: `/agents/self/events/next.json`
 - First-class memory service path: `/agents/self/memory`
 - First-class web search service path: `/agents/self/web_search`
+- First-class code search service path: `/agents/self/search_code`
 - First-class terminal service path: `/agents/self/terminal`
 
 `/agents/self/services/SERVICES.json` entries include:
@@ -95,7 +96,7 @@ Node directories also expose:
 - `service_path`
 - `invoke_path`
 - `has_invoke`
-- `scope` (`node`, `agent_contract`, or `agent_namespace`)
+- `scope` (`node` or `agent_namespace`)
 
 Use `service_path` to inspect each service descriptor (`README.md`, `SCHEMA.json`,
 `TEMPLATE.json`, `CAPS.json`, `MOUNTS.json`, `OPS.json`, `PERMISSIONS.json`).
@@ -111,25 +112,6 @@ For node services with `CAPS.invoke=true`, runtime derives `invoke_path` using:
 Workspace mount projection now applies the same invoke policy checks for
 non-admin sessions: invoke-capable service mounts are omitted when project
 `invoke` access or service `PERMISSIONS.json` deny invoke access.
-
-`/agents/self/services/contracts/` currently seeds baseline contracts for:
-
-- `memory`
-- `web_search`
-- `terminal`
-
-Contract service invoke flow:
-
-1. Write invoke payload JSON to:
-   - `/agents/self/services/contracts/<service_id>/control/invoke.json`
-2. Read runtime status:
-   - `/agents/self/services/contracts/<service_id>/status.json`
-3. Read tool result payload:
-   - `/agents/self/services/contracts/<service_id>/result.json`
-
-Invoke payload shape:
-`{"tool_name":"memory_create","arguments":{...}}`
-(`tool` and `args` aliases are also accepted.)
 
 First-class memory namespace flow:
 
@@ -155,6 +137,16 @@ First-class web search namespace flow:
    - `/agents/self/web_search/status.json`
 3. Read tool result payload:
    - `/agents/self/web_search/result.json`
+
+First-class code search namespace flow:
+
+1. Write search payload JSON to one of:
+   - `/agents/self/search_code/control/search.json`
+   - `/agents/self/search_code/control/invoke.json` (generic tool call envelope)
+2. Read runtime status:
+   - `/agents/self/search_code/status.json`
+3. Read tool result payload:
+   - `/agents/self/search_code/result.json`
 
 First-class terminal namespace flow:
 

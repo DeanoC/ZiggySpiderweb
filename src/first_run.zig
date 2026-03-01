@@ -73,45 +73,34 @@ pub fn runFirstRun(allocator: std.mem.Allocator, args: []const []const u8) !void
     // Step 2: Configure credentials
     try configureCredentials(allocator, provider_name, non_interactive);
 
-    // Step 3: Create first agent
-    var chosen_agent_name_owned: ?[]const u8 = null;
-    defer if (chosen_agent_name_owned) |value| allocator.free(value);
-
-    const chosen_agent_name = if (non_interactive)
-        agent_name_param orelse "ziggy"
-    else blk: {
-        chosen_agent_name_owned = try createAgentInteractive(allocator, agent_name_param);
-        break :blk chosen_agent_name_owned.?;
-    };
-    const agent_name = normalizeAgentId(allocator, chosen_agent_name) catch |err| switch (err) {
-        error.AgentIdTooLong => {
-            std.log.err("Agent id must be at most {d} characters after normalization", .{max_agent_id_len});
-            return error.InvalidArguments;
-        },
-        else => return err,
-    };
-    defer allocator.free(agent_name);
-
-    // Step 4: Save configuration
+    // Step 3: Save configuration
     {
         var config = try Config.init(allocator, null);
         defer config.deinit();
         try config.setProvider(provider_name, model_name);
-        try config.setDefaultAgentId(agent_name);
         std.log.info("Configuration saved", .{});
     }
 
-    // Step 5: Summary
+    // Step 4: Summary
     try std.fs.File.stdout().writeAll("\n");
     try std.fs.File.stdout().writeAll("╔═══════════════════════════════════════════════════════════════╗\n");
     try std.fs.File.stdout().writeAll("║  Setup Complete!                                              ║\n");
     try std.fs.File.stdout().writeAll("╚═══════════════════════════════════════════════════════════════╝\n");
     try println("\n  Provider: {s}/{s}", .{ provider_name, model_name orelse "default" });
-    try println("  Agent: {s}", .{agent_name});
+    if (agent_name_param) |hint| {
+        if (normalizeAgentId(allocator, hint)) |normalized| {
+            defer allocator.free(normalized);
+            try println("  First agent hint: {s}", .{normalized});
+        } else |_| {
+            try println("  First agent hint: {s}", .{hint});
+        }
+    }
+    try std.fs.File.stdout().writeAll("  System agent: mother (auto-managed)\n");
     try std.fs.File.stdout().writeAll("  Config: ~/.config/spiderweb/config.json\n");
     try std.fs.File.stdout().writeAll("\nNext steps:\n");
     try std.fs.File.stdout().writeAll("  Start server:    spiderweb\n");
     try std.fs.File.stdout().writeAll("  Connect client:  zss connect --url ws://127.0.0.1:18790\n");
+    try std.fs.File.stdout().writeAll("  Bootstrap:       admin chats with Mother to create first project + agent\n");
     try std.fs.File.stdout().writeAll("\nInstall systemd service:\n");
     try std.fs.File.stdout().writeAll("  spiderweb-config config install-service\n");
 
@@ -296,20 +285,6 @@ fn configureCredentials(allocator: std.mem.Allocator, provider_name: []const u8,
 
     try store.setProviderApiKey(provider_name, key.?);
     try std.fs.File.stdout().writeAll("API key stored securely\n");
-}
-
-fn createAgentInteractive(allocator: std.mem.Allocator, default_name: ?[]const u8) ![]const u8 {
-    try std.fs.File.stdout().writeAll("\n");
-    try std.fs.File.stdout().writeAll("Name your first agent:\n");
-    try print("  [default: {s}]: ", .{default_name orelse "ziggy"});
-
-    const line = try readLineTrimmedAlloc(allocator, 64);
-    if (line == null or line.?.len == 0) {
-        if (line) |value| allocator.free(value);
-        return allocator.dupe(u8, default_name orelse "ziggy");
-    }
-
-    return line.?;
 }
 
 fn readLineTrimmedAlloc(allocator: std.mem.Allocator, max_len: usize) !?[]u8 {

@@ -1,82 +1,50 @@
-# First Agent Bootstrap Ops Runbook
+# Mother Bootstrap Runbook
 
-This runbook is for bringing up the first live agent (for example `ziggy`) and validating bootstrap behavior end-to-end.
+This runbook validates first-boot behavior where only `mother` + `system` exist, then verifies first project/agent provisioning.
 
-## 1) Verify Config
+## Fast Path: Provider-Backed Manual Canary
 
-Check `~/.config/spiderweb/config.json`:
-
-- `server.bind` and `server.port` are reachable from your client machine
-- `provider.name` and `provider.model` are valid
-- `runtime.default_agent_id` is set to your first agent id (for example `ziggy`)
-- `runtime.ltm_directory` and `runtime.ltm_filename` are set
-
-Quick check:
+Run:
 
 ```bash
-spiderweb-config config
+./scripts/manual-mother-provider-canary.sh
 ```
 
-## 2) Start Spiderweb
+What this checks:
+
+1. `control.connect` returns `control.connect_ack` bound to `mother/system` with `bootstrap_only=true`.
+2. A real provider-backed Mother reply is produced over Acheron chat.
+3. First project is created with required `vision`.
+4. First non-system agent is created via Acheron (`/agents/self/agents/control/create.json`).
+5. Created agent has `agent.json` + `HATCH.md` scaffold.
+6. `control.session_attach` to the new project/agent succeeds.
+7. Post-bootstrap `control.connect` reports `bootstrap_only=false`.
+
+If it fails with `provider request invalid`, fix provider credentials/model in:
+
+- `~/.config/spiderweb/config.json`
+
+and rerun.
+
+Useful options:
 
 ```bash
-spiderweb
+KEEP_CANARY_DIR=1 ./scripts/manual-mother-provider-canary.sh
+CANARY_PROVIDER_NAME=openai CANARY_PROVIDER_MODEL=gpt-4o-mini ./scripts/manual-mother-provider-canary.sh
 ```
 
-For remote LAN testing:
+## Protocol Notes (Current Behavior)
 
-- bind with `0.0.0.0`
-- open firewall for the configured port
+- `control.connect` returns `control.connect_ack` even when context selection is needed.
+- Context gating is exposed in payload fields:
+  - `requires_session_attach`
+  - `connect_gate` (`code`/`message`)
+- Bootstrap mode indicator:
+  - `bootstrap_only=true`
+  - non-null `bootstrap_message`
 
-## 3) Connect from Client
+## Important Constraints
 
-Use base websocket URL (routing is internal):
-
-```text
-ws://<host>:<port>
-```
-
-Do not require direct route paths for normal startup chat.
-
-## 4) Expected Connect Sequence
-
-On first connect for a new/default agent:
-
-1. server sends `connect.ack` immediately
-2. server may send one bootstrap `session.receive` message
-
-On later connects:
-
-1. server sends `connect.ack`
-2. no bootstrap message (unless bootstrap marker/memory was reset)
-
-## 5) Quick Wire Test
-
-```bash
-printf '{"id":"c1","type":"connect"}\n' | websocat -n1 ws://127.0.0.1:18790
-```
-
-Then send a chat turn:
-
-```bash
-printf '{"id":"m1","type":"session.send","content":"hello"}\n' | websocat -n1 ws://127.0.0.1:18790
-```
-
-## 6) Troubleshooting
-
-- `connection refused`
-  - server not running, wrong bind address, wrong port, or firewall block
-- `missing provider API key`
-  - configure secure key storage or provider env var
-- `provider stream failed`
-  - verify provider auth/token, model name, and upstream provider status
-  - for Codex debugging:
-    - run with `ZIGGY_DEBUG_CODEX_ERRORS=1 spiderweb`
-- connects but no bootstrap
-  - expected after first successful bootstrap
-  - inspect/reset bootstrap marker memory if you need to force bootstrap again
-
-## 7) Operational Notes
-
-- Identity memories (`system.soul`, `system.agent`, `system.identity`) are rehydrated from persisted LTM on restart.
-- Bootstrap and chat use the runtime queue; ACK is intentionally immediate so client connection state is not blocked by provider latency.
+- Mother is system-locked (`project_id=system`) and user role cannot attach to Mother.
+- Project creation requires non-empty `vision`.
+- Unified v2 gateway rejects legacy websocket chat envelopes (`session.send`, `chat.send`).

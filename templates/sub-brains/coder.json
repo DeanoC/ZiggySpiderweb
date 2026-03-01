@@ -37,24 +37,12 @@
   ],
   
   "allowed_tools": [
-    "memory_create",
-    "memory_load",
-    "memory_versions",
-    "memory_mutate",
-    "memory_search",
-    "talk_brain",
-    "talk_agent",
-    "talk_log",
-    "wait_for",
     "file_read",
     "file_write",
-    "file_list",
-    "shell"
+    "file_list"
   ],
   
-  "denied_tools": [
-    "talk_user"
-  ],
+  "denied_tools": [],
   
   "can_spawn_subbrains": false
 }
