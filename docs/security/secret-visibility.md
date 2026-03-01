@@ -36,3 +36,6 @@ Longer-term, these static node secrets should be replaced with scoped and expiri
 - session
 - TTL
 
+## Implementation Pointers
+
+- `src/fs_control_plane.zig`

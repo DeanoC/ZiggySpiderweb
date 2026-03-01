@@ -39,7 +39,7 @@ This release is **unified v2 only**. Legacy compatibility paths were removed.
 2. Optional workspace selection:
 - `control.workspace_status` accepts optional payload `{"project_id":"<id>","project_token":"<token>"}`.
 - explicit `project_id` selection now requires either a matching `project_token` or an existing active binding for that agent.
-- `spiderweb-fs-mount` supports `--project-id <id> [--project-token <token>]`
+- `spiderweb-fs-mount` supports `--project-id <id> [--project-token <token>]`.
 - workspace topology mount entries now expose both `online` (`bool`) and `state` (`online`, `degraded`, `missing`) fields.
 - workspace status payloads now include `availability` rollups (`mounts_total`, `online`, `degraded`, `missing`).
 - when multiple mounts share a `mount_path`, control-plane selection is deterministic and availability-aware (`online` > `degraded` > `missing`, then latest lease expiry).
@@ -71,10 +71,15 @@ This release is **unified v2 only**. Legacy compatibility paths were removed.
 2. `control.connect`
 3. normal control operations (`control.metrics`, `control.workspace_status`, project/node ops, etc.)
 
-`spiderweb-control` now automates this negotiation and sends a single control operation.
+`spiderweb-control` automates this negotiation and sends a single control operation.
 
 ## Minimal Client Flow (Runtime Acheron)
 
 1. `acheron.t_version` (`"version":"acheron-1"`)
 2. `acheron.t_attach`
 3. remaining Acheron operations
+
+## Implementation Pointers
+
+- Control gateway: `src/server_piai.zig`
+- Node FS handshake: `src/fs_node_main.zig`
