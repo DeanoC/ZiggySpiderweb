@@ -3134,6 +3134,21 @@ const AgentRuntimeRegistry = struct {
         return self.local_fs_node;
     }
 
+    fn copyLocalFsWorkspaceRoot(self: *AgentRuntimeRegistry, allocator: std.mem.Allocator) !?[]u8 {
+        const local_node = self.getLocalFsNode() orelse return null;
+        const roots = try local_node.service.copyExportRootPaths(allocator);
+        if (roots.len == 0) {
+            allocator.free(roots);
+            return null;
+        }
+
+        const selected = roots[0];
+        var idx: usize = 1;
+        while (idx < roots.len) : (idx += 1) allocator.free(roots[idx]);
+        allocator.free(roots);
+        return @as(?[]u8, selected);
+    }
+
     fn rotateAuthToken(self: *AgentRuntimeRegistry, role: ConnectionRole) ![]u8 {
         return self.auth_tokens.rotateRoleToken(role);
     }
@@ -7214,6 +7229,8 @@ fn handleWebSocketConnection(
                             else => return err,
                         };
                         defer target_runtime.release();
+                        const local_fs_workspace_root = try runtime_registry.copyLocalFsWorkspaceRoot(allocator);
+                        defer if (local_fs_workspace_root) |value| allocator.free(value);
                         if (fsrpc == null) {
                             fsrpc = try fsrpc_session.Session.initWithOptions(
                                 allocator,
@@ -7226,6 +7243,7 @@ fn handleWebSocketConnection(
                                     .agents_dir = runtime_registry.runtime_config.agents_dir,
                                     .assets_dir = runtime_registry.runtime_config.assets_dir,
                                     .projects_dir = "projects",
+                                    .local_fs_export_root = local_fs_workspace_root,
                                     .control_plane = &runtime_registry.control_plane,
                                     .is_admin = principal.role == .admin,
                                 },
@@ -7246,6 +7264,7 @@ fn handleWebSocketConnection(
                                         .agents_dir = runtime_registry.runtime_config.agents_dir,
                                         .assets_dir = runtime_registry.runtime_config.assets_dir,
                                         .projects_dir = "projects",
+                                        .local_fs_export_root = local_fs_workspace_root,
                                         .control_plane = &runtime_registry.control_plane,
                                         .is_admin = principal.role == .admin,
                                     },

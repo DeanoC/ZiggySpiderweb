@@ -44,6 +44,7 @@ const SpecialKind = enum {
     mounts_invoke,
     mounts_list,
     mounts_mount,
+    mounts_mkdir,
     mounts_unmount,
     mounts_bind,
     mounts_unbind,
@@ -72,6 +73,7 @@ const debug_stream_log_max_bytes: usize = 2 * 1024 * 1024;
 const max_agent_id_len: usize = 64;
 const max_signal_events: usize = 512;
 const max_chat_runtime_internal_retries: usize = 2;
+const local_fs_world_prefix = "/nodes/local/fs";
 
 const sub_brains_manage_capabilities = [_][]const u8{
     "sub_brains.manage",
@@ -268,6 +270,7 @@ pub const Session = struct {
         agents_dir: []const u8 = "agents",
         assets_dir: []const u8 = "templates",
         projects_dir: []const u8 = "projects",
+        local_fs_export_root: ?[]const u8 = null,
         control_plane: ?*fs_control_plane.ControlPlane = null,
         is_admin: bool = false,
     };
@@ -281,6 +284,7 @@ pub const Session = struct {
     agents_dir: []u8,
     assets_dir: []u8,
     projects_dir: []u8,
+    local_fs_export_root: ?[]u8 = null,
     control_plane: ?*fs_control_plane.ControlPlane = null,
     is_admin: bool = false,
 
@@ -359,6 +363,11 @@ pub const Session = struct {
         errdefer allocator.free(owned_assets_dir);
         const owned_projects_dir = try allocator.dupe(u8, options.projects_dir);
         errdefer allocator.free(owned_projects_dir);
+        const owned_local_fs_export_root = if (options.local_fs_export_root) |value|
+            try allocator.dupe(u8, value)
+        else
+            null;
+        errdefer if (owned_local_fs_export_root) |value| allocator.free(value);
         runtime_handle.retain();
         errdefer runtime_handle.release();
 
@@ -372,6 +381,7 @@ pub const Session = struct {
             .agents_dir = owned_agents_dir,
             .assets_dir = owned_assets_dir,
             .projects_dir = owned_projects_dir,
+            .local_fs_export_root = owned_local_fs_export_root,
             .control_plane = options.control_plane,
             .is_admin = options.is_admin,
         };
@@ -397,6 +407,7 @@ pub const Session = struct {
         self.allocator.free(self.agents_dir);
         self.allocator.free(self.assets_dir);
         self.allocator.free(self.projects_dir);
+        if (self.local_fs_export_root) |value| self.allocator.free(value);
         self.runtime_handle.release();
         self.* = undefined;
     }
@@ -415,6 +426,7 @@ pub const Session = struct {
                 .agents_dir = self.agents_dir,
                 .assets_dir = self.assets_dir,
                 .projects_dir = self.projects_dir,
+                .local_fs_export_root = self.local_fs_export_root,
                 .control_plane = self.control_plane,
                 .is_admin = self.is_admin,
             },
@@ -828,6 +840,7 @@ pub const Session = struct {
             .mounts_invoke,
             .mounts_list,
             .mounts_mount,
+            .mounts_mkdir,
             .mounts_unmount,
             .mounts_bind,
             .mounts_unbind,
@@ -2618,13 +2631,13 @@ pub const Session = struct {
             mounts_dir,
             "Mounts and Binds",
             "{\"kind\":\"service\",\"service_id\":\"mounts\",\"shape\":\"/agents/self/mounts/{README.md,SCHEMA.json,CAPS.json,OPS.json,RUNTIME.json,PERMISSIONS.json,STATUS.json,status.json,result.json,control/*}\"}",
-            "{\"invoke\":true,\"operations\":[\"list\",\"mount\",\"unmount\",\"bind\",\"unbind\",\"resolve\"],\"discoverable\":true,\"project_scope\":true}",
+            "{\"invoke\":true,\"operations\":[\"list\",\"mount\",\"mkdir\",\"unmount\",\"bind\",\"unbind\",\"resolve\"],\"discoverable\":true,\"project_scope\":true}",
             "Manage project mounts and path binds through Acheron control files.",
         );
         _ = try self.addFile(
             mounts_dir,
             "OPS.json",
-            "{\"model\":\"local_bridge\",\"invoke\":\"control/invoke.json\",\"transport\":\"acheron-local\",\"paths\":{\"list\":\"control/list.json\",\"mount\":\"control/mount.json\",\"unmount\":\"control/unmount.json\",\"bind\":\"control/bind.json\",\"unbind\":\"control/unbind.json\",\"resolve\":\"control/resolve.json\"},\"operations\":{\"list\":\"list\",\"mount\":\"mount\",\"unmount\":\"unmount\",\"bind\":\"bind\",\"unbind\":\"unbind\",\"resolve\":\"resolve\"}}",
+            "{\"model\":\"local_bridge\",\"invoke\":\"control/invoke.json\",\"transport\":\"acheron-local\",\"paths\":{\"list\":\"control/list.json\",\"mount\":\"control/mount.json\",\"mkdir\":\"control/mkdir.json\",\"unmount\":\"control/unmount.json\",\"bind\":\"control/bind.json\",\"unbind\":\"control/unbind.json\",\"resolve\":\"control/resolve.json\"},\"operations\":{\"list\":\"list\",\"mount\":\"mount\",\"mkdir\":\"mkdir\",\"unmount\":\"unmount\",\"bind\":\"bind\",\"unbind\":\"unbind\",\"resolve\":\"resolve\"}}",
             false,
             .none,
         );
@@ -2670,13 +2683,14 @@ pub const Session = struct {
         _ = try self.addFile(
             control_dir,
             "README.md",
-            "Use list/mount/unmount/bind/unbind/resolve operation files, or invoke.json with op plus arguments.\nMount and bind operations require project mount permission.\n",
+            "Use list/mount/mkdir/unmount/bind/unbind/resolve operation files, or invoke.json with op plus arguments.\nMount, mkdir, and bind operations require project mount permission.\n",
             false,
             .none,
         );
         _ = try self.addFile(control_dir, "invoke.json", "", true, .mounts_invoke);
         _ = try self.addFile(control_dir, "list.json", "", true, .mounts_list);
         _ = try self.addFile(control_dir, "mount.json", "", true, .mounts_mount);
+        _ = try self.addFile(control_dir, "mkdir.json", "", true, .mounts_mkdir);
         _ = try self.addFile(control_dir, "unmount.json", "", true, .mounts_unmount);
         _ = try self.addFile(control_dir, "bind.json", "", true, .mounts_bind);
         _ = try self.addFile(control_dir, "unbind.json", "", true, .mounts_unbind);
@@ -6047,6 +6061,7 @@ pub const Session = struct {
     const MountsOp = enum {
         list,
         mount,
+        mkdir,
         unmount,
         bind,
         unbind,
@@ -6066,6 +6081,7 @@ pub const Session = struct {
         const op = switch (special) {
             .mounts_list => MountsOp.list,
             .mounts_mount => MountsOp.mount,
+            .mounts_mkdir => MountsOp.mkdir,
             .mounts_unmount => MountsOp.unmount,
             .mounts_bind => MountsOp.bind,
             .mounts_unbind => MountsOp.unbind,
@@ -6101,11 +6117,78 @@ pub const Session = struct {
         const value = std.mem.trim(u8, raw, " \t\r\n");
         if (std.mem.eql(u8, value, "list")) return .list;
         if (std.mem.eql(u8, value, "mount")) return .mount;
+        if (std.mem.eql(u8, value, "mkdir") or std.mem.eql(u8, value, "create_folder")) return .mkdir;
         if (std.mem.eql(u8, value, "unmount")) return .unmount;
         if (std.mem.eql(u8, value, "bind")) return .bind;
         if (std.mem.eql(u8, value, "unbind")) return .unbind;
         if (std.mem.eql(u8, value, "resolve")) return .resolve;
         return null;
+    }
+
+    fn normalizeLocalFsRelativePath(self: *Session, raw_path: []const u8) ![]u8 {
+        var path = std.mem.trim(u8, raw_path, " \t\r\n");
+        if (path.len == 0) return error.InvalidPayload;
+
+        if (std.mem.startsWith(u8, path, local_fs_world_prefix)) {
+            path = path[local_fs_world_prefix.len..];
+            if (path.len == 0) return error.InvalidPayload;
+            if (path[0] != '/') return error.InvalidPayload;
+            path = path[1..];
+        } else if (path[0] == '/') {
+            return error.InvalidPayload;
+        }
+
+        var normalized = std.ArrayListUnmanaged(u8){};
+        errdefer normalized.deinit(self.allocator);
+
+        var token_it = std.mem.tokenizeAny(u8, path, "/\\");
+        var first = true;
+        while (token_it.next()) |segment| {
+            if (segment.len == 0) continue;
+            if (std.mem.eql(u8, segment, ".") or std.mem.eql(u8, segment, "..")) return error.InvalidPayload;
+            if (std.mem.indexOfScalar(u8, segment, ':') != null) return error.InvalidPayload;
+            if (!first) try normalized.append(self.allocator, '/');
+            first = false;
+            try normalized.appendSlice(self.allocator, segment);
+        }
+
+        if (normalized.items.len == 0) return error.InvalidPayload;
+        return normalized.toOwnedSlice(self.allocator);
+    }
+
+    fn buildLocalFsWorldPath(allocator: std.mem.Allocator, relative_path: []const u8) ![]u8 {
+        return std.fmt.allocPrint(allocator, "{s}/{s}", .{ local_fs_world_prefix, relative_path });
+    }
+
+    fn pathExistsAsDirectory(path: []const u8) !bool {
+        if (std.fs.path.isAbsolute(path)) {
+            var dir = std.fs.openDirAbsolute(path, .{}) catch |err| switch (err) {
+                error.FileNotFound => return false,
+                else => return err,
+            };
+            defer dir.close();
+            return true;
+        }
+
+        var dir = std.fs.cwd().openDir(path, .{}) catch |err| switch (err) {
+            error.FileNotFound => return false,
+            else => return err,
+        };
+        defer dir.close();
+        return true;
+    }
+
+    fn ensurePathExists(path: []const u8) !void {
+        if (path.len == 0) return error.InvalidPath;
+        if (std.fs.path.isAbsolute(path)) {
+            var root_dir = try std.fs.openDirAbsolute("/", .{});
+            defer root_dir.close();
+            const rel_path = std.mem.trimLeft(u8, path, "/");
+            if (rel_path.len == 0) return;
+            try root_dir.makePath(rel_path);
+            return;
+        }
+        try std.fs.cwd().makePath(path);
     }
 
     fn executeMountsOp(self: *Session, op: MountsOp, args_obj: std.json.ObjectMap, written: usize) !WriteOutcome {
@@ -6226,6 +6309,41 @@ pub const Session = struct {
                 defer self.allocator.free(result);
                 try self.refreshProjectBindsFromControlPlane();
                 return self.buildMountsSuccessResultJson(op, result);
+            },
+            .mkdir => {
+                if (!self.projectAllowsAction(.mount)) return error.AccessDenied;
+                const path = extractOptionalStringByNames(args_obj, &[_][]const u8{ "path", "folder", "relative_path" }) orelse return error.InvalidPayload;
+                const local_root = self.local_fs_export_root orelse return error.InvalidPayload;
+                const relative_path = try self.normalizeLocalFsRelativePath(path);
+                defer self.allocator.free(relative_path);
+                const host_path = try std.fs.path.join(self.allocator, &.{ local_root, relative_path });
+                defer self.allocator.free(host_path);
+
+                const exists_before = pathExistsAsDirectory(host_path) catch |err| switch (err) {
+                    error.NotDir => return error.InvalidPayload,
+                    else => return err,
+                };
+                if (!exists_before) {
+                    ensurePathExists(host_path) catch |err| switch (err) {
+                        error.PathAlreadyExists,
+                        error.NotDir,
+                        error.AccessDenied,
+                        => return error.InvalidPayload,
+                        else => return err,
+                    };
+                }
+
+                const world_path = try buildLocalFsWorldPath(self.allocator, relative_path);
+                defer self.allocator.free(world_path);
+                const escaped_world_path = try unified.jsonEscape(self.allocator, world_path);
+                defer self.allocator.free(escaped_world_path);
+                const detail = try std.fmt.allocPrint(
+                    self.allocator,
+                    "{{\"path\":\"{s}\",\"created\":{}}}",
+                    .{ escaped_world_path, !exists_before },
+                );
+                defer self.allocator.free(detail);
+                return self.buildMountsSuccessResultJson(op, detail);
             },
             .resolve => {
                 const path = extractOptionalStringByNames(args_obj, &[_][]const u8{ "path", "mount_path", "bind_path" }) orelse return error.InvalidPayload;
@@ -6399,6 +6517,7 @@ pub const Session = struct {
         return switch (op) {
             .list => "list",
             .mount => "mount",
+            .mkdir => "mkdir",
             .unmount => "unmount",
             .bind => "bind",
             .unbind => "unbind",
@@ -6410,6 +6529,7 @@ pub const Session = struct {
         return switch (op) {
             .list => "mounts_list",
             .mount => "mounts_mount",
+            .mkdir => "mounts_mkdir",
             .unmount => "mounts_unmount",
             .bind => "mounts_bind",
             .unbind => "mounts_unbind",
@@ -8652,7 +8772,7 @@ fn defaultGlobalLibraryTopicMemoryWorkflows() []const u8 {
 
 fn defaultGlobalLibraryTopicProjectMountsAndBinds() []const u8 {
     return "# Project Mounts and Binds\n\n" ++
-        "Use `/agents/self/mounts/control/mount.json` and `unmount.json` for project mounts.\n" ++
+        "Use `/agents/self/mounts/control/mount.json`, `mkdir.json`, and `unmount.json` for project mounts.\n" ++
         "Use `/agents/self/mounts/control/bind.json` and `resolve.json` for stable project paths.\n";
 }
 
@@ -11119,6 +11239,106 @@ test "fsrpc_session: mounts namespace manages mount bind and resolve operations"
         870,
     );
     defer allocator.free(repo_listing);
+}
+
+test "fsrpc_session: mounts namespace mkdir creates local export folders" {
+    const allocator = std.testing.allocator;
+
+    var control_plane = fs_control_plane.ControlPlane.init(allocator);
+    defer control_plane.deinit();
+
+    const project_json = try control_plane.createProject("{\"name\":\"MountMkdir\",\"vision\":\"MountMkdir\"}");
+    defer allocator.free(project_json);
+    var project_parsed = try std.json.parseFromSlice(std.json.Value, allocator, project_json, .{});
+    defer project_parsed.deinit();
+    const project_id = project_parsed.value.object.get("project_id").?.string;
+    const project_token = project_parsed.value.object.get("project_token").?.string;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const local_export_root = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(local_export_root);
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "default",
+        .{
+            .project_id = project_id,
+            .project_token = project_token,
+            .control_plane = &control_plane,
+            .local_fs_export_root = local_export_root,
+        },
+    );
+    defer session.deinit();
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        170,
+        171,
+        &.{ "agents", "self", "mounts", "control", "mkdir.json" },
+        "{\"path\":\"new-project/workspace\"}",
+        875,
+    );
+
+    const created_payload = try protocolReadFile(
+        &session,
+        allocator,
+        172,
+        173,
+        &.{ "agents", "self", "mounts", "result.json" },
+        876,
+    );
+    defer allocator.free(created_payload);
+    try std.testing.expect(std.mem.indexOf(u8, created_payload, "\"operation\":\"mkdir\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, created_payload, "\"path\":\"/nodes/local/fs/new-project/workspace\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, created_payload, "\"created\":true") != null);
+
+    const created_host_path = try std.fs.path.join(allocator, &.{ local_export_root, "new-project", "workspace" });
+    defer allocator.free(created_host_path);
+    var created_dir = try std.fs.openDirAbsolute(created_host_path, .{});
+    created_dir.close();
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        174,
+        175,
+        &.{ "agents", "self", "mounts", "control", "mkdir.json" },
+        "{\"path\":\"/nodes/local/fs/new-project/workspace\"}",
+        877,
+    );
+
+    const existing_payload = try protocolReadFile(
+        &session,
+        allocator,
+        176,
+        177,
+        &.{ "agents", "self", "mounts", "result.json" },
+        878,
+    );
+    defer allocator.free(existing_payload);
+    try std.testing.expect(std.mem.indexOf(u8, existing_payload, "\"created\":false") != null);
+
+    const invalid_response = try protocolWriteFileExpectError(
+        &session,
+        allocator,
+        178,
+        179,
+        &.{ "agents", "self", "mounts", "control", "mkdir.json" },
+        "{\"path\":\"../escape\"}",
+        879,
+        "invalid",
+    );
+    defer allocator.free(invalid_response);
 }
 
 test "fsrpc_session: node services namespace prefers control-plane catalog" {
