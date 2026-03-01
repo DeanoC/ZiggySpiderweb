@@ -2952,27 +2952,30 @@ const AgentRuntimeRegistry = struct {
         else
             false;
 
+        var effective_runtime_config = runtime_config;
+        effective_runtime_config.default_agent_id = effective_default;
+
         var registry: AgentRuntimeRegistry = .{
             .allocator = allocator,
-            .runtime_config = runtime_config,
+            .runtime_config = effective_runtime_config,
             .provider_config = provider_config,
             .default_agent_id = effective_default,
             .max_runtimes = if (max_runtimes == 0) 1 else max_runtimes,
             .debug_stream_sink = debug_stream_sink,
             .control_plane = fs_control_plane.ControlPlane.initWithPersistenceOptions(
                 allocator,
-                runtime_config.ltm_directory,
-                runtime_config.ltm_filename,
+                effective_runtime_config.ltm_directory,
+                effective_runtime_config.ltm_filename,
                 .{
                     .primary_agent_id = system_agent_id,
-                    .spider_web_root = runtime_config.spider_web_root,
+                    .spider_web_root = effective_runtime_config.spider_web_root,
                 },
             ),
             .job_index = chat_job_index.ChatJobIndex.init(
                 allocator,
-                runtime_config.ltm_directory,
+                effective_runtime_config.ltm_directory,
             ),
-            .auth_tokens = AuthTokenStore.init(allocator, runtime_config),
+            .auth_tokens = AuthTokenStore.init(allocator, effective_runtime_config),
             .control_operator_token = operator_token,
             .control_project_scope_token = project_scope_token,
             .control_node_scope_token = node_scope_token,
@@ -3190,7 +3193,7 @@ const AgentRuntimeRegistry = struct {
     }
 
     fn isBootstrapMotherOnlyState(self: *AgentRuntimeRegistry) bool {
-        return !self.hasNonSystemProject() and !self.hasNonSystemAgent();
+        return !self.hasNonSystemProject() or !self.hasNonSystemAgent();
     }
 
     fn agentExists(self: *AgentRuntimeRegistry, agent_id: []const u8) bool {
