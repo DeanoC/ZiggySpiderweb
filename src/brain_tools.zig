@@ -291,7 +291,8 @@ pub const Engine = struct {
         const chat_reply_content = extractChatReplyContentForWorldTool(tool_name, args);
         if (chat_reply_content) |reply| {
             const synthetic_payload = try buildSyntheticChatReplyPayload(self.allocator, args, reply);
-            errdefer self.allocator.free(synthetic_payload);
+            var synthetic_payload_owned = true;
+            errdefer if (synthetic_payload_owned) self.allocator.free(synthetic_payload);
 
             if (tool_call_id) |call_id| {
                 var wrapped_buf = std.ArrayListUnmanaged(u8){};
@@ -303,6 +304,7 @@ pub const Engine = struct {
                 try wrapped_buf.append(self.allocator, '}');
                 const wrapped = try wrapped_buf.toOwnedSlice(self.allocator);
                 self.allocator.free(synthetic_payload);
+                synthetic_payload_owned = false;
                 return self.success(tool_name, wrapped);
             }
             return self.success(tool_name, synthetic_payload);
@@ -665,7 +667,8 @@ pub const Engine = struct {
         // Include persisted LTM records so memory_search still works after restart.
         if (emitted < limit) {
             if (self.runtime_memory.persisted_store) |store| {
-                const persisted_fanout_limit = std.math.mul(usize, @max(limit, 1), 4) catch std.math.maxInt(usize);
+                const persisted_fanout_base = @max(limit, 1);
+                const persisted_fanout_limit = std.math.mul(usize, persisted_fanout_base, 4) catch persisted_fanout_base;
                 const persisted_hits = store.search(self.allocator, query, persisted_fanout_limit) catch |err| {
                     return self.failure(tool_name, "execution_failed", @errorName(err));
                 };

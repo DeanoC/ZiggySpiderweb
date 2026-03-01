@@ -7811,10 +7811,11 @@ pub const Session = struct {
             const marker = "/agents/self/events/sources/time/after/";
             const token = path[prefix_index + marker.len ..];
             const delay_ms = try self.parseWaitSelectorMillis(token);
+            const target_time_ms = std.math.add(i64, std.time.milliTimestamp(), delay_ms) catch return error.InvalidPayload;
             return .{
                 .raw_path = try self.allocator.dupe(u8, path),
                 .kind = .time_after,
-                .target_time_ms = std.time.milliTimestamp() + delay_ms,
+                .target_time_ms = target_time_ms,
             };
         }
         if (std.mem.indexOf(u8, path, "/agents/self/events/sources/time/at/")) |prefix_index| {
