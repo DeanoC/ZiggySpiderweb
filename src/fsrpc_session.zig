@@ -6610,7 +6610,8 @@ pub const Session = struct {
         };
 
         var new_sub = try self.parseSubBrainConfigFromObject(config_obj);
-        errdefer new_sub.deinit(self.allocator);
+        var new_sub_owned = true;
+        errdefer if (new_sub_owned) new_sub.deinit(self.allocator);
 
         var config = try self.loadOrInitSelfAgentConfig();
         defer config.deinit();
@@ -6618,10 +6619,12 @@ pub const Session = struct {
         if (config.sub_brains.getPtr(brain_name)) |existing| {
             existing.deinit(self.allocator);
             existing.* = new_sub;
+            new_sub_owned = false;
         } else {
             const key = try self.allocator.dupe(u8, brain_name);
             errdefer self.allocator.free(key);
             try config.sub_brains.put(self.allocator, key, new_sub);
+            new_sub_owned = false;
         }
 
         try std.fs.cwd().makePath(self.agents_dir);
