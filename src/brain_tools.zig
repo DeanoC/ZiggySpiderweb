@@ -296,6 +296,7 @@ pub const Engine = struct {
             if (tool_call_id) |call_id| {
                 var wrapped_buf = std.ArrayListUnmanaged(u8){};
                 defer wrapped_buf.deinit(self.allocator);
+                defer self.allocator.free(synthetic_payload);
                 try wrapped_buf.appendSlice(self.allocator, "{\"tool_call_id\":\"");
                 try appendJsonEscaped(self.allocator, &wrapped_buf, call_id);
                 try wrapped_buf.appendSlice(self.allocator, "\",\"result\":");

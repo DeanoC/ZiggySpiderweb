@@ -2718,7 +2718,7 @@ pub const RuntimeServer = struct {
             const thought_text = if (assistant.thinking.len > 0) assistant.thinking else assistant.text;
             const thought_source = if (assistant.thinking.len > 0) "thinking" else "text";
             const thought_trimmed = std.mem.trim(u8, thought_text, " \t\r\n");
-            if (thought_trimmed.len > 0) {
+            if (job.emit_debug and thought_trimmed.len > 0) {
                 const thought_frame = try self.buildThoughtFrame(job.request_id, thought_trimmed, thought_source, round);
                 try debug_frames.append(self.allocator, thought_frame);
             }
