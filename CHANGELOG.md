@@ -36,5 +36,5 @@ All notable changes to this project are documented in this file.
 - Added long-running soak/chaos harness: `test-distributed-soak-chaos.sh`.
 
 ### Docs
-- Updated migration guidance in `docs/UNIFIED_V2_FS_MIGRATION.md`.
+- Updated migration guidance in `docs/protocols/unified-v2-fs-migration.md`.
 - Updated `README.md` and `test-env/README.md` for auth, metrics, health, and new test targets.
