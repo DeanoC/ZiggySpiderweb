@@ -53,7 +53,7 @@ pub fn main() !void {
                 .runtime_request_queue_max = 128,
                 .chat_operation_timeout_ms = 120_000,
                 .control_operation_timeout_ms = 5_000,
-                .default_agent_id = try allocator.dupe(u8, "default"),
+                .default_agent_id = try allocator.dupe(u8, "mother"),
                 .ltm_directory = try allocator.dupe(u8, ".spiderweb-ltm"),
                 .ltm_filename = try allocator.dupe(u8, "runtime-memory.db"),
             },

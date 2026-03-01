@@ -521,6 +521,20 @@ fi
 # Ensure remaining install steps run from the spiderweb repo.
 cd "$REPO_DIR"
 
+# Ensure Mother system agent scaffold exists.
+log_info "Ensuring Mother system agent scaffold..."
+mkdir -p "$REPO_DIR/agents/mother"
+if [[ ! -f "$REPO_DIR/agents/mother/agent.json" ]]; then
+cat > "$REPO_DIR/agents/mother/agent.json" <<'EOF'
+{
+  "name": "Mother",
+  "description": "System orchestration and bootstrap guardian",
+  "is_default": true,
+  "capabilities": ["chat","plan","code","research"]
+}
+EOF
+fi
+
 # Ask about systemd service
 INSTALL_SYSTEMD=false
 SYSTEMD_SCOPE="user"
@@ -624,7 +638,7 @@ echo ""
 if [[ -n "${SPIDERWEB_NON_INTERACTIVE:-}" ]]; then
     # Non-interactive mode - skip first-run, user should run manually
     log_info "Skipping interactive first-time setup (non-interactive mode)"
-    log_info "Run 'spiderweb-config first-run' manually to configure your agent"
+    log_info "Run 'spiderweb-config first-run' manually to configure provider/auth"
 else
     # Clear any leftover input before running first-run
     while IFS= read -r -t 0.1 dummy 2>/dev/null; do : ; done

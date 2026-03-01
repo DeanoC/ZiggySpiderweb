@@ -63,14 +63,12 @@ pub const AgentRegistry = struct {
         self.agents.clearRetainingCapacity();
 
         // Try to open agents/ directory
-        const agents_dir_path = try std.fs.path.join(self.allocator, &.{ self.base_dir, self.agents_dir_rel });
+        const agents_dir_path = try self.resolveAgentsDirPath();
         defer self.allocator.free(agents_dir_path);
 
         var agents_dir = std.fs.cwd().openDir(agents_dir_path, .{ .iterate = true }) catch |err| {
             if (err == error.FileNotFound) {
-                // No agents directory - we're in first-boot state
-                // Don't create anything yet - wait for client to trigger first boot
-                try self.loadDefaultAgent();
+                // No agents directory yet - first-boot state with no provisioned agents.
                 return;
             }
             return err;
@@ -78,69 +76,41 @@ pub const AgentRegistry = struct {
         defer agents_dir.close();
 
         var has_default = false;
+        var mother_index: ?usize = null;
         var it = agents_dir.iterate();
         while (try it.next()) |entry| {
             if (entry.kind != .directory) continue;
 
             const agent = try self.loadAgent(entry.name, agents_dir_path);
+            if (std.mem.eql(u8, agent.id, "mother")) {
+                mother_index = self.agents.items.len;
+            }
             if (agent.is_default) {
                 has_default = true;
             }
             try self.agents.append(self.allocator, agent);
         }
 
-        // If no agent marked as default, mark first one
+        // If no agent is marked as default, prefer Mother and otherwise the first agent.
         if (!has_default and self.agents.items.len > 0) {
-            self.agents.items[0].is_default = true;
-        }
-
-        // If no agents found, create default
-        if (self.agents.items.len == 0) {
-            try self.loadDefaultAgent();
+            if (mother_index) |idx| {
+                self.agents.items[idx].is_default = true;
+            } else {
+                self.agents.items[0].is_default = true;
+            }
         }
     }
 
-    /// Check if server is in first-boot state (no real agents exist yet)
+    /// Check if server is in first-boot state (no provisioned agents exist yet).
+    /// Call `scan()` before this check.
     pub fn isFirstBoot(self: *const AgentRegistry) bool {
-        // First boot if only the in-memory default agent exists
-        // Distinguish synthetic placeholder from real agent by checking if agents/ has any subdirectories
-        const len_ok = self.agents.items.len == 1;
-        const id_ok = len_ok and std.mem.eql(u8, self.agents.items[0].id, "default");
-        const identity_ok = len_ok and !self.agents.items[0].identity_loaded;
-        const needs_hatching_ok = len_ok and !self.agents.items[0].needs_hatching;
-
-        // The key check: synthetic placeholder has no agent subdirectories in agents/
-        // Real agents have at least one subdirectory (even if hatched with no identity files yet)
-        const agents_dir_path = std.fs.path.join(self.allocator, &.{ self.base_dir, self.agents_dir_rel }) catch return false;
-        defer self.allocator.free(agents_dir_path);
-
-        var has_agent_subdirs = false;
-        var agents_dir = std.fs.cwd().openDir(agents_dir_path, .{ .iterate = true }) catch |err| blk: {
-            if (err == error.FileNotFound) {
-                // Directory doesn't exist = definitely first boot
-                break :blk null;
-            }
-            return false;
-        };
-        if (agents_dir) |*dir| {
-            defer dir.close(); // P1 fix: close the handle
-            var it = dir.iterate();
-            while (it.next() catch null) |entry| {
-                if (entry.kind == .directory) {
-                    has_agent_subdirs = true;
-                    break;
-                }
-            }
-        }
-
-        // First boot = only synthetic placeholder in memory, no agent subdirectories
-        return len_ok and id_ok and identity_ok and needs_hatching_ok and !has_agent_subdirs;
+        return self.agents.items.len == 0;
     }
 
     /// Initialize first agent on first boot
     pub fn initializeFirstAgent(self: *AgentRegistry, agent_id: []const u8, template_path: ?[]const u8) !void {
         // Create the agents directory
-        const agents_dir_path = try std.fs.path.join(self.allocator, &.{ self.base_dir, "agents" });
+        const agents_dir_path = try self.resolveAgentsDirPath();
         defer self.allocator.free(agents_dir_path);
 
         try std.fs.cwd().makePath(agents_dir_path);
@@ -309,7 +279,9 @@ pub const AgentRegistry = struct {
 
     /// Read HATCH.md content if it exists
     pub fn readHatchFile(self: *AgentRegistry, agent_id: []const u8) !?[]u8 {
-        const agent_path = try std.fs.path.join(self.allocator, &.{ self.base_dir, "agents", agent_id });
+        const agents_dir_path = try self.resolveAgentsDirPath();
+        defer self.allocator.free(agents_dir_path);
+        const agent_path = try std.fs.path.join(self.allocator, &.{ agents_dir_path, agent_id });
         defer self.allocator.free(agent_path);
 
         const hatch_path = try std.fs.path.join(self.allocator, &.{ agent_path, "HATCH.md" });
@@ -332,7 +304,9 @@ pub const AgentRegistry = struct {
         defer self.allocator.free(template_source);
 
         // Create agent directory
-        const agent_path = try std.fs.path.join(self.allocator, &.{ self.base_dir, self.agents_dir_rel, agent_id });
+        const agents_dir_path = try self.resolveAgentsDirPath();
+        defer self.allocator.free(agents_dir_path);
+        const agent_path = try std.fs.path.join(self.allocator, &.{ agents_dir_path, agent_id });
         defer self.allocator.free(agent_path);
 
         try std.fs.cwd().makePath(agent_path);
@@ -352,7 +326,9 @@ pub const AgentRegistry = struct {
 
     /// Complete hatching - delete HATCH.md and update agent
     pub fn completeHatching(self: *AgentRegistry, agent_id: []const u8) !void {
-        const agent_path = try std.fs.path.join(self.allocator, &.{ self.base_dir, self.agents_dir_rel, agent_id });
+        const agents_dir_path = try self.resolveAgentsDirPath();
+        defer self.allocator.free(agents_dir_path);
+        const agent_path = try std.fs.path.join(self.allocator, &.{ agents_dir_path, agent_id });
         defer self.allocator.free(agent_path);
 
         // Delete HATCH.md
@@ -369,13 +345,17 @@ pub const AgentRegistry = struct {
 
     fn loadDefaultHatchTemplate(self: *AgentRegistry) ![]u8 {
         // Try to load from templates/ first, then fallback to agents/ (legacy)
-        const templates_path = try std.fs.path.join(self.allocator, &.{ self.base_dir, self.assets_dir_rel, "HATCH.template.md" });
+        const assets_dir_path = try self.resolveAssetsDirPath();
+        defer self.allocator.free(assets_dir_path);
+        const templates_path = try std.fs.path.join(self.allocator, &.{ assets_dir_path, "HATCH.template.md" });
         defer self.allocator.free(templates_path);
 
         if (std.fs.cwd().readFileAlloc(self.allocator, templates_path, 64 * 1024)) |content| {
             return content;
         } else |_| {
-            const legacy_path = try std.fs.path.join(self.allocator, &.{ self.base_dir, self.agents_dir_rel, "HATCH.template.md" });
+            const agents_dir_path = try self.resolveAgentsDirPath();
+            defer self.allocator.free(agents_dir_path);
+            const legacy_path = try std.fs.path.join(self.allocator, &.{ agents_dir_path, "HATCH.template.md" });
             defer self.allocator.free(legacy_path);
 
             return std.fs.cwd().readFileAlloc(self.allocator, legacy_path, 64 * 1024) catch {
@@ -392,6 +372,14 @@ pub const AgentRegistry = struct {
                     "You won't need it again.\n");
             };
         }
+    }
+
+    fn resolveAgentsDirPath(self: *const AgentRegistry) ![]u8 {
+        return resolveConfiguredPath(self.allocator, self.base_dir, self.agents_dir_rel);
+    }
+
+    fn resolveAssetsDirPath(self: *const AgentRegistry) ![]u8 {
+        return resolveConfiguredPath(self.allocator, self.base_dir, self.assets_dir_rel);
     }
 
     fn extractNameFromIdentity(self: *AgentRegistry, agent_path: []const u8) !?[]u8 {
@@ -437,23 +425,6 @@ pub const AgentRegistry = struct {
         return null;
     }
 
-    fn loadDefaultAgent(self: *AgentRegistry) !void {
-        var capabilities = std.ArrayListUnmanaged(AgentCapability){};
-        try capabilities.append(self.allocator, .chat);
-
-        const agent = AgentInfo{
-            .id = try self.allocator.dupe(u8, "default"),
-            .name = try self.allocator.dupe(u8, "Assistant"),
-            .description = try self.allocator.dupe(u8, "General purpose AI assistant"),
-            .is_default = true,
-            .capabilities = capabilities,
-            .identity_loaded = false,
-            .needs_hatching = false,
-        };
-
-        try self.agents.append(self.allocator, agent);
-    }
-
     /// Get all agents
     pub fn listAgents(self: *const AgentRegistry) []const AgentInfo {
         return self.agents.items;
@@ -483,10 +454,58 @@ pub const AgentRegistry = struct {
     }
 };
 
+fn resolveConfiguredPath(allocator: std.mem.Allocator, base_dir: []const u8, configured_path: []const u8) ![]u8 {
+    if (std.fs.path.isAbsolute(configured_path)) {
+        return allocator.dupe(u8, configured_path);
+    }
+    return std.fs.path.join(allocator, &.{ base_dir, configured_path });
+}
+
 fn parseCapability(str: []const u8) !AgentCapability {
     if (std.mem.eql(u8, str, "chat")) return .chat;
     if (std.mem.eql(u8, str, "code")) return .code;
     if (std.mem.eql(u8, str, "plan")) return .plan;
     if (std.mem.eql(u8, str, "research")) return .research;
     return error.UnknownCapability;
+}
+
+test "agent_registry: scan supports absolute agents_dir path" {
+    const allocator = std.testing.allocator;
+    const nonce = std.crypto.random.int(u64);
+    const rel_root = try std.fmt.allocPrint(allocator, ".tmp-agent-registry-abs-{d}", .{nonce});
+    defer allocator.free(rel_root);
+    defer std.fs.cwd().deleteTree(rel_root) catch {};
+    try std.fs.cwd().makePath(rel_root);
+
+    const abs_root = try std.fs.cwd().realpathAlloc(allocator, rel_root);
+    defer allocator.free(abs_root);
+    const abs_agents_dir = try std.fs.path.join(allocator, &.{ abs_root, "agents" });
+    defer allocator.free(abs_agents_dir);
+    try std.fs.cwd().makePath(abs_agents_dir);
+
+    const mother_dir = try std.fs.path.join(allocator, &.{ abs_agents_dir, "mother" });
+    defer allocator.free(mother_dir);
+    try std.fs.cwd().makePath(mother_dir);
+    const mother_json_path = try std.fs.path.join(allocator, &.{ mother_dir, "agent.json" });
+    defer allocator.free(mother_json_path);
+    try std.fs.cwd().writeFile(.{
+        .sub_path = mother_json_path,
+        .data =
+        \\{
+        \\  "name": "Mother",
+        \\  "description": "Primary orchestrator",
+        \\  "is_default": true,
+        \\  "capabilities": ["chat","plan"]
+        \\}
+        ,
+    });
+
+    var registry = AgentRegistry.init(allocator, ".", abs_agents_dir, abs_root);
+    defer registry.deinit();
+    try registry.scan();
+    try std.testing.expect(registry.listAgents().len == 1);
+    const mother = registry.getAgent("mother");
+    try std.testing.expect(mother != null);
+    try std.testing.expect(mother.?.is_default);
+    try std.testing.expectEqualStrings("Mother", mother.?.name);
 }

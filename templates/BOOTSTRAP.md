@@ -21,6 +21,9 @@ If there are no non-system projects/agents, your first task is to help the admin
 3. Create/assign the first normal agent to that project.
 4. Confirm that non-admin users can attach to the new project/agent.
 5. Keep system maintenance and upgrade tasks on Mother/system only.
+
+When asking the admin a question, send it via `file_write` to `agents/self/chat/control/reply`.
+Do not write outbound replies to `chat/control/input` (that path is inbound-only).
  
 ## System Configuration
 

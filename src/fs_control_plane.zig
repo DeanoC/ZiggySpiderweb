@@ -42,6 +42,8 @@ pub const ControlPlaneError = error{
     ProjectPolicyForbidden,
     MountConflict,
     MountNotFound,
+    BindConflict,
+    BindNotFound,
 };
 
 pub const ProjectAction = enum {
@@ -215,6 +217,17 @@ const ProjectMount = struct {
     }
 };
 
+const ProjectBind = struct {
+    bind_path: []u8,
+    target_path: []u8,
+
+    fn deinit(self: *ProjectBind, allocator: std.mem.Allocator) void {
+        allocator.free(self.bind_path);
+        allocator.free(self.target_path);
+        self.* = undefined;
+    }
+};
+
 const Project = struct {
     id: []u8,
     name: []u8,
@@ -228,6 +241,7 @@ const Project = struct {
     created_at_ms: i64,
     updated_at_ms: i64,
     mounts: std.ArrayListUnmanaged(ProjectMount) = .{},
+    binds: std.ArrayListUnmanaged(ProjectBind) = .{},
 
     fn deinit(self: *Project, allocator: std.mem.Allocator) void {
         allocator.free(self.id);
@@ -238,6 +252,8 @@ const Project = struct {
         self.access_policy.deinit(allocator);
         for (self.mounts.items) |*mount| mount.deinit(allocator);
         self.mounts.deinit(allocator);
+        for (self.binds.items) |*bind| bind.deinit(allocator);
+        self.binds.deinit(allocator);
         self.* = undefined;
     }
 };
@@ -452,6 +468,21 @@ pub const ControlPlane = struct {
             changed = true;
         }
 
+        if (self.active_project_by_agent.getPtr(self.primary_agent_id)) |existing| {
+            if (!std.mem.eql(u8, existing.*, spider_web_project_id)) {
+                self.allocator.free(existing.*);
+                existing.* = try self.allocator.dupe(u8, spider_web_project_id);
+                changed = true;
+            }
+        } else {
+            try self.active_project_by_agent.put(
+                self.allocator,
+                try self.allocator.dupe(u8, self.primary_agent_id),
+                try self.allocator.dupe(u8, spider_web_project_id),
+            );
+            changed = true;
+        }
+
         if (changed and self.store != null) self.persistSnapshotBestEffortLocked();
     }
 
@@ -513,6 +544,11 @@ pub const ControlPlane = struct {
                 }
                 if (std.mem.eql(u8, existing.mount_path, normalized) and std.mem.eql(u8, existing.node_id, node_id)) {
                     existing_for_node = mount_idx;
+                }
+            }
+            for (project.binds.items) |existing_bind| {
+                if (pathsConflict(existing_bind.bind_path, normalized)) {
+                    return ControlPlaneError.MountConflict;
                 }
             }
 
@@ -1269,12 +1305,12 @@ pub const ControlPlane = struct {
         const obj = payload.value.object;
 
         const name_raw = getRequiredString(obj, "name") catch return ControlPlaneError.MissingField;
-        const vision_raw = getOptionalString(obj, "vision") orelse "";
+        const vision_raw = getRequiredString(obj, "vision") catch return ControlPlaneError.MissingField;
         const status_raw = getOptionalString(obj, "status") orelse "active";
         const now = std.time.milliTimestamp();
         try validateDisplayString(name_raw, 128);
         try validateIdentifier(status_raw, 64);
-        try validateDisplayStringAllowEmpty(vision_raw, 1024);
+        try validateDisplayString(vision_raw, 1024);
 
         var access_policy: ProjectAccessPolicy = .{};
         errdefer access_policy.deinit(self.allocator);
@@ -1345,7 +1381,7 @@ pub const ControlPlane = struct {
             project.name = try self.allocator.dupe(u8, value);
         }
         if (next_vision) |value| {
-            try validateDisplayStringAllowEmpty(value, 1024);
+            try validateDisplayString(value, 1024);
             self.allocator.free(project.vision);
             project.vision = try self.allocator.dupe(u8, value);
         }
@@ -1425,6 +1461,32 @@ pub const ControlPlane = struct {
         return out.toOwnedSlice(self.allocator);
     }
 
+    /// Resolve a deterministic "first" agent for a project from active bindings.
+    /// Current ordering is lexical `agent_id` to keep selection stable across restarts.
+    pub fn firstProjectAgent(self: *ControlPlane, project_id: []const u8, include_primary: bool) !?[]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        _ = self.reapExpiredLeasesLocked(std.time.milliTimestamp());
+        if (!self.projects.contains(project_id)) return ControlPlaneError.ProjectNotFound;
+
+        var selected: ?[]const u8 = null;
+        var it = self.active_project_by_agent.iterator();
+        while (it.next()) |entry| {
+            const agent_id = entry.key_ptr.*;
+            const active_project = entry.value_ptr.*;
+            if (!std.mem.eql(u8, active_project, project_id)) continue;
+            if (!include_primary and std.mem.eql(u8, agent_id, self.primary_agent_id)) continue;
+            if (selected == null or std.mem.lessThan(u8, agent_id, selected.?)) {
+                selected = agent_id;
+            }
+        }
+        if (selected) |agent_id| {
+            const owned = try self.allocator.dupe(u8, agent_id);
+            return owned;
+        }
+        return null;
+    }
+
     pub fn getProject(self: *ControlPlane, payload_json: ?[]const u8) ![]u8 {
         return self.getProjectWithRole(payload_json, false);
     }
@@ -1485,6 +1547,9 @@ pub const ControlPlane = struct {
                 continue;
             }
             if (mountPathsOverlap(existing.mount_path, mount_path)) return ControlPlaneError.MountConflict;
+        }
+        for (project.binds.items) |existing_bind| {
+            if (pathsConflict(existing_bind.bind_path, mount_path)) return ControlPlaneError.MountConflict;
         }
 
         try project.mounts.append(self.allocator, .{
@@ -1594,6 +1659,179 @@ pub const ControlPlane = struct {
         return out.toOwnedSlice(self.allocator);
     }
 
+    pub fn setProjectBind(self: *ControlPlane, payload_json: ?[]const u8) ![]u8 {
+        return self.setProjectBindWithRole(payload_json, false);
+    }
+
+    pub fn setProjectBindWithRole(self: *ControlPlane, payload_json: ?[]const u8, is_admin: bool) ![]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        _ = self.reapExpiredLeasesLocked(std.time.milliTimestamp());
+
+        var payload = try parsePayload(self.allocator, payload_json);
+        defer payload.deinit();
+        const obj = payload.value.object;
+
+        const project_id = getRequiredString(obj, "project_id") catch return ControlPlaneError.MissingField;
+        const project_token = getOptionalString(obj, "project_token");
+        const bind_path_raw = getRequiredString(obj, "bind_path") catch return ControlPlaneError.MissingField;
+        const target_path_raw = getRequiredString(obj, "target_path") catch return ControlPlaneError.MissingField;
+        try validateIdentifier(project_id, 128);
+
+        const project = self.projects.getPtr(project_id) orelse return ControlPlaneError.ProjectNotFound;
+        if (project.kind == .spider_web_builtin and !is_admin) return ControlPlaneError.ProjectProtected;
+        try requireProjectActionAccess(project, .mount, null, project_token, is_admin);
+
+        const bind_path = try normalizeMountPath(self.allocator, bind_path_raw);
+        errdefer self.allocator.free(bind_path);
+        if (std.mem.eql(u8, bind_path, "/")) return ControlPlaneError.InvalidPayload;
+        const target_path = try normalizeMountPath(self.allocator, target_path_raw);
+        errdefer self.allocator.free(target_path);
+
+        for (project.mounts.items) |mount| {
+            if (pathsConflict(mount.mount_path, bind_path)) return ControlPlaneError.BindConflict;
+        }
+        for (project.binds.items) |*existing| {
+            if (std.mem.eql(u8, existing.bind_path, bind_path)) {
+                if (std.mem.eql(u8, existing.target_path, target_path)) {
+                    self.allocator.free(bind_path);
+                    self.allocator.free(target_path);
+                    return renderProjectPayload(self.allocator, project.*, false);
+                }
+                self.allocator.free(existing.target_path);
+                existing.target_path = target_path;
+                self.allocator.free(bind_path);
+                project.updated_at_ms = std.time.milliTimestamp();
+                self.persistSnapshotBestEffortLocked();
+                return renderProjectPayload(self.allocator, project.*, false);
+            }
+            if (pathsConflict(existing.bind_path, bind_path)) return ControlPlaneError.BindConflict;
+        }
+
+        try project.binds.append(self.allocator, .{
+            .bind_path = bind_path,
+            .target_path = target_path,
+        });
+        project.updated_at_ms = std.time.milliTimestamp();
+        self.persistSnapshotBestEffortLocked();
+        return renderProjectPayload(self.allocator, project.*, false);
+    }
+
+    pub fn removeProjectBind(self: *ControlPlane, payload_json: ?[]const u8) ![]u8 {
+        return self.removeProjectBindWithRole(payload_json, false);
+    }
+
+    pub fn removeProjectBindWithRole(self: *ControlPlane, payload_json: ?[]const u8, is_admin: bool) ![]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        _ = self.reapExpiredLeasesLocked(std.time.milliTimestamp());
+
+        var payload = try parsePayload(self.allocator, payload_json);
+        defer payload.deinit();
+        const obj = payload.value.object;
+
+        const project_id = getRequiredString(obj, "project_id") catch return ControlPlaneError.MissingField;
+        const project_token = getOptionalString(obj, "project_token");
+        const bind_path_raw = getRequiredString(obj, "bind_path") catch return ControlPlaneError.MissingField;
+        try validateIdentifier(project_id, 128);
+        const bind_path = try normalizeMountPath(self.allocator, bind_path_raw);
+        defer self.allocator.free(bind_path);
+
+        const project = self.projects.getPtr(project_id) orelse return ControlPlaneError.ProjectNotFound;
+        if (project.kind == .spider_web_builtin and !is_admin) return ControlPlaneError.ProjectProtected;
+        try requireProjectActionAccess(project, .mount, null, project_token, is_admin);
+
+        var removed = false;
+        var i: usize = 0;
+        while (i < project.binds.items.len) {
+            const bind = project.binds.items[i];
+            if (!std.mem.eql(u8, bind.bind_path, bind_path)) {
+                i += 1;
+                continue;
+            }
+            var removed_bind = project.binds.orderedRemove(i);
+            removed_bind.deinit(self.allocator);
+            removed = true;
+            break;
+        }
+        if (!removed) return ControlPlaneError.BindNotFound;
+        project.updated_at_ms = std.time.milliTimestamp();
+        self.persistSnapshotBestEffortLocked();
+        return renderProjectPayload(self.allocator, project.*, false);
+    }
+
+    pub fn listProjectBinds(self: *ControlPlane, payload_json: ?[]const u8) ![]u8 {
+        return self.listProjectBindsWithRole(payload_json, false);
+    }
+
+    pub fn listProjectBindsWithRole(self: *ControlPlane, payload_json: ?[]const u8, is_admin: bool) ![]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        _ = self.reapExpiredLeasesLocked(std.time.milliTimestamp());
+
+        var payload = try parsePayload(self.allocator, payload_json);
+        defer payload.deinit();
+        const obj = payload.value.object;
+        const project_id = getRequiredString(obj, "project_id") catch return ControlPlaneError.MissingField;
+        const project_token = getOptionalString(obj, "project_token");
+        const project = self.projects.get(project_id) orelse return ControlPlaneError.ProjectNotFound;
+        if (project.kind == .spider_web_builtin and !is_admin) return ControlPlaneError.ProjectAssignmentForbidden;
+        try requireProjectActionAccess(&project, .read, null, project_token, is_admin);
+
+        const escaped_id = try jsonEscape(self.allocator, project.id);
+        defer self.allocator.free(escaped_id);
+        var out = std.ArrayListUnmanaged(u8){};
+        defer out.deinit(self.allocator);
+        try out.writer(self.allocator).print("{{\"project_id\":\"{s}\",\"binds\":[", .{escaped_id});
+        for (project.binds.items, 0..) |bind, idx| {
+            if (idx != 0) try out.append(self.allocator, ',');
+            try appendBindJson(self.allocator, &out, bind);
+        }
+        try out.appendSlice(self.allocator, "]}");
+        return out.toOwnedSlice(self.allocator);
+    }
+
+    pub fn resolveProjectPath(self: *ControlPlane, payload_json: ?[]const u8) ![]u8 {
+        return self.resolveProjectPathWithRole(payload_json, false);
+    }
+
+    pub fn resolveProjectPathWithRole(self: *ControlPlane, payload_json: ?[]const u8, is_admin: bool) ![]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        _ = self.reapExpiredLeasesLocked(std.time.milliTimestamp());
+
+        var payload = try parsePayload(self.allocator, payload_json);
+        defer payload.deinit();
+        const obj = payload.value.object;
+        const project_id = getRequiredString(obj, "project_id") catch return ControlPlaneError.MissingField;
+        const project_token = getOptionalString(obj, "project_token");
+        const path_raw = getRequiredString(obj, "path") catch return ControlPlaneError.MissingField;
+        const path = try normalizeMountPath(self.allocator, path_raw);
+        defer self.allocator.free(path);
+
+        const project = self.projects.get(project_id) orelse return ControlPlaneError.ProjectNotFound;
+        if (project.kind == .spider_web_builtin and !is_admin) return ControlPlaneError.ProjectAssignmentForbidden;
+        try requireProjectActionAccess(&project, .read, null, project_token, is_admin);
+
+        const resolved_path = try resolveBoundPath(self.allocator, &project, path);
+        defer if (resolved_path) |value| self.allocator.free(value);
+        const escaped_project = try jsonEscape(self.allocator, project.id);
+        defer self.allocator.free(escaped_project);
+        const escaped_path = try jsonEscape(self.allocator, path);
+        defer self.allocator.free(escaped_path);
+        const resolved_json = if (resolved_path) |value| blk: {
+            const escaped = try jsonEscape(self.allocator, value);
+            defer self.allocator.free(escaped);
+            break :blk try std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped});
+        } else try self.allocator.dupe(u8, "null");
+        defer self.allocator.free(resolved_json);
+        return std.fmt.allocPrint(
+            self.allocator,
+            "{{\"project_id\":\"{s}\",\"path\":\"{s}\",\"resolved_path\":{s},\"matched\":{s}}}",
+            .{ escaped_project, escaped_path, resolved_json, if (resolved_path != null) "true" else "false" },
+        );
+    }
+
     pub fn rotateProjectToken(self: *ControlPlane, payload_json: ?[]const u8) ![]u8 {
         return self.rotateProjectTokenWithRole(payload_json, false);
     }
@@ -1686,6 +1924,9 @@ pub const ControlPlane = struct {
         try validateIdentifier(project_id, 128);
         const project = self.projects.get(project_id) orelse return ControlPlaneError.ProjectNotFound;
         const is_primary_agent = self.isPrimaryAgent(agent_id);
+        if (is_primary_agent and !std.mem.eql(u8, project_id, spider_web_project_id)) {
+            return ControlPlaneError.ProjectAssignmentForbidden;
+        }
         if (project.kind == .spider_web_builtin and !(is_primary_agent or is_admin)) return ControlPlaneError.ProjectAssignmentForbidden;
 
         const maybe_project_token = getOptionalString(obj, "project_token");
@@ -1803,10 +2044,10 @@ pub const ControlPlane = struct {
 
         if (project_ptr == null) {
             const name_raw = requested_name orelse return ControlPlaneError.MissingField;
-            const vision_raw = requested_vision orelse "";
+            const vision_raw = requested_vision orelse return ControlPlaneError.MissingField;
             const status_raw = requested_status orelse "active";
             try validateDisplayString(name_raw, 128);
-            try validateDisplayStringAllowEmpty(vision_raw, 1024);
+            try validateDisplayString(vision_raw, 1024);
             try validateIdentifier(status_raw, 64);
 
             const project_id = try makeSequentialId(self.allocator, "proj", &self.next_project_id);
@@ -1883,7 +2124,7 @@ pub const ControlPlane = struct {
                 project.name = try self.allocator.dupe(u8, next_name);
             }
             if (requested_vision) |next_vision| {
-                try validateDisplayStringAllowEmpty(next_vision, 1024);
+                try validateDisplayString(next_vision, 1024);
                 self.allocator.free(project.vision);
                 project.vision = try self.allocator.dupe(u8, next_vision);
             }
@@ -1932,6 +2173,9 @@ pub const ControlPlane = struct {
                     }
                     if (mountPathsOverlap(existing.mount_path, mount_path)) return ControlPlaneError.MountConflict;
                 }
+                for (project.binds.items) |existing_bind| {
+                    if (pathsConflict(existing_bind.bind_path, mount_path)) return ControlPlaneError.MountConflict;
+                }
                 if (duplicate_exact) {
                     self.allocator.free(mount_path);
                     continue;
@@ -1955,6 +2199,9 @@ pub const ControlPlane = struct {
         if (mounts_replaced) self.mount_sets_total +%= 1;
 
         if (activate) {
+            if (is_primary_agent and !std.mem.eql(u8, project.id, spider_web_project_id)) {
+                return ControlPlaneError.ProjectAssignmentForbidden;
+            }
             if (project.kind == .spider_web_builtin and !(is_primary_agent or is_admin)) {
                 return ControlPlaneError.ProjectAssignmentForbidden;
             }
@@ -3368,6 +3615,18 @@ pub const ControlPlane = struct {
                     .{ escaped_path, escaped_node, escaped_export },
                 );
             }
+            try out.appendSlice(self.allocator, "],\"binds\":[");
+            for (project.binds.items, 0..) |bind, idx| {
+                if (idx != 0) try out.append(self.allocator, ',');
+                const escaped_bind = try jsonEscape(self.allocator, bind.bind_path);
+                defer self.allocator.free(escaped_bind);
+                const escaped_target = try jsonEscape(self.allocator, bind.target_path);
+                defer self.allocator.free(escaped_target);
+                try out.writer(self.allocator).print(
+                    "{{\"bind_path\":\"{s}\",\"target_path\":\"{s}\"}}",
+                    .{ escaped_bind, escaped_target },
+                );
+            }
             try out.appendSlice(self.allocator, "]}");
         }
 
@@ -3601,6 +3860,18 @@ pub const ControlPlane = struct {
                     };
                     errdefer mount.deinit(self.allocator);
                     try project.mounts.append(self.allocator, mount);
+                }
+                if (item.object.get("binds")) |binds_val| {
+                    if (binds_val != .array) return error.InvalidSnapshot;
+                    for (binds_val.array.items) |bind_item| {
+                        if (bind_item != .object) return error.InvalidSnapshot;
+                        var bind = ProjectBind{
+                            .bind_path = try dupeRequiredString(self.allocator, bind_item.object, "bind_path"),
+                            .target_path = try dupeRequiredString(self.allocator, bind_item.object, "target_path"),
+                        };
+                        errdefer bind.deinit(self.allocator);
+                        try project.binds.append(self.allocator, bind);
+                    }
                 }
                 try self.projects.put(self.allocator, project.id, project);
             }
@@ -3909,6 +4180,17 @@ fn appendMountJson(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8
     try out.writer(allocator).print(
         "{{\"mount_path\":\"{s}\",\"node_id\":\"{s}\",\"export_name\":\"{s}\"}}",
         .{ escaped_path, escaped_node, escaped_export },
+    );
+}
+
+fn appendBindJson(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), bind: ProjectBind) !void {
+    const escaped_bind = try jsonEscape(allocator, bind.bind_path);
+    defer allocator.free(escaped_bind);
+    const escaped_target = try jsonEscape(allocator, bind.target_path);
+    defer allocator.free(escaped_target);
+    try out.writer(allocator).print(
+        "{{\"bind_path\":\"{s}\",\"target_path\":\"{s}\"}}",
+        .{ escaped_bind, escaped_target },
     );
 }
 
@@ -4416,6 +4698,11 @@ fn renderProjectPayload(allocator: std.mem.Allocator, project: Project, include_
         if (idx != 0) try out.append(allocator, ',');
         try appendMountJson(allocator, &out, mount);
     }
+    try out.appendSlice(allocator, "],\"binds\":[");
+    for (project.binds.items, 0..) |bind, idx| {
+        if (idx != 0) try out.append(allocator, ',');
+        try appendBindJson(allocator, &out, bind);
+    }
     try out.appendSlice(allocator, "]}");
     return out.toOwnedSlice(allocator);
 }
@@ -4440,6 +4727,37 @@ fn mountPathsOverlap(a: []const u8, b: []const u8) bool {
         return b.len > a.len and b[a.len] == '/';
     }
     return false;
+}
+
+fn pathsConflict(a: []const u8, b: []const u8) bool {
+    return std.mem.eql(u8, a, b) or mountPathsOverlap(a, b);
+}
+
+fn pathMatchesPrefix(path: []const u8, prefix: []const u8) bool {
+    if (std.mem.eql(u8, path, prefix)) return true;
+    if (prefix.len == 0 or !std.mem.startsWith(u8, path, prefix)) return false;
+    return path.len > prefix.len and path[prefix.len] == '/';
+}
+
+fn joinBoundPath(allocator: std.mem.Allocator, target: []const u8, suffix: []const u8) ![]u8 {
+    if (suffix.len == 0) return allocator.dupe(u8, target);
+    if (std.mem.eql(u8, target, "/")) return std.fmt.allocPrint(allocator, "{s}", .{suffix});
+    return std.fmt.allocPrint(allocator, "{s}{s}", .{ target, suffix });
+}
+
+fn resolveBoundPath(allocator: std.mem.Allocator, project: *const Project, path: []const u8) !?[]u8 {
+    var selected: ?*const ProjectBind = null;
+    for (project.binds.items) |*bind| {
+        if (!pathMatchesPrefix(path, bind.bind_path)) continue;
+        if (selected == null or bind.bind_path.len > selected.?.bind_path.len) {
+            selected = bind;
+        }
+    }
+    if (selected) |bind| {
+        const suffix = path[bind.bind_path.len..];
+        return try joinBoundPath(allocator, bind.target_path, suffix);
+    }
+    return null;
 }
 
 fn validateIdentifier(value: []const u8, max_len: usize) !void {
@@ -4693,6 +5011,18 @@ test "fs_control_plane: builtin system project is protected and primary-only" {
     const status = try plane.workspaceStatus("mother", "{\"project_id\":\"system\"}");
     defer allocator.free(status);
     try std.testing.expect(std.mem.indexOf(u8, status, "\"project_id\":\"system\"") != null);
+
+    const non_system = try plane.createProject("{\"name\":\"Product\",\"vision\":\"Ship product milestones\"}");
+    defer allocator.free(non_system);
+    var parsed_non_system = try std.json.parseFromSlice(std.json.Value, allocator, non_system, .{});
+    defer parsed_non_system.deinit();
+    const non_system_project_id = parsed_non_system.value.object.get("project_id").?.string;
+    const activate_non_system = try std.fmt.allocPrint(allocator, "{{\"project_id\":\"{s}\"}}", .{non_system_project_id});
+    defer allocator.free(activate_non_system);
+    try std.testing.expectError(
+        ControlPlaneError.ProjectAssignmentForbidden,
+        plane.activateProject("mother", activate_non_system),
+    );
 }
 
 test "fs_control_plane: builtin system mount can be bound from local node" {
@@ -4888,7 +5218,7 @@ test "fs_control_plane: project mount conflict is rejected" {
     defer parsed_join.deinit();
     const node_id = parsed_join.value.object.get("node_id").?.string;
 
-    const create_json = try plane.createProject("{\"name\":\"Demo\"}");
+    const create_json = try plane.createProject("{\"name\":\"Demo\",\"vision\":\"Demo\"}");
     defer allocator.free(create_json);
     var parsed_project = try std.json.parseFromSlice(std.json.Value, allocator, create_json, .{});
     defer parsed_project.deinit();
@@ -4911,6 +5241,96 @@ test "fs_control_plane: project mount conflict is rejected" {
     );
     defer allocator.free(mount_b);
     try std.testing.expectError(ControlPlaneError.MountConflict, plane.setProjectMount(mount_b));
+}
+
+test "fs_control_plane: project bind lifecycle resolves bound paths" {
+    const allocator = std.testing.allocator;
+    var plane = ControlPlane.init(allocator);
+    defer plane.deinit();
+
+    const project_json = try plane.createProject("{\"name\":\"Bindings\",\"vision\":\"Bindings\"}");
+    defer allocator.free(project_json);
+    var project = try std.json.parseFromSlice(std.json.Value, allocator, project_json, .{});
+    defer project.deinit();
+    const project_id = project.value.object.get("project_id").?.string;
+    const project_token = project.value.object.get("project_token").?.string;
+
+    const bind_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"project_id\":\"{s}\",\"project_token\":\"{s}\",\"bind_path\":\"/repo\",\"target_path\":\"/nodes/local/fs\"}}",
+        .{ project_id, project_token },
+    );
+    defer allocator.free(bind_req);
+    const bound = try plane.setProjectBind(bind_req);
+    defer allocator.free(bound);
+    try std.testing.expect(std.mem.indexOf(u8, bound, "\"bind_path\":\"/repo\"") != null);
+
+    const list_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"project_id\":\"{s}\",\"project_token\":\"{s}\"}}",
+        .{ project_id, project_token },
+    );
+    defer allocator.free(list_req);
+    const listed = try plane.listProjectBinds(list_req);
+    defer allocator.free(listed);
+    try std.testing.expect(std.mem.indexOf(u8, listed, "\"target_path\":\"/nodes/local/fs\"") != null);
+
+    const resolve_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"project_id\":\"{s}\",\"project_token\":\"{s}\",\"path\":\"/repo/src\"}}",
+        .{ project_id, project_token },
+    );
+    defer allocator.free(resolve_req);
+    const resolved = try plane.resolveProjectPath(resolve_req);
+    defer allocator.free(resolved);
+    try std.testing.expect(std.mem.indexOf(u8, resolved, "\"matched\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resolved, "\"resolved_path\":\"/nodes/local/fs/src\"") != null);
+
+    const unbind_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"project_id\":\"{s}\",\"project_token\":\"{s}\",\"bind_path\":\"/repo\"}}",
+        .{ project_id, project_token },
+    );
+    defer allocator.free(unbind_req);
+    const unbound = try plane.removeProjectBind(unbind_req);
+    defer allocator.free(unbound);
+    try std.testing.expect(std.mem.indexOf(u8, unbound, "\"binds\":[]") != null);
+}
+
+test "fs_control_plane: bind conflicts with existing mount path" {
+    const allocator = std.testing.allocator;
+    var plane = ControlPlane.init(allocator);
+    defer plane.deinit();
+
+    const joined = try plane.ensureNode("bind-conflict-node", "ws://127.0.0.1:18891/v2/fs", 60_000);
+    defer allocator.free(joined);
+    var joined_parsed = try std.json.parseFromSlice(std.json.Value, allocator, joined, .{});
+    defer joined_parsed.deinit();
+    const node_id = joined_parsed.value.object.get("node_id").?.string;
+
+    const project_json = try plane.createProject("{\"name\":\"BindConflict\",\"vision\":\"BindConflict\"}");
+    defer allocator.free(project_json);
+    var project = try std.json.parseFromSlice(std.json.Value, allocator, project_json, .{});
+    defer project.deinit();
+    const project_id = project.value.object.get("project_id").?.string;
+    const project_token = project.value.object.get("project_token").?.string;
+
+    const mount_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"project_id\":\"{s}\",\"project_token\":\"{s}\",\"node_id\":\"{s}\",\"export_name\":\"work\",\"mount_path\":\"/src\"}}",
+        .{ project_id, project_token, node_id },
+    );
+    defer allocator.free(mount_req);
+    const mounted = try plane.setProjectMount(mount_req);
+    defer allocator.free(mounted);
+
+    const bind_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"project_id\":\"{s}\",\"project_token\":\"{s}\",\"bind_path\":\"/src\",\"target_path\":\"/nodes/{s}/fs\"}}",
+        .{ project_id, project_token, node_id },
+    );
+    defer allocator.free(bind_req);
+    try std.testing.expectError(ControlPlaneError.BindConflict, plane.setProjectBind(bind_req));
 }
 
 test "fs_control_plane: project mutation requires valid project_token" {
@@ -4936,7 +5356,7 @@ test "fs_control_plane: project mutation requires valid project_token" {
     defer parsed_join.deinit();
     const node_id = parsed_join.value.object.get("node_id").?.string;
 
-    const project_json = try plane.createProject("{\"name\":\"Secure\"}");
+    const project_json = try plane.createProject("{\"name\":\"Secure\",\"vision\":\"Secure\"}");
     defer allocator.free(project_json);
     var parsed_project = try std.json.parseFromSlice(std.json.Value, allocator, project_json, .{});
     defer parsed_project.deinit();
@@ -4965,7 +5385,7 @@ test "fs_control_plane: access policy enforces action modes and per-agent overri
     const node_id = ensured_parsed.value.object.get("node_id").?.string;
 
     const create_project = try plane.createProject(
-        "{\"name\":\"PolicyOps\",\"access_policy\":{\"actions\":{\"mount\":\"deny\"}}}",
+        "{\"name\":\"PolicyOps\",\"vision\":\"PolicyOps\",\"access_policy\":{\"actions\":{\"mount\":\"deny\"}}}",
     );
     defer allocator.free(create_project);
     try std.testing.expect(std.mem.indexOf(u8, create_project, "\"access_policy\"") != null);
@@ -5030,7 +5450,7 @@ test "fs_control_plane: access policy action matrix honors token admin and per-a
     defer plane.deinit();
 
     const project_json = try plane.createProject(
-        "{\"name\":\"PolicyMatrix\",\"access_policy\":{\"actions\":{\"read\":\"open\",\"observe\":\"token\",\"invoke\":\"admin\",\"mount\":\"deny\",\"admin\":\"token\"},\"agents\":{\"worker\":{\"invoke\":\"open\",\"mount\":\"token\"}}}}",
+        "{\"name\":\"PolicyMatrix\",\"vision\":\"PolicyMatrix\",\"access_policy\":{\"actions\":{\"read\":\"open\",\"observe\":\"token\",\"invoke\":\"admin\",\"mount\":\"deny\",\"admin\":\"token\"},\"agents\":{\"worker\":{\"invoke\":\"open\",\"mount\":\"token\"}}}}",
     );
     defer allocator.free(project_json);
     var project = try std.json.parseFromSlice(std.json.Value, allocator, project_json, .{});
@@ -5096,7 +5516,7 @@ test "fs_control_plane: workspace status filters invoke service mounts when invo
     defer allocator.free(upserted);
 
     const project_json = try plane.createProject(
-        "{\"name\":\"InvokeFilteredWorkspace\",\"access_policy\":{\"actions\":{\"invoke\":\"open\"},\"agents\":{\"mother\":{\"invoke\":\"deny\"}}}}",
+        "{\"name\":\"InvokeFilteredWorkspace\",\"vision\":\"InvokeFilteredWorkspace\",\"access_policy\":{\"actions\":{\"invoke\":\"open\"},\"agents\":{\"mother\":{\"invoke\":\"deny\"}}}}",
     );
     defer allocator.free(project_json);
     var project_parsed = try std.json.parseFromSlice(std.json.Value, allocator, project_json, .{});
@@ -5143,7 +5563,7 @@ test "fs_control_plane: invalid access policy payload is rejected" {
 
     try std.testing.expectError(
         ControlPlaneError.InvalidPayload,
-        plane.createProject("{\"name\":\"BadPolicy\",\"access_policy\":{\"actions\":{\"read\":true}}}"),
+        plane.createProject("{\"name\":\"BadPolicy\",\"vision\":\"BadPolicy\",\"access_policy\":{\"actions\":{\"read\":true}}}"),
     );
 }
 
@@ -5188,7 +5608,7 @@ test "fs_control_plane: identical mount path can be used for failover nodes" {
     defer join_b.deinit();
     const node_b = join_b.value.object.get("node_id").?.string;
 
-    const project_json = try plane.createProject("{\"name\":\"Failover\"}");
+    const project_json = try plane.createProject("{\"name\":\"Failover\",\"vision\":\"Failover\"}");
     defer allocator.free(project_json);
     var parsed_project = try std.json.parseFromSlice(std.json.Value, allocator, project_json, .{});
     defer parsed_project.deinit();
@@ -5258,7 +5678,7 @@ test "fs_control_plane: removeProjectMount supports path-wide and targeted failo
     defer join_b.deinit();
     const node_b = join_b.value.object.get("node_id").?.string;
 
-    const project_json = try plane.createProject("{\"name\":\"FailoverRemove\"}");
+    const project_json = try plane.createProject("{\"name\":\"FailoverRemove\",\"vision\":\"FailoverRemove\"}");
     defer allocator.free(project_json);
     var parsed_project = try std.json.parseFromSlice(std.json.Value, allocator, project_json, .{});
     defer parsed_project.deinit();
@@ -5332,7 +5752,7 @@ test "fs_control_plane: lease reaper removes expired nodes and project mounts" {
     defer join.deinit();
     const node_id = join.value.object.get("node_id").?.string;
 
-    const project_json = try plane.createProject("{\"name\":\"Lease GC\"}");
+    const project_json = try plane.createProject("{\"name\":\"Lease GC\",\"vision\":\"Lease GC\"}");
     defer allocator.free(project_json);
     var parsed_project = try std.json.parseFromSlice(std.json.Value, allocator, project_json, .{});
     defer parsed_project.deinit();
@@ -5413,7 +5833,7 @@ test "fs_control_plane: metricsJson reports mutation counters" {
     defer join.deinit();
     const node_id = join.value.object.get("node_id").?.string;
 
-    const project_json = try plane.createProject("{\"name\":\"Metrics\"}");
+    const project_json = try plane.createProject("{\"name\":\"Metrics\",\"vision\":\"Metrics\"}");
     defer allocator.free(project_json);
     var project = try std.json.parseFromSlice(std.json.Value, allocator, project_json, .{});
     defer project.deinit();
@@ -5469,7 +5889,7 @@ test "fs_control_plane: rotate and revoke project tokens invalidate previous tok
     defer join.deinit();
     const node_id = join.value.object.get("node_id").?.string;
 
-    const project_json = try plane.createProject("{\"name\":\"TokenOps\"}");
+    const project_json = try plane.createProject("{\"name\":\"TokenOps\",\"vision\":\"TokenOps\"}");
     defer allocator.free(project_json);
     var project = try std.json.parseFromSlice(std.json.Value, allocator, project_json, .{});
     defer project.deinit();
@@ -5560,7 +5980,7 @@ test "fs_control_plane: workspaceStatus supports explicit project selection" {
     defer join.deinit();
     const node_id = join.value.object.get("node_id").?.string;
 
-    const project_json = try plane.createProject("{\"name\":\"Selector\"}");
+    const project_json = try plane.createProject("{\"name\":\"Selector\",\"vision\":\"Selector\"}");
     defer allocator.free(project_json);
     var project = try std.json.parseFromSlice(std.json.Value, allocator, project_json, .{});
     defer project.deinit();
@@ -5630,7 +6050,7 @@ test "fs_control_plane: workspace topology prefers best available candidate and 
     defer node_b_payload.deinit();
     const node_b_id = node_b_payload.value.object.get("node_id").?.string;
 
-    const project_json = try plane.createProject("{\"name\":\"Failover Select\"}");
+    const project_json = try plane.createProject("{\"name\":\"Failover Select\",\"vision\":\"Failover Select\"}");
     defer allocator.free(project_json);
     var project = try std.json.parseFromSlice(std.json.Value, allocator, project_json, .{});
     defer project.deinit();
@@ -5868,7 +6288,7 @@ test "fs_control_plane: projectUp requires project_token for existing non-builti
     var plane = ControlPlane.init(allocator);
     defer plane.deinit();
 
-    const project_json = try plane.createProject("{\"name\":\"UpAuth\"}");
+    const project_json = try plane.createProject("{\"name\":\"UpAuth\",\"vision\":\"UpAuth\"}");
     defer allocator.free(project_json);
     var project = try std.json.parseFromSlice(std.json.Value, allocator, project_json, .{});
     defer project.deinit();
@@ -5925,19 +6345,24 @@ test "fs_control_plane: projectUp requires project_token for existing non-builti
     try std.testing.expect(std.mem.indexOf(u8, get_json, "\"status\":\"paused\"") != null);
 }
 
-test "fs_control_plane: project create/up allow omitted and empty vision" {
+test "fs_control_plane: project create/up require non-empty vision" {
     const allocator = std.testing.allocator;
     var plane = ControlPlane.init(allocator);
     defer plane.deinit();
 
-    const created = try plane.createProject("{\"name\":\"Visionless\"}");
+    const created = try plane.createProject("{\"name\":\"Visionless\",\"vision\":\"Visionless\"}");
     defer allocator.free(created);
-    try std.testing.expect(std.mem.indexOf(u8, created, "\"vision\":\"\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, created, "\"vision\":\"Visionless\"") != null);
 
     var parsed_created = try std.json.parseFromSlice(std.json.Value, allocator, created, .{});
     defer parsed_created.deinit();
     const project_id = parsed_created.value.object.get("project_id").?.string;
     const project_token = parsed_created.value.object.get("project_token").?.string;
+
+    try std.testing.expectError(
+        ControlPlaneError.MissingField,
+        plane.createProject("{\"name\":\"MissingVision\"}"),
+    );
 
     const clear_req = try std.fmt.allocPrint(
         allocator,
@@ -5945,19 +6370,22 @@ test "fs_control_plane: project create/up allow omitted and empty vision" {
         .{ project_id, project_token },
     );
     defer allocator.free(clear_req);
-    const cleared = try plane.projectUp("agent-vision", clear_req);
-    defer allocator.free(cleared);
-    try std.testing.expect(std.mem.indexOf(u8, cleared, "\"created\":false") != null);
+    try std.testing.expectError(ControlPlaneError.InvalidPayload, plane.projectUp("agent-vision", clear_req));
 
     const get_req = try std.fmt.allocPrint(allocator, "{{\"project_id\":\"{s}\"}}", .{project_id});
     defer allocator.free(get_req);
     const fetched = try plane.getProject(get_req);
     defer allocator.free(fetched);
-    try std.testing.expect(std.mem.indexOf(u8, fetched, "\"vision\":\"\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fetched, "\"vision\":\"Visionless\"") != null);
 
-    const up_created = try plane.projectUp("agent-vision", "{\"name\":\"UpNoVision\"}");
+    const up_created = try plane.projectUp("agent-vision", "{\"name\":\"UpNoVision\",\"vision\":\"UpNoVision\"}");
     defer allocator.free(up_created);
     try std.testing.expect(std.mem.indexOf(u8, up_created, "\"created\":true") != null);
+
+    try std.testing.expectError(
+        ControlPlaneError.MissingField,
+        plane.projectUp("agent-vision", "{\"name\":\"StillNoVision\"}"),
+    );
 }
 
 test "fs_control_plane: snapshot encryption envelope roundtrip" {

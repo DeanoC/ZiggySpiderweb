@@ -497,8 +497,8 @@ fn printHelp() !void {
         \\  spiderweb-control workspace_status
         \\  spiderweb-control --auth-token sw-admin-... auth_status
         \\  spiderweb-control project_list
-        \\  spiderweb-control project_create '{"name":"Demo"}'
-        \\  spiderweb-control --operator-token mytoken project_create '{"name":"Secure"}'
+        \\  spiderweb-control project_create '{"name":"Demo","vision":"Track and deliver demo milestones"}'
+        \\  spiderweb-control --operator-token mytoken project_create '{"name":"Secure","vision":"Harden service auth and policy"}'
         \\  spiderweb-control --url ws://127.0.0.1:28790/ project_get '{"project_id":"proj-1"}'
         \\
     ;

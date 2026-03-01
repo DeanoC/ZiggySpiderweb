@@ -46,6 +46,9 @@ ROM entries:
 ```json
 {
   "name": "Human-readable name",
+  "creature": "Archetype label",
+  "vibe": "Personality shorthand",
+  "emoji": "Identity marker",
   "specialization": "Role description",
   "default_provider": {
     "name": "provider",
@@ -56,8 +59,8 @@ ROM entries:
   "rom_entries": [
     {"key": "system:xxx", "value": "Guidance text"}
   ],
-  "allowed_tools": ["tool.*"],
-  "denied_tools": ["talk_user"],
+  "allowed_tools": ["file_read", "file_write", "file_list"],
+  "denied_tools": [],
   "can_spawn_subbrains": false
 }
 ```
@@ -100,7 +103,7 @@ If no template specified, define everything inline:
     "custom-brain": {
       "provider": { "name": "openai", "model": "gpt-4o" },
       "capabilities": ["chat"],
-      "allowed_tools": ["talk_user"]
+      "allowed_tools": ["file_read", "file_write", "file_list"]
     }
   }
 }

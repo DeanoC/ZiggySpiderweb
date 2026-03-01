@@ -235,7 +235,7 @@ pub fn loadBrainSpecializationFlat(
     brain_name: []const u8,
 ) !?BrainSpecialization {
     // Try to load flat config first
-    var flat_config = try agent_config.loadAgentConfig(allocator, runtime.agent_id);
+    var flat_config = try agent_config.loadAgentConfigFromDir(allocator, runtime.runtime_config.agents_dir, runtime.agent_id);
     if (flat_config == null) {
         // Fall back to old agent.json loading
         return loadBrainSpecialization(allocator, runtime, brain_name);
@@ -260,6 +260,7 @@ pub fn loadBrainSpecializationFlat(
 
                 // Need to reconstruct BrainConfig from view for merging
                 var cfg = agent_config.BrainConfig.init(allocator);
+                defer cfg.deinit();
                 cfg.provider.name = if (brain_cfg.provider.name) |n| try allocator.dupe(u8, n) else null;
                 cfg.provider.model = if (brain_cfg.provider.model) |m| try allocator.dupe(u8, m) else null;
                 cfg.provider.think_level = if (brain_cfg.provider.think_level) |tl| try allocator.dupe(u8, tl) else null;
@@ -350,18 +351,51 @@ pub fn loadBrainSpecializationFlat(
     // Copy ROM entries
     if (effective_config.rom_overrides) |roms| {
         for (roms.items) |rom| {
-            const owned_key = try allocator.dupe(u8, rom.key);
-            errdefer allocator.free(owned_key);
-            const owned_value = try allocator.dupe(u8, rom.value);
-            try spec.additional_rom.append(allocator, .{
-                .key = owned_key,
-                .value = owned_value,
-                .mutable = true,
-            });
+            try appendOrReplaceAdditionalRom(&spec, rom.key, rom.value);
+        }
+    }
+
+    // Primary-brain personality metadata (OpenClaw-style customization fields).
+    if (std.mem.eql(u8, brain_name, "primary")) {
+        if (flat_config.?.name) |value| {
+            try appendOrReplaceAdditionalRom(&spec, "system:agent_name", value);
+            try appendOrReplaceAdditionalRom(&spec, "system:personality_name", value);
+        }
+        if (flat_config.?.description) |value| {
+            try appendOrReplaceAdditionalRom(&spec, "system:agent_description", value);
+            try appendOrReplaceAdditionalRom(&spec, "system:personality_description", value);
+        }
+        if (flat_config.?.creature) |value| {
+            try appendOrReplaceAdditionalRom(&spec, "system:personality_creature", value);
+        }
+        if (flat_config.?.vibe) |value| {
+            try appendOrReplaceAdditionalRom(&spec, "system:personality_vibe", value);
+        }
+        if (flat_config.?.emoji) |value| {
+            try appendOrReplaceAdditionalRom(&spec, "system:personality_emoji", value);
         }
     }
 
     return spec;
+}
+
+fn appendOrReplaceAdditionalRom(
+    spec: *BrainSpecialization,
+    key: []const u8,
+    value: []const u8,
+) !void {
+    for (spec.additional_rom.items) |*entry| {
+        if (!std.mem.eql(u8, entry.key, key)) continue;
+        spec.allocator.free(entry.value);
+        entry.value = try spec.allocator.dupe(u8, value);
+        return;
+    }
+
+    try spec.additional_rom.append(spec.allocator, .{
+        .key = try spec.allocator.dupe(u8, key),
+        .value = try spec.allocator.dupe(u8, value),
+        .mutable = true,
+    });
 }
 
 /// Hook that applies brain specialization to ROM
