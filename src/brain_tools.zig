@@ -296,13 +296,13 @@ pub const Engine = struct {
             if (tool_call_id) |call_id| {
                 var wrapped_buf = std.ArrayListUnmanaged(u8){};
                 defer wrapped_buf.deinit(self.allocator);
-                defer self.allocator.free(synthetic_payload);
                 try wrapped_buf.appendSlice(self.allocator, "{\"tool_call_id\":\"");
                 try appendJsonEscaped(self.allocator, &wrapped_buf, call_id);
                 try wrapped_buf.appendSlice(self.allocator, "\",\"result\":");
                 try wrapped_buf.appendSlice(self.allocator, synthetic_payload);
                 try wrapped_buf.append(self.allocator, '}');
                 const wrapped = try wrapped_buf.toOwnedSlice(self.allocator);
+                self.allocator.free(synthetic_payload);
                 return self.success(tool_name, wrapped);
             }
             return self.success(tool_name, synthetic_payload);
@@ -665,7 +665,8 @@ pub const Engine = struct {
         // Include persisted LTM records so memory_search still works after restart.
         if (emitted < limit) {
             if (self.runtime_memory.persisted_store) |store| {
-                const persisted_hits = store.search(self.allocator, query, @max(limit, 1) * 4) catch |err| {
+                const persisted_fanout_limit = std.math.mul(usize, @max(limit, 1), 4) catch std.math.maxInt(usize);
+                const persisted_hits = store.search(self.allocator, query, persisted_fanout_limit) catch |err| {
                     return self.failure(tool_name, "execution_failed", @errorName(err));
                 };
                 defer ltm_store.deinitRecords(self.allocator, persisted_hits);
