@@ -1527,10 +1527,7 @@ pub const RuntimeServer = struct {
     }
 
     fn refreshProjectSetupGatePrompt(self: *RuntimeServer, brain_name: []const u8) !void {
-        const snapshot = self.runtime.active_memory.snapshotActive(self.allocator, brain_name) catch |err| switch (err) {
-            memory.MemoryError.NotFound => return,
-            else => return err,
-        };
+        const snapshot = try self.runtime.active_memory.snapshotActive(self.allocator, brain_name);
         defer memory.deinitItems(self.allocator, snapshot);
 
         var prompt = std.ArrayListUnmanaged(u8){};
@@ -1801,7 +1798,32 @@ pub const RuntimeServer = struct {
         if (try self.loadMemoryByName(brain_name, name)) |existing_item| {
             var item = existing_item;
             defer item.deinit(self.allocator);
-            var mutated = try self.runtime.active_memory.mutate(item.mem_id, payload);
+            var mutated = self.runtime.active_memory.mutate(item.mem_id, payload) catch |err| switch (err) {
+                memory.MemoryError.NotFound => blk: {
+                    if (no_history) {
+                        const recreated_no_history = try self.runtime.active_memory.createActiveNoHistory(
+                            brain_name,
+                            name,
+                            kind,
+                            payload,
+                            false,
+                            false,
+                        );
+                        break :blk recreated_no_history;
+                    }
+
+                    const recreated = try self.runtime.active_memory.create(
+                        brain_name,
+                        name,
+                        kind,
+                        payload,
+                        false,
+                        true,
+                    );
+                    break :blk recreated;
+                },
+                else => return err,
+            };
             mutated.deinit(self.allocator);
             return;
         }
