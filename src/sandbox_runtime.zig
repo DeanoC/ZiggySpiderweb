@@ -259,6 +259,13 @@ pub const SandboxRuntime = struct {
                             std.fmt.allocPrint(allocator, "sandbox tool response read failed: {s}; restart failed: {s}", .{ @errorName(err), @errorName(restart_err) }) catch null,
                         );
                     };
+                    if (attempt + 1 < 2 and shouldRetryToolRequestAfterRestart(tool_name, args_json)) {
+                        std.log.warn(
+                            "sandbox tool retry after runtime restart on response read error: tool={s} err={s}",
+                            .{ tool_name, @errorName(err) },
+                        );
+                        continue :request_attempt_loop;
+                    }
                     return toolBridgeFailureOwned(
                         allocator,
                         std.fmt.allocPrint(
@@ -289,7 +296,7 @@ pub const SandboxRuntime = struct {
                         std.fmt.allocPrint(allocator, "sandbox mount/runtime restart failed: {s}", .{@errorName(restart_err)}) catch null,
                     );
                 };
-                if (attempt + 1 < 2 and shouldRetryToolRequestAfterRestart(tool_name)) {
+                if (attempt + 1 < 2 and shouldRetryToolRequestAfterRestart(tool_name, args_json)) {
                     std.log.warn(
                         "sandbox tool retry after mount/runtime restart: tool={s}",
                         .{tool_name},
@@ -410,11 +417,25 @@ fn shouldRestartOnToolFailure(result: tool_registry.ToolExecutionResult) bool {
     };
 }
 
-fn shouldRetryToolRequestAfterRestart(tool_name: []const u8) bool {
-    // Retry only idempotent read/query tools after reconnecting the workspace.
+fn shouldRetryToolRequestAfterRestart(tool_name: []const u8, args_json: []const u8) bool {
+    // Retry only idempotent tools after reconnecting the workspace.
     return std.mem.eql(u8, tool_name, "file_read") or
         std.mem.eql(u8, tool_name, "file_list") or
+        (std.mem.eql(u8, tool_name, "file_write") and fileWriteIsSafeToRetry(args_json)) or
         std.mem.eql(u8, tool_name, "search_code");
+}
+
+fn fileWriteIsSafeToRetry(args_json: []const u8) bool {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, args_json, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    const append_val = parsed.value.object.get("append") orelse return true;
+    if (append_val != .bool) return false;
+    return !append_val.bool;
 }
 
 fn containsAnyIgnoreCase(haystack: []const u8, needles: []const []const u8) bool {
@@ -491,12 +512,15 @@ fn buildToolRequestLine(allocator: std.mem.Allocator, tool_name: []const u8, arg
     );
 }
 
-test "sandbox_runtime: retry after restart only for safe read tools" {
-    try std.testing.expect(shouldRetryToolRequestAfterRestart("file_read"));
-    try std.testing.expect(shouldRetryToolRequestAfterRestart("file_list"));
-    try std.testing.expect(shouldRetryToolRequestAfterRestart("search_code"));
-    try std.testing.expect(!shouldRetryToolRequestAfterRestart("file_write"));
-    try std.testing.expect(!shouldRetryToolRequestAfterRestart("shell_exec"));
+test "sandbox_runtime: retry after restart only for idempotent tools" {
+    try std.testing.expect(shouldRetryToolRequestAfterRestart("file_read", "{}"));
+    try std.testing.expect(shouldRetryToolRequestAfterRestart("file_list", "{}"));
+    try std.testing.expect(shouldRetryToolRequestAfterRestart("search_code", "{}"));
+    try std.testing.expect(shouldRetryToolRequestAfterRestart("file_write", "{\"path\":\"a.txt\",\"content\":\"x\"}"));
+    try std.testing.expect(shouldRetryToolRequestAfterRestart("file_write", "{\"path\":\"a.txt\",\"content\":\"x\",\"append\":false}"));
+    try std.testing.expect(!shouldRetryToolRequestAfterRestart("file_write", "{\"path\":\"a.txt\",\"content\":\"x\",\"append\":true}"));
+    try std.testing.expect(!shouldRetryToolRequestAfterRestart("file_write", "not-json"));
+    try std.testing.expect(!shouldRetryToolRequestAfterRestart("shell_exec", "{}"));
 }
 
 test "sandbox_runtime: timeout failures do not trigger mount restart" {
