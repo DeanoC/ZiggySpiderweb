@@ -6,7 +6,7 @@ SystemD-based deployment scripts for ZiggySpiderWeb.
 
 ```bash
 cd scripts
-sudo ./install-systemd.sh
+sudo PROVIDER_NAME=openai-codex PROVIDER_MODEL=gpt-5.3-codex ./install-systemd.sh
 ```
 
 This will:
@@ -187,13 +187,13 @@ CANARY_PROVIDER_NAME=openai CANARY_PROVIDER_MODEL=gpt-4o-mini ./scripts/manual-m
 | `SERVICE_NAME` | `spiderweb` | systemd service name |
 | `PORT` | `18790` | Default listening port |
 | `BIND_ADDR` | `0.0.0.0` | Default bind address |
-| `PROVIDER_NAME` | `openai` | Provider written to generated config |
-| `PROVIDER_MODEL` | `gpt-4o-mini` | Model written to generated config |
+| `PROVIDER_NAME` | required | Provider written to generated config (required for new/overwrite installs) |
+| `PROVIDER_MODEL` | required | Model written to generated config (required for new/overwrite installs) |
 | `OVERWRITE_CONFIG` | `0` | If `1`, replace existing `/etc/spiderweb/config.json` |
 | `OPENAI_API_KEY` | unset | Writes `OPENAI_API_KEY` to service env file when provider is `openai` |
 | `OPENAI_CODEX_API_KEY` | unset | Writes `OPENAI_CODEX_API_KEY` for `openai-codex*` providers |
 
 Example with custom settings:
 ```bash
-sudo PORT=8080 BIND_ADDR=0.0.0.0 ./install-systemd.sh
+sudo PORT=8080 BIND_ADDR=0.0.0.0 PROVIDER_NAME=openai-codex PROVIDER_MODEL=gpt-5.3-codex ./install-systemd.sh
 ```
