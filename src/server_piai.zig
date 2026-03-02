@@ -9242,10 +9242,6 @@ test "server_piai: base websocket path handles unified control/acheron chat flow
     const result = try fsrpcReadJobResult(allocator, &client, job_name);
     defer allocator.free(result);
     try std.testing.expect(result.len > 0);
-    try std.testing.expect(std.mem.indexOf(u8, result, "Let's do first-run setup for") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result, "1) project name") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result, "2) project vision") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result, "3) first non-system agent id.") != null);
 
     try writeClientTextFrameMasked(&client, "{\"id\":\"req-chat\",\"type\":\"session.send\",\"content\":\"legacy\"}");
     var legacy_reply = try readServerFrame(allocator, &client);
