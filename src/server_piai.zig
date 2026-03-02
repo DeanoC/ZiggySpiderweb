@@ -4946,26 +4946,6 @@ const AgentRuntimeRegistry = struct {
 
     fn buildInitialSessionBinding(self: *AgentRuntimeRegistry, role: ConnectionRole) !InitialSessionBinding {
         const bootstrap_only = self.isBootstrapMotherOnlyState();
-        if (bootstrap_only and role == .admin) {
-            return .{
-                .binding = .{
-                    .agent_id = try self.allocator.dupe(u8, system_agent_id),
-                    .project_id = try self.allocator.dupe(u8, system_project_id),
-                    .project_token = null,
-                },
-                .bootstrap_only = true,
-            };
-        }
-
-        if (try self.resolvePreferredBindingForRole(role)) |binding| {
-            return .{
-                .binding = binding,
-                .bootstrap_only = bootstrap_only,
-            };
-        }
-
-        // Admin connections always retain Mother/system access for provisioning and recovery,
-        // even when non-system projects exist without attachable agents.
         if (role == .admin) {
             return .{
                 .binding = .{
@@ -4973,6 +4953,13 @@ const AgentRuntimeRegistry = struct {
                     .project_id = try self.allocator.dupe(u8, system_project_id),
                     .project_token = null,
                 },
+                .bootstrap_only = bootstrap_only,
+            };
+        }
+
+        if (try self.resolvePreferredBindingForRole(role)) |binding| {
+            return .{
+                .binding = binding,
                 .bootstrap_only = bootstrap_only,
             };
         }
@@ -10245,6 +10232,51 @@ fn seedUserRememberedTargetForTests(
     if (project_id_value != .string) return error.TestExpectedResult;
 
     try runtime_registry.auth_tokens.setRememberedTarget(.user, agent_id, project_id_value.string);
+}
+
+test "server_piai: admin initial binding stays on mother/system even with remembered target" {
+    const allocator = std.testing.allocator;
+    var runtime_registry = AgentRuntimeRegistry.init(allocator, .{
+        .ltm_directory = "",
+        .ltm_filename = "",
+    }, null);
+    defer runtime_registry.deinit();
+    try setAuthTokensForTests(&runtime_registry, "admin-secret", "user-secret");
+
+    const project_up = try runtime_registry.control_plane.projectUpWithRole(
+        system_agent_id,
+        "{\"name\":\"Admin Remembered\",\"vision\":\"Remembered target test\",\"activate\":false}",
+        true,
+    );
+    defer allocator.free(project_up);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, project_up, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.TestExpectedResult;
+    const project_id_value = parsed.value.object.get("project_id") orelse return error.TestExpectedResult;
+    if (project_id_value != .string or project_id_value.string.len == 0) return error.TestExpectedResult;
+
+    var registry = agent_registry_mod.AgentRegistry.init(
+        allocator,
+        ".",
+        runtime_registry.runtime_config.agents_dir,
+        runtime_registry.runtime_config.assets_dir,
+    );
+    defer registry.deinit();
+    try registry.scan();
+    if (registry.getAgent("roger") == null) {
+        try registry.createAgent("roger", null);
+    }
+    try runtime_registry.auth_tokens.setRememberedTarget(.admin, "roger", project_id_value.string);
+
+    const initial = try runtime_registry.buildInitialSessionBinding(.admin);
+    defer {
+        var owned = initial.binding;
+        owned.deinit(allocator);
+    }
+    try std.testing.expect(initial.connect_gate_error == null);
+    try std.testing.expectEqualStrings(system_agent_id, initial.binding.agent_id);
+    try std.testing.expect(initial.binding.project_id != null);
+    try std.testing.expectEqualStrings(system_project_id, initial.binding.project_id.?);
 }
 
 fn readHttpHeadersAlloc(allocator: std.mem.Allocator, stream: *std.net.Stream, max_bytes: usize) ![]u8 {
