@@ -5626,30 +5626,17 @@ const AgentRuntimeRegistry = struct {
         };
         defer if (export_path_owned) |value| self.allocator.free(value);
         const configured_export_path = std.mem.trim(u8, self.runtime_config.spider_web_root, " \t\r\n");
-        const cwd_owned = std.process.getCwdAlloc(self.allocator) catch null;
-        defer if (cwd_owned) |value| self.allocator.free(value);
-        const cwd_trimmed = if (cwd_owned) |value| std.mem.trim(u8, value, " \t\r\n") else "";
         const export_path = if (export_path_owned) |value| blk: {
             const trimmed = std.mem.trim(u8, value, " \t\r\n");
             if (trimmed.len > 0) break :blk trimmed;
-            if (std.mem.eql(u8, configured_export_path, "/") and cwd_trimmed.len > 0 and !std.mem.eql(u8, cwd_trimmed, "/")) {
-                break :blk cwd_trimmed;
-            }
             break :blk configured_export_path;
         } else blk: {
-            if (std.mem.eql(u8, configured_export_path, "/") and cwd_trimmed.len > 0 and !std.mem.eql(u8, cwd_trimmed, "/")) {
-                break :blk cwd_trimmed;
-            }
             break :blk configured_export_path;
         };
-        const using_workdir_export_default = export_path_owned == null and
-            std.mem.eql(u8, configured_export_path, "/") and
-            cwd_trimmed.len > 0 and
-            !std.mem.eql(u8, cwd_trimmed, "/");
-        if (using_workdir_export_default) {
+        if (std.mem.eql(u8, export_path, "/")) {
             std.log.warn(
-                "local fs export defaulting to service working directory {s} because runtime.spider_web_root='/' (set runtime.spider_web_root or {s} to override)",
-                .{ export_path, local_node_export_path_env },
+                "local fs export scope is host filesystem root '/' (set {s} or runtime.spider_web_root to restrict scope)",
+                .{local_node_export_path_env},
             );
         }
         if (export_path.len == 0) {

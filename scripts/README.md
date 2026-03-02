@@ -197,3 +197,7 @@ Example with custom settings:
 ```bash
 sudo PORT=8080 BIND_ADDR=0.0.0.0 PROVIDER_NAME=openai-codex PROVIDER_MODEL=gpt-5.3-codex ./install-systemd.sh
 ```
+
+Current system-project scope note:
+- `SPIDER_WEB_ROOT` defaults to `/`, so the `system` project (Mother) is host-wide by default.
+- Restrict scope by setting `SPIDER_WEB_ROOT` to a narrower path during install.
