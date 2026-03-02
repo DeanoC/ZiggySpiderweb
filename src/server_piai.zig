@@ -3791,6 +3791,13 @@ const AgentRuntimeRegistry = struct {
         project_id: []const u8,
         project_token: ?[]const u8,
     ) !AgentRuntimeEntry {
+        if (!self.runtime_config.sandbox_enabled and !builtin.is_test) {
+            std.log.err(
+                "invalid runtime configuration: sandbox mode is required for agent runtime (agent={s} project={s})",
+                .{ agent_id, project_id },
+            );
+            return error.InvalidSandboxConfig;
+        }
         if (self.runtime_config.sandbox_enabled) {
             const workspace_url = self.workspace_url orelse return error.InvalidSandboxConfig;
             const workspace_auth = try self.auth_tokens.copyAdminToken();
@@ -3881,6 +3888,7 @@ const AgentRuntimeRegistry = struct {
         }
 
         if (!self.runtime_config.sandbox_enabled) {
+            if (!builtin.is_test) return error.InvalidSandboxConfig;
             return self.allocator.dupe(u8, "__local__");
         }
         return error.ProjectRequired;

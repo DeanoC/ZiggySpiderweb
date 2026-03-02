@@ -251,6 +251,7 @@ pub fn init(allocator: std.mem.Allocator, config_path: ?[]const u8) !Config {
         },
         .config_path = path,
     };
+    errdefer self.deinit();
 
     // Try to load existing config
     self.load() catch |err| {
@@ -258,11 +259,14 @@ pub fn init(allocator: std.mem.Allocator, config_path: ?[]const u8) !Config {
             // Create default config
             try self.save();
             std.log.info("Created default config at {s}", .{path});
+        } else if (err == error.InvalidConfig) {
+            return err;
         } else {
             std.log.warn("Failed to load config: {s}, using defaults", .{@errorName(err)});
         }
     };
 
+    try self.validateRuntimeConfig();
     return self;
 }
 
@@ -527,6 +531,18 @@ pub fn load(self: *Config) !void {
                 }
             }
         }
+    }
+
+    try self.validateRuntimeConfig();
+}
+
+fn validateRuntimeConfig(self: *Config) !void {
+    if (!builtin.is_test and !self.runtime.sandbox_enabled) {
+        std.log.err(
+            "invalid config: runtime.sandbox_enabled=false is unsupported (Acheron runtime requires sandbox mode)",
+            .{},
+        );
+        return error.InvalidConfig;
     }
 }
 pub fn save(self: Config) !void {

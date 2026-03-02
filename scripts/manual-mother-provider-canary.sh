@@ -119,6 +119,10 @@ $JQ_BIN -n \
   --arg ltm_dir "state" \
   --arg assets_dir "$REPO_ROOT/templates" \
   --arg agents_dir "agents" \
+  --arg sandbox_mounts_root "$TMP_ROOT/sandbox/mounts" \
+  --arg sandbox_runtime_root "$TMP_ROOT/sandbox/runtime" \
+  --arg sandbox_fs_mount_bin "$BIN_DIR/spiderweb-fs-mount" \
+  --arg sandbox_agent_runtime_bin "$BIN_DIR/spiderweb-agent-runtime" \
   --argjson port "$CANARY_PORT" \
   '{
     server: { bind: "127.0.0.1", port: $port },
@@ -130,11 +134,16 @@ $JQ_BIN -n \
     ),
     log: { level: "warn" },
     runtime: {
-      sandbox_enabled: false,
+      sandbox_enabled: true,
       default_agent_id: "mother",
       ltm_directory: $ltm_dir,
       assets_dir: $assets_dir,
-      agents_dir: $agents_dir
+      agents_dir: $agents_dir,
+      sandbox_mounts_root: $sandbox_mounts_root,
+      sandbox_runtime_root: $sandbox_runtime_root,
+      sandbox_launcher: "bwrap",
+      sandbox_fs_mount_bin: $sandbox_fs_mount_bin,
+      sandbox_agent_runtime_bin: $sandbox_agent_runtime_bin
     }
   }' > "$CONFIG_PATH"
 

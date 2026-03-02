@@ -29,40 +29,8 @@ pub fn main() !void {
 
     // Load config
     var config = Config.init(allocator, null) catch |err| {
-        std.log.warn("Failed to load config: {s}, using defaults", .{@errorName(err)});
-        // Continue with defaults
-        const cfg = Config{
-            .allocator = allocator,
-            .server = .{},
-            .provider = .{
-                .name = try allocator.dupe(u8, "openai"),
-                .model = try allocator.dupe(u8, "gpt-4o-mini"),
-                .base_url = null,
-            },
-            .log = .{
-                .level = try allocator.dupe(u8, "info"),
-            },
-            .runtime = .{
-                .inbound_queue_max = 512,
-                .brain_tick_queue_max = 256,
-                .outbound_queue_max = 512,
-                .control_queue_max = 128,
-                .connection_worker_threads = 4,
-                .connection_queue_max = 128,
-                .runtime_worker_threads = 2,
-                .runtime_request_queue_max = 128,
-                .chat_operation_timeout_ms = 120_000,
-                .control_operation_timeout_ms = 5_000,
-                .default_agent_id = try allocator.dupe(u8, "mother"),
-                .ltm_directory = try allocator.dupe(u8, ".spiderweb-ltm"),
-                .ltm_filename = try allocator.dupe(u8, "runtime-memory.db"),
-            },
-            .config_path = try allocator.dupe(u8, ".spiderweb.json"),
-        };
-        // Need to handle deinit, but we already have an error path
-        std.log.info("Starting ZiggySpiderweb v0.3.0 (Pi AI)", .{});
-        try server.run(allocator, cfg.server.bind, cfg.server.port, cfg.provider, cfg.runtime);
-        return;
+        std.log.err("Failed to load config: {s}", .{@errorName(err)});
+        return err;
     };
     defer config.deinit();
 
