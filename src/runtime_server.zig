@@ -42,7 +42,7 @@ const PROJECT_SETUP_STATE_MEM_NAME_PREFIX = "project.setup.state.";
 const PROJECT_SETUP_STATE_MEM_KIND = "project.setup_state";
 const PROJECT_SETUP_REQUIRED_MEM_NAME_PREFIX = "project.setup.required.";
 const PROJECT_SETUP_REQUIRED_MEM_KIND = "project.setup_required";
-const PROJECT_SETUP_GATE_PROMPT_MEM_NAME = "core.system.project_setup_gate";
+const PROJECT_SETUP_GATE_PROMPT_MEM_NAME = "project.setup_gate.instructions";
 const PROJECT_SETUP_GATE_PROMPT_MEM_KIND = "core.system_prompt";
 
 const RuntimeServerError = error{
