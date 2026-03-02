@@ -1527,7 +1527,10 @@ pub const RuntimeServer = struct {
     }
 
     fn refreshProjectSetupGatePrompt(self: *RuntimeServer, brain_name: []const u8) !void {
-        const snapshot = try self.runtime.active_memory.snapshotActive(self.allocator, brain_name);
+        const snapshot = self.runtime.active_memory.snapshotActive(self.allocator, brain_name) catch |err| switch (err) {
+            memory.MemoryError.NotFound => return,
+            else => return err,
+        };
         defer memory.deinitItems(self.allocator, snapshot);
 
         var prompt = std.ArrayListUnmanaged(u8){};
