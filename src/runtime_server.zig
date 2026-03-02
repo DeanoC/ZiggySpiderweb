@@ -8132,6 +8132,7 @@ test "runtime_server: agent.control project.setup.sync upserts setup state and r
     const required_response = try server.handleMessage(required_request);
     defer allocator.free(required_response);
     try std.testing.expect(std.mem.indexOf(u8, required_response, "\"type\":\"session.receive\"") != null);
+    try server.runtime.refreshCorePrompt("primary");
 
     const required_snapshot = try server.runtime.active_memory.snapshotActive(allocator, "primary");
     defer memory.deinitItems(allocator, required_snapshot);
