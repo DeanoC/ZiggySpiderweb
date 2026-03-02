@@ -1442,9 +1442,10 @@ pub const RuntimeServer = struct {
                         "For first-project bootstrap, do not mutate the `system` project and do not include `project_id`.\n" ++
                         "After all fields are known, execute provisioning via Acheron namespaces:\n" ++
                         "1) `agents/self/projects/control/up.json` with `{name, vision, activate:false}` only.\n" ++
-                        "   If this call returns AccessDenied/ProjectProtected, retry once with exactly the same minimal payload.\n" ++
-                        "2) `agents/self/agents/control/create.json` with `{agent_id, name, description}`\n" ++
-                        "3) verify `status.json`/`result.json`, then send completion reply.\n" ++
+                        "2) Read the `operation_result.project_id` returned by that file_write tool result.\n" ++
+                        "3) `agents/self/agents/control/create.json` with `{agent_id, name, description, project_id}`\n" ++
+                        "4) Treat successful file_write tool results as authoritative completion for provisioning.\n" ++
+                        "   Do not block on `status.json`/`result.json` in bootstrap mode.\n" ++
                         "Do not switch to unrelated chit-chat until setup blockers are resolved.\n" ++
                         "Active setup requirements:\n",
                 );
