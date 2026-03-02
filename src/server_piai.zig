@@ -3313,7 +3313,18 @@ const AgentRuntimeRegistry = struct {
             self.allocator.free(responses);
         }
         if (responses.len == 0) return error.MissingJobResponse;
-        if (std.mem.indexOf(u8, responses[0], "\"type\":\"error\"") != null) return error.RuntimeControlRejected;
+        if (std.mem.indexOf(u8, responses[0], "\"type\":\"error\"") != null) {
+            std.log.warn(
+                "runtime agent.control rejected: action={s} agent={s} project={s} response={s}",
+                .{
+                    action,
+                    binding.agent_id,
+                    binding.project_id orelse "null",
+                    responses[0],
+                },
+            );
+            return error.RuntimeControlRejected;
+        }
     }
 
     fn getRuntimeForBindingIfReady(
