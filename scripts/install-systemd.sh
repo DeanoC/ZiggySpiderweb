@@ -152,6 +152,8 @@ install_files() {
     mkdir -p "$CONFIG_DIR"
     mkdir -p "/var/log/spiderweb"
     mkdir -p "/var/lib/spiderweb"
+    mkdir -p "/var/lib/spiderweb/mounts"
+    mkdir -p "/var/lib/spiderweb/runtime"
     
     SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
     PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
@@ -196,7 +198,10 @@ install_config() {
   "runtime": {
     "spider_web_root": "$SPIDER_WEB_ROOT",
     "ltm_directory": "/var/lib/spiderweb/.spiderweb-ltm",
-    "ltm_filename": "runtime-memory.db"
+    "ltm_filename": "runtime-memory.db",
+    "sandbox_enabled": true,
+    "sandbox_mounts_root": "/var/lib/spiderweb/mounts",
+    "sandbox_runtime_root": "/var/lib/spiderweb/runtime"
   }
 }
 EOF
@@ -218,7 +223,10 @@ EOF
   "runtime": {
     "spider_web_root": "$SPIDER_WEB_ROOT",
     "ltm_directory": "/var/lib/spiderweb/.spiderweb-ltm",
-    "ltm_filename": "runtime-memory.db"
+    "ltm_filename": "runtime-memory.db",
+    "sandbox_enabled": true,
+    "sandbox_mounts_root": "/var/lib/spiderweb/mounts",
+    "sandbox_runtime_root": "/var/lib/spiderweb/runtime"
   }
 }
 EOF
