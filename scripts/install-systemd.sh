@@ -12,8 +12,8 @@ CONFIG_DIR="${CONFIG_DIR:-/etc/spiderweb}"
 SERVICE_NAME="${SERVICE_NAME:-spiderweb}"
 PORT="${PORT:-18790}"
 BIND_ADDR="${BIND_ADDR:-0.0.0.0}"
-PROVIDER_NAME="${PROVIDER_NAME:-openai}"
-PROVIDER_MODEL="${PROVIDER_MODEL:-gpt-4o-mini}"
+PROVIDER_NAME="${PROVIDER_NAME:-}"
+PROVIDER_MODEL="${PROVIDER_MODEL:-}"
 SPIDER_WEB_ROOT="${SPIDER_WEB_ROOT:-/}"
 OVERWRITE_CONFIG="${OVERWRITE_CONFIG:-0}"
 SERVICE_ENV_FILE="${SERVICE_ENV_FILE:-$CONFIG_DIR/service.env}"
@@ -63,6 +63,47 @@ check_zig() {
     log_info "Zig version: $(zig version)"
 }
 
+require_provider_selection() {
+    local config_file="$CONFIG_DIR/config.json"
+
+    # When preserving an existing config, provider/model should come from that file.
+    if [ -f "$config_file" ] && [ "$OVERWRITE_CONFIG" != "1" ]; then
+        if command -v jq &> /dev/null; then
+            detected_provider="$(jq -r '.provider.name // empty' "$config_file" 2>/dev/null || true)"
+            detected_model="$(jq -r '.provider.model // empty' "$config_file" 2>/dev/null || true)"
+            if [ -n "$detected_provider" ] && [ -n "$detected_model" ]; then
+                if [ -n "$PROVIDER_NAME" ] || [ -n "$PROVIDER_MODEL" ]; then
+                    log_warn "Preserving existing config at $config_file; ignoring PROVIDER_NAME/PROVIDER_MODEL overrides"
+                fi
+                PROVIDER_NAME="$detected_provider"
+                PROVIDER_MODEL="$detected_model"
+                log_info "Using provider from existing config: $PROVIDER_NAME/$PROVIDER_MODEL"
+                return 0
+            fi
+        fi
+
+        # Existing config path but provider data unavailable/parsing failed.
+        if [ -z "$PROVIDER_NAME" ] || [ -z "$PROVIDER_MODEL" ]; then
+            log_error "Provider is not configured in $config_file and no explicit values were provided."
+            log_error "Set PROVIDER_NAME and PROVIDER_MODEL, or install jq so the script can read config values."
+            log_info "Example:"
+            log_info "  sudo PROVIDER_NAME=openai-codex PROVIDER_MODEL=gpt-5.3-codex ./scripts/install-systemd.sh"
+            exit 1
+        fi
+        return 0
+    fi
+
+    # New config or overwrite: require explicit provider/model.
+    if [ -z "$PROVIDER_NAME" ] || [ -z "$PROVIDER_MODEL" ]; then
+        log_error "Missing required provider configuration."
+        log_error "Set both PROVIDER_NAME and PROVIDER_MODEL."
+        log_info "Examples:"
+        log_info "  sudo PROVIDER_NAME=openai-codex PROVIDER_MODEL=gpt-5.3-codex ./scripts/install-systemd.sh"
+        log_info "  sudo PROVIDER_NAME=openai PROVIDER_MODEL=gpt-4.1 ./scripts/install-systemd.sh"
+        exit 1
+    fi
+}
+
 build_project() {
     log_info "Building ZiggySpiderWeb..."
     
@@ -95,6 +136,8 @@ create_user() {
     SERVICE_USER_HOME=$(getent passwd "$INSTALL_USER" | cut -d: -f6)
     if [ -n "$SERVICE_USER_HOME" ] && [ "$SERVICE_USER_HOME" != "/" ]; then
         mkdir -p "$SERVICE_USER_HOME/.config/spiderweb"
+        mkdir -p "$SERVICE_USER_HOME/.pi/agent"
+        mkdir -p "$SERVICE_USER_HOME/.codex"
         chown -R "$INSTALL_USER:$INSTALL_USER" "$SERVICE_USER_HOME"
         chmod 700 "$SERVICE_USER_HOME"
     else
@@ -111,6 +154,8 @@ install_files() {
     mkdir -p "$CONFIG_DIR"
     mkdir -p "/var/log/spiderweb"
     mkdir -p "/var/lib/spiderweb"
+    mkdir -p "/var/lib/spiderweb/mounts"
+    mkdir -p "/var/lib/spiderweb/runtime"
     
     SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
     PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
@@ -118,11 +163,15 @@ install_files() {
     # Copy binaries
     cp "$PROJECT_DIR/zig-out/bin/spiderweb" "$INSTALL_DIR/bin/"
     cp "$PROJECT_DIR/zig-out/bin/spiderweb-config" "$INSTALL_DIR/bin/"
+    cp "$PROJECT_DIR/zig-out/bin/spiderweb-agent-runtime" "$INSTALL_DIR/bin/"
+    cp "$PROJECT_DIR/zig-out/bin/spiderweb-fs-mount" "$INSTALL_DIR/bin/"
+    cp "$PROJECT_DIR/zig-out/bin/spiderweb-control" "$INSTALL_DIR/bin/"
     chmod +x "$INSTALL_DIR/bin/"*
     
     # Create symlink in /usr/local/bin
     ln -sf "$INSTALL_DIR/bin/spiderweb" /usr/local/bin/spiderweb
     ln -sf "$INSTALL_DIR/bin/spiderweb-config" /usr/local/bin/spiderweb-config
+    ln -sf "$INSTALL_DIR/bin/spiderweb-control" /usr/local/bin/spiderweb-control
     
     log_info "Binaries installed ✓"
 }
@@ -138,7 +187,7 @@ install_config() {
         log_warn "Config already exists at $CONFIG_FILE"
         log_info "Backing up to $CONFIG_FILE.bak"
         cp "$CONFIG_FILE" "$CONFIG_FILE.bak"
-        # Generate default config
+        # Generate config from explicit provider/model selection
         cat > "$CONFIG_FILE" <<EOF
 {
   "server": {
@@ -155,12 +204,17 @@ install_config() {
   "runtime": {
     "spider_web_root": "$SPIDER_WEB_ROOT",
     "ltm_directory": "/var/lib/spiderweb/.spiderweb-ltm",
-    "ltm_filename": "runtime-memory.db"
+    "ltm_filename": "runtime-memory.db",
+    "sandbox_enabled": true,
+    "sandbox_mounts_root": "/var/lib/spiderweb/mounts",
+    "sandbox_runtime_root": "/var/lib/spiderweb/runtime",
+    "sandbox_fs_mount_bin": "$INSTALL_DIR/bin/spiderweb-fs-mount",
+    "sandbox_agent_runtime_bin": "$INSTALL_DIR/bin/spiderweb-agent-runtime"
   }
 }
 EOF
     else
-        # Generate default config
+        # Generate config from explicit provider/model selection
         cat > "$CONFIG_FILE" <<EOF
 {
   "server": {
@@ -177,7 +231,12 @@ EOF
   "runtime": {
     "spider_web_root": "$SPIDER_WEB_ROOT",
     "ltm_directory": "/var/lib/spiderweb/.spiderweb-ltm",
-    "ltm_filename": "runtime-memory.db"
+    "ltm_filename": "runtime-memory.db",
+    "sandbox_enabled": true,
+    "sandbox_mounts_root": "/var/lib/spiderweb/mounts",
+    "sandbox_runtime_root": "/var/lib/spiderweb/runtime",
+    "sandbox_fs_mount_bin": "$INSTALL_DIR/bin/spiderweb-fs-mount",
+    "sandbox_agent_runtime_bin": "$INSTALL_DIR/bin/spiderweb-agent-runtime"
   }
 }
 EOF
@@ -325,7 +384,8 @@ StartLimitInterval=60s
 StartLimitBurst=3
 
 # Security hardening
-NoNewPrivileges=true
+# FUSE mount helpers (fusermount3) require setuid transitions.
+NoNewPrivileges=false
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=read-only
@@ -333,7 +393,7 @@ ReadWritePaths=/var/lib/spiderweb /var/log/spiderweb $SERVICE_USER_HOME/.config 
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
-RestrictSUIDSGID=true
+RestrictSUIDSGID=false
 RestrictRealtime=true
 RestrictNamespaces=true
 LockPersonality=true
@@ -412,9 +472,10 @@ print_summary() {
     echo ""
     echo "Credential notes:"
     echo "  - For system services, keys must be available to user '$INSTALL_USER'."
+    echo "  - Provider/model selection is required for new/overwrite installs (no defaults)."
     echo "  - OpenAI/OpenAI Codex keys can be supplied via environment at install time:"
-    echo "      sudo OPENAI_API_KEY=... ./scripts/install-systemd.sh"
-    echo "      sudo OPENAI_CODEX_API_KEY=... PROVIDER_NAME=openai-codex PROVIDER_MODEL=gpt-5.1-codex-mini ./scripts/install-systemd.sh"
+    echo "      sudo OPENAI_API_KEY=... PROVIDER_NAME=openai PROVIDER_MODEL=gpt-4.1 ./scripts/install-systemd.sh"
+    echo "      sudo OPENAI_CODEX_API_KEY=... PROVIDER_NAME=openai-codex PROVIDER_MODEL=gpt-5.3-codex ./scripts/install-systemd.sh"
     echo "  - For Codex OAuth, place auth at: $SERVICE_USER_HOME/.codex/auth.json"
     echo "  - Or run OAuth login as service user:"
     echo "      sudo -u $INSTALL_USER HOME=$SERVICE_USER_HOME SPIDERWEB_CONFIG=$CONFIG_DIR/config.json $INSTALL_DIR/bin/spiderweb-config oauth login openai-codex --no-set-provider"
@@ -430,6 +491,7 @@ main() {
     check_root
     check_systemd
     check_zig
+    require_provider_selection
     build_project
     create_user
     install_files

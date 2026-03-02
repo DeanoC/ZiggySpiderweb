@@ -3164,6 +3164,303 @@ const AgentRuntimeRegistry = struct {
         bootstrap_only: bool = false,
     };
 
+    const ProjectSetupSnapshot = struct {
+        vision: ?[]u8 = null,
+        mount_count: usize = 0,
+
+        fn deinit(self: *ProjectSetupSnapshot, allocator: std.mem.Allocator) void {
+            if (self.vision) |value| allocator.free(value);
+            self.* = undefined;
+        }
+    };
+
+    const ProjectSetupHint = struct {
+        required: bool = false,
+        message: ?[]u8 = null,
+        project_id: ?[]u8 = null,
+        project_vision: ?[]u8 = null,
+
+        fn deinit(self: *ProjectSetupHint, allocator: std.mem.Allocator) void {
+            if (self.message) |value| allocator.free(value);
+            if (self.project_id) |value| allocator.free(value);
+            if (self.project_vision) |value| allocator.free(value);
+            self.* = undefined;
+        }
+    };
+
+    fn projectSetupSnapshot(self: *AgentRuntimeRegistry, project_id: []const u8, is_admin: bool) !ProjectSetupSnapshot {
+        const escaped_project = try unified.jsonEscape(self.allocator, project_id);
+        defer self.allocator.free(escaped_project);
+        const payload = try std.fmt.allocPrint(self.allocator, "{{\"project_id\":\"{s}\"}}", .{escaped_project});
+        defer self.allocator.free(payload);
+        const project_json = try self.control_plane.getProjectWithRole(payload, is_admin);
+        defer self.allocator.free(project_json);
+
+        var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, project_json, .{});
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidResponse;
+
+        const vision_owned = if (parsed.value.object.get("vision")) |vision_val| blk: {
+            if (vision_val != .string) break :blk null;
+            if (vision_val.string.len == 0) break :blk null;
+            break :blk try self.allocator.dupe(u8, vision_val.string);
+        } else null;
+
+        var mount_count: usize = 0;
+        if (parsed.value.object.get("mounts")) |mounts_val| {
+            if (mounts_val == .array) mount_count = mounts_val.array.items.len;
+        }
+
+        return .{
+            .vision = vision_owned,
+            .mount_count = mount_count,
+        };
+    }
+
+    fn projectSetupHint(
+        self: *AgentRuntimeRegistry,
+        role: ConnectionRole,
+        active_binding: SessionBinding,
+        bootstrap_only: bool,
+    ) !ProjectSetupHint {
+        var hint = ProjectSetupHint{};
+        errdefer hint.deinit(self.allocator);
+
+        if (active_binding.project_id) |project_id| {
+            hint.project_id = try self.allocator.dupe(u8, project_id);
+        } else {
+            return hint;
+        }
+
+        if (bootstrap_only and role == .admin) {
+            hint.required = true;
+            hint.message = try self.allocator.dupe(
+                u8,
+                "Project setup required: ask Mother for the first project name, vision, and first non-system agent.",
+            );
+            return hint;
+        }
+
+        const project_id = hint.project_id.?;
+        if (std.mem.eql(u8, project_id, system_project_id)) return hint;
+
+        var snapshot = self.projectSetupSnapshot(project_id, role == .admin) catch |err| {
+            std.log.warn("failed to compute project setup snapshot for {s}: {s}", .{ project_id, @errorName(err) });
+            return hint;
+        };
+        defer snapshot.deinit(self.allocator);
+
+        if (snapshot.vision) |vision| {
+            hint.project_vision = try self.allocator.dupe(u8, vision);
+        }
+
+        const vision_text = snapshot.vision orelse "";
+        const vision_missing = std.mem.trim(u8, vision_text, " \t\r\n").len == 0;
+        const mounts_missing = snapshot.mount_count == 0;
+        const first_agent = self.firstAgentForProject(role, project_id);
+        defer if (first_agent) |agent_id| self.allocator.free(agent_id);
+        const agent_missing = first_agent == null;
+        hint.required = vision_missing or mounts_missing or agent_missing;
+
+        if (hint.required) {
+            hint.message = if (agent_missing)
+                try std.fmt.allocPrint(
+                    self.allocator,
+                    "Project setup required for {s}: attach a non-system agent, then ask Mother to confirm setup details.",
+                    .{project_id},
+                )
+            else if (mounts_missing)
+                try std.fmt.allocPrint(
+                    self.allocator,
+                    "Project setup required for {s}: no workspace mounts are configured yet.",
+                    .{project_id},
+                )
+            else
+                try std.fmt.allocPrint(
+                    self.allocator,
+                    "Project setup required for {s}: project vision is missing.",
+                    .{project_id},
+                );
+        }
+
+        return hint;
+    }
+
+    fn dispatchRuntimeAgentControl(
+        self: *AgentRuntimeRegistry,
+        binding: SessionBinding,
+        action: []const u8,
+        content_json: []const u8,
+    ) !void {
+        const runtime = self.getRuntimeForBindingIfReady(binding.agent_id, binding.project_id) orelse
+            return error.RuntimeUnavailable;
+        defer runtime.release();
+
+        const escaped_content = try unified.jsonEscape(self.allocator, content_json);
+        defer self.allocator.free(escaped_content);
+        const request_id = try std.fmt.allocPrint(self.allocator, "runtime-control-{d}", .{std.time.nanoTimestamp()});
+        defer self.allocator.free(request_id);
+        const request_json = try std.fmt.allocPrint(
+            self.allocator,
+            "{{\"id\":\"{s}\",\"type\":\"agent.control\",\"action\":\"{s}\",\"content\":\"{s}\"}}",
+            .{ request_id, action, escaped_content },
+        );
+        defer self.allocator.free(request_json);
+
+        const responses = try runtime.handleMessageFramesWithDebug(request_json, false);
+        defer {
+            for (responses) |frame| self.allocator.free(frame);
+            self.allocator.free(responses);
+        }
+        if (responses.len == 0) return error.MissingJobResponse;
+        if (std.mem.indexOf(u8, responses[0], "\"type\":\"error\"") != null) {
+            std.log.warn(
+                "runtime agent.control rejected: action={s} agent={s} project={s} response={s}",
+                .{
+                    action,
+                    binding.agent_id,
+                    binding.project_id orelse "null",
+                    responses[0],
+                },
+            );
+            return error.RuntimeControlRejected;
+        }
+    }
+
+    fn getRuntimeForBindingIfReady(
+        self: *AgentRuntimeRegistry,
+        agent_id: []const u8,
+        project_id: ?[]const u8,
+    ) ?*runtime_handle_mod.RuntimeHandle {
+        var removed_unhealthy: ?RemovedRuntimeEntry = null;
+        var selected_runtime: ?*runtime_handle_mod.RuntimeHandle = null;
+
+        self.mutex.lock();
+        removed_unhealthy = self.takeUnhealthyRuntimeLocked(agent_id);
+        if (removed_unhealthy == null) {
+            if (self.by_agent.getPtr(agent_id)) |existing| {
+                const binding_matches = if (project_id) |project|
+                    std.mem.eql(u8, existing.project_id, project)
+                else
+                    true;
+                if (binding_matches) {
+                    selected_runtime = existing.runtime;
+                    selected_runtime.?.retain();
+                }
+            }
+        }
+        self.mutex.unlock();
+
+        if (removed_unhealthy) |removed| {
+            self.deinitRemovedRuntime(removed);
+            return null;
+        }
+        return selected_runtime;
+    }
+
+    fn publishServicePresenceForBinding(
+        self: *AgentRuntimeRegistry,
+        role: ConnectionRole,
+        binding: SessionBinding,
+        session_key: []const u8,
+        service_id: []const u8,
+        attached: bool,
+    ) void {
+        const escaped_service = unified.jsonEscape(self.allocator, service_id) catch return;
+        defer self.allocator.free(escaped_service);
+        const escaped_session = unified.jsonEscape(self.allocator, session_key) catch return;
+        defer self.allocator.free(escaped_session);
+        const escaped_role = unified.jsonEscape(self.allocator, connectionRoleName(role)) catch return;
+        defer self.allocator.free(escaped_role);
+        const project_json = if (binding.project_id) |project_id| blk: {
+            const escaped_project = unified.jsonEscape(self.allocator, project_id) catch return;
+            defer self.allocator.free(escaped_project);
+            break :blk std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped_project}) catch return;
+        } else self.allocator.dupe(u8, "null") catch return;
+        defer self.allocator.free(project_json);
+
+        const payload_json = std.fmt.allocPrint(
+            self.allocator,
+            "{{\"service_id\":\"{s}\",\"status\":\"{s}\",\"session_key\":\"{s}\",\"role\":\"{s}\",\"project_id\":{s}}}",
+            .{
+                escaped_service,
+                if (attached) "attached" else "detached",
+                escaped_session,
+                escaped_role,
+                project_json,
+            },
+        ) catch return;
+        defer self.allocator.free(payload_json);
+
+        self.dispatchRuntimeAgentControl(binding, "service.event", payload_json) catch |err| {
+            std.log.warn(
+                "service presence sync failed: agent={s} session={s} status={s} err={s}",
+                .{
+                    binding.agent_id,
+                    session_key,
+                    if (attached) "attached" else "detached",
+                    @errorName(err),
+                },
+            );
+        };
+    }
+
+    fn syncProjectSetupForBinding(
+        self: *AgentRuntimeRegistry,
+        role: ConnectionRole,
+        binding: SessionBinding,
+        bootstrap_only: bool,
+        source: []const u8,
+    ) void {
+        if (binding.project_id == null) return;
+
+        var hint = self.projectSetupHint(role, binding, bootstrap_only) catch |err| {
+            std.log.warn("project setup hint sync failed for {s}: {s}", .{ binding.agent_id, @errorName(err) });
+            return;
+        };
+        defer hint.deinit(self.allocator);
+        const project_id = hint.project_id orelse return;
+
+        const escaped_project = unified.jsonEscape(self.allocator, project_id) catch return;
+        defer self.allocator.free(escaped_project);
+        const escaped_source = unified.jsonEscape(self.allocator, source) catch return;
+        defer self.allocator.free(escaped_source);
+
+        const message_json = if (hint.message) |message| blk: {
+            const escaped_message = unified.jsonEscape(self.allocator, message) catch return;
+            defer self.allocator.free(escaped_message);
+            break :blk std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped_message}) catch return;
+        } else self.allocator.dupe(u8, "null") catch return;
+        defer self.allocator.free(message_json);
+
+        const vision_json = if (hint.project_vision) |vision| blk: {
+            const escaped_vision = unified.jsonEscape(self.allocator, vision) catch return;
+            defer self.allocator.free(escaped_vision);
+            break :blk std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped_vision}) catch return;
+        } else self.allocator.dupe(u8, "null") catch return;
+        defer self.allocator.free(vision_json);
+
+        const payload_json = std.fmt.allocPrint(
+            self.allocator,
+            "{{\"project_id\":\"{s}\",\"required\":{},\"message\":{s},\"project_vision\":{s},\"source\":\"{s}\"}}",
+            .{
+                escaped_project,
+                hint.required,
+                message_json,
+                vision_json,
+                escaped_source,
+            },
+        ) catch return;
+        defer self.allocator.free(payload_json);
+
+        self.dispatchRuntimeAgentControl(binding, "project.setup.sync", payload_json) catch |err| {
+            std.log.warn(
+                "project setup sync failed: agent={s} project={s} err={s}",
+                .{ binding.agent_id, project_id, @errorName(err) },
+            );
+        };
+    }
+
     fn projectExistsWithRole(self: *AgentRuntimeRegistry, project_id: []const u8, is_admin: bool) bool {
         const escaped_project = unified.jsonEscape(self.allocator, project_id) catch return false;
         defer self.allocator.free(escaped_project);
@@ -5513,20 +5810,6 @@ fn handleWebSocketConnection(
         initial_binding.binding.project_id,
         initial_binding.binding.project_token,
     );
-    var initial_warmup_snapshot = if (connect_gate_error == null)
-        runtime_registry.ensureRuntimeWarmup(
-            initial_binding.binding.agent_id,
-            initial_binding.binding.project_id,
-            initial_binding.binding.project_token,
-            true,
-        ) catch |err| blk: {
-            std.log.warn("default session warmup failed: {s}", .{@errorName(err)});
-            break :blk SessionAttachStateSnapshot{};
-        }
-    else
-        SessionAttachStateSnapshot{};
-    defer initial_warmup_snapshot.deinit(allocator);
-
     var active_session_key = try allocator.dupe(u8, "main");
     defer allocator.free(active_session_key);
     var fsrpc: ?fsrpc_session.Session = null;
@@ -5540,6 +5823,26 @@ fn handleWebSocketConnection(
     defer if (node_service_subscriber_id) |subscriber_id| {
         runtime_registry.unregisterNodeServiceSubscriber(subscriber_id);
     };
+    const connection_service_id = try std.fmt.allocPrint(
+        allocator,
+        "ws.{s}.{d}",
+        .{ connectionRoleName(principal.role), std.time.nanoTimestamp() },
+    );
+    defer allocator.free(connection_service_id);
+    var control_service_attached = false;
+    defer {
+        if (control_service_attached) {
+            if (session_bindings.get(active_session_key)) |binding| {
+                runtime_registry.publishServicePresenceForBinding(
+                    principal.role,
+                    binding,
+                    active_session_key,
+                    connection_service_id,
+                    false,
+                );
+            }
+        }
+    }
 
     while (true) {
         var frame = websocket_transport.readFrame(
@@ -5654,6 +5957,12 @@ fn handleWebSocketConnection(
                             },
                             .connect => {
                                 const active_binding = session_bindings.get(active_session_key) orelse return error.InvalidState;
+                                var project_setup = try runtime_registry.projectSetupHint(
+                                    principal.role,
+                                    active_binding,
+                                    bootstrap_only_mode,
+                                );
+                                defer project_setup.deinit(allocator);
                                 const escaped_role = switch (principal.role) {
                                     .admin => "admin",
                                     .user => "user",
@@ -5673,6 +5982,24 @@ fn handleWebSocketConnection(
                                     break :blk try std.fmt.allocPrint(allocator, "\"{s}\"", .{escaped_bootstrap});
                                 } else try allocator.dupe(u8, "null");
                                 defer allocator.free(bootstrap_message_json);
+                                const project_setup_message_json = if (project_setup.message) |setup_message| blk: {
+                                    const escaped_message = try unified.jsonEscape(allocator, setup_message);
+                                    defer allocator.free(escaped_message);
+                                    break :blk try std.fmt.allocPrint(allocator, "\"{s}\"", .{escaped_message});
+                                } else try allocator.dupe(u8, "null");
+                                defer allocator.free(project_setup_message_json);
+                                const project_setup_project_id_json = if (project_setup.project_id) |setup_project_id| blk: {
+                                    const escaped_project_id = try unified.jsonEscape(allocator, setup_project_id);
+                                    defer allocator.free(escaped_project_id);
+                                    break :blk try std.fmt.allocPrint(allocator, "\"{s}\"", .{escaped_project_id});
+                                } else try allocator.dupe(u8, "null");
+                                defer allocator.free(project_setup_project_id_json);
+                                const project_setup_vision_json = if (project_setup.project_vision) |setup_vision| blk: {
+                                    const escaped_vision = try unified.jsonEscape(allocator, setup_vision);
+                                    defer allocator.free(escaped_vision);
+                                    break :blk try std.fmt.allocPrint(allocator, "\"{s}\"", .{escaped_vision});
+                                } else try allocator.dupe(u8, "null");
+                                defer allocator.free(project_setup_vision_json);
                                 const connect_gate_json = if (connect_gate_error) |gate| blk: {
                                     const escaped_code = try unified.jsonEscape(allocator, gate.code);
                                     defer allocator.free(escaped_code);
@@ -5687,7 +6014,7 @@ fn handleWebSocketConnection(
                                 defer allocator.free(connect_gate_json);
                                 const payload = try std.fmt.allocPrint(
                                     allocator,
-                                    "{{\"agent_id\":\"{s}\",\"project_id\":{s},\"session\":\"{s}\",\"protocol\":\"{s}\",\"role\":\"{s}\",\"bootstrap_only\":{},\"bootstrap_message\":{s},\"requires_session_attach\":{},\"connect_gate\":{s}}}",
+                                    "{{\"agent_id\":\"{s}\",\"project_id\":{s},\"session\":\"{s}\",\"protocol\":\"{s}\",\"role\":\"{s}\",\"bootstrap_only\":{},\"bootstrap_message\":{s},\"project_setup_required\":{},\"project_setup_message\":{s},\"project_setup_project_id\":{s},\"project_setup_project_vision\":{s},\"requires_session_attach\":{},\"connect_gate\":{s}}}",
                                     .{
                                         active_binding.agent_id,
                                         project_json,
@@ -5696,6 +6023,10 @@ fn handleWebSocketConnection(
                                         escaped_role,
                                         bootstrap_only_mode,
                                         bootstrap_message_json,
+                                        project_setup.required,
+                                        project_setup_message_json,
+                                        project_setup_project_id_json,
+                                        project_setup_vision_json,
                                         connect_gate_error != null,
                                         connect_gate_json,
                                     },
@@ -5709,6 +6040,20 @@ fn handleWebSocketConnection(
                                 );
                                 defer allocator.free(response);
                                 try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                control_service_attached = true;
+                                runtime_registry.publishServicePresenceForBinding(
+                                    principal.role,
+                                    active_binding,
+                                    active_session_key,
+                                    connection_service_id,
+                                    true,
+                                );
+                                runtime_registry.syncProjectSetupForBinding(
+                                    principal.role,
+                                    active_binding,
+                                    bootstrap_only_mode,
+                                    "control.connect",
+                                );
                                 continue;
                             },
                             .ping => {
@@ -6153,6 +6498,8 @@ fn handleWebSocketConnection(
                                     };
                                 }
 
+                                const previous_session_key = try allocator.dupe(u8, active_session_key);
+                                defer allocator.free(previous_session_key);
                                 try upsertSessionBinding(
                                     allocator,
                                     &session_bindings,
@@ -6210,6 +6557,32 @@ fn handleWebSocketConnection(
                                     active_binding.agent_id,
                                     active_binding.project_id,
                                 );
+                                if (control_service_attached) {
+                                    const runtime_binding_changed = !std.mem.eql(u8, current_binding.agent_id, active_binding.agent_id) or
+                                        !optionalStringsEqual(current_binding.project_id, active_binding.project_id);
+                                    if (runtime_binding_changed) {
+                                        runtime_registry.publishServicePresenceForBinding(
+                                            principal.role,
+                                            current_binding,
+                                            previous_session_key,
+                                            connection_service_id,
+                                            false,
+                                        );
+                                    }
+                                    runtime_registry.publishServicePresenceForBinding(
+                                        principal.role,
+                                        active_binding,
+                                        session_key,
+                                        connection_service_id,
+                                        true,
+                                    );
+                                    runtime_registry.syncProjectSetupForBinding(
+                                        principal.role,
+                                        active_binding,
+                                        bootstrap_only_mode,
+                                        "control.session_attach",
+                                    );
+                                }
                                 continue;
                             },
                             .session_status => {
@@ -6336,6 +6709,9 @@ fn handleWebSocketConnection(
                                     continue;
                                 };
 
+                                const previous_binding = session_bindings.get(active_session_key) orelse return error.InvalidState;
+                                const previous_session_key = try allocator.dupe(u8, active_session_key);
+                                defer allocator.free(previous_session_key);
                                 allocator.free(active_session_key);
                                 active_session_key = try allocator.dupe(u8, session_key);
                                 var attach_state = runtime_registry.ensureRuntimeWarmup(
@@ -6381,6 +6757,32 @@ fn handleWebSocketConnection(
                                     binding.agent_id,
                                     binding.project_id,
                                 );
+                                if (control_service_attached) {
+                                    const runtime_binding_changed = !std.mem.eql(u8, previous_binding.agent_id, binding.agent_id) or
+                                        !optionalStringsEqual(previous_binding.project_id, binding.project_id);
+                                    if (runtime_binding_changed) {
+                                        runtime_registry.publishServicePresenceForBinding(
+                                            principal.role,
+                                            previous_binding,
+                                            previous_session_key,
+                                            connection_service_id,
+                                            false,
+                                        );
+                                    }
+                                    runtime_registry.publishServicePresenceForBinding(
+                                        principal.role,
+                                        binding,
+                                        session_key,
+                                        connection_service_id,
+                                        true,
+                                    );
+                                    runtime_registry.syncProjectSetupForBinding(
+                                        principal.role,
+                                        binding,
+                                        bootstrap_only_mode,
+                                        "control.session_resume",
+                                    );
+                                }
                                 continue;
                             },
                             .session_list => {
@@ -6515,6 +6917,15 @@ fn handleWebSocketConnection(
                                     try writeFrameLocked(stream, &connection_write_mutex, response, .text);
                                     continue;
                                 }
+                                var previous_active_binding: ?SessionBinding = null;
+                                defer if (previous_active_binding) |*value| value.deinit(allocator);
+                                var previous_active_session_key: ?[]u8 = null;
+                                defer if (previous_active_session_key) |value| allocator.free(value);
+                                if (control_service_attached and std.mem.eql(u8, active_session_key, session_key)) {
+                                    const active_binding_before_close = session_bindings.get(active_session_key) orelse return error.InvalidState;
+                                    previous_active_binding = try cloneSessionBinding(allocator, active_binding_before_close);
+                                    previous_active_session_key = try allocator.dupe(u8, active_session_key);
+                                }
                                 if (session_bindings.fetchRemove(session_key)) |removed| {
                                     allocator.free(removed.key);
                                     var binding = removed.value;
@@ -6624,6 +7035,34 @@ fn handleWebSocketConnection(
                                             },
                                         );
                                     }
+                                }
+                                if (control_service_attached and previous_active_binding != null and previous_active_session_key != null) {
+                                    const main_binding = session_bindings.get(active_session_key) orelse return error.InvalidState;
+                                    const old_binding = previous_active_binding.?;
+                                    const runtime_binding_changed = !std.mem.eql(u8, old_binding.agent_id, main_binding.agent_id) or
+                                        !optionalStringsEqual(old_binding.project_id, main_binding.project_id);
+                                    if (runtime_binding_changed) {
+                                        runtime_registry.publishServicePresenceForBinding(
+                                            principal.role,
+                                            old_binding,
+                                            previous_active_session_key.?,
+                                            connection_service_id,
+                                            false,
+                                        );
+                                    }
+                                    runtime_registry.publishServicePresenceForBinding(
+                                        principal.role,
+                                        main_binding,
+                                        active_session_key,
+                                        connection_service_id,
+                                        true,
+                                    );
+                                    runtime_registry.syncProjectSetupForBinding(
+                                        principal.role,
+                                        main_binding,
+                                        bootstrap_only_mode,
+                                        "control.session_close",
+                                    );
                                 }
 
                                 const payload_json = try std.fmt.allocPrint(
@@ -7229,6 +7668,14 @@ fn handleWebSocketConnection(
                             else => return err,
                         };
                         defer target_runtime.release();
+                        if (fsrpc_type == .t_write) {
+                            runtime_registry.syncProjectSetupForBinding(
+                                principal.role,
+                                target_binding,
+                                bootstrap_only_mode,
+                                "acheron.t_write",
+                            );
+                        }
                         const local_fs_workspace_root = try runtime_registry.copyLocalFsWorkspaceRoot(allocator);
                         defer if (local_fs_workspace_root) |value| allocator.free(value);
                         if (fsrpc == null) {
@@ -7303,6 +7750,18 @@ fn deinitSessionBindings(allocator: std.mem.Allocator, map: *std.StringHashMapUn
     }
     map.deinit(allocator);
     map.* = .{};
+}
+
+fn cloneSessionBinding(allocator: std.mem.Allocator, binding: SessionBinding) !SessionBinding {
+    var out = SessionBinding{
+        .agent_id = try allocator.dupe(u8, binding.agent_id),
+        .project_id = null,
+        .project_token = null,
+    };
+    errdefer out.deinit(allocator);
+    if (binding.project_id) |value| out.project_id = try allocator.dupe(u8, value);
+    if (binding.project_token) |value| out.project_token = try allocator.dupe(u8, value);
+    return out;
 }
 
 fn upsertSessionBinding(
@@ -9056,6 +9515,8 @@ test "server_piai: auth matrix gates admin endpoints and handshake tokens" {
         defer connect_ack.deinit(allocator);
         try std.testing.expect(std.mem.indexOf(u8, connect_ack.payload, "\"type\":\"control.connect_ack\"") != null);
         try std.testing.expect(std.mem.indexOf(u8, connect_ack.payload, "\"role\":\"admin\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, connect_ack.payload, "\"project_setup_required\":true") != null);
+        try std.testing.expect(std.mem.indexOf(u8, connect_ack.payload, "\"project_setup_message\":\"Project setup required") != null);
 
         try writeClientTextFrameMasked(&admin_client, "{\"channel\":\"control\",\"type\":\"control.auth_status\",\"id\":\"admin-auth-status\"}");
         var auth_status = try readServerFrame(allocator, &admin_client);
@@ -9214,6 +9675,7 @@ test "server_piai: user connect advertises provisioning gate when no remembered 
     try std.testing.expect(std.mem.indexOf(u8, connect_ack.payload, "\"type\":\"control.connect_ack\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, connect_ack.payload, "\"requires_session_attach\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, connect_ack.payload, "\"connect_gate\":{\"code\":\"provisioning_required\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, connect_ack.payload, "\"project_setup_required\":false") != null);
 
     const attach_primary = try std.fmt.allocPrint(
         allocator,
