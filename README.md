@@ -22,7 +22,9 @@ If that resonates, start with:
 
 ```bash
 # One-line install - downloads, builds, configures, and runs
-curl -fsSL https://raw.githubusercontent.com/DeanoC/ZiggySpiderweb/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/DeanoC/ZiggySpiderweb/main/install.sh -o /tmp/install.sh
+chmod +x /tmp/install.sh
+/tmp/instaill.sh
 ```
 
 This script will:
