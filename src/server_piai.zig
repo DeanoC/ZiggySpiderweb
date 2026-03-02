@@ -3164,6 +3164,128 @@ const AgentRuntimeRegistry = struct {
         bootstrap_only: bool = false,
     };
 
+    const ProjectSetupSnapshot = struct {
+        vision: ?[]u8 = null,
+        mount_count: usize = 0,
+
+        fn deinit(self: *ProjectSetupSnapshot, allocator: std.mem.Allocator) void {
+            if (self.vision) |value| allocator.free(value);
+            self.* = undefined;
+        }
+    };
+
+    const ProjectSetupHint = struct {
+        required: bool = false,
+        message: ?[]u8 = null,
+        project_id: ?[]u8 = null,
+        project_vision: ?[]u8 = null,
+
+        fn deinit(self: *ProjectSetupHint, allocator: std.mem.Allocator) void {
+            if (self.message) |value| allocator.free(value);
+            if (self.project_id) |value| allocator.free(value);
+            if (self.project_vision) |value| allocator.free(value);
+            self.* = undefined;
+        }
+    };
+
+    fn projectSetupSnapshot(self: *AgentRuntimeRegistry, project_id: []const u8, is_admin: bool) !ProjectSetupSnapshot {
+        const escaped_project = try unified.jsonEscape(self.allocator, project_id);
+        defer self.allocator.free(escaped_project);
+        const payload = try std.fmt.allocPrint(self.allocator, "{{\"project_id\":\"{s}\"}}", .{escaped_project});
+        defer self.allocator.free(payload);
+        const project_json = try self.control_plane.getProjectWithRole(payload, is_admin);
+        defer self.allocator.free(project_json);
+
+        var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, project_json, .{});
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidResponse;
+
+        const vision_owned = if (parsed.value.object.get("vision")) |vision_val| blk: {
+            if (vision_val != .string) break :blk null;
+            if (vision_val.string.len == 0) break :blk null;
+            break :blk try self.allocator.dupe(u8, vision_val.string);
+        } else null;
+
+        var mount_count: usize = 0;
+        if (parsed.value.object.get("mounts")) |mounts_val| {
+            if (mounts_val == .array) mount_count = mounts_val.array.items.len;
+        }
+
+        return .{
+            .vision = vision_owned,
+            .mount_count = mount_count,
+        };
+    }
+
+    fn projectSetupHint(
+        self: *AgentRuntimeRegistry,
+        role: ConnectionRole,
+        active_binding: SessionBinding,
+        bootstrap_only: bool,
+    ) !ProjectSetupHint {
+        var hint = ProjectSetupHint{};
+        errdefer hint.deinit(self.allocator);
+
+        if (active_binding.project_id) |project_id| {
+            hint.project_id = try self.allocator.dupe(u8, project_id);
+        } else {
+            return hint;
+        }
+
+        if (bootstrap_only and role == .admin) {
+            hint.required = true;
+            hint.message = try self.allocator.dupe(
+                u8,
+                "Project setup required: ask Mother for the first project name, vision, and first non-system agent.",
+            );
+            return hint;
+        }
+
+        const project_id = hint.project_id.?;
+        if (std.mem.eql(u8, project_id, system_project_id)) return hint;
+
+        var snapshot = self.projectSetupSnapshot(project_id, role == .admin) catch |err| {
+            std.log.warn("failed to compute project setup snapshot for {s}: {s}", .{ project_id, @errorName(err) });
+            return hint;
+        };
+        defer snapshot.deinit(self.allocator);
+
+        if (snapshot.vision) |vision| {
+            hint.project_vision = try self.allocator.dupe(u8, vision);
+        }
+
+        const vision_text = snapshot.vision orelse "";
+        const vision_missing = std.mem.trim(u8, vision_text, " \t\r\n").len == 0;
+        const mounts_missing = snapshot.mount_count == 0;
+        const first_agent = self.firstAgentForProject(role, project_id);
+        defer if (first_agent) |agent_id| self.allocator.free(agent_id);
+        const agent_missing = first_agent == null;
+        hint.required = vision_missing or mounts_missing or agent_missing;
+
+        if (hint.required) {
+            hint.message = if (agent_missing)
+                try std.fmt.allocPrint(
+                    self.allocator,
+                    "Project setup required for {s}: attach a non-system agent, then ask Mother to confirm setup details.",
+                    .{project_id},
+                )
+            else if (mounts_missing)
+                try std.fmt.allocPrint(
+                    self.allocator,
+                    "Project setup required for {s}: no workspace mounts are configured yet.",
+                    .{project_id},
+                )
+            else
+                try std.fmt.allocPrint(
+                    self.allocator,
+                    "Project setup required for {s}: project vision is missing.",
+                    .{project_id},
+                );
+        }
+
+        return hint;
+    }
+
     fn projectExistsWithRole(self: *AgentRuntimeRegistry, project_id: []const u8, is_admin: bool) bool {
         const escaped_project = unified.jsonEscape(self.allocator, project_id) catch return false;
         defer self.allocator.free(escaped_project);
@@ -5654,6 +5776,12 @@ fn handleWebSocketConnection(
                             },
                             .connect => {
                                 const active_binding = session_bindings.get(active_session_key) orelse return error.InvalidState;
+                                var project_setup = try runtime_registry.projectSetupHint(
+                                    principal.role,
+                                    active_binding,
+                                    bootstrap_only_mode,
+                                );
+                                defer project_setup.deinit(allocator);
                                 const escaped_role = switch (principal.role) {
                                     .admin => "admin",
                                     .user => "user",
@@ -5673,6 +5801,24 @@ fn handleWebSocketConnection(
                                     break :blk try std.fmt.allocPrint(allocator, "\"{s}\"", .{escaped_bootstrap});
                                 } else try allocator.dupe(u8, "null");
                                 defer allocator.free(bootstrap_message_json);
+                                const project_setup_message_json = if (project_setup.message) |setup_message| blk: {
+                                    const escaped_message = try unified.jsonEscape(allocator, setup_message);
+                                    defer allocator.free(escaped_message);
+                                    break :blk try std.fmt.allocPrint(allocator, "\"{s}\"", .{escaped_message});
+                                } else try allocator.dupe(u8, "null");
+                                defer allocator.free(project_setup_message_json);
+                                const project_setup_project_id_json = if (project_setup.project_id) |setup_project_id| blk: {
+                                    const escaped_project_id = try unified.jsonEscape(allocator, setup_project_id);
+                                    defer allocator.free(escaped_project_id);
+                                    break :blk try std.fmt.allocPrint(allocator, "\"{s}\"", .{escaped_project_id});
+                                } else try allocator.dupe(u8, "null");
+                                defer allocator.free(project_setup_project_id_json);
+                                const project_setup_vision_json = if (project_setup.project_vision) |setup_vision| blk: {
+                                    const escaped_vision = try unified.jsonEscape(allocator, setup_vision);
+                                    defer allocator.free(escaped_vision);
+                                    break :blk try std.fmt.allocPrint(allocator, "\"{s}\"", .{escaped_vision});
+                                } else try allocator.dupe(u8, "null");
+                                defer allocator.free(project_setup_vision_json);
                                 const connect_gate_json = if (connect_gate_error) |gate| blk: {
                                     const escaped_code = try unified.jsonEscape(allocator, gate.code);
                                     defer allocator.free(escaped_code);
@@ -5687,7 +5833,7 @@ fn handleWebSocketConnection(
                                 defer allocator.free(connect_gate_json);
                                 const payload = try std.fmt.allocPrint(
                                     allocator,
-                                    "{{\"agent_id\":\"{s}\",\"project_id\":{s},\"session\":\"{s}\",\"protocol\":\"{s}\",\"role\":\"{s}\",\"bootstrap_only\":{},\"bootstrap_message\":{s},\"requires_session_attach\":{},\"connect_gate\":{s}}}",
+                                    "{{\"agent_id\":\"{s}\",\"project_id\":{s},\"session\":\"{s}\",\"protocol\":\"{s}\",\"role\":\"{s}\",\"bootstrap_only\":{},\"bootstrap_message\":{s},\"project_setup_required\":{},\"project_setup_message\":{s},\"project_setup_project_id\":{s},\"project_setup_project_vision\":{s},\"requires_session_attach\":{},\"connect_gate\":{s}}}",
                                     .{
                                         active_binding.agent_id,
                                         project_json,
@@ -5696,6 +5842,10 @@ fn handleWebSocketConnection(
                                         escaped_role,
                                         bootstrap_only_mode,
                                         bootstrap_message_json,
+                                        project_setup.required,
+                                        project_setup_message_json,
+                                        project_setup_project_id_json,
+                                        project_setup_vision_json,
                                         connect_gate_error != null,
                                         connect_gate_json,
                                     },
@@ -9056,6 +9206,8 @@ test "server_piai: auth matrix gates admin endpoints and handshake tokens" {
         defer connect_ack.deinit(allocator);
         try std.testing.expect(std.mem.indexOf(u8, connect_ack.payload, "\"type\":\"control.connect_ack\"") != null);
         try std.testing.expect(std.mem.indexOf(u8, connect_ack.payload, "\"role\":\"admin\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, connect_ack.payload, "\"project_setup_required\":true") != null);
+        try std.testing.expect(std.mem.indexOf(u8, connect_ack.payload, "\"project_setup_message\":\"Project setup required") != null);
 
         try writeClientTextFrameMasked(&admin_client, "{\"channel\":\"control\",\"type\":\"control.auth_status\",\"id\":\"admin-auth-status\"}");
         var auth_status = try readServerFrame(allocator, &admin_client);
@@ -9214,6 +9366,7 @@ test "server_piai: user connect advertises provisioning gate when no remembered 
     try std.testing.expect(std.mem.indexOf(u8, connect_ack.payload, "\"type\":\"control.connect_ack\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, connect_ack.payload, "\"requires_session_attach\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, connect_ack.payload, "\"connect_gate\":{\"code\":\"provisioning_required\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, connect_ack.payload, "\"project_setup_required\":false") != null);
 
     const attach_primary = try std.fmt.allocPrint(
         allocator,
