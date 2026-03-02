@@ -10593,6 +10593,66 @@ test "fsrpc_session: agent services index includes first-class projects namespac
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"invoke_path\":\"/agents/self/projects/control/invoke.json\"") != null);
 }
 
+test "fsrpc_session: mother can upsert project from system context without project token" {
+    const allocator = std.testing.allocator;
+
+    var control_plane = fs_control_plane.ControlPlane.init(allocator);
+    defer control_plane.deinit();
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "mother", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "mother",
+        .{
+            .project_id = fs_control_plane.spider_web_project_id,
+            .control_plane = &control_plane,
+            .is_admin = false,
+        },
+    );
+    defer session.deinit();
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        332,
+        333,
+        &.{ "agents", "self", "projects", "control", "up.json" },
+        "{\"name\":\"ZiggyPR\",\"vision\":\"Bootstrap project setup\",\"activate\":false}",
+        954,
+    );
+
+    const status = try protocolReadFile(
+        &session,
+        allocator,
+        334,
+        335,
+        &.{ "agents", "self", "projects", "status.json" },
+        955,
+    );
+    defer allocator.free(status);
+    try std.testing.expect(std.mem.indexOf(u8, status, "\"state\":\"done\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status, "\"tool\":\"projects_up\"") != null);
+
+    const result = try protocolReadFile(
+        &session,
+        allocator,
+        336,
+        337,
+        &.{ "agents", "self", "projects", "result.json" },
+        956,
+    );
+    defer allocator.free(result);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"ok\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"operation\":\"up\"") != null);
+}
+
 test "fsrpc_session: agents namespace create/list provisions new agent when capability is present" {
     const allocator = std.testing.allocator;
 

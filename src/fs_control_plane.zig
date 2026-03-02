@@ -592,9 +592,10 @@ pub const ControlPlane = struct {
         _ = self.reapExpiredLeasesLocked(std.time.milliTimestamp());
 
         const project = self.projects.get(project_id) orelse return false;
+        const actor_is_primary = if (agent_id) |actor| self.isPrimaryAgent(actor) else false;
+        if (actor_is_primary) return true;
         if (project.kind == .spider_web_builtin and !is_admin) {
-            const actor = agent_id orelse return false;
-            if (!self.isPrimaryAgent(actor)) return false;
+            return false;
         }
         requireProjectActionAccess(&project, action, agent_id, project_token, is_admin) catch return false;
         return true;
@@ -613,11 +614,13 @@ pub const ControlPlane = struct {
         _ = self.reapExpiredLeasesLocked(std.time.milliTimestamp());
 
         const project = self.projects.get(project_id) orelse return false;
+        const actor_is_primary = if (agent_id) |actor| self.isPrimaryAgent(actor) else false;
         if (project.kind == .spider_web_builtin and !is_admin) {
-            const actor = agent_id orelse return false;
-            if (!self.isPrimaryAgent(actor)) return false;
+            if (!actor_is_primary) return false;
         }
-        requireProjectActionAccess(&project, .observe, agent_id, project_token, is_admin) catch return false;
+        if (!actor_is_primary) {
+            requireProjectActionAccess(&project, .observe, agent_id, project_token, is_admin) catch return false;
+        }
 
         for (project.mounts.items) |mount| {
             if (std.mem.eql(u8, mount.node_id, node_id)) return true;
@@ -6378,6 +6381,26 @@ test "fs_control_plane: primary agent can upsert existing non-system project by 
     const get_json = try plane.getProject(get_req);
     defer allocator.free(get_json);
     try std.testing.expect(std.mem.indexOf(u8, get_json, "\"vision\":\"Help review PRs\"") != null);
+}
+
+test "fs_control_plane: primary agent bypasses project invoke token gates" {
+    const allocator = std.testing.allocator;
+    var plane = ControlPlane.init(allocator);
+    defer plane.deinit();
+
+    try std.testing.expect(!plane.projectAllowsAction(spider_web_project_id, "worker", .invoke, null, false));
+    try std.testing.expect(plane.projectAllowsAction(spider_web_project_id, "mother", .invoke, null, false));
+
+    const created = try plane.createProject("{\"name\":\"InvokeGate\",\"vision\":\"InvokeGate\"}");
+    defer allocator.free(created);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, created, .{});
+    defer parsed.deinit();
+    const project_id = parsed.value.object.get("project_id").?.string;
+    const project_token = parsed.value.object.get("project_token").?.string;
+
+    try std.testing.expect(!plane.projectAllowsAction(project_id, "worker", .invoke, null, false));
+    try std.testing.expect(plane.projectAllowsAction(project_id, "worker", .invoke, project_token, false));
+    try std.testing.expect(plane.projectAllowsAction(project_id, "mother", .invoke, null, false));
 }
 
 test "fs_control_plane: project create/up require non-empty vision" {
