@@ -2096,14 +2096,23 @@ pub const ControlPlane = struct {
                     requested_vision != null or
                     requested_status != null or
                     requested_access_policy_value != null;
-                if (wants_mount_update) {
-                    try requireProjectActionAccess(project, .mount, agent_id, requested_project_token, is_admin);
-                }
-                if (wants_admin_update) {
-                    try requireProjectActionAccess(project, .admin, agent_id, requested_project_token, is_admin);
-                }
-                if (!wants_mount_update and !wants_admin_update) {
-                    try requireProjectActionAccess(project, .read, agent_id, requested_project_token, is_admin);
+                if (!is_primary_agent) {
+                    if (wants_mount_update) {
+                        try requireProjectActionAccess(project, .mount, agent_id, requested_project_token, is_admin);
+                    }
+                    if (wants_admin_update) {
+                        try requireProjectActionAccess(project, .admin, agent_id, requested_project_token, is_admin);
+                    }
+                    if (!wants_mount_update and !wants_admin_update) {
+                        try requireProjectActionAccess(project, .read, agent_id, requested_project_token, is_admin);
+                    }
+                } else if (requested_project_token) |project_token| {
+                    // Primary agent may bootstrap/update non-system projects without token, but when
+                    // an explicit token is supplied we still validate it to avoid silent mismatches.
+                    try validateSecretToken(project_token, 256);
+                    if (!projectTokenEnabled(project) or !secureTokenEql(project.mutation_token, project_token)) {
+                        return ControlPlaneError.ProjectAuthFailed;
+                    }
                 }
             } else if (requested_project_token) |project_token| {
                 try validateSecretToken(project_token, 256);
@@ -6343,6 +6352,32 @@ test "fs_control_plane: projectUp requires project_token for existing non-builti
     const get_json = try plane.getProject(get_req);
     defer allocator.free(get_json);
     try std.testing.expect(std.mem.indexOf(u8, get_json, "\"status\":\"paused\"") != null);
+}
+
+test "fs_control_plane: primary agent can upsert existing non-system project by name without token" {
+    const allocator = std.testing.allocator;
+    var plane = ControlPlane.init(allocator);
+    defer plane.deinit();
+
+    const project_json = try plane.createProject("{\"name\":\"ZiggyPR\",\"vision\":\"Initial\"}");
+    defer allocator.free(project_json);
+
+    const upsert_json = try plane.projectUp(
+        "mother",
+        "{\"name\":\"ZiggyPR\",\"vision\":\"Help review PRs\",\"activate\":false}",
+    );
+    defer allocator.free(upsert_json);
+    try std.testing.expect(std.mem.indexOf(u8, upsert_json, "\"created\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, upsert_json, "\"activated\":false") != null);
+
+    var parsed_project = try std.json.parseFromSlice(std.json.Value, allocator, project_json, .{});
+    defer parsed_project.deinit();
+    const project_id = parsed_project.value.object.get("project_id").?.string;
+    const get_req = try std.fmt.allocPrint(allocator, "{{\"project_id\":\"{s}\"}}", .{project_id});
+    defer allocator.free(get_req);
+    const get_json = try plane.getProject(get_req);
+    defer allocator.free(get_json);
+    try std.testing.expect(std.mem.indexOf(u8, get_json, "\"vision\":\"Help review PRs\"") != null);
 }
 
 test "fs_control_plane: project create/up require non-empty vision" {
