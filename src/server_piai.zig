@@ -7559,6 +7559,30 @@ fn handleWebSocketConnection(
                                     try writeFrameLocked(stream, &connection_write_mutex, response, .text);
                                     continue;
                                 }
+                                if (attach_project_id != null and
+                                    std.mem.eql(u8, attach_agent_id, system_agent_id) and
+                                    !std.mem.eql(u8, attach_project_id.?, system_project_id))
+                                {
+                                    runtime_registry.appendSecurityAuditAndDebug(
+                                        current_binding.agent_id,
+                                        .session_attach,
+                                        principal.role,
+                                        security_correlation,
+                                        "session_attach_forbidden_primary_project",
+                                        false,
+                                        "forbidden",
+                                        "mother can only attach to system project",
+                                    );
+                                    const response = try unified.buildControlError(
+                                        allocator,
+                                        parsed.id,
+                                        "forbidden",
+                                        "mother can only attach to system project",
+                                    );
+                                    defer allocator.free(response);
+                                    try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                    continue;
+                                }
                                 const rebind_requested = if (existing_binding) |binding|
                                     !std.mem.eql(u8, binding.agent_id, attach_agent_id) or
                                         !optionalStringsEqual(binding.project_id, attach_project_id)
@@ -11311,6 +11335,75 @@ test "server_piai: session_attach rejects project changes while jobs are in-flig
     try std.testing.expect(std.mem.indexOf(u8, audit_reply.payload, "\"type\":\"control.audit_tail\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, audit_reply.payload, "\"control_type\":\"control.session_attach\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, audit_reply.payload, "\"error_code\":\"session_busy\"") != null);
+
+    try websocket_transport.writeFrame(&client, "", .close);
+    var close_reply = try readServerFrame(allocator, &client);
+    defer close_reply.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0x8), close_reply.opcode);
+
+    try std.testing.expect(server_ctx.err_name == null);
+}
+
+test "server_piai: session_attach forbids mother on non-system project" {
+    const allocator = std.testing.allocator;
+    var runtime_registry = AgentRuntimeRegistry.init(allocator, .{
+        .ltm_directory = "",
+        .ltm_filename = "",
+    }, null);
+    defer runtime_registry.deinit();
+    try setAuthTokensForTests(&runtime_registry, "admin-secret", "user-secret");
+
+    const project_up_payload = "{\"name\":\"NonSystem\",\"vision\":\"non-system\",\"activate\":false}";
+    const project_up_result = try runtime_registry.control_plane.projectUpWithRole(system_agent_id, project_up_payload, true);
+    defer allocator.free(project_up_result);
+
+    var parsed_project = try std.json.parseFromSlice(std.json.Value, allocator, project_up_result, .{});
+    defer parsed_project.deinit();
+    if (parsed_project.value != .object) return error.TestExpectedResult;
+    const project_id_val = parsed_project.value.object.get("project_id") orelse return error.TestExpectedResult;
+    if (project_id_val != .string or project_id_val.string.len == 0) return error.TestExpectedResult;
+    const non_system_project_id = project_id_val.string;
+
+    var listener = try (try std.net.Address.parseIp("127.0.0.1", 0)).listen(.{ .reuse_address = true });
+    defer listener.deinit();
+
+    var server_ctx = WsTestServerCtx{
+        .allocator = allocator,
+        .runtime_registry = &runtime_registry,
+        .listener = &listener,
+    };
+    defer server_ctx.deinit();
+
+    const server_thread = try std.Thread.spawn(.{}, runSingleWsConnection, .{&server_ctx});
+    defer server_thread.join();
+
+    var client = try std.net.tcpConnectToAddress(listener.listen_address);
+    defer client.close();
+    try performClientHandshakeWithBearerToken(allocator, &client, "/", "admin-secret");
+
+    try writeClientTextFrameMasked(&client, "{\"channel\":\"control\",\"type\":\"control.version\",\"id\":\"mother-guard-version\",\"payload\":{\"protocol\":\"unified-v2\"}}");
+    var version_ack = try readServerFrame(allocator, &client);
+    defer version_ack.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, version_ack.payload, "\"type\":\"control.version_ack\"") != null);
+
+    try writeClientTextFrameMasked(&client, "{\"channel\":\"control\",\"type\":\"control.connect\",\"id\":\"mother-guard-connect\"}");
+    var connect_ack = try readServerFrame(allocator, &client);
+    defer connect_ack.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, connect_ack.payload, "\"type\":\"control.connect_ack\"") != null);
+
+    const attach_request = try std.fmt.allocPrint(
+        allocator,
+        "{{\"channel\":\"control\",\"type\":\"control.session_attach\",\"id\":\"mother-guard-attach\",\"payload\":{{\"session_key\":\"main\",\"agent_id\":\"{s}\",\"project_id\":\"{s}\"}}}}",
+        .{ system_agent_id, non_system_project_id },
+    );
+    defer allocator.free(attach_request);
+    try writeClientTextFrameMasked(&client, attach_request);
+
+    var attach_error = try readServerFrame(allocator, &client);
+    defer attach_error.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, attach_error.payload, "\"type\":\"control.error\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, attach_error.payload, "\"code\":\"forbidden\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, attach_error.payload, "mother can only attach to system project") != null);
 
     try websocket_transport.writeFrame(&client, "", .close);
     var close_reply = try readServerFrame(allocator, &client);
