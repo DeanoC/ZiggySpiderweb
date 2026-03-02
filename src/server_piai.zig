@@ -7669,10 +7669,11 @@ fn handleWebSocketConnection(
                         };
                         defer target_runtime.release();
                         if (fsrpc_type == .t_write) {
+                            const bootstrap_only_now = runtime_registry.isBootstrapMotherOnlyState();
                             runtime_registry.syncProjectSetupForBinding(
                                 principal.role,
                                 target_binding,
-                                bootstrap_only_mode,
+                                bootstrap_only_now,
                                 "acheron.t_write",
                             );
                         }
