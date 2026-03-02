@@ -3366,6 +3366,16 @@ const AgentRuntimeRegistry = struct {
         service_id: []const u8,
         attached: bool,
     ) void {
+        var setup_hint = ProjectSetupHint{};
+        defer setup_hint.deinit(self.allocator);
+        if (attached and binding.project_id != null) {
+            const bootstrap_only = self.isBootstrapMotherOnlyState();
+            setup_hint = self.projectSetupHint(role, binding, bootstrap_only) catch |err| blk: {
+                std.log.warn("project setup hint presence sync failed for {s}: {s}", .{ binding.agent_id, @errorName(err) });
+                break :blk ProjectSetupHint{};
+            };
+        }
+
         const escaped_service = unified.jsonEscape(self.allocator, service_id) catch return;
         defer self.allocator.free(escaped_service);
         const escaped_session = unified.jsonEscape(self.allocator, session_key) catch return;
@@ -3378,16 +3388,46 @@ const AgentRuntimeRegistry = struct {
             break :blk std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped_project}) catch return;
         } else self.allocator.dupe(u8, "null") catch return;
         defer self.allocator.free(project_json);
+        const project_setup_required = attached and setup_hint.required;
+        const project_setup_project_id_json = if (attached and setup_hint.project_id != null) blk: {
+            const escaped_project = unified.jsonEscape(self.allocator, setup_hint.project_id.?) catch return;
+            defer self.allocator.free(escaped_project);
+            break :blk std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped_project}) catch return;
+        } else self.allocator.dupe(u8, "null") catch return;
+        defer self.allocator.free(project_setup_project_id_json);
+        const project_setup_message_json = if (attached and setup_hint.message != null) blk: {
+            const escaped_message = unified.jsonEscape(self.allocator, setup_hint.message.?) catch return;
+            defer self.allocator.free(escaped_message);
+            break :blk std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped_message}) catch return;
+        } else self.allocator.dupe(u8, "null") catch return;
+        defer self.allocator.free(project_setup_message_json);
+        const project_setup_vision_json = if (attached and setup_hint.project_vision != null) blk: {
+            const escaped_vision = unified.jsonEscape(self.allocator, setup_hint.project_vision.?) catch return;
+            defer self.allocator.free(escaped_vision);
+            break :blk std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped_vision}) catch return;
+        } else self.allocator.dupe(u8, "null") catch return;
+        defer self.allocator.free(project_setup_vision_json);
+        const project_setup_source_json = if (attached) blk: {
+            const escaped_source = unified.jsonEscape(self.allocator, "service.event") catch return;
+            defer self.allocator.free(escaped_source);
+            break :blk std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped_source}) catch return;
+        } else self.allocator.dupe(u8, "null") catch return;
+        defer self.allocator.free(project_setup_source_json);
 
         const payload_json = std.fmt.allocPrint(
             self.allocator,
-            "{{\"service_id\":\"{s}\",\"status\":\"{s}\",\"session_key\":\"{s}\",\"role\":\"{s}\",\"project_id\":{s}}}",
+            "{{\"service_id\":\"{s}\",\"status\":\"{s}\",\"session_key\":\"{s}\",\"role\":\"{s}\",\"project_id\":{s},\"project_setup_required\":{},\"project_setup_project_id\":{s},\"project_setup_message\":{s},\"project_setup_project_vision\":{s},\"project_setup_source\":{s}}}",
             .{
                 escaped_service,
                 if (attached) "attached" else "detached",
                 escaped_session,
                 escaped_role,
                 project_json,
+                project_setup_required,
+                project_setup_project_id_json,
+                project_setup_message_json,
+                project_setup_vision_json,
+                project_setup_source_json,
             },
         ) catch return;
         defer self.allocator.free(payload_json);
@@ -3401,62 +3441,6 @@ const AgentRuntimeRegistry = struct {
                     if (attached) "attached" else "detached",
                     @errorName(err),
                 },
-            );
-        };
-    }
-
-    fn syncProjectSetupForBinding(
-        self: *AgentRuntimeRegistry,
-        role: ConnectionRole,
-        binding: SessionBinding,
-        bootstrap_only: bool,
-        source: []const u8,
-    ) void {
-        if (binding.project_id == null) return;
-
-        var hint = self.projectSetupHint(role, binding, bootstrap_only) catch |err| {
-            std.log.warn("project setup hint sync failed for {s}: {s}", .{ binding.agent_id, @errorName(err) });
-            return;
-        };
-        defer hint.deinit(self.allocator);
-        const project_id = hint.project_id orelse return;
-
-        const escaped_project = unified.jsonEscape(self.allocator, project_id) catch return;
-        defer self.allocator.free(escaped_project);
-        const escaped_source = unified.jsonEscape(self.allocator, source) catch return;
-        defer self.allocator.free(escaped_source);
-
-        const message_json = if (hint.message) |message| blk: {
-            const escaped_message = unified.jsonEscape(self.allocator, message) catch return;
-            defer self.allocator.free(escaped_message);
-            break :blk std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped_message}) catch return;
-        } else self.allocator.dupe(u8, "null") catch return;
-        defer self.allocator.free(message_json);
-
-        const vision_json = if (hint.project_vision) |vision| blk: {
-            const escaped_vision = unified.jsonEscape(self.allocator, vision) catch return;
-            defer self.allocator.free(escaped_vision);
-            break :blk std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped_vision}) catch return;
-        } else self.allocator.dupe(u8, "null") catch return;
-        defer self.allocator.free(vision_json);
-
-        const payload_json = std.fmt.allocPrint(
-            self.allocator,
-            "{{\"project_id\":\"{s}\",\"required\":{},\"message\":{s},\"project_vision\":{s},\"source\":\"{s}\"}}",
-            .{
-                escaped_project,
-                hint.required,
-                message_json,
-                vision_json,
-                escaped_source,
-            },
-        ) catch return;
-        defer self.allocator.free(payload_json);
-
-        self.dispatchRuntimeAgentControl(binding, "project.setup.sync", payload_json) catch |err| {
-            std.log.warn(
-                "project setup sync failed: agent={s} project={s} err={s}",
-                .{ binding.agent_id, project_id, @errorName(err) },
             );
         };
     }
@@ -6048,12 +6032,6 @@ fn handleWebSocketConnection(
                                     connection_service_id,
                                     true,
                                 );
-                                runtime_registry.syncProjectSetupForBinding(
-                                    principal.role,
-                                    active_binding,
-                                    bootstrap_only_mode,
-                                    "control.connect",
-                                );
                                 continue;
                             },
                             .ping => {
@@ -6576,12 +6554,6 @@ fn handleWebSocketConnection(
                                         connection_service_id,
                                         true,
                                     );
-                                    runtime_registry.syncProjectSetupForBinding(
-                                        principal.role,
-                                        active_binding,
-                                        bootstrap_only_mode,
-                                        "control.session_attach",
-                                    );
                                 }
                                 continue;
                             },
@@ -6775,12 +6747,6 @@ fn handleWebSocketConnection(
                                         session_key,
                                         connection_service_id,
                                         true,
-                                    );
-                                    runtime_registry.syncProjectSetupForBinding(
-                                        principal.role,
-                                        binding,
-                                        bootstrap_only_mode,
-                                        "control.session_resume",
                                     );
                                 }
                                 continue;
@@ -7056,12 +7022,6 @@ fn handleWebSocketConnection(
                                         active_session_key,
                                         connection_service_id,
                                         true,
-                                    );
-                                    runtime_registry.syncProjectSetupForBinding(
-                                        principal.role,
-                                        main_binding,
-                                        bootstrap_only_mode,
-                                        "control.session_close",
                                     );
                                 }
 
@@ -7668,13 +7628,13 @@ fn handleWebSocketConnection(
                             else => return err,
                         };
                         defer target_runtime.release();
-                        if (fsrpc_type == .t_write) {
-                            const bootstrap_only_now = runtime_registry.isBootstrapMotherOnlyState();
-                            runtime_registry.syncProjectSetupForBinding(
+                        if (fsrpc_type == .t_write and control_service_attached) {
+                            runtime_registry.publishServicePresenceForBinding(
                                 principal.role,
                                 target_binding,
-                                bootstrap_only_now,
-                                "acheron.t_write",
+                                target_session_key,
+                                connection_service_id,
+                                true,
                             );
                         }
                         const local_fs_workspace_root = try runtime_registry.copyLocalFsWorkspaceRoot(allocator);
