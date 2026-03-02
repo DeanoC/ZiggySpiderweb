@@ -49,6 +49,7 @@ pub const TOOL_CONTRACT_TEXT =
     \\Before claiming a capability is unavailable, check `/agents/self/services/SERVICES.json` and relevant first-class namespaces.
     \\Use agent_namespace for agent-local capabilities and node scope for node-specific capabilities.
     \\If `/agents/self/web_search` exists, do not claim you cannot do web search; invoke the web search service.
+    \\For "what projects/agents exist" requests, use `agents/self/projects/control/list.json` and `agents/self/agents/control/list.json` (or invoke.json), not directory-entry inference.
     \\To reply to user/admin, write text to agents/self/chat/control/reply.
     \\Treat /agents/self/chat/control/input as inbound user/admin input channel (do not use it for outbound replies).
     \\Internal thought telemetry is exposed at /agents/self/thoughts/* and is observational (not chat).

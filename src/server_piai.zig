@@ -2907,11 +2907,18 @@ const RuntimeToolDispatchProxy = struct {
         const content = requiredStringField(obj, "content") orelse
             return runtimeDispatchFailure(allocator, .invalid_params, "file_write content must be provided");
 
-        if (pathMatchesControlTarget(path, "agents/self/projects/control/up.json")) {
-            return self.handleProjectsUpWrite(allocator, path, content);
+        if (pathMatchesControlTarget(path, "agents/self/projects/control/invoke.json") or
+            pathMatchesControlTarget(path, "agents/self/projects/control/list.json") or
+            pathMatchesControlTarget(path, "agents/self/projects/control/get.json") or
+            pathMatchesControlTarget(path, "agents/self/projects/control/up.json"))
+        {
+            return self.handleProjectsControlWrite(allocator, path, content);
         }
-        if (pathMatchesControlTarget(path, "agents/self/agents/control/create.json")) {
-            return self.handleAgentsCreateWrite(allocator, path, content);
+        if (pathMatchesControlTarget(path, "agents/self/agents/control/invoke.json") or
+            pathMatchesControlTarget(path, "agents/self/agents/control/list.json") or
+            pathMatchesControlTarget(path, "agents/self/agents/control/create.json"))
+        {
+            return self.handleAgentsControlWrite(allocator, path, content);
         }
         if (pathMatchesControlTarget(path, "agents/self/mounts/control/invoke.json") or
             pathMatchesControlTarget(path, "agents/self/mounts/control/list.json") or
@@ -2936,6 +2943,15 @@ const RuntimeToolDispatchProxy = struct {
         bind,
         unbind,
         resolve,
+    };
+    const ProjectsOp = enum {
+        list,
+        get,
+        up,
+    };
+    const AgentsOp = enum {
+        list,
+        create,
     };
 
     const RuntimeFileListEntry = struct {
@@ -3153,6 +3169,96 @@ const RuntimeToolDispatchProxy = struct {
         return runtimeDispatchFileWriteSuccess(allocator, path, content.len, up_result);
     }
 
+    fn handleProjectsControlWrite(
+        self: *RuntimeToolDispatchProxy,
+        allocator: std.mem.Allocator,
+        path: []const u8,
+        content: []const u8,
+    ) tool_registry.ToolExecutionResult {
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch {
+            return runtimeDispatchFailure(allocator, .invalid_params, "projects payload must be a JSON object");
+        };
+        defer parsed.deinit();
+        if (parsed.value != .object) {
+            return runtimeDispatchFailure(allocator, .invalid_params, "projects payload must be a JSON object");
+        }
+        const obj = parsed.value.object;
+        const op = if (pathMatchesControlTarget(path, "agents/self/projects/control/list.json"))
+            ProjectsOp.list
+        else if (pathMatchesControlTarget(path, "agents/self/projects/control/get.json"))
+            ProjectsOp.get
+        else if (pathMatchesControlTarget(path, "agents/self/projects/control/up.json"))
+            ProjectsOp.up
+        else if (pathMatchesControlTarget(path, "agents/self/projects/control/invoke.json"))
+            self.parseProjectsInvokeOp(obj) orelse
+                return runtimeDispatchFailure(allocator, .invalid_params, "projects invoke payload requires op=list|get|up")
+        else
+            return runtimeDispatchFailure(allocator, .invalid_params, "unsupported projects control path");
+
+        const args_value = if (obj.get("arguments")) |args| args else if (obj.get("args")) |args| args else parsed.value;
+        if (args_value != .object) {
+            return runtimeDispatchFailure(allocator, .invalid_params, "projects arguments must be a JSON object");
+        }
+        const args_obj = args_value.object;
+        const is_admin = std.mem.eql(u8, self.runtime_agent_id, system_agent_id);
+
+        switch (op) {
+            .up => {
+                if (pathMatchesControlTarget(path, "agents/self/projects/control/up.json")) {
+                    return self.handleProjectsUpWrite(allocator, path, content);
+                }
+                const up_payload = stringifyJsonValueAlloc(allocator, args_value) catch {
+                    return runtimeDispatchFailure(allocator, .execution_failed, "failed to serialize projects up payload");
+                };
+                defer allocator.free(up_payload);
+                return self.handleProjectsUpWrite(allocator, path, up_payload);
+            },
+            .list => {
+                const list_result = self.control_plane.listProjects() catch |err| {
+                    return runtimeDispatchFailure(allocator, runtimeDispatchErrorCode(err), @errorName(err));
+                };
+                defer self.control_plane.allocator.free(list_result);
+                return runtimeDispatchFileWriteSuccess(allocator, path, content.len, list_result);
+            },
+            .get => {
+                var project_id_owned: ?[]u8 = null;
+                defer if (project_id_owned) |value| allocator.free(value);
+                const project_id = optionalStringField(args_obj, "project_id") orelse blk: {
+                    const remembered = self.copyLastProjectId(allocator) catch null;
+                    if (remembered) |value| {
+                        project_id_owned = value;
+                        break :blk value;
+                    }
+                    return runtimeDispatchFailure(allocator, .invalid_params, "projects get requires project_id");
+                };
+                const project_token = optionalStringField(args_obj, "project_token");
+                const payload = buildProjectScopedPayload(allocator, project_id, project_token) catch {
+                    return runtimeDispatchFailure(allocator, .execution_failed, "failed to build projects get payload");
+                };
+                defer allocator.free(payload);
+                const get_result = self.control_plane.getProjectWithRole(payload, is_admin) catch |err| {
+                    return runtimeDispatchFailure(allocator, runtimeDispatchErrorCode(err), @errorName(err));
+                };
+                defer self.control_plane.allocator.free(get_result);
+                return runtimeDispatchFileWriteSuccess(allocator, path, content.len, get_result);
+            },
+        }
+    }
+
+    fn parseProjectsInvokeOp(self: *RuntimeToolDispatchProxy, obj: std.json.ObjectMap) ?ProjectsOp {
+        _ = self;
+        const raw = optionalStringField(obj, "op") orelse
+            optionalStringField(obj, "operation") orelse
+            optionalStringField(obj, "tool") orelse
+            optionalStringField(obj, "tool_name") orelse
+            return null;
+        const value = std.mem.trim(u8, raw, " \t\r\n");
+        if (std.mem.eql(u8, value, "list") or std.mem.eql(u8, value, "projects_list")) return .list;
+        if (std.mem.eql(u8, value, "get") or std.mem.eql(u8, value, "projects_get")) return .get;
+        if (std.mem.eql(u8, value, "up") or std.mem.eql(u8, value, "projects_up")) return .up;
+        return null;
+    }
+
     fn handleAgentsCreateWrite(
         self: *RuntimeToolDispatchProxy,
         allocator: std.mem.Allocator,
@@ -3241,6 +3347,91 @@ const RuntimeToolDispatchProxy = struct {
         defer allocator.free(op_json);
 
         return runtimeDispatchFileWriteSuccess(allocator, path, content.len, op_json);
+    }
+
+    fn handleAgentsControlWrite(
+        self: *RuntimeToolDispatchProxy,
+        allocator: std.mem.Allocator,
+        path: []const u8,
+        content: []const u8,
+    ) tool_registry.ToolExecutionResult {
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch {
+            return runtimeDispatchFailure(allocator, .invalid_params, "agents payload must be a JSON object");
+        };
+        defer parsed.deinit();
+        if (parsed.value != .object) {
+            return runtimeDispatchFailure(allocator, .invalid_params, "agents payload must be a JSON object");
+        }
+        const obj = parsed.value.object;
+        const op = if (pathMatchesControlTarget(path, "agents/self/agents/control/list.json"))
+            AgentsOp.list
+        else if (pathMatchesControlTarget(path, "agents/self/agents/control/create.json"))
+            AgentsOp.create
+        else if (pathMatchesControlTarget(path, "agents/self/agents/control/invoke.json"))
+            self.parseAgentsInvokeOp(obj) orelse
+                return runtimeDispatchFailure(allocator, .invalid_params, "agents invoke payload requires op=list|create")
+        else
+            return runtimeDispatchFailure(allocator, .invalid_params, "unsupported agents control path");
+
+        const args_value = if (obj.get("arguments")) |args| args else if (obj.get("args")) |args| args else parsed.value;
+        if (args_value != .object) {
+            return runtimeDispatchFailure(allocator, .invalid_params, "agents arguments must be a JSON object");
+        }
+        switch (op) {
+            .create => {
+                if (pathMatchesControlTarget(path, "agents/self/agents/control/create.json")) {
+                    return self.handleAgentsCreateWrite(allocator, path, content);
+                }
+                const create_payload = stringifyJsonValueAlloc(allocator, args_value) catch {
+                    return runtimeDispatchFailure(allocator, .execution_failed, "failed to serialize agents create payload");
+                };
+                defer allocator.free(create_payload);
+                return self.handleAgentsCreateWrite(allocator, path, create_payload);
+            },
+            .list => {
+                const list_payload = self.buildAgentsListJson(allocator) catch |err| {
+                    return runtimeDispatchFailure(allocator, runtimeDispatchErrorCode(err), @errorName(err));
+                };
+                defer allocator.free(list_payload);
+                return runtimeDispatchFileWriteSuccess(allocator, path, content.len, list_payload);
+            },
+        }
+    }
+
+    fn parseAgentsInvokeOp(self: *RuntimeToolDispatchProxy, obj: std.json.ObjectMap) ?AgentsOp {
+        _ = self;
+        const raw = optionalStringField(obj, "op") orelse
+            optionalStringField(obj, "operation") orelse
+            optionalStringField(obj, "tool") orelse
+            optionalStringField(obj, "tool_name") orelse
+            return null;
+        const value = std.mem.trim(u8, raw, " \t\r\n");
+        if (std.mem.eql(u8, value, "list") or std.mem.eql(u8, value, "agents_list")) return .list;
+        if (std.mem.eql(u8, value, "create") or std.mem.eql(u8, value, "agents_create")) return .create;
+        return null;
+    }
+
+    fn buildAgentsListJson(self: *RuntimeToolDispatchProxy, allocator: std.mem.Allocator) ![]u8 {
+        var registry = agent_registry_mod.AgentRegistry.init(
+            self.allocator,
+            ".",
+            self.agents_dir,
+            self.assets_dir,
+        );
+        defer registry.deinit();
+        try registry.scan();
+
+        var out = std.ArrayListUnmanaged(u8){};
+        errdefer out.deinit(allocator);
+        try out.appendSlice(allocator, "{\"agents\":[");
+        var first = true;
+        for (registry.listAgents()) |agent| {
+            if (!first) try out.append(allocator, ',');
+            first = false;
+            try appendAgentInfoJson(allocator, &out, agent);
+        }
+        try out.appendSlice(allocator, "]}");
+        return out.toOwnedSlice(allocator);
     }
 
     fn handleMountsControlWrite(
@@ -3691,6 +3882,10 @@ fn runtimeDispatchFileListSuccess(
         return runtimeDispatchFailure(allocator, .execution_failed, "out of memory");
     };
     return .{ .success = .{ .payload_json = payload.toOwnedSlice(allocator) catch return runtimeDispatchFailure(allocator, .execution_failed, "out of memory") } };
+}
+
+fn stringifyJsonValueAlloc(allocator: std.mem.Allocator, value: std.json.Value) ![]u8 {
+    return std.json.Stringify.valueAlloc(allocator, value, .{});
 }
 
 fn extractOptionalStringByNames(obj: std.json.ObjectMap, names: []const []const u8) ?[]const u8 {
@@ -10515,6 +10710,54 @@ test "server_piai: runtime dispatch proxy exposes agents/self/services/SERVICES.
     try std.testing.expect(std.mem.indexOf(u8, read_result.success.payload_json, "\"service_id\":\"agents\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, read_result.success.payload_json, "\"service_id\":\"mounts\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, read_result.success.payload_json, "\"service_id\":\"library\"") != null);
+}
+
+test "server_piai: runtime dispatch proxy bridges projects and agents list controls" {
+    const allocator = std.testing.allocator;
+    var runtime_registry = AgentRuntimeRegistry.init(allocator, .{
+        .ltm_directory = "",
+        .ltm_filename = "",
+    }, null);
+    defer runtime_registry.deinit();
+
+    var dummy_sandbox: sandbox_runtime_mod.SandboxRuntime = undefined;
+    const proxy = try RuntimeToolDispatchProxy.create(
+        allocator,
+        &dummy_sandbox,
+        &runtime_registry.control_plane,
+        runtime_registry.runtime_config.agents_dir,
+        runtime_registry.runtime_config.assets_dir,
+        runtime_registry.runtime_config.spider_web_root,
+        system_agent_id,
+    );
+    defer proxy.destroy();
+
+    const project_up_args =
+        \\{"path":"agents/self/projects/control/up.json","content":"{\"name\":\"ProxyListProject\",\"vision\":\"Proxy list bridge\",\"activate\":false}"}
+    ;
+    var project_up_result = RuntimeToolDispatchProxy.dispatchWorldTool(proxy, allocator, "file_write", project_up_args);
+    defer project_up_result.deinit(allocator);
+    try std.testing.expect(project_up_result == .success);
+
+    var projects_list_result = RuntimeToolDispatchProxy.dispatchWorldTool(
+        proxy,
+        allocator,
+        "file_write",
+        "{\"path\":\"agents/self/projects/control/list.json\",\"content\":\"{}\"}",
+    );
+    defer projects_list_result.deinit(allocator);
+    try std.testing.expect(projects_list_result == .success);
+    try std.testing.expect(std.mem.indexOf(u8, projects_list_result.success.payload_json, "\"name\":\"ProxyListProject\"") != null);
+
+    var agents_list_result = RuntimeToolDispatchProxy.dispatchWorldTool(
+        proxy,
+        allocator,
+        "file_write",
+        "{\"path\":\"agents/self/agents/control/list.json\",\"content\":\"{}\"}",
+    );
+    defer agents_list_result.deinit(allocator);
+    try std.testing.expect(agents_list_result == .success);
+    try std.testing.expect(std.mem.indexOf(u8, agents_list_result.success.payload_json, "\"agents\":[") != null);
 }
 
 test "server_piai: runtime dispatch proxy handles mounts control writes via control-plane bridge" {
