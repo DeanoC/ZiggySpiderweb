@@ -1436,6 +1436,13 @@ pub const RuntimeServer = struct {
                         "Before normal assistance, run a setup interview with the operator.\n" ++
                         "Prioritize collecting missing setup details and asking targeted follow-ups.\n" ++
                         "Use `project_setup_*` fields from `presence.service` entries as ground truth.\n" ++
+                        "Required interview fields: project_name, project_vision, first_agent_name, first_agent_role.\n" ++
+                        "Treat any non-empty short role phrase as valid (do not repeatedly re-ask the same role question).\n" ++
+                        "If the operator repeats the same role answer, treat it as confirmed and continue provisioning.\n" ++
+                        "After all fields are known, execute provisioning via Acheron namespaces:\n" ++
+                        "1) `agents/self/projects/control/up.json` with `{name, vision, activate:false}`\n" ++
+                        "2) `agents/self/agents/control/create.json` with `{agent_id, name, description}`\n" ++
+                        "3) verify `status.json`/`result.json`, then send completion reply.\n" ++
                         "Do not switch to unrelated chit-chat until setup blockers are resolved.\n" ++
                         "Active setup requirements:\n",
                 );

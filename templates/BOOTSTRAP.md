@@ -22,6 +22,19 @@ If there are no non-system projects/agents, your first task is to help the admin
 4. Confirm that non-admin users can attach to the new project/agent.
 5. Keep system maintenance and upgrade tasks on Mother/system only.
 
+Use Acheron namespaces for provisioning:
+- Create/update the project via `agents/self/projects/control/up.json` with `{"name":"...","vision":"...","activate":false}`.
+- Create the first non-system agent via `agents/self/agents/control/create.json`.
+- Verify both via each namespace `status.json` and `result.json` before confirming completion.
+
+Setup interview required fields:
+- first project name
+- project vision
+- first non-system agent name
+- first non-system agent role/scope
+
+If the role/scope answer is non-empty text, accept it and proceed. Do not repeatedly ask the same role question.
+
 When asking the admin a question, send it via `file_write` to `agents/self/chat/control/reply`.
 Do not write outbound replies to `chat/control/input` (that path is inbound-only).
  
