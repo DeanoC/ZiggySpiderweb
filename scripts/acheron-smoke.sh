@@ -11,6 +11,7 @@ SMOKE_TIMEOUT_SEC="${SMOKE_TIMEOUT_SEC:-15}"
 SMOKE_FAIL_ON_DEGRADED="${SMOKE_FAIL_ON_DEGRADED:-1}"
 SMOKE_CONNECT_RETRIES="${SMOKE_CONNECT_RETRIES:-8}"
 SMOKE_RETRY_DELAY_MS="${SMOKE_RETRY_DELAY_MS:-500}"
+SPIDERWEB_SERVICE="${SPIDERWEB_SERVICE:-spiderweb.service}"
 
 require_bin() {
     if ! command -v "$1" >/dev/null 2>&1; then
@@ -23,6 +24,15 @@ require_bin spiderweb-control
 require_bin spiderweb-fs-mount
 require_bin jq
 require_bin timeout
+
+if command -v systemctl >/dev/null 2>&1 && systemctl show "$SPIDERWEB_SERVICE" >/dev/null 2>&1; then
+    restrict_namespaces="$(systemctl show "$SPIDERWEB_SERVICE" -p RestrictNamespaces --value 2>/dev/null || true)"
+    if [[ "$restrict_namespaces" == "yes" ]]; then
+        echo "error: $SPIDERWEB_SERVICE has RestrictNamespaces=yes; sandbox runtime/bwrap will fail" >&2
+        echo "hint: reinstall with scripts/install-systemd.sh or set RestrictNamespaces=false in the unit" >&2
+        exit 1
+    fi
+fi
 
 if [[ -z "$SPIDERWEB_AUTH_TOKEN" && -f "$SPIDERWEB_AUTH_TOKEN_FILE" ]]; then
     SPIDERWEB_AUTH_TOKEN="$(jq -r '.admin_token // .user_token // empty' "$SPIDERWEB_AUTH_TOKEN_FILE" 2>/dev/null || true)"

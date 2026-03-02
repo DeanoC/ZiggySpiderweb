@@ -205,7 +205,6 @@ install_config() {
     "spider_web_root": "$SPIDER_WEB_ROOT",
     "ltm_directory": "/var/lib/spiderweb/.spiderweb-ltm",
     "ltm_filename": "runtime-memory.db",
-    "sandbox_enabled": true,
     "sandbox_mounts_root": "/var/lib/spiderweb/mounts",
     "sandbox_runtime_root": "/var/lib/spiderweb/runtime",
     "sandbox_fs_mount_bin": "$INSTALL_DIR/bin/spiderweb-fs-mount",
@@ -232,7 +231,6 @@ EOF
     "spider_web_root": "$SPIDER_WEB_ROOT",
     "ltm_directory": "/var/lib/spiderweb/.spiderweb-ltm",
     "ltm_filename": "runtime-memory.db",
-    "sandbox_enabled": true,
     "sandbox_mounts_root": "/var/lib/spiderweb/mounts",
     "sandbox_runtime_root": "/var/lib/spiderweb/runtime",
     "sandbox_fs_mount_bin": "$INSTALL_DIR/bin/spiderweb-fs-mount",
@@ -395,7 +393,8 @@ ProtectKernelModules=true
 ProtectControlGroups=true
 RestrictSUIDSGID=false
 RestrictRealtime=true
-RestrictNamespaces=true
+# Sandbox runtime uses bwrap/unshare for Acheron tool execution.
+RestrictNamespaces=false
 LockPersonality=true
 MemoryDenyWriteExecute=true
 

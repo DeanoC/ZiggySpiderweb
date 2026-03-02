@@ -648,8 +648,6 @@ pub fn save(self: Config) !void {
     try file.writeAll(assets_dir_line);
     const agents_dir_line = try std.fmt.bufPrint(&buf, "    \"agents_dir\": \"{s}\",\n", .{self.runtime.agents_dir});
     try file.writeAll(agents_dir_line);
-    const sandbox_enabled_line = try std.fmt.bufPrint(&buf, "    \"sandbox_enabled\": {},\n", .{self.runtime.sandbox_enabled});
-    try file.writeAll(sandbox_enabled_line);
     const sandbox_mounts_line = try std.fmt.bufPrint(&buf, "    \"sandbox_mounts_root\": \"{s}\",\n", .{self.runtime.sandbox_mounts_root});
     try file.writeAll(sandbox_mounts_line);
     const sandbox_runtime_line = try std.fmt.bufPrint(&buf, "    \"sandbox_runtime_root\": \"{s}\",\n", .{self.runtime.sandbox_runtime_root});
