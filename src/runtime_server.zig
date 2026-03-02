@@ -1086,6 +1086,14 @@ pub const RuntimeServer = struct {
             return self.wrapRuntimeErrorResponse(request_id, err, job.emit_debug);
         };
 
+        if (try self.projectSetupGreetingNudgeForInput(DEFAULT_BRAIN, content)) |setup_nudge| {
+            defer self.allocator.free(setup_nudge);
+            self.runtime.appendMessageMemory(DEFAULT_BRAIN, "assistant", setup_nudge) catch |err| {
+                return self.wrapRuntimeErrorResponse(request_id, err, job.emit_debug);
+            };
+            return self.wrapSingleFrame(try protocol.buildSessionReceive(self.allocator, request_id, setup_nudge));
+        }
+
         var provider_completion: ProviderCompletion = undefined;
         if (self.provider_runtime != null) {
             var reset_attempts: usize = 0;
@@ -1147,6 +1155,84 @@ pub const RuntimeServer = struct {
         }
 
         return responses.toOwnedSlice(self.allocator);
+    }
+
+    fn projectSetupGreetingNudgeForInput(
+        self: *RuntimeServer,
+        brain_name: []const u8,
+        content: []const u8,
+    ) !?[]u8 {
+        if (!isGreetingLikeInput(content)) return null;
+
+        const snapshot = try self.runtime.active_memory.snapshotActive(self.allocator, brain_name);
+        defer memory.deinitItems(self.allocator, snapshot);
+
+        var idx = snapshot.len;
+        while (idx > 0) : (idx -= 1) {
+            const item = snapshot[idx - 1];
+            if (!std.mem.eql(u8, item.kind, PROJECT_SETUP_REQUIRED_MEM_KIND)) continue;
+            return buildProjectSetupGreetingNudge(self.allocator, item.content_json);
+        }
+        return null;
+    }
+
+    fn buildProjectSetupGreetingNudge(allocator: std.mem.Allocator, content_json: []const u8) ![]u8 {
+        var project_id: ?[]const u8 = null;
+        var message: ?[]const u8 = null;
+        var vision: ?[]const u8 = null;
+
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, content_json, .{}) catch null;
+        defer if (parsed) |*value| value.deinit();
+        if (parsed) |*value| {
+            if (value.value == .object) {
+                if (value.value.object.get("project_id")) |entry| {
+                    if (entry == .string and entry.string.len > 0) project_id = entry.string;
+                }
+                if (value.value.object.get("message")) |entry| {
+                    if (entry == .string and entry.string.len > 0) message = entry.string;
+                }
+                if (value.value.object.get("project_vision")) |entry| {
+                    if (entry == .string and entry.string.len > 0) vision = entry.string;
+                }
+            }
+        }
+
+        const project_id_text = project_id orelse "this project";
+        const setup_message = message orelse "Project setup is still required.";
+        const vision_hint = if (vision) |value|
+            try std.fmt.allocPrint(allocator, "\nCurrent vision hint: {s}", .{value})
+        else
+            try allocator.dupe(u8, "");
+        defer allocator.free(vision_hint);
+
+        return std.fmt.allocPrint(
+            allocator,
+            "{s}\nLet's do first-run setup for {s}. Please answer:\n1) project name\n2) project vision\n3) first non-system agent id.{s}",
+            .{ setup_message, project_id_text, vision_hint },
+        );
+    }
+
+    fn isGreetingLikeInput(content: []const u8) bool {
+        const trimmed = std.mem.trim(u8, content, " \t\r\n");
+        if (trimmed.len == 0 or trimmed.len > 48) return false;
+
+        var lower_buf: [64]u8 = undefined;
+        if (trimmed.len > lower_buf.len) return false;
+        for (trimmed, 0..) |ch, idx| {
+            lower_buf[idx] = std.ascii.toLower(ch);
+        }
+        const lowered = lower_buf[0..trimmed.len];
+        const normalized = std.mem.trim(u8, lowered, " .,!?:;\"'()[]{}");
+
+        return std.mem.eql(u8, normalized, "hi") or
+            std.mem.eql(u8, normalized, "hello") or
+            std.mem.eql(u8, normalized, "hey") or
+            std.mem.eql(u8, normalized, "yo") or
+            std.mem.eql(u8, normalized, "sup") or
+            std.mem.eql(u8, normalized, "start") or
+            std.mem.eql(u8, normalized, "continue") or
+            std.mem.eql(u8, normalized, "ok") or
+            std.mem.eql(u8, normalized, "okay");
     }
 
     fn clearRuntimeOutboundLocked(self: *RuntimeServer) void {
@@ -8065,6 +8151,30 @@ test "runtime_server: agent.control project.setup.sync upserts setup state and r
     try std.testing.expect(std.mem.indexOf(u8, complete_json, "project.setup.state.proj-alpha") != null);
     try std.testing.expect(std.mem.indexOf(u8, complete_json, "project.setup.required.proj-alpha") == null);
     try std.testing.expect(std.mem.indexOf(u8, complete_json, "\"required\":false") != null);
+}
+
+test "runtime_server: greeting input returns project setup questionnaire when setup is required" {
+    const allocator = std.testing.allocator;
+    const server = try RuntimeServer.create(allocator, "agent-test", .{
+        .ltm_directory = "",
+        .ltm_filename = "",
+    });
+    defer server.destroy();
+
+    const required_request =
+        "{\"id\":\"req-setup-required\",\"type\":\"agent.control\",\"action\":\"project.setup.sync\",\"content\":\"{\\\"project_id\\\":\\\"proj-alpha\\\",\\\"required\\\":true,\\\"message\\\":\\\"Project setup required\\\",\\\"project_vision\\\":\\\"Build spider web\\\",\\\"source\\\":\\\"control.connect\\\"}\"}";
+    const required_response = try server.handleMessage(required_request);
+    defer allocator.free(required_response);
+    try std.testing.expect(std.mem.indexOf(u8, required_response, "\"type\":\"session.receive\"") != null);
+
+    const greeting_response = try server.handleMessage("{\"id\":\"req-user-hello\",\"type\":\"session.send\",\"content\":\"Hello\"}");
+    defer allocator.free(greeting_response);
+
+    try std.testing.expect(std.mem.indexOf(u8, greeting_response, "\"type\":\"session.receive\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, greeting_response, "Let's do first-run setup for proj-alpha.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, greeting_response, "1) project name") != null);
+    try std.testing.expect(std.mem.indexOf(u8, greeting_response, "2) project vision") != null);
+    try std.testing.expect(std.mem.indexOf(u8, greeting_response, "3) first non-system agent id.") != null);
 }
 
 test "runtime_server: non-chat agent.control actions are unsupported" {
