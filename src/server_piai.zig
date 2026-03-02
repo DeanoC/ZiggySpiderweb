@@ -2975,7 +2975,8 @@ const RuntimeToolDispatchProxy = struct {
                 const activation_payload = std.fmt.allocPrint(self.control_plane.allocator, "{{\"project_id\":\"{s}\"}}", .{escaped}) catch null;
                 if (activation_payload) |payload| {
                     defer self.control_plane.allocator.free(payload);
-                    if (self.control_plane.activateProjectWithRole(agent_id, payload, true)) |activation_result| {
+                    const activation_is_admin = std.mem.eql(u8, self.runtime_agent_id, system_agent_id);
+                    if (self.control_plane.activateProjectWithRole(agent_id, payload, activation_is_admin)) |activation_result| {
                         defer self.control_plane.allocator.free(activation_result);
                         activated = true;
                     } else |_| {}
@@ -9548,6 +9549,49 @@ test "server_piai: runtime dispatch proxy provisions project and agent via contr
     defer if (first_agent) |value| allocator.free(value);
     try std.testing.expect(first_agent != null);
     try std.testing.expectEqualStrings(agent_id, first_agent.?);
+}
+
+test "server_piai: runtime dispatch proxy does not grant admin activation to non-system runtime" {
+    const allocator = std.testing.allocator;
+    var runtime_registry = AgentRuntimeRegistry.init(allocator, .{
+        .ltm_directory = "",
+        .ltm_filename = "",
+    }, null);
+    defer runtime_registry.deinit();
+
+    var dummy_sandbox: sandbox_runtime_mod.SandboxRuntime = undefined;
+    const proxy = try RuntimeToolDispatchProxy.create(
+        allocator,
+        &dummy_sandbox,
+        &runtime_registry.control_plane,
+        runtime_registry.runtime_config.agents_dir,
+        runtime_registry.runtime_config.assets_dir,
+        "rogue-runtime",
+    );
+    defer proxy.destroy();
+
+    const suffix: u64 = @intCast(@abs(std.time.nanoTimestamp()));
+    const agent_id = try std.fmt.allocPrint(allocator, "rogue{d}", .{suffix});
+    defer allocator.free(agent_id);
+    const create_content = try std.fmt.allocPrint(
+        allocator,
+        "{{\"agent_id\":\"{s}\",\"name\":\"Rogue\",\"description\":\"test\",\"project_id\":\"system\"}}",
+        .{agent_id},
+    );
+    defer allocator.free(create_content);
+    const create_content_escaped = try unified.jsonEscape(allocator, create_content);
+    defer allocator.free(create_content_escaped);
+    const create_args = try std.fmt.allocPrint(
+        allocator,
+        "{{\"path\":\"agents/self/agents/control/create.json\",\"content\":\"{s}\"}}",
+        .{create_content_escaped},
+    );
+    defer allocator.free(create_args);
+
+    var create_result = RuntimeToolDispatchProxy.dispatchWorldTool(proxy, allocator, "file_write", create_args);
+    defer create_result.deinit(allocator);
+    try std.testing.expect(create_result == .success);
+    try std.testing.expect(std.mem.indexOf(u8, create_result.success.payload_json, "\"activated\":false") != null);
 }
 
 test "server_piai: base websocket path handles unified control/acheron chat flow and rejects legacy session.send" {

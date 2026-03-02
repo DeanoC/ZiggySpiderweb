@@ -419,11 +419,12 @@ fn shouldRestartOnToolFailure(result: tool_registry.ToolExecutionResult) bool {
 }
 
 fn shouldRetryToolRequestAfterRestart(tool_name: []const u8, args_json: []const u8) bool {
-    // Bridge-level response read failures are ambiguous; retry once-or-twice after restart.
-    // Higher-level tool semantics remain responsible for idempotency/duplication handling.
-    _ = tool_name;
+    // Bridge-level response read failures are ambiguous, so only retry idempotent tools.
+    // This avoids replaying side effects when the first attempt may have already executed.
     _ = args_json;
-    return true;
+    return std.mem.eql(u8, tool_name, "file_read") or
+        std.mem.eql(u8, tool_name, "file_list") or
+        std.mem.eql(u8, tool_name, "search_code");
 }
 
 fn containsAnyIgnoreCase(haystack: []const u8, needles: []const []const u8) bool {
@@ -500,11 +501,12 @@ fn buildToolRequestLine(allocator: std.mem.Allocator, tool_name: []const u8, arg
     );
 }
 
-test "sandbox_runtime: retry after restart applies to all tools" {
+test "sandbox_runtime: retry after restart is limited to idempotent tools" {
     try std.testing.expect(shouldRetryToolRequestAfterRestart("file_read", "{}"));
     try std.testing.expect(shouldRetryToolRequestAfterRestart("file_list", "{}"));
-    try std.testing.expect(shouldRetryToolRequestAfterRestart("file_write", "{\"append\":true}"));
-    try std.testing.expect(shouldRetryToolRequestAfterRestart("shell_exec", "{}"));
+    try std.testing.expect(shouldRetryToolRequestAfterRestart("search_code", "{}"));
+    try std.testing.expect(!shouldRetryToolRequestAfterRestart("file_write", "{\"append\":true}"));
+    try std.testing.expect(!shouldRetryToolRequestAfterRestart("shell_exec", "{}"));
 }
 
 test "sandbox_runtime: timeout failures do not trigger mount restart" {
