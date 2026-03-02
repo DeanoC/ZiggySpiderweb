@@ -136,6 +136,8 @@ create_user() {
     SERVICE_USER_HOME=$(getent passwd "$INSTALL_USER" | cut -d: -f6)
     if [ -n "$SERVICE_USER_HOME" ] && [ "$SERVICE_USER_HOME" != "/" ]; then
         mkdir -p "$SERVICE_USER_HOME/.config/spiderweb"
+        mkdir -p "$SERVICE_USER_HOME/.pi/agent"
+        mkdir -p "$SERVICE_USER_HOME/.codex"
         chown -R "$INSTALL_USER:$INSTALL_USER" "$SERVICE_USER_HOME"
         chmod 700 "$SERVICE_USER_HOME"
     else
@@ -161,11 +163,15 @@ install_files() {
     # Copy binaries
     cp "$PROJECT_DIR/zig-out/bin/spiderweb" "$INSTALL_DIR/bin/"
     cp "$PROJECT_DIR/zig-out/bin/spiderweb-config" "$INSTALL_DIR/bin/"
+    cp "$PROJECT_DIR/zig-out/bin/spiderweb-agent-runtime" "$INSTALL_DIR/bin/"
+    cp "$PROJECT_DIR/zig-out/bin/spiderweb-fs-mount" "$INSTALL_DIR/bin/"
+    cp "$PROJECT_DIR/zig-out/bin/spiderweb-control" "$INSTALL_DIR/bin/"
     chmod +x "$INSTALL_DIR/bin/"*
     
     # Create symlink in /usr/local/bin
     ln -sf "$INSTALL_DIR/bin/spiderweb" /usr/local/bin/spiderweb
     ln -sf "$INSTALL_DIR/bin/spiderweb-config" /usr/local/bin/spiderweb-config
+    ln -sf "$INSTALL_DIR/bin/spiderweb-control" /usr/local/bin/spiderweb-control
     
     log_info "Binaries installed ✓"
 }
@@ -201,7 +207,9 @@ install_config() {
     "ltm_filename": "runtime-memory.db",
     "sandbox_enabled": true,
     "sandbox_mounts_root": "/var/lib/spiderweb/mounts",
-    "sandbox_runtime_root": "/var/lib/spiderweb/runtime"
+    "sandbox_runtime_root": "/var/lib/spiderweb/runtime",
+    "sandbox_fs_mount_bin": "$INSTALL_DIR/bin/spiderweb-fs-mount",
+    "sandbox_agent_runtime_bin": "$INSTALL_DIR/bin/spiderweb-agent-runtime"
   }
 }
 EOF
@@ -226,7 +234,9 @@ EOF
     "ltm_filename": "runtime-memory.db",
     "sandbox_enabled": true,
     "sandbox_mounts_root": "/var/lib/spiderweb/mounts",
-    "sandbox_runtime_root": "/var/lib/spiderweb/runtime"
+    "sandbox_runtime_root": "/var/lib/spiderweb/runtime",
+    "sandbox_fs_mount_bin": "$INSTALL_DIR/bin/spiderweb-fs-mount",
+    "sandbox_agent_runtime_bin": "$INSTALL_DIR/bin/spiderweb-agent-runtime"
   }
 }
 EOF
@@ -374,7 +384,8 @@ StartLimitInterval=60s
 StartLimitBurst=3
 
 # Security hardening
-NoNewPrivileges=true
+# FUSE mount helpers (fusermount3) require setuid transitions.
+NoNewPrivileges=false
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=read-only
@@ -382,7 +393,7 @@ ReadWritePaths=/var/lib/spiderweb /var/log/spiderweb $SERVICE_USER_HOME/.config 
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
-RestrictSUIDSGID=true
+RestrictSUIDSGID=false
 RestrictRealtime=true
 RestrictNamespaces=true
 LockPersonality=true

@@ -3292,7 +3292,8 @@ const AgentRuntimeRegistry = struct {
         action: []const u8,
         content_json: []const u8,
     ) !void {
-        const runtime = try self.getOrCreate(binding.agent_id, binding.project_id, binding.project_token);
+        const runtime = self.getRuntimeForBindingIfReady(binding.agent_id, binding.project_id) orelse
+            return error.RuntimeUnavailable;
         defer runtime.release();
 
         const escaped_content = try unified.jsonEscape(self.allocator, content_json);
@@ -3313,6 +3314,37 @@ const AgentRuntimeRegistry = struct {
         }
         if (responses.len == 0) return error.MissingJobResponse;
         if (std.mem.indexOf(u8, responses[0], "\"type\":\"error\"") != null) return error.RuntimeControlRejected;
+    }
+
+    fn getRuntimeForBindingIfReady(
+        self: *AgentRuntimeRegistry,
+        agent_id: []const u8,
+        project_id: ?[]const u8,
+    ) ?*runtime_handle_mod.RuntimeHandle {
+        var removed_unhealthy: ?RemovedRuntimeEntry = null;
+        var selected_runtime: ?*runtime_handle_mod.RuntimeHandle = null;
+
+        self.mutex.lock();
+        removed_unhealthy = self.takeUnhealthyRuntimeLocked(agent_id);
+        if (removed_unhealthy == null) {
+            if (self.by_agent.getPtr(agent_id)) |existing| {
+                const binding_matches = if (project_id) |project|
+                    std.mem.eql(u8, existing.project_id, project)
+                else
+                    true;
+                if (binding_matches) {
+                    selected_runtime = existing.runtime;
+                    selected_runtime.?.retain();
+                }
+            }
+        }
+        self.mutex.unlock();
+
+        if (removed_unhealthy) |removed| {
+            self.deinitRemovedRuntime(removed);
+            return null;
+        }
+        return selected_runtime;
     }
 
     fn publishServicePresenceForBinding(
@@ -5767,20 +5799,6 @@ fn handleWebSocketConnection(
         initial_binding.binding.project_id,
         initial_binding.binding.project_token,
     );
-    var initial_warmup_snapshot = if (connect_gate_error == null)
-        runtime_registry.ensureRuntimeWarmup(
-            initial_binding.binding.agent_id,
-            initial_binding.binding.project_id,
-            initial_binding.binding.project_token,
-            true,
-        ) catch |err| blk: {
-            std.log.warn("default session warmup failed: {s}", .{@errorName(err)});
-            break :blk SessionAttachStateSnapshot{};
-        }
-    else
-        SessionAttachStateSnapshot{};
-    defer initial_warmup_snapshot.deinit(allocator);
-
     var active_session_key = try allocator.dupe(u8, "main");
     defer allocator.free(active_session_key);
     var fsrpc: ?fsrpc_session.Session = null;
