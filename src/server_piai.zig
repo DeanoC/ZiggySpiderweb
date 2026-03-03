@@ -2835,8 +2835,6 @@ const RuntimeToolDispatchProxy = struct {
     assets_dir: []const u8,
     local_fs_export_root: []u8,
     runtime_agent_id: []u8,
-    mutex: std.Thread.Mutex = .{},
-    last_project_id: ?[]u8 = null,
 
     fn create(
         allocator: std.mem.Allocator,
@@ -2862,7 +2860,6 @@ const RuntimeToolDispatchProxy = struct {
     }
 
     fn destroy(self: *RuntimeToolDispatchProxy) void {
-        if (self.last_project_id) |project_id| self.allocator.free(project_id);
         self.allocator.free(self.local_fs_export_root);
         self.allocator.free(self.runtime_agent_id);
         self.allocator.destroy(self);
@@ -3165,7 +3162,6 @@ const RuntimeToolDispatchProxy = struct {
         };
         defer self.control_plane.allocator.free(up_result);
 
-        self.rememberLastProjectId(allocator, up_result) catch {};
         return runtimeDispatchFileWriteSuccess(allocator, path, content.len, up_result);
     }
 
@@ -3221,16 +3217,8 @@ const RuntimeToolDispatchProxy = struct {
                 return runtimeDispatchFileWriteSuccess(allocator, path, content.len, list_result);
             },
             .get => {
-                var project_id_owned: ?[]u8 = null;
-                defer if (project_id_owned) |value| allocator.free(value);
-                const project_id = optionalStringField(args_obj, "project_id") orelse blk: {
-                    const remembered = self.copyLastProjectId(allocator) catch null;
-                    if (remembered) |value| {
-                        project_id_owned = value;
-                        break :blk value;
-                    }
+                const project_id = optionalStringField(args_obj, "project_id") orelse
                     return runtimeDispatchFailure(allocator, .invalid_params, "projects get requires project_id");
-                };
                 const project_token = optionalStringField(args_obj, "project_token");
                 const payload = buildProjectScopedPayload(allocator, project_id, project_token) catch {
                     return runtimeDispatchFailure(allocator, .execution_failed, "failed to build projects get payload");
@@ -3299,10 +3287,7 @@ const RuntimeToolDispatchProxy = struct {
             created = true;
         }
 
-        const desired_project_id = optionalStringField(obj, "project_id") orelse self.copyLastProjectId(allocator) catch null;
-        defer if (desired_project_id) |project_id| {
-            if (optionalStringField(obj, "project_id") == null) allocator.free(project_id);
-        };
+        const desired_project_id = optionalStringField(obj, "project_id");
         var activated = false;
         if (desired_project_id) |project_id| {
             const escaped_project = unified.jsonEscape(self.control_plane.allocator, project_id) catch null;
@@ -3739,25 +3724,6 @@ const RuntimeToolDispatchProxy = struct {
         return allocator.dupe(u8, trimmed);
     }
 
-    fn rememberLastProjectId(self: *RuntimeToolDispatchProxy, allocator: std.mem.Allocator, project_up_json: []const u8) !void {
-        var parsed = std.json.parseFromSlice(std.json.Value, allocator, project_up_json, .{}) catch return;
-        defer parsed.deinit();
-        if (parsed.value != .object) return;
-        const project_id_value = parsed.value.object.get("project_id") orelse return;
-        if (project_id_value != .string or project_id_value.string.len == 0) return;
-
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        if (self.last_project_id) |value| self.allocator.free(value);
-        self.last_project_id = try self.allocator.dupe(u8, project_id_value.string);
-    }
-
-    fn copyLastProjectId(self: *RuntimeToolDispatchProxy, allocator: std.mem.Allocator) !?[]u8 {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        const project_id = self.last_project_id orelse return null;
-        return @as(?[]u8, try allocator.dupe(u8, project_id));
-    }
 };
 
 fn runtimeDispatchErrorCode(err: anyerror) tool_registry.ToolErrorCode {
@@ -4119,10 +4085,7 @@ fn normalizeControlPath(path: []const u8) []const u8 {
 
 fn pathMatchesControlTarget(path: []const u8, target: []const u8) bool {
     const normalized = normalizeControlPath(path);
-    if (std.mem.eql(u8, normalized, target)) return true;
-    if (normalized.len <= target.len + 1) return false;
-    if (normalized[normalized.len - target.len - 1] != '/') return false;
-    return std.mem.eql(u8, normalized[normalized.len - target.len ..], target);
+    return std.mem.eql(u8, normalized, target);
 }
 
 fn requiredStringField(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
@@ -10896,6 +10859,95 @@ test "server_piai: runtime dispatch proxy mounts control requires explicit proje
     try std.testing.expectEqual(tool_registry.ToolErrorCode.invalid_params, mount_result.failure.code);
 }
 
+test "server_piai: runtime dispatch proxy does not reuse project context across control writes" {
+    const allocator = std.testing.allocator;
+    var runtime_registry = AgentRuntimeRegistry.init(allocator, .{
+        .ltm_directory = "",
+        .ltm_filename = "",
+    }, null);
+    defer runtime_registry.deinit();
+
+    var dummy_sandbox: sandbox_runtime_mod.SandboxRuntime = undefined;
+    const proxy = try RuntimeToolDispatchProxy.create(
+        allocator,
+        &dummy_sandbox,
+        &runtime_registry.control_plane,
+        runtime_registry.runtime_config.agents_dir,
+        runtime_registry.runtime_config.assets_dir,
+        runtime_registry.runtime_config.spider_web_root,
+        system_agent_id,
+    );
+    defer proxy.destroy();
+
+    const suffix: u64 = @intCast(@abs(std.time.nanoTimestamp()));
+    const project_name = try std.fmt.allocPrint(allocator, "ProxyNoReuse-{d}", .{suffix});
+    defer allocator.free(project_name);
+    const project_up_content = try std.fmt.allocPrint(
+        allocator,
+        "{{\"name\":\"{s}\",\"vision\":\"No fallback state\",\"activate\":false}}",
+        .{project_name},
+    );
+    defer allocator.free(project_up_content);
+    const project_up_content_escaped = try unified.jsonEscape(allocator, project_up_content);
+    defer allocator.free(project_up_content_escaped);
+    const project_up_args = try std.fmt.allocPrint(
+        allocator,
+        "{{\"path\":\"agents/self/projects/control/up.json\",\"content\":\"{s}\"}}",
+        .{project_up_content_escaped},
+    );
+    defer allocator.free(project_up_args);
+
+    var project_up_result = RuntimeToolDispatchProxy.dispatchWorldTool(proxy, allocator, "file_write", project_up_args);
+    defer project_up_result.deinit(allocator);
+    try std.testing.expect(project_up_result == .success);
+
+    var project_up_parsed = try std.json.parseFromSlice(std.json.Value, allocator, project_up_result.success.payload_json, .{});
+    defer project_up_parsed.deinit();
+    if (project_up_parsed.value != .object) return error.TestExpectedResponse;
+    const project_up_operation_result = project_up_parsed.value.object.get("operation_result") orelse return error.TestExpectedResponse;
+    if (project_up_operation_result != .object) return error.TestExpectedResponse;
+    const project_id_value = project_up_operation_result.object.get("project_id") orelse return error.TestExpectedResponse;
+    if (project_id_value != .string or project_id_value.string.len == 0) return error.TestExpectedResponse;
+    const project_id = project_id_value.string;
+
+    const agent_id = try std.fmt.allocPrint(allocator, "no_reuse_{d}", .{suffix});
+    defer allocator.free(agent_id);
+    const create_content = try std.fmt.allocPrint(
+        allocator,
+        "{{\"agent_id\":\"{s}\",\"name\":\"No Reuse\",\"description\":\"no implicit project fallback\"}}",
+        .{agent_id},
+    );
+    defer allocator.free(create_content);
+    const create_content_escaped = try unified.jsonEscape(allocator, create_content);
+    defer allocator.free(create_content_escaped);
+    const create_args = try std.fmt.allocPrint(
+        allocator,
+        "{{\"path\":\"agents/self/agents/control/create.json\",\"content\":\"{s}\"}}",
+        .{create_content_escaped},
+    );
+    defer allocator.free(create_args);
+
+    var create_result = RuntimeToolDispatchProxy.dispatchWorldTool(proxy, allocator, "file_write", create_args);
+    defer create_result.deinit(allocator);
+    try std.testing.expect(create_result == .success);
+    try std.testing.expect(std.mem.indexOf(u8, create_result.success.payload_json, "\"project_id\":null") != null);
+    try std.testing.expect(std.mem.indexOf(u8, create_result.success.payload_json, "\"activated\":false") != null);
+
+    const project_first_agent = try runtime_registry.control_plane.firstProjectAgent(project_id, false);
+    defer if (project_first_agent) |value| allocator.free(value);
+    try std.testing.expect(project_first_agent == null);
+
+    var get_result = RuntimeToolDispatchProxy.dispatchWorldTool(
+        proxy,
+        allocator,
+        "file_write",
+        "{\"path\":\"agents/self/projects/control/get.json\",\"content\":\"{}\"}",
+    );
+    defer get_result.deinit(allocator);
+    try std.testing.expect(get_result == .failure);
+    try std.testing.expectEqual(tool_registry.ToolErrorCode.invalid_params, get_result.failure.code);
+}
+
 test "server_piai: base websocket path handles unified control/acheron chat flow and rejects legacy session.send" {
     const allocator = std.testing.allocator;
     var runtime_registry = AgentRuntimeRegistry.init(allocator, .{
@@ -12073,6 +12125,12 @@ test "server_piai: resolve connection path maps base URL to default agent" {
     try std.testing.expectEqualStrings("default", resolved_query);
     try std.testing.expect(resolveAgentIdFromConnectionPath("/v2/agents/default/stream", "default") == null);
     try std.testing.expect(resolveAgentIdFromConnectionPath("/v1/agents/default/stream", "default") == null);
+}
+
+test "server_piai: pathMatchesControlTarget only matches control namespace root path" {
+    try std.testing.expect(pathMatchesControlTarget("agents/self/projects/control/up.json", "agents/self/projects/control/up.json"));
+    try std.testing.expect(pathMatchesControlTarget("/agents/self/projects/control/up.json", "agents/self/projects/control/up.json"));
+    try std.testing.expect(!pathMatchesControlTarget("workspace/agents/self/projects/control/up.json", "agents/self/projects/control/up.json"));
 }
 
 test "server_piai: parseHttpRequestPath parses GET line" {
