@@ -76,7 +76,27 @@ Canonical mounts inside the namespace:
 
 `/nodes/local/fs` remains the canonical bridge to host-mounted paths.
 
-## 3. Host Access as Mount Capability
+## 3. Namespace Operations: `mount` vs `bind`
+
+Spiderweb should adopt Inferno/Plan9-style semantics with a strict distinction:
+
+- `mount` imports a service/capability into the namespace from a catalog source (for example under `/nodes/...`).
+- `bind` creates a namespace alias/composition from one existing namespace path to another.
+
+In this model:
+
+- `/nodes` is a service catalog and discovery surface.
+- `mount` is the action that attaches catalog resources into the active namespace.
+- `bind` is the action that reshapes an already attached namespace view without adding new capability.
+
+Examples:
+
+- `mount`: attach `/nodes/local/fs/safe/Safe/ZiggyPR` to `/workspace`
+- `bind`: alias `/workspace` to `/agents/self/workspace`
+
+Normative rule: `bind` must not grant access to any path/capability that is not already reachable through existing mounts and policy.
+
+## 4. Host Access as Mount Capability
 
 Host paths are never assumed globally visible. They are attached explicitly:
 
@@ -84,7 +104,7 @@ Host paths are never assumed globally visible. They are attached explicitly:
 - project mounts and binds remain control-plane governed
 - agents reason in namespace paths, not raw host paths
 
-## 4. Internal Path Hygiene
+## 5. Internal Path Hygiene
 
 Paths such as `/underworld/...` are internal-only and must not appear in:
 
@@ -92,7 +112,7 @@ Paths such as `/underworld/...` are internal-only and must not appear in:
 - GUI operator messages
 - error guidance intended for operators
 
-## 5. Snapshot and Reproducibility
+## 6. Snapshot and Reproducibility
 
 Project state can be captured as:
 
@@ -123,6 +143,9 @@ For runtime:
 - Capability is conveyed by namespace attachment (mount/bind), not by broad host visibility.
 - Project rootfs boundary provides strong default separation between projects.
 - Host write authority can be narrowed to mounted subtrees and explicit policy actions.
+- `mount` permission and `bind` permission are distinct policy decisions.
+- `mount` controls importing new capability from catalog/host sources.
+- `bind` controls namespace composition of already-permitted paths.
 
 ## Migration Plan
 
@@ -152,6 +175,7 @@ For runtime:
 
 - Require explicit mount grants for host path exposure.
 - Add per-project defaults that start from zero host mounts.
+- Enforce split authorization for `mount` vs `bind` operations in control-plane endpoints.
 
 ## Acceptance Criteria
 
@@ -160,6 +184,8 @@ For runtime:
 3. Agent-visible messages never contain `/underworld`.
 4. Mount operation examples and prompts use `/nodes/local/fs/...` (or relative mount-control forms).
 5. Project snapshot can recreate filesystem state for a subsequent run.
+6. Mounting from `/nodes/...` requires `mount` authorization; aliasing existing paths requires `bind` authorization.
+7. `bind` cannot be used to escape policy boundaries or access paths outside mounted authority.
 
 ## Alternatives Considered
 
@@ -178,7 +204,7 @@ This direction intentionally aligns with proven Inferno/Plan9 ideas:
 
 - per-context namespace composition
 - file protocol as universal service surface
-- capability via mounts/binds
+- explicit distinction between `mount` (capability import) and `bind` (namespace alias/composition)
 
 Modern additions are:
 
