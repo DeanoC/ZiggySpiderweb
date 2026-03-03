@@ -141,7 +141,11 @@ cleanup() {
     SPIDERWEB_PID=""
   fi
   if [[ "$KEEP_CANARY_DIR" != "1" ]]; then
-    rm -rf "$TMP_ROOT"
+    if command -v timeout >/dev/null 2>&1; then
+      timeout --kill-after=2s 10s rm -rf "$TMP_ROOT" >/dev/null 2>&1 || true
+    else
+      rm -rf "$TMP_ROOT" >/dev/null 2>&1 || true
+    fi
   fi
 }
 trap cleanup EXIT
