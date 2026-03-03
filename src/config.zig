@@ -46,6 +46,10 @@ pub const RuntimeConfig = struct {
     sandbox_enabled: bool = builtin.os.tag == .linux and !builtin.is_test,
     sandbox_mounts_root: []const u8 = "/var/lib/spiderweb/mounts",
     sandbox_runtime_root: []const u8 = "/var/lib/spiderweb/runtime",
+    sandbox_rootfs_base_ref: []const u8 = "debian:bookworm-slim",
+    sandbox_rootfs_store_root: []const u8 = "/var/lib/spiderweb/rootfs/base",
+    sandbox_overlay_root: []const u8 = "/var/lib/spiderweb/rootfs/overlays",
+    sandbox_snapshot_root: []const u8 = "/var/lib/spiderweb/rootfs/snapshots",
     sandbox_launcher: []const u8 = "bwrap",
     sandbox_fs_mount_bin: []const u8 = "spiderweb-fs-mount",
     sandbox_agent_runtime_bin: []const u8 = "spiderweb-agent-runtime",
@@ -77,6 +81,10 @@ pub const RuntimeConfig = struct {
             .sandbox_enabled = self.sandbox_enabled,
             .sandbox_mounts_root = try allocator.dupe(u8, self.sandbox_mounts_root),
             .sandbox_runtime_root = try allocator.dupe(u8, self.sandbox_runtime_root),
+            .sandbox_rootfs_base_ref = try allocator.dupe(u8, self.sandbox_rootfs_base_ref),
+            .sandbox_rootfs_store_root = try allocator.dupe(u8, self.sandbox_rootfs_store_root),
+            .sandbox_overlay_root = try allocator.dupe(u8, self.sandbox_overlay_root),
+            .sandbox_snapshot_root = try allocator.dupe(u8, self.sandbox_snapshot_root),
             .sandbox_launcher = try allocator.dupe(u8, self.sandbox_launcher),
             .sandbox_fs_mount_bin = try allocator.dupe(u8, self.sandbox_fs_mount_bin),
             .sandbox_agent_runtime_bin = try allocator.dupe(u8, self.sandbox_agent_runtime_bin),
@@ -92,6 +100,10 @@ pub const RuntimeConfig = struct {
         allocator.free(self.agents_dir);
         allocator.free(self.sandbox_mounts_root);
         allocator.free(self.sandbox_runtime_root);
+        allocator.free(self.sandbox_rootfs_base_ref);
+        allocator.free(self.sandbox_rootfs_store_root);
+        allocator.free(self.sandbox_overlay_root);
+        allocator.free(self.sandbox_snapshot_root);
         allocator.free(self.sandbox_launcher);
         allocator.free(self.sandbox_fs_mount_bin);
         allocator.free(self.sandbox_agent_runtime_bin);
@@ -148,10 +160,16 @@ const default_config =
 const SandboxPathDefaults = struct {
     mounts_root: []u8,
     runtime_root: []u8,
+    rootfs_store_root: []u8,
+    overlay_root: []u8,
+    snapshot_root: []u8,
 
     fn deinit(self: *SandboxPathDefaults, allocator: std.mem.Allocator) void {
         allocator.free(self.mounts_root);
         allocator.free(self.runtime_root);
+        allocator.free(self.rootfs_store_root);
+        allocator.free(self.overlay_root);
+        allocator.free(self.snapshot_root);
         self.* = undefined;
     }
 };
@@ -161,6 +179,9 @@ fn resolveSandboxPathDefaults(allocator: std.mem.Allocator) !SandboxPathDefaults
         return .{
             .mounts_root = try allocator.dupe(u8, "/var/lib/spiderweb/mounts"),
             .runtime_root = try allocator.dupe(u8, "/var/lib/spiderweb/runtime"),
+            .rootfs_store_root = try allocator.dupe(u8, "/var/lib/spiderweb/rootfs/base"),
+            .overlay_root = try allocator.dupe(u8, "/var/lib/spiderweb/rootfs/overlays"),
+            .snapshot_root = try allocator.dupe(u8, "/var/lib/spiderweb/rootfs/snapshots"),
         };
     }
 
@@ -168,6 +189,9 @@ fn resolveSandboxPathDefaults(allocator: std.mem.Allocator) !SandboxPathDefaults
         return .{
             .mounts_root = try allocator.dupe(u8, "/var/lib/spiderweb/mounts"),
             .runtime_root = try allocator.dupe(u8, "/var/lib/spiderweb/runtime"),
+            .rootfs_store_root = try allocator.dupe(u8, "/var/lib/spiderweb/rootfs/base"),
+            .overlay_root = try allocator.dupe(u8, "/var/lib/spiderweb/rootfs/overlays"),
+            .snapshot_root = try allocator.dupe(u8, "/var/lib/spiderweb/rootfs/snapshots"),
         };
     }
 
@@ -176,6 +200,9 @@ fn resolveSandboxPathDefaults(allocator: std.mem.Allocator) !SandboxPathDefaults
         return .{
             .mounts_root = try allocator.dupe(u8, "/var/lib/spiderweb/mounts"),
             .runtime_root = try allocator.dupe(u8, "/var/lib/spiderweb/runtime"),
+            .rootfs_store_root = try allocator.dupe(u8, "/var/lib/spiderweb/rootfs/base"),
+            .overlay_root = try allocator.dupe(u8, "/var/lib/spiderweb/rootfs/overlays"),
+            .snapshot_root = try allocator.dupe(u8, "/var/lib/spiderweb/rootfs/snapshots"),
         };
     }
     defer allocator.free(home.?);
@@ -196,6 +223,9 @@ fn resolveSandboxPathDefaults(allocator: std.mem.Allocator) !SandboxPathDefaults
     return .{
         .mounts_root = try std.fs.path.join(allocator, &.{ sandbox_root, "mounts" }),
         .runtime_root = try std.fs.path.join(allocator, &.{ sandbox_root, "runtime" }),
+        .rootfs_store_root = try std.fs.path.join(allocator, &.{ sandbox_root, "rootfs", "base" }),
+        .overlay_root = try std.fs.path.join(allocator, &.{ sandbox_root, "rootfs", "overlays" }),
+        .snapshot_root = try std.fs.path.join(allocator, &.{ sandbox_root, "rootfs", "snapshots" }),
     };
 }
 
@@ -245,6 +275,10 @@ pub fn init(allocator: std.mem.Allocator, config_path: ?[]const u8) !Config {
             .sandbox_enabled = builtin.os.tag == .linux and !builtin.is_test,
             .sandbox_mounts_root = try allocator.dupe(u8, sandbox_defaults.mounts_root),
             .sandbox_runtime_root = try allocator.dupe(u8, sandbox_defaults.runtime_root),
+            .sandbox_rootfs_base_ref = try allocator.dupe(u8, "debian:bookworm-slim"),
+            .sandbox_rootfs_store_root = try allocator.dupe(u8, sandbox_defaults.rootfs_store_root),
+            .sandbox_overlay_root = try allocator.dupe(u8, sandbox_defaults.overlay_root),
+            .sandbox_snapshot_root = try allocator.dupe(u8, sandbox_defaults.snapshot_root),
             .sandbox_launcher = try allocator.dupe(u8, "bwrap"),
             .sandbox_fs_mount_bin = try allocator.dupe(u8, "spiderweb-fs-mount"),
             .sandbox_agent_runtime_bin = try allocator.dupe(u8, "spiderweb-agent-runtime"),
@@ -512,6 +546,30 @@ pub fn load(self: *Config) !void {
                     self.runtime.sandbox_runtime_root = try self.allocator.dupe(u8, value.string);
                 }
             }
+            if (runtime_val.object.get("sandbox_rootfs_base_ref")) |value| {
+                if (value == .string and value.string.len > 0) {
+                    self.allocator.free(self.runtime.sandbox_rootfs_base_ref);
+                    self.runtime.sandbox_rootfs_base_ref = try self.allocator.dupe(u8, value.string);
+                }
+            }
+            if (runtime_val.object.get("sandbox_rootfs_store_root")) |value| {
+                if (value == .string and value.string.len > 0) {
+                    self.allocator.free(self.runtime.sandbox_rootfs_store_root);
+                    self.runtime.sandbox_rootfs_store_root = try self.allocator.dupe(u8, value.string);
+                }
+            }
+            if (runtime_val.object.get("sandbox_overlay_root")) |value| {
+                if (value == .string and value.string.len > 0) {
+                    self.allocator.free(self.runtime.sandbox_overlay_root);
+                    self.runtime.sandbox_overlay_root = try self.allocator.dupe(u8, value.string);
+                }
+            }
+            if (runtime_val.object.get("sandbox_snapshot_root")) |value| {
+                if (value == .string and value.string.len > 0) {
+                    self.allocator.free(self.runtime.sandbox_snapshot_root);
+                    self.runtime.sandbox_snapshot_root = try self.allocator.dupe(u8, value.string);
+                }
+            }
             if (runtime_val.object.get("sandbox_launcher")) |value| {
                 if (value == .string and value.string.len > 0) {
                     self.allocator.free(self.runtime.sandbox_launcher);
@@ -538,10 +596,142 @@ pub fn load(self: *Config) !void {
 
 fn validateRuntimeConfig(self: *Config) !void {
     if (!builtin.is_test and !self.runtime.sandbox_enabled) {
-        std.log.err(
-            "invalid config: runtime.sandbox_enabled=false is unsupported (Acheron runtime requires sandbox mode)",
-            .{},
-        );
+        if (!builtin.is_test) {
+            std.log.err(
+                "invalid config: runtime.sandbox_enabled=false is unsupported (Acheron runtime requires sandbox mode)",
+                .{},
+            );
+        }
+        return error.InvalidConfig;
+    }
+
+    const mounts_root = try requireAbsoluteRuntimePath("runtime.sandbox_mounts_root", self.runtime.sandbox_mounts_root);
+    const runtime_root = try requireAbsoluteRuntimePath("runtime.sandbox_runtime_root", self.runtime.sandbox_runtime_root);
+    const rootfs_store_root = try requireAbsoluteRuntimePath("runtime.sandbox_rootfs_store_root", self.runtime.sandbox_rootfs_store_root);
+    const overlay_root = try requireAbsoluteRuntimePath("runtime.sandbox_overlay_root", self.runtime.sandbox_overlay_root);
+    const snapshot_root = try requireAbsoluteRuntimePath("runtime.sandbox_snapshot_root", self.runtime.sandbox_snapshot_root);
+
+    _ = try requireRuntimeField("runtime.sandbox_rootfs_base_ref", self.runtime.sandbox_rootfs_base_ref);
+    _ = try requireRuntimeField("runtime.sandbox_launcher", self.runtime.sandbox_launcher);
+    _ = try requireRuntimeField("runtime.sandbox_fs_mount_bin", self.runtime.sandbox_fs_mount_bin);
+    _ = try requireRuntimeField("runtime.sandbox_agent_runtime_bin", self.runtime.sandbox_agent_runtime_bin);
+
+    try ensureRuntimePathsDoNotOverlap(
+        "runtime.sandbox_mounts_root",
+        mounts_root,
+        "runtime.sandbox_runtime_root",
+        runtime_root,
+    );
+    try ensureRuntimePathsDoNotOverlap(
+        "runtime.sandbox_mounts_root",
+        mounts_root,
+        "runtime.sandbox_rootfs_store_root",
+        rootfs_store_root,
+    );
+    try ensureRuntimePathsDoNotOverlap(
+        "runtime.sandbox_mounts_root",
+        mounts_root,
+        "runtime.sandbox_overlay_root",
+        overlay_root,
+    );
+    try ensureRuntimePathsDoNotOverlap(
+        "runtime.sandbox_mounts_root",
+        mounts_root,
+        "runtime.sandbox_snapshot_root",
+        snapshot_root,
+    );
+    try ensureRuntimePathsDoNotOverlap(
+        "runtime.sandbox_runtime_root",
+        runtime_root,
+        "runtime.sandbox_rootfs_store_root",
+        rootfs_store_root,
+    );
+    try ensureRuntimePathsDoNotOverlap(
+        "runtime.sandbox_runtime_root",
+        runtime_root,
+        "runtime.sandbox_overlay_root",
+        overlay_root,
+    );
+    try ensureRuntimePathsDoNotOverlap(
+        "runtime.sandbox_runtime_root",
+        runtime_root,
+        "runtime.sandbox_snapshot_root",
+        snapshot_root,
+    );
+    try ensureRuntimePathsDoNotOverlap(
+        "runtime.sandbox_rootfs_store_root",
+        rootfs_store_root,
+        "runtime.sandbox_overlay_root",
+        overlay_root,
+    );
+    try ensureRuntimePathsDoNotOverlap(
+        "runtime.sandbox_rootfs_store_root",
+        rootfs_store_root,
+        "runtime.sandbox_snapshot_root",
+        snapshot_root,
+    );
+    try ensureRuntimePathsDoNotOverlap(
+        "runtime.sandbox_overlay_root",
+        overlay_root,
+        "runtime.sandbox_snapshot_root",
+        snapshot_root,
+    );
+}
+
+fn requireRuntimeField(field_name: []const u8, value: []const u8) ![]const u8 {
+    const trimmed = std.mem.trim(u8, value, " \t\r\n");
+    if (trimmed.len == 0) {
+        if (!builtin.is_test) {
+            std.log.err("invalid config: {s} is required and cannot be empty", .{field_name});
+        }
+        return error.InvalidConfig;
+    }
+    return trimmed;
+}
+
+fn trimTrailingSlashes(path: []const u8) []const u8 {
+    var out = path;
+    while (out.len > 1 and out[out.len - 1] == '/') {
+        out = out[0 .. out.len - 1];
+    }
+    return out;
+}
+
+fn requireAbsoluteRuntimePath(field_name: []const u8, value: []const u8) ![]const u8 {
+    const trimmed = trimTrailingSlashes(try requireRuntimeField(field_name, value));
+    if (!std.fs.path.isAbsolute(trimmed)) {
+        if (!builtin.is_test) {
+            std.log.err(
+                "invalid config: {s} must be an absolute path, got '{s}'",
+                .{ field_name, trimmed },
+            );
+        }
+        return error.InvalidConfig;
+    }
+    return trimmed;
+}
+
+fn pathIsAncestorOrEqual(ancestor: []const u8, path: []const u8) bool {
+    if (ancestor.len == 0 or path.len == 0) return false;
+    if (!std.mem.startsWith(u8, path, ancestor)) return false;
+    if (ancestor.len == path.len) return true;
+    if (std.mem.eql(u8, ancestor, "/")) return true;
+    return path[ancestor.len] == '/';
+}
+
+fn ensureRuntimePathsDoNotOverlap(
+    field_a: []const u8,
+    path_a: []const u8,
+    field_b: []const u8,
+    path_b: []const u8,
+) !void {
+    if (pathIsAncestorOrEqual(path_a, path_b) or pathIsAncestorOrEqual(path_b, path_a)) {
+        if (!builtin.is_test) {
+            std.log.err(
+                "invalid config: {s}='{s}' overlaps {s}='{s}'",
+                .{ field_a, path_a, field_b, path_b },
+            );
+        }
         return error.InvalidConfig;
     }
 }
@@ -652,6 +842,14 @@ pub fn save(self: Config) !void {
     try file.writeAll(sandbox_mounts_line);
     const sandbox_runtime_line = try std.fmt.bufPrint(&buf, "    \"sandbox_runtime_root\": \"{s}\",\n", .{self.runtime.sandbox_runtime_root});
     try file.writeAll(sandbox_runtime_line);
+    const sandbox_rootfs_base_line = try std.fmt.bufPrint(&buf, "    \"sandbox_rootfs_base_ref\": \"{s}\",\n", .{self.runtime.sandbox_rootfs_base_ref});
+    try file.writeAll(sandbox_rootfs_base_line);
+    const sandbox_rootfs_store_line = try std.fmt.bufPrint(&buf, "    \"sandbox_rootfs_store_root\": \"{s}\",\n", .{self.runtime.sandbox_rootfs_store_root});
+    try file.writeAll(sandbox_rootfs_store_line);
+    const sandbox_overlay_line = try std.fmt.bufPrint(&buf, "    \"sandbox_overlay_root\": \"{s}\",\n", .{self.runtime.sandbox_overlay_root});
+    try file.writeAll(sandbox_overlay_line);
+    const sandbox_snapshot_line = try std.fmt.bufPrint(&buf, "    \"sandbox_snapshot_root\": \"{s}\",\n", .{self.runtime.sandbox_snapshot_root});
+    try file.writeAll(sandbox_snapshot_line);
     const sandbox_launcher_line = try std.fmt.bufPrint(&buf, "    \"sandbox_launcher\": \"{s}\",\n", .{self.runtime.sandbox_launcher});
     try file.writeAll(sandbox_launcher_line);
     const sandbox_fs_mount_line = try std.fmt.bufPrint(&buf, "    \"sandbox_fs_mount_bin\": \"{s}\",\n", .{self.runtime.sandbox_fs_mount_bin});
@@ -774,4 +972,42 @@ test "Config setProvider safely reuses current model pointer" {
     const existing_model = config.provider.model.?;
     try config.setProvider(config.provider.name, existing_model);
     try std.testing.expectEqualStrings("gpt-4o-mini", config.provider.model.?);
+}
+
+test "Config validation rejects overlapping sandbox roots" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const tmp_root = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_root);
+    const cfg_path = try std.fs.path.join(allocator, &.{ tmp_root, "config.json" });
+
+    var config = try Config.init(allocator, cfg_path);
+    defer config.deinit();
+
+    config.allocator.free(config.runtime.sandbox_mounts_root);
+    config.runtime.sandbox_mounts_root = try allocator.dupe(u8, "/tmp/spiderweb-overlap");
+    config.allocator.free(config.runtime.sandbox_runtime_root);
+    config.runtime.sandbox_runtime_root = try allocator.dupe(u8, "/tmp/spiderweb-overlap");
+
+    try std.testing.expectError(error.InvalidConfig, config.validateRuntimeConfig());
+}
+
+test "Config validation rejects empty rootfs base ref" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const tmp_root = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_root);
+    const cfg_path = try std.fs.path.join(allocator, &.{ tmp_root, "config.json" });
+
+    var config = try Config.init(allocator, cfg_path);
+    defer config.deinit();
+
+    config.allocator.free(config.runtime.sandbox_rootfs_base_ref);
+    config.runtime.sandbox_rootfs_base_ref = try allocator.dupe(u8, "   ");
+
+    try std.testing.expectError(error.InvalidConfig, config.validateRuntimeConfig());
 }

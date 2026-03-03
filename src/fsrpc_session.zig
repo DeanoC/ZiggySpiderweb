@@ -11594,7 +11594,7 @@ test "fsrpc_session: mounts namespace manages mount bind and resolve operations"
     defer allocator.free(escaped_node_id);
     const mount_payload = try std.fmt.allocPrint(
         allocator,
-        "{{\"node_id\":\"{s}\",\"export_name\":\"work\",\"mount_path\":\"/src\"}}",
+        "{{\"node_id\":\"{s}\",\"export_name\":\"work\",\"mount_path\":\"/nodes/local/fs\"}}",
         .{escaped_node_id},
     );
     defer allocator.free(mount_payload);

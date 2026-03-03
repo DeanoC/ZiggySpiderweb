@@ -177,6 +177,30 @@ KEEP_CANARY_DIR=1 ./scripts/manual-mother-provider-canary.sh
 CANARY_PROVIDER_NAME=openai CANARY_PROVIDER_MODEL=gpt-4o-mini ./scripts/manual-mother-provider-canary.sh
 ```
 
+## Mother-Driven Agent Workflow E2E
+
+Run an end-to-end canary where Mother performs the project/agent/mount/bind work via chat-driven tool use:
+
+```bash
+./scripts/manual-mother-agent-e2e.sh
+```
+
+What it validates:
+- first connect starts in bootstrap mode (`bootstrap_only=true`)
+- provider-backed Mother chat can execute a multi-step workflow
+- Mother creates a new non-system project and first agent
+- Mother performs `mount`, `bind`, and `resolve` via `/agents/self/mounts/control/*.json`
+- result verification confirms mounted path and bind target
+- attach to the Mother-created `(project_id, agent_id)` succeeds and bootstrap mode exits
+
+Useful overrides:
+
+```bash
+KEEP_CANARY_DIR=1 ./scripts/manual-mother-agent-e2e.sh
+PROJECT_NAME=my-e2e AGENT_ID=my-e2e-agent ./scripts/manual-mother-agent-e2e.sh
+CANARY_PROVIDER_NAME=openai-codex CANARY_PROVIDER_MODEL=gpt-5.3-codex ./scripts/manual-mother-agent-e2e.sh
+```
+
 ## Environment Variables
 
 | Variable | Default | Description |
