@@ -4655,6 +4655,15 @@ fn defaultProjectActionMode(project: *const Project, action: ProjectAction) Acce
 }
 
 fn resolveProjectActionMode(project: *const Project, action: ProjectAction, actor_id: ?[]const u8) AccessMode {
+    // Backward compatibility: projects created before `bind` policy existed often
+    // only set `mount`. Preserve that intent by inheriting `mount` policy for
+    // `bind` when `bind` is not explicitly configured.
+    if (action == .bind) {
+        if (project.access_policy.modeFor(actor_id, .bind)) |mode| return mode;
+        if (project.access_policy.modeFor(actor_id, .mount)) |mode| return mode;
+        return defaultProjectActionMode(project, .bind);
+    }
+
     var mode = defaultProjectActionMode(project, action);
     if (project.access_policy.modeFor(actor_id, action)) |override_mode| {
         mode = override_mode;
@@ -5496,6 +5505,15 @@ test "fs_control_plane: access policy enforces action modes and per-agent overri
     );
     defer allocator.free(denied_mount_req);
     try std.testing.expectError(ControlPlaneError.ProjectPolicyForbidden, plane.setProjectMount(denied_mount_req));
+    try std.testing.expect(!plane.projectAllowsAction(project_id, "bob", .bind, null, false));
+
+    const denied_bind_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"project_id\":\"{s}\",\"bind_path\":\"/repo\",\"target_path\":\"/nodes/local/fs\"}}",
+        .{project_id},
+    );
+    defer allocator.free(denied_bind_req);
+    try std.testing.expectError(ControlPlaneError.ProjectPolicyForbidden, plane.setProjectBind(denied_bind_req));
 
     const update_policy_req = try std.fmt.allocPrint(
         allocator,
@@ -5508,7 +5526,9 @@ test "fs_control_plane: access policy enforces action modes and per-agent overri
     try std.testing.expect(std.mem.indexOf(u8, updated, "\"access_policy\"") != null);
 
     try std.testing.expect(plane.projectAllowsAction(project_id, "bob", .mount, null, false));
+    try std.testing.expect(plane.projectAllowsAction(project_id, "bob", .bind, null, false));
     try std.testing.expect(!plane.projectAllowsAction(project_id, "alice", .mount, null, false));
+    try std.testing.expect(!plane.projectAllowsAction(project_id, "alice", .bind, null, false));
     try std.testing.expect(plane.projectAllowsAction(project_id, "bob", .observe, null, false));
     try std.testing.expect(!plane.projectAllowsAction(project_id, "alice", .observe, null, false));
 
