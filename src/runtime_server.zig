@@ -36,6 +36,10 @@ const BASE_CORE_PROMPT_KIND = "core.base_prompt";
 const BASE_CORE_PROMPT_NAME = "core.system.base_instructions";
 const CORE_CAPABILITIES_PROMPT_NAME = "core.system.capabilities";
 const CORE_IDENTITY_GUIDANCE_PROMPT_NAME = "core.system.identity_guidance";
+const SERVICE_PRESENCE_MEM_NAME_PREFIX = "service.presence.";
+const SERVICE_PRESENCE_MEM_KIND = "presence.service";
+const PROJECT_SETUP_GATE_PROMPT_MEM_NAME = "project.setup_gate.instructions";
+const PROJECT_SETUP_GATE_PROMPT_MEM_KIND = "core.system_prompt";
 
 const RuntimeServerError = error{
     RuntimeTickTimeout,
@@ -92,6 +96,38 @@ const ControlToolCallRequest = struct {
         allocator.free(self.brain_name);
         allocator.free(self.tool_name);
         allocator.free(self.arguments_json);
+        self.* = undefined;
+    }
+};
+
+const ServiceEventStatus = enum {
+    attached,
+    detached,
+};
+
+const ControlServiceEventRequest = struct {
+    brain_name: []u8,
+    service_id: []u8,
+    session_key: []u8,
+    role: []u8,
+    status: ServiceEventStatus,
+    project_id: ?[]u8,
+    project_setup_required: bool,
+    project_setup_project_id: ?[]u8,
+    project_setup_message: ?[]u8,
+    project_setup_vision: ?[]u8,
+    project_setup_source: ?[]u8,
+
+    fn deinit(self: *ControlServiceEventRequest, allocator: std.mem.Allocator) void {
+        allocator.free(self.brain_name);
+        allocator.free(self.service_id);
+        allocator.free(self.session_key);
+        allocator.free(self.role);
+        if (self.project_id) |value| allocator.free(value);
+        if (self.project_setup_project_id) |value| allocator.free(value);
+        if (self.project_setup_message) |value| allocator.free(value);
+        if (self.project_setup_vision) |value| allocator.free(value);
+        if (self.project_setup_source) |value| allocator.free(value);
         self.* = undefined;
     }
 };
@@ -1031,6 +1067,9 @@ pub const RuntimeServer = struct {
         memory_schema.ensureRuntimeInstructionMemories(&self.runtime, DEFAULT_BRAIN) catch |err| {
             std.log.warn("Failed to ensure runtime instruction memories for {s}: {s}", .{ self.runtime.agent_id, @errorName(err) });
         };
+        self.refreshProjectSetupGatePrompt(DEFAULT_BRAIN) catch |err| {
+            std.log.warn("Failed to refresh project setup gate prompt for {s}: {s}", .{ self.runtime.agent_id, @errorName(err) });
+        };
         memory_schema.setActiveGoal(&self.runtime, DEFAULT_BRAIN, content) catch |err| {
             std.log.warn("Failed to update active goal memory for {s}: {s}", .{ self.runtime.agent_id, @errorName(err) });
         };
@@ -1218,6 +1257,16 @@ pub const RuntimeServer = struct {
             return self.handleControlToolCall(job, request_id, payload);
         }
 
+        if (std.mem.eql(u8, control_action, "service.event")) {
+            const payload = content orelse return self.wrapSingleFrame(try protocol.buildErrorWithCode(
+                self.allocator,
+                request_id,
+                .missing_content,
+                "agent.control service.event requires content",
+            ));
+            return self.handleControlServiceEvent(job, request_id, payload);
+        }
+
         return self.wrapSingleFrame(try protocol.buildErrorWithCode(
             self.allocator,
             request_id,
@@ -1278,6 +1327,338 @@ pub const RuntimeServer = struct {
         return self.wrapSingleFrame(try protocol.buildSessionReceive(self.allocator, request_id, payload));
     }
 
+    fn handleControlServiceEvent(
+        self: *RuntimeServer,
+        job: *RuntimeQueueJob,
+        request_id: []const u8,
+        content: []const u8,
+    ) ![][]u8 {
+        _ = job;
+        var request = self.parseControlServiceEventPayload(content) catch {
+            return self.wrapSingleFrame(try protocol.buildErrorWithCode(
+                self.allocator,
+                request_id,
+                .invalid_envelope,
+                "service.event content must include service_id and status",
+            ));
+        };
+        defer request.deinit(self.allocator);
+
+        const mem_name = try std.fmt.allocPrint(
+            self.allocator,
+            "{s}{s}",
+            .{ SERVICE_PRESENCE_MEM_NAME_PREFIX, request.service_id },
+        );
+        defer self.allocator.free(mem_name);
+
+        if (request.status == .detached) {
+            try self.removeNamedMemoryIfExists(request.brain_name, mem_name);
+            try self.refreshProjectSetupGatePrompt(request.brain_name);
+            return self.wrapSingleFrame(try protocol.buildSessionReceive(self.allocator, request_id, "{\"ok\":true,\"status\":\"detached\"}"));
+        }
+
+        const escaped_service_id = try protocol.jsonEscape(self.allocator, request.service_id);
+        defer self.allocator.free(escaped_service_id);
+        const escaped_session_key = try protocol.jsonEscape(self.allocator, request.session_key);
+        defer self.allocator.free(escaped_session_key);
+        const escaped_role = try protocol.jsonEscape(self.allocator, request.role);
+        defer self.allocator.free(escaped_role);
+        const project_id_json = if (request.project_id) |project_id| blk: {
+            const escaped_project = try protocol.jsonEscape(self.allocator, project_id);
+            defer self.allocator.free(escaped_project);
+            break :blk try std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped_project});
+        } else try self.allocator.dupe(u8, "null");
+        defer self.allocator.free(project_id_json);
+        const project_setup_project_id_json = if (request.project_setup_project_id) |project_id| blk: {
+            const escaped_project = try protocol.jsonEscape(self.allocator, project_id);
+            defer self.allocator.free(escaped_project);
+            break :blk try std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped_project});
+        } else try self.allocator.dupe(u8, "null");
+        defer self.allocator.free(project_setup_project_id_json);
+        const project_setup_message_json = if (request.project_setup_message) |message| blk: {
+            const escaped_message = try protocol.jsonEscape(self.allocator, message);
+            defer self.allocator.free(escaped_message);
+            break :blk try std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped_message});
+        } else try self.allocator.dupe(u8, "null");
+        defer self.allocator.free(project_setup_message_json);
+        const project_setup_vision_json = if (request.project_setup_vision) |vision| blk: {
+            const escaped_vision = try protocol.jsonEscape(self.allocator, vision);
+            defer self.allocator.free(escaped_vision);
+            break :blk try std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped_vision});
+        } else try self.allocator.dupe(u8, "null");
+        defer self.allocator.free(project_setup_vision_json);
+        const project_setup_source_json = if (request.project_setup_source) |source| blk: {
+            const escaped_source = try protocol.jsonEscape(self.allocator, source);
+            defer self.allocator.free(escaped_source);
+            break :blk try std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped_source});
+        } else try self.allocator.dupe(u8, "null");
+        defer self.allocator.free(project_setup_source_json);
+
+        const payload = try std.fmt.allocPrint(
+            self.allocator,
+            "{{\"service_id\":\"{s}\",\"status\":\"attached\",\"session_key\":\"{s}\",\"role\":\"{s}\",\"project_id\":{s},\"project_setup_required\":{},\"project_setup_project_id\":{s},\"project_setup_message\":{s},\"project_setup_project_vision\":{s},\"project_setup_source\":{s},\"updated_at_ms\":{d}}}",
+            .{
+                escaped_service_id,
+                escaped_session_key,
+                escaped_role,
+                project_id_json,
+                request.project_setup_required,
+                project_setup_project_id_json,
+                project_setup_message_json,
+                project_setup_vision_json,
+                project_setup_source_json,
+                std.time.milliTimestamp(),
+            },
+        );
+        defer self.allocator.free(payload);
+
+        try self.upsertNamedMemory(request.brain_name, mem_name, SERVICE_PRESENCE_MEM_KIND, payload, true);
+        try self.refreshProjectSetupGatePrompt(request.brain_name);
+        return self.wrapSingleFrame(try protocol.buildSessionReceive(self.allocator, request_id, "{\"ok\":true,\"status\":\"attached\"}"));
+    }
+
+    fn refreshProjectSetupGatePrompt(self: *RuntimeServer, brain_name: []const u8) !void {
+        const snapshot = try self.runtime.active_memory.snapshotActive(self.allocator, brain_name);
+        defer memory.deinitItems(self.allocator, snapshot);
+
+        var prompt = std.ArrayListUnmanaged(u8){};
+        defer prompt.deinit(self.allocator);
+
+        var required_count: usize = 0;
+        for (snapshot) |item| {
+            if (!std.mem.eql(u8, item.kind, SERVICE_PRESENCE_MEM_KIND)) continue;
+            if (!servicePresenceRequiresProjectSetup(self.allocator, item.content_json)) continue;
+            if (required_count == 0) {
+                try prompt.appendSlice(
+                    self.allocator,
+                    "## Project Setup Gate\n" ++
+                        "One or more attached services report incomplete project setup state.\n" ++
+                        "Before normal assistance, run a setup interview with the operator.\n" ++
+                        "Prioritize collecting missing setup details and asking targeted follow-ups.\n" ++
+                        "Use `project_setup_*` fields from `presence.service` entries as ground truth.\n" ++
+                        "Required interview fields: project_name, project_vision, first_agent_name, first_agent_role.\n" ++
+                        "Treat any non-empty short role phrase as valid (do not repeatedly re-ask the same role question).\n" ++
+                        "If the operator repeats the same role answer, treat it as confirmed and continue provisioning.\n" ++
+                        "For first-project bootstrap, do not mutate the `system` project and do not include `project_id`.\n" ++
+                        "After all fields are known, execute provisioning via Acheron namespaces:\n" ++
+                        "1) `agents/self/projects/control/up.json` with `{name, vision, activate:false}` only.\n" ++
+                        "2) Read the `operation_result.project_id` returned by that file_write tool result.\n" ++
+                        "3) `agents/self/agents/control/create.json` with `{agent_id, name, description, project_id}`\n" ++
+                        "4) Treat successful file_write tool results as authoritative completion for provisioning.\n" ++
+                        "   Do not block on `status.json`/`result.json` in bootstrap mode.\n" ++
+                        "Do not switch to unrelated chit-chat until setup blockers are resolved.\n" ++
+                        "Active setup requirements:\n",
+                );
+            }
+            const added = try appendProjectSetupRequiredSummaryLine(self.allocator, &prompt, item.content_json);
+            if (!added) continue;
+            required_count += 1;
+        }
+
+        if (required_count == 0) {
+            try self.removeNamedMemoryIfExists(brain_name, PROJECT_SETUP_GATE_PROMPT_MEM_NAME);
+            return;
+        }
+
+        const escaped = try protocol.jsonEscape(self.allocator, prompt.items);
+        defer self.allocator.free(escaped);
+        const payload = try std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped});
+        defer self.allocator.free(payload);
+
+        try self.upsertNamedMemory(
+            brain_name,
+            PROJECT_SETUP_GATE_PROMPT_MEM_NAME,
+            PROJECT_SETUP_GATE_PROMPT_MEM_KIND,
+            payload,
+            false,
+        );
+    }
+
+    fn appendProjectSetupRequiredSummaryLine(
+        allocator: std.mem.Allocator,
+        out: *std.ArrayListUnmanaged(u8),
+        content_json: []const u8,
+    ) !bool {
+        var required = false;
+        var project_id: []const u8 = "unknown";
+        var message: ?[]const u8 = null;
+        var vision: ?[]const u8 = null;
+
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, content_json, .{}) catch null;
+        defer if (parsed) |*value| value.deinit();
+        if (parsed) |*value| {
+            if (value.value == .object) {
+                if (value.value.object.get("project_setup_required")) |entry| {
+                    if (entry == .bool) required = entry.bool;
+                }
+                if (value.value.object.get("project_setup_project_id")) |entry| {
+                    if (entry == .string and entry.string.len > 0) project_id = entry.string;
+                } else if (value.value.object.get("project_id")) |entry| {
+                    if (entry == .string and entry.string.len > 0) project_id = entry.string;
+                }
+                if (value.value.object.get("project_setup_message")) |entry| {
+                    if (entry == .string and entry.string.len > 0) message = entry.string;
+                } else if (value.value.object.get("message")) |entry| {
+                    if (entry == .string and entry.string.len > 0) message = entry.string;
+                }
+                if (value.value.object.get("project_setup_project_vision")) |entry| {
+                    if (entry == .string and entry.string.len > 0) vision = entry.string;
+                } else if (value.value.object.get("project_vision")) |entry| {
+                    if (entry == .string and entry.string.len > 0) vision = entry.string;
+                }
+            }
+        }
+
+        if (!required) return false;
+        try out.appendSlice(allocator, "- project_id=");
+        try out.appendSlice(allocator, project_id);
+        if (message) |msg| {
+            try out.appendSlice(allocator, " message=");
+            try out.appendSlice(allocator, msg);
+        }
+        if (vision) |value| {
+            try out.appendSlice(allocator, " vision_hint=");
+            try out.appendSlice(allocator, value);
+        }
+        try out.appendSlice(allocator, "\n");
+        return true;
+    }
+
+    fn servicePresenceRequiresProjectSetup(allocator: std.mem.Allocator, content_json: []const u8) bool {
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, content_json, .{}) catch return false;
+        defer parsed.deinit();
+        if (parsed.value != .object) return false;
+        const required_val = parsed.value.object.get("project_setup_required") orelse return false;
+        if (required_val != .bool) return false;
+        return required_val.bool;
+    }
+
+    fn parseControlServiceEventPayload(self: *RuntimeServer, content: []const u8) !ControlServiceEventRequest {
+        const trimmed = std.mem.trim(u8, content, " \t\r\n");
+        if (trimmed.len == 0) return error.InvalidPayload;
+
+        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, trimmed, .{}) catch return error.InvalidPayload;
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidPayload;
+        const obj = parsed.value.object;
+
+        const service_id = blk: {
+            const value = obj.get("service_id") orelse return error.InvalidPayload;
+            if (value != .string or value.string.len == 0) return error.InvalidPayload;
+            if (!isValidControlMemorySegment(value.string)) return error.InvalidPayload;
+            break :blk value.string;
+        };
+        const session_key = blk: {
+            if (obj.get("session_key")) |value| {
+                if (value != .string or value.string.len == 0) return error.InvalidPayload;
+                if (!isValidControlMemorySegment(value.string)) return error.InvalidPayload;
+                break :blk value.string;
+            }
+            break :blk "main";
+        };
+        const role = blk: {
+            if (obj.get("role")) |value| {
+                if (value != .string or value.string.len == 0) return error.InvalidPayload;
+                break :blk value.string;
+            }
+            break :blk "service";
+        };
+        const brain_name = blk: {
+            if (obj.get("brain")) |value| {
+                if (value == .string and value.string.len > 0) break :blk value.string;
+                return error.InvalidPayload;
+            }
+            break :blk DEFAULT_BRAIN;
+        };
+        const status = blk: {
+            const value = obj.get("status") orelse return error.InvalidPayload;
+            if (value != .string or value.string.len == 0) return error.InvalidPayload;
+            if (std.mem.eql(u8, value.string, "attached")) break :blk ServiceEventStatus.attached;
+            if (std.mem.eql(u8, value.string, "detached")) break :blk ServiceEventStatus.detached;
+            return error.InvalidPayload;
+        };
+
+        const project_id = blk: {
+            if (obj.get("project_id")) |value| {
+                if (value == .null) break :blk null;
+                if (value != .string or value.string.len == 0) return error.InvalidPayload;
+                if (!isValidControlMemorySegment(value.string)) return error.InvalidPayload;
+                break :blk try self.allocator.dupe(u8, value.string);
+            }
+            break :blk null;
+        };
+        errdefer if (project_id) |value| self.allocator.free(value);
+
+        const project_setup_required = blk: {
+            if (obj.get("project_setup_required")) |value| {
+                if (value == .null) break :blk false;
+                if (value != .bool) return error.InvalidPayload;
+                break :blk value.bool;
+            }
+            break :blk false;
+        };
+
+        const project_setup_project_id = blk: {
+            if (obj.get("project_setup_project_id")) |value| {
+                if (value == .null) break :blk null;
+                if (value != .string or value.string.len == 0) return error.InvalidPayload;
+                if (!isValidControlMemorySegment(value.string)) return error.InvalidPayload;
+                break :blk try self.allocator.dupe(u8, value.string);
+            }
+            break :blk null;
+        };
+        errdefer if (project_setup_project_id) |value| self.allocator.free(value);
+
+        const project_setup_message = blk: {
+            if (obj.get("project_setup_message")) |value| {
+                if (value == .null) break :blk null;
+                if (value != .string) return error.InvalidPayload;
+                const trimmed_value = std.mem.trim(u8, value.string, " \t\r\n");
+                if (trimmed_value.len == 0) break :blk null;
+                break :blk try self.allocator.dupe(u8, trimmed_value);
+            }
+            break :blk null;
+        };
+        errdefer if (project_setup_message) |value| self.allocator.free(value);
+
+        const project_setup_vision = blk: {
+            if (obj.get("project_setup_project_vision")) |value| {
+                if (value == .null) break :blk null;
+                if (value != .string) return error.InvalidPayload;
+                const trimmed_value = std.mem.trim(u8, value.string, " \t\r\n");
+                if (trimmed_value.len == 0) break :blk null;
+                break :blk try self.allocator.dupe(u8, trimmed_value);
+            }
+            break :blk null;
+        };
+        errdefer if (project_setup_vision) |value| self.allocator.free(value);
+
+        const project_setup_source = blk: {
+            if (obj.get("project_setup_source")) |value| {
+                if (value == .null) break :blk null;
+                if (value != .string) return error.InvalidPayload;
+                const trimmed_value = std.mem.trim(u8, value.string, " \t\r\n");
+                if (trimmed_value.len == 0) break :blk null;
+                break :blk try self.allocator.dupe(u8, trimmed_value);
+            }
+            break :blk null;
+        };
+        errdefer if (project_setup_source) |value| self.allocator.free(value);
+
+        return .{
+            .brain_name = try self.allocator.dupe(u8, brain_name),
+            .service_id = try self.allocator.dupe(u8, service_id),
+            .session_key = try self.allocator.dupe(u8, session_key),
+            .role = try self.allocator.dupe(u8, role),
+            .status = status,
+            .project_id = project_id,
+            .project_setup_required = project_setup_required,
+            .project_setup_project_id = project_setup_project_id,
+            .project_setup_message = project_setup_message,
+            .project_setup_vision = project_setup_vision,
+            .project_setup_source = project_setup_source,
+        };
+    }
     fn parseControlToolCallPayload(self: *RuntimeServer, content: []const u8) !ControlToolCallRequest {
         const trimmed = std.mem.trim(u8, content, " \t\r\n");
         if (trimmed.len == 0) return error.InvalidPayload;
@@ -1314,6 +1695,91 @@ pub const RuntimeServer = struct {
             .tool_name = try self.allocator.dupe(u8, tool_name),
             .arguments_json = args_json,
         };
+    }
+
+    fn upsertNamedMemory(
+        self: *RuntimeServer,
+        brain_name: []const u8,
+        name: []const u8,
+        kind: []const u8,
+        payload: []const u8,
+        no_history: bool,
+    ) !void {
+        if (try self.loadMemoryByName(brain_name, name)) |existing_item| {
+            var item = existing_item;
+            defer item.deinit(self.allocator);
+            var mutated = self.runtime.active_memory.mutate(item.mem_id, payload) catch |err| switch (err) {
+                memory.MemoryError.NotFound => blk: {
+                    if (no_history) {
+                        const recreated_no_history = try self.runtime.active_memory.createActiveNoHistory(
+                            brain_name,
+                            name,
+                            kind,
+                            payload,
+                            false,
+                            false,
+                        );
+                        break :blk recreated_no_history;
+                    }
+
+                    const recreated = try self.runtime.active_memory.create(
+                        brain_name,
+                        name,
+                        kind,
+                        payload,
+                        false,
+                        true,
+                    );
+                    break :blk recreated;
+                },
+                else => return err,
+            };
+            mutated.deinit(self.allocator);
+            return;
+        }
+
+        if (no_history) {
+            var created_no_history = try self.runtime.active_memory.createActiveNoHistory(
+                brain_name,
+                name,
+                kind,
+                payload,
+                false,
+                false,
+            );
+            created_no_history.deinit(self.allocator);
+            return;
+        }
+
+        var created = try self.runtime.active_memory.create(
+            brain_name,
+            name,
+            kind,
+            payload,
+            false,
+            true,
+        );
+        created.deinit(self.allocator);
+    }
+
+    fn removeNamedMemoryIfExists(self: *RuntimeServer, brain_name: []const u8, name: []const u8) !void {
+        var existing = (try self.loadMemoryByName(brain_name, name)) orelse return;
+        defer existing.deinit(self.allocator);
+        var removed = self.runtime.active_memory.removeActiveNoHistory(existing.mem_id) catch |err| switch (err) {
+            memory.MemoryError.NotFound => return,
+            else => return err,
+        };
+        removed.deinit(self.allocator);
+    }
+
+    fn isValidControlMemorySegment(value: []const u8) bool {
+        if (value.len == 0 or value.len > 128) return false;
+        for (value) |char| {
+            if (std.ascii.isAlphanumeric(char)) continue;
+            if (char == '-' or char == '_' or char == '.' or char == ':') continue;
+            return false;
+        }
+        return true;
     }
 
     fn handleRunStart(
@@ -7552,6 +8018,82 @@ test "runtime_server: agent.control tool.call executes allowed filesystem runtim
 
     try std.testing.expect(std.mem.indexOf(u8, response, "\"type\":\"session.receive\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, response, "\"entries\"") != null);
+}
+
+test "runtime_server: agent.control service.event tracks attach and detach presence memory" {
+    const allocator = std.testing.allocator;
+    const server = try RuntimeServer.create(allocator, "agent-test", .{
+        .ltm_directory = "",
+        .ltm_filename = "",
+    });
+    defer server.destroy();
+
+    const attach_request =
+        "{\"id\":\"req-service-attach\",\"type\":\"agent.control\",\"action\":\"service.event\",\"content\":\"{\\\"service_id\\\":\\\"gui_ws_1\\\",\\\"status\\\":\\\"attached\\\",\\\"session_key\\\":\\\"main\\\",\\\"role\\\":\\\"user\\\",\\\"project_id\\\":\\\"proj-alpha\\\"}\"}";
+    const attach_response = try server.handleMessage(attach_request);
+    defer allocator.free(attach_response);
+    try std.testing.expect(std.mem.indexOf(u8, attach_response, "\"type\":\"session.receive\"") != null);
+
+    const attached_snapshot = try server.runtime.active_memory.snapshotActive(allocator, "primary");
+    defer memory.deinitItems(allocator, attached_snapshot);
+    const attached_json = try memory.toActiveMemoryJson(allocator, "primary", attached_snapshot);
+    defer allocator.free(attached_json);
+    try std.testing.expect(std.mem.indexOf(u8, attached_json, "service.presence.gui_ws_1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, attached_json, "\"kind\":\"presence.service\"") != null);
+
+    const detach_request =
+        "{\"id\":\"req-service-detach\",\"type\":\"agent.control\",\"action\":\"service.event\",\"content\":\"{\\\"service_id\\\":\\\"gui_ws_1\\\",\\\"status\\\":\\\"detached\\\",\\\"session_key\\\":\\\"main\\\",\\\"role\\\":\\\"user\\\",\\\"project_id\\\":\\\"proj-alpha\\\"}\"}";
+    const detach_response = try server.handleMessage(detach_request);
+    defer allocator.free(detach_response);
+    try std.testing.expect(std.mem.indexOf(u8, detach_response, "\"type\":\"session.receive\"") != null);
+
+    const detached_snapshot = try server.runtime.active_memory.snapshotActive(allocator, "primary");
+    defer memory.deinitItems(allocator, detached_snapshot);
+    const detached_json = try memory.toActiveMemoryJson(allocator, "primary", detached_snapshot);
+    defer allocator.free(detached_json);
+    try std.testing.expect(std.mem.indexOf(u8, detached_json, "service.presence.gui_ws_1") == null);
+}
+
+test "runtime_server: service.event setup metadata drives project setup gate prompt" {
+    const allocator = std.testing.allocator;
+    const server = try RuntimeServer.create(allocator, "agent-test", .{
+        .ltm_directory = "",
+        .ltm_filename = "",
+    });
+    defer server.destroy();
+
+    const required_request =
+        "{\"id\":\"req-setup-required\",\"type\":\"agent.control\",\"action\":\"service.event\",\"content\":\"{\\\"service_id\\\":\\\"gui_ws_setup\\\",\\\"status\\\":\\\"attached\\\",\\\"session_key\\\":\\\"main\\\",\\\"role\\\":\\\"admin\\\",\\\"project_id\\\":\\\"proj-alpha\\\",\\\"project_setup_required\\\":true,\\\"project_setup_project_id\\\":\\\"proj-alpha\\\",\\\"project_setup_message\\\":\\\"Need project setup details\\\",\\\"project_setup_project_vision\\\":\\\"Build spider web\\\",\\\"project_setup_source\\\":\\\"control.connect\\\"}\"}";
+    const required_response = try server.handleMessage(required_request);
+    defer allocator.free(required_response);
+    try std.testing.expect(std.mem.indexOf(u8, required_response, "\"type\":\"session.receive\"") != null);
+    try server.runtime.refreshCorePrompt("primary");
+
+    const required_snapshot = try server.runtime.active_memory.snapshotActive(allocator, "primary");
+    defer memory.deinitItems(allocator, required_snapshot);
+    const required_json = try memory.toActiveMemoryJson(allocator, "primary", required_snapshot);
+    defer allocator.free(required_json);
+    try std.testing.expect(std.mem.indexOf(u8, required_json, "service.presence.gui_ws_setup") != null);
+    try std.testing.expect(std.mem.indexOf(u8, required_json, PROJECT_SETUP_GATE_PROMPT_MEM_NAME) != null);
+    try std.testing.expect(std.mem.indexOf(u8, required_json, "\"project_setup_required\":true") != null);
+    const required_prompt = try server.buildCoreSystemPrompt("primary");
+    defer allocator.free(required_prompt);
+    try std.testing.expect(std.mem.indexOf(u8, required_prompt, "## Project Setup Gate") != null);
+    try std.testing.expect(std.mem.indexOf(u8, required_prompt, "project_id=proj-alpha") != null);
+
+    const complete_request =
+        "{\"id\":\"req-setup-complete\",\"type\":\"agent.control\",\"action\":\"service.event\",\"content\":\"{\\\"service_id\\\":\\\"gui_ws_setup\\\",\\\"status\\\":\\\"attached\\\",\\\"session_key\\\":\\\"main\\\",\\\"role\\\":\\\"admin\\\",\\\"project_id\\\":\\\"proj-alpha\\\",\\\"project_setup_required\\\":false,\\\"project_setup_project_id\\\":\\\"proj-alpha\\\",\\\"project_setup_source\\\":\\\"control.session_attach\\\"}\"}";
+    const complete_response = try server.handleMessage(complete_request);
+    defer allocator.free(complete_response);
+    try std.testing.expect(std.mem.indexOf(u8, complete_response, "\"type\":\"session.receive\"") != null);
+
+    const complete_snapshot = try server.runtime.active_memory.snapshotActive(allocator, "primary");
+    defer memory.deinitItems(allocator, complete_snapshot);
+    const complete_json = try memory.toActiveMemoryJson(allocator, "primary", complete_snapshot);
+    defer allocator.free(complete_json);
+    try std.testing.expect(std.mem.indexOf(u8, complete_json, "service.presence.gui_ws_setup") != null);
+    try std.testing.expect(std.mem.indexOf(u8, complete_json, PROJECT_SETUP_GATE_PROMPT_MEM_NAME) == null);
+    try std.testing.expect(std.mem.indexOf(u8, complete_json, "\"project_setup_required\":false") != null);
 }
 
 test "runtime_server: non-chat agent.control actions are unsupported" {

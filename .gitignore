@@ -1,6 +1,9 @@
 # Zig build artifacts
 .zig-cache/
 zig-out/
+.zig-cache-user/
+.zig-global-cache-user/
+.zig-out-user/
 
 # Binary
 *.exe

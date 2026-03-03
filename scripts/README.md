@@ -6,7 +6,7 @@ SystemD-based deployment scripts for ZiggySpiderWeb.
 
 ```bash
 cd scripts
-sudo ./install-systemd.sh
+sudo PROVIDER_NAME=openai-codex PROVIDER_MODEL=gpt-5.3-codex ./install-systemd.sh
 ```
 
 This will:
@@ -177,6 +177,50 @@ KEEP_CANARY_DIR=1 ./scripts/manual-mother-provider-canary.sh
 CANARY_PROVIDER_NAME=openai CANARY_PROVIDER_MODEL=gpt-4o-mini ./scripts/manual-mother-provider-canary.sh
 ```
 
+## Mother-Driven Agent Workflow E2E
+
+Run an end-to-end canary for project/agent/mount/bind/resolve.
+
+```bash
+./scripts/manual-mother-agent-e2e.sh
+```
+
+Modes:
+
+- `MOTHER_E2E_MODE=provider_chat` (default): Mother does setup work via chat/tool use.
+- `MOTHER_E2E_MODE=deterministic`: script writes control files directly (CI-friendly, no provider call required).
+
+What it validates:
+- first connect starts in bootstrap mode (`bootstrap_only=true`)
+- provider-backed Mother chat can execute a multi-step workflow
+- Mother creates a new non-system project and first agent
+- Mother performs `mount`, `bind`, and `resolve` via `/agents/self/mounts/control/*.json`
+- result verification confirms mounted path and bind target
+- attach to the Mother-created `(project_id, agent_id)` succeeds and bootstrap mode exits
+
+Useful overrides:
+
+```bash
+KEEP_CANARY_DIR=1 ./scripts/manual-mother-agent-e2e.sh
+PROJECT_NAME=my-e2e AGENT_ID=my-e2e-agent ./scripts/manual-mother-agent-e2e.sh
+CANARY_PROVIDER_NAME=openai-codex CANARY_PROVIDER_MODEL=gpt-5.3-codex ./scripts/manual-mother-agent-e2e.sh
+MOTHER_E2E_MODE=deterministic ./scripts/manual-mother-agent-e2e.sh
+MOTHER_E2E_MODE=provider_chat CANARY_PROVIDER_NAME=openai-codex CANARY_PROVIDER_MODEL=gpt-5.3-codex ./scripts/manual-mother-agent-e2e.sh
+```
+
+Run both deterministic + provider-chat in one command (uses `~/.codex/auth.json` automatically when present):
+
+```bash
+./scripts/mother-agent-e2e-suite.sh
+
+# force provider mode on/off
+RUN_PROVIDER_CHAT=1 ./scripts/mother-agent-e2e-suite.sh
+RUN_PROVIDER_CHAT=0 ./scripts/mother-agent-e2e-suite.sh
+
+# CI usage (reuse prior build artifacts)
+SKIP_BUILD=1 ./scripts/mother-agent-e2e-suite.sh
+```
+
 ## Environment Variables
 
 | Variable | Default | Description |
@@ -187,13 +231,17 @@ CANARY_PROVIDER_NAME=openai CANARY_PROVIDER_MODEL=gpt-4o-mini ./scripts/manual-m
 | `SERVICE_NAME` | `spiderweb` | systemd service name |
 | `PORT` | `18790` | Default listening port |
 | `BIND_ADDR` | `0.0.0.0` | Default bind address |
-| `PROVIDER_NAME` | `openai` | Provider written to generated config |
-| `PROVIDER_MODEL` | `gpt-4o-mini` | Model written to generated config |
+| `PROVIDER_NAME` | required | Provider written to generated config (required for new/overwrite installs) |
+| `PROVIDER_MODEL` | required | Model written to generated config (required for new/overwrite installs) |
 | `OVERWRITE_CONFIG` | `0` | If `1`, replace existing `/etc/spiderweb/config.json` |
 | `OPENAI_API_KEY` | unset | Writes `OPENAI_API_KEY` to service env file when provider is `openai` |
 | `OPENAI_CODEX_API_KEY` | unset | Writes `OPENAI_CODEX_API_KEY` for `openai-codex*` providers |
 
 Example with custom settings:
 ```bash
-sudo PORT=8080 BIND_ADDR=0.0.0.0 ./install-systemd.sh
+sudo PORT=8080 BIND_ADDR=0.0.0.0 PROVIDER_NAME=openai-codex PROVIDER_MODEL=gpt-5.3-codex ./install-systemd.sh
 ```
+
+Current system-project scope note:
+- `SPIDER_WEB_ROOT` defaults to `/`, so the `system` project (Mother) is host-wide by default.
+- Restrict scope by setting `SPIDER_WEB_ROOT` to a narrower path during install.

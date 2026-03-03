@@ -41,6 +41,10 @@ const SpecialKind = enum {
     agents_invoke,
     agents_list,
     agents_create,
+    projects_invoke,
+    projects_list,
+    projects_get,
+    projects_up,
     mounts_invoke,
     mounts_list,
     mounts_mount,
@@ -316,6 +320,8 @@ pub const Session = struct {
     sub_brains_result_id: u32 = 0,
     agents_status_id: u32 = 0,
     agents_result_id: u32 = 0,
+    projects_status_id: u32 = 0,
+    projects_result_id: u32 = 0,
     mounts_status_id: u32 = 0,
     mounts_result_id: u32 = 0,
     wait_sources: std.ArrayListUnmanaged(WaitSource) = .{},
@@ -1005,6 +1011,32 @@ pub const Session = struct {
                 };
                 written = outcome.written;
             },
+            .projects_invoke,
+            .projects_list,
+            .projects_get,
+            .projects_up,
+            => {
+                const outcome = self.handleProjectsNamespaceWrite(node.special, state.node_id, data) catch |err| switch (err) {
+                    error.InvalidPayload => {
+                        return unified.buildFsrpcError(
+                            self.allocator,
+                            msg.tag,
+                            "invalid",
+                            "projects payload is invalid for requested operation",
+                        );
+                    },
+                    error.AccessDenied => {
+                        return unified.buildFsrpcError(
+                            self.allocator,
+                            msg.tag,
+                            "eperm",
+                            "projects operation denied by policy",
+                        );
+                    },
+                    else => return err,
+                };
+                written = outcome.written;
+            },
             .pairing_refresh => {
                 const outcome = try self.handlePairingControlWrite(.refresh, data);
                 written = outcome.written;
@@ -1518,6 +1550,8 @@ pub const Session = struct {
         try self.seedAgentSubBrainsNamespace(sub_brains_dir);
         const agents_dir = try self.addDir(self_agent_dir, "agents", false);
         try self.seedAgentAgentsNamespace(agents_dir);
+        const projects_dir = try self.addDir(self_agent_dir, "projects", false);
+        try self.seedAgentProjectsNamespace(projects_dir);
 
         self.jobs_root_id = try self.addDir(self_agent_dir, "jobs", false);
         try self.addDirectoryDescriptors(
@@ -2669,7 +2703,7 @@ pub const Session = struct {
             false,
             .none,
         );
-        const initial_result = try self.buildMountsListResultJson();
+        const initial_result = try self.buildMountsListResultJson(null, null);
         defer self.allocator.free(initial_result);
         self.mounts_result_id = try self.addFile(
             mounts_dir,
@@ -2838,6 +2872,73 @@ pub const Session = struct {
         _ = try self.addFile(control_dir, "invoke.json", "", true, .agents_invoke);
         _ = try self.addFile(control_dir, "list.json", "", true, .agents_list);
         _ = try self.addFile(control_dir, "create.json", "", can_create_agents, .agents_create);
+    }
+
+    fn seedAgentProjectsNamespace(self: *Session, projects_dir: u32) !void {
+        try self.addDirectoryDescriptors(
+            projects_dir,
+            "Projects Management",
+            "{\"kind\":\"service\",\"service_id\":\"projects\",\"shape\":\"/agents/self/projects/{README.md,SCHEMA.json,CAPS.json,OPS.json,PERMISSIONS.json,STATUS.json,status.json,result.json,control/*}\"}",
+            "{\"invoke\":true,\"operations\":[\"projects_list\",\"projects_get\",\"projects_up\"],\"discoverable\":true}",
+            "List, inspect, and create/update projects through Acheron control files.",
+        );
+        _ = try self.addFile(
+            projects_dir,
+            "OPS.json",
+            "{\"model\":\"local_bridge\",\"invoke\":\"control/invoke.json\",\"transport\":\"acheron-local\",\"paths\":{\"list\":\"control/list.json\",\"get\":\"control/get.json\",\"up\":\"control/up.json\"},\"operations\":{\"list\":\"projects_list\",\"get\":\"projects_get\",\"up\":\"projects_up\"}}",
+            false,
+            .none,
+        );
+        _ = try self.addFile(
+            projects_dir,
+            "RUNTIME.json",
+            "{\"type\":\"acheron_local\",\"component\":\"fsrpc_session\",\"subject\":\"control_plane_projects\"}",
+            false,
+            .none,
+        );
+        _ = try self.addFile(
+            projects_dir,
+            "PERMISSIONS.json",
+            "{\"default\":\"allow-by-default\",\"allow_roles\":[\"admin\",\"user\"],\"scope\":\"project_control_plane\"}",
+            false,
+            .none,
+        );
+        _ = try self.addFile(
+            projects_dir,
+            "STATUS.json",
+            "{\"service_id\":\"projects\",\"state\":\"namespace\",\"has_invoke\":true}",
+            false,
+            .none,
+        );
+        self.projects_status_id = try self.addFile(
+            projects_dir,
+            "status.json",
+            "{\"state\":\"idle\",\"tool\":null,\"updated_at_ms\":0,\"error\":null}",
+            false,
+            .none,
+        );
+        const initial_result = try self.buildProjectListResultJson();
+        defer self.allocator.free(initial_result);
+        self.projects_result_id = try self.addFile(
+            projects_dir,
+            "result.json",
+            initial_result,
+            false,
+            .none,
+        );
+
+        const control_dir = try self.addDir(projects_dir, "control", false);
+        _ = try self.addFile(
+            control_dir,
+            "README.md",
+            "Use list/get/up operation files, or invoke.json with op=list|get|up plus arguments. For Mother bootstrap provisioning, use up with activate=false.\n",
+            false,
+            .none,
+        );
+        _ = try self.addFile(control_dir, "invoke.json", "", true, .projects_invoke);
+        _ = try self.addFile(control_dir, "list.json", "", true, .projects_list);
+        _ = try self.addFile(control_dir, "get.json", "", true, .projects_get);
+        _ = try self.addFile(control_dir, "up.json", "", true, .projects_up);
     }
 
     fn seedGlobalLibraryNamespace(self: *Session, library_dir: u32) !void {
@@ -6125,6 +6226,23 @@ pub const Session = struct {
         return null;
     }
 
+    const MountProjectScope = struct {
+        project_id: []const u8,
+        project_token: ?[]const u8,
+    };
+
+    fn resolveMountProjectScope(self: *Session, args_obj: std.json.ObjectMap) !MountProjectScope {
+        _ = self;
+        const project_id_raw = extractOptionalStringByNames(args_obj, &[_][]const u8{"project_id"}) orelse
+            return error.InvalidPayload;
+        const project_id = std.mem.trim(u8, project_id_raw, " \t\r\n");
+        if (project_id.len == 0) return error.InvalidPayload;
+        return .{
+            .project_id = project_id,
+            .project_token = extractOptionalStringByNames(args_obj, &[_][]const u8{"project_token"}),
+        };
+    }
+
     fn normalizeLocalFsRelativePath(self: *Session, raw_path: []const u8) ![]u8 {
         var path = std.mem.trim(u8, raw_path, " \t\r\n");
         if (path.len == 0) return error.InvalidPayload;
@@ -6221,13 +6339,14 @@ pub const Session = struct {
     }
 
     fn executeMountsOpPayload(self: *Session, op: MountsOp, args_obj: std.json.ObjectMap) ![]u8 {
+        const scope = try self.resolveMountProjectScope(args_obj);
         switch (op) {
-            .list => return self.buildMountsListResultJson(),
+            .list => return self.buildMountsListResultJson(scope.project_id, scope.project_token),
             .mount => {
                 const node_id = extractOptionalStringByNames(args_obj, &[_][]const u8{"node_id"}) orelse return error.InvalidPayload;
                 const export_name = extractOptionalStringByNames(args_obj, &[_][]const u8{"export_name"}) orelse return error.InvalidPayload;
                 const mount_path = extractOptionalStringByNames(args_obj, &[_][]const u8{"mount_path"}) orelse return error.InvalidPayload;
-                const payload = try self.buildProjectScopedMountPayload(node_id, export_name, mount_path);
+                const payload = try self.buildProjectScopedMountPayload(scope.project_id, scope.project_token, node_id, export_name, mount_path);
                 defer self.allocator.free(payload);
                 const plane = self.control_plane orelse return error.InvalidPayload;
                 const result = plane.setProjectMountWithRole(payload, self.is_admin) catch |err| switch (err) {
@@ -6249,7 +6368,7 @@ pub const Session = struct {
                 const mount_path = extractOptionalStringByNames(args_obj, &[_][]const u8{"mount_path"}) orelse return error.InvalidPayload;
                 const node_id = extractOptionalStringByNames(args_obj, &[_][]const u8{"node_id"});
                 const export_name = extractOptionalStringByNames(args_obj, &[_][]const u8{"export_name"});
-                const payload = try self.buildProjectScopedUnmountPayload(mount_path, node_id, export_name);
+                const payload = try self.buildProjectScopedUnmountPayload(scope.project_id, scope.project_token, mount_path, node_id, export_name);
                 defer self.allocator.free(payload);
                 const plane = self.control_plane orelse return error.InvalidPayload;
                 const result = plane.removeProjectMountWithRole(payload, self.is_admin) catch |err| switch (err) {
@@ -6270,7 +6389,7 @@ pub const Session = struct {
             .bind => {
                 const bind_path = extractOptionalStringByNames(args_obj, &[_][]const u8{"bind_path"}) orelse return error.InvalidPayload;
                 const target_path = extractOptionalStringByNames(args_obj, &[_][]const u8{"target_path"}) orelse return error.InvalidPayload;
-                const payload = try self.buildProjectScopedBindPayload(bind_path, target_path);
+                const payload = try self.buildProjectScopedBindPayload(scope.project_id, scope.project_token, bind_path, target_path);
                 defer self.allocator.free(payload);
                 const plane = self.control_plane orelse return error.InvalidPayload;
                 const result = plane.setProjectBindWithRole(payload, self.is_admin) catch |err| switch (err) {
@@ -6291,7 +6410,7 @@ pub const Session = struct {
             },
             .unbind => {
                 const bind_path = extractOptionalStringByNames(args_obj, &[_][]const u8{"bind_path"}) orelse return error.InvalidPayload;
-                const payload = try self.buildProjectScopedUnbindPayload(bind_path);
+                const payload = try self.buildProjectScopedUnbindPayload(scope.project_id, scope.project_token, bind_path);
                 defer self.allocator.free(payload);
                 const plane = self.control_plane orelse return error.InvalidPayload;
                 const result = plane.removeProjectBindWithRole(payload, self.is_admin) catch |err| switch (err) {
@@ -6311,7 +6430,10 @@ pub const Session = struct {
                 return self.buildMountsSuccessResultJson(op, result);
             },
             .mkdir => {
-                if (!self.projectAllowsAction(.mount)) return error.AccessDenied;
+                const plane = self.control_plane orelse return error.InvalidPayload;
+                if (!plane.projectAllowsAction(scope.project_id, self.agent_id, .mount, scope.project_token, self.is_admin)) {
+                    return error.AccessDenied;
+                }
                 const path = extractOptionalStringByNames(args_obj, &[_][]const u8{ "path", "folder", "relative_path" }) orelse return error.InvalidPayload;
                 const local_root = self.local_fs_export_root orelse return error.InvalidPayload;
                 const relative_path = try self.normalizeLocalFsRelativePath(path);
@@ -6347,7 +6469,7 @@ pub const Session = struct {
             },
             .resolve => {
                 const path = extractOptionalStringByNames(args_obj, &[_][]const u8{ "path", "mount_path", "bind_path" }) orelse return error.InvalidPayload;
-                const payload = try self.buildProjectScopedResolvePayload(path);
+                const payload = try self.buildProjectScopedResolvePayload(scope.project_id, scope.project_token, path);
                 defer self.allocator.free(payload);
                 const plane = self.control_plane orelse return error.InvalidPayload;
                 const result = plane.resolveProjectPathWithRole(payload, self.is_admin) catch |err| switch (err) {
@@ -6368,11 +6490,12 @@ pub const Session = struct {
 
     fn buildProjectScopedMountPayload(
         self: *Session,
+        project_id: []const u8,
+        project_token: ?[]const u8,
         node_id: []const u8,
         export_name: []const u8,
         mount_path: []const u8,
     ) ![]u8 {
-        const project_id = self.project_id orelse return error.InvalidPayload;
         const escaped_project = try unified.jsonEscape(self.allocator, project_id);
         defer self.allocator.free(escaped_project);
         const escaped_node = try unified.jsonEscape(self.allocator, node_id);
@@ -6381,7 +6504,7 @@ pub const Session = struct {
         defer self.allocator.free(escaped_export);
         const escaped_path = try unified.jsonEscape(self.allocator, mount_path);
         defer self.allocator.free(escaped_path);
-        const token_fragment = if (self.project_token) |token| blk: {
+        const token_fragment = if (project_token) |token| blk: {
             const escaped_token = try unified.jsonEscape(self.allocator, token);
             defer self.allocator.free(escaped_token);
             break :blk try std.fmt.allocPrint(self.allocator, "\"project_token\":\"{s}\",", .{escaped_token});
@@ -6394,15 +6517,14 @@ pub const Session = struct {
         );
     }
 
-    fn buildProjectScopedBindPayload(self: *Session, bind_path: []const u8, target_path: []const u8) ![]u8 {
-        const project_id = self.project_id orelse return error.InvalidPayload;
+    fn buildProjectScopedBindPayload(self: *Session, project_id: []const u8, project_token: ?[]const u8, bind_path: []const u8, target_path: []const u8) ![]u8 {
         const escaped_project = try unified.jsonEscape(self.allocator, project_id);
         defer self.allocator.free(escaped_project);
         const escaped_bind = try unified.jsonEscape(self.allocator, bind_path);
         defer self.allocator.free(escaped_bind);
         const escaped_target = try unified.jsonEscape(self.allocator, target_path);
         defer self.allocator.free(escaped_target);
-        const token_fragment = if (self.project_token) |token| blk: {
+        const token_fragment = if (project_token) |token| blk: {
             const escaped_token = try unified.jsonEscape(self.allocator, token);
             defer self.allocator.free(escaped_token);
             break :blk try std.fmt.allocPrint(self.allocator, "\"project_token\":\"{s}\",", .{escaped_token});
@@ -6415,13 +6537,12 @@ pub const Session = struct {
         );
     }
 
-    fn buildProjectScopedUnbindPayload(self: *Session, bind_path: []const u8) ![]u8 {
-        const project_id = self.project_id orelse return error.InvalidPayload;
+    fn buildProjectScopedUnbindPayload(self: *Session, project_id: []const u8, project_token: ?[]const u8, bind_path: []const u8) ![]u8 {
         const escaped_project = try unified.jsonEscape(self.allocator, project_id);
         defer self.allocator.free(escaped_project);
         const escaped_bind = try unified.jsonEscape(self.allocator, bind_path);
         defer self.allocator.free(escaped_bind);
-        const token_fragment = if (self.project_token) |token| blk: {
+        const token_fragment = if (project_token) |token| blk: {
             const escaped_token = try unified.jsonEscape(self.allocator, token);
             defer self.allocator.free(escaped_token);
             break :blk try std.fmt.allocPrint(self.allocator, "\"project_token\":\"{s}\",", .{escaped_token});
@@ -6434,13 +6555,12 @@ pub const Session = struct {
         );
     }
 
-    fn buildProjectScopedResolvePayload(self: *Session, path: []const u8) ![]u8 {
-        const project_id = self.project_id orelse return error.InvalidPayload;
+    fn buildProjectScopedResolvePayload(self: *Session, project_id: []const u8, project_token: ?[]const u8, path: []const u8) ![]u8 {
         const escaped_project = try unified.jsonEscape(self.allocator, project_id);
         defer self.allocator.free(escaped_project);
         const escaped_path = try unified.jsonEscape(self.allocator, path);
         defer self.allocator.free(escaped_path);
-        const token_fragment = if (self.project_token) |token| blk: {
+        const token_fragment = if (project_token) |token| blk: {
             const escaped_token = try unified.jsonEscape(self.allocator, token);
             defer self.allocator.free(escaped_token);
             break :blk try std.fmt.allocPrint(self.allocator, "\"project_token\":\"{s}\",", .{escaped_token});
@@ -6455,16 +6575,17 @@ pub const Session = struct {
 
     fn buildProjectScopedUnmountPayload(
         self: *Session,
+        project_id: []const u8,
+        project_token: ?[]const u8,
         mount_path: []const u8,
         node_id: ?[]const u8,
         export_name: ?[]const u8,
     ) ![]u8 {
-        const project_id = self.project_id orelse return error.InvalidPayload;
         const escaped_project = try unified.jsonEscape(self.allocator, project_id);
         defer self.allocator.free(escaped_project);
         const escaped_mount = try unified.jsonEscape(self.allocator, mount_path);
         defer self.allocator.free(escaped_mount);
-        const token_fragment = if (self.project_token) |token| blk: {
+        const token_fragment = if (project_token) |token| blk: {
             const escaped_token = try unified.jsonEscape(self.allocator, token);
             defer self.allocator.free(escaped_token);
             break :blk try std.fmt.allocPrint(self.allocator, "\"project_token\":\"{s}\",", .{escaped_token});
@@ -6537,12 +6658,13 @@ pub const Session = struct {
         };
     }
 
-    fn buildMountsListResultJson(self: *Session) ![]u8 {
+    fn buildMountsListResultJson(self: *Session, project_id_override: ?[]const u8, project_token_override: ?[]const u8) ![]u8 {
         const plane = self.control_plane orelse return self.buildMountsSuccessResultJson(.list, "{\"project_id\":null,\"mounts\":[],\"binds\":[]}");
-        const project_id = self.project_id orelse return self.buildMountsSuccessResultJson(.list, "{\"project_id\":null,\"mounts\":[],\"binds\":[]}");
+        const project_id = project_id_override orelse self.project_id orelse return self.buildMountsSuccessResultJson(.list, "{\"project_id\":null,\"mounts\":[],\"binds\":[]}");
+        const project_token = if (project_token_override) |value| value else self.project_token;
         const escaped_project = try unified.jsonEscape(self.allocator, project_id);
         defer self.allocator.free(escaped_project);
-        const payload = if (self.project_token) |token| blk: {
+        const payload = if (project_token) |token| blk: {
             const escaped_token = try unified.jsonEscape(self.allocator, token);
             defer self.allocator.free(escaped_token);
             break :blk try std.fmt.allocPrint(
@@ -7496,6 +7618,226 @@ pub const Session = struct {
             }
         }
         return null;
+    }
+
+    const ProjectsOp = enum {
+        list,
+        get,
+        up,
+    };
+
+    fn handleProjectsNamespaceWrite(self: *Session, special: SpecialKind, node_id: u32, raw_input: []const u8) !WriteOutcome {
+        const input = std.mem.trim(u8, raw_input, " \t\r\n");
+        const payload = if (input.len == 0) "{}" else input;
+        try self.setFileContent(node_id, payload);
+
+        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, payload, .{}) catch return error.InvalidPayload;
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidPayload;
+        const obj = parsed.value.object;
+
+        const op = switch (special) {
+            .projects_list => ProjectsOp.list,
+            .projects_get => ProjectsOp.get,
+            .projects_up => ProjectsOp.up,
+            .projects_invoke => blk: {
+                const op_raw = blk2: {
+                    if (obj.get("op")) |value| if (value == .string and value.string.len > 0) break :blk2 value.string;
+                    if (obj.get("operation")) |value| if (value == .string and value.string.len > 0) break :blk2 value.string;
+                    if (obj.get("tool")) |value| if (value == .string and value.string.len > 0) break :blk2 value.string;
+                    if (obj.get("tool_name")) |value| if (value == .string and value.string.len > 0) break :blk2 value.string;
+                    break :blk2 null;
+                } orelse return error.InvalidPayload;
+                break :blk parseProjectsOp(op_raw) orelse return error.InvalidPayload;
+            },
+            else => return error.InvalidPayload,
+        };
+
+        const args_obj = blk: {
+            if (obj.get("arguments")) |value| {
+                if (value != .object) return error.InvalidPayload;
+                break :blk value.object;
+            }
+            if (obj.get("args")) |value| {
+                if (value != .object) return error.InvalidPayload;
+                break :blk value.object;
+            }
+            break :blk obj;
+        };
+
+        return self.executeProjectsOp(op, args_obj, raw_input.len);
+    }
+
+    fn parseProjectsOp(raw: []const u8) ?ProjectsOp {
+        const value = std.mem.trim(u8, raw, " \t\r\n");
+        if (std.mem.eql(u8, value, "list") or std.mem.eql(u8, value, "projects_list")) return .list;
+        if (std.mem.eql(u8, value, "get") or std.mem.eql(u8, value, "projects_get")) return .get;
+        if (std.mem.eql(u8, value, "up") or std.mem.eql(u8, value, "project_up") or std.mem.eql(u8, value, "projects_up")) return .up;
+        return null;
+    }
+
+    fn executeProjectsOp(self: *Session, op: ProjectsOp, args_obj: std.json.ObjectMap, written: usize) !WriteOutcome {
+        const tool_name = projectsStatusToolName(op);
+        const running_status = try self.buildServiceInvokeStatusJson("running", tool_name, null);
+        defer self.allocator.free(running_status);
+        if (self.projects_status_id != 0) try self.setFileContent(self.projects_status_id, running_status);
+
+        const result_payload = self.executeProjectsOpPayload(op, args_obj) catch |err| {
+            const error_message = @errorName(err);
+            const error_code = switch (err) {
+                error.AccessDenied => "forbidden",
+                else => "invalid_payload",
+            };
+            const failed_status = try self.buildServiceInvokeStatusJson("failed", tool_name, error_message);
+            defer self.allocator.free(failed_status);
+            if (self.projects_status_id != 0) try self.setFileContent(self.projects_status_id, failed_status);
+            const failed_result = try self.buildProjectFailureResultJson(op, error_code, error_message);
+            defer self.allocator.free(failed_result);
+            if (self.projects_result_id != 0) try self.setFileContent(self.projects_result_id, failed_result);
+            return err;
+        };
+        defer self.allocator.free(result_payload);
+
+        const done_status = try self.buildServiceInvokeStatusJson("done", tool_name, null);
+        defer self.allocator.free(done_status);
+        if (self.projects_status_id != 0) try self.setFileContent(self.projects_status_id, done_status);
+        if (self.projects_result_id != 0) try self.setFileContent(self.projects_result_id, result_payload);
+        return .{ .written = written };
+    }
+
+    fn executeProjectsOpPayload(self: *Session, op: ProjectsOp, args_obj: std.json.ObjectMap) ![]u8 {
+        const plane = self.control_plane orelse return error.InvalidPayload;
+        return switch (op) {
+            .list => self.buildProjectListResultJson(),
+            .get => blk: {
+                const project_id = extractOptionalStringByNames(args_obj, &[_][]const u8{ "project_id", "id" }) orelse return error.InvalidPayload;
+                const escaped_project = try unified.jsonEscape(self.allocator, project_id);
+                defer self.allocator.free(escaped_project);
+                const token_fragment = if (extractOptionalStringByNames(args_obj, &[_][]const u8{"project_token"})) |token| blk2: {
+                    const escaped = try unified.jsonEscape(self.allocator, token);
+                    defer self.allocator.free(escaped);
+                    break :blk2 try std.fmt.allocPrint(self.allocator, ",\"project_token\":\"{s}\"", .{escaped});
+                } else if (self.project_token) |token| blk2: {
+                    const escaped = try unified.jsonEscape(self.allocator, token);
+                    defer self.allocator.free(escaped);
+                    break :blk2 try std.fmt.allocPrint(self.allocator, ",\"project_token\":\"{s}\"", .{escaped});
+                } else try self.allocator.dupe(u8, "");
+                defer self.allocator.free(token_fragment);
+                const payload = try std.fmt.allocPrint(
+                    self.allocator,
+                    "{{\"project_id\":\"{s}\"{s}}}",
+                    .{ escaped_project, token_fragment },
+                );
+                defer self.allocator.free(payload);
+                const result = plane.getProjectWithRole(payload, self.is_admin) catch |err| switch (err) {
+                    fs_control_plane.ControlPlaneError.ProjectPolicyForbidden,
+                    fs_control_plane.ControlPlaneError.ProjectAuthFailed,
+                    fs_control_plane.ControlPlaneError.ProjectAssignmentForbidden,
+                    => return error.AccessDenied,
+                    fs_control_plane.ControlPlaneError.MissingField,
+                    fs_control_plane.ControlPlaneError.InvalidPayload,
+                    fs_control_plane.ControlPlaneError.ProjectNotFound,
+                    => return error.InvalidPayload,
+                    else => return err,
+                };
+                defer self.allocator.free(result);
+                break :blk self.buildProjectSuccessResultJson(.get, result);
+            },
+            .up => blk: {
+                const payload = try self.renderProjectUpPayload(args_obj);
+                defer self.allocator.free(payload);
+                const result = plane.projectUpWithRole(self.agent_id, payload, self.is_admin) catch |err| switch (err) {
+                    fs_control_plane.ControlPlaneError.ProjectPolicyForbidden,
+                    fs_control_plane.ControlPlaneError.ProjectAuthFailed,
+                    fs_control_plane.ControlPlaneError.ProjectAssignmentForbidden,
+                    fs_control_plane.ControlPlaneError.ProjectProtected,
+                    => return error.AccessDenied,
+                    fs_control_plane.ControlPlaneError.MissingField,
+                    fs_control_plane.ControlPlaneError.InvalidPayload,
+                    fs_control_plane.ControlPlaneError.ProjectNotFound,
+                    fs_control_plane.ControlPlaneError.NodeNotFound,
+                    fs_control_plane.ControlPlaneError.MountConflict,
+                    => return error.InvalidPayload,
+                    else => return err,
+                };
+                defer self.allocator.free(result);
+                break :blk self.buildProjectSuccessResultJson(.up, result);
+            },
+        };
+    }
+
+    fn renderProjectUpPayload(self: *Session, args_obj: std.json.ObjectMap) ![]u8 {
+        if (!std.mem.eql(u8, self.agent_id, "mother")) {
+            return self.renderJsonValue(.{ .object = args_obj });
+        }
+        if (args_obj.get("activate") != null) {
+            return self.renderJsonValue(.{ .object = args_obj });
+        }
+
+        var out = std.ArrayListUnmanaged(u8){};
+        errdefer out.deinit(self.allocator);
+        const writer = out.writer(self.allocator);
+        try writer.writeByte('{');
+        var first = true;
+        var it = args_obj.iterator();
+        while (it.next()) |entry| {
+            if (!first) try writer.writeByte(',');
+            first = false;
+            try writeJsonString(writer, entry.key_ptr.*);
+            try writer.writeByte(':');
+            try writer.print("{f}", .{std.json.fmt(entry.value_ptr.*, .{})});
+        }
+        if (!first) try writer.writeByte(',');
+        try writer.writeAll("\"activate\":false");
+        try writer.writeByte('}');
+        return out.toOwnedSlice(self.allocator);
+    }
+
+    fn buildProjectListResultJson(self: *Session) ![]u8 {
+        const plane = self.control_plane orelse return self.buildProjectSuccessResultJson(.list, "{\"projects\":[]}");
+        const result = try plane.listProjects();
+        defer self.allocator.free(result);
+        return self.buildProjectSuccessResultJson(.list, result);
+    }
+
+    fn buildProjectSuccessResultJson(self: *Session, op: ProjectsOp, result_json: []const u8) ![]u8 {
+        const escaped_operation = try unified.jsonEscape(self.allocator, projectsOperationName(op));
+        defer self.allocator.free(escaped_operation);
+        return std.fmt.allocPrint(
+            self.allocator,
+            "{{\"ok\":true,\"operation\":\"{s}\",\"result\":{s},\"error\":null}}",
+            .{ escaped_operation, result_json },
+        );
+    }
+
+    fn buildProjectFailureResultJson(self: *Session, op: ProjectsOp, code: []const u8, message: []const u8) ![]u8 {
+        const escaped_operation = try unified.jsonEscape(self.allocator, projectsOperationName(op));
+        defer self.allocator.free(escaped_operation);
+        const escaped_code = try unified.jsonEscape(self.allocator, code);
+        defer self.allocator.free(escaped_code);
+        const escaped_message = try unified.jsonEscape(self.allocator, message);
+        defer self.allocator.free(escaped_message);
+        return std.fmt.allocPrint(
+            self.allocator,
+            "{{\"ok\":false,\"operation\":\"{s}\",\"result\":null,\"error\":{{\"code\":\"{s}\",\"message\":\"{s}\"}}}}",
+            .{ escaped_operation, escaped_code, escaped_message },
+        );
+    }
+
+    fn projectsOperationName(op: ProjectsOp) []const u8 {
+        return switch (op) {
+            .list => "list",
+            .get => "get",
+            .up => "up",
+        };
+    }
+
+    fn projectsStatusToolName(op: ProjectsOp) []const u8 {
+        return switch (op) {
+            .list => "projects_list",
+            .get => "projects_get",
+            .up => "projects_up",
+        };
     }
 
     fn renderJsonValue(self: *Session, value: std.json.Value) ![]u8 {
@@ -8492,7 +8834,7 @@ pub const Session = struct {
     ) !void {
         const agents_root = self.lookupChild(self.root_id, "agents") orelse return;
         const self_agent_dir = self.lookupChild(agents_root, "self") orelse return;
-        const namespace_services = [_][]const u8{ "memory", "web_search", "search_code", "terminal", "mounts", "sub_brains", "agents" };
+        const namespace_services = [_][]const u8{ "memory", "web_search", "search_code", "terminal", "mounts", "sub_brains", "agents", "projects" };
         for (namespace_services) |service_id| {
             const service_dir_id = self.lookupChild(self_agent_dir, service_id) orelse continue;
             const service_dir = self.nodes.get(service_dir_id) orelse continue;
@@ -8743,7 +9085,8 @@ fn defaultGlobalLibraryTopicServiceDiscovery() []const u8 {
         "- Node services: `/nodes/<node_id>/services/<service_id>`\n" ++
         "- Agent namespaces: `/agents/self/<service_id>`\n" ++
         "- Global namespaces: `/global/<service_id>`\n" ++
-        "- Start with `/agents/self/services/SERVICES.json`.\n";
+        "- Start with `/agents/self/services/SERVICES.json`.\n" ++
+        "- Common agent namespaces include: memory, web_search, search_code, terminal, mounts, sub_brains, agents, projects.\n";
 }
 
 fn defaultGlobalLibraryTopicEventsAndWaits() []const u8 {
@@ -8778,7 +9121,7 @@ fn defaultGlobalLibraryTopicProjectMountsAndBinds() []const u8 {
 
 fn defaultGlobalLibraryTopicAgentManagementAndSubBrains() []const u8 {
     return "# Agent Management and Sub-Brains\n\n" ++
-        "Use `/agents/self/agents` for list/create and `/agents/self/sub_brains` for list/upsert/delete.\n" ++
+        "Use `/agents/self/agents` for list/create, `/agents/self/sub_brains` for list/upsert/delete, and `/agents/self/projects` for list/get/up.\n" ++
         "Mutation operations depend on capability flags and service permissions.\n";
 }
 
@@ -9982,9 +10325,11 @@ test "fsrpc_session: agent services index includes first-class namespaces only" 
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"service_id\":\"search_code\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"service_id\":\"terminal\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"service_id\":\"mounts\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"service_id\":\"projects\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"service_id\":\"library\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"service_path\":\"/agents/self/search_code\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"service_path\":\"/agents/self/mounts\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"service_path\":\"/agents/self/projects\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"service_path\":\"/global/library\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"scope\":\"global_namespace\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"has_invoke\":false") != null);
@@ -10240,6 +10585,93 @@ test "fsrpc_session: agent services index includes first-class agents namespace 
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"scope\":\"agent_namespace\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"service_path\":\"/agents/self/agents\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"invoke_path\":\"/agents/self/agents/control/invoke.json\"") != null);
+}
+
+test "fsrpc_session: agent services index includes first-class projects namespace entry" {
+    const allocator = std.testing.allocator;
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.init(allocator, runtime_handle, &job_index, "default");
+    defer session.deinit();
+
+    const payload = try protocolReadFile(
+        &session,
+        allocator,
+        272,
+        273,
+        &.{ "agents", "self", "services", "SERVICES.json" },
+        926,
+    );
+    defer allocator.free(payload);
+
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"scope\":\"agent_namespace\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"service_path\":\"/agents/self/projects\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"invoke_path\":\"/agents/self/projects/control/invoke.json\"") != null);
+}
+
+test "fsrpc_session: mother can upsert project from system context without project token" {
+    const allocator = std.testing.allocator;
+
+    var control_plane = fs_control_plane.ControlPlane.init(allocator);
+    defer control_plane.deinit();
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "mother", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "mother",
+        .{
+            .project_id = fs_control_plane.spider_web_project_id,
+            .control_plane = &control_plane,
+            .is_admin = false,
+        },
+    );
+    defer session.deinit();
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        332,
+        333,
+        &.{ "agents", "self", "projects", "control", "up.json" },
+        "{\"name\":\"ZiggyPR\",\"vision\":\"Bootstrap project setup\",\"activate\":false}",
+        954,
+    );
+
+    const status = try protocolReadFile(
+        &session,
+        allocator,
+        334,
+        335,
+        &.{ "agents", "self", "projects", "status.json" },
+        955,
+    );
+    defer allocator.free(status);
+    try std.testing.expect(std.mem.indexOf(u8, status, "\"state\":\"done\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status, "\"tool\":\"projects_up\"") != null);
+
+    const result = try protocolReadFile(
+        &session,
+        allocator,
+        336,
+        337,
+        &.{ "agents", "self", "projects", "result.json" },
+        956,
+    );
+    defer allocator.free(result);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"ok\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"operation\":\"up\"") != null);
 }
 
 test "fsrpc_session: agents namespace create/list provisions new agent when capability is present" {
@@ -11181,10 +11613,14 @@ test "fsrpc_session: mounts namespace manages mount bind and resolve operations"
 
     const escaped_node_id = try unified.jsonEscape(allocator, node_id);
     defer allocator.free(escaped_node_id);
+    const escaped_project_id = try unified.jsonEscape(allocator, project_id);
+    defer allocator.free(escaped_project_id);
+    const escaped_project_token = try unified.jsonEscape(allocator, project_token);
+    defer allocator.free(escaped_project_token);
     const mount_payload = try std.fmt.allocPrint(
         allocator,
-        "{{\"node_id\":\"{s}\",\"export_name\":\"work\",\"mount_path\":\"/src\"}}",
-        .{escaped_node_id},
+        "{{\"project_id\":\"{s}\",\"project_token\":\"{s}\",\"node_id\":\"{s}\",\"export_name\":\"work\",\"mount_path\":\"/nodes/local/fs\"}}",
+        .{ escaped_project_id, escaped_project_token, escaped_node_id },
     );
     defer allocator.free(mount_payload);
     try protocolWriteFile(
@@ -11197,23 +11633,35 @@ test "fsrpc_session: mounts namespace manages mount bind and resolve operations"
         866,
     );
 
+    const bind_payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"project_id\":\"{s}\",\"project_token\":\"{s}\",\"bind_path\":\"/repo\",\"target_path\":\"/nodes/local/fs\"}}",
+        .{ escaped_project_id, escaped_project_token },
+    );
+    defer allocator.free(bind_payload);
     try protocolWriteFile(
         &session,
         allocator,
         152,
         153,
         &.{ "agents", "self", "mounts", "control", "bind.json" },
-        "{\"bind_path\":\"/repo\",\"target_path\":\"/nodes/local/fs\"}",
+        bind_payload,
         867,
     );
 
+    const resolve_payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"project_id\":\"{s}\",\"project_token\":\"{s}\",\"path\":\"/repo/src\"}}",
+        .{ escaped_project_id, escaped_project_token },
+    );
+    defer allocator.free(resolve_payload);
     try protocolWriteFile(
         &session,
         allocator,
         154,
         155,
         &.{ "agents", "self", "mounts", "control", "resolve.json" },
-        "{\"path\":\"/repo/src\"}",
+        resolve_payload,
         868,
     );
 
@@ -11279,13 +11727,23 @@ test "fsrpc_session: mounts namespace mkdir creates local export folders" {
     );
     defer session.deinit();
 
+    const escaped_project_id = try unified.jsonEscape(allocator, project_id);
+    defer allocator.free(escaped_project_id);
+    const escaped_project_token = try unified.jsonEscape(allocator, project_token);
+    defer allocator.free(escaped_project_token);
+    const mkdir_payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"project_id\":\"{s}\",\"project_token\":\"{s}\",\"path\":\"new-project/workspace\"}}",
+        .{ escaped_project_id, escaped_project_token },
+    );
+    defer allocator.free(mkdir_payload);
     try protocolWriteFile(
         &session,
         allocator,
         170,
         171,
         &.{ "agents", "self", "mounts", "control", "mkdir.json" },
-        "{\"path\":\"new-project/workspace\"}",
+        mkdir_payload,
         875,
     );
 
@@ -11307,13 +11765,19 @@ test "fsrpc_session: mounts namespace mkdir creates local export folders" {
     var created_dir = try std.fs.openDirAbsolute(created_host_path, .{});
     created_dir.close();
 
+    const mkdir_existing_payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"project_id\":\"{s}\",\"project_token\":\"{s}\",\"path\":\"/nodes/local/fs/new-project/workspace\"}}",
+        .{ escaped_project_id, escaped_project_token },
+    );
+    defer allocator.free(mkdir_existing_payload);
     try protocolWriteFile(
         &session,
         allocator,
         174,
         175,
         &.{ "agents", "self", "mounts", "control", "mkdir.json" },
-        "{\"path\":\"/nodes/local/fs/new-project/workspace\"}",
+        mkdir_existing_payload,
         877,
     );
 
@@ -11328,13 +11792,19 @@ test "fsrpc_session: mounts namespace mkdir creates local export folders" {
     defer allocator.free(existing_payload);
     try std.testing.expect(std.mem.indexOf(u8, existing_payload, "\"created\":false") != null);
 
+    const mkdir_invalid_payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"project_id\":\"{s}\",\"project_token\":\"{s}\",\"path\":\"../escape\"}}",
+        .{ escaped_project_id, escaped_project_token },
+    );
+    defer allocator.free(mkdir_invalid_payload);
     const invalid_response = try protocolWriteFileExpectError(
         &session,
         allocator,
         178,
         179,
         &.{ "agents", "self", "mounts", "control", "mkdir.json" },
-        "{\"path\":\"../escape\"}",
+        mkdir_invalid_payload,
         879,
         "invalid",
     );

@@ -54,4 +54,5 @@ Quick roots:
 - `/agents/self/mounts`
 - `/agents/self/sub_brains`
 - `/agents/self/agents`
+- `/agents/self/projects`
 - `/global/library`
