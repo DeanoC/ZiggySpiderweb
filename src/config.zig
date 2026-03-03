@@ -529,11 +529,6 @@ pub fn load(self: *Config) !void {
                     self.runtime.agents_dir = try self.allocator.dupe(u8, value.string);
                 }
             }
-            if (runtime_val.object.get("sandbox_enabled")) |value| {
-                if (value == .bool) {
-                    self.runtime.sandbox_enabled = value.bool;
-                }
-            }
             if (runtime_val.object.get("sandbox_mounts_root")) |value| {
                 if (value == .string and value.string.len > 0) {
                     self.allocator.free(self.runtime.sandbox_mounts_root);
@@ -972,6 +967,41 @@ test "Config setProvider safely reuses current model pointer" {
     const existing_model = config.provider.model.?;
     try config.setProvider(config.provider.name, existing_model);
     try std.testing.expectEqualStrings("gpt-4o-mini", config.provider.model.?);
+}
+
+test "Config ignores deprecated runtime.sandbox_enabled field and does not persist it" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const tmp_root = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_root);
+    const cfg_path = try std.fs.path.join(allocator, &.{ tmp_root, "config.json" });
+
+    var config = try Config.init(allocator, cfg_path);
+    defer config.deinit();
+
+    config.runtime.sandbox_enabled = true;
+
+    const legacy_contents =
+        \\{
+        \\  "runtime": {
+        \\    "sandbox_enabled": false
+        \\  }
+        \\}
+    ;
+    try std.fs.cwd().writeFile(.{
+        .sub_path = cfg_path,
+        .data = legacy_contents,
+    });
+
+    try config.load();
+    try std.testing.expect(config.runtime.sandbox_enabled);
+
+    try config.save();
+    const saved = try std.fs.cwd().readFileAlloc(allocator, cfg_path, 1024 * 64);
+    defer allocator.free(saved);
+    try std.testing.expect(std.mem.indexOf(u8, saved, "\"sandbox_enabled\"") == null);
 }
 
 test "Config validation rejects overlapping sandbox roots" {
