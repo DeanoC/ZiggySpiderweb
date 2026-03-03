@@ -10,6 +10,7 @@ This folder contains the maintained docs for Spiderweb. Files are grouped by top
 - `runtime/tool-system.md` - provider-driven tool loop and tool constraints
 
 ## Architecture & Design
+- `architecture/rfc-project-rootfs-and-namespace-unification.md` - proposed namespace/rootfs architecture RFC
 - `design/architecture.md` - current runtime architecture and threading model
 - `design/projects.md` - project model and workspace topology as implemented
 - `design/filesystem.md` - distributed FS runtime and node/mount flow
