@@ -51,6 +51,7 @@ pub const ProjectAction = enum {
     observe,
     invoke,
     mount,
+    bind,
     admin,
 };
 
@@ -66,6 +67,7 @@ const ProjectActionPolicy = struct {
     observe: ?AccessMode = null,
     invoke: ?AccessMode = null,
     mount: ?AccessMode = null,
+    bind: ?AccessMode = null,
     admin: ?AccessMode = null,
 
     fn modeFor(self: *const ProjectActionPolicy, action: ProjectAction) ?AccessMode {
@@ -74,6 +76,7 @@ const ProjectActionPolicy = struct {
             .observe => self.observe,
             .invoke => self.invoke,
             .mount => self.mount,
+            .bind => self.bind,
             .admin => self.admin,
         };
     }
@@ -1683,13 +1686,14 @@ pub const ControlPlane = struct {
 
         const project = self.projects.getPtr(project_id) orelse return ControlPlaneError.ProjectNotFound;
         if (project.kind == .spider_web_builtin and !is_admin) return ControlPlaneError.ProjectProtected;
-        try requireProjectActionAccess(project, .mount, null, project_token, is_admin);
+        try requireProjectActionAccess(project, .bind, null, project_token, is_admin);
 
         const bind_path = try normalizeMountPath(self.allocator, bind_path_raw);
         errdefer self.allocator.free(bind_path);
         if (std.mem.eql(u8, bind_path, "/")) return ControlPlaneError.InvalidPayload;
         const target_path = try normalizeMountPath(self.allocator, target_path_raw);
         errdefer self.allocator.free(target_path);
+        if (!projectPathWithinMountAuthority(project, target_path)) return ControlPlaneError.BindConflict;
 
         for (project.mounts.items) |mount| {
             if (pathsConflict(mount.mount_path, bind_path)) return ControlPlaneError.BindConflict;
@@ -1742,7 +1746,7 @@ pub const ControlPlane = struct {
 
         const project = self.projects.getPtr(project_id) orelse return ControlPlaneError.ProjectNotFound;
         if (project.kind == .spider_web_builtin and !is_admin) return ControlPlaneError.ProjectProtected;
-        try requireProjectActionAccess(project, .mount, null, project_token, is_admin);
+        try requireProjectActionAccess(project, .bind, null, project_token, is_admin);
 
         var removed = false;
         var i: usize = 0;
@@ -4471,7 +4475,12 @@ fn parseAccessMode(value: []const u8) !AccessMode {
 }
 
 fn projectActionPolicyIsEmpty(policy: *const ProjectActionPolicy) bool {
-    return policy.read == null and policy.observe == null and policy.invoke == null and policy.mount == null and policy.admin == null;
+    return policy.read == null and
+        policy.observe == null and
+        policy.invoke == null and
+        policy.mount == null and
+        policy.bind == null and
+        policy.admin == null;
 }
 
 fn parseProjectActionPolicyFromObject(obj: std.json.ObjectMap, policy: *ProjectActionPolicy) !void {
@@ -4494,6 +4503,10 @@ fn parseProjectActionPolicyFromObject(obj: std.json.ObjectMap, policy: *ProjectA
     if (obj.get("mount")) |value| {
         if (value != .string) return ControlPlaneError.InvalidPayload;
         policy.mount = try parseAccessMode(value.string);
+    }
+    if (obj.get("bind")) |value| {
+        if (value != .string) return ControlPlaneError.InvalidPayload;
+        policy.bind = try parseAccessMode(value.string);
     }
     if (obj.get("admin")) |value| {
         if (value != .string) return ControlPlaneError.InvalidPayload;
@@ -4606,6 +4619,11 @@ fn appendProjectActionPolicyJson(
         first = false;
         try out.writer(allocator).print("\"mount\":\"{s}\"", .{accessModeName(mode)});
     }
+    if (policy.bind) |mode| {
+        if (!first) try out.append(allocator, ',');
+        first = false;
+        try out.writer(allocator).print("\"bind\":\"{s}\"", .{accessModeName(mode)});
+    }
     if (policy.admin) |mode| {
         if (!first) try out.append(allocator, ',');
         try out.writer(allocator).print("\"admin\":\"{s}\"", .{accessModeName(mode)});
@@ -4637,6 +4655,15 @@ fn defaultProjectActionMode(project: *const Project, action: ProjectAction) Acce
 }
 
 fn resolveProjectActionMode(project: *const Project, action: ProjectAction, actor_id: ?[]const u8) AccessMode {
+    // Backward compatibility: projects created before `bind` policy existed often
+    // only set `mount`. Preserve that intent by inheriting `mount` policy for
+    // `bind` when `bind` is not explicitly configured.
+    if (action == .bind) {
+        if (project.access_policy.modeFor(actor_id, .bind)) |mode| return mode;
+        if (project.access_policy.modeFor(actor_id, .mount)) |mode| return mode;
+        return defaultProjectActionMode(project, .bind);
+    }
+
     var mode = defaultProjectActionMode(project, action);
     if (project.access_policy.modeFor(actor_id, action)) |override_mode| {
         mode = override_mode;
@@ -4743,6 +4770,21 @@ fn mountPathsOverlap(a: []const u8, b: []const u8) bool {
 
 fn pathsConflict(a: []const u8, b: []const u8) bool {
     return std.mem.eql(u8, a, b) or mountPathsOverlap(a, b);
+}
+
+fn pathIsAncestorOrEqual(ancestor: []const u8, path: []const u8) bool {
+    if (ancestor.len == 0 or path.len == 0) return false;
+    if (!std.mem.startsWith(u8, path, ancestor)) return false;
+    if (ancestor.len == path.len) return true;
+    if (std.mem.eql(u8, ancestor, "/")) return true;
+    return path[ancestor.len] == '/';
+}
+
+fn projectPathWithinMountAuthority(project: *const Project, path: []const u8) bool {
+    for (project.mounts.items) |mount| {
+        if (pathIsAncestorOrEqual(mount.mount_path, path)) return true;
+    }
+    return false;
 }
 
 fn pathMatchesPrefix(path: []const u8, prefix: []const u8) bool {
@@ -5260,12 +5302,27 @@ test "fs_control_plane: project bind lifecycle resolves bound paths" {
     var plane = ControlPlane.init(allocator);
     defer plane.deinit();
 
+    const joined = try plane.ensureNode("bind-lifecycle-node", "ws://127.0.0.1:18891/v2/fs", 60_000);
+    defer allocator.free(joined);
+    var joined_parsed = try std.json.parseFromSlice(std.json.Value, allocator, joined, .{});
+    defer joined_parsed.deinit();
+    const node_id = joined_parsed.value.object.get("node_id").?.string;
+
     const project_json = try plane.createProject("{\"name\":\"Bindings\",\"vision\":\"Bindings\"}");
     defer allocator.free(project_json);
     var project = try std.json.parseFromSlice(std.json.Value, allocator, project_json, .{});
     defer project.deinit();
     const project_id = project.value.object.get("project_id").?.string;
     const project_token = project.value.object.get("project_token").?.string;
+
+    const mount_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"project_id\":\"{s}\",\"project_token\":\"{s}\",\"node_id\":\"{s}\",\"export_name\":\"work\",\"mount_path\":\"/nodes/local/fs\"}}",
+        .{ project_id, project_token, node_id },
+    );
+    defer allocator.free(mount_req);
+    const mounted = try plane.setProjectMount(mount_req);
+    defer allocator.free(mounted);
 
     const bind_req = try std.fmt.allocPrint(
         allocator,
@@ -5345,6 +5402,42 @@ test "fs_control_plane: bind conflicts with existing mount path" {
     try std.testing.expectError(ControlPlaneError.BindConflict, plane.setProjectBind(bind_req));
 }
 
+test "fs_control_plane: bind target must remain within mounted authority" {
+    const allocator = std.testing.allocator;
+    var plane = ControlPlane.init(allocator);
+    defer plane.deinit();
+
+    const joined = try plane.ensureNode("bind-authority-node", "ws://127.0.0.1:18891/v2/fs", 60_000);
+    defer allocator.free(joined);
+    var joined_parsed = try std.json.parseFromSlice(std.json.Value, allocator, joined, .{});
+    defer joined_parsed.deinit();
+    const node_id = joined_parsed.value.object.get("node_id").?.string;
+
+    const project_json = try plane.createProject("{\"name\":\"BindAuthority\",\"vision\":\"BindAuthority\"}");
+    defer allocator.free(project_json);
+    var project = try std.json.parseFromSlice(std.json.Value, allocator, project_json, .{});
+    defer project.deinit();
+    const project_id = project.value.object.get("project_id").?.string;
+    const project_token = project.value.object.get("project_token").?.string;
+
+    const mount_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"project_id\":\"{s}\",\"project_token\":\"{s}\",\"node_id\":\"{s}\",\"export_name\":\"work\",\"mount_path\":\"/src\"}}",
+        .{ project_id, project_token, node_id },
+    );
+    defer allocator.free(mount_req);
+    const mounted = try plane.setProjectMount(mount_req);
+    defer allocator.free(mounted);
+
+    const bind_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"project_id\":\"{s}\",\"project_token\":\"{s}\",\"bind_path\":\"/repo\",\"target_path\":\"/nodes/local/fs\"}}",
+        .{ project_id, project_token },
+    );
+    defer allocator.free(bind_req);
+    try std.testing.expectError(ControlPlaneError.BindConflict, plane.setProjectBind(bind_req));
+}
+
 test "fs_control_plane: project mutation requires valid project_token" {
     const allocator = std.testing.allocator;
     var plane = ControlPlane.init(allocator);
@@ -5412,6 +5505,15 @@ test "fs_control_plane: access policy enforces action modes and per-agent overri
     );
     defer allocator.free(denied_mount_req);
     try std.testing.expectError(ControlPlaneError.ProjectPolicyForbidden, plane.setProjectMount(denied_mount_req));
+    try std.testing.expect(!plane.projectAllowsAction(project_id, "bob", .bind, null, false));
+
+    const denied_bind_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"project_id\":\"{s}\",\"bind_path\":\"/repo\",\"target_path\":\"/nodes/local/fs\"}}",
+        .{project_id},
+    );
+    defer allocator.free(denied_bind_req);
+    try std.testing.expectError(ControlPlaneError.ProjectPolicyForbidden, plane.setProjectBind(denied_bind_req));
 
     const update_policy_req = try std.fmt.allocPrint(
         allocator,
@@ -5424,7 +5526,9 @@ test "fs_control_plane: access policy enforces action modes and per-agent overri
     try std.testing.expect(std.mem.indexOf(u8, updated, "\"access_policy\"") != null);
 
     try std.testing.expect(plane.projectAllowsAction(project_id, "bob", .mount, null, false));
+    try std.testing.expect(plane.projectAllowsAction(project_id, "bob", .bind, null, false));
     try std.testing.expect(!plane.projectAllowsAction(project_id, "alice", .mount, null, false));
+    try std.testing.expect(!plane.projectAllowsAction(project_id, "alice", .bind, null, false));
     try std.testing.expect(plane.projectAllowsAction(project_id, "bob", .observe, null, false));
     try std.testing.expect(!plane.projectAllowsAction(project_id, "alice", .observe, null, false));
 
@@ -5462,7 +5566,7 @@ test "fs_control_plane: access policy action matrix honors token admin and per-a
     defer plane.deinit();
 
     const project_json = try plane.createProject(
-        "{\"name\":\"PolicyMatrix\",\"vision\":\"PolicyMatrix\",\"access_policy\":{\"actions\":{\"read\":\"open\",\"observe\":\"token\",\"invoke\":\"admin\",\"mount\":\"deny\",\"admin\":\"token\"},\"agents\":{\"worker\":{\"invoke\":\"open\",\"mount\":\"token\"}}}}",
+        "{\"name\":\"PolicyMatrix\",\"vision\":\"PolicyMatrix\",\"access_policy\":{\"actions\":{\"read\":\"open\",\"observe\":\"token\",\"invoke\":\"admin\",\"mount\":\"deny\",\"bind\":\"deny\",\"admin\":\"token\"},\"agents\":{\"worker\":{\"invoke\":\"open\",\"mount\":\"token\",\"bind\":\"token\"}}}}",
     );
     defer allocator.free(project_json);
     var project = try std.json.parseFromSlice(std.json.Value, allocator, project_json, .{});
@@ -5477,17 +5581,22 @@ test "fs_control_plane: access policy action matrix honors token admin and per-a
     try std.testing.expect(!plane.projectAllowsAction(project_id, "bob", .invoke, project_token, false));
     try std.testing.expect(!plane.projectAllowsAction(project_id, "bob", .mount, null, false));
     try std.testing.expect(!plane.projectAllowsAction(project_id, "bob", .mount, project_token, false));
+    try std.testing.expect(!plane.projectAllowsAction(project_id, "bob", .bind, null, false));
+    try std.testing.expect(!plane.projectAllowsAction(project_id, "bob", .bind, project_token, false));
     try std.testing.expect(!plane.projectAllowsAction(project_id, "bob", .admin, null, false));
     try std.testing.expect(plane.projectAllowsAction(project_id, "bob", .admin, project_token, false));
 
     try std.testing.expect(plane.projectAllowsAction(project_id, "worker", .invoke, null, false));
     try std.testing.expect(!plane.projectAllowsAction(project_id, "worker", .mount, null, false));
     try std.testing.expect(plane.projectAllowsAction(project_id, "worker", .mount, project_token, false));
+    try std.testing.expect(!plane.projectAllowsAction(project_id, "worker", .bind, null, false));
+    try std.testing.expect(plane.projectAllowsAction(project_id, "worker", .bind, project_token, false));
 
     try std.testing.expect(plane.projectAllowsAction(project_id, "bob", .read, null, true));
     try std.testing.expect(plane.projectAllowsAction(project_id, "bob", .observe, null, true));
     try std.testing.expect(plane.projectAllowsAction(project_id, "bob", .invoke, null, true));
     try std.testing.expect(plane.projectAllowsAction(project_id, "bob", .mount, null, true));
+    try std.testing.expect(plane.projectAllowsAction(project_id, "bob", .bind, null, true));
     try std.testing.expect(plane.projectAllowsAction(project_id, "bob", .admin, null, true));
 }
 

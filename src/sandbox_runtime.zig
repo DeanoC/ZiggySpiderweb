@@ -6,8 +6,8 @@ const tool_registry = @import("ziggy-tool-runtime").tool_registry;
 const max_ipc_line_bytes: usize = 16 * 1024 * 1024;
 const mount_startup_timeout_ms: u64 = 15_000;
 const mount_poll_interval_ms: u64 = 100;
-const sandbox_namespace_root = "/underworld";
-const sandbox_home_path = "/underworld";
+const sandbox_namespace_root = "/workspace";
+const sandbox_home_path = "/workspace";
 
 pub const Options = struct {
     allocator: std.mem.Allocator,
@@ -28,6 +28,8 @@ pub const SandboxRuntime = struct {
     workspace_auth_token: ?[]u8 = null,
     workspace_mount_path: []u8,
     workspace_bind_source_path: []u8,
+    rootfs_overlay_path: []u8,
+    rootfs_metadata_path: []u8,
     fs_mount_bin_path: []u8,
     child_bin_path: []u8,
     mount_process: ?std.process.Child = null,
@@ -46,12 +48,38 @@ pub const SandboxRuntime = struct {
         errdefer runtime_cfg_for_child.deinit(options.allocator);
 
         const mounts_root_trimmed = std.mem.trim(u8, runtime_cfg_for_child.sandbox_mounts_root, " \t\r\n");
+        const runtime_root_trimmed = std.mem.trim(u8, runtime_cfg_for_child.sandbox_runtime_root, " \t\r\n");
+        const rootfs_base_ref_trimmed = std.mem.trim(u8, runtime_cfg_for_child.sandbox_rootfs_base_ref, " \t\r\n");
+        const rootfs_store_root_trimmed = std.mem.trim(u8, runtime_cfg_for_child.sandbox_rootfs_store_root, " \t\r\n");
+        const overlay_root_trimmed = std.mem.trim(u8, runtime_cfg_for_child.sandbox_overlay_root, " \t\r\n");
+        const snapshot_root_trimmed = std.mem.trim(u8, runtime_cfg_for_child.sandbox_snapshot_root, " \t\r\n");
         if (mounts_root_trimmed.len == 0) return error.InvalidSandboxConfig;
+        if (runtime_root_trimmed.len == 0) return error.InvalidSandboxConfig;
+        if (rootfs_base_ref_trimmed.len == 0) return error.InvalidSandboxConfig;
+        if (rootfs_store_root_trimmed.len == 0) return error.InvalidSandboxConfig;
+        if (overlay_root_trimmed.len == 0) return error.InvalidSandboxConfig;
+        if (snapshot_root_trimmed.len == 0) return error.InvalidSandboxConfig;
 
         try ensurePathExists(mounts_root_trimmed);
+        try ensurePathExists(runtime_root_trimmed);
+        try ensurePathExists(rootfs_store_root_trimmed);
+        try ensurePathExists(overlay_root_trimmed);
+        try ensurePathExists(snapshot_root_trimmed);
         const project_mount_root = try std.fs.path.join(options.allocator, &.{ mounts_root_trimmed, options.project_id });
         defer options.allocator.free(project_mount_root);
         try ensurePathExists(project_mount_root);
+        const project_runtime_root = try std.fs.path.join(options.allocator, &.{ runtime_root_trimmed, options.project_id });
+        defer options.allocator.free(project_runtime_root);
+        try ensurePathExists(project_runtime_root);
+        const project_overlay_root = try std.fs.path.join(options.allocator, &.{ overlay_root_trimmed, options.project_id });
+        defer options.allocator.free(project_overlay_root);
+        try ensurePathExists(project_overlay_root);
+        const project_snapshot_root = try std.fs.path.join(options.allocator, &.{ snapshot_root_trimmed, options.project_id });
+        defer options.allocator.free(project_snapshot_root);
+        try ensurePathExists(project_snapshot_root);
+        const rootfs_overlay_path = try std.fs.path.join(options.allocator, &.{ project_overlay_root, options.agent_id });
+        errdefer options.allocator.free(rootfs_overlay_path);
+        try ensurePathExists(rootfs_overlay_path);
 
         const workspace_mount_path = try makeRuntimeMountPath(options.allocator, project_mount_root, options.agent_id);
         errdefer options.allocator.free(workspace_mount_path);
@@ -107,6 +135,17 @@ pub const SandboxRuntime = struct {
         }
         const workspace_bind_source_path = try resolveWorkspaceBindSourcePath(options.allocator, workspace_mount_path);
         errdefer options.allocator.free(workspace_bind_source_path);
+        const rootfs_metadata_path = try persistRootfsMetadata(
+            options.allocator,
+            project_runtime_root,
+            options.agent_id,
+            rootfs_base_ref_trimmed,
+            rootfs_overlay_path,
+            options.project_id,
+            options.workspace_url,
+            workspace_mount_path,
+        );
+        errdefer options.allocator.free(rootfs_metadata_path);
 
         var child = try spawnSandboxChild(
             options.allocator,
@@ -130,6 +169,8 @@ pub const SandboxRuntime = struct {
             .workspace_auth_token = if (options.workspace_auth_token) |value| try options.allocator.dupe(u8, value) else null,
             .workspace_mount_path = workspace_mount_path,
             .workspace_bind_source_path = workspace_bind_source_path,
+            .rootfs_overlay_path = rootfs_overlay_path,
+            .rootfs_metadata_path = rootfs_metadata_path,
             .fs_mount_bin_path = fs_mount_bin_path,
             .child_bin_path = child_bin_path,
             .mount_process = mount_process,
@@ -161,6 +202,8 @@ pub const SandboxRuntime = struct {
         if (self.workspace_auth_token) |value| self.allocator.free(value);
         self.allocator.free(self.workspace_mount_path);
         self.allocator.free(self.workspace_bind_source_path);
+        self.allocator.free(self.rootfs_overlay_path);
+        self.allocator.free(self.rootfs_metadata_path);
         self.allocator.free(self.fs_mount_bin_path);
         self.allocator.free(self.child_bin_path);
         self.runtime_cfg.deinit(self.allocator);
@@ -713,6 +756,76 @@ fn spawnSandboxChild(
     child.env_map = null;
 
     return child;
+}
+
+fn persistRootfsMetadata(
+    allocator: std.mem.Allocator,
+    project_runtime_root: []const u8,
+    agent_id: []const u8,
+    base_ref: []const u8,
+    overlay_path: []const u8,
+    project_id: []const u8,
+    workspace_url: []const u8,
+    workspace_mount_path: []const u8,
+) ![]u8 {
+    const metadata_filename = try std.fmt.allocPrint(allocator, "rootfs-meta-{s}.json", .{agent_id});
+    defer allocator.free(metadata_filename);
+    const metadata_path = try std.fs.path.join(allocator, &.{ project_runtime_root, metadata_filename });
+    errdefer allocator.free(metadata_path);
+
+    const metadata = RootfsRuntimeMetadata{
+        .project_id = project_id,
+        .agent_id = agent_id,
+        .base_ref = base_ref,
+        .overlay_id = std.fs.path.basename(overlay_path),
+        .overlay_path = overlay_path,
+        .mount_manifest_digest = computeMountManifestDigest(project_id, workspace_url, workspace_mount_path),
+        .namespace_root = sandbox_namespace_root,
+        .workspace_mount_path = workspace_mount_path,
+    };
+    const metadata_json = try std.json.Stringify.valueAlloc(allocator, metadata, .{
+        .emit_null_optional_fields = true,
+        .whitespace = .minified,
+    });
+    defer allocator.free(metadata_json);
+    try writeTextFile(metadata_path, metadata_json);
+    return metadata_path;
+}
+
+const RootfsRuntimeMetadata = struct {
+    project_id: []const u8,
+    agent_id: []const u8,
+    base_ref: []const u8,
+    overlay_id: []const u8,
+    overlay_path: []const u8,
+    mount_manifest_digest: u64,
+    namespace_root: []const u8,
+    workspace_mount_path: []const u8,
+};
+
+fn computeMountManifestDigest(
+    project_id: []const u8,
+    workspace_url: []const u8,
+    workspace_mount_path: []const u8,
+) u64 {
+    var hasher = std.hash.Wyhash.init(0);
+    hasher.update(project_id);
+    hasher.update("|");
+    hasher.update(workspace_url);
+    hasher.update("|");
+    hasher.update(workspace_mount_path);
+    hasher.update("|");
+    hasher.update(sandbox_namespace_root);
+    return hasher.final();
+}
+
+fn writeTextFile(path: []const u8, content: []const u8) !void {
+    const file = if (std.fs.path.isAbsolute(path))
+        try std.fs.createFileAbsolute(path, .{ .truncate = true })
+    else
+        try std.fs.cwd().createFile(path, .{ .truncate = true });
+    defer file.close();
+    try file.writeAll(content);
 }
 
 fn readLineAlloc(allocator: std.mem.Allocator, file: std.fs.File, max_bytes: usize) ![]u8 {

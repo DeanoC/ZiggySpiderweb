@@ -2835,8 +2835,6 @@ const RuntimeToolDispatchProxy = struct {
     assets_dir: []const u8,
     local_fs_export_root: []u8,
     runtime_agent_id: []u8,
-    mutex: std.Thread.Mutex = .{},
-    last_project_id: ?[]u8 = null,
 
     fn create(
         allocator: std.mem.Allocator,
@@ -2862,7 +2860,6 @@ const RuntimeToolDispatchProxy = struct {
     }
 
     fn destroy(self: *RuntimeToolDispatchProxy) void {
-        if (self.last_project_id) |project_id| self.allocator.free(project_id);
         self.allocator.free(self.local_fs_export_root);
         self.allocator.free(self.runtime_agent_id);
         self.allocator.destroy(self);
@@ -3165,7 +3162,6 @@ const RuntimeToolDispatchProxy = struct {
         };
         defer self.control_plane.allocator.free(up_result);
 
-        self.rememberLastProjectId(allocator, up_result) catch {};
         return runtimeDispatchFileWriteSuccess(allocator, path, content.len, up_result);
     }
 
@@ -3221,16 +3217,8 @@ const RuntimeToolDispatchProxy = struct {
                 return runtimeDispatchFileWriteSuccess(allocator, path, content.len, list_result);
             },
             .get => {
-                var project_id_owned: ?[]u8 = null;
-                defer if (project_id_owned) |value| allocator.free(value);
-                const project_id = optionalStringField(args_obj, "project_id") orelse blk: {
-                    const remembered = self.copyLastProjectId(allocator) catch null;
-                    if (remembered) |value| {
-                        project_id_owned = value;
-                        break :blk value;
-                    }
+                const project_id = optionalStringField(args_obj, "project_id") orelse
                     return runtimeDispatchFailure(allocator, .invalid_params, "projects get requires project_id");
-                };
                 const project_token = optionalStringField(args_obj, "project_token");
                 const payload = buildProjectScopedPayload(allocator, project_id, project_token) catch {
                     return runtimeDispatchFailure(allocator, .execution_failed, "failed to build projects get payload");
@@ -3299,10 +3287,7 @@ const RuntimeToolDispatchProxy = struct {
             created = true;
         }
 
-        const desired_project_id = optionalStringField(obj, "project_id") orelse self.copyLastProjectId(allocator) catch null;
-        defer if (desired_project_id) |project_id| {
-            if (optionalStringField(obj, "project_id") == null) allocator.free(project_id);
-        };
+        const desired_project_id = optionalStringField(obj, "project_id");
         var activated = false;
         if (desired_project_id) |project_id| {
             const escaped_project = unified.jsonEscape(self.control_plane.allocator, project_id) catch null;
@@ -3732,37 +3717,13 @@ const RuntimeToolDispatchProxy = struct {
         allocator: std.mem.Allocator,
         args_obj: std.json.ObjectMap,
     ) ![]u8 {
-        if (optionalStringField(args_obj, "project_id")) |project_id| {
-            return allocator.dupe(u8, project_id);
-        }
-        if (self.copyLastProjectId(allocator) catch null) |project_id| {
-            return project_id;
-        }
-        if (std.mem.eql(u8, self.runtime_agent_id, system_agent_id)) {
-            return allocator.dupe(u8, system_project_id);
-        }
-        return error.InvalidPayload;
+        _ = self;
+        const project_id = optionalStringField(args_obj, "project_id") orelse return error.InvalidPayload;
+        const trimmed = std.mem.trim(u8, project_id, " \t\r\n");
+        if (trimmed.len == 0) return error.InvalidPayload;
+        return allocator.dupe(u8, trimmed);
     }
 
-    fn rememberLastProjectId(self: *RuntimeToolDispatchProxy, allocator: std.mem.Allocator, project_up_json: []const u8) !void {
-        var parsed = std.json.parseFromSlice(std.json.Value, allocator, project_up_json, .{}) catch return;
-        defer parsed.deinit();
-        if (parsed.value != .object) return;
-        const project_id_value = parsed.value.object.get("project_id") orelse return;
-        if (project_id_value != .string or project_id_value.string.len == 0) return;
-
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        if (self.last_project_id) |value| self.allocator.free(value);
-        self.last_project_id = try self.allocator.dupe(u8, project_id_value.string);
-    }
-
-    fn copyLastProjectId(self: *RuntimeToolDispatchProxy, allocator: std.mem.Allocator) !?[]u8 {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        const project_id = self.last_project_id orelse return null;
-        return @as(?[]u8, try allocator.dupe(u8, project_id));
-    }
 };
 
 fn runtimeDispatchErrorCode(err: anyerror) tool_registry.ToolErrorCode {
@@ -4124,10 +4085,7 @@ fn normalizeControlPath(path: []const u8) []const u8 {
 
 fn pathMatchesControlTarget(path: []const u8, target: []const u8) bool {
     const normalized = normalizeControlPath(path);
-    if (std.mem.eql(u8, normalized, target)) return true;
-    if (normalized.len <= target.len + 1) return false;
-    if (normalized[normalized.len - target.len - 1] != '/') return false;
-    return std.mem.eql(u8, normalized[normalized.len - target.len ..], target);
+    return std.mem.eql(u8, normalized, target);
 }
 
 fn requiredStringField(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
@@ -7603,12 +7561,31 @@ fn handleWebSocketConnection(
                                     try writeFrameLocked(stream, &connection_write_mutex, response, .text);
                                     continue;
                                 };
-                                const requested_agent_id = getOptionalStringField(payload.value.object, "agent_id");
-                                var attach_project_id = getOptionalStringField(payload.value.object, "project_id");
+                                const attach_agent_id = getRequiredStringField(payload.value.object, "agent_id") catch {
+                                    const response = try unified.buildControlError(
+                                        allocator,
+                                        parsed.id,
+                                        "missing_field",
+                                        "agent_id is required",
+                                    );
+                                    defer allocator.free(response);
+                                    try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                    continue;
+                                };
+                                const attach_project_id = getRequiredStringField(payload.value.object, "project_id") catch {
+                                    const response = try unified.buildControlError(
+                                        allocator,
+                                        parsed.id,
+                                        "missing_field",
+                                        "project_id is required",
+                                    );
+                                    defer allocator.free(response);
+                                    try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                    continue;
+                                };
                                 var attach_project_token = getOptionalStringField(payload.value.object, "project_token");
                                 const current_binding = session_bindings.get(active_session_key) orelse return error.InvalidState;
                                 const security_correlation = parsed.correlation_id orelse parsed.id;
-                                const bootstrap_only_now = runtime_registry.isBootstrapMotherOnlyState();
 
                                 if (!isValidSessionKey(session_key)) {
                                     const response = try unified.buildControlError(
@@ -7621,78 +7598,28 @@ fn handleWebSocketConnection(
                                     try writeFrameLocked(stream, &connection_write_mutex, response, .text);
                                     continue;
                                 }
-                                if (requested_agent_id) |agent_id| {
-                                    if (!AgentRuntimeRegistry.isValidAgentId(agent_id)) {
-                                        const response = try unified.buildControlError(
-                                            allocator,
-                                            parsed.id,
-                                            "invalid_payload",
-                                            "invalid agent_id",
-                                        );
-                                        defer allocator.free(response);
-                                        try writeFrameLocked(stream, &connection_write_mutex, response, .text);
-                                        continue;
-                                    }
-                                }
-                                if (attach_project_id) |project_id| {
-                                    if (!AgentRuntimeRegistry.isValidProjectId(project_id)) {
-                                        const response = try unified.buildControlError(
-                                            allocator,
-                                            parsed.id,
-                                            "invalid_payload",
-                                            "invalid project_id",
-                                        );
-                                        defer allocator.free(response);
-                                        try writeFrameLocked(stream, &connection_write_mutex, response, .text);
-                                        continue;
-                                    }
-                                }
-
-                                if (attach_project_id == null) {
-                                    if (bootstrap_only_now and principal.role == .admin and
-                                        requested_agent_id != null and std.mem.eql(u8, requested_agent_id.?, system_agent_id))
-                                    {
-                                        attach_project_id = system_project_id;
-                                    } else {
-                                        const response = try unified.buildControlError(
-                                            allocator,
-                                            parsed.id,
-                                            "missing_field",
-                                            "project_id is required",
-                                        );
-                                        defer allocator.free(response);
-                                        try writeFrameLocked(stream, &connection_write_mutex, response, .text);
-                                        continue;
-                                    }
-                                }
-
-                                var selected_agent_id_owned: ?[]u8 = null;
-                                defer if (selected_agent_id_owned) |value| allocator.free(value);
-
-                                var selected_agent_id: ?[]const u8 = requested_agent_id;
-                                if (selected_agent_id) |candidate| {
-                                    if (!runtime_registry.agentExists(candidate)) {
-                                        selected_agent_id = null;
-                                    }
-                                }
-                                if (selected_agent_id == null) {
-                                    if (runtime_registry.firstAgentForProject(principal.role, attach_project_id.?)) |fallback_agent| {
-                                        selected_agent_id_owned = fallback_agent;
-                                        selected_agent_id = selected_agent_id_owned.?;
-                                    }
-                                }
-                                if (selected_agent_id == null) {
+                                if (!AgentRuntimeRegistry.isValidAgentId(attach_agent_id)) {
                                     const response = try unified.buildControlError(
                                         allocator,
                                         parsed.id,
-                                        "provisioning_required",
-                                        "project has no available agents; provision an agent for this project",
+                                        "invalid_payload",
+                                        "invalid agent_id",
                                     );
                                     defer allocator.free(response);
                                     try writeFrameLocked(stream, &connection_write_mutex, response, .text);
                                     continue;
                                 }
-                                const attach_agent_id = selected_agent_id.?;
+                                if (!AgentRuntimeRegistry.isValidProjectId(attach_project_id)) {
+                                    const response = try unified.buildControlError(
+                                        allocator,
+                                        parsed.id,
+                                        "invalid_payload",
+                                        "invalid project_id",
+                                    );
+                                    defer allocator.free(response);
+                                    try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                    continue;
+                                }
 
                                 const existing_binding = session_bindings.get(session_key);
                                 if (existing_binding != null and std.mem.eql(u8, existing_binding.?.agent_id, attach_agent_id) and attach_project_token == null) {
@@ -7720,7 +7647,7 @@ fn handleWebSocketConnection(
                                     try writeFrameLocked(stream, &connection_write_mutex, response, .text);
                                     continue;
                                 }
-                                if (principal.role == .user and attach_project_id != null and std.mem.eql(u8, attach_project_id.?, system_project_id)) {
+                                if (principal.role == .user and std.mem.eql(u8, attach_project_id, system_project_id)) {
                                     runtime_registry.appendSecurityAuditAndDebug(
                                         current_binding.agent_id,
                                         .session_attach,
@@ -7741,9 +7668,8 @@ fn handleWebSocketConnection(
                                     try writeFrameLocked(stream, &connection_write_mutex, response, .text);
                                     continue;
                                 }
-                                if (attach_project_id != null and
-                                    std.mem.eql(u8, attach_agent_id, system_agent_id) and
-                                    !std.mem.eql(u8, attach_project_id.?, system_project_id))
+                                if (std.mem.eql(u8, attach_agent_id, system_agent_id) and
+                                    !std.mem.eql(u8, attach_project_id, system_project_id))
                                 {
                                     runtime_registry.appendSecurityAuditAndDebug(
                                         current_binding.agent_id,
@@ -7795,7 +7721,7 @@ fn handleWebSocketConnection(
                                     }
                                 }
 
-                                if (attach_project_id != null and try runtime_registry.job_index.hasInFlightForAgent(attach_agent_id)) {
+                                if (try runtime_registry.job_index.hasInFlightForAgent(attach_agent_id)) {
                                     const same_existing_binding = if (existing_binding) |binding|
                                         std.mem.eql(u8, binding.agent_id, attach_agent_id) and optionalStringsEqual(binding.project_id, attach_project_id)
                                     else
@@ -7825,25 +7751,23 @@ fn handleWebSocketConnection(
                                     }
                                 }
 
-                                if (attach_project_id) |project_id| {
-                                    const activate_payload = try buildProjectActivatePayload(allocator, project_id, attach_project_token);
-                                    defer allocator.free(activate_payload);
-                                    _ = runtime_registry.control_plane.activateProjectWithRole(
-                                        attach_agent_id,
-                                        activate_payload,
-                                        principal.role == .admin,
-                                    ) catch |activate_err| {
-                                        const response = try unified.buildControlError(
-                                            allocator,
-                                            parsed.id,
-                                            controlPlaneErrorCode(activate_err),
-                                            @errorName(activate_err),
-                                        );
-                                        defer allocator.free(response);
-                                        try writeFrameLocked(stream, &connection_write_mutex, response, .text);
-                                        continue;
-                                    };
-                                }
+                                const activate_payload = try buildProjectActivatePayload(allocator, attach_project_id, attach_project_token);
+                                defer allocator.free(activate_payload);
+                                _ = runtime_registry.control_plane.activateProjectWithRole(
+                                    attach_agent_id,
+                                    activate_payload,
+                                    principal.role == .admin,
+                                ) catch |activate_err| {
+                                    const response = try unified.buildControlError(
+                                        allocator,
+                                        parsed.id,
+                                        controlPlaneErrorCode(activate_err),
+                                        @errorName(activate_err),
+                                    );
+                                    defer allocator.free(response);
+                                    try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                    continue;
+                                };
 
                                 const previous_session_key = try allocator.dupe(u8, active_session_key);
                                 defer allocator.free(previous_session_key);
@@ -10833,13 +10757,23 @@ test "server_piai: runtime dispatch proxy handles mounts control writes via cont
     var project_up_result = RuntimeToolDispatchProxy.dispatchWorldTool(proxy, allocator, "file_write", project_up_args);
     defer project_up_result.deinit(allocator);
     try std.testing.expect(project_up_result == .success);
+    var project_up_parsed = try std.json.parseFromSlice(std.json.Value, allocator, project_up_result.success.payload_json, .{});
+    defer project_up_parsed.deinit();
+    if (project_up_parsed.value != .object) return error.TestExpectedResponse;
+    const project_up_operation_result = project_up_parsed.value.object.get("operation_result") orelse return error.TestExpectedResponse;
+    if (project_up_operation_result != .object) return error.TestExpectedResponse;
+    const project_id_value = project_up_operation_result.object.get("project_id") orelse return error.TestExpectedResponse;
+    if (project_id_value != .string or project_id_value.string.len == 0) return error.TestExpectedResponse;
+    const project_id = project_id_value.string;
 
     const escaped_node_id = try unified.jsonEscape(allocator, node_id);
     defer allocator.free(escaped_node_id);
+    const escaped_project_id = try unified.jsonEscape(allocator, project_id);
+    defer allocator.free(escaped_project_id);
     const mount_content = try std.fmt.allocPrint(
         allocator,
-        "{{\"node_id\":\"{s}\",\"export_name\":\"work\",\"mount_path\":\"/src\"}}",
-        .{escaped_node_id},
+        "{{\"project_id\":\"{s}\",\"node_id\":\"{s}\",\"export_name\":\"work\",\"mount_path\":\"/src\"}}",
+        .{ escaped_project_id, escaped_node_id },
     );
     defer allocator.free(mount_content);
     const mount_content_escaped = try unified.jsonEscape(allocator, mount_content);
@@ -10857,11 +10791,25 @@ test "server_piai: runtime dispatch proxy handles mounts control writes via cont
     try std.testing.expect(std.mem.indexOf(u8, mount_result.success.payload_json, "\"operation\":\"mount\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, mount_result.success.payload_json, "\"ok\":true") != null);
 
+    const mkdir_content = try std.fmt.allocPrint(
+        allocator,
+        "{{\"project_id\":\"{s}\",\"path\":\"workspace/proxy\"}}",
+        .{escaped_project_id},
+    );
+    defer allocator.free(mkdir_content);
+    const mkdir_content_escaped = try unified.jsonEscape(allocator, mkdir_content);
+    defer allocator.free(mkdir_content_escaped);
+    const mkdir_args = try std.fmt.allocPrint(
+        allocator,
+        "{{\"path\":\"agents/self/mounts/control/mkdir.json\",\"content\":\"{s}\"}}",
+        .{mkdir_content_escaped},
+    );
+    defer allocator.free(mkdir_args);
     var mkdir_result = RuntimeToolDispatchProxy.dispatchWorldTool(
         proxy,
         allocator,
         "file_write",
-        "{\"path\":\"agents/self/mounts/control/mkdir.json\",\"content\":\"{\\\"path\\\":\\\"workspace/proxy\\\"}\"}",
+        mkdir_args,
     );
     defer mkdir_result.deinit(allocator);
     try std.testing.expect(mkdir_result == .success);
@@ -10872,6 +10820,132 @@ test "server_piai: runtime dispatch proxy handles mounts control writes via cont
     defer allocator.free(created_path);
     var created_dir = try std.fs.cwd().openDir(created_path, .{});
     created_dir.close();
+}
+
+test "server_piai: runtime dispatch proxy mounts control requires explicit project_id" {
+    const allocator = std.testing.allocator;
+    const nonce = std.crypto.random.int(u64);
+    const local_root = try std.fmt.allocPrint(allocator, ".tmp-runtime-proxy-mounts-required-project-{d}", .{nonce});
+    defer allocator.free(local_root);
+    defer std.fs.cwd().deleteTree(local_root) catch {};
+    try std.fs.cwd().makePath(local_root);
+
+    var runtime_registry = AgentRuntimeRegistry.init(allocator, .{
+        .ltm_directory = "",
+        .ltm_filename = "",
+    }, null);
+    defer runtime_registry.deinit();
+
+    var dummy_sandbox: sandbox_runtime_mod.SandboxRuntime = undefined;
+    const proxy = try RuntimeToolDispatchProxy.create(
+        allocator,
+        &dummy_sandbox,
+        &runtime_registry.control_plane,
+        runtime_registry.runtime_config.agents_dir,
+        runtime_registry.runtime_config.assets_dir,
+        local_root,
+        system_agent_id,
+    );
+    defer proxy.destroy();
+
+    var mount_result = RuntimeToolDispatchProxy.dispatchWorldTool(
+        proxy,
+        allocator,
+        "file_write",
+        "{\"path\":\"agents/self/mounts/control/mount.json\",\"content\":\"{\\\"node_id\\\":\\\"node-1\\\",\\\"export_name\\\":\\\"work\\\",\\\"mount_path\\\":\\\"/src\\\"}\"}",
+    );
+    defer mount_result.deinit(allocator);
+    try std.testing.expect(mount_result == .failure);
+    try std.testing.expectEqual(tool_registry.ToolErrorCode.invalid_params, mount_result.failure.code);
+}
+
+test "server_piai: runtime dispatch proxy does not reuse project context across control writes" {
+    const allocator = std.testing.allocator;
+    var runtime_registry = AgentRuntimeRegistry.init(allocator, .{
+        .ltm_directory = "",
+        .ltm_filename = "",
+    }, null);
+    defer runtime_registry.deinit();
+
+    var dummy_sandbox: sandbox_runtime_mod.SandboxRuntime = undefined;
+    const proxy = try RuntimeToolDispatchProxy.create(
+        allocator,
+        &dummy_sandbox,
+        &runtime_registry.control_plane,
+        runtime_registry.runtime_config.agents_dir,
+        runtime_registry.runtime_config.assets_dir,
+        runtime_registry.runtime_config.spider_web_root,
+        system_agent_id,
+    );
+    defer proxy.destroy();
+
+    const suffix: u64 = @intCast(@abs(std.time.nanoTimestamp()));
+    const project_name = try std.fmt.allocPrint(allocator, "ProxyNoReuse-{d}", .{suffix});
+    defer allocator.free(project_name);
+    const project_up_content = try std.fmt.allocPrint(
+        allocator,
+        "{{\"name\":\"{s}\",\"vision\":\"No fallback state\",\"activate\":false}}",
+        .{project_name},
+    );
+    defer allocator.free(project_up_content);
+    const project_up_content_escaped = try unified.jsonEscape(allocator, project_up_content);
+    defer allocator.free(project_up_content_escaped);
+    const project_up_args = try std.fmt.allocPrint(
+        allocator,
+        "{{\"path\":\"agents/self/projects/control/up.json\",\"content\":\"{s}\"}}",
+        .{project_up_content_escaped},
+    );
+    defer allocator.free(project_up_args);
+
+    var project_up_result = RuntimeToolDispatchProxy.dispatchWorldTool(proxy, allocator, "file_write", project_up_args);
+    defer project_up_result.deinit(allocator);
+    try std.testing.expect(project_up_result == .success);
+
+    var project_up_parsed = try std.json.parseFromSlice(std.json.Value, allocator, project_up_result.success.payload_json, .{});
+    defer project_up_parsed.deinit();
+    if (project_up_parsed.value != .object) return error.TestExpectedResponse;
+    const project_up_operation_result = project_up_parsed.value.object.get("operation_result") orelse return error.TestExpectedResponse;
+    if (project_up_operation_result != .object) return error.TestExpectedResponse;
+    const project_id_value = project_up_operation_result.object.get("project_id") orelse return error.TestExpectedResponse;
+    if (project_id_value != .string or project_id_value.string.len == 0) return error.TestExpectedResponse;
+    const project_id = project_id_value.string;
+
+    const agent_id = try std.fmt.allocPrint(allocator, "no_reuse_{d}", .{suffix});
+    defer allocator.free(agent_id);
+    const create_content = try std.fmt.allocPrint(
+        allocator,
+        "{{\"agent_id\":\"{s}\",\"name\":\"No Reuse\",\"description\":\"no implicit project fallback\"}}",
+        .{agent_id},
+    );
+    defer allocator.free(create_content);
+    const create_content_escaped = try unified.jsonEscape(allocator, create_content);
+    defer allocator.free(create_content_escaped);
+    const create_args = try std.fmt.allocPrint(
+        allocator,
+        "{{\"path\":\"agents/self/agents/control/create.json\",\"content\":\"{s}\"}}",
+        .{create_content_escaped},
+    );
+    defer allocator.free(create_args);
+
+    var create_result = RuntimeToolDispatchProxy.dispatchWorldTool(proxy, allocator, "file_write", create_args);
+    defer create_result.deinit(allocator);
+    try std.testing.expect(create_result == .success);
+    try std.testing.expect(std.mem.indexOf(u8, create_result.success.payload_json, "\"project_id\":null") != null);
+    try std.testing.expect(std.mem.indexOf(u8, create_result.success.payload_json, "\"activated\":false") != null);
+
+    const project_first_agent = try runtime_registry.control_plane.firstProjectAgent(project_id, false);
+    defer if (project_first_agent) |value| allocator.free(value);
+    try std.testing.expect(project_first_agent == null);
+
+    var get_result = RuntimeToolDispatchProxy.dispatchWorldTool(
+        proxy,
+        allocator,
+        "file_write",
+        "{\"path\":\"agents/self/projects/control/get.json\",\"content\":\"{}\"}",
+    );
+    defer get_result.deinit(allocator);
+    try std.testing.expect(get_result == .failure);
+    try std.testing.expectEqual(tool_registry.ToolErrorCode.invalid_params, get_result.failure.code);
 }
 
 test "server_piai: base websocket path handles unified control/acheron chat flow and rejects legacy session.send" {
@@ -11276,7 +11350,8 @@ test "server_piai: auth matrix gates admin endpoints and handshake tokens" {
         var forbidden_attach = try readServerFrame(allocator, &user_client);
         defer forbidden_attach.deinit(allocator);
         try std.testing.expect(std.mem.indexOf(u8, forbidden_attach.payload, "\"type\":\"control.error\"") != null);
-        try std.testing.expect(std.mem.indexOf(u8, forbidden_attach.payload, "\"code\":\"provisioning_required\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, forbidden_attach.payload, "\"code\":\"missing_field\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, forbidden_attach.payload, "project_id is required") != null);
 
         try websocket_transport.writeFrame(&user_client, "", .close);
         var close_reply = try readServerFrame(allocator, &user_client);
@@ -11370,7 +11445,8 @@ test "server_piai: user connect advertises provisioning gate when no remembered 
     var attach_forbidden = try readServerFrame(allocator, &user_client);
     defer attach_forbidden.deinit(allocator);
     try std.testing.expect(std.mem.indexOf(u8, attach_forbidden.payload, "\"type\":\"control.error\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, attach_forbidden.payload, "\"code\":\"provisioning_required\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, attach_forbidden.payload, "\"code\":\"missing_field\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, attach_forbidden.payload, "project_id is required") != null);
 
     try websocket_transport.writeFrame(&user_client, "", .close);
     var close_reply = try readServerFrame(allocator, &user_client);
@@ -12049,6 +12125,12 @@ test "server_piai: resolve connection path maps base URL to default agent" {
     try std.testing.expectEqualStrings("default", resolved_query);
     try std.testing.expect(resolveAgentIdFromConnectionPath("/v2/agents/default/stream", "default") == null);
     try std.testing.expect(resolveAgentIdFromConnectionPath("/v1/agents/default/stream", "default") == null);
+}
+
+test "server_piai: pathMatchesControlTarget only matches control namespace root path" {
+    try std.testing.expect(pathMatchesControlTarget("agents/self/projects/control/up.json", "agents/self/projects/control/up.json"));
+    try std.testing.expect(pathMatchesControlTarget("/agents/self/projects/control/up.json", "agents/self/projects/control/up.json"));
+    try std.testing.expect(!pathMatchesControlTarget("workspace/agents/self/projects/control/up.json", "agents/self/projects/control/up.json"));
 }
 
 test "server_piai: parseHttpRequestPath parses GET line" {

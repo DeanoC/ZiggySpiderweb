@@ -74,6 +74,9 @@ jobs:
         if: ${{ inputs.extra_commands != '' }}
         env:
           EXTRA_COMMANDS: ${{ inputs.extra_commands }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_CODEX_API_KEY: ${{ secrets.OPENAI_CODEX_API_KEY }}
+          CANARY_PROVIDER_API_KEY: ${{ secrets.CANARY_PROVIDER_API_KEY }}
         run: |
           printf '%s\n' "$EXTRA_COMMANDS" > /tmp/ziggy-ci-extra.sh
           bash /tmp/ziggy-ci-extra.sh
