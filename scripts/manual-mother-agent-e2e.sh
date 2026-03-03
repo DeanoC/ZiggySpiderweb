@@ -4,11 +4,15 @@ set -euo pipefail
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd "$SCRIPT_DIR/.." && pwd)
 BIN_DIR=${BIN_DIR:-"$REPO_ROOT/zig-out/bin"}
+if [[ "$BIN_DIR" != /* ]]; then
+  BIN_DIR="$REPO_ROOT/$BIN_DIR"
+fi
 SPIDERWEB_BIN=${SPIDERWEB_BIN:-"$BIN_DIR/spiderweb"}
 CONTROL_BIN=${CONTROL_BIN:-"$BIN_DIR/spiderweb-control"}
 FS_MOUNT_BIN=${FS_MOUNT_BIN:-"$BIN_DIR/spiderweb-fs-mount"}
 WEBSOCAT_BIN=${WEBSOCAT_BIN:-"$(command -v websocat || true)"}
 JQ_BIN=${JQ_BIN:-"$(command -v jq || true)"}
+MOTHER_E2E_MODE=${MOTHER_E2E_MODE:-provider_chat}
 
 if [[ -z "$WEBSOCAT_BIN" ]]; then
   echo "error: websocat is required" >&2
@@ -20,6 +24,10 @@ if [[ -z "$JQ_BIN" ]]; then
 fi
 if [[ ! -x "$SPIDERWEB_BIN" || ! -x "$CONTROL_BIN" || ! -x "$FS_MOUNT_BIN" ]]; then
   echo "error: expected spiderweb, spiderweb-control, and spiderweb-fs-mount under $BIN_DIR (build first with: zig build)" >&2
+  exit 1
+fi
+if [[ "$MOTHER_E2E_MODE" != "provider_chat" && "$MOTHER_E2E_MODE" != "deterministic" ]]; then
+  echo "error: MOTHER_E2E_MODE must be one of: provider_chat, deterministic" >&2
   exit 1
 fi
 
@@ -41,6 +49,13 @@ else
   PROVIDER_API_KEY=${CANARY_PROVIDER_API_KEY:-}
 fi
 
+if [[ -z "$PROVIDER_NAME" && "$MOTHER_E2E_MODE" == "deterministic" ]]; then
+  PROVIDER_NAME="openai-codex"
+fi
+if [[ -z "$PROVIDER_MODEL" && "$MOTHER_E2E_MODE" == "deterministic" ]]; then
+  PROVIDER_MODEL="gpt-5.3-codex"
+fi
+
 if [[ -z "$PROVIDER_NAME" ]]; then
   if [[ "$HAS_PROVIDER_CONFIG" == "1" ]]; then
     echo "error: provider.name is empty in $CONFIG_SOURCE_PATH" >&2
@@ -55,8 +70,11 @@ if [[ -z "$PROVIDER_API_KEY" ]]; then
     openrouter)
       PROVIDER_API_KEY=${OPENROUTER_API_KEY:-}
       ;;
-    openai|openai-codex|openai-codex-spark)
+    openai)
       PROVIDER_API_KEY=${OPENAI_API_KEY:-}
+      ;;
+    openai-codex|openai-codex-spark)
+      PROVIDER_API_KEY=${OPENAI_CODEX_API_KEY:-${OPENAI_API_KEY:-}}
       ;;
     anthropic)
       PROVIDER_API_KEY=${ANTHROPIC_API_KEY:-}
@@ -173,7 +191,8 @@ $JQ_BIN -n \
 
 echo "[mother-e2e] config: $CONFIG_PATH"
 echo "[mother-e2e] provider: ${PROVIDER_NAME}/${PROVIDER_MODEL:-default}"
-if [[ -z "$PROVIDER_API_KEY" ]]; then
+echo "[mother-e2e] mode: $MOTHER_E2E_MODE"
+if [[ -z "$PROVIDER_API_KEY" && "$MOTHER_E2E_MODE" == "provider_chat" ]]; then
   echo "[mother-e2e] warning: no provider API key supplied via CANARY_PROVIDER_API_KEY, config provider.api_key, or provider env var."
   if [[ "$PROVIDER_NAME" == "openrouter" ]]; then
     echo "error: openrouter provider requires an API key; set CANARY_PROVIDER_API_KEY or OPENROUTER_API_KEY." >&2
@@ -497,74 +516,129 @@ if [[ -z "$NODE_ID" || -z "$EXPORT_NAME" ]]; then
   exit 1
 fi
 
-MOTHER_PROMPT=$(cat <<EOF
-Run this e2e workflow now using your tools and Acheron control files:
-Bootstrap setup details:
-- project_name="$PROJECT_NAME"
-- project_vision="$PROJECT_VISION"
-- first_agent_name="$AGENT_NAME"
-- first_agent_role="builder"
-
-1) Create a project with:
-   name="$PROJECT_NAME"
-   vision="$PROJECT_VISION"
-   Write to /agents/self/projects/control/up.json.
-2) Create an agent with:
-   agent_id="$AGENT_ID"
-   name="$AGENT_NAME"
-   description="Mother-driven e2e validation agent."
-   project_id=<the new project_id from step 1>
-   Write to /agents/self/agents/control/create.json.
-3) Mount this export into the same project by writing to /agents/self/mounts/control/mount.json:
-   node_id="$NODE_ID"
-   export_name="$EXPORT_NAME"
-   mount_path="$MOUNT_PATH"
-   project_id=<same project_id>
-4) Bind by writing to /agents/self/mounts/control/bind.json:
-   project_id=<same project_id>
-   bind_path="$BIND_PATH"
-   target_path="$MOUNT_PATH"
-5) Resolve by writing to /agents/self/mounts/control/resolve.json:
-   project_id=<same project_id>
-   path="$BIND_PATH"
-
-When complete, reply with one compact JSON object:
-{"ok":true,"project_id":"...","agent_id":"$AGENT_ID","mount_path":"$MOUNT_PATH","bind_path":"$BIND_PATH","resolved_path":"..."}
-If any step fails, set ok=false and include "error".
-EOF
-)
-
 ws_attach_with_retry "mother-e2e-version" "mother-e2e-connect" 1 2 "$WS_ATTACH_RETRY_ATTEMPTS"
 
 CHAT_REPLY=""
-for attempt in $(seq 1 "$CHAT_MAX_ATTEMPTS"); do
-  CHAT_REPLY=$(ws_chat_and_read_reply "$MOTHER_PROMPT" "$CHAT_TIMEOUT_SEC")
-  LOWER_REPLY=$(printf '%s' "$CHAT_REPLY" | tr '[:upper:]' '[:lower:]')
-  if [[ "$LOWER_REPLY" == *"provider request invalid"* ]]; then
-    echo "error: provider request invalid (check provider credentials/model in $CONFIG_SOURCE_PATH)" >&2
-    echo "$CHAT_REPLY" >&2
+PROJECT_ID=""
+if [[ "$MOTHER_E2E_MODE" == "deterministic" ]]; then
+  PROJECT_UP_PAYLOAD=$($JQ_BIN -cn --arg name "$PROJECT_NAME" --arg vision "$PROJECT_VISION" '{name:$name,vision:$vision,activate:false}')
+  PROJECT_UP_RESULT=$(ws_invoke_and_read_result "projects" "/agents/self/projects/control/up.json" "$PROJECT_UP_PAYLOAD" "$SERVICE_STATUS_TIMEOUT_SEC")
+  json_assert "$PROJECT_UP_RESULT" '.ok == true' 'deterministic project up failed'
+
+  PROJECT_ID=$($JQ_BIN -r '.result.project_id // empty' 2>/dev/null <<<"$PROJECT_UP_RESULT" || true)
+  if [[ -z "$PROJECT_ID" ]]; then
+    PROJECT_LIST_JSON=$(control_retry "$CONTROL_RETRY_ATTEMPTS" "$CONTROL_RETRY_DELAY_SEC" project_list)
+    PROJECT_ID=$($JQ_BIN -r --arg name "$PROJECT_NAME" '.payload.projects[]? | select((.name // "") == $name) | .project_id' <<<"$PROJECT_LIST_JSON" | head -n1)
+  fi
+  if [[ -z "$PROJECT_ID" ]]; then
+    echo "error: deterministic flow could not resolve project_id for $PROJECT_NAME" >&2
+    echo "$PROJECT_UP_RESULT" >&2
     exit 1
   fi
-  if grep -Eqi '"ok"[[:space:]]*:[[:space:]]*true' <<<"$CHAT_REPLY"; then
-    break
-  fi
-  if [[ "$attempt" -lt "$CHAT_MAX_ATTEMPTS" ]]; then
-    sleep 1
-  fi
-done
 
-if [[ -z "$CHAT_REPLY" ]]; then
-  echo "error: Mother chat reply is empty" >&2
-  exit 1
-fi
+  AGENT_CREATE_PAYLOAD=$($JQ_BIN -cn \
+    --arg agent_id "$AGENT_ID" \
+    --arg name "$AGENT_NAME" \
+    --arg description "Mother-driven e2e validation agent." \
+    --arg project_id "$PROJECT_ID" \
+    '{agent_id:$agent_id,name:$name,description:$description,project_id:$project_id}')
+  AGENT_CREATE_RESULT=$(ws_invoke_and_read_result "agents" "/agents/self/agents/control/create.json" "$AGENT_CREATE_PAYLOAD" "$SERVICE_STATUS_TIMEOUT_SEC")
+  json_assert "$AGENT_CREATE_RESULT" '.ok == true' 'deterministic agent create failed'
 
-# 2) verify project + agent were created by Mother workflow
-PROJECT_ID=$($JQ_BIN -r '.project_id // empty' 2>/dev/null <<<"$CHAT_REPLY" || true)
-if [[ -z "$PROJECT_ID" ]]; then
-  echo "error: Mother reply did not include project_id" >&2
-  echo "[mother-e2e] chat reply:" >&2
-  echo "$CHAT_REPLY" >&2
-  exit 1
+  MOUNT_PAYLOAD=$($JQ_BIN -cn \
+    --arg project_id "$PROJECT_ID" \
+    --arg node_id "$NODE_ID" \
+    --arg export_name "$EXPORT_NAME" \
+    --arg mount_path "$MOUNT_PATH" \
+    '{project_id:$project_id,node_id:$node_id,export_name:$export_name,mount_path:$mount_path}')
+  MOUNT_RESULT=$(ws_invoke_and_read_result "mounts" "/agents/self/mounts/control/mount.json" "$MOUNT_PAYLOAD" "$SERVICE_STATUS_TIMEOUT_SEC")
+  json_assert "$MOUNT_RESULT" '.ok == true' 'deterministic mount failed'
+
+  BIND_PAYLOAD=$($JQ_BIN -cn \
+    --arg project_id "$PROJECT_ID" \
+    --arg bind_path "$BIND_PATH" \
+    --arg target_path "$MOUNT_PATH" \
+    '{project_id:$project_id,bind_path:$bind_path,target_path:$target_path}')
+  BIND_RESULT=$(ws_invoke_and_read_result "mounts" "/agents/self/mounts/control/bind.json" "$BIND_PAYLOAD" "$SERVICE_STATUS_TIMEOUT_SEC")
+  json_assert "$BIND_RESULT" '.ok == true' 'deterministic bind failed'
+
+  RESOLVE_PAYLOAD=$($JQ_BIN -cn --arg project_id "$PROJECT_ID" --arg path "$BIND_PATH" '{project_id:$project_id,path:$path}')
+  RESOLVE_RESULT=$(ws_invoke_and_read_result "mounts" "/agents/self/mounts/control/resolve.json" "$RESOLVE_PAYLOAD" "$SERVICE_STATUS_TIMEOUT_SEC")
+  json_assert "$RESOLVE_RESULT" '.ok == true' 'deterministic resolve failed'
+
+  CHAT_REPLY=$(printf '{"ok":true,"mode":"deterministic","project_id":"%s","agent_id":"%s"}' "$PROJECT_ID" "$AGENT_ID")
+else
+  SETUP_PROMPT=$(cat <<EOF
+Run this setup now using your tools and Acheron control files:
+1) Create project via /agents/self/projects/control/up.json with name="$PROJECT_NAME" and vision="$PROJECT_VISION".
+2) Create agent via /agents/self/agents/control/create.json with:
+   agent_id="$AGENT_ID"
+   name="$AGENT_NAME"
+   description="Mother-driven e2e validation agent."
+   project_id=<project_id from step 1>
+Reply with compact JSON only:
+{"ok":true,"project_id":"...","agent_id":"$AGENT_ID"}
+EOF
+)
+
+  SETUP_REPLY=""
+  for attempt in $(seq 1 "$CHAT_MAX_ATTEMPTS"); do
+    SETUP_REPLY=$(ws_chat_and_read_reply "$SETUP_PROMPT" "$CHAT_TIMEOUT_SEC")
+    LOWER_REPLY=$(printf '%s' "$SETUP_REPLY" | tr '[:upper:]' '[:lower:]')
+    if [[ "$LOWER_REPLY" == *"provider request invalid"* ]]; then
+      echo "error: provider request invalid (check provider credentials/model in $CONFIG_SOURCE_PATH)" >&2
+      echo "$SETUP_REPLY" >&2
+      exit 1
+    fi
+    if grep -Eqi '"ok"[[:space:]]*:[[:space:]]*true' <<<"$SETUP_REPLY"; then
+      break
+    fi
+    if [[ "$attempt" -lt "$CHAT_MAX_ATTEMPTS" ]]; then
+      sleep 1
+    fi
+  done
+  if [[ -z "$SETUP_REPLY" ]]; then
+    echo "error: Mother setup reply is empty" >&2
+    exit 1
+  fi
+
+  PROJECT_ID=$($JQ_BIN -r '.project_id // empty' 2>/dev/null <<<"$SETUP_REPLY" || true)
+  if [[ -z "$PROJECT_ID" ]]; then
+    PROJECT_LIST_JSON=$(control_retry "$CONTROL_RETRY_ATTEMPTS" "$CONTROL_RETRY_DELAY_SEC" project_list)
+    PROJECT_ID=$($JQ_BIN -r --arg name "$PROJECT_NAME" '.payload.projects[]? | select((.name // "") == $name) | .project_id' <<<"$PROJECT_LIST_JSON" | head -n1)
+  fi
+  if [[ -z "$PROJECT_ID" ]]; then
+    echo "error: Mother setup did not yield project_id" >&2
+    echo "$SETUP_REPLY" >&2
+    exit 1
+  fi
+
+  MOUNTS_PROMPT=$(cat <<EOF
+Now execute mount and bind for project_id "$PROJECT_ID" using control files:
+1) /agents/self/mounts/control/mount.json with {"project_id":"$PROJECT_ID","node_id":"$NODE_ID","export_name":"$EXPORT_NAME","mount_path":"$MOUNT_PATH"}
+2) /agents/self/mounts/control/bind.json with {"project_id":"$PROJECT_ID","bind_path":"$BIND_PATH","target_path":"$MOUNT_PATH"}
+3) /agents/self/mounts/control/resolve.json with {"project_id":"$PROJECT_ID","path":"$BIND_PATH"}
+Reply with compact JSON only:
+{"ok":true,"project_id":"$PROJECT_ID","bind_path":"$BIND_PATH","resolved_path":"..."}
+EOF
+)
+  MOUNTS_REPLY=""
+  for attempt in $(seq 1 "$CHAT_MAX_ATTEMPTS"); do
+    MOUNTS_REPLY=$(ws_chat_and_read_reply "$MOUNTS_PROMPT" "$CHAT_TIMEOUT_SEC")
+    LOWER_REPLY=$(printf '%s' "$MOUNTS_REPLY" | tr '[:upper:]' '[:lower:]')
+    if [[ "$LOWER_REPLY" == *"provider request invalid"* ]]; then
+      echo "error: provider request invalid (check provider credentials/model in $CONFIG_SOURCE_PATH)" >&2
+      echo "$MOUNTS_REPLY" >&2
+      exit 1
+    fi
+    if grep -Eqi '"ok"[[:space:]]*:[[:space:]]*true' <<<"$MOUNTS_REPLY"; then
+      break
+    fi
+    if [[ "$attempt" -lt "$CHAT_MAX_ATTEMPTS" ]]; then
+      sleep 1
+    fi
+  done
+  CHAT_REPLY="$SETUP_REPLY"$'\n'"$MOUNTS_REPLY"
 fi
 
 PROJECT_LIST_JSON=$(control_retry "$CONTROL_RETRY_ATTEMPTS" "$CONTROL_RETRY_DELAY_SEC" project_list)
@@ -593,19 +667,54 @@ if ! retry_cmd 10 0.5 "$FS_MOUNT_BIN" --workspace-url "$URL" --auth-token "$ADMI
   exit 1
 fi
 
-if ! retry_cmd 6 0.5 "$FS_MOUNT_BIN" --workspace-url "$URL" --auth-token "$ADMIN_TOKEN" --project-id "$PROJECT_ID" getattr "$BIND_PATH" >/dev/null 2>&1; then
-  BIND_FIX_PROMPT=$(cat <<EOF
+check_bind_and_resolve() {
+  local list_result resolve_result
+  list_result=$(ws_invoke_and_read_result "mounts" "/agents/self/mounts/control/list.json" "{\"project_id\":\"$PROJECT_ID\"}" "$SERVICE_STATUS_TIMEOUT_SEC")
+  if ! $JQ_BIN -e '.ok == true' >/dev/null <<<"$list_result"; then
+    return 1
+  fi
+  if ! $JQ_BIN -e --arg bind_path "$BIND_PATH" --arg target_path "$MOUNT_PATH" \
+    '.result.binds[]? | select((.bind_path // "") == $bind_path and (.target_path // "") == $target_path)' >/dev/null <<<"$list_result"; then
+    return 1
+  fi
+  resolve_result=$(ws_invoke_and_read_result "mounts" "/agents/self/mounts/control/resolve.json" "{\"project_id\":\"$PROJECT_ID\",\"path\":\"$BIND_PATH\"}" "$SERVICE_STATUS_TIMEOUT_SEC")
+  if ! $JQ_BIN -e --arg target_path "$MOUNT_PATH" '.ok == true and .result.matched == true and .result.resolved_path == $target_path' >/dev/null <<<"$resolve_result"; then
+    return 1
+  fi
+  return 0
+}
+
+if [[ "$MOTHER_E2E_MODE" == "provider_chat" ]]; then
+  if ! check_bind_and_resolve; then
+    for _ in $(seq 1 3); do
+      BIND_FIX_PROMPT=$(cat <<EOF
 Bind is missing for project_id "$PROJECT_ID".
 Please execute only this now:
 1) Write {"project_id":"$PROJECT_ID","bind_path":"$BIND_PATH","target_path":"$MOUNT_PATH"} to /agents/self/mounts/control/bind.json
 2) Write {"project_id":"$PROJECT_ID","path":"$BIND_PATH"} to /agents/self/mounts/control/resolve.json
 3) Reply with compact JSON: {"ok":true,"project_id":"$PROJECT_ID","bind_path":"$BIND_PATH","resolved_path":"..."}
 EOF
-)
-  _=$(ws_chat_and_read_reply "$BIND_FIX_PROMPT" "$CHAT_TIMEOUT_SEC")
+      )
+      _=$(ws_chat_and_read_reply "$BIND_FIX_PROMPT" "$CHAT_TIMEOUT_SEC")
+      if check_bind_and_resolve; then
+        break
+      fi
+    done
+  fi
+else
+  if ! check_bind_and_resolve; then
+    echo "error: deterministic bind/resolve verification failed for project_id=$PROJECT_ID path=$BIND_PATH" >&2
+    exit 1
+  fi
 fi
-if ! retry_cmd 10 0.5 "$FS_MOUNT_BIN" --workspace-url "$URL" --auth-token "$ADMIN_TOKEN" --project-id "$PROJECT_ID" getattr "$BIND_PATH" >/dev/null 2>&1; then
-  echo "error: expected bind path is not readable in project namespace: $BIND_PATH" >&2
+
+if [[ "$MOTHER_E2E_MODE" == "provider_chat" ]] && ! check_bind_and_resolve; then
+  echo "error: expected bind path mapping not established for project namespace: $BIND_PATH -> $MOUNT_PATH" >&2
+  exit 1
+fi
+
+if [[ "$MOTHER_E2E_MODE" == "deterministic" ]] && ! check_bind_and_resolve; then
+  echo "error: expected bind path mapping not established for deterministic flow: $BIND_PATH -> $MOUNT_PATH" >&2
   exit 1
 fi
 

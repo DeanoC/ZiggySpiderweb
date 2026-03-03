@@ -47,6 +47,29 @@ What this additionally checks:
 2. Mother executes mount/bind/resolve through `/agents/self/mounts/control/*.json`.
 3. Script verifies resulting mount/bind state and successful `session_attach` to the Mother-created context.
 
+Modes:
+
+- `MOTHER_E2E_MODE=provider_chat` (default): real Mother/tool workflow.
+- `MOTHER_E2E_MODE=deterministic`: direct control-file path (useful for CI and isolated debugging).
+
+Examples:
+
+```bash
+MOTHER_E2E_MODE=deterministic ./scripts/manual-mother-agent-e2e.sh
+MOTHER_E2E_MODE=provider_chat CANARY_PROVIDER_NAME=openai-codex CANARY_PROVIDER_MODEL=gpt-5.3-codex ./scripts/manual-mother-agent-e2e.sh
+```
+
+Run deterministic first, then real Mother mode in one command:
+
+```bash
+./scripts/mother-agent-e2e-suite.sh
+```
+
+In CI, provider-chat is auto-gated:
+
+- runs when Codex auth (`~/.codex/auth.json`) exists, or provider secrets are present
+- otherwise runs deterministic mode only
+
 ## Protocol Notes (Current Behavior)
 
 - `control.connect` returns `control.connect_ack` even when context selection is needed.

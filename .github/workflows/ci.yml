@@ -7,6 +7,7 @@ on:
 jobs:
   build-and-test:
     uses: ./.github/workflows/ziggy-shared-ci.yml
+    secrets: inherit
     with:
       verify_script: |
         if grep -qE '\.path = "\.\./Ziggy' build.zig.zon; then
@@ -22,6 +23,12 @@ jobs:
       extra_commands: |
         SKIP_BUILD=1 bash test-env/test-distributed-workspace-matrix.sh
         SKIP_BUILD=1 bash test-env/test-unified-v2-protocol.sh
+        if ! command -v websocat >/dev/null 2>&1; then
+          curl -fsSL -o /tmp/websocat https://github.com/vi/websocat/releases/download/v1.13.0/websocat.x86_64-unknown-linux-musl
+          chmod +x /tmp/websocat
+          sudo mv /tmp/websocat /usr/local/bin/websocat
+        fi
+        SKIP_BUILD=1 RUN_PROVIDER_CHAT=auto CANARY_PROVIDER_NAME=openai-codex CANARY_PROVIDER_MODEL=gpt-5.3-codex ./scripts/mother-agent-e2e-suite.sh
 
   windows-fs-tests:
     name: windows-fs-tests

@@ -179,11 +179,16 @@ CANARY_PROVIDER_NAME=openai CANARY_PROVIDER_MODEL=gpt-4o-mini ./scripts/manual-m
 
 ## Mother-Driven Agent Workflow E2E
 
-Run an end-to-end canary where Mother performs the project/agent/mount/bind work via chat-driven tool use:
+Run an end-to-end canary for project/agent/mount/bind/resolve.
 
 ```bash
 ./scripts/manual-mother-agent-e2e.sh
 ```
+
+Modes:
+
+- `MOTHER_E2E_MODE=provider_chat` (default): Mother does setup work via chat/tool use.
+- `MOTHER_E2E_MODE=deterministic`: script writes control files directly (CI-friendly, no provider call required).
 
 What it validates:
 - first connect starts in bootstrap mode (`bootstrap_only=true`)
@@ -199,6 +204,21 @@ Useful overrides:
 KEEP_CANARY_DIR=1 ./scripts/manual-mother-agent-e2e.sh
 PROJECT_NAME=my-e2e AGENT_ID=my-e2e-agent ./scripts/manual-mother-agent-e2e.sh
 CANARY_PROVIDER_NAME=openai-codex CANARY_PROVIDER_MODEL=gpt-5.3-codex ./scripts/manual-mother-agent-e2e.sh
+MOTHER_E2E_MODE=deterministic ./scripts/manual-mother-agent-e2e.sh
+MOTHER_E2E_MODE=provider_chat CANARY_PROVIDER_NAME=openai-codex CANARY_PROVIDER_MODEL=gpt-5.3-codex ./scripts/manual-mother-agent-e2e.sh
+```
+
+Run both deterministic + provider-chat in one command (uses `~/.codex/auth.json` automatically when present):
+
+```bash
+./scripts/mother-agent-e2e-suite.sh
+
+# force provider mode on/off
+RUN_PROVIDER_CHAT=1 ./scripts/mother-agent-e2e-suite.sh
+RUN_PROVIDER_CHAT=0 ./scripts/mother-agent-e2e-suite.sh
+
+# CI usage (reuse prior build artifacts)
+SKIP_BUILD=1 ./scripts/mother-agent-e2e-suite.sh
 ```
 
 ## Environment Variables
