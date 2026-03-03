@@ -28,7 +28,7 @@ jobs:
           chmod +x /tmp/websocat
           sudo mv /tmp/websocat /usr/local/bin/websocat
         fi
-        SKIP_BUILD=1 RUN_PROVIDER_CHAT=auto CANARY_PROVIDER_NAME=openai-codex CANARY_PROVIDER_MODEL=gpt-5.3-codex ./scripts/mother-agent-e2e-suite.sh
+        SKIP_BUILD=1 ZIG_OUT_DIR=zig-out BIN_DIR=zig-out/bin RUN_PROVIDER_CHAT=auto CANARY_PROVIDER_NAME=openai-codex CANARY_PROVIDER_MODEL=gpt-5.3-codex ./scripts/mother-agent-e2e-suite.sh
 
   windows-fs-tests:
     name: windows-fs-tests
