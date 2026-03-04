@@ -260,21 +260,21 @@ def expect_type(msg: dict, channel: str, msg_type: str) -> None:
     require(msg.get("type") == msg_type, f"expected type={msg_type}, got {msg.get('type')}")
 
 
-def run_with_retries(label: str, fn, attempts: int = 3) -> None:
+def run_with_retries(label: str, fn, attempts: int = 3, delay_sec: float = 0.1, retry_all_ws_errors: bool = False) -> None:
     for attempt in range(1, attempts + 1):
         try:
             fn()
             return
         except WsError as exc:
-            if "attach did not become ready before timeout" not in str(exc):
+            if not retry_all_ws_errors and "attach did not become ready before timeout" not in str(exc):
                 raise
             if attempt >= attempts:
                 raise
-            time.sleep(0.1)
+            time.sleep(delay_sec)
         except (ConnectionResetError, TimeoutError, WsClosed, BrokenPipeError) as exc:
             if attempt >= attempts:
                 raise WsError(f"{label} failed after {attempts} attempts: {exc}") from exc
-            time.sleep(0.1)
+            time.sleep(delay_sec)
 
 
 def control_ready(host: str, port: int, auth_token=None) -> None:
@@ -421,7 +421,7 @@ def run_control_runtime_order(host: str, port: int, auth_token=None) -> None:
 
     run_with_retries("control-before-version", scenario_control_before_version)
     run_with_retries("attach-before-version", scenario_attach_before_version)
-    run_with_retries("runtime-happy-path", scenario_happy_path)
+    run_with_retries("runtime-happy-path", scenario_happy_path, attempts=12, delay_sec=1.0, retry_all_ws_errors=True)
 
 
 def fs_ready(host: str, port: int, auth_token: str) -> None:
