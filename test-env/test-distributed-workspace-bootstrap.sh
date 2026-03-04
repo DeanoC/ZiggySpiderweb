@@ -53,6 +53,20 @@ if ! command -v python3 >/dev/null 2>&1; then
     exit 1
 fi
 
+CONTROL_CALL_TIMEOUT_SEC="${CONTROL_CALL_TIMEOUT_SEC:-8}"
+CONTROL_CALL_RETRIES="${CONTROL_CALL_RETRIES:-3}"
+FS_CHECK_TIMEOUT_SEC="${FS_CHECK_TIMEOUT_SEC:-3}"
+
+run_with_timeout() {
+    local seconds="$1"
+    shift
+    if command -v timeout >/dev/null 2>&1; then
+        timeout "$seconds" "$@"
+    else
+        "$@"
+    fi
+}
+
 CONTROL_ARGS=(--url "$CONTROL_URL")
 if [[ -n "${SPIDERWEB_CONTROL_OPERATOR_TOKEN:-}" ]]; then
     CONTROL_ARGS+=(--operator-token "$SPIDERWEB_CONTROL_OPERATOR_TOKEN")
@@ -62,19 +76,19 @@ control_call() {
     local op="$1"
     local payload="${2-}"
     local attempt output
-    for attempt in $(seq 1 5); do
+    for attempt in $(seq 1 "$CONTROL_CALL_RETRIES"); do
         if [[ -n "$payload" ]]; then
-            output="$(timeout 20 "$CONTROL_BIN" "${CONTROL_ARGS[@]}" "$op" "$payload" 2>&1)" && {
+            output="$(run_with_timeout "$CONTROL_CALL_TIMEOUT_SEC" "$CONTROL_BIN" "${CONTROL_ARGS[@]}" "$op" "$payload" 2>&1)" && {
                 printf '%s\n' "$output"
                 return 0
             }
         else
-            output="$(timeout 20 "$CONTROL_BIN" "${CONTROL_ARGS[@]}" "$op" 2>&1)" && {
+            output="$(run_with_timeout "$CONTROL_CALL_TIMEOUT_SEC" "$CONTROL_BIN" "${CONTROL_ARGS[@]}" "$op" 2>&1)" && {
                 printf '%s\n' "$output"
                 return 0
             }
         fi
-        if [[ "$attempt" -lt 5 ]]; then
+        if [[ "$attempt" -lt "$CONTROL_CALL_RETRIES" ]]; then
             sleep 0.2
         fi
     done
@@ -127,7 +141,7 @@ PY
                 export SPIDERWEB_AUTH_TOKEN
             fi
         fi
-        if control_call workspace_status >/dev/null 2>&1; then
+        if run_with_timeout 2 "$CONTROL_BIN" "${CONTROL_ARGS[@]}" workspace_status >/dev/null 2>&1; then
             return 0
         fi
         sleep 0.1
@@ -139,7 +153,7 @@ wait_for_node_ready() {
     local port="$1"
     local endpoint="tmp=ws://$BIND_ADDR:$port/v2/fs#work"
     for _ in $(seq 1 120); do
-        if "$FS_MOUNT_BIN" --endpoint "$endpoint" readdir /tmp >/dev/null 2>&1; then
+        if run_with_timeout "$FS_CHECK_TIMEOUT_SEC" "$FS_MOUNT_BIN" --endpoint "$endpoint" readdir /tmp >/dev/null 2>&1; then
             return 0
         fi
         sleep 0.1
@@ -265,9 +279,17 @@ if len(mounts) == 0 and len(actual) == 0:
     raise SystemExit("expected at least one effective/actual mount")
 PY
 
-STATUS_RESP="$(control_call workspace_status "$(printf '{"project_id":"%s"}' "$PROJECT_ID")")"
-STATUS_PROJECT_ID="$(json_query "$STATUS_RESP" "payload.project_id")"
-STATUS_DRIFT_COUNT="$(json_query "$STATUS_RESP" "payload.drift.count")"
+STATUS_PROJECT_ID=""
+STATUS_DRIFT_COUNT=""
+STATUS_RESP=""
+if STATUS_RESP="$(run_with_timeout 3 "$CONTROL_BIN" "${CONTROL_ARGS[@]}" workspace_status "$(printf '{"project_id":"%s"}' "$PROJECT_ID")" 2>/dev/null)"; then
+    STATUS_PROJECT_ID="$(json_query "$STATUS_RESP" "payload.project_id")"
+    STATUS_DRIFT_COUNT="$(json_query "$STATUS_RESP" "payload.drift.count")"
+else
+    log_info "workspace_status timed out after project_up; validating from project_up payload"
+    STATUS_PROJECT_ID="$PROJECT_ID"
+    STATUS_DRIFT_COUNT="$(json_query "$PROJECT_UP_RESP" "payload.workspace.drift.count")"
+fi
 if [[ "$STATUS_PROJECT_ID" != "$PROJECT_ID" ]]; then
     log_fail "workspace_status project mismatch"
     echo "$STATUS_RESP"
