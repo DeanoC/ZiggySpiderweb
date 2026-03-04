@@ -1446,8 +1446,9 @@ pub const RuntimeServer = struct {
                         "3) `agents/self/agents/control/create.json` with `{agent_id, name, description, project_id}`\n" ++
                         "4) Treat successful file_write tool results as authoritative completion for provisioning.\n" ++
                         "   Do not block on `status.json`/`result.json` in bootstrap mode.\n" ++
-                        "After provisioning succeeds, send a handoff-only completion reply with created `project_id` + `agent_id`.\n" ++
-                        "Direct the operator to attach via `control.session_attach` for project execution.\n" ++
+                        "After provisioning succeeds, send a handoff-only completion reply confirming the created project and agent.\n" ++
+                        "Tell the operator to switch to the newly created project/agent to continue project work.\n" ++
+                        "Do not include protocol-level or API instructions in that handoff reply.\n" ++
                         "Do not offer to begin repo setup, PR preparation, coding, or execution from Mother in the same reply.\n" ++
                         "Do not switch to unrelated chit-chat until setup blockers are resolved.\n" ++
                         "Active setup requirements:\n",

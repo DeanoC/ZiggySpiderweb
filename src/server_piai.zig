@@ -3985,7 +3985,6 @@ const RuntimeToolDispatchProxy = struct {
         if (trimmed.len == 0) return error.InvalidPayload;
         return allocator.dupe(u8, trimmed);
     }
-
 };
 
 fn runtimeDispatchErrorCode(err: anyerror) tool_registry.ToolErrorCode {
@@ -5369,23 +5368,32 @@ const AgentRuntimeRegistry = struct {
         };
 
         self.mutex.lock();
-        defer self.mutex.unlock();
+        var cleanup_after_unlock: ?AgentRuntimeEntry = null;
+        var replaced_after_unlock: ?AgentRuntimeEntry = null;
+        defer {
+            self.mutex.unlock();
+            if (cleanup_after_unlock) |*cleanup| {
+                cleanup.deinit(self.allocator);
+            }
+            if (replaced_after_unlock) |*replaced| {
+                replaced.deinit(self.allocator);
+            }
+        }
 
         if (self.by_agent.getPtr(agent_id)) |existing| {
             if (std.mem.eql(u8, existing.project_id, entry.project_id)) {
-                var cleanup = entry;
-                cleanup.deinit(self.allocator);
+                cleanup_after_unlock = entry;
                 entry_installed = true;
                 const runtime = existing.runtime;
                 runtime.retain();
                 return runtime;
             }
-            var replaced = existing.*;
+            const replaced = existing.*;
             existing.* = entry;
             entry_installed = true;
             const runtime = existing.runtime;
             runtime.retain();
-            replaced.deinit(self.allocator);
+            replaced_after_unlock = replaced;
             return runtime;
         }
 
@@ -5545,25 +5553,14 @@ const AgentRuntimeRegistry = struct {
     }
 
     fn hasRuntimeForBinding(self: *AgentRuntimeRegistry, agent_id: []const u8, project_id: ?[]const u8) bool {
-        var removed_unhealthy: ?RemovedRuntimeEntry = null;
-        var has_binding = false;
         self.mutex.lock();
-        removed_unhealthy = self.takeUnhealthyRuntimeLocked(agent_id);
-        if (removed_unhealthy == null) {
-            if (self.by_agent.getPtr(agent_id)) |existing| {
-                has_binding = if (project_id) |project|
-                    std.mem.eql(u8, existing.project_id, project)
-                else
-                    true;
-            }
-        }
-        self.mutex.unlock();
+        defer self.mutex.unlock();
 
-        if (removed_unhealthy) |removed| {
-            self.deinitRemovedRuntime(removed);
-            return false;
+        const existing = self.by_agent.getPtr(agent_id) orelse return false;
+        if (project_id) |project| {
+            if (!std.mem.eql(u8, existing.project_id, project)) return false;
         }
-        return has_binding;
+        return existing.runtime.isHealthy();
     }
 
     fn runtimeBindingKey(self: *AgentRuntimeRegistry, agent_id: []const u8, project_id: ?[]const u8) ![]u8 {
@@ -5599,14 +5596,6 @@ const AgentRuntimeRegistry = struct {
                 .updated_at_ms = std.time.milliTimestamp(),
             };
         }
-        if (self.hasRuntimeForBinding(agent_id, project_id)) {
-            return .{
-                .state = .ready,
-                .runtime_ready = true,
-                .mount_ready = true,
-                .updated_at_ms = std.time.milliTimestamp(),
-            };
-        }
         const binding_key = self.runtimeBindingKey(agent_id, project_id) catch {
             return .{
                 .state = .warming,
@@ -5616,7 +5605,47 @@ const AgentRuntimeRegistry = struct {
             };
         };
         defer self.allocator.free(binding_key);
-        return self.runtimeAttachSnapshotByKey(binding_key);
+
+        // Read warmup state first so callers don't block on runtime mutex while
+        // a background warmup is in-flight.
+        var warmup_snapshot: ?SessionAttachStateSnapshot = null;
+        self.runtime_warmups_mutex.lock();
+        if (self.runtime_warmups.getPtr(binding_key)) |state| {
+            warmup_snapshot = state.snapshotOwned(self.allocator) catch .{
+                .state = state.state,
+                .runtime_ready = state.runtime_ready,
+                .mount_ready = state.mount_ready,
+                .updated_at_ms = state.updated_at_ms,
+            };
+        }
+        self.runtime_warmups_mutex.unlock();
+
+        if (warmup_snapshot) |snapshot| {
+            if (snapshot.state != .ready) {
+                return snapshot;
+            }
+            var ready_snapshot = snapshot;
+            ready_snapshot.deinit(self.allocator);
+            warmup_snapshot = null;
+        }
+
+        const has_runtime = self.hasRuntimeForBinding(agent_id, project_id);
+        if (has_runtime) {
+            return .{
+                .state = .ready,
+                .runtime_ready = true,
+                .mount_ready = true,
+                .updated_at_ms = std.time.milliTimestamp(),
+            };
+        }
+
+        if (warmup_snapshot) |snapshot| return snapshot;
+        return .{
+            .state = .warming,
+            .runtime_ready = false,
+            .mount_ready = false,
+            .updated_at_ms = std.time.milliTimestamp(),
+        };
     }
 
     fn touchRuntimeAttachState(self: *AgentRuntimeRegistry, agent_id: []const u8, project_id: ?[]const u8) void {
@@ -5935,7 +5964,9 @@ const AgentRuntimeRegistry = struct {
                     if (state.state == .err and !retry_on_error) {
                         // Preserve sticky error state for read-only status probes so callers can
                         // surface the real failure instead of oscillating forever in "warming".
-                    } else if (state.state != .ready) {
+                    } else {
+                        // Runtime is currently absent/unhealthy, so move the warmup state back
+                        // to warming even if a stale "ready" snapshot is present.
                         state.setWarming(self.allocator);
                         state.in_flight = true;
                         should_spawn = true;
@@ -9196,14 +9227,6 @@ fn handleWebSocketConnection(
                             attach_state.deinit(allocator);
                             attach_state = warmed_attach_state;
 
-                            if (attach_state.state == .warming) {
-                                attach_state.deinit(allocator);
-                                attach_state = runtime_registry.waitForRuntimeWarmup(
-                                    target_binding.agent_id,
-                                    target_binding.project_id,
-                                    runtime_warmup_wait_timeout_ms,
-                                );
-                            }
                             if (attach_state.state == .warming) {
                                 const response = try unified.buildFsrpcError(
                                     allocator,

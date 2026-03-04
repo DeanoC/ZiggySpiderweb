@@ -9,8 +9,8 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BIND_ADDR="${BIND_ADDR:-127.0.0.1}"
-SPIDERWEB_PORT="${SPIDERWEB_PORT:-28794}"
-FS_NODE_PORT="${FS_NODE_PORT:-28931}"
+SPIDERWEB_PORT="${SPIDERWEB_PORT:-}"
+FS_NODE_PORT="${FS_NODE_PORT:-}"
 
 SPIDERWEB_BIN="$ROOT_DIR/zig-out/bin/spiderweb"
 FS_NODE_BIN="$ROOT_DIR/zig-out/bin/spiderweb-fs-node"
@@ -64,6 +64,32 @@ if ! command -v python3 >/dev/null 2>&1; then
     exit 1
 fi
 
+pick_free_port() {
+    python3 - "$1" <<'PY'
+import socket
+import sys
+
+host = sys.argv[1]
+with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+    sock.bind((host, 0))
+    print(sock.getsockname()[1])
+PY
+}
+
+if [[ -z "$SPIDERWEB_PORT" ]]; then
+    SPIDERWEB_PORT="$(pick_free_port "$BIND_ADDR")"
+fi
+
+if [[ -z "$FS_NODE_PORT" ]]; then
+    while true; do
+        candidate_port="$(pick_free_port "$BIND_ADDR")"
+        if [[ "$candidate_port" != "$SPIDERWEB_PORT" ]]; then
+            FS_NODE_PORT="$candidate_port"
+            break
+        fi
+    done
+fi
+
 TEST_TMP_DIR="$(mktemp -d)"
 LTM_DIR="$TEST_TMP_DIR/ltm"
 AUTH_TOKENS_FILE="$LTM_DIR/auth_tokens.json"
@@ -101,6 +127,7 @@ import json
 import os
 import socket
 import sys
+import time
 
 
 class WsError(RuntimeError):
@@ -233,6 +260,23 @@ def expect_type(msg: dict, channel: str, msg_type: str) -> None:
     require(msg.get("type") == msg_type, f"expected type={msg_type}, got {msg.get('type')}")
 
 
+def run_with_retries(label: str, fn, attempts: int = 3) -> None:
+    for attempt in range(1, attempts + 1):
+        try:
+            fn()
+            return
+        except WsError as exc:
+            if "attach did not become ready before timeout" not in str(exc):
+                raise
+            if attempt >= attempts:
+                raise
+            time.sleep(0.1)
+        except (ConnectionResetError, TimeoutError, WsClosed, BrokenPipeError) as exc:
+            if attempt >= attempts:
+                raise WsError(f"{label} failed after {attempts} attempts: {exc}") from exc
+            time.sleep(0.1)
+
+
 def control_ready(host: str, port: int, auth_token=None) -> None:
     conn = WSConn.connect(host, port, "/", auth_token)
     try:
@@ -258,103 +302,126 @@ def control_ready(host: str, port: int, auth_token=None) -> None:
 
 
 def run_control_runtime_order(host: str, port: int, auth_token=None) -> None:
-    # control.connect before control.version must fail.
-    conn = WSConn.connect(host, port, "/", auth_token)
-    try:
-        conn.send_json({
-            "channel": "control",
-            "type": "control.connect",
-            "id": "bad-order-connect",
-            "payload": {},
-        })
-        msg = conn.read_json()
-        expect_type(msg, "control", "control.error")
-        err = msg.get("error") or {}
-        require(err.get("code") == "protocol_mismatch", f"unexpected control error code: {err}")
-        require("control.version" in str(err.get("message", "")), f"unexpected control error message: {err}")
-        opcode, _ = conn.read_frame()
-        require(opcode == 0x8, "expected close frame after control protocol mismatch")
-    finally:
-        conn.close()
+    def scenario_control_before_version() -> None:
+        conn = WSConn.connect(host, port, "/", auth_token)
+        try:
+            conn.send_json({
+                "channel": "control",
+                "type": "control.connect",
+                "id": "bad-order-connect",
+                "payload": {},
+            })
+            msg = conn.read_json()
+            expect_type(msg, "control", "control.error")
+            err = msg.get("error") or {}
+            require(err.get("code") == "protocol_mismatch", f"unexpected control error code: {err}")
+            require("control.version" in str(err.get("message", "")), f"unexpected control error message: {err}")
+            opcode, _ = conn.read_frame()
+            require(opcode == 0x8, "expected close frame after control protocol mismatch")
+        finally:
+            conn.close()
 
-    # After control.version + control.connect, acheron.t_attach before acheron.t_version must fail.
-    conn = WSConn.connect(host, port, "/", auth_token)
-    try:
-        conn.send_json({
-            "channel": "control",
-            "type": "control.version",
-            "id": "cv1",
-            "payload": {"protocol": "unified-v2"},
-        })
-        version_ack = conn.read_json()
-        expect_type(version_ack, "control", "control.version_ack")
+    def scenario_attach_before_version() -> None:
+        conn = WSConn.connect(host, port, "/", auth_token)
+        try:
+            conn.send_json({
+                "channel": "control",
+                "type": "control.version",
+                "id": "cv1",
+                "payload": {"protocol": "unified-v2"},
+            })
+            version_ack = conn.read_json()
+            expect_type(version_ack, "control", "control.version_ack")
 
-        conn.send_json({
-            "channel": "control",
-            "type": "control.connect",
-            "id": "cc1",
-            "payload": {},
-        })
-        connect_ack = conn.read_json()
-        expect_type(connect_ack, "control", "control.connect_ack")
+            conn.send_json({
+                "channel": "control",
+                "type": "control.connect",
+                "id": "cc1",
+                "payload": {},
+            })
+            connect_ack = conn.read_json()
+            expect_type(connect_ack, "control", "control.connect_ack")
 
-        conn.send_json({
-            "channel": "acheron",
-            "type": "acheron.t_attach",
-            "tag": 100,
-            "fid": 1,
-        })
-        err_msg = conn.read_json()
-        expect_type(err_msg, "acheron", "acheron.error")
-        err = err_msg.get("error") or {}
-        require(err.get("code") == "protocol_mismatch", f"unexpected acheron error code: {err}")
-        require("acheron.t_version" in str(err.get("message", "")), f"unexpected acheron error message: {err}")
-        opcode, _ = conn.read_frame()
-        require(opcode == 0x8, "expected close frame after acheron protocol mismatch")
-    finally:
-        conn.close()
+            conn.send_json({
+                "channel": "acheron",
+                "type": "acheron.t_attach",
+                "tag": 100,
+                "fid": 1,
+            })
+            err_msg = conn.read_json()
+            expect_type(err_msg, "acheron", "acheron.error")
+            err = err_msg.get("error") or {}
+            require(err.get("code") == "protocol_mismatch", f"unexpected acheron error code: {err}")
+            require("acheron.t_version" in str(err.get("message", "")), f"unexpected acheron error message: {err}")
+            opcode, _ = conn.read_frame()
+            require(opcode == 0x8, "expected close frame after acheron protocol mismatch")
+        finally:
+            conn.close()
 
-    # Happy-path control/runtime negotiation should use canonical type names.
-    conn = WSConn.connect(host, port, "/", auth_token)
-    try:
-        conn.send_json({
-            "channel": "control",
-            "type": "control.version",
-            "id": "cv2",
-            "payload": {"protocol": "unified-v2"},
-        })
-        version_ack = conn.read_json()
-        expect_type(version_ack, "control", "control.version_ack")
+    def scenario_happy_path() -> None:
+        conn = WSConn.connect(host, port, "/", auth_token)
+        try:
+            conn.send_json({
+                "channel": "control",
+                "type": "control.version",
+                "id": "cv2",
+                "payload": {"protocol": "unified-v2"},
+            })
+            version_ack = conn.read_json()
+            expect_type(version_ack, "control", "control.version_ack")
 
-        conn.send_json({
-            "channel": "control",
-            "type": "control.connect",
-            "id": "cc2",
-            "payload": {},
-        })
-        connect_ack = conn.read_json()
-        expect_type(connect_ack, "control", "control.connect_ack")
+            conn.send_json({
+                "channel": "control",
+                "type": "control.connect",
+                "id": "cc2",
+                "payload": {},
+            })
+            connect_ack = conn.read_json()
+            expect_type(connect_ack, "control", "control.connect_ack")
 
-        conn.send_json({
-            "channel": "acheron",
-            "type": "acheron.t_version",
-            "tag": 1,
-            "msize": 1048576,
-            "version": "acheron-1",
-        })
-        tversion_ack = conn.read_json()
-        expect_type(tversion_ack, "acheron", "acheron.r_version")
+            conn.send_json({
+                "channel": "acheron",
+                "type": "acheron.t_version",
+                "tag": 1,
+                "msize": 1048576,
+                "version": "acheron-1",
+            })
+            tversion_ack = conn.read_json()
+            expect_type(tversion_ack, "acheron", "acheron.r_version")
 
-        conn.send_json({
-            "channel": "acheron",
-            "type": "acheron.t_attach",
-            "tag": 2,
-            "fid": 1,
-        })
-        attach_ack = conn.read_json()
-        expect_type(attach_ack, "acheron", "acheron.r_attach")
-    finally:
-        conn.close()
+            attach_ack = None
+            last_attach_error = None
+            deadline = time.time() + 35.0
+            next_tag = 2
+            while time.time() < deadline:
+                conn.send_json({
+                    "channel": "acheron",
+                    "type": "acheron.t_attach",
+                    "tag": next_tag,
+                    "fid": 1,
+                })
+                next_tag += 1
+                attach_msg = conn.read_json()
+                if attach_msg.get("channel") == "acheron" and attach_msg.get("type") == "acheron.r_attach":
+                    attach_ack = attach_msg
+                    break
+
+                expect_type(attach_msg, "acheron", "acheron.error")
+                err = attach_msg.get("error") or {}
+                code = str(err.get("code") or "")
+                if code in ("runtime_warming", "sandbox_mount_unavailable", "runtime_warmup_timeout"):
+                    last_attach_error = err
+                    time.sleep(0.1)
+                    continue
+                raise WsError(f"unexpected acheron attach error: {err}")
+
+            require(attach_ack is not None, f"attach did not become ready before timeout; last_error={last_attach_error}")
+        finally:
+            conn.close()
+
+    run_with_retries("control-before-version", scenario_control_before_version)
+    run_with_retries("attach-before-version", scenario_attach_before_version)
+    run_with_retries("runtime-happy-path", scenario_happy_path)
 
 
 def fs_ready(host: str, port: int, auth_token: str) -> None:

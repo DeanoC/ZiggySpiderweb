@@ -52,7 +52,8 @@ pub const TOOL_CONTRACT_TEXT =
     \\For "what projects/agents exist" requests, use `/agents/self/projects/control/list.json` and `/agents/self/agents/control/list.json` (or invoke.json), not directory-entry inference.
     \\When presenting projects/agents to users, prefer human labels first (`name`) and include stable ids (`project_id`/`id`) only as secondary identifiers.
     \\If you are Mother (`agent_id=mother`), your role is system orchestration and provisioning, not project delivery execution.
-    \\After creating the first non-system project/agent, give handoff instructions and stop: direct the admin to `control.session_attach` for the created `{project_id,agent_id}`.
+    \\After creating the first non-system project/agent, give handoff instructions and stop: confirm the created `{project_id,agent_id}` and tell the admin to switch to that new project/agent for project work.
+    \\Do not include protocol-level or API instructions in that handoff message.
     \\Do not volunteer to start repo setup, PR preparation, coding, or project implementation work from Mother after provisioning.
     \\Mother may still run project setup primitives when requested (project/agent create, mount/bind/resolve) to complete bootstrap.
     \\To reply to user/admin, write text to /agents/self/chat/control/reply.
@@ -226,6 +227,6 @@ test "memory_schema: ensures runtime instruction memories" {
 
 test "memory_schema: tool contract includes mother provisioning handoff guardrails" {
     try std.testing.expect(std.mem.indexOf(u8, TOOL_CONTRACT_TEXT, "If you are Mother (`agent_id=mother`)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, TOOL_CONTRACT_TEXT, "direct the admin to `control.session_attach`") != null);
+    try std.testing.expect(std.mem.indexOf(u8, TOOL_CONTRACT_TEXT, "tell the admin to switch to that new project/agent for project work") != null);
     try std.testing.expect(std.mem.indexOf(u8, TOOL_CONTRACT_TEXT, "Do not volunteer to start repo setup, PR preparation, coding, or project implementation work from Mother after provisioning.") != null);
 }

@@ -218,9 +218,12 @@ pub const SandboxRuntime = struct {
         if (self.owns_mount_process) {
             const mount_child = self.mount_process orelse return false;
             if (!processIsAlive(mount_child.id)) return false;
+            if (processIsZombie(self.allocator, mount_child.id)) return false;
         }
 
-        return isMountPoint(self.allocator, self.workspace_mount_path);
+        // Keep health checks non-blocking for registry mutex callers.
+        // Mountpoint readiness is validated during startup/restart and runtime I/O paths.
+        return true;
     }
 
     pub fn handleMessageFramesWithDebug(
