@@ -110,6 +110,7 @@ mkdir -p "$STATE_DIR" "$AGENTS_DIR"
 CONFIG_PATH="$TMP_ROOT/config.json"
 SERVER_LOG="$TMP_ROOT/server.log"
 WS_TRACE="$TMP_ROOT/ws-trace.ndjson"
+WS_ERROR_LOG="$TMP_ROOT/ws-stderr.log"
 
 SPIDERWEB_PID=""
 WS_PID=""
@@ -273,7 +274,7 @@ next_tag() {
 }
 
 ws_open() {
-  coproc WS { "$WEBSOCAT_BIN" -H="Authorization: Bearer $ADMIN_TOKEN" "$URL"; }
+  coproc WS { "$WEBSOCAT_BIN" -H="Authorization: Bearer $ADMIN_TOKEN" "$URL" 2>>"$WS_ERROR_LOG"; }
   exec {WS_IN}>&"${WS[1]}"
   exec {WS_OUT}<&"${WS[0]}"
 }
@@ -368,12 +369,43 @@ ws_attach_with_retry() {
     if [[ "$negotiated" -eq 0 ]]; then
       ws_close
       ws_open
-      if ! ws_send "{\"channel\":\"control\",\"type\":\"control.version\",\"id\":\"${version_id}\",\"payload\":{\"protocol\":\"unified-v2\"}}" \
-        || ! ws_expect_type "control.version_ack" 10 >/dev/null \
-        || ! ws_send "{\"channel\":\"control\",\"type\":\"control.connect\",\"id\":\"${connect_id}\"}" \
-        || ! ws_expect_type "control.connect_ack" 10 >/dev/null \
-        || ! ws_send "{\"channel\":\"acheron\",\"type\":\"acheron.t_version\",\"tag\":${t_version_tag},\"msize\":1048576,\"version\":\"acheron-1\"}" \
-        || ! ws_expect_type "acheron.r_version" 10 >/dev/null; then
+      if ! ws_send "{\"channel\":\"control\",\"type\":\"control.version\",\"id\":\"${version_id}\",\"payload\":{\"protocol\":\"unified-v2\"}}"; then
+        echo "[mother-e2e] attach attempt ${attempt}/${attempts}: failed to send control.version" >&2
+        if [[ "$attempt" -lt "$attempts" ]]; then
+          sleep "$WS_ATTACH_RETRY_DELAY_SEC"
+        fi
+        continue
+      fi
+      if ! ws_expect_type "control.version_ack" 10 >/dev/null; then
+        echo "[mother-e2e] attach attempt ${attempt}/${attempts}: missing control.version_ack" >&2
+        if [[ "$attempt" -lt "$attempts" ]]; then
+          sleep "$WS_ATTACH_RETRY_DELAY_SEC"
+        fi
+        continue
+      fi
+      if ! ws_send "{\"channel\":\"control\",\"type\":\"control.connect\",\"id\":\"${connect_id}\"}"; then
+        echo "[mother-e2e] attach attempt ${attempt}/${attempts}: failed to send control.connect" >&2
+        if [[ "$attempt" -lt "$attempts" ]]; then
+          sleep "$WS_ATTACH_RETRY_DELAY_SEC"
+        fi
+        continue
+      fi
+      if ! ws_expect_type "control.connect_ack" 10 >/dev/null; then
+        echo "[mother-e2e] attach attempt ${attempt}/${attempts}: missing control.connect_ack" >&2
+        if [[ "$attempt" -lt "$attempts" ]]; then
+          sleep "$WS_ATTACH_RETRY_DELAY_SEC"
+        fi
+        continue
+      fi
+      if ! ws_send "{\"channel\":\"acheron\",\"type\":\"acheron.t_version\",\"tag\":${t_version_tag},\"msize\":1048576,\"version\":\"acheron-1\"}"; then
+        echo "[mother-e2e] attach attempt ${attempt}/${attempts}: failed to send acheron.t_version" >&2
+        if [[ "$attempt" -lt "$attempts" ]]; then
+          sleep "$WS_ATTACH_RETRY_DELAY_SEC"
+        fi
+        continue
+      fi
+      if ! ws_expect_type "acheron.r_version" 10 >/dev/null; then
+        echo "[mother-e2e] attach attempt ${attempt}/${attempts}: missing acheron.r_version" >&2
         if [[ "$attempt" -lt "$attempts" ]]; then
           sleep "$WS_ATTACH_RETRY_DELAY_SEC"
         fi
@@ -382,7 +414,15 @@ ws_attach_with_retry() {
       negotiated=1
     fi
 
-    ws_send "{\"channel\":\"acheron\",\"type\":\"acheron.t_attach\",\"tag\":${attach_tag},\"fid\":1}"
+    if ! ws_send "{\"channel\":\"acheron\",\"type\":\"acheron.t_attach\",\"tag\":${attach_tag},\"fid\":1}"; then
+      echo "[mother-e2e] attach attempt ${attempt}/${attempts}: failed to send acheron.t_attach" >&2
+      negotiated=0
+      attach_tag=$((attach_tag + 1))
+      if [[ "$attempt" -lt "$attempts" ]]; then
+        sleep "$WS_ATTACH_RETRY_DELAY_SEC"
+      fi
+      continue
+    fi
     if ws_expect_attach_ready_or_warming 5; then
       return 0
     fi
@@ -399,11 +439,20 @@ ws_attach_with_retry() {
       continue
     fi
 
+    echo "[mother-e2e] attach attempt ${attempt}/${attempts}: no attach readiness response, renegotiating" >&2
     negotiated=0
     if [[ "$attempt" -lt "$attempts" ]]; then
       sleep "$WS_ATTACH_RETRY_DELAY_SEC"
     fi
   done
+  if [[ -s "$WS_ERROR_LOG" ]]; then
+    echo "[mother-e2e] websocat stderr tail:" >&2
+    tail -n 40 "$WS_ERROR_LOG" >&2 || true
+  fi
+  if [[ -f "$SERVER_LOG" ]]; then
+    echo "[mother-e2e] server log tail:" >&2
+    tail -n 80 "$SERVER_LOG" >&2 || true
+  fi
   echo "error: websocket attach handshake failed after ${attempts} attempts" >&2
   return 1
 }

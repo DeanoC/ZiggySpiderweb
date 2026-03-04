@@ -23,12 +23,9 @@ jobs:
       extra_commands: |
         timeout 240 env SKIP_BUILD=1 bash test-env/test-distributed-workspace-matrix.sh
         timeout 240 env SKIP_BUILD=1 bash test-env/test-unified-v2-protocol.sh
-        if ! command -v websocat >/dev/null 2>&1; then
-          curl -fsSL -o /tmp/websocat https://github.com/vi/websocat/releases/download/v1.13.0/websocat.x86_64-unknown-linux-musl
-          chmod +x /tmp/websocat
-          sudo mv /tmp/websocat /usr/local/bin/websocat
-        fi
-        timeout 300 env SKIP_BUILD=1 ZIG_OUT_DIR=zig-out BIN_DIR=zig-out/bin RUN_PROVIDER_CHAT=auto CANARY_PROVIDER_NAME=openai-codex CANARY_PROVIDER_MODEL=gpt-5.3-codex ./scripts/mother-agent-e2e-suite.sh
+        curl -fsSL -o /tmp/websocat-ci https://github.com/vi/websocat/releases/download/v1.13.0/websocat.x86_64-unknown-linux-musl
+        chmod +x /tmp/websocat-ci
+        timeout 300 env SKIP_BUILD=1 ZIG_OUT_DIR=zig-out BIN_DIR=zig-out/bin RUN_PROVIDER_CHAT=auto CANARY_PROVIDER_NAME=openai-codex CANARY_PROVIDER_MODEL=gpt-5.3-codex WEBSOCAT_BIN=/tmp/websocat-ci ./scripts/mother-agent-e2e-suite.sh
 
   windows-fs-tests:
     name: windows-fs-tests
