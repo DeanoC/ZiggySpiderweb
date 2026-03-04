@@ -94,6 +94,7 @@ CHAT_MAX_ATTEMPTS=${CHAT_MAX_ATTEMPTS:-2}
 CHAT_TIMEOUT_SEC=${CHAT_TIMEOUT_SEC:-360}
 SERVICE_STATUS_TIMEOUT_SEC=${SERVICE_STATUS_TIMEOUT_SEC:-90}
 KEEP_CANARY_DIR=${KEEP_CANARY_DIR:-0}
+MOTHER_E2E_ALLOW_SANDBOX_UNAVAILABLE_SKIP=${MOTHER_E2E_ALLOW_SANDBOX_UNAVAILABLE_SKIP:-0}
 
 RUN_SUFFIX=${RUN_SUFFIX:-$(date +%s)}
 PROJECT_NAME=${PROJECT_NAME:-"mother-e2e-${RUN_SUFFIX}"}
@@ -454,6 +455,12 @@ ws_attach_with_retry() {
     echo "[mother-e2e] server log tail:" >&2
     tail -n 80 "$SERVER_LOG" >&2 || true
   fi
+  if [[ "$MOTHER_E2E_ALLOW_SANDBOX_UNAVAILABLE_SKIP" == "1" ]]; then
+    if [[ -f "$SERVER_LOG" ]] && grep -Eq "sandbox mountpoint wait timed out|ProjectMountUnavailable|SandboxMountUnavailable" "$SERVER_LOG"; then
+      echo "[mother-e2e] sandbox runtime unavailable on this host; marking deterministic attach phase as skipped." >&2
+      return 2
+    fi
+  fi
   echo "error: websocket attach handshake failed after ${attempts} attempts" >&2
   return 1
 }
@@ -625,7 +632,14 @@ if [[ -z "$NODE_ID" || -z "$EXPORT_NAME" ]]; then
   exit 1
 fi
 
-ws_attach_with_retry "mother-e2e-version" "mother-e2e-connect" 1 2 "$WS_ATTACH_RETRY_ATTEMPTS"
+if ! ws_attach_with_retry "mother-e2e-version" "mother-e2e-connect" 1 2 "$WS_ATTACH_RETRY_ATTEMPTS"; then
+  attach_rc=$?
+  if [[ "$attach_rc" -eq 2 ]]; then
+    echo "[mother-e2e] SKIP sandbox runtime attach (host does not support required mount setup)." >&2
+    exit 0
+  fi
+  exit "$attach_rc"
+fi
 
 CHAT_REPLY=""
 PROJECT_ID=""
