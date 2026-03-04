@@ -88,7 +88,7 @@ fi
 CANARY_PORT=${CANARY_PORT:-28832}
 CONTROL_RETRY_ATTEMPTS=${CONTROL_RETRY_ATTEMPTS:-40}
 CONTROL_RETRY_DELAY_SEC=${CONTROL_RETRY_DELAY_SEC:-0.25}
-WS_ATTACH_RETRY_ATTEMPTS=${WS_ATTACH_RETRY_ATTEMPTS:-90}
+WS_ATTACH_RETRY_ATTEMPTS=${WS_ATTACH_RETRY_ATTEMPTS:-30}
 WS_ATTACH_RETRY_DELAY_SEC=${WS_ATTACH_RETRY_DELAY_SEC:-2}
 CHAT_MAX_ATTEMPTS=${CHAT_MAX_ATTEMPTS:-2}
 CHAT_TIMEOUT_SEC=${CHAT_TIMEOUT_SEC:-360}
@@ -352,8 +352,7 @@ ws_expect_attach_ready_or_warming() {
       fi
     fi
   done
-  echo "error: timeout waiting for acheron.r_attach" >&2
-  return 1
+  return 2
 }
 
 ws_attach_with_retry() {
@@ -370,11 +369,11 @@ ws_attach_with_retry() {
       ws_close
       ws_open
       if ! ws_send "{\"channel\":\"control\",\"type\":\"control.version\",\"id\":\"${version_id}\",\"payload\":{\"protocol\":\"unified-v2\"}}" \
-        || ! ws_expect_type "control.version_ack" 30 >/dev/null \
+        || ! ws_expect_type "control.version_ack" 10 >/dev/null \
         || ! ws_send "{\"channel\":\"control\",\"type\":\"control.connect\",\"id\":\"${connect_id}\"}" \
-        || ! ws_expect_type "control.connect_ack" 30 >/dev/null \
+        || ! ws_expect_type "control.connect_ack" 10 >/dev/null \
         || ! ws_send "{\"channel\":\"acheron\",\"type\":\"acheron.t_version\",\"tag\":${t_version_tag},\"msize\":1048576,\"version\":\"acheron-1\"}" \
-        || ! ws_expect_type "acheron.r_version" 30 >/dev/null; then
+        || ! ws_expect_type "acheron.r_version" 10 >/dev/null; then
         if [[ "$attempt" -lt "$attempts" ]]; then
           sleep "$WS_ATTACH_RETRY_DELAY_SEC"
         fi
@@ -384,13 +383,16 @@ ws_attach_with_retry() {
     fi
 
     ws_send "{\"channel\":\"acheron\",\"type\":\"acheron.t_attach\",\"tag\":${attach_tag},\"fid\":1}"
-    if ws_expect_attach_ready_or_warming 30; then
+    if ws_expect_attach_ready_or_warming 5; then
       return 0
     fi
     attach_status=$?
     attach_tag=$((attach_tag + 1))
 
     if [[ "$attach_status" -eq 2 ]]; then
+      if (( attempt % 5 == 0 )); then
+        echo "[mother-e2e] attach pending (attempt ${attempt}/${attempts})" >&2
+      fi
       if [[ "$attempt" -lt "$attempts" ]]; then
         sleep "$WS_ATTACH_RETRY_DELAY_SEC"
       fi
