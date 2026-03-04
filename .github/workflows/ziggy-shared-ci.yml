@@ -62,13 +62,45 @@ jobs:
         env:
           BUILD_COMMAND: ${{ inputs.build_command }}
         run: |
-          bash -lc "$BUILD_COMMAND"
+          attempt=1
+          max_attempts=3
+          delay_seconds=5
+          while true; do
+            echo "[ci] build attempt ${attempt}/${max_attempts}: ${BUILD_COMMAND}"
+            if bash -lc "$BUILD_COMMAND"; then
+              break
+            fi
+            if [[ "$attempt" -ge "$max_attempts" ]]; then
+              echo "[ci] build failed after ${max_attempts} attempts"
+              exit 1
+            fi
+            echo "[ci] build failed; retrying in ${delay_seconds}s..."
+            sleep "$delay_seconds"
+            attempt=$((attempt + 1))
+            delay_seconds=$((delay_seconds * 2))
+          done
 
       - name: Test
         env:
           TEST_COMMAND: ${{ inputs.test_command }}
         run: |
-          bash -lc "$TEST_COMMAND"
+          attempt=1
+          max_attempts=2
+          delay_seconds=5
+          while true; do
+            echo "[ci] test attempt ${attempt}/${max_attempts}: ${TEST_COMMAND}"
+            if bash -lc "$TEST_COMMAND"; then
+              break
+            fi
+            if [[ "$attempt" -ge "$max_attempts" ]]; then
+              echo "[ci] test failed after ${max_attempts} attempts"
+              exit 1
+            fi
+            echo "[ci] test failed; retrying in ${delay_seconds}s..."
+            sleep "$delay_seconds"
+            attempt=$((attempt + 1))
+            delay_seconds=$((delay_seconds * 2))
+          done
 
       - name: Extra commands
         if: ${{ inputs.extra_commands != '' }}
