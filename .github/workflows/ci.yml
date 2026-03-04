@@ -21,14 +21,14 @@ jobs:
         grep -q 'ziggy_run_orchestrator' build.zig.zon
         grep -q '\.hash =' build.zig.zon
       extra_commands: |
-        SKIP_BUILD=1 bash test-env/test-distributed-workspace-matrix.sh
-        SKIP_BUILD=1 bash test-env/test-unified-v2-protocol.sh
+        timeout 900 env SKIP_BUILD=1 bash test-env/test-distributed-workspace-matrix.sh
+        timeout 900 env SKIP_BUILD=1 bash test-env/test-unified-v2-protocol.sh
         if ! command -v websocat >/dev/null 2>&1; then
           curl -fsSL -o /tmp/websocat https://github.com/vi/websocat/releases/download/v1.13.0/websocat.x86_64-unknown-linux-musl
           chmod +x /tmp/websocat
           sudo mv /tmp/websocat /usr/local/bin/websocat
         fi
-        SKIP_BUILD=1 ZIG_OUT_DIR=zig-out BIN_DIR=zig-out/bin RUN_PROVIDER_CHAT=auto CANARY_PROVIDER_NAME=openai-codex CANARY_PROVIDER_MODEL=gpt-5.3-codex ./scripts/mother-agent-e2e-suite.sh
+        timeout 900 env SKIP_BUILD=1 ZIG_OUT_DIR=zig-out BIN_DIR=zig-out/bin RUN_PROVIDER_CHAT=auto CANARY_PROVIDER_NAME=openai-codex CANARY_PROVIDER_MODEL=gpt-5.3-codex ./scripts/mother-agent-e2e-suite.sh
 
   windows-fs-tests:
     name: windows-fs-tests
