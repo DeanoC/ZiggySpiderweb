@@ -327,25 +327,77 @@ ws_expect_type() {
   return 1
 }
 
+ws_expect_attach_ready_or_warming() {
+  local timeout_sec="$1"
+  local deadline=$((SECONDS + timeout_sec))
+  local line
+  while (( SECONDS < deadline )); do
+    if IFS= read -r -t 1 -u "$WS_OUT" line; then
+      [[ -z "$line" ]] && continue
+      printf '%s\n' "$line" >> "$WS_TRACE"
+      local line_type
+      line_type=$($JQ_BIN -r '.type // empty' 2>/dev/null <<<"$line" || true)
+      if [[ "$line_type" == "acheron.r_attach" ]]; then
+        return 0
+      fi
+      if [[ "$line_type" == "acheron.error" || "$line_type" == "acheron.err" || "$line_type" == "acheron.err_fs" ]]; then
+        local err_code
+        err_code=$($JQ_BIN -r '.error.code // empty' 2>/dev/null <<<"$line" || true)
+        if [[ "$err_code" == "runtime_warming" || "$err_code" == "sandbox_mount_unavailable" || "$err_code" == "runtime_warmup_timeout" ]]; then
+          return 2
+        fi
+        echo "error: unexpected error frame while waiting for acheron.r_attach" >&2
+        echo "$line" >&2
+        return 1
+      fi
+    fi
+  done
+  echo "error: timeout waiting for acheron.r_attach" >&2
+  return 1
+}
+
 ws_attach_with_retry() {
   local version_id="$1"
   local connect_id="$2"
   local t_version_tag="$3"
   local t_attach_tag="$4"
   local attempts="$5"
+  local attach_tag="$t_attach_tag"
+  local negotiated=0
+  local attach_status=0
   for attempt in $(seq 1 "$attempts"); do
-    ws_close
-    ws_open
-    if ws_send "{\"channel\":\"control\",\"type\":\"control.version\",\"id\":\"${version_id}\",\"payload\":{\"protocol\":\"unified-v2\"}}" \
-      && ws_expect_type "control.version_ack" 30 >/dev/null \
-      && ws_send "{\"channel\":\"control\",\"type\":\"control.connect\",\"id\":\"${connect_id}\"}" \
-      && ws_expect_type "control.connect_ack" 30 >/dev/null \
-      && ws_send "{\"channel\":\"acheron\",\"type\":\"acheron.t_version\",\"tag\":${t_version_tag},\"msize\":1048576,\"version\":\"acheron-1\"}" \
-      && ws_expect_type "acheron.r_version" 30 >/dev/null \
-      && ws_send "{\"channel\":\"acheron\",\"type\":\"acheron.t_attach\",\"tag\":${t_attach_tag},\"fid\":1}" \
-      && ws_expect_type "acheron.r_attach" 30 >/dev/null; then
+    if [[ "$negotiated" -eq 0 ]]; then
+      ws_close
+      ws_open
+      if ! ws_send "{\"channel\":\"control\",\"type\":\"control.version\",\"id\":\"${version_id}\",\"payload\":{\"protocol\":\"unified-v2\"}}" \
+        || ! ws_expect_type "control.version_ack" 30 >/dev/null \
+        || ! ws_send "{\"channel\":\"control\",\"type\":\"control.connect\",\"id\":\"${connect_id}\"}" \
+        || ! ws_expect_type "control.connect_ack" 30 >/dev/null \
+        || ! ws_send "{\"channel\":\"acheron\",\"type\":\"acheron.t_version\",\"tag\":${t_version_tag},\"msize\":1048576,\"version\":\"acheron-1\"}" \
+        || ! ws_expect_type "acheron.r_version" 30 >/dev/null; then
+        if [[ "$attempt" -lt "$attempts" ]]; then
+          sleep "$WS_ATTACH_RETRY_DELAY_SEC"
+        fi
+        continue
+      fi
+      negotiated=1
+    fi
+
+    ws_send "{\"channel\":\"acheron\",\"type\":\"acheron.t_attach\",\"tag\":${attach_tag},\"fid\":1}"
+    if ws_expect_attach_ready_or_warming 30; then
       return 0
     fi
+    attach_status=$?
+    attach_tag=$((attach_tag + 1))
+
+    if [[ "$attach_status" -eq 2 ]]; then
+      if [[ "$attempt" -lt "$attempts" ]]; then
+        sleep "$WS_ATTACH_RETRY_DELAY_SEC"
+      fi
+      continue
+    fi
+
+    negotiated=0
     if [[ "$attempt" -lt "$attempts" ]]; then
       sleep "$WS_ATTACH_RETRY_DELAY_SEC"
     fi
