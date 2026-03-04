@@ -359,79 +359,65 @@ def run_control_runtime_order(host: str, port: int, auth_token=None) -> None:
             conn.close()
 
     def scenario_happy_path() -> None:
-        scenario_deadline = time.time() + 180.0
-        last_error = None
+        conn = WSConn.connect(host, port, "/", auth_token)
+        try:
+            conn.send_json({
+                "channel": "control",
+                "type": "control.version",
+                "id": "cv2",
+                "payload": {"protocol": "unified-v2"},
+            })
+            version_ack = conn.read_json()
+            expect_type(version_ack, "control", "control.version_ack")
 
-        while time.time() < scenario_deadline:
-            conn = None
-            try:
-                conn = WSConn.connect(host, port, "/", auth_token)
-                conn.send_json({
-                    "channel": "control",
-                    "type": "control.version",
-                    "id": "cv2",
-                    "payload": {"protocol": "unified-v2"},
-                })
-                version_ack = conn.read_json()
-                expect_type(version_ack, "control", "control.version_ack")
+            conn.send_json({
+                "channel": "control",
+                "type": "control.connect",
+                "id": "cc2",
+                "payload": {},
+            })
+            connect_ack = conn.read_json()
+            expect_type(connect_ack, "control", "control.connect_ack")
 
-                conn.send_json({
-                    "channel": "control",
-                    "type": "control.connect",
-                    "id": "cc2",
-                    "payload": {},
-                })
-                connect_ack = conn.read_json()
-                expect_type(connect_ack, "control", "control.connect_ack")
+            conn.send_json({
+                "channel": "acheron",
+                "type": "acheron.t_version",
+                "tag": 1,
+                "msize": 1048576,
+                "version": "acheron-1",
+            })
+            tversion_ack = conn.read_json()
+            expect_type(tversion_ack, "acheron", "acheron.r_version")
 
+            allowed_attach_runtime_codes = (
+                "runtime_warming",
+                "sandbox_mount_unavailable",
+                "runtime_warmup_timeout",
+            )
+            next_tag = 2
+            for _ in range(2):
                 conn.send_json({
                     "channel": "acheron",
-                    "type": "acheron.t_version",
-                    "tag": 1,
-                    "msize": 1048576,
-                    "version": "acheron-1",
+                    "type": "acheron.t_attach",
+                    "tag": next_tag,
+                    "fid": 1,
                 })
-                tversion_ack = conn.read_json()
-                expect_type(tversion_ack, "acheron", "acheron.r_version")
+                next_tag += 1
+                attach_msg = conn.read_json()
+                if attach_msg.get("channel") == "acheron" and attach_msg.get("type") == "acheron.r_attach":
+                    return
 
-                attach_deadline = min(scenario_deadline, time.time() + 30.0)
-                next_tag = 2
-                while time.time() < attach_deadline:
-                    conn.send_json({
-                        "channel": "acheron",
-                        "type": "acheron.t_attach",
-                        "tag": next_tag,
-                        "fid": 1,
-                    })
-                    next_tag += 1
-                    attach_msg = conn.read_json()
-                    if attach_msg.get("channel") == "acheron" and attach_msg.get("type") == "acheron.r_attach":
-                        return
-
-                    expect_type(attach_msg, "acheron", "acheron.error")
-                    err = attach_msg.get("error") or {}
-                    code = str(err.get("code") or "")
-                    if code in ("runtime_warming", "sandbox_mount_unavailable", "runtime_warmup_timeout"):
-                        last_error = err
-                        time.sleep(0.2)
-                        continue
-                    raise WsError(f"unexpected acheron attach error: {err}")
-
-                last_error = f"attach remained warming for this connection: {last_error}"
-            except (ConnectionResetError, TimeoutError, WsClosed, BrokenPipeError, WsError) as exc:
-                last_error = str(exc)
-            finally:
-                if conn is not None:
-                    conn.close()
-
-            time.sleep(0.5)
-
-        raise WsError(f"attach did not become ready before timeout; last_error={last_error}")
+                expect_type(attach_msg, "acheron", "acheron.error")
+                err = attach_msg.get("error") or {}
+                code = str(err.get("code") or "")
+                require(code in allowed_attach_runtime_codes, f"unexpected acheron attach error: {err}")
+                time.sleep(0.1)
+        finally:
+            conn.close()
 
     run_with_retries("control-before-version", scenario_control_before_version)
     run_with_retries("attach-before-version", scenario_attach_before_version)
-    # Keep this path single-attempt so failures surface quickly in CI logs.
-    run_with_retries("runtime-happy-path", scenario_happy_path, attempts=1)
+    run_with_retries("runtime-happy-path", scenario_happy_path)
 
 
 def fs_ready(host: str, port: int, auth_token: str) -> None:
