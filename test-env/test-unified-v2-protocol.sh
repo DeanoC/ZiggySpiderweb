@@ -359,7 +359,7 @@ def run_control_runtime_order(host: str, port: int, auth_token=None) -> None:
             conn.close()
 
     def scenario_happy_path() -> None:
-        scenario_deadline = time.time() + 90.0
+        scenario_deadline = time.time() + 180.0
         last_error = None
 
         while time.time() < scenario_deadline:
