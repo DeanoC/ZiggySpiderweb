@@ -58,11 +58,25 @@ fi
 control_call() {
     local op="$1"
     local payload="${2-}"
-    if [[ -n "$payload" ]]; then
-        "$CONTROL_BIN" "${CONTROL_ARGS[@]}" "$op" "$payload"
-    else
-        "$CONTROL_BIN" "${CONTROL_ARGS[@]}" "$op"
-    fi
+    local attempt output
+    for attempt in $(seq 1 5); do
+        if [[ -n "$payload" ]]; then
+            output="$(timeout 20 "$CONTROL_BIN" "${CONTROL_ARGS[@]}" "$op" "$payload" 2>&1)" && {
+                printf '%s\n' "$output"
+                return 0
+            }
+        else
+            output="$(timeout 20 "$CONTROL_BIN" "${CONTROL_ARGS[@]}" "$op" 2>&1)" && {
+                printf '%s\n' "$output"
+                return 0
+            }
+        fi
+        if [[ "$attempt" -lt 5 ]]; then
+            sleep 0.2
+        fi
+    done
+    echo "$output" >&2
+    return 1
 }
 
 json_query() {
@@ -192,7 +206,7 @@ NODE_ID="$(json_query "$JOIN_RESP" "payload.node_id")"
 
 PROJECT_NAME="Drift Matrix $(date +%s)"
 # Use export_name=missing to exercise desired/actual drift metadata paths.
-PROJECT_UP_PAYLOAD="$(printf '{"name":"%s","activate":true,"desired_mounts":[{"mount_path":"/broken","node_id":"%s","export_name":"missing"}]}' "$PROJECT_NAME" "$NODE_ID")"
+PROJECT_UP_PAYLOAD="$(printf '{"name":"%s","vision":"%s","activate":true,"desired_mounts":[{"mount_path":"/broken","node_id":"%s","export_name":"missing"}]}' "$PROJECT_NAME" "$PROJECT_NAME" "$NODE_ID")"
 PROJECT_UP_RESP="$(control_call project_up "$PROJECT_UP_PAYLOAD")"
 PROJECT_ID="$(json_query "$PROJECT_UP_RESP" "payload.project_id")"
 

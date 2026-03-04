@@ -1021,7 +1021,21 @@ PY
 log_pass "control-plane state recovered after spiderweb restart"
 
 WORKSPACE_URL="ws://$BIND_ADDR:$SPIDERWEB_PORT/"
-INITIAL_READ="$("$FS_MOUNT_BIN" --workspace-url "$WORKSPACE_URL" cat "/src/$FIXTURE_NAME")"
+INITIAL_READ=""
+initial_read_ok=0
+for _ in $(seq 1 150); do
+    if INITIAL_READ="$("$FS_MOUNT_BIN" --workspace-url "$WORKSPACE_URL" cat "/src/$FIXTURE_NAME" 2>/dev/null)"; then
+        initial_read_ok=1
+        break
+    fi
+    sleep 0.2
+done
+if [[ "$initial_read_ok" -ne 1 ]]; then
+    log_fail "initial read did not converge after restart"
+    echo "--- spiderweb log ---"
+    cat "$SPIDERWEB_LOG"
+    exit 1
+fi
 
 FAILOVER_TARGET_CONTENT=""
 STOPPED_NODE_PORT=""

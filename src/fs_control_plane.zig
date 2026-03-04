@@ -483,7 +483,11 @@ pub const ControlPlane = struct {
         }
 
         if (self.active_project_by_agent.getPtr(self.primary_agent_id)) |existing| {
-            if (!std.mem.eql(u8, existing.*, spider_web_project_id)) {
+            if (existing.*.len == 0) {
+                self.allocator.free(existing.*);
+                existing.* = try self.allocator.dupe(u8, spider_web_project_id);
+                changed = true;
+            } else if (!self.projects.contains(existing.*)) {
                 self.allocator.free(existing.*);
                 existing.* = try self.allocator.dupe(u8, spider_web_project_id);
                 changed = true;
@@ -1982,7 +1986,7 @@ pub const ControlPlane = struct {
         try validateIdentifier(project_id, 128);
         const project = self.projects.get(project_id) orelse return ControlPlaneError.ProjectNotFound;
         const is_primary_agent = self.isPrimaryAgent(agent_id);
-        if (is_primary_agent and !std.mem.eql(u8, project_id, spider_web_project_id)) {
+        if (is_primary_agent and !is_admin and !std.mem.eql(u8, project_id, spider_web_project_id)) {
             return ControlPlaneError.ProjectAssignmentForbidden;
         }
         if (project.kind == .spider_web_builtin and !(is_primary_agent or is_admin)) return ControlPlaneError.ProjectAssignmentForbidden;
@@ -2266,7 +2270,7 @@ pub const ControlPlane = struct {
         if (mounts_replaced) self.mount_sets_total +%= 1;
 
         if (activate) {
-            if (is_primary_agent and !std.mem.eql(u8, project.id, spider_web_project_id)) {
+            if (is_primary_agent and !is_admin and !std.mem.eql(u8, project.id, spider_web_project_id)) {
                 return ControlPlaneError.ProjectAssignmentForbidden;
             }
             if (project.kind == .spider_web_builtin and !(is_primary_agent or is_admin)) {
@@ -5128,6 +5132,16 @@ test "fs_control_plane: builtin system project is protected and primary-only" {
         ControlPlaneError.ProjectAssignmentForbidden,
         plane.activateProject("mother", activate_non_system),
     );
+
+    const activated_admin = try plane.activateProjectWithRole("mother", activate_non_system, true);
+    defer allocator.free(activated_admin);
+    try std.testing.expect(std.mem.indexOf(u8, activated_admin, "\"project_id\":\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, activated_admin, non_system_project_id) != null);
+
+    const status_admin = try plane.workspaceStatusWithRole("mother", activate_non_system, true);
+    defer allocator.free(status_admin);
+    try std.testing.expect(std.mem.indexOf(u8, status_admin, "\"project_id\":\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status_admin, non_system_project_id) != null);
 }
 
 test "fs_control_plane: builtin system mount can be bound from local node" {
@@ -6719,5 +6733,49 @@ test "fs_control_plane: persistence restores nodes projects mounts and active wo
         const invite2 = try plane.createNodeInvite(null);
         defer allocator.free(invite2);
         try std.testing.expect(std.mem.indexOf(u8, invite2, "\"invite_id\":\"invite-2\"") != null);
+    }
+}
+
+test "fs_control_plane: persistence keeps primary active project override" {
+    const allocator = std.testing.allocator;
+    const dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/fs-control-plane-primary-{d}", .{std.time.nanoTimestamp()});
+    defer allocator.free(dir);
+    defer std.fs.cwd().deleteTree(dir) catch {};
+
+    try std.fs.cwd().makePath(dir);
+
+    var expected_project_id: ?[]u8 = null;
+    defer if (expected_project_id) |id| allocator.free(id);
+
+    {
+        var plane = ControlPlane.initWithPersistence(allocator, dir, "control-plane.db");
+        defer plane.deinit();
+
+        const project_json = try plane.createProject("{\"name\":\"PrimaryPersist\",\"vision\":\"PrimaryPersist\"}");
+        defer allocator.free(project_json);
+        var project_parsed = try std.json.parseFromSlice(std.json.Value, allocator, project_json, .{});
+        defer project_parsed.deinit();
+        const project_id = project_parsed.value.object.get("project_id").?.string;
+        const project_token = project_parsed.value.object.get("project_token").?.string;
+        expected_project_id = try allocator.dupe(u8, project_id);
+
+        const activate_req = try std.fmt.allocPrint(
+            allocator,
+            "{{\"project_id\":\"{s}\",\"project_token\":\"{s}\"}}",
+            .{ project_id, project_token },
+        );
+        defer allocator.free(activate_req);
+        const activated = try plane.activateProjectWithRole("mother", activate_req, true);
+        defer allocator.free(activated);
+        try std.testing.expect(std.mem.indexOf(u8, activated, expected_project_id.?) != null);
+    }
+
+    {
+        var plane = ControlPlane.initWithPersistence(allocator, dir, "control-plane.db");
+        defer plane.deinit();
+
+        const status = try plane.workspaceStatusWithRole("mother", null, true);
+        defer allocator.free(status);
+        try std.testing.expect(std.mem.indexOf(u8, status, expected_project_id.?) != null);
     }
 }

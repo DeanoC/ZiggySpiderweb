@@ -351,6 +351,7 @@ pub const Session = struct {
     current_terminal_session_id: ?[]u8 = null,
     next_terminal_session_seq: u64 = 1,
     next_thought_seq: u64 = 1,
+    thought_log_sync_offsets: std.StringHashMapUnmanaged(usize) = .{},
     project_binds: std.ArrayListUnmanaged(PathBind) = .{},
 
     pub fn init(
@@ -418,6 +419,7 @@ pub const Session = struct {
         self.clearSignalEvents();
         self.clearTerminalSessions();
         self.clearProjectBinds();
+        self.clearThoughtLogSyncOffsets();
         var it = self.nodes.iterator();
         while (it.next()) |entry| {
             var node = entry.value_ptr.*;
@@ -5754,6 +5756,9 @@ pub const Session = struct {
                                     }
                                 }
                             }
+                        } else if (std.mem.eql(u8, type_value.string, "agent.thought")) {
+                            // Thought telemetry is replayed from persisted job logs when
+                            // job status/result/log files are refreshed.
                         } else if (std.mem.eql(u8, type_value.string, "error")) {
                             failed = true;
                             if (obj.get("message")) |err_msg| {
@@ -8180,6 +8185,13 @@ pub const Session = struct {
         self.project_binds = .{};
     }
 
+    fn clearThoughtLogSyncOffsets(self: *Session) void {
+        var it = self.thought_log_sync_offsets.iterator();
+        while (it.next()) |entry| self.allocator.free(entry.key_ptr.*);
+        self.thought_log_sync_offsets.deinit(self.allocator);
+        self.thought_log_sync_offsets = .{};
+    }
+
     fn handleEventWaitConfigWrite(self: *Session, node_id: u32, raw_input: []const u8) !WriteOutcome {
         const written = raw_input.len;
         const trimmed = std.mem.trim(u8, raw_input, " \t\r\n");
@@ -8801,6 +8813,7 @@ pub const Session = struct {
         var view = owned_view.?;
         defer view.deinit(self.allocator);
         if (!std.mem.eql(u8, view.agent_id, self.agent_id)) return;
+        if (view.log_text) |log_text| try self.syncThoughtFramesFromJobLog(job_id, log_text);
 
         switch (special) {
             .job_status => {
@@ -8816,6 +8829,59 @@ pub const Session = struct {
             },
             else => {},
         }
+    }
+
+    fn syncThoughtFramesFromJobLog(self: *Session, job_id: []const u8, log_text: []const u8) !void {
+        if (log_text.len == 0) return;
+
+        const offset_ptr = blk: {
+            const gop = try self.thought_log_sync_offsets.getOrPut(self.allocator, job_id);
+            if (!gop.found_existing) {
+                gop.key_ptr.* = try self.allocator.dupe(u8, job_id);
+                gop.value_ptr.* = 0;
+            }
+            break :blk gop.value_ptr;
+        };
+
+        var cursor = offset_ptr.*;
+        if (cursor > log_text.len) cursor = 0;
+
+        while (cursor < log_text.len) {
+            const line_end = std.mem.indexOfScalarPos(u8, log_text, cursor, '\n') orelse log_text.len;
+            const line = std.mem.trim(u8, log_text[cursor..line_end], " \t\r\n");
+            self.tryRecordThoughtFrameFromLogLine(line);
+            cursor = if (line_end < log_text.len) line_end + 1 else line_end;
+        }
+
+        offset_ptr.* = log_text.len;
+    }
+
+    fn tryRecordThoughtFrameFromLogLine(self: *Session, line: []const u8) void {
+        if (line.len == 0 or line[0] != '{') return;
+
+        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, line, .{}) catch return;
+        defer parsed.deinit();
+        if (parsed.value != .object) return;
+
+        const obj = parsed.value.object;
+        const type_value = obj.get("type") orelse return;
+        if (type_value != .string or !std.mem.eql(u8, type_value.string, "agent.thought")) return;
+
+        const thought_content = obj.get("content") orelse return;
+        if (thought_content != .string) return;
+
+        const source = if (obj.get("source")) |value|
+            if (value == .string and value.string.len > 0) value.string else null
+        else
+            null;
+        const round = if (obj.get("round")) |value|
+            if (value == .integer and value.integer >= 0) @as(usize, @intCast(value.integer)) else null
+        else
+            null;
+
+        self.recordThoughtFrame(thought_content.string, source, round) catch |err| {
+            std.log.warn("failed to persist thought frame from job log: {s}", .{@errorName(err)});
+        };
     }
 
     fn refreshAgentServicesIndex(self: *Session, node_id: u32) !void {
@@ -9740,6 +9806,82 @@ test "fsrpc_session: thoughts namespace exposes latest history and status files"
     );
     defer allocator.free(history_payload);
     try std.testing.expectEqualStrings("", history_payload);
+}
+
+test "fsrpc_session: job log thought frames refresh thoughts namespace once" {
+    const allocator = std.testing.allocator;
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    const job_id = try job_index.createJob("default", "corr-thought-sync");
+    defer allocator.free(job_id);
+    try job_index.markCompleted(
+        job_id,
+        true,
+        "done",
+        null,
+        "{\"type\":\"agent.thought\",\"source\":\"thinking\",\"round\":1,\"content\":\"drafting test plan\"}\n{\"type\":\"session.receive\",\"content\":\"done\"}\n",
+    );
+
+    var session = try Session.init(allocator, runtime_handle, &job_index, "default");
+    defer session.deinit();
+
+    const job_status_path = [_][]const u8{ "agents", "self", "jobs", job_id, "status.json" };
+    const status_payload = try protocolReadFile(&session, allocator, 341, 342, job_status_path[0..], 451);
+    defer allocator.free(status_payload);
+    try std.testing.expect(std.mem.indexOf(u8, status_payload, "\"state\":\"done\"") != null);
+
+    const latest_payload = try protocolReadFile(
+        &session,
+        allocator,
+        343,
+        344,
+        &.{ "agents", "self", "thoughts", "latest.txt" },
+        452,
+    );
+    defer allocator.free(latest_payload);
+    try std.testing.expectEqualStrings("drafting test plan", latest_payload);
+
+    const history_payload = try protocolReadFile(
+        &session,
+        allocator,
+        345,
+        346,
+        &.{ "agents", "self", "thoughts", "history.ndjson" },
+        453,
+    );
+    defer allocator.free(history_payload);
+    try std.testing.expect(std.mem.indexOf(u8, history_payload, "\"content\":\"drafting test plan\"") != null);
+
+    const thought_status_payload = try protocolReadFile(
+        &session,
+        allocator,
+        347,
+        348,
+        &.{ "agents", "self", "thoughts", "status.json" },
+        454,
+    );
+    defer allocator.free(thought_status_payload);
+    try std.testing.expect(std.mem.indexOf(u8, thought_status_payload, "\"count\":1") != null);
+
+    const status_payload_second = try protocolReadFile(&session, allocator, 349, 350, job_status_path[0..], 455);
+    defer allocator.free(status_payload_second);
+    try std.testing.expect(std.mem.indexOf(u8, status_payload_second, "\"state\":\"done\"") != null);
+
+    const thought_status_payload_second = try protocolReadFile(
+        &session,
+        allocator,
+        351,
+        352,
+        &.{ "agents", "self", "thoughts", "status.json" },
+        456,
+    );
+    defer allocator.free(thought_status_payload_second);
+    try std.testing.expect(std.mem.indexOf(u8, thought_status_payload_second, "\"count\":1") != null);
 }
 
 test "fsrpc_session: admin debug stream logs runtime frames as synthetic debug events" {

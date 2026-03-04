@@ -163,7 +163,7 @@ fn safeFileRead(
     };
     defer file.close();
 
-    const file_size = file.getEndPos() catch 0;
+    const file_size = if (file.stat()) |stat| stat.size else |_| 0;
     const content_buffer = allocator.alloc(u8, effective_max) catch return failResult(allocator, .execution_failed, "out of memory");
     defer allocator.free(content_buffer);
     const content_len = if (wait_until_ready)
