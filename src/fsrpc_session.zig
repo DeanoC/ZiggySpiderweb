@@ -167,6 +167,24 @@ const WriteOutcome = struct {
     chat_reply_content: ?[]u8 = null,
 };
 
+const AsyncChatRuntimeContext = struct {
+    allocator: std.mem.Allocator,
+    runtime_handle: *runtime_handle_mod.RuntimeHandle,
+    job_index: *chat_job_index.ChatJobIndex,
+    emit_debug: bool = false,
+    job_name: ?[]u8 = null,
+    input: ?[]u8 = null,
+    correlation_id: ?[]u8 = null,
+
+    fn deinit(self: *AsyncChatRuntimeContext) void {
+        if (self.job_name) |value| self.allocator.free(value);
+        if (self.input) |value| self.allocator.free(value);
+        if (self.correlation_id) |value| self.allocator.free(value);
+        self.runtime_handle.release();
+        self.allocator.destroy(self);
+    }
+};
+
 const PathBind = struct {
     bind_path: []u8,
     target_path: []u8,
@@ -333,6 +351,7 @@ pub const Session = struct {
     current_terminal_session_id: ?[]u8 = null,
     next_terminal_session_seq: u64 = 1,
     next_thought_seq: u64 = 1,
+    thought_log_sync_offsets: std.StringHashMapUnmanaged(usize) = .{},
     project_binds: std.ArrayListUnmanaged(PathBind) = .{},
 
     pub fn init(
@@ -400,6 +419,7 @@ pub const Session = struct {
         self.clearSignalEvents();
         self.clearTerminalSessions();
         self.clearProjectBinds();
+        self.clearThoughtLogSyncOffsets();
         var it = self.nodes.iterator();
         while (it.next()) |entry| {
             var node = entry.value_ptr.*;
@@ -678,7 +698,10 @@ pub const Session = struct {
                         try self.syncDebugStreamLogFromControlPlane();
                     }
                     switch (node.special) {
-                        .job_status, .job_result => {
+                        .job_status => {
+                            try self.refreshJobNodeFromIndex(state.node_id, node.special);
+                        },
+                        .job_result => {
                             try self.waitForJobTerminalState(state.node_id);
                             try self.refreshJobNodeFromIndex(state.node_id, node.special);
                         },
@@ -5545,34 +5568,140 @@ pub const Session = struct {
         defer self.allocator.free(running_status);
         try self.setFileContent(status_id, running_status);
 
-        const escaped = try unified.jsonEscape(self.allocator, input);
-        defer self.allocator.free(escaped);
-        const runtime_req = if (correlation_id) |value| blk: {
-            const escaped_corr = try unified.jsonEscape(self.allocator, value);
-            defer self.allocator.free(escaped_corr);
-            break :blk try std.fmt.allocPrint(
+        self.spawnAsyncChatRuntimeJob(job_name, input, correlation_id) catch |spawn_err| {
+            const normalized = normalizeRuntimeFailureForAgent("runtime_error", @errorName(spawn_err));
+            const failed_status = try self.buildJobStatusJson(.failed, correlation_id, normalized.message);
+            defer self.allocator.free(failed_status);
+
+            self.setFileContent(status_id, failed_status) catch |err| {
+                std.log.warn("failed to update chat status after spawn failure: {s}", .{@errorName(err)});
+            };
+            self.setFileContent(result_id, normalized.message) catch |err| {
+                std.log.warn("failed to update chat result after spawn failure: {s}", .{@errorName(err)});
+            };
+
+            const spawn_log_owned = std.fmt.allocPrint(
                 self.allocator,
+                "[runtime worker spawn failure] {s}\n",
+                .{@errorName(spawn_err)},
+            ) catch null;
+            defer if (spawn_log_owned) |value| self.allocator.free(value);
+            const spawn_log = if (spawn_log_owned) |value|
+                value
+            else
+                "[runtime worker spawn failure]\n";
+
+            self.setFileContent(log_id, spawn_log) catch |err| {
+                std.log.warn("failed to update chat log after spawn failure: {s}", .{@errorName(err)});
+            };
+            self.job_index.markCompleted(
+                job_name,
+                false,
+                normalized.message,
+                normalized.message,
+                spawn_log,
+            ) catch |err| {
+                std.log.warn("chat job index completion update failed after spawn failure: {s}", .{@errorName(err)});
+            };
+        };
+
+        return .{
+            .written = raw_input.len,
+            .job_name = try self.allocator.dupe(u8, job_name),
+            .correlation_id = if (correlation_id) |value| try self.allocator.dupe(u8, value) else null,
+        };
+    }
+
+    fn spawnAsyncChatRuntimeJob(
+        self: *Session,
+        job_name: []const u8,
+        input: []const u8,
+        correlation_id: ?[]const u8,
+    ) !void {
+        self.runtime_handle.retain();
+        const ctx = try self.allocator.create(AsyncChatRuntimeContext);
+        ctx.* = .{
+            .allocator = self.allocator,
+            .runtime_handle = self.runtime_handle,
+            .job_index = self.job_index,
+            .emit_debug = self.shouldEmitRuntimeDebugFrames(),
+        };
+        errdefer ctx.deinit();
+
+        ctx.job_name = try self.allocator.dupe(u8, job_name);
+        ctx.input = try self.allocator.dupe(u8, input);
+        if (correlation_id) |value| {
+            ctx.correlation_id = try self.allocator.dupe(u8, value);
+        }
+
+        const thread = try std.Thread.spawn(.{}, asyncChatRuntimeThreadMain, .{ctx});
+        thread.detach();
+    }
+
+    fn asyncChatRuntimeThreadMain(ctx: *AsyncChatRuntimeContext) void {
+        defer ctx.deinit();
+        const job_name = ctx.job_name orelse return;
+        const input = ctx.input orelse return;
+
+        asyncExecuteChatRuntimeJob(ctx, job_name, input, ctx.correlation_id) catch |err| {
+            const normalized = normalizeRuntimeFailureForAgent("runtime_error", @errorName(err));
+            const failure_log_owned = std.fmt.allocPrint(
+                ctx.allocator,
+                "[runtime worker failure] {s}\n",
+                .{@errorName(err)},
+            ) catch null;
+            defer if (failure_log_owned) |value| ctx.allocator.free(value);
+            const failure_log = if (failure_log_owned) |value|
+                value
+            else
+                "[runtime worker failure]\n";
+
+            ctx.job_index.markCompleted(
+                job_name,
+                false,
+                normalized.message,
+                normalized.message,
+                failure_log,
+            ) catch |mark_err| {
+                std.log.warn("chat job completion failed after runtime worker error: {s}", .{@errorName(mark_err)});
+            };
+        };
+    }
+
+    fn asyncExecuteChatRuntimeJob(
+        ctx: *AsyncChatRuntimeContext,
+        job_name: []const u8,
+        input: []const u8,
+        correlation_id: ?[]const u8,
+    ) !void {
+        const escaped = try unified.jsonEscape(ctx.allocator, input);
+        defer ctx.allocator.free(escaped);
+        const runtime_req = if (correlation_id) |value| blk: {
+            const escaped_corr = try unified.jsonEscape(ctx.allocator, value);
+            defer ctx.allocator.free(escaped_corr);
+            break :blk try std.fmt.allocPrint(
+                ctx.allocator,
                 "{{\"id\":\"{s}\",\"type\":\"session.send\",\"content\":\"{s}\",\"correlation_id\":\"{s}\"}}",
                 .{ job_name, escaped, escaped_corr },
             );
         } else try std.fmt.allocPrint(
-            self.allocator,
+            ctx.allocator,
             "{{\"id\":\"{s}\",\"type\":\"session.send\",\"content\":\"{s}\"}}",
             .{ job_name, escaped },
         );
-        defer self.allocator.free(runtime_req);
+        defer ctx.allocator.free(runtime_req);
 
         var log_buf = std.ArrayListUnmanaged(u8){};
-        defer log_buf.deinit(self.allocator);
+        defer log_buf.deinit(ctx.allocator);
 
-        var result_text = try self.allocator.dupe(u8, "");
-        defer self.allocator.free(result_text);
+        var result_text = try ctx.allocator.dupe(u8, "");
+        defer ctx.allocator.free(result_text);
 
         var failed = true;
         var failure_code: []const u8 = "runtime_error";
         var failure_message: []const u8 = "runtime error";
         var failure_message_owned: ?[]u8 = null;
-        defer if (failure_message_owned) |owned| self.allocator.free(owned);
+        defer if (failure_message_owned) |owned| ctx.allocator.free(owned);
 
         var attempt_idx: usize = 0;
         while (attempt_idx <= max_chat_runtime_internal_retries) : (attempt_idx += 1) {
@@ -5580,30 +5709,30 @@ pub const Session = struct {
             failure_code = "runtime_error";
             failure_message = "";
             if (failure_message_owned) |owned| {
-                self.allocator.free(owned);
+                ctx.allocator.free(owned);
                 failure_message_owned = null;
             }
-            self.allocator.free(result_text);
-            result_text = try self.allocator.dupe(u8, "");
+            ctx.allocator.free(result_text);
+            result_text = try ctx.allocator.dupe(u8, "");
 
             var responses: ?[][]u8 = null;
-            if (self.runtime_handle.handleMessageFramesWithDebug(runtime_req, self.shouldEmitRuntimeDebugFrames())) |frames| {
+            if (ctx.runtime_handle.handleMessageFramesWithDebug(runtime_req, ctx.emit_debug)) |frames| {
                 responses = frames;
-            } else |err| {
+            } else |runtime_err| {
                 failed = true;
-                const normalized = normalizeRuntimeFailureForAgent("runtime_error", @errorName(err));
+                const normalized = normalizeRuntimeFailureForAgent("runtime_error", @errorName(runtime_err));
                 failure_code = normalized.code;
                 failure_message = normalized.message;
+                try log_buf.writer(ctx.allocator).print("[runtime error] {s}\n", .{@errorName(runtime_err)});
             }
-            defer if (responses) |frames| runtime_server_mod.deinitResponseFrames(self.allocator, frames);
+            defer if (responses) |frames| runtime_server_mod.deinitResponseFrames(ctx.allocator, frames);
 
             if (responses) |frames| {
                 for (frames) |frame| {
-                    try log_buf.appendSlice(self.allocator, frame);
-                    try log_buf.append(self.allocator, '\n');
-                    try self.recordRuntimeFrameForDebug(job_name, frame);
+                    try log_buf.appendSlice(ctx.allocator, frame);
+                    try log_buf.append(ctx.allocator, '\n');
 
-                    const maybe = std.json.parseFromSlice(std.json.Value, self.allocator, frame, .{}) catch null;
+                    const maybe = std.json.parseFromSlice(std.json.Value, ctx.allocator, frame, .{}) catch null;
                     if (maybe) |parsed| {
                         defer parsed.deinit();
                         if (parsed.value != .object) continue;
@@ -5614,46 +5743,34 @@ pub const Session = struct {
                         if (std.mem.eql(u8, type_value.string, "session.receive")) {
                             if (obj.get("content")) |content| {
                                 if (content == .string) {
-                                    self.allocator.free(result_text);
-                                    result_text = try self.allocator.dupe(u8, content.string);
+                                    ctx.allocator.free(result_text);
+                                    result_text = try ctx.allocator.dupe(u8, content.string);
                                 }
                             } else if (obj.get("payload")) |payload| {
                                 if (payload == .object) {
                                     if (payload.object.get("content")) |content| {
                                         if (content == .string) {
-                                            self.allocator.free(result_text);
-                                            result_text = try self.allocator.dupe(u8, content.string);
+                                            ctx.allocator.free(result_text);
+                                            result_text = try ctx.allocator.dupe(u8, content.string);
                                         }
                                     }
                                 }
                             }
                         } else if (std.mem.eql(u8, type_value.string, "agent.thought")) {
-                            const thought_content = obj.get("content") orelse continue;
-                            if (thought_content != .string) continue;
-
-                            const source = if (obj.get("source")) |value|
-                                if (value == .string and value.string.len > 0) value.string else null
-                            else
-                                null;
-                            const round = if (obj.get("round")) |value|
-                                if (value == .integer and value.integer >= 0) @as(usize, @intCast(value.integer)) else null
-                            else
-                                null;
-                            self.recordThoughtFrame(thought_content.string, source, round) catch |thought_err| {
-                                std.log.warn("failed to persist thought frame: {s}", .{@errorName(thought_err)});
-                            };
+                            // Thought telemetry is replayed from persisted job logs when
+                            // job status/result/log files are refreshed.
                         } else if (std.mem.eql(u8, type_value.string, "error")) {
                             failed = true;
                             if (obj.get("message")) |err_msg| {
                                 if (err_msg == .string) {
-                                    if (failure_message_owned) |owned| self.allocator.free(owned);
+                                    if (failure_message_owned) |owned| ctx.allocator.free(owned);
                                     const code = if (obj.get("code")) |value|
                                         if (value == .string) value.string else "runtime_error"
                                     else
                                         "runtime_error";
                                     const normalized = normalizeRuntimeFailureForAgent(code, err_msg.string);
                                     failure_code = normalized.code;
-                                    failure_message_owned = try self.allocator.dupe(u8, normalized.message);
+                                    failure_message_owned = try ctx.allocator.dupe(u8, normalized.message);
                                     failure_message = failure_message_owned.?;
                                 }
                             }
@@ -5664,10 +5781,10 @@ pub const Session = struct {
 
             if (!failed and isInternalRuntimeLoopGuardText(result_text)) {
                 failed = true;
-                if (failure_message_owned) |owned| self.allocator.free(owned);
+                if (failure_message_owned) |owned| ctx.allocator.free(owned);
                 const normalized = normalizeRuntimeFailureForAgent("execution_failed", result_text);
                 failure_code = normalized.code;
-                failure_message_owned = try self.allocator.dupe(u8, normalized.message);
+                failure_message_owned = try ctx.allocator.dupe(u8, normalized.message);
                 failure_message = failure_message_owned.?;
             }
 
@@ -5675,28 +5792,15 @@ pub const Session = struct {
             if (!std.mem.eql(u8, failure_code, "runtime_internal_limit")) break;
             if (attempt_idx >= max_chat_runtime_internal_retries) break;
 
-            try log_buf.writer(self.allocator).print(
+            try log_buf.writer(ctx.allocator).print(
                 "[runtime retry] attempt={d} reason={s}\n",
                 .{ attempt_idx + 1, failure_code },
             );
         }
 
-        if (failed) {
-            const status = try self.buildJobStatusJson(.failed, correlation_id, failure_message);
-            defer self.allocator.free(status);
-            try self.setFileContent(status_id, status);
-            try self.setFileContent(result_id, failure_message);
-        } else {
-            const status = try self.buildJobStatusJson(.done, correlation_id, null);
-            defer self.allocator.free(status);
-            try self.setFileContent(status_id, status);
-            try self.setFileContent(result_id, result_text);
-        }
-
-        const log_content = try log_buf.toOwnedSlice(self.allocator);
-        defer self.allocator.free(log_content);
-        try self.setFileContent(log_id, log_content);
-        self.job_index.markCompleted(
+        const log_content = try log_buf.toOwnedSlice(ctx.allocator);
+        defer ctx.allocator.free(log_content);
+        ctx.job_index.markCompleted(
             job_name,
             !failed,
             if (failed) failure_message else result_text,
@@ -5704,12 +5808,6 @@ pub const Session = struct {
             log_content,
         ) catch |err| {
             std.log.warn("chat job index completion update failed: {s}", .{@errorName(err)});
-        };
-
-        return .{
-            .written = raw_input.len,
-            .job_name = try self.allocator.dupe(u8, job_name),
-            .correlation_id = if (correlation_id) |value| try self.allocator.dupe(u8, value) else null,
         };
     }
 
@@ -8087,6 +8185,13 @@ pub const Session = struct {
         self.project_binds = .{};
     }
 
+    fn clearThoughtLogSyncOffsets(self: *Session) void {
+        var it = self.thought_log_sync_offsets.iterator();
+        while (it.next()) |entry| self.allocator.free(entry.key_ptr.*);
+        self.thought_log_sync_offsets.deinit(self.allocator);
+        self.thought_log_sync_offsets = .{};
+    }
+
     fn handleEventWaitConfigWrite(self: *Session, node_id: u32, raw_input: []const u8) !WriteOutcome {
         const written = raw_input.len;
         const trimmed = std.mem.trim(u8, raw_input, " \t\r\n");
@@ -8708,6 +8813,7 @@ pub const Session = struct {
         var view = owned_view.?;
         defer view.deinit(self.allocator);
         if (!std.mem.eql(u8, view.agent_id, self.agent_id)) return;
+        if (view.log_text) |log_text| try self.syncThoughtFramesFromJobLog(job_id, log_text);
 
         switch (special) {
             .job_status => {
@@ -8723,6 +8829,59 @@ pub const Session = struct {
             },
             else => {},
         }
+    }
+
+    fn syncThoughtFramesFromJobLog(self: *Session, job_id: []const u8, log_text: []const u8) !void {
+        if (log_text.len == 0) return;
+
+        const offset_ptr = blk: {
+            const gop = try self.thought_log_sync_offsets.getOrPut(self.allocator, job_id);
+            if (!gop.found_existing) {
+                gop.key_ptr.* = try self.allocator.dupe(u8, job_id);
+                gop.value_ptr.* = 0;
+            }
+            break :blk gop.value_ptr;
+        };
+
+        var cursor = offset_ptr.*;
+        if (cursor > log_text.len) cursor = 0;
+
+        while (cursor < log_text.len) {
+            const line_end = std.mem.indexOfScalarPos(u8, log_text, cursor, '\n') orelse log_text.len;
+            const line = std.mem.trim(u8, log_text[cursor..line_end], " \t\r\n");
+            self.tryRecordThoughtFrameFromLogLine(line);
+            cursor = if (line_end < log_text.len) line_end + 1 else line_end;
+        }
+
+        offset_ptr.* = log_text.len;
+    }
+
+    fn tryRecordThoughtFrameFromLogLine(self: *Session, line: []const u8) void {
+        if (line.len == 0 or line[0] != '{') return;
+
+        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, line, .{}) catch return;
+        defer parsed.deinit();
+        if (parsed.value != .object) return;
+
+        const obj = parsed.value.object;
+        const type_value = obj.get("type") orelse return;
+        if (type_value != .string or !std.mem.eql(u8, type_value.string, "agent.thought")) return;
+
+        const thought_content = obj.get("content") orelse return;
+        if (thought_content != .string) return;
+
+        const source = if (obj.get("source")) |value|
+            if (value == .string and value.string.len > 0) value.string else null
+        else
+            null;
+        const round = if (obj.get("round")) |value|
+            if (value == .integer and value.integer >= 0) @as(usize, @intCast(value.integer)) else null
+        else
+            null;
+
+        self.recordThoughtFrame(thought_content.string, source, round) catch |err| {
+            std.log.warn("failed to persist thought frame from job log: {s}", .{@errorName(err)});
+        };
     }
 
     fn refreshAgentServicesIndex(self: *Session, node_id: u32) !void {
@@ -9649,6 +9808,82 @@ test "fsrpc_session: thoughts namespace exposes latest history and status files"
     try std.testing.expectEqualStrings("", history_payload);
 }
 
+test "fsrpc_session: job log thought frames refresh thoughts namespace once" {
+    const allocator = std.testing.allocator;
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    const job_id = try job_index.createJob("default", "corr-thought-sync");
+    defer allocator.free(job_id);
+    try job_index.markCompleted(
+        job_id,
+        true,
+        "done",
+        null,
+        "{\"type\":\"agent.thought\",\"source\":\"thinking\",\"round\":1,\"content\":\"drafting test plan\"}\n{\"type\":\"session.receive\",\"content\":\"done\"}\n",
+    );
+
+    var session = try Session.init(allocator, runtime_handle, &job_index, "default");
+    defer session.deinit();
+
+    const job_status_path = [_][]const u8{ "agents", "self", "jobs", job_id, "status.json" };
+    const status_payload = try protocolReadFile(&session, allocator, 341, 342, job_status_path[0..], 451);
+    defer allocator.free(status_payload);
+    try std.testing.expect(std.mem.indexOf(u8, status_payload, "\"state\":\"done\"") != null);
+
+    const latest_payload = try protocolReadFile(
+        &session,
+        allocator,
+        343,
+        344,
+        &.{ "agents", "self", "thoughts", "latest.txt" },
+        452,
+    );
+    defer allocator.free(latest_payload);
+    try std.testing.expectEqualStrings("drafting test plan", latest_payload);
+
+    const history_payload = try protocolReadFile(
+        &session,
+        allocator,
+        345,
+        346,
+        &.{ "agents", "self", "thoughts", "history.ndjson" },
+        453,
+    );
+    defer allocator.free(history_payload);
+    try std.testing.expect(std.mem.indexOf(u8, history_payload, "\"content\":\"drafting test plan\"") != null);
+
+    const thought_status_payload = try protocolReadFile(
+        &session,
+        allocator,
+        347,
+        348,
+        &.{ "agents", "self", "thoughts", "status.json" },
+        454,
+    );
+    defer allocator.free(thought_status_payload);
+    try std.testing.expect(std.mem.indexOf(u8, thought_status_payload, "\"count\":1") != null);
+
+    const status_payload_second = try protocolReadFile(&session, allocator, 349, 350, job_status_path[0..], 455);
+    defer allocator.free(status_payload_second);
+    try std.testing.expect(std.mem.indexOf(u8, status_payload_second, "\"state\":\"done\"") != null);
+
+    const thought_status_payload_second = try protocolReadFile(
+        &session,
+        allocator,
+        351,
+        352,
+        &.{ "agents", "self", "thoughts", "status.json" },
+        456,
+    );
+    defer allocator.free(thought_status_payload_second);
+    try std.testing.expect(std.mem.indexOf(u8, thought_status_payload_second, "\"count\":1") != null);
+}
+
 test "fsrpc_session: admin debug stream logs runtime frames as synthetic debug events" {
     const allocator = std.testing.allocator;
 
@@ -9705,7 +9940,7 @@ test "fsrpc_session: events wait returns next completed chat job" {
         80,
         81,
         &.{ "agents", "self", "events", "control", "wait.json" },
-        "{\"paths\":[\"/agents/self/chat/control/input\"],\"timeout_ms\":0}",
+        "{\"paths\":[\"/agents/self/chat/control/input\"],\"timeout_ms\":2000}",
         700,
     );
 
@@ -9854,7 +10089,7 @@ test "fsrpc_session: events wait supports agent signal source selectors" {
     try std.testing.expect(std.mem.indexOf(u8, next_payload, "\"payload\":{\"status\":\"ok\"}") != null);
 }
 
-test "fsrpc_session: blocking read on job status waits for terminal state" {
+test "fsrpc_session: job status read returns current state without waiting for terminal state" {
     const allocator = std.testing.allocator;
 
     const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
@@ -9874,7 +10109,7 @@ test "fsrpc_session: blocking read on job status waits for terminal state" {
     var delayed = DelayedJobCompletion{
         .job_index = &job_index,
         .job_id = job_id,
-        .delay_ms = 200,
+        .delay_ms = 800,
         .result_text = "status-ready",
     };
     const worker = try std.Thread.spawn(.{}, delayedCompleteJob, .{&delayed});
@@ -9894,8 +10129,8 @@ test "fsrpc_session: blocking read on job status waits for terminal state" {
     const elapsed_ms = std.time.milliTimestamp() - start_ms;
 
     try std.testing.expect(delayed.success);
-    try std.testing.expect(elapsed_ms >= 120);
-    try std.testing.expect(std.mem.indexOf(u8, status_payload, "\"state\":\"done\"") != null);
+    try std.testing.expect(elapsed_ms < 250);
+    try std.testing.expect(std.mem.indexOf(u8, status_payload, "\"state\":\"running\"") != null);
 }
 
 test "fsrpc_session: blocking read on job result waits for terminal payload" {

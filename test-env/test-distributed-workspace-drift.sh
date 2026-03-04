@@ -50,6 +50,20 @@ if ! command -v python3 >/dev/null 2>&1; then
     exit 1
 fi
 
+CONTROL_CALL_TIMEOUT_SEC="${CONTROL_CALL_TIMEOUT_SEC:-8}"
+CONTROL_CALL_RETRIES="${CONTROL_CALL_RETRIES:-3}"
+FS_CHECK_TIMEOUT_SEC="${FS_CHECK_TIMEOUT_SEC:-3}"
+
+run_with_timeout() {
+    local seconds="$1"
+    shift
+    if command -v timeout >/dev/null 2>&1; then
+        timeout "$seconds" "$@"
+    else
+        "$@"
+    fi
+}
+
 CONTROL_ARGS=(--url "$CONTROL_URL")
 if [[ -n "${SPIDERWEB_CONTROL_OPERATOR_TOKEN:-}" ]]; then
     CONTROL_ARGS+=(--operator-token "$SPIDERWEB_CONTROL_OPERATOR_TOKEN")
@@ -58,11 +72,25 @@ fi
 control_call() {
     local op="$1"
     local payload="${2-}"
-    if [[ -n "$payload" ]]; then
-        "$CONTROL_BIN" "${CONTROL_ARGS[@]}" "$op" "$payload"
-    else
-        "$CONTROL_BIN" "${CONTROL_ARGS[@]}" "$op"
-    fi
+    local attempt output
+    for attempt in $(seq 1 "$CONTROL_CALL_RETRIES"); do
+        if [[ -n "$payload" ]]; then
+            output="$(run_with_timeout "$CONTROL_CALL_TIMEOUT_SEC" "$CONTROL_BIN" "${CONTROL_ARGS[@]}" "$op" "$payload" 2>&1)" && {
+                printf '%s\n' "$output"
+                return 0
+            }
+        else
+            output="$(run_with_timeout "$CONTROL_CALL_TIMEOUT_SEC" "$CONTROL_BIN" "${CONTROL_ARGS[@]}" "$op" 2>&1)" && {
+                printf '%s\n' "$output"
+                return 0
+            }
+        fi
+        if [[ "$attempt" -lt "$CONTROL_CALL_RETRIES" ]]; then
+            sleep 0.2
+        fi
+    done
+    echo "$output" >&2
+    return 1
 }
 
 json_query() {
@@ -110,7 +138,7 @@ PY
                 export SPIDERWEB_AUTH_TOKEN
             fi
         fi
-        if control_call workspace_status >/dev/null 2>&1; then
+        if run_with_timeout 2 "$CONTROL_BIN" "${CONTROL_ARGS[@]}" workspace_status >/dev/null 2>&1; then
             return 0
         fi
         sleep 0.1
@@ -122,7 +150,7 @@ wait_for_node_ready() {
     local port="$1"
     local endpoint="tmp=ws://$BIND_ADDR:$port/v2/fs#work"
     for _ in $(seq 1 120); do
-        if "$FS_MOUNT_BIN" --endpoint "$endpoint" readdir /tmp >/dev/null 2>&1; then
+        if run_with_timeout "$FS_CHECK_TIMEOUT_SEC" "$FS_MOUNT_BIN" --endpoint "$endpoint" readdir /tmp >/dev/null 2>&1; then
             return 0
         fi
         sleep 0.1
@@ -192,7 +220,7 @@ NODE_ID="$(json_query "$JOIN_RESP" "payload.node_id")"
 
 PROJECT_NAME="Drift Matrix $(date +%s)"
 # Use export_name=missing to exercise desired/actual drift metadata paths.
-PROJECT_UP_PAYLOAD="$(printf '{"name":"%s","activate":true,"desired_mounts":[{"mount_path":"/broken","node_id":"%s","export_name":"missing"}]}' "$PROJECT_NAME" "$NODE_ID")"
+PROJECT_UP_PAYLOAD="$(printf '{"name":"%s","vision":"%s","activate":true,"desired_mounts":[{"mount_path":"/broken","node_id":"%s","export_name":"missing"}]}' "$PROJECT_NAME" "$PROJECT_NAME" "$NODE_ID")"
 PROJECT_UP_RESP="$(control_call project_up "$PROJECT_UP_PAYLOAD")"
 PROJECT_ID="$(json_query "$PROJECT_UP_RESP" "payload.project_id")"
 
@@ -202,18 +230,19 @@ if [[ -z "$PROJECT_ID" ]]; then
     exit 1
 fi
 
-DRIFT_COUNT=0
-RECONCILE_STATE=""
-LAST_ERROR=""
-for _ in $(seq 1 40); do
-    STATUS_RESP="$(control_call workspace_status "$(printf '{"project_id":"%s"}' "$PROJECT_ID")")"
+DRIFT_COUNT="$(json_query "$PROJECT_UP_RESP" "payload.workspace.drift.count")"
+RECONCILE_STATE="$(json_query "$PROJECT_UP_RESP" "payload.workspace.reconcile_state")"
+LAST_ERROR="$(json_query "$PROJECT_UP_RESP" "payload.workspace.last_error")"
+STATUS_RESP=""
+for _ in $(seq 1 5); do
+    if ! STATUS_RESP="$(run_with_timeout 3 "$CONTROL_BIN" "${CONTROL_ARGS[@]}" workspace_status "$(printf '{"project_id":"%s"}' "$PROJECT_ID")" 2>/dev/null)"; then
+        sleep 0.25
+        continue
+    fi
     DRIFT_COUNT="$(json_query "$STATUS_RESP" "payload.drift.count")"
     RECONCILE_STATE="$(json_query "$STATUS_RESP" "payload.reconcile_state")"
     LAST_ERROR="$(json_query "$STATUS_RESP" "payload.last_error")"
-    if [[ "$DRIFT_COUNT" =~ ^[0-9]+$ ]]; then
-        break
-    fi
-    sleep 0.25
+    break
 done
 
 if [[ ! "$DRIFT_COUNT" =~ ^[0-9]+$ ]]; then

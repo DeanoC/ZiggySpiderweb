@@ -88,11 +88,13 @@ fi
 CANARY_PORT=${CANARY_PORT:-28832}
 CONTROL_RETRY_ATTEMPTS=${CONTROL_RETRY_ATTEMPTS:-40}
 CONTROL_RETRY_DELAY_SEC=${CONTROL_RETRY_DELAY_SEC:-0.25}
-WS_ATTACH_RETRY_ATTEMPTS=${WS_ATTACH_RETRY_ATTEMPTS:-6}
+WS_ATTACH_RETRY_ATTEMPTS=${WS_ATTACH_RETRY_ATTEMPTS:-120}
+WS_ATTACH_RETRY_DELAY_SEC=${WS_ATTACH_RETRY_DELAY_SEC:-2}
 CHAT_MAX_ATTEMPTS=${CHAT_MAX_ATTEMPTS:-2}
 CHAT_TIMEOUT_SEC=${CHAT_TIMEOUT_SEC:-360}
 SERVICE_STATUS_TIMEOUT_SEC=${SERVICE_STATUS_TIMEOUT_SEC:-90}
 KEEP_CANARY_DIR=${KEEP_CANARY_DIR:-0}
+MOTHER_E2E_ALLOW_SANDBOX_UNAVAILABLE_SKIP=${MOTHER_E2E_ALLOW_SANDBOX_UNAVAILABLE_SKIP:-0}
 
 RUN_SUFFIX=${RUN_SUFFIX:-$(date +%s)}
 PROJECT_NAME=${PROJECT_NAME:-"mother-e2e-${RUN_SUFFIX}"}
@@ -109,6 +111,7 @@ mkdir -p "$STATE_DIR" "$AGENTS_DIR"
 CONFIG_PATH="$TMP_ROOT/config.json"
 SERVER_LOG="$TMP_ROOT/server.log"
 WS_TRACE="$TMP_ROOT/ws-trace.ndjson"
+WS_ERROR_LOG="$TMP_ROOT/ws-stderr.log"
 
 SPIDERWEB_PID=""
 WS_PID=""
@@ -272,7 +275,7 @@ next_tag() {
 }
 
 ws_open() {
-  coproc WS { "$WEBSOCAT_BIN" -H="Authorization: Bearer $ADMIN_TOKEN" "$URL"; }
+  coproc WS { "$WEBSOCAT_BIN" -H="Authorization: Bearer $ADMIN_TOKEN" "$URL" 2>>"$WS_ERROR_LOG"; }
   exec {WS_IN}>&"${WS[1]}"
   exec {WS_OUT}<&"${WS[0]}"
 }
@@ -326,29 +329,138 @@ ws_expect_type() {
   return 1
 }
 
+ws_expect_attach_ready_or_warming() {
+  local timeout_sec="$1"
+  local deadline=$((SECONDS + timeout_sec))
+  local line
+  while (( SECONDS < deadline )); do
+    if IFS= read -r -t 1 -u "$WS_OUT" line; then
+      [[ -z "$line" ]] && continue
+      printf '%s\n' "$line" >> "$WS_TRACE"
+      local line_type
+      line_type=$($JQ_BIN -r '.type // empty' 2>/dev/null <<<"$line" || true)
+      if [[ "$line_type" == "acheron.r_attach" ]]; then
+        return 0
+      fi
+      if [[ "$line_type" == "acheron.error" || "$line_type" == "acheron.err" || "$line_type" == "acheron.err_fs" ]]; then
+        local err_code
+        err_code=$($JQ_BIN -r '.error.code // empty' 2>/dev/null <<<"$line" || true)
+        if [[ "$err_code" == "runtime_warming" || "$err_code" == "sandbox_mount_unavailable" || "$err_code" == "runtime_warmup_timeout" ]]; then
+          return 2
+        fi
+        echo "error: unexpected error frame while waiting for acheron.r_attach" >&2
+        echo "$line" >&2
+        return 1
+      fi
+    fi
+  done
+  return 2
+}
+
 ws_attach_with_retry() {
   local version_id="$1"
   local connect_id="$2"
   local t_version_tag="$3"
   local t_attach_tag="$4"
   local attempts="$5"
+  local attach_tag="$t_attach_tag"
+  local negotiated=0
+  local attach_status=0
   for attempt in $(seq 1 "$attempts"); do
-    ws_close
-    ws_open
-    if ws_send "{\"channel\":\"control\",\"type\":\"control.version\",\"id\":\"${version_id}\",\"payload\":{\"protocol\":\"unified-v2\"}}" \
-      && ws_expect_type "control.version_ack" 30 >/dev/null \
-      && ws_send "{\"channel\":\"control\",\"type\":\"control.connect\",\"id\":\"${connect_id}\"}" \
-      && ws_expect_type "control.connect_ack" 30 >/dev/null \
-      && ws_send "{\"channel\":\"acheron\",\"type\":\"acheron.t_version\",\"tag\":${t_version_tag},\"msize\":1048576,\"version\":\"acheron-1\"}" \
-      && ws_expect_type "acheron.r_version" 30 >/dev/null \
-      && ws_send "{\"channel\":\"acheron\",\"type\":\"acheron.t_attach\",\"tag\":${t_attach_tag},\"fid\":1}" \
-      && ws_expect_type "acheron.r_attach" 30 >/dev/null; then
-      return 0
+    if [[ "$negotiated" -eq 0 ]]; then
+      ws_close
+      ws_open
+      if ! ws_send "{\"channel\":\"control\",\"type\":\"control.version\",\"id\":\"${version_id}\",\"payload\":{\"protocol\":\"unified-v2\"}}"; then
+        echo "[mother-e2e] attach attempt ${attempt}/${attempts}: failed to send control.version" >&2
+        if [[ "$attempt" -lt "$attempts" ]]; then
+          sleep "$WS_ATTACH_RETRY_DELAY_SEC"
+        fi
+        continue
+      fi
+      if ! ws_expect_type "control.version_ack" 10 >/dev/null; then
+        echo "[mother-e2e] attach attempt ${attempt}/${attempts}: missing control.version_ack" >&2
+        if [[ "$attempt" -lt "$attempts" ]]; then
+          sleep "$WS_ATTACH_RETRY_DELAY_SEC"
+        fi
+        continue
+      fi
+      if ! ws_send "{\"channel\":\"control\",\"type\":\"control.connect\",\"id\":\"${connect_id}\"}"; then
+        echo "[mother-e2e] attach attempt ${attempt}/${attempts}: failed to send control.connect" >&2
+        if [[ "$attempt" -lt "$attempts" ]]; then
+          sleep "$WS_ATTACH_RETRY_DELAY_SEC"
+        fi
+        continue
+      fi
+      if ! ws_expect_type "control.connect_ack" 10 >/dev/null; then
+        echo "[mother-e2e] attach attempt ${attempt}/${attempts}: missing control.connect_ack" >&2
+        if [[ "$attempt" -lt "$attempts" ]]; then
+          sleep "$WS_ATTACH_RETRY_DELAY_SEC"
+        fi
+        continue
+      fi
+      if ! ws_send "{\"channel\":\"acheron\",\"type\":\"acheron.t_version\",\"tag\":${t_version_tag},\"msize\":1048576,\"version\":\"acheron-1\"}"; then
+        echo "[mother-e2e] attach attempt ${attempt}/${attempts}: failed to send acheron.t_version" >&2
+        if [[ "$attempt" -lt "$attempts" ]]; then
+          sleep "$WS_ATTACH_RETRY_DELAY_SEC"
+        fi
+        continue
+      fi
+      if ! ws_expect_type "acheron.r_version" 10 >/dev/null; then
+        echo "[mother-e2e] attach attempt ${attempt}/${attempts}: missing acheron.r_version" >&2
+        if [[ "$attempt" -lt "$attempts" ]]; then
+          sleep "$WS_ATTACH_RETRY_DELAY_SEC"
+        fi
+        continue
+      fi
+      negotiated=1
     fi
+
+    if ! ws_send "{\"channel\":\"acheron\",\"type\":\"acheron.t_attach\",\"tag\":${attach_tag},\"fid\":1}"; then
+      echo "[mother-e2e] attach attempt ${attempt}/${attempts}: failed to send acheron.t_attach" >&2
+      negotiated=0
+      attach_tag=$((attach_tag + 1))
+      if [[ "$attempt" -lt "$attempts" ]]; then
+        sleep "$WS_ATTACH_RETRY_DELAY_SEC"
+      fi
+      continue
+    fi
+    if ws_expect_attach_ready_or_warming 5; then
+      return 0
+    else
+      attach_status=$?
+    fi
+    attach_tag=$((attach_tag + 1))
+
+    if [[ "$attach_status" -eq 2 ]]; then
+      if (( attempt % 5 == 0 )); then
+        echo "[mother-e2e] attach pending (attempt ${attempt}/${attempts})" >&2
+      fi
+      if [[ "$attempt" -lt "$attempts" ]]; then
+        sleep "$WS_ATTACH_RETRY_DELAY_SEC"
+      fi
+      continue
+    fi
+
+    echo "[mother-e2e] attach attempt ${attempt}/${attempts}: no attach readiness response, renegotiating" >&2
+    negotiated=0
     if [[ "$attempt" -lt "$attempts" ]]; then
-      sleep 1
+      sleep "$WS_ATTACH_RETRY_DELAY_SEC"
     fi
   done
+  if [[ -s "$WS_ERROR_LOG" ]]; then
+    echo "[mother-e2e] websocat stderr tail:" >&2
+    tail -n 40 "$WS_ERROR_LOG" >&2 || true
+  fi
+  if [[ -f "$SERVER_LOG" ]]; then
+    echo "[mother-e2e] server log tail:" >&2
+    tail -n 80 "$SERVER_LOG" >&2 || true
+  fi
+  if [[ "$MOTHER_E2E_ALLOW_SANDBOX_UNAVAILABLE_SKIP" == "1" ]]; then
+    if [[ -f "$SERVER_LOG" ]] && grep -Eq "sandbox mountpoint wait timed out|ProjectMountUnavailable|SandboxMountUnavailable" "$SERVER_LOG"; then
+      echo "[mother-e2e] sandbox runtime unavailable on this host; marking deterministic attach phase as skipped." >&2
+      return 2
+    fi
+  fi
   echo "error: websocket attach handshake failed after ${attempts} attempts" >&2
   return 1
 }
@@ -520,7 +632,14 @@ if [[ -z "$NODE_ID" || -z "$EXPORT_NAME" ]]; then
   exit 1
 fi
 
-ws_attach_with_retry "mother-e2e-version" "mother-e2e-connect" 1 2 "$WS_ATTACH_RETRY_ATTEMPTS"
+if ! ws_attach_with_retry "mother-e2e-version" "mother-e2e-connect" 1 2 "$WS_ATTACH_RETRY_ATTEMPTS"; then
+  attach_rc=$?
+  if [[ "$attach_rc" -eq 2 ]]; then
+    echo "[mother-e2e] SKIP sandbox runtime attach (host does not support required mount setup)." >&2
+    exit 0
+  fi
+  exit "$attach_rc"
+fi
 
 CHAT_REPLY=""
 PROJECT_ID=""

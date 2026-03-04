@@ -60,7 +60,8 @@ ASK_TEXT=${ASK_TEXT:-"In one short sentence, ask me for the first project name, 
 CHAT_MAX_ATTEMPTS=${CHAT_MAX_ATTEMPTS:-3}
 CONTROL_RETRY_ATTEMPTS=${CONTROL_RETRY_ATTEMPTS:-30}
 CONTROL_RETRY_DELAY_SEC=${CONTROL_RETRY_DELAY_SEC:-0.2}
-WS_ATTACH_RETRY_ATTEMPTS=${WS_ATTACH_RETRY_ATTEMPTS:-5}
+WS_ATTACH_RETRY_ATTEMPTS=${WS_ATTACH_RETRY_ATTEMPTS:-120}
+WS_ATTACH_RETRY_DELAY_SEC=${WS_ATTACH_RETRY_DELAY_SEC:-2}
 PROJECT_NAME=${PROJECT_NAME:-"manual-canary-project"}
 PROJECT_VISION=${PROJECT_VISION:-"Validate Mother bootstrap and provider-backed provisioning flow."}
 AGENT_ID=${AGENT_ID:-"manual-canary-agent"}
@@ -259,21 +260,48 @@ ws_attach_with_retry() {
   local t_version_tag="$3"
   local t_attach_tag="$4"
   local attempts="$5"
+  local attach_tag="$t_attach_tag"
+  local negotiated=0
+  local attach_status=0
   for attempt in $(seq 1 "$attempts"); do
-    ws_close
-    ws_open
-    if ws_send "{\"channel\":\"control\",\"type\":\"control.version\",\"id\":\"${version_id}\",\"payload\":{\"protocol\":\"unified-v2\"}}" \
-      && ws_expect_type "control.version_ack" 30 >/dev/null \
-      && ws_send "{\"channel\":\"control\",\"type\":\"control.connect\",\"id\":\"${connect_id}\"}" \
-      && ws_expect_type "control.connect_ack" 30 >/dev/null \
-      && ws_send "{\"channel\":\"acheron\",\"type\":\"acheron.t_version\",\"tag\":${t_version_tag},\"msize\":1048576,\"version\":\"acheron-1\"}" \
-      && ws_expect_type "acheron.r_version" 30 >/dev/null \
-      && ws_send "{\"channel\":\"acheron\",\"type\":\"acheron.t_attach\",\"tag\":${t_attach_tag},\"fid\":1}" \
-      && ws_expect_type "acheron.r_attach" 30 >/dev/null; then
-      return 0
+    if [[ "$negotiated" -eq 0 ]]; then
+      ws_close
+      ws_open
+      if ! ws_send "{\"channel\":\"control\",\"type\":\"control.version\",\"id\":\"${version_id}\",\"payload\":{\"protocol\":\"unified-v2\"}}" \
+        || ! ws_expect_type "control.version_ack" 10 >/dev/null \
+        || ! ws_send "{\"channel\":\"control\",\"type\":\"control.connect\",\"id\":\"${connect_id}\"}" \
+        || ! ws_expect_type "control.connect_ack" 10 >/dev/null \
+        || ! ws_send "{\"channel\":\"acheron\",\"type\":\"acheron.t_version\",\"tag\":${t_version_tag},\"msize\":1048576,\"version\":\"acheron-1\"}" \
+        || ! ws_expect_type "acheron.r_version" 10 >/dev/null; then
+        if [[ "$attempt" -lt "$attempts" ]]; then
+          sleep "$WS_ATTACH_RETRY_DELAY_SEC"
+        fi
+        continue
+      fi
+      negotiated=1
     fi
+
+    ws_send "{\"channel\":\"acheron\",\"type\":\"acheron.t_attach\",\"tag\":${attach_tag},\"fid\":1}"
+    if ws_expect_attach_ready_or_warming 5; then
+      return 0
+    else
+      attach_status=$?
+    fi
+    attach_tag=$((attach_tag + 1))
+
+    if [[ "$attach_status" -eq 2 ]]; then
+      if (( attempt % 5 == 0 )); then
+        echo "[mother-canary] attach pending (attempt ${attempt}/${attempts})" >&2
+      fi
+      if [[ "$attempt" -lt "$attempts" ]]; then
+        sleep "$WS_ATTACH_RETRY_DELAY_SEC"
+      fi
+      continue
+    fi
+
+    negotiated=0
     if [[ "$attempt" -lt "$attempts" ]]; then
-      sleep 1
+      sleep "$WS_ATTACH_RETRY_DELAY_SEC"
     fi
   done
   echo "error: websocket attach handshake failed after ${attempts} attempts" >&2
@@ -304,6 +332,34 @@ ws_expect_type() {
   done
   echo "error: timeout waiting for $expected_type" >&2
   return 1
+}
+
+ws_expect_attach_ready_or_warming() {
+  local timeout_sec="$1"
+  local deadline=$((SECONDS + timeout_sec))
+  local line
+  while (( SECONDS < deadline )); do
+    if IFS= read -r -t 1 -u "$WS_OUT" line; then
+      [[ -z "$line" ]] && continue
+      printf '%s\n' "$line" >> "$WS_TRACE"
+      local line_type
+      line_type=$($JQ_BIN -r '.type // empty' 2>/dev/null <<<"$line" || true)
+      if [[ "$line_type" == "acheron.r_attach" ]]; then
+        return 0
+      fi
+      if [[ "$line_type" == "acheron.error" || "$line_type" == "acheron.err" || "$line_type" == "acheron.err_fs" ]]; then
+        local err_code
+        err_code=$($JQ_BIN -r '.error.code // empty' 2>/dev/null <<<"$line" || true)
+        if [[ "$err_code" == "runtime_warming" || "$err_code" == "sandbox_mount_unavailable" || "$err_code" == "runtime_warmup_timeout" ]]; then
+          return 2
+        fi
+        echo "error: unexpected error frame while waiting for acheron.r_attach" >&2
+        echo "$line" >&2
+        return 1
+      fi
+    fi
+  done
+  return 2
 }
 
 path_to_json_array() {

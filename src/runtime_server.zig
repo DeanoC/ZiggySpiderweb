@@ -1446,6 +1446,10 @@ pub const RuntimeServer = struct {
                         "3) `agents/self/agents/control/create.json` with `{agent_id, name, description, project_id}`\n" ++
                         "4) Treat successful file_write tool results as authoritative completion for provisioning.\n" ++
                         "   Do not block on `status.json`/`result.json` in bootstrap mode.\n" ++
+                        "After provisioning succeeds, send a handoff-only completion reply confirming the created project and agent.\n" ++
+                        "Tell the operator to switch to the newly created project/agent to continue project work.\n" ++
+                        "Do not include protocol-level or API instructions in that handoff reply.\n" ++
+                        "Do not offer to begin repo setup, PR preparation, coding, or execution from Mother in the same reply.\n" ++
                         "Do not switch to unrelated chit-chat until setup blockers are resolved.\n" ++
                         "Active setup requirements:\n",
                 );
@@ -8080,6 +8084,8 @@ test "runtime_server: service.event setup metadata drives project setup gate pro
     defer allocator.free(required_prompt);
     try std.testing.expect(std.mem.indexOf(u8, required_prompt, "## Project Setup Gate") != null);
     try std.testing.expect(std.mem.indexOf(u8, required_prompt, "project_id=proj-alpha") != null);
+    try std.testing.expect(std.mem.indexOf(u8, required_prompt, "handoff-only completion reply") != null);
+    try std.testing.expect(std.mem.indexOf(u8, required_prompt, "Do not offer to begin repo setup, PR preparation, coding, or execution from Mother") != null);
 
     const complete_request =
         "{\"id\":\"req-setup-complete\",\"type\":\"agent.control\",\"action\":\"service.event\",\"content\":\"{\\\"service_id\\\":\\\"gui_ws_setup\\\",\\\"status\\\":\\\"attached\\\",\\\"session_key\\\":\\\"main\\\",\\\"role\\\":\\\"admin\\\",\\\"project_id\\\":\\\"proj-alpha\\\",\\\"project_setup_required\\\":false,\\\"project_setup_project_id\\\":\\\"proj-alpha\\\",\\\"project_setup_source\\\":\\\"control.session_attach\\\"}\"}";

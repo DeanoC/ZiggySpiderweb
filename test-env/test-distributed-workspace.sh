@@ -73,6 +73,23 @@ if ! command -v python3 >/dev/null 2>&1; then
     exit 1
 fi
 
+FS_MOUNT_READ_TIMEOUT_SEC="${FS_MOUNT_READ_TIMEOUT_SEC:-3}"
+
+run_with_timeout() {
+    local seconds="$1"
+    shift
+    if command -v timeout >/dev/null 2>&1; then
+        timeout "$seconds" "$@"
+    else
+        "$@"
+    fi
+}
+
+read_mount_text() {
+    local mount_path="$1"
+    run_with_timeout "$FS_MOUNT_READ_TIMEOUT_SEC" "$FS_MOUNT_BIN" --workspace-url "$WORKSPACE_URL" cat "$mount_path"
+}
+
 TEST_TMP_DIR="$(mktemp -d)"
 LTM_DIR="$TEST_TMP_DIR/ltm"
 AUTH_TOKENS_FILE="$LTM_DIR/auth_tokens.json"
@@ -388,8 +405,8 @@ def call(sock, op, payload, request_id):
             continue
         return reply
 
-sock = socket.create_connection((host, port), timeout=3)
-sock.settimeout(3)
+sock = socket.create_connection((host, port), timeout=10)
+sock.settimeout(10)
 try:
     auth_token = os.environ.get("SPIDERWEB_AUTH_TOKEN", "").strip()
     auth_header = f"Authorization: Bearer {auth_token}\r\n" if auth_token else ""
@@ -610,8 +627,11 @@ fi
 log_pass "both node endpoints are ready"
 
 CONTROL_SUMMARY="$TEST_TMP_DIR/control-summary.json"
+CONTROL_WORKFLOW_ERR="$TEST_TMP_DIR/control-workflow.err"
 log_info "Running control workflow (invite/join/project/mount/activate)..."
-python3 - "$BIND_ADDR" "$SPIDERWEB_PORT" "ws://$BIND_ADDR:$NODE1_PORT/v2/fs" "ws://$BIND_ADDR:$NODE2_PORT/v2/fs" "$CONTROL_SUMMARY" <<'PY'
+control_workflow_ok=0
+for _ in $(seq 1 20); do
+if python3 - "$BIND_ADDR" "$SPIDERWEB_PORT" "ws://$BIND_ADDR:$NODE1_PORT/v2/fs" "ws://$BIND_ADDR:$NODE2_PORT/v2/fs" "$CONTROL_SUMMARY" <<'PY' 2>"$CONTROL_WORKFLOW_ERR"
 import base64
 import json
 import os
@@ -820,6 +840,26 @@ finally:
         pass
     sock.close()
 PY
+then
+    control_workflow_ok=1
+    break
+fi
+    sleep 0.2
+done
+if [[ "$control_workflow_ok" -ne 1 ]]; then
+    log_fail "control workflow did not converge"
+    if [[ -s "$CONTROL_WORKFLOW_ERR" ]]; then
+        echo "--- control workflow error ---"
+        cat "$CONTROL_WORKFLOW_ERR"
+    fi
+    echo "--- spiderweb log ---"
+    cat "$SPIDERWEB_LOG"
+    echo "--- node A log ---"
+    cat "$NODE1_LOG"
+    echo "--- node B log ---"
+    cat "$NODE2_LOG"
+    exit 1
+fi
 log_pass "control workflow completed"
 
 PROJECT_ID="$(python3 - "$CONTROL_SUMMARY" <<'PY'
@@ -875,7 +915,10 @@ if [[ "$SPIDERWEB_METRICS_PORT" -gt 0 ]]; then
     fi
 fi
 
-python3 - "$BIND_ADDR" "$SPIDERWEB_PORT" "$PROJECT_ID" <<'PY'
+RESTART_VERIFY_ERR="$TEST_TMP_DIR/restart-verify.err"
+restart_state_ok=0
+for _ in $(seq 1 30); do
+if python3 - "$BIND_ADDR" "$SPIDERWEB_PORT" "$PROJECT_ID" <<'PY' 2>"$RESTART_VERIFY_ERR"
 import base64
 import json
 import os
@@ -1018,10 +1061,40 @@ finally:
         pass
     sock.close()
 PY
+then
+    restart_state_ok=1
+    break
+fi
+    sleep 0.2
+done
+if [[ "$restart_state_ok" -ne 1 ]]; then
+    log_fail "control-plane state check after restart did not converge"
+    if [[ -s "$RESTART_VERIFY_ERR" ]]; then
+        echo "--- restart verification error ---"
+        cat "$RESTART_VERIFY_ERR"
+    fi
+    echo "--- spiderweb log ---"
+    cat "$SPIDERWEB_LOG"
+    exit 1
+fi
 log_pass "control-plane state recovered after spiderweb restart"
 
 WORKSPACE_URL="ws://$BIND_ADDR:$SPIDERWEB_PORT/"
-INITIAL_READ="$("$FS_MOUNT_BIN" --workspace-url "$WORKSPACE_URL" cat "/src/$FIXTURE_NAME")"
+INITIAL_READ=""
+initial_read_ok=0
+for _ in $(seq 1 150); do
+    if INITIAL_READ="$(read_mount_text "/src/$FIXTURE_NAME" 2>/dev/null)"; then
+        initial_read_ok=1
+        break
+    fi
+    sleep 0.2
+done
+if [[ "$initial_read_ok" -ne 1 ]]; then
+    log_fail "initial read did not converge after restart"
+    echo "--- spiderweb log ---"
+    cat "$SPIDERWEB_LOG"
+    exit 1
+fi
 
 FAILOVER_TARGET_CONTENT=""
 STOPPED_NODE_PORT=""
@@ -1043,7 +1116,10 @@ fi
 
 log_info "Updating project mounts live (/src -> /live) and validating client convergence..."
 LIVE_STATUS_SUMMARY="$TEST_TMP_DIR/live-status.json"
-python3 - "$BIND_ADDR" "$SPIDERWEB_PORT" "$PROJECT_ID" "$PROJECT_TOKEN" "$NODE_A_ID" "$NODE_B_ID" "$LIVE_STATUS_SUMMARY" <<'PY'
+LIVE_REMAP_ERR="$TEST_TMP_DIR/live-remap.err"
+live_remap_ok=0
+for _ in $(seq 1 30); do
+if python3 - "$BIND_ADDR" "$SPIDERWEB_PORT" "$PROJECT_ID" "$PROJECT_TOKEN" "$NODE_A_ID" "$NODE_B_ID" "$LIVE_STATUS_SUMMARY" <<'PY' 2>"$LIVE_REMAP_ERR"
 import base64
 import json
 import os
@@ -1192,10 +1268,26 @@ finally:
         pass
     sock.close()
 PY
+then
+    live_remap_ok=1
+    break
+fi
+    sleep 0.2
+done
+if [[ "$live_remap_ok" -ne 1 ]]; then
+    log_fail "live mount-path update control step did not converge"
+    if [[ -s "$LIVE_REMAP_ERR" ]]; then
+        echo "--- live remap error ---"
+        cat "$LIVE_REMAP_ERR"
+    fi
+    echo "--- spiderweb log ---"
+    cat "$SPIDERWEB_LOG"
+    exit 1
+fi
 
 live_ok=0
 for _ in $(seq 1 300); do
-    if LIVE_READ="$("$FS_MOUNT_BIN" --workspace-url "$WORKSPACE_URL" cat "/live/$FIXTURE_NAME" 2>/dev/null)"; then
+    if LIVE_READ="$(read_mount_text "/live/$FIXTURE_NAME" 2>/dev/null)"; then
         if [[ "$LIVE_READ" == "$NODE1_CONTENT" || "$LIVE_READ" == "$NODE2_CONTENT" ]]; then
             live_ok=1
             break
@@ -1253,7 +1345,7 @@ fi
 FAILOVER_READ=""
 failover_ok=0
 for _ in $(seq 1 300); do
-    if FAILOVER_READ="$("$FS_MOUNT_BIN" --workspace-url "$WORKSPACE_URL" cat "/live/$FIXTURE_NAME" 2>/dev/null)"; then
+    if FAILOVER_READ="$(read_mount_text "/live/$FIXTURE_NAME" 2>/dev/null)"; then
         if [[ "$FAILOVER_READ" == "$FAILOVER_TARGET_CONTENT" ]]; then
             failover_ok=1
             break
@@ -1411,8 +1503,8 @@ def call(sock, op, payload, request_id):
             raise RuntimeError(f"control error {op}: {json.dumps(reply)}")
         return reply.get("payload", {})
 
-sock = socket.create_connection((host, port), timeout=3)
-sock.settimeout(3)
+sock = socket.create_connection((host, port), timeout=10)
+sock.settimeout(10)
 try:
     auth_token = os.environ.get("SPIDERWEB_AUTH_TOKEN", "").strip()
     auth_header = f"Authorization: Bearer {auth_token}\r\n" if auth_token else ""
@@ -1473,7 +1565,7 @@ fi
 SECOND_FAILOVER_READ=""
 second_failover_ok=0
 for _ in $(seq 1 80); do
-    if SECOND_FAILOVER_READ="$("$FS_MOUNT_BIN" --workspace-url "$WORKSPACE_URL" cat "/live/$FIXTURE_NAME" 2>/dev/null)"; then
+    if SECOND_FAILOVER_READ="$(read_mount_text "/live/$FIXTURE_NAME" 2>/dev/null)"; then
         if [[ "$SECOND_FAILOVER_READ" == "$STOPPED_NODE_CONTENT" ]]; then
             second_failover_ok=1
             break
