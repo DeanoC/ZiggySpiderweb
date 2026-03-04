@@ -25,9 +25,10 @@ const namespace_protocol_json =
 const namespace_chat_help_md =
     "# Chat Capability\n\n" ++
     "Write UTF-8 text to `control/input` to create a chat job.\n" ++
+    "Write UTF-8 text to `control/reply` for outbound agent replies.\n" ++
     "Read `/agents/self/jobs/<job-id>/result.txt` for assistant output.\n";
 const namespace_chat_schema_json =
-    "{\"name\":\"chat\",\"input\":\"control/input\",\"jobs\":\"/agents/self/jobs\",\"result\":\"result.txt\"}";
+    "{\"name\":\"chat\",\"input\":\"control/input\",\"reply\":\"control/reply\",\"jobs\":\"/agents/self/jobs\",\"result\":\"result.txt\"}";
 const namespace_chat_meta_json =
     "{\"name\":\"chat\",\"version\":\"1\",\"agent_id\":\"system\",\"cost_hint\":\"provider-dependent\",\"latency_hint\":\"seconds\"}";
 
@@ -257,6 +258,35 @@ const SourceOpenResult = struct {
     stat: std.fs.File.Stat,
 };
 
+pub const NamespaceWriteSnapshot = struct {
+    source_id: []u8,
+    node_path: []u8,
+    content: []u8,
+
+    pub fn deinit(self: *NamespaceWriteSnapshot, allocator: std.mem.Allocator) void {
+        allocator.free(self.source_id);
+        allocator.free(self.node_path);
+        allocator.free(self.content);
+        self.* = undefined;
+    }
+};
+
+pub const ChatJobState = enum {
+    queued,
+    running,
+    done,
+    failed,
+};
+
+pub const NamespaceChatJobUpdate = struct {
+    job_id: []const u8,
+    state: ChatJobState,
+    correlation_id: ?[]const u8 = null,
+    error_text: ?[]const u8 = null,
+    result_text: []const u8 = "",
+    log_text: []const u8 = "",
+};
+
 const SourceLockMode = enum {
     shared,
     exclusive,
@@ -390,6 +420,28 @@ pub const NodeOps = struct {
 
     pub fn copyPendingEvents(self: *const NodeOps, allocator: std.mem.Allocator) ![]fs_protocol.InvalidationEvent {
         return allocator.dupe(fs_protocol.InvalidationEvent, self.pending_events.items);
+    }
+
+    pub fn clearPendingEvents(self: *NodeOps) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.pending_events.clearRetainingCapacity();
+    }
+
+    pub fn captureNamespaceWriteSnapshot(
+        self: *NodeOps,
+        allocator: std.mem.Allocator,
+        handle_id: u64,
+    ) !?NamespaceWriteSnapshot {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.captureNamespaceWriteSnapshotLocked(allocator, handle_id);
+    }
+
+    pub fn upsertNamespaceChatJob(self: *NodeOps, update: NamespaceChatJobUpdate) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        try self.upsertNamespaceChatJobLocked(update);
     }
 
     pub fn pollFilesystemInvalidations(
@@ -659,14 +711,14 @@ pub const NodeOps = struct {
         if (std.mem.eql(u8, export_cfg.source_id, "meta")) {
             _ = try self.namespaceCreateNode(export_index, &ns, root.id, "protocol.json", .file, false, namespace_protocol_json);
         } else if (std.mem.eql(u8, export_cfg.source_id, "capabilities")) {
-            const chat_dir = try self.namespaceCreateNode(export_index, &ns, root.id, "chat", .dir, false, "");
-            _ = try self.namespaceCreateNode(export_index, &ns, chat_dir, "help.md", .file, false, namespace_chat_help_md);
-            _ = try self.namespaceCreateNode(export_index, &ns, chat_dir, "schema.json", .file, false, namespace_chat_schema_json);
-            _ = try self.namespaceCreateNode(export_index, &ns, chat_dir, "meta.json", .file, false, namespace_chat_meta_json);
-            const examples_dir = try self.namespaceCreateNode(export_index, &ns, chat_dir, "examples", .dir, false, "");
+            _ = try self.namespaceCreateNode(export_index, &ns, root.id, "help.md", .file, false, namespace_chat_help_md);
+            _ = try self.namespaceCreateNode(export_index, &ns, root.id, "schema.json", .file, false, namespace_chat_schema_json);
+            _ = try self.namespaceCreateNode(export_index, &ns, root.id, "meta.json", .file, false, namespace_chat_meta_json);
+            const examples_dir = try self.namespaceCreateNode(export_index, &ns, root.id, "examples", .dir, false, "");
             _ = try self.namespaceCreateNode(export_index, &ns, examples_dir, "send.txt", .file, false, "hello from acheron chat");
-            const control_dir = try self.namespaceCreateNode(export_index, &ns, chat_dir, "control", .dir, true, "");
+            const control_dir = try self.namespaceCreateNode(export_index, &ns, root.id, "control", .dir, true, "");
             _ = try self.namespaceCreateNode(export_index, &ns, control_dir, "input", .file, true, "");
+            _ = try self.namespaceCreateNode(export_index, &ns, control_dir, "reply", .file, true, "");
         }
 
         if (try self.namespace_exports.fetchPut(self.allocator, export_index, ns)) |existing| {
@@ -739,6 +791,14 @@ pub const NodeOps = struct {
 
     fn namespaceExportFor(self: *NodeOps, export_index: usize) ?*NamespaceExport {
         return self.namespace_exports.getPtr(export_index);
+    }
+
+    fn namespaceExportIndexBySourceId(self: *const NodeOps, source_id: []const u8) ?usize {
+        for (self.exports.items, 0..) |export_cfg, idx| {
+            if (export_cfg.source_kind != .namespace) continue;
+            if (std.mem.eql(u8, export_cfg.source_id, source_id)) return idx;
+        }
+        return null;
     }
 
     fn namespaceBumpGeneration(self: *NodeOps, ns: *NamespaceExport, node_id: u64) void {
@@ -3902,6 +3962,178 @@ pub const NodeOps = struct {
 
     fn queueInvalidation(self: *NodeOps, event: fs_protocol.InvalidationEvent) void {
         self.pending_events.append(self.allocator, event) catch {};
+    }
+
+    fn captureNamespaceWriteSnapshotLocked(
+        self: *NodeOps,
+        allocator: std.mem.Allocator,
+        handle_id: u64,
+    ) !?NamespaceWriteSnapshot {
+        const handle = self.namespace_handles.get(handle_id) orelse return null;
+        const export_cfg = self.exports.items[handle.export_index];
+        if (export_cfg.source_kind != .namespace) return null;
+        const ns = self.namespaceExportFor(handle.export_index) orelse return null;
+        const node = ns.nodes.get(handle.node_id) orelse return null;
+        if (node.kind == .dir) return null;
+
+        return .{
+            .source_id = try allocator.dupe(u8, export_cfg.source_id),
+            .node_path = try allocator.dupe(u8, node.path),
+            .content = try allocator.dupe(u8, node.content),
+        };
+    }
+
+    fn upsertNamespaceChatJobLocked(self: *NodeOps, update: NamespaceChatJobUpdate) !void {
+        const jobs_export_index = self.namespaceExportIndexBySourceId("jobs") orelse return error.FileNotFound;
+        const ns = self.namespaceExportFor(jobs_export_index) orelse return error.FileNotFound;
+
+        const job_dir_id = if (ns.nodes.get(ns.root_id)) |root_node|
+            root_node.children.get(update.job_id)
+        else
+            null;
+
+        const ensured_job_dir_id = if (job_dir_id) |existing_id|
+            existing_id
+        else blk: {
+            const created = try self.namespaceCreateNode(
+                jobs_export_index,
+                ns,
+                ns.root_id,
+                update.job_id,
+                .dir,
+                true,
+                "",
+            );
+            self.namespaceBumpGeneration(ns, ns.root_id);
+            self.queueInvalidation(.{
+                .INVAL_DIR = .{
+                    .dir = ns.root_id,
+                    .dir_gen = null,
+                },
+            });
+            const created_node = ns.nodes.get(created) orelse return error.FileNotFound;
+            self.queueInvalidation(.{
+                .INVAL = .{
+                    .node = created,
+                    .what = .all,
+                    .gen = created_node.generation,
+                },
+            });
+            break :blk created;
+        };
+
+        const status_json = try self.buildNamespaceChatJobStatusJson(update.state, update.correlation_id, update.error_text);
+        defer self.allocator.free(status_json);
+        _ = try self.namespaceEnsureFileContent(
+            jobs_export_index,
+            ns,
+            ensured_job_dir_id,
+            "status.json",
+            status_json,
+            true,
+        );
+        _ = try self.namespaceEnsureFileContent(
+            jobs_export_index,
+            ns,
+            ensured_job_dir_id,
+            "result.txt",
+            update.result_text,
+            true,
+        );
+        _ = try self.namespaceEnsureFileContent(
+            jobs_export_index,
+            ns,
+            ensured_job_dir_id,
+            "log.txt",
+            update.log_text,
+            true,
+        );
+    }
+
+    fn namespaceEnsureFileContent(
+        self: *NodeOps,
+        export_index: usize,
+        ns: *NamespaceExport,
+        parent_id: u64,
+        name: []const u8,
+        content: []const u8,
+        writable: bool,
+    ) !u64 {
+        if (ns.nodes.get(parent_id)) |parent| {
+            if (parent.children.get(name)) |existing_id| {
+                const node = ns.nodes.getPtr(existing_id) orelse return error.FileNotFound;
+                if (node.kind != .file) return error.NotFile;
+                if (!std.mem.eql(u8, node.content, content)) {
+                    const replaced = try self.allocator.dupe(u8, content);
+                    self.allocator.free(node.content);
+                    node.content = replaced;
+                    self.namespaceBumpGeneration(ns, existing_id);
+                    self.queueInvalidation(.{
+                        .INVAL = .{
+                            .node = existing_id,
+                            .what = .data,
+                            .gen = node.generation,
+                        },
+                    });
+                }
+                return existing_id;
+            }
+        }
+
+        const created = try self.namespaceCreateNode(export_index, ns, parent_id, name, .file, writable, content);
+        self.namespaceBumpGeneration(ns, parent_id);
+        self.queueInvalidation(.{
+            .INVAL_DIR = .{
+                .dir = parent_id,
+                .dir_gen = null,
+            },
+        });
+        const created_node = ns.nodes.get(created) orelse return error.FileNotFound;
+        self.queueInvalidation(.{
+            .INVAL = .{
+                .node = created,
+                .what = .all,
+                .gen = created_node.generation,
+            },
+        });
+        return created;
+    }
+
+    fn buildNamespaceChatJobStatusJson(
+        self: *NodeOps,
+        state: ChatJobState,
+        correlation_id: ?[]const u8,
+        error_text: ?[]const u8,
+    ) ![]u8 {
+        const correlation_json = if (correlation_id) |value| blk: {
+            const escaped = try fs_protocol.jsonEscape(self.allocator, value);
+            defer self.allocator.free(escaped);
+            break :blk try std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped});
+        } else try self.allocator.dupe(u8, "null");
+        defer self.allocator.free(correlation_json);
+
+        const error_json = if (error_text) |value| blk: {
+            const escaped = try fs_protocol.jsonEscape(self.allocator, value);
+            defer self.allocator.free(escaped);
+            break :blk try std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped});
+        } else try self.allocator.dupe(u8, "null");
+        defer self.allocator.free(error_json);
+
+        return std.fmt.allocPrint(
+            self.allocator,
+            "{{\"state\":\"{s}\",\"correlation_id\":{s},\"error\":{s},\"updated_at_ms\":{d}}}",
+            .{
+                switch (state) {
+                    .queued => "queued",
+                    .running => "running",
+                    .done => "done",
+                    .failed => "failed",
+                },
+                correlation_json,
+                error_json,
+                std.time.milliTimestamp(),
+            },
+        );
     }
 };
 

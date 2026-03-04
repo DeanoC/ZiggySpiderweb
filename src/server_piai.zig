@@ -45,17 +45,19 @@ const system_agent_id = "mother";
 const system_project_id = fs_control_plane.spider_web_project_id;
 const local_node_default_workspace_export_name = "system-workspace";
 const local_node_meta_export_name = "system-meta";
-const local_node_capabilities_export_name = "system-capabilities";
+const local_node_chat_export_name = "system-chat";
 const local_node_jobs_export_name = "system-jobs";
 const local_node_mount_meta = "/meta";
-const local_node_mount_agents_self_capabilities = "/agents/self/capabilities";
+const local_node_mount_agents_self_chat = "/agents/self/chat";
 const local_node_mount_agents_self_jobs = "/agents/self/jobs";
 const local_node_mount_nodes_local_fs = "/nodes/local/fs";
 const local_node_mount_projects_system_meta = "/projects/" ++ system_project_id ++ "/meta";
-const local_node_mount_projects_system_agents_self_capabilities = "/projects/" ++ system_project_id ++ "/agents/self/capabilities";
+const local_node_mount_projects_system_agents_self_chat = "/projects/" ++ system_project_id ++ "/agents/self/chat";
 const local_node_mount_projects_system_agents_self_jobs = "/projects/" ++ system_project_id ++ "/agents/self/jobs";
 const local_node_mount_projects_system_nodes_local_fs = "/projects/" ++ system_project_id ++ "/nodes/local/fs";
 const local_node_mount_projects_system_fs_local = "/projects/" ++ system_project_id ++ "/fs/local::fs";
+const legacy_local_node_mount_agents_self_capabilities = "/agents/self/capabilities";
+const legacy_local_node_mount_projects_system_agents_self_capabilities = "/projects/" ++ system_project_id ++ "/agents/self/capabilities";
 const control_operator_token_env = "SPIDERWEB_CONTROL_OPERATOR_TOKEN";
 const control_project_scope_token_env = "SPIDERWEB_CONTROL_PROJECT_SCOPE_TOKEN";
 const control_node_scope_token_env = "SPIDERWEB_CONTROL_NODE_SCOPE_TOKEN";
@@ -75,6 +77,7 @@ const min_connection_worker_threads: usize = 16;
 const runtime_warmup_wait_timeout_ms: i64 = 12_000;
 const runtime_warmup_stale_timeout_ms: i64 = 30_000;
 const runtime_warmup_poll_interval_ms: u64 = 100;
+const runtime_residency_worker_interval_ms_default: u64 = 1_000;
 const session_heartbeat_ttl_ms: i64 = 5 * 60 * 1000;
 const agent_heartbeat_ttl_ms: i64 = 5 * 60 * 1000;
 
@@ -1123,6 +1126,7 @@ const LocalFsMountSpec = struct {
 
 const LocalFsNode = struct {
     allocator: std.mem.Allocator,
+    runtime_registry: *AgentRuntimeRegistry,
     service: fs_node_service.NodeService,
     hub: FsConnectionHub,
     node_name: []u8,
@@ -1139,6 +1143,7 @@ const LocalFsNode = struct {
 
     fn create(
         allocator: std.mem.Allocator,
+        runtime_registry: *AgentRuntimeRegistry,
         export_specs: []const fs_node_ops.ExportSpec,
         mount_specs: []const fs_control_plane.SpiderWebMountSpec,
         node_name: []const u8,
@@ -1167,7 +1172,17 @@ const LocalFsNode = struct {
 
         endpoint.* = .{
             .allocator = allocator,
-            .service = try fs_node_service.NodeService.init(allocator, export_specs),
+            .runtime_registry = runtime_registry,
+            .service = try fs_node_service.NodeService.initWithOptions(
+                allocator,
+                export_specs,
+                .{
+                    .chat_input_hook = .{
+                        .ctx = @ptrCast(endpoint),
+                        .on_submit = localFsNodeChatInputSubmitHook,
+                    },
+                },
+            ),
             .hub = .{ .allocator = allocator },
             .node_name = try allocator.dupe(u8, node_name),
             .mount_specs = owned_mount_specs,
@@ -1314,7 +1329,254 @@ const LocalFsNode = struct {
         }
         return null;
     }
+
+    fn submitChatInput(
+        self: *LocalFsNode,
+        input: []const u8,
+        correlation_id: ?[]const u8,
+    ) !fs_node_service.NodeService.ChatInputSubmission {
+        const job_id = try self.runtime_registry.job_index.createJob(system_agent_id, correlation_id);
+        errdefer self.allocator.free(job_id);
+        self.runtime_registry.job_index.markRunning(job_id) catch |err| {
+            const message = try std.fmt.allocPrint(self.allocator, "chat job markRunning failed: {s}", .{@errorName(err)});
+            defer self.allocator.free(message);
+            try self.runtime_registry.job_index.markCompleted(
+                job_id,
+                false,
+                message,
+                message,
+                "[local fs chat submit failure]\n",
+            );
+            return .{
+                .job_id = job_id,
+                .correlation_id = if (correlation_id) |value| try self.allocator.dupe(u8, value) else null,
+                .state = .failed,
+                .error_text = try self.allocator.dupe(u8, message),
+                .result_text = try self.allocator.dupe(u8, message),
+                .log_text = try self.allocator.dupe(u8, "[local fs chat submit failure]\n"),
+            };
+        };
+
+        const worker_ctx = try self.allocator.create(LocalFsChatJobContext);
+        worker_ctx.* = .{
+            .allocator = self.allocator,
+            .node = self,
+            .job_id = try self.allocator.dupe(u8, job_id),
+            .input = try self.allocator.dupe(u8, input),
+            .correlation_id = if (correlation_id) |value| try self.allocator.dupe(u8, value) else null,
+        };
+        const worker = std.Thread.spawn(.{}, localFsChatJobThreadMain, .{worker_ctx}) catch |spawn_err| {
+            worker_ctx.deinit();
+            const message = try std.fmt.allocPrint(self.allocator, "chat job worker spawn failed: {s}", .{@errorName(spawn_err)});
+            defer self.allocator.free(message);
+            try self.runtime_registry.job_index.markCompleted(
+                job_id,
+                false,
+                message,
+                message,
+                "[local fs chat worker spawn failure]\n",
+            );
+            return .{
+                .job_id = job_id,
+                .correlation_id = if (correlation_id) |value| try self.allocator.dupe(u8, value) else null,
+                .state = .failed,
+                .error_text = try self.allocator.dupe(u8, message),
+                .result_text = try self.allocator.dupe(u8, message),
+                .log_text = try self.allocator.dupe(u8, "[local fs chat worker spawn failure]\n"),
+            };
+        };
+        worker.detach();
+
+        return .{
+            .job_id = job_id,
+            .correlation_id = if (correlation_id) |value| try self.allocator.dupe(u8, value) else null,
+            .state = .running,
+        };
+    }
+
+    fn publishChatJobUpdate(self: *LocalFsNode, update: fs_node_ops.NamespaceChatJobUpdate) void {
+        const events = self.service.upsertNamespaceChatJobWithEvents(update) catch |err| {
+            std.log.warn("local fs chat job namespace update failed for {s}: {s}", .{ update.job_id, @errorName(err) });
+            return;
+        };
+        defer self.allocator.free(events);
+        if (events.len > 0) self.hub.broadcastInvalidations(0, events);
+    }
 };
+
+const LocalFsChatJobContext = struct {
+    allocator: std.mem.Allocator,
+    node: *LocalFsNode,
+    job_id: []u8,
+    input: []u8,
+    correlation_id: ?[]u8 = null,
+
+    fn deinit(self: *LocalFsChatJobContext) void {
+        self.allocator.free(self.job_id);
+        self.allocator.free(self.input);
+        if (self.correlation_id) |value| self.allocator.free(value);
+        self.allocator.destroy(self);
+    }
+};
+
+fn localFsNodeChatInputSubmitHook(
+    raw_ctx: ?*anyopaque,
+    allocator: std.mem.Allocator,
+    input: []const u8,
+    correlation_id: ?[]const u8,
+) anyerror!fs_node_service.NodeService.ChatInputSubmission {
+    _ = allocator;
+    const ctx = raw_ctx orelse return error.InvalidContext;
+    const node: *LocalFsNode = @ptrCast(@alignCast(ctx));
+    return node.submitChatInput(input, correlation_id);
+}
+
+fn localFsChatJobThreadMain(ctx: *LocalFsChatJobContext) void {
+    defer ctx.deinit();
+    executeLocalFsChatJob(ctx.node, ctx.job_id, ctx.input, ctx.correlation_id) catch |err| {
+        const message = std.fmt.allocPrint(
+            ctx.allocator,
+            "runtime execution failed: {s}",
+            .{@errorName(err)},
+        ) catch return;
+        defer ctx.allocator.free(message);
+        const log_owned = std.fmt.allocPrint(
+            ctx.allocator,
+            "[local fs chat runtime failure] {s}\n",
+            .{@errorName(err)},
+        ) catch null;
+        defer if (log_owned) |value| ctx.allocator.free(value);
+        const log = if (log_owned) |value|
+            value
+        else
+            "[local fs chat runtime failure]\n";
+        ctx.node.runtime_registry.job_index.markCompleted(
+            ctx.job_id,
+            false,
+            message,
+            message,
+            log,
+        ) catch |mark_err| {
+            std.log.warn("local fs chat job completion update failed after runtime error: {s}", .{@errorName(mark_err)});
+        };
+        ctx.node.publishChatJobUpdate(.{
+            .job_id = ctx.job_id,
+            .state = .failed,
+            .correlation_id = ctx.correlation_id,
+            .error_text = message,
+            .result_text = message,
+            .log_text = log,
+        });
+    };
+}
+
+fn executeLocalFsChatJob(
+    node: *LocalFsNode,
+    job_id: []const u8,
+    input: []const u8,
+    correlation_id: ?[]const u8,
+) !void {
+    const runtime = try node.runtime_registry.getOrCreate(system_agent_id, system_project_id, null);
+    defer runtime.release();
+
+    const escaped = try unified.jsonEscape(node.allocator, input);
+    defer node.allocator.free(escaped);
+    const runtime_req = if (correlation_id) |value| blk: {
+        const escaped_corr = try unified.jsonEscape(node.allocator, value);
+        defer node.allocator.free(escaped_corr);
+        break :blk try std.fmt.allocPrint(
+            node.allocator,
+            "{{\"id\":\"{s}\",\"type\":\"session.send\",\"content\":\"{s}\",\"correlation_id\":\"{s}\"}}",
+            .{ job_id, escaped, escaped_corr },
+        );
+    } else try std.fmt.allocPrint(
+        node.allocator,
+        "{{\"id\":\"{s}\",\"type\":\"session.send\",\"content\":\"{s}\"}}",
+        .{ job_id, escaped },
+    );
+    defer node.allocator.free(runtime_req);
+
+    var log_buf = std.ArrayListUnmanaged(u8){};
+    defer log_buf.deinit(node.allocator);
+
+    var result_text = try node.allocator.dupe(u8, "");
+    defer node.allocator.free(result_text);
+    var failed = false;
+    var failure_message: ?[]u8 = null;
+    defer if (failure_message) |value| node.allocator.free(value);
+
+    const frames = try runtime.handleMessageFramesWithDebug(runtime_req, false);
+    defer runtime_server_mod.deinitResponseFrames(node.allocator, frames);
+    for (frames) |frame| {
+        try log_buf.appendSlice(node.allocator, frame);
+        try log_buf.append(node.allocator, '\n');
+
+        var parsed = std.json.parseFromSlice(std.json.Value, node.allocator, frame, .{}) catch continue;
+        defer parsed.deinit();
+        if (parsed.value != .object) continue;
+        const obj = parsed.value.object;
+        const type_value = obj.get("type") orelse continue;
+        if (type_value != .string) continue;
+
+        if (std.mem.eql(u8, type_value.string, "session.receive")) {
+            if (obj.get("content")) |content| {
+                if (content == .string) {
+                    node.allocator.free(result_text);
+                    result_text = try node.allocator.dupe(u8, content.string);
+                }
+            }
+            continue;
+        }
+
+        if (std.mem.eql(u8, type_value.string, "error")) {
+            failed = true;
+            if (obj.get("message")) |message| {
+                if (message == .string) {
+                    if (failure_message) |value| node.allocator.free(value);
+                    failure_message = try node.allocator.dupe(u8, message.string);
+                }
+            }
+        }
+    }
+
+    const log_content = try log_buf.toOwnedSlice(node.allocator);
+    defer node.allocator.free(log_content);
+
+    if (failed) {
+        const message = failure_message orelse "runtime error";
+        try node.runtime_registry.job_index.markCompleted(
+            job_id,
+            false,
+            message,
+            message,
+            log_content,
+        );
+        node.publishChatJobUpdate(.{
+            .job_id = job_id,
+            .state = .failed,
+            .correlation_id = correlation_id,
+            .error_text = message,
+            .result_text = message,
+            .log_text = log_content,
+        });
+        return;
+    }
+
+    try node.runtime_registry.job_index.markCompleted(
+        job_id,
+        true,
+        result_text,
+        null,
+        log_content,
+    );
+    node.publishChatJobUpdate(.{
+        .job_id = job_id,
+        .state = .done,
+        .correlation_id = correlation_id,
+        .result_text = result_text,
+        .log_text = log_content,
+    });
+}
 
 const NodeRegistration = struct {
     node_id: []u8,
@@ -4190,6 +4452,10 @@ const AgentRuntimeRegistry = struct {
     reconcile_worker_stop: bool = false,
     reconcile_worker_mutex: std.Thread.Mutex = .{},
     reconcile_worker_interval_ms: u64 = 250,
+    runtime_residency_worker_thread: ?std.Thread = null,
+    runtime_residency_worker_stop: bool = false,
+    runtime_residency_worker_mutex: std.Thread.Mutex = .{},
+    runtime_residency_worker_interval_ms: u64 = runtime_residency_worker_interval_ms_default,
 
     fn init(
         allocator: std.mem.Allocator,
@@ -4305,6 +4571,12 @@ const AgentRuntimeRegistry = struct {
     }
 
     fn deinit(self: *AgentRuntimeRegistry) void {
+        self.requestRuntimeResidencyWorkerStop();
+        if (self.runtime_residency_worker_thread) |thread| {
+            thread.join();
+            self.runtime_residency_worker_thread = null;
+        }
+
         self.requestReconcileWorkerStop();
         if (self.reconcile_worker_thread) |thread| {
             thread.join();
@@ -4973,6 +5245,17 @@ const AgentRuntimeRegistry = struct {
         );
     }
 
+    fn startRuntimeResidencyWorker(self: *AgentRuntimeRegistry) !void {
+        self.runtime_residency_worker_mutex.lock();
+        self.runtime_residency_worker_stop = false;
+        self.runtime_residency_worker_mutex.unlock();
+        self.runtime_residency_worker_thread = try std.Thread.spawn(
+            .{},
+            runtimeResidencyWorkerMain,
+            .{self},
+        );
+    }
+
     fn requestReconcileWorkerStop(self: *AgentRuntimeRegistry) void {
         self.reconcile_worker_mutex.lock();
         self.reconcile_worker_stop = true;
@@ -4983,6 +5266,43 @@ const AgentRuntimeRegistry = struct {
         self.reconcile_worker_mutex.lock();
         defer self.reconcile_worker_mutex.unlock();
         return self.reconcile_worker_stop;
+    }
+
+    fn requestRuntimeResidencyWorkerStop(self: *AgentRuntimeRegistry) void {
+        self.runtime_residency_worker_mutex.lock();
+        self.runtime_residency_worker_stop = true;
+        self.runtime_residency_worker_mutex.unlock();
+    }
+
+    fn shouldStopRuntimeResidencyWorker(self: *AgentRuntimeRegistry) bool {
+        self.runtime_residency_worker_mutex.lock();
+        defer self.runtime_residency_worker_mutex.unlock();
+        return self.runtime_residency_worker_stop;
+    }
+
+    fn ensureActiveRuntimeResidency(self: *AgentRuntimeRegistry, retry_on_error: bool) !void {
+        const bindings = try self.control_plane.snapshotActiveProjectBindings(self.allocator, true);
+        defer {
+            for (bindings) |*binding| binding.deinit(self.allocator);
+            self.allocator.free(bindings);
+        }
+
+        for (bindings) |binding| {
+            if (!self.control_plane.projectHasMounts(binding.project_id)) continue;
+            var attach_state = self.ensureRuntimeWarmup(
+                binding.agent_id,
+                binding.project_id,
+                null,
+                retry_on_error,
+            ) catch |err| {
+                std.log.warn(
+                    "active runtime residency warmup failed: agent={s} project={s} err={s}",
+                    .{ binding.agent_id, binding.project_id, @errorName(err) },
+                );
+                continue;
+            };
+            attach_state.deinit(self.allocator);
+        }
     }
 
     const RemovedRuntimeEntry = struct {
@@ -6613,6 +6933,38 @@ const AgentRuntimeRegistry = struct {
         }
     }
 
+    fn pruneLegacySystemCapabilityMounts(self: *AgentRuntimeRegistry) void {
+        const legacy_paths = [_][]const u8{
+            legacy_local_node_mount_agents_self_capabilities,
+            legacy_local_node_mount_projects_system_agents_self_capabilities,
+        };
+        for (legacy_paths) |mount_path| {
+            const escaped_project = unified.jsonEscape(self.allocator, system_project_id) catch continue;
+            defer self.allocator.free(escaped_project);
+            const escaped_mount = unified.jsonEscape(self.allocator, mount_path) catch continue;
+            defer self.allocator.free(escaped_mount);
+            const payload = std.fmt.allocPrint(
+                self.allocator,
+                "{{\"project_id\":\"{s}\",\"mount_path\":\"{s}\"}}",
+                .{ escaped_project, escaped_mount },
+            ) catch continue;
+            defer self.allocator.free(payload);
+
+            const result = self.control_plane.removeProjectMountWithRole(payload, true) catch |err| switch (err) {
+                fs_control_plane.ControlPlaneError.MountNotFound => continue,
+                else => {
+                    std.log.warn(
+                        "failed pruning legacy system mount {s}: {s}",
+                        .{ mount_path, @errorName(err) },
+                    );
+                    continue;
+                },
+            };
+            self.allocator.free(result);
+            std.log.info("pruned legacy system mount path: {s}", .{mount_path});
+        }
+    }
+
     fn maybeInitLocalFsNode(self: *AgentRuntimeRegistry, bind_addr: []const u8, port: u16) !void {
         self.mutex.lock();
         const existing_node = self.local_fs_node;
@@ -6715,10 +7067,12 @@ const AgentRuntimeRegistry = struct {
                 .source_id = "meta",
             },
             .{
-                .name = local_node_capabilities_export_name,
-                .path = "capabilities",
-                .ro = true,
-                .desc = "spiderweb-capabilities-export",
+                .name = local_node_chat_export_name,
+                .path = "chat",
+                // chat/control/input and chat/control/reply must accept writes.
+                // Per-node writable flags still enforce read-only for docs/meta files.
+                .ro = false,
+                .desc = "spiderweb-chat-export",
                 .source_kind = .namespace,
                 .source_id = "capabilities",
             },
@@ -6733,11 +7087,11 @@ const AgentRuntimeRegistry = struct {
         };
         const mount_specs = [_]fs_control_plane.SpiderWebMountSpec{
             .{ .mount_path = local_node_mount_meta, .export_name = local_node_meta_export_name },
-            .{ .mount_path = local_node_mount_agents_self_capabilities, .export_name = local_node_capabilities_export_name },
+            .{ .mount_path = local_node_mount_agents_self_chat, .export_name = local_node_chat_export_name },
             .{ .mount_path = local_node_mount_agents_self_jobs, .export_name = local_node_jobs_export_name },
             .{ .mount_path = local_node_mount_nodes_local_fs, .export_name = workspace_export_name },
             .{ .mount_path = local_node_mount_projects_system_meta, .export_name = local_node_meta_export_name },
-            .{ .mount_path = local_node_mount_projects_system_agents_self_capabilities, .export_name = local_node_capabilities_export_name },
+            .{ .mount_path = local_node_mount_projects_system_agents_self_chat, .export_name = local_node_chat_export_name },
             .{ .mount_path = local_node_mount_projects_system_agents_self_jobs, .export_name = local_node_jobs_export_name },
             .{ .mount_path = local_node_mount_projects_system_nodes_local_fs, .export_name = workspace_export_name },
             .{ .mount_path = local_node_mount_projects_system_fs_local, .export_name = workspace_export_name },
@@ -6745,6 +7099,7 @@ const AgentRuntimeRegistry = struct {
 
         const local_node = try LocalFsNode.create(
             self.allocator,
+            self,
             &export_specs,
             &mount_specs,
             node_name,
@@ -6755,6 +7110,7 @@ const AgentRuntimeRegistry = struct {
         );
         errdefer local_node.deinit(&self.control_plane);
         try local_node.startRegistrationAndHeartbeat(&self.control_plane);
+        self.pruneLegacySystemCapabilityMounts();
 
         var installed = false;
         self.mutex.lock();
@@ -6939,6 +7295,21 @@ fn reconcileWorkerMain(runtime_registry: *AgentRuntimeRegistry) void {
     }
 }
 
+fn runtimeResidencyWorkerMain(runtime_registry: *AgentRuntimeRegistry) void {
+    var sweep_count: u64 = 0;
+    while (true) {
+        if (runtime_registry.shouldStopRuntimeResidencyWorker()) return;
+
+        const retry_on_error = @mod(sweep_count, 5) == 0;
+        runtime_registry.ensureActiveRuntimeResidency(retry_on_error) catch |err| {
+            std.log.warn("runtime residency worker error: {s}", .{@errorName(err)});
+        };
+        sweep_count +%= 1;
+
+        std.Thread.sleep(runtime_registry.runtime_residency_worker_interval_ms * std.time.ns_per_ms);
+    }
+}
+
 pub fn run(
     allocator: std.mem.Allocator,
     bind_addr: []const u8,
@@ -7007,6 +7378,10 @@ pub fn run(
         .{ bind_addr, port },
     );
     startLocalFsBootstrapThread(allocator, &runtime_registry, bind_addr, port);
+    try runtime_registry.startRuntimeResidencyWorker();
+    runtime_registry.ensureActiveRuntimeResidency(true) catch |err| {
+        std.log.warn("initial runtime residency warmup failed: {s}", .{@errorName(err)});
+    };
 
     while (true) {
         var connection = tcp_server.accept() catch |err| {
@@ -8669,6 +9044,11 @@ fn handleWebSocketConnection(
                                             availability_after,
                                         );
                                     }
+                                }
+                                if (topology_mutation) {
+                                    runtime_registry.ensureActiveRuntimeResidency(true) catch |err| {
+                                        std.log.warn("runtime residency refresh failed after topology mutation: {s}", .{@errorName(err)});
+                                    };
                                 }
                                 continue;
                             },

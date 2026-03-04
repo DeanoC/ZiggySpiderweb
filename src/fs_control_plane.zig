@@ -332,6 +332,17 @@ pub const ControlPlane = struct {
     reconcile_max_retries_per_cycle: u32 = 3,
     reconcile_last_failed_ops: std.ArrayListUnmanaged([]u8) = .{},
 
+    pub const ActiveProjectBinding = struct {
+        agent_id: []u8,
+        project_id: []u8,
+
+        pub fn deinit(self: *ActiveProjectBinding, allocator: std.mem.Allocator) void {
+            allocator.free(self.agent_id);
+            allocator.free(self.project_id);
+            self.* = undefined;
+        }
+    };
+
     pub const InitOptions = struct {
         primary_agent_id: []const u8 = default_primary_agent_id,
         spider_web_root: []const u8 = default_spider_web_root,
@@ -1491,6 +1502,46 @@ pub const ControlPlane = struct {
             return owned;
         }
         return null;
+    }
+
+    pub fn projectHasMounts(self: *ControlPlane, project_id: []const u8) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        _ = self.reapExpiredLeasesLocked(std.time.milliTimestamp());
+        const project = self.projects.get(project_id) orelse return false;
+        return project.mounts.items.len > 0;
+    }
+
+    pub fn snapshotActiveProjectBindings(
+        self: *ControlPlane,
+        allocator: std.mem.Allocator,
+        include_primary: bool,
+    ) ![]ActiveProjectBinding {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        _ = self.reapExpiredLeasesLocked(std.time.milliTimestamp());
+
+        var bindings = std.ArrayListUnmanaged(ActiveProjectBinding){};
+        errdefer {
+            for (bindings.items) |*item| item.deinit(allocator);
+            bindings.deinit(allocator);
+        }
+
+        var it = self.active_project_by_agent.iterator();
+        while (it.next()) |entry| {
+            const agent_id = entry.key_ptr.*;
+            const project_id = entry.value_ptr.*;
+            if (project_id.len == 0) continue;
+            if (!include_primary and std.mem.eql(u8, agent_id, self.primary_agent_id)) continue;
+            if (!self.projects.contains(project_id)) continue;
+
+            try bindings.append(allocator, .{
+                .agent_id = try allocator.dupe(u8, agent_id),
+                .project_id = try allocator.dupe(u8, project_id),
+            });
+        }
+
+        return bindings.toOwnedSlice(allocator);
     }
 
     pub fn getProject(self: *ControlPlane, payload_json: ?[]const u8) ![]u8 {

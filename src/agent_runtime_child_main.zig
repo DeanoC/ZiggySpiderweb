@@ -4,6 +4,7 @@ const tool_registry = @import("ziggy-tool-runtime").tool_registry;
 
 const max_line_bytes: usize = 16 * 1024 * 1024;
 const file_list_timeout_ms: usize = 5_000;
+const workspace_root_env = "SPIDERWEB_WORKSPACE_ROOT";
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -86,10 +87,218 @@ fn executeWorldToolNoPanic(
     tool_name: []const u8,
     args: std.json.ObjectMap,
 ) tool_registry.ToolExecutionResult {
+    if (std.mem.eql(u8, tool_name, "file_read")) {
+        return safeFileRead(allocator, args);
+    }
+    if (std.mem.eql(u8, tool_name, "file_write")) {
+        return safeFileWrite(allocator, args);
+    }
     if (std.mem.eql(u8, tool_name, "file_list")) {
         return safeFileList(allocator, args);
     }
     return registry.executeWorld(allocator, tool_name, args);
+}
+
+fn safeFileRead(
+    allocator: std.mem.Allocator,
+    args: std.json.ObjectMap,
+) tool_registry.ToolExecutionResult {
+    const path_value = args.get("path") orelse return failResult(allocator, .invalid_params, "missing required parameter: path");
+    if (path_value != .string) return failResult(allocator, .invalid_params, "path must be string");
+    const path = path_value.string;
+
+    if (validatePathOwned(allocator, path)) |message| {
+        defer allocator.free(message);
+        return failResult(allocator, .permission_denied, message);
+    }
+
+    const max_bytes = blk: {
+        const maybe = args.get("max_bytes") orelse break :blk @as(usize, tool_executor.DEFAULT_MAX_FILE_READ_BYTES);
+        if (maybe != .integer or maybe.integer < 0) {
+            return failResult(allocator, .invalid_params, "max_bytes must be a non-negative integer");
+        }
+        break :blk @as(usize, @intCast(maybe.integer));
+    };
+    const wait_until_ready = blk: {
+        const maybe = args.get("wait_until_ready") orelse break :blk true;
+        if (maybe != .bool) return failResult(allocator, .invalid_params, "wait_until_ready must be boolean");
+        break :blk maybe.bool;
+    };
+    const effective_max = @min(max_bytes, 8 * 1024 * 1024);
+
+    const workspace_real = getWorkspaceRootRealpath(allocator) catch |err| {
+        return failResult(allocator, .execution_failed, @errorName(err));
+    };
+    defer allocator.free(workspace_real);
+    const absolute_path = resolveAbsolutePathInWorkspace(allocator, workspace_real, path) catch {
+        return failResult(allocator, .execution_failed, "out of memory");
+    };
+    defer allocator.free(absolute_path);
+
+    var file: std.fs.File = blk: {
+        if (wait_until_ready) {
+            break :blk std.fs.openFileAbsolute(absolute_path, .{}) catch |err| {
+                return failResult(allocator, .execution_failed, @errorName(err));
+            };
+        }
+
+        const fd = std.posix.open(
+            absolute_path,
+            .{
+                .ACCMODE = .RDONLY,
+                .NONBLOCK = true,
+                .CLOEXEC = true,
+            },
+            0,
+        ) catch |err| {
+            if (isWouldBlockError(err)) {
+                const payload = buildFileReadPayload(allocator, path, 0, false, "", false, false) catch {
+                    return failResult(allocator, .execution_failed, "out of memory");
+                };
+                return .{ .success = .{ .payload_json = payload } };
+            }
+            return failResult(allocator, .execution_failed, @errorName(err));
+        };
+        break :blk .{ .handle = fd };
+    };
+    defer file.close();
+
+    const file_size = file.getEndPos() catch 0;
+    const content_buffer = allocator.alloc(u8, effective_max) catch return failResult(allocator, .execution_failed, "out of memory");
+    defer allocator.free(content_buffer);
+    const content_len = if (wait_until_ready)
+        file.readAll(content_buffer) catch |err| return failResult(allocator, .execution_failed, @errorName(err))
+    else
+        file.read(content_buffer) catch |err| {
+            if (isWouldBlockError(err)) {
+                const payload = buildFileReadPayload(allocator, path, 0, false, "", false, false) catch {
+                    return failResult(allocator, .execution_failed, "out of memory");
+                };
+                return .{ .success = .{ .payload_json = payload } };
+            }
+            return failResult(allocator, .execution_failed, @errorName(err));
+        };
+    const raw_content = content_buffer[0..content_len];
+    const truncated = file_size > content_len;
+    const content = if (truncated) utf8SafePrefix(raw_content) else raw_content;
+    const payload = buildFileReadPayload(
+        allocator,
+        path,
+        content.len,
+        truncated,
+        content,
+        true,
+        wait_until_ready,
+    ) catch return failResult(allocator, .execution_failed, "out of memory");
+    return .{ .success = .{ .payload_json = payload } };
+}
+
+fn safeFileWrite(
+    allocator: std.mem.Allocator,
+    args: std.json.ObjectMap,
+) tool_registry.ToolExecutionResult {
+    const path_value = args.get("path") orelse return failResult(allocator, .invalid_params, "missing required parameter: path");
+    if (path_value != .string) return failResult(allocator, .invalid_params, "path must be string");
+    const content_value = args.get("content") orelse return failResult(allocator, .invalid_params, "missing required parameter: content");
+    if (content_value != .string) return failResult(allocator, .invalid_params, "content must be string");
+    const path = path_value.string;
+    const content = content_value.string;
+
+    if (validatePathOwned(allocator, path)) |message| {
+        defer allocator.free(message);
+        return failResult(allocator, .permission_denied, message);
+    }
+
+    const append = blk: {
+        const maybe = args.get("append") orelse break :blk false;
+        if (maybe != .bool) return failResult(allocator, .invalid_params, "append must be boolean");
+        break :blk maybe.bool;
+    };
+    const create_parents = blk: {
+        const maybe = args.get("create_parents") orelse break :blk true;
+        if (maybe != .bool) return failResult(allocator, .invalid_params, "create_parents must be boolean");
+        break :blk maybe.bool;
+    };
+    const wait_until_ready = blk: {
+        const maybe = args.get("wait_until_ready") orelse break :blk true;
+        if (maybe != .bool) return failResult(allocator, .invalid_params, "wait_until_ready must be boolean");
+        break :blk maybe.bool;
+    };
+
+    const workspace_real = getWorkspaceRootRealpath(allocator) catch |err| {
+        return failResult(allocator, .execution_failed, @errorName(err));
+    };
+    defer allocator.free(workspace_real);
+    const absolute_path = resolveAbsolutePathInWorkspace(allocator, workspace_real, path) catch {
+        return failResult(allocator, .execution_failed, "out of memory");
+    };
+    defer allocator.free(absolute_path);
+
+    if (create_parents) {
+        ensureAbsoluteParentDir(absolute_path) catch |err| return failResult(allocator, .execution_failed, @errorName(err));
+    }
+
+    var bytes_written: usize = 0;
+    var ready = true;
+    if (wait_until_ready) {
+        if (append) {
+            var file = std.fs.createFileAbsolute(absolute_path, .{ .truncate = false }) catch |err| return failResult(allocator, .execution_failed, @errorName(err));
+            defer file.close();
+            file.seekFromEnd(0) catch |err| return failResult(allocator, .execution_failed, @errorName(err));
+            file.writeAll(content) catch |err| return failResult(allocator, .execution_failed, @errorName(err));
+        } else {
+            var file = std.fs.createFileAbsolute(absolute_path, .{ .truncate = true }) catch |err| return failResult(allocator, .execution_failed, @errorName(err));
+            defer file.close();
+            file.writeAll(content) catch |err| return failResult(allocator, .execution_failed, @errorName(err));
+        }
+        bytes_written = content.len;
+    } else {
+        const fd = std.posix.open(
+            absolute_path,
+            .{
+                .ACCMODE = .WRONLY,
+                .CREAT = true,
+                .TRUNC = !append,
+                .APPEND = append,
+                .NONBLOCK = true,
+                .CLOEXEC = true,
+            },
+            0o644,
+        ) catch |err| {
+            if (isWouldBlockError(err)) {
+                const payload = buildFileWritePayload(allocator, path, 0, append, false, false) catch {
+                    return failResult(allocator, .execution_failed, "out of memory");
+                };
+                return .{ .success = .{ .payload_json = payload } };
+            }
+            return failResult(allocator, .execution_failed, @errorName(err));
+        };
+        var file = std.fs.File{ .handle = fd };
+        defer file.close();
+        while (bytes_written < content.len) {
+            const written_now = file.write(content[bytes_written..]) catch |err| {
+                if (isWouldBlockError(err)) {
+                    ready = false;
+                    break;
+                }
+                return failResult(allocator, .execution_failed, @errorName(err));
+            };
+            if (written_now == 0) {
+                ready = false;
+                break;
+            }
+            bytes_written += written_now;
+        }
+    }
+    const payload = buildFileWritePayload(
+        allocator,
+        path,
+        bytes_written,
+        append,
+        ready,
+        wait_until_ready,
+    ) catch return failResult(allocator, .execution_failed, "out of memory");
+    return .{ .success = .{ .payload_json = payload } };
 }
 
 fn safeFileList(
@@ -115,8 +324,9 @@ fn safeFileList(
     };
     const effective_max = @min(max_entries, 5000);
 
-    if (!isSafeRelativePath(path)) {
-        return failResult(allocator, .permission_denied, "path must be relative and stay within workspace");
+    if (validatePathOwned(allocator, path)) |message| {
+        defer allocator.free(message);
+        return failResult(allocator, .permission_denied, message);
     }
 
     var payload = std.ArrayListUnmanaged(u8){};
@@ -130,7 +340,16 @@ fn safeFileList(
     var count: usize = 0;
     var truncated = false;
     const start_ms = std.time.milliTimestamp();
-    var root_dir = std.fs.cwd().openDir(path, .{ .iterate = true }) catch |err| {
+    const workspace_real = getWorkspaceRootRealpath(allocator) catch |err| {
+        return failResult(allocator, .execution_failed, @errorName(err));
+    };
+    defer allocator.free(workspace_real);
+    const absolute_path = resolveAbsolutePathInWorkspace(allocator, workspace_real, path) catch {
+        return failResult(allocator, .execution_failed, "out of memory");
+    };
+    defer allocator.free(absolute_path);
+
+    var root_dir = std.fs.openDirAbsolute(absolute_path, .{ .iterate = true }) catch |err| {
         return failFileListFsError(allocator, err);
     };
     defer root_dir.close();
@@ -270,18 +489,167 @@ fn failResult(
     };
 }
 
-fn isSafeRelativePath(path: []const u8) bool {
-    if (path.len == 0) return false;
-    if (std.fs.path.isAbsolute(path)) return false;
-    if (path[0] == '~') return false;
-    if (path[0] == '-') return false;
-
-    var parts = std.mem.splitScalar(u8, path, std.fs.path.sep);
-    while (parts.next()) |part| {
-        if (part.len == 0 or std.mem.eql(u8, part, ".")) continue;
-        if (std.mem.eql(u8, part, "..")) return false;
+fn ensureAbsoluteParentDir(path: []const u8) !void {
+    const parent = std.fs.path.dirname(path) orelse return;
+    if (std.fs.path.isAbsolute(parent)) {
+        var root = try std.fs.openDirAbsolute("/", .{});
+        defer root.close();
+        const rel_parent = std.mem.trimLeft(u8, parent, "/");
+        if (rel_parent.len == 0) return;
+        try root.makePath(rel_parent);
+        return;
     }
-    return true;
+    try std.fs.cwd().makePath(parent);
+}
+
+fn buildFileReadPayload(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    bytes: usize,
+    truncated: bool,
+    content: []const u8,
+    ready: bool,
+    wait_until_ready: bool,
+) ![]u8 {
+    var payload = std.ArrayListUnmanaged(u8){};
+    errdefer payload.deinit(allocator);
+
+    try payload.appendSlice(allocator, "{\"path\":\"");
+    try appendJsonEscaped(allocator, &payload, path);
+    try payload.appendSlice(allocator, "\",\"bytes\":");
+    try payload.writer(allocator).print("{d}", .{bytes});
+    try payload.appendSlice(allocator, ",\"truncated\":");
+    try payload.appendSlice(allocator, if (truncated) "true" else "false");
+    try payload.appendSlice(allocator, ",\"content\":\"");
+    try appendJsonEscaped(allocator, &payload, content);
+    try payload.appendSlice(allocator, "\",\"ready\":");
+    try payload.appendSlice(allocator, if (ready) "true" else "false");
+    try payload.appendSlice(allocator, ",\"wait_until_ready\":");
+    try payload.appendSlice(allocator, if (wait_until_ready) "true" else "false");
+    try payload.append(allocator, '}');
+    return payload.toOwnedSlice(allocator);
+}
+
+fn buildFileWritePayload(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    bytes_written: usize,
+    append: bool,
+    ready: bool,
+    wait_until_ready: bool,
+) ![]u8 {
+    var payload = std.ArrayListUnmanaged(u8){};
+    errdefer payload.deinit(allocator);
+
+    try payload.appendSlice(allocator, "{\"path\":\"");
+    try appendJsonEscaped(allocator, &payload, path);
+    try payload.appendSlice(allocator, "\",\"bytes_written\":");
+    try payload.writer(allocator).print("{d}", .{bytes_written});
+    try payload.appendSlice(allocator, ",\"append\":");
+    try payload.appendSlice(allocator, if (append) "true" else "false");
+    try payload.appendSlice(allocator, ",\"ready\":");
+    try payload.appendSlice(allocator, if (ready) "true" else "false");
+    try payload.appendSlice(allocator, ",\"wait_until_ready\":");
+    try payload.appendSlice(allocator, if (wait_until_ready) "true" else "false");
+    try payload.append(allocator, '}');
+    return payload.toOwnedSlice(allocator);
+}
+
+fn getWorkspaceRootRealpath(allocator: std.mem.Allocator) ![]u8 {
+    const configured_root = std.process.getEnvVarOwned(allocator, workspace_root_env) catch null;
+    defer if (configured_root) |value| allocator.free(value);
+
+    const cwd = std.fs.cwd();
+    if (configured_root) |raw| {
+        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+        if (trimmed.len > 0) {
+            if (std.fs.path.isAbsolute(trimmed)) {
+                return std.fs.realpathAlloc(allocator, trimmed);
+            }
+            const joined = try std.fs.path.join(allocator, &.{ ".", trimmed });
+            defer allocator.free(joined);
+            return cwd.realpathAlloc(allocator, joined);
+        }
+    }
+    return cwd.realpathAlloc(allocator, ".");
+}
+
+fn resolveAbsolutePathInWorkspace(
+    allocator: std.mem.Allocator,
+    workspace_real: []const u8,
+    path: []const u8,
+) ![]u8 {
+    if (std.fs.path.isAbsolute(path)) return allocator.dupe(u8, path);
+    if (std.mem.eql(u8, path, ".")) return allocator.dupe(u8, workspace_real);
+    return std.fs.path.join(allocator, &.{ workspace_real, path });
+}
+
+fn isWithinWorkspace(workspace: []const u8, target: []const u8) bool {
+    if (std.mem.eql(u8, workspace, "/")) return std.fs.path.isAbsolute(target);
+    if (std.mem.eql(u8, workspace, target)) return true;
+    if (!std.mem.startsWith(u8, target, workspace)) return false;
+    if (target.len <= workspace.len) return false;
+    return target[workspace.len] == std.fs.path.sep;
+}
+
+fn validatePathOwned(allocator: std.mem.Allocator, path: []const u8) ?[]u8 {
+    if (path.len == 0) return allocator.dupe(u8, "path cannot be empty") catch null;
+    if (path[0] == '~') return allocator.dupe(u8, "home directory references are not allowed") catch null;
+    if (path[0] == '-') return allocator.dupe(u8, "path cannot start with '-'") catch null;
+
+    const workspace_real = getWorkspaceRootRealpath(allocator) catch |err| {
+        return std.fmt.allocPrint(allocator, "failed to resolve workspace path: {s}", .{@errorName(err)}) catch null;
+    };
+    defer allocator.free(workspace_real);
+
+    var candidate = path;
+    while (true) {
+        const candidate_abs = resolveAbsolutePathInWorkspace(allocator, workspace_real, candidate) catch {
+            return allocator.dupe(u8, "failed to resolve candidate path") catch null;
+        };
+        defer allocator.free(candidate_abs);
+
+        const resolved = std.fs.realpathAlloc(allocator, candidate_abs) catch |err| switch (err) {
+            error.FileNotFound, error.NotDir => {
+                if ((std.fs.path.isAbsolute(candidate) and std.mem.eql(u8, candidate, "/")) or std.mem.eql(u8, candidate, ".")) {
+                    return std.fmt.allocPrint(allocator, "failed to resolve path: {s}", .{@errorName(err)}) catch null;
+                }
+                candidate = std.fs.path.dirname(candidate) orelse if (std.fs.path.isAbsolute(candidate)) "/" else ".";
+                continue;
+            },
+            else => return std.fmt.allocPrint(allocator, "failed to resolve path: {s}", .{@errorName(err)}) catch null,
+        };
+        defer allocator.free(resolved);
+
+        if (!isWithinWorkspace(workspace_real, resolved)) {
+            return allocator.dupe(u8, "path resolves outside workspace") catch null;
+        }
+        return null;
+    }
+}
+
+fn utf8SafePrefix(value: []const u8) []const u8 {
+    if (std.unicode.utf8ValidateSlice(value)) return value;
+    return value[0..longestValidUtf8PrefixLen(value)];
+}
+
+fn longestValidUtf8PrefixLen(value: []const u8) usize {
+    var i: usize = 0;
+    while (i < value.len) {
+        const seq_len = std.unicode.utf8ByteSequenceLength(value[i]) catch break;
+        const next = i + @as(usize, @intCast(seq_len));
+        if (next > value.len) break;
+        _ = std.unicode.utf8Decode(value[i..next]) catch break;
+        i = next;
+    }
+    return i;
+}
+
+fn isWouldBlockError(err: anyerror) bool {
+    return switch (err) {
+        error.WouldBlock => true,
+        else => false,
+    };
 }
 
 fn mapDirEntryKind(kind: std.fs.Dir.Entry.Kind) []const u8 {

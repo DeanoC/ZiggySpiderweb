@@ -42,16 +42,20 @@ pub const LOOP_CONTRACT_TEXT =
 pub const TOOL_CONTRACT_TEXT =
     \\Use only these runtime tools: file_read, file_write, file_list.
     \\Use JSON object args that match the tool schema; file_read/file_write support wait_until_ready (default true).
-    \\For file_* tool args, prefer workspace-relative Acheron paths (for example: agents/self/...).
+    \\For file_* tool args, use canonical absolute Acheron paths (for example: /agents/self/...).
     \\Do not use talk_* tools.
     \\Do not call memory_* directly; use Acheron paths under /agents/self/memory/control/*.json.
     \\Access web search, code search, terminal, sub-brains, and agent management via Acheron namespaces under /agents/self.
     \\Before claiming a capability is unavailable, check `/agents/self/services/SERVICES.json` and relevant first-class namespaces.
     \\Use agent_namespace for agent-local capabilities and node scope for node-specific capabilities.
     \\If `/agents/self/web_search` exists, do not claim you cannot do web search; invoke the web search service.
-    \\For "what projects/agents exist" requests, use `agents/self/projects/control/list.json` and `agents/self/agents/control/list.json` (or invoke.json), not directory-entry inference.
+    \\For "what projects/agents exist" requests, use `/agents/self/projects/control/list.json` and `/agents/self/agents/control/list.json` (or invoke.json), not directory-entry inference.
     \\When presenting projects/agents to users, prefer human labels first (`name`) and include stable ids (`project_id`/`id`) only as secondary identifiers.
-    \\To reply to user/admin, write text to agents/self/chat/control/reply.
+    \\If you are Mother (`agent_id=mother`), your role is system orchestration and provisioning, not project delivery execution.
+    \\After creating the first non-system project/agent, give handoff instructions and stop: direct the admin to `control.session_attach` for the created `{project_id,agent_id}`.
+    \\Do not volunteer to start repo setup, PR preparation, coding, or project implementation work from Mother after provisioning.
+    \\Mother may still run project setup primitives when requested (project/agent create, mount/bind/resolve) to complete bootstrap.
+    \\To reply to user/admin, write text to /agents/self/chat/control/reply.
     \\Treat /agents/self/chat/control/input as inbound user/admin input channel (do not use it for outbound replies).
     \\Internal thought telemetry is exposed at /agents/self/thoughts/* and is observational (not chat).
     \\Use `/agents/self/terminal/control/*.json` when terminal execution is required.
@@ -218,4 +222,10 @@ test "memory_schema: ensures runtime instruction memories" {
 
     try std.testing.expect(saw_policy);
     try std.testing.expect(saw_goal);
+}
+
+test "memory_schema: tool contract includes mother provisioning handoff guardrails" {
+    try std.testing.expect(std.mem.indexOf(u8, TOOL_CONTRACT_TEXT, "If you are Mother (`agent_id=mother`)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, TOOL_CONTRACT_TEXT, "direct the admin to `control.session_attach`") != null);
+    try std.testing.expect(std.mem.indexOf(u8, TOOL_CONTRACT_TEXT, "Do not volunteer to start repo setup, PR preparation, coding, or project implementation work from Mother after provisioning.") != null);
 }

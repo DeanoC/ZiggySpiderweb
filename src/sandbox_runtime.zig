@@ -6,7 +6,8 @@ const tool_registry = @import("ziggy-tool-runtime").tool_registry;
 const max_ipc_line_bytes: usize = 16 * 1024 * 1024;
 const mount_startup_timeout_ms: u64 = 15_000;
 const mount_poll_interval_ms: u64 = 100;
-const sandbox_namespace_root = "/workspace";
+const sandbox_namespace_root = "/";
+const sandbox_workspace_alias_path = "/workspace";
 const sandbox_home_path = "/workspace";
 
 pub const Options = struct {
@@ -212,6 +213,7 @@ pub const SandboxRuntime = struct {
 
     pub fn isHealthy(self: *SandboxRuntime) bool {
         if (!processIsAlive(self.child.id)) return false;
+        if (processIsZombie(self.allocator, self.child.id)) return false;
 
         if (self.owns_mount_process) {
             const mount_child = self.mount_process orelse return false;
@@ -687,9 +689,18 @@ fn spawnSandboxChild(
     defer allocator.free(runtime_json);
 
     const child_dir = std.fs.path.dirname(child_bin_path) orelse return error.InvalidChildBinary;
+    const child_basename = std.fs.path.basename(child_bin_path);
+    const sandbox_child_dir = "/opt/spiderweb/bin";
+    const sandbox_child_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ sandbox_child_dir, child_basename });
+    defer allocator.free(sandbox_child_path);
 
     var args = std.ArrayListUnmanaged([]const u8){};
     defer args.deinit(allocator);
+    var owned_args = std.ArrayListUnmanaged([]u8){};
+    defer {
+        for (owned_args.items) |value| allocator.free(value);
+        owned_args.deinit(allocator);
+    }
 
     try args.append(allocator, launcher);
     try args.append(allocator, "--die-with-parent");
@@ -702,7 +713,7 @@ fn spawnSandboxChild(
     try args.append(allocator, "--tmpfs");
     try args.append(allocator, "/tmp");
     try args.append(allocator, "--tmpfs");
-    try args.append(allocator, sandbox_namespace_root);
+    try args.append(allocator, sandbox_workspace_alias_path);
     try args.append(allocator, "--ro-bind");
     try args.append(allocator, "/usr");
     try args.append(allocator, "/usr");
@@ -721,12 +732,23 @@ fn spawnSandboxChild(
         try args.append(allocator, "/lib64");
         try args.append(allocator, "/lib64");
     }
+    try args.append(allocator, "--dir");
+    try args.append(allocator, "/opt");
+    try args.append(allocator, "--dir");
+    try args.append(allocator, "/opt/spiderweb");
+    try args.append(allocator, "--dir");
+    try args.append(allocator, sandbox_child_dir);
     try args.append(allocator, "--ro-bind");
     try args.append(allocator, child_dir);
-    try args.append(allocator, child_dir);
+    try args.append(allocator, sandbox_child_dir);
     try args.append(allocator, "--bind");
     try args.append(allocator, workspace_bind_source_path);
-    try args.append(allocator, sandbox_namespace_root);
+    try args.append(allocator, sandbox_workspace_alias_path);
+    try appendNamespaceBindIfExists(allocator, &args, &owned_args, workspace_bind_source_path, "agents");
+    try appendNamespaceBindIfExists(allocator, &args, &owned_args, workspace_bind_source_path, "nodes");
+    try appendNamespaceBindIfExists(allocator, &args, &owned_args, workspace_bind_source_path, "projects");
+    try appendNamespaceBindIfExists(allocator, &args, &owned_args, workspace_bind_source_path, "meta");
+    try appendNamespaceBindIfExists(allocator, &args, &owned_args, workspace_bind_source_path, "global");
     try args.append(allocator, "--chdir");
     try args.append(allocator, sandbox_namespace_root);
     try args.append(allocator, "--setenv");
@@ -734,9 +756,9 @@ fn spawnSandboxChild(
     try args.append(allocator, sandbox_home_path);
     try args.append(allocator, "--setenv");
     try args.append(allocator, "PATH");
-    try args.append(allocator, "/usr/bin:/bin");
+    try args.append(allocator, "/usr/bin:/bin:/opt/spiderweb/bin");
     try args.append(allocator, "--");
-    try args.append(allocator, child_bin_path);
+    try args.append(allocator, sandbox_child_path);
     try args.append(allocator, "--agent-id");
     try args.append(allocator, agent_id);
 
@@ -756,6 +778,38 @@ fn spawnSandboxChild(
     child.env_map = null;
 
     return child;
+}
+
+fn appendOwnedArg(
+    allocator: std.mem.Allocator,
+    args: *std.ArrayListUnmanaged([]const u8),
+    owned_args: *std.ArrayListUnmanaged([]u8),
+    value: []const u8,
+) !void {
+    const owned = try allocator.dupe(u8, value);
+    try owned_args.append(allocator, owned);
+    try args.append(allocator, owned);
+}
+
+fn appendNamespaceBindIfExists(
+    allocator: std.mem.Allocator,
+    args: *std.ArrayListUnmanaged([]const u8),
+    owned_args: *std.ArrayListUnmanaged([]u8),
+    workspace_bind_source_path: []const u8,
+    namespace_name: []const u8,
+) !void {
+    const source_path = try std.fs.path.join(allocator, &.{ workspace_bind_source_path, namespace_name });
+    defer allocator.free(source_path);
+    if (!pathExists(source_path)) return;
+
+    const target_path = try std.fmt.allocPrint(allocator, "/{s}", .{namespace_name});
+    defer allocator.free(target_path);
+
+    try args.append(allocator, "--dir");
+    try appendOwnedArg(allocator, args, owned_args, target_path);
+    try args.append(allocator, "--bind");
+    try appendOwnedArg(allocator, args, owned_args, source_path);
+    try appendOwnedArg(allocator, args, owned_args, target_path);
 }
 
 fn persistRootfsMetadata(
