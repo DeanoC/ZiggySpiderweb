@@ -391,7 +391,7 @@ def run_control_runtime_order(host: str, port: int, auth_token=None) -> None:
 
             attach_ack = None
             last_attach_error = None
-            deadline = time.time() + 35.0
+            deadline = time.time() + 120.0
             next_tag = 2
             while time.time() < deadline:
                 conn.send_json({
