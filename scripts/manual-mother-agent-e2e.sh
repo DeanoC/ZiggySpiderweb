@@ -425,8 +425,9 @@ ws_attach_with_retry() {
     fi
     if ws_expect_attach_ready_or_warming 5; then
       return 0
+    else
+      attach_status=$?
     fi
-    attach_status=$?
     attach_tag=$((attach_tag + 1))
 
     if [[ "$attach_status" -eq 2 ]]; then
