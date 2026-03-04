@@ -60,7 +60,8 @@ ASK_TEXT=${ASK_TEXT:-"In one short sentence, ask me for the first project name, 
 CHAT_MAX_ATTEMPTS=${CHAT_MAX_ATTEMPTS:-3}
 CONTROL_RETRY_ATTEMPTS=${CONTROL_RETRY_ATTEMPTS:-30}
 CONTROL_RETRY_DELAY_SEC=${CONTROL_RETRY_DELAY_SEC:-0.2}
-WS_ATTACH_RETRY_ATTEMPTS=${WS_ATTACH_RETRY_ATTEMPTS:-30}
+WS_ATTACH_RETRY_ATTEMPTS=${WS_ATTACH_RETRY_ATTEMPTS:-90}
+WS_ATTACH_RETRY_DELAY_SEC=${WS_ATTACH_RETRY_DELAY_SEC:-2}
 PROJECT_NAME=${PROJECT_NAME:-"manual-canary-project"}
 PROJECT_VISION=${PROJECT_VISION:-"Validate Mother bootstrap and provider-backed provisioning flow."}
 AGENT_ID=${AGENT_ID:-"manual-canary-agent"}
@@ -273,7 +274,7 @@ ws_attach_with_retry() {
       return 0
     fi
     if [[ "$attempt" -lt "$attempts" ]]; then
-      sleep 1
+      sleep "$WS_ATTACH_RETRY_DELAY_SEC"
     fi
   done
   echo "error: websocket attach handshake failed after ${attempts} attempts" >&2

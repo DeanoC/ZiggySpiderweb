@@ -145,8 +145,8 @@ class WSConn:
 
     @classmethod
     def connect(cls, host: str, port: int, path: str, auth_token=None) -> "WSConn":
-        sock = socket.create_connection((host, port), timeout=3)
-        sock.settimeout(3)
+        sock = socket.create_connection((host, port), timeout=10)
+        sock.settimeout(10)
         key = base64.b64encode(os.urandom(16)).decode("ascii")
         auth_line = f"Authorization: Bearer {auth_token}\r\n" if auth_token else ""
         request = (
