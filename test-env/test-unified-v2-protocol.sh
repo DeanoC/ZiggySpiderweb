@@ -359,7 +359,7 @@ def run_control_runtime_order(host: str, port: int, auth_token=None) -> None:
             conn.close()
 
     def scenario_happy_path() -> None:
-        scenario_deadline = time.time() + 120.0
+        scenario_deadline = time.time() + 90.0
         last_error = None
 
         while time.time() < scenario_deadline:
@@ -430,7 +430,8 @@ def run_control_runtime_order(host: str, port: int, auth_token=None) -> None:
 
     run_with_retries("control-before-version", scenario_control_before_version)
     run_with_retries("attach-before-version", scenario_attach_before_version)
-    run_with_retries("runtime-happy-path", scenario_happy_path)
+    # Keep this path single-attempt so failures surface quickly in CI logs.
+    run_with_retries("runtime-happy-path", scenario_happy_path, attempts=1)
 
 
 def fs_ready(host: str, port: int, auth_token: str) -> None:
