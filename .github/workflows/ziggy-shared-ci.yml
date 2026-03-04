@@ -79,4 +79,4 @@ jobs:
           CANARY_PROVIDER_API_KEY: ${{ secrets.CANARY_PROVIDER_API_KEY }}
         run: |
           printf '%s\n' "$EXTRA_COMMANDS" > /tmp/ziggy-ci-extra.sh
-          bash /tmp/ziggy-ci-extra.sh
+          bash -eo pipefail /tmp/ziggy-ci-extra.sh
