@@ -4,7 +4,7 @@ const Config = @import("config.zig");
 const tool_registry = @import("ziggy-tool-runtime").tool_registry;
 
 const max_ipc_line_bytes: usize = 16 * 1024 * 1024;
-const mount_startup_timeout_ms: u64 = 15_000;
+const mount_startup_timeout_ms: u64 = 60_000;
 const mount_poll_interval_ms: u64 = 100;
 const sandbox_namespace_root = "/";
 const sandbox_workspace_alias_path = "/workspace";
