@@ -1140,6 +1140,10 @@ const LocalFsNode = struct {
     registration_mutex: std.Thread.Mutex = .{},
     registered_node_id: ?[]u8 = null,
     session_auth_token: ?[]u8 = null,
+    chat_jobs_mutex: std.Thread.Mutex = .{},
+    chat_jobs_cond: std.Thread.Condition = .{},
+    chat_jobs_inflight: usize = 0,
+    chat_jobs_stopping: bool = false,
 
     fn create(
         allocator: std.mem.Allocator,
@@ -1226,6 +1230,7 @@ const LocalFsNode = struct {
     }
 
     fn deinit(self: *LocalFsNode, control_plane: *fs_control_plane.ControlPlane) void {
+        self.stopAndWaitForChatJobWorkers();
         self.requestHeartbeatStop();
         if (self.heartbeat_thread) |thread| {
             thread.join();
@@ -1256,6 +1261,35 @@ const LocalFsNode = struct {
         self.mount_specs.deinit(self.allocator);
         self.allocator.free(self.fs_url);
         self.allocator.destroy(self);
+    }
+
+    fn beginChatJobWorker(self: *LocalFsNode) !void {
+        self.chat_jobs_mutex.lock();
+        defer self.chat_jobs_mutex.unlock();
+        if (self.chat_jobs_stopping) return error.ShuttingDown;
+        self.chat_jobs_inflight += 1;
+    }
+
+    fn finishChatJobWorker(self: *LocalFsNode) void {
+        self.chat_jobs_mutex.lock();
+        if (self.chat_jobs_inflight > 0) {
+            self.chat_jobs_inflight -= 1;
+        }
+        if (self.chat_jobs_stopping and self.chat_jobs_inflight == 0) {
+            self.chat_jobs_cond.broadcast();
+        } else if (self.chat_jobs_inflight == 0) {
+            self.chat_jobs_cond.signal();
+        }
+        self.chat_jobs_mutex.unlock();
+    }
+
+    fn stopAndWaitForChatJobWorkers(self: *LocalFsNode) void {
+        self.chat_jobs_mutex.lock();
+        self.chat_jobs_stopping = true;
+        while (self.chat_jobs_inflight > 0) {
+            self.chat_jobs_cond.wait(&self.chat_jobs_mutex);
+        }
+        self.chat_jobs_mutex.unlock();
     }
 
     fn startRegistrationAndHeartbeat(self: *LocalFsNode, control_plane: *fs_control_plane.ControlPlane) !void {
@@ -1357,6 +1391,28 @@ const LocalFsNode = struct {
             };
         };
 
+        self.beginChatJobWorker() catch |begin_err| {
+            const message = try std.fmt.allocPrint(self.allocator, "chat job worker start blocked: {s}", .{@errorName(begin_err)});
+            defer self.allocator.free(message);
+            try self.runtime_registry.job_index.markCompleted(
+                job_id,
+                false,
+                message,
+                message,
+                "[local fs chat worker start blocked]\n",
+            );
+            return .{
+                .job_id = job_id,
+                .correlation_id = if (correlation_id) |value| try self.allocator.dupe(u8, value) else null,
+                .state = .failed,
+                .error_text = try self.allocator.dupe(u8, message),
+                .result_text = try self.allocator.dupe(u8, message),
+                .log_text = try self.allocator.dupe(u8, "[local fs chat worker start blocked]\n"),
+            };
+        };
+        var worker_handed_off = false;
+        defer if (!worker_handed_off) self.finishChatJobWorker();
+
         const worker_ctx = try self.allocator.create(LocalFsChatJobContext);
         worker_ctx.* = .{
             .allocator = self.allocator,
@@ -1385,6 +1441,7 @@ const LocalFsNode = struct {
                 .log_text = try self.allocator.dupe(u8, "[local fs chat worker spawn failure]\n"),
             };
         };
+        worker_handed_off = true;
         worker.detach();
 
         return .{
@@ -1433,6 +1490,7 @@ fn localFsNodeChatInputSubmitHook(
 
 fn localFsChatJobThreadMain(ctx: *LocalFsChatJobContext) void {
     defer ctx.deinit();
+    defer ctx.node.finishChatJobWorker();
     executeLocalFsChatJob(ctx.node, ctx.job_id, ctx.input, ctx.correlation_id) catch |err| {
         const message = std.fmt.allocPrint(
             ctx.allocator,
@@ -4588,6 +4646,13 @@ const AgentRuntimeRegistry = struct {
             self.runtime_warmup_lifecycle_cond.wait(&self.runtime_warmup_lifecycle_mutex);
         }
         self.runtime_warmup_lifecycle_mutex.unlock();
+
+        self.mutex.lock();
+        const local_fs_node_for_shutdown = self.local_fs_node;
+        self.mutex.unlock();
+        if (local_fs_node_for_shutdown) |local_fs_node| {
+            local_fs_node.stopAndWaitForChatJobWorkers();
+        }
 
         self.mutex.lock();
         defer self.mutex.unlock();

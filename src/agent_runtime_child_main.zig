@@ -5,6 +5,14 @@ const tool_registry = @import("ziggy-tool-runtime").tool_registry;
 const max_line_bytes: usize = 16 * 1024 * 1024;
 const file_list_timeout_ms: usize = 5_000;
 const workspace_root_env = "SPIDERWEB_WORKSPACE_ROOT";
+const sandbox_namespace_allowed_roots = [_][]const u8{
+    "/workspace",
+    "/agents",
+    "/nodes",
+    "/projects",
+    "/meta",
+    "/global",
+};
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -584,12 +592,21 @@ fn resolveAbsolutePathInWorkspace(
     return std.fs.path.join(allocator, &.{ workspace_real, path });
 }
 
+fn isWithinRootPath(root: []const u8, target: []const u8) bool {
+    if (std.mem.eql(u8, root, target)) return true;
+    if (!std.mem.startsWith(u8, target, root)) return false;
+    if (target.len <= root.len) return false;
+    return target[root.len] == std.fs.path.sep;
+}
+
 fn isWithinWorkspace(workspace: []const u8, target: []const u8) bool {
-    if (std.mem.eql(u8, workspace, "/")) return std.fs.path.isAbsolute(target);
-    if (std.mem.eql(u8, workspace, target)) return true;
-    if (!std.mem.startsWith(u8, target, workspace)) return false;
-    if (target.len <= workspace.len) return false;
-    return target[workspace.len] == std.fs.path.sep;
+    if (std.mem.eql(u8, workspace, "/")) {
+        for (sandbox_namespace_allowed_roots) |root| {
+            if (isWithinRootPath(root, target)) return true;
+        }
+        return false;
+    }
+    return isWithinRootPath(workspace, target);
 }
 
 fn validatePathOwned(allocator: std.mem.Allocator, path: []const u8) ?[]u8 {
@@ -681,6 +698,17 @@ test "agent_runtime_child_main: mount-unavailable error-name markers" {
     try std.testing.expect(isMountUnavailableErrorName("StaleFileHandle"));
     try std.testing.expect(isMountUnavailableErrorName("ConnectionTimedOut"));
     try std.testing.expect(!isMountUnavailableErrorName("FileNotFound"));
+}
+
+test "agent_runtime_child_main: slash workspace stays within namespace mounts" {
+    try std.testing.expect(isWithinWorkspace("/", "/workspace"));
+    try std.testing.expect(isWithinWorkspace("/", "/workspace/src"));
+    try std.testing.expect(isWithinWorkspace("/", "/projects/system"));
+    try std.testing.expect(isWithinWorkspace("/", "/agents/self"));
+    try std.testing.expect(!isWithinWorkspace("/", "/"));
+    try std.testing.expect(!isWithinWorkspace("/", "/usr/bin"));
+    try std.testing.expect(!isWithinWorkspace("/", "/tmp"));
+    try std.testing.expect(!isWithinWorkspace("/", "/projects2"));
 }
 
 fn appendJsonEscaped(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), value: []const u8) !void {
