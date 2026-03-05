@@ -8143,7 +8143,6 @@ pub const Session = struct {
             "ProviderStreamFailed",
             "ProviderRateLimited",
             "ProviderAuthFailed",
-            "MissingProviderApiKey",
             "ProviderModelNotFound",
             "provider request invalid",
             "provider tool loop exceeded",
@@ -8152,7 +8151,6 @@ pub const Session = struct {
             "provider request timed out",
             "provider rate limited",
             "provider authentication failed",
-            "missing provider api key",
             "provider model not found",
             "internal runtime limit",
         };
@@ -14130,6 +14128,12 @@ test "fsrpc_session: runtime failure normalization redacts provider details" {
     const normalized = Session.normalizeRuntimeFailureForAgent("provider_request_invalid", "provider request invalid");
     try std.testing.expectEqualStrings("runtime_internal_limit", normalized.code);
     try std.testing.expectEqualStrings("Temporary internal runtime limit reached; retry this request.", normalized.message);
+}
+
+test "fsrpc_session: missing provider API key is surfaced directly" {
+    const normalized = Session.normalizeRuntimeFailureForAgent("execution_failed", "missing provider api key");
+    try std.testing.expectEqualStrings("execution_failed", normalized.code);
+    try std.testing.expectEqualStrings("missing provider api key", normalized.message);
 }
 
 test "fsrpc_session: runtime loop-guard text is classified as internal failure" {
