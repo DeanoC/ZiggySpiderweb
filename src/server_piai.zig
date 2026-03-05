@@ -4310,17 +4310,21 @@ const AgentRuntimeRegistry = struct {
             errdefer sandbox_runtime.destroy();
 
             const runtime_server = if (self.provider_config) |provider_cfg|
-                try RuntimeServer.createWithProvider(
+                try RuntimeServer.createWithProviderAndToolDispatch(
                     self.allocator,
                     agent_id,
                     self.runtime_config,
                     provider_cfg,
+                    sandbox_runtime,
+                    sandbox_runtime_mod.SandboxRuntime.dispatchWorldTool,
                 )
             else
-                try RuntimeServer.create(
+                try RuntimeServer.createWithToolDispatch(
                     self.allocator,
                     agent_id,
                     self.runtime_config,
+                    sandbox_runtime,
+                    sandbox_runtime_mod.SandboxRuntime.dispatchWorldTool,
                 );
             errdefer runtime_server.destroy();
 
