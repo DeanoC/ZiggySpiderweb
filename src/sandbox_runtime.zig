@@ -4,11 +4,10 @@ const Config = @import("config.zig");
 const tool_registry = @import("ziggy-tool-runtime").tool_registry;
 
 const max_ipc_line_bytes: usize = 16 * 1024 * 1024;
-const mount_startup_timeout_ms: u64 = 60_000;
+const mount_startup_timeout_ms: u64 = 20_000;
 const mount_poll_interval_ms: u64 = 100;
 const sandbox_namespace_root = "/";
-const sandbox_workspace_alias_path = "/workspace";
-const sandbox_home_path = "/workspace";
+const sandbox_home_path = "/tmp";
 
 pub const Options = struct {
     allocator: std.mem.Allocator,
@@ -715,8 +714,6 @@ fn spawnSandboxChild(
     try args.append(allocator, "/dev");
     try args.append(allocator, "--tmpfs");
     try args.append(allocator, "/tmp");
-    try args.append(allocator, "--tmpfs");
-    try args.append(allocator, sandbox_workspace_alias_path);
     try args.append(allocator, "--ro-bind");
     try args.append(allocator, "/usr");
     try args.append(allocator, "/usr");
@@ -744,9 +741,6 @@ fn spawnSandboxChild(
     try args.append(allocator, "--ro-bind");
     try args.append(allocator, child_dir);
     try args.append(allocator, sandbox_child_dir);
-    try args.append(allocator, "--bind");
-    try args.append(allocator, workspace_bind_source_path);
-    try args.append(allocator, sandbox_workspace_alias_path);
     try appendNamespaceBindIfExists(allocator, &args, &owned_args, workspace_bind_source_path, "agents");
     try appendNamespaceBindIfExists(allocator, &args, &owned_args, workspace_bind_source_path, "nodes");
     try appendNamespaceBindIfExists(allocator, &args, &owned_args, workspace_bind_source_path, "projects");

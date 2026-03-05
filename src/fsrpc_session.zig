@@ -12030,7 +12030,7 @@ test "fsrpc_session: mounts namespace mkdir creates local export folders" {
     defer allocator.free(escaped_project_token);
     const mkdir_payload = try std.fmt.allocPrint(
         allocator,
-        "{{\"project_id\":\"{s}\",\"project_token\":\"{s}\",\"path\":\"new-project/workspace\"}}",
+        "{{\"project_id\":\"{s}\",\"project_token\":\"{s}\",\"path\":\"new-project/root\"}}",
         .{ escaped_project_id, escaped_project_token },
     );
     defer allocator.free(mkdir_payload);
@@ -12054,17 +12054,17 @@ test "fsrpc_session: mounts namespace mkdir creates local export folders" {
     );
     defer allocator.free(created_payload);
     try std.testing.expect(std.mem.indexOf(u8, created_payload, "\"operation\":\"mkdir\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, created_payload, "\"path\":\"/nodes/local/fs/new-project/workspace\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, created_payload, "\"path\":\"/nodes/local/fs/new-project/root\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, created_payload, "\"created\":true") != null);
 
-    const created_host_path = try std.fs.path.join(allocator, &.{ local_export_root, "new-project", "workspace" });
+    const created_host_path = try std.fs.path.join(allocator, &.{ local_export_root, "new-project", "root" });
     defer allocator.free(created_host_path);
     var created_dir = try std.fs.openDirAbsolute(created_host_path, .{});
     created_dir.close();
 
     const mkdir_existing_payload = try std.fmt.allocPrint(
         allocator,
-        "{{\"project_id\":\"{s}\",\"project_token\":\"{s}\",\"path\":\"/nodes/local/fs/new-project/workspace\"}}",
+        "{{\"project_id\":\"{s}\",\"project_token\":\"{s}\",\"path\":\"/nodes/local/fs/new-project/root\"}}",
         .{ escaped_project_id, escaped_project_token },
     );
     defer allocator.free(mkdir_existing_payload);

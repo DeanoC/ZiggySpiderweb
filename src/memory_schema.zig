@@ -42,7 +42,7 @@ pub const LOOP_CONTRACT_TEXT =
 pub const TOOL_CONTRACT_TEXT =
     \\Use only these runtime tools: file_read, file_write, file_list.
     \\Use JSON object args that match the tool schema; file_read/file_write support wait_until_ready (default true).
-    \\For file_* tool args, use canonical absolute Acheron paths (for example: /global/...).
+    \\For file_* tool args, use canonical absolute paths. Project sandboxes expose a full rootfs at `/`; use `/global/...` for Acheron service/control paths.
     \\Do not use talk_* tools.
     \\Do not call memory_* directly; use Acheron paths under /global/memory/control/*.json.
     \\Access web search, code search, terminal, sub-brains, and agent management via Acheron namespaces under /global.

@@ -11,7 +11,9 @@ pub const spider_web_project_id = "system";
 const spider_web_project_name = "System";
 const spider_web_project_status = "active";
 const spider_web_project_vision = "System project for Spiderweb control and host integrations";
-const spider_web_workspace_mount_path = "/workspace";
+const spider_web_workspace_mount_path = "/nodes/local/fs";
+const spider_web_project_mount_prefix = "/nodes/local/projects/" ++ spider_web_project_id ++ "/";
+const default_project_up_export_name = "work";
 const spider_web_project_kind_name = "system_builtin";
 const normal_project_kind_name = "normal";
 const default_primary_agent_id = "mother";
@@ -448,6 +450,7 @@ pub const ControlPlane = struct {
                 project.name = try self.allocator.dupe(u8, spider_web_project_name);
                 changed = true;
             }
+            if (pruneLegacyWorkspaceAliasMountsLocked(self, project)) changed = true;
             if (changed) project.updated_at_ms = now_ms;
         } else {
             const project = Project{
@@ -498,6 +501,14 @@ pub const ControlPlane = struct {
                 try self.allocator.dupe(u8, self.primary_agent_id),
                 try self.allocator.dupe(u8, spider_web_project_id),
             );
+            changed = true;
+        }
+
+        var project_it = self.projects.valueIterator();
+        while (project_it.next()) |project| {
+            if (project.kind == .spider_web_builtin) continue;
+            if (!pruneLegacyWorkspaceAliasMountsLocked(self, project)) continue;
+            project.updated_at_ms = now_ms;
             changed = true;
         }
 
@@ -1329,6 +1340,7 @@ pub const ControlPlane = struct {
         const vision_raw = getRequiredString(obj, "vision") catch return ControlPlaneError.MissingField;
         const status_raw = getOptionalString(obj, "status") orelse "active";
         const now = std.time.milliTimestamp();
+        try self.ensureBuiltinSpiderWebProjectLocked(now);
         try validateDisplayString(name_raw, 128);
         try validateIdentifier(status_raw, 64);
         try validateDisplayString(vision_raw, 1024);
@@ -1362,10 +1374,17 @@ pub const ControlPlane = struct {
             self.allocator.free(project.mutation_token);
         }
         try self.projects.put(self.allocator, project.id, project);
+        const stored_project = self.projects.getPtr(project_id) orelse return error.ProjectNotFound;
+        if (try ensureDefaultProjectMountsLocked(self, stored_project)) {
+            stored_project.updated_at_ms = now;
+            self.mount_sets_total +%= 1;
+            self.requestReconcileLocked(now);
+            _ = try self.runReconcileCycleLocked(now, false);
+        }
         self.project_creates_total +%= 1;
         self.persistSnapshotBestEffortLocked();
 
-        return renderProjectPayload(self.allocator, self.projects.get(project_id).?, true);
+        return renderProjectPayload(self.allocator, stored_project.*, true);
     }
 
     pub fn updateProject(self: *ControlPlane, payload_json: ?[]const u8) ![]u8 {
@@ -1984,7 +2003,7 @@ pub const ControlPlane = struct {
         const obj = payload.value.object;
         const project_id = getRequiredString(obj, "project_id") catch return ControlPlaneError.MissingField;
         try validateIdentifier(project_id, 128);
-        const project = self.projects.get(project_id) orelse return ControlPlaneError.ProjectNotFound;
+        const project = self.projects.getPtr(project_id) orelse return ControlPlaneError.ProjectNotFound;
         const is_primary_agent = self.isPrimaryAgent(agent_id);
         if (is_primary_agent and !is_admin and !std.mem.eql(u8, project_id, spider_web_project_id)) {
             return ControlPlaneError.ProjectAssignmentForbidden;
@@ -1993,11 +2012,17 @@ pub const ControlPlane = struct {
 
         const maybe_project_token = getOptionalString(obj, "project_token");
         if (project.kind != .spider_web_builtin) {
-            try requireProjectActionAccess(&project, .read, agent_id, maybe_project_token, is_admin);
+            try requireProjectActionAccess(project, .read, agent_id, maybe_project_token, is_admin);
         } else if (maybe_project_token) |project_token| {
             // Optional explicit validation when selecting the system project with a token provided.
             try validateSecretToken(project_token, 256);
             if (!secureTokenEql(project.mutation_token, project_token)) return ControlPlaneError.ProjectAuthFailed;
+        }
+        if (project.kind != .spider_web_builtin and try ensureDefaultProjectMountsLocked(self, project)) {
+            project.updated_at_ms = now_ms;
+            self.mount_sets_total +%= 1;
+            self.requestReconcileLocked(now_ms);
+            _ = try self.runReconcileCycleLocked(now_ms, false);
         }
 
         if (self.active_project_by_agent.getPtr(agent_id)) |existing| {
@@ -2016,7 +2041,7 @@ pub const ControlPlane = struct {
         }
         self.persistSnapshotBestEffortLocked();
 
-        const workspace_root = try std.fmt.allocPrint(self.allocator, "/spiderweb/projects/{s}/workspace", .{project_id});
+        const workspace_root = try std.fmt.allocPrint(self.allocator, "/spiderweb/projects/{s}", .{project_id});
         defer self.allocator.free(workspace_root);
         const escaped_agent = try jsonEscape(self.allocator, agent_id);
         defer self.allocator.free(escaped_agent);
@@ -2263,6 +2288,8 @@ pub const ControlPlane = struct {
             project.mounts.deinit(self.allocator);
             project.mounts = next_mounts;
             mounts_replaced = true;
+        } else if (created and project.kind != .spider_web_builtin) {
+            if (try ensureDefaultProjectMountsLocked(self, project)) mounts_replaced = true;
         }
 
         project.updated_at_ms = now_ms;
@@ -2607,7 +2634,7 @@ pub const ControlPlane = struct {
         now_ms: i64,
     ) ![]u8 {
         const project = self.projects.get(project_id) orelse return ControlPlaneError.ProjectNotFound;
-        const workspace_root = try std.fmt.allocPrint(self.allocator, "/spiderweb/projects/{s}/workspace", .{project_id});
+        const workspace_root = try std.fmt.allocPrint(self.allocator, "/spiderweb/projects/{s}", .{project_id});
         defer self.allocator.free(workspace_root);
         const escaped_agent = try jsonEscape(self.allocator, agent_id);
         defer self.allocator.free(escaped_agent);
@@ -4811,6 +4838,110 @@ fn normalizeMountPath(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
     return std.fmt.allocPrint(allocator, "/{s}", .{trimmed});
 }
 
+fn ensureDefaultProjectMountsLocked(self: *ControlPlane, project: *Project) !bool {
+    if (project.kind == .spider_web_builtin) return false;
+
+    var changed = pruneLegacyWorkspaceAliasMountsLocked(self, project);
+    var mounted_from_system = false;
+    if (self.projects.get(spider_web_project_id)) |system_project| {
+        for (system_project.mounts.items) |system_mount| {
+            if (!self.nodes.contains(system_mount.node_id)) continue;
+
+            const remapped_path = try remapSystemMountPathForProject(
+                self.allocator,
+                project.id,
+                system_mount.mount_path,
+            );
+            errdefer self.allocator.free(remapped_path);
+
+            var conflict = false;
+            for (project.mounts.items) |existing| {
+                if (std.mem.eql(u8, existing.mount_path, remapped_path)) {
+                    conflict = true;
+                    break;
+                }
+                if (mountPathsOverlap(existing.mount_path, remapped_path)) {
+                    conflict = true;
+                    break;
+                }
+            }
+            if (!conflict) {
+                for (project.binds.items) |existing_bind| {
+                    if (pathsConflict(existing_bind.bind_path, remapped_path)) {
+                        conflict = true;
+                        break;
+                    }
+                }
+            }
+            if (conflict) {
+                self.allocator.free(remapped_path);
+                continue;
+            }
+
+            try project.mounts.append(self.allocator, .{
+                .mount_path = remapped_path,
+                .node_id = try self.allocator.dupe(u8, system_mount.node_id),
+                .export_name = try self.allocator.dupe(u8, system_mount.export_name),
+            });
+            mounted_from_system = true;
+            changed = true;
+        }
+    }
+
+    if (!mounted_from_system and project.mounts.items.len == 0) {
+        var default_node_id: ?[]const u8 = null;
+        var node_it = self.nodes.iterator();
+        if (node_it.next()) |entry| default_node_id = entry.key_ptr.*;
+        if (default_node_id) |node_id| {
+            var conflicts = false;
+            for (project.binds.items) |existing_bind| {
+                if (pathsConflict(existing_bind.bind_path, spider_web_workspace_mount_path)) {
+                    conflicts = true;
+                    break;
+                }
+            }
+            if (!conflicts) {
+                try project.mounts.append(self.allocator, .{
+                    .mount_path = try self.allocator.dupe(u8, spider_web_workspace_mount_path),
+                    .node_id = try self.allocator.dupe(u8, node_id),
+                    .export_name = try self.allocator.dupe(u8, default_project_up_export_name),
+                });
+                changed = true;
+            }
+        }
+    }
+    return changed;
+}
+
+fn pruneLegacyWorkspaceAliasMountsLocked(self: *ControlPlane, project: *Project) bool {
+    var removed = false;
+    var idx: usize = 0;
+    while (idx < project.mounts.items.len) {
+        const mount = &project.mounts.items[idx];
+        if (!std.mem.eql(u8, mount.mount_path, "/workspace")) {
+            idx += 1;
+            continue;
+        }
+
+        var removed_mount = project.mounts.orderedRemove(idx);
+        removed_mount.deinit(self.allocator);
+        removed = true;
+    }
+    return removed;
+}
+
+fn remapSystemMountPathForProject(
+    allocator: std.mem.Allocator,
+    project_id: []const u8,
+    mount_path: []const u8,
+) ![]u8 {
+    if (std.mem.startsWith(u8, mount_path, spider_web_project_mount_prefix)) {
+        const suffix = mount_path[spider_web_project_mount_prefix.len..];
+        return std.fmt.allocPrint(allocator, "/nodes/local/projects/{s}/{s}", .{ project_id, suffix });
+    }
+    return allocator.dupe(u8, mount_path);
+}
+
 fn mountPathsOverlap(a: []const u8, b: []const u8) bool {
     if (std.mem.eql(u8, a, "/") or std.mem.eql(u8, b, "/")) return true;
 
@@ -5160,7 +5291,7 @@ test "fs_control_plane: builtin system mount can be bound from local node" {
     const status = try plane.workspaceStatus("mother", "{\"project_id\":\"system\"}");
     defer allocator.free(status);
     try std.testing.expect(std.mem.indexOf(u8, status, "\"project_id\":\"system\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, status, "\"mount_path\":\"/workspace\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status, "\"mount_path\":\"/nodes/local/fs\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, status, "\"export_name\":\"system-root\"") != null);
 }
 
@@ -5176,10 +5307,12 @@ test "fs_control_plane: builtin system mounts support namespace topology" {
     const node_id = parsed_join.value.object.get("node_id").?.string;
 
     const mounts = [_]SpiderWebMountSpec{
+        .{ .mount_path = "/agents", .export_name = "agents" },
         .{ .mount_path = "/meta", .export_name = "meta" },
         .{ .mount_path = "/global/capabilities", .export_name = "capabilities" },
         .{ .mount_path = "/global/jobs", .export_name = "jobs" },
         .{ .mount_path = "/nodes/local/fs", .export_name = "workspace" },
+        .{ .mount_path = "/nodes/local/projects/system/agents", .export_name = "agents" },
         .{ .mount_path = "/nodes/local/projects/system/meta", .export_name = "meta" },
         .{ .mount_path = "/nodes/local/projects/system/global/capabilities", .export_name = "capabilities" },
         .{ .mount_path = "/nodes/local/projects/system/global/jobs", .export_name = "jobs" },
@@ -5190,10 +5323,12 @@ test "fs_control_plane: builtin system mounts support namespace topology" {
 
     const status = try plane.workspaceStatus("mother", "{\"project_id\":\"system\"}");
     defer allocator.free(status);
+    try std.testing.expect(std.mem.indexOf(u8, status, "\"mount_path\":\"/agents\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, status, "\"mount_path\":\"/meta\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, status, "\"mount_path\":\"/global/capabilities\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, status, "\"mount_path\":\"/global/jobs\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, status, "\"mount_path\":\"/nodes/local/fs\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status, "\"mount_path\":\"/nodes/local/projects/system/agents\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, status, "\"mount_path\":\"/nodes/local/projects/system/meta\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, status, "\"mount_path\":\"/nodes/local/projects/system/global/capabilities\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, status, "\"mount_path\":\"/nodes/local/projects/system/global/jobs\"") != null);
@@ -5273,7 +5408,7 @@ test "fs_control_plane: ensureSpiderWebMounts preserves extra builtin mounts" {
 
     const status = try plane.workspaceStatus("mother", "{\"project_id\":\"system\"}");
     defer allocator.free(status);
-    try std.testing.expect(std.mem.indexOf(u8, status, "\"mount_path\":\"/workspace\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status, "\"mount_path\":\"/nodes/local/fs\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, status, "\"mount_path\":\"/nodes/clawz/fs\"") != null);
 }
 
@@ -6618,6 +6753,38 @@ test "fs_control_plane: project create/up require non-empty vision" {
         ControlPlaneError.MissingField,
         plane.projectUp("agent-vision", "{\"name\":\"StillNoVision\"}"),
     );
+}
+
+test "fs_control_plane: projectUp auto-provisions default /nodes/local/fs mount for new projects" {
+    const allocator = std.testing.allocator;
+    var plane = ControlPlane.init(allocator);
+    defer plane.deinit();
+
+    const node_json = try plane.ensureNode("bootstrap-node", "ws://127.0.0.1:18891/v2/fs", 60_000);
+    defer allocator.free(node_json);
+    var parsed_node = try std.json.parseFromSlice(std.json.Value, allocator, node_json, .{});
+    defer parsed_node.deinit();
+    const node_id = parsed_node.value.object.get("node_id").?.string;
+
+    try plane.ensureSpiderWebMount(node_id, "bootstrap-workspace");
+
+    const up_json = try plane.projectUp(
+        "mother",
+        "{\"name\":\"BootstrapProject\",\"vision\":\"BootstrapProject\",\"activate\":false}",
+    );
+    defer allocator.free(up_json);
+    var parsed_up = try std.json.parseFromSlice(std.json.Value, allocator, up_json, .{});
+    defer parsed_up.deinit();
+    const project_id = parsed_up.value.object.get("project_id").?.string;
+
+    const get_req = try std.fmt.allocPrint(allocator, "{{\"project_id\":\"{s}\"}}", .{project_id});
+    defer allocator.free(get_req);
+    const get_json = try plane.getProject(get_req);
+    defer allocator.free(get_json);
+
+    try std.testing.expect(std.mem.indexOf(u8, get_json, "\"mount_path\":\"/nodes/local/fs\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, get_json, "\"node_id\":\"node-1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, get_json, "\"export_name\":\"bootstrap-workspace\"") != null);
 }
 
 test "fs_control_plane: snapshot encryption envelope roundtrip" {

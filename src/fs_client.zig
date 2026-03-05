@@ -3,6 +3,7 @@ const fs_protocol = @import("fs_protocol.zig");
 const unified = @import("ziggy-spider-protocol").unified;
 
 const request_response_timeout_ms: i32 = 15_000;
+const handshake_reply_timeout_ms: i32 = 10_000;
 const max_event_frames_per_pump: usize = 256;
 
 pub const ClientResponse = struct {
@@ -198,8 +199,14 @@ fn readHttpResponse(allocator: std.mem.Allocator, stream: *std.net.Stream, max_b
     var buffer = std.ArrayListUnmanaged(u8){};
     errdefer buffer.deinit(allocator);
 
+    const deadline_ms = std.time.milliTimestamp() + @as(i64, handshake_reply_timeout_ms);
     var chunk: [512]u8 = undefined;
     while (buffer.items.len < max_bytes) {
+        const now_ms = std.time.milliTimestamp();
+        if (now_ms >= deadline_ms) return error.HandshakeTimeout;
+        const remaining_i64 = deadline_ms - now_ms;
+        const remaining_ms: i32 = @intCast(@min(remaining_i64, @as(i64, std.math.maxInt(i32))));
+        if (!try waitForReadable(stream, remaining_ms)) return error.HandshakeTimeout;
         const n = try stream.read(&chunk);
         if (n == 0) return error.ConnectionClosed;
         try buffer.appendSlice(allocator, chunk[0..n]);

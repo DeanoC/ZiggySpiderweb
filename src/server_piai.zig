@@ -46,13 +46,16 @@ const local_node_watcher_enabled_env = "SPIDERWEB_LOCAL_NODE_WATCHER_ENABLED";
 const system_agent_id = "mother";
 const system_project_id = fs_control_plane.spider_web_project_id;
 const local_node_default_workspace_export_name = "system-workspace";
+const local_node_agents_export_name = "system-agents";
 const local_node_meta_export_name = "system-meta";
 const local_node_chat_export_name = "system-chat";
 const local_node_jobs_export_name = "system-jobs";
+const local_node_mount_agents_root = "/agents";
 const local_node_mount_meta = "/meta";
 const local_node_mount_agents_self_chat = "/global/chat";
 const local_node_mount_agents_self_jobs = "/global/jobs";
 const local_node_mount_nodes_local_fs = "/nodes/local/fs";
+const local_node_mount_projects_system_agents_root = "/nodes/local/projects/" ++ system_project_id ++ "/agents";
 const local_node_mount_projects_system_meta = "/nodes/local/projects/" ++ system_project_id ++ "/meta";
 const local_node_mount_projects_system_agents_self_chat = "/nodes/local/projects/" ++ system_project_id ++ "/global/chat";
 const local_node_mount_projects_system_agents_self_jobs = "/nodes/local/projects/" ++ system_project_id ++ "/global/jobs";
@@ -76,7 +79,7 @@ const fsrpc_node_protocol_version = "unified-v2-fs";
 const fsrpc_node_proto_id: i64 = 2;
 const node_tunnel_reply_timeout_ms: i32 = 45_000;
 const min_connection_worker_threads: usize = 16;
-const runtime_warmup_wait_timeout_ms: i64 = 12_000;
+const runtime_warmup_wait_timeout_ms: i64 = 30_000;
 const runtime_warmup_stale_timeout_ms: i64 = 30_000;
 const runtime_warmup_poll_interval_ms: u64 = 100;
 const runtime_residency_worker_interval_ms_default: u64 = 1_000;
@@ -4842,6 +4845,16 @@ const AgentRuntimeRegistry = struct {
 
         for (bindings) |binding| {
             if (!self.control_plane.projectHasMounts(binding.project_id)) continue;
+            if (std.mem.eql(u8, binding.agent_id, system_agent_id) and
+                !std.mem.eql(u8, binding.project_id, system_project_id))
+            {
+                continue;
+            }
+            if (self.hasHealthyRuntimeForProject(binding.project_id) and
+                !self.hasRuntimeForBinding(binding.agent_id, binding.project_id))
+            {
+                continue;
+            }
             var attach_state = self.ensureRuntimeWarmup(
                 binding.agent_id,
                 binding.project_id,
@@ -5092,6 +5105,9 @@ const AgentRuntimeRegistry = struct {
         _ = agent_id;
         if (requested_project_id) |project_id| {
             if (!isValidProjectId(project_id)) return error.InvalidProjectId;
+            if (self.runtime_config.sandbox_enabled and !self.control_plane.projectHasMounts(project_id)) {
+                return error.ProjectMountsMissing;
+            }
             return self.allocator.dupe(u8, project_id);
         }
 
@@ -5130,6 +5146,14 @@ const AgentRuntimeRegistry = struct {
         const runtime_key = runtimeMapKeyForProject(project_id);
         const existing = self.by_agent.getPtr(runtime_key) orelse return false;
         if (!std.mem.eql(u8, existing.runtime_agent_id, agent_id)) return false;
+        return existing.runtime.isHealthy();
+    }
+
+    fn hasHealthyRuntimeForProject(self: *AgentRuntimeRegistry, project_id: ?[]const u8) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const runtime_key = runtimeMapKeyForProject(project_id);
+        const existing = self.by_agent.getPtr(runtime_key) orelse return false;
         return existing.runtime.isHealthy();
     }
 
@@ -5240,23 +5264,23 @@ const AgentRuntimeRegistry = struct {
                 state.state = .ready;
                 state.runtime_ready = true;
                 state.mount_ready = true;
-            }
-            state.updated_at_ms = now_ms;
-            state.in_flight = false;
-            if (state.error_code) |value| {
-                self.allocator.free(value);
-                state.error_code = null;
-            }
-            if (state.error_message) |value| {
-                self.allocator.free(value);
-                state.error_message = null;
+                state.updated_at_ms = now_ms;
+                state.in_flight = false;
+                if (state.error_code) |value| {
+                    self.allocator.free(value);
+                    state.error_code = null;
+                }
+                if (state.error_message) |value| {
+                    self.allocator.free(value);
+                    state.error_message = null;
+                }
             }
             snapshot.deinit(self.allocator);
             snapshot = state.snapshotOwned(self.allocator) catch .{
                 .state = if (has_runtime) .ready else state.state,
                 .runtime_ready = if (has_runtime) true else state.runtime_ready,
                 .mount_ready = if (has_runtime) true else state.mount_ready,
-                .updated_at_ms = now_ms,
+                .updated_at_ms = if (has_runtime) now_ms else state.updated_at_ms,
             };
         } else if (has_runtime) {
             const owned_key = self.allocator.dupe(u8, binding_key) catch {
@@ -5301,6 +5325,10 @@ const AgentRuntimeRegistry = struct {
             error.ProjectRequired => .{
                 .code = "sandbox_mount_missing",
                 .message = "sandbox requires a project binding",
+            },
+            error.ProjectMountsMissing => .{
+                .code = "project_mounts_missing",
+                .message = "project has no workspace mounts configured",
             },
             error.SandboxMountUnavailable => .{
                 .code = "sandbox_mount_unavailable",
@@ -5423,6 +5451,47 @@ const AgentRuntimeRegistry = struct {
             if (snapshot.error_message == null) {
                 snapshot.error_message = self.allocator.dupe(u8, message) catch null;
             }
+        } else {
+            const owned_key = self.allocator.dupe(u8, binding_key) catch {
+                self.runtime_warmups_mutex.unlock();
+                self.emitSessionAttachStateDebugEvent(binding_key, snapshot);
+                return;
+            };
+            var state = RuntimeWarmupState{};
+            state.setError(self.allocator, code, message) catch {
+                if (state.error_code) |value| self.allocator.free(value);
+                if (state.error_message) |value| self.allocator.free(value);
+                state.error_code = null;
+                state.error_message = null;
+                state.state = .err;
+                state.runtime_ready = false;
+                state.mount_ready = false;
+                state.updated_at_ms = std.time.milliTimestamp();
+            };
+            state.in_flight = false;
+            self.runtime_warmups.put(self.allocator, owned_key, state) catch {
+                var cleanup = state;
+                cleanup.deinit(self.allocator);
+                self.allocator.free(owned_key);
+                self.runtime_warmups_mutex.unlock();
+                self.emitSessionAttachStateDebugEvent(binding_key, snapshot);
+                return;
+            };
+            if (self.runtime_warmups.getPtr(binding_key)) |inserted| {
+                snapshot.deinit(self.allocator);
+                snapshot = inserted.snapshotOwned(self.allocator) catch .{
+                    .state = .err,
+                    .runtime_ready = false,
+                    .mount_ready = false,
+                    .updated_at_ms = std.time.milliTimestamp(),
+                };
+                if (snapshot.error_code == null) {
+                    snapshot.error_code = self.allocator.dupe(u8, code) catch null;
+                }
+                if (snapshot.error_message == null) {
+                    snapshot.error_message = self.allocator.dupe(u8, message) catch null;
+                }
+            }
         }
         self.runtime_warmups_mutex.unlock();
         self.emitSessionAttachStateDebugEvent(binding_key, snapshot);
@@ -5496,6 +5565,18 @@ const AgentRuntimeRegistry = struct {
                 .mount_ready = true,
                 .updated_at_ms = std.time.milliTimestamp(),
             };
+        }
+        if (project_id) |value| {
+            if (!self.control_plane.projectHasMounts(value)) {
+                const binding_key = try self.runtimeBindingKey(agent_id, project_id);
+                defer self.allocator.free(binding_key);
+                self.markRuntimeWarmupError(
+                    binding_key,
+                    "project_mounts_missing",
+                    "project has no workspace mounts configured",
+                );
+                return self.runtimeAttachSnapshotByKey(binding_key);
+            }
         }
         if (self.hasRuntimeForBinding(agent_id, project_id)) {
             return .{
@@ -6660,6 +6741,12 @@ const AgentRuntimeRegistry = struct {
                 .desc = "spiderweb-workspace-export",
             },
             .{
+                .name = local_node_agents_export_name,
+                .path = "agents",
+                .ro = false,
+                .desc = "spiderweb-agents-export",
+            },
+            .{
                 .name = local_node_meta_export_name,
                 .path = "meta",
                 .ro = true,
@@ -6687,10 +6774,12 @@ const AgentRuntimeRegistry = struct {
             },
         };
         const mount_specs = [_]fs_control_plane.SpiderWebMountSpec{
+            .{ .mount_path = local_node_mount_agents_root, .export_name = local_node_agents_export_name },
             .{ .mount_path = local_node_mount_meta, .export_name = local_node_meta_export_name },
             .{ .mount_path = local_node_mount_agents_self_chat, .export_name = local_node_chat_export_name },
             .{ .mount_path = local_node_mount_agents_self_jobs, .export_name = local_node_jobs_export_name },
             .{ .mount_path = local_node_mount_nodes_local_fs, .export_name = workspace_export_name },
+            .{ .mount_path = local_node_mount_projects_system_agents_root, .export_name = local_node_agents_export_name },
             .{ .mount_path = local_node_mount_projects_system_meta, .export_name = local_node_meta_export_name },
             .{ .mount_path = local_node_mount_projects_system_agents_self_chat, .export_name = local_node_chat_export_name },
             .{ .mount_path = local_node_mount_projects_system_agents_self_jobs, .export_name = local_node_jobs_export_name },
@@ -6897,15 +6986,14 @@ fn reconcileWorkerMain(runtime_registry: *AgentRuntimeRegistry) void {
 }
 
 fn runtimeResidencyWorkerMain(runtime_registry: *AgentRuntimeRegistry) void {
-    var sweep_count: u64 = 0;
     while (true) {
         if (runtime_registry.shouldStopRuntimeResidencyWorker()) return;
 
-        const retry_on_error = @mod(sweep_count, 5) == 0;
-        runtime_registry.ensureActiveRuntimeResidency(retry_on_error) catch |err| {
+        // Keep mount/runtime failures sticky until an explicit attach retry.
+        // Aggressive background retries can flood the control socket pool.
+        runtime_registry.ensureActiveRuntimeResidency(false) catch |err| {
             std.log.warn("runtime residency worker error: {s}", .{@errorName(err)});
         };
-        sweep_count +%= 1;
 
         std.Thread.sleep(runtime_registry.runtime_residency_worker_interval_ms * std.time.ns_per_ms);
     }
@@ -6979,10 +7067,10 @@ pub fn run(
         .{ bind_addr, port },
     );
     startLocalFsBootstrapThread(allocator, &runtime_registry, bind_addr, port);
-    try runtime_registry.startRuntimeResidencyWorker();
     runtime_registry.ensureActiveRuntimeResidency(true) catch |err| {
         std.log.warn("initial runtime residency warmup failed: {s}", .{@errorName(err)});
     };
+    try runtime_registry.startRuntimeResidencyWorker();
 
     while (true) {
         var connection = tcp_server.accept() catch |err| {
@@ -7841,6 +7929,14 @@ fn handleWebSocketConnection(
                                     try writeFrameLocked(stream, &connection_write_mutex, response, .text);
                                     continue;
                                 };
+                                if (attach_state.state == .warming) {
+                                    attach_state.deinit(allocator);
+                                    attach_state = runtime_registry.waitForRuntimeWarmup(
+                                        active_binding.agent_id,
+                                        active_binding.project_id,
+                                        runtime_warmup_wait_timeout_ms,
+                                    );
+                                }
                                 defer attach_state.deinit(allocator);
                                 const attach_json = try buildSessionAttachStateJson(allocator, attach_state);
                                 defer allocator.free(attach_json);
@@ -8312,6 +8408,17 @@ fn handleWebSocketConnection(
                                                     parsed.id,
                                                     "sandbox_mount_missing",
                                                     "sandbox requires a project binding",
+                                                );
+                                                defer allocator.free(response);
+                                                try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                                continue;
+                                            },
+                                            error.ProjectMountsMissing => {
+                                                const response = try unified.buildControlError(
+                                                    allocator,
+                                                    parsed.id,
+                                                    "project_mounts_missing",
+                                                    "project has no workspace mounts configured",
                                                 );
                                                 defer allocator.free(response);
                                                 try writeFrameLocked(stream, &connection_write_mutex, response, .text);
@@ -8886,11 +8993,19 @@ fn handleWebSocketConnection(
                             attach_state = warmed_attach_state;
 
                             if (attach_state.state == .warming) {
+                                attach_state.deinit(allocator);
+                                attach_state = runtime_registry.waitForRuntimeWarmup(
+                                    target_binding.agent_id,
+                                    target_binding.project_id,
+                                    runtime_warmup_wait_timeout_ms,
+                                );
+                            }
+                            if (attach_state.state == .warming) {
                                 const response = try unified.buildFsrpcError(
                                     allocator,
                                     parsed.tag,
                                     "runtime_warming",
-                                    "runtime is warming",
+                                    "sandbox attach is still preparing for this project",
                                 );
                                 defer allocator.free(response);
                                 try writeFrameLocked(stream, &connection_write_mutex, response, .text);
@@ -8952,6 +9067,17 @@ fn handleWebSocketConnection(
                                     parsed.tag,
                                     "sandbox_mount_missing",
                                     "sandbox requires a project binding",
+                                );
+                                defer allocator.free(response);
+                                try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                continue;
+                            },
+                            error.ProjectMountsMissing => {
+                                const response = try unified.buildFsrpcError(
+                                    allocator,
+                                    parsed.tag,
+                                    "project_mounts_missing",
+                                    "project has no workspace mounts configured",
                                 );
                                 defer allocator.free(response);
                                 try writeFrameLocked(stream, &connection_write_mutex, response, .text);
@@ -10677,8 +10803,8 @@ test "server_piai: workspace namespace stays project-scoped across user session 
     defer bob_scope.deinit(allocator);
 
     try expectWorkspaceScopeSnapshotsEqual(&alice_scope, &bob_scope);
-    try std.testing.expect(std.mem.indexOf(u8, attach_alice_ack.payload, "\"mount_path\":\"/workspace\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, attach_bob_ack.payload, "\"mount_path\":\"/workspace\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, attach_alice_ack.payload, "\"mount_path\":\"/nodes/local/fs\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, attach_bob_ack.payload, "\"mount_path\":\"/nodes/local/fs\"") != null);
 
     try writeClientTextFrameMasked(
         &client,
