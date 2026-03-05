@@ -403,7 +403,7 @@ pub const Engine = struct {
         const trimmed = std.mem.trim(u8, path, " \t\r\n");
         if (trimmed.len == 0) return false;
         const without_leading = std.mem.trimLeft(u8, trimmed, "/");
-        return std.mem.eql(u8, without_leading, "agents/self/chat/control/reply");
+        return std.mem.eql(u8, without_leading, "global/chat/control/reply");
     }
 
     fn decorateWorldToolSuccessPayload(

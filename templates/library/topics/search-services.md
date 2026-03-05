@@ -2,8 +2,8 @@
 
 Spiderweb exposes two search-oriented agent namespaces:
 
-- `/agents/self/web_search`
-- `/agents/self/search_code`
+- `/global/web_search`
+- `/global/search_code`
 
 Both support:
 

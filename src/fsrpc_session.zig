@@ -294,6 +294,8 @@ pub const Session = struct {
         projects_dir: []const u8 = "projects",
         local_fs_export_root: ?[]const u8 = null,
         control_plane: ?*fs_control_plane.ControlPlane = null,
+        actor_type: ?[]const u8 = null,
+        actor_id: ?[]const u8 = null,
         is_admin: bool = false,
     };
 
@@ -301,6 +303,8 @@ pub const Session = struct {
     runtime_handle: *runtime_handle_mod.RuntimeHandle,
     job_index: *chat_job_index.ChatJobIndex,
     agent_id: []u8,
+    actor_type: []u8,
+    actor_id: []u8,
     project_id: ?[]u8 = null,
     project_token: ?[]u8 = null,
     agents_dir: []u8,
@@ -382,6 +386,12 @@ pub const Session = struct {
         else
             null;
         errdefer if (owned_project_token) |value| allocator.free(value);
+        const actor_type_value = options.actor_type orelse "agent";
+        const owned_actor_type = try allocator.dupe(u8, actor_type_value);
+        errdefer allocator.free(owned_actor_type);
+        const actor_id_value = options.actor_id orelse agent_id;
+        const owned_actor_id = try allocator.dupe(u8, actor_id_value);
+        errdefer allocator.free(owned_actor_id);
         const owned_agents_dir = try allocator.dupe(u8, options.agents_dir);
         errdefer allocator.free(owned_agents_dir);
         const owned_assets_dir = try allocator.dupe(u8, options.assets_dir);
@@ -401,6 +411,8 @@ pub const Session = struct {
             .runtime_handle = runtime_handle,
             .job_index = job_index,
             .agent_id = owned_agent,
+            .actor_type = owned_actor_type,
+            .actor_id = owned_actor_id,
             .project_id = owned_project,
             .project_token = owned_project_token,
             .agents_dir = owned_agents_dir,
@@ -428,6 +440,8 @@ pub const Session = struct {
         self.nodes.deinit(self.allocator);
         self.fids.deinit(self.allocator);
         self.allocator.free(self.agent_id);
+        self.allocator.free(self.actor_type);
+        self.allocator.free(self.actor_id);
         if (self.project_id) |value| self.allocator.free(value);
         if (self.project_token) |value| self.allocator.free(value);
         self.allocator.free(self.agents_dir);
@@ -454,6 +468,8 @@ pub const Session = struct {
                 .projects_dir = self.projects_dir,
                 .local_fs_export_root = self.local_fs_export_root,
                 .control_plane = self.control_plane,
+                .actor_type = self.actor_type,
+                .actor_id = self.actor_id,
                 .is_admin = self.is_admin,
             },
         );
@@ -1399,13 +1415,13 @@ pub const Session = struct {
                 defer self.allocator.free(escaped_corr);
                 break :blk try std.fmt.allocPrint(
                     self.allocator,
-                    "{{\"n\":{d},\"job\":\"{s}\",\"result_path\":\"/agents/self/jobs/{s}/result.txt\",\"correlation_id\":\"{s}\"}}",
+                    "{{\"n\":{d},\"job\":\"{s}\",\"result_path\":\"/global/jobs/{s}/result.txt\",\"correlation_id\":\"{s}\"}}",
                     .{ written, escaped, escaped, escaped_corr },
                 );
             }
             break :blk try std.fmt.allocPrint(
                 self.allocator,
-                "{{\"n\":{d},\"job\":\"{s}\",\"result_path\":\"/agents/self/jobs/{s}/result.txt\"}}",
+                "{{\"n\":{d},\"job\":\"{s}\",\"result_path\":\"/global/jobs/{s}/result.txt\"}}",
                 .{ written, escaped, escaped },
             );
         } else if (chat_reply_content) |reply| blk: {
@@ -1465,6 +1481,7 @@ pub const Session = struct {
         const nodes_root = try self.addDir(self.root_id, "nodes", false);
         self.nodes_root_id = nodes_root;
         const agents_root = try self.addDir(self.root_id, "agents", false);
+        const users_root = try self.addDir(self.root_id, "users", false);
         const projects_root = try self.addDir(self.root_id, "projects", false);
         const global_root = try self.addDir(self.root_id, "global", false);
         const meta_root = try self.addDir(self.root_id, "meta", false);
@@ -1483,9 +1500,16 @@ pub const Session = struct {
         try self.addDirectoryDescriptors(
             agents_root,
             "Agents",
-            "{\"kind\":\"collection\",\"entries\":\"agent directories\",\"self\":\"/agents/self\"}",
+            "{\"kind\":\"collection\",\"entries\":\"agent directories\",\"shape\":\"/agents/<agent_id>\"}",
             "{\"read\":true,\"write\":true}",
-            "Agent-visible chat/jobs/memory views.",
+            "Agent identities attached to this project namespace.",
+        );
+        try self.addDirectoryDescriptors(
+            users_root,
+            "Users",
+            "{\"kind\":\"collection\",\"entries\":\"user directories\",\"shape\":\"/users/<user_id>\"}",
+            "{\"read\":true,\"write\":true}",
+            "User identities attached to this project namespace.",
         );
         try self.addDirectoryDescriptors(
             projects_root,
@@ -1510,8 +1534,14 @@ pub const Session = struct {
             try self.addNodeDirectory(nodes_root, node, false);
         }
 
-        const self_agent_dir = try self.addDir(agents_root, "self", false);
-        const chat = try self.addDir(self_agent_dir, "chat", false);
+        const active_agent_dir = try self.addDir(agents_root, self.agent_id, false);
+        _ = try self.addFile(active_agent_dir, "README.md", "Active agent identity in this project namespace.\n", false, .none);
+        if (std.mem.eql(u8, self.actor_type, "user")) {
+            const active_user_dir = try self.addDir(users_root, self.actor_id, false);
+            _ = try self.addFile(active_user_dir, "README.md", "Active user identity in this project namespace.\n", false, .none);
+        }
+
+        const chat = try self.addDir(global_root, "chat", false);
         const control = try self.addDir(chat, "control", false);
         const examples = try self.addDir(chat, "examples", false);
         self.chat_input_id = try self.addFile(control, "input", "", true, .chat_input);
@@ -1522,32 +1552,36 @@ pub const Session = struct {
             "# Chat Capability\n\n" ++
             "Use `control/input` for inbound user/admin chat (creates a chat job).\n" ++
             "Use `control/reply` for outbound agent reply text to the current chat turn.\n" ++
-            "Read `/agents/self/jobs/<job-id>/result.txt` for chat job output.\n";
+            "Read `/global/jobs/<job-id>/result.txt` for chat job output.\n";
         _ = try self.addFile(chat, "README.md", chat_help_md, false, .none);
-        _ = try self.addFile(chat, "SCHEMA.json", "{\"name\":\"chat\",\"input\":\"control/input\",\"reply\":\"control/reply\",\"jobs\":\"/agents/self/jobs\",\"result\":\"result.txt\"}", false, .none);
+        _ = try self.addFile(chat, "SCHEMA.json", "{\"name\":\"chat\",\"input\":\"control/input\",\"reply\":\"control/reply\",\"jobs\":\"/global/jobs\",\"result\":\"result.txt\"}", false, .none);
         _ = try self.addFile(chat, "CAPS.json", "{\"write_input\":true,\"write_reply\":true,\"read_jobs\":true}", false, .none);
 
         const escaped_agent = try unified.jsonEscape(self.allocator, self.agent_id);
         defer self.allocator.free(escaped_agent);
+        const escaped_actor_type = try unified.jsonEscape(self.allocator, self.actor_type);
+        defer self.allocator.free(escaped_actor_type);
+        const escaped_actor_id = try unified.jsonEscape(self.allocator, self.actor_id);
+        defer self.allocator.free(escaped_actor_id);
         const escaped_project = if (policy.project_id.len > 0) blk: {
             break :blk try unified.jsonEscape(self.allocator, policy.project_id);
         } else try self.allocator.dupe(u8, "");
         defer self.allocator.free(escaped_project);
         const chat_meta_json = try std.fmt.allocPrint(
             self.allocator,
-            "{{\"name\":\"chat\",\"version\":\"1\",\"agent_id\":\"{s}\",\"project_id\":\"{s}\",\"cost_hint\":\"provider-dependent\",\"latency_hint\":\"seconds\"}}",
-            .{ escaped_agent, escaped_project },
+            "{{\"name\":\"chat\",\"version\":\"1\",\"agent_id\":\"{s}\",\"actor_type\":\"{s}\",\"actor_id\":\"{s}\",\"project_id\":\"{s}\",\"cost_hint\":\"provider-dependent\",\"latency_hint\":\"seconds\"}}",
+            .{ escaped_agent, escaped_actor_type, escaped_actor_id, escaped_project },
         );
         defer self.allocator.free(chat_meta_json);
         _ = try self.addFile(chat, "meta.json", chat_meta_json, false, .none);
 
-        const agent_services_dir = try self.addDir(self_agent_dir, "services", false);
+        const agent_services_dir = try self.addDir(global_root, "services", false);
         try self.addDirectoryDescriptors(
             agent_services_dir,
-            "Agent Services",
-            "{\"kind\":\"service_index\",\"files\":[\"SERVICES.json\"],\"roots\":[\"/nodes/<node_id>/services/<service_id>\",\"/agents/self/<service_id>\"]}",
+            "Services",
+            "{\"kind\":\"service_index\",\"files\":[\"SERVICES.json\"],\"roots\":[\"/nodes/<node_id>/services/<service_id>\",\"/global/<service_id>\"]}",
             "{\"discover\":true,\"invoke_via_paths\":true}",
-            "Service discovery index for this agent. Use listed paths to inspect/invoke service endpoints.",
+            "Project-wide service discovery index. Use listed paths to inspect/invoke service endpoints.",
         );
         const initial_agent_services_index = try self.buildAgentServicesIndexJson();
         defer self.allocator.free(initial_agent_services_index);
@@ -1559,24 +1593,24 @@ pub const Session = struct {
             .agent_services_index,
         );
 
-        const memory_dir = try self.addDir(self_agent_dir, "memory", false);
+        const memory_dir = try self.addDir(global_root, "memory", false);
         try self.seedAgentMemoryNamespace(memory_dir);
-        const web_search_dir = try self.addDir(self_agent_dir, "web_search", false);
+        const web_search_dir = try self.addDir(global_root, "web_search", false);
         try self.seedAgentWebSearchNamespace(web_search_dir);
-        const search_code_dir = try self.addDir(self_agent_dir, "search_code", false);
+        const search_code_dir = try self.addDir(global_root, "search_code", false);
         try self.seedAgentSearchCodeNamespace(search_code_dir);
-        const terminal_dir = try self.addDir(self_agent_dir, "terminal", false);
+        const terminal_dir = try self.addDir(global_root, "terminal", false);
         try self.seedAgentTerminalNamespace(terminal_dir);
-        const mounts_dir = try self.addDir(self_agent_dir, "mounts", false);
+        const mounts_dir = try self.addDir(global_root, "mounts", false);
         try self.seedAgentMountsNamespace(mounts_dir);
-        const sub_brains_dir = try self.addDir(self_agent_dir, "sub_brains", false);
+        const sub_brains_dir = try self.addDir(global_root, "sub_brains", false);
         try self.seedAgentSubBrainsNamespace(sub_brains_dir);
-        const agents_dir = try self.addDir(self_agent_dir, "agents", false);
-        try self.seedAgentAgentsNamespace(agents_dir);
-        const projects_dir = try self.addDir(self_agent_dir, "projects", false);
-        try self.seedAgentProjectsNamespace(projects_dir);
+        const agents_control_dir = try self.addDir(global_root, "agents", false);
+        try self.seedAgentAgentsNamespace(agents_control_dir);
+        const projects_control_dir = try self.addDir(global_root, "projects", false);
+        try self.seedAgentProjectsNamespace(projects_control_dir);
 
-        self.jobs_root_id = try self.addDir(self_agent_dir, "jobs", false);
+        self.jobs_root_id = try self.addDir(global_root, "jobs", false);
         try self.addDirectoryDescriptors(
             self.jobs_root_id,
             "Jobs",
@@ -1586,7 +1620,7 @@ pub const Session = struct {
         );
         try self.seedJobsFromIndex();
 
-        const thoughts_dir = try self.addDir(self_agent_dir, "thoughts", false);
+        const thoughts_dir = try self.addDir(global_root, "thoughts", false);
         try self.addDirectoryDescriptors(
             thoughts_dir,
             "Thoughts",
@@ -1625,27 +1659,27 @@ pub const Session = struct {
             .none,
         );
 
-        const events_dir = try self.addDir(self_agent_dir, "events", false);
+        const events_dir = try self.addDir(global_root, "events", false);
         const events_control_dir = try self.addDir(events_dir, "control", false);
         const events_sources_dir = try self.addDir(events_dir, "sources", false);
         const events_help =
             "# Event Waiting\n\n" ++
             "1. Write selector JSON to `control/wait.json`.\n" ++
             "2. Read `next.json` to block until the first matching event.\n\n" ++
-            "Selectors support chat/jobs plus event sources under `/agents/self/events/sources/*`.\n" ++
+            "Selectors support chat/jobs plus event sources under `/global/events/sources/*`.\n" ++
             "Single-event waits can also use a direct blocking read on that endpoint when supported.\n";
         _ = try self.addFile(events_dir, "README.md", events_help, false, .none);
         _ = try self.addFile(
             events_dir,
             "SCHEMA.json",
-            "{\"wait_config\":{\"paths\":[\"/agents/self/chat/control/input\",\"/agents/self/jobs/<job-id>/status.json\",\"/agents/self/events/sources/time/after/1000.json\",\"/agents/self/events/sources/agent/build.json\",\"/agents/self/events/sources/hook/pre_observe.json\"],\"timeout_ms\":60000},\"signal\":{\"event_type\":\"agent|hook|user\",\"parameter\":\"string?\",\"payload\":{}},\"event\":{\"event_id\":1,\"source_path\":\"...\",\"event_path\":\"...\",\"updated_at_ms\":0}}",
+            "{\"wait_config\":{\"paths\":[\"/global/chat/control/input\",\"/global/jobs/<job-id>/status.json\",\"/global/events/sources/time/after/1000.json\",\"/global/events/sources/agent/build.json\",\"/global/events/sources/hook/pre_observe.json\"],\"timeout_ms\":60000},\"signal\":{\"event_type\":\"agent|hook|user\",\"parameter\":\"string?\",\"payload\":{}},\"event\":{\"event_id\":1,\"source_path\":\"...\",\"event_path\":\"...\",\"updated_at_ms\":0}}",
             false,
             .none,
         );
         _ = try self.addFile(
             events_dir,
             "CAPS.json",
-            "{\"sources\":[\"/agents/self/chat/control/input\",\"/agents/self/jobs/<job-id>/status.json\",\"/agents/self/jobs/<job-id>/result.txt\",\"/agents/self/events/sources/time/after/<ms>.json\",\"/agents/self/events/sources/time/at/<unix_ms>.json\",\"/agents/self/events/sources/agent/<parameter>.json\",\"/agents/self/events/sources/hook/<parameter>.json\",\"/agents/self/events/sources/user/<parameter>.json\"],\"multi_wait\":true,\"single_blocking_read\":true}",
+            "{\"sources\":[\"/global/chat/control/input\",\"/global/jobs/<job-id>/status.json\",\"/global/jobs/<job-id>/result.txt\",\"/global/events/sources/time/after/<ms>.json\",\"/global/events/sources/time/at/<unix_ms>.json\",\"/global/events/sources/agent/<parameter>.json\",\"/global/events/sources/hook/<parameter>.json\",\"/global/events/sources/user/<parameter>.json\"],\"multi_wait\":true,\"single_blocking_read\":true}",
             false,
             .none,
         );
@@ -1677,10 +1711,10 @@ pub const Session = struct {
             false,
             .none,
         );
-        _ = try self.addFile(events_sources_dir, "agent.json", "Use `/agents/self/events/sources/agent/<parameter>.json` in wait.json selectors.\n", false, .none);
-        _ = try self.addFile(events_sources_dir, "hook.json", "Use `/agents/self/events/sources/hook/<parameter>.json` in wait.json selectors.\n", false, .none);
-        _ = try self.addFile(events_sources_dir, "user.json", "Use `/agents/self/events/sources/user/<parameter>.json` in wait.json selectors.\n", false, .none);
-        _ = try self.addFile(events_sources_dir, "time.json", "Use `/agents/self/events/sources/time/after/<ms>.json` or `/agents/self/events/sources/time/at/<unix_ms>.json` in wait.json selectors.\n", false, .none);
+        _ = try self.addFile(events_sources_dir, "agent.json", "Use `/global/events/sources/agent/<parameter>.json` in wait.json selectors.\n", false, .none);
+        _ = try self.addFile(events_sources_dir, "hook.json", "Use `/global/events/sources/hook/<parameter>.json` in wait.json selectors.\n", false, .none);
+        _ = try self.addFile(events_sources_dir, "user.json", "Use `/global/events/sources/user/<parameter>.json` in wait.json selectors.\n", false, .none);
+        _ = try self.addFile(events_sources_dir, "time.json", "Use `/global/events/sources/time/after/<ms>.json` or `/global/events/sources/time/at/<unix_ms>.json` in wait.json selectors.\n", false, .none);
         self.event_next_id = try self.addFile(
             events_dir,
             "next.json",
@@ -1688,12 +1722,6 @@ pub const Session = struct {
             false,
             .event_next,
         );
-
-        if (!std.mem.eql(u8, self.agent_id, "self")) {
-            const agent_dir = try self.addDir(agents_root, self.agent_id, false);
-            _ = try self.addFile(agent_dir, "README.md", "Primary agent path. Canonical interactive path is /agents/self.\n", false, .none);
-            _ = try self.addFile(agent_dir, "LINK.txt", "/agents/self\n", false, .none);
-        }
 
         for (policy.visible_agents.items) |agent_name| {
             if (std.mem.eql(u8, agent_name, "self")) continue;
@@ -1734,7 +1762,7 @@ pub const Session = struct {
         try self.addDirectoryDescriptors(
             project_agents_dir,
             "Project Agents",
-            "{\"kind\":\"collection\",\"entries\":\"agent links\",\"self\":\"/agents/self\"}",
+            "{\"kind\":\"collection\",\"entries\":\"agent links\",\"scope\":\"project\",\"targets\":\"/projects/<project_id>/agents/<agent_id>\"}",
             "{\"read\":true,\"write\":false}",
             "Agent links visible within this project context.",
         );
@@ -1759,10 +1787,21 @@ pub const Session = struct {
         else
             false;
 
-        _ = try self.addFile(project_agents_dir, "self", "/agents/self\n", false, .none);
+        const active_agent_target = try std.fmt.allocPrint(
+            self.allocator,
+            "/projects/{s}/agents/{s}\n",
+            .{ policy.project_id, self.agent_id },
+        );
+        defer self.allocator.free(active_agent_target);
+        _ = try self.addFile(project_agents_dir, self.agent_id, active_agent_target, false, .none);
         for (policy.visible_agents.items) |agent_name| {
             if (std.mem.eql(u8, agent_name, "self")) continue;
-            const target = try std.fmt.allocPrint(self.allocator, "/agents/{s}\n", .{agent_name});
+            if (std.mem.eql(u8, agent_name, self.agent_id)) continue;
+            const target = try std.fmt.allocPrint(
+                self.allocator,
+                "/projects/{s}/agents/{s}\n",
+                .{ policy.project_id, agent_name },
+            );
             defer self.allocator.free(target);
             _ = try self.addFile(project_agents_dir, agent_name, target, false, .none);
         }
@@ -2410,7 +2449,7 @@ pub const Session = struct {
         try self.addDirectoryDescriptors(
             memory_dir,
             "Memory",
-            "{\"kind\":\"service\",\"service_id\":\"memory\",\"shape\":\"/agents/self/memory/{README.md,SCHEMA.json,CAPS.json,OPS.json,PERMISSIONS.json,STATUS.json,status.json,result.json,control/*}\"}",
+            "{\"kind\":\"service\",\"service_id\":\"memory\",\"shape\":\"/global/memory/{README.md,SCHEMA.json,CAPS.json,OPS.json,PERMISSIONS.json,STATUS.json,status.json,result.json,control/*}\"}",
             "{\"invoke\":true,\"operations\":[\"memory_create\",\"memory_load\",\"memory_versions\",\"memory_mutate\",\"memory_evict\",\"memory_search\"],\"discoverable\":true}",
             "First-class memory namespace. Write operation payloads to control/*.json, then read status.json/result.json.",
         );
@@ -2478,7 +2517,7 @@ pub const Session = struct {
         try self.addDirectoryDescriptors(
             web_search_dir,
             "Web Search",
-            "{\"kind\":\"service\",\"service_id\":\"web_search\",\"shape\":\"/agents/self/web_search/{README.md,SCHEMA.json,CAPS.json,OPS.json,RUNTIME.json,PERMISSIONS.json,STATUS.json,status.json,result.json,control/*}\"}",
+            "{\"kind\":\"service\",\"service_id\":\"web_search\",\"shape\":\"/global/web_search/{README.md,SCHEMA.json,CAPS.json,OPS.json,RUNTIME.json,PERMISSIONS.json,STATUS.json,status.json,result.json,control/*}\"}",
             "{\"invoke\":true,\"operations\":[\"web_search\"],\"discoverable\":true,\"network\":true}",
             "First-class web search namespace. Write search payloads to control/search.json (or invoke.json), then read status.json/result.json.",
         );
@@ -2541,7 +2580,7 @@ pub const Session = struct {
         try self.addDirectoryDescriptors(
             search_code_dir,
             "Search Code",
-            "{\"kind\":\"service\",\"service_id\":\"search_code\",\"shape\":\"/agents/self/search_code/{README.md,SCHEMA.json,CAPS.json,OPS.json,RUNTIME.json,PERMISSIONS.json,STATUS.json,status.json,result.json,control/*}\"}",
+            "{\"kind\":\"service\",\"service_id\":\"search_code\",\"shape\":\"/global/search_code/{README.md,SCHEMA.json,CAPS.json,OPS.json,RUNTIME.json,PERMISSIONS.json,STATUS.json,status.json,result.json,control/*}\"}",
             "{\"invoke\":true,\"operations\":[\"search_code\"],\"discoverable\":true}",
             "First-class code search namespace. Write search payloads to control/search.json (or invoke.json), then read status.json/result.json.",
         );
@@ -2604,7 +2643,7 @@ pub const Session = struct {
         try self.addDirectoryDescriptors(
             terminal_dir,
             "Terminal",
-            "{\"kind\":\"service\",\"service_id\":\"terminal-v2\",\"shape\":\"/agents/self/terminal/{README.md,SCHEMA.json,CAPS.json,OPS.json,RUNTIME.json,PERMISSIONS.json,STATUS.json,status.json,result.json,sessions.json,current.json,control/*}\"}",
+            "{\"kind\":\"service\",\"service_id\":\"terminal-v2\",\"shape\":\"/global/terminal/{README.md,SCHEMA.json,CAPS.json,OPS.json,RUNTIME.json,PERMISSIONS.json,STATUS.json,status.json,result.json,sessions.json,current.json,control/*}\"}",
             "{\"invoke\":true,\"operations\":[\"terminal_session_create\",\"terminal_session_resume\",\"terminal_session_close\",\"terminal_session_write\",\"terminal_session_read\",\"terminal_session_resize\",\"shell_exec\"],\"discoverable\":true,\"interactive\":true,\"sessionized\":true,\"pty\":true}",
             "Sessionized terminal namespace. Create/resume/close PTY sessions and use write/read/resize for interactive workflows.",
         );
@@ -2687,7 +2726,7 @@ pub const Session = struct {
         try self.addDirectoryDescriptors(
             mounts_dir,
             "Mounts and Binds",
-            "{\"kind\":\"service\",\"service_id\":\"mounts\",\"shape\":\"/agents/self/mounts/{README.md,SCHEMA.json,CAPS.json,OPS.json,RUNTIME.json,PERMISSIONS.json,STATUS.json,status.json,result.json,control/*}\"}",
+            "{\"kind\":\"service\",\"service_id\":\"mounts\",\"shape\":\"/global/mounts/{README.md,SCHEMA.json,CAPS.json,OPS.json,RUNTIME.json,PERMISSIONS.json,STATUS.json,status.json,result.json,control/*}\"}",
             "{\"invoke\":true,\"operations\":[\"list\",\"mount\",\"mkdir\",\"unmount\",\"bind\",\"unbind\",\"resolve\"],\"discoverable\":true,\"project_scope\":true}",
             "Manage project mounts and path binds through Acheron control files.",
         );
@@ -2763,7 +2802,7 @@ pub const Session = struct {
         try self.addDirectoryDescriptors(
             sub_brains_dir,
             "Sub-Brains",
-            "{\"kind\":\"service\",\"service_id\":\"sub_brains\",\"shape\":\"/agents/self/sub_brains/{README.md,SCHEMA.json,CAPS.json,OPS.json,PERMISSIONS.json,STATUS.json,status.json,result.json,control/*}\"}",
+            "{\"kind\":\"service\",\"service_id\":\"sub_brains\",\"shape\":\"/global/sub_brains/{README.md,SCHEMA.json,CAPS.json,OPS.json,PERMISSIONS.json,STATUS.json,status.json,result.json,control/*}\"}",
             caps_json,
             "Manage sub-brain configuration for this agent through Acheron control files.",
         );
@@ -2835,7 +2874,7 @@ pub const Session = struct {
         try self.addDirectoryDescriptors(
             agents_dir,
             "Agents Management",
-            "{\"kind\":\"service\",\"service_id\":\"agents\",\"shape\":\"/agents/self/agents/{README.md,SCHEMA.json,CAPS.json,OPS.json,PERMISSIONS.json,STATUS.json,status.json,result.json,control/*}\"}",
+            "{\"kind\":\"service\",\"service_id\":\"agents\",\"shape\":\"/global/agents/{README.md,SCHEMA.json,CAPS.json,OPS.json,PERMISSIONS.json,STATUS.json,status.json,result.json,control/*}\"}",
             caps_json,
             "List and create agent workspaces through Acheron control files.",
         );
@@ -2901,7 +2940,7 @@ pub const Session = struct {
         try self.addDirectoryDescriptors(
             projects_dir,
             "Projects Management",
-            "{\"kind\":\"service\",\"service_id\":\"projects\",\"shape\":\"/agents/self/projects/{README.md,SCHEMA.json,CAPS.json,OPS.json,PERMISSIONS.json,STATUS.json,status.json,result.json,control/*}\"}",
+            "{\"kind\":\"service\",\"service_id\":\"projects\",\"shape\":\"/global/projects/{README.md,SCHEMA.json,CAPS.json,OPS.json,PERMISSIONS.json,STATUS.json,status.json,result.json,control/*}\"}",
             "{\"invoke\":true,\"operations\":[\"projects_list\",\"projects_get\",\"projects_up\"],\"discoverable\":true}",
             "List, inspect, and create/update projects through Acheron control files.",
         );
@@ -3921,12 +3960,22 @@ pub const Session = struct {
         var out = std.ArrayListUnmanaged(u8){};
         errdefer out.deinit(self.allocator);
         try out.appendSlice(self.allocator, "[");
-        try out.appendSlice(self.allocator, "{\"name\":\"self\",\"target\":\"/agents/self\",\"kind\":\"self\"}");
+        const escaped_self_name = try unified.jsonEscape(self.allocator, self.agent_id);
+        defer self.allocator.free(escaped_self_name);
+        const self_target = try std.fmt.allocPrint(self.allocator, "/projects/{s}/agents/{s}", .{ policy.project_id, self.agent_id });
+        defer self.allocator.free(self_target);
+        const escaped_self_target = try unified.jsonEscape(self.allocator, self_target);
+        defer self.allocator.free(escaped_self_target);
+        try out.writer(self.allocator).print(
+            "{{\"name\":\"{s}\",\"target\":\"{s}\",\"kind\":\"active\"}}",
+            .{ escaped_self_name, escaped_self_target },
+        );
         for (policy.visible_agents.items) |agent_name| {
             if (std.mem.eql(u8, agent_name, "self")) continue;
+            if (std.mem.eql(u8, agent_name, self.agent_id)) continue;
             const escaped_agent_name = try unified.jsonEscape(self.allocator, agent_name);
             defer self.allocator.free(escaped_agent_name);
-            const target = try std.fmt.allocPrint(self.allocator, "/agents/{s}", .{agent_name});
+            const target = try std.fmt.allocPrint(self.allocator, "/projects/{s}/agents/{s}", .{ policy.project_id, agent_name });
             defer self.allocator.free(target);
             const escaped_target = try unified.jsonEscape(self.allocator, target);
             defer self.allocator.free(escaped_target);
@@ -3944,8 +3993,8 @@ pub const Session = struct {
         defer self.allocator.free(escaped_project_id);
         return std.fmt.allocPrint(
             self.allocator,
-            "{{\"version\":\"acheron-worldfs-project-contract-v1\",\"project_id\":\"{s}\",\"project_dirs\":[\"fs\",\"nodes\",\"agents\",\"meta\"],\"meta_files\":[\"topology.json\",\"nodes.json\",\"agents.json\",\"sources.json\",\"contracts.json\",\"paths.json\",\"summary.json\",\"alerts.json\",\"workspace_status.json\",\"mounts.json\",\"desired_mounts.json\",\"actual_mounts.json\",\"drift.json\",\"reconcile.json\",\"availability.json\",\"health.json\"],\"links\":{{\"fs\":\"/nodes/<node_id>/fs\",\"nodes\":\"/nodes/<node_id>\",\"agents\":\"/agents/<agent_id>\"}}}}",
-            .{escaped_project_id},
+            "{{\"version\":\"acheron-worldfs-project-contract-v1\",\"project_id\":\"{s}\",\"project_dirs\":[\"fs\",\"nodes\",\"agents\",\"meta\"],\"meta_files\":[\"topology.json\",\"nodes.json\",\"agents.json\",\"sources.json\",\"contracts.json\",\"paths.json\",\"summary.json\",\"alerts.json\",\"workspace_status.json\",\"mounts.json\",\"desired_mounts.json\",\"actual_mounts.json\",\"drift.json\",\"reconcile.json\",\"availability.json\",\"health.json\"],\"links\":{{\"project_root\":\"/projects/{s}\",\"fs_root\":\"/projects/{s}/fs\",\"nodes_root\":\"/projects/{s}/nodes\",\"agents_root\":\"/projects/{s}/agents\",\"users_root\":\"/users/<user_id>\"}}}}",
+            .{ escaped_project_id, escaped_project_id, escaped_project_id, escaped_project_id, escaped_project_id },
         );
     }
 
@@ -3954,7 +4003,7 @@ pub const Session = struct {
         defer self.allocator.free(escaped_project_id);
         return std.fmt.allocPrint(
             self.allocator,
-            "{{\"project_root\":\"/projects/{s}\",\"fs_root\":\"/projects/{s}/fs\",\"nodes_root\":\"/projects/{s}/nodes\",\"agents_root\":\"/projects/{s}/agents\",\"meta_root\":\"/projects/{s}/meta\",\"global\":{{\"root\":\"/global\",\"library\":\"/global/library\",\"nodes\":\"/nodes\",\"agents\":\"/agents\",\"meta\":\"/meta\",\"debug\":{s}}}}}",
+            "{{\"project_root\":\"/projects/{s}\",\"fs_root\":\"/projects/{s}/fs\",\"nodes_root\":\"/projects/{s}/nodes\",\"agents_root\":\"/projects/{s}/agents\",\"meta_root\":\"/projects/{s}/meta\",\"global\":{{\"root\":\"/global\",\"library\":\"/global/library\",\"nodes\":\"/nodes\",\"agents\":\"/agents\",\"users\":\"/users\",\"meta\":\"/meta\",\"debug\":{s}}}}}",
             .{
                 escaped_project_id,
                 escaped_project_id,
@@ -4002,7 +4051,9 @@ pub const Session = struct {
 
         var policy_agent_links: usize = 1;
         for (policy.visible_agents.items) |agent_name| {
-            if (!std.mem.eql(u8, agent_name, "self")) policy_agent_links += 1;
+            if (std.mem.eql(u8, agent_name, "self")) continue;
+            if (std.mem.eql(u8, agent_name, self.agent_id)) continue;
+            policy_agent_links += 1;
         }
 
         var workspace_mount_links: usize = 0;
@@ -8311,8 +8362,8 @@ pub const Session = struct {
     }
 
     fn parseWaitSourcePath(self: *Session, path: []const u8) !WaitSource {
-        if (std.mem.eql(u8, path, "/agents/self/chat/control/input") or
-            std.mem.endsWith(u8, path, "/agents/self/chat/control/input"))
+        if (std.mem.eql(u8, path, "/global/chat/control/input") or
+            std.mem.endsWith(u8, path, "/global/chat/control/input"))
         {
             return .{
                 .raw_path = try self.allocator.dupe(u8, path),
@@ -8320,32 +8371,32 @@ pub const Session = struct {
             };
         }
 
-        if (std.mem.eql(u8, path, "/agents/self/events/sources/agent.json") or
-            std.mem.endsWith(u8, path, "/agents/self/events/sources/agent.json"))
+        if (std.mem.eql(u8, path, "/global/events/sources/agent.json") or
+            std.mem.endsWith(u8, path, "/global/events/sources/agent.json"))
         {
             return .{
                 .raw_path = try self.allocator.dupe(u8, path),
                 .kind = .agent_signal,
             };
         }
-        if (std.mem.eql(u8, path, "/agents/self/events/sources/hook.json") or
-            std.mem.endsWith(u8, path, "/agents/self/events/sources/hook.json"))
+        if (std.mem.eql(u8, path, "/global/events/sources/hook.json") or
+            std.mem.endsWith(u8, path, "/global/events/sources/hook.json"))
         {
             return .{
                 .raw_path = try self.allocator.dupe(u8, path),
                 .kind = .hook_signal,
             };
         }
-        if (std.mem.eql(u8, path, "/agents/self/events/sources/user.json") or
-            std.mem.endsWith(u8, path, "/agents/self/events/sources/user.json"))
+        if (std.mem.eql(u8, path, "/global/events/sources/user.json") or
+            std.mem.endsWith(u8, path, "/global/events/sources/user.json"))
         {
             return .{
                 .raw_path = try self.allocator.dupe(u8, path),
                 .kind = .user_signal,
             };
         }
-        if (std.mem.indexOf(u8, path, "/agents/self/events/sources/agent/")) |prefix_index| {
-            const marker = "/agents/self/events/sources/agent/";
+        if (std.mem.indexOf(u8, path, "/global/events/sources/agent/")) |prefix_index| {
+            const marker = "/global/events/sources/agent/";
             const token = path[prefix_index + marker.len ..];
             const parameter = try self.parseWaitSelectorToken(token);
             errdefer self.allocator.free(parameter);
@@ -8355,8 +8406,8 @@ pub const Session = struct {
                 .parameter = parameter,
             };
         }
-        if (std.mem.indexOf(u8, path, "/agents/self/events/sources/hook/")) |prefix_index| {
-            const marker = "/agents/self/events/sources/hook/";
+        if (std.mem.indexOf(u8, path, "/global/events/sources/hook/")) |prefix_index| {
+            const marker = "/global/events/sources/hook/";
             const token = path[prefix_index + marker.len ..];
             const parameter = try self.parseWaitSelectorToken(token);
             errdefer self.allocator.free(parameter);
@@ -8366,8 +8417,8 @@ pub const Session = struct {
                 .parameter = parameter,
             };
         }
-        if (std.mem.indexOf(u8, path, "/agents/self/events/sources/user/")) |prefix_index| {
-            const marker = "/agents/self/events/sources/user/";
+        if (std.mem.indexOf(u8, path, "/global/events/sources/user/")) |prefix_index| {
+            const marker = "/global/events/sources/user/";
             const token = path[prefix_index + marker.len ..];
             const parameter = try self.parseWaitSelectorToken(token);
             errdefer self.allocator.free(parameter);
@@ -8377,8 +8428,8 @@ pub const Session = struct {
                 .parameter = parameter,
             };
         }
-        if (std.mem.indexOf(u8, path, "/agents/self/events/sources/time/after/")) |prefix_index| {
-            const marker = "/agents/self/events/sources/time/after/";
+        if (std.mem.indexOf(u8, path, "/global/events/sources/time/after/")) |prefix_index| {
+            const marker = "/global/events/sources/time/after/";
             const token = path[prefix_index + marker.len ..];
             const delay_ms = try self.parseWaitSelectorMillis(token);
             const target_time_ms = std.math.add(i64, std.time.milliTimestamp(), delay_ms) catch return error.InvalidPayload;
@@ -8388,8 +8439,8 @@ pub const Session = struct {
                 .target_time_ms = target_time_ms,
             };
         }
-        if (std.mem.indexOf(u8, path, "/agents/self/events/sources/time/at/")) |prefix_index| {
-            const marker = "/agents/self/events/sources/time/at/";
+        if (std.mem.indexOf(u8, path, "/global/events/sources/time/at/")) |prefix_index| {
+            const marker = "/global/events/sources/time/at/";
             const token = path[prefix_index + marker.len ..];
             const target_ms = try self.parseWaitSelectorMillis(token);
             return .{
@@ -8399,8 +8450,8 @@ pub const Session = struct {
             };
         }
 
-        if (std.mem.indexOf(u8, path, "/agents/self/jobs/")) |prefix_index| {
-            const prefix = "/agents/self/jobs/";
+        if (std.mem.indexOf(u8, path, "/global/jobs/")) |prefix_index| {
+            const prefix = "/global/jobs/";
             const tail = path[prefix_index + prefix.len ..];
             var tokens = std.mem.tokenizeScalar(u8, tail, '/');
             const job_id = tokens.next() orelse return error.InvalidPayload;
@@ -8552,8 +8603,8 @@ pub const Session = struct {
         if (view.updated_at_ms <= source.last_seen_updated_at_ms) return null;
 
         const event_path = switch (source.kind) {
-            .job_status => try std.fmt.allocPrint(self.allocator, "/agents/self/jobs/{s}/status.json", .{view.job_id}),
-            .job_result => try std.fmt.allocPrint(self.allocator, "/agents/self/jobs/{s}/result.txt", .{view.job_id}),
+            .job_status => try std.fmt.allocPrint(self.allocator, "/global/jobs/{s}/status.json", .{view.job_id}),
+            .job_result => try std.fmt.allocPrint(self.allocator, "/global/jobs/{s}/result.txt", .{view.job_id}),
             else => unreachable,
         };
         defer self.allocator.free(event_path);
@@ -8600,7 +8651,7 @@ pub const Session = struct {
         }
         self.allocator.free(jobs);
 
-        const event_path = try std.fmt.allocPrint(self.allocator, "/agents/self/jobs/{s}/status.json", .{selected.job_id});
+        const event_path = try std.fmt.allocPrint(self.allocator, "/global/jobs/{s}/status.json", .{selected.job_id});
         defer self.allocator.free(event_path);
         const payload = try self.buildJobWaitEventPayload(source.raw_path, event_path, selected);
         const updated_at_ms = selected.updated_at_ms;
@@ -8650,17 +8701,17 @@ pub const Session = struct {
         const event = selected.?;
         const event_path = switch (source.kind) {
             .agent_signal => if (event.parameter) |value|
-                try std.fmt.allocPrint(self.allocator, "/agents/self/events/sources/agent/{s}.json", .{value})
+                try std.fmt.allocPrint(self.allocator, "/global/events/sources/agent/{s}.json", .{value})
             else
-                try self.allocator.dupe(u8, "/agents/self/events/sources/agent.json"),
+                try self.allocator.dupe(u8, "/global/events/sources/agent.json"),
             .hook_signal => if (event.parameter) |value|
-                try std.fmt.allocPrint(self.allocator, "/agents/self/events/sources/hook/{s}.json", .{value})
+                try std.fmt.allocPrint(self.allocator, "/global/events/sources/hook/{s}.json", .{value})
             else
-                try self.allocator.dupe(u8, "/agents/self/events/sources/hook.json"),
+                try self.allocator.dupe(u8, "/global/events/sources/hook.json"),
             .user_signal => if (event.parameter) |value|
-                try std.fmt.allocPrint(self.allocator, "/agents/self/events/sources/user/{s}.json", .{value})
+                try std.fmt.allocPrint(self.allocator, "/global/events/sources/user/{s}.json", .{value})
             else
-                try self.allocator.dupe(u8, "/agents/self/events/sources/user.json"),
+                try self.allocator.dupe(u8, "/global/events/sources/user.json"),
             else => unreachable,
         };
         defer self.allocator.free(event_path);
@@ -8691,7 +8742,7 @@ pub const Session = struct {
         const event_id = self.nextWaitEventId();
         return std.fmt.allocPrint(
             self.allocator,
-            "{{\"configured\":true,\"waiting\":false,\"event_id\":{d},\"source_path\":\"{s}\",\"event_path\":\"/agents/self/events/sources/time\",\"updated_at_ms\":{d},\"time\":{{\"target_ms\":{d},\"now_ms\":{d},\"fired\":true}}}}",
+            "{{\"configured\":true,\"waiting\":false,\"event_id\":{d},\"source_path\":\"{s}\",\"event_path\":\"/global/events/sources/time\",\"updated_at_ms\":{d},\"time\":{{\"target_ms\":{d},\"now_ms\":{d},\"fired\":true}}}}",
             .{ event_id, source_path_escaped, now_ms, target_ms, now_ms },
         );
     }
@@ -8751,9 +8802,9 @@ pub const Session = struct {
         defer self.allocator.free(job_id_escaped);
         const state_escaped = try unified.jsonEscape(self.allocator, jobStateLabel(view.state));
         defer self.allocator.free(state_escaped);
-        const status_path = try std.fmt.allocPrint(self.allocator, "/agents/self/jobs/{s}/status.json", .{view.job_id});
+        const status_path = try std.fmt.allocPrint(self.allocator, "/global/jobs/{s}/status.json", .{view.job_id});
         defer self.allocator.free(status_path);
-        const result_path = try std.fmt.allocPrint(self.allocator, "/agents/self/jobs/{s}/result.txt", .{view.job_id});
+        const result_path = try std.fmt.allocPrint(self.allocator, "/global/jobs/{s}/result.txt", .{view.job_id});
         defer self.allocator.free(result_path);
         const status_path_escaped = try unified.jsonEscape(self.allocator, status_path);
         defer self.allocator.free(status_path_escaped);
@@ -8991,17 +9042,30 @@ pub const Session = struct {
         out: *std.ArrayListUnmanaged(u8),
         first: *bool,
     ) !void {
-        const agents_root = self.lookupChild(self.root_id, "agents") orelse return;
-        const self_agent_dir = self.lookupChild(agents_root, "self") orelse return;
-        const namespace_services = [_][]const u8{ "memory", "web_search", "search_code", "terminal", "mounts", "sub_brains", "agents", "projects" };
+        const global_root = self.lookupChild(self.root_id, "global") orelse return;
+        const namespace_services = [_][]const u8{
+            "services",
+            "chat",
+            "jobs",
+            "events",
+            "memory",
+            "web_search",
+            "search_code",
+            "terminal",
+            "mounts",
+            "sub_brains",
+            "agents",
+            "projects",
+            "thoughts",
+        };
         for (namespace_services) |service_id| {
-            const service_dir_id = self.lookupChild(self_agent_dir, service_id) orelse continue;
+            const service_dir_id = self.lookupChild(global_root, service_id) orelse continue;
             const service_dir = self.nodes.get(service_dir_id) orelse continue;
             if (service_dir.kind != .dir) continue;
 
             const service_path = try std.fmt.allocPrint(
                 self.allocator,
-                "/agents/self/{s}",
+                "/global/{s}",
                 .{service_id},
             );
             defer self.allocator.free(service_path);
@@ -9015,11 +9079,11 @@ pub const Session = struct {
             try self.appendAgentServiceIndexEntry(
                 out,
                 first,
-                "self",
+                "global",
                 service_id,
                 service_path,
                 invoke_path,
-                "agent_namespace",
+                "project_namespace",
             );
         }
     }
@@ -9234,7 +9298,7 @@ fn defaultGlobalLibraryIndexMd() []const u8 {
 
 fn defaultGlobalLibraryTopicGettingStarted() []const u8 {
     return "# Getting Started\n\n" ++
-        "1. Discover services in `/agents/self/services/SERVICES.json`.\n" ++
+        "1. Discover services in `/global/services/SERVICES.json`.\n" ++
         "2. Read each service `README.md`, `SCHEMA.json`, and `CAPS.json` before using it.\n" ++
         "3. Use `/global/library` for system guides.\n";
 }
@@ -9242,45 +9306,45 @@ fn defaultGlobalLibraryTopicGettingStarted() []const u8 {
 fn defaultGlobalLibraryTopicServiceDiscovery() []const u8 {
     return "# Service Discovery\n\n" ++
         "- Node services: `/nodes/<node_id>/services/<service_id>`\n" ++
-        "- Agent namespaces: `/agents/self/<service_id>`\n" ++
+        "- Agent namespaces: `/global/<service_id>`\n" ++
         "- Global namespaces: `/global/<service_id>`\n" ++
-        "- Start with `/agents/self/services/SERVICES.json`.\n" ++
+        "- Start with `/global/services/SERVICES.json`.\n" ++
         "- Common agent namespaces include: memory, web_search, search_code, terminal, mounts, sub_brains, agents, projects.\n";
 }
 
 fn defaultGlobalLibraryTopicEventsAndWaits() []const u8 {
     return "# Events and Waits\n\n" ++
         "Use single-source blocking reads first for deterministic waits.\n" ++
-        "Use `/agents/self/events/control/wait.json` + `/agents/self/events/next.json` for one-of-many waits.\n";
+        "Use `/global/events/control/wait.json` + `/global/events/next.json` for one-of-many waits.\n";
 }
 
 fn defaultGlobalLibraryTopicSearchServices() []const u8 {
     return "# Search Services\n\n" ++
-        "Use `/agents/self/search_code` for repository-local search and `/agents/self/web_search` for external lookup.\n" ++
+        "Use `/global/search_code` for repository-local search and `/global/web_search` for external lookup.\n" ++
         "Drive both through `control/search.json` or `control/invoke.json`, then check `status.json` and `result.json`.\n";
 }
 
 fn defaultGlobalLibraryTopicTerminalWorkflows() []const u8 {
     return "# Terminal Workflows\n\n" ++
-        "Use `/agents/self/terminal/control/*.json` for sessionized shell execution.\n" ++
+        "Use `/global/terminal/control/*.json` for sessionized shell execution.\n" ++
         "Prefer `create` + `write/read` for interactive loops and `exec` for single command tasks.\n";
 }
 
 fn defaultGlobalLibraryTopicMemoryWorkflows() []const u8 {
     return "# Memory Workflows\n\n" ++
-        "Use `/agents/self/memory/control/*.json` and pass `memory_path` for targeted operations.\n" ++
+        "Use `/global/memory/control/*.json` and pass `memory_path` for targeted operations.\n" ++
         "Use `search` before creating duplicate memories.\n";
 }
 
 fn defaultGlobalLibraryTopicProjectMountsAndBinds() []const u8 {
     return "# Project Mounts and Binds\n\n" ++
-        "Use `/agents/self/mounts/control/mount.json`, `mkdir.json`, and `unmount.json` for project mounts.\n" ++
-        "Use `/agents/self/mounts/control/bind.json` and `resolve.json` for stable project paths.\n";
+        "Use `/global/mounts/control/mount.json`, `mkdir.json`, and `unmount.json` for project mounts.\n" ++
+        "Use `/global/mounts/control/bind.json` and `resolve.json` for stable project paths.\n";
 }
 
 fn defaultGlobalLibraryTopicAgentManagementAndSubBrains() []const u8 {
     return "# Agent Management and Sub-Brains\n\n" ++
-        "Use `/agents/self/agents` for list/create, `/agents/self/sub_brains` for list/upsert/delete, and `/agents/self/projects` for list/get/up.\n" ++
+        "Use `/global/agents` for list/create, `/global/sub_brains` for list/upsert/delete, and `/global/projects` for list/get/up.\n" ++
         "Mutation operations depend on capability flags and service permissions.\n";
 }
 
@@ -9359,11 +9423,11 @@ fn urlPathDecode(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
 fn buildMemoryPathFromMemId(allocator: std.mem.Allocator, mem_id: []const u8) ![]u8 {
     const encoded = try urlPathEncode(allocator, mem_id);
     defer allocator.free(encoded);
-    return std.fmt.allocPrint(allocator, "/agents/self/memory/items/{s}", .{encoded});
+    return std.fmt.allocPrint(allocator, "/global/memory/items/{s}", .{encoded});
 }
 
 fn decodeMemIdFromPath(allocator: std.mem.Allocator, path_or_mem_id: []const u8) ![]u8 {
-    const prefix = "/agents/self/memory/items/";
+    const prefix = "/global/memory/items/";
     if (!std.mem.startsWith(u8, path_or_mem_id, prefix)) {
         return allocator.dupe(u8, path_or_mem_id);
     }
@@ -9940,7 +10004,7 @@ test "fsrpc_session: events wait returns next completed chat job" {
         80,
         81,
         &.{ "agents", "self", "events", "control", "wait.json" },
-        "{\"paths\":[\"/agents/self/chat/control/input\"],\"timeout_ms\":2000}",
+        "{\"paths\":[\"/global/chat/control/input\"],\"timeout_ms\":2000}",
         700,
     );
 
@@ -9965,8 +10029,8 @@ test "fsrpc_session: events wait returns next completed chat job" {
     defer allocator.free(next_payload);
 
     try std.testing.expect(std.mem.indexOf(u8, next_payload, "\"configured\":true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, next_payload, "\"source_path\":\"/agents/self/chat/control/input\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, next_payload, "\"event_path\":\"/agents/self/jobs/job-") != null);
+    try std.testing.expect(std.mem.indexOf(u8, next_payload, "\"source_path\":\"/global/chat/control/input\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, next_payload, "\"event_path\":\"/global/jobs/job-") != null);
     try std.testing.expect(std.mem.indexOf(u8, next_payload, "\"job_id\":\"job-") != null);
 }
 
@@ -9988,7 +10052,7 @@ test "fsrpc_session: events wait reports timeout when no source event is availab
         90,
         91,
         &.{ "agents", "self", "events", "control", "wait.json" },
-        "{\"paths\":[\"/agents/self/jobs/job-missing/status.json\"],\"timeout_ms\":0}",
+        "{\"paths\":[\"/global/jobs/job-missing/status.json\"],\"timeout_ms\":0}",
         730,
     );
 
@@ -10023,7 +10087,7 @@ test "fsrpc_session: events wait supports time source selectors" {
         94,
         95,
         &.{ "agents", "self", "events", "control", "wait.json" },
-        "{\"paths\":[\"/agents/self/events/sources/time/after/0.json\"],\"timeout_ms\":0}",
+        "{\"paths\":[\"/global/events/sources/time/after/0.json\"],\"timeout_ms\":0}",
         745,
     );
 
@@ -10038,7 +10102,7 @@ test "fsrpc_session: events wait supports time source selectors" {
     defer allocator.free(next_payload);
 
     try std.testing.expect(std.mem.indexOf(u8, next_payload, "\"configured\":true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, next_payload, "\"event_path\":\"/agents/self/events/sources/time\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, next_payload, "\"event_path\":\"/global/events/sources/time\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, next_payload, "\"time\":{") != null);
 }
 
@@ -10060,7 +10124,7 @@ test "fsrpc_session: events wait supports agent signal source selectors" {
         98,
         99,
         &.{ "agents", "self", "events", "control", "wait.json" },
-        "{\"paths\":[\"/agents/self/events/sources/agent/build.json\"],\"timeout_ms\":0}",
+        "{\"paths\":[\"/global/events/sources/agent/build.json\"],\"timeout_ms\":0}",
         747,
     );
     try protocolWriteFile(
@@ -10562,13 +10626,13 @@ test "fsrpc_session: agent services index includes first-class namespaces only" 
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"service_id\":\"mounts\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"service_id\":\"projects\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"service_id\":\"library\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"service_path\":\"/agents/self/search_code\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"service_path\":\"/agents/self/mounts\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"service_path\":\"/agents/self/projects\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"service_path\":\"/global/search_code\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"service_path\":\"/global/mounts\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"service_path\":\"/global/projects\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"service_path\":\"/global/library\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"scope\":\"global_namespace\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"has_invoke\":false") != null);
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"service_path\":\"/agents/self/services/contracts/") == null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"service_path\":\"/global/services/contracts/") == null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"scope\":\"agent_contract\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"has_invoke\":true") != null);
 }
@@ -10710,8 +10774,8 @@ test "fsrpc_session: agent services index includes first-class memory namespace 
     defer allocator.free(payload);
 
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"scope\":\"agent_namespace\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"service_path\":\"/agents/self/memory\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"invoke_path\":\"/agents/self/memory/control/invoke.json\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"service_path\":\"/global/memory\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"invoke_path\":\"/global/memory/control/invoke.json\"") != null);
 }
 
 test "fsrpc_session: agent services index includes first-class web_search namespace entry" {
@@ -10737,8 +10801,8 @@ test "fsrpc_session: agent services index includes first-class web_search namesp
     defer allocator.free(payload);
 
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"scope\":\"agent_namespace\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"service_path\":\"/agents/self/web_search\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"invoke_path\":\"/agents/self/web_search/control/invoke.json\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"service_path\":\"/global/web_search\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"invoke_path\":\"/global/web_search/control/invoke.json\"") != null);
 }
 
 test "fsrpc_session: agent services index includes first-class terminal namespace entry" {
@@ -10764,8 +10828,8 @@ test "fsrpc_session: agent services index includes first-class terminal namespac
     defer allocator.free(payload);
 
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"scope\":\"agent_namespace\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"service_path\":\"/agents/self/terminal\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"invoke_path\":\"/agents/self/terminal/control/invoke.json\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"service_path\":\"/global/terminal\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"invoke_path\":\"/global/terminal/control/invoke.json\"") != null);
 }
 
 test "fsrpc_session: agent services index includes first-class sub_brains namespace entry" {
@@ -10791,8 +10855,8 @@ test "fsrpc_session: agent services index includes first-class sub_brains namesp
     defer allocator.free(payload);
 
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"scope\":\"agent_namespace\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"service_path\":\"/agents/self/sub_brains\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"invoke_path\":\"/agents/self/sub_brains/control/invoke.json\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"service_path\":\"/global/sub_brains\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"invoke_path\":\"/global/sub_brains/control/invoke.json\"") != null);
 }
 
 test "fsrpc_session: agent services index includes first-class agents namespace entry" {
@@ -10818,8 +10882,8 @@ test "fsrpc_session: agent services index includes first-class agents namespace 
     defer allocator.free(payload);
 
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"scope\":\"agent_namespace\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"service_path\":\"/agents/self/agents\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"invoke_path\":\"/agents/self/agents/control/invoke.json\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"service_path\":\"/global/agents\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"invoke_path\":\"/global/agents/control/invoke.json\"") != null);
 }
 
 test "fsrpc_session: agent services index includes first-class projects namespace entry" {
@@ -10845,8 +10909,8 @@ test "fsrpc_session: agent services index includes first-class projects namespac
     defer allocator.free(payload);
 
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"scope\":\"agent_namespace\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"service_path\":\"/agents/self/projects\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"invoke_path\":\"/agents/self/projects/control/invoke.json\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"service_path\":\"/global/projects\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"invoke_path\":\"/global/projects/control/invoke.json\"") != null);
 }
 
 test "fsrpc_session: mother can upsert project from system context without project token" {
@@ -12083,24 +12147,21 @@ test "fsrpc_session: node services namespace prefers control-plane catalog" {
     defer allocator.free(agents_dir);
     const projects_dir = try std.fmt.allocPrint(allocator, "{s}/projects", .{root});
     defer allocator.free(projects_dir);
-    const agent_policy_dir = try std.fmt.allocPrint(allocator, "{s}/default", .{agents_dir});
-    defer allocator.free(agent_policy_dir);
     const project_dir = try std.fmt.allocPrint(allocator, "{s}/proj-test", .{projects_dir});
     defer allocator.free(project_dir);
-    try std.fs.cwd().makePath(agent_policy_dir);
     try std.fs.cwd().makePath(project_dir);
 
-    const agent_policy_path = try std.fmt.allocPrint(allocator, "{s}/agent_policy.json", .{agent_policy_dir});
-    defer allocator.free(agent_policy_path);
-    const agent_policy_json = try std.fmt.allocPrint(
+    const project_policy_path = try std.fmt.allocPrint(allocator, "{s}/project_policy.json", .{project_dir});
+    defer allocator.free(project_policy_path);
+    const project_policy_json = try std.fmt.allocPrint(
         allocator,
         "{{\"project_id\":\"proj-test\",\"nodes\":[{{\"id\":\"{s}\",\"resources\":{{\"fs\":false,\"camera\":false,\"screen\":false,\"user\":false}},\"terminals\":[]}}],\"visible_agents\":[\"default\"],\"project_links\":[]}}",
         .{escaped_node_id},
     );
-    defer allocator.free(agent_policy_json);
+    defer allocator.free(project_policy_json);
     try std.fs.cwd().writeFile(.{
-        .sub_path = agent_policy_path,
-        .data = agent_policy_json,
+        .sub_path = project_policy_path,
+        .data = project_policy_json,
     });
 
     const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
@@ -12188,24 +12249,21 @@ test "fsrpc_session: empty control-plane service catalog suppresses policy fallb
     defer allocator.free(agents_dir);
     const projects_dir = try std.fmt.allocPrint(allocator, "{s}/projects", .{root});
     defer allocator.free(projects_dir);
-    const agent_policy_dir = try std.fmt.allocPrint(allocator, "{s}/default", .{agents_dir});
-    defer allocator.free(agent_policy_dir);
     const project_dir = try std.fmt.allocPrint(allocator, "{s}/proj-empty", .{projects_dir});
     defer allocator.free(project_dir);
-    try std.fs.cwd().makePath(agent_policy_dir);
     try std.fs.cwd().makePath(project_dir);
 
-    const agent_policy_path = try std.fmt.allocPrint(allocator, "{s}/agent_policy.json", .{agent_policy_dir});
-    defer allocator.free(agent_policy_path);
-    const agent_policy_json = try std.fmt.allocPrint(
+    const project_policy_path = try std.fmt.allocPrint(allocator, "{s}/project_policy.json", .{project_dir});
+    defer allocator.free(project_policy_path);
+    const project_policy_json = try std.fmt.allocPrint(
         allocator,
         "{{\"project_id\":\"proj-empty\",\"nodes\":[{{\"id\":\"{s}\",\"resources\":{{\"fs\":true,\"camera\":false,\"screen\":false,\"user\":false}},\"terminals\":[\"1\"]}}],\"visible_agents\":[\"default\"],\"project_links\":[]}}",
         .{escaped_node_id},
     );
-    defer allocator.free(agent_policy_json);
+    defer allocator.free(project_policy_json);
     try std.fs.cwd().writeFile(.{
-        .sub_path = agent_policy_path,
-        .data = agent_policy_json,
+        .sub_path = project_policy_path,
+        .data = project_policy_json,
     });
 
     const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
@@ -12302,24 +12360,21 @@ test "fsrpc_session: project meta includes control-plane workspace status" {
     defer allocator.free(agents_dir);
     const projects_dir = try std.fmt.allocPrint(allocator, "{s}/projects", .{root});
     defer allocator.free(projects_dir);
-    const agent_policy_dir = try std.fmt.allocPrint(allocator, "{s}/default", .{agents_dir});
-    defer allocator.free(agent_policy_dir);
     const project_dir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ projects_dir, project_id.string });
     defer allocator.free(project_dir);
-    try std.fs.cwd().makePath(agent_policy_dir);
     try std.fs.cwd().makePath(project_dir);
 
-    const agent_policy_path = try std.fmt.allocPrint(allocator, "{s}/agent_policy.json", .{agent_policy_dir});
-    defer allocator.free(agent_policy_path);
-    const agent_policy_json = try std.fmt.allocPrint(
+    const project_policy_path = try std.fmt.allocPrint(allocator, "{s}/project_policy.json", .{project_dir});
+    defer allocator.free(project_policy_path);
+    const project_policy_json = try std.fmt.allocPrint(
         allocator,
         "{{\"project_id\":\"{s}\",\"nodes\":[{{\"id\":\"{s}\",\"resources\":{{\"fs\":true,\"camera\":false,\"screen\":false,\"user\":false}},\"terminals\":[]}}],\"visible_agents\":[\"default\"],\"project_links\":[{{\"name\":\"{s}::fs\",\"node_id\":\"{s}\",\"resource\":\"fs\"}}]}}",
         .{ escaped_project_id, escaped_node_id, escaped_node_id, escaped_node_id },
     );
-    defer allocator.free(agent_policy_json);
+    defer allocator.free(project_policy_json);
     try std.fs.cwd().writeFile(.{
-        .sub_path = agent_policy_path,
-        .data = agent_policy_json,
+        .sub_path = project_policy_path,
+        .data = project_policy_json,
     });
 
     const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
@@ -12440,13 +12495,13 @@ test "fsrpc_session: project meta includes control-plane workspace status" {
     try std.testing.expect(std.mem.indexOf(u8, nodes_meta_node.content, node_id.string) != null);
     try std.testing.expect(std.mem.indexOf(u8, nodes_meta_node.content, "\"state\":\"online\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, nodes_meta_node.content, "\"mounts\":1") != null);
-    try std.testing.expect(std.mem.indexOf(u8, agents_meta_node.content, "\"name\":\"self\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, agents_meta_node.content, "\"target\":\"/agents/self\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, agents_meta_node.content, "\"name\":\"default\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, agents_meta_node.content, "\"target\":\"/agents/default\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, agents_meta_node.content, "\"target\":\"/projects/") != null);
+    try std.testing.expect(std.mem.indexOf(u8, agents_meta_node.content, "/agents/default\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, contracts_node.content, "\"version\":\"acheron-worldfs-project-contract-v1\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, contracts_node.content, "\"project_dirs\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, contracts_node.content, "\"meta_files\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, contracts_node.content, "\"agents_root\":\"/projects/") != null);
     try std.testing.expect(std.mem.indexOf(u8, contracts_node.content, "\"sources.json\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, paths_node.content, "\"project_root\":\"/projects/") != null);
     try std.testing.expect(std.mem.indexOf(u8, paths_node.content, "\"fs_root\":\"/projects/") != null);
@@ -12455,7 +12510,7 @@ test "fsrpc_session: project meta includes control-plane workspace status" {
     try std.testing.expect(std.mem.indexOf(u8, summary_node.content, "\"workspace_status\":\"control_plane\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, summary_node.content, "\"project_mount_links\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, summary_node.content, "\"project_node_links\":1") != null);
-    try std.testing.expect(std.mem.indexOf(u8, summary_node.content, "\"project_agent_links\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, summary_node.content, "\"project_agent_links\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, summary_node.content, "\"state\":\"healthy\"") != null);
     try std.testing.expect(std.mem.eql(u8, alerts_node.content, "[]"));
     try std.testing.expect(std.mem.indexOf(u8, sources_node.content, "\"workspace_status\":\"control_plane\"") != null);
@@ -12629,24 +12684,21 @@ test "fsrpc_session: project meta summary and alerts reflect degraded and missin
     defer allocator.free(agents_dir);
     const projects_dir = try std.fmt.allocPrint(allocator, "{s}/projects", .{root});
     defer allocator.free(projects_dir);
-    const agent_policy_dir = try std.fmt.allocPrint(allocator, "{s}/default", .{agents_dir});
-    defer allocator.free(agent_policy_dir);
     const project_dir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ projects_dir, project_id.string });
     defer allocator.free(project_dir);
-    try std.fs.cwd().makePath(agent_policy_dir);
     try std.fs.cwd().makePath(project_dir);
 
-    const agent_policy_path = try std.fmt.allocPrint(allocator, "{s}/agent_policy.json", .{agent_policy_dir});
-    defer allocator.free(agent_policy_path);
-    const agent_policy_json = try std.fmt.allocPrint(
+    const project_policy_path = try std.fmt.allocPrint(allocator, "{s}/project_policy.json", .{project_dir});
+    defer allocator.free(project_policy_path);
+    const project_policy_json = try std.fmt.allocPrint(
         allocator,
         "{{\"project_id\":\"{s}\",\"nodes\":[{{\"id\":\"{s}\",\"resources\":{{\"fs\":true,\"camera\":false,\"screen\":false,\"user\":false}},\"terminals\":[]}}],\"visible_agents\":[\"default\"],\"project_links\":[{{\"name\":\"{s}::fs\",\"node_id\":\"{s}\",\"resource\":\"fs\"}}]}}",
         .{ escaped_project_id, escaped_node_id, escaped_node_id, escaped_node_id },
     );
-    defer allocator.free(agent_policy_json);
+    defer allocator.free(project_policy_json);
     try std.fs.cwd().writeFile(.{
-        .sub_path = agent_policy_path,
-        .data = agent_policy_json,
+        .sub_path = project_policy_path,
+        .data = project_policy_json,
     });
 
     const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
@@ -12810,26 +12862,23 @@ test "fsrpc_session: project workspace fallback is scoped to requested project" 
     defer allocator.free(agents_dir);
     const projects_dir = try std.fmt.allocPrint(allocator, "{s}/projects", .{root});
     defer allocator.free(projects_dir);
-    const agent_policy_dir = try std.fmt.allocPrint(allocator, "{s}/default", .{agents_dir});
-    defer allocator.free(agent_policy_dir);
     const project_a_dir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ projects_dir, project_a_id.string });
     defer allocator.free(project_a_dir);
-    try std.fs.cwd().makePath(agent_policy_dir);
     try std.fs.cwd().makePath(project_a_dir);
 
     const escaped_project_a_id = try unified.jsonEscape(allocator, project_a_id.string);
     defer allocator.free(escaped_project_a_id);
-    const agent_policy_path = try std.fmt.allocPrint(allocator, "{s}/agent_policy.json", .{agent_policy_dir});
-    defer allocator.free(agent_policy_path);
-    const agent_policy_json = try std.fmt.allocPrint(
+    const project_policy_path = try std.fmt.allocPrint(allocator, "{s}/project_policy.json", .{project_a_dir});
+    defer allocator.free(project_policy_path);
+    const project_policy_json = try std.fmt.allocPrint(
         allocator,
         "{{\"project_id\":\"{s}\",\"nodes\":[{{\"id\":\"local\",\"resources\":{{\"fs\":true,\"camera\":false,\"screen\":false,\"user\":false}},\"terminals\":[\"1\"]}}],\"visible_agents\":[\"default\"],\"project_links\":[{{\"name\":\"local::fs\",\"node_id\":\"local\",\"resource\":\"fs\"}}]}}",
         .{escaped_project_a_id},
     );
-    defer allocator.free(agent_policy_json);
+    defer allocator.free(project_policy_json);
     try std.fs.cwd().writeFile(.{
-        .sub_path = agent_policy_path,
-        .data = agent_policy_json,
+        .sub_path = project_policy_path,
+        .data = project_policy_json,
     });
 
     const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
@@ -12895,14 +12944,14 @@ test "fsrpc_session: project workspace fallback is scoped to requested project" 
     try std.testing.expect(std.mem.indexOf(u8, nodes_meta_node.content, "\"node_id\":\"local\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, nodes_meta_node.content, "\"state\":\"unknown\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, nodes_meta_node.content, node_id.string) == null);
-    try std.testing.expect(std.mem.indexOf(u8, agents_meta_node.content, "\"name\":\"self\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, agents_meta_node.content, "\"target\":\"/agents/self\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, agents_meta_node.content, "\"name\":\"default\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, agents_meta_node.content, "\"target\":\"/agents/default\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, agents_meta_node.content, "\"target\":\"/projects/") != null);
+    try std.testing.expect(std.mem.indexOf(u8, agents_meta_node.content, "/agents/default\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, contracts_node.content, "\"version\":\"acheron-worldfs-project-contract-v1\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, contracts_node.content, "\"project_id\":\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, contracts_node.content, project_a_id.string) != null);
     try std.testing.expect(std.mem.indexOf(u8, contracts_node.content, "\"meta_files\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, contracts_node.content, "\"agents_root\":\"/projects/") != null);
     try std.testing.expect(std.mem.indexOf(u8, paths_node.content, "\"project_root\":\"/projects/") != null);
     try std.testing.expect(std.mem.indexOf(u8, paths_node.content, project_a_id.string) != null);
     try std.testing.expect(std.mem.indexOf(u8, paths_node.content, "\"global\":") != null);
@@ -12965,24 +13014,21 @@ test "fsrpc_session: node roots are derived from control-plane service kinds" {
     defer allocator.free(agents_dir);
     const projects_dir = try std.fmt.allocPrint(allocator, "{s}/projects", .{root});
     defer allocator.free(projects_dir);
-    const agent_policy_dir = try std.fmt.allocPrint(allocator, "{s}/default", .{agents_dir});
-    defer allocator.free(agent_policy_dir);
     const project_dir = try std.fmt.allocPrint(allocator, "{s}/proj-roots", .{projects_dir});
     defer allocator.free(project_dir);
-    try std.fs.cwd().makePath(agent_policy_dir);
     try std.fs.cwd().makePath(project_dir);
 
-    const agent_policy_path = try std.fmt.allocPrint(allocator, "{s}/agent_policy.json", .{agent_policy_dir});
-    defer allocator.free(agent_policy_path);
-    const agent_policy_json = try std.fmt.allocPrint(
+    const project_policy_path = try std.fmt.allocPrint(allocator, "{s}/project_policy.json", .{project_dir});
+    defer allocator.free(project_policy_path);
+    const project_policy_json = try std.fmt.allocPrint(
         allocator,
         "{{\"project_id\":\"proj-roots\",\"nodes\":[{{\"id\":\"{s}\",\"resources\":{{\"fs\":false,\"camera\":false,\"screen\":false,\"user\":false}},\"terminals\":[]}}],\"visible_agents\":[\"default\"],\"project_links\":[]}}",
         .{escaped_node_id},
     );
-    defer allocator.free(agent_policy_json);
+    defer allocator.free(project_policy_json);
     try std.fs.cwd().writeFile(.{
-        .sub_path = agent_policy_path,
-        .data = agent_policy_json,
+        .sub_path = project_policy_path,
+        .data = project_policy_json,
     });
 
     const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
@@ -13058,24 +13104,21 @@ test "fsrpc_session: control-plane mounts expose custom node roots and metadata 
     defer allocator.free(agents_dir);
     const projects_dir = try std.fmt.allocPrint(allocator, "{s}/projects", .{root});
     defer allocator.free(projects_dir);
-    const agent_policy_dir = try std.fmt.allocPrint(allocator, "{s}/default", .{agents_dir});
-    defer allocator.free(agent_policy_dir);
     const project_dir = try std.fmt.allocPrint(allocator, "{s}/proj-custom-mounts", .{projects_dir});
     defer allocator.free(project_dir);
-    try std.fs.cwd().makePath(agent_policy_dir);
     try std.fs.cwd().makePath(project_dir);
 
-    const agent_policy_path = try std.fmt.allocPrint(allocator, "{s}/agent_policy.json", .{agent_policy_dir});
-    defer allocator.free(agent_policy_path);
-    const agent_policy_json = try std.fmt.allocPrint(
+    const project_policy_path = try std.fmt.allocPrint(allocator, "{s}/project_policy.json", .{project_dir});
+    defer allocator.free(project_policy_path);
+    const project_policy_json = try std.fmt.allocPrint(
         allocator,
         "{{\"project_id\":\"proj-custom-mounts\",\"nodes\":[{{\"id\":\"{s}\",\"resources\":{{\"fs\":false,\"camera\":false,\"screen\":false,\"user\":false}},\"terminals\":[]}}],\"visible_agents\":[\"default\"],\"project_links\":[]}}",
         .{escaped_node_id},
     );
-    defer allocator.free(agent_policy_json);
+    defer allocator.free(project_policy_json);
     try std.fs.cwd().writeFile(.{
-        .sub_path = agent_policy_path,
-        .data = agent_policy_json,
+        .sub_path = project_policy_path,
+        .data = project_policy_json,
     });
 
     const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
@@ -13159,24 +13202,21 @@ test "fsrpc_session: service permissions enforce deny-by-default with admin bypa
     defer allocator.free(agents_dir);
     const projects_dir = try std.fmt.allocPrint(allocator, "{s}/projects", .{root});
     defer allocator.free(projects_dir);
-    const agent_policy_dir = try std.fmt.allocPrint(allocator, "{s}/default", .{agents_dir});
-    defer allocator.free(agent_policy_dir);
     const project_dir = try std.fmt.allocPrint(allocator, "{s}/proj-secure", .{projects_dir});
     defer allocator.free(project_dir);
-    try std.fs.cwd().makePath(agent_policy_dir);
     try std.fs.cwd().makePath(project_dir);
 
-    const agent_policy_path = try std.fmt.allocPrint(allocator, "{s}/agent_policy.json", .{agent_policy_dir});
-    defer allocator.free(agent_policy_path);
-    const agent_policy_json = try std.fmt.allocPrint(
+    const project_policy_path = try std.fmt.allocPrint(allocator, "{s}/project_policy.json", .{project_dir});
+    defer allocator.free(project_policy_path);
+    const project_policy_json = try std.fmt.allocPrint(
         allocator,
         "{{\"project_id\":\"proj-secure\",\"nodes\":[{{\"id\":\"{s}\",\"resources\":{{\"fs\":false,\"camera\":false,\"screen\":false,\"user\":false}},\"terminals\":[]}}],\"visible_agents\":[\"default\"],\"project_links\":[]}}",
         .{escaped_node_id},
     );
-    defer allocator.free(agent_policy_json);
+    defer allocator.free(project_policy_json);
     try std.fs.cwd().writeFile(.{
-        .sub_path = agent_policy_path,
-        .data = agent_policy_json,
+        .sub_path = project_policy_path,
+        .data = project_policy_json,
     });
 
     const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});

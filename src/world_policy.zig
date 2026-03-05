@@ -65,10 +65,8 @@ pub fn load(allocator: std.mem.Allocator, options: LoadOptions) !Policy {
     var policy = try initDefaults(allocator, options);
     errdefer policy.deinit(allocator);
 
-    const agent_policy_path = try std.fs.path.join(allocator, &.{ options.agents_dir, options.agent_id, "agent_policy.json" });
-    defer allocator.free(agent_policy_path);
-    try applyPolicyFile(allocator, &policy, options.agent_id, agent_policy_path);
-
+    // Policy lookup is project-scoped so all actors in the same project share
+    // one namespace view regardless of active agent identity.
     const project_policy_path = try std.fs.path.join(allocator, &.{ options.projects_dir, policy.project_id, "project_policy.json" });
     defer allocator.free(project_policy_path);
     try applyPolicyFile(allocator, &policy, options.agent_id, project_policy_path);

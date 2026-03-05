@@ -704,7 +704,7 @@ test "agent_runtime_child_main: slash workspace stays within namespace mounts" {
     try std.testing.expect(isWithinWorkspace("/", "/workspace"));
     try std.testing.expect(isWithinWorkspace("/", "/workspace/src"));
     try std.testing.expect(isWithinWorkspace("/", "/projects/system"));
-    try std.testing.expect(isWithinWorkspace("/", "/agents/self"));
+    try std.testing.expect(isWithinWorkspace("/", "/global"));
     try std.testing.expect(!isWithinWorkspace("/", "/"));
     try std.testing.expect(!isWithinWorkspace("/", "/usr/bin"));
     try std.testing.expect(!isWithinWorkspace("/", "/tmp"));

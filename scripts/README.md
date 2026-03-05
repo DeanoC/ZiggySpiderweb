@@ -194,7 +194,7 @@ What it validates:
 - first connect starts in bootstrap mode (`bootstrap_only=true`)
 - provider-backed Mother chat can execute a multi-step workflow
 - Mother creates a new non-system project and first agent
-- Mother performs `mount`, `bind`, and `resolve` via `/agents/self/mounts/control/*.json`
+- Mother performs `mount`, `bind`, and `resolve` via `/global/mounts/control/*.json`
 - result verification confirms mounted path and bind target
 - attach to the Mother-created `(project_id, agent_id)` succeeds and bootstrap mode exits
 

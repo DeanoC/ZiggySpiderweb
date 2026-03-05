@@ -120,6 +120,46 @@ WS_OUT=""
 TAG_COUNTER=100
 CURRENT_TAG=0
 
+stop_pid() {
+  local pid="$1"
+  if [[ -z "$pid" ]]; then
+    return 0
+  fi
+  kill "$pid" >/dev/null 2>&1 || true
+  local deadline=$((SECONDS + 10))
+  while kill -0 "$pid" >/dev/null 2>&1; do
+    if (( SECONDS >= deadline )); then
+      kill -9 "$pid" >/dev/null 2>&1 || true
+      break
+    fi
+    sleep 0.2
+  done
+  wait "$pid" >/dev/null 2>&1 || true
+}
+
+unmount_tmp_mounts() {
+  local mounts_root="$TMP_ROOT/sandbox/mounts"
+  if [[ ! -d "$mounts_root" ]]; then
+    return 0
+  fi
+
+  while IFS= read -r mount_point; do
+    [[ -z "$mount_point" ]] && continue
+    if command -v fusermount3 >/dev/null 2>&1; then
+      fusermount3 -u "$mount_point" >/dev/null 2>&1 || true
+    fi
+    if command -v fusermount >/dev/null 2>&1; then
+      fusermount -u "$mount_point" >/dev/null 2>&1 || true
+    fi
+    umount "$mount_point" >/dev/null 2>&1 || true
+    umount -l "$mount_point" >/dev/null 2>&1 || true
+  done < <(
+    awk -v prefix="$mounts_root/" '
+      index($2, prefix) == 1 { print $2 }
+    ' /proc/mounts | awk '{ print length($0), $0 }' | sort -rn | cut -d" " -f2-
+  )
+}
+
 cleanup() {
   if [[ -n "${WS_IN:-}" ]]; then
     exec {WS_IN}>&- || true
@@ -130,19 +170,14 @@ cleanup() {
     WS_OUT=""
   fi
   if [[ -n "${WS_PID:-}" ]]; then
-    kill "$WS_PID" >/dev/null 2>&1 || true
-    if kill -0 "$WS_PID" >/dev/null 2>&1; then
-      wait "$WS_PID" >/dev/null 2>&1 || true
-    fi
+    stop_pid "$WS_PID"
     WS_PID=""
   fi
   if [[ -n "${SPIDERWEB_PID:-}" ]]; then
-    kill "$SPIDERWEB_PID" >/dev/null 2>&1 || true
-    if kill -0 "$SPIDERWEB_PID" >/dev/null 2>&1; then
-      wait "$SPIDERWEB_PID" >/dev/null 2>&1 || true
-    fi
+    stop_pid "$SPIDERWEB_PID"
     SPIDERWEB_PID=""
   fi
+  unmount_tmp_mounts
   if [[ "$KEEP_CANARY_DIR" != "1" ]]; then
     if command -v timeout >/dev/null 2>&1; then
       timeout --kill-after=2s 10s rm -rf "$TMP_ROOT" >/dev/null 2>&1 || true
@@ -546,7 +581,7 @@ ws_wait_service_done() {
   local deadline=$((SECONDS + timeout_sec))
   local status_json state
   while (( SECONDS < deadline )); do
-    status_json=$(ws_read_text_file "/agents/self/${service_name}/status.json" 30 || true)
+    status_json=$(ws_read_text_file "/global/${service_name}/status.json" 30 || true)
     state=$($JQ_BIN -r '.state // empty' 2>/dev/null <<<"$status_json" || true)
     if [[ "$state" == "done" ]]; then
       return 0
@@ -557,7 +592,7 @@ ws_wait_service_done() {
     fi
     sleep 1
   done
-  echo "error: timeout waiting for /agents/self/${service_name}/status.json to reach done" >&2
+  echo "error: timeout waiting for /global/${service_name}/status.json to reach done" >&2
   return 1
 }
 
@@ -571,14 +606,14 @@ ws_invoke_and_read_result() {
   _=$(ws_write_text_file "$control_path" "${payload}
 ${padding}" 60)
   ws_wait_service_done "$service_name" "$timeout_sec"
-  ws_read_text_file "/agents/self/${service_name}/result.json" 30
+  ws_read_text_file "/global/${service_name}/result.json" 30
 }
 
 ws_chat_and_read_reply() {
   local prompt="$1"
   local timeout_sec="${2:-240}"
   local write_frame chat_job chat_result_path
-  write_frame=$(ws_write_text_file "/agents/self/chat/control/input" "$prompt" 180)
+  write_frame=$(ws_write_text_file "/global/chat/control/input" "$prompt" 180)
   chat_job=$($JQ_BIN -r '.payload.job // empty' <<<"$write_frame")
   chat_result_path=$($JQ_BIN -r '.payload.result_path // empty' <<<"$write_frame")
   if [[ -z "$chat_result_path" ]]; then
@@ -586,7 +621,7 @@ ws_chat_and_read_reply() {
       echo "error: chat write did not return job/result_path" >&2
       exit 1
     fi
-    chat_result_path="/agents/self/jobs/${chat_job}/result.txt"
+    chat_result_path="/global/jobs/${chat_job}/result.txt"
   fi
   ws_read_text_file "$chat_result_path" "$timeout_sec"
 }
@@ -612,23 +647,21 @@ json_assert "$CONNECT_JSON" '.type == "control.connect_ack"' 'connect did not re
 json_assert "$CONNECT_JSON" '.payload.agent_id == "mother" and .payload.project_id == "system"' 'connect ack not bound to mother/system'
 json_assert "$CONNECT_JSON" '.payload.bootstrap_only == true' 'expected bootstrap_only=true on first connect'
 
-WORKSPACE_JSON=$(control_retry "$CONTROL_RETRY_ATTEMPTS" "$CONTROL_RETRY_DELAY_SEC" workspace_status '{}')
-json_assert "$WORKSPACE_JSON" '.type == "control.workspace_status"' 'workspace_status failed'
 NODE_ID=$($JQ_BIN -r '
-  def mounts: ((.payload.actual_mounts // []) | if length > 0 then . else (.payload.mounts // []) end);
+  def mounts: ((.payload.workspace.actual_mounts // []) | if length > 0 then . else (.payload.workspace.mounts // []) end);
   (mounts | map(select((.mount_path // "") == "/nodes/local/fs")) | .[0].node_id)
   // (mounts[0].node_id)
   // empty
-' <<<"$WORKSPACE_JSON")
+' <<<"$CONNECT_JSON")
 EXPORT_NAME=$($JQ_BIN -r '
-  def mounts: ((.payload.actual_mounts // []) | if length > 0 then . else (.payload.mounts // []) end);
+  def mounts: ((.payload.workspace.actual_mounts // []) | if length > 0 then . else (.payload.workspace.mounts // []) end);
   (mounts | map(select((.mount_path // "") == "/nodes/local/fs")) | .[0].export_name)
   // (mounts[0].export_name)
   // empty
-' <<<"$WORKSPACE_JSON")
+' <<<"$CONNECT_JSON")
 if [[ -z "$NODE_ID" || -z "$EXPORT_NAME" ]]; then
-  echo "error: could not resolve source node/export from workspace_status" >&2
-  echo "$WORKSPACE_JSON" >&2
+  echo "error: could not resolve source node/export from connect_ack payload.workspace" >&2
+  echo "$CONNECT_JSON" >&2
   exit 1
 fi
 
@@ -645,7 +678,7 @@ CHAT_REPLY=""
 PROJECT_ID=""
 if [[ "$MOTHER_E2E_MODE" == "deterministic" ]]; then
   PROJECT_UP_PAYLOAD=$($JQ_BIN -cn --arg name "$PROJECT_NAME" --arg vision "$PROJECT_VISION" '{name:$name,vision:$vision,activate:false}')
-  PROJECT_UP_RESULT=$(ws_invoke_and_read_result "projects" "/agents/self/projects/control/up.json" "$PROJECT_UP_PAYLOAD" "$SERVICE_STATUS_TIMEOUT_SEC")
+  PROJECT_UP_RESULT=$(ws_invoke_and_read_result "projects" "/global/projects/control/up.json" "$PROJECT_UP_PAYLOAD" "$SERVICE_STATUS_TIMEOUT_SEC")
   json_assert "$PROJECT_UP_RESULT" '.ok == true' 'deterministic project up failed'
 
   PROJECT_ID=$($JQ_BIN -r '.result.project_id // empty' 2>/dev/null <<<"$PROJECT_UP_RESULT" || true)
@@ -665,7 +698,7 @@ if [[ "$MOTHER_E2E_MODE" == "deterministic" ]]; then
     --arg description "Mother-driven e2e validation agent." \
     --arg project_id "$PROJECT_ID" \
     '{agent_id:$agent_id,name:$name,description:$description,project_id:$project_id}')
-  AGENT_CREATE_RESULT=$(ws_invoke_and_read_result "agents" "/agents/self/agents/control/create.json" "$AGENT_CREATE_PAYLOAD" "$SERVICE_STATUS_TIMEOUT_SEC")
+  AGENT_CREATE_RESULT=$(ws_invoke_and_read_result "agents" "/global/agents/control/create.json" "$AGENT_CREATE_PAYLOAD" "$SERVICE_STATUS_TIMEOUT_SEC")
   json_assert "$AGENT_CREATE_RESULT" '.ok == true' 'deterministic agent create failed'
 
   MOUNT_PAYLOAD=$($JQ_BIN -cn \
@@ -674,7 +707,7 @@ if [[ "$MOTHER_E2E_MODE" == "deterministic" ]]; then
     --arg export_name "$EXPORT_NAME" \
     --arg mount_path "$MOUNT_PATH" \
     '{project_id:$project_id,node_id:$node_id,export_name:$export_name,mount_path:$mount_path}')
-  MOUNT_RESULT=$(ws_invoke_and_read_result "mounts" "/agents/self/mounts/control/mount.json" "$MOUNT_PAYLOAD" "$SERVICE_STATUS_TIMEOUT_SEC")
+  MOUNT_RESULT=$(ws_invoke_and_read_result "mounts" "/global/mounts/control/mount.json" "$MOUNT_PAYLOAD" "$SERVICE_STATUS_TIMEOUT_SEC")
   json_assert "$MOUNT_RESULT" '.ok == true' 'deterministic mount failed'
 
   BIND_PAYLOAD=$($JQ_BIN -cn \
@@ -682,19 +715,19 @@ if [[ "$MOTHER_E2E_MODE" == "deterministic" ]]; then
     --arg bind_path "$BIND_PATH" \
     --arg target_path "$MOUNT_PATH" \
     '{project_id:$project_id,bind_path:$bind_path,target_path:$target_path}')
-  BIND_RESULT=$(ws_invoke_and_read_result "mounts" "/agents/self/mounts/control/bind.json" "$BIND_PAYLOAD" "$SERVICE_STATUS_TIMEOUT_SEC")
+  BIND_RESULT=$(ws_invoke_and_read_result "mounts" "/global/mounts/control/bind.json" "$BIND_PAYLOAD" "$SERVICE_STATUS_TIMEOUT_SEC")
   json_assert "$BIND_RESULT" '.ok == true' 'deterministic bind failed'
 
   RESOLVE_PAYLOAD=$($JQ_BIN -cn --arg project_id "$PROJECT_ID" --arg path "$BIND_PATH" '{project_id:$project_id,path:$path}')
-  RESOLVE_RESULT=$(ws_invoke_and_read_result "mounts" "/agents/self/mounts/control/resolve.json" "$RESOLVE_PAYLOAD" "$SERVICE_STATUS_TIMEOUT_SEC")
+  RESOLVE_RESULT=$(ws_invoke_and_read_result "mounts" "/global/mounts/control/resolve.json" "$RESOLVE_PAYLOAD" "$SERVICE_STATUS_TIMEOUT_SEC")
   json_assert "$RESOLVE_RESULT" '.ok == true' 'deterministic resolve failed'
 
   CHAT_REPLY=$(printf '{"ok":true,"mode":"deterministic","project_id":"%s","agent_id":"%s"}' "$PROJECT_ID" "$AGENT_ID")
 else
   SETUP_PROMPT=$(cat <<EOF
 Run this setup now using your tools and Acheron control files:
-1) Create project via /agents/self/projects/control/up.json with name="$PROJECT_NAME" and vision="$PROJECT_VISION".
-2) Create agent via /agents/self/agents/control/create.json with:
+1) Create project via /global/projects/control/up.json with name="$PROJECT_NAME" and vision="$PROJECT_VISION".
+2) Create agent via /global/agents/control/create.json with:
    agent_id="$AGENT_ID"
    name="$AGENT_NAME"
    description="Mother-driven e2e validation agent."
@@ -738,9 +771,9 @@ EOF
 
   MOUNTS_PROMPT=$(cat <<EOF
 Now execute mount and bind for project_id "$PROJECT_ID" using control files:
-1) /agents/self/mounts/control/mount.json with {"project_id":"$PROJECT_ID","node_id":"$NODE_ID","export_name":"$EXPORT_NAME","mount_path":"$MOUNT_PATH"}
-2) /agents/self/mounts/control/bind.json with {"project_id":"$PROJECT_ID","bind_path":"$BIND_PATH","target_path":"$MOUNT_PATH"}
-3) /agents/self/mounts/control/resolve.json with {"project_id":"$PROJECT_ID","path":"$BIND_PATH"}
+1) /global/mounts/control/mount.json with {"project_id":"$PROJECT_ID","node_id":"$NODE_ID","export_name":"$EXPORT_NAME","mount_path":"$MOUNT_PATH"}
+2) /global/mounts/control/bind.json with {"project_id":"$PROJECT_ID","bind_path":"$BIND_PATH","target_path":"$MOUNT_PATH"}
+3) /global/mounts/control/resolve.json with {"project_id":"$PROJECT_ID","path":"$BIND_PATH"}
 Reply with compact JSON only:
 {"ok":true,"project_id":"$PROJECT_ID","bind_path":"$BIND_PATH","resolved_path":"..."}
 EOF
@@ -792,7 +825,7 @@ fi
 
 check_bind_and_resolve() {
   local list_result resolve_result
-  list_result=$(ws_invoke_and_read_result "mounts" "/agents/self/mounts/control/list.json" "{\"project_id\":\"$PROJECT_ID\"}" "$SERVICE_STATUS_TIMEOUT_SEC")
+  list_result=$(ws_invoke_and_read_result "mounts" "/global/mounts/control/list.json" "{\"project_id\":\"$PROJECT_ID\"}" "$SERVICE_STATUS_TIMEOUT_SEC")
   if ! $JQ_BIN -e '.ok == true' >/dev/null <<<"$list_result"; then
     return 1
   fi
@@ -800,7 +833,7 @@ check_bind_and_resolve() {
     '.result.binds[]? | select((.bind_path // "") == $bind_path and (.target_path // "") == $target_path)' >/dev/null <<<"$list_result"; then
     return 1
   fi
-  resolve_result=$(ws_invoke_and_read_result "mounts" "/agents/self/mounts/control/resolve.json" "{\"project_id\":\"$PROJECT_ID\",\"path\":\"$BIND_PATH\"}" "$SERVICE_STATUS_TIMEOUT_SEC")
+  resolve_result=$(ws_invoke_and_read_result "mounts" "/global/mounts/control/resolve.json" "{\"project_id\":\"$PROJECT_ID\",\"path\":\"$BIND_PATH\"}" "$SERVICE_STATUS_TIMEOUT_SEC")
   if ! $JQ_BIN -e --arg target_path "$MOUNT_PATH" '.ok == true and .result.matched == true and .result.resolved_path == $target_path' >/dev/null <<<"$resolve_result"; then
     return 1
   fi
@@ -813,8 +846,8 @@ if [[ "$MOTHER_E2E_MODE" == "provider_chat" ]]; then
       BIND_FIX_PROMPT=$(cat <<EOF
 Bind is missing for project_id "$PROJECT_ID".
 Please execute only this now:
-1) Write {"project_id":"$PROJECT_ID","bind_path":"$BIND_PATH","target_path":"$MOUNT_PATH"} to /agents/self/mounts/control/bind.json
-2) Write {"project_id":"$PROJECT_ID","path":"$BIND_PATH"} to /agents/self/mounts/control/resolve.json
+1) Write {"project_id":"$PROJECT_ID","bind_path":"$BIND_PATH","target_path":"$MOUNT_PATH"} to /global/mounts/control/bind.json
+2) Write {"project_id":"$PROJECT_ID","path":"$BIND_PATH"} to /global/mounts/control/resolve.json
 3) Reply with compact JSON: {"ok":true,"project_id":"$PROJECT_ID","bind_path":"$BIND_PATH","resolved_path":"..."}
 EOF
       )

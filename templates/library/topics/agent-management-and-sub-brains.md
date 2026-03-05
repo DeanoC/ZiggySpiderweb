@@ -2,9 +2,9 @@
 
 Two namespaces cover agent topology management:
 
-- `/agents/self/agents` for agent inventory and creation
-- `/agents/self/sub_brains` for per-agent sub-brain lifecycle
-- `/agents/self/projects` for project list/get/up bootstrap and lifecycle operations
+- `/global/agents` for agent inventory and creation
+- `/global/sub_brains` for per-agent sub-brain lifecycle
+- `/global/projects` for project list/get/up bootstrap and lifecycle operations
 
 Common operation mapping:
 
