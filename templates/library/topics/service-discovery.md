@@ -2,7 +2,7 @@
 
 Start at:
 
-- `/agents/self/services/SERVICES.json`
+- `/global/services/SERVICES.json`
 
 Each entry provides:
 
@@ -15,7 +15,7 @@ Each entry provides:
 
 Scope guidance:
 
-- `agent_namespace`: agent-local services under `/agents/self/*`
+- `agent_namespace`: agent-local services under `/global/*`
 - `node`: node/device services under `/nodes/<node_id>/services/*`
 - `global_namespace`: shared global resources under `/global/*`
 
@@ -35,24 +35,24 @@ Contract check workflow:
 
 Example: invoke terminal
 
-1. Read `/agents/self/services/SERVICES.json`.
-2. Select `{"service_id":"terminal","invoke_path":"/agents/self/terminal/control/invoke.json"}`.
-3. Read `/agents/self/terminal/SCHEMA.json`.
+1. Read `/global/services/SERVICES.json`.
+2. Select `{"service_id":"terminal","invoke_path":"/global/terminal/control/invoke.json"}`.
+3. Read `/global/terminal/SCHEMA.json`.
 4. Write:
-   - path: `/agents/self/terminal/control/invoke.json`
+   - path: `/global/terminal/control/invoke.json`
    - payload: `{"op":"exec","arguments":{"command":"pwd"}}`
 5. Read:
-   - `/agents/self/terminal/status.json`
-   - `/agents/self/terminal/result.json`
+   - `/global/terminal/status.json`
+   - `/global/terminal/result.json`
 
 Quick roots:
 
-- `/agents/self/memory`
-- `/agents/self/web_search`
-- `/agents/self/search_code`
-- `/agents/self/terminal`
-- `/agents/self/mounts`
-- `/agents/self/sub_brains`
-- `/agents/self/agents`
-- `/agents/self/projects`
+- `/global/memory`
+- `/global/web_search`
+- `/global/search_code`
+- `/global/terminal`
+- `/global/mounts`
+- `/global/sub_brains`
+- `/global/agents`
+- `/global/projects`
 - `/global/library`

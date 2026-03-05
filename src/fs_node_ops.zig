@@ -26,9 +26,9 @@ const namespace_chat_help_md =
     "# Chat Capability\n\n" ++
     "Write UTF-8 text to `control/input` to create a chat job.\n" ++
     "Write UTF-8 text to `control/reply` for outbound agent replies.\n" ++
-    "Read `/agents/self/jobs/<job-id>/result.txt` for assistant output.\n";
+    "Read `/global/jobs/<job-id>/result.txt` for assistant output.\n";
 const namespace_chat_schema_json =
-    "{\"name\":\"chat\",\"input\":\"control/input\",\"reply\":\"control/reply\",\"jobs\":\"/agents/self/jobs\",\"result\":\"result.txt\"}";
+    "{\"name\":\"chat\",\"input\":\"control/input\",\"reply\":\"control/reply\",\"jobs\":\"/global/jobs\",\"result\":\"result.txt\"}";
 const namespace_chat_meta_json =
     "{\"name\":\"chat\",\"version\":\"1\",\"agent_id\":\"system\",\"cost_hint\":\"provider-dependent\",\"latency_hint\":\"seconds\"}";
 

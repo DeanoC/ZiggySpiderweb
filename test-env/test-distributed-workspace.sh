@@ -73,7 +73,7 @@ if ! command -v python3 >/dev/null 2>&1; then
     exit 1
 fi
 
-FS_MOUNT_READ_TIMEOUT_SEC="${FS_MOUNT_READ_TIMEOUT_SEC:-3}"
+FS_MOUNT_READ_TIMEOUT_SEC="${FS_MOUNT_READ_TIMEOUT_SEC:-6}"
 
 run_with_timeout() {
     local seconds="$1"
@@ -87,7 +87,11 @@ run_with_timeout() {
 
 read_mount_text() {
     local mount_path="$1"
-    run_with_timeout "$FS_MOUNT_READ_TIMEOUT_SEC" "$FS_MOUNT_BIN" --workspace-url "$WORKSPACE_URL" cat "$mount_path"
+    local args=(--workspace-url "$WORKSPACE_URL")
+    if [[ -n "${SPIDERWEB_AUTH_TOKEN:-}" ]]; then
+        args+=(--auth-token "$SPIDERWEB_AUTH_TOKEN")
+    fi
+    run_with_timeout "$FS_MOUNT_READ_TIMEOUT_SEC" "$FS_MOUNT_BIN" "${args[@]}" cat "$mount_path"
 }
 
 TEST_TMP_DIR="$(mktemp -d)"

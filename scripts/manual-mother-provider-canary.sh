@@ -4,6 +4,9 @@ set -euo pipefail
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd "$SCRIPT_DIR/.." && pwd)
 BIN_DIR=${BIN_DIR:-"$REPO_ROOT/zig-out/bin"}
+if [[ "$BIN_DIR" != /* ]]; then
+  BIN_DIR="$REPO_ROOT/$BIN_DIR"
+fi
 SPIDERWEB_BIN=${SPIDERWEB_BIN:-"$BIN_DIR/spiderweb"}
 CONTROL_BIN=${CONTROL_BIN:-"$BIN_DIR/spiderweb-control"}
 WEBSOCAT_BIN=${WEBSOCAT_BIN:-"$(command -v websocat || true)"}
@@ -60,8 +63,8 @@ ASK_TEXT=${ASK_TEXT:-"In one short sentence, ask me for the first project name, 
 CHAT_MAX_ATTEMPTS=${CHAT_MAX_ATTEMPTS:-3}
 CONTROL_RETRY_ATTEMPTS=${CONTROL_RETRY_ATTEMPTS:-30}
 CONTROL_RETRY_DELAY_SEC=${CONTROL_RETRY_DELAY_SEC:-0.2}
-WS_ATTACH_RETRY_ATTEMPTS=${WS_ATTACH_RETRY_ATTEMPTS:-120}
-WS_ATTACH_RETRY_DELAY_SEC=${WS_ATTACH_RETRY_DELAY_SEC:-2}
+WS_ATTACH_RETRY_ATTEMPTS=${WS_ATTACH_RETRY_ATTEMPTS:-40}
+WS_ATTACH_RETRY_DELAY_SEC=${WS_ATTACH_RETRY_DELAY_SEC:-1}
 PROJECT_NAME=${PROJECT_NAME:-"manual-canary-project"}
 PROJECT_VISION=${PROJECT_VISION:-"Validate Mother bootstrap and provider-backed provisioning flow."}
 AGENT_ID=${AGENT_ID:-"manual-canary-agent"}
@@ -83,6 +86,46 @@ WS_OUT=""
 TAG_COUNTER=100
 CURRENT_TAG=0
 
+stop_pid() {
+  local pid="$1"
+  if [[ -z "$pid" ]]; then
+    return 0
+  fi
+  kill "$pid" >/dev/null 2>&1 || true
+  local deadline=$((SECONDS + 10))
+  while kill -0 "$pid" >/dev/null 2>&1; do
+    if (( SECONDS >= deadline )); then
+      kill -9 "$pid" >/dev/null 2>&1 || true
+      break
+    fi
+    sleep 0.2
+  done
+  wait "$pid" >/dev/null 2>&1 || true
+}
+
+unmount_tmp_mounts() {
+  local mounts_root="$TMP_ROOT/sandbox/mounts"
+  if [[ ! -d "$mounts_root" ]]; then
+    return 0
+  fi
+
+  while IFS= read -r mount_point; do
+    [[ -z "$mount_point" ]] && continue
+    if command -v fusermount3 >/dev/null 2>&1; then
+      fusermount3 -u "$mount_point" >/dev/null 2>&1 || true
+    fi
+    if command -v fusermount >/dev/null 2>&1; then
+      fusermount -u "$mount_point" >/dev/null 2>&1 || true
+    fi
+    umount "$mount_point" >/dev/null 2>&1 || true
+    umount -l "$mount_point" >/dev/null 2>&1 || true
+  done < <(
+    awk -v prefix="$mounts_root/" '
+      index($2, prefix) == 1 { print $2 }
+    ' /proc/mounts | awk '{ print length($0), $0 }' | sort -rn | cut -d" " -f2-
+  )
+}
+
 cleanup() {
   if [[ -n "${WS_IN:-}" ]]; then
     exec {WS_IN}>&- || true
@@ -93,21 +136,20 @@ cleanup() {
     WS_OUT=""
   fi
   if [[ -n "${WS_PID:-}" ]]; then
-    kill "$WS_PID" >/dev/null 2>&1 || true
-    if kill -0 "$WS_PID" >/dev/null 2>&1; then
-      wait "$WS_PID" >/dev/null 2>&1 || true
-    fi
+    stop_pid "$WS_PID"
     WS_PID=""
   fi
   if [[ -n "${SPIDERWEB_PID:-}" ]]; then
-    kill "$SPIDERWEB_PID" >/dev/null 2>&1 || true
-    if kill -0 "$SPIDERWEB_PID" >/dev/null 2>&1; then
-      wait "$SPIDERWEB_PID" >/dev/null 2>&1 || true
-    fi
+    stop_pid "$SPIDERWEB_PID"
     SPIDERWEB_PID=""
   fi
+  unmount_tmp_mounts
   if [[ "$KEEP_CANARY_DIR" != "1" ]]; then
-    rm -rf "$TMP_ROOT"
+    if command -v timeout >/dev/null 2>&1; then
+      timeout --kill-after=2s 10s rm -rf "$TMP_ROOT" >/dev/null 2>&1 || true
+    else
+      rm -rf "$TMP_ROOT" >/dev/null 2>&1 || true
+    fi
   fi
 }
 trap cleanup EXIT
@@ -122,6 +164,9 @@ $JQ_BIN -n \
   --arg agents_dir "agents" \
   --arg sandbox_mounts_root "$TMP_ROOT/sandbox/mounts" \
   --arg sandbox_runtime_root "$TMP_ROOT/sandbox/runtime" \
+  --arg sandbox_rootfs_store_root "$TMP_ROOT/sandbox/rootfs-store" \
+  --arg sandbox_overlay_root "$TMP_ROOT/sandbox/overlay" \
+  --arg sandbox_snapshot_root "$TMP_ROOT/sandbox/snapshot" \
   --arg sandbox_fs_mount_bin "$BIN_DIR/spiderweb-fs-mount" \
   --arg sandbox_agent_runtime_bin "$BIN_DIR/spiderweb-agent-runtime" \
   --argjson port "$CANARY_PORT" \
@@ -142,6 +187,10 @@ $JQ_BIN -n \
       agents_dir: $agents_dir,
       sandbox_mounts_root: $sandbox_mounts_root,
       sandbox_runtime_root: $sandbox_runtime_root,
+      sandbox_rootfs_base_ref: "mother-canary-default",
+      sandbox_rootfs_store_root: $sandbox_rootfs_store_root,
+      sandbox_overlay_root: $sandbox_overlay_root,
+      sandbox_snapshot_root: $sandbox_snapshot_root,
       sandbox_launcher: "bwrap",
       sandbox_fs_mount_bin: $sandbox_fs_mount_bin,
       sandbox_agent_runtime_bin: $sandbox_agent_runtime_bin
@@ -454,7 +503,7 @@ ws_attach_with_retry "manual-version" "manual-connect" 1 2 "$WS_ATTACH_RETRY_ATT
 EXPECTED_PROMPT="$ASK_TEXT"
 CHAT_REPLY=""
 for attempt in $(seq 1 "$CHAT_MAX_ATTEMPTS"); do
-  CHAT_WRITE_FRAME=$(ws_write_text_file "/agents/self/chat/control/input" "$EXPECTED_PROMPT" 180)
+  CHAT_WRITE_FRAME=$(ws_write_text_file "/global/chat/control/input" "$EXPECTED_PROMPT" 180)
   CHAT_JOB=$($JQ_BIN -r '.payload.job // empty' <<<"$CHAT_WRITE_FRAME")
   CHAT_RESULT_PATH=$($JQ_BIN -r '.payload.result_path // empty' <<<"$CHAT_WRITE_FRAME")
   if [[ -z "$CHAT_RESULT_PATH" ]]; then
@@ -462,7 +511,7 @@ for attempt in $(seq 1 "$CHAT_MAX_ATTEMPTS"); do
       echo "error: chat write did not return job/result_path" >&2
       exit 1
     fi
-    CHAT_RESULT_PATH="/agents/self/jobs/${CHAT_JOB}/result.txt"
+    CHAT_RESULT_PATH="/global/jobs/${CHAT_JOB}/result.txt"
   fi
   CHAT_REPLY=$(ws_read_text_file "$CHAT_RESULT_PATH" 240)
   LOWER_REPLY=$(printf '%s' "$CHAT_REPLY" | tr '[:upper:]' '[:lower:]')
@@ -552,11 +601,11 @@ AGENT_CREATE_PAYLOAD=$($JQ_BIN -cn \
   --arg name "$AGENT_NAME" \
   '{agent_id:$agent_id,name:$name,description:"Manual provider canary agent",capabilities:["chat","plan","code"]}')
 
-_=$(ws_write_text_file "/agents/self/agents/control/create.json" "$AGENT_CREATE_PAYLOAD" 60)
+_=$(ws_write_text_file "/global/agents/control/create.json" "$AGENT_CREATE_PAYLOAD" 60)
 
 AGENT_STATE=""
 for _ in $(seq 1 60); do
-  STATUS_JSON=$(ws_read_text_file "/agents/self/agents/status.json" 30)
+  STATUS_JSON=$(ws_read_text_file "/global/agents/status.json" 30)
   AGENT_STATE=$($JQ_BIN -r '.state // empty' <<<"$STATUS_JSON" 2>/dev/null || true)
   if [[ "$AGENT_STATE" == "done" ]]; then
     break
@@ -567,7 +616,7 @@ if [[ "$AGENT_STATE" != "done" ]]; then
   echo "error: agents_create did not reach done state" >&2
   exit 1
 fi
-AGENT_RESULT_JSON=$(ws_read_text_file "/agents/self/agents/result.json" 30)
+AGENT_RESULT_JSON=$(ws_read_text_file "/global/agents/result.json" 30)
 ws_close
 json_assert "$AGENT_RESULT_JSON" '.ok == true and .operation == "create" and .result.agent_id == $id' 'agents/result.json did not confirm create' --arg id "$AGENT_ID"
 

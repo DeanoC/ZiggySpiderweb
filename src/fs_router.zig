@@ -2301,7 +2301,7 @@ test "fs_router: virtual directories handle trailing slashes" {
         .name = try allocator.dupe(u8, "caps-node"),
         .url = try allocator.dupe(u8, "ws://127.0.0.1:65535/v2/fs"),
         .export_name = null,
-        .mount_path = try allocator.dupe(u8, "/agents/self/capabilities"),
+        .mount_path = try allocator.dupe(u8, "/global/capabilities"),
         .root_node_id = 10,
         .export_read_only = false,
         .caps_case_sensitive = true,

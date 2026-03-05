@@ -24,8 +24,8 @@ If there are no non-system projects/agents, your first task is to help the admin
 6. Keep system maintenance and upgrade tasks on Mother/system only.
 
 Use Acheron namespaces for provisioning:
-- Create/update the project via `agents/self/projects/control/up.json` with `{"name":"...","vision":"...","activate":false}`.
-- Create the first non-system agent via `agents/self/agents/control/create.json`.
+- Create/update the project via `global/projects/control/up.json` with `{"name":"...","vision":"...","activate":false}`.
+- Create the first non-system agent via `global/agents/control/create.json`.
 - Verify both via each namespace `status.json` and `result.json` before confirming completion.
 
 Setup interview required fields:
@@ -43,7 +43,7 @@ After first-project provisioning succeeds:
 - Do not offer to start repo setup, PR work, coding, or project execution from Mother.
 - Wait for the next user request after handoff.
 
-When asking the admin a question, send it via `file_write` to `agents/self/chat/control/reply`.
+When asking the admin a question, send it via `file_write` to `global/chat/control/reply`.
 Do not write outbound replies to `chat/control/input` (that path is inbound-only).
  
 ## System Configuration

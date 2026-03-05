@@ -43,8 +43,52 @@ if [[ "$SKIP_BUILD" != "0" && "$SKIP_BUILD" != "1" ]]; then
   exit 1
 fi
 
+auth_json_has_nonempty_key() {
+  local key="$1"
+  local path="$2"
+  if [[ ! -f "$path" ]]; then
+    return 1
+  fi
+
+  if command -v jq >/dev/null 2>&1; then
+    jq -e --arg key "$key" '((.[$key] // "") | type == "string" and length > 0)' "$path" >/dev/null 2>&1
+    return $?
+  fi
+
+  grep -Eq "\"${key}\"[[:space:]]*:[[:space:]]*\"[^\"]+\"" "$path"
+}
+
+provider_chat_secret_available() {
+  if [[ -n "${CANARY_PROVIDER_API_KEY:-}" ]]; then
+    return 0
+  fi
+
+  case "$CANARY_PROVIDER_NAME" in
+    openai|openai-codex|openai-codex-spark)
+      [[ -n "${OPENAI_CODEX_API_KEY:-}" || -n "${OPENAI_API_KEY:-}" ]] && return 0
+      auth_json_has_nonempty_key "OPENAI_CODEX_API_KEY" "$CODEX_AUTH_PATH" && return 0
+      auth_json_has_nonempty_key "OPENAI_API_KEY" "$CODEX_AUTH_PATH" && return 0
+      ;;
+    openrouter)
+      [[ -n "${OPENROUTER_API_KEY:-}" ]] && return 0
+      auth_json_has_nonempty_key "OPENROUTER_API_KEY" "$CODEX_AUTH_PATH" && return 0
+      ;;
+    anthropic)
+      [[ -n "${ANTHROPIC_API_KEY:-}" ]] && return 0
+      auth_json_has_nonempty_key "ANTHROPIC_API_KEY" "$CODEX_AUTH_PATH" && return 0
+      ;;
+    google|gemini)
+      [[ -n "${GOOGLE_API_KEY:-}" || -n "${GEMINI_API_KEY:-}" ]] && return 0
+      auth_json_has_nonempty_key "GOOGLE_API_KEY" "$CODEX_AUTH_PATH" && return 0
+      auth_json_has_nonempty_key "GEMINI_API_KEY" "$CODEX_AUTH_PATH" && return 0
+      ;;
+  esac
+
+  return 1
+}
+
 if [[ "$RUN_PROVIDER_CHAT" == "auto" ]]; then
-  if [[ -f "$CODEX_AUTH_PATH" || -n "${CANARY_PROVIDER_API_KEY:-}" || -n "${OPENAI_CODEX_API_KEY:-}" || -n "${OPENAI_API_KEY:-}" ]]; then
+  if provider_chat_secret_available; then
     RUN_PROVIDER_CHAT=1
   else
     RUN_PROVIDER_CHAT=0

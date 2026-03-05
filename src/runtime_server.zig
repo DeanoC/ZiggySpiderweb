@@ -110,6 +110,8 @@ const ControlServiceEventRequest = struct {
     service_id: []u8,
     session_key: []u8,
     role: []u8,
+    actor_type: []u8,
+    actor_id: []u8,
     status: ServiceEventStatus,
     project_id: ?[]u8,
     project_setup_required: bool,
@@ -123,6 +125,8 @@ const ControlServiceEventRequest = struct {
         allocator.free(self.service_id);
         allocator.free(self.session_key);
         allocator.free(self.role);
+        allocator.free(self.actor_type);
+        allocator.free(self.actor_id);
         if (self.project_id) |value| allocator.free(value);
         if (self.project_setup_project_id) |value| allocator.free(value);
         if (self.project_setup_message) |value| allocator.free(value);
@@ -1363,6 +1367,10 @@ pub const RuntimeServer = struct {
         defer self.allocator.free(escaped_session_key);
         const escaped_role = try protocol.jsonEscape(self.allocator, request.role);
         defer self.allocator.free(escaped_role);
+        const escaped_actor_type = try protocol.jsonEscape(self.allocator, request.actor_type);
+        defer self.allocator.free(escaped_actor_type);
+        const escaped_actor_id = try protocol.jsonEscape(self.allocator, request.actor_id);
+        defer self.allocator.free(escaped_actor_id);
         const project_id_json = if (request.project_id) |project_id| blk: {
             const escaped_project = try protocol.jsonEscape(self.allocator, project_id);
             defer self.allocator.free(escaped_project);
@@ -1396,11 +1404,13 @@ pub const RuntimeServer = struct {
 
         const payload = try std.fmt.allocPrint(
             self.allocator,
-            "{{\"service_id\":\"{s}\",\"status\":\"attached\",\"session_key\":\"{s}\",\"role\":\"{s}\",\"project_id\":{s},\"project_setup_required\":{},\"project_setup_project_id\":{s},\"project_setup_message\":{s},\"project_setup_project_vision\":{s},\"project_setup_source\":{s},\"updated_at_ms\":{d}}}",
+            "{{\"service_id\":\"{s}\",\"status\":\"attached\",\"session_key\":\"{s}\",\"role\":\"{s}\",\"actor_type\":\"{s}\",\"actor_id\":\"{s}\",\"project_id\":{s},\"project_setup_required\":{},\"project_setup_project_id\":{s},\"project_setup_message\":{s},\"project_setup_project_vision\":{s},\"project_setup_source\":{s},\"updated_at_ms\":{d}}}",
             .{
                 escaped_service_id,
                 escaped_session_key,
                 escaped_role,
+                escaped_actor_type,
+                escaped_actor_id,
                 project_id_json,
                 request.project_setup_required,
                 project_setup_project_id_json,
@@ -1441,9 +1451,9 @@ pub const RuntimeServer = struct {
                         "If the operator repeats the same role answer, treat it as confirmed and continue provisioning.\n" ++
                         "For first-project bootstrap, do not mutate the `system` project and do not include `project_id`.\n" ++
                         "After all fields are known, execute provisioning via Acheron namespaces:\n" ++
-                        "1) `agents/self/projects/control/up.json` with `{name, vision, activate:false}` only.\n" ++
+                        "1) `global/projects/control/up.json` with `{name, vision, activate:false}` only.\n" ++
                         "2) Read the `operation_result.project_id` returned by that file_write tool result.\n" ++
-                        "3) `agents/self/agents/control/create.json` with `{agent_id, name, description, project_id}`\n" ++
+                        "3) `global/agents/control/create.json` with `{agent_id, name, description, project_id}`\n" ++
                         "4) Treat successful file_write tool results as authoritative completion for provisioning.\n" ++
                         "   Do not block on `status.json`/`result.json` in bootstrap mode.\n" ++
                         "After provisioning succeeds, send a handoff-only completion reply confirming the created project and agent.\n" ++
@@ -1567,6 +1577,22 @@ pub const RuntimeServer = struct {
             }
             break :blk "service";
         };
+        const actor_type = blk: {
+            if (obj.get("actor_type")) |value| {
+                if (value != .string or value.string.len == 0) return error.InvalidPayload;
+                if (!isValidControlMemorySegment(value.string)) return error.InvalidPayload;
+                break :blk value.string;
+            }
+            break :blk "user";
+        };
+        const actor_id = blk: {
+            if (obj.get("actor_id")) |value| {
+                if (value != .string or value.string.len == 0) return error.InvalidPayload;
+                if (!isValidControlMemorySegment(value.string)) return error.InvalidPayload;
+                break :blk value.string;
+            }
+            break :blk role;
+        };
         const brain_name = blk: {
             if (obj.get("brain")) |value| {
                 if (value == .string and value.string.len > 0) break :blk value.string;
@@ -1654,6 +1680,8 @@ pub const RuntimeServer = struct {
             .service_id = try self.allocator.dupe(u8, service_id),
             .session_key = try self.allocator.dupe(u8, session_key),
             .role = try self.allocator.dupe(u8, role),
+            .actor_type = try self.allocator.dupe(u8, actor_type),
+            .actor_id = try self.allocator.dupe(u8, actor_id),
             .status = status,
             .project_id = project_id,
             .project_setup_required = project_setup_required,
@@ -3584,6 +3612,8 @@ pub const RuntimeServer = struct {
         const unix_time = std.time.timestamp();
         const timestamp_utc = try formatUtcTimestamp(self.allocator, unix_time);
         defer self.allocator.free(timestamp_utc);
+        const alias_lines = try self.buildDynamicPathAliasLines(brain_name);
+        defer self.allocator.free(alias_lines);
         const board_template =
             \\## Dynamic Info Board
             \\- agent_name: {s}
@@ -3602,7 +3632,7 @@ pub const RuntimeServer = struct {
         const preview_board_no_guidance = try std.fmt.allocPrint(
             self.allocator,
             board_template,
-            .{ self.runtime.agent_id, brain_name, base_estimate, context_limit, timestamp_utc, unix_time, "" },
+            .{ self.runtime.agent_id, brain_name, base_estimate, context_limit, timestamp_utc, unix_time, alias_lines },
         );
         defer self.allocator.free(preview_board_no_guidance);
 
@@ -3615,11 +3645,13 @@ pub const RuntimeServer = struct {
             memory_guidance_line
         else
             "";
+        const preview_suffix = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ preview_guidance, alias_lines });
+        defer self.allocator.free(preview_suffix);
 
         const preview_board_with_guidance = try std.fmt.allocPrint(
             self.allocator,
             board_template,
-            .{ self.runtime.agent_id, brain_name, interim_estimate, context_limit, timestamp_utc, unix_time, preview_guidance },
+            .{ self.runtime.agent_id, brain_name, interim_estimate, context_limit, timestamp_utc, unix_time, preview_suffix },
         );
         defer self.allocator.free(preview_board_with_guidance);
 
@@ -3632,12 +3664,93 @@ pub const RuntimeServer = struct {
             memory_guidance_line
         else
             "";
+        const final_suffix = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ final_guidance, alias_lines });
+        defer self.allocator.free(final_suffix);
 
         return std.fmt.allocPrint(
             self.allocator,
             board_template,
-            .{ self.runtime.agent_id, brain_name, final_estimate, context_limit, timestamp_utc, unix_time, final_guidance },
+            .{ self.runtime.agent_id, brain_name, final_estimate, context_limit, timestamp_utc, unix_time, final_suffix },
         );
+    }
+
+    fn buildDynamicPathAliasLines(self: *RuntimeServer, brain_name: []const u8) ![]u8 {
+        var lines = std.ArrayListUnmanaged(u8){};
+        errdefer lines.deinit(self.allocator);
+
+        try lines.appendSlice(self.allocator, "## Path Aliases\n");
+        try lines.appendSlice(self.allocator, "- self: /agents/");
+        try lines.appendSlice(self.allocator, self.runtime.agent_id);
+        try lines.appendSlice(self.allocator, "\n");
+
+        const snapshot = try self.runtime.active_memory.snapshotActive(self.allocator, brain_name);
+        defer memory.deinitItems(self.allocator, snapshot);
+
+        var selected_payload: ?[]const u8 = null;
+        var selected_updated_at_ms: i64 = std.math.minInt(i64);
+        for (snapshot) |item| {
+            if (!std.mem.eql(u8, item.kind, SERVICE_PRESENCE_MEM_KIND)) continue;
+
+            var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, item.content_json, .{}) catch continue;
+            defer parsed.deinit();
+            if (parsed.value != .object) continue;
+            const obj = parsed.value.object;
+            const status_value = obj.get("status") orelse continue;
+            if (status_value != .string or !std.mem.eql(u8, status_value.string, "attached")) continue;
+
+            var updated_at_ms: i64 = 0;
+            if (obj.get("updated_at_ms")) |updated_value| {
+                switch (updated_value) {
+                    .integer => updated_at_ms = updated_value.integer,
+                    .float => updated_at_ms = @as(i64, @intFromFloat(updated_value.float)),
+                    else => {},
+                }
+            }
+
+            if (selected_payload == null or updated_at_ms >= selected_updated_at_ms) {
+                selected_payload = item.content_json;
+                selected_updated_at_ms = updated_at_ms;
+            }
+        }
+
+        if (selected_payload) |payload| {
+            var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, payload, .{}) catch {
+                try lines.appendSlice(self.allocator, "\n");
+                return lines.toOwnedSlice(self.allocator);
+            };
+            defer parsed.deinit();
+            if (parsed.value == .object) {
+                const obj = parsed.value.object;
+                if (obj.get("project_id")) |project_value| {
+                    if (project_value == .string and project_value.string.len > 0) {
+                        try lines.appendSlice(self.allocator, "- project: /projects/");
+                        try lines.appendSlice(self.allocator, project_value.string);
+                        try lines.appendSlice(self.allocator, "\n");
+                    }
+                }
+
+                var actor_type: []const u8 = "user";
+                if (obj.get("actor_type")) |actor_type_value| {
+                    if (actor_type_value == .string and actor_type_value.string.len > 0) {
+                        actor_type = actor_type_value.string;
+                    }
+                }
+                if (obj.get("actor_id")) |actor_id_value| {
+                    if (actor_id_value == .string and actor_id_value.string.len > 0) {
+                        try lines.appendSlice(self.allocator, "- actor: ");
+                        try lines.appendSlice(
+                            self.allocator,
+                            if (std.mem.eql(u8, actor_type, "agent")) "/agents/" else "/users/",
+                        );
+                        try lines.appendSlice(self.allocator, actor_id_value.string);
+                        try lines.appendSlice(self.allocator, "\n");
+                    }
+                }
+            }
+        }
+
+        try lines.appendSlice(self.allocator, "\n");
+        return lines.toOwnedSlice(self.allocator);
     }
 
     fn normalizeProviderUtf8(self: *RuntimeServer, input: []const u8) ![]u8 {
@@ -5083,7 +5196,7 @@ fn mockDispatchWorldToolOk(
         const message = allocator.dupe(u8, "unexpected tool name in dispatch") catch @panic("out of memory");
         return .{ .failure = .{ .code = .invalid_params, .message = message } };
     }
-    const payload = allocator.dupe(u8, "{\"path\":\"agents/self/chat/control/reply\",\"bytes_written\":42,\"ready\":true}") catch {
+    const payload = allocator.dupe(u8, "{\"path\":\"global/chat/control/reply\",\"bytes_written\":42,\"ready\":true}") catch {
         const msg = allocator.dupe(u8, "out of memory") catch @panic("out of memory");
         return .{ .failure = .{ .code = .execution_failed, .message = msg } };
     };
@@ -5107,7 +5220,7 @@ fn mockProviderStreamByModelWithChatReplyTool(
         .name = try allocator.dupe(u8, "file_write"),
         .arguments_json = try allocator.dupe(
             u8,
-            "{\"path\":\"agents/self/chat/control/reply\",\"content\":\"Please share the first project name, project vision, and first non-system agent name.\"}",
+            "{\"path\":\"global/chat/control/reply\",\"content\":\"Please share the first project name, project vision, and first non-system agent name.\"}",
         ),
     };
     try events.append(.{ .done = .{
@@ -6616,6 +6729,8 @@ test "runtime_server: provider instructions include dynamic info board without p
     const board_idx = std.mem.indexOf(u8, instructions, "## Dynamic Info Board") orelse return error.TestUnexpectedResult;
     const soul_idx = std.mem.indexOf(u8, instructions, "SOUL.md") orelse return error.TestUnexpectedResult;
     try std.testing.expect(board_idx > soul_idx);
+    try std.testing.expect(std.mem.indexOf(u8, instructions, "## Path Aliases") != null);
+    try std.testing.expect(std.mem.indexOf(u8, instructions, "- self: /agents/agent-test") != null);
     try std.testing.expect(std.mem.indexOf(u8, instructions, "approximate_context_used: ") != null);
     try std.testing.expect(std.mem.indexOf(u8, instructions, "date_time_utc: ") != null);
 
@@ -8033,7 +8148,7 @@ test "runtime_server: agent.control service.event tracks attach and detach prese
     defer server.destroy();
 
     const attach_request =
-        "{\"id\":\"req-service-attach\",\"type\":\"agent.control\",\"action\":\"service.event\",\"content\":\"{\\\"service_id\\\":\\\"gui_ws_1\\\",\\\"status\\\":\\\"attached\\\",\\\"session_key\\\":\\\"main\\\",\\\"role\\\":\\\"user\\\",\\\"project_id\\\":\\\"proj-alpha\\\"}\"}";
+        "{\"id\":\"req-service-attach\",\"type\":\"agent.control\",\"action\":\"service.event\",\"content\":\"{\\\"service_id\\\":\\\"gui_ws_1\\\",\\\"status\\\":\\\"attached\\\",\\\"session_key\\\":\\\"main\\\",\\\"role\\\":\\\"user\\\",\\\"actor_type\\\":\\\"user\\\",\\\"actor_id\\\":\\\"user\\\",\\\"project_id\\\":\\\"proj-alpha\\\"}\"}";
     const attach_response = try server.handleMessage(attach_request);
     defer allocator.free(attach_response);
     try std.testing.expect(std.mem.indexOf(u8, attach_response, "\"type\":\"session.receive\"") != null);
@@ -8044,6 +8159,14 @@ test "runtime_server: agent.control service.event tracks attach and detach prese
     defer allocator.free(attached_json);
     try std.testing.expect(std.mem.indexOf(u8, attached_json, "service.presence.gui_ws_1") != null);
     try std.testing.expect(std.mem.indexOf(u8, attached_json, "\"kind\":\"presence.service\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, attached_json, "\"actor_type\":\"user\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, attached_json, "\"actor_id\":\"user\"") != null);
+    const attached_board = try server.buildDynamicCoreInfoBoard("primary", "core", "active", 128_000, 0);
+    defer allocator.free(attached_board);
+    try std.testing.expect(std.mem.indexOf(u8, attached_board, "## Path Aliases") != null);
+    try std.testing.expect(std.mem.indexOf(u8, attached_board, "- self: /agents/agent-test") != null);
+    try std.testing.expect(std.mem.indexOf(u8, attached_board, "- project: /projects/proj-alpha") != null);
+    try std.testing.expect(std.mem.indexOf(u8, attached_board, "- actor: /users/user") != null);
 
     const detach_request =
         "{\"id\":\"req-service-detach\",\"type\":\"agent.control\",\"action\":\"service.event\",\"content\":\"{\\\"service_id\\\":\\\"gui_ws_1\\\",\\\"status\\\":\\\"detached\\\",\\\"session_key\\\":\\\"main\\\",\\\"role\\\":\\\"user\\\",\\\"project_id\\\":\\\"proj-alpha\\\"}\"}";
@@ -8056,6 +8179,11 @@ test "runtime_server: agent.control service.event tracks attach and detach prese
     const detached_json = try memory.toActiveMemoryJson(allocator, "primary", detached_snapshot);
     defer allocator.free(detached_json);
     try std.testing.expect(std.mem.indexOf(u8, detached_json, "service.presence.gui_ws_1") == null);
+    const detached_board = try server.buildDynamicCoreInfoBoard("primary", "core", "active", 128_000, 0);
+    defer allocator.free(detached_board);
+    try std.testing.expect(std.mem.indexOf(u8, detached_board, "- self: /agents/agent-test") != null);
+    try std.testing.expect(std.mem.indexOf(u8, detached_board, "- project: /projects/proj-alpha") == null);
+    try std.testing.expect(std.mem.indexOf(u8, detached_board, "- actor: /users/user") == null);
 }
 
 test "runtime_server: service.event setup metadata drives project setup gate prompt" {

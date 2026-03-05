@@ -5177,28 +5177,28 @@ test "fs_control_plane: builtin system mounts support namespace topology" {
 
     const mounts = [_]SpiderWebMountSpec{
         .{ .mount_path = "/meta", .export_name = "meta" },
-        .{ .mount_path = "/agents/self/capabilities", .export_name = "capabilities" },
-        .{ .mount_path = "/agents/self/jobs", .export_name = "jobs" },
+        .{ .mount_path = "/global/capabilities", .export_name = "capabilities" },
+        .{ .mount_path = "/global/jobs", .export_name = "jobs" },
         .{ .mount_path = "/nodes/local/fs", .export_name = "workspace" },
-        .{ .mount_path = "/projects/system/meta", .export_name = "meta" },
-        .{ .mount_path = "/projects/system/agents/self/capabilities", .export_name = "capabilities" },
-        .{ .mount_path = "/projects/system/agents/self/jobs", .export_name = "jobs" },
-        .{ .mount_path = "/projects/system/nodes/local/fs", .export_name = "workspace" },
-        .{ .mount_path = "/projects/system/fs/local::fs", .export_name = "workspace" },
+        .{ .mount_path = "/nodes/local/projects/system/meta", .export_name = "meta" },
+        .{ .mount_path = "/nodes/local/projects/system/global/capabilities", .export_name = "capabilities" },
+        .{ .mount_path = "/nodes/local/projects/system/global/jobs", .export_name = "jobs" },
+        .{ .mount_path = "/nodes/local/projects/system/nodes/local/fs", .export_name = "workspace" },
+        .{ .mount_path = "/nodes/local/projects/system/fs/local::fs", .export_name = "workspace" },
     };
     try plane.ensureSpiderWebMounts(node_id, &mounts);
 
     const status = try plane.workspaceStatus("mother", "{\"project_id\":\"system\"}");
     defer allocator.free(status);
     try std.testing.expect(std.mem.indexOf(u8, status, "\"mount_path\":\"/meta\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, status, "\"mount_path\":\"/agents/self/capabilities\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, status, "\"mount_path\":\"/agents/self/jobs\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status, "\"mount_path\":\"/global/capabilities\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status, "\"mount_path\":\"/global/jobs\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, status, "\"mount_path\":\"/nodes/local/fs\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, status, "\"mount_path\":\"/projects/system/meta\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, status, "\"mount_path\":\"/projects/system/agents/self/capabilities\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, status, "\"mount_path\":\"/projects/system/agents/self/jobs\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, status, "\"mount_path\":\"/projects/system/nodes/local/fs\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, status, "\"mount_path\":\"/projects/system/fs/local::fs\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status, "\"mount_path\":\"/nodes/local/projects/system/meta\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status, "\"mount_path\":\"/nodes/local/projects/system/global/capabilities\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status, "\"mount_path\":\"/nodes/local/projects/system/global/jobs\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status, "\"mount_path\":\"/nodes/local/projects/system/nodes/local/fs\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status, "\"mount_path\":\"/nodes/local/projects/system/fs/local::fs\"") != null);
 }
 
 test "fs_control_plane: admin can set and remove builtin system mounts" {

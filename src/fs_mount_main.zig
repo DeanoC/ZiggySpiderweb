@@ -125,7 +125,7 @@ pub fn main() !void {
 
     if (endpoint_specs.items.len == 0) {
         if (workspace_url != null) {
-            std.log.err("no mountable workspace endpoints were returned by control.workspace_status", .{});
+            std.log.err("no mountable workspace endpoints were returned by control.connect_ack payload.workspace", .{});
             return error.NoWorkspaceMounts;
         }
         try endpoint_specs.append(allocator, .{
@@ -517,7 +517,7 @@ fn tryRefreshWorkspaceTopology(allocator: std.mem.Allocator, ctx: *WorkspaceSync
         if (ctx.project_token) |project_token| project_token else null,
         if (ctx.auth_token) |token| token else null,
     ) catch |err| {
-        std.log.warn("workspace sync: fetch control.workspace_status failed: {s}", .{@errorName(err)});
+        std.log.warn("workspace sync: fetch workspace endpoint specs failed: {s}", .{@errorName(err)});
         return;
     };
     defer specs.deinit(allocator);
@@ -761,42 +761,86 @@ fn fetchWorkspaceEndpointSpecs(
         "fs-mount-connect",
         "control.connect_ack",
     );
-    allocator.free(connect_payload);
+    defer allocator.free(connect_payload);
 
-    const workspace_request = if (project_id) |selected_project| blk: {
-        const escaped_project = try jsonEscape(allocator, selected_project);
-        defer allocator.free(escaped_project);
-        if (project_token) |token| {
-            const escaped_token = try jsonEscape(allocator, token);
-            defer allocator.free(escaped_token);
+    var parsed_connect = try std.json.parseFromSlice(std.json.Value, allocator, connect_payload, .{});
+    defer parsed_connect.deinit();
+    if (parsed_connect.value != .object) return error.InvalidWorkspacePayload;
+    const connect_obj = parsed_connect.value.object;
+
+    const connect_project_id: ?[]const u8 = blk: {
+        const raw_project = connect_obj.get("project_id") orelse break :blk null;
+        if (raw_project == .string and raw_project.string.len > 0) break :blk raw_project.string;
+        break :blk null;
+    };
+    const connect_workspace = connect_obj.get("workspace");
+    const connect_has_workspace_mounts = connectWorkspaceHasMounts(connect_workspace);
+
+    if (shouldFetchWorkspaceStatusFromControl(project_id, project_token, connect_project_id, connect_has_workspace_mounts)) {
+        const workspace_request = if (project_id) |selected_project| blk: {
+            const escaped_project = try jsonEscape(allocator, selected_project);
+            defer allocator.free(escaped_project);
+            if (project_token) |token| {
+                const escaped_token = try jsonEscape(allocator, token);
+                defer allocator.free(escaped_token);
+                break :blk try std.fmt.allocPrint(
+                    allocator,
+                    "{{\"channel\":\"control\",\"type\":\"control.workspace_status\",\"id\":\"fs-mount-workspace\",\"payload\":{{\"project_id\":\"{s}\",\"project_token\":\"{s}\"}}}}",
+                    .{ escaped_project, escaped_token },
+                );
+            }
             break :blk try std.fmt.allocPrint(
                 allocator,
-                "{{\"channel\":\"control\",\"type\":\"control.workspace_status\",\"id\":\"fs-mount-workspace\",\"payload\":{{\"project_id\":\"{s}\",\"project_token\":\"{s}\"}}}}",
-                .{ escaped_project, escaped_token },
+                "{{\"channel\":\"control\",\"type\":\"control.workspace_status\",\"id\":\"fs-mount-workspace\",\"payload\":{{\"project_id\":\"{s}\"}}}}",
+                .{escaped_project},
             );
-        }
-        break :blk try std.fmt.allocPrint(
+        } else try allocator.dupe(u8, "{\"channel\":\"control\",\"type\":\"control.workspace_status\",\"id\":\"fs-mount-workspace\",\"payload\":{}}");
+        defer allocator.free(workspace_request);
+        try writeClientTextFrameMasked(allocator, &stream, workspace_request);
+        const payload_json = try readControlPayloadFor(
             allocator,
-            "{{\"channel\":\"control\",\"type\":\"control.workspace_status\",\"id\":\"fs-mount-workspace\",\"payload\":{{\"project_id\":\"{s}\"}}}}",
-            .{escaped_project},
+            &stream,
+            "fs-mount-workspace",
+            "control.workspace_status",
         );
-    } else try allocator.dupe(u8, "{\"channel\":\"control\",\"type\":\"control.workspace_status\",\"id\":\"fs-mount-workspace\",\"payload\":{}}");
-    defer allocator.free(workspace_request);
-    try writeClientTextFrameMasked(allocator, &stream, workspace_request);
-    const payload_json = try readControlPayloadFor(
-        allocator,
-        &stream,
-        "fs-mount-workspace",
-        "control.workspace_status",
-    );
-    defer allocator.free(payload_json);
+        defer allocator.free(payload_json);
 
-    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload_json, .{});
-    defer parsed.deinit();
-    if (parsed.value != .object) return error.InvalidWorkspacePayload;
-    try appendWorkspaceMountSpecsFromStatusObject(allocator, &specs, parsed.value.object);
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload_json, .{});
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidWorkspacePayload;
+        try appendWorkspaceMountSpecsFromStatusObject(allocator, &specs, parsed.value.object);
+    } else if (connect_workspace) |workspace_value| {
+        if (workspace_value == .object) {
+            try appendWorkspaceMountSpecsFromStatusObject(allocator, &specs, workspace_value.object);
+        }
+    }
 
     return specs;
+}
+
+fn shouldFetchWorkspaceStatusFromControl(
+    requested_project_id: ?[]const u8,
+    requested_project_token: ?[]const u8,
+    connect_project_id: ?[]const u8,
+    connect_has_workspace_mounts: bool,
+) bool {
+    if (requested_project_token != null) return true;
+    if (requested_project_id) |selected_project| {
+        if (connect_project_id) |connected_project| {
+            if (!std.mem.eql(u8, selected_project, connected_project)) return true;
+            return !connect_has_workspace_mounts;
+        }
+        return true;
+    }
+    return !connect_has_workspace_mounts;
+}
+
+fn connectWorkspaceHasMounts(connect_workspace: ?std.json.Value) bool {
+    const workspace_value = connect_workspace orelse return false;
+    if (workspace_value != .object) return false;
+    const mounts_value = workspace_value.object.get("mounts") orelse return false;
+    if (mounts_value != .array) return false;
+    return mounts_value.array.items.len > 0;
 }
 
 fn appendWorkspaceMountSpecsFromStatusObject(
@@ -1103,4 +1147,30 @@ test "fs_mount_main: parseEndpointFlag defaults mount path to endpoint name" {
     try std.testing.expectEqualStrings("ws://127.0.0.1:18891/v2/fs", parsed.url);
     try std.testing.expectEqualStrings("work", parsed.export_name.?);
     try std.testing.expect(parsed.mount_path == null);
+}
+
+test "fs_mount_main: shouldFetchWorkspaceStatusFromControl only falls back when needed" {
+    try std.testing.expect(!shouldFetchWorkspaceStatusFromControl(null, null, "proj-a", true));
+    try std.testing.expect(shouldFetchWorkspaceStatusFromControl(null, null, "proj-a", false));
+
+    try std.testing.expect(!shouldFetchWorkspaceStatusFromControl("proj-a", null, "proj-a", true));
+    try std.testing.expect(shouldFetchWorkspaceStatusFromControl("proj-a", null, "proj-b", true));
+    try std.testing.expect(shouldFetchWorkspaceStatusFromControl("proj-a", null, null, true));
+    try std.testing.expect(shouldFetchWorkspaceStatusFromControl("proj-a", "token-a", "proj-a", true));
+}
+
+test "fs_mount_main: connectWorkspaceHasMounts requires non-empty mounts array" {
+    const allocator = std.testing.allocator;
+
+    var parsed_empty = try std.json.parseFromSlice(std.json.Value, allocator, "{\"workspace\":{}}", .{});
+    defer parsed_empty.deinit();
+    try std.testing.expect(!connectWorkspaceHasMounts(parsed_empty.value.object.get("workspace")));
+
+    var parsed_empty_mounts = try std.json.parseFromSlice(std.json.Value, allocator, "{\"workspace\":{\"mounts\":[]}}", .{});
+    defer parsed_empty_mounts.deinit();
+    try std.testing.expect(!connectWorkspaceHasMounts(parsed_empty_mounts.value.object.get("workspace")));
+
+    var parsed_with_mount = try std.json.parseFromSlice(std.json.Value, allocator, "{\"workspace\":{\"mounts\":[{\"mount_path\":\"/m\",\"fs_url\":\"ws://127.0.0.1:18891/v2/fs\"}]}}", .{});
+    defer parsed_with_mount.deinit();
+    try std.testing.expect(connectWorkspaceHasMounts(parsed_with_mount.value.object.get("workspace")));
 }
