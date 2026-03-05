@@ -3174,7 +3174,8 @@ fn pathExistsAsDirectory(path: []const u8) !bool {
 
 fn normalizeControlPath(path: []const u8) []const u8 {
     const trimmed = std.mem.trim(u8, path, " \t\r\n");
-    return std.mem.trimLeft(u8, trimmed, "/");
+    const no_leading = std.mem.trimLeft(u8, trimmed, "/");
+    return std.mem.trimRight(u8, no_leading, "/");
 }
 
 fn pathMatchesControlTarget(path: []const u8, target: []const u8) bool {
@@ -3293,6 +3294,9 @@ const RuntimeToolDispatchProxy = struct {
         tool_name: []const u8,
         args_json: []const u8,
     ) tool_registry.ToolExecutionResult {
+        if (std.mem.eql(u8, tool_name, "file_read")) {
+            return self.handleFileRead(allocator, args_json);
+        }
         if (std.mem.eql(u8, tool_name, "file_write")) {
             return self.handleFileWrite(allocator, args_json);
         }
@@ -3300,6 +3304,29 @@ const RuntimeToolDispatchProxy = struct {
             return self.handleFileList(allocator, args_json);
         }
         return self.sandbox_runtime.executeWorldTool(allocator, tool_name, args_json);
+    }
+
+    fn handleFileRead(
+        self: *RuntimeToolDispatchProxy,
+        allocator: std.mem.Allocator,
+        args_json: []const u8,
+    ) tool_registry.ToolExecutionResult {
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, args_json, .{}) catch {
+            return runtimeDispatchFailure(allocator, .invalid_params, "file_read arguments must be a JSON object");
+        };
+        defer parsed.deinit();
+        if (parsed.value != .object) {
+            return runtimeDispatchFailure(allocator, .invalid_params, "file_read arguments must be a JSON object");
+        }
+
+        const obj = parsed.value.object;
+        const path = requiredStringField(obj, "path") orelse
+            return runtimeDispatchFailure(allocator, .invalid_params, "file_read path must be provided");
+
+        if (runtimeDispatchSyntheticReadContent(path)) |content| {
+            return runtimeDispatchFileReadSuccess(allocator, path, content);
+        }
+        return self.sandbox_runtime.executeWorldTool(allocator, "file_read", args_json);
     }
 
     fn handleFileWrite(
@@ -3347,19 +3374,34 @@ const RuntimeToolDispatchProxy = struct {
 
         if (pathMatchesAnyControlTarget(path, &.{"global"})) {
             return runtimeDispatchFileListSuccess(allocator, path, &.{
+                .{ .name = "services", .kind = "dir" },
                 .{ .name = "chat", .kind = "dir" },
                 .{ .name = "jobs", .kind = "dir" },
                 .{ .name = "projects", .kind = "dir" },
                 .{ .name = "agents", .kind = "dir" },
             });
         }
+        if (pathMatchesAnyControlTarget(path, &.{"global/services"})) {
+            return runtimeDispatchFileListSuccess(allocator, path, &.{
+                .{ .name = "SERVICES.json", .kind = "file" },
+            });
+        }
         if (pathMatchesAnyControlTarget(path, &.{"global/projects"})) {
             return runtimeDispatchFileListSuccess(allocator, path, &.{
+                .{ .name = "README.md", .kind = "file" },
+                .{ .name = "SCHEMA.json", .kind = "file" },
+                .{ .name = "CAPS.json", .kind = "file" },
+                .{ .name = "OPS.json", .kind = "file" },
+                .{ .name = "PERMISSIONS.json", .kind = "file" },
+                .{ .name = "STATUS.json", .kind = "file" },
+                .{ .name = "status.json", .kind = "file" },
+                .{ .name = "result.json", .kind = "file" },
                 .{ .name = "control", .kind = "dir" },
             });
         }
         if (pathMatchesAnyControlTarget(path, &.{"global/projects/control"})) {
             return runtimeDispatchFileListSuccess(allocator, path, &.{
+                .{ .name = "README.md", .kind = "file" },
                 .{ .name = "invoke.json", .kind = "file" },
                 .{ .name = "list.json", .kind = "file" },
                 .{ .name = "get.json", .kind = "file" },
@@ -3368,11 +3410,20 @@ const RuntimeToolDispatchProxy = struct {
         }
         if (pathMatchesAnyControlTarget(path, &.{"global/agents"})) {
             return runtimeDispatchFileListSuccess(allocator, path, &.{
+                .{ .name = "README.md", .kind = "file" },
+                .{ .name = "SCHEMA.json", .kind = "file" },
+                .{ .name = "CAPS.json", .kind = "file" },
+                .{ .name = "OPS.json", .kind = "file" },
+                .{ .name = "PERMISSIONS.json", .kind = "file" },
+                .{ .name = "STATUS.json", .kind = "file" },
+                .{ .name = "status.json", .kind = "file" },
+                .{ .name = "result.json", .kind = "file" },
                 .{ .name = "control", .kind = "dir" },
             });
         }
         if (pathMatchesAnyControlTarget(path, &.{"global/agents/control"})) {
             return runtimeDispatchFileListSuccess(allocator, path, &.{
+                .{ .name = "README.md", .kind = "file" },
                 .{ .name = "invoke.json", .kind = "file" },
                 .{ .name = "list.json", .kind = "file" },
                 .{ .name = "create.json", .kind = "file" },
@@ -3728,6 +3779,30 @@ fn runtimeDispatchFileWriteSuccess(
     return .{ .success = .{ .payload_json = payload } };
 }
 
+fn runtimeDispatchFileReadSuccess(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    content: []const u8,
+) tool_registry.ToolExecutionResult {
+    const escaped_path = unified.jsonEscape(allocator, path) catch {
+        return runtimeDispatchFailure(allocator, .execution_failed, "failed to encode file_read path");
+    };
+    defer allocator.free(escaped_path);
+    const escaped_content = unified.jsonEscape(allocator, content) catch {
+        return runtimeDispatchFailure(allocator, .execution_failed, "failed to encode file_read content");
+    };
+    defer allocator.free(escaped_content);
+
+    const payload = std.fmt.allocPrint(
+        allocator,
+        "{{\"path\":\"{s}\",\"bytes\":{d},\"truncated\":false,\"content\":\"{s}\",\"ready\":true,\"wait_until_ready\":true}}",
+        .{ escaped_path, content.len, escaped_content },
+    ) catch {
+        return runtimeDispatchFailure(allocator, .execution_failed, "failed to build file_read payload");
+    };
+    return .{ .success = .{ .payload_json = payload } };
+}
+
 fn runtimeDispatchFileListSuccess(
     allocator: std.mem.Allocator,
     path: []const u8,
@@ -3767,6 +3842,74 @@ fn runtimeDispatchFileListSuccess(
 
 fn stringifyJsonValueAlloc(allocator: std.mem.Allocator, value: std.json.Value) ![]u8 {
     return std.json.Stringify.valueAlloc(allocator, value, .{});
+}
+
+fn runtimeDispatchSyntheticReadContent(path: []const u8) ?[]const u8 {
+    if (pathMatchesAnyControlTarget(path, &.{"global/services/SERVICES.json"})) {
+        return runtimeDispatchServicesIndexJson();
+    }
+
+    if (pathMatchesAnyControlTarget(path, &.{"global/projects/README.md"})) {
+        return "# Projects Management\n\nList, inspect, and create/update projects through Acheron control files.\n";
+    }
+    if (pathMatchesAnyControlTarget(path, &.{"global/projects/SCHEMA.json"})) {
+        return "{\"kind\":\"service\",\"service_id\":\"projects\",\"shape\":\"/global/projects/{README.md,SCHEMA.json,CAPS.json,OPS.json,PERMISSIONS.json,STATUS.json,status.json,result.json,control/*}\"}";
+    }
+    if (pathMatchesAnyControlTarget(path, &.{"global/projects/CAPS.json"})) {
+        return "{\"invoke\":true,\"operations\":[\"projects_list\",\"projects_get\",\"projects_up\"],\"discoverable\":true}";
+    }
+    if (pathMatchesAnyControlTarget(path, &.{"global/projects/OPS.json"})) {
+        return "{\"model\":\"local_bridge\",\"invoke\":\"control/invoke.json\",\"transport\":\"acheron-local\",\"paths\":{\"list\":\"control/list.json\",\"get\":\"control/get.json\",\"up\":\"control/up.json\"},\"operations\":{\"list\":\"projects_list\",\"get\":\"projects_get\",\"up\":\"projects_up\"}}";
+    }
+    if (pathMatchesAnyControlTarget(path, &.{"global/projects/PERMISSIONS.json"})) {
+        return "{\"default\":\"allow-by-default\",\"allow_roles\":[\"admin\",\"user\"],\"scope\":\"project_control_plane\"}";
+    }
+    if (pathMatchesAnyControlTarget(path, &.{"global/projects/STATUS.json"})) {
+        return "{\"service_id\":\"projects\",\"state\":\"namespace\",\"has_invoke\":true}";
+    }
+    if (pathMatchesAnyControlTarget(path, &.{"global/projects/status.json"})) {
+        return "{\"state\":\"idle\",\"tool\":null,\"updated_at_ms\":0,\"error\":null}";
+    }
+    if (pathMatchesAnyControlTarget(path, &.{"global/projects/result.json"})) {
+        return "{\"projects\":[]}";
+    }
+    if (pathMatchesAnyControlTarget(path, &.{"global/projects/control/README.md"})) {
+        return "Use list/get/up operation files, or invoke.json with op=list|get|up plus arguments. For Mother bootstrap provisioning, use up with activate=false.\n";
+    }
+
+    if (pathMatchesAnyControlTarget(path, &.{"global/agents/README.md"})) {
+        return "# Agents Management\n\nList and create agent workspaces through Acheron control files.\n";
+    }
+    if (pathMatchesAnyControlTarget(path, &.{"global/agents/SCHEMA.json"})) {
+        return "{\"kind\":\"service\",\"service_id\":\"agents\",\"shape\":\"/global/agents/{README.md,SCHEMA.json,CAPS.json,OPS.json,PERMISSIONS.json,STATUS.json,status.json,result.json,control/*}\"}";
+    }
+    if (pathMatchesAnyControlTarget(path, &.{"global/agents/CAPS.json"})) {
+        return "{\"invoke\":true,\"operations\":[\"agents_list\",\"agents_create\"],\"discoverable\":true,\"create_allowed\":true}";
+    }
+    if (pathMatchesAnyControlTarget(path, &.{"global/agents/OPS.json"})) {
+        return "{\"model\":\"local_bridge\",\"invoke\":\"control/invoke.json\",\"transport\":\"acheron-local\",\"paths\":{\"list\":\"control/list.json\",\"create\":\"control/create.json\"},\"operations\":{\"list\":\"agents_list\",\"create\":\"agents_create\"}}";
+    }
+    if (pathMatchesAnyControlTarget(path, &.{"global/agents/PERMISSIONS.json"})) {
+        return "{\"default\":\"allow-by-default\",\"allow_roles\":[\"admin\",\"user\"],\"scope\":\"agent\",\"project_token_required\":false}";
+    }
+    if (pathMatchesAnyControlTarget(path, &.{"global/agents/STATUS.json"})) {
+        return "{\"service_id\":\"agents\",\"state\":\"namespace\",\"has_invoke\":true}";
+    }
+    if (pathMatchesAnyControlTarget(path, &.{"global/agents/status.json"})) {
+        return "{\"state\":\"idle\",\"tool\":null,\"updated_at_ms\":0,\"error\":null}";
+    }
+    if (pathMatchesAnyControlTarget(path, &.{"global/agents/result.json"})) {
+        return "{\"agents\":[]}";
+    }
+    if (pathMatchesAnyControlTarget(path, &.{"global/agents/control/README.md"})) {
+        return "Use list/create operation files, or invoke.json with op=list|create plus arguments. Create requires agent provisioning capability.\n";
+    }
+
+    return null;
+}
+
+fn runtimeDispatchServicesIndexJson() []const u8 {
+    return "[{\"node_id\":\"global\",\"service_id\":\"services\",\"service_path\":\"/global/services\",\"invoke_path\":null,\"has_invoke\":false,\"scope\":\"project_namespace\"},{\"node_id\":\"global\",\"service_id\":\"chat\",\"service_path\":\"/global/chat\",\"invoke_path\":null,\"has_invoke\":false,\"scope\":\"project_namespace\"},{\"node_id\":\"global\",\"service_id\":\"jobs\",\"service_path\":\"/global/jobs\",\"invoke_path\":null,\"has_invoke\":false,\"scope\":\"project_namespace\"},{\"node_id\":\"global\",\"service_id\":\"projects\",\"service_path\":\"/global/projects\",\"invoke_path\":\"/global/projects/control/invoke.json\",\"has_invoke\":true,\"scope\":\"project_namespace\"},{\"node_id\":\"global\",\"service_id\":\"agents\",\"service_path\":\"/global/agents\",\"invoke_path\":\"/global/agents/control/invoke.json\",\"has_invoke\":true,\"scope\":\"project_namespace\"},{\"node_id\":\"global\",\"service_id\":\"library\",\"service_path\":\"/global/library\",\"invoke_path\":null,\"has_invoke\":false,\"scope\":\"global_namespace\"}]";
 }
 
 fn buildProjectScopedPayload(allocator: std.mem.Allocator, project_id: []const u8, project_token: ?[]const u8) ![]u8 {
@@ -11826,7 +11969,17 @@ test "server_piai: resolve connection path maps base URL to default agent" {
 test "server_piai: pathMatchesControlTarget only matches control namespace root path" {
     try std.testing.expect(pathMatchesControlTarget("global/projects/control/up.json", "global/projects/control/up.json"));
     try std.testing.expect(pathMatchesControlTarget("/global/projects/control/up.json", "global/projects/control/up.json"));
+    try std.testing.expect(pathMatchesControlTarget("/global/projects/control/up.json/", "global/projects/control/up.json"));
     try std.testing.expect(!pathMatchesControlTarget("workspace/global/projects/control/up.json", "global/projects/control/up.json"));
+}
+
+test "server_piai: runtime dispatch synthetic service docs are discoverable" {
+    const services_index = runtimeDispatchSyntheticReadContent("/global/services/SERVICES.json") orelse return error.TestExpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, services_index, "\"service_id\":\"projects\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, services_index, "\"service_id\":\"agents\"") != null);
+
+    const projects_schema = runtimeDispatchSyntheticReadContent("/global/projects/SCHEMA.json") orelse return error.TestExpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, projects_schema, "\"service_id\":\"projects\"") != null);
 }
 
 test "server_piai: projects control path matcher is global-only" {
