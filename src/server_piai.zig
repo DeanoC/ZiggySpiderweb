@@ -3353,12 +3353,12 @@ const RuntimeToolDispatchProxy = struct {
                 .{ .name = "agents", .kind = "dir" },
             });
         }
-        if (pathMatchesAnyControlTarget(path, &.{"global/projects", "agents/self/projects"})) {
+        if (pathMatchesAnyControlTarget(path, &.{"global/projects"})) {
             return runtimeDispatchFileListSuccess(allocator, path, &.{
                 .{ .name = "control", .kind = "dir" },
             });
         }
-        if (pathMatchesAnyControlTarget(path, &.{"global/projects/control", "agents/self/projects/control"})) {
+        if (pathMatchesAnyControlTarget(path, &.{"global/projects/control"})) {
             return runtimeDispatchFileListSuccess(allocator, path, &.{
                 .{ .name = "invoke.json", .kind = "file" },
                 .{ .name = "list.json", .kind = "file" },
@@ -3366,12 +3366,12 @@ const RuntimeToolDispatchProxy = struct {
                 .{ .name = "up.json", .kind = "file" },
             });
         }
-        if (pathMatchesAnyControlTarget(path, &.{"global/agents", "agents/self/agents"})) {
+        if (pathMatchesAnyControlTarget(path, &.{"global/agents"})) {
             return runtimeDispatchFileListSuccess(allocator, path, &.{
                 .{ .name = "control", .kind = "dir" },
             });
         }
-        if (pathMatchesAnyControlTarget(path, &.{"global/agents/control", "agents/self/agents/control"})) {
+        if (pathMatchesAnyControlTarget(path, &.{"global/agents/control"})) {
             return runtimeDispatchFileListSuccess(allocator, path, &.{
                 .{ .name = "invoke.json", .kind = "file" },
                 .{ .name = "list.json", .kind = "file" },
@@ -3410,13 +3410,13 @@ const RuntimeToolDispatchProxy = struct {
         }
         const obj = parsed.value.object;
 
-        const op = if (pathMatchesAnyControlTarget(path, &.{"global/projects/control/list.json", "agents/self/projects/control/list.json"}))
+        const op = if (pathMatchesAnyControlTarget(path, &.{"global/projects/control/list.json"}))
             ProjectsOp.list
-        else if (pathMatchesAnyControlTarget(path, &.{"global/projects/control/get.json", "agents/self/projects/control/get.json"}))
+        else if (pathMatchesAnyControlTarget(path, &.{"global/projects/control/get.json"}))
             ProjectsOp.get
-        else if (pathMatchesAnyControlTarget(path, &.{"global/projects/control/up.json", "agents/self/projects/control/up.json"}))
+        else if (pathMatchesAnyControlTarget(path, &.{"global/projects/control/up.json"}))
             ProjectsOp.up
-        else if (pathMatchesAnyControlTarget(path, &.{"global/projects/control/invoke.json", "agents/self/projects/control/invoke.json"}))
+        else if (pathMatchesAnyControlTarget(path, &.{"global/projects/control/invoke.json"}))
             self.parseProjectsInvokeOp(obj) orelse
                 return runtimeDispatchFailure(allocator, .invalid_params, "projects invoke payload requires op=list|get|up")
         else
@@ -3431,7 +3431,7 @@ const RuntimeToolDispatchProxy = struct {
 
         switch (op) {
             .up => {
-                if (pathMatchesAnyControlTarget(path, &.{"global/projects/control/up.json", "agents/self/projects/control/up.json"})) {
+                if (pathMatchesAnyControlTarget(path, &.{"global/projects/control/up.json"})) {
                     return self.handleProjectsUpWrite(allocator, path, content);
                 }
                 const up_payload = stringifyJsonValueAlloc(allocator, args_value) catch {
@@ -3580,11 +3580,11 @@ const RuntimeToolDispatchProxy = struct {
         }
         const obj = parsed.value.object;
 
-        const op = if (pathMatchesAnyControlTarget(path, &.{"global/agents/control/list.json", "agents/self/agents/control/list.json"}))
+        const op = if (pathMatchesAnyControlTarget(path, &.{"global/agents/control/list.json"}))
             AgentsOp.list
-        else if (pathMatchesAnyControlTarget(path, &.{"global/agents/control/create.json", "agents/self/agents/control/create.json"}))
+        else if (pathMatchesAnyControlTarget(path, &.{"global/agents/control/create.json"}))
             AgentsOp.create
-        else if (pathMatchesAnyControlTarget(path, &.{"global/agents/control/invoke.json", "agents/self/agents/control/invoke.json"}))
+        else if (pathMatchesAnyControlTarget(path, &.{"global/agents/control/invoke.json"}))
             self.parseAgentsInvokeOp(obj) orelse
                 return runtimeDispatchFailure(allocator, .invalid_params, "agents invoke payload requires op=list|create")
         else
@@ -3596,7 +3596,7 @@ const RuntimeToolDispatchProxy = struct {
         }
         switch (op) {
             .create => {
-                if (pathMatchesAnyControlTarget(path, &.{"global/agents/control/create.json", "agents/self/agents/control/create.json"})) {
+                if (pathMatchesAnyControlTarget(path, &.{"global/agents/control/create.json"})) {
                     return self.handleAgentsCreateWrite(allocator, path, content);
                 }
                 const create_payload = stringifyJsonValueAlloc(allocator, args_value) catch {
@@ -3658,10 +3658,6 @@ fn isProjectsControlPath(path: []const u8) bool {
         "global/projects/control/list.json",
         "global/projects/control/get.json",
         "global/projects/control/up.json",
-        "agents/self/projects/control/invoke.json",
-        "agents/self/projects/control/list.json",
-        "agents/self/projects/control/get.json",
-        "agents/self/projects/control/up.json",
     });
 }
 
@@ -3670,9 +3666,6 @@ fn isAgentsControlPath(path: []const u8) bool {
         "global/agents/control/invoke.json",
         "global/agents/control/list.json",
         "global/agents/control/create.json",
-        "agents/self/agents/control/invoke.json",
-        "agents/self/agents/control/list.json",
-        "agents/self/agents/control/create.json",
     });
 }
 
@@ -11836,17 +11829,17 @@ test "server_piai: pathMatchesControlTarget only matches control namespace root 
     try std.testing.expect(!pathMatchesControlTarget("workspace/global/projects/control/up.json", "global/projects/control/up.json"));
 }
 
-test "server_piai: projects control path matcher supports global and legacy aliases" {
+test "server_piai: projects control path matcher is global-only" {
     try std.testing.expect(isProjectsControlPath("/global/projects/control/up.json"));
     try std.testing.expect(isProjectsControlPath("global/projects/control/list.json"));
-    try std.testing.expect(isProjectsControlPath("/agents/self/projects/control/invoke.json"));
+    try std.testing.expect(!isProjectsControlPath("/agents/self/projects/control/invoke.json"));
     try std.testing.expect(!isProjectsControlPath("/global/mounts/control/up.json"));
 }
 
-test "server_piai: agents control path matcher supports global and legacy aliases" {
+test "server_piai: agents control path matcher is global-only" {
     try std.testing.expect(isAgentsControlPath("/global/agents/control/create.json"));
     try std.testing.expect(isAgentsControlPath("global/agents/control/list.json"));
-    try std.testing.expect(isAgentsControlPath("/agents/self/agents/control/invoke.json"));
+    try std.testing.expect(!isAgentsControlPath("/agents/self/agents/control/invoke.json"));
     try std.testing.expect(!isAgentsControlPath("/global/projects/control/create.json"));
 }
 
