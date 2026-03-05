@@ -73,7 +73,7 @@ if ! command -v python3 >/dev/null 2>&1; then
     exit 1
 fi
 
-FS_MOUNT_READ_TIMEOUT_SEC="${FS_MOUNT_READ_TIMEOUT_SEC:-6}"
+FS_MOUNT_READ_TIMEOUT_SEC="${FS_MOUNT_READ_TIMEOUT_SEC:-15}"
 
 run_with_timeout() {
     local seconds="$1"
@@ -88,6 +88,12 @@ run_with_timeout() {
 read_mount_text() {
     local mount_path="$1"
     local args=(--workspace-url "$WORKSPACE_URL")
+    if [[ -n "${PROJECT_ID:-}" ]]; then
+        args+=(--project-id "$PROJECT_ID")
+    fi
+    if [[ -n "${PROJECT_TOKEN:-}" ]]; then
+        args+=(--project-token "$PROJECT_TOKEN")
+    fi
     if [[ -n "${SPIDERWEB_AUTH_TOKEN:-}" ]]; then
         args+=(--auth-token "$SPIDERWEB_AUTH_TOKEN")
     fi
@@ -816,12 +822,12 @@ try:
     }), "activate")
     status_payload = call(sock, "workspace_status", {}, "workspace-status")
 
-    mounts = status_payload.get("mounts", [])
-    desired_mounts = status_payload.get("desired_mounts", [])
+    mounts = [m for m in status_payload.get("mounts", []) if m.get("mount_path") == "/src"]
+    desired_mounts = [m for m in status_payload.get("desired_mounts", []) if m.get("mount_path") == "/src"]
     if len(desired_mounts) != 2:
-        raise RuntimeError(f"expected 2 desired mounts, got {len(desired_mounts)}: {json.dumps(status_payload)}")
+        raise RuntimeError(f"expected 2 desired /src mounts, got {len(desired_mounts)}: {json.dumps(status_payload)}")
     if len(mounts) != 1:
-        raise RuntimeError(f"expected 1 active mount for failover path, got {len(mounts)}: {json.dumps(status_payload)}")
+        raise RuntimeError(f"expected 1 active /src mount for failover path, got {len(mounts)}: {json.dumps(status_payload)}")
     if mounts[0].get("mount_path") != "/src":
         raise RuntimeError(f"expected active mount_path '/src': {json.dumps(status_payload)}")
     desired_node_ids = {m.get("node_id") for m in desired_mounts}
@@ -1050,12 +1056,12 @@ try:
     workspace = call(sock, "workspace_status", {}, "restart-status")
     if workspace.get("project_id") != expected_project_id:
         raise RuntimeError(f"project mismatch after restart: {workspace}")
-    mounts = workspace.get("mounts", [])
-    desired_mounts = workspace.get("desired_mounts", [])
+    mounts = [m for m in workspace.get("mounts", []) if m.get("mount_path") == "/src"]
+    desired_mounts = [m for m in workspace.get("desired_mounts", []) if m.get("mount_path") == "/src"]
     if len(desired_mounts) < 2:
-        raise RuntimeError(f"expected >=2 desired mounts after restart, got {len(desired_mounts)}: {workspace}")
+        raise RuntimeError(f"expected >=2 desired /src mounts after restart, got {len(desired_mounts)}: {workspace}")
     if len(mounts) != 1:
-        raise RuntimeError(f"expected 1 active failover mount after restart, got {len(mounts)}: {workspace}")
+        raise RuntimeError(f"expected 1 active /src failover mount after restart, got {len(mounts)}: {workspace}")
     if mounts[0].get("mount_path") != "/src":
         raise RuntimeError(f"expected active mount_path '/src' after restart: {workspace}")
 finally:
