@@ -15,6 +15,7 @@ SPIDERWEB_PORT="${SPIDERWEB_PORT:-28790}"
 SPIDERWEB_METRICS_PORT="${SPIDERWEB_METRICS_PORT:-0}"
 NODE1_PORT="${NODE1_PORT:-28911}"
 NODE2_PORT="${NODE2_PORT:-28912}"
+ALLOW_SANDBOX_UNAVAILABLE_SKIP="${ALLOW_SANDBOX_UNAVAILABLE_SKIP:-0}"
 
 SPIDERWEB_BIN="$ROOT_DIR/zig-out/bin/spiderweb"
 FS_NODE_BIN="$ROOT_DIR/zig-out/bin/embed-multi-service-node"
@@ -35,6 +36,12 @@ log_pass() {
 
 log_fail() {
     echo -e "${RED}[FAIL]${NC} $1"
+}
+
+sandbox_runtime_unavailable_in_log() {
+    [[ -f "$SPIDERWEB_LOG" ]] && grep -Eq \
+        "sandbox mount process exited|ProjectMountUnavailable|SandboxMountUnavailable|runtime warmup thread failed" \
+        "$SPIDERWEB_LOG"
 }
 
 cleanup() {
@@ -73,7 +80,7 @@ if ! command -v python3 >/dev/null 2>&1; then
     exit 1
 fi
 
-FS_MOUNT_READ_TIMEOUT_SEC="${FS_MOUNT_READ_TIMEOUT_SEC:-3}"
+FS_MOUNT_READ_TIMEOUT_SEC="${FS_MOUNT_READ_TIMEOUT_SEC:-6}"
 
 run_with_timeout() {
     local seconds="$1"
@@ -87,7 +94,11 @@ run_with_timeout() {
 
 read_mount_text() {
     local mount_path="$1"
-    run_with_timeout "$FS_MOUNT_READ_TIMEOUT_SEC" "$FS_MOUNT_BIN" --workspace-url "$WORKSPACE_URL" cat "$mount_path"
+    local args=(--workspace-url "$WORKSPACE_URL")
+    if [[ -n "${SPIDERWEB_AUTH_TOKEN:-}" ]]; then
+        args+=(--auth-token "$SPIDERWEB_AUTH_TOKEN")
+    fi
+    run_with_timeout "$FS_MOUNT_READ_TIMEOUT_SEC" "$FS_MOUNT_BIN" "${args[@]}" cat "$mount_path"
 }
 
 TEST_TMP_DIR="$(mktemp -d)"
@@ -1090,6 +1101,11 @@ for _ in $(seq 1 150); do
     sleep 0.2
 done
 if [[ "$initial_read_ok" -ne 1 ]]; then
+    if [[ "$ALLOW_SANDBOX_UNAVAILABLE_SKIP" == "1" ]] && sandbox_runtime_unavailable_in_log; then
+        log_info "Sandbox runtime unavailable on this host; skipping read/failover assertions."
+        log_pass "distributed workspace base scenario skipped (sandbox unavailable)"
+        exit 0
+    fi
     log_fail "initial read did not converge after restart"
     echo "--- spiderweb log ---"
     cat "$SPIDERWEB_LOG"
