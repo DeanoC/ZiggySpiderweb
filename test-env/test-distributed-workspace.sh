@@ -40,7 +40,7 @@ log_fail() {
 
 sandbox_runtime_unavailable_in_log() {
     [[ -f "$SPIDERWEB_LOG" ]] && grep -Eq \
-        "sandbox mount process exited|ProjectMountUnavailable|SandboxMountUnavailable|runtime warmup thread failed" \
+        "RuntimeUnavailable|sandbox mount process exited|ProjectMountUnavailable|SandboxMountUnavailable|runtime warmup thread failed|sandbox mountpoint wait timed out" \
         "$SPIDERWEB_LOG"
 }
 
