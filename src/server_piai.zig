@@ -75,6 +75,7 @@ const fsrpc_runtime_protocol_version = "acheron-1";
 const fsrpc_node_protocol_version = "unified-v2-fs";
 const fsrpc_node_proto_id: i64 = 2;
 const node_tunnel_reply_timeout_ms: i32 = 45_000;
+const service_presence_dispatch_queue_max: usize = 256;
 // Each accepted websocket occupies a worker thread for its full lifetime.
 // Internal fs-mount/runtime fan-out can exceed 16 steady-state connections,
 // which starves new control/gui handshakes and appears as "can't connect".
@@ -2458,6 +2459,39 @@ const SessionBinding = struct {
     }
 };
 
+const ServicePresenceDispatchJob = struct {
+    agent_id: []u8,
+    project_id: ?[]u8 = null,
+    session_key: []u8,
+    service_id: []u8,
+    attached: bool,
+    payload_json: []u8,
+
+    fn deinit(self: *ServicePresenceDispatchJob, allocator: std.mem.Allocator) void {
+        allocator.free(self.agent_id);
+        if (self.project_id) |value| allocator.free(value);
+        allocator.free(self.session_key);
+        allocator.free(self.service_id);
+        allocator.free(self.payload_json);
+        self.* = undefined;
+    }
+
+    fn matches(
+        self: *const ServicePresenceDispatchJob,
+        agent_id: []const u8,
+        project_id: ?[]const u8,
+        session_key: []const u8,
+        service_id: []const u8,
+        attached: bool,
+    ) bool {
+        return std.mem.eql(u8, self.agent_id, agent_id) and
+            optionalStringsEqual(self.project_id, project_id) and
+            std.mem.eql(u8, self.session_key, session_key) and
+            std.mem.eql(u8, self.service_id, service_id) and
+            self.attached == attached;
+    }
+};
+
 const RememberedTarget = struct {
     agent_id: []u8,
     project_id: []u8,
@@ -3925,6 +3959,11 @@ const AgentRuntimeRegistry = struct {
     node_service_event_log_rotate_max_bytes: u64 = 4 * 1024 * 1024,
     node_service_event_log_archive_keep: usize = 8,
     node_service_event_log_gzip_available: bool = false,
+    service_presence_worker_thread: ?std.Thread = null,
+    service_presence_worker_stop: bool = false,
+    service_presence_worker_mutex: std.Thread.Mutex = .{},
+    service_presence_worker_cond: std.Thread.Condition = .{},
+    service_presence_jobs: std.ArrayListUnmanaged(ServicePresenceDispatchJob) = .{},
     audit_records_mutex: std.Thread.Mutex = .{},
     audit_records: std.ArrayListUnmanaged(AuditRecord) = .{},
     next_audit_record_id: u64 = 1,
@@ -4045,6 +4084,17 @@ const AgentRuntimeRegistry = struct {
     }
 
     fn deinit(self: *AgentRuntimeRegistry) void {
+        self.requestServicePresenceWorkerStop();
+        if (self.service_presence_worker_thread) |thread| {
+            thread.join();
+            self.service_presence_worker_thread = null;
+        }
+        self.service_presence_worker_mutex.lock();
+        for (self.service_presence_jobs.items) |*job| job.deinit(self.allocator);
+        self.service_presence_jobs.deinit(self.allocator);
+        self.service_presence_jobs = .{};
+        self.service_presence_worker_mutex.unlock();
+
         self.requestRuntimeResidencyWorkerStop();
         if (self.runtime_residency_worker_thread) |thread| {
             thread.join();
@@ -4352,13 +4402,14 @@ const AgentRuntimeRegistry = struct {
         return hint;
     }
 
-    fn dispatchRuntimeAgentControl(
+    fn dispatchRuntimeAgentControlForTarget(
         self: *AgentRuntimeRegistry,
-        binding: SessionBinding,
+        agent_id: []const u8,
+        project_id: ?[]const u8,
         action: []const u8,
         content_json: []const u8,
     ) !void {
-        const runtime = self.getRuntimeForBindingIfReady(binding.agent_id, binding.project_id) orelse
+        const runtime = self.getRuntimeForBindingIfReady(agent_id, project_id) orelse
             return error.RuntimeUnavailable;
         defer runtime.release();
 
@@ -4384,13 +4435,73 @@ const AgentRuntimeRegistry = struct {
                 "runtime agent.control rejected: action={s} agent={s} project={s} response={s}",
                 .{
                     action,
-                    binding.agent_id,
-                    binding.project_id orelse "null",
+                    agent_id,
+                    project_id orelse "null",
                     responses[0],
                 },
             );
             return error.RuntimeControlRejected;
         }
+    }
+
+    fn dispatchRuntimeAgentControl(
+        self: *AgentRuntimeRegistry,
+        binding: SessionBinding,
+        action: []const u8,
+        content_json: []const u8,
+    ) !void {
+        return self.dispatchRuntimeAgentControlForTarget(binding.agent_id, binding.project_id, action, content_json);
+    }
+
+    fn enqueueServicePresenceDispatch(
+        self: *AgentRuntimeRegistry,
+        binding: SessionBinding,
+        session_key: []const u8,
+        service_id: []const u8,
+        attached: bool,
+        payload_json: []u8,
+    ) !void {
+        errdefer self.allocator.free(payload_json);
+
+        const owned_agent_id = try self.allocator.dupe(u8, binding.agent_id);
+        errdefer self.allocator.free(owned_agent_id);
+        const owned_project_id = if (binding.project_id) |value|
+            try self.allocator.dupe(u8, value)
+        else
+            null;
+        errdefer if (owned_project_id) |value| self.allocator.free(value);
+        const owned_session_key = try self.allocator.dupe(u8, session_key);
+        errdefer self.allocator.free(owned_session_key);
+        const owned_service_id = try self.allocator.dupe(u8, service_id);
+        errdefer self.allocator.free(owned_service_id);
+
+        self.service_presence_worker_mutex.lock();
+        defer self.service_presence_worker_mutex.unlock();
+
+        if (self.service_presence_worker_stop) return error.ShuttingDown;
+
+        for (self.service_presence_jobs.items) |*job| {
+            if (job.matches(binding.agent_id, binding.project_id, session_key, service_id, attached)) {
+                self.allocator.free(owned_service_id);
+                self.allocator.free(owned_session_key);
+                if (owned_project_id) |value| self.allocator.free(value);
+                self.allocator.free(owned_agent_id);
+                self.allocator.free(payload_json);
+                return;
+            }
+        }
+
+        if (self.service_presence_jobs.items.len >= service_presence_dispatch_queue_max) return error.QueueFull;
+
+        try self.service_presence_jobs.append(self.allocator, .{
+            .agent_id = owned_agent_id,
+            .project_id = owned_project_id,
+            .session_key = owned_session_key,
+            .service_id = owned_service_id,
+            .attached = attached,
+            .payload_json = payload_json,
+        });
+        self.service_presence_worker_cond.signal();
     }
 
     fn getRuntimeForBindingIfReady(
@@ -4540,11 +4651,15 @@ const AgentRuntimeRegistry = struct {
                 project_setup_source_json,
             },
         ) catch return;
-        defer self.allocator.free(payload_json);
-
-        self.dispatchRuntimeAgentControl(binding, "service.event", payload_json) catch |err| {
+        self.enqueueServicePresenceDispatch(
+            binding,
+            session_key,
+            service_id,
+            attached,
+            payload_json,
+        ) catch |err| {
             std.log.warn(
-                "service presence sync failed: agent={s} session={s} status={s} err={s}",
+                "service presence enqueue failed: agent={s} session={s} status={s} err={s}",
                 .{
                     binding.agent_id,
                     session_key,
@@ -4782,6 +4897,17 @@ const AgentRuntimeRegistry = struct {
         );
     }
 
+    fn startServicePresenceWorker(self: *AgentRuntimeRegistry) !void {
+        self.service_presence_worker_mutex.lock();
+        self.service_presence_worker_stop = false;
+        self.service_presence_worker_mutex.unlock();
+        self.service_presence_worker_thread = try std.Thread.spawn(
+            .{},
+            servicePresenceWorkerMain,
+            .{self},
+        );
+    }
+
     fn startRuntimeResidencyWorker(self: *AgentRuntimeRegistry) !void {
         self.runtime_residency_worker_mutex.lock();
         self.runtime_residency_worker_stop = false;
@@ -4797,6 +4923,13 @@ const AgentRuntimeRegistry = struct {
         self.reconcile_worker_mutex.lock();
         self.reconcile_worker_stop = true;
         self.reconcile_worker_mutex.unlock();
+    }
+
+    fn requestServicePresenceWorkerStop(self: *AgentRuntimeRegistry) void {
+        self.service_presence_worker_mutex.lock();
+        self.service_presence_worker_stop = true;
+        self.service_presence_worker_cond.broadcast();
+        self.service_presence_worker_mutex.unlock();
     }
 
     fn shouldStopReconcileWorker(self: *AgentRuntimeRegistry) bool {
@@ -6513,6 +6646,39 @@ fn reconcileWorkerMain(runtime_registry: *AgentRuntimeRegistry) void {
     }
 }
 
+fn servicePresenceWorkerMain(runtime_registry: *AgentRuntimeRegistry) void {
+    while (true) {
+        runtime_registry.service_presence_worker_mutex.lock();
+        while (runtime_registry.service_presence_jobs.items.len == 0 and !runtime_registry.service_presence_worker_stop) {
+            runtime_registry.service_presence_worker_cond.wait(&runtime_registry.service_presence_worker_mutex);
+        }
+        if (runtime_registry.service_presence_worker_stop and runtime_registry.service_presence_jobs.items.len == 0) {
+            runtime_registry.service_presence_worker_mutex.unlock();
+            return;
+        }
+        var job = runtime_registry.service_presence_jobs.orderedRemove(0);
+        runtime_registry.service_presence_worker_mutex.unlock();
+        defer job.deinit(runtime_registry.allocator);
+
+        runtime_registry.dispatchRuntimeAgentControlForTarget(
+            job.agent_id,
+            job.project_id,
+            "service.event",
+            job.payload_json,
+        ) catch |err| {
+            std.log.warn(
+                "service presence sync failed: agent={s} session={s} status={s} err={s}",
+                .{
+                    job.agent_id,
+                    job.session_key,
+                    if (job.attached) "attached" else "detached",
+                    @errorName(err),
+                },
+            );
+        };
+    }
+}
+
 fn runtimeResidencyWorkerMain(runtime_registry: *AgentRuntimeRegistry) void {
     while (true) {
         if (runtime_registry.shouldStopRuntimeResidencyWorker()) return;
@@ -6540,6 +6706,7 @@ pub fn run(
     ensureMotherAgentScaffoldBestEffort(allocator, runtime_registry.runtime_config);
 
     runtime_registry.workspace_url = try formatInternalWsUrl(allocator, bind_addr, port, "/");
+    try runtime_registry.startServicePresenceWorker();
     try runtime_registry.startReconcileWorker();
 
     const metrics_port_raw = parseUnsignedEnv(allocator, metrics_port_env, 0);

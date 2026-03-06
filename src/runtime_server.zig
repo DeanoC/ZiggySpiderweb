@@ -61,6 +61,12 @@ const RuntimeServerError = error{
 
 const RuntimeOperationClass = run_orchestration.OperationClass;
 
+fn isChatLikeControlAction(action: ?[]const u8) bool {
+    const control_action = action orelse "";
+    return run_orchestration.isChatLikeControlAction(action) or
+        std.mem.eql(u8, control_action, "service.event");
+}
+
 const RuntimeQueueJob = struct {
     msg_type: protocol.MessageType,
     request_id: []u8,
@@ -537,7 +543,7 @@ pub const RuntimeServer = struct {
                 return self.submitRuntimeJobAndAwait(parsed.msg_type, request_id, parsed.content, parsed.action, .control, emit_debug);
             },
             .agent_control => {
-                const operation_class: RuntimeOperationClass = if (run_orchestration.isChatLikeControlAction(parsed.action)) .chat else .control;
+                const operation_class: RuntimeOperationClass = if (isChatLikeControlAction(parsed.action)) .chat else .control;
                 return self.submitRuntimeJobAndAwait(
                     parsed.msg_type,
                     request_id,
@@ -8309,7 +8315,7 @@ test "runtime_server: queued control request times out with runtime_timeout code
     try std.testing.expect(std.mem.indexOf(u8, ctx.response.?, "\"code\":\"runtime_timeout\"") != null);
 }
 
-test "runtime_server: agent.control goal/plan use chat timeout class" {
+test "runtime_server: agent.control goal/plan/service.event use chat timeout class" {
     const allocator = std.testing.allocator;
     const server = try RuntimeServer.create(allocator, "agent-test", .{
         .chat_operation_timeout_ms = 120,
@@ -8322,6 +8328,7 @@ test "runtime_server: agent.control goal/plan use chat timeout class" {
     const requests = [_][]const u8{
         "{\"id\":\"req-goal-timeout-class\",\"type\":\"agent.control\",\"action\":\"goal\",\"content\":\"hello\"}",
         "{\"id\":\"req-plan-timeout-class\",\"type\":\"agent.control\",\"action\":\"plan\",\"content\":\"hello\"}",
+        "{\"id\":\"req-service-timeout-class\",\"type\":\"agent.control\",\"action\":\"service.event\",\"content\":\"{\\\"service_id\\\":\\\"gui_ws_1\\\",\\\"status\\\":\\\"attached\\\",\\\"session_key\\\":\\\"main\\\",\\\"role\\\":\\\"user\\\",\\\"actor_type\\\":\\\"user\\\",\\\"actor_id\\\":\\\"user\\\",\\\"project_id\\\":\\\"proj-alpha\\\"}\"}",
     };
 
     for (requests) |request_json| {
