@@ -38,6 +38,21 @@ pub const SandboxRuntime = struct {
     io_mutex: std.Thread.Mutex = .{},
     runtime_cfg: Config.RuntimeConfig,
 
+    fn closeChildIoPipes(child: *std.process.Child) void {
+        if (child.stdin) |file| {
+            file.close();
+            child.stdin = null;
+        }
+        if (child.stdout) |file| {
+            file.close();
+            child.stdout = null;
+        }
+        if (child.stderr) |file| {
+            file.close();
+            child.stderr = null;
+        }
+    }
+
     pub fn create(options: Options) !*SandboxRuntime {
         if (builtin.os.tag != .linux) return error.UnsupportedOs;
 
@@ -158,6 +173,7 @@ pub const SandboxRuntime = struct {
         errdefer {
             _ = child.kill() catch {};
             _ = child.wait() catch {};
+            closeChildIoPipes(&child);
         }
 
         self.* = .{
@@ -185,6 +201,7 @@ pub const SandboxRuntime = struct {
         self.io_mutex.lock();
         _ = self.child.kill() catch {};
         _ = self.child.wait() catch {};
+        closeChildIoPipes(&self.child);
         self.io_mutex.unlock();
 
         if (self.owns_mount_process) {
@@ -362,6 +379,7 @@ pub const SandboxRuntime = struct {
     fn restartChildRuntime(self: *SandboxRuntime) !void {
         _ = self.child.kill() catch {};
         _ = self.child.wait() catch {};
+        closeChildIoPipes(&self.child);
 
         const replacement = try spawnSandboxChild(
             self.allocator,
@@ -377,6 +395,7 @@ pub const SandboxRuntime = struct {
     fn restartMountAndChild(self: *SandboxRuntime) !void {
         _ = self.child.kill() catch {};
         _ = self.child.wait() catch {};
+        closeChildIoPipes(&self.child);
 
         if (self.owns_mount_process) {
             if (self.mount_process) |*mount_child| {
@@ -423,6 +442,7 @@ pub const SandboxRuntime = struct {
         errdefer {
             _ = replacement.kill() catch {};
             _ = replacement.wait() catch {};
+            closeChildIoPipes(&replacement);
         }
 
         self.mount_process = mount_process;

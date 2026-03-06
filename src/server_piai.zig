@@ -80,6 +80,7 @@ const node_tunnel_reply_timeout_ms: i32 = 45_000;
 // which starves new control/gui handshakes and appears as "can't connect".
 const min_connection_worker_threads: usize = 64;
 const runtime_warmup_stale_timeout_ms: i64 = 30_000;
+const runtime_warmup_error_retry_backoff_ms: i64 = 10_000;
 const runtime_residency_worker_interval_ms_default: u64 = 1_000;
 const session_heartbeat_ttl_ms: i64 = 5 * 60 * 1000;
 const agent_heartbeat_ttl_ms: i64 = 5 * 60 * 1000;
@@ -2373,6 +2374,7 @@ const RuntimeWarmupState = struct {
     error_code: ?[]u8 = null,
     error_message: ?[]u8 = null,
     updated_at_ms: i64 = 0,
+    retry_after_ms: i64 = 0,
     in_flight: bool = false,
 
     fn deinit(self: *RuntimeWarmupState, allocator: std.mem.Allocator) void {
@@ -2390,6 +2392,7 @@ const RuntimeWarmupState = struct {
         self.runtime_ready = false;
         self.mount_ready = false;
         self.updated_at_ms = std.time.milliTimestamp();
+        self.retry_after_ms = 0;
     }
 
     fn setReady(self: *RuntimeWarmupState, allocator: std.mem.Allocator) void {
@@ -2401,6 +2404,7 @@ const RuntimeWarmupState = struct {
         self.runtime_ready = true;
         self.mount_ready = true;
         self.updated_at_ms = std.time.milliTimestamp();
+        self.retry_after_ms = 0;
     }
 
     fn setError(self: *RuntimeWarmupState, allocator: std.mem.Allocator, code: []const u8, message: []const u8) !void {
@@ -2416,6 +2420,7 @@ const RuntimeWarmupState = struct {
         self.runtime_ready = false;
         self.mount_ready = false;
         self.updated_at_ms = std.time.milliTimestamp();
+        self.retry_after_ms = self.updated_at_ms + runtime_warmup_error_retry_backoff_ms;
     }
 
     fn snapshotOwned(self: *const RuntimeWarmupState, allocator: std.mem.Allocator) !SessionAttachStateSnapshot {
@@ -4960,6 +4965,7 @@ const AgentRuntimeRegistry = struct {
                 );
                 switch (err) {
                     error.ProjectMountUnavailable => return error.SandboxMountUnavailable,
+                    error.ProcessFdQuotaExceeded => return error.ProcessFdQuotaExceeded,
                     else => return error.InvalidSandboxConfig,
                 }
             };
@@ -5258,6 +5264,10 @@ const AgentRuntimeRegistry = struct {
                 .code = "queue_saturated",
                 .message = "project runtime limit reached",
             },
+            error.ProcessFdQuotaExceeded => .{
+                .code = "runtime_resource_exhausted",
+                .message = "sandbox runtime hit process fd quota",
+            },
             error.ProjectRequired => .{
                 .code = "sandbox_mount_missing",
                 .message = "sandbox requires a project binding",
@@ -5519,6 +5529,9 @@ const AgentRuntimeRegistry = struct {
                     if (state.state == .err and !retry_on_error) {
                         // Preserve sticky error state for read-only status probes so callers can
                         // surface the real failure instead of oscillating forever in "warming".
+                    } else if (state.state == .err and state.retry_after_ms > now_ms) {
+                        // Back off after a terminal warmup failure so attach/status/presence
+                        // probes do not immediately recreate the same broken runtime.
                     } else {
                         // Runtime is currently absent/unhealthy, so move the warmup state back
                         // to warming even if a stale "ready" snapshot is present.
@@ -7841,6 +7854,17 @@ fn handleWebSocketConnection(
                                                 try writeFrameLocked(stream, &connection_write_mutex, response, .text);
                                                 continue;
                                             },
+                                            error.ProcessFdQuotaExceeded => {
+                                                const response = try unified.buildControlError(
+                                                    allocator,
+                                                    parsed.id,
+                                                    "runtime_resource_exhausted",
+                                                    "sandbox runtime hit process fd quota",
+                                                );
+                                                defer allocator.free(response);
+                                                try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                                continue;
+                                            },
                                             error.InvalidSandboxConfig => {
                                                 const response = try unified.buildControlError(
                                                     allocator,
@@ -8325,6 +8349,17 @@ fn handleWebSocketConnection(
                                     parsed.tag,
                                     "sandbox_invalid_config",
                                     "sandbox config is invalid",
+                                );
+                                defer allocator.free(response);
+                                try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                continue;
+                            },
+                            error.ProcessFdQuotaExceeded => {
+                                const response = try unified.buildFsrpcError(
+                                    allocator,
+                                    parsed.tag,
+                                    "runtime_resource_exhausted",
+                                    "sandbox runtime hit process fd quota",
                                 );
                                 defer allocator.free(response);
                                 try writeFrameLocked(stream, &connection_write_mutex, response, .text);
