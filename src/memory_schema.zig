@@ -2,7 +2,7 @@ const std = @import("std");
 const agent_runtime = @import("agent_runtime.zig");
 const memory = @import("ziggy-memory-store").memory;
 const memid = @import("ziggy-memory-store").memid;
-const protocol = @import("ziggy-spider-protocol").protocol;
+const protocol = @import("spider-protocol").protocol;
 
 pub const POLICY_MEM_NAME = "system.policy";
 pub const LOOP_CONTRACT_MEM_NAME = "system.loop_contract";

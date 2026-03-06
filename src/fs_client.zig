@@ -1,6 +1,6 @@
 const std = @import("std");
 const fs_protocol = @import("fs_protocol.zig");
-const unified = @import("ziggy-spider-protocol").unified;
+const unified = @import("spider-protocol").unified;
 
 const request_response_timeout_ms: i32 = 15_000;
 const handshake_reply_timeout_ms: i32 = 10_000;
@@ -96,9 +96,9 @@ pub const FsClient = struct {
         timeout_ms: i32,
         on_event: ?EventCallback,
         on_event_ctx: ?*anyopaque,
-    ) !void {
+    ) !usize {
         if (timeout_ms < -1) return error.InvalidTimeout;
-        if (!try waitForReadable(&self.stream, timeout_ms)) return;
+        if (!try waitForReadable(&self.stream, timeout_ms)) return 0;
 
         var processed_frames: usize = 0;
         while (true) {
@@ -121,6 +121,8 @@ pub const FsClient = struct {
             if (processed_frames >= max_event_frames_per_pump) break;
             if (!try waitForReadable(&self.stream, 0)) break;
         }
+
+        return processed_frames;
     }
 };
 

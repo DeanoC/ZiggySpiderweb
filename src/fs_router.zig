@@ -54,7 +54,7 @@ const Endpoint = struct {
     caps_native_watch: ?bool = null,
     caps_case_sensitive: ?bool = null,
     client: ?fs_client.FsClient = null,
-    event_client: ?fs_client.FsClient = null,
+    client_mutex: std.Thread.Mutex = .{},
     event_thread: ?std.Thread = null,
     event_stop: bool = false,
     event_mutex: std.Thread.Mutex = .{},
@@ -66,7 +66,6 @@ const Endpoint = struct {
 
     fn deinit(self: *Endpoint, allocator: std.mem.Allocator) void {
         if (self.client) |*client| client.deinit();
-        if (self.event_client) |*client| client.deinit();
         allocator.free(self.name);
         allocator.free(self.url);
         if (self.export_name) |value| allocator.free(value);
@@ -1159,13 +1158,13 @@ pub const Router = struct {
             };
         }
 
-        var response = endpoint.client.?.call(
+        var response = self.callEndpointClientLocked(
+            endpoint,
             op,
             node,
             handle,
             args_json,
-            handleClientEvent,
-            @ptrCast(&event_ctx),
+            &event_ctx,
         ) catch |err| {
             if (!isEndpointFailureError(err)) return err;
 
@@ -1178,13 +1177,13 @@ pub const Router = struct {
                 return reconnect_err;
             };
 
-            const retried = self.endpoints.items[endpoint_usize].client.?.call(
+            const retried = self.callEndpointClientLocked(
+                &self.endpoints.items[endpoint_usize],
                 op,
                 node,
                 handle,
                 args_json,
-                handleClientEvent,
-                @ptrCast(&event_ctx),
+                &event_ctx,
             ) catch |retry_err| {
                 if (isEndpointFailureError(retry_err)) {
                     self.noteEndpointFailure(endpoint_usize);
@@ -1207,13 +1206,13 @@ pub const Router = struct {
             };
 
             response.deinit(self.allocator);
-            response = self.endpoints.items[endpoint_usize].client.?.call(
+            response = self.callEndpointClientLocked(
+                &self.endpoints.items[endpoint_usize],
                 op,
                 node,
                 handle,
                 args_json,
-                handleClientEvent,
-                @ptrCast(&event_ctx),
+                &event_ctx,
             ) catch |retry_err| {
                 if (isEndpointFailureError(retry_err)) {
                     self.noteEndpointFailure(endpoint_usize);
@@ -1227,12 +1226,37 @@ pub const Router = struct {
         return response;
     }
 
+    fn callEndpointClientLocked(
+        self: *Router,
+        endpoint: *Endpoint,
+        op: fs_protocol.Op,
+        node: ?u64,
+        handle: ?u64,
+        args_json: ?[]const u8,
+        event_ctx: *EventDispatchContext,
+    ) !fs_client.ClientResponse {
+        _ = self;
+        endpoint.client_mutex.lock();
+        defer endpoint.client_mutex.unlock();
+        if (endpoint.client) |*client| {
+            return client.call(
+                op,
+                node,
+                handle,
+                args_json,
+                handleClientEvent,
+                @ptrCast(event_ctx),
+            );
+        }
+        return error.ConnectionClosed;
+    }
+
     fn reconnectEndpoint(self: *Router, endpoint_index: usize) !void {
         const endpoint = &self.endpoints.items[endpoint_index];
         var replacement = try fs_client.FsClient.connect(self.allocator, endpoint.url);
         errdefer replacement.deinit();
 
-        const hello_payload = try self.buildFsHelloPayload(endpoint, false);
+        const hello_payload = try self.buildFsHelloPayload(endpoint, true);
         defer self.allocator.free(hello_payload);
 
         var hello = try replacement.call(.HELLO, null, null, hello_payload, null, null);
@@ -1244,6 +1268,9 @@ pub const Router = struct {
 
         var selected = try pickExportInfo(self.allocator, exports.result_json, endpoint.export_name);
         errdefer selected.deinit(self.allocator);
+        if (self.event_pumps_armed) {
+            self.stopEventPump(endpoint_index);
+        }
         if (endpoint.client) |*existing| {
             existing.deinit();
         }
@@ -1316,22 +1343,7 @@ pub const Router = struct {
     fn restartEventPump(self: *Router, endpoint_index: usize) !void {
         self.stopEventPump(endpoint_index);
         const endpoint = &self.endpoints.items[endpoint_index];
-
-        var event_client = try fs_client.FsClient.connect(self.allocator, endpoint.url);
-        errdefer event_client.deinit();
-
-        const hello_payload = try self.buildFsHelloPayload(endpoint, true);
-        defer self.allocator.free(hello_payload);
-        var hello = try event_client.call(.HELLO, null, null, hello_payload, null, null);
-        hello.deinit(self.allocator);
-
-        endpoint.event_client = event_client;
-        errdefer {
-            if (endpoint.event_client) |*client| {
-                client.deinit();
-                endpoint.event_client = null;
-            }
-        }
+        if (endpoint.client == null) return;
         endpoint.event_mutex.lock();
         endpoint.event_stop = false;
         endpoint.event_mutex.unlock();
@@ -1353,10 +1365,6 @@ pub const Router = struct {
             thread.join();
             endpoint.event_thread = null;
         }
-        if (endpoint.event_client) |*client| {
-            client.deinit();
-            endpoint.event_client = null;
-        }
     }
 
     fn shouldStopEventPump(endpoint: *Endpoint) bool {
@@ -1371,25 +1379,39 @@ pub const Router = struct {
             if (endpoint_usize >= self.endpoints.items.len) return;
             const endpoint = &self.endpoints.items[endpoint_usize];
             if (shouldStopEventPump(endpoint)) return;
-            if (endpoint.event_client == null) return;
+            if (endpoint.client == null) return;
 
             var event_ctx = EventDispatchContext{
                 .router = self,
                 .endpoint_index = endpoint_index,
             };
-
-            endpoint.event_client.?.pumpEvents(
-                250,
-                handleClientEvent,
-                @ptrCast(&event_ctx),
-            ) catch |err| {
-                if (isEndpointFailureError(err)) return;
+            const pump_result = blk: {
+                endpoint.client_mutex.lock();
+                defer endpoint.client_mutex.unlock();
+                if (shouldStopEventPump(endpoint)) return;
+                if (endpoint.client == null) return;
+                break :blk endpoint.client.?.pumpEvents(
+                    0,
+                    handleClientEvent,
+                    @ptrCast(&event_ctx),
+                );
+            };
+            const processed_frames = pump_result catch |err| {
+                if (isEndpointFailureError(err)) {
+                    self.noteEndpointFailure(endpoint_usize);
+                    return;
+                }
                 std.log.warn(
                     "fs router event pump error endpoint {d}: {s}",
                     .{ endpoint_index, @errorName(err) },
                 );
                 std.Thread.sleep(250 * std.time.ns_per_ms);
+                continue;
             };
+
+            if (processed_frames == 0) {
+                std.Thread.sleep(250 * std.time.ns_per_ms);
+            }
         }
     }
 
@@ -1437,7 +1459,7 @@ pub const Router = struct {
         }
 
         endpoint.last_health_check_ms = now;
-        const hello_payload = try self.buildFsHelloPayload(endpoint, false);
+        const hello_payload = try self.buildFsHelloPayload(endpoint, self.event_pumps_armed);
         defer self.allocator.free(hello_payload);
         var hello = self.callEndpoint(@intCast(endpoint_index), .HELLO, null, null, hello_payload) catch |err| {
             if (isEndpointFailureError(err)) {

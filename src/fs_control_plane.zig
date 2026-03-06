@@ -22,6 +22,7 @@ const default_platform_os = "unknown";
 const default_platform_arch = "unknown";
 const default_platform_runtime_kind = "unknown";
 const debug_stream_max_bytes: usize = 2 * 1024 * 1024;
+const node_service_event_history_max_default: usize = 1024;
 
 const ProjectKind = enum {
     normal,
@@ -189,6 +190,18 @@ const NodeServiceDigest = struct {
     }
 };
 
+const NodeServiceEventRecord = struct {
+    timestamp_ms: i64,
+    node_id: []u8,
+    payload_json: []u8,
+
+    fn deinit(self: *NodeServiceEventRecord, allocator: std.mem.Allocator) void {
+        allocator.free(self.node_id);
+        allocator.free(self.payload_json);
+        self.* = undefined;
+    }
+};
+
 const PendingJoin = struct {
     id: []u8,
     node_name: []u8,
@@ -289,6 +302,7 @@ pub const ControlPlane = struct {
     allocator: std.mem.Allocator,
     primary_agent_id: []const u8 = default_primary_agent_id,
     spider_web_root: []const u8 = default_spider_web_root,
+    node_service_event_history_max: usize = node_service_event_history_max_default,
     store: ?*ltm_store.VersionedMemStore = null,
     state_encryption_key: ?[persistence_cipher.key_length]u8 = null,
     mutex: std.Thread.Mutex = .{},
@@ -299,6 +313,7 @@ pub const ControlPlane = struct {
     projects: std.StringHashMapUnmanaged(Project) = .{},
     active_project_by_agent: std.StringHashMapUnmanaged([]u8) = .{},
     debug_stream_by_agent: std.StringHashMapUnmanaged([]u8) = .{},
+    node_service_event_history: std.ArrayListUnmanaged(NodeServiceEventRecord) = .{},
 
     next_invite_id: u64 = 1,
     next_node_id: u64 = 1,
@@ -348,6 +363,7 @@ pub const ControlPlane = struct {
     pub const InitOptions = struct {
         primary_agent_id: []const u8 = default_primary_agent_id,
         spider_web_root: []const u8 = default_spider_web_root,
+        node_service_event_history_max: usize = node_service_event_history_max_default,
     };
 
     pub fn init(allocator: std.mem.Allocator) ControlPlane {
@@ -363,10 +379,15 @@ pub const ControlPlane = struct {
             options.spider_web_root
         else
             default_spider_web_root;
+        const node_service_event_history_max = if (options.node_service_event_history_max == 0)
+            node_service_event_history_max_default
+        else
+            options.node_service_event_history_max;
         var plane: ControlPlane = .{
             .allocator = allocator,
             .primary_agent_id = primary_agent_id,
             .spider_web_root = spider_web_root,
+            .node_service_event_history_max = node_service_event_history_max,
         };
         plane.ensureBuiltinProjectBestEffortLocked(std.time.milliTimestamp());
         return plane;
@@ -707,6 +728,91 @@ pub const ControlPlane = struct {
         return allocator.dupe(u8, "");
     }
 
+    fn appendNodeServiceEventLocked(self: *ControlPlane, node_id: []const u8, payload_json: []const u8) void {
+        while (self.node_service_event_history.items.len >= self.node_service_event_history_max and
+            self.node_service_event_history.items.len > 0)
+        {
+            var dropped = self.node_service_event_history.orderedRemove(0);
+            dropped.deinit(self.allocator);
+        }
+
+        const node_copy = self.allocator.dupe(u8, node_id) catch return;
+        errdefer self.allocator.free(node_copy);
+        const payload_copy = self.allocator.dupe(u8, payload_json) catch return;
+        errdefer self.allocator.free(payload_copy);
+        self.node_service_event_history.append(self.allocator, .{
+            .timestamp_ms = std.time.milliTimestamp(),
+            .node_id = node_copy,
+            .payload_json = payload_copy,
+        }) catch {
+            self.allocator.free(node_copy);
+            self.allocator.free(payload_copy);
+        };
+    }
+
+    pub fn snapshotNodeServiceEvents(
+        self: *ControlPlane,
+        allocator: std.mem.Allocator,
+        project_id: ?[]const u8,
+        agent_id: ?[]const u8,
+        project_token: ?[]const u8,
+        is_admin: bool,
+        replay_limit: usize,
+    ) ![]u8 {
+        var snapshot = std.ArrayListUnmanaged(NodeServiceEventRecord){};
+        defer {
+            for (snapshot.items) |*record| record.deinit(allocator);
+            snapshot.deinit(allocator);
+        }
+
+        {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            _ = self.reapExpiredLeasesLocked(std.time.milliTimestamp());
+            for (self.node_service_event_history.items) |record| {
+                try snapshot.append(allocator, .{
+                    .timestamp_ms = record.timestamp_ms,
+                    .node_id = try allocator.dupe(u8, record.node_id),
+                    .payload_json = try allocator.dupe(u8, record.payload_json),
+                });
+            }
+        }
+
+        var visible_indexes = std.ArrayListUnmanaged(usize){};
+        defer visible_indexes.deinit(allocator);
+        for (snapshot.items, 0..) |record, idx| {
+            if (!is_admin) {
+                const visible_project_id = project_id orelse continue;
+                const visible_agent_id = agent_id orelse continue;
+                if (!self.projectAllowsNodeServiceEvent(
+                    visible_project_id,
+                    visible_agent_id,
+                    project_token,
+                    record.node_id,
+                    false,
+                )) continue;
+            }
+            try visible_indexes.append(allocator, idx);
+        }
+
+        const limit = if (replay_limit == 0) visible_indexes.items.len else @min(replay_limit, visible_indexes.items.len);
+        const start_index = visible_indexes.items.len - limit;
+
+        var out = std.ArrayListUnmanaged(u8){};
+        errdefer out.deinit(allocator);
+        for (visible_indexes.items[start_index..], 0..) |record_index, idx| {
+            const record = snapshot.items[record_index];
+            const escaped_node_id = try jsonEscape(allocator, record.node_id);
+            defer allocator.free(escaped_node_id);
+            if (idx != 0) try out.append(allocator, '\n');
+            try out.writer(allocator).print(
+                "{{\"timestamp_ms\":{d},\"node_id\":\"{s}\",\"payload\":{s}}}",
+                .{ record.timestamp_ms, escaped_node_id, record.payload_json },
+            );
+        }
+        return out.toOwnedSlice(allocator);
+    }
+
     pub fn deinit(self: *ControlPlane) void {
         self.clearState();
 
@@ -753,6 +859,10 @@ pub const ControlPlane = struct {
         }
         self.debug_stream_by_agent.deinit(self.allocator);
         self.debug_stream_by_agent = .{};
+
+        for (self.node_service_event_history.items) |*record| record.deinit(self.allocator);
+        self.node_service_event_history.deinit(self.allocator);
+        self.node_service_event_history = .{};
 
         self.invites_created_total = 0;
         self.invites_redeemed_total = 0;
@@ -1050,8 +1160,11 @@ pub const ControlPlane = struct {
         const delta_json = try renderNodeServiceDeltaJson(self.allocator, &previous, &current);
         defer self.allocator.free(delta_json);
 
+        const response_payload = try self.renderNodeServicePayload(node_id, delta_json);
+        errdefer self.allocator.free(response_payload);
+        self.appendNodeServiceEventLocked(node_id, response_payload);
         self.persistSnapshotBestEffortLocked();
-        return self.renderNodeServicePayload(node_id, delta_json);
+        return response_payload;
     }
 
     pub fn nodeServiceGet(self: *ControlPlane, payload_json: ?[]const u8) ![]u8 {
@@ -6617,6 +6730,41 @@ test "fs_control_plane: node service upsert reports unchanged catalog delta" {
     try std.testing.expect(std.mem.indexOf(u8, second, "\"added\":[]") != null);
     try std.testing.expect(std.mem.indexOf(u8, second, "\"updated\":[]") != null);
     try std.testing.expect(std.mem.indexOf(u8, second, "\"removed\":[]") != null);
+}
+
+test "fs_control_plane: node service event retention honors configured history max" {
+    const allocator = std.testing.allocator;
+    var plane = ControlPlane.initWithOptions(allocator, .{
+        .node_service_event_history_max = 2,
+    });
+    defer plane.deinit();
+
+    const ensured = try plane.ensureNode("retained-node", "ws://127.0.0.1:18891/v2/fs", 60_000);
+    defer allocator.free(ensured);
+    var ensured_parsed = try std.json.parseFromSlice(std.json.Value, allocator, ensured, .{});
+    defer ensured_parsed.deinit();
+    const node_id = ensured_parsed.value.object.get("node_id").?.string;
+    const node_secret = ensured_parsed.value.object.get("node_secret").?.string;
+
+    inline for (0..3) |idx| {
+        const upsert_req = try std.fmt.allocPrint(
+            allocator,
+            "{{\"node_id\":\"{s}\",\"node_secret\":\"{s}\",\"services\":[{{\"service_id\":\"terminal-main\",\"kind\":\"terminal\",\"version\":\"{d}\",\"state\":\"online\",\"endpoints\":[\"/nodes/{s}/terminal/main\"],\"capabilities\":{{\"pty\":true}}}}]}}",
+            .{ node_id, node_secret, idx, node_id },
+        );
+        defer allocator.free(upsert_req);
+        const upserted = try plane.nodeServiceUpsert(upsert_req);
+        defer allocator.free(upserted);
+    }
+
+    const snapshot = try plane.snapshotNodeServiceEvents(allocator, null, null, null, true, 0);
+    defer allocator.free(snapshot);
+
+    const line_count: usize = if (snapshot.len == 0) 0 else std.mem.count(u8, snapshot, "\n") + 1;
+    try std.testing.expectEqual(@as(usize, 2), line_count);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"version\":\"2\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"version\":\"1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"version\":\"0\"") == null);
 }
 
 test "fs_control_plane: projectUp requires project_token for existing non-builtin project" {

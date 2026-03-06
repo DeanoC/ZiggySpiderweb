@@ -3,7 +3,7 @@ const builtin = @import("builtin");
 const Config = @import("config.zig");
 const connection_dispatcher = @import("connection_dispatcher.zig");
 const memory = @import("ziggy-memory-store").memory;
-const protocol = @import("ziggy-spider-protocol").protocol;
+const protocol = @import("spider-protocol").protocol;
 const runtime_server_mod = @import("runtime_server.zig");
 const runtime_handle_mod = @import("runtime_handle.zig");
 const sandbox_runtime_mod = @import("sandbox_runtime.zig");
@@ -17,7 +17,7 @@ const fs_node_service = @import("fs_node_service.zig");
 const fs_watch_runtime = @import("fs_watch_runtime.zig");
 const agent_registry_mod = @import("agent_registry.zig");
 const tool_registry = @import("ziggy-tool-runtime").tool_registry;
-const unified = @import("ziggy-spider-protocol").unified;
+const unified = @import("spider-protocol").unified;
 
 pub const RuntimeServer = runtime_server_mod.RuntimeServer;
 
@@ -66,9 +66,6 @@ const legacy_local_node_mount_projects_system_agents_self_capabilities = "/nodes
 const control_operator_token_env = "SPIDERWEB_CONTROL_OPERATOR_TOKEN";
 const control_project_scope_token_env = "SPIDERWEB_CONTROL_PROJECT_SCOPE_TOKEN";
 const control_node_scope_token_env = "SPIDERWEB_CONTROL_NODE_SCOPE_TOKEN";
-const node_service_watch_allow_admin_env = "SPIDERWEB_NODE_SERVICE_WATCH_ALLOW_ADMIN";
-const node_service_watch_allow_user_env = "SPIDERWEB_NODE_SERVICE_WATCH_ALLOW_USER";
-const node_service_watch_replay_max_env = "SPIDERWEB_NODE_SERVICE_WATCH_REPLAY_MAX";
 const node_service_event_history_max_env = "SPIDERWEB_NODE_SERVICE_EVENT_HISTORY_MAX";
 const node_service_event_log_rotate_max_bytes_env = "SPIDERWEB_NODE_SERVICE_EVENT_LOG_ROTATE_MAX_BYTES";
 const node_service_event_log_archive_keep_env = "SPIDERWEB_NODE_SERVICE_EVENT_LOG_ARCHIVE_KEEP";
@@ -78,10 +75,11 @@ const fsrpc_runtime_protocol_version = "acheron-1";
 const fsrpc_node_protocol_version = "unified-v2-fs";
 const fsrpc_node_proto_id: i64 = 2;
 const node_tunnel_reply_timeout_ms: i32 = 45_000;
-const min_connection_worker_threads: usize = 16;
-const runtime_warmup_wait_timeout_ms: i64 = 30_000;
+// Each accepted websocket occupies a worker thread for its full lifetime.
+// Internal fs-mount/runtime fan-out can exceed 16 steady-state connections,
+// which starves new control/gui handshakes and appears as "can't connect".
+const min_connection_worker_threads: usize = 64;
 const runtime_warmup_stale_timeout_ms: i64 = 30_000;
-const runtime_warmup_poll_interval_ms: u64 = 100;
 const runtime_residency_worker_interval_ms_default: u64 = 1_000;
 const session_heartbeat_ttl_ms: i64 = 5 * 60 * 1000;
 const agent_heartbeat_ttl_ms: i64 = 5 * 60 * 1000;
@@ -1026,31 +1024,6 @@ const NodeTunnelRegistry = struct {
     }
 };
 
-const ControlTopologySubscriber = struct {
-    id: u64,
-    stream: *std.net.Stream,
-    write_mutex: *std.Thread.Mutex,
-};
-
-const NodeServiceSubscriber = struct {
-    id: u64,
-    stream: *std.net.Stream,
-    write_mutex: *std.Thread.Mutex,
-    node_id_filter: ?[]u8 = null,
-    role: ConnectionRole = .admin,
-    agent_id: ?[]u8 = null,
-    project_id: ?[]u8 = null,
-    project_token: ?[]u8 = null,
-
-    fn deinit(self: *NodeServiceSubscriber, allocator: std.mem.Allocator) void {
-        if (self.node_id_filter) |value| allocator.free(value);
-        if (self.agent_id) |value| allocator.free(value);
-        if (self.project_id) |value| allocator.free(value);
-        if (self.project_token) |value| allocator.free(value);
-        self.* = undefined;
-    }
-};
-
 const NodeServiceEventRecord = struct {
     timestamp_ms: i64,
     node_id: ?[]u8 = null,
@@ -1063,27 +1036,7 @@ const NodeServiceEventRecord = struct {
     }
 };
 
-const NodeServiceWatchRequest = struct {
-    node_id: ?[]u8 = null,
-    replay_limit: usize = 25,
-
-    fn deinit(self: *NodeServiceWatchRequest, allocator: std.mem.Allocator) void {
-        if (self.node_id) |value| allocator.free(value);
-        self.* = undefined;
-    }
-};
-
-const NodeServiceWatchMetricsSnapshot = struct {
-    subscribers_current: usize = 0,
-    subscribers_peak: usize = 0,
-    replay_requests_total: u64 = 0,
-    replay_attempted_total: u64 = 0,
-    replay_sent_total: u64 = 0,
-    replay_bytes_total: u64 = 0,
-    fanout_events_total: u64 = 0,
-    fanout_attempted_total: u64 = 0,
-    fanout_sent_total: u64 = 0,
-    fanout_dropped_total: u64 = 0,
+const NodeServiceEventMetricsSnapshot = struct {
     retained_events: usize = 0,
     retained_capacity: usize = 0,
     retained_oldest_ms: ?i64 = null,
@@ -3958,15 +3911,6 @@ const AgentRuntimeRegistry = struct {
     runtime_warmup_lifecycle_cond: std.Thread.Condition = .{},
     runtime_warmup_inflight: usize = 0,
     runtime_warmup_stopping: bool = false,
-    topology_subscribers_mutex: std.Thread.Mutex = .{},
-    topology_subscribers: std.ArrayListUnmanaged(ControlTopologySubscriber) = .{},
-    next_topology_subscriber_id: u64 = 1,
-    node_service_subscribers_mutex: std.Thread.Mutex = .{},
-    node_service_subscribers: std.ArrayListUnmanaged(NodeServiceSubscriber) = .{},
-    next_node_service_subscriber_id: u64 = 1,
-    node_service_watch_allow_admin: bool = true,
-    node_service_watch_allow_user: bool = false,
-    node_service_watch_replay_max: usize = 250,
     node_service_event_history_mutex: std.Thread.Mutex = .{},
     node_service_event_history: std.ArrayListUnmanaged(NodeServiceEventRecord) = .{},
     node_service_event_history_max: usize = node_service_event_history_max_default,
@@ -3974,16 +3918,6 @@ const AgentRuntimeRegistry = struct {
     node_service_event_log_rotate_max_bytes: u64 = 4 * 1024 * 1024,
     node_service_event_log_archive_keep: usize = 8,
     node_service_event_log_gzip_available: bool = false,
-    node_service_watch_metrics_mutex: std.Thread.Mutex = .{},
-    node_service_watch_subscribers_peak: usize = 0,
-    node_service_watch_replay_requests_total: u64 = 0,
-    node_service_watch_replay_attempted_total: u64 = 0,
-    node_service_watch_replay_sent_total: u64 = 0,
-    node_service_watch_replay_bytes_total: u64 = 0,
-    node_service_watch_fanout_events_total: u64 = 0,
-    node_service_watch_fanout_attempted_total: u64 = 0,
-    node_service_watch_fanout_sent_total: u64 = 0,
-    node_service_watch_fanout_dropped_total: u64 = 0,
     audit_records_mutex: std.Thread.Mutex = .{},
     audit_records: std.ArrayListUnmanaged(AuditRecord) = .{},
     next_audit_record_id: u64 = 1,
@@ -4036,10 +3970,6 @@ const AgentRuntimeRegistry = struct {
         if (node_scope_token != null) {
             std.log.info("control-plane node-scope token enabled via {s}", .{control_node_scope_token_env});
         }
-        const watch_allow_admin = parseBoolEnv(allocator, node_service_watch_allow_admin_env, true);
-        const watch_allow_user = parseBoolEnv(allocator, node_service_watch_allow_user_env, false);
-        const replay_max_raw = parseUnsignedEnv(allocator, node_service_watch_replay_max_env, 250);
-        const replay_max: usize = @intCast(@max(@as(u64, 1), @min(replay_max_raw, 10_000)));
         const history_max_raw = parseUnsignedEnv(
             allocator,
             node_service_event_history_max_env,
@@ -4083,6 +4013,7 @@ const AgentRuntimeRegistry = struct {
                 .{
                     .primary_agent_id = system_agent_id,
                     .spider_web_root = effective_runtime_config.spider_web_root,
+                    .node_service_event_history_max = history_max,
                 },
             ),
             .job_index = chat_job_index.ChatJobIndex.init(
@@ -4093,9 +4024,6 @@ const AgentRuntimeRegistry = struct {
             .control_operator_token = operator_token,
             .control_project_scope_token = project_scope_token,
             .control_node_scope_token = node_scope_token,
-            .node_service_watch_allow_admin = watch_allow_admin,
-            .node_service_watch_allow_user = watch_allow_user,
-            .node_service_watch_replay_max = replay_max,
             .node_service_event_history_max = history_max,
             .node_service_event_log_path = event_log_path,
             .node_service_event_log_rotate_max_bytes = event_rotate_max_bytes,
@@ -4156,8 +4084,6 @@ const AgentRuntimeRegistry = struct {
         self.runtime_warmups.deinit(self.allocator);
         self.runtime_warmups = .{};
         self.runtime_warmups_mutex.unlock();
-        self.clearTopologySubscribers();
-        self.clearNodeServiceSubscribers();
         if (self.local_fs_node) |local_fs_node| {
             local_fs_node.deinit(&self.control_plane);
             self.local_fs_node = null;
@@ -4459,24 +4385,27 @@ const AgentRuntimeRegistry = struct {
         agent_id: []const u8,
         project_id: ?[]const u8,
     ) ?*runtime_handle_mod.RuntimeHandle {
-        var removed_unhealthy: ?RemovedRuntimeEntry = null;
         var selected_runtime: ?*runtime_handle_mod.RuntimeHandle = null;
+        var removed_unhealthy: ?RemovedRuntimeEntry = null;
         const runtime_key = runtimeMapKeyForProject(project_id);
         self.mutex.lock();
-        removed_unhealthy = self.takeUnhealthyRuntimeLocked(runtime_key);
-        if (removed_unhealthy == null) {
-            if (self.by_agent.getPtr(runtime_key)) |existing| {
-                if (std.mem.eql(u8, existing.runtime_agent_id, agent_id)) {
+        if (self.by_agent.getPtr(runtime_key)) |existing| {
+            if (std.mem.eql(u8, existing.runtime_agent_id, agent_id)) {
+                if (existing.runtime.isHealthy()) {
                     selected_runtime = existing.runtime;
                     selected_runtime.?.retain();
+                } else {
+                    removed_unhealthy = self.takeUnhealthyRuntimeLocked(runtime_key);
                 }
             }
         }
         self.mutex.unlock();
-
         if (removed_unhealthy) |removed| {
+            std.log.warn(
+                "dropping unhealthy ready runtime binding: project={s} agent={s}",
+                .{ project_id orelse "__auto__", removed.entry.runtime_agent_id },
+            );
             self.deinitRemovedRuntime(removed);
-            return null;
         }
         return selected_runtime;
     }
@@ -4938,6 +4867,13 @@ const AgentRuntimeRegistry = struct {
         }
         self.mutex.unlock();
 
+        if (removed_unhealthy) |removed| {
+            std.log.warn(
+                "replacing unhealthy project runtime: project={s} agent={s}",
+                .{ resolved_project_id, removed.entry.runtime_agent_id },
+            );
+        }
+
         if (removed_mismatched) |removed| {
             std.log.info(
                 "switching project runtime persona: project={s} from={s} to={s}",
@@ -5354,41 +5290,9 @@ const AgentRuntimeRegistry = struct {
         binding_key: []const u8,
         state: SessionAttachStateSnapshot,
     ) void {
-        const escaped_binding = unified.jsonEscape(self.allocator, binding_key) catch return;
-        defer self.allocator.free(escaped_binding);
-        const escaped_state = unified.jsonEscape(self.allocator, sessionAttachStateName(state.state)) catch return;
-        defer self.allocator.free(escaped_state);
-
-        const error_code_json = if (state.error_code) |value| blk: {
-            const escaped = unified.jsonEscape(self.allocator, value) catch return;
-            defer self.allocator.free(escaped);
-            break :blk std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped}) catch return;
-        } else self.allocator.dupe(u8, "null") catch return;
-        defer self.allocator.free(error_code_json);
-
-        const error_message_json = if (state.error_message) |value| blk: {
-            const escaped = unified.jsonEscape(self.allocator, value) catch return;
-            defer self.allocator.free(escaped);
-            break :blk std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped}) catch return;
-        } else self.allocator.dupe(u8, "null") catch return;
-        defer self.allocator.free(error_message_json);
-
-        const payload_json = std.fmt.allocPrint(
-            self.allocator,
-            "{{\"binding\":\"{s}\",\"state\":\"{s}\",\"runtime_ready\":{},\"mount_ready\":{},\"error_code\":{s},\"error_message\":{s},\"updated_at_ms\":{d}}}",
-            .{
-                escaped_binding,
-                escaped_state,
-                state.runtime_ready,
-                state.mount_ready,
-                error_code_json,
-                error_message_json,
-                state.updated_at_ms,
-            },
-        ) catch return;
-        defer self.allocator.free(payload_json);
-
-        self.broadcastTopologyDebugEvent("control.session_attach_state", payload_json);
+        _ = self;
+        _ = binding_key;
+        _ = state;
     }
 
     fn markRuntimeWarmupReady(self: *AgentRuntimeRegistry, binding_key: []const u8) void {
@@ -5647,26 +5551,6 @@ const AgentRuntimeRegistry = struct {
         return self.runtimeAttachSnapshotByKey(binding_key);
     }
 
-    fn waitForRuntimeWarmup(
-        self: *AgentRuntimeRegistry,
-        agent_id: []const u8,
-        project_id: ?[]const u8,
-        timeout_ms: i64,
-    ) SessionAttachStateSnapshot {
-        var snapshot = self.runtimeAttachSnapshot(agent_id, project_id);
-        if (snapshot.state != .warming or timeout_ms <= 0) return snapshot;
-
-        const started_ms = std.time.milliTimestamp();
-        while (snapshot.state == .warming) {
-            const elapsed_ms = std.time.milliTimestamp() - started_ms;
-            if (elapsed_ms >= timeout_ms) break;
-            std.Thread.sleep(runtime_warmup_poll_interval_ms * std.time.ns_per_ms);
-            snapshot.deinit(self.allocator);
-            snapshot = self.runtimeAttachSnapshot(agent_id, project_id);
-        }
-        return snapshot;
-    }
-
     fn getFirstAgentId(self: *AgentRuntimeRegistry) ?[]const u8 {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -5851,155 +5735,6 @@ const AgentRuntimeRegistry = struct {
         }
         try out.appendSlice(self.allocator, "]}");
         return out.toOwnedSlice(self.allocator);
-    }
-
-    fn clearTopologySubscribers(self: *AgentRuntimeRegistry) void {
-        self.topology_subscribers_mutex.lock();
-        defer self.topology_subscribers_mutex.unlock();
-        self.topology_subscribers.deinit(self.allocator);
-        self.topology_subscribers = .{};
-        self.next_topology_subscriber_id = 1;
-    }
-
-    fn registerTopologySubscriber(
-        self: *AgentRuntimeRegistry,
-        stream: *std.net.Stream,
-        write_mutex: *std.Thread.Mutex,
-    ) !u64 {
-        self.topology_subscribers_mutex.lock();
-        defer self.topology_subscribers_mutex.unlock();
-        const id = self.next_topology_subscriber_id;
-        self.next_topology_subscriber_id +%= 1;
-        if (self.next_topology_subscriber_id == 0) self.next_topology_subscriber_id = 1;
-        try self.topology_subscribers.append(self.allocator, .{
-            .id = id,
-            .stream = stream,
-            .write_mutex = write_mutex,
-        });
-        return id;
-    }
-
-    fn unregisterTopologySubscriber(self: *AgentRuntimeRegistry, subscriber_id: u64) void {
-        self.topology_subscribers_mutex.lock();
-        defer self.topology_subscribers_mutex.unlock();
-        var idx: usize = 0;
-        while (idx < self.topology_subscribers.items.len) : (idx += 1) {
-            if (self.topology_subscribers.items[idx].id != subscriber_id) continue;
-            _ = self.topology_subscribers.swapRemove(idx);
-            return;
-        }
-    }
-
-    fn clearNodeServiceSubscribers(self: *AgentRuntimeRegistry) void {
-        self.node_service_subscribers_mutex.lock();
-        defer self.node_service_subscribers_mutex.unlock();
-        for (self.node_service_subscribers.items) |*subscriber| {
-            subscriber.deinit(self.allocator);
-        }
-        self.node_service_subscribers.deinit(self.allocator);
-        self.node_service_subscribers = .{};
-        self.next_node_service_subscriber_id = 1;
-    }
-
-    fn registerNodeServiceSubscriber(
-        self: *AgentRuntimeRegistry,
-        stream: *std.net.Stream,
-        write_mutex: *std.Thread.Mutex,
-        node_id_filter: ?[]const u8,
-        role: ConnectionRole,
-        agent_id: ?[]const u8,
-        project_id: ?[]const u8,
-        project_token: ?[]const u8,
-    ) !u64 {
-        self.node_service_subscribers_mutex.lock();
-        defer self.node_service_subscribers_mutex.unlock();
-        const id = self.next_node_service_subscriber_id;
-        self.next_node_service_subscriber_id +%= 1;
-        if (self.next_node_service_subscriber_id == 0) self.next_node_service_subscriber_id = 1;
-        const filter_copy = if (node_id_filter) |value|
-            try self.allocator.dupe(u8, value)
-        else
-            null;
-        errdefer if (filter_copy) |value| self.allocator.free(value);
-        const agent_copy = if (agent_id) |value|
-            try self.allocator.dupe(u8, value)
-        else
-            null;
-        errdefer if (agent_copy) |value| self.allocator.free(value);
-        const project_copy = if (project_id) |value|
-            try self.allocator.dupe(u8, value)
-        else
-            null;
-        errdefer if (project_copy) |value| self.allocator.free(value);
-        const project_token_copy = if (project_token) |value|
-            try self.allocator.dupe(u8, value)
-        else
-            null;
-        errdefer if (project_token_copy) |value| self.allocator.free(value);
-        try self.node_service_subscribers.append(self.allocator, .{
-            .id = id,
-            .stream = stream,
-            .write_mutex = write_mutex,
-            .node_id_filter = filter_copy,
-            .role = role,
-            .agent_id = agent_copy,
-            .project_id = project_copy,
-            .project_token = project_token_copy,
-        });
-        self.node_service_watch_metrics_mutex.lock();
-        const next_count = self.node_service_subscribers.items.len;
-        if (next_count > self.node_service_watch_subscribers_peak) {
-            self.node_service_watch_subscribers_peak = next_count;
-        }
-        self.node_service_watch_metrics_mutex.unlock();
-        return id;
-    }
-
-    fn unregisterNodeServiceSubscriber(self: *AgentRuntimeRegistry, subscriber_id: u64) void {
-        self.node_service_subscribers_mutex.lock();
-        defer self.node_service_subscribers_mutex.unlock();
-        var idx: usize = 0;
-        while (idx < self.node_service_subscribers.items.len) : (idx += 1) {
-            if (self.node_service_subscribers.items[idx].id != subscriber_id) continue;
-            var removed = self.node_service_subscribers.swapRemove(idx);
-            removed.deinit(self.allocator);
-            return;
-        }
-    }
-
-    fn isNodeServiceWatchAllowedForRole(self: *AgentRuntimeRegistry, role: ConnectionRole) bool {
-        return switch (role) {
-            .admin => self.node_service_watch_allow_admin,
-            .user => self.node_service_watch_allow_user,
-        };
-    }
-
-    fn nodeServiceEventVisibleToContext(
-        self: *AgentRuntimeRegistry,
-        role: ConnectionRole,
-        agent_id: ?[]const u8,
-        project_id: ?[]const u8,
-        project_token: ?[]const u8,
-        node_id_filter: ?[]const u8,
-        event_node_id: ?[]const u8,
-    ) bool {
-        if (node_id_filter) |filter| {
-            const concrete_event_node_id = event_node_id orelse return false;
-            if (!std.mem.eql(u8, filter, concrete_event_node_id)) return false;
-        }
-
-        if (role == .admin) return true;
-
-        const concrete_project_id = project_id orelse return false;
-        const concrete_agent_id = agent_id orelse return false;
-        const concrete_event_node_id = event_node_id orelse return false;
-        return self.control_plane.projectAllowsNodeServiceEvent(
-            concrete_project_id,
-            concrete_agent_id,
-            project_token,
-            concrete_event_node_id,
-            false,
-        );
     }
 
     fn clearNodeServiceEventHistory(self: *AgentRuntimeRegistry) void {
@@ -6197,41 +5932,8 @@ const AgentRuntimeRegistry = struct {
         }
     }
 
-    fn recordNodeServiceReplayMetrics(
-        self: *AgentRuntimeRegistry,
-        attempted: usize,
-        sent: usize,
-        bytes: usize,
-    ) void {
-        self.node_service_watch_metrics_mutex.lock();
-        defer self.node_service_watch_metrics_mutex.unlock();
-        self.node_service_watch_replay_requests_total +%= 1;
-        self.node_service_watch_replay_attempted_total +%= @intCast(attempted);
-        self.node_service_watch_replay_sent_total +%= @intCast(sent);
-        self.node_service_watch_replay_bytes_total +%= @intCast(bytes);
-    }
-
-    fn recordNodeServiceFanoutMetrics(
-        self: *AgentRuntimeRegistry,
-        attempts: usize,
-        sent: usize,
-        dropped: usize,
-    ) void {
-        self.node_service_watch_metrics_mutex.lock();
-        defer self.node_service_watch_metrics_mutex.unlock();
-        self.node_service_watch_fanout_events_total +%= 1;
-        self.node_service_watch_fanout_attempted_total +%= @intCast(attempts);
-        self.node_service_watch_fanout_sent_total +%= @intCast(sent);
-        self.node_service_watch_fanout_dropped_total +%= @intCast(dropped);
-    }
-
-    fn snapshotNodeServiceWatchMetrics(self: *AgentRuntimeRegistry) NodeServiceWatchMetricsSnapshot {
-        var snapshot = NodeServiceWatchMetricsSnapshot{};
-
-        self.node_service_subscribers_mutex.lock();
-        snapshot.subscribers_current = self.node_service_subscribers.items.len;
-        self.node_service_subscribers_mutex.unlock();
-
+    fn snapshotNodeServiceEventMetrics(self: *AgentRuntimeRegistry) NodeServiceEventMetricsSnapshot {
+        var snapshot = NodeServiceEventMetricsSnapshot{};
         self.node_service_event_history_mutex.lock();
         snapshot.retained_events = self.node_service_event_history.items.len;
         snapshot.retained_capacity = self.node_service_event_history_max;
@@ -6245,40 +5947,17 @@ const AgentRuntimeRegistry = struct {
             }
         }
         self.node_service_event_history_mutex.unlock();
-
-        self.node_service_watch_metrics_mutex.lock();
-        snapshot.subscribers_peak = self.node_service_watch_subscribers_peak;
-        snapshot.replay_requests_total = self.node_service_watch_replay_requests_total;
-        snapshot.replay_attempted_total = self.node_service_watch_replay_attempted_total;
-        snapshot.replay_sent_total = self.node_service_watch_replay_sent_total;
-        snapshot.replay_bytes_total = self.node_service_watch_replay_bytes_total;
-        snapshot.fanout_events_total = self.node_service_watch_fanout_events_total;
-        snapshot.fanout_attempted_total = self.node_service_watch_fanout_attempted_total;
-        snapshot.fanout_sent_total = self.node_service_watch_fanout_sent_total;
-        snapshot.fanout_dropped_total = self.node_service_watch_fanout_dropped_total;
-        self.node_service_watch_metrics_mutex.unlock();
-
         return snapshot;
     }
 
-    fn appendNodeServiceWatchMetricsJson(
+    fn appendNodeServiceEventMetricsJson(
         self: *AgentRuntimeRegistry,
         out: *std.ArrayListUnmanaged(u8),
-        snapshot: NodeServiceWatchMetricsSnapshot,
+        snapshot: NodeServiceEventMetricsSnapshot,
     ) !void {
         try out.writer(self.allocator).print(
-            "{{\"subscribers\":{{\"current\":{d},\"peak\":{d}}},\"replay\":{{\"requests_total\":{d},\"attempted_total\":{d},\"sent_total\":{d},\"bytes_total\":{d}}},\"fanout\":{{\"events_total\":{d},\"attempted_total\":{d},\"sent_total\":{d},\"dropped_total\":{d}}},\"retained\":{{\"events\":{d},\"capacity\":{d},\"oldest_ms\":",
+            "{{\"retained\":{{\"events\":{d},\"capacity\":{d},\"oldest_ms\":",
             .{
-                snapshot.subscribers_current,
-                snapshot.subscribers_peak,
-                snapshot.replay_requests_total,
-                snapshot.replay_attempted_total,
-                snapshot.replay_sent_total,
-                snapshot.replay_bytes_total,
-                snapshot.fanout_events_total,
-                snapshot.fanout_attempted_total,
-                snapshot.fanout_sent_total,
-                snapshot.fanout_dropped_total,
                 snapshot.retained_events,
                 snapshot.retained_capacity,
             },
@@ -6301,7 +5980,7 @@ const AgentRuntimeRegistry = struct {
         const base = try self.control_plane.metricsJson();
         defer self.allocator.free(base);
 
-        const snapshot = self.snapshotNodeServiceWatchMetrics();
+        const snapshot = self.snapshotNodeServiceEventMetrics();
         const trimmed = std.mem.trimRight(u8, base, " \t\r\n");
         if (trimmed.len == 0 or trimmed[trimmed.len - 1] != '}') {
             return self.allocator.dupe(u8, base);
@@ -6310,8 +5989,8 @@ const AgentRuntimeRegistry = struct {
         var out = std.ArrayListUnmanaged(u8){};
         errdefer out.deinit(self.allocator);
         try out.appendSlice(self.allocator, trimmed[0 .. trimmed.len - 1]);
-        try out.appendSlice(self.allocator, ",\"node_service_watch\":");
-        try self.appendNodeServiceWatchMetricsJson(&out, snapshot);
+        try out.appendSlice(self.allocator, ",\"node_service_events\":");
+        try self.appendNodeServiceEventMetricsJson(&out, snapshot);
         try out.append(self.allocator, '}');
         return out.toOwnedSlice(self.allocator);
     }
@@ -6320,7 +5999,7 @@ const AgentRuntimeRegistry = struct {
         const base = try self.control_plane.metricsPrometheus();
         defer self.allocator.free(base);
 
-        const snapshot = self.snapshotNodeServiceWatchMetrics();
+        const snapshot = self.snapshotNodeServiceEventMetrics();
         var out = std.ArrayListUnmanaged(u8){};
         errdefer out.deinit(self.allocator);
         try out.appendSlice(self.allocator, base);
@@ -6328,45 +6007,15 @@ const AgentRuntimeRegistry = struct {
             try out.append(self.allocator, '\n');
         }
         try out.writer(self.allocator).print(
-            \\# TYPE spiderweb_node_service_watch_subscribers gauge
-            \\spiderweb_node_service_watch_subscribers {d}
-            \\# TYPE spiderweb_node_service_watch_subscribers_peak gauge
-            \\spiderweb_node_service_watch_subscribers_peak {d}
-            \\# TYPE spiderweb_node_service_watch_replay_requests_total counter
-            \\spiderweb_node_service_watch_replay_requests_total {d}
-            \\# TYPE spiderweb_node_service_watch_replay_attempted_total counter
-            \\spiderweb_node_service_watch_replay_attempted_total {d}
-            \\# TYPE spiderweb_node_service_watch_replay_sent_total counter
-            \\spiderweb_node_service_watch_replay_sent_total {d}
-            \\# TYPE spiderweb_node_service_watch_replay_bytes_total counter
-            \\spiderweb_node_service_watch_replay_bytes_total {d}
-            \\# TYPE spiderweb_node_service_watch_fanout_events_total counter
-            \\spiderweb_node_service_watch_fanout_events_total {d}
-            \\# TYPE spiderweb_node_service_watch_fanout_attempted_total counter
-            \\spiderweb_node_service_watch_fanout_attempted_total {d}
-            \\# TYPE spiderweb_node_service_watch_fanout_sent_total counter
-            \\spiderweb_node_service_watch_fanout_sent_total {d}
-            \\# TYPE spiderweb_node_service_watch_fanout_dropped_total counter
-            \\spiderweb_node_service_watch_fanout_dropped_total {d}
-            \\# TYPE spiderweb_node_service_watch_retained_events gauge
-            \\spiderweb_node_service_watch_retained_events {d}
-            \\# TYPE spiderweb_node_service_watch_retained_capacity gauge
-            \\spiderweb_node_service_watch_retained_capacity {d}
-            \\# TYPE spiderweb_node_service_watch_retained_window_ms gauge
-            \\spiderweb_node_service_watch_retained_window_ms {d}
+            \\# TYPE spiderweb_node_service_events_retained_events gauge
+            \\spiderweb_node_service_events_retained_events {d}
+            \\# TYPE spiderweb_node_service_events_retained_capacity gauge
+            \\spiderweb_node_service_events_retained_capacity {d}
+            \\# TYPE spiderweb_node_service_events_retained_window_ms gauge
+            \\spiderweb_node_service_events_retained_window_ms {d}
             \\
         ,
             .{
-                snapshot.subscribers_current,
-                snapshot.subscribers_peak,
-                snapshot.replay_requests_total,
-                snapshot.replay_attempted_total,
-                snapshot.replay_sent_total,
-                snapshot.replay_bytes_total,
-                snapshot.fanout_events_total,
-                snapshot.fanout_attempted_total,
-                snapshot.fanout_sent_total,
-                snapshot.fanout_dropped_total,
                 snapshot.retained_events,
                 snapshot.retained_capacity,
                 snapshot.retained_window_ms,
@@ -6375,244 +6024,12 @@ const AgentRuntimeRegistry = struct {
         return out.toOwnedSlice(self.allocator);
     }
 
-    fn replayNodeServiceEvents(
-        self: *AgentRuntimeRegistry,
-        stream: *std.net.Stream,
-        write_mutex: *std.Thread.Mutex,
-        role: ConnectionRole,
-        agent_id: ?[]const u8,
-        project_id: ?[]const u8,
-        project_token: ?[]const u8,
-        node_id_filter: ?[]const u8,
-        replay_limit: usize,
-    ) !usize {
-        var replay_attempted: usize = 0;
-        var replay_sent: usize = 0;
-        var replay_bytes: usize = 0;
-        defer self.recordNodeServiceReplayMetrics(replay_attempted, replay_sent, replay_bytes);
-        if (replay_limit == 0) return 0;
-
-        var replay_payloads = std.ArrayListUnmanaged([]u8){};
-        defer {
-            for (replay_payloads.items) |payload| self.allocator.free(payload);
-            replay_payloads.deinit(self.allocator);
-        }
-
-        {
-            self.node_service_event_history_mutex.lock();
-            defer self.node_service_event_history_mutex.unlock();
-            var idx = self.node_service_event_history.items.len;
-            while (idx > 0 and replay_payloads.items.len < replay_limit) {
-                idx -= 1;
-                const record = self.node_service_event_history.items[idx];
-                if (!self.nodeServiceEventVisibleToContext(
-                    role,
-                    agent_id,
-                    project_id,
-                    project_token,
-                    node_id_filter,
-                    record.node_id,
-                )) continue;
-                try replay_payloads.append(self.allocator, try self.allocator.dupe(u8, record.payload_json));
-            }
-        }
-
-        var sent: usize = 0;
-        var replay_idx = replay_payloads.items.len;
-        while (replay_idx > 0) {
-            replay_idx -= 1;
-            const frame_json = try unified.buildControlAck(
-                self.allocator,
-                .node_service_event,
-                null,
-                replay_payloads.items[replay_idx],
-            );
-            defer self.allocator.free(frame_json);
-            replay_attempted += 1;
-            try writeFrameLocked(stream, write_mutex, frame_json, .text);
-            sent += 1;
-            replay_sent += 1;
-            replay_bytes += replay_payloads.items[replay_idx].len;
-        }
-        return sent;
-    }
-
     fn emitNodeServiceEvent(
         self: *AgentRuntimeRegistry,
         node_id: ?[]const u8,
         payload_json: []const u8,
     ) void {
         self.recordNodeServiceEvent(node_id, payload_json);
-        const event_json = unified.buildControlAck(
-            self.allocator,
-            .node_service_event,
-            null,
-            payload_json,
-        ) catch return;
-        defer self.allocator.free(event_json);
-
-        self.node_service_subscribers_mutex.lock();
-        defer self.node_service_subscribers_mutex.unlock();
-
-        var fanout_attempts: usize = 0;
-        var fanout_sent: usize = 0;
-        var fanout_dropped: usize = 0;
-        var idx: usize = 0;
-        while (idx < self.node_service_subscribers.items.len) {
-            const subscriber = &self.node_service_subscribers.items[idx];
-            if (!self.nodeServiceEventVisibleToContext(
-                subscriber.role,
-                subscriber.agent_id,
-                subscriber.project_id,
-                subscriber.project_token,
-                subscriber.node_id_filter,
-                node_id,
-            )) {
-                idx += 1;
-                continue;
-            }
-            fanout_attempts += 1;
-            subscriber.write_mutex.lock();
-            const write_result = websocket_transport.writeFrame(subscriber.stream, event_json, .text);
-            subscriber.write_mutex.unlock();
-            if (write_result) |_| {
-                fanout_sent += 1;
-                idx += 1;
-            } else |_| {
-                fanout_dropped += 1;
-                var removed = self.node_service_subscribers.swapRemove(idx);
-                removed.deinit(self.allocator);
-            }
-        }
-        self.recordNodeServiceFanoutMetrics(fanout_attempts, fanout_sent, fanout_dropped);
-    }
-
-    fn emitWorkspaceTopologyChanged(self: *AgentRuntimeRegistry, reason: []const u8) void {
-        const escaped_reason = unified.jsonEscape(self.allocator, reason) catch return;
-        defer self.allocator.free(escaped_reason);
-        const payload_json = std.fmt.allocPrint(
-            self.allocator,
-            "{{\"event\":\"workspace_topology_changed\",\"reason\":\"{s}\",\"ts_ms\":{d}}}",
-            .{ escaped_reason, std.time.milliTimestamp() },
-        ) catch return;
-        defer self.allocator.free(payload_json);
-        self.broadcastTopologyDebugEvent("control.workspace_topology", payload_json);
-    }
-
-    fn emitWorkspaceTopologyProjectDelta(
-        self: *AgentRuntimeRegistry,
-        agent_id: []const u8,
-        reason: []const u8,
-        control_request_payload_json: ?[]const u8,
-        control_response_payload_json: []const u8,
-    ) void {
-        const response_project_id = extractProjectIdFromControlPayload(self.allocator, control_response_payload_json) catch return;
-        defer if (response_project_id) |value| self.allocator.free(value);
-        const request_project_id = if (control_request_payload_json) |value|
-            extractProjectIdFromControlPayload(self.allocator, value) catch return
-        else
-            null;
-        defer if (request_project_id) |value| self.allocator.free(value);
-        const selected_project = response_project_id orelse request_project_id orelse return;
-
-        const response_project_token = extractProjectTokenFromControlPayload(self.allocator, control_response_payload_json) catch return;
-        defer if (response_project_token) |value| self.allocator.free(value);
-        const request_project_token = if (control_request_payload_json) |value|
-            extractProjectTokenFromControlPayload(self.allocator, value) catch return
-        else
-            null;
-        defer if (request_project_token) |value| self.allocator.free(value);
-        const selected_project_token = response_project_token orelse request_project_token;
-
-        const escaped_project = unified.jsonEscape(self.allocator, selected_project) catch return;
-        defer self.allocator.free(escaped_project);
-        const status_req = if (selected_project_token) |project_token| blk: {
-            const escaped_token = unified.jsonEscape(self.allocator, project_token) catch return;
-            defer self.allocator.free(escaped_token);
-            break :blk std.fmt.allocPrint(
-                self.allocator,
-                "{{\"project_id\":\"{s}\",\"project_token\":\"{s}\"}}",
-                .{ escaped_project, escaped_token },
-            ) catch return;
-        } else std.fmt.allocPrint(
-            self.allocator,
-            "{{\"project_id\":\"{s}\"}}",
-            .{escaped_project},
-        ) catch return;
-        defer self.allocator.free(status_req);
-
-        const status_json = self.control_plane.workspaceStatus(agent_id, status_req) catch return;
-        defer self.allocator.free(status_json);
-        if (std.mem.indexOf(u8, status_json, "\"project_id\":null") != null) return;
-
-        const escaped_reason = unified.jsonEscape(self.allocator, reason) catch return;
-        defer self.allocator.free(escaped_reason);
-        const escaped_agent = unified.jsonEscape(self.allocator, agent_id) catch return;
-        defer self.allocator.free(escaped_agent);
-
-        const payload_json = std.fmt.allocPrint(
-            self.allocator,
-            "{{\"event\":\"workspace_topology_delta\",\"reason\":\"{s}\",\"agent_id\":\"{s}\",\"status\":{s},\"ts_ms\":{d}}}",
-            .{ escaped_reason, escaped_agent, status_json, std.time.milliTimestamp() },
-        ) catch return;
-        defer self.allocator.free(payload_json);
-
-        self.broadcastTopologyDebugEvent("control.workspace_topology_delta", payload_json);
-    }
-
-    fn emitWorkspaceAvailabilityRollupChanged(
-        self: *AgentRuntimeRegistry,
-        reason: []const u8,
-        before: fs_control_plane.ControlPlane.AvailabilitySnapshot,
-        after: fs_control_plane.ControlPlane.AvailabilitySnapshot,
-    ) void {
-        const escaped_reason = unified.jsonEscape(self.allocator, reason) catch return;
-        defer self.allocator.free(escaped_reason);
-        var payload = std.ArrayListUnmanaged(u8){};
-        defer payload.deinit(self.allocator);
-        payload.appendSlice(self.allocator, "{\"event\":\"workspace_availability_changed\",\"reason\":\"") catch return;
-        payload.appendSlice(self.allocator, escaped_reason) catch return;
-        payload.appendSlice(self.allocator, "\",\"before\":") catch return;
-        appendAvailabilitySnapshotJson(self.allocator, &payload, before) catch return;
-        payload.appendSlice(self.allocator, ",\"after\":") catch return;
-        appendAvailabilitySnapshotJson(self.allocator, &payload, after) catch return;
-        payload.appendSlice(self.allocator, ",\"ts_ms\":") catch return;
-        payload.writer(self.allocator).print("{d}", .{std.time.milliTimestamp()}) catch return;
-        payload.append(self.allocator, '}') catch return;
-
-        const payload_json = payload.toOwnedSlice(self.allocator) catch return;
-        defer self.allocator.free(payload_json);
-        self.broadcastTopologyDebugEvent("control.workspace_availability", payload_json);
-    }
-
-    fn broadcastTopologyDebugEvent(
-        self: *AgentRuntimeRegistry,
-        category: []const u8,
-        payload_json: []const u8,
-    ) void {
-        const event_json = protocol.buildDebugEvent(
-            self.allocator,
-            "workspace-topology",
-            category,
-            payload_json,
-        ) catch return;
-        defer self.allocator.free(event_json);
-
-        self.topology_subscribers_mutex.lock();
-        defer self.topology_subscribers_mutex.unlock();
-
-        var idx: usize = 0;
-        while (idx < self.topology_subscribers.items.len) {
-            const subscriber = self.topology_subscribers.items[idx];
-            subscriber.write_mutex.lock();
-            const write_result = websocket_transport.writeFrame(subscriber.stream, event_json, .text);
-            subscriber.write_mutex.unlock();
-            if (write_result) |_| {
-                idx += 1;
-            } else |_| {
-                _ = self.topology_subscribers.swapRemove(idx);
-            }
-        }
     }
 
     fn pruneLegacySystemCapabilityMounts(self: *AgentRuntimeRegistry) void {
@@ -6978,7 +6395,6 @@ fn reconcileWorkerMain(runtime_registry: *AgentRuntimeRegistry) void {
         };
         if (maybe_payload) |payload| {
             defer runtime_registry.allocator.free(payload);
-            runtime_registry.broadcastTopologyDebugEvent("control.reconcile", payload);
         }
 
         std.Thread.sleep(runtime_registry.reconcile_worker_interval_ms * std.time.ns_per_ms);
@@ -7172,10 +6588,6 @@ fn handleWebSocketConnection(
     var control_protocol_negotiated = false;
     var runtime_fsrpc_version_negotiated = false;
     var connection_write_mutex: std.Thread.Mutex = .{};
-    var node_service_subscriber_id: ?u64 = null;
-    defer if (node_service_subscriber_id) |subscriber_id| {
-        runtime_registry.unregisterNodeServiceSubscriber(subscriber_id);
-    };
     const connection_service_id = try std.fmt.allocPrint(
         allocator,
         "ws.{s}.{d}",
@@ -7929,14 +7341,8 @@ fn handleWebSocketConnection(
                                     try writeFrameLocked(stream, &connection_write_mutex, response, .text);
                                     continue;
                                 };
-                                if (attach_state.state == .warming) {
-                                    attach_state.deinit(allocator);
-                                    attach_state = runtime_registry.waitForRuntimeWarmup(
-                                        active_binding.agent_id,
-                                        active_binding.project_id,
-                                        runtime_warmup_wait_timeout_ms,
-                                    );
-                                }
+                                // Keep session_attach responsive even when runtime warmup is in-flight.
+                                // Clients can poll control.session_status for warmup progression.
                                 defer attach_state.deinit(allocator);
                                 const attach_json = try buildSessionAttachStateJson(allocator, attach_state);
                                 defer allocator.free(attach_json);
@@ -8505,161 +7911,6 @@ fn handleWebSocketConnection(
                                 try writeFrameLocked(stream, &connection_write_mutex, response, .text);
                                 continue;
                             },
-                            .node_service_watch => {
-                                if (!runtime_registry.isNodeServiceWatchAllowedForRole(principal.role)) {
-                                    const role_name = connectionRoleName(principal.role);
-                                    const response = try unified.buildControlError(
-                                        allocator,
-                                        parsed.id,
-                                        "forbidden",
-                                        if (principal.role == .admin)
-                                            "node service watch is disabled for admin role"
-                                        else
-                                            "node service watch is disabled for user role",
-                                    );
-                                    defer allocator.free(response);
-                                    try writeFrameLocked(stream, &connection_write_mutex, response, .text);
-                                    runtime_registry.appendSecurityAuditAndDebug(
-                                        (session_bindings.get(active_session_key) orelse return error.InvalidState).agent_id,
-                                        .node_service_watch,
-                                        principal.role,
-                                        parsed.correlation_id orelse parsed.id,
-                                        "watch_role_forbidden",
-                                        false,
-                                        "forbidden",
-                                        role_name,
-                                    );
-                                    continue;
-                                }
-                                var watch_request = parseNodeServiceWatchRequest(allocator, parsed.payload_json) catch |err| {
-                                    const response = try unified.buildControlError(
-                                        allocator,
-                                        parsed.id,
-                                        if (err == error.MissingField) "missing_field" else "invalid_payload",
-                                        @errorName(err),
-                                    );
-                                    defer allocator.free(response);
-                                    try writeFrameLocked(stream, &connection_write_mutex, response, .text);
-                                    continue;
-                                };
-                                defer watch_request.deinit(allocator);
-
-                                const active_binding = session_bindings.get(active_session_key) orelse return error.InvalidState;
-                                const watch_agent_id = active_binding.agent_id;
-                                const watch_project_id = active_binding.project_id;
-                                const watch_project_token = active_binding.project_token;
-
-                                if (principal.role == .user) {
-                                    const concrete_project_id = watch_project_id orelse {
-                                        const response = try unified.buildControlError(
-                                            allocator,
-                                            parsed.id,
-                                            "forbidden",
-                                            "watch requires a project-scoped session binding",
-                                        );
-                                        defer allocator.free(response);
-                                        try writeFrameLocked(stream, &connection_write_mutex, response, .text);
-                                        continue;
-                                    };
-                                    if (!runtime_registry.control_plane.projectAllowsAction(
-                                        concrete_project_id,
-                                        watch_agent_id,
-                                        .observe,
-                                        watch_project_token,
-                                        false,
-                                    )) {
-                                        const response = try unified.buildControlError(
-                                            allocator,
-                                            parsed.id,
-                                            "forbidden",
-                                            "observe access denied for active project",
-                                        );
-                                        defer allocator.free(response);
-                                        try writeFrameLocked(stream, &connection_write_mutex, response, .text);
-                                        continue;
-                                    }
-                                }
-
-                                if (node_service_subscriber_id) |subscriber_id| {
-                                    runtime_registry.unregisterNodeServiceSubscriber(subscriber_id);
-                                    node_service_subscriber_id = null;
-                                }
-                                node_service_subscriber_id = try runtime_registry.registerNodeServiceSubscriber(
-                                    stream,
-                                    &connection_write_mutex,
-                                    watch_request.node_id,
-                                    principal.role,
-                                    watch_agent_id,
-                                    watch_project_id,
-                                    watch_project_token,
-                                );
-
-                                const bounded_replay_limit = @min(watch_request.replay_limit, runtime_registry.node_service_watch_replay_max);
-                                const replayed_count = runtime_registry.replayNodeServiceEvents(
-                                    stream,
-                                    &connection_write_mutex,
-                                    principal.role,
-                                    watch_agent_id,
-                                    watch_project_id,
-                                    watch_project_token,
-                                    watch_request.node_id,
-                                    bounded_replay_limit,
-                                ) catch |err| {
-                                    if (node_service_subscriber_id) |subscriber_id| {
-                                        runtime_registry.unregisterNodeServiceSubscriber(subscriber_id);
-                                        node_service_subscriber_id = null;
-                                    }
-                                    const response = try unified.buildControlError(
-                                        allocator,
-                                        parsed.id,
-                                        "execution_failed",
-                                        @errorName(err),
-                                    );
-                                    defer allocator.free(response);
-                                    try writeFrameLocked(stream, &connection_write_mutex, response, .text);
-                                    continue;
-                                };
-
-                                const payload_json = if (watch_request.node_id) |value| blk: {
-                                    const escaped_node = try unified.jsonEscape(allocator, value);
-                                    defer allocator.free(escaped_node);
-                                    break :blk try std.fmt.allocPrint(
-                                        allocator,
-                                        "{{\"enabled\":true,\"node_id\":\"{s}\",\"replay_limit\":{d},\"replayed\":{d}}}",
-                                        .{ escaped_node, bounded_replay_limit, replayed_count },
-                                    );
-                                } else try std.fmt.allocPrint(
-                                    allocator,
-                                    "{{\"enabled\":true,\"replay_limit\":{d},\"replayed\":{d}}}",
-                                    .{ bounded_replay_limit, replayed_count },
-                                );
-                                defer allocator.free(payload_json);
-
-                                const response = try unified.buildControlAck(
-                                    allocator,
-                                    .node_service_watch,
-                                    parsed.id,
-                                    payload_json,
-                                );
-                                defer allocator.free(response);
-                                try writeFrameLocked(stream, &connection_write_mutex, response, .text);
-                                continue;
-                            },
-                            .node_service_unwatch => {
-                                if (node_service_subscriber_id) |subscriber_id| {
-                                    runtime_registry.unregisterNodeServiceSubscriber(subscriber_id);
-                                    node_service_subscriber_id = null;
-                                }
-                                const response = try unified.buildControlAck(
-                                    allocator,
-                                    .node_service_unwatch,
-                                    parsed.id,
-                                    "{\"enabled\":false}",
-                                );
-                                defer allocator.free(response);
-                                try writeFrameLocked(stream, &connection_write_mutex, response, .text);
-                                continue;
-                            },
                             .node_invite_create,
                             .node_join_request,
                             .node_join_pending_list,
@@ -8822,24 +8073,6 @@ fn handleWebSocketConnection(
                                 );
                                 if (topology_mutation or availability_changed) {
                                     runtime_registry.control_plane.requestReconcile();
-                                    const reason = if (availability_changed and !topology_mutation)
-                                        "availability_changed"
-                                    else
-                                        unified.controlTypeName(control_type);
-                                    runtime_registry.emitWorkspaceTopologyChanged(reason);
-                                    runtime_registry.emitWorkspaceTopologyProjectDelta(
-                                        control_agent_id,
-                                        reason,
-                                        parsed.payload_json,
-                                        payload_json,
-                                    );
-                                    if (availability_changed) {
-                                        runtime_registry.emitWorkspaceAvailabilityRollupChanged(
-                                            reason,
-                                            availability_before,
-                                            availability_after,
-                                        );
-                                    }
                                 }
                                 if (topology_mutation) {
                                     runtime_registry.ensureActiveRuntimeResidency(true) catch |err| {
@@ -8992,14 +8225,6 @@ fn handleWebSocketConnection(
                             attach_state.deinit(allocator);
                             attach_state = warmed_attach_state;
 
-                            if (attach_state.state == .warming) {
-                                attach_state.deinit(allocator);
-                                attach_state = runtime_registry.waitForRuntimeWarmup(
-                                    target_binding.agent_id,
-                                    target_binding.project_id,
-                                    runtime_warmup_wait_timeout_ms,
-                                );
-                            }
                             if (attach_state.state == .warming) {
                                 const response = try unified.buildFsrpcError(
                                     allocator,
@@ -9703,30 +8928,6 @@ fn appendAvailabilitySnapshotJson(
     try out.appendSlice(allocator, "}");
 }
 
-fn parseNodeServiceWatchRequest(
-    allocator: std.mem.Allocator,
-    payload_json: ?[]const u8,
-) !NodeServiceWatchRequest {
-    if (payload_json == null) return .{};
-    const raw = payload_json.?;
-    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
-    defer parsed.deinit();
-    if (parsed.value != .object) return error.InvalidPayload;
-
-    var request = NodeServiceWatchRequest{};
-    if (parsed.value.object.get("node_id")) |node_id| {
-        if (node_id != .string or !isValidNodeIdentifier(node_id.string)) return error.InvalidPayload;
-        request.node_id = try allocator.dupe(u8, node_id.string);
-    }
-    errdefer request.deinit(allocator);
-
-    if (parsed.value.object.get("replay_limit")) |replay_limit| {
-        if (replay_limit != .integer or replay_limit.integer < 0) return error.InvalidPayload;
-        request.replay_limit = @intCast(replay_limit.integer);
-    }
-    return request;
-}
-
 fn extractNodeIdFromControlPayload(allocator: std.mem.Allocator, payload_json: []const u8) !?[]u8 {
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload_json, .{});
     defer parsed.deinit();
@@ -10367,19 +9568,11 @@ fn readServerFrame(allocator: std.mem.Allocator, stream: *std.net.Stream) !TestS
     return .{ .opcode = opcode, .payload = payload };
 }
 
-fn readServerFrameSkippingDebug(
+fn readServerFrameForProtocolTest(
     allocator: std.mem.Allocator,
     stream: *std.net.Stream,
-    debug_events_seen: ?*usize,
 ) !TestServerFrame {
-    while (true) {
-        var frame = try readServerFrame(allocator, stream);
-        if (frame.opcode != 0x1 or std.mem.indexOf(u8, frame.payload, "\"type\":\"debug.event\"") == null) {
-            return frame;
-        }
-        if (debug_events_seen) |count| count.* += 1;
-        frame.deinit(allocator);
-    }
+    return readServerFrame(allocator, stream);
 }
 
 fn readExactFromStream(stream: *std.net.Stream, out: []u8) !void {
@@ -10478,18 +9671,17 @@ fn fsrpcWriteChatInput(
     allocator: std.mem.Allocator,
     client: *std.net.Stream,
     content: []const u8,
-    debug_events_seen: ?*usize,
 ) ![]u8 {
     const encoded = try unified.encodeDataB64(allocator, content);
     defer allocator.free(encoded);
 
     try writeClientTextFrameMasked(client, "{\"channel\":\"acheron\",\"type\":\"acheron.t_walk\",\"tag\":10,\"fid\":1,\"newfid\":2,\"path\":[\"capabilities\",\"chat\",\"control\",\"input\"]}");
-    var walk = try readServerFrameSkippingDebug(allocator, client, debug_events_seen);
+    var walk = try readServerFrameForProtocolTest(allocator, client);
     defer walk.deinit(allocator);
     try std.testing.expect(std.mem.indexOf(u8, walk.payload, "\"type\":\"acheron.r_walk\"") != null);
 
     try writeClientTextFrameMasked(client, "{\"channel\":\"acheron\",\"type\":\"acheron.t_open\",\"tag\":11,\"fid\":2,\"mode\":\"rw\"}");
-    var open = try readServerFrameSkippingDebug(allocator, client, debug_events_seen);
+    var open = try readServerFrameForProtocolTest(allocator, client);
     defer open.deinit(allocator);
     try std.testing.expect(std.mem.indexOf(u8, open.payload, "\"type\":\"acheron.r_open\"") != null);
 
@@ -10500,7 +9692,7 @@ fn fsrpcWriteChatInput(
     );
     defer allocator.free(write_req);
     try writeClientTextFrameMasked(client, write_req);
-    var write = try readServerFrameSkippingDebug(allocator, client, debug_events_seen);
+    var write = try readServerFrameForProtocolTest(allocator, client);
     defer write.deinit(allocator);
     try std.testing.expect(std.mem.indexOf(u8, write.payload, "\"type\":\"acheron.r_write\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, write.payload, "\"job\":\"job-") != null);
@@ -10515,7 +9707,7 @@ fn fsrpcWriteChatInput(
     const job_name = try allocator.dupe(u8, job.string);
 
     try writeClientTextFrameMasked(client, "{\"channel\":\"acheron\",\"type\":\"acheron.t_clunk\",\"tag\":13,\"fid\":2}");
-    var clunk = try readServerFrameSkippingDebug(allocator, client, debug_events_seen);
+    var clunk = try readServerFrameForProtocolTest(allocator, client);
     defer clunk.deinit(allocator);
     try std.testing.expect(std.mem.indexOf(u8, clunk.payload, "\"type\":\"acheron.r_clunk\"") != null);
 
@@ -10533,17 +9725,17 @@ fn fsrpcReadJobResult(allocator: std.mem.Allocator, client: *std.net.Stream, job
     );
     defer allocator.free(walk_req);
     try writeClientTextFrameMasked(client, walk_req);
-    var walk = try readServerFrameSkippingDebug(allocator, client, null);
+    var walk = try readServerFrameForProtocolTest(allocator, client);
     defer walk.deinit(allocator);
     try std.testing.expect(std.mem.indexOf(u8, walk.payload, "\"type\":\"acheron.r_walk\"") != null);
 
     try writeClientTextFrameMasked(client, "{\"channel\":\"acheron\",\"type\":\"acheron.t_open\",\"tag\":21,\"fid\":3,\"mode\":\"r\"}");
-    var open = try readServerFrameSkippingDebug(allocator, client, null);
+    var open = try readServerFrameForProtocolTest(allocator, client);
     defer open.deinit(allocator);
     try std.testing.expect(std.mem.indexOf(u8, open.payload, "\"type\":\"acheron.r_open\"") != null);
 
     try writeClientTextFrameMasked(client, "{\"channel\":\"acheron\",\"type\":\"acheron.t_read\",\"tag\":22,\"fid\":3,\"offset\":0,\"count\":1048576}");
-    var read = try readServerFrameSkippingDebug(allocator, client, null);
+    var read = try readServerFrameForProtocolTest(allocator, client);
     defer read.deinit(allocator);
     try std.testing.expect(std.mem.indexOf(u8, read.payload, "\"type\":\"acheron.r_read\"") != null);
 
@@ -10561,7 +9753,7 @@ fn fsrpcReadJobResult(allocator: std.mem.Allocator, client: *std.net.Stream, job
     _ = std.base64.standard.Decoder.decode(decoded, data_b64.string) catch return error.TestExpectedResponse;
 
     try writeClientTextFrameMasked(client, "{\"channel\":\"acheron\",\"type\":\"acheron.t_clunk\",\"tag\":23,\"fid\":3}");
-    var clunk = try readServerFrameSkippingDebug(allocator, client, null);
+    var clunk = try readServerFrameForProtocolTest(allocator, client);
     defer clunk.deinit(allocator);
     try std.testing.expect(std.mem.indexOf(u8, clunk.payload, "\"type\":\"acheron.r_clunk\"") != null);
 
@@ -10679,22 +9871,22 @@ test "server_piai: base websocket path handles unified control/acheron chat flow
     try std.testing.expect(std.mem.indexOf(u8, metrics.payload, "\"type\":\"control.metrics\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, metrics.payload, "\"nodes\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, metrics.payload, "\"projects\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, metrics.payload, "\"node_service_watch\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, metrics.payload, "\"node_service_events\"") != null);
 
     try writeClientTextFrameMasked(&client, "{\"channel\":\"control\",\"type\":\"control.debug_subscribe\",\"id\":\"req-debug-sub\"}");
     var debug_sub = try readServerFrame(allocator, &client);
     defer debug_sub.deinit(allocator);
     try std.testing.expect(std.mem.indexOf(u8, debug_sub.payload, "\"type\":\"control.error\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, debug_sub.payload, "\"code\":\"unsupported\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, debug_sub.payload, "\"code\":\"unsupported_legacy_api\"") != null);
 
-    const job_name = try fsrpcWriteChatInput(allocator, &client, "hello", null);
+    const job_name = try fsrpcWriteChatInput(allocator, &client, "hello");
     defer allocator.free(job_name);
 
     try writeClientTextFrameMasked(&client, "{\"channel\":\"control\",\"type\":\"control.debug_unsubscribe\",\"id\":\"req-debug-unsub\"}");
     var debug_unsub = try readServerFrame(allocator, &client);
     defer debug_unsub.deinit(allocator);
     try std.testing.expect(std.mem.indexOf(u8, debug_unsub.payload, "\"type\":\"control.error\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, debug_unsub.payload, "\"code\":\"unsupported\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, debug_unsub.payload, "\"code\":\"unsupported_legacy_api\"") != null);
 
     const result = try fsrpcReadJobResult(allocator, &client, job_name);
     defer allocator.free(result);
@@ -11732,13 +10924,13 @@ test "server_piai: debug subscription control operations are unsupported in ache
     var subscribe = try readServerFrame(allocator, &client);
     defer subscribe.deinit(allocator);
     try std.testing.expect(std.mem.indexOf(u8, subscribe.payload, "\"type\":\"control.error\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, subscribe.payload, "\"code\":\"unsupported\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, subscribe.payload, "\"code\":\"unsupported_legacy_api\"") != null);
 
     try writeClientTextFrameMasked(&client, "{\"channel\":\"control\",\"type\":\"control.debug_unsubscribe\",\"id\":\"unsub\"}");
     var unsubscribe = try readServerFrame(allocator, &client);
     defer unsubscribe.deinit(allocator);
     try std.testing.expect(std.mem.indexOf(u8, unsubscribe.payload, "\"type\":\"control.error\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, unsubscribe.payload, "\"code\":\"unsupported\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unsubscribe.payload, "\"code\":\"unsupported_legacy_api\"") != null);
 
     try websocket_transport.writeFrame(&client, "", .close);
     var close_reply = try readServerFrame(allocator, &client);
@@ -11747,7 +10939,7 @@ test "server_piai: debug subscription control operations are unsupported in ache
     try std.testing.expect(server_ctx.err_name == null);
 }
 
-test "server_piai: node service upserts are pushed to node service watchers" {
+test "server_piai: node service watch control path is deprecated" {
     const allocator = std.testing.allocator;
     var runtime_registry = AgentRuntimeRegistry.init(allocator, .{
         .ltm_directory = "",
@@ -11766,10 +10958,8 @@ test "server_piai: node service upserts are pushed to node service watchers" {
     };
     defer server_ctx.deinit();
 
-    const sub_server_thread = try std.Thread.spawn(.{}, runSingleWsConnection, .{&server_ctx});
-    defer sub_server_thread.join();
-    const mut_server_thread = try std.Thread.spawn(.{}, runSingleWsConnection, .{&server_ctx});
-    defer mut_server_thread.join();
+    const server_thread = try std.Thread.spawn(.{}, runSingleWsConnection, .{&server_ctx});
+    defer server_thread.join();
 
     var subscriber = try std.net.tcpConnectToAddress(listener.listen_address);
     defer subscriber.close();
@@ -11786,79 +10976,9 @@ test "server_piai: node service upserts are pushed to node service watchers" {
     try writeClientTextFrameMasked(&subscriber, "{\"channel\":\"control\",\"type\":\"control.node_service_watch\",\"id\":\"sub-watch\",\"payload\":{}}");
     var sub_watch_ack = try readServerFrame(allocator, &subscriber);
     defer sub_watch_ack.deinit(allocator);
-    try std.testing.expect(std.mem.indexOf(u8, sub_watch_ack.payload, "\"type\":\"control.node_service_watch\"") != null);
-
-    var mutator = try std.net.tcpConnectToAddress(listener.listen_address);
-    defer mutator.close();
-    try performClientHandshakeWithBearerToken(allocator, &mutator, "/", "admin-secret");
-    try writeClientTextFrameMasked(&mutator, "{\"channel\":\"control\",\"type\":\"control.version\",\"id\":\"mut-version\",\"payload\":{\"protocol\":\"unified-v2\"}}");
-    var mut_version_ack = try readServerFrame(allocator, &mutator);
-    defer mut_version_ack.deinit(allocator);
-    try std.testing.expect(std.mem.indexOf(u8, mut_version_ack.payload, "\"type\":\"control.version_ack\"") != null);
-    try writeClientTextFrameMasked(&mutator, "{\"channel\":\"control\",\"type\":\"control.connect\",\"id\":\"mut-connect\"}");
-    var mut_connect_ack = try readServerFrame(allocator, &mutator);
-    defer mut_connect_ack.deinit(allocator);
-    try std.testing.expect(std.mem.indexOf(u8, mut_connect_ack.payload, "\"type\":\"control.connect_ack\"") != null);
-
-    try writeClientTextFrameMasked(
-        &mutator,
-        "{\"channel\":\"control\",\"type\":\"control.node_invite_create\",\"id\":\"mut-invite\"}",
-    );
-    var invite_created = try readServerFrame(allocator, &mutator);
-    defer invite_created.deinit(allocator);
-    var invite_json = try std.json.parseFromSlice(std.json.Value, allocator, invite_created.payload, .{});
-    defer invite_json.deinit();
-    const invite_payload = invite_json.value.object.get("payload") orelse return error.TestExpectedResponse;
-    if (invite_payload != .object) return error.TestExpectedResponse;
-    const invite_token_val = invite_payload.object.get("invite_token") orelse return error.TestExpectedResponse;
-    if (invite_token_val != .string) return error.TestExpectedResponse;
-    const escaped_invite_token = try unified.jsonEscape(allocator, invite_token_val.string);
-    defer allocator.free(escaped_invite_token);
-
-    const join_req = try std.fmt.allocPrint(
-        allocator,
-        "{{\"channel\":\"control\",\"type\":\"control.node_join\",\"id\":\"mut-join\",\"payload\":{{\"invite_token\":\"{s}\",\"node_name\":\"service-node\",\"fs_url\":\"ws://127.0.0.1:18891/v2/fs\"}}}}",
-        .{escaped_invite_token},
-    );
-    defer allocator.free(join_req);
-    try writeClientTextFrameMasked(&mutator, join_req);
-    var joined = try readServerFrame(allocator, &mutator);
-    defer joined.deinit(allocator);
-
-    var join_json = try std.json.parseFromSlice(std.json.Value, allocator, joined.payload, .{});
-    defer join_json.deinit();
-    const join_payload = join_json.value.object.get("payload") orelse return error.TestExpectedResponse;
-    if (join_payload != .object) return error.TestExpectedResponse;
-    const node_id_val = join_payload.object.get("node_id") orelse return error.TestExpectedResponse;
-    const node_secret_val = join_payload.object.get("node_secret") orelse return error.TestExpectedResponse;
-    if (node_id_val != .string or node_secret_val != .string) return error.TestExpectedResponse;
-    const escaped_node_id = try unified.jsonEscape(allocator, node_id_val.string);
-    defer allocator.free(escaped_node_id);
-    const escaped_node_secret = try unified.jsonEscape(allocator, node_secret_val.string);
-    defer allocator.free(escaped_node_secret);
-
-    const upsert_req = try std.fmt.allocPrint(
-        allocator,
-        "{{\"channel\":\"control\",\"type\":\"control.node_service_upsert\",\"id\":\"mut-upsert\",\"payload\":{{\"node_id\":\"{s}\",\"node_secret\":\"{s}\",\"services\":[{{\"service_id\":\"camera\",\"kind\":\"camera\",\"version\":\"1\",\"state\":\"online\",\"endpoints\":[\"/nodes/service-node/camera\"],\"capabilities\":{{\"still\":true}}}}]}}}}",
-        .{ escaped_node_id, escaped_node_secret },
-    );
-    defer allocator.free(upsert_req);
-    try writeClientTextFrameMasked(&mutator, upsert_req);
-    var upsert_ack = try readServerFrame(allocator, &mutator);
-    defer upsert_ack.deinit(allocator);
-    try std.testing.expect(std.mem.indexOf(u8, upsert_ack.payload, "\"type\":\"control.node_service_upsert\"") != null);
-
-    var pushed_event = try readServerFrame(allocator, &subscriber);
-    defer pushed_event.deinit(allocator);
-    try std.testing.expect(std.mem.indexOf(u8, pushed_event.payload, "\"type\":\"control.node_service_event\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, pushed_event.payload, "\"node_id\":\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, pushed_event.payload, "\"service_delta\":{\"changed\":true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, pushed_event.payload, "\"added\":[") != null);
-
-    try websocket_transport.writeFrame(&mutator, "", .close);
-    var mut_close = try readServerFrame(allocator, &mutator);
-    defer mut_close.deinit(allocator);
-    try std.testing.expectEqual(@as(u8, 0x8), mut_close.opcode);
+    try std.testing.expect(std.mem.indexOf(u8, sub_watch_ack.payload, "\"type\":\"control.error\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sub_watch_ack.payload, "\"code\":\"unsupported_legacy_api\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sub_watch_ack.payload, "UnsupportedType") != null);
 
     try websocket_transport.writeFrame(&subscriber, "", .close);
     var sub_close = try readServerFrame(allocator, &subscriber);
@@ -11896,7 +11016,7 @@ test "server_piai: base path routes all connections to default runtime" {
         try performClientHandshakeWithBearerToken(allocator, &client, "/", "admin-secret");
 
         try fsrpcConnectAndAttach(allocator, &client, "a-connect");
-        const alpha_job = try fsrpcWriteChatInput(allocator, &client, "alpha hello", null);
+        const alpha_job = try fsrpcWriteChatInput(allocator, &client, "alpha hello");
         defer allocator.free(alpha_job);
 
         try websocket_transport.writeFrame(&client, "", .close);
@@ -11914,7 +11034,7 @@ test "server_piai: base path routes all connections to default runtime" {
         try performClientHandshakeWithBearerToken(allocator, &client, "/", "admin-secret");
 
         try fsrpcConnectAndAttach(allocator, &client, "b-connect");
-        const beta_job = try fsrpcWriteChatInput(allocator, &client, "beta hello", null);
+        const beta_job = try fsrpcWriteChatInput(allocator, &client, "beta hello");
         defer allocator.free(beta_job);
 
         try websocket_transport.writeFrame(&client, "", .close);
@@ -12045,6 +11165,63 @@ test "server_piai: project runtime switches persona when agent changes" {
     try std.testing.expectEqualStrings(system_agent_id, active_entry.runtime_agent_id);
 }
 
+test "server_piai: getOrCreate replaces unhealthy runtime for same agent" {
+    const allocator = std.testing.allocator;
+    var runtime_registry = AgentRuntimeRegistry.initWithLimits(
+        allocator,
+        .{ .ltm_directory = "", .ltm_filename = "" },
+        null,
+        1,
+    );
+    defer runtime_registry.deinit();
+
+    const project_id = "proj-unhealthy-runtime";
+    const first_runtime = try runtime_registry.getOrCreate(runtime_registry.default_agent_id, project_id, null);
+    runtime_registry.mutex.lock();
+    {
+        const entry = runtime_registry.by_agent.getPtr(project_id) orelse return error.TestExpectedResult;
+        entry.runtime.kind = .local_sandbox;
+        entry.runtime.sandbox = null;
+    }
+    runtime_registry.mutex.unlock();
+
+    const second_runtime = try runtime_registry.getOrCreate(runtime_registry.default_agent_id, project_id, null);
+    defer second_runtime.release();
+    defer first_runtime.release();
+
+    try std.testing.expect(second_runtime != first_runtime);
+    try std.testing.expect(runtime_registry.hasRuntimeForBinding(runtime_registry.default_agent_id, project_id));
+    try std.testing.expectEqual(@as(usize, 1), runtime_registry.by_agent.count());
+}
+
+test "server_piai: ready runtime lookup rejects unhealthy binding" {
+    const allocator = std.testing.allocator;
+    var runtime_registry = AgentRuntimeRegistry.initWithLimits(
+        allocator,
+        .{ .ltm_directory = "", .ltm_filename = "" },
+        null,
+        1,
+    );
+    defer runtime_registry.deinit();
+
+    const project_id = "proj-unhealthy-ready-lookup";
+    const runtime = try runtime_registry.getOrCreate(runtime_registry.default_agent_id, project_id, null);
+    defer runtime.release();
+
+    runtime_registry.mutex.lock();
+    {
+        const entry = runtime_registry.by_agent.getPtr(project_id) orelse return error.TestExpectedResult;
+        entry.runtime.kind = .local_sandbox;
+        entry.runtime.sandbox = null;
+    }
+    runtime_registry.mutex.unlock();
+
+    const ready = runtime_registry.getRuntimeForBindingIfReady(runtime_registry.default_agent_id, project_id);
+    try std.testing.expect(ready == null);
+    try std.testing.expect(!runtime_registry.hasRuntimeForBinding(runtime_registry.default_agent_id, project_id));
+    try std.testing.expectEqual(@as(usize, 0), runtime_registry.by_agent.count());
+}
+
 test "server_piai: websocket rejects unsupported route version" {
     const allocator = std.testing.allocator;
     var runtime_registry = AgentRuntimeRegistry.init(allocator, .{
@@ -12136,7 +11313,7 @@ test "server_piai: stripHttpRequestTargetQuery removes query string" {
     try std.testing.expectEqualStrings("/readyz", stripHttpRequestTargetQuery("/readyz"));
 }
 
-test "server_piai: metrics include node service watch telemetry" {
+test "server_piai: metrics include retained node service event telemetry" {
     const allocator = std.testing.allocator;
     var runtime_registry = AgentRuntimeRegistry.init(allocator, .{
         .ltm_directory = "",
@@ -12146,15 +11323,13 @@ test "server_piai: metrics include node service watch telemetry" {
 
     const metrics_json = try runtime_registry.metricsJson();
     defer allocator.free(metrics_json);
-    try std.testing.expect(std.mem.indexOf(u8, metrics_json, "\"node_service_watch\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, metrics_json, "\"replay\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, metrics_json, "\"fanout\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, metrics_json, "\"node_service_events\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, metrics_json, "\"retained\"") != null);
 
     const metrics_prom = try runtime_registry.metricsPrometheus();
     defer allocator.free(metrics_prom);
-    try std.testing.expect(std.mem.indexOf(u8, metrics_prom, "spiderweb_node_service_watch_replay_requests_total") != null);
-    try std.testing.expect(std.mem.indexOf(u8, metrics_prom, "spiderweb_node_service_watch_fanout_events_total") != null);
+    try std.testing.expect(std.mem.indexOf(u8, metrics_prom, "spiderweb_node_service_events_retained_events") != null);
+    try std.testing.expect(std.mem.indexOf(u8, metrics_prom, "spiderweb_node_service_events_retained_window_ms") != null);
 }
 
 test "server_piai: extract project payload helpers parse id and token" {
@@ -12185,29 +11360,6 @@ test "server_piai: extract node id helper parses valid payload" {
 
     const missing = try extractNodeIdFromControlPayload(allocator, "{\"service_delta\":{}}");
     try std.testing.expect(missing == null);
-}
-
-test "server_piai: parse node service watch request supports filters and replay limit" {
-    const allocator = std.testing.allocator;
-    var request = try parseNodeServiceWatchRequest(allocator, "{\"node_id\":\"node-7\",\"replay_limit\":42}");
-    defer request.deinit(allocator);
-    try std.testing.expect(request.node_id != null);
-    try std.testing.expectEqualStrings("node-7", request.node_id.?);
-    try std.testing.expectEqual(@as(usize, 42), request.replay_limit);
-
-    var default_request = try parseNodeServiceWatchRequest(allocator, null);
-    defer default_request.deinit(allocator);
-    try std.testing.expect(default_request.node_id == null);
-    try std.testing.expectEqual(@as(usize, 25), default_request.replay_limit);
-
-    try std.testing.expectError(
-        error.InvalidPayload,
-        parseNodeServiceWatchRequest(allocator, "{\"node_id\":\"bad/node\"}"),
-    );
-    try std.testing.expectError(
-        error.InvalidPayload,
-        parseNodeServiceWatchRequest(allocator, "{\"replay_limit\":-1}"),
-    );
 }
 
 test "server_piai: user node service visibility is project mounted-node scoped" {
@@ -12243,29 +11395,26 @@ test "server_piai: user node service visibility is project mounted-node scoped" 
     const mount_result = try runtime_registry.control_plane.setProjectMountWithRole(mount_payload, false);
     defer allocator.free(mount_result);
 
-    try std.testing.expect(runtime_registry.nodeServiceEventVisibleToContext(
-        .user,
-        "bob",
+    try std.testing.expect(runtime_registry.control_plane.projectAllowsNodeServiceEvent(
         project_id.?,
-        null,
+        "bob",
         null,
         node_registration.node_id,
+        false,
     ));
-    try std.testing.expect(!runtime_registry.nodeServiceEventVisibleToContext(
-        .user,
-        "bob",
+    try std.testing.expect(!runtime_registry.control_plane.projectAllowsNodeServiceEvent(
         project_id.?,
-        null,
+        "bob",
         null,
         "node-missing",
+        false,
     ));
-    try std.testing.expect(!runtime_registry.nodeServiceEventVisibleToContext(
-        .user,
-        "bob",
+    try std.testing.expect(!runtime_registry.control_plane.projectAllowsNodeServiceEvent(
         project_id.?,
+        "bob",
         null,
         "node-other",
-        node_registration.node_id,
+        false,
     ));
 }
 

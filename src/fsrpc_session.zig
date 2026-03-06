@@ -1,7 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const unified = @import("ziggy-spider-protocol").unified;
-const protocol = @import("ziggy-spider-protocol").protocol;
+const unified = @import("spider-protocol").unified;
+const protocol = @import("spider-protocol").protocol;
 const runtime_server_mod = @import("runtime_server.zig");
 const runtime_handle_mod = @import("runtime_handle.zig");
 const chat_job_index = @import("chat_job_index.zig");
@@ -23,6 +23,7 @@ const SpecialKind = enum {
     job_result,
     job_log,
     agent_services_index,
+    node_service_events_log,
     web_search_invoke,
     web_search_search,
     search_code_invoke,
@@ -326,6 +327,7 @@ pub const Session = struct {
     thoughts_history_id: u32 = 0,
     thoughts_status_id: u32 = 0,
     agent_services_index_id: u32 = 0,
+    node_service_events_log_id: u32 = 0,
     event_next_id: u32 = 0,
     debug_stream_log_id: u32 = 0,
     pairing_pending_id: u32 = 0,
@@ -578,6 +580,21 @@ pub const Session = struct {
         try self.setFileContent(self.debug_stream_log_id, snapshot);
     }
 
+    fn syncNodeServiceEventsLogFromControlPlane(self: *Session) !void {
+        if (self.node_service_events_log_id == 0) return;
+        const plane = self.control_plane orelse return;
+        const snapshot = try plane.snapshotNodeServiceEvents(
+            self.allocator,
+            self.project_id,
+            self.agent_id,
+            self.project_token,
+            self.is_admin,
+            0,
+        );
+        defer self.allocator.free(snapshot);
+        try self.setFileContent(self.node_service_events_log_id, snapshot);
+    }
+
     pub fn handle(self: *Session, msg: *const unified.ParsedMessage) ![]u8 {
         const msg_type = msg.acheron_type orelse {
             return unified.buildFsrpcError(self.allocator, msg.tag, "invalid_type", "missing acheron message type");
@@ -612,10 +629,27 @@ pub const Session = struct {
         const fid = msg.fid orelse return unified.buildFsrpcError(self.allocator, msg.tag, "invalid", "fid is required");
         try self.fids.put(self.allocator, fid, .{ .node_id = self.root_id });
 
+        const escaped_project_id = if (self.project_id) |project_id|
+            try unified.jsonEscape(self.allocator, project_id)
+        else
+            null;
+        defer if (escaped_project_id) |value| self.allocator.free(value);
+        const project_id_json = if (escaped_project_id) |value|
+            try std.fmt.allocPrint(self.allocator, "\"{s}\"", .{value})
+        else
+            try self.allocator.dupe(u8, "null");
+        defer self.allocator.free(project_id_json);
+        const debug_visible = self.lookupChild(self.root_id, "debug") != null;
         const payload = try std.fmt.allocPrint(
             self.allocator,
-            "{{\"qid\":{{\"path\":{d},\"type\":\"dir\"}}}}",
-            .{self.root_id},
+            "{{\"qid\":{{\"path\":{d},\"type\":\"dir\"}},\"layout\":\"worldfs-v1\",\"project_id\":{s},\"roots\":[\"nodes\",\"agents\",\"users\",\"projects\",\"global\",\"meta\"{s}],\"dynamic_bind_paths\":{s},\"bind_count\":{d}}}",
+            .{
+                self.root_id,
+                project_id_json,
+                if (debug_visible) ",\"debug\"" else "",
+                if (self.project_binds.items.len > 0) "true" else "false",
+                self.project_binds.items.len,
+            },
         );
         defer self.allocator.free(payload);
         return unified.buildFsrpcResponse(self.allocator, .r_attach, msg.tag, payload);
@@ -718,7 +752,6 @@ pub const Session = struct {
                             try self.refreshJobNodeFromIndex(state.node_id, node.special);
                         },
                         .job_result => {
-                            try self.waitForJobTerminalState(state.node_id);
                             try self.refreshJobNodeFromIndex(state.node_id, node.special);
                         },
                         .job_log => {
@@ -726,6 +759,9 @@ pub const Session = struct {
                         },
                         .agent_services_index => {
                             try self.refreshAgentServicesIndex(state.node_id);
+                        },
+                        .node_service_events_log => {
+                            try self.syncNodeServiceEventsLogFromControlPlane();
                         },
                         .event_next => {
                             data_owned = try self.handleEventNextRead();
@@ -1579,9 +1615,9 @@ pub const Session = struct {
         try self.addDirectoryDescriptors(
             agent_services_dir,
             "Services",
-            "{\"kind\":\"service_index\",\"files\":[\"SERVICES.json\"],\"roots\":[\"/nodes/<node_id>/services/<service_id>\",\"/global/<service_id>\"]}",
+            "{\"kind\":\"service_index\",\"files\":[\"SERVICES.json\",\"node-service-events.ndjson\"],\"roots\":[\"/nodes/<node_id>/services/<service_id>\",\"/global/<service_id>\"]}",
             "{\"discover\":true,\"invoke_via_paths\":true}",
-            "Project-wide service discovery index. Use listed paths to inspect/invoke service endpoints.",
+            "Project-wide service discovery index plus retained node service change history.",
         );
         const initial_agent_services_index = try self.buildAgentServicesIndexJson();
         defer self.allocator.free(initial_agent_services_index);
@@ -1591,6 +1627,13 @@ pub const Session = struct {
             initial_agent_services_index,
             false,
             .agent_services_index,
+        );
+        self.node_service_events_log_id = try self.addFile(
+            agent_services_dir,
+            "node-service-events.ndjson",
+            "",
+            false,
+            .node_service_events_log,
         );
 
         const memory_dir = try self.addDir(global_root, "memory", false);
@@ -1834,7 +1877,7 @@ pub const Session = struct {
             "Protocol and effective view metadata.",
         );
         const protocol_json =
-            "{\"channel\":\"acheron\",\"version\":\"acheron-1\",\"layout\":\"world-v1\",\"ops\":[\"t_version\",\"t_attach\",\"t_walk\",\"t_open\",\"t_read\",\"t_write\",\"t_stat\",\"t_clunk\",\"t_flush\"]}";
+            "{\"channel\":\"acheron\",\"version\":\"acheron-1\",\"layout\":\"worldfs-v1\",\"ops\":[\"t_version\",\"t_attach\",\"t_walk\",\"t_open\",\"t_read\",\"t_write\",\"t_stat\",\"t_clunk\",\"t_flush\"]}";
         _ = try self.addFile(meta_root, "protocol.json", protocol_json, false, .none);
         const view_json = try std.fmt.allocPrint(
             self.allocator,
@@ -8187,35 +8230,6 @@ pub const Session = struct {
         return @as(?[]u8, try self.allocator.dupe(u8, "tool returned error"));
     }
 
-    fn waitForJobTerminalState(self: *Session, node_id: u32) !void {
-        const node = self.nodes.get(node_id) orelse return error.MissingNode;
-        const job_dir_id = node.parent orelse return;
-        const job_dir = self.nodes.get(job_dir_id) orelse return error.MissingNode;
-        const job_id = job_dir.name;
-
-        const timeout_ms = if (self.wait_timeout_ms > 0) self.wait_timeout_ms else default_wait_timeout_ms;
-        const start_ms = std.time.milliTimestamp();
-        while (true) {
-            const owned_view = try self.job_index.getJob(self.allocator, job_id);
-            if (owned_view) |owned| {
-                var view = owned;
-                defer view.deinit(self.allocator);
-                if (!std.mem.eql(u8, view.agent_id, self.agent_id)) return;
-                if (isTerminalJobState(view.state)) return;
-            } else {
-                return;
-            }
-
-            if (timeout_ms == 0) return;
-            const elapsed_ms = std.time.milliTimestamp() - start_ms;
-            if (elapsed_ms >= timeout_ms) return;
-            const remaining_ms = timeout_ms - elapsed_ms;
-            const poll_ms = @as(i64, @intCast(wait_poll_interval_ms));
-            const sleep_ms = if (remaining_ms < poll_ms) remaining_ms else poll_ms;
-            std.Thread.sleep(@as(u64, @intCast(sleep_ms)) * std.time.ns_per_ms);
-        }
-    }
-
     fn clearWaitSources(self: *Session) void {
         for (self.wait_sources.items) |*source| source.deinit(self.allocator);
         self.wait_sources.deinit(self.allocator);
@@ -12199,6 +12213,15 @@ test "fsrpc_session: node services namespace prefers control-plane catalog" {
     const self_services_dir = session.lookupChild(self_agent, "services") orelse return error.TestExpectedResponse;
     const self_services_index_id = session.lookupChild(self_services_dir, "SERVICES.json") orelse return error.TestExpectedResponse;
     const self_services_index = session.nodes.get(self_services_index_id) orelse return error.TestExpectedResponse;
+    const node_service_events_payload = try protocolReadFile(
+        &session,
+        allocator,
+        140,
+        141,
+        &.{ "global", "services", "node-service-events.ndjson" },
+        142,
+    );
+    defer allocator.free(node_service_events_payload);
 
     try std.testing.expect(std.mem.indexOf(u8, node_caps.content, "\"fs\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, node_caps.content, "\"terminal\":true") != null);
@@ -12208,6 +12231,77 @@ test "fsrpc_session: node services namespace prefers control-plane catalog" {
     try std.testing.expect(std.mem.indexOf(u8, caps_node.content, "\"terminal_id\":\"9\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, self_services_index.content, "\"node_id\":\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, self_services_index.content, "\"service_id\":\"terminal-9\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, node_service_events_payload, "\"node_id\":\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, node_service_events_payload, "\"service_delta\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, node_service_events_payload, "\"service_id\":\"terminal-9\"") != null);
+}
+
+test "fsrpc_session: node service events file returns full retained feed" {
+    const allocator = std.testing.allocator;
+
+    var control_plane = fs_control_plane.ControlPlane.initWithOptions(allocator, .{
+        .node_service_event_history_max = 520,
+    });
+    defer control_plane.deinit();
+
+    const ensured = try control_plane.ensureNode("edge-retained-feed", "ws://127.0.0.1:18891/v2/fs", 60_000);
+    defer allocator.free(ensured);
+    var ensured_parsed = try std.json.parseFromSlice(std.json.Value, allocator, ensured, .{});
+    defer ensured_parsed.deinit();
+    if (ensured_parsed.value != .object) return error.TestExpectedResponse;
+    const node_id = ensured_parsed.value.object.get("node_id") orelse return error.TestExpectedResponse;
+    if (node_id != .string) return error.TestExpectedResponse;
+    const node_secret = ensured_parsed.value.object.get("node_secret") orelse return error.TestExpectedResponse;
+    if (node_secret != .string) return error.TestExpectedResponse;
+
+    const escaped_node_id = try unified.jsonEscape(allocator, node_id.string);
+    defer allocator.free(escaped_node_id);
+    const escaped_node_secret = try unified.jsonEscape(allocator, node_secret.string);
+    defer allocator.free(escaped_node_secret);
+
+    for (0..513) |idx| {
+        const upsert_req = try std.fmt.allocPrint(
+            allocator,
+            "{{\"node_id\":\"{s}\",\"node_secret\":\"{s}\",\"services\":[{{\"service_id\":\"terminal-main\",\"kind\":\"terminal\",\"version\":\"{d}\",\"state\":\"online\",\"endpoints\":[\"/nodes/{s}/terminal/main\"],\"capabilities\":{{\"pty\":true}}}}]}}",
+            .{ escaped_node_id, escaped_node_secret, idx, escaped_node_id },
+        );
+        defer allocator.free(upsert_req);
+        const upserted = try control_plane.nodeServiceUpsert(upsert_req);
+        defer allocator.free(upserted);
+    }
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "default",
+        .{
+            .control_plane = &control_plane,
+            .is_admin = true,
+        },
+    );
+    defer session.deinit();
+
+    const node_service_events_payload = try protocolReadFile(
+        &session,
+        allocator,
+        240,
+        241,
+        &.{ "global", "services", "node-service-events.ndjson" },
+        242,
+    );
+    defer allocator.free(node_service_events_payload);
+
+    const line_count: usize = if (node_service_events_payload.len == 0) 0 else std.mem.count(u8, node_service_events_payload, "\n") + 1;
+    try std.testing.expectEqual(@as(usize, 513), line_count);
+    try std.testing.expect(std.mem.indexOf(u8, node_service_events_payload, "\"version\":\"512\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, node_service_events_payload, "\"version\":\"0\"") != null);
 }
 
 test "fsrpc_session: empty control-plane service catalog suppresses policy fallback roots" {

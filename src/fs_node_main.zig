@@ -5,7 +5,7 @@ const fs_node_service = @import("fs_node_service.zig");
 const fs_node_ops = @import("fs_node_ops.zig");
 const fs_protocol = @import("fs_protocol.zig");
 const node_capability_providers = @import("node_capability_providers.zig");
-const unified = @import("ziggy-spider-protocol").unified;
+const unified = @import("spider-protocol").unified;
 
 const default_state_path = ".spiderweb-fs-node-state.json";
 const default_node_name = "spiderweb-fs-node";

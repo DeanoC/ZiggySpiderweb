@@ -9,7 +9,7 @@ All notable changes to this project are documented in this file.
   - `channel` is required
   - `type` must match the selected channel namespace
   - legacy/implicit compatibility envelopes are rejected
-- Added protocol contract tests in `ZiggySpiderProtocol` for canonical v2 control/acheron naming and strict envelope validation.
+- Added protocol contract tests in `SpiderProtocol` for canonical v2 control/acheron naming and strict envelope validation.
 
 ### Control Plane, Projects, and Nodes
 - Local spiderweb filesystem node remains protocol-identical to external nodes and is surfaced as a standard project mount endpoint.

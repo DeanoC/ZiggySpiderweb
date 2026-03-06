@@ -1,3 +1,6 @@
 [submodule "docs"]
 	path = docs
 	url = https://github.com/DeanoC/ZiggySpiderwebDocs.git
+[submodule "deps/spider-protocol"]
+	path = deps/spider-protocol
+	url = https://github.com/DeanoC/SpiderProtocol.git

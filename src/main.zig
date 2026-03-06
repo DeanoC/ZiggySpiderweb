@@ -17,7 +17,7 @@ comptime {
     _ = @import("memory_schema.zig");
     _ = @import("ziggy-memory-store").memid;
     _ = @import("prompt_compiler.zig");
-    _ = @import("ziggy-spider-protocol").protocol;
+    _ = @import("spider-protocol").protocol;
     _ = @import("ziggy-memory-store").run_store;
     _ = @import("ziggy-tool-runtime").tool_registry;
 }
