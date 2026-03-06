@@ -4386,15 +4386,27 @@ const AgentRuntimeRegistry = struct {
         project_id: ?[]const u8,
     ) ?*runtime_handle_mod.RuntimeHandle {
         var selected_runtime: ?*runtime_handle_mod.RuntimeHandle = null;
+        var removed_unhealthy: ?RemovedRuntimeEntry = null;
         const runtime_key = runtimeMapKeyForProject(project_id);
         self.mutex.lock();
         if (self.by_agent.getPtr(runtime_key)) |existing| {
             if (std.mem.eql(u8, existing.runtime_agent_id, agent_id)) {
-                selected_runtime = existing.runtime;
-                selected_runtime.?.retain();
+                if (existing.runtime.isHealthy()) {
+                    selected_runtime = existing.runtime;
+                    selected_runtime.?.retain();
+                } else {
+                    removed_unhealthy = self.takeUnhealthyRuntimeLocked(runtime_key);
+                }
             }
         }
         self.mutex.unlock();
+        if (removed_unhealthy) |removed| {
+            std.log.warn(
+                "dropping unhealthy ready runtime binding: project={s} agent={s}",
+                .{ project_id orelse "__auto__", removed.entry.runtime_agent_id },
+            );
+            self.deinitRemovedRuntime(removed);
+        }
         return selected_runtime;
     }
 
@@ -11180,6 +11192,34 @@ test "server_piai: getOrCreate replaces unhealthy runtime for same agent" {
     try std.testing.expect(second_runtime != first_runtime);
     try std.testing.expect(runtime_registry.hasRuntimeForBinding(runtime_registry.default_agent_id, project_id));
     try std.testing.expectEqual(@as(usize, 1), runtime_registry.by_agent.count());
+}
+
+test "server_piai: ready runtime lookup rejects unhealthy binding" {
+    const allocator = std.testing.allocator;
+    var runtime_registry = AgentRuntimeRegistry.initWithLimits(
+        allocator,
+        .{ .ltm_directory = "", .ltm_filename = "" },
+        null,
+        1,
+    );
+    defer runtime_registry.deinit();
+
+    const project_id = "proj-unhealthy-ready-lookup";
+    const runtime = try runtime_registry.getOrCreate(runtime_registry.default_agent_id, project_id, null);
+    defer runtime.release();
+
+    runtime_registry.mutex.lock();
+    {
+        const entry = runtime_registry.by_agent.getPtr(project_id) orelse return error.TestExpectedResult;
+        entry.runtime.kind = .local_sandbox;
+        entry.runtime.sandbox = null;
+    }
+    runtime_registry.mutex.unlock();
+
+    const ready = runtime_registry.getRuntimeForBindingIfReady(runtime_registry.default_agent_id, project_id);
+    try std.testing.expect(ready == null);
+    try std.testing.expect(!runtime_registry.hasRuntimeForBinding(runtime_registry.default_agent_id, project_id));
+    try std.testing.expectEqual(@as(usize, 0), runtime_registry.by_agent.count());
 }
 
 test "server_piai: websocket rejects unsupported route version" {
