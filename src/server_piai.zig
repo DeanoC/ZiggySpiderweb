@@ -80,6 +80,7 @@ const node_tunnel_reply_timeout_ms: i32 = 45_000;
 // which starves new control/gui handshakes and appears as "can't connect".
 const min_connection_worker_threads: usize = 64;
 const runtime_warmup_stale_timeout_ms: i64 = 30_000;
+const runtime_warmup_error_retry_backoff_ms: i64 = 10_000;
 const runtime_residency_worker_interval_ms_default: u64 = 1_000;
 const session_heartbeat_ttl_ms: i64 = 5 * 60 * 1000;
 const agent_heartbeat_ttl_ms: i64 = 5 * 60 * 1000;
@@ -2373,6 +2374,7 @@ const RuntimeWarmupState = struct {
     error_code: ?[]u8 = null,
     error_message: ?[]u8 = null,
     updated_at_ms: i64 = 0,
+    retry_after_ms: i64 = 0,
     in_flight: bool = false,
 
     fn deinit(self: *RuntimeWarmupState, allocator: std.mem.Allocator) void {
@@ -2390,6 +2392,7 @@ const RuntimeWarmupState = struct {
         self.runtime_ready = false;
         self.mount_ready = false;
         self.updated_at_ms = std.time.milliTimestamp();
+        self.retry_after_ms = 0;
     }
 
     fn setReady(self: *RuntimeWarmupState, allocator: std.mem.Allocator) void {
@@ -2401,6 +2404,7 @@ const RuntimeWarmupState = struct {
         self.runtime_ready = true;
         self.mount_ready = true;
         self.updated_at_ms = std.time.milliTimestamp();
+        self.retry_after_ms = 0;
     }
 
     fn setError(self: *RuntimeWarmupState, allocator: std.mem.Allocator, code: []const u8, message: []const u8) !void {
@@ -2416,6 +2420,7 @@ const RuntimeWarmupState = struct {
         self.runtime_ready = false;
         self.mount_ready = false;
         self.updated_at_ms = std.time.milliTimestamp();
+        self.retry_after_ms = self.updated_at_ms + runtime_warmup_error_retry_backoff_ms;
     }
 
     fn snapshotOwned(self: *const RuntimeWarmupState, allocator: std.mem.Allocator) !SessionAttachStateSnapshot {
@@ -3905,6 +3910,8 @@ const AgentRuntimeRegistry = struct {
     workspace_url: ?[]u8 = null,
     mutex: std.Thread.Mutex = .{},
     by_agent: std.StringHashMapUnmanaged(AgentRuntimeEntry) = .{},
+    creating_runtime_keys: std.StringHashMapUnmanaged(void) = .{},
+    runtime_create_cond: std.Thread.Condition = .{},
     runtime_warmups_mutex: std.Thread.Mutex = .{},
     runtime_warmups: std.StringHashMapUnmanaged(RuntimeWarmupState) = .{},
     runtime_warmup_lifecycle_mutex: std.Thread.Mutex = .{},
@@ -4074,6 +4081,12 @@ const AgentRuntimeRegistry = struct {
             runtime_entry.deinit(self.allocator);
         }
         self.by_agent.deinit(self.allocator);
+        var creating_it = self.creating_runtime_keys.iterator();
+        while (creating_it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+        }
+        self.creating_runtime_keys.deinit(self.allocator);
+        self.creating_runtime_keys = .{};
         self.runtime_warmups_mutex.lock();
         var warmup_it = self.runtime_warmups.iterator();
         while (warmup_it.next()) |entry| {
@@ -4386,7 +4399,6 @@ const AgentRuntimeRegistry = struct {
         project_id: ?[]const u8,
     ) ?*runtime_handle_mod.RuntimeHandle {
         var selected_runtime: ?*runtime_handle_mod.RuntimeHandle = null;
-        var removed_unhealthy: ?RemovedRuntimeEntry = null;
         const runtime_key = runtimeMapKeyForProject(project_id);
         self.mutex.lock();
         if (self.by_agent.getPtr(runtime_key)) |existing| {
@@ -4394,20 +4406,60 @@ const AgentRuntimeRegistry = struct {
                 if (existing.runtime.isHealthy()) {
                     selected_runtime = existing.runtime;
                     selected_runtime.?.retain();
-                } else {
-                    removed_unhealthy = self.takeUnhealthyRuntimeLocked(runtime_key);
                 }
             }
         }
         self.mutex.unlock();
-        if (removed_unhealthy) |removed| {
-            std.log.warn(
-                "dropping unhealthy ready runtime binding: project={s} agent={s}",
-                .{ project_id orelse "__auto__", removed.entry.runtime_agent_id },
+        if (selected_runtime == null) {
+            _ = self.dropUnhealthyRuntimeForBinding(
+                agent_id,
+                project_id,
+                "runtime_unhealthy",
+                "project runtime became unhealthy",
             );
-            self.deinitRemovedRuntime(removed);
         }
         return selected_runtime;
+    }
+
+    fn dropUnhealthyRuntimeForBinding(
+        self: *AgentRuntimeRegistry,
+        agent_id: []const u8,
+        project_id: ?[]const u8,
+        error_code: []const u8,
+        error_message: []const u8,
+    ) bool {
+        var removed_unhealthy: ?RemovedRuntimeEntry = null;
+        const runtime_key = runtimeMapKeyForProject(project_id);
+        const binding_key = self.runtimeBindingKey(agent_id, project_id) catch null;
+        defer if (binding_key) |value| self.allocator.free(value);
+
+        self.mutex.lock();
+        if (self.by_agent.getPtr(runtime_key)) |existing| {
+            if (std.mem.eql(u8, existing.runtime_agent_id, agent_id) and !existing.runtime.isHealthy()) {
+                removed_unhealthy = self.takeUnhealthyRuntimeLocked(runtime_key);
+            }
+        }
+        self.mutex.unlock();
+
+        if (removed_unhealthy) |removed| {
+            const health_summary = removed.entry.runtime.healthSummary(self.allocator) catch null;
+            defer if (health_summary) |value| self.allocator.free(value);
+            std.log.warn(
+                "dropping unhealthy ready runtime binding: project={s} agent={s} detail={s}",
+                .{
+                    project_id orelse "__auto__",
+                    removed.entry.runtime_agent_id,
+                    health_summary orelse "unavailable",
+                },
+            );
+            if (binding_key) |key| {
+                self.markRuntimeWarmupError(key, error_code, error_message);
+            }
+            self.deinitRemovedRuntime(removed);
+            return true;
+        }
+
+        return false;
     }
 
     fn publishServicePresenceForBinding(
@@ -4844,41 +4896,87 @@ const AgentRuntimeRegistry = struct {
         defer self.allocator.free(resolved_project_id);
         const runtime_key = runtimeMapKeyForProject(resolved_project_id);
 
-        var removed_unhealthy: ?RemovedRuntimeEntry = null;
-        var removed_mismatched: ?RemovedRuntimeEntry = null;
-        defer if (removed_unhealthy) |removed| self.deinitRemovedRuntime(removed);
-        defer if (removed_mismatched) |removed| self.deinitRemovedRuntime(removed);
+        var creation_claimed = false;
+        while (!creation_claimed) {
+            var removed_unhealthy: ?RemovedRuntimeEntry = null;
+            var removed_mismatched: ?RemovedRuntimeEntry = null;
+            var selected_runtime: ?*runtime_handle_mod.RuntimeHandle = null;
+            var should_wait = false;
 
-        self.mutex.lock();
-        removed_unhealthy = self.takeUnhealthyRuntimeLocked(runtime_key);
-        if (removed_unhealthy == null) {
-            if (self.by_agent.getPtr(runtime_key)) |existing| {
-                if (std.mem.eql(u8, existing.runtime_agent_id, agent_id)) {
-                    const runtime = existing.runtime;
-                    runtime.retain();
-                    self.mutex.unlock();
-                    return runtime;
+            self.mutex.lock();
+            removed_unhealthy = self.takeUnhealthyRuntimeLocked(runtime_key);
+            if (removed_unhealthy == null) {
+                if (self.by_agent.getPtr(runtime_key)) |existing| {
+                    if (std.mem.eql(u8, existing.runtime_agent_id, agent_id)) {
+                        selected_runtime = existing.runtime;
+                        selected_runtime.?.retain();
+                    } else {
+                        removed_mismatched = self.takeRuntimeLocked(runtime_key);
+                    }
                 }
-                removed_mismatched = self.takeRuntimeLocked(runtime_key);
-            } else if (self.by_agent.count() >= self.max_runtimes) {
-                self.mutex.unlock();
-                return error.RuntimeLimitReached;
             }
-        }
-        self.mutex.unlock();
+            if (selected_runtime == null) {
+                if (self.creating_runtime_keys.contains(runtime_key)) {
+                    should_wait = true;
+                } else if (self.by_agent.count() >= self.max_runtimes) {
+                    self.mutex.unlock();
+                    if (removed_unhealthy) |removed| {
+                        std.log.warn(
+                            "replacing unhealthy project runtime: project={s} agent={s}",
+                            .{ resolved_project_id, removed.entry.runtime_agent_id },
+                        );
+                        self.deinitRemovedRuntime(removed);
+                    }
+                    if (removed_mismatched) |removed| {
+                        std.log.info(
+                            "switching project runtime persona: project={s} from={s} to={s}",
+                            .{ resolved_project_id, removed.entry.runtime_agent_id, agent_id },
+                        );
+                        self.deinitRemovedRuntime(removed);
+                    }
+                    return error.RuntimeLimitReached;
+                } else {
+                    const owned_runtime_key = try self.allocator.dupe(u8, runtime_key);
+                    errdefer self.allocator.free(owned_runtime_key);
+                    try self.creating_runtime_keys.put(self.allocator, owned_runtime_key, {});
+                    creation_claimed = true;
+                }
+            }
+            self.mutex.unlock();
 
-        if (removed_unhealthy) |removed| {
-            std.log.warn(
-                "replacing unhealthy project runtime: project={s} agent={s}",
-                .{ resolved_project_id, removed.entry.runtime_agent_id },
-            );
+            if (removed_unhealthy) |removed| {
+                std.log.warn(
+                    "replacing unhealthy project runtime: project={s} agent={s}",
+                    .{ resolved_project_id, removed.entry.runtime_agent_id },
+                );
+                self.deinitRemovedRuntime(removed);
+            }
+
+            if (removed_mismatched) |removed| {
+                std.log.info(
+                    "switching project runtime persona: project={s} from={s} to={s}",
+                    .{ resolved_project_id, removed.entry.runtime_agent_id, agent_id },
+                );
+                self.deinitRemovedRuntime(removed);
+            }
+
+            if (selected_runtime) |runtime| return runtime;
+            if (!should_wait) break;
+
+            self.mutex.lock();
+            while (self.creating_runtime_keys.contains(runtime_key)) {
+                self.runtime_create_cond.wait(&self.mutex);
+            }
+            self.mutex.unlock();
         }
 
-        if (removed_mismatched) |removed| {
-            std.log.info(
-                "switching project runtime persona: project={s} from={s} to={s}",
-                .{ resolved_project_id, removed.entry.runtime_agent_id, agent_id },
-            );
+        defer {
+            self.mutex.lock();
+            if (self.creating_runtime_keys.fetchRemove(runtime_key)) |removed| {
+                self.allocator.free(removed.key);
+            }
+            self.runtime_create_cond.broadcast();
+            self.mutex.unlock();
         }
 
         const entry = try self.createRuntimeEntry(
@@ -4960,6 +5058,7 @@ const AgentRuntimeRegistry = struct {
                 );
                 switch (err) {
                     error.ProjectMountUnavailable => return error.SandboxMountUnavailable,
+                    error.ProcessFdQuotaExceeded => return error.ProcessFdQuotaExceeded,
                     else => return error.InvalidSandboxConfig,
                 }
             };
@@ -5258,6 +5357,10 @@ const AgentRuntimeRegistry = struct {
                 .code = "queue_saturated",
                 .message = "project runtime limit reached",
             },
+            error.ProcessFdQuotaExceeded => .{
+                .code = "runtime_resource_exhausted",
+                .message = "sandbox runtime hit process fd quota",
+            },
             error.ProjectRequired => .{
                 .code = "sandbox_mount_missing",
                 .message = "sandbox requires a project binding",
@@ -5482,6 +5585,12 @@ const AgentRuntimeRegistry = struct {
                 return self.runtimeAttachSnapshotByKey(binding_key);
             }
         }
+        _ = self.dropUnhealthyRuntimeForBinding(
+            agent_id,
+            project_id,
+            "runtime_unhealthy",
+            "project runtime became unhealthy",
+        );
         if (self.hasRuntimeForBinding(agent_id, project_id)) {
             return .{
                 .state = .ready,
@@ -5519,6 +5628,9 @@ const AgentRuntimeRegistry = struct {
                     if (state.state == .err and !retry_on_error) {
                         // Preserve sticky error state for read-only status probes so callers can
                         // surface the real failure instead of oscillating forever in "warming".
+                    } else if (state.state == .err and state.retry_after_ms > now_ms) {
+                        // Back off after a terminal warmup failure so attach/status/presence
+                        // probes do not immediately recreate the same broken runtime.
                     } else {
                         // Runtime is currently absent/unhealthy, so move the warmup state back
                         // to warming even if a stale "ready" snapshot is present.
@@ -7841,6 +7953,17 @@ fn handleWebSocketConnection(
                                                 try writeFrameLocked(stream, &connection_write_mutex, response, .text);
                                                 continue;
                                             },
+                                            error.ProcessFdQuotaExceeded => {
+                                                const response = try unified.buildControlError(
+                                                    allocator,
+                                                    parsed.id,
+                                                    "runtime_resource_exhausted",
+                                                    "sandbox runtime hit process fd quota",
+                                                );
+                                                defer allocator.free(response);
+                                                try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                                continue;
+                                            },
                                             error.InvalidSandboxConfig => {
                                                 const response = try unified.buildControlError(
                                                     allocator,
@@ -8325,6 +8448,17 @@ fn handleWebSocketConnection(
                                     parsed.tag,
                                     "sandbox_invalid_config",
                                     "sandbox config is invalid",
+                                );
+                                defer allocator.free(response);
+                                try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                continue;
+                            },
+                            error.ProcessFdQuotaExceeded => {
+                                const response = try unified.buildFsrpcError(
+                                    allocator,
+                                    parsed.tag,
+                                    "runtime_resource_exhausted",
+                                    "sandbox runtime hit process fd quota",
                                 );
                                 defer allocator.free(response);
                                 try writeFrameLocked(stream, &connection_write_mutex, response, .text);
@@ -11220,6 +11354,46 @@ test "server_piai: ready runtime lookup rejects unhealthy binding" {
     try std.testing.expect(ready == null);
     try std.testing.expect(!runtime_registry.hasRuntimeForBinding(runtime_registry.default_agent_id, project_id));
     try std.testing.expectEqual(@as(usize, 0), runtime_registry.by_agent.count());
+}
+
+test "server_piai: unhealthy binding drop marks warmup error" {
+    const allocator = std.testing.allocator;
+    var runtime_registry = AgentRuntimeRegistry.initWithLimits(
+        allocator,
+        .{ .ltm_directory = "", .ltm_filename = "" },
+        null,
+        1,
+    );
+    defer runtime_registry.deinit();
+
+    const project_id = "proj-unhealthy-warmup-error";
+    const runtime = try runtime_registry.getOrCreate(runtime_registry.default_agent_id, project_id, null);
+    defer runtime.release();
+
+    runtime_registry.mutex.lock();
+    {
+        const entry = runtime_registry.by_agent.getPtr(project_id) orelse return error.TestExpectedResult;
+        entry.runtime.kind = .local_sandbox;
+        entry.runtime.sandbox = null;
+    }
+    runtime_registry.mutex.unlock();
+
+    try std.testing.expect(runtime_registry.dropUnhealthyRuntimeForBinding(
+        runtime_registry.default_agent_id,
+        project_id,
+        "runtime_unhealthy",
+        "project runtime became unhealthy",
+    ));
+
+    const binding_key = try runtime_registry.runtimeBindingKey(runtime_registry.default_agent_id, project_id);
+    defer allocator.free(binding_key);
+
+    const snapshot = runtime_registry.runtimeAttachSnapshotByKey(binding_key);
+    defer snapshot.deinit(allocator);
+
+    try std.testing.expectEqual(SessionAttachState.err, snapshot.state);
+    try std.testing.expectEqualStrings("runtime_unhealthy", snapshot.error_code orelse "");
+    try std.testing.expect(!runtime_registry.hasRuntimeForBinding(runtime_registry.default_agent_id, project_id));
 }
 
 test "server_piai: websocket rejects unsupported route version" {

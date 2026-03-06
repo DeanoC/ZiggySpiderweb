@@ -69,6 +69,23 @@ log_ok() {
     printf '[OK] %s\n' "$1"
 }
 
+cleanup_mounts() {
+    log_info "Unmounting Spiderweb FUSE mounts..."
+
+    mapfile -t mount_paths < <(mount 2>/dev/null | awk '/type fuse\.spiderweb-fs-mount / {print $3}')
+    if [ "${#mount_paths[@]}" -eq 0 ]; then
+        log_info "No spiderweb FUSE mounts found"
+        return 0
+    fi
+
+    for mount_path in "${mount_paths[@]}"; do
+        [ -n "$mount_path" ] || continue
+        fusermount3 -u -z "$mount_path" 2>/dev/null || true
+        umount -l "$mount_path" 2>/dev/null || run_root umount -l "$mount_path" 2>/dev/null || true
+        rm -rf "$mount_path" 2>/dev/null || run_root rm -rf "$mount_path" 2>/dev/null || true
+    done
+}
+
 run_root() {
     if [ "${EUID:-$(id -u)}" -eq 0 ]; then
         "$@"
@@ -195,6 +212,7 @@ main() {
     confirm_two
     echo ""
     stop_services_and_processes
+    cleanup_mounts
     delete_user_artifacts
     delete_system_artifacts
     verify_clean
