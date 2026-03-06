@@ -4391,7 +4391,6 @@ const AgentRuntimeRegistry = struct {
         project_id: ?[]const u8,
     ) ?*runtime_handle_mod.RuntimeHandle {
         var selected_runtime: ?*runtime_handle_mod.RuntimeHandle = null;
-        var removed_unhealthy: ?RemovedRuntimeEntry = null;
         const runtime_key = runtimeMapKeyForProject(project_id);
         self.mutex.lock();
         if (self.by_agent.getPtr(runtime_key)) |existing| {
@@ -4399,20 +4398,54 @@ const AgentRuntimeRegistry = struct {
                 if (existing.runtime.isHealthy()) {
                     selected_runtime = existing.runtime;
                     selected_runtime.?.retain();
-                } else {
-                    removed_unhealthy = self.takeUnhealthyRuntimeLocked(runtime_key);
                 }
             }
         }
         self.mutex.unlock();
+        if (selected_runtime == null) {
+            _ = self.dropUnhealthyRuntimeForBinding(
+                agent_id,
+                project_id,
+                "runtime_unhealthy",
+                "project runtime became unhealthy",
+            );
+        }
+        return selected_runtime;
+    }
+
+    fn dropUnhealthyRuntimeForBinding(
+        self: *AgentRuntimeRegistry,
+        agent_id: []const u8,
+        project_id: ?[]const u8,
+        error_code: []const u8,
+        error_message: []const u8,
+    ) bool {
+        var removed_unhealthy: ?RemovedRuntimeEntry = null;
+        const runtime_key = runtimeMapKeyForProject(project_id);
+        const binding_key = self.runtimeBindingKey(agent_id, project_id) catch null;
+        defer if (binding_key) |value| self.allocator.free(value);
+
+        self.mutex.lock();
+        if (self.by_agent.getPtr(runtime_key)) |existing| {
+            if (std.mem.eql(u8, existing.runtime_agent_id, agent_id) and !existing.runtime.isHealthy()) {
+                removed_unhealthy = self.takeUnhealthyRuntimeLocked(runtime_key);
+            }
+        }
+        self.mutex.unlock();
+
         if (removed_unhealthy) |removed| {
             std.log.warn(
                 "dropping unhealthy ready runtime binding: project={s} agent={s}",
                 .{ project_id orelse "__auto__", removed.entry.runtime_agent_id },
             );
+            if (binding_key) |key| {
+                self.markRuntimeWarmupError(key, error_code, error_message);
+            }
             self.deinitRemovedRuntime(removed);
+            return true;
         }
-        return selected_runtime;
+
+        return false;
     }
 
     fn publishServicePresenceForBinding(
@@ -5492,6 +5525,12 @@ const AgentRuntimeRegistry = struct {
                 return self.runtimeAttachSnapshotByKey(binding_key);
             }
         }
+        _ = self.dropUnhealthyRuntimeForBinding(
+            agent_id,
+            project_id,
+            "runtime_unhealthy",
+            "project runtime became unhealthy",
+        );
         if (self.hasRuntimeForBinding(agent_id, project_id)) {
             return .{
                 .state = .ready,
@@ -11255,6 +11294,46 @@ test "server_piai: ready runtime lookup rejects unhealthy binding" {
     try std.testing.expect(ready == null);
     try std.testing.expect(!runtime_registry.hasRuntimeForBinding(runtime_registry.default_agent_id, project_id));
     try std.testing.expectEqual(@as(usize, 0), runtime_registry.by_agent.count());
+}
+
+test "server_piai: unhealthy binding drop marks warmup error" {
+    const allocator = std.testing.allocator;
+    var runtime_registry = AgentRuntimeRegistry.initWithLimits(
+        allocator,
+        .{ .ltm_directory = "", .ltm_filename = "" },
+        null,
+        1,
+    );
+    defer runtime_registry.deinit();
+
+    const project_id = "proj-unhealthy-warmup-error";
+    const runtime = try runtime_registry.getOrCreate(runtime_registry.default_agent_id, project_id, null);
+    defer runtime.release();
+
+    runtime_registry.mutex.lock();
+    {
+        const entry = runtime_registry.by_agent.getPtr(project_id) orelse return error.TestExpectedResult;
+        entry.runtime.kind = .local_sandbox;
+        entry.runtime.sandbox = null;
+    }
+    runtime_registry.mutex.unlock();
+
+    try std.testing.expect(runtime_registry.dropUnhealthyRuntimeForBinding(
+        runtime_registry.default_agent_id,
+        project_id,
+        "runtime_unhealthy",
+        "project runtime became unhealthy",
+    ));
+
+    const binding_key = try runtime_registry.runtimeBindingKey(runtime_registry.default_agent_id, project_id);
+    defer allocator.free(binding_key);
+
+    const snapshot = runtime_registry.runtimeAttachSnapshotByKey(binding_key);
+    defer snapshot.deinit(allocator);
+
+    try std.testing.expectEqual(SessionAttachState.err, snapshot.state);
+    try std.testing.expectEqualStrings("runtime_unhealthy", snapshot.error_code orelse "");
+    try std.testing.expect(!runtime_registry.hasRuntimeForBinding(runtime_registry.default_agent_id, project_id));
 }
 
 test "server_piai: websocket rejects unsupported route version" {
