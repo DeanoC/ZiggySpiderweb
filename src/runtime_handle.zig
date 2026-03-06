@@ -124,4 +124,18 @@ pub const RuntimeHandle = struct {
             .sandbox => if (self.sandbox) |runtime| runtime.isHealthy() else false,
         };
     }
+
+    pub fn healthSummary(self: *RuntimeHandle, allocator: std.mem.Allocator) ![]u8 {
+        return switch (self.kind) {
+            .local => allocator.dupe(u8, "local runtime is always treated as healthy"),
+            .local_sandbox => if (self.sandbox) |runtime|
+                runtime.healthSummary(allocator)
+            else
+                allocator.dupe(u8, "local_sandbox runtime missing sandbox handle"),
+            .sandbox => if (self.sandbox) |runtime|
+                runtime.healthSummary(allocator)
+            else
+                allocator.dupe(u8, "sandbox runtime missing sandbox handle"),
+        };
+    }
 };

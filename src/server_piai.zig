@@ -3910,6 +3910,8 @@ const AgentRuntimeRegistry = struct {
     workspace_url: ?[]u8 = null,
     mutex: std.Thread.Mutex = .{},
     by_agent: std.StringHashMapUnmanaged(AgentRuntimeEntry) = .{},
+    creating_runtime_keys: std.StringHashMapUnmanaged(void) = .{},
+    runtime_create_cond: std.Thread.Condition = .{},
     runtime_warmups_mutex: std.Thread.Mutex = .{},
     runtime_warmups: std.StringHashMapUnmanaged(RuntimeWarmupState) = .{},
     runtime_warmup_lifecycle_mutex: std.Thread.Mutex = .{},
@@ -4079,6 +4081,12 @@ const AgentRuntimeRegistry = struct {
             runtime_entry.deinit(self.allocator);
         }
         self.by_agent.deinit(self.allocator);
+        var creating_it = self.creating_runtime_keys.iterator();
+        while (creating_it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+        }
+        self.creating_runtime_keys.deinit(self.allocator);
+        self.creating_runtime_keys = .{};
         self.runtime_warmups_mutex.lock();
         var warmup_it = self.runtime_warmups.iterator();
         while (warmup_it.next()) |entry| {
@@ -4434,9 +4442,15 @@ const AgentRuntimeRegistry = struct {
         self.mutex.unlock();
 
         if (removed_unhealthy) |removed| {
+            const health_summary = removed.entry.runtime.healthSummary(self.allocator) catch null;
+            defer if (health_summary) |value| self.allocator.free(value);
             std.log.warn(
-                "dropping unhealthy ready runtime binding: project={s} agent={s}",
-                .{ project_id orelse "__auto__", removed.entry.runtime_agent_id },
+                "dropping unhealthy ready runtime binding: project={s} agent={s} detail={s}",
+                .{
+                    project_id orelse "__auto__",
+                    removed.entry.runtime_agent_id,
+                    health_summary orelse "unavailable",
+                },
             );
             if (binding_key) |key| {
                 self.markRuntimeWarmupError(key, error_code, error_message);
@@ -4882,41 +4896,87 @@ const AgentRuntimeRegistry = struct {
         defer self.allocator.free(resolved_project_id);
         const runtime_key = runtimeMapKeyForProject(resolved_project_id);
 
-        var removed_unhealthy: ?RemovedRuntimeEntry = null;
-        var removed_mismatched: ?RemovedRuntimeEntry = null;
-        defer if (removed_unhealthy) |removed| self.deinitRemovedRuntime(removed);
-        defer if (removed_mismatched) |removed| self.deinitRemovedRuntime(removed);
+        var creation_claimed = false;
+        while (!creation_claimed) {
+            var removed_unhealthy: ?RemovedRuntimeEntry = null;
+            var removed_mismatched: ?RemovedRuntimeEntry = null;
+            var selected_runtime: ?*runtime_handle_mod.RuntimeHandle = null;
+            var should_wait = false;
 
-        self.mutex.lock();
-        removed_unhealthy = self.takeUnhealthyRuntimeLocked(runtime_key);
-        if (removed_unhealthy == null) {
-            if (self.by_agent.getPtr(runtime_key)) |existing| {
-                if (std.mem.eql(u8, existing.runtime_agent_id, agent_id)) {
-                    const runtime = existing.runtime;
-                    runtime.retain();
-                    self.mutex.unlock();
-                    return runtime;
+            self.mutex.lock();
+            removed_unhealthy = self.takeUnhealthyRuntimeLocked(runtime_key);
+            if (removed_unhealthy == null) {
+                if (self.by_agent.getPtr(runtime_key)) |existing| {
+                    if (std.mem.eql(u8, existing.runtime_agent_id, agent_id)) {
+                        selected_runtime = existing.runtime;
+                        selected_runtime.?.retain();
+                    } else {
+                        removed_mismatched = self.takeRuntimeLocked(runtime_key);
+                    }
                 }
-                removed_mismatched = self.takeRuntimeLocked(runtime_key);
-            } else if (self.by_agent.count() >= self.max_runtimes) {
-                self.mutex.unlock();
-                return error.RuntimeLimitReached;
             }
-        }
-        self.mutex.unlock();
+            if (selected_runtime == null) {
+                if (self.creating_runtime_keys.contains(runtime_key)) {
+                    should_wait = true;
+                } else if (self.by_agent.count() >= self.max_runtimes) {
+                    self.mutex.unlock();
+                    if (removed_unhealthy) |removed| {
+                        std.log.warn(
+                            "replacing unhealthy project runtime: project={s} agent={s}",
+                            .{ resolved_project_id, removed.entry.runtime_agent_id },
+                        );
+                        self.deinitRemovedRuntime(removed);
+                    }
+                    if (removed_mismatched) |removed| {
+                        std.log.info(
+                            "switching project runtime persona: project={s} from={s} to={s}",
+                            .{ resolved_project_id, removed.entry.runtime_agent_id, agent_id },
+                        );
+                        self.deinitRemovedRuntime(removed);
+                    }
+                    return error.RuntimeLimitReached;
+                } else {
+                    const owned_runtime_key = try self.allocator.dupe(u8, runtime_key);
+                    errdefer self.allocator.free(owned_runtime_key);
+                    try self.creating_runtime_keys.put(self.allocator, owned_runtime_key, {});
+                    creation_claimed = true;
+                }
+            }
+            self.mutex.unlock();
 
-        if (removed_unhealthy) |removed| {
-            std.log.warn(
-                "replacing unhealthy project runtime: project={s} agent={s}",
-                .{ resolved_project_id, removed.entry.runtime_agent_id },
-            );
+            if (removed_unhealthy) |removed| {
+                std.log.warn(
+                    "replacing unhealthy project runtime: project={s} agent={s}",
+                    .{ resolved_project_id, removed.entry.runtime_agent_id },
+                );
+                self.deinitRemovedRuntime(removed);
+            }
+
+            if (removed_mismatched) |removed| {
+                std.log.info(
+                    "switching project runtime persona: project={s} from={s} to={s}",
+                    .{ resolved_project_id, removed.entry.runtime_agent_id, agent_id },
+                );
+                self.deinitRemovedRuntime(removed);
+            }
+
+            if (selected_runtime) |runtime| return runtime;
+            if (!should_wait) break;
+
+            self.mutex.lock();
+            while (self.creating_runtime_keys.contains(runtime_key)) {
+                self.runtime_create_cond.wait(&self.mutex);
+            }
+            self.mutex.unlock();
         }
 
-        if (removed_mismatched) |removed| {
-            std.log.info(
-                "switching project runtime persona: project={s} from={s} to={s}",
-                .{ resolved_project_id, removed.entry.runtime_agent_id, agent_id },
-            );
+        defer {
+            self.mutex.lock();
+            if (self.creating_runtime_keys.fetchRemove(runtime_key)) |removed| {
+                self.allocator.free(removed.key);
+            }
+            self.runtime_create_cond.broadcast();
+            self.mutex.unlock();
         }
 
         const entry = try self.createRuntimeEntry(
