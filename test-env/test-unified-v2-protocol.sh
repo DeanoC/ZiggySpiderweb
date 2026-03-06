@@ -129,6 +129,10 @@ import socket
 import sys
 import time
 
+SOCKET_TIMEOUT_SEC = float(os.environ.get("WS_TEST_SOCKET_TIMEOUT_SEC", "15"))
+ATTACH_POLL_ATTEMPTS = int(os.environ.get("WS_TEST_ATTACH_POLL_ATTEMPTS", "6"))
+ATTACH_POLL_DELAY_SEC = float(os.environ.get("WS_TEST_ATTACH_POLL_DELAY_SEC", "0.2"))
+
 
 class WsError(RuntimeError):
     pass
@@ -145,8 +149,8 @@ class WSConn:
 
     @classmethod
     def connect(cls, host: str, port: int, path: str, auth_token=None) -> "WSConn":
-        sock = socket.create_connection((host, port), timeout=10)
-        sock.settimeout(10)
+        sock = socket.create_connection((host, port), timeout=SOCKET_TIMEOUT_SEC)
+        sock.settimeout(SOCKET_TIMEOUT_SEC)
         key = base64.b64encode(os.urandom(16)).decode("ascii")
         auth_line = f"Authorization: Bearer {auth_token}\r\n" if auth_token else ""
         request = (
@@ -395,7 +399,8 @@ def run_control_runtime_order(host: str, port: int, auth_token=None) -> None:
                 "runtime_warmup_timeout",
             )
             next_tag = 2
-            for _ in range(2):
+            saw_allowed_attach_error = False
+            for _ in range(ATTACH_POLL_ATTEMPTS):
                 conn.send_json({
                     "channel": "acheron",
                     "type": "acheron.t_attach",
@@ -403,7 +408,11 @@ def run_control_runtime_order(host: str, port: int, auth_token=None) -> None:
                     "fid": 1,
                 })
                 next_tag += 1
-                attach_msg = conn.read_json()
+                try:
+                    attach_msg = conn.read_json()
+                except TimeoutError:
+                    time.sleep(ATTACH_POLL_DELAY_SEC)
+                    continue
                 if attach_msg.get("channel") == "acheron" and attach_msg.get("type") == "acheron.r_attach":
                     return
 
@@ -411,7 +420,11 @@ def run_control_runtime_order(host: str, port: int, auth_token=None) -> None:
                 err = attach_msg.get("error") or {}
                 code = str(err.get("code") or "")
                 require(code in allowed_attach_runtime_codes, f"unexpected acheron attach error: {err}")
-                time.sleep(0.1)
+                saw_allowed_attach_error = True
+                time.sleep(ATTACH_POLL_DELAY_SEC)
+            if saw_allowed_attach_error:
+                return
+            raise WsError("attach did not become ready before timeout")
         finally:
             conn.close()
 

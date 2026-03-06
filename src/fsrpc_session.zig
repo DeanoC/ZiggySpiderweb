@@ -8143,7 +8143,6 @@ pub const Session = struct {
             "ProviderStreamFailed",
             "ProviderRateLimited",
             "ProviderAuthFailed",
-            "MissingProviderApiKey",
             "ProviderModelNotFound",
             "provider request invalid",
             "provider tool loop exceeded",
@@ -8152,7 +8151,6 @@ pub const Session = struct {
             "provider request timed out",
             "provider rate limited",
             "provider authentication failed",
-            "missing provider api key",
             "provider model not found",
             "internal runtime limit",
         };
@@ -12032,7 +12030,7 @@ test "fsrpc_session: mounts namespace mkdir creates local export folders" {
     defer allocator.free(escaped_project_token);
     const mkdir_payload = try std.fmt.allocPrint(
         allocator,
-        "{{\"project_id\":\"{s}\",\"project_token\":\"{s}\",\"path\":\"new-project/workspace\"}}",
+        "{{\"project_id\":\"{s}\",\"project_token\":\"{s}\",\"path\":\"new-project/root\"}}",
         .{ escaped_project_id, escaped_project_token },
     );
     defer allocator.free(mkdir_payload);
@@ -12056,17 +12054,17 @@ test "fsrpc_session: mounts namespace mkdir creates local export folders" {
     );
     defer allocator.free(created_payload);
     try std.testing.expect(std.mem.indexOf(u8, created_payload, "\"operation\":\"mkdir\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, created_payload, "\"path\":\"/nodes/local/fs/new-project/workspace\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, created_payload, "\"path\":\"/nodes/local/fs/new-project/root\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, created_payload, "\"created\":true") != null);
 
-    const created_host_path = try std.fs.path.join(allocator, &.{ local_export_root, "new-project", "workspace" });
+    const created_host_path = try std.fs.path.join(allocator, &.{ local_export_root, "new-project", "root" });
     defer allocator.free(created_host_path);
     var created_dir = try std.fs.openDirAbsolute(created_host_path, .{});
     created_dir.close();
 
     const mkdir_existing_payload = try std.fmt.allocPrint(
         allocator,
-        "{{\"project_id\":\"{s}\",\"project_token\":\"{s}\",\"path\":\"/nodes/local/fs/new-project/workspace\"}}",
+        "{{\"project_id\":\"{s}\",\"project_token\":\"{s}\",\"path\":\"/nodes/local/fs/new-project/root\"}}",
         .{ escaped_project_id, escaped_project_token },
     );
     defer allocator.free(mkdir_existing_payload);
@@ -14130,6 +14128,12 @@ test "fsrpc_session: runtime failure normalization redacts provider details" {
     const normalized = Session.normalizeRuntimeFailureForAgent("provider_request_invalid", "provider request invalid");
     try std.testing.expectEqualStrings("runtime_internal_limit", normalized.code);
     try std.testing.expectEqualStrings("Temporary internal runtime limit reached; retry this request.", normalized.message);
+}
+
+test "fsrpc_session: missing provider API key is surfaced directly" {
+    const normalized = Session.normalizeRuntimeFailureForAgent("execution_failed", "missing provider api key");
+    try std.testing.expectEqualStrings("execution_failed", normalized.code);
+    try std.testing.expectEqualStrings("missing provider api key", normalized.message);
 }
 
 test "fsrpc_session: runtime loop-guard text is classified as internal failure" {

@@ -3,6 +3,7 @@ const fs_router = @import("fs_router.zig");
 const fs_fuse_adapter = @import("fs_fuse_adapter.zig");
 
 const control_reply_timeout_ms: i32 = 45_000;
+const control_handshake_timeout_ms: i32 = 10_000;
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -971,8 +972,14 @@ fn readHttpResponse(allocator: std.mem.Allocator, stream: *std.net.Stream, max_b
     var out = std.ArrayListUnmanaged(u8){};
     errdefer out.deinit(allocator);
 
+    const deadline_ms = std.time.milliTimestamp() + @as(i64, control_handshake_timeout_ms);
     var chunk: [512]u8 = undefined;
     while (out.items.len < max_bytes) {
+        const now_ms = std.time.milliTimestamp();
+        if (now_ms >= deadline_ms) return error.ControlHandshakeTimeout;
+        const remaining_i64 = deadline_ms - now_ms;
+        const remaining_ms: i32 = @intCast(@min(remaining_i64, @as(i64, std.math.maxInt(i32))));
+        if (!try waitReadable(stream, remaining_ms)) return error.ControlHandshakeTimeout;
         const n = try stream.read(&chunk);
         if (n == 0) return error.ConnectionClosed;
         try out.appendSlice(allocator, chunk[0..n]);

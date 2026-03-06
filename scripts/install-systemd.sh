@@ -6,9 +6,24 @@
 
 set -e
 
+BASE_DIR="${SPIDERWEB_BASE_DIR:-${BASE_DIR:-}}"
+if [ -n "$BASE_DIR" ]; then
+    INSTALL_DIR_DEFAULT="$BASE_DIR/opt/spiderweb"
+    CONFIG_DIR_DEFAULT="$BASE_DIR/etc/spiderweb"
+    DATA_DIR_DEFAULT="$BASE_DIR/var/lib/spiderweb"
+    LOG_DIR_DEFAULT="$BASE_DIR/var/log/spiderweb"
+else
+    INSTALL_DIR_DEFAULT="/opt/spiderweb"
+    CONFIG_DIR_DEFAULT="/etc/spiderweb"
+    DATA_DIR_DEFAULT="/var/lib/spiderweb"
+    LOG_DIR_DEFAULT="/var/log/spiderweb"
+fi
+
 INSTALL_USER="${INSTALL_USER:-spiderweb}"
-INSTALL_DIR="${INSTALL_DIR:-/opt/spiderweb}"
-CONFIG_DIR="${CONFIG_DIR:-/etc/spiderweb}"
+INSTALL_DIR="${INSTALL_DIR:-$INSTALL_DIR_DEFAULT}"
+CONFIG_DIR="${CONFIG_DIR:-$CONFIG_DIR_DEFAULT}"
+DATA_DIR="${DATA_DIR:-$DATA_DIR_DEFAULT}"
+LOG_DIR="${LOG_DIR:-$LOG_DIR_DEFAULT}"
 SERVICE_NAME="${SERVICE_NAME:-spiderweb}"
 PORT="${PORT:-18790}"
 BIND_ADDR="${BIND_ADDR:-0.0.0.0}"
@@ -152,10 +167,13 @@ install_files() {
     # Create directories
     mkdir -p "$INSTALL_DIR/bin"
     mkdir -p "$CONFIG_DIR"
-    mkdir -p "/var/log/spiderweb"
-    mkdir -p "/var/lib/spiderweb"
-    mkdir -p "/var/lib/spiderweb/mounts"
-    mkdir -p "/var/lib/spiderweb/runtime"
+    mkdir -p "$LOG_DIR"
+    mkdir -p "$DATA_DIR"
+    mkdir -p "$DATA_DIR/mounts"
+    mkdir -p "$DATA_DIR/runtime"
+    mkdir -p "$DATA_DIR/rootfs/base"
+    mkdir -p "$DATA_DIR/rootfs/overlays"
+    mkdir -p "$DATA_DIR/rootfs/snapshots"
     
     SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
     PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
@@ -203,10 +221,14 @@ install_config() {
   },
   "runtime": {
     "spider_web_root": "$SPIDER_WEB_ROOT",
-    "ltm_directory": "/var/lib/spiderweb/.spiderweb-ltm",
+    "ltm_directory": "$DATA_DIR/.spiderweb-ltm",
     "ltm_filename": "runtime-memory.db",
-    "sandbox_mounts_root": "/var/lib/spiderweb/mounts",
-    "sandbox_runtime_root": "/var/lib/spiderweb/runtime",
+    "sandbox_mounts_root": "$DATA_DIR/mounts",
+    "sandbox_runtime_root": "$DATA_DIR/runtime",
+    "sandbox_rootfs_base_ref": "debian:bookworm-slim",
+    "sandbox_rootfs_store_root": "$DATA_DIR/rootfs/base",
+    "sandbox_overlay_root": "$DATA_DIR/rootfs/overlays",
+    "sandbox_snapshot_root": "$DATA_DIR/rootfs/snapshots",
     "sandbox_fs_mount_bin": "$INSTALL_DIR/bin/spiderweb-fs-mount",
     "sandbox_agent_runtime_bin": "$INSTALL_DIR/bin/spiderweb-agent-runtime"
   }
@@ -229,10 +251,14 @@ EOF
   },
   "runtime": {
     "spider_web_root": "$SPIDER_WEB_ROOT",
-    "ltm_directory": "/var/lib/spiderweb/.spiderweb-ltm",
+    "ltm_directory": "$DATA_DIR/.spiderweb-ltm",
     "ltm_filename": "runtime-memory.db",
-    "sandbox_mounts_root": "/var/lib/spiderweb/mounts",
-    "sandbox_runtime_root": "/var/lib/spiderweb/runtime",
+    "sandbox_mounts_root": "$DATA_DIR/mounts",
+    "sandbox_runtime_root": "$DATA_DIR/runtime",
+    "sandbox_rootfs_base_ref": "debian:bookworm-slim",
+    "sandbox_rootfs_store_root": "$DATA_DIR/rootfs/base",
+    "sandbox_overlay_root": "$DATA_DIR/rootfs/overlays",
+    "sandbox_snapshot_root": "$DATA_DIR/rootfs/snapshots",
     "sandbox_fs_mount_bin": "$INSTALL_DIR/bin/spiderweb-fs-mount",
     "sandbox_agent_runtime_bin": "$INSTALL_DIR/bin/spiderweb-agent-runtime"
   }
@@ -369,7 +395,7 @@ Environment="RUST_LOG=info"
 EnvironmentFile=-$SERVICE_ENV_FILE
 
 # Working directory
-WorkingDirectory=/var/lib/spiderweb
+WorkingDirectory=$DATA_DIR
 
 # Binary
 ExecStart=$INSTALL_DIR/bin/spiderweb
@@ -387,7 +413,7 @@ NoNewPrivileges=false
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=/var/lib/spiderweb /var/log/spiderweb $SERVICE_USER_HOME/.config $SERVICE_USER_HOME/.codex $SERVICE_USER_HOME/.pi
+ReadWritePaths=$DATA_DIR $LOG_DIR $SERVICE_USER_HOME/.config $SERVICE_USER_HOME/.codex $SERVICE_USER_HOME/.pi
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
@@ -419,8 +445,8 @@ set_permissions() {
     log_info "Setting permissions..."
     
     chown -R root:root "$INSTALL_DIR"
-    chown -R "$INSTALL_USER:$INSTALL_USER" "/var/lib/spiderweb"
-    chown -R "$INSTALL_USER:$INSTALL_USER" "/var/log/spiderweb"
+    chown -R "$INSTALL_USER:$INSTALL_USER" "$DATA_DIR"
+    chown -R "$INSTALL_USER:$INSTALL_USER" "$LOG_DIR"
     chown root:"$INSTALL_USER" "$CONFIG_DIR"
     chown root:"$INSTALL_USER" "$CONFIG_DIR/config.json"
     chmod 755 "$CONFIG_DIR"
@@ -455,8 +481,8 @@ print_summary() {
     if [ -f "$SERVICE_ENV_FILE" ]; then
         echo "Env file:    $SERVICE_ENV_FILE"
     fi
-    echo "Logs:        /var/log/spiderweb/"
-    echo "Data:        /var/lib/spiderweb/"
+    echo "Logs:        $LOG_DIR/"
+    echo "Data:        $DATA_DIR/"
     echo "Port:        $PORT"
     echo "Bind:        $BIND_ADDR"
     echo "Provider:    $PROVIDER_NAME/$PROVIDER_MODEL"

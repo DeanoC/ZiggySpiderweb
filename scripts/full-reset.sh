@@ -8,6 +8,7 @@
 set -euo pipefail
 
 SERVICE_NAME="${SERVICE_NAME:-spiderweb}"
+BASE_DIR="${SPIDERWEB_BASE_DIR:-${BASE_DIR:-}}"
 TARGET_HOME_FROM_ENV=0
 if [ -n "${TARGET_HOME:-}" ]; then
     TARGET_HOME_FROM_ENV=1
@@ -46,6 +47,15 @@ SYSTEM_PATHS=(
     "/usr/local/bin/spiderweb"
     "/usr/local/bin/spiderweb-config"
 )
+
+if [ -n "$BASE_DIR" ]; then
+    SYSTEM_PATHS+=(
+        "$BASE_DIR/etc/spiderweb"
+        "$BASE_DIR/var/lib/spiderweb"
+        "$BASE_DIR/var/log/spiderweb"
+        "$BASE_DIR/opt/spiderweb"
+    )
+fi
 
 log_info() {
     printf '[INFO] %s\n' "$1"
