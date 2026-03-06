@@ -1385,18 +1385,18 @@ pub const Router = struct {
                 .router = self,
                 .endpoint_index = endpoint_index,
             };
-            endpoint.client_mutex.lock();
             const pump_result = blk: {
+                endpoint.client_mutex.lock();
                 defer endpoint.client_mutex.unlock();
                 if (shouldStopEventPump(endpoint)) return;
                 if (endpoint.client == null) return;
                 break :blk endpoint.client.?.pumpEvents(
-                    250,
+                    0,
                     handleClientEvent,
                     @ptrCast(&event_ctx),
                 );
             };
-            pump_result catch |err| {
+            const processed_frames = pump_result catch |err| {
                 if (isEndpointFailureError(err)) {
                     self.noteEndpointFailure(endpoint_usize);
                     return;
@@ -1406,7 +1406,12 @@ pub const Router = struct {
                     .{ endpoint_index, @errorName(err) },
                 );
                 std.Thread.sleep(250 * std.time.ns_per_ms);
+                continue;
             };
+
+            if (processed_frames == 0) {
+                std.Thread.sleep(250 * std.time.ns_per_ms);
+            }
         }
     }
 

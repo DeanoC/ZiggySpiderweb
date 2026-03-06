@@ -4831,23 +4831,35 @@ const AgentRuntimeRegistry = struct {
         defer self.allocator.free(resolved_project_id);
         const runtime_key = runtimeMapKeyForProject(resolved_project_id);
 
+        var removed_unhealthy: ?RemovedRuntimeEntry = null;
         var removed_mismatched: ?RemovedRuntimeEntry = null;
+        defer if (removed_unhealthy) |removed| self.deinitRemovedRuntime(removed);
         defer if (removed_mismatched) |removed| self.deinitRemovedRuntime(removed);
 
         self.mutex.lock();
-        if (self.by_agent.getPtr(runtime_key)) |existing| {
-            if (std.mem.eql(u8, existing.runtime_agent_id, agent_id)) {
-                const runtime = existing.runtime;
-                runtime.retain();
+        removed_unhealthy = self.takeUnhealthyRuntimeLocked(runtime_key);
+        if (removed_unhealthy == null) {
+            if (self.by_agent.getPtr(runtime_key)) |existing| {
+                if (std.mem.eql(u8, existing.runtime_agent_id, agent_id)) {
+                    const runtime = existing.runtime;
+                    runtime.retain();
+                    self.mutex.unlock();
+                    return runtime;
+                }
+                removed_mismatched = self.takeRuntimeLocked(runtime_key);
+            } else if (self.by_agent.count() >= self.max_runtimes) {
                 self.mutex.unlock();
-                return runtime;
+                return error.RuntimeLimitReached;
             }
-            removed_mismatched = self.takeRuntimeLocked(runtime_key);
-        } else if (self.by_agent.count() >= self.max_runtimes) {
-            self.mutex.unlock();
-            return error.RuntimeLimitReached;
         }
         self.mutex.unlock();
+
+        if (removed_unhealthy) |removed| {
+            std.log.warn(
+                "replacing unhealthy project runtime: project={s} agent={s}",
+                .{ resolved_project_id, removed.entry.runtime_agent_id },
+            );
+        }
 
         if (removed_mismatched) |removed| {
             std.log.info(
@@ -11138,6 +11150,35 @@ test "server_piai: project runtime switches persona when agent changes" {
     defer runtime_registry.mutex.unlock();
     const active_entry = runtime_registry.by_agent.getPtr(project_id) orelse return error.TestExpectedResult;
     try std.testing.expectEqualStrings(system_agent_id, active_entry.runtime_agent_id);
+}
+
+test "server_piai: getOrCreate replaces unhealthy runtime for same agent" {
+    const allocator = std.testing.allocator;
+    var runtime_registry = AgentRuntimeRegistry.initWithLimits(
+        allocator,
+        .{ .ltm_directory = "", .ltm_filename = "" },
+        null,
+        1,
+    );
+    defer runtime_registry.deinit();
+
+    const project_id = "proj-unhealthy-runtime";
+    const first_runtime = try runtime_registry.getOrCreate(runtime_registry.default_agent_id, project_id, null);
+    runtime_registry.mutex.lock();
+    {
+        const entry = runtime_registry.by_agent.getPtr(project_id) orelse return error.TestExpectedResult;
+        entry.runtime.kind = .local_sandbox;
+        entry.runtime.sandbox = null;
+    }
+    runtime_registry.mutex.unlock();
+
+    const second_runtime = try runtime_registry.getOrCreate(runtime_registry.default_agent_id, project_id, null);
+    defer second_runtime.release();
+    defer first_runtime.release();
+
+    try std.testing.expect(second_runtime != first_runtime);
+    try std.testing.expect(runtime_registry.hasRuntimeForBinding(runtime_registry.default_agent_id, project_id));
+    try std.testing.expectEqual(@as(usize, 1), runtime_registry.by_agent.count());
 }
 
 test "server_piai: websocket rejects unsupported route version" {
