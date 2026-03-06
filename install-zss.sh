@@ -22,6 +22,20 @@ log_warn() {
     echo -e "${YELLOW}[WARN]${NC} $1"
 }
 
+sync_git_submodules() {
+    local dir="$1"
+    local name
+    name="$(basename "$dir")"
+
+    if [[ ! -f "$dir/.gitmodules" ]]; then
+        return 0
+    fi
+
+    log_info "Initializing ${name} submodules..."
+    git -C "$dir" submodule sync --recursive >/dev/null 2>&1 || true
+    git -C "$dir" submodule update --init --recursive
+}
+
 # Check OS
 if [[ "$OSTYPE" != "linux-gnu"* ]]; then
     echo "Error: This installer only supports Linux"
@@ -64,6 +78,8 @@ else
     git clone --progress https://github.com/DeanoC/ZiggyStarSpider.git "$ZSS_REPO"
     cd "$ZSS_REPO"
 fi
+
+sync_git_submodules "$ZSS_REPO"
 
 # Build zss
 log_info "Building zss client (this may take 2-3 minutes)..."

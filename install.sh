@@ -89,6 +89,20 @@ ensure_git_repo() {
     fi
 }
 
+sync_git_submodules() {
+    local dir="$1"
+    local name
+    name="$(basename "$dir")"
+
+    if [[ ! -f "$dir/.gitmodules" ]]; then
+        return 0
+    fi
+
+    log_info "Initializing ${name} submodules..."
+    git -C "$dir" submodule sync --recursive >/dev/null 2>&1 || true
+    git -C "$dir" submodule update --init --recursive
+}
+
 print_auth_tokens_summary() {
     local config_cmd="${INSTALL_DIR}/spiderweb-config"
     local has_auth_cli=false
@@ -504,6 +518,7 @@ if [[ "$INSTALL_ZSS" == "true" ]]; then
 
     mkdir -p "$(dirname "$ZSS_REPO")"
     ensure_git_repo "$ZSS_REPO" "$ZSS_REPO_URL" "$ZSS_GIT_REF"
+    sync_git_submodules "$ZSS_REPO"
     cd "$ZSS_REPO"
     
     log_info "Building ZiggyStarSpider CLI..."
