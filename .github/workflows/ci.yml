@@ -10,11 +10,13 @@ jobs:
     secrets: inherit
     with:
       verify_script: |
+        set -euo pipefail
         if grep -qE '\.path = "\.\./Ziggy' build.zig.zon; then
           echo "Local path Ziggy dependencies are not allowed in CI"
           exit 1
         fi
-        grep -q 'ziggy_spider_protocol' build.zig.zon
+        grep -q 'spider_protocol' build.zig.zon
+        grep -q 'deps/spider-protocol' build.zig.zon
         grep -q 'ziggy_memory_store' build.zig.zon
         grep -q 'ziggy_tool_runtime' build.zig.zon
         grep -q 'ziggy_runtime_hooks' build.zig.zon
@@ -36,6 +38,8 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
       - name: Install Zig
         uses: mlugg/setup-zig@v2
