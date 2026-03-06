@@ -22,7 +22,7 @@ const default_platform_os = "unknown";
 const default_platform_arch = "unknown";
 const default_platform_runtime_kind = "unknown";
 const debug_stream_max_bytes: usize = 2 * 1024 * 1024;
-const node_service_event_history_max: usize = 1024;
+const node_service_event_history_max_default: usize = 1024;
 
 const ProjectKind = enum {
     normal,
@@ -302,6 +302,7 @@ pub const ControlPlane = struct {
     allocator: std.mem.Allocator,
     primary_agent_id: []const u8 = default_primary_agent_id,
     spider_web_root: []const u8 = default_spider_web_root,
+    node_service_event_history_max: usize = node_service_event_history_max_default,
     store: ?*ltm_store.VersionedMemStore = null,
     state_encryption_key: ?[persistence_cipher.key_length]u8 = null,
     mutex: std.Thread.Mutex = .{},
@@ -362,6 +363,7 @@ pub const ControlPlane = struct {
     pub const InitOptions = struct {
         primary_agent_id: []const u8 = default_primary_agent_id,
         spider_web_root: []const u8 = default_spider_web_root,
+        node_service_event_history_max: usize = node_service_event_history_max_default,
     };
 
     pub fn init(allocator: std.mem.Allocator) ControlPlane {
@@ -377,10 +379,15 @@ pub const ControlPlane = struct {
             options.spider_web_root
         else
             default_spider_web_root;
+        const node_service_event_history_max = if (options.node_service_event_history_max == 0)
+            node_service_event_history_max_default
+        else
+            options.node_service_event_history_max;
         var plane: ControlPlane = .{
             .allocator = allocator,
             .primary_agent_id = primary_agent_id,
             .spider_web_root = spider_web_root,
+            .node_service_event_history_max = node_service_event_history_max,
         };
         plane.ensureBuiltinProjectBestEffortLocked(std.time.milliTimestamp());
         return plane;
@@ -722,7 +729,7 @@ pub const ControlPlane = struct {
     }
 
     fn appendNodeServiceEventLocked(self: *ControlPlane, node_id: []const u8, payload_json: []const u8) void {
-        while (self.node_service_event_history.items.len >= node_service_event_history_max and
+        while (self.node_service_event_history.items.len >= self.node_service_event_history_max and
             self.node_service_event_history.items.len > 0)
         {
             var dropped = self.node_service_event_history.orderedRemove(0);
@@ -6723,6 +6730,41 @@ test "fs_control_plane: node service upsert reports unchanged catalog delta" {
     try std.testing.expect(std.mem.indexOf(u8, second, "\"added\":[]") != null);
     try std.testing.expect(std.mem.indexOf(u8, second, "\"updated\":[]") != null);
     try std.testing.expect(std.mem.indexOf(u8, second, "\"removed\":[]") != null);
+}
+
+test "fs_control_plane: node service event retention honors configured history max" {
+    const allocator = std.testing.allocator;
+    var plane = ControlPlane.initWithOptions(allocator, .{
+        .node_service_event_history_max = 2,
+    });
+    defer plane.deinit();
+
+    const ensured = try plane.ensureNode("retained-node", "ws://127.0.0.1:18891/v2/fs", 60_000);
+    defer allocator.free(ensured);
+    var ensured_parsed = try std.json.parseFromSlice(std.json.Value, allocator, ensured, .{});
+    defer ensured_parsed.deinit();
+    const node_id = ensured_parsed.value.object.get("node_id").?.string;
+    const node_secret = ensured_parsed.value.object.get("node_secret").?.string;
+
+    inline for (0..3) |idx| {
+        const upsert_req = try std.fmt.allocPrint(
+            allocator,
+            "{{\"node_id\":\"{s}\",\"node_secret\":\"{s}\",\"services\":[{{\"service_id\":\"terminal-main\",\"kind\":\"terminal\",\"version\":\"{d}\",\"state\":\"online\",\"endpoints\":[\"/nodes/{s}/terminal/main\"],\"capabilities\":{{\"pty\":true}}}}]}}",
+            .{ node_id, node_secret, idx, node_id },
+        );
+        defer allocator.free(upsert_req);
+        const upserted = try plane.nodeServiceUpsert(upsert_req);
+        defer allocator.free(upserted);
+    }
+
+    const snapshot = try plane.snapshotNodeServiceEvents(allocator, null, null, null, true, 0);
+    defer allocator.free(snapshot);
+
+    const line_count: usize = if (snapshot.len == 0) 0 else std.mem.count(u8, snapshot, "\n") + 1;
+    try std.testing.expectEqual(@as(usize, 2), line_count);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"version\":\"2\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"version\":\"1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"version\":\"0\"") == null);
 }
 
 test "fs_control_plane: projectUp requires project_token for existing non-builtin project" {

@@ -589,7 +589,7 @@ pub const Session = struct {
             self.agent_id,
             self.project_token,
             self.is_admin,
-            512,
+            0,
         );
         defer self.allocator.free(snapshot);
         try self.setFileContent(self.node_service_events_log_id, snapshot);
@@ -12234,6 +12234,74 @@ test "fsrpc_session: node services namespace prefers control-plane catalog" {
     try std.testing.expect(std.mem.indexOf(u8, node_service_events_payload, "\"node_id\":\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, node_service_events_payload, "\"service_delta\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, node_service_events_payload, "\"service_id\":\"terminal-9\"") != null);
+}
+
+test "fsrpc_session: node service events file returns full retained feed" {
+    const allocator = std.testing.allocator;
+
+    var control_plane = fs_control_plane.ControlPlane.initWithOptions(allocator, .{
+        .node_service_event_history_max = 520,
+    });
+    defer control_plane.deinit();
+
+    const ensured = try control_plane.ensureNode("edge-retained-feed", "ws://127.0.0.1:18891/v2/fs", 60_000);
+    defer allocator.free(ensured);
+    var ensured_parsed = try std.json.parseFromSlice(std.json.Value, allocator, ensured, .{});
+    defer ensured_parsed.deinit();
+    if (ensured_parsed.value != .object) return error.TestExpectedResponse;
+    const node_id = ensured_parsed.value.object.get("node_id") orelse return error.TestExpectedResponse;
+    if (node_id != .string) return error.TestExpectedResponse;
+    const node_secret = ensured_parsed.value.object.get("node_secret") orelse return error.TestExpectedResponse;
+    if (node_secret != .string) return error.TestExpectedResponse;
+
+    const escaped_node_id = try unified.jsonEscape(allocator, node_id.string);
+    defer allocator.free(escaped_node_id);
+    const escaped_node_secret = try unified.jsonEscape(allocator, node_secret.string);
+    defer allocator.free(escaped_node_secret);
+
+    for (0..513) |idx| {
+        const upsert_req = try std.fmt.allocPrint(
+            allocator,
+            "{{\"node_id\":\"{s}\",\"node_secret\":\"{s}\",\"services\":[{{\"service_id\":\"terminal-main\",\"kind\":\"terminal\",\"version\":\"{d}\",\"state\":\"online\",\"endpoints\":[\"/nodes/{s}/terminal/main\"],\"capabilities\":{{\"pty\":true}}}}]}}",
+            .{ escaped_node_id, escaped_node_secret, idx, escaped_node_id },
+        );
+        defer allocator.free(upsert_req);
+        const upserted = try control_plane.nodeServiceUpsert(upsert_req);
+        defer allocator.free(upserted);
+    }
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "default",
+        .{
+            .control_plane = &control_plane,
+            .is_admin = true,
+        },
+    );
+    defer session.deinit();
+
+    const node_service_events_payload = try protocolReadFile(
+        &session,
+        allocator,
+        240,
+        241,
+        &.{ "global", "services", "node-service-events.ndjson" },
+        242,
+    );
+    defer allocator.free(node_service_events_payload);
+
+    const line_count: usize = if (node_service_events_payload.len == 0) 0 else std.mem.count(u8, node_service_events_payload, "\n") + 1;
+    try std.testing.expectEqual(@as(usize, 513), line_count);
+    try std.testing.expect(std.mem.indexOf(u8, node_service_events_payload, "\"version\":\"512\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, node_service_events_payload, "\"version\":\"0\"") != null);
 }
 
 test "fsrpc_session: empty control-plane service catalog suppresses policy fallback roots" {

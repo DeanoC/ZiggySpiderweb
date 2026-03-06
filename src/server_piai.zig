@@ -4013,6 +4013,7 @@ const AgentRuntimeRegistry = struct {
                 .{
                     .primary_agent_id = system_agent_id,
                     .spider_web_root = effective_runtime_config.spider_web_root,
+                    .node_service_event_history_max = history_max,
                 },
             ),
             .job_index = chat_job_index.ChatJobIndex.init(
