@@ -445,11 +445,12 @@ fi
 
 mkdir -p "$(dirname "$REPO_DIR")"
 ensure_git_repo "$REPO_DIR" "$SPIDERWEB_REPO_URL" "$SPIDERWEB_GIT_REF"
-
+log_info "Syncing Spiderweb submodules..."
+git -C "$REPO_DIR" submodule sync --recursive
+git -C "$REPO_DIR" submodule update --init --recursive
 REPO_BASE_DIR="$(dirname "$REPO_DIR")"
 log_info "Ensuring local Ziggy module dependencies..."
 ensure_git_repo "${REPO_BASE_DIR}/ZiggyPiAi" "https://github.com/DeanoC/ZiggyPiAi.git"
-ensure_git_repo "${REPO_BASE_DIR}/ZiggySpiderProtocol" "https://github.com/DeanoC/ZiggySpiderProtocol.git"
 ensure_git_repo "${REPO_BASE_DIR}/ZiggyMemoryStore" "https://github.com/DeanoC/ZiggyMemoryStore.git"
 ensure_git_repo "${REPO_BASE_DIR}/ZiggyToolRuntime" "https://github.com/DeanoC/ZiggyToolRuntime.git"
 ensure_git_repo "${REPO_BASE_DIR}/ZiggyRuntimeHooks" "https://github.com/DeanoC/ZiggyRuntimeHooks.git"

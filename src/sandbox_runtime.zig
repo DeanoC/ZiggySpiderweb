@@ -386,6 +386,8 @@ pub const SandboxRuntime = struct {
         }
         self.mount_process = null;
 
+        const project_mount_root = std.fs.path.dirname(self.workspace_mount_path) orelse return error.InvalidSandboxConfig;
+        cleanupStaleAgentMounts(self.allocator, project_mount_root, self.agent_id, self.workspace_mount_path);
         detachMountAtPath(self.allocator, self.workspace_mount_path);
         try ensurePathExists(self.workspace_mount_path);
 
@@ -498,6 +500,7 @@ fn cleanupStaleAgentMounts(
     allocator: std.mem.Allocator,
     project_mount_root: []const u8,
     agent_id: []const u8,
+    keep_mount_path: []const u8,
 ) void {
     var prefix_buf = std.ArrayListUnmanaged(u8){};
     defer prefix_buf.deinit(allocator);
@@ -505,7 +508,10 @@ fn cleanupStaleAgentMounts(
     prefix_buf.append(allocator, '-') catch return;
     const prefix = prefix_buf.items;
 
-    var dir = std.fs.openDirAbsolute(project_mount_root, .{ .iterate = true }) catch return;
+    var dir = if (std.fs.path.isAbsolute(project_mount_root))
+        std.fs.openDirAbsolute(project_mount_root, .{ .iterate = true }) catch return
+    else
+        std.fs.cwd().openDir(project_mount_root, .{ .iterate = true }) catch return;
     defer dir.close();
 
     var it = dir.iterate();
@@ -517,8 +523,74 @@ fn cleanupStaleAgentMounts(
 
         const path = std.fs.path.join(allocator, &.{ project_mount_root, entry.name }) catch continue;
         defer allocator.free(path);
-        detachMountAtPath(allocator, path);
+        if (std.mem.eql(u8, path, keep_mount_path)) continue;
+        std.log.warn("sandbox runtime: cleaning stale mount path for project agent: {s}", .{path});
+        terminateMountAtPath(allocator, path);
     }
+}
+
+fn terminateMountAtPath(allocator: std.mem.Allocator, path: []const u8) void {
+    terminateMountProcessesForPath(allocator, path);
+    runBestEffortCommand(allocator, &.{ "fuser", "-km", path });
+    detachMountAtPath(allocator, path);
+}
+
+fn terminateMountProcessesForPath(allocator: std.mem.Allocator, mount_path: []const u8) void {
+    if (builtin.os.tag != .linux) return;
+
+    var proc_dir = std.fs.openDirAbsolute("/proc", .{ .iterate = true }) catch return;
+    defer proc_dir.close();
+
+    var it = proc_dir.iterate();
+    while (true) {
+        const maybe_entry = it.next() catch break;
+        const entry = maybe_entry orelse break;
+        if (entry.kind != .directory) continue;
+        if (!isDecimalDigits(entry.name)) continue;
+
+        const pid = std.fmt.parseInt(std.posix.pid_t, entry.name, 10) catch continue;
+        if (pid <= 0) continue;
+
+        var path_buf: [64]u8 = undefined;
+        const cmdline_path = std.fmt.bufPrint(&path_buf, "/proc/{d}/cmdline", .{pid}) catch continue;
+        const cmdline_file = std.fs.openFileAbsolute(cmdline_path, .{}) catch continue;
+        defer cmdline_file.close();
+        const cmdline = cmdline_file.readToEndAlloc(allocator, 16 * 1024) catch continue;
+        defer allocator.free(cmdline);
+        if (!cmdlineMatchesMountPath(cmdline, mount_path)) continue;
+
+        std.log.warn("sandbox runtime: terminating stale mount process pid={d} path={s}", .{ pid, mount_path });
+        std.posix.kill(pid, std.posix.SIG.TERM) catch {};
+
+        var wait_loops: u8 = 0;
+        while (wait_loops < 20 and processIsAlive(pid)) : (wait_loops += 1) {
+            std.Thread.sleep(50 * std.time.ns_per_ms);
+        }
+        if (processIsAlive(pid)) std.posix.kill(pid, std.posix.SIG.KILL) catch {};
+    }
+}
+
+fn cmdlineMatchesMountPath(cmdline: []const u8, mount_path: []const u8) bool {
+    var it = std.mem.splitScalar(u8, cmdline, 0);
+    const argv0 = it.next() orelse return false;
+    if (argv0.len == 0) return false;
+    if (std.mem.indexOf(u8, argv0, "spiderweb-fs-mount") == null) return false;
+
+    var expect_path = false;
+    while (it.next()) |arg| {
+        if (arg.len == 0) continue;
+        if (expect_path) return std.mem.eql(u8, arg, mount_path);
+        expect_path = std.mem.eql(u8, arg, "mount");
+    }
+    return false;
+}
+
+fn isDecimalDigits(value: []const u8) bool {
+    if (value.len == 0) return false;
+    for (value) |ch| {
+        if (ch < '0' or ch > '9') return false;
+    }
+    return true;
 }
 
 fn resolveWorkspaceBindSourcePath(

@@ -22,6 +22,7 @@ const default_platform_os = "unknown";
 const default_platform_arch = "unknown";
 const default_platform_runtime_kind = "unknown";
 const debug_stream_max_bytes: usize = 2 * 1024 * 1024;
+const node_service_event_history_max: usize = 1024;
 
 const ProjectKind = enum {
     normal,
@@ -189,6 +190,18 @@ const NodeServiceDigest = struct {
     }
 };
 
+const NodeServiceEventRecord = struct {
+    timestamp_ms: i64,
+    node_id: []u8,
+    payload_json: []u8,
+
+    fn deinit(self: *NodeServiceEventRecord, allocator: std.mem.Allocator) void {
+        allocator.free(self.node_id);
+        allocator.free(self.payload_json);
+        self.* = undefined;
+    }
+};
+
 const PendingJoin = struct {
     id: []u8,
     node_name: []u8,
@@ -299,6 +312,7 @@ pub const ControlPlane = struct {
     projects: std.StringHashMapUnmanaged(Project) = .{},
     active_project_by_agent: std.StringHashMapUnmanaged([]u8) = .{},
     debug_stream_by_agent: std.StringHashMapUnmanaged([]u8) = .{},
+    node_service_event_history: std.ArrayListUnmanaged(NodeServiceEventRecord) = .{},
 
     next_invite_id: u64 = 1,
     next_node_id: u64 = 1,
@@ -707,6 +721,91 @@ pub const ControlPlane = struct {
         return allocator.dupe(u8, "");
     }
 
+    fn appendNodeServiceEventLocked(self: *ControlPlane, node_id: []const u8, payload_json: []const u8) void {
+        while (self.node_service_event_history.items.len >= node_service_event_history_max and
+            self.node_service_event_history.items.len > 0)
+        {
+            var dropped = self.node_service_event_history.orderedRemove(0);
+            dropped.deinit(self.allocator);
+        }
+
+        const node_copy = self.allocator.dupe(u8, node_id) catch return;
+        errdefer self.allocator.free(node_copy);
+        const payload_copy = self.allocator.dupe(u8, payload_json) catch return;
+        errdefer self.allocator.free(payload_copy);
+        self.node_service_event_history.append(self.allocator, .{
+            .timestamp_ms = std.time.milliTimestamp(),
+            .node_id = node_copy,
+            .payload_json = payload_copy,
+        }) catch {
+            self.allocator.free(node_copy);
+            self.allocator.free(payload_copy);
+        };
+    }
+
+    pub fn snapshotNodeServiceEvents(
+        self: *ControlPlane,
+        allocator: std.mem.Allocator,
+        project_id: ?[]const u8,
+        agent_id: ?[]const u8,
+        project_token: ?[]const u8,
+        is_admin: bool,
+        replay_limit: usize,
+    ) ![]u8 {
+        var snapshot = std.ArrayListUnmanaged(NodeServiceEventRecord){};
+        defer {
+            for (snapshot.items) |*record| record.deinit(allocator);
+            snapshot.deinit(allocator);
+        }
+
+        {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            _ = self.reapExpiredLeasesLocked(std.time.milliTimestamp());
+            for (self.node_service_event_history.items) |record| {
+                try snapshot.append(allocator, .{
+                    .timestamp_ms = record.timestamp_ms,
+                    .node_id = try allocator.dupe(u8, record.node_id),
+                    .payload_json = try allocator.dupe(u8, record.payload_json),
+                });
+            }
+        }
+
+        var visible_indexes = std.ArrayListUnmanaged(usize){};
+        defer visible_indexes.deinit(allocator);
+        for (snapshot.items, 0..) |record, idx| {
+            if (!is_admin) {
+                const visible_project_id = project_id orelse continue;
+                const visible_agent_id = agent_id orelse continue;
+                if (!self.projectAllowsNodeServiceEvent(
+                    visible_project_id,
+                    visible_agent_id,
+                    project_token,
+                    record.node_id,
+                    false,
+                )) continue;
+            }
+            try visible_indexes.append(allocator, idx);
+        }
+
+        const limit = if (replay_limit == 0) visible_indexes.items.len else @min(replay_limit, visible_indexes.items.len);
+        const start_index = visible_indexes.items.len - limit;
+
+        var out = std.ArrayListUnmanaged(u8){};
+        errdefer out.deinit(allocator);
+        for (visible_indexes.items[start_index..], 0..) |record_index, idx| {
+            const record = snapshot.items[record_index];
+            const escaped_node_id = try jsonEscape(allocator, record.node_id);
+            defer allocator.free(escaped_node_id);
+            if (idx != 0) try out.append(allocator, '\n');
+            try out.writer(allocator).print(
+                "{{\"timestamp_ms\":{d},\"node_id\":\"{s}\",\"payload\":{s}}}",
+                .{ record.timestamp_ms, escaped_node_id, record.payload_json },
+            );
+        }
+        return out.toOwnedSlice(allocator);
+    }
+
     pub fn deinit(self: *ControlPlane) void {
         self.clearState();
 
@@ -753,6 +852,10 @@ pub const ControlPlane = struct {
         }
         self.debug_stream_by_agent.deinit(self.allocator);
         self.debug_stream_by_agent = .{};
+
+        for (self.node_service_event_history.items) |*record| record.deinit(self.allocator);
+        self.node_service_event_history.deinit(self.allocator);
+        self.node_service_event_history = .{};
 
         self.invites_created_total = 0;
         self.invites_redeemed_total = 0;
@@ -1050,8 +1153,11 @@ pub const ControlPlane = struct {
         const delta_json = try renderNodeServiceDeltaJson(self.allocator, &previous, &current);
         defer self.allocator.free(delta_json);
 
+        const response_payload = try self.renderNodeServicePayload(node_id, delta_json);
+        errdefer self.allocator.free(response_payload);
+        self.appendNodeServiceEventLocked(node_id, response_payload);
         self.persistSnapshotBestEffortLocked();
-        return self.renderNodeServicePayload(node_id, delta_json);
+        return response_payload;
     }
 
     pub fn nodeServiceGet(self: *ControlPlane, payload_json: ?[]const u8) ![]u8 {

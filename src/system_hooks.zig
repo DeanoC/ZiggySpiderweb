@@ -7,7 +7,7 @@ const Rom = hook_registry.Rom;
 const AgentRuntime = @import("agent_runtime.zig").AgentRuntime;
 const memory = @import("ziggy-memory-store").memory;
 const memid = @import("ziggy-memory-store").memid;
-const protocol = @import("ziggy-spider-protocol").protocol;
+const protocol = @import("spider-protocol").protocol;
 const Config = @import("config.zig");
 const memory_schema = @import("memory_schema.zig");
 

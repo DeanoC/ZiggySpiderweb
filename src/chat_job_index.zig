@@ -1,5 +1,5 @@
 const std = @import("std");
-const unified = @import("ziggy-spider-protocol").unified;
+const unified = @import("spider-protocol").unified;
 
 const snapshot_filename = "chat-job-index.json";
 const snapshot_schema: u32 = 1;

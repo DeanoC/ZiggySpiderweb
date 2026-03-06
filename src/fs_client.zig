@@ -1,6 +1,6 @@
 const std = @import("std");
 const fs_protocol = @import("fs_protocol.zig");
-const unified = @import("ziggy-spider-protocol").unified;
+const unified = @import("spider-protocol").unified;
 
 const request_response_timeout_ms: i32 = 15_000;
 const handshake_reply_timeout_ms: i32 = 10_000;

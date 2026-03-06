@@ -1,5 +1,5 @@
 const std = @import("std");
-const protocol = @import("ziggy-spider-protocol").protocol;
+const protocol = @import("spider-protocol").protocol;
 const runtime_server_mod = @import("runtime_server.zig");
 const sandbox_runtime = @import("sandbox_runtime.zig");
 

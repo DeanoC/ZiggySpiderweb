@@ -4,7 +4,7 @@ const fs_protocol = @import("fs_protocol.zig");
 const fs_node_ops = @import("fs_node_ops.zig");
 const fs_node_service = @import("fs_node_service.zig");
 const fs_watch_runtime = @import("fs_watch_runtime.zig");
-const unified = @import("ziggy-spider-protocol").unified;
+const unified = @import("spider-protocol").unified;
 const fsrpc_node_protocol_version = "unified-v2-fs";
 const fsrpc_node_proto_id: i64 = 2;
 

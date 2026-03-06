@@ -2,7 +2,7 @@ const std = @import("std");
 const fs = @import("spiderweb_fs");
 const websocket_transport = @import("websocket_transport");
 const fs_watch_runtime = fs.watch_runtime;
-const unified = @import("ziggy-spider-protocol").unified;
+const unified = @import("spider-protocol").unified;
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};

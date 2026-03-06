@@ -16,6 +16,8 @@ If that resonates, start with:
 - `docs/overview.md`
 - `docs/README.md`
 
+The docs tree is intentionally minimal and code-grounded. Older RFC/migration notes were removed once the single-websocket worldfs transport became the shipped behavior.
+
 ## Quick Start
 
 ### Automated Install (Recommended for Debian/Ubuntu)
@@ -39,8 +41,10 @@ This script will:
 
 ```bash
 # Clone and build
-git clone https://github.com/DeanoC/ZiggySpiderweb.git
+git clone --recurse-submodules https://github.com/DeanoC/ZiggySpiderweb.git
 cd ZiggySpiderweb
+# If you already cloned without submodules:
+git submodule update --init --recursive
 zig build
 
 # Store provider key in secure credential backend (Linux: secret-tool)

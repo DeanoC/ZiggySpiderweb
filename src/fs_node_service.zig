@@ -1,7 +1,7 @@
 const std = @import("std");
 const fs_protocol = @import("fs_protocol.zig");
 const fs_node_ops = @import("fs_node_ops.zig");
-const unified = @import("ziggy-spider-protocol").unified;
+const unified = @import("spider-protocol").unified;
 
 pub const NodeService = struct {
     pub const ChatInputSubmission = struct {
