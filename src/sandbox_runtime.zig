@@ -35,8 +35,37 @@ pub const SandboxRuntime = struct {
     mount_process: ?std.process.Child = null,
     owns_mount_process: bool = false,
     child: std.process.Child,
+    child_stdin_keepalive: ?std.fs.File = null,
     io_mutex: std.Thread.Mutex = .{},
     runtime_cfg: Config.RuntimeConfig,
+
+    fn closeChildIoPipes(child: *std.process.Child) void {
+        if (child.stdin) |file| {
+            file.close();
+            child.stdin = null;
+        }
+        if (child.stdout) |file| {
+            file.close();
+            child.stdout = null;
+        }
+        if (child.stderr) |file| {
+            file.close();
+            child.stderr = null;
+        }
+    }
+
+    fn closeChildStdinKeepalive(file: *?std.fs.File) void {
+        if (file.*) |keepalive| {
+            keepalive.close();
+            file.* = null;
+        }
+    }
+
+    fn duplicateChildStdinKeepalive(child: *std.process.Child) !?std.fs.File {
+        const stdin_file = child.stdin orelse return null;
+        const duped = try std.posix.dup(stdin_file.handle);
+        return std.fs.File{ .handle = duped };
+    }
 
     pub fn create(options: Options) !*SandboxRuntime {
         if (builtin.os.tag != .linux) return error.UnsupportedOs;
@@ -80,6 +109,8 @@ pub const SandboxRuntime = struct {
         const rootfs_overlay_path = try std.fs.path.join(options.allocator, &.{ project_overlay_root, options.agent_id });
         errdefer options.allocator.free(rootfs_overlay_path);
         try ensurePathExists(rootfs_overlay_path);
+
+        cleanupStaleAgentMounts(options.allocator, project_mount_root, options.agent_id, null);
 
         const workspace_mount_path = try makeRuntimeMountPath(options.allocator, project_mount_root, options.agent_id);
         errdefer options.allocator.free(workspace_mount_path);
@@ -158,7 +189,10 @@ pub const SandboxRuntime = struct {
         errdefer {
             _ = child.kill() catch {};
             _ = child.wait() catch {};
+            closeChildIoPipes(&child);
         }
+        var child_stdin_keepalive = try duplicateChildStdinKeepalive(&child);
+        errdefer closeChildStdinKeepalive(&child_stdin_keepalive);
 
         self.* = .{
             .allocator = options.allocator,
@@ -176,6 +210,7 @@ pub const SandboxRuntime = struct {
             .mount_process = mount_process,
             .owns_mount_process = owns_mount_process,
             .child = child,
+            .child_stdin_keepalive = child_stdin_keepalive,
             .runtime_cfg = runtime_cfg_for_child,
         };
         return self;
@@ -185,6 +220,8 @@ pub const SandboxRuntime = struct {
         self.io_mutex.lock();
         _ = self.child.kill() catch {};
         _ = self.child.wait() catch {};
+        closeChildStdinKeepalive(&self.child_stdin_keepalive);
+        closeChildIoPipes(&self.child);
         self.io_mutex.unlock();
 
         if (self.owns_mount_process) {
@@ -223,6 +260,43 @@ pub const SandboxRuntime = struct {
         // Keep health checks non-blocking for registry mutex callers.
         // Mountpoint readiness is validated during startup/restart and runtime I/O paths.
         return true;
+    }
+
+    pub fn healthSummary(self: *SandboxRuntime, allocator: std.mem.Allocator) ![]u8 {
+        const launcher_pid = self.child.id;
+        const child_alive = processIsAlive(launcher_pid);
+        const child_zombie = processIsZombie(allocator, launcher_pid);
+        const child_status = if (child_zombie)
+            blk: {
+                const term = self.child.wait() catch |err| break :blk try std.fmt.allocPrint(allocator, "wait_failed:{s}", .{@errorName(err)});
+                break :blk try std.fmt.allocPrint(allocator, "{any}", .{term});
+            }
+        else
+            try allocator.dupe(u8, "running");
+        defer allocator.free(child_status);
+        const mount_pid = if (self.mount_process) |mount_child| mount_child.id else @as(std.posix.pid_t, 0);
+        const mount_alive = if (self.mount_process) |mount_child| processIsAlive(mount_child.id) else false;
+        const mount_zombie = if (self.mount_process) |mount_child| processIsZombie(allocator, mount_child.id) else false;
+        const stdin_open = self.child.stdin != null;
+        const stdout_open = self.child.stdout != null;
+        const keepalive_open = self.child_stdin_keepalive != null;
+        return std.fmt.allocPrint(
+            allocator,
+            "sandbox launcher pid={d} alive={} zombie={} status={s} stdin_open={} stdout_open={} keepalive_open={} mount pid={d} alive={} zombie={} mount_path={s}",
+            .{
+                launcher_pid,
+                child_alive,
+                child_zombie,
+                child_status,
+                stdin_open,
+                stdout_open,
+                keepalive_open,
+                mount_pid,
+                mount_alive,
+                mount_zombie,
+                self.workspace_mount_path,
+            },
+        );
     }
 
     pub fn handleMessageFramesWithDebug(
@@ -362,8 +436,10 @@ pub const SandboxRuntime = struct {
     fn restartChildRuntime(self: *SandboxRuntime) !void {
         _ = self.child.kill() catch {};
         _ = self.child.wait() catch {};
+        closeChildStdinKeepalive(&self.child_stdin_keepalive);
+        closeChildIoPipes(&self.child);
 
-        const replacement = try spawnSandboxChild(
+        var replacement = try spawnSandboxChild(
             self.allocator,
             std.mem.trim(u8, self.runtime_cfg.sandbox_launcher, " \t\r\n"),
             self.child_bin_path,
@@ -371,12 +447,16 @@ pub const SandboxRuntime = struct {
             self.agent_id,
             self.runtime_cfg,
         );
+        errdefer closeChildIoPipes(&replacement);
+        self.child_stdin_keepalive = try duplicateChildStdinKeepalive(&replacement);
         self.child = replacement;
     }
 
     fn restartMountAndChild(self: *SandboxRuntime) !void {
         _ = self.child.kill() catch {};
         _ = self.child.wait() catch {};
+        closeChildStdinKeepalive(&self.child_stdin_keepalive);
+        closeChildIoPipes(&self.child);
 
         if (self.owns_mount_process) {
             if (self.mount_process) |*mount_child| {
@@ -423,7 +503,9 @@ pub const SandboxRuntime = struct {
         errdefer {
             _ = replacement.kill() catch {};
             _ = replacement.wait() catch {};
+            closeChildIoPipes(&replacement);
         }
+        self.child_stdin_keepalive = try duplicateChildStdinKeepalive(&replacement);
 
         self.mount_process = mount_process;
         self.owns_mount_process = true;
@@ -500,7 +582,7 @@ fn cleanupStaleAgentMounts(
     allocator: std.mem.Allocator,
     project_mount_root: []const u8,
     agent_id: []const u8,
-    keep_mount_path: []const u8,
+    keep_mount_path: ?[]const u8,
 ) void {
     var prefix_buf = std.ArrayListUnmanaged(u8){};
     defer prefix_buf.deinit(allocator);
@@ -523,7 +605,9 @@ fn cleanupStaleAgentMounts(
 
         const path = std.fs.path.join(allocator, &.{ project_mount_root, entry.name }) catch continue;
         defer allocator.free(path);
-        if (std.mem.eql(u8, path, keep_mount_path)) continue;
+        if (keep_mount_path) |keep| {
+            if (std.mem.eql(u8, path, keep)) continue;
+        }
         std.log.warn("sandbox runtime: cleaning stale mount path for project agent: {s}", .{path});
         terminateMountAtPath(allocator, path);
     }
@@ -768,70 +852,73 @@ fn spawnSandboxChild(
     const sandbox_child_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ sandbox_child_dir, child_basename });
     defer allocator.free(sandbox_child_path);
 
-    var args = std.ArrayListUnmanaged([]const u8){};
-    defer args.deinit(allocator);
+    var sandbox_args = std.ArrayListUnmanaged([]const u8){};
+    defer sandbox_args.deinit(allocator);
     var owned_args = std.ArrayListUnmanaged([]u8){};
     defer {
         for (owned_args.items) |value| allocator.free(value);
         owned_args.deinit(allocator);
     }
 
-    try args.append(allocator, launcher);
-    try args.append(allocator, "--die-with-parent");
-    try args.append(allocator, "--new-session");
-    try args.append(allocator, "--clearenv");
-    try args.append(allocator, "--proc");
-    try args.append(allocator, "/proc");
-    try args.append(allocator, "--dev");
-    try args.append(allocator, "/dev");
-    try args.append(allocator, "--tmpfs");
-    try args.append(allocator, "/tmp");
-    try args.append(allocator, "--ro-bind");
-    try args.append(allocator, "/usr");
-    try args.append(allocator, "/usr");
+    try sandbox_args.append(allocator, launcher);
+    // Bubblewrap's parent-death handling is tied to the creating task on Linux.
+    // We spawn runtimes from short-lived warmup threads, so --die-with-parent can
+    // kill a healthy sandbox as soon as that thread exits. Runtime teardown is
+    // handled explicitly by Spiderweb instead.
+    try sandbox_args.append(allocator, "--new-session");
+    try sandbox_args.append(allocator, "--clearenv");
+    try sandbox_args.append(allocator, "--proc");
+    try sandbox_args.append(allocator, "/proc");
+    try sandbox_args.append(allocator, "--dev");
+    try sandbox_args.append(allocator, "/dev");
+    try sandbox_args.append(allocator, "--tmpfs");
+    try sandbox_args.append(allocator, "/tmp");
+    try sandbox_args.append(allocator, "--ro-bind");
+    try sandbox_args.append(allocator, "/usr");
+    try sandbox_args.append(allocator, "/usr");
     if (pathExists("/bin")) {
-        try args.append(allocator, "--ro-bind");
-        try args.append(allocator, "/bin");
-        try args.append(allocator, "/bin");
+        try sandbox_args.append(allocator, "--ro-bind");
+        try sandbox_args.append(allocator, "/bin");
+        try sandbox_args.append(allocator, "/bin");
     }
     if (pathExists("/lib")) {
-        try args.append(allocator, "--ro-bind");
-        try args.append(allocator, "/lib");
-        try args.append(allocator, "/lib");
+        try sandbox_args.append(allocator, "--ro-bind");
+        try sandbox_args.append(allocator, "/lib");
+        try sandbox_args.append(allocator, "/lib");
     }
     if (pathExists("/lib64")) {
-        try args.append(allocator, "--ro-bind");
-        try args.append(allocator, "/lib64");
-        try args.append(allocator, "/lib64");
+        try sandbox_args.append(allocator, "--ro-bind");
+        try sandbox_args.append(allocator, "/lib64");
+        try sandbox_args.append(allocator, "/lib64");
     }
-    try args.append(allocator, "--dir");
-    try args.append(allocator, "/opt");
-    try args.append(allocator, "--dir");
-    try args.append(allocator, "/opt/spiderweb");
-    try args.append(allocator, "--dir");
-    try args.append(allocator, sandbox_child_dir);
-    try args.append(allocator, "--ro-bind");
-    try args.append(allocator, child_dir);
-    try args.append(allocator, sandbox_child_dir);
-    try appendNamespaceBindIfExists(allocator, &args, &owned_args, workspace_bind_source_path, "agents");
-    try appendNamespaceBindIfExists(allocator, &args, &owned_args, workspace_bind_source_path, "nodes");
-    try appendNamespaceBindIfExists(allocator, &args, &owned_args, workspace_bind_source_path, "projects");
-    try appendNamespaceBindIfExists(allocator, &args, &owned_args, workspace_bind_source_path, "meta");
-    try appendNamespaceBindIfExists(allocator, &args, &owned_args, workspace_bind_source_path, "global");
-    try args.append(allocator, "--chdir");
-    try args.append(allocator, sandbox_namespace_root);
-    try args.append(allocator, "--setenv");
-    try args.append(allocator, "HOME");
-    try args.append(allocator, sandbox_home_path);
-    try args.append(allocator, "--setenv");
-    try args.append(allocator, "PATH");
-    try args.append(allocator, "/usr/bin:/bin:/opt/spiderweb/bin");
-    try args.append(allocator, "--");
-    try args.append(allocator, sandbox_child_path);
-    try args.append(allocator, "--agent-id");
-    try args.append(allocator, agent_id);
+    try sandbox_args.append(allocator, "--dir");
+    try sandbox_args.append(allocator, "/opt");
+    try sandbox_args.append(allocator, "--dir");
+    try sandbox_args.append(allocator, "/opt/spiderweb");
+    try sandbox_args.append(allocator, "--dir");
+    try sandbox_args.append(allocator, sandbox_child_dir);
+    try sandbox_args.append(allocator, "--ro-bind");
+    try sandbox_args.append(allocator, child_dir);
+    try sandbox_args.append(allocator, sandbox_child_dir);
+    try appendNamespaceBindIfExists(allocator, &sandbox_args, &owned_args, workspace_bind_source_path, "agents");
+    try appendNamespaceBindIfExists(allocator, &sandbox_args, &owned_args, workspace_bind_source_path, "nodes");
+    try appendNamespaceBindIfExists(allocator, &sandbox_args, &owned_args, workspace_bind_source_path, "projects");
+    try appendNamespaceBindIfExists(allocator, &sandbox_args, &owned_args, workspace_bind_source_path, "meta");
+    try appendNamespaceBindIfExists(allocator, &sandbox_args, &owned_args, workspace_bind_source_path, "global");
+    try sandbox_args.append(allocator, "--chdir");
+    try sandbox_args.append(allocator, sandbox_namespace_root);
+    try sandbox_args.append(allocator, "--setenv");
+    try sandbox_args.append(allocator, "HOME");
+    try sandbox_args.append(allocator, sandbox_home_path);
+    try sandbox_args.append(allocator, "--setenv");
+    try sandbox_args.append(allocator, "PATH");
+    try sandbox_args.append(allocator, "/usr/bin:/bin:/opt/spiderweb/bin");
+    try sandbox_args.append(allocator, "--");
+    try sandbox_args.append(allocator, sandbox_child_path);
+    try sandbox_args.append(allocator, "--agent-id");
+    try sandbox_args.append(allocator, agent_id);
 
-    var child = std.process.Child.init(args.items, allocator);
+    var child = std.process.Child.init(sandbox_args.items, allocator);
     child.stdin_behavior = .Pipe;
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Inherit;

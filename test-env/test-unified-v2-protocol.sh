@@ -395,6 +395,7 @@ def run_control_runtime_order(host: str, port: int, auth_token=None) -> None:
 
             allowed_attach_runtime_codes = (
                 "runtime_warming",
+                "runtime_unhealthy",
                 "sandbox_mount_unavailable",
                 "runtime_warmup_timeout",
             )
