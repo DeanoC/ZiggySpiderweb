@@ -471,6 +471,7 @@ pub const ControlPlane = struct {
                 project.name = try self.allocator.dupe(u8, spider_web_project_name);
                 changed = true;
             }
+            if (pruneLegacyWorkspaceAliasMountsIfReplacementLocked(self, project)) changed = true;
             if (changed) project.updated_at_ms = now_ms;
         } else {
             const project = Project{
@@ -4842,6 +4843,12 @@ fn defaultProjectActionMode(project: *const Project, action: ProjectAction) Acce
 }
 
 fn resolveProjectActionMode(project: *const Project, action: ProjectAction, actor_id: ?[]const u8) AccessMode {
+    if (action == .bind) {
+        if (project.access_policy.modeFor(actor_id, .bind)) |mode| return mode;
+        if (project.access_policy.modeFor(actor_id, .mount)) |mode| return mode;
+        return defaultProjectActionMode(project, .bind);
+    }
+
     var mode = defaultProjectActionMode(project, action);
     if (project.access_policy.modeFor(actor_id, action)) |override_mode| {
         mode = override_mode;
@@ -5016,6 +5023,11 @@ fn projectHasCanonicalWorkspaceMount(project: *const Project) bool {
         if (!std.mem.eql(u8, mount.mount_path, "/workspace")) return true;
     }
     return false;
+}
+
+fn pruneLegacyWorkspaceAliasMountsIfReplacementLocked(self: *ControlPlane, project: *Project) bool {
+    if (!projectHasCanonicalWorkspaceMount(project)) return false;
+    return pruneLegacyWorkspaceAliasMountsLocked(self, project);
 }
 
 fn pruneLegacyWorkspaceAliasMountsLocked(self: *ControlPlane, project: *Project) bool {
@@ -6963,6 +6975,32 @@ test "fs_control_plane: default mount migration replaces legacy /workspace-only 
     try std.testing.expectEqualStrings("/nodes/local/fs", project.mounts.items[0].mount_path);
     try std.testing.expectEqualStrings(node_id, project.mounts.items[0].node_id);
     try std.testing.expectEqualStrings(default_project_up_export_name, project.mounts.items[0].export_name);
+}
+
+test "fs_control_plane: builtin ensure prunes legacy workspace alias when canonical mount exists" {
+    const allocator = std.testing.allocator;
+    var plane = ControlPlane.init(allocator);
+    defer plane.deinit();
+
+    const now_ms = std.time.milliTimestamp();
+    try plane.ensureBuiltinSpiderWebProjectLocked(now_ms);
+    const project = plane.projects.getPtr(spider_web_project_id).?;
+
+    try project.mounts.append(allocator, .{
+        .mount_path = try allocator.dupe(u8, "/workspace"),
+        .node_id = try allocator.dupe(u8, "node-legacy"),
+        .export_name = try allocator.dupe(u8, "legacy"),
+    });
+    try project.mounts.append(allocator, .{
+        .mount_path = try allocator.dupe(u8, "/nodes/local/fs"),
+        .node_id = try allocator.dupe(u8, "node-canonical"),
+        .export_name = try allocator.dupe(u8, "work"),
+    });
+
+    try plane.ensureBuiltinSpiderWebProjectLocked(now_ms + 1);
+    try std.testing.expectEqual(@as(usize, 1), project.mounts.items.len);
+    try std.testing.expectEqualStrings("/nodes/local/fs", project.mounts.items[0].mount_path);
+    try std.testing.expectEqualStrings("node-canonical", project.mounts.items[0].node_id);
 }
 
 test "fs_control_plane: snapshot encryption envelope roundtrip" {
