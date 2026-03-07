@@ -8166,6 +8166,12 @@ pub const Session = struct {
     };
 
     fn normalizeRuntimeFailureForAgent(code: []const u8, message: []const u8) NormalizedRuntimeFailure {
+        if (runtimeFailureIsToolContractFailure(code, message)) {
+            return .{
+                .code = "runtime_protocol_error",
+                .message = "Assistant runtime lost the tool-call contract after the last result. The agent should use the last result to reply or choose a different approach.",
+            };
+        }
         if (runtimeFailureShouldBeRedacted(code, message)) {
             return .{
                 .code = "runtime_internal_limit",
@@ -8196,6 +8202,18 @@ pub const Session = struct {
             "provider authentication failed",
             "provider model not found",
             "internal runtime limit",
+        };
+        return containsAnyIgnoreCase(message, &markers);
+    }
+
+    fn runtimeFailureIsToolContractFailure(code: []const u8, message: []const u8) bool {
+        _ = code;
+        const markers = [_][]const u8{
+            "single_tool_call_per_round",
+            "missing_tool_calls",
+            "exactly one tool call",
+            "zero tool calls is protocol-invalid",
+            "provider tool loop exceeded",
         };
         return containsAnyIgnoreCase(message, &markers);
     }
@@ -9318,10 +9336,10 @@ fn defaultGlobalLibraryTopicGettingStarted() []const u8 {
 fn defaultGlobalLibraryTopicServiceDiscovery() []const u8 {
     return "# Service Discovery\n\n" ++
         "- Node services: `/nodes/<node_id>/services/<service_id>`\n" ++
-        "- Agent namespaces: `/global/<service_id>`\n" ++
+        "- Project namespaces: `/global/<service_id>`\n" ++
         "- Global namespaces: `/global/<service_id>`\n" ++
         "- Start with `/global/services/SERVICES.json`.\n" ++
-        "- Common agent namespaces include: memory, web_search, search_code, terminal, mounts, sub_brains, agents, projects.\n";
+        "- Common project namespaces include: memory, web_search, search_code, terminal, mounts, sub_brains, agents, projects.\n";
 }
 
 fn defaultGlobalLibraryTopicEventsAndWaits() []const u8 {
@@ -10785,7 +10803,7 @@ test "fsrpc_session: agent services index includes first-class memory namespace 
     );
     defer allocator.free(payload);
 
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"scope\":\"agent_namespace\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"scope\":\"project_namespace\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"service_path\":\"/global/memory\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"invoke_path\":\"/global/memory/control/invoke.json\"") != null);
 }
@@ -10812,7 +10830,7 @@ test "fsrpc_session: agent services index includes first-class web_search namesp
     );
     defer allocator.free(payload);
 
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"scope\":\"agent_namespace\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"scope\":\"project_namespace\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"service_path\":\"/global/web_search\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"invoke_path\":\"/global/web_search/control/invoke.json\"") != null);
 }
@@ -10839,7 +10857,7 @@ test "fsrpc_session: agent services index includes first-class terminal namespac
     );
     defer allocator.free(payload);
 
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"scope\":\"agent_namespace\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"scope\":\"project_namespace\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"service_path\":\"/global/terminal\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"invoke_path\":\"/global/terminal/control/invoke.json\"") != null);
 }
@@ -10866,7 +10884,7 @@ test "fsrpc_session: agent services index includes first-class sub_brains namesp
     );
     defer allocator.free(payload);
 
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"scope\":\"agent_namespace\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"scope\":\"project_namespace\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"service_path\":\"/global/sub_brains\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"invoke_path\":\"/global/sub_brains/control/invoke.json\"") != null);
 }
@@ -10893,7 +10911,7 @@ test "fsrpc_session: agent services index includes first-class agents namespace 
     );
     defer allocator.free(payload);
 
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"scope\":\"agent_namespace\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"scope\":\"project_namespace\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"service_path\":\"/global/agents\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"invoke_path\":\"/global/agents/control/invoke.json\"") != null);
 }
@@ -10920,7 +10938,7 @@ test "fsrpc_session: agent services index includes first-class projects namespac
     );
     defer allocator.free(payload);
 
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"scope\":\"agent_namespace\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"scope\":\"project_namespace\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"service_path\":\"/global/projects\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"invoke_path\":\"/global/projects/control/invoke.json\"") != null);
 }
@@ -14233,5 +14251,6 @@ test "fsrpc_session: missing provider API key is surfaced directly" {
 test "fsrpc_session: runtime loop-guard text is classified as internal failure" {
     try std.testing.expect(Session.isInternalRuntimeLoopGuardText("I hit an internal reasoning loop while preparing that response. Please retry."));
     const normalized = Session.normalizeRuntimeFailureForAgent("execution_failed", "provider tool loop exceeded limits");
-    try std.testing.expectEqualStrings("runtime_internal_limit", normalized.code);
+    try std.testing.expectEqualStrings("runtime_protocol_error", normalized.code);
+    try std.testing.expect(std.mem.indexOf(u8, normalized.message, "tool-call contract") != null);
 }

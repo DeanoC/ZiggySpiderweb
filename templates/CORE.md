@@ -106,7 +106,7 @@ For `file_*` tool args, prefer workspace-relative paths (for example `global/...
 - Each service entry includes:
   - `node_id`, `service_id`, `service_path`, `invoke_path`, `has_invoke`, `scope`.
 - Scope selection:
-  - `agent_namespace`: agent-local capabilities (`/global/*`)
+  - `project_namespace`: project-shared capabilities (`/global/*`)
   - `node`: node/device capabilities (`/nodes/<node_id>/services/*`)
   - `global_namespace`: shared global docs/capabilities (`/global/*`)
 - Before invoking:
@@ -114,7 +114,7 @@ For `file_*` tool args, prefer workspace-relative paths (for example `global/...
   - only invoke when `has_invoke` is `true`
 - Example:
   - read `/global/services/SERVICES.json`
-  - pick entry `{ "service_id":"terminal", "invoke_path":"/global/terminal/control/invoke.json", "scope":"agent_namespace" }`
+  - pick entry `{ "service_id":"terminal", "invoke_path":"/global/terminal/control/invoke.json", "scope":"project_namespace" }`
   - read `/global/terminal/SCHEMA.json` and `/global/terminal/control/README.md`
   - write payload to `/global/terminal/control/invoke.json`
   - read `/global/terminal/status.json` and `/global/terminal/result.json`
