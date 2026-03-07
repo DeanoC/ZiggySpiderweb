@@ -2493,6 +2493,9 @@ pub const ControlPlane = struct {
         if (selected_project_id) |project_id| {
             const project = self.projects.get(project_id) orelse return ControlPlaneError.ProjectNotFound;
             const is_primary_agent = self.isPrimaryAgent(agent_id);
+            if (is_primary_agent and !std.mem.eql(u8, project_id, spider_web_project_id)) {
+                return ControlPlaneError.ProjectAssignmentForbidden;
+            }
             if (project.kind == .spider_web_builtin and !(is_primary_agent or is_admin)) {
                 return ControlPlaneError.ProjectAssignmentForbidden;
             }
