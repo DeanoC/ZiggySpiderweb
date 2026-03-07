@@ -4984,7 +4984,7 @@ fn ensureDefaultProjectMountsLocked(self: *ControlPlane, project: *Project) !boo
         }
     }
 
-    if (!mounted_from_system and project.mounts.items.len == 0) {
+    if (!mounted_from_system and !projectHasCanonicalWorkspaceMount(project)) {
         var default_node_id: ?[]const u8 = null;
         var node_it = self.nodes.iterator();
         if (node_it.next()) |entry| default_node_id = entry.key_ptr.*;
@@ -5006,7 +5006,35 @@ fn ensureDefaultProjectMountsLocked(self: *ControlPlane, project: *Project) !boo
             }
         }
     }
+
+    if (pruneLegacyWorkspaceAliasMountsLocked(self, project)) changed = true;
     return changed;
+}
+
+fn projectHasCanonicalWorkspaceMount(project: *const Project) bool {
+    for (project.mounts.items) |mount| {
+        if (!std.mem.eql(u8, mount.mount_path, "/workspace")) return true;
+    }
+    return false;
+}
+
+fn pruneLegacyWorkspaceAliasMountsLocked(self: *ControlPlane, project: *Project) bool {
+    if (!projectHasCanonicalWorkspaceMount(project)) return false;
+
+    var removed = false;
+    var idx: usize = 0;
+    while (idx < project.mounts.items.len) {
+        const mount = &project.mounts.items[idx];
+        if (!std.mem.eql(u8, mount.mount_path, "/workspace")) {
+            idx += 1;
+            continue;
+        }
+
+        var removed_mount = project.mounts.orderedRemove(idx);
+        removed_mount.deinit(self.allocator);
+        removed = true;
+    }
+    return removed;
 }
 
 fn remapSystemMountPathForProject(
@@ -6899,6 +6927,42 @@ test "fs_control_plane: projectUp auto-provisions default /nodes/local/fs mount 
     try std.testing.expect(std.mem.indexOf(u8, get_json, "\"mount_path\":\"/nodes/local/fs\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, get_json, "\"node_id\":\"node-1\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, get_json, "\"export_name\":\"bootstrap-workspace\"") != null);
+}
+
+test "fs_control_plane: default mount migration replaces legacy /workspace-only mounts" {
+    const allocator = std.testing.allocator;
+    var plane = ControlPlane.init(allocator);
+    defer plane.deinit();
+
+    const node_json = try plane.ensureNode("bootstrap-node", "ws://127.0.0.1:18891/v2/fs", 60_000);
+    defer allocator.free(node_json);
+    var parsed_node = try std.json.parseFromSlice(std.json.Value, allocator, node_json, .{});
+    defer parsed_node.deinit();
+    const node_id = parsed_node.value.object.get("node_id").?.string;
+
+    const up_json = try plane.projectUp(
+        "mother",
+        "{\"name\":\"LegacyMountProject\",\"vision\":\"LegacyMountProject\",\"activate\":false}",
+    );
+    defer allocator.free(up_json);
+    var parsed_up = try std.json.parseFromSlice(std.json.Value, allocator, up_json, .{});
+    defer parsed_up.deinit();
+    const project_id = parsed_up.value.object.get("project_id").?.string;
+
+    const project = plane.projects.getPtr(project_id).?;
+    for (project.mounts.items) |*mount| mount.deinit(allocator);
+    project.mounts.clearRetainingCapacity();
+    try project.mounts.append(allocator, .{
+        .mount_path = try allocator.dupe(u8, "/workspace"),
+        .node_id = try allocator.dupe(u8, node_id),
+        .export_name = try allocator.dupe(u8, "legacy-workspace"),
+    });
+
+    try std.testing.expect(try ensureDefaultProjectMountsLocked(&plane, project));
+    try std.testing.expectEqual(@as(usize, 1), project.mounts.items.len);
+    try std.testing.expectEqualStrings("/nodes/local/fs", project.mounts.items[0].mount_path);
+    try std.testing.expectEqualStrings(node_id, project.mounts.items[0].node_id);
+    try std.testing.expectEqualStrings(default_project_up_export_name, project.mounts.items[0].export_name);
 }
 
 test "fs_control_plane: snapshot encryption envelope roundtrip" {
