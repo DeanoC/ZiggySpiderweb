@@ -5397,7 +5397,9 @@ test "fs_control_plane: builtin system project is protected and primary-only" {
     );
     const admin_status = try plane.workspaceStatusWithRole("mother", activate_non_system, true);
     defer allocator.free(admin_status);
-    try std.testing.expect(std.mem.indexOf(u8, admin_status, "\"project_id\":\"proj-admin-read\"") != null);
+    const expected_project_id = try std.fmt.allocPrint(allocator, "\"project_id\":\"{s}\"", .{non_system_project_id});
+    defer allocator.free(expected_project_id);
+    try std.testing.expect(std.mem.indexOf(u8, admin_status, expected_project_id) != null);
 }
 
 test "fs_control_plane: builtin system mount can be bound from local node" {
