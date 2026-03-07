@@ -4034,7 +4034,7 @@ pub const Session = struct {
         defer self.allocator.free(escaped_project_id);
         return std.fmt.allocPrint(
             self.allocator,
-            "{{\"project_id\":\"{s}\",\"nodes_root\":\"/nodes\",\"agents_root\":\"/agents\",\"global\":{{\"root\":\"/global\",\"library\":\"/global/library\",\"projects\":\"/global/projects\",\"chat\":\"/global/chat\",\"jobs\":\"/global/jobs\",\"mounts\":\"/global/mounts\",\"debug\":{s}}}}",
+            "{{\"project_id\":\"{s}\",\"nodes_root\":\"/nodes\",\"agents_root\":\"/agents\",\"global\":{{\"root\":\"/global\",\"library\":\"/global/library\",\"projects\":\"/global/projects\",\"chat\":\"/global/chat\",\"jobs\":\"/global/jobs\",\"mounts\":\"/global/mounts\",\"debug\":{s}}}}}",
             .{
                 escaped_project_id,
                 if (policy.show_debug or self.is_admin) "\"/debug\"" else "null",
