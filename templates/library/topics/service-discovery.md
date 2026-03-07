@@ -11,11 +11,11 @@ Each entry provides:
 - `service_path`
 - `invoke_path`
 - `has_invoke`
-- `scope` (`node` | `agent_namespace` | `global_namespace`)
+- `scope` (`node` | `project_namespace` | `global_namespace`)
 
 Scope guidance:
 
-- `agent_namespace`: agent-local services under `/global/*`
+- `project_namespace`: project-shared services under `/global/*`
 - `node`: node/device services under `/nodes/<node_id>/services/*`
 - `global_namespace`: shared global resources under `/global/*`
 

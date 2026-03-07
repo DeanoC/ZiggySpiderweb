@@ -3349,6 +3349,9 @@ const RuntimeToolDispatchProxy = struct {
         if (isAgentsControlPath(path)) {
             return self.handleAgentsControlWrite(allocator, path, content);
         }
+        if (isTerminalControlPath(path)) {
+            return self.handleTerminalControlWrite(allocator, path, content);
+        }
         return self.sandbox_runtime.executeWorldTool(allocator, "file_write", args_json);
     }
 
@@ -3372,6 +3375,7 @@ const RuntimeToolDispatchProxy = struct {
                 .{ .name = "services", .kind = "dir" },
                 .{ .name = "chat", .kind = "dir" },
                 .{ .name = "jobs", .kind = "dir" },
+                .{ .name = "terminal", .kind = "dir" },
                 .{ .name = "projects", .kind = "dir" },
                 .{ .name = "agents", .kind = "dir" },
             });
@@ -3379,6 +3383,27 @@ const RuntimeToolDispatchProxy = struct {
         if (pathMatchesAnyControlTarget(path, &.{"global/services"})) {
             return runtimeDispatchFileListSuccess(allocator, path, &.{
                 .{ .name = "SERVICES.json", .kind = "file" },
+            });
+        }
+        if (pathMatchesAnyControlTarget(path, &.{"global/terminal"})) {
+            return runtimeDispatchFileListSuccess(allocator, path, &.{
+                .{ .name = "README.md", .kind = "file" },
+                .{ .name = "SCHEMA.json", .kind = "file" },
+                .{ .name = "CAPS.json", .kind = "file" },
+                .{ .name = "OPS.json", .kind = "file" },
+                .{ .name = "RUNTIME.json", .kind = "file" },
+                .{ .name = "PERMISSIONS.json", .kind = "file" },
+                .{ .name = "STATUS.json", .kind = "file" },
+                .{ .name = "status.json", .kind = "file" },
+                .{ .name = "result.json", .kind = "file" },
+                .{ .name = "control", .kind = "dir" },
+            });
+        }
+        if (pathMatchesAnyControlTarget(path, &.{"global/terminal/control"})) {
+            return runtimeDispatchFileListSuccess(allocator, path, &.{
+                .{ .name = "README.md", .kind = "file" },
+                .{ .name = "invoke.json", .kind = "file" },
+                .{ .name = "exec.json", .kind = "file" },
             });
         }
         if (pathMatchesAnyControlTarget(path, &.{"global/projects"})) {
@@ -3425,6 +3450,35 @@ const RuntimeToolDispatchProxy = struct {
             });
         }
         return self.sandbox_runtime.executeWorldTool(allocator, "file_list", args_json);
+    }
+
+    fn handleTerminalControlWrite(
+        self: *RuntimeToolDispatchProxy,
+        allocator: std.mem.Allocator,
+        path: []const u8,
+        content: []const u8,
+    ) tool_registry.ToolExecutionResult {
+        const mode = terminalWriteMode(path, content, allocator) catch {
+            return runtimeDispatchFailure(allocator, .invalid_params, "terminal payload must be a JSON object");
+        };
+
+        return switch (mode) {
+            .exec => {
+                const exec_result = self.sandbox_runtime.executeWorldTool(allocator, "shell_exec", content);
+                return switch (exec_result) {
+                    .success => |success| runtimeDispatchFileWriteSuccess(allocator, path, content.len, success.payload_json),
+                    .failure => |failure| .{ .failure = .{
+                        .code = failure.code,
+                        .message = allocator.dupe(u8, failure.message) catch @panic("out of memory"),
+                    } },
+                };
+            },
+            .unsupported_session_op => runtimeDispatchFailure(
+                allocator,
+                .invalid_params,
+                "agent runtime terminal supports exec only; use /global/terminal/control/exec.json or invoke.json with op=exec",
+            ),
+        };
     }
 
     fn handleProjectsUpWrite(
@@ -3715,6 +3769,65 @@ fn isAgentsControlPath(path: []const u8) bool {
     });
 }
 
+const TerminalWriteMode = enum {
+    exec,
+    unsupported_session_op,
+};
+
+fn isTerminalControlPath(path: []const u8) bool {
+    return pathMatchesAnyControlTarget(path, &.{
+        "global/terminal/control/invoke.json",
+        "global/terminal/control/exec.json",
+        "global/terminal/control/create.json",
+        "global/terminal/control/resume.json",
+        "global/terminal/control/close.json",
+        "global/terminal/control/write.json",
+        "global/terminal/control/read.json",
+        "global/terminal/control/resize.json",
+    });
+}
+
+fn terminalWriteMode(path: []const u8, content: []const u8, allocator: std.mem.Allocator) !TerminalWriteMode {
+    if (pathMatchesAnyControlTarget(path, &.{"global/terminal/control/exec.json"})) return .exec;
+    if (pathMatchesAnyControlTarget(path, &.{
+        "global/terminal/control/create.json",
+        "global/terminal/control/resume.json",
+        "global/terminal/control/close.json",
+        "global/terminal/control/write.json",
+        "global/terminal/control/read.json",
+        "global/terminal/control/resize.json",
+    })) {
+        return .unsupported_session_op;
+    }
+    if (!pathMatchesAnyControlTarget(path, &.{"global/terminal/control/invoke.json"})) {
+        return .unsupported_session_op;
+    }
+
+    const trimmed = std.mem.trim(u8, content, " \t\r\n");
+    if (trimmed.len == 0) return error.InvalidPayload;
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, trimmed, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidPayload;
+
+    const root = parsed.value.object;
+    const args_obj = if (root.get("arguments")) |value|
+        if (value == .object) value.object else return error.InvalidPayload
+    else if (root.get("args")) |value|
+        if (value == .object) value.object else return error.InvalidPayload
+    else
+        root;
+
+    const op = optionalStringField(args_obj, "op") orelse
+        optionalStringField(args_obj, "operation") orelse
+        optionalStringField(root, "op") orelse
+        optionalStringField(root, "operation") orelse
+        "exec";
+
+    if (std.mem.eql(u8, op, "exec") or std.mem.eql(u8, op, "shell_exec")) return .exec;
+    return .unsupported_session_op;
+}
+
 fn pathMatchesAnyControlTarget(path: []const u8, targets: []const []const u8) bool {
     for (targets) |target| {
         if (pathMatchesControlTarget(path, target)) return true;
@@ -3844,6 +3957,37 @@ fn runtimeDispatchSyntheticReadContent(path: []const u8) ?[]const u8 {
         return runtimeDispatchServicesIndexJson();
     }
 
+    if (pathMatchesAnyControlTarget(path, &.{"global/terminal/README.md"})) {
+        return "# Terminal\n\nExec terminal namespace for agent runtime. Use `control/exec.json` or `control/invoke.json` with `op=exec` to run a command in the project sandbox.\n";
+    }
+    if (pathMatchesAnyControlTarget(path, &.{"global/terminal/SCHEMA.json"})) {
+        return "{\"kind\":\"service\",\"service_id\":\"terminal\",\"shape\":\"/global/terminal/{README.md,SCHEMA.json,CAPS.json,OPS.json,RUNTIME.json,PERMISSIONS.json,STATUS.json,status.json,result.json,control/*}\"}";
+    }
+    if (pathMatchesAnyControlTarget(path, &.{"global/terminal/CAPS.json"})) {
+        return "{\"invoke\":true,\"operations\":[\"shell_exec\"],\"discoverable\":true,\"interactive\":false,\"sessionized\":false,\"pty\":false}";
+    }
+    if (pathMatchesAnyControlTarget(path, &.{"global/terminal/OPS.json"})) {
+        return "{\"model\":\"local_bridge\",\"invoke\":\"control/invoke.json\",\"transport\":\"acheron-local\",\"paths\":{\"exec\":\"control/exec.json\"},\"operations\":{\"exec\":\"exec\"}}";
+    }
+    if (pathMatchesAnyControlTarget(path, &.{"global/terminal/RUNTIME.json"})) {
+        return "{\"type\":\"runtime_tool\",\"tool\":\"shell_exec\",\"session_model\":\"exec-only\"}";
+    }
+    if (pathMatchesAnyControlTarget(path, &.{"global/terminal/PERMISSIONS.json"})) {
+        return "{\"default\":\"allow-by-default\",\"allow_roles\":[\"admin\",\"user\"],\"scope\":\"project_namespace\"}";
+    }
+    if (pathMatchesAnyControlTarget(path, &.{"global/terminal/STATUS.json"})) {
+        return "{\"service_id\":\"terminal\",\"state\":\"namespace\",\"has_invoke\":true,\"sessionized\":false}";
+    }
+    if (pathMatchesAnyControlTarget(path, &.{"global/terminal/status.json"})) {
+        return "{\"state\":\"idle\",\"tool\":null,\"session_id\":null,\"updated_at_ms\":0,\"error\":null}";
+    }
+    if (pathMatchesAnyControlTarget(path, &.{"global/terminal/result.json"})) {
+        return "{\"ok\":false,\"result\":null,\"error\":null}";
+    }
+    if (pathMatchesAnyControlTarget(path, &.{"global/terminal/control/README.md"})) {
+        return "Use exec.json for direct command execution. invoke.json also accepts `{\\\"op\\\":\\\"exec\\\",\\\"args\\\":{...}}` envelopes.\n";
+    }
+
     if (pathMatchesAnyControlTarget(path, &.{"global/projects/README.md"})) {
         return "# Projects Management\n\nList, inspect, and create/update projects through Acheron control files.\n";
     }
@@ -3904,7 +4048,7 @@ fn runtimeDispatchSyntheticReadContent(path: []const u8) ?[]const u8 {
 }
 
 fn runtimeDispatchServicesIndexJson() []const u8 {
-    return "[{\"node_id\":\"global\",\"service_id\":\"services\",\"service_path\":\"/global/services\",\"invoke_path\":null,\"has_invoke\":false,\"scope\":\"project_namespace\"},{\"node_id\":\"global\",\"service_id\":\"chat\",\"service_path\":\"/global/chat\",\"invoke_path\":null,\"has_invoke\":false,\"scope\":\"project_namespace\"},{\"node_id\":\"global\",\"service_id\":\"jobs\",\"service_path\":\"/global/jobs\",\"invoke_path\":null,\"has_invoke\":false,\"scope\":\"project_namespace\"},{\"node_id\":\"global\",\"service_id\":\"projects\",\"service_path\":\"/global/projects\",\"invoke_path\":\"/global/projects/control/invoke.json\",\"has_invoke\":true,\"scope\":\"project_namespace\"},{\"node_id\":\"global\",\"service_id\":\"agents\",\"service_path\":\"/global/agents\",\"invoke_path\":\"/global/agents/control/invoke.json\",\"has_invoke\":true,\"scope\":\"project_namespace\"},{\"node_id\":\"global\",\"service_id\":\"library\",\"service_path\":\"/global/library\",\"invoke_path\":null,\"has_invoke\":false,\"scope\":\"global_namespace\"}]";
+    return "[{\"node_id\":\"global\",\"service_id\":\"services\",\"service_path\":\"/global/services\",\"invoke_path\":null,\"has_invoke\":false,\"scope\":\"project_namespace\"},{\"node_id\":\"global\",\"service_id\":\"chat\",\"service_path\":\"/global/chat\",\"invoke_path\":null,\"has_invoke\":false,\"scope\":\"project_namespace\"},{\"node_id\":\"global\",\"service_id\":\"jobs\",\"service_path\":\"/global/jobs\",\"invoke_path\":null,\"has_invoke\":false,\"scope\":\"project_namespace\"},{\"node_id\":\"global\",\"service_id\":\"events\",\"service_path\":\"/global/events\",\"invoke_path\":null,\"has_invoke\":false,\"scope\":\"project_namespace\"},{\"node_id\":\"global\",\"service_id\":\"memory\",\"service_path\":\"/global/memory\",\"invoke_path\":\"/global/memory/control/invoke.json\",\"has_invoke\":true,\"scope\":\"project_namespace\"},{\"node_id\":\"global\",\"service_id\":\"web_search\",\"service_path\":\"/global/web_search\",\"invoke_path\":\"/global/web_search/control/invoke.json\",\"has_invoke\":true,\"scope\":\"project_namespace\"},{\"node_id\":\"global\",\"service_id\":\"search_code\",\"service_path\":\"/global/search_code\",\"invoke_path\":\"/global/search_code/control/invoke.json\",\"has_invoke\":true,\"scope\":\"project_namespace\"},{\"node_id\":\"global\",\"service_id\":\"terminal\",\"service_path\":\"/global/terminal\",\"invoke_path\":\"/global/terminal/control/invoke.json\",\"has_invoke\":true,\"scope\":\"project_namespace\"},{\"node_id\":\"global\",\"service_id\":\"mounts\",\"service_path\":\"/global/mounts\",\"invoke_path\":\"/global/mounts/control/invoke.json\",\"has_invoke\":true,\"scope\":\"project_namespace\"},{\"node_id\":\"global\",\"service_id\":\"sub_brains\",\"service_path\":\"/global/sub_brains\",\"invoke_path\":\"/global/sub_brains/control/invoke.json\",\"has_invoke\":true,\"scope\":\"project_namespace\"},{\"node_id\":\"global\",\"service_id\":\"agents\",\"service_path\":\"/global/agents\",\"invoke_path\":\"/global/agents/control/invoke.json\",\"has_invoke\":true,\"scope\":\"project_namespace\"},{\"node_id\":\"global\",\"service_id\":\"projects\",\"service_path\":\"/global/projects\",\"invoke_path\":\"/global/projects/control/invoke.json\",\"has_invoke\":true,\"scope\":\"project_namespace\"},{\"node_id\":\"global\",\"service_id\":\"thoughts\",\"service_path\":\"/global/thoughts\",\"invoke_path\":null,\"has_invoke\":false,\"scope\":\"project_namespace\"},{\"node_id\":\"global\",\"service_id\":\"library\",\"service_path\":\"/global/library\",\"invoke_path\":null,\"has_invoke\":false,\"scope\":\"global_namespace\"}]";
 }
 
 fn buildProjectScopedPayload(allocator: std.mem.Allocator, project_id: []const u8, project_token: ?[]const u8) ![]u8 {
@@ -11649,9 +11793,17 @@ test "server_piai: runtime dispatch synthetic service docs are discoverable" {
     const services_index = runtimeDispatchSyntheticReadContent("/global/services/SERVICES.json") orelse return error.TestExpectedResult;
     try std.testing.expect(std.mem.indexOf(u8, services_index, "\"service_id\":\"projects\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, services_index, "\"service_id\":\"agents\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, services_index, "\"service_id\":\"terminal\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, services_index, "\"invoke_path\":\"/global/terminal/control/invoke.json\"") != null);
 
     const projects_schema = runtimeDispatchSyntheticReadContent("/global/projects/SCHEMA.json") orelse return error.TestExpectedResult;
     try std.testing.expect(std.mem.indexOf(u8, projects_schema, "\"service_id\":\"projects\"") != null);
+
+    const terminal_schema = runtimeDispatchSyntheticReadContent("/global/terminal/SCHEMA.json") orelse return error.TestExpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, terminal_schema, "\"service_id\":\"terminal\"") != null);
+
+    const terminal_ops = runtimeDispatchSyntheticReadContent("/global/terminal/OPS.json") orelse return error.TestExpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, terminal_ops, "\"exec\":\"control/exec.json\"") != null);
 }
 
 test "server_piai: projects control path matcher is global-only" {
@@ -11666,6 +11818,42 @@ test "server_piai: agents control path matcher is global-only" {
     try std.testing.expect(isAgentsControlPath("global/agents/control/list.json"));
     try std.testing.expect(!isAgentsControlPath("/agents/self/agents/control/invoke.json"));
     try std.testing.expect(!isAgentsControlPath("/global/projects/control/create.json"));
+}
+
+test "server_piai: terminal control path matcher is global-only" {
+    try std.testing.expect(isTerminalControlPath("/global/terminal/control/invoke.json"));
+    try std.testing.expect(isTerminalControlPath("global/terminal/control/exec.json"));
+    try std.testing.expect(!isTerminalControlPath("/agents/self/terminal/control/invoke.json"));
+    try std.testing.expect(!isTerminalControlPath("/global/projects/control/exec.json"));
+}
+
+test "server_piai: terminal invoke mode accepts exec and rejects session ops" {
+    const allocator = std.testing.allocator;
+
+    try std.testing.expectEqual(
+        TerminalWriteMode.exec,
+        try terminalWriteMode(
+            "/global/terminal/control/invoke.json",
+            "{\"op\":\"exec\",\"args\":{\"command\":\"git status\"}}",
+            allocator,
+        ),
+    );
+    try std.testing.expectEqual(
+        TerminalWriteMode.exec,
+        try terminalWriteMode(
+            "/global/terminal/control/exec.json",
+            "{\"command\":\"git status\"}",
+            allocator,
+        ),
+    );
+    try std.testing.expectEqual(
+        TerminalWriteMode.unsupported_session_op,
+        try terminalWriteMode(
+            "/global/terminal/control/invoke.json",
+            "{\"op\":\"create\",\"args\":{}}",
+            allocator,
+        ),
+    );
 }
 
 test "server_piai: parseHttpRequestPath parses GET line" {
