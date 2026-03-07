@@ -2915,6 +2915,7 @@ pub const RuntimeServer = struct {
         var pending_tool_failure_followup = false;
         var protocol_repair_after_tool_result = false;
         var protocol_repair_rounds: usize = 0;
+        var saw_tool_result_this_turn = false;
         var last_meaningful_followup_text: ?[]u8 = null;
         defer if (last_meaningful_followup_text) |value| self.allocator.free(value);
         while (round < MAX_PROVIDER_TOOL_ROUNDS) : (round += 1) {
@@ -3339,6 +3340,7 @@ pub const RuntimeServer = struct {
                         if (err == RuntimeServerError.RuntimeJobCancelled) return err;
                         return err;
                     };
+                    if (structured_tool_payloads.items.len > 0) saw_tool_result_this_turn = true;
                     if (job.emit_debug) {
                         try self.appendToolResultDebugFrames(
                             &debug_frames,
@@ -3423,7 +3425,7 @@ pub const RuntimeServer = struct {
                     if (meaningful_followup) |meaningful| {
                         if (last_meaningful_followup_text) |old| self.allocator.free(old);
                         last_meaningful_followup_text = try self.allocator.dupe(u8, meaningful);
-                        if (total_calls > 0) {
+                        if (saw_tool_result_this_turn) {
                             if (job.emit_debug) {
                                 const payload = try std.fmt.allocPrint(
                                     self.allocator,
@@ -3441,7 +3443,7 @@ pub const RuntimeServer = struct {
                 }
 
                 followup_rounds += 1;
-                if (total_calls > 0 and protocol_repair_rounds == 0) {
+                if (saw_tool_result_this_turn and protocol_repair_rounds == 0) {
                     protocol_repair_rounds += 1;
                     protocol_repair_after_tool_result = true;
                     followup_requested = true;
@@ -3452,7 +3454,7 @@ pub const RuntimeServer = struct {
                         &debug_frames,
                         "provider_followup_cap_zero_tool_calls",
                     );
-                    if (last_meaningful_followup_text) |message| {
+                    if (saw_tool_result_this_turn and last_meaningful_followup_text) |message| {
                         const completion = try self.finalizeProviderCompletion(&debug_frames, message);
                         pending_tool_failure_followup = false;
                         return completion;
@@ -3545,6 +3547,7 @@ pub const RuntimeServer = struct {
                 if (err == RuntimeServerError.RuntimeJobCancelled) return err;
                 return err;
             };
+            if (tool_payloads.items.len > 0) saw_tool_result_this_turn = true;
             if (job.emit_debug) {
                 try self.appendToolResultDebugFrames(
                     &debug_frames,
@@ -3606,7 +3609,7 @@ pub const RuntimeServer = struct {
             &debug_frames,
             "provider_round_cap",
         );
-        if (last_meaningful_followup_text) |message| {
+        if (saw_tool_result_this_turn and last_meaningful_followup_text) |message| {
             const completion = try self.finalizeProviderCompletion(&debug_frames, message);
             return completion;
         }
@@ -7830,7 +7833,7 @@ test "runtime_server: provider loop guard surfaces failure without automatic res
     try std.testing.expectEqual(@as(usize, 4), mockLoopResetRecoveryCallCount);
 }
 
-test "runtime_server: provider loop guard preserves meaningful assistant text" {
+test "runtime_server: provider loop guard still fails without any tool result" {
     const allocator = std.testing.allocator;
     const original_stream_fn = streamByModelFn;
     defer streamByModelFn = original_stream_fn;
@@ -7847,12 +7850,18 @@ test "runtime_server: provider loop guard preserves meaningful assistant text" {
     });
     defer server.destroy();
 
-    const response = try server.handleMessage("{\"id\":\"req-provider-loop-guard-meaningful\",\"type\":\"session.send\",\"content\":\"recover\"}");
-    defer allocator.free(response);
+    const responses = try server.handleMessageFrames("{\"id\":\"req-provider-loop-guard-meaningful\",\"type\":\"session.send\",\"content\":\"recover\"}");
+    defer deinitResponseFrames(allocator, responses);
 
-    try std.testing.expect(std.mem.indexOf(u8, response, "\"type\":\"session.receive\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, response, "none of them are a git repository") != null);
-    try std.testing.expect(std.mem.indexOf(u8, response, "\"type\":\"error\"") == null);
+    var saw_error = false;
+    var saw_reply = false;
+    for (responses) |payload| {
+        if (std.mem.indexOf(u8, payload, "\"type\":\"error\"") != null) saw_error = true;
+        if (std.mem.indexOf(u8, payload, "\"type\":\"session.receive\"") != null) saw_reply = true;
+    }
+
+    try std.testing.expect(saw_error);
+    try std.testing.expect(!saw_reply);
     try std.testing.expectEqual(@as(usize, 4), mockMeaningfulLoopGuardCallCount);
 }
 
