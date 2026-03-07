@@ -2493,7 +2493,7 @@ pub const ControlPlane = struct {
         if (selected_project_id) |project_id| {
             const project = self.projects.get(project_id) orelse return ControlPlaneError.ProjectNotFound;
             const is_primary_agent = self.isPrimaryAgent(agent_id);
-            if (is_primary_agent and !std.mem.eql(u8, project_id, spider_web_project_id)) {
+            if (is_primary_agent and !is_admin and !std.mem.eql(u8, project_id, spider_web_project_id)) {
                 return ControlPlaneError.ProjectAssignmentForbidden;
             }
             if (project.kind == .spider_web_builtin and !(is_primary_agent or is_admin)) {
@@ -5395,10 +5395,11 @@ test "fs_control_plane: builtin system project is protected and primary-only" {
         ControlPlaneError.ProjectAssignmentForbidden,
         plane.activateProjectWithRole("mother", activate_non_system, true),
     );
-    try std.testing.expectError(
-        ControlPlaneError.ProjectAssignmentForbidden,
-        plane.workspaceStatusWithRole("mother", activate_non_system, true),
-    );
+    const admin_status = try plane.workspaceStatusWithRole("mother", activate_non_system, true);
+    defer allocator.free(admin_status);
+    const expected_project_id = try std.fmt.allocPrint(allocator, "\"project_id\":\"{s}\"", .{non_system_project_id});
+    defer allocator.free(expected_project_id);
+    try std.testing.expect(std.mem.indexOf(u8, admin_status, expected_project_id) != null);
 }
 
 test "fs_control_plane: builtin system mount can be bound from local node" {
