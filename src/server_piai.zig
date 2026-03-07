@@ -4957,6 +4957,26 @@ const AgentRuntimeRegistry = struct {
             self.allocator.free(bindings);
         }
 
+        // Admin/control connections default to mother@system even when Mother's
+        // active project has moved to a non-system workspace. Keep the system
+        // runtime resident independently of active project assignment so the
+        // default control route remains available.
+        if (self.control_plane.projectHasMounts(system_project_id)) {
+            var system_attach_state = self.ensureRuntimeWarmup(
+                system_agent_id,
+                system_project_id,
+                null,
+                retry_on_error,
+            ) catch |err| blk: {
+                std.log.warn(
+                    "system runtime residency warmup failed: agent={s} project={s} err={s}",
+                    .{ system_agent_id, system_project_id, @errorName(err) },
+                );
+                break :blk null;
+            };
+            if (system_attach_state) |*attach_state| attach_state.deinit(self.allocator);
+        }
+
         for (bindings) |binding| {
             if (!self.control_plane.projectHasMounts(binding.project_id)) continue;
             if (std.mem.eql(u8, binding.agent_id, system_agent_id) and
@@ -6585,6 +6605,14 @@ fn localFsBootstrapThreadMain(ctx: *LocalFsBootstrapContext) void {
 
     ctx.runtime_registry.maybeInitLocalFsNode(ctx.bind_addr, ctx.port) catch |err| {
         std.log.warn("local fs node setup skipped: {s}", .{@errorName(err)});
+        return;
+    };
+
+    // Startup can race the initial residency warmup before the local fs node
+    // has finished registering and writing the system project mounts. Retry
+    // residency after bootstrap so mother@system recovers once mounts exist.
+    ctx.runtime_registry.ensureActiveRuntimeResidency(true) catch |err| {
+        std.log.warn("local fs bootstrap runtime residency retry failed: {s}", .{@errorName(err)});
     };
 }
 

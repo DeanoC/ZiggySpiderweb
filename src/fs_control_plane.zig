@@ -507,11 +507,7 @@ pub const ControlPlane = struct {
         }
 
         if (self.active_project_by_agent.getPtr(self.primary_agent_id)) |existing| {
-            if (existing.*.len == 0) {
-                self.allocator.free(existing.*);
-                existing.* = try self.allocator.dupe(u8, spider_web_project_id);
-                changed = true;
-            } else if (!self.projects.contains(existing.*)) {
+            if (!std.mem.eql(u8, existing.*, spider_web_project_id)) {
                 self.allocator.free(existing.*);
                 existing.* = try self.allocator.dupe(u8, spider_web_project_id);
                 changed = true;
@@ -2118,7 +2114,7 @@ pub const ControlPlane = struct {
         try validateIdentifier(project_id, 128);
         const project = self.projects.getPtr(project_id) orelse return ControlPlaneError.ProjectNotFound;
         const is_primary_agent = self.isPrimaryAgent(agent_id);
-        if (is_primary_agent and !is_admin and !std.mem.eql(u8, project_id, spider_web_project_id)) {
+        if (is_primary_agent and !std.mem.eql(u8, project_id, spider_web_project_id)) {
             return ControlPlaneError.ProjectAssignmentForbidden;
         }
         if (project.kind == .spider_web_builtin and !(is_primary_agent or is_admin)) return ControlPlaneError.ProjectAssignmentForbidden;
@@ -2410,7 +2406,7 @@ pub const ControlPlane = struct {
         if (mounts_replaced) self.mount_sets_total +%= 1;
 
         if (activate) {
-            if (is_primary_agent and !is_admin and !std.mem.eql(u8, project.id, spider_web_project_id)) {
+            if (is_primary_agent and !std.mem.eql(u8, project.id, spider_web_project_id)) {
                 return ControlPlaneError.ProjectAssignmentForbidden;
             }
             if (project.kind == .spider_web_builtin and !(is_primary_agent or is_admin)) {
@@ -2497,6 +2493,9 @@ pub const ControlPlane = struct {
         if (selected_project_id) |project_id| {
             const project = self.projects.get(project_id) orelse return ControlPlaneError.ProjectNotFound;
             const is_primary_agent = self.isPrimaryAgent(agent_id);
+            if (is_primary_agent and !std.mem.eql(u8, project_id, spider_web_project_id)) {
+                return ControlPlaneError.ProjectAssignmentForbidden;
+            }
             if (project.kind == .spider_web_builtin and !(is_primary_agent or is_admin)) {
                 return ControlPlaneError.ProjectAssignmentForbidden;
             }
@@ -5392,15 +5391,14 @@ test "fs_control_plane: builtin system project is protected and primary-only" {
         plane.activateProject("mother", activate_non_system),
     );
 
-    const activated_admin = try plane.activateProjectWithRole("mother", activate_non_system, true);
-    defer allocator.free(activated_admin);
-    try std.testing.expect(std.mem.indexOf(u8, activated_admin, "\"project_id\":\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, activated_admin, non_system_project_id) != null);
-
-    const status_admin = try plane.workspaceStatusWithRole("mother", activate_non_system, true);
-    defer allocator.free(status_admin);
-    try std.testing.expect(std.mem.indexOf(u8, status_admin, "\"project_id\":\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, status_admin, non_system_project_id) != null);
+    try std.testing.expectError(
+        ControlPlaneError.ProjectAssignmentForbidden,
+        plane.activateProjectWithRole("mother", activate_non_system, true),
+    );
+    try std.testing.expectError(
+        ControlPlaneError.ProjectAssignmentForbidden,
+        plane.workspaceStatusWithRole("mother", activate_non_system, true),
+    );
 }
 
 test "fs_control_plane: builtin system mount can be bound from local node" {
