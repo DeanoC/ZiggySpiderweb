@@ -3461,10 +3461,14 @@ const RuntimeToolDispatchProxy = struct {
         const mode = terminalWriteMode(path, content, allocator) catch {
             return runtimeDispatchFailure(allocator, .invalid_params, "terminal payload must be a JSON object");
         };
+        const exec_payload = normalizeTerminalExecPayload(path, content, allocator) catch {
+            return runtimeDispatchFailure(allocator, .invalid_params, "terminal payload must be a JSON object");
+        };
+        defer allocator.free(exec_payload);
 
         return switch (mode) {
             .exec => {
-                const exec_result = self.sandbox_runtime.executeWorldTool(allocator, "shell_exec", content);
+                const exec_result = self.sandbox_runtime.executeWorldTool(allocator, "shell_exec", exec_payload);
                 return switch (exec_result) {
                     .success => |success| runtimeDispatchFileWriteSuccess(allocator, path, content.len, success.payload_json),
                     .failure => |failure| .{ .failure = .{
@@ -3826,6 +3830,30 @@ fn terminalWriteMode(path: []const u8, content: []const u8, allocator: std.mem.A
 
     if (std.mem.eql(u8, op, "exec") or std.mem.eql(u8, op, "shell_exec")) return .exec;
     return .unsupported_session_op;
+}
+
+fn normalizeTerminalExecPayload(path: []const u8, content: []const u8, allocator: std.mem.Allocator) ![]u8 {
+    const trimmed = std.mem.trim(u8, content, " \t\r\n");
+    if (trimmed.len == 0) return error.InvalidPayload;
+    if (!pathMatchesAnyControlTarget(path, &.{"global/terminal/control/invoke.json"})) {
+        return allocator.dupe(u8, trimmed);
+    }
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, trimmed, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidPayload;
+
+    const root = parsed.value.object;
+    if (root.get("arguments")) |value| {
+        if (value != .object) return error.InvalidPayload;
+        return std.json.Stringify.valueAlloc(allocator, value, .{});
+    }
+    if (root.get("args")) |value| {
+        if (value != .object) return error.InvalidPayload;
+        return std.json.Stringify.valueAlloc(allocator, value, .{});
+    }
+
+    return allocator.dupe(u8, trimmed);
 }
 
 fn pathMatchesAnyControlTarget(path: []const u8, targets: []const []const u8) bool {
@@ -11854,6 +11882,22 @@ test "server_piai: terminal invoke mode accepts exec and rejects session ops" {
             allocator,
         ),
     );
+}
+
+test "server_piai: terminal invoke payload unwraps arguments envelope" {
+    const allocator = std.testing.allocator;
+
+    const payload = try normalizeTerminalExecPayload(
+        "/global/terminal/control/invoke.json",
+        "{\"op\":\"exec\",\"arguments\":{\"command\":\"git status\",\"cwd\":\"/agents/bob\"}}",
+        allocator,
+    );
+    defer allocator.free(payload);
+
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"command\":\"git status\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"cwd\":\"/agents/bob\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"arguments\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"op\"") == null);
 }
 
 test "server_piai: parseHttpRequestPath parses GET line" {

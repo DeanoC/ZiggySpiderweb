@@ -3423,9 +3423,9 @@ pub const RuntimeServer = struct {
                     meaningful_followup = extractMeaningfulAssistantFollowupText(self.allocator, trimmed);
                     pending_tool_failure_followup = true;
                     if (meaningful_followup) |meaningful| {
-                        if (last_meaningful_followup_text) |old| self.allocator.free(old);
-                        last_meaningful_followup_text = try self.allocator.dupe(u8, meaningful);
                         if (saw_tool_result_this_turn) {
+                            if (last_meaningful_followup_text) |old| self.allocator.free(old);
+                            last_meaningful_followup_text = try self.allocator.dupe(u8, meaningful);
                             if (job.emit_debug) {
                                 const payload = try std.fmt.allocPrint(
                                     self.allocator,
@@ -5199,6 +5199,7 @@ var mockJsonMessageOnlyFollowupCallCount: usize = 0;
 var mockLoopResetRecoveryCallCount: usize = 0;
 var mockMeaningfulPostToolReplyCallCount: usize = 0;
 var mockToolContractRepairCallCount: usize = 0;
+var mockPreToolNarrativeThenToolLoopCallCount: usize = 0;
 var mockRateLimitCallCount: usize = 0;
 var mockAuthFailureCallCount: usize = 0;
 var mockFilesystemUnavailableShortCircuitCallCount: usize = 0;
@@ -5793,6 +5794,76 @@ fn mockProviderStreamByModelWithToolContractRepair(
         .stop_reason = .stop,
         .error_message = null,
     } });
+}
+
+fn mockProviderStreamByModelWithPreToolNarrativeThenToolLoop(
+    allocator: std.mem.Allocator,
+    _: *std.http.Client,
+    _: *ziggy_piai.api_registry.ApiRegistry,
+    model: ziggy_piai.types.Model,
+    _: ziggy_piai.types.Context,
+    _: ziggy_piai.types.StreamOptions,
+    events: *std.array_list.Managed(ziggy_piai.types.AssistantMessageEvent),
+) anyerror!void {
+    if (mockPreToolNarrativeThenToolLoopCallCount == 0) {
+        mockPreToolNarrativeThenToolLoopCallCount += 1;
+        const output = try buildMessageOnlyOutput(
+            allocator,
+            "I think I know what to say, but I have not actually used a tool yet.",
+        );
+        try events.append(.{ .done = .{
+            .text = output,
+            .thinking = try allocator.dupe(u8, ""),
+            .tool_calls = &.{},
+            .api = model.api,
+            .provider = model.provider,
+            .model = model.id,
+            .usage = .{},
+            .stop_reason = .stop,
+            .error_message = null,
+        } });
+        return;
+    }
+
+    if (mockPreToolNarrativeThenToolLoopCallCount == 1) {
+        mockPreToolNarrativeThenToolLoopCallCount += 1;
+        const tool_calls = try allocator.alloc(ziggy_piai.types.ToolCall, 1);
+        tool_calls[0] = .{
+            .id = try allocator.dupe(u8, "call-list-root-stale"),
+            .name = try allocator.dupe(u8, "file_list"),
+            .arguments_json = try allocator.dupe(u8, "{\"path\":\"/\",\"recursive\":false,\"max_entries\":50}"),
+        };
+        try events.append(.{ .done = .{
+            .text = try allocator.dupe(u8, ""),
+            .thinking = try allocator.dupe(u8, ""),
+            .tool_calls = tool_calls,
+            .api = model.api,
+            .provider = model.provider,
+            .model = model.id,
+            .usage = .{},
+            .stop_reason = .tool_use,
+            .error_message = null,
+        } });
+        return;
+    }
+
+    if (mockPreToolNarrativeThenToolLoopCallCount < 5) {
+        mockPreToolNarrativeThenToolLoopCallCount += 1;
+        try events.append(.{ .done = .{
+            .text = try allocator.dupe(u8, "ok"),
+            .thinking = try allocator.dupe(u8, ""),
+            .tool_calls = &.{},
+            .api = model.api,
+            .provider = model.provider,
+            .model = model.id,
+            .usage = .{},
+            .stop_reason = .stop,
+            .error_message = null,
+        } });
+        return;
+    }
+
+    return error.TestUnexpectedResult;
 }
 
 fn mockProviderStreamByModelWithJsonToolEnvelopeErrorThenWait(
@@ -7919,6 +7990,38 @@ test "runtime_server: zero-tool-call after tool result gets one protocol repair 
     try std.testing.expect(std.mem.indexOf(u8, response, "none of them are a git repository") != null);
     try std.testing.expect(std.mem.indexOf(u8, response, "\"type\":\"error\"") == null);
     try std.testing.expectEqual(@as(usize, 3), mockToolContractRepairCallCount);
+}
+
+test "runtime_server: pre-tool narrative is not replayed as stale fallback after later tool result" {
+    const allocator = std.testing.allocator;
+    const original_stream_fn = streamByModelFn;
+    defer streamByModelFn = original_stream_fn;
+    streamByModelFn = mockProviderStreamByModelWithPreToolNarrativeThenToolLoop;
+    mockPreToolNarrativeThenToolLoopCallCount = 0;
+
+    const server = try RuntimeServer.createWithProvider(allocator, "agent-test", .{
+        .ltm_directory = "",
+        .ltm_filename = "",
+    }, .{
+        .name = "openai",
+        .model = "gpt-4o-mini",
+        .api_key = "test-key",
+    });
+    defer server.destroy();
+
+    const responses = try server.handleMessageFrames("{\"id\":\"req-provider-stale-fallback\",\"type\":\"session.send\",\"content\":\"try git status\"}");
+    defer deinitResponseFrames(allocator, responses);
+
+    var saw_error = false;
+    var saw_stale_reply = false;
+    for (responses) |payload| {
+        if (std.mem.indexOf(u8, payload, "\"type\":\"error\"") != null) saw_error = true;
+        if (std.mem.indexOf(u8, payload, "I think I know what to say") != null) saw_stale_reply = true;
+    }
+
+    try std.testing.expect(saw_error);
+    try std.testing.expect(!saw_stale_reply);
+    try std.testing.expectEqual(@as(usize, 5), mockPreToolNarrativeThenToolLoopCallCount);
 }
 
 test "runtime_server: chat error wrapper preserves outbound reply over runtime error" {
