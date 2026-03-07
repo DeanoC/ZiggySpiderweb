@@ -26,16 +26,20 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     const ziggy_tool_runtime_module = ziggy_tool_runtime_dep.module("ziggy-tool-runtime");
-    const ziggy_runtime_hooks_dep = b.dependency("ziggy_runtime_hooks", .{
+    const ziggy_run_orchestrator_module = b.createModule(.{
+        .root_source_file = b.path("deps/ziggy-run-orchestrator/src/lib.zig"),
         .target = target,
         .optimize = optimize,
     });
-    const ziggy_runtime_hooks_module = ziggy_runtime_hooks_dep.module("ziggy-runtime-hooks");
-    const ziggy_run_orchestrator_dep = b.dependency("ziggy_run_orchestrator", .{
+    ziggy_run_orchestrator_module.addImport("ziggy-memory-store", ziggy_memory_store_module);
+
+    const ziggy_runtime_hooks_module = b.createModule(.{
+        .root_source_file = b.path("deps/ziggy-runtime-hooks/src/lib.zig"),
         .target = target,
         .optimize = optimize,
     });
-    const ziggy_run_orchestrator_module = ziggy_run_orchestrator_dep.module("ziggy-run-orchestrator");
+    ziggy_runtime_hooks_module.addImport("ziggy-memory-store", ziggy_memory_store_module);
+    ziggy_runtime_hooks_module.addImport("ziggy-run-orchestrator", ziggy_run_orchestrator_module);
 
     // Embeddable distributed filesystem module
     const spiderweb_fs_mod = b.addModule("spiderweb_fs", .{
