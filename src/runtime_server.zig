@@ -3454,10 +3454,12 @@ pub const RuntimeServer = struct {
                         &debug_frames,
                         "provider_followup_cap_zero_tool_calls",
                     );
-                    if (saw_tool_result_this_turn and last_meaningful_followup_text) |message| {
-                        const completion = try self.finalizeProviderCompletion(&debug_frames, message);
-                        pending_tool_failure_followup = false;
-                        return completion;
+                    if (saw_tool_result_this_turn) {
+                        if (last_meaningful_followup_text) |message| {
+                            const completion = try self.finalizeProviderCompletion(&debug_frames, message);
+                            pending_tool_failure_followup = false;
+                            return completion;
+                        }
                     }
                     return RuntimeServerError.ProviderToolLoopExceeded;
                 }
@@ -3609,9 +3611,11 @@ pub const RuntimeServer = struct {
             &debug_frames,
             "provider_round_cap",
         );
-        if (saw_tool_result_this_turn and last_meaningful_followup_text) |message| {
-            const completion = try self.finalizeProviderCompletion(&debug_frames, message);
-            return completion;
+        if (saw_tool_result_this_turn) {
+            if (last_meaningful_followup_text) |message| {
+                const completion = try self.finalizeProviderCompletion(&debug_frames, message);
+                return completion;
+            }
         }
         return RuntimeServerError.ProviderToolLoopExceeded;
     }
