@@ -4,3 +4,18 @@
 [submodule "deps/spider-protocol"]
 	path = deps/spider-protocol
 	url = https://github.com/DeanoC/SpiderProtocol.git
+[submodule "deps/ziggy-piai"]
+	path = deps/ziggy-piai
+	url = https://github.com/DeanoC/ZiggyPiAi.git
+[submodule "deps/ziggy-memory-store"]
+	path = deps/ziggy-memory-store
+	url = https://github.com/DeanoC/ZiggyMemoryStore.git
+[submodule "deps/ziggy-tool-runtime"]
+	path = deps/ziggy-tool-runtime
+	url = https://github.com/DeanoC/ZiggyToolRuntime.git
+[submodule "deps/ziggy-runtime-hooks"]
+	path = deps/ziggy-runtime-hooks
+	url = https://github.com/DeanoC/ZiggyRuntimeHooks.git
+[submodule "deps/ziggy-run-orchestrator"]
+	path = deps/ziggy-run-orchestrator
+	url = https://github.com/DeanoC/ZiggyRunOrchestrator.git

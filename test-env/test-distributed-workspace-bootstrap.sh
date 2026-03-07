@@ -239,7 +239,7 @@ JOIN_B="$(control_call node_join "$JOIN_B_PAYLOAD")"
 NODE_B_ID="$(json_query "$JOIN_B" "payload.node_id")"
 
 PROJECT_NAME="Bootstrap Matrix $(date +%s)"
-PROJECT_UP_PAYLOAD="$(printf '{"name":"%s","vision":"%s","activate":true,"desired_mounts":[{"mount_path":"/workspace","node_id":"%s","export_name":"work"},{"mount_path":"/workspace","node_id":"%s","export_name":"work"}]}' "$PROJECT_NAME" "$PROJECT_NAME" "$NODE_A_ID" "$NODE_B_ID")"
+PROJECT_UP_PAYLOAD="$(printf '{"name":"%s","vision":"%s","activate":true,"desired_mounts":[{"mount_path":"/nodes/local/fs","node_id":"%s","export_name":"work"},{"mount_path":"/nodes/local/fs","node_id":"%s","export_name":"work"}]}' "$PROJECT_NAME" "$PROJECT_NAME" "$NODE_A_ID" "$NODE_B_ID")"
 PROJECT_UP_RESP="$(control_call project_up "$PROJECT_UP_PAYLOAD")"
 
 PROJECT_ID="$(json_query "$PROJECT_UP_RESP" "payload.project_id")"

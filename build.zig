@@ -254,7 +254,4 @@ pub fn build(b: *std.Build) void {
     const run_tests = b.addRunArtifact(spiderweb_tests);
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_tests.step);
-
-    const hatch_test_step = b.step("test-hatch", "Deprecated: no-op step retained for compatibility");
-    hatch_test_step.dependOn(&run_tests.step);
 }
