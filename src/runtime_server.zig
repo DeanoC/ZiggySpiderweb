@@ -7161,7 +7161,7 @@ test "runtime_server: connect returns ack while bootstrap runs separately once" 
     defer deinitResponseFrames(allocator, first_connect);
 
     try std.testing.expectEqual(@as(usize, 1), first_connect.len);
-    try std.testing.expect(std.mem.indexOf(u8, first_connect[0], "\"type\":\"connect.ack\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first_connect[0], "\"type\":\"control.connect_ack\"") != null);
 
     const first_bootstrap = try server.handleConnectBootstrapFrames("req-connect-1");
     defer deinitResponseFrames(allocator, first_bootstrap);

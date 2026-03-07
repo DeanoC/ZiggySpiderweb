@@ -902,8 +902,6 @@ fn spawnSandboxChild(
     try sandbox_args.append(allocator, sandbox_child_dir);
     try appendNamespaceBindIfExists(allocator, &sandbox_args, &owned_args, workspace_bind_source_path, "agents");
     try appendNamespaceBindIfExists(allocator, &sandbox_args, &owned_args, workspace_bind_source_path, "nodes");
-    try appendNamespaceBindIfExists(allocator, &sandbox_args, &owned_args, workspace_bind_source_path, "projects");
-    try appendNamespaceBindIfExists(allocator, &sandbox_args, &owned_args, workspace_bind_source_path, "meta");
     try appendNamespaceBindIfExists(allocator, &sandbox_args, &owned_args, workspace_bind_source_path, "global");
     try sandbox_args.append(allocator, "--chdir");
     try sandbox_args.append(allocator, sandbox_namespace_root);

@@ -642,7 +642,7 @@ pub const Session = struct {
         const debug_visible = self.lookupChild(self.root_id, "debug") != null;
         const payload = try std.fmt.allocPrint(
             self.allocator,
-            "{{\"qid\":{{\"path\":{d},\"type\":\"dir\"}},\"layout\":\"worldfs-v1\",\"project_id\":{s},\"roots\":[\"nodes\",\"agents\",\"users\",\"projects\",\"global\",\"meta\"{s}],\"dynamic_bind_paths\":{s},\"bind_count\":{d}}}",
+            "{{\"qid\":{{\"path\":{d},\"type\":\"dir\"}},\"layout\":\"unified-v2-fs\",\"project_id\":{s},\"roots\":[\"nodes\",\"agents\",\"global\"{s}],\"dynamic_bind_paths\":{s},\"bind_count\":{d}}}",
             .{
                 self.root_id,
                 project_id_json,
@@ -1517,7 +1517,6 @@ pub const Session = struct {
         const nodes_root = try self.addDir(self.root_id, "nodes", false);
         self.nodes_root_id = nodes_root;
         const agents_root = try self.addDir(self.root_id, "agents", false);
-        const users_root = try self.addDir(self.root_id, "users", false);
         const projects_root = try self.addDir(self.root_id, "projects", false);
         const global_root = try self.addDir(self.root_id, "global", false);
         const meta_root = try self.addDir(self.root_id, "meta", false);
@@ -1541,18 +1540,11 @@ pub const Session = struct {
             "Agent identities attached to this project namespace.",
         );
         try self.addDirectoryDescriptors(
-            users_root,
-            "Users",
-            "{\"kind\":\"collection\",\"entries\":\"user directories\",\"shape\":\"/users/<user_id>\"}",
-            "{\"read\":true,\"write\":true}",
-            "User identities attached to this project namespace.",
-        );
-        try self.addDirectoryDescriptors(
             projects_root,
             "Projects",
-            "{\"kind\":\"collection\",\"entries\":\"project directories\",\"shape\":\"/projects/<project_id>/{fs,agents,meta}\"}",
+            "{\"kind\":\"collection\",\"entries\":\"project directories\",\"shape\":\"/projects/<project_id>/{fs,nodes,agents,meta}\"}",
             "{\"read\":true,\"write\":false}",
-            "Project-centric cross-node and agent views.",
+            "Attached-session compatibility view for project metadata and links.",
         );
         try self.addDirectoryDescriptors(
             global_root,
@@ -1572,11 +1564,6 @@ pub const Session = struct {
 
         const active_agent_dir = try self.addDir(agents_root, self.agent_id, false);
         _ = try self.addFile(active_agent_dir, "README.md", "Active agent identity in this project namespace.\n", false, .none);
-        if (std.mem.eql(u8, self.actor_type, "user")) {
-            const active_user_dir = try self.addDir(users_root, self.actor_id, false);
-            _ = try self.addFile(active_user_dir, "README.md", "Active user identity in this project namespace.\n", false, .none);
-        }
-
         const chat = try self.addDir(global_root, "chat", false);
         const control = try self.addDir(chat, "control", false);
         const examples = try self.addDir(chat, "examples", false);
@@ -1786,21 +1773,21 @@ pub const Session = struct {
             "Project",
             "{\"kind\":\"project\",\"children\":[\"fs\",\"nodes\",\"agents\",\"meta\"]}",
             "{\"read\":true,\"write\":false}",
-            "Project-composed world view.",
+            "Attached-session compatibility projection for the active project.",
         );
         try self.addDirectoryDescriptors(
             project_fs_dir,
             "Project Mounts",
             "{\"kind\":\"collection\",\"entries\":\"mount links\",\"source\":\"control.workspace_status mounts\"}",
             "{\"read\":true,\"write\":false}",
-            "Mount links for the active project workspace view.",
+            "Mount links for the active project compatibility view.",
         );
         try self.addDirectoryDescriptors(
             project_nodes_dir,
             "Project Nodes",
             "{\"kind\":\"collection\",\"entries\":\"node links\",\"source\":\"control.workspace_status selected mounts\"}",
             "{\"read\":true,\"write\":false}",
-            "Node links for the active project workspace view.",
+            "Node links for the active project compatibility view.",
         );
         try self.addDirectoryDescriptors(
             project_agents_dir,
@@ -1874,10 +1861,10 @@ pub const Session = struct {
             "Meta",
             "{\"kind\":\"meta\",\"entries\":[\"protocol.json\",\"view.json\",\"workspace_status.json\",\"workspace_availability.json\",\"workspace_health.json\",\"workspace_alerts.json\"]}",
             "{\"read\":true,\"write\":false}",
-            "Protocol and effective view metadata.",
+            "Attached-session compatibility metadata.",
         );
         const protocol_json =
-            "{\"channel\":\"acheron\",\"version\":\"acheron-1\",\"layout\":\"worldfs-v1\",\"ops\":[\"t_version\",\"t_attach\",\"t_walk\",\"t_open\",\"t_read\",\"t_write\",\"t_stat\",\"t_clunk\",\"t_flush\"]}";
+            "{\"channel\":\"acheron\",\"version\":\"acheron-1\",\"layout\":\"acheron-namespace-project-contract-v2\",\"ops\":[\"t_version\",\"t_attach\",\"t_walk\",\"t_open\",\"t_read\",\"t_write\",\"t_stat\",\"t_clunk\",\"t_flush\"]}";
         _ = try self.addFile(meta_root, "protocol.json", protocol_json, false, .none);
         const view_json = try std.fmt.allocPrint(
             self.allocator,
@@ -1921,6 +1908,7 @@ pub const Session = struct {
             _ = try self.addFile(meta_root, "workspace_health.json", "{\"state\":\"unknown\",\"availability\":{\"mounts_total\":0,\"online\":0,\"degraded\":0,\"missing\":0},\"drift_count\":0,\"reconcile_state\":\"unknown\",\"queue_depth\":0}", false, .none);
             _ = try self.addFile(meta_root, "workspace_alerts.json", "[]", false, .none);
         }
+
         try self.refreshProjectBindsFromControlPlane();
     }
 
@@ -4005,7 +3993,7 @@ pub const Session = struct {
         try out.appendSlice(self.allocator, "[");
         const escaped_self_name = try unified.jsonEscape(self.allocator, self.agent_id);
         defer self.allocator.free(escaped_self_name);
-        const self_target = try std.fmt.allocPrint(self.allocator, "/projects/{s}/agents/{s}", .{ policy.project_id, self.agent_id });
+        const self_target = try std.fmt.allocPrint(self.allocator, "/agents/{s}", .{self.agent_id});
         defer self.allocator.free(self_target);
         const escaped_self_target = try unified.jsonEscape(self.allocator, self_target);
         defer self.allocator.free(escaped_self_target);
@@ -4018,7 +4006,7 @@ pub const Session = struct {
             if (std.mem.eql(u8, agent_name, self.agent_id)) continue;
             const escaped_agent_name = try unified.jsonEscape(self.allocator, agent_name);
             defer self.allocator.free(escaped_agent_name);
-            const target = try std.fmt.allocPrint(self.allocator, "/projects/{s}/agents/{s}", .{ policy.project_id, agent_name });
+            const target = try std.fmt.allocPrint(self.allocator, "/agents/{s}", .{agent_name});
             defer self.allocator.free(target);
             const escaped_target = try unified.jsonEscape(self.allocator, target);
             defer self.allocator.free(escaped_target);
@@ -4036,8 +4024,8 @@ pub const Session = struct {
         defer self.allocator.free(escaped_project_id);
         return std.fmt.allocPrint(
             self.allocator,
-            "{{\"version\":\"acheron-worldfs-project-contract-v1\",\"project_id\":\"{s}\",\"project_dirs\":[\"fs\",\"nodes\",\"agents\",\"meta\"],\"meta_files\":[\"topology.json\",\"nodes.json\",\"agents.json\",\"sources.json\",\"contracts.json\",\"paths.json\",\"summary.json\",\"alerts.json\",\"workspace_status.json\",\"mounts.json\",\"desired_mounts.json\",\"actual_mounts.json\",\"drift.json\",\"reconcile.json\",\"availability.json\",\"health.json\"],\"links\":{{\"project_root\":\"/projects/{s}\",\"fs_root\":\"/projects/{s}/fs\",\"nodes_root\":\"/projects/{s}/nodes\",\"agents_root\":\"/projects/{s}/agents\",\"users_root\":\"/users/<user_id>\"}}}}",
-            .{ escaped_project_id, escaped_project_id, escaped_project_id, escaped_project_id, escaped_project_id },
+            "{{\"version\":\"acheron-namespace-project-contract-v2\",\"project_id\":\"{s}\",\"top_level_roots\":[\"/nodes\",\"/agents\",\"/global\"],\"project_metadata_files\":[\"topology.json\",\"nodes.json\",\"agents.json\",\"sources.json\",\"contracts.json\",\"paths.json\",\"summary.json\",\"alerts.json\",\"workspace_status.json\",\"mounts.json\",\"desired_mounts.json\",\"actual_mounts.json\",\"drift.json\",\"reconcile.json\",\"availability.json\",\"health.json\"],\"links\":{{\"nodes_root\":\"/nodes\",\"agents_root\":\"/agents\",\"global_root\":\"/global\",\"project_control\":\"/global/projects\",\"workspace_status\":\"/global/projects/control/invoke.json\"}}}}",
+            .{escaped_project_id},
         );
     }
 
@@ -4046,12 +4034,8 @@ pub const Session = struct {
         defer self.allocator.free(escaped_project_id);
         return std.fmt.allocPrint(
             self.allocator,
-            "{{\"project_root\":\"/projects/{s}\",\"fs_root\":\"/projects/{s}/fs\",\"nodes_root\":\"/projects/{s}/nodes\",\"agents_root\":\"/projects/{s}/agents\",\"meta_root\":\"/projects/{s}/meta\",\"global\":{{\"root\":\"/global\",\"library\":\"/global/library\",\"nodes\":\"/nodes\",\"agents\":\"/agents\",\"users\":\"/users\",\"meta\":\"/meta\",\"debug\":{s}}}}}",
+            "{{\"project_id\":\"{s}\",\"nodes_root\":\"/nodes\",\"agents_root\":\"/agents\",\"global\":{{\"root\":\"/global\",\"library\":\"/global/library\",\"projects\":\"/global/projects\",\"chat\":\"/global/chat\",\"jobs\":\"/global/jobs\",\"mounts\":\"/global/mounts\",\"debug\":{s}}}}}",
             .{
-                escaped_project_id,
-                escaped_project_id,
-                escaped_project_id,
-                escaped_project_id,
                 escaped_project_id,
                 if (policy.show_debug or self.is_admin) "\"/debug\"" else "null",
             },
@@ -9308,10 +9292,8 @@ fn jobStateLabel(state: chat_job_index.JobState) []const u8 {
 fn isWorldAbsolutePath(path: []const u8) bool {
     return std.mem.startsWith(u8, path, "/nodes/") or
         std.mem.startsWith(u8, path, "/agents/") or
-        std.mem.startsWith(u8, path, "/projects/") or
         std.mem.startsWith(u8, path, "/global/") or
-        std.mem.startsWith(u8, path, "/debug/") or
-        std.mem.startsWith(u8, path, "/meta/");
+        std.mem.startsWith(u8, path, "/debug/");
 }
 
 fn defaultGlobalLibraryIndexMd() []const u8 {
@@ -12606,16 +12588,16 @@ test "fsrpc_session: project meta includes control-plane workspace status" {
     try std.testing.expect(std.mem.indexOf(u8, nodes_meta_node.content, "\"state\":\"online\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, nodes_meta_node.content, "\"mounts\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, agents_meta_node.content, "\"name\":\"default\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, agents_meta_node.content, "\"target\":\"/projects/") != null);
+    try std.testing.expect(std.mem.indexOf(u8, agents_meta_node.content, "\"target\":\"/agents/") != null);
     try std.testing.expect(std.mem.indexOf(u8, agents_meta_node.content, "/agents/default\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, contracts_node.content, "\"version\":\"acheron-worldfs-project-contract-v1\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, contracts_node.content, "\"project_dirs\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, contracts_node.content, "\"meta_files\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, contracts_node.content, "\"agents_root\":\"/projects/") != null);
+    try std.testing.expect(std.mem.indexOf(u8, contracts_node.content, "\"version\":\"acheron-namespace-project-contract-v2\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, contracts_node.content, "\"top_level_roots\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, contracts_node.content, "\"project_metadata_files\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, contracts_node.content, "\"agents_root\":\"/agents\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, contracts_node.content, "\"sources.json\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, paths_node.content, "\"project_root\":\"/projects/") != null);
-    try std.testing.expect(std.mem.indexOf(u8, paths_node.content, "\"fs_root\":\"/projects/") != null);
-    try std.testing.expect(std.mem.indexOf(u8, paths_node.content, "\"nodes\":\"/nodes\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, paths_node.content, "\"project_id\":\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, paths_node.content, "\"nodes_root\":\"/nodes\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, paths_node.content, "\"agents_root\":\"/agents\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, paths_node.content, "\"library\":\"/global/library\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, summary_node.content, "\"workspace_status\":\"control_plane\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, summary_node.content, "\"project_mount_links\":1") != null);
@@ -13055,14 +13037,14 @@ test "fsrpc_session: project workspace fallback is scoped to requested project" 
     try std.testing.expect(std.mem.indexOf(u8, nodes_meta_node.content, "\"state\":\"unknown\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, nodes_meta_node.content, node_id.string) == null);
     try std.testing.expect(std.mem.indexOf(u8, agents_meta_node.content, "\"name\":\"default\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, agents_meta_node.content, "\"target\":\"/projects/") != null);
+    try std.testing.expect(std.mem.indexOf(u8, agents_meta_node.content, "\"target\":\"/agents/") != null);
     try std.testing.expect(std.mem.indexOf(u8, agents_meta_node.content, "/agents/default\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, contracts_node.content, "\"version\":\"acheron-worldfs-project-contract-v1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, contracts_node.content, "\"version\":\"acheron-namespace-project-contract-v2\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, contracts_node.content, "\"project_id\":\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, contracts_node.content, project_a_id.string) != null);
-    try std.testing.expect(std.mem.indexOf(u8, contracts_node.content, "\"meta_files\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, contracts_node.content, "\"agents_root\":\"/projects/") != null);
-    try std.testing.expect(std.mem.indexOf(u8, paths_node.content, "\"project_root\":\"/projects/") != null);
+    try std.testing.expect(std.mem.indexOf(u8, contracts_node.content, "\"project_metadata_files\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, contracts_node.content, "\"agents_root\":\"/agents\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, paths_node.content, "\"project_id\":\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, paths_node.content, project_a_id.string) != null);
     try std.testing.expect(std.mem.indexOf(u8, paths_node.content, "\"global\":") != null);
     try std.testing.expect(std.mem.indexOf(u8, paths_node.content, "\"library\":\"/global/library\"") != null);

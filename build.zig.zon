@@ -5,32 +5,29 @@
     .minimum_zig_version = "0.13.0",
     .dependencies = .{
         .ziggy_piai = .{
-            .url = "https://github.com/DeanoC/ZiggyPiAi/archive/847db4e5ac127b7c29f05325c458b61882b96de0.tar.gz",
-            .hash = "N-V-__8AALkBCwDkzKHmU553QXkf7d8LyyHkSBNgCpyuZiRg",
+            .path = "deps/ziggy-piai",
         },
         .spider_protocol = .{
             .path = "deps/spider-protocol",
         },
         .ziggy_memory_store = .{
-            .url = "https://github.com/DeanoC/ZiggyMemoryStore/archive/refs/tags/v0.1.0.tar.gz",
-            .hash = "ziggy_memory_store-0.1.0-QlN-_5uGAQAT0z2xGi3yBmg3YOPYt288yaKoEjSBM_EU",
+            .path = "deps/ziggy-memory-store",
         },
         .ziggy_tool_runtime = .{
-            .url = "https://github.com/DeanoC/ZiggyToolRuntime/archive/refs/tags/v0.1.0.tar.gz",
-            .hash = "ziggy_tool_runtime-0.1.0-t8uaSEGuAACsRd_CxS3bTmnodmeUo1SYpBDONhrphUit",
+            .path = "deps/ziggy-tool-runtime",
         },
         .ziggy_runtime_hooks = .{
-            .url = "https://github.com/DeanoC/ZiggyRuntimeHooks/archive/a928d762d2ef3fe67b08b7bc2eba5b30b86c2c08.tar.gz",
-            .hash = "ziggy_runtime_hooks-0.4.0-68kKIGUfAQAdnk_5_IAhBq0vkOxAZjbzBphuUMCbAqfp",
+            .path = "deps/ziggy-runtime-hooks",
         },
         .ziggy_run_orchestrator = .{
-            .url = "https://github.com/DeanoC/ZiggyRunOrchestrator/archive/dbd10f24fdecd5cce606b19ddde8d50a4a7b1ab9.tar.gz",
-            .hash = "ziggy_run_orchestrator-0.1.0-iczgkPzWAADoxANEsAoIo5hZcraQ5lZ8BOWeuX3RX3SI",
+            .path = "deps/ziggy-run-orchestrator",
         },
     },
     .paths = .{
+        ".gitmodules",
         "build.zig",
         "build.zig.zon",
+        "deps",
         "src",
         "README.md",
         "CHANGELOG.md",

@@ -21,7 +21,13 @@ jobs:
         grep -q 'ziggy_tool_runtime' build.zig.zon
         grep -q 'ziggy_runtime_hooks' build.zig.zon
         grep -q 'ziggy_run_orchestrator' build.zig.zon
-        grep -q '\.hash =' build.zig.zon
+        grep -q '\.path = "deps/ziggy-piai"' build.zig.zon
+        grep -q '\.path = "deps/spider-protocol"' build.zig.zon
+        grep -q '\.path = "deps/ziggy-memory-store"' build.zig.zon
+        grep -q '\.path = "deps/ziggy-tool-runtime"' build.zig.zon
+        grep -q '\.path = "deps/ziggy-runtime-hooks"' build.zig.zon
+        grep -q '\.path = "deps/ziggy-run-orchestrator"' build.zig.zon
+        grep -q '".gitmodules"' build.zig.zon
       extra_commands: |
         timeout 240 env SKIP_BUILD=1 bash test-env/test-unified-v2-protocol.sh
         if [[ "${RUN_SANDBOX_CI_TESTS:-0}" == "1" ]]; then
