@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# ZiggySpiderWeb SystemD Install Script
+# Spiderweb SystemD Install Script
 # Run as root or with sudo
 #
 
@@ -120,7 +120,7 @@ require_provider_selection() {
 }
 
 build_project() {
-    log_info "Building ZiggySpiderWeb..."
+    log_info "Building Spiderweb..."
     
     SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
     PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
@@ -378,8 +378,8 @@ install_systemd_service() {
     
     cat > "/etc/systemd/system/${SERVICE_NAME}.service" <<EOF
 [Unit]
-Description=ZiggySpiderWeb Pi AI Gateway
-Documentation=https://github.com/DeanoC/ZiggySpiderweb
+Description=Spiderweb Pi AI Gateway
+Documentation=https://github.com/DeanoC/Spiderweb
 After=network.target
 Wants=network.target
 
@@ -471,7 +471,7 @@ set_permissions() {
 print_summary() {
     echo ""
     echo "=========================================="
-    echo "  ZiggySpiderWeb Installation Complete!"
+    echo "  Spiderweb Installation Complete!"
     echo "=========================================="
     echo ""
     echo "Service:     $SERVICE_NAME"
@@ -512,7 +512,7 @@ print_summary() {
 
 main() {
     echo "========================================"
-    echo "  ZiggySpiderWeb SystemD Installer"
+    echo "  Spiderweb SystemD Installer"
     echo "========================================"
     echo ""
     

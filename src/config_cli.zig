@@ -316,7 +316,7 @@ fn installSystemdService(allocator: std.mem.Allocator) !void {
 
     const service_content =
         \\[Unit]
-        \\Description=ZiggySpiderweb AI Agent Gateway
+        \\Description=Spiderweb AI Agent Gateway
         \\After=network.target
         \\
         \\[Service]
@@ -553,7 +553,7 @@ fn printAuthUsage() !void {
 
 fn printUsage() !void {
     const usage =
-        \\ZiggySpiderweb Configuration Tool
+        \\Spiderweb Configuration Tool
         \\
         \\Usage:
         \\  spiderweb-config auth path
@@ -615,7 +615,7 @@ test "config_cli: parse service working directory from unit file" {
         .sub_path = "spiderweb.service",
         .data =
         \\[Unit]
-        \\Description=ZiggySpiderweb
+        \\Description=Spiderweb
         \\
         \\[Service]
         \\WorkingDirectory=/opt/ziggy-spiderweb

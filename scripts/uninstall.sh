@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# ZiggySpiderWeb Uninstall Script
+# Spiderweb Uninstall Script
 # Run as root or with sudo
 #
 
@@ -37,7 +37,7 @@ check_root() {
 }
 
 read_confirm() {
-    echo "This will completely remove ZiggySpiderWeb from your system."
+    echo "This will completely remove Spiderweb from your system."
     echo ""
     echo "The following will be DELETED:"
     echo "  - Service: $SERVICE_NAME"
@@ -99,7 +99,7 @@ remove_user() {
 
 main() {
     echo "========================================"
-    echo "  ZiggySpiderWeb Uninstaller"
+    echo "  Spiderweb Uninstaller"
     echo "========================================"
     echo ""
     
@@ -110,7 +110,7 @@ main() {
     remove_files
     remove_user
     
-    log_info "ZiggySpiderWeb has been uninstalled"
+    log_info "Spiderweb has been uninstalled"
 }
 
 main "$@"

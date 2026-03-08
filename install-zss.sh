@@ -1,6 +1,6 @@
 #!/bin/bash
 # ZiggyStarSpider (zss) Client Install Script
-# Usage: curl -fsSL https://raw.githubusercontent.com/DeanoC/ZiggySpiderweb/main/install-zss.sh | bash
+# Usage: curl -fsSL https://raw.githubusercontent.com/DeanoC/Spiderweb/main/install-zss.sh | bash
 
 set -euo pipefail
 

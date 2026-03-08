@@ -5,8 +5,12 @@ const protocol = @import("spider-protocol").protocol;
 const runtime_server_mod = @import("runtime_server.zig");
 const runtime_handle_mod = @import("runtime_handle.zig");
 const chat_job_index = @import("chat_job_index.zig");
+const chat_runtime_job = @import("chat_runtime_job.zig");
+const fsrpc_job_projection = @import("fsrpc_job_projection.zig");
+const shared_node = @import("spiderweb_node");
 const world_policy = @import("world_policy.zig");
 const fs_control_plane = @import("fs_control_plane.zig");
+const fs_router = @import("fs_router.zig");
 const agent_config = @import("agent_config.zig");
 const agent_registry = @import("agent_registry.zig");
 
@@ -22,8 +26,8 @@ const SpecialKind = enum {
     job_status,
     job_result,
     job_log,
-    agent_services_index,
-    node_service_events_log,
+    agent_venoms_index,
+    node_venom_events_log,
     web_search_invoke,
     web_search_search,
     search_code_invoke,
@@ -77,7 +81,6 @@ const wait_poll_interval_ms: u64 = 100;
 const debug_stream_log_max_bytes: usize = 2 * 1024 * 1024;
 const max_agent_id_len: usize = 64;
 const max_signal_events: usize = 512;
-const max_chat_runtime_internal_retries: usize = 2;
 const local_fs_world_prefix = "/nodes/local/fs";
 
 const sub_brains_manage_capabilities = [_][]const u8{
@@ -118,6 +121,7 @@ const WaitSource = struct {
     parameter: ?[]u8 = null,
     target_time_ms: i64 = 0,
     last_seen_updated_at_ms: i64 = 0,
+    last_seen_job_event_seq: u64 = 0,
     last_seen_signal_seq: u64 = 0,
 
     fn deinit(self: *WaitSource, allocator: std.mem.Allocator) void {
@@ -153,6 +157,7 @@ const WaitCandidate = struct {
     sort_key_ms: i64,
     payload_json: []u8,
     next_last_seen_updated_at_ms: ?i64 = null,
+    next_last_seen_job_event_seq: ?u64 = null,
     next_last_seen_signal_seq: ?u64 = null,
 
     fn deinit(self: *WaitCandidate, allocator: std.mem.Allocator) void {
@@ -168,16 +173,31 @@ const WriteOutcome = struct {
     chat_reply_content: ?[]u8 = null,
 };
 
+const BoundVenomProxyPath = struct {
+    venom_id: []const u8,
+    remote_path: []const u8,
+    project_id: ?[]const u8 = null,
+    agent_id: ?[]const u8 = null,
+};
+
+const BoundVenomProxyAttrSummary = struct {
+    kind: NodeKind,
+    writable: bool,
+};
+
 const AsyncChatRuntimeContext = struct {
     allocator: std.mem.Allocator,
     runtime_handle: *runtime_handle_mod.RuntimeHandle,
     job_index: *chat_job_index.ChatJobIndex,
+    control_plane: ?*fs_control_plane.ControlPlane = null,
     emit_debug: bool = false,
+    agent_id: ?[]u8 = null,
     job_name: ?[]u8 = null,
     input: ?[]u8 = null,
     correlation_id: ?[]u8 = null,
 
     fn deinit(self: *AsyncChatRuntimeContext) void {
+        if (self.agent_id) |value| self.allocator.free(value);
         if (self.job_name) |value| self.allocator.free(value);
         if (self.input) |value| self.allocator.free(value);
         if (self.correlation_id) |value| self.allocator.free(value);
@@ -193,6 +213,27 @@ const PathBind = struct {
     fn deinit(self: *PathBind, allocator: std.mem.Allocator) void {
         allocator.free(self.bind_path);
         allocator.free(self.target_path);
+        self.* = undefined;
+    }
+};
+
+const ScopedVenomBinding = struct {
+    venom_id: []u8,
+    scope: []u8,
+    venom_path: []u8,
+    provider_node_id: ?[]u8 = null,
+    provider_venom_path: ?[]u8 = null,
+    endpoint_path: ?[]u8 = null,
+    invoke_path: ?[]u8 = null,
+
+    fn deinit(self: *ScopedVenomBinding, allocator: std.mem.Allocator) void {
+        allocator.free(self.venom_id);
+        allocator.free(self.scope);
+        allocator.free(self.venom_path);
+        if (self.provider_node_id) |value| allocator.free(value);
+        if (self.provider_venom_path) |value| allocator.free(value);
+        if (self.endpoint_path) |value| allocator.free(value);
+        if (self.invoke_path) |value| allocator.free(value);
         self.* = undefined;
     }
 };
@@ -307,6 +348,7 @@ pub const Session = struct {
     actor_type: []u8,
     actor_id: []u8,
     project_id: ?[]u8 = null,
+    active_namespace_project_id: ?[]u8 = null,
     project_token: ?[]u8 = null,
     agents_dir: []u8,
     assets_dir: []u8,
@@ -326,8 +368,10 @@ pub const Session = struct {
     thoughts_latest_id: u32 = 0,
     thoughts_history_id: u32 = 0,
     thoughts_status_id: u32 = 0,
-    agent_services_index_id: u32 = 0,
-    node_service_events_log_id: u32 = 0,
+    agent_venoms_index_id: u32 = 0,
+    active_agent_venoms_index_id: u32 = 0,
+    active_project_venoms_index_id: u32 = 0,
+    node_venom_events_log_id: u32 = 0,
     event_next_id: u32 = 0,
     debug_stream_log_id: u32 = 0,
     pairing_pending_id: u32 = 0,
@@ -357,8 +401,9 @@ pub const Session = struct {
     current_terminal_session_id: ?[]u8 = null,
     next_terminal_session_seq: u64 = 1,
     next_thought_seq: u64 = 1,
-    thought_log_sync_offsets: std.StringHashMapUnmanaged(usize) = .{},
+    thought_job_sync_counts: std.StringHashMapUnmanaged(usize) = .{},
     project_binds: std.ArrayListUnmanaged(PathBind) = .{},
+    scoped_venom_bindings: std.ArrayListUnmanaged(ScopedVenomBinding) = .{},
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -433,7 +478,8 @@ pub const Session = struct {
         self.clearSignalEvents();
         self.clearTerminalSessions();
         self.clearProjectBinds();
-        self.clearThoughtLogSyncOffsets();
+        self.clearScopedVenomBindings();
+        self.clearThoughtJobSyncCounts();
         var it = self.nodes.iterator();
         while (it.next()) |entry| {
             var node = entry.value_ptr.*;
@@ -445,6 +491,7 @@ pub const Session = struct {
         self.allocator.free(self.actor_type);
         self.allocator.free(self.actor_id);
         if (self.project_id) |value| self.allocator.free(value);
+        if (self.active_namespace_project_id) |value| self.allocator.free(value);
         if (self.project_token) |value| self.allocator.free(value);
         self.allocator.free(self.agents_dir);
         self.allocator.free(self.assets_dir);
@@ -572,6 +619,36 @@ pub const Session = struct {
         node_ptr.content = next;
     }
 
+    fn appendDebugEventsFromLogText(
+        allocator: std.mem.Allocator,
+        plane: *fs_control_plane.ControlPlane,
+        agent_id: []const u8,
+        log_text: []const u8,
+    ) !void {
+        var cursor: usize = 0;
+        while (cursor < log_text.len) {
+            const line_end = std.mem.indexOfScalarPos(u8, log_text, cursor, '\n') orelse log_text.len;
+            const line = std.mem.trim(u8, log_text[cursor..line_end], " \t\r\n");
+            if (line.len > 0 and line[0] == '{') {
+                var parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch {
+                    cursor = if (line_end < log_text.len) line_end + 1 else line_end;
+                    continue;
+                };
+                defer parsed.deinit();
+                if (parsed.value == .object) {
+                    const type_value = parsed.value.object.get("type") orelse {
+                        cursor = if (line_end < log_text.len) line_end + 1 else line_end;
+                        continue;
+                    };
+                    if (type_value == .string and std.mem.eql(u8, type_value.string, "debug.event")) {
+                        plane.appendDebugStreamEvent(agent_id, line);
+                    }
+                }
+            }
+            cursor = if (line_end < log_text.len) line_end + 1 else line_end;
+        }
+    }
+
     fn syncDebugStreamLogFromControlPlane(self: *Session) !void {
         if (self.debug_stream_log_id == 0) return;
         const plane = self.control_plane orelse return;
@@ -580,10 +657,10 @@ pub const Session = struct {
         try self.setFileContent(self.debug_stream_log_id, snapshot);
     }
 
-    fn syncNodeServiceEventsLogFromControlPlane(self: *Session) !void {
-        if (self.node_service_events_log_id == 0) return;
+    fn syncNodeVenomEventsLogFromControlPlane(self: *Session) !void {
+        if (self.node_venom_events_log_id == 0) return;
         const plane = self.control_plane orelse return;
-        const snapshot = try plane.snapshotNodeServiceEvents(
+        const snapshot = try plane.snapshotNodeVenomEvents(
             self.allocator,
             self.project_id,
             self.agent_id,
@@ -592,7 +669,7 @@ pub const Session = struct {
             0,
         );
         defer self.allocator.free(snapshot);
-        try self.setFileContent(self.node_service_events_log_id, snapshot);
+        try self.setFileContent(self.node_venom_events_log_id, snapshot);
     }
 
     pub fn handle(self: *Session, msg: *const unified.ParsedMessage) ![]u8 {
@@ -743,7 +820,13 @@ pub const Session = struct {
                 break :blk data_owned.?;
             },
             .file => blk: {
-                if (offset == 0) {
+                var used_bound_proxy = false;
+                if (try self.tryReadBoundVenomProxyFile(state.node_id)) |proxied| {
+                    defer self.allocator.free(proxied);
+                    try self.setFileContent(state.node_id, proxied);
+                    used_bound_proxy = true;
+                }
+                if (offset == 0 and !used_bound_proxy) {
                     if (state.node_id == self.debug_stream_log_id) {
                         try self.syncDebugStreamLogFromControlPlane();
                     }
@@ -757,11 +840,11 @@ pub const Session = struct {
                         .job_log => {
                             try self.refreshJobNodeFromIndex(state.node_id, node.special);
                         },
-                        .agent_services_index => {
-                            try self.refreshAgentServicesIndex(state.node_id);
+                        .agent_venoms_index => {
+                            try self.refreshScopedVenomIndexes();
                         },
-                        .node_service_events_log => {
-                            try self.syncNodeServiceEventsLogFromControlPlane();
+                        .node_venom_events_log => {
+                            try self.syncNodeVenomEventsLogFromControlPlane();
                         },
                         .event_next => {
                             data_owned = try self.handleEventNextRead();
@@ -802,8 +885,10 @@ pub const Session = struct {
     }
 
     fn refreshDynamicDirectory(self: *Session, dir_id: u32) !void {
-        if (dir_id != self.nodes_root_id) return;
-        try self.addNodeDirectoriesFromControlPlane(self.nodes_root_id);
+        if (dir_id == self.nodes_root_id) {
+            try self.addNodeDirectoriesFromControlPlane(self.nodes_root_id);
+        }
+        try self.refreshBoundVenomProxyDirectory(dir_id);
     }
 
     fn handleWrite(self: *Session, msg: *const unified.ParsedMessage) ![]u8 {
@@ -823,7 +908,12 @@ pub const Session = struct {
         defer if (job_name) |value| self.allocator.free(value);
         defer if (correlation_id) |value| self.allocator.free(value);
         defer if (chat_reply_content) |value| self.allocator.free(value);
-        switch (node.special) {
+        if (try self.tryWriteBoundVenomProxyFile(state.node_id, offset, data)) |proxied| {
+            written = proxied.written;
+            job_name = proxied.job_name;
+            correlation_id = proxied.correlation_id;
+            chat_reply_content = proxied.chat_reply_content;
+        } else switch (node.special) {
             .chat_input => {
                 const outcome = try self.handleChatInputWrite(msg, data);
                 written = outcome.written;
@@ -1071,7 +1161,7 @@ pub const Session = struct {
                             self.allocator,
                             msg.tag,
                             "invalid",
-                            "agents create payload requires agent_id (or id) and optional metadata fields",
+                            "agents create payload requires agent_id (or id) and optional metadata/project fields",
                         );
                     },
                     error.AccessDenied => {
@@ -1446,19 +1536,23 @@ pub const Session = struct {
         const payload = if (job_name) |job| blk: {
             const escaped = try unified.jsonEscape(self.allocator, job);
             defer self.allocator.free(escaped);
+            const result_path = try self.buildJobResultPathForNode(state.node_id, job);
+            defer self.allocator.free(result_path);
+            const escaped_result_path = try unified.jsonEscape(self.allocator, result_path);
+            defer self.allocator.free(escaped_result_path);
             if (correlation_id) |corr| {
                 const escaped_corr = try unified.jsonEscape(self.allocator, corr);
                 defer self.allocator.free(escaped_corr);
                 break :blk try std.fmt.allocPrint(
                     self.allocator,
-                    "{{\"n\":{d},\"job\":\"{s}\",\"result_path\":\"/global/jobs/{s}/result.txt\",\"correlation_id\":\"{s}\"}}",
-                    .{ written, escaped, escaped, escaped_corr },
+                    "{{\"n\":{d},\"job\":\"{s}\",\"result_path\":\"{s}\",\"correlation_id\":\"{s}\"}}",
+                    .{ written, escaped, escaped_result_path, escaped_corr },
                 );
             }
             break :blk try std.fmt.allocPrint(
                 self.allocator,
-                "{{\"n\":{d},\"job\":\"{s}\",\"result_path\":\"/global/jobs/{s}/result.txt\"}}",
-                .{ written, escaped, escaped },
+                "{{\"n\":{d},\"job\":\"{s}\",\"result_path\":\"{s}\"}}",
+                .{ written, escaped, escaped_result_path },
             );
         } else if (chat_reply_content) |reply| blk: {
             const escaped_reply = try unified.jsonEscape(self.allocator, reply);
@@ -1477,6 +1571,11 @@ pub const Session = struct {
         const fid = msg.fid orelse return unified.buildFsrpcError(self.allocator, msg.tag, "invalid", "fid is required");
         const state = self.fids.get(fid) orelse return unified.buildFsrpcError(self.allocator, msg.tag, "enoent", "unknown fid");
         const node = self.nodes.get(state.node_id) orelse return unified.buildFsrpcError(self.allocator, msg.tag, "eio", "missing node");
+
+        if (try self.buildBoundVenomProxyStatPayload(state.node_id)) |payload| {
+            defer self.allocator.free(payload);
+            return unified.buildFsrpcResponse(self.allocator, .r_stat, msg.tag, payload);
+        }
 
         const escaped_name = try unified.jsonEscape(self.allocator, node.name);
         defer self.allocator.free(escaped_name);
@@ -1511,6 +1610,8 @@ pub const Session = struct {
             },
         );
         defer policy.deinit(self.allocator);
+        if (self.active_namespace_project_id) |value| self.allocator.free(value);
+        self.active_namespace_project_id = try self.allocator.dupe(u8, policy.project_id);
         const show_debug = policy.show_debug or self.is_admin;
 
         self.root_id = try self.addDir(null, "/", false);
@@ -1564,63 +1665,70 @@ pub const Session = struct {
 
         const active_agent_dir = try self.addDir(agents_root, self.agent_id, false);
         _ = try self.addFile(active_agent_dir, "README.md", "Active agent identity in this project namespace.\n", false, .none);
+        const active_agent_venoms_dir = try self.addDir(active_agent_dir, "venoms", false);
+        try self.addDirectoryDescriptors(
+            active_agent_venoms_dir,
+            "Agent Venoms",
+            "{\"kind\":\"venom_index\",\"files\":[\"VENOMS.json\"],\"roots\":[\"/agents/<agent_id>/venoms/<venom_id>\",\"/nodes/<node_id>/venoms/<venom_id>\"]}",
+            "{\"discover\":true,\"invoke_via_paths\":true}",
+            "Active-agent Venom bindings plus raw node Venom discovery.",
+        );
+        self.active_agent_venoms_index_id = try self.addFile(
+            active_agent_venoms_dir,
+            "VENOMS.json",
+            "[]",
+            false,
+            .agent_venoms_index,
+        );
         const chat = try self.addDir(global_root, "chat", false);
         const control = try self.addDir(chat, "control", false);
         const examples = try self.addDir(chat, "examples", false);
         self.chat_input_id = try self.addFile(control, "input", "", true, .chat_input);
         _ = try self.addFile(control, "reply", "", true, .chat_reply);
-        _ = try self.addFile(examples, "send.txt", "hello from acheron chat", false, .none);
+        _ = try self.addFile(examples, "send.txt", shared_node.venom_contracts.chat.example_send_txt, false, .none);
 
-        const chat_help_md =
-            "# Chat Capability\n\n" ++
-            "Use `control/input` for inbound user/admin chat (creates a chat job).\n" ++
-            "Use `control/reply` for outbound agent reply text to the current chat turn.\n" ++
-            "Read `/global/jobs/<job-id>/result.txt` for chat job output.\n";
-        _ = try self.addFile(chat, "README.md", chat_help_md, false, .none);
-        _ = try self.addFile(chat, "SCHEMA.json", "{\"name\":\"chat\",\"input\":\"control/input\",\"reply\":\"control/reply\",\"jobs\":\"/global/jobs\",\"result\":\"result.txt\"}", false, .none);
-        _ = try self.addFile(chat, "CAPS.json", "{\"write_input\":true,\"write_reply\":true,\"read_jobs\":true}", false, .none);
+        const chat_schema_json = try shared_node.venom_contracts.chat.renderSchemaJson(self.allocator, "/global/jobs", "control/reply");
+        defer self.allocator.free(chat_schema_json);
+        const chat_ops_json = try shared_node.venom_contracts.chat.renderOpsJson(self.allocator, "control/input", "/global/jobs", "control/reply");
+        defer self.allocator.free(chat_ops_json);
+        const chat_status_json = try shared_node.venom_contracts.chat.renderStatusJson(self.allocator, "/global/chat", "/global/jobs");
+        defer self.allocator.free(chat_status_json);
+        _ = try self.addFile(chat, "README.md", shared_node.venom_contracts.chat.readme_md, false, .none);
+        _ = try self.addFile(chat, "SCHEMA.json", chat_schema_json, false, .none);
+        _ = try self.addFile(chat, "CAPS.json", shared_node.venom_contracts.chat.caps_json, false, .none);
+        _ = try self.addFile(chat, "OPS.json", chat_ops_json, false, .none);
+        _ = try self.addFile(chat, "STATUS.json", chat_status_json, false, .none);
 
-        const escaped_agent = try unified.jsonEscape(self.allocator, self.agent_id);
-        defer self.allocator.free(escaped_agent);
-        const escaped_actor_type = try unified.jsonEscape(self.allocator, self.actor_type);
-        defer self.allocator.free(escaped_actor_type);
-        const escaped_actor_id = try unified.jsonEscape(self.allocator, self.actor_id);
-        defer self.allocator.free(escaped_actor_id);
-        const escaped_project = if (policy.project_id.len > 0) blk: {
-            break :blk try unified.jsonEscape(self.allocator, policy.project_id);
-        } else try self.allocator.dupe(u8, "");
-        defer self.allocator.free(escaped_project);
-        const chat_meta_json = try std.fmt.allocPrint(
-            self.allocator,
-            "{{\"name\":\"chat\",\"version\":\"1\",\"agent_id\":\"{s}\",\"actor_type\":\"{s}\",\"actor_id\":\"{s}\",\"project_id\":\"{s}\",\"cost_hint\":\"provider-dependent\",\"latency_hint\":\"seconds\"}}",
-            .{ escaped_agent, escaped_actor_type, escaped_actor_id, escaped_project },
-        );
+        const chat_meta_json = try shared_node.venom_contracts.chat.renderMetaJson(self.allocator, .{
+            .agent_id = self.agent_id,
+            .actor_type = self.actor_type,
+            .actor_id = self.actor_id,
+            .project_id = policy.project_id,
+        });
         defer self.allocator.free(chat_meta_json);
         _ = try self.addFile(chat, "meta.json", chat_meta_json, false, .none);
 
-        const agent_services_dir = try self.addDir(global_root, "services", false);
+        const agent_venoms_dir = try self.addDir(global_root, "venoms", false);
         try self.addDirectoryDescriptors(
-            agent_services_dir,
-            "Services",
-            "{\"kind\":\"service_index\",\"files\":[\"SERVICES.json\",\"node-service-events.ndjson\"],\"roots\":[\"/nodes/<node_id>/services/<service_id>\",\"/global/<service_id>\"]}",
+            agent_venoms_dir,
+            "Venoms",
+            "{\"kind\":\"venom_index\",\"files\":[\"VENOMS.json\",\"node-venom-events.ndjson\"],\"roots\":[\"/nodes/<node_id>/venoms/<venom_id>\",\"/global/<venom_id>\"]}",
             "{\"discover\":true,\"invoke_via_paths\":true}",
-            "Project-wide service discovery index plus retained node service change history.",
+            "Project-wide Venom discovery index plus retained node Venom change history.",
         );
-        const initial_agent_services_index = try self.buildAgentServicesIndexJson();
-        defer self.allocator.free(initial_agent_services_index);
-        self.agent_services_index_id = try self.addFile(
-            agent_services_dir,
-            "SERVICES.json",
-            initial_agent_services_index,
+        self.agent_venoms_index_id = try self.addFile(
+            agent_venoms_dir,
+            "VENOMS.json",
+            "[]",
             false,
-            .agent_services_index,
+            .agent_venoms_index,
         );
-        self.node_service_events_log_id = try self.addFile(
-            agent_services_dir,
-            "node-service-events.ndjson",
+        self.node_venom_events_log_id = try self.addFile(
+            agent_venoms_dir,
+            "node-venom-events.ndjson",
             "",
             false,
-            .node_service_events_log,
+            .node_venom_events_log,
         );
 
         const memory_dir = try self.addDir(global_root, "memory", false);
@@ -1648,6 +1756,15 @@ pub const Session = struct {
             "{\"read\":true,\"write\":false}",
             "Chat job status and outputs.",
         );
+        const jobs_schema_json = try shared_node.venom_contracts.jobs.renderSchemaJson(self.allocator, "/global/jobs");
+        defer self.allocator.free(jobs_schema_json);
+        const jobs_status_json = try shared_node.venom_contracts.jobs.renderStatusJson(self.allocator, "/global/jobs");
+        defer self.allocator.free(jobs_status_json);
+        _ = try self.addFile(self.jobs_root_id, "README.md", shared_node.venom_contracts.jobs.readme_md, false, .none);
+        _ = try self.addFile(self.jobs_root_id, "SCHEMA.json", jobs_schema_json, false, .none);
+        _ = try self.addFile(self.jobs_root_id, "CAPS.json", shared_node.venom_contracts.jobs.caps_json, false, .none);
+        _ = try self.addFile(self.jobs_root_id, "OPS.json", shared_node.venom_contracts.jobs.ops_json, false, .none);
+        _ = try self.addFile(self.jobs_root_id, "STATUS.json", jobs_status_json, false, .none);
         try self.seedJobsFromIndex();
 
         const thoughts_dir = try self.addDir(global_root, "thoughts", false);
@@ -1661,30 +1778,31 @@ pub const Session = struct {
         _ = try self.addFile(
             thoughts_dir,
             "README.md",
-            "Internal per-cycle thought frames from runtime provider loops.\nUse latest.txt for current thought and history.ndjson for trace.\n",
+            shared_node.venom_contracts.thoughts.readme_md,
             false,
             .none,
         );
         _ = try self.addFile(
             thoughts_dir,
             "SCHEMA.json",
-            "{\"latest\":\"latest.txt\",\"history\":\"history.ndjson\",\"status\":\"status.json\",\"event\":{\"seq\":1,\"ts_ms\":0,\"source\":\"thinking|text\",\"round\":1,\"content\":\"...\"}}",
+            shared_node.venom_contracts.thoughts.schema_json,
             false,
             .none,
         );
         _ = try self.addFile(
             thoughts_dir,
             "CAPS.json",
-            "{\"read_latest\":true,\"read_history\":true,\"stream_append\":true}",
+            shared_node.venom_contracts.thoughts.caps_json,
             false,
             .none,
         );
+        _ = try self.addFile(thoughts_dir, "OPS.json", shared_node.venom_contracts.thoughts.ops_json, false, .none);
         self.thoughts_latest_id = try self.addFile(thoughts_dir, "latest.txt", "", false, .none);
         self.thoughts_history_id = try self.addFile(thoughts_dir, "history.ndjson", "", false, .none);
         self.thoughts_status_id = try self.addFile(
             thoughts_dir,
             "status.json",
-            "{\"count\":0,\"updated_at_ms\":0,\"latest_source\":null,\"latest_round\":null}",
+            shared_node.venom_contracts.thoughts.initial_status_json,
             false,
             .none,
         );
@@ -1692,63 +1810,59 @@ pub const Session = struct {
         const events_dir = try self.addDir(global_root, "events", false);
         const events_control_dir = try self.addDir(events_dir, "control", false);
         const events_sources_dir = try self.addDir(events_dir, "sources", false);
-        const events_help =
-            "# Event Waiting\n\n" ++
-            "1. Write selector JSON to `control/wait.json`.\n" ++
-            "2. Read `next.json` to block until the first matching event.\n\n" ++
-            "Selectors support chat/jobs plus event sources under `/global/events/sources/*`.\n" ++
-            "Single-event waits can also use a direct blocking read on that endpoint when supported.\n";
-        _ = try self.addFile(events_dir, "README.md", events_help, false, .none);
+        _ = try self.addFile(events_dir, "README.md", shared_node.venom_contracts.events.readme_md, false, .none);
         _ = try self.addFile(
             events_dir,
             "SCHEMA.json",
-            "{\"wait_config\":{\"paths\":[\"/global/chat/control/input\",\"/global/jobs/<job-id>/status.json\",\"/global/events/sources/time/after/1000.json\",\"/global/events/sources/agent/build.json\",\"/global/events/sources/hook/pre_observe.json\"],\"timeout_ms\":60000},\"signal\":{\"event_type\":\"agent|hook|user\",\"parameter\":\"string?\",\"payload\":{}},\"event\":{\"event_id\":1,\"source_path\":\"...\",\"event_path\":\"...\",\"updated_at_ms\":0}}",
+            shared_node.venom_contracts.events.schema_json,
             false,
             .none,
         );
         _ = try self.addFile(
             events_dir,
             "CAPS.json",
-            "{\"sources\":[\"/global/chat/control/input\",\"/global/jobs/<job-id>/status.json\",\"/global/jobs/<job-id>/result.txt\",\"/global/events/sources/time/after/<ms>.json\",\"/global/events/sources/time/at/<unix_ms>.json\",\"/global/events/sources/agent/<parameter>.json\",\"/global/events/sources/hook/<parameter>.json\",\"/global/events/sources/user/<parameter>.json\"],\"multi_wait\":true,\"single_blocking_read\":true}",
+            shared_node.venom_contracts.events.caps_json,
             false,
             .none,
         );
+        _ = try self.addFile(events_dir, "OPS.json", shared_node.venom_contracts.events.ops_json, false, .none);
+        _ = try self.addFile(events_dir, "STATUS.json", shared_node.venom_contracts.events.status_json, false, .none);
         _ = try self.addFile(
             events_control_dir,
             "README.md",
-            "Write wait selector JSON to wait.json. Required: paths[]. Optional: timeout_ms. Emit synthetic agent/hook/user signals via signal.json.\n",
+            shared_node.venom_contracts.events.control_readme_md,
             false,
             .none,
         );
         _ = try self.addFile(
             events_control_dir,
             "wait.json",
-            "{\"paths\":[],\"timeout_ms\":60000}",
+            shared_node.venom_contracts.events.default_wait_json,
             true,
             .event_wait_config,
         );
         _ = try self.addFile(
             events_control_dir,
             "signal.json",
-            "{\"event_type\":\"agent\",\"parameter\":\"example\",\"payload\":{}}",
+            shared_node.venom_contracts.events.default_signal_json,
             true,
             .event_signal,
         );
         _ = try self.addFile(
             events_sources_dir,
             "README.md",
-            "Wait source selectors: time/after/<ms>.json, time/at/<unix_ms>.json, agent/<parameter>.json, hook/<parameter>.json, user/<parameter>.json.\n",
+            shared_node.venom_contracts.events.sources_readme_md,
             false,
             .none,
         );
-        _ = try self.addFile(events_sources_dir, "agent.json", "Use `/global/events/sources/agent/<parameter>.json` in wait.json selectors.\n", false, .none);
-        _ = try self.addFile(events_sources_dir, "hook.json", "Use `/global/events/sources/hook/<parameter>.json` in wait.json selectors.\n", false, .none);
-        _ = try self.addFile(events_sources_dir, "user.json", "Use `/global/events/sources/user/<parameter>.json` in wait.json selectors.\n", false, .none);
-        _ = try self.addFile(events_sources_dir, "time.json", "Use `/global/events/sources/time/after/<ms>.json` or `/global/events/sources/time/at/<unix_ms>.json` in wait.json selectors.\n", false, .none);
+        _ = try self.addFile(events_sources_dir, "agent.json", shared_node.venom_contracts.events.agent_source_help_md, false, .none);
+        _ = try self.addFile(events_sources_dir, "hook.json", shared_node.venom_contracts.events.hook_source_help_md, false, .none);
+        _ = try self.addFile(events_sources_dir, "user.json", shared_node.venom_contracts.events.user_source_help_md, false, .none);
+        _ = try self.addFile(events_sources_dir, "time.json", shared_node.venom_contracts.events.time_source_help_md, false, .none);
         self.event_next_id = try self.addFile(
             events_dir,
             "next.json",
-            "{\"configured\":false,\"waiting\":false}",
+            shared_node.venom_contracts.events.initial_next_json,
             false,
             .event_next,
         );
@@ -1768,10 +1882,11 @@ pub const Session = struct {
         const project_nodes_dir = try self.addDir(project_dir, "nodes", false);
         const project_agents_dir = try self.addDir(project_dir, "agents", false);
         const project_meta_dir = try self.addDir(project_dir, "meta", false);
+        const project_venoms_dir = try self.addDir(project_dir, "venoms", false);
         try self.addDirectoryDescriptors(
             project_dir,
             "Project",
-            "{\"kind\":\"project\",\"children\":[\"fs\",\"nodes\",\"agents\",\"meta\"]}",
+            "{\"kind\":\"project\",\"children\":[\"fs\",\"nodes\",\"agents\",\"venoms\",\"meta\"]}",
             "{\"read\":true,\"write\":false}",
             "Attached-session compatibility projection for the active project.",
         );
@@ -1795,6 +1910,20 @@ pub const Session = struct {
             "{\"kind\":\"collection\",\"entries\":\"agent links\",\"scope\":\"project\",\"targets\":\"/projects/<project_id>/agents/<agent_id>\"}",
             "{\"read\":true,\"write\":false}",
             "Agent links visible within this project context.",
+        );
+        try self.addDirectoryDescriptors(
+            project_venoms_dir,
+            "Project Venoms",
+            "{\"kind\":\"venom_index\",\"files\":[\"VENOMS.json\"],\"roots\":[\"/projects/<project_id>/venoms/<venom_id>\",\"/nodes/<node_id>/venoms/<venom_id>\"]}",
+            "{\"discover\":true,\"invoke_via_paths\":true}",
+            "Project-scoped Venom bindings plus raw node Venom discovery.",
+        );
+        self.active_project_venoms_index_id = try self.addFile(
+            project_venoms_dir,
+            "VENOMS.json",
+            "[]",
+            false,
+            .agent_venoms_index,
         );
         try self.addDirectoryDescriptors(
             project_meta_dir,
@@ -1866,6 +1995,10 @@ pub const Session = struct {
         const protocol_json =
             "{\"channel\":\"acheron\",\"version\":\"acheron-1\",\"layout\":\"acheron-namespace-project-contract-v2\",\"ops\":[\"t_version\",\"t_attach\",\"t_walk\",\"t_open\",\"t_read\",\"t_write\",\"t_stat\",\"t_clunk\",\"t_flush\"]}";
         _ = try self.addFile(meta_root, "protocol.json", protocol_json, false, .none);
+        const escaped_agent = try unified.jsonEscape(self.allocator, self.agent_id);
+        defer self.allocator.free(escaped_agent);
+        const escaped_project = try unified.jsonEscape(self.allocator, policy.project_id);
+        defer self.allocator.free(escaped_project);
         const view_json = try std.fmt.allocPrint(
             self.allocator,
             "{{\"agent_id\":\"{s}\",\"project_id\":\"{s}\",\"show_debug\":{s},\"nodes\":{d},\"visible_agents\":{d},\"project_links\":{d}}}",
@@ -1910,6 +2043,25 @@ pub const Session = struct {
         }
 
         try self.refreshProjectBindsFromControlPlane();
+
+        try self.registerExistingGlobalVenomBinding(global_root, "chat", "project_namespace");
+        try self.registerExistingGlobalVenomBinding(global_root, "jobs", "project_namespace");
+        try self.registerExistingGlobalVenomBinding(global_root, "events", "project_namespace");
+        try self.registerExistingGlobalVenomBinding(global_root, "memory", "project_namespace");
+        try self.registerExistingGlobalVenomBinding(global_root, "web_search", "project_namespace");
+        try self.registerExistingGlobalVenomBinding(global_root, "search_code", "project_namespace");
+        try self.registerExistingGlobalVenomBinding(global_root, "terminal", "project_namespace");
+        try self.registerExistingGlobalVenomBinding(global_root, "mounts", "project_namespace");
+        try self.registerExistingGlobalVenomBinding(global_root, "sub_brains", "project_namespace");
+        try self.registerExistingGlobalVenomBinding(global_root, "agents", "project_namespace");
+        try self.registerExistingGlobalVenomBinding(global_root, "projects", "project_namespace");
+        try self.registerExistingGlobalVenomBinding(global_root, "thoughts", "project_namespace");
+        try self.registerExistingGlobalVenomBinding(global_root, "library", "global_namespace");
+        const preferred_fs_node_id = try self.resolvePreferredBoundVenomNodeId("fs");
+        defer if (preferred_fs_node_id) |value| self.allocator.free(value);
+        _ = try self.seedBoundGlobalFsNamespace(global_root, preferred_fs_node_id orelse "local");
+        try self.seedActiveScopedVenomBindings(active_agent_venoms_dir, project_venoms_dir, policy.project_id);
+        try self.refreshScopedVenomIndexes();
     }
 
     fn addProjectMetaFiles(
@@ -2299,7 +2451,7 @@ pub const Session = struct {
         discovered_from_workspace: bool,
     ) !void {
         const node_dir = try self.addDir(nodes_root, node.id, false);
-        var resource_view = try self.addNodeServices(node_dir, node);
+        var resource_view = try self.addNodeVenoms(node_dir, node);
         defer resource_view.deinit(self.allocator);
 
         const node_schema = "{\"kind\":\"node\",\"children\":\"services + mount roots\"}";
@@ -4622,7 +4774,7 @@ pub const Session = struct {
             allocator: std.mem.Allocator,
             node_id: []const u8,
             kind: []const u8,
-            service_id: []const u8,
+            venom_id: []const u8,
             endpoint: []const u8,
             mounts_json: []const u8,
         ) !void {
@@ -4647,8 +4799,8 @@ pub const Session = struct {
                 handled_terminal = true;
                 try self.addRoot(allocator, "terminal");
 
-                const maybe_terminal_id = if (std.mem.startsWith(u8, service_id, "terminal-") and service_id.len > "terminal-".len)
-                    service_id["terminal-".len..]
+                const maybe_terminal_id = if (std.mem.startsWith(u8, venom_id, "terminal-") and venom_id.len > "terminal-".len)
+                    venom_id["terminal-".len..]
                 else
                     terminalIdFromEndpoint(endpoint);
                 const terminal_id = maybe_terminal_id orelse {
@@ -4768,19 +4920,19 @@ pub const Session = struct {
         return self.canAccessServiceWithPermissions(permissions_node.content);
     }
 
-    fn appendServiceIndexEntry(
+    fn appendVenomIndexEntry(
         self: *Session,
         out: *std.ArrayListUnmanaged(u8),
         first: *bool,
-        service_id: []const u8,
+        venom_id: []const u8,
         kind: []const u8,
         state: []const u8,
         endpoint: []const u8,
     ) !void {
         if (!first.*) try out.append(self.allocator, ',');
         first.* = false;
-        const escaped_service_id = try unified.jsonEscape(self.allocator, service_id);
-        defer self.allocator.free(escaped_service_id);
+        const escaped_venom_id = try unified.jsonEscape(self.allocator, venom_id);
+        defer self.allocator.free(escaped_venom_id);
         const escaped_kind = try unified.jsonEscape(self.allocator, kind);
         defer self.allocator.free(escaped_kind);
         const escaped_state = try unified.jsonEscape(self.allocator, state);
@@ -4788,76 +4940,76 @@ pub const Session = struct {
         const escaped_endpoint = try unified.jsonEscape(self.allocator, endpoint);
         defer self.allocator.free(escaped_endpoint);
         try out.writer(self.allocator).print(
-            "{{\"service_id\":\"{s}\",\"kind\":\"{s}\",\"state\":\"{s}\",\"endpoint\":\"{s}\"}}",
-            .{ escaped_service_id, escaped_kind, escaped_state, escaped_endpoint },
+            "{{\"venom_id\":\"{s}\",\"kind\":\"{s}\",\"state\":\"{s}\",\"endpoint\":\"{s}\"}}",
+            .{ escaped_venom_id, escaped_kind, escaped_state, escaped_endpoint },
         );
     }
 
-    fn addNodeServices(self: *Session, node_dir: u32, node: world_policy.NodePolicy) !NodeResourceView {
+    fn addNodeVenoms(self: *Session, node_dir: u32, node: world_policy.NodePolicy) !NodeResourceView {
         var view = NodeResourceView{};
         errdefer view.deinit(self.allocator);
 
-        const services_root = try self.addDir(node_dir, "services", false);
+        const venoms_root = try self.addDir(node_dir, "venoms", false);
         try self.addDirectoryDescriptors(
-            services_root,
-            "Node Services",
-            "{\"kind\":\"collection\",\"entries\":\"service_id\",\"shape\":\"/nodes/<node_id>/services/<service_id>/{SCHEMA.json,STATUS.json,CAPS.json,MOUNTS.json,OPS.json,RUNTIME.json,PERMISSIONS.json}\"}",
+            venoms_root,
+            "Node Venoms",
+            "{\"kind\":\"collection\",\"entries\":\"venom_id\",\"shape\":\"/nodes/<node_id>/venoms/<venom_id>/{SCHEMA.json,STATUS.json,CAPS.json,MOUNTS.json,OPS.json,RUNTIME.json,PERMISSIONS.json}\"}",
             "{\"read\":true,\"write\":false}",
-            "Node service descriptors. This view prefers control-plane catalog data and falls back to policy.",
+            "Node Venom descriptors mirrored from the node Venom catalog.",
         );
         var services_index = std.ArrayListUnmanaged(u8){};
         defer services_index.deinit(self.allocator);
         try services_index.append(self.allocator, '[');
         var services_index_first = true;
 
-        switch (try self.loadNodeServicesFromControlPlane(node.id)) {
+        switch (try self.loadNodeVenomsFromControlPlane(node.id)) {
             .catalog => |catalog_value| {
                 var catalog = catalog_value;
                 defer catalog.deinit(self.allocator);
-                for (catalog.items.items) |service| {
-                    if (!self.canAccessServiceWithPermissions(service.permissions_json)) continue;
-                    try self.addNodeServiceEntry(
-                        services_root,
-                        service.service_id,
-                        service.kind,
-                        service.state,
-                        service.endpoint,
-                        service.caps_json,
-                        service.mounts_json,
-                        service.ops_json,
-                        service.runtime_json,
-                        service.permissions_json,
-                        service.schema_json,
-                        service.help_md,
+                for (catalog.items.items) |venom| {
+                    if (!self.canAccessServiceWithPermissions(venom.permissions_json)) continue;
+                    try self.addNodeVenomEntry(
+                        venoms_root,
+                        venom.venom_id,
+                        venom.kind,
+                        venom.state,
+                        venom.endpoint,
+                        venom.caps_json,
+                        venom.mounts_json,
+                        venom.ops_json,
+                        venom.runtime_json,
+                        venom.permissions_json,
+                        venom.schema_json,
+                        venom.help_md,
                     );
                     try view.observe(
                         self.allocator,
                         node.id,
-                        service.kind,
-                        service.service_id,
-                        service.endpoint,
-                        service.mounts_json,
+                        venom.kind,
+                        venom.venom_id,
+                        venom.endpoint,
+                        venom.mounts_json,
                     );
-                    try self.appendServiceIndexEntry(
+                    try self.appendVenomIndexEntry(
                         &services_index,
                         &services_index_first,
-                        service.service_id,
-                        service.kind,
-                        service.state,
-                        service.endpoint,
+                        venom.venom_id,
+                        venom.kind,
+                        venom.state,
+                        venom.endpoint,
                     );
                 }
                 try services_index.append(self.allocator, ']');
                 const services_index_json = try services_index.toOwnedSlice(self.allocator);
                 defer self.allocator.free(services_index_json);
-                _ = try self.addFile(services_root, "SERVICES.json", services_index_json, false, .none);
+                _ = try self.addFile(venoms_root, "VENOMS.json", services_index_json, false, .none);
                 return view;
             },
             .empty => {
                 try services_index.append(self.allocator, ']');
                 const services_index_json = try services_index.toOwnedSlice(self.allocator);
                 defer self.allocator.free(services_index_json);
-                _ = try self.addFile(services_root, "SERVICES.json", services_index_json, false, .none);
+                _ = try self.addFile(venoms_root, "VENOMS.json", services_index_json, false, .none);
                 return view;
             },
             .unavailable => {},
@@ -4875,8 +5027,22 @@ pub const Session = struct {
             defer self.allocator.free(endpoint);
             const permissions = "{\"default\":\"allow-by-default\",\"allow_roles\":[\"admin\",\"user\"],\"scope\":\"project\"}";
             if (self.canAccessServiceWithPermissions(permissions)) {
-                try self.addNodeServiceEntry(
-                    services_root,
+                try self.addNodeVenomEntry(
+                    venoms_root,
+                    "fs",
+                    "fs",
+                    "online",
+                    endpoint,
+                    caps,
+                    mounts,
+                    "{\"model\":\"namespace\"}",
+                    "{\"type\":\"builtin\"}",
+                    permissions,
+                    "{\"model\":\"filesystem\"}",
+                    "Project node filesystem export.",
+                );
+                try self.addNodeVenomEntry(
+                    venoms_root,
                     "fs",
                     "fs",
                     "online",
@@ -4890,7 +5056,7 @@ pub const Session = struct {
                     "Project node filesystem export.",
                 );
                 try view.observe(self.allocator, node.id, "fs", "fs", endpoint, mounts);
-                try self.appendServiceIndexEntry(&services_index, &services_index_first, "fs", "fs", "online", endpoint);
+                try self.appendVenomIndexEntry(&services_index, &services_index_first, "fs", "fs", "online", endpoint);
             }
         }
         if (node.resources.camera) {
@@ -4905,8 +5071,22 @@ pub const Session = struct {
             defer self.allocator.free(endpoint);
             const permissions = "{\"default\":\"allow-by-default\",\"allow_roles\":[\"admin\",\"user\"],\"scope\":\"node\"}";
             if (self.canAccessServiceWithPermissions(permissions)) {
-                try self.addNodeServiceEntry(
-                    services_root,
+                try self.addNodeVenomEntry(
+                    venoms_root,
+                    "camera",
+                    "camera",
+                    "online",
+                    endpoint,
+                    caps,
+                    mounts,
+                    "{\"model\":\"namespace\"}",
+                    "{\"type\":\"builtin\"}",
+                    permissions,
+                    "{\"model\":\"camera\"}",
+                    "Camera capture namespace.",
+                );
+                try self.addNodeVenomEntry(
+                    venoms_root,
                     "camera",
                     "camera",
                     "online",
@@ -4920,7 +5100,7 @@ pub const Session = struct {
                     "Camera capture namespace.",
                 );
                 try view.observe(self.allocator, node.id, "camera", "camera", endpoint, mounts);
-                try self.appendServiceIndexEntry(&services_index, &services_index_first, "camera", "camera", "online", endpoint);
+                try self.appendVenomIndexEntry(&services_index, &services_index_first, "camera", "camera", "online", endpoint);
             }
         }
         if (node.resources.screen) {
@@ -4935,8 +5115,22 @@ pub const Session = struct {
             defer self.allocator.free(endpoint);
             const permissions = "{\"default\":\"allow-by-default\",\"allow_roles\":[\"admin\",\"user\"],\"scope\":\"node\"}";
             if (self.canAccessServiceWithPermissions(permissions)) {
-                try self.addNodeServiceEntry(
-                    services_root,
+                try self.addNodeVenomEntry(
+                    venoms_root,
+                    "screen",
+                    "screen",
+                    "online",
+                    endpoint,
+                    caps,
+                    mounts,
+                    "{\"model\":\"namespace\"}",
+                    "{\"type\":\"builtin\"}",
+                    permissions,
+                    "{\"model\":\"screen\"}",
+                    "Screen capture namespace.",
+                );
+                try self.addNodeVenomEntry(
+                    venoms_root,
                     "screen",
                     "screen",
                     "online",
@@ -4950,7 +5144,7 @@ pub const Session = struct {
                     "Screen capture namespace.",
                 );
                 try view.observe(self.allocator, node.id, "screen", "screen", endpoint, mounts);
-                try self.appendServiceIndexEntry(&services_index, &services_index_first, "screen", "screen", "online", endpoint);
+                try self.appendVenomIndexEntry(&services_index, &services_index_first, "screen", "screen", "online", endpoint);
             }
         }
         if (node.resources.user) {
@@ -4965,8 +5159,22 @@ pub const Session = struct {
             defer self.allocator.free(endpoint);
             const permissions = "{\"default\":\"allow-by-default\",\"allow_roles\":[\"admin\",\"user\"],\"scope\":\"node\"}";
             if (self.canAccessServiceWithPermissions(permissions)) {
-                try self.addNodeServiceEntry(
-                    services_root,
+                try self.addNodeVenomEntry(
+                    venoms_root,
+                    "user",
+                    "user",
+                    "online",
+                    endpoint,
+                    caps,
+                    mounts,
+                    "{\"model\":\"namespace\"}",
+                    "{\"type\":\"builtin\"}",
+                    permissions,
+                    "{\"model\":\"user\"}",
+                    "User interaction namespace.",
+                );
+                try self.addNodeVenomEntry(
+                    venoms_root,
                     "user",
                     "user",
                     "online",
@@ -4980,7 +5188,7 @@ pub const Session = struct {
                     "User interaction namespace.",
                 );
                 try view.observe(self.allocator, node.id, "user", "user", endpoint, mounts);
-                try self.appendServiceIndexEntry(&services_index, &services_index_first, "user", "user", "online", endpoint);
+                try self.appendVenomIndexEntry(&services_index, &services_index_first, "user", "user", "online", endpoint);
             }
         }
 
@@ -5005,8 +5213,22 @@ pub const Session = struct {
             defer self.allocator.free(mounts);
             const permissions = "{\"default\":\"allow-by-default\",\"allow_roles\":[\"admin\",\"user\"],\"scope\":\"node\"}";
             if (self.canAccessServiceWithPermissions(permissions)) {
-                try self.addNodeServiceEntry(
-                    services_root,
+                try self.addNodeVenomEntry(
+                    venoms_root,
+                    service_id,
+                    "terminal",
+                    "online",
+                    endpoint,
+                    caps,
+                    mounts,
+                    "{\"model\":\"namespace\"}",
+                    "{\"type\":\"builtin\"}",
+                    permissions,
+                    "{\"model\":\"terminal\"}",
+                    "Interactive terminal namespace.",
+                );
+                try self.addNodeVenomEntry(
+                    venoms_root,
                     service_id,
                     "terminal",
                     "online",
@@ -5020,20 +5242,20 @@ pub const Session = struct {
                     "Interactive terminal namespace.",
                 );
                 try view.observe(self.allocator, node.id, "terminal", service_id, endpoint, mounts);
-                try self.appendServiceIndexEntry(&services_index, &services_index_first, service_id, "terminal", "online", endpoint);
+                try self.appendVenomIndexEntry(&services_index, &services_index_first, service_id, "terminal", "online", endpoint);
             }
         }
 
         try services_index.append(self.allocator, ']');
         const services_index_json = try services_index.toOwnedSlice(self.allocator);
         defer self.allocator.free(services_index_json);
-        _ = try self.addFile(services_root, "SERVICES.json", services_index_json, false, .none);
+        _ = try self.addFile(venoms_root, "VENOMS.json", services_index_json, false, .none);
         return view;
     }
 
-    const NodeServiceCatalog = struct {
+    const NodeVenomCatalog = struct {
         const Entry = struct {
-            service_id: []u8,
+            venom_id: []u8,
             kind: []u8,
             state: []u8,
             endpoint: []u8,
@@ -5046,7 +5268,7 @@ pub const Session = struct {
             help_md: ?[]u8 = null,
 
             fn deinit(self: *Entry, allocator: std.mem.Allocator) void {
-                allocator.free(self.service_id);
+                allocator.free(self.venom_id);
                 allocator.free(self.kind);
                 allocator.free(self.state);
                 allocator.free(self.endpoint);
@@ -5063,20 +5285,20 @@ pub const Session = struct {
 
         items: std.ArrayListUnmanaged(Entry) = .{},
 
-        fn deinit(self: *NodeServiceCatalog, allocator: std.mem.Allocator) void {
+        fn deinit(self: *NodeVenomCatalog, allocator: std.mem.Allocator) void {
             for (self.items.items) |*item| item.deinit(allocator);
             self.items.deinit(allocator);
             self.* = undefined;
         }
     };
 
-    const NodeServiceCatalogResult = union(enum) {
+    const NodeVenomCatalogResult = union(enum) {
         unavailable,
         empty,
-        catalog: NodeServiceCatalog,
+        catalog: NodeVenomCatalog,
     };
 
-    fn loadNodeServicesFromControlPlane(self: *Session, node_id: []const u8) !NodeServiceCatalogResult {
+    fn loadNodeVenomsFromControlPlane(self: *Session, node_id: []const u8) !NodeVenomCatalogResult {
         const plane = self.control_plane orelse return .unavailable;
         const escaped_node_id = try unified.jsonEscape(self.allocator, node_id);
         defer self.allocator.free(escaped_node_id);
@@ -5087,22 +5309,22 @@ pub const Session = struct {
         );
         defer self.allocator.free(request_json);
 
-        const response_json = plane.nodeServiceGet(request_json) catch return .unavailable;
+        const response_json = plane.nodeVenomGet(request_json) catch return .unavailable;
         defer self.allocator.free(response_json);
 
         var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, response_json, .{}) catch return .unavailable;
         defer parsed.deinit();
         if (parsed.value != .object) return .unavailable;
-        const services_val = parsed.value.object.get("services") orelse return .unavailable;
-        if (services_val != .array) return .unavailable;
-        if (services_val.array.items.len == 0) return .empty;
+        const venoms_val = parsed.value.object.get("venoms") orelse return .unavailable;
+        if (venoms_val != .array) return .unavailable;
+        if (venoms_val.array.items.len == 0) return .empty;
 
-        var catalog = NodeServiceCatalog{};
+        var catalog = NodeVenomCatalog{};
         errdefer catalog.deinit(self.allocator);
 
-        for (services_val.array.items) |item| {
+        for (venoms_val.array.items) |item| {
             if (item != .object) continue;
-            const service_id_val = item.object.get("service_id") orelse continue;
+            const service_id_val = item.object.get("venom_id") orelse continue;
             if (service_id_val != .string or service_id_val.string.len == 0) continue;
             const kind_val = item.object.get("kind") orelse continue;
             if (kind_val != .string or kind_val.string.len == 0) continue;
@@ -5126,7 +5348,7 @@ pub const Session = struct {
             const resolved_endpoint = if (endpoint.len > 0)
                 try self.allocator.dupe(u8, endpoint)
             else
-                try std.fmt.allocPrint(self.allocator, "/nodes/{s}/{s}", .{ node_id, service_id_val.string });
+                try std.fmt.allocPrint(self.allocator, "/nodes/{s}/venoms/{s}", .{ node_id, service_id_val.string });
             errdefer self.allocator.free(resolved_endpoint);
 
             const caps_json = if (item.object.get("capabilities")) |caps|
@@ -5193,7 +5415,7 @@ pub const Session = struct {
             errdefer if (help_md) |value| self.allocator.free(value);
 
             try catalog.items.append(self.allocator, .{
-                .service_id = try self.allocator.dupe(u8, service_id_val.string),
+                .venom_id = try self.allocator.dupe(u8, service_id_val.string),
                 .kind = try self.allocator.dupe(u8, kind_val.string),
                 .state = try self.allocator.dupe(u8, state),
                 .endpoint = resolved_endpoint,
@@ -5214,10 +5436,10 @@ pub const Session = struct {
         return .{ .catalog = catalog };
     }
 
-    fn addNodeServiceEntry(
+    fn addNodeVenomEntry(
         self: *Session,
         services_root: u32,
-        service_id: []const u8,
+        venom_id: []const u8,
         kind: []const u8,
         state: []const u8,
         endpoint: []const u8,
@@ -5229,10 +5451,10 @@ pub const Session = struct {
         schema_json: []const u8,
         help_md: ?[]const u8,
     ) !void {
-        const service_dir = try self.addDir(services_root, service_id, false);
+        const service_dir = try self.addDir(services_root, venom_id, false);
 
-        const escaped_service_id = try unified.jsonEscape(self.allocator, service_id);
-        defer self.allocator.free(escaped_service_id);
+        const escaped_venom_id = try unified.jsonEscape(self.allocator, venom_id);
+        defer self.allocator.free(escaped_venom_id);
         const escaped_kind = try unified.jsonEscape(self.allocator, kind);
         defer self.allocator.free(escaped_kind);
         const escaped_state = try unified.jsonEscape(self.allocator, state);
@@ -5243,7 +5465,7 @@ pub const Session = struct {
         const readme = if (help_md) |value|
             value
         else
-            "# Service metadata for this node capability.\n";
+            "# Venom metadata for this node capability.\n";
         _ = try self.addFile(service_dir, "README.md", readme, false, .none);
         _ = try self.addFile(service_dir, "SCHEMA.json", schema_json, false, .none);
         _ = try self.addFile(service_dir, "CAPS.json", caps_json, false, .none);
@@ -5254,11 +5476,171 @@ pub const Session = struct {
 
         const status = try std.fmt.allocPrint(
             self.allocator,
-            "{{\"service_id\":\"{s}\",\"kind\":\"{s}\",\"state\":\"{s}\",\"endpoint\":\"{s}\"}}",
-            .{ escaped_service_id, escaped_kind, escaped_state, escaped_endpoint },
+            "{{\"venom_id\":\"{s}\",\"kind\":\"{s}\",\"state\":\"{s}\",\"endpoint\":\"{s}\"}}",
+            .{ escaped_venom_id, escaped_kind, escaped_state, escaped_endpoint },
         );
         defer self.allocator.free(status);
         _ = try self.addFile(service_dir, "STATUS.json", status, false, .none);
+    }
+
+    fn copyOptionalServiceFile(self: *Session, source_dir_id: u32, target_dir_id: u32, name: []const u8) !void {
+        const source_id = self.lookupChild(source_dir_id, name) orelse return;
+        const source_node = self.nodes.get(source_id) orelse return;
+        if (source_node.kind != .file) return;
+        _ = try self.addFile(target_dir_id, name, source_node.content, false, .none);
+    }
+
+    fn seedActiveScopedVenomBindings(
+        self: *Session,
+        active_agent_venoms_dir: u32,
+        project_venoms_dir: u32,
+        active_project_id: []const u8,
+    ) !void {
+        const agent_prefix = try std.fmt.allocPrint(self.allocator, "/agents/{s}/venoms", .{self.agent_id});
+        defer self.allocator.free(agent_prefix);
+        const project_prefix = try std.fmt.allocPrint(self.allocator, "/projects/{s}/venoms", .{active_project_id});
+        defer self.allocator.free(project_prefix);
+
+        inline for ([_][]const u8{ "chat", "jobs", "events", "thoughts", "fs" }) |venom_id| {
+            const preferred_agent_node_id = try self.resolvePreferredBoundVenomNodeIdForContext(
+                venom_id,
+                active_project_id,
+                self.agent_id,
+            );
+            defer if (preferred_agent_node_id) |value| self.allocator.free(value);
+            _ = try self.addDir(active_agent_venoms_dir, venom_id, false);
+            _ = try self.registerBoundVenomAliasOnly(
+                agent_prefix,
+                venom_id,
+                "agent_binding",
+                preferred_agent_node_id,
+            );
+
+            const preferred_project_node_id = try self.resolvePreferredBoundVenomNodeIdForContext(
+                venom_id,
+                active_project_id,
+                null,
+            );
+            defer if (preferred_project_node_id) |value| self.allocator.free(value);
+            _ = try self.addDir(project_venoms_dir, venom_id, false);
+            _ = try self.registerBoundVenomAliasOnly(
+                project_prefix,
+                venom_id,
+                "project_binding",
+                preferred_project_node_id,
+            );
+        }
+    }
+
+    fn seedBoundNodeVenomNamespace(
+        self: *Session,
+        global_root: u32,
+        venom_id: []const u8,
+        preferred_node_id: []const u8,
+    ) !bool {
+        return self.seedBoundNodeVenomNamespaceAt(global_root, "/global", venom_id, "global_binding", preferred_node_id);
+    }
+
+    fn seedBoundNodeVenomNamespaceAt(
+        self: *Session,
+        alias_root: u32,
+        alias_base_path: []const u8,
+        venom_id: []const u8,
+        scope: []const u8,
+        preferred_node_id: ?[]const u8,
+    ) !bool {
+        const nodes_root = self.lookupChild(self.root_id, "nodes") orelse return false;
+
+        var selected_node_id: ?[]const u8 = null;
+        var selected_venom_dir_id: ?u32 = null;
+
+        if (preferred_node_id) |selected| {
+            const preferred_node_dir_id = self.lookupChild(nodes_root, selected);
+            if (preferred_node_dir_id) |node_dir_id| {
+                if (self.lookupChild(node_dir_id, "venoms")) |venoms_root_id| {
+                    if (self.lookupChild(venoms_root_id, venom_id)) |venom_dir_id| {
+                        selected_node_id = selected;
+                        selected_venom_dir_id = venom_dir_id;
+                    }
+                }
+            }
+        }
+
+        if (selected_venom_dir_id == null) {
+            const nodes_root_node = self.nodes.get(nodes_root) orelse return false;
+            var node_it = nodes_root_node.children.iterator();
+            while (node_it.next()) |entry| {
+                const node_name = entry.key_ptr.*;
+                const node_dir_id = entry.value_ptr.*;
+                const venoms_root_id = self.lookupChild(node_dir_id, "venoms") orelse continue;
+                const venom_dir_id = self.lookupChild(venoms_root_id, venom_id) orelse continue;
+                selected_node_id = node_name;
+                selected_venom_dir_id = venom_dir_id;
+                break;
+            }
+        }
+
+        const provider_node_id = selected_node_id orelse return false;
+        const provider_dir_id = selected_venom_dir_id orelse return false;
+
+        const alias_dir_id = try self.addDir(alias_root, venom_id, false);
+        try self.copyOptionalServiceFile(provider_dir_id, alias_dir_id, "README.md");
+        try self.copyOptionalServiceFile(provider_dir_id, alias_dir_id, "SCHEMA.json");
+        try self.copyOptionalServiceFile(provider_dir_id, alias_dir_id, "CAPS.json");
+        try self.copyOptionalServiceFile(provider_dir_id, alias_dir_id, "MOUNTS.json");
+        try self.copyOptionalServiceFile(provider_dir_id, alias_dir_id, "OPS.json");
+        try self.copyOptionalServiceFile(provider_dir_id, alias_dir_id, "RUNTIME.json");
+        try self.copyOptionalServiceFile(provider_dir_id, alias_dir_id, "PERMISSIONS.json");
+        try self.copyOptionalServiceFile(provider_dir_id, alias_dir_id, "STATUS.json");
+
+        const venom_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ alias_base_path, venom_id });
+        defer self.allocator.free(venom_path);
+        const provider_venom_path = try std.fmt.allocPrint(
+            self.allocator,
+            "/nodes/{s}/venoms/{s}",
+            .{ provider_node_id, venom_id },
+        );
+        defer self.allocator.free(provider_venom_path);
+        const endpoint_path = blk: {
+            if (try self.firstServiceMountPath(provider_dir_id)) |value| break :blk value;
+            break :blk try self.serviceEndpointPath(provider_dir_id);
+        };
+        defer if (endpoint_path) |value| self.allocator.free(value);
+        const invoke_path = try self.deriveVenomInvokePath(provider_node_id, venom_id, provider_dir_id);
+        defer if (invoke_path) |value| self.allocator.free(value);
+
+        try self.registerScopedVenomBinding(
+            venom_id,
+            scope,
+            venom_path,
+            provider_node_id,
+            provider_venom_path,
+            endpoint_path,
+            invoke_path,
+        );
+        return true;
+    }
+
+    fn resolvePreferredBoundVenomNodeId(self: *Session, venom_id: []const u8) !?[]u8 {
+        return self.resolvePreferredBoundVenomNodeIdForContext(venom_id, null, null);
+    }
+
+    fn resolvePreferredBoundVenomNodeIdForContext(
+        self: *Session,
+        venom_id: []const u8,
+        project_id: ?[]const u8,
+        agent_id: ?[]const u8,
+    ) !?[]u8 {
+        const plane = self.control_plane orelse return null;
+        var provider = (try plane.resolvePreferredVenomProviderForContext(
+            self.allocator,
+            venom_id,
+            &.{ "spiderapp-default", "spiderweb-local", "local" },
+            project_id,
+            agent_id,
+        )) orelse return null;
+        defer provider.deinit(self.allocator);
+        return try self.allocator.dupe(u8, provider.node_id);
     }
 
     fn addDir(self: *Session, parent: ?u32, name: []const u8, writable: bool) !u32 {
@@ -5423,6 +5805,441 @@ pub const Session = struct {
         if (node_ptr.kind != .file) return error.NotFile;
         self.allocator.free(node_ptr.content);
         node_ptr.content = try self.allocator.dupe(u8, data);
+    }
+
+    fn tryReadBoundVenomProxyFile(self: *Session, node_id: u32) !?[]u8 {
+        const absolute_path = try self.nodeAbsolutePath(node_id);
+        defer self.allocator.free(absolute_path);
+
+        if (try self.readBoundVenomProxyFileByPath(absolute_path)) |value| return value;
+        return null;
+    }
+
+    fn readBoundVenomProxyFileByPath(self: *Session, absolute_path: []const u8) !?[]u8 {
+        const proxy = (try self.boundVenomProxyPathForAbsolutePath(absolute_path)) orelse return null;
+        if (std.mem.eql(u8, proxy.remote_path, "/")) return null;
+
+        var router = (try self.boundVenomRouter(proxy.venom_id, proxy.project_id, proxy.agent_id)) orelse return null;
+        defer router.deinit();
+        defer self.allocator.free(proxy.remote_path);
+        const file = router.open(proxy.remote_path, 0) catch return null;
+        defer router.close(file) catch {};
+        return router.read(file, 0, 1024 * 1024) catch null;
+    }
+
+    fn tryWriteBoundVenomProxyFile(self: *Session, node_id: u32, offset: u64, data: []const u8) !?WriteOutcome {
+        const absolute_path = try self.nodeAbsolutePath(node_id);
+        defer self.allocator.free(absolute_path);
+
+        if (try self.boundVenomProxyPathForAbsolutePath(absolute_path)) |proxy| {
+            defer self.allocator.free(proxy.remote_path);
+            if (std.mem.eql(u8, proxy.venom_id, "chat") and std.mem.eql(u8, proxy.remote_path, "/control/input")) {
+                return self.writeBoundChatInputProxy(proxy.project_id, proxy.agent_id, node_id, data);
+            }
+            if (std.mem.eql(u8, proxy.venom_id, "events") and std.mem.eql(u8, proxy.remote_path, "/control/wait.json")) {
+                return self.writeBoundSimpleProxy("events", proxy.project_id, proxy.agent_id, "/control/wait.json", data);
+            }
+            if (std.mem.eql(u8, proxy.venom_id, "events") and std.mem.eql(u8, proxy.remote_path, "/control/signal.json")) {
+                return self.writeBoundSimpleProxy("events", proxy.project_id, proxy.agent_id, "/control/signal.json", data);
+            }
+            if (std.mem.eql(u8, proxy.remote_path, "/")) return null;
+            return self.writeBoundGenericProxy(proxy.venom_id, proxy.project_id, proxy.agent_id, proxy.remote_path, offset, data);
+        }
+        return null;
+    }
+
+    fn writeBoundChatInputProxy(
+        self: *Session,
+        project_id: ?[]const u8,
+        agent_id: ?[]const u8,
+        source_node_id: u32,
+        data: []const u8,
+    ) !?WriteOutcome {
+        var router = (try self.boundVenomRouter("chat", project_id, agent_id)) orelse return null;
+        defer router.deinit();
+        const file = router.open("/control/input", 1) catch return null;
+        defer router.close(file) catch {};
+        const result_json = router.writeResult(file, 0, data) catch return null;
+        defer self.allocator.free(result_json);
+
+        var outcome = WriteOutcome{ .written = data.len };
+        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, result_json, .{}) catch return outcome;
+        defer parsed.deinit();
+        if (parsed.value != .object) return outcome;
+        const obj = parsed.value.object;
+        if (obj.get("n")) |value| {
+            if (value == .integer and value.integer >= 0) outcome.written = @intCast(value.integer);
+        }
+        if (obj.get("job")) |value| {
+            if (value == .string and value.string.len > 0) {
+                outcome.job_name = try self.allocator.dupe(u8, value.string);
+                try self.ensureProxyJobDirectoryForSource(source_node_id, value.string);
+            }
+        }
+        if (obj.get("correlation_id")) |value| {
+            if (value == .string and value.string.len > 0) {
+                outcome.correlation_id = try self.allocator.dupe(u8, value.string);
+            }
+        }
+        return outcome;
+    }
+
+    fn writeBoundSimpleProxy(
+        self: *Session,
+        venom_id: []const u8,
+        project_id: ?[]const u8,
+        agent_id: ?[]const u8,
+        remote_path: []const u8,
+        data: []const u8,
+    ) !?WriteOutcome {
+        var router = (try self.boundVenomRouter(venom_id, project_id, agent_id)) orelse return null;
+        defer router.deinit();
+        const file = router.open(remote_path, 1) catch return null;
+        defer router.close(file) catch {};
+        const result_json = router.writeResult(file, 0, data) catch return null;
+        defer self.allocator.free(result_json);
+
+        var outcome = WriteOutcome{ .written = data.len };
+        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, result_json, .{}) catch return outcome;
+        defer parsed.deinit();
+        if (parsed.value != .object) return outcome;
+        if (parsed.value.object.get("n")) |value| {
+            if (value == .integer and value.integer >= 0) outcome.written = @intCast(value.integer);
+        }
+        return outcome;
+    }
+
+    fn writeBoundGenericProxy(
+        self: *Session,
+        venom_id: []const u8,
+        project_id: ?[]const u8,
+        agent_id: ?[]const u8,
+        remote_path: []const u8,
+        offset: u64,
+        data: []const u8,
+    ) !?WriteOutcome {
+        var router = (try self.boundVenomRouter(venom_id, project_id, agent_id)) orelse return null;
+        defer router.deinit();
+        const file = router.open(remote_path, 1) catch return null;
+        defer router.close(file) catch {};
+        const result_json = router.writeResult(file, offset, data) catch return null;
+        defer self.allocator.free(result_json);
+
+        var outcome = WriteOutcome{ .written = data.len };
+        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, result_json, .{}) catch return outcome;
+        defer parsed.deinit();
+        if (parsed.value != .object) return outcome;
+        if (parsed.value.object.get("n")) |value| {
+            if (value == .integer and value.integer >= 0) outcome.written = @intCast(value.integer);
+        }
+        return outcome;
+    }
+
+    fn buildBoundVenomProxyStatPayload(self: *Session, node_id: u32) !?[]u8 {
+        const absolute_path = try self.nodeAbsolutePath(node_id);
+        defer self.allocator.free(absolute_path);
+        const proxy = (try self.boundVenomProxyPathForAbsolutePath(absolute_path)) orelse return null;
+        defer self.allocator.free(proxy.remote_path);
+
+        var router = (try self.boundVenomRouter(proxy.venom_id, proxy.project_id, proxy.agent_id)) orelse return null;
+        defer router.deinit();
+        const attr_json = router.getattr(proxy.remote_path) catch return null;
+        defer self.allocator.free(attr_json);
+
+        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, attr_json, .{}) catch return null;
+        defer parsed.deinit();
+        if (parsed.value != .object) return null;
+
+        const node = self.nodes.get(node_id) orelse return null;
+        const escaped_name = try unified.jsonEscape(self.allocator, node.name);
+        defer self.allocator.free(escaped_name);
+
+        const mode: u32 = if (parsed.value.object.get("m")) |value|
+            switch (value) {
+                .integer => if (value.integer >= 0) @intCast(value.integer) else nodeMode(node),
+                else => nodeMode(node),
+            }
+        else
+            nodeMode(node);
+        const summary = parseBoundVenomProxyAttr(parsed.value) orelse BoundVenomProxyAttrSummary{
+            .kind = node.kind,
+            .writable = node.writable,
+        };
+        const size: u64 = if (parsed.value.object.get("sz")) |value|
+            switch (value) {
+                .integer => if (value.integer >= 0) @intCast(value.integer) else node.content.len,
+                else => node.content.len,
+            }
+        else
+            node.content.len;
+
+        return try std.fmt.allocPrint(
+            self.allocator,
+            "{{\"id\":{d},\"name\":\"{s}\",\"kind\":\"{s}\",\"size\":{d},\"mode\":{d},\"writable\":{s}}}",
+            .{ node.id, escaped_name, kindName(summary.kind), size, mode, if (summary.writable) "true" else "false" },
+        );
+    }
+
+    fn ensureProxyJobDirectory(self: *Session, jobs_root_id: u32, job_id: []const u8) !void {
+        if (self.lookupChild(jobs_root_id, job_id) != null) return;
+        const job_dir = try self.addDir(jobs_root_id, job_id, false);
+        _ = try self.addFile(job_dir, "status.json", "", false, .none);
+        _ = try self.addFile(job_dir, "result.txt", "", false, .none);
+        _ = try self.addFile(job_dir, "log.txt", "", false, .none);
+    }
+
+    fn ensureProxyJobDirectoryForSource(self: *Session, source_node_id: u32, job_id: []const u8) !void {
+        const absolute_path = try self.nodeAbsolutePath(source_node_id);
+        defer self.allocator.free(absolute_path);
+
+        if (pathMatchesPrefixBoundary(absolute_path, "/agents/")) {
+            const jobs_root = try self.jobsAliasRootForAbsolutePath(absolute_path, "agents");
+            if (jobs_root) |value| {
+                try self.ensureProxyJobDirectory(value, job_id);
+                return;
+            }
+        }
+        if (pathMatchesPrefixBoundary(absolute_path, "/projects/")) {
+            const jobs_root = try self.jobsAliasRootForAbsolutePath(absolute_path, "projects");
+            if (jobs_root) |value| {
+                try self.ensureProxyJobDirectory(value, job_id);
+                return;
+            }
+        }
+        try self.ensureProxyJobDirectory(self.jobs_root_id, job_id);
+    }
+
+    fn jobsAliasRootForAbsolutePath(self: *Session, absolute_path: []const u8, scope_root: []const u8) !?u32 {
+        if (std.mem.eql(u8, scope_root, "agents")) {
+            const parsed = parseEntityScopedVenomAliasPrefix(absolute_path, "/agents/", "/venoms/") orelse return null;
+            const agents_root = self.lookupChild(self.root_id, "agents") orelse return null;
+            const agent_dir = self.lookupChild(agents_root, parsed.entity_id) orelse return null;
+            const venoms_dir = self.lookupChild(agent_dir, "venoms") orelse return null;
+            return self.lookupChild(venoms_dir, "jobs");
+        }
+        if (std.mem.eql(u8, scope_root, "projects")) {
+            const parsed = parseEntityScopedVenomAliasPrefix(absolute_path, "/projects/", "/venoms/") orelse return null;
+            const projects_root = self.lookupChild(self.root_id, "projects") orelse return null;
+            const project_dir = self.lookupChild(projects_root, parsed.entity_id) orelse return null;
+            const venoms_dir = self.lookupChild(project_dir, "venoms") orelse return null;
+            return self.lookupChild(venoms_dir, "jobs");
+        }
+        return null;
+    }
+
+    fn buildJobResultPathForNode(self: *Session, node_id: u32, job_id: []const u8) ![]u8 {
+        const absolute_path = try self.nodeAbsolutePath(node_id);
+        defer self.allocator.free(absolute_path);
+
+        if (parseEntityScopedVenomAliasPrefix(absolute_path, "/agents/", "/venoms/")) |parsed| {
+            return std.fmt.allocPrint(
+                self.allocator,
+                "/agents/{s}/venoms/jobs/{s}/result.txt",
+                .{ parsed.entity_id, job_id },
+            );
+        }
+        if (parseEntityScopedVenomAliasPrefix(absolute_path, "/projects/", "/venoms/")) |parsed| {
+            return std.fmt.allocPrint(
+                self.allocator,
+                "/projects/{s}/venoms/jobs/{s}/result.txt",
+                .{ parsed.entity_id, job_id },
+            );
+        }
+        return std.fmt.allocPrint(self.allocator, "/global/jobs/{s}/result.txt", .{job_id});
+    }
+
+    fn boundVenomProxyPathForAbsolutePath(self: *Session, absolute_path: []const u8) !?BoundVenomProxyPath {
+        const global_match = parseScopedVenomAliasPrefix(absolute_path, "/global/");
+        if (global_match) |value| {
+            return .{
+                .venom_id = value.venom_id,
+                .remote_path = try self.allocator.dupe(u8, value.remote_path),
+            };
+        }
+        const agent_match = parseEntityScopedVenomAliasPrefix(absolute_path, "/agents/", "/venoms/");
+        if (agent_match) |value| {
+            return .{
+                .venom_id = value.venom_id,
+                .remote_path = try self.allocator.dupe(u8, value.remote_path),
+                .agent_id = value.entity_id,
+            };
+        }
+        const project_match = parseEntityScopedVenomAliasPrefix(absolute_path, "/projects/", "/venoms/");
+        if (project_match) |value| {
+            return .{
+                .venom_id = value.venom_id,
+                .remote_path = try self.allocator.dupe(u8, value.remote_path),
+                .project_id = value.entity_id,
+            };
+        }
+        return null;
+    }
+
+    fn refreshBoundVenomProxyDirectory(self: *Session, dir_id: u32) !void {
+        const absolute_path = try self.nodeAbsolutePath(dir_id);
+        defer self.allocator.free(absolute_path);
+
+        const proxy = (try self.boundVenomProxyPathForAbsolutePath(absolute_path)) orelse return;
+        defer self.allocator.free(proxy.remote_path);
+
+        var router = (try self.boundVenomRouter(proxy.venom_id, proxy.project_id, proxy.agent_id)) orelse return;
+        defer router.deinit();
+
+        var cookie: u64 = 0;
+        while (true) {
+            const listing_json = router.readdir(proxy.remote_path, cookie, 4096) catch return;
+            defer self.allocator.free(listing_json);
+            cookie = try self.applyBoundVenomProxyListing(dir_id, listing_json);
+            if (cookie == 0) break;
+        }
+    }
+
+    fn applyBoundVenomProxyListing(self: *Session, parent_id: u32, listing_json: []const u8) !u64 {
+        var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, listing_json, .{});
+        defer parsed.deinit();
+        if (parsed.value != .object) return 0;
+
+        const next_cookie: u64 = if (parsed.value.object.get("next_cookie")) |value|
+            if (value == .integer and value.integer >= 0) @intCast(value.integer) else 0
+        else
+            0;
+        const ents = parsed.value.object.get("ents") orelse return next_cookie;
+        if (ents != .array) return next_cookie;
+        for (ents.array.items) |entry| {
+            if (entry != .object) continue;
+            const name_val = entry.object.get("name") orelse continue;
+            const attr_val = entry.object.get("attr") orelse continue;
+            if (name_val != .string or name_val.string.len == 0) continue;
+            try self.upsertBoundVenomProxyChild(parent_id, name_val.string, attr_val);
+        }
+        return next_cookie;
+    }
+
+    fn upsertBoundVenomProxyChild(self: *Session, parent_id: u32, name: []const u8, attr_val: std.json.Value) !void {
+        const summary = parseBoundVenomProxyAttr(attr_val) orelse return;
+        if (self.lookupChild(parent_id, name)) |child_id| {
+            const child = self.nodes.getPtr(child_id) orelse return;
+            child.kind = summary.kind;
+            child.writable = summary.writable;
+            return;
+        }
+        switch (summary.kind) {
+            .dir => _ = try self.addDir(parent_id, name, false),
+            .file => _ = try self.addFile(parent_id, name, "", summary.writable, .none),
+        }
+    }
+
+    fn boundVenomRouter(
+        self: *Session,
+        venom_id: []const u8,
+        project_id: ?[]const u8,
+        agent_id: ?[]const u8,
+    ) !?fs_router.Router {
+        const plane = self.control_plane orelse return null;
+        var provider = (try plane.resolvePreferredVenomProviderForContext(
+            self.allocator,
+            venom_id,
+            &.{ "spiderapp-default", "spiderweb-local", "local" },
+            project_id,
+            agent_id,
+        )) orelse return null;
+        defer provider.deinit(self.allocator);
+
+        const node_payload_req = try std.fmt.allocPrint(self.allocator, "{{\"node_id\":\"{s}\"}}", .{provider.node_id});
+        defer self.allocator.free(node_payload_req);
+        const node_payload = plane.getNode(node_payload_req) catch return null;
+        defer self.allocator.free(node_payload);
+
+        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, node_payload, .{}) catch return null;
+        defer parsed.deinit();
+        if (parsed.value != .object) return null;
+        const fs_url_val = parsed.value.object.get("fs_url") orelse return null;
+        if (fs_url_val != .string or fs_url_val.string.len == 0) return null;
+
+        return try fs_router.Router.init(self.allocator, &[_]fs_router.EndpointConfig{.{
+            .name = provider.node_id,
+            .url = fs_url_val.string,
+            .export_name = venom_id,
+            .mount_path = "/",
+        }});
+    }
+
+    fn seedBoundGlobalFsNamespace(
+        self: *Session,
+        global_root: u32,
+        preferred_node_id: []const u8,
+    ) !bool {
+        const alias_dir_id = try self.addDir(global_root, "fs", false);
+        _ = alias_dir_id;
+        return self.registerBoundVenomAliasOnly("/global", "fs", "global_binding", preferred_node_id);
+    }
+
+    fn registerBoundVenomAliasOnly(
+        self: *Session,
+        alias_base_path: []const u8,
+        venom_id: []const u8,
+        scope: []const u8,
+        preferred_node_id: ?[]const u8,
+    ) !bool {
+        const nodes_root = self.lookupChild(self.root_id, "nodes") orelse return false;
+
+        var selected_node_id: ?[]const u8 = null;
+        var selected_venom_dir_id: ?u32 = null;
+
+        if (preferred_node_id) |selected| {
+            const preferred_node_dir_id = self.lookupChild(nodes_root, selected);
+            if (preferred_node_dir_id) |node_dir_id| {
+                if (self.lookupChild(node_dir_id, "venoms")) |venoms_root_id| {
+                    if (self.lookupChild(venoms_root_id, venom_id)) |venom_dir_id| {
+                        selected_node_id = selected;
+                        selected_venom_dir_id = venom_dir_id;
+                    }
+                }
+            }
+        }
+
+        if (selected_venom_dir_id == null) {
+            const nodes_root_node = self.nodes.get(nodes_root) orelse return false;
+            var node_it = nodes_root_node.children.iterator();
+            while (node_it.next()) |entry| {
+                const node_name = entry.key_ptr.*;
+                const node_dir_id = entry.value_ptr.*;
+                const venoms_root_id = self.lookupChild(node_dir_id, "venoms") orelse continue;
+                const venom_dir_id = self.lookupChild(venoms_root_id, venom_id) orelse continue;
+                selected_node_id = node_name;
+                selected_venom_dir_id = venom_dir_id;
+                break;
+            }
+        }
+
+        const provider_node_id = selected_node_id orelse return false;
+        const provider_dir_id = selected_venom_dir_id orelse return false;
+        const venom_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ alias_base_path, venom_id });
+        defer self.allocator.free(venom_path);
+        const provider_venom_path = try std.fmt.allocPrint(
+            self.allocator,
+            "/nodes/{s}/venoms/{s}",
+            .{ provider_node_id, venom_id },
+        );
+        defer self.allocator.free(provider_venom_path);
+        const endpoint_path = blk: {
+            if (try self.firstServiceMountPath(provider_dir_id)) |value| break :blk value;
+            break :blk try self.serviceEndpointPath(provider_dir_id);
+        };
+        defer if (endpoint_path) |value| self.allocator.free(value);
+        const invoke_path = try self.deriveVenomInvokePath(provider_node_id, venom_id, provider_dir_id);
+        defer if (invoke_path) |value| self.allocator.free(value);
+
+        try self.registerScopedVenomBinding(
+            venom_id,
+            scope,
+            venom_path,
+            provider_node_id,
+            provider_venom_path,
+            endpoint_path,
+            invoke_path,
+        );
+        return true;
     }
 
     fn handlePairingControlWrite(self: *Session, action: PairingAction, raw_input: []const u8) !WriteOutcome {
@@ -5647,7 +6464,7 @@ pub const Session = struct {
         try self.setFileContent(status_id, running_status);
 
         self.spawnAsyncChatRuntimeJob(job_name, input, correlation_id) catch |spawn_err| {
-            const normalized = normalizeRuntimeFailureForAgent("runtime_error", @errorName(spawn_err));
+            const normalized = chat_runtime_job.normalizeRuntimeFailureForAgent("runtime_error", @errorName(spawn_err));
             const failed_status = try self.buildJobStatusJson(.failed, correlation_id, normalized.message);
             defer self.allocator.free(failed_status);
 
@@ -5702,10 +6519,14 @@ pub const Session = struct {
             .allocator = self.allocator,
             .runtime_handle = self.runtime_handle,
             .job_index = self.job_index,
+            .control_plane = self.control_plane,
             .emit_debug = self.shouldEmitRuntimeDebugFrames(),
         };
         errdefer ctx.deinit();
 
+        if (ctx.emit_debug and self.control_plane != null) {
+            ctx.agent_id = try self.allocator.dupe(u8, self.agent_id);
+        }
         ctx.job_name = try self.allocator.dupe(u8, job_name);
         ctx.input = try self.allocator.dupe(u8, input);
         if (correlation_id) |value| {
@@ -5722,7 +6543,7 @@ pub const Session = struct {
         const input = ctx.input orelse return;
 
         asyncExecuteChatRuntimeJob(ctx, job_name, input, ctx.correlation_id) catch |err| {
-            const normalized = normalizeRuntimeFailureForAgent("runtime_error", @errorName(err));
+            const normalized = chat_runtime_job.normalizeRuntimeFailureForAgent("runtime_error", @errorName(err));
             const failure_log_owned = std.fmt.allocPrint(
                 ctx.allocator,
                 "[runtime worker failure] {s}\n",
@@ -5752,141 +6573,25 @@ pub const Session = struct {
         input: []const u8,
         correlation_id: ?[]const u8,
     ) !void {
-        const escaped = try unified.jsonEscape(ctx.allocator, input);
-        defer ctx.allocator.free(escaped);
-        const runtime_req = if (correlation_id) |value| blk: {
-            const escaped_corr = try unified.jsonEscape(ctx.allocator, value);
-            defer ctx.allocator.free(escaped_corr);
-            break :blk try std.fmt.allocPrint(
+        var outcome = try chat_runtime_job.execute(.{
+            .allocator = ctx.allocator,
+            .runtime_handle = ctx.runtime_handle,
+            .job_index = ctx.job_index,
+            .job_id = job_name,
+            .input = input,
+            .correlation_id = correlation_id,
+            .emit_debug = ctx.emit_debug,
+        });
+        defer outcome.deinit(ctx.allocator);
+
+        if (ctx.emit_debug and ctx.control_plane != null and ctx.agent_id != null) {
+            try appendDebugEventsFromLogText(
                 ctx.allocator,
-                "{{\"id\":\"{s}\",\"type\":\"session.send\",\"content\":\"{s}\",\"correlation_id\":\"{s}\"}}",
-                .{ job_name, escaped, escaped_corr },
-            );
-        } else try std.fmt.allocPrint(
-            ctx.allocator,
-            "{{\"id\":\"{s}\",\"type\":\"session.send\",\"content\":\"{s}\"}}",
-            .{ job_name, escaped },
-        );
-        defer ctx.allocator.free(runtime_req);
-
-        var log_buf = std.ArrayListUnmanaged(u8){};
-        defer log_buf.deinit(ctx.allocator);
-
-        var result_text = try ctx.allocator.dupe(u8, "");
-        defer ctx.allocator.free(result_text);
-
-        var failed = true;
-        var failure_code: []const u8 = "runtime_error";
-        var failure_message: []const u8 = "runtime error";
-        var failure_message_owned: ?[]u8 = null;
-        defer if (failure_message_owned) |owned| ctx.allocator.free(owned);
-
-        var attempt_idx: usize = 0;
-        while (attempt_idx <= max_chat_runtime_internal_retries) : (attempt_idx += 1) {
-            failed = false;
-            failure_code = "runtime_error";
-            failure_message = "";
-            if (failure_message_owned) |owned| {
-                ctx.allocator.free(owned);
-                failure_message_owned = null;
-            }
-            ctx.allocator.free(result_text);
-            result_text = try ctx.allocator.dupe(u8, "");
-
-            var responses: ?[][]u8 = null;
-            if (ctx.runtime_handle.handleMessageFramesWithDebug(runtime_req, ctx.emit_debug)) |frames| {
-                responses = frames;
-            } else |runtime_err| {
-                failed = true;
-                const normalized = normalizeRuntimeFailureForAgent("runtime_error", @errorName(runtime_err));
-                failure_code = normalized.code;
-                failure_message = normalized.message;
-                try log_buf.writer(ctx.allocator).print("[runtime error] {s}\n", .{@errorName(runtime_err)});
-            }
-            defer if (responses) |frames| runtime_server_mod.deinitResponseFrames(ctx.allocator, frames);
-
-            if (responses) |frames| {
-                for (frames) |frame| {
-                    try log_buf.appendSlice(ctx.allocator, frame);
-                    try log_buf.append(ctx.allocator, '\n');
-
-                    const maybe = std.json.parseFromSlice(std.json.Value, ctx.allocator, frame, .{}) catch null;
-                    if (maybe) |parsed| {
-                        defer parsed.deinit();
-                        if (parsed.value != .object) continue;
-                        const obj = parsed.value.object;
-                        const type_value = obj.get("type") orelse continue;
-                        if (type_value != .string) continue;
-
-                        if (std.mem.eql(u8, type_value.string, "session.receive")) {
-                            if (obj.get("content")) |content| {
-                                if (content == .string) {
-                                    ctx.allocator.free(result_text);
-                                    result_text = try ctx.allocator.dupe(u8, content.string);
-                                }
-                            } else if (obj.get("payload")) |payload| {
-                                if (payload == .object) {
-                                    if (payload.object.get("content")) |content| {
-                                        if (content == .string) {
-                                            ctx.allocator.free(result_text);
-                                            result_text = try ctx.allocator.dupe(u8, content.string);
-                                        }
-                                    }
-                                }
-                            }
-                        } else if (std.mem.eql(u8, type_value.string, "agent.thought")) {
-                            // Thought telemetry is replayed from persisted job logs when
-                            // job status/result/log files are refreshed.
-                        } else if (std.mem.eql(u8, type_value.string, "error")) {
-                            failed = true;
-                            if (obj.get("message")) |err_msg| {
-                                if (err_msg == .string) {
-                                    if (failure_message_owned) |owned| ctx.allocator.free(owned);
-                                    const code = if (obj.get("code")) |value|
-                                        if (value == .string) value.string else "runtime_error"
-                                    else
-                                        "runtime_error";
-                                    const normalized = normalizeRuntimeFailureForAgent(code, err_msg.string);
-                                    failure_code = normalized.code;
-                                    failure_message_owned = try ctx.allocator.dupe(u8, normalized.message);
-                                    failure_message = failure_message_owned.?;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            if (!failed and isInternalRuntimeLoopGuardText(result_text)) {
-                failed = true;
-                if (failure_message_owned) |owned| ctx.allocator.free(owned);
-                const normalized = normalizeRuntimeFailureForAgent("execution_failed", result_text);
-                failure_code = normalized.code;
-                failure_message_owned = try ctx.allocator.dupe(u8, normalized.message);
-                failure_message = failure_message_owned.?;
-            }
-
-            if (!failed) break;
-            if (!std.mem.eql(u8, failure_code, "runtime_internal_limit")) break;
-            if (attempt_idx >= max_chat_runtime_internal_retries) break;
-
-            try log_buf.writer(ctx.allocator).print(
-                "[runtime retry] attempt={d} reason={s}\n",
-                .{ attempt_idx + 1, failure_code },
+                ctx.control_plane.?,
+                ctx.agent_id.?,
+                outcome.log_text,
             );
         }
-
-        const log_content = try log_buf.toOwnedSlice(ctx.allocator);
-        defer ctx.allocator.free(log_content);
-        ctx.job_index.markCompleted(
-            job_name,
-            !failed,
-            if (failed) failure_message else result_text,
-            if (failed) failure_message else null,
-            log_content,
-        ) catch |err| {
-            std.log.warn("chat job index completion update failed: {s}", .{@errorName(err)});
-        };
     }
 
     fn handleChatReplyWrite(self: *Session, node_id: u32, raw_input: []const u8) !WriteOutcome {
@@ -7209,6 +7914,8 @@ pub const Session = struct {
         if (std.mem.eql(u8, new_agent_id, "self")) return error.InvalidAgentId;
 
         const template_path = extractOptionalStringByNames(args_obj, &.{ "template_path", "template" });
+        const desired_project_id = extractOptionalStringByNames(args_obj, &.{"project_id"});
+        const desired_project_token = extractOptionalStringByNames(args_obj, &.{"project_token"});
 
         var registry = agent_registry.AgentRegistry.init(
             self.allocator,
@@ -7222,18 +7929,73 @@ pub const Session = struct {
         try registry.createAgent(new_agent_id, template_path);
 
         const metadata_written = try self.maybeWriteAgentMetadataFile(new_agent_id, args_obj);
+        var activated = false;
+        var activation_error: ?[]u8 = null;
+        defer if (activation_error) |value| self.allocator.free(value);
+
+        if (desired_project_id) |project_id| {
+            if (self.control_plane) |plane| {
+                const activation_payload = try buildAgentProjectActivationPayload(self.allocator, project_id, desired_project_token);
+                defer self.allocator.free(activation_payload);
+                const activation_result = plane.activateProjectWithRole(new_agent_id, activation_payload, self.is_admin) catch |err| blk: {
+                    activation_error = try self.allocator.dupe(u8, @errorName(err));
+                    break :blk null;
+                };
+                if (activation_result) |payload| {
+                    defer plane.allocator.free(payload);
+                    activated = true;
+                }
+            } else {
+                activation_error = try self.allocator.dupe(u8, "ControlPlaneUnavailable");
+            }
+        }
 
         const inventory = try self.buildAgentInventoryJson();
         defer self.allocator.free(inventory);
         const escaped_agent = try unified.jsonEscape(self.allocator, new_agent_id);
         defer self.allocator.free(escaped_agent);
+        const project_json = if (desired_project_id) |project_id| blk: {
+            const escaped = try unified.jsonEscape(self.allocator, project_id);
+            defer self.allocator.free(escaped);
+            break :blk try std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped});
+        } else try self.allocator.dupe(u8, "null");
+        defer self.allocator.free(project_json);
+        const activation_error_json = if (activation_error) |value| blk: {
+            const escaped = try unified.jsonEscape(self.allocator, value);
+            defer self.allocator.free(escaped);
+            break :blk try std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped});
+        } else try self.allocator.dupe(u8, "null");
+        defer self.allocator.free(activation_error_json);
         const detail = try std.fmt.allocPrint(
             self.allocator,
-            "{{\"agent_id\":\"{s}\",\"created\":true,\"metadata_updated\":{},\"inventory\":{s}}}",
-            .{ escaped_agent, metadata_written, inventory },
+            "{{\"agent_id\":\"{s}\",\"created\":true,\"metadata_updated\":{},\"project_id\":{s},\"activated\":{},\"activation_error\":{s},\"inventory\":{s}}}",
+            .{ escaped_agent, metadata_written, project_json, activated, activation_error_json, inventory },
         );
         defer self.allocator.free(detail);
         return self.buildAgentSuccessResultJson(.create, detail);
+    }
+
+    fn buildAgentProjectActivationPayload(
+        allocator: std.mem.Allocator,
+        project_id: []const u8,
+        project_token: ?[]const u8,
+    ) ![]u8 {
+        const escaped_project = try unified.jsonEscape(allocator, project_id);
+        defer allocator.free(escaped_project);
+        if (project_token) |token| {
+            const escaped_token = try unified.jsonEscape(allocator, token);
+            defer allocator.free(escaped_token);
+            return std.fmt.allocPrint(
+                allocator,
+                "{{\"project_id\":\"{s}\",\"project_token\":\"{s}\"}}",
+                .{ escaped_project, escaped_token },
+            );
+        }
+        return std.fmt.allocPrint(
+            allocator,
+            "{{\"project_id\":\"{s}\"}}",
+            .{escaped_project},
+        );
     }
 
     fn buildAgentListResultJson(self: *Session) ![]u8 {
@@ -8050,7 +8812,7 @@ pub const Session = struct {
         if (self.runtime_handle.handleMessageFramesWithDebug(runtime_req, self.shouldEmitRuntimeDebugFrames())) |frames| {
             responses = frames;
         } else |err| {
-            const normalized = normalizeRuntimeFailureForAgent("runtime_error", @errorName(err));
+            const normalized = chat_runtime_job.normalizeRuntimeFailureForAgent("runtime_error", @errorName(err));
             return self.buildServiceInvokeFailureResultJson(normalized.code, normalized.message);
         }
         defer if (responses) |frames| runtime_server_mod.deinitResponseFrames(self.allocator, frames);
@@ -8085,15 +8847,15 @@ pub const Session = struct {
                         if (value == .string) value.string else "runtime tool call failed"
                     else
                         "runtime tool call failed";
-                    const normalized = normalizeRuntimeFailureForAgent(code, message);
+                    const normalized = chat_runtime_job.normalizeRuntimeFailureForAgent(code, message);
                     return self.buildServiceInvokeFailureResultJson(normalized.code, normalized.message);
                 }
             }
         }
 
         if (content_payload) |payload| {
-            if (isInternalRuntimeLoopGuardText(payload)) {
-                const normalized = normalizeRuntimeFailureForAgent("execution_failed", payload);
+            if (chat_runtime_job.isInternalRuntimeLoopGuardText(payload)) {
+                const normalized = chat_runtime_job.normalizeRuntimeFailureForAgent("execution_failed", payload);
                 return self.buildServiceInvokeFailureResultJson(normalized.code, normalized.message);
             }
             var payload_parsed = std.json.parseFromSlice(std.json.Value, self.allocator, payload, .{}) catch {
@@ -8144,81 +8906,6 @@ pub const Session = struct {
         );
     }
 
-    const NormalizedRuntimeFailure = struct {
-        code: []const u8,
-        message: []const u8,
-    };
-
-    fn normalizeRuntimeFailureForAgent(code: []const u8, message: []const u8) NormalizedRuntimeFailure {
-        if (runtimeFailureIsToolContractFailure(code, message)) {
-            return .{
-                .code = "runtime_protocol_error",
-                .message = "Assistant runtime lost the tool-call contract after the last result. The agent should use the last result to reply or choose a different approach.",
-            };
-        }
-        if (runtimeFailureShouldBeRedacted(code, message)) {
-            return .{
-                .code = "runtime_internal_limit",
-                .message = "Temporary internal runtime limit reached; retry this request.",
-            };
-        }
-        return .{ .code = code, .message = message };
-    }
-
-    fn runtimeFailureShouldBeRedacted(code: []const u8, message: []const u8) bool {
-        if (std.mem.startsWith(u8, code, "provider_")) return true;
-        if (isInternalRuntimeLoopGuardText(message)) return true;
-        const markers = [_][]const u8{
-            "ProviderRequestInvalid",
-            "ProviderToolLoopExceeded",
-            "ProviderTimeout",
-            "ProviderUnavailable",
-            "ProviderStreamFailed",
-            "ProviderRateLimited",
-            "ProviderAuthFailed",
-            "ProviderModelNotFound",
-            "provider request invalid",
-            "provider tool loop exceeded",
-            "provider stream failed",
-            "provider temporarily unavailable",
-            "provider request timed out",
-            "provider rate limited",
-            "provider authentication failed",
-            "provider model not found",
-            "internal runtime limit",
-        };
-        return containsAnyIgnoreCase(message, &markers);
-    }
-
-    fn runtimeFailureIsToolContractFailure(code: []const u8, message: []const u8) bool {
-        _ = code;
-        const markers = [_][]const u8{
-            "single_tool_call_per_round",
-            "missing_tool_calls",
-            "exactly one tool call",
-            "zero tool calls is protocol-invalid",
-            "provider tool loop exceeded",
-        };
-        return containsAnyIgnoreCase(message, &markers);
-    }
-
-    fn isInternalRuntimeLoopGuardText(text: []const u8) bool {
-        const markers = [_][]const u8{
-            "internal reasoning loop",
-            "loop while preparing that response",
-            "provider followup cap",
-            "provider tool loop exceeded",
-        };
-        return containsAnyIgnoreCase(text, &markers);
-    }
-
-    fn containsAnyIgnoreCase(haystack: []const u8, needles: []const []const u8) bool {
-        for (needles) |needle| {
-            if (std.ascii.indexOfIgnoreCase(haystack, needle) != null) return true;
-        }
-        return false;
-    }
-
     fn extractErrorMessageFromToolPayload(self: *Session, payload_json: []const u8) !?[]u8 {
         var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, payload_json, .{}) catch return null;
         defer parsed.deinit();
@@ -8250,11 +8937,17 @@ pub const Session = struct {
         self.project_binds = .{};
     }
 
-    fn clearThoughtLogSyncOffsets(self: *Session) void {
-        var it = self.thought_log_sync_offsets.iterator();
+    fn clearScopedVenomBindings(self: *Session) void {
+        for (self.scoped_venom_bindings.items) |*binding| binding.deinit(self.allocator);
+        self.scoped_venom_bindings.deinit(self.allocator);
+        self.scoped_venom_bindings = .{};
+    }
+
+    fn clearThoughtJobSyncCounts(self: *Session) void {
+        var it = self.thought_job_sync_counts.iterator();
         while (it.next()) |entry| self.allocator.free(entry.key_ptr.*);
-        self.thought_log_sync_offsets.deinit(self.allocator);
-        self.thought_log_sync_offsets = .{};
+        self.thought_job_sync_counts.deinit(self.allocator);
+        self.thought_job_sync_counts = .{};
     }
 
     fn handleEventWaitConfigWrite(self: *Session, node_id: u32, raw_input: []const u8) !WriteOutcome {
@@ -8511,14 +9204,7 @@ pub const Session = struct {
         source.last_seen_updated_at_ms = 0;
         switch (source.kind) {
             .chat_input => {
-                const jobs = try self.job_index.listJobsForAgent(self.allocator, self.agent_id);
-                defer chat_job_index.deinitJobViews(self.allocator, jobs);
-                var max_seen: i64 = 0;
-                for (jobs) |job| {
-                    if (!isTerminalJobState(job.state)) continue;
-                    if (job.updated_at_ms > max_seen) max_seen = job.updated_at_ms;
-                }
-                source.last_seen_updated_at_ms = max_seen;
+                source.last_seen_job_event_seq = try self.job_index.latestTerminalEventSeqForAgent(self.agent_id);
             },
             .job_status, .job_result => {
                 const job_id = source.job_id orelse return;
@@ -8553,6 +9239,7 @@ pub const Session = struct {
             if (try self.pollWaitSources()) |candidate| {
                 var source = &self.wait_sources.items[candidate.source_index];
                 if (candidate.next_last_seen_updated_at_ms) |value| source.last_seen_updated_at_ms = value;
+                if (candidate.next_last_seen_job_event_seq) |value| source.last_seen_job_event_seq = value;
                 if (candidate.next_last_seen_signal_seq) |value| source.last_seen_signal_seq = value;
                 return candidate.payload_json;
             }
@@ -8613,8 +9300,9 @@ pub const Session = struct {
         var view = owned_view.?;
         errdefer view.deinit(self.allocator);
         if (!std.mem.eql(u8, view.agent_id, self.agent_id)) return null;
-        if (!isTerminalJobState(view.state)) return null;
+        if (!chat_job_index.isTerminalState(view.state)) return null;
         if (view.updated_at_ms <= source.last_seen_updated_at_ms) return null;
+        try self.syncThoughtFramesFromJobTelemetry(job_id);
 
         const event_path = switch (source.kind) {
             .job_status => try std.fmt.allocPrint(self.allocator, "/global/jobs/{s}/status.json", .{view.job_id}),
@@ -8622,7 +9310,13 @@ pub const Session = struct {
             else => unreachable,
         };
         defer self.allocator.free(event_path);
-        const payload = try self.buildJobWaitEventPayload(source.raw_path, event_path, view);
+        const payload = try fsrpc_job_projection.buildJobWaitEventPayload(
+            self.allocator,
+            self.nextWaitEventId(),
+            source.raw_path,
+            event_path,
+            view,
+        );
         const updated_at_ms = view.updated_at_ms;
         view.deinit(self.allocator);
         return .{
@@ -8634,47 +9328,31 @@ pub const Session = struct {
     }
 
     fn buildChatInputCandidate(self: *Session, source: WaitSource, source_index: usize) !?WaitCandidate {
-        const jobs = try self.job_index.listJobsForAgent(self.allocator, self.agent_id);
-        if (jobs.len == 0) {
-            chat_job_index.deinitJobViews(self.allocator, jobs);
-            return null;
-        }
+        const owned_event = try self.job_index.firstTerminalEventForAgentAfter(
+            self.allocator,
+            self.agent_id,
+            source.last_seen_job_event_seq,
+        );
+        if (owned_event == null) return null;
 
-        var selected_idx: ?usize = null;
-        var selected_updated_at_ms: i64 = 0;
-        for (jobs, 0..) |job, idx| {
-            if (!isTerminalJobState(job.state)) continue;
-            if (job.updated_at_ms <= source.last_seen_updated_at_ms) continue;
-            if (selected_idx == null or job.updated_at_ms < selected_updated_at_ms) {
-                selected_idx = idx;
-                selected_updated_at_ms = job.updated_at_ms;
-            }
-        }
+        var event = owned_event.?;
+        defer event.deinit(self.allocator);
+        try self.syncThoughtFramesFromJobTelemetry(event.job_id);
 
-        if (selected_idx == null) {
-            chat_job_index.deinitJobViews(self.allocator, jobs);
-            return null;
-        }
-
-        const chosen_idx = selected_idx.?;
-        var selected = jobs[chosen_idx];
-        errdefer selected.deinit(self.allocator);
-        for (jobs, 0..) |*job, idx| {
-            if (idx == chosen_idx) continue;
-            job.deinit(self.allocator);
-        }
-        self.allocator.free(jobs);
-
-        const event_path = try std.fmt.allocPrint(self.allocator, "/global/jobs/{s}/status.json", .{selected.job_id});
+        const event_path = try std.fmt.allocPrint(self.allocator, "/global/jobs/{s}/status.json", .{event.job_id});
         defer self.allocator.free(event_path);
-        const payload = try self.buildJobWaitEventPayload(source.raw_path, event_path, selected);
-        const updated_at_ms = selected.updated_at_ms;
-        selected.deinit(self.allocator);
+        const payload = try fsrpc_job_projection.buildTerminalJobWaitEventPayload(
+            self.allocator,
+            self.nextWaitEventId(),
+            source.raw_path,
+            event_path,
+            event,
+        );
         return .{
             .source_index = source_index,
-            .sort_key_ms = updated_at_ms,
+            .sort_key_ms = event.created_at_ms,
             .payload_json = payload,
-            .next_last_seen_updated_at_ms = updated_at_ms,
+            .next_last_seen_job_event_seq = event.seq,
         };
     }
 
@@ -8802,71 +9480,6 @@ pub const Session = struct {
         );
     }
 
-    fn buildJobWaitEventPayload(
-        self: *Session,
-        source_path: []const u8,
-        event_path: []const u8,
-        view: chat_job_index.JobView,
-    ) ![]u8 {
-        const source_path_escaped = try unified.jsonEscape(self.allocator, source_path);
-        defer self.allocator.free(source_path_escaped);
-        const event_path_escaped = try unified.jsonEscape(self.allocator, event_path);
-        defer self.allocator.free(event_path_escaped);
-        const job_id_escaped = try unified.jsonEscape(self.allocator, view.job_id);
-        defer self.allocator.free(job_id_escaped);
-        const state_escaped = try unified.jsonEscape(self.allocator, jobStateLabel(view.state));
-        defer self.allocator.free(state_escaped);
-        const status_path = try std.fmt.allocPrint(self.allocator, "/global/jobs/{s}/status.json", .{view.job_id});
-        defer self.allocator.free(status_path);
-        const result_path = try std.fmt.allocPrint(self.allocator, "/global/jobs/{s}/result.txt", .{view.job_id});
-        defer self.allocator.free(result_path);
-        const status_path_escaped = try unified.jsonEscape(self.allocator, status_path);
-        defer self.allocator.free(status_path_escaped);
-        const result_path_escaped = try unified.jsonEscape(self.allocator, result_path);
-        defer self.allocator.free(result_path_escaped);
-
-        const correlation_json = if (view.correlation_id) |value| blk: {
-            const escaped = try unified.jsonEscape(self.allocator, value);
-            defer self.allocator.free(escaped);
-            break :blk try std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped});
-        } else try self.allocator.dupe(u8, "null");
-        defer self.allocator.free(correlation_json);
-
-        const result_json = if (view.result_text) |value| blk: {
-            const escaped = try unified.jsonEscape(self.allocator, value);
-            defer self.allocator.free(escaped);
-            break :blk try std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped});
-        } else try self.allocator.dupe(u8, "null");
-        defer self.allocator.free(result_json);
-
-        const error_json = if (view.error_text) |value| blk: {
-            const escaped = try unified.jsonEscape(self.allocator, value);
-            defer self.allocator.free(escaped);
-            break :blk try std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped});
-        } else try self.allocator.dupe(u8, "null");
-        defer self.allocator.free(error_json);
-
-        const event_id = self.nextWaitEventId();
-
-        return std.fmt.allocPrint(
-            self.allocator,
-            "{{\"configured\":true,\"waiting\":false,\"event_id\":{d},\"source_path\":\"{s}\",\"event_path\":\"{s}\",\"updated_at_ms\":{d},\"job\":{{\"job_id\":\"{s}\",\"state\":\"{s}\",\"correlation_id\":{s},\"status_path\":\"{s}\",\"result_path\":\"{s}\",\"result\":{s},\"error\":{s}}}}}",
-            .{
-                event_id,
-                source_path_escaped,
-                event_path_escaped,
-                view.updated_at_ms,
-                job_id_escaped,
-                state_escaped,
-                correlation_json,
-                status_path_escaped,
-                result_path_escaped,
-                result_json,
-                error_json,
-            },
-        );
-    }
-
     fn refreshJobNodeFromIndex(self: *Session, node_id: u32, special: SpecialKind) !void {
         const node = self.nodes.get(node_id) orelse return error.MissingNode;
         const job_dir_id = node.parent orelse return;
@@ -8878,7 +9491,7 @@ pub const Session = struct {
         var view = owned_view.?;
         defer view.deinit(self.allocator);
         if (!std.mem.eql(u8, view.agent_id, self.agent_id)) return;
-        if (view.log_text) |log_text| try self.syncThoughtFramesFromJobLog(job_id, log_text);
+        try self.syncThoughtFramesFromJobTelemetry(job_id);
 
         switch (special) {
             .job_status => {
@@ -8896,11 +9509,13 @@ pub const Session = struct {
         }
     }
 
-    fn syncThoughtFramesFromJobLog(self: *Session, job_id: []const u8, log_text: []const u8) !void {
-        if (log_text.len == 0) return;
+    fn syncThoughtFramesFromJobTelemetry(self: *Session, job_id: []const u8) !void {
+        const thought_frames = try self.job_index.listThoughtFramesForJob(self.allocator, job_id);
+        defer chat_job_index.deinitThoughtFrames(self.allocator, thought_frames);
+        if (thought_frames.len == 0) return;
 
         const offset_ptr = blk: {
-            const gop = try self.thought_log_sync_offsets.getOrPut(self.allocator, job_id);
+            const gop = try self.thought_job_sync_counts.getOrPut(self.allocator, job_id);
             if (!gop.found_existing) {
                 gop.key_ptr.* = try self.allocator.dupe(u8, job_id);
                 gop.value_ptr.* = 0;
@@ -8909,53 +9524,39 @@ pub const Session = struct {
         };
 
         var cursor = offset_ptr.*;
-        if (cursor > log_text.len) cursor = 0;
+        if (cursor > thought_frames.len) cursor = 0;
 
-        while (cursor < log_text.len) {
-            const line_end = std.mem.indexOfScalarPos(u8, log_text, cursor, '\n') orelse log_text.len;
-            const line = std.mem.trim(u8, log_text[cursor..line_end], " \t\r\n");
-            self.tryRecordThoughtFrameFromLogLine(line);
-            cursor = if (line_end < log_text.len) line_end + 1 else line_end;
+        while (cursor < thought_frames.len) : (cursor += 1) {
+            const frame = thought_frames[cursor];
+            try self.recordThoughtFrame(frame.content, frame.source, frame.round);
         }
 
-        offset_ptr.* = log_text.len;
+        offset_ptr.* = thought_frames.len;
     }
 
-    fn tryRecordThoughtFrameFromLogLine(self: *Session, line: []const u8) void {
-        if (line.len == 0 or line[0] != '{') return;
+    fn refreshScopedVenomIndexes(self: *Session) !void {
+        try self.refreshVenomsIndexFile(self.agent_venoms_index_id, "/global/", "global");
 
-        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, line, .{}) catch return;
-        defer parsed.deinit();
-        if (parsed.value != .object) return;
+        if (self.active_agent_venoms_index_id != 0) {
+            const prefix = try std.fmt.allocPrint(self.allocator, "/agents/{s}/venoms/", .{self.agent_id});
+            defer self.allocator.free(prefix);
+            try self.refreshVenomsIndexFile(self.active_agent_venoms_index_id, prefix, self.agent_id);
+        }
 
-        const obj = parsed.value.object;
-        const type_value = obj.get("type") orelse return;
-        if (type_value != .string or !std.mem.eql(u8, type_value.string, "agent.thought")) return;
-
-        const thought_content = obj.get("content") orelse return;
-        if (thought_content != .string) return;
-
-        const source = if (obj.get("source")) |value|
-            if (value == .string and value.string.len > 0) value.string else null
-        else
-            null;
-        const round = if (obj.get("round")) |value|
-            if (value == .integer and value.integer >= 0) @as(usize, @intCast(value.integer)) else null
-        else
-            null;
-
-        self.recordThoughtFrame(thought_content.string, source, round) catch |err| {
-            std.log.warn("failed to persist thought frame from job log: {s}", .{@errorName(err)});
-        };
+        if (self.active_project_venoms_index_id != 0 and self.active_namespace_project_id != null) {
+            const prefix = try std.fmt.allocPrint(self.allocator, "/projects/{s}/venoms/", .{self.active_namespace_project_id.?});
+            defer self.allocator.free(prefix);
+            try self.refreshVenomsIndexFile(self.active_project_venoms_index_id, prefix, self.active_namespace_project_id.?);
+        }
     }
 
-    fn refreshAgentServicesIndex(self: *Session, node_id: u32) !void {
-        const index_json = try self.buildAgentServicesIndexJson();
+    fn refreshVenomsIndexFile(self: *Session, node_id: u32, binding_prefix: []const u8, binding_owner_id: []const u8) !void {
+        const index_json = try self.buildScopedVenomsIndexJson(binding_prefix, binding_owner_id);
         defer self.allocator.free(index_json);
         try self.setFileContent(node_id, index_json);
     }
 
-    fn buildAgentServicesIndexJson(self: *Session) ![]u8 {
+    fn buildScopedVenomsIndexJson(self: *Session, binding_prefix: []const u8, binding_owner_id: []const u8) ![]u8 {
         // Keep node discovery fresh so newly joined nodes are visible in service index reads.
         self.refreshDynamicDirectory(self.nodes_root_id) catch {};
 
@@ -8972,7 +9573,7 @@ pub const Session = struct {
             const node_dir = self.nodes.get(node_dir_id) orelse continue;
             if (node_dir.kind != .dir) continue;
 
-            const services_root_id = self.lookupChild(node_dir_id, "services") orelse continue;
+            const services_root_id = self.lookupChild(node_dir_id, "venoms") orelse continue;
             const services_root = self.nodes.get(services_root_id) orelse continue;
             if (services_root.kind != .dir) continue;
 
@@ -8985,49 +9586,66 @@ pub const Session = struct {
 
                 const service_path = try std.fmt.allocPrint(
                     self.allocator,
-                    "/nodes/{s}/services/{s}",
+                    "/nodes/{s}/venoms/{s}",
                     .{ node_id, service_id },
                 );
                 defer self.allocator.free(service_path);
-                const invoke_path = try self.deriveServiceInvokePath(node_id, service_id, service_dir_id);
+                const endpoint_path = blk: {
+                    if (try self.firstServiceMountPath(service_dir_id)) |value| break :blk value;
+                    break :blk try self.serviceEndpointPath(service_dir_id);
+                };
+                defer if (endpoint_path) |value| self.allocator.free(value);
+                const invoke_path = try self.deriveVenomInvokePath(node_id, service_id, service_dir_id);
                 defer if (invoke_path) |value| self.allocator.free(value);
 
-                try self.appendAgentServiceIndexEntry(
+                try self.appendAgentVenomIndexEntry(
                     &out,
                     &first,
                     node_id,
                     service_id,
                     service_path,
+                    endpoint_path,
                     invoke_path,
                     "node",
+                    null,
+                    null,
                 );
             }
         }
 
-        try self.appendAgentNamespaceServiceIndexEntries(&out, &first);
-        try self.appendGlobalNamespaceServiceIndexEntries(&out, &first);
+        try self.appendScopedVenomBindingIndexEntriesForPrefix(&out, &first, binding_prefix, binding_owner_id);
         try out.append(self.allocator, ']');
         return out.toOwnedSlice(self.allocator);
     }
 
-    fn appendAgentServiceIndexEntry(
+    fn appendAgentVenomIndexEntry(
         self: *Session,
         out: *std.ArrayListUnmanaged(u8),
         first: *bool,
         node_id: []const u8,
-        service_id: []const u8,
+        venom_id: []const u8,
         service_path: []const u8,
+        endpoint_path: ?[]const u8,
         invoke_path: ?[]const u8,
         scope: []const u8,
+        provider_node_id: ?[]const u8,
+        provider_venom_path: ?[]const u8,
     ) !void {
         const escaped_node_id = try unified.jsonEscape(self.allocator, node_id);
         defer self.allocator.free(escaped_node_id);
-        const escaped_service_id = try unified.jsonEscape(self.allocator, service_id);
-        defer self.allocator.free(escaped_service_id);
+        const escaped_venom_id = try unified.jsonEscape(self.allocator, venom_id);
+        defer self.allocator.free(escaped_venom_id);
         const escaped_service_path = try unified.jsonEscape(self.allocator, service_path);
         defer self.allocator.free(escaped_service_path);
         const escaped_scope = try unified.jsonEscape(self.allocator, scope);
         defer self.allocator.free(escaped_scope);
+
+        const endpoint_json = if (endpoint_path) |value| blk: {
+            const escaped = try unified.jsonEscape(self.allocator, value);
+            defer self.allocator.free(escaped);
+            break :blk try std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped});
+        } else try self.allocator.dupe(u8, "null");
+        defer self.allocator.free(endpoint_json);
 
         const invoke_json = if (invoke_path) |value| blk: {
             const escaped = try unified.jsonEscape(self.allocator, value);
@@ -9036,113 +9654,142 @@ pub const Session = struct {
         } else try self.allocator.dupe(u8, "null");
         defer self.allocator.free(invoke_json);
 
+        const provider_node_json = if (provider_node_id) |value| blk: {
+            const escaped = try unified.jsonEscape(self.allocator, value);
+            defer self.allocator.free(escaped);
+            break :blk try std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped});
+        } else try self.allocator.dupe(u8, "null");
+        defer self.allocator.free(provider_node_json);
+
+        const provider_path_json = if (provider_venom_path) |value| blk: {
+            const escaped = try unified.jsonEscape(self.allocator, value);
+            defer self.allocator.free(escaped);
+            break :blk try std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped});
+        } else try self.allocator.dupe(u8, "null");
+        defer self.allocator.free(provider_path_json);
+
         if (!first.*) try out.append(self.allocator, ',');
         first.* = false;
         try out.writer(self.allocator).print(
-            "{{\"node_id\":\"{s}\",\"service_id\":\"{s}\",\"service_path\":\"{s}\",\"invoke_path\":{s},\"has_invoke\":{s},\"scope\":\"{s}\"}}",
+            "{{\"node_id\":\"{s}\",\"venom_id\":\"{s}\",\"venom_path\":\"{s}\",\"endpoint_path\":{s},\"invoke_path\":{s},\"has_invoke\":{s},\"scope\":\"{s}\",\"provider_node_id\":{s},\"provider_venom_path\":{s}}}",
             .{
                 escaped_node_id,
-                escaped_service_id,
+                escaped_venom_id,
                 escaped_service_path,
+                endpoint_json,
                 invoke_json,
                 if (invoke_path != null) "true" else "false",
                 escaped_scope,
+                provider_node_json,
+                provider_path_json,
             },
         );
     }
 
-    fn appendAgentNamespaceServiceIndexEntries(
+    fn appendScopedVenomBindingIndexEntriesForPrefix(
         self: *Session,
         out: *std.ArrayListUnmanaged(u8),
         first: *bool,
+        binding_prefix: []const u8,
+        binding_owner_id: []const u8,
     ) !void {
-        const global_root = self.lookupChild(self.root_id, "global") orelse return;
-        const namespace_services = [_][]const u8{
-            "services",
-            "chat",
-            "jobs",
-            "events",
-            "memory",
-            "web_search",
-            "search_code",
-            "terminal",
-            "mounts",
-            "sub_brains",
-            "agents",
-            "projects",
-            "thoughts",
+        for (self.scoped_venom_bindings.items) |binding| {
+            if (!std.mem.startsWith(u8, binding.venom_path, binding_prefix)) continue;
+            try self.appendAgentVenomIndexEntry(
+                out,
+                first,
+                binding_owner_id,
+                binding.venom_id,
+                binding.venom_path,
+                binding.endpoint_path,
+                binding.invoke_path,
+                binding.scope,
+                binding.provider_node_id,
+                binding.provider_venom_path,
+            );
+        }
+    }
+
+    fn registerScopedVenomBinding(
+        self: *Session,
+        venom_id: []const u8,
+        scope: []const u8,
+        venom_path: []const u8,
+        provider_node_id: ?[]const u8,
+        provider_venom_path: ?[]const u8,
+        endpoint_path: ?[]const u8,
+        invoke_path: ?[]const u8,
+    ) !void {
+        try self.scoped_venom_bindings.append(self.allocator, .{
+            .venom_id = try self.allocator.dupe(u8, venom_id),
+            .scope = try self.allocator.dupe(u8, scope),
+            .venom_path = try self.allocator.dupe(u8, venom_path),
+            .provider_node_id = if (provider_node_id) |value| try self.allocator.dupe(u8, value) else null,
+            .provider_venom_path = if (provider_venom_path) |value| try self.allocator.dupe(u8, value) else null,
+            .endpoint_path = if (endpoint_path) |value| try self.allocator.dupe(u8, value) else null,
+            .invoke_path = if (invoke_path) |value| try self.allocator.dupe(u8, value) else null,
+        });
+    }
+
+    fn registerExistingGlobalVenomBinding(
+        self: *Session,
+        global_root: u32,
+        venom_id: []const u8,
+        scope: []const u8,
+    ) !void {
+        const service_dir_id = self.lookupChild(global_root, venom_id) orelse return;
+        const service_dir = self.nodes.get(service_dir_id) orelse return;
+        if (service_dir.kind != .dir) return;
+
+        const venom_path = try std.fmt.allocPrint(self.allocator, "/global/{s}", .{venom_id});
+        defer self.allocator.free(venom_path);
+        const invoke_path = if (self.serviceCapsInvoke(service_dir_id)) blk: {
+            const invoke_target = try self.resolveNodeServiceInvokeTarget(service_dir_id);
+            defer self.allocator.free(invoke_target);
+            break :blk try self.pathWithInvokeTarget(venom_path, invoke_target);
+        } else null;
+        defer if (invoke_path) |value| self.allocator.free(value);
+
+        var explicit_provider = blk: {
+            const plane = self.control_plane orelse break :blk null;
+            break :blk try plane.resolveExplicitPreferredVenomProvider(self.allocator, venom_id);
         };
-        for (namespace_services) |service_id| {
-            const service_dir_id = self.lookupChild(global_root, service_id) orelse continue;
-            const service_dir = self.nodes.get(service_dir_id) orelse continue;
-            if (service_dir.kind != .dir) continue;
+        defer if (explicit_provider) |*value| value.deinit(self.allocator);
 
-            const service_path = try std.fmt.allocPrint(
-                self.allocator,
-                "/global/{s}",
-                .{service_id},
-            );
-            defer self.allocator.free(service_path);
+        const provider_node_id = if (explicit_provider) |provider|
+            try self.allocator.dupe(u8, provider.node_id)
+        else
+            null;
+        defer if (provider_node_id) |value| self.allocator.free(value);
+        const provider_venom_path = if (provider_node_id) |node_id|
+            try std.fmt.allocPrint(self.allocator, "/nodes/{s}/venoms/{s}", .{ node_id, venom_id })
+        else
+            null;
+        defer if (provider_venom_path) |value| self.allocator.free(value);
+        const provider_invoke_path = if (explicit_provider) |provider| blk: {
+            const nodes_root = self.lookupChild(self.root_id, "nodes") orelse break :blk null;
+            const node_dir_id = self.lookupChild(nodes_root, provider.node_id) orelse break :blk null;
+            const venoms_root_id = self.lookupChild(node_dir_id, "venoms") orelse break :blk null;
+            const provider_dir_id = self.lookupChild(venoms_root_id, venom_id) orelse break :blk null;
+            break :blk try self.deriveVenomInvokePath(provider.node_id, venom_id, provider_dir_id);
+        } else null;
+        defer if (provider_invoke_path) |value| self.allocator.free(value);
 
-            const invoke_path = if (self.serviceCapsInvoke(service_dir_id))
-                try self.pathWithInvokeSuffix(service_path)
-            else
-                null;
-            defer if (invoke_path) |value| self.allocator.free(value);
-
-            try self.appendAgentServiceIndexEntry(
-                out,
-                first,
-                "global",
-                service_id,
-                service_path,
-                invoke_path,
-                "project_namespace",
-            );
-        }
+        try self.registerScopedVenomBinding(
+            venom_id,
+            scope,
+            venom_path,
+            provider_node_id,
+            provider_venom_path,
+            if (provider_venom_path != null) provider_venom_path else venom_path,
+            if (provider_invoke_path != null) provider_invoke_path else invoke_path,
+        );
     }
 
-    fn appendGlobalNamespaceServiceIndexEntries(
-        self: *Session,
-        out: *std.ArrayListUnmanaged(u8),
-        first: *bool,
-    ) !void {
-        const global_root = self.lookupChild(self.root_id, "global") orelse return;
-        const global_services = [_][]const u8{"library"};
-        for (global_services) |service_id| {
-            const service_dir_id = self.lookupChild(global_root, service_id) orelse continue;
-            const service_dir = self.nodes.get(service_dir_id) orelse continue;
-            if (service_dir.kind != .dir) continue;
-
-            const service_path = try std.fmt.allocPrint(
-                self.allocator,
-                "/global/{s}",
-                .{service_id},
-            );
-            defer self.allocator.free(service_path);
-
-            const invoke_path = if (self.serviceCapsInvoke(service_dir_id))
-                try self.pathWithInvokeSuffix(service_path)
-            else
-                null;
-            defer if (invoke_path) |value| self.allocator.free(value);
-
-            try self.appendAgentServiceIndexEntry(
-                out,
-                first,
-                "global",
-                service_id,
-                service_path,
-                invoke_path,
-                "global_namespace",
-            );
-        }
-    }
-
-    fn deriveServiceInvokePath(
+    fn deriveVenomInvokePath(
         self: *Session,
         node_id: []const u8,
-        service_id: []const u8,
+        venom_id: []const u8,
         service_dir_id: u32,
     ) !?[]u8 {
         if (!self.serviceCapsInvoke(service_dir_id)) return null;
@@ -9168,8 +9815,8 @@ pub const Session = struct {
 
         return try std.fmt.allocPrint(
             self.allocator,
-            "/nodes/{s}/services/{s}/{s}",
-            .{ node_id, service_id, invoke_suffix },
+            "/nodes/{s}/venoms/{s}/{s}",
+            .{ node_id, venom_id, invoke_suffix },
         );
     }
 
@@ -9276,19 +9923,6 @@ pub const Session = struct {
     }
 };
 
-fn isTerminalJobState(state: chat_job_index.JobState) bool {
-    return state == .done or state == .failed;
-}
-
-fn jobStateLabel(state: chat_job_index.JobState) []const u8 {
-    return switch (state) {
-        .queued => "queued",
-        .running => "running",
-        .done => "done",
-        .failed => "failed",
-    };
-}
-
 fn isWorldAbsolutePath(path: []const u8) bool {
     return std.mem.startsWith(u8, path, "/nodes/") or
         std.mem.startsWith(u8, path, "/agents/") or
@@ -9310,18 +9944,18 @@ fn defaultGlobalLibraryIndexMd() []const u8 {
 
 fn defaultGlobalLibraryTopicGettingStarted() []const u8 {
     return "# Getting Started\n\n" ++
-        "1. Discover services in `/global/services/SERVICES.json`.\n" ++
-        "2. Read each service `README.md`, `SCHEMA.json`, and `CAPS.json` before using it.\n" ++
+        "1. Discover Venoms in `/global/venoms/VENOMS.json`.\n" ++
+        "2. Read each Venom `README.md`, `SCHEMA.json`, and `CAPS.json` before using it.\n" ++
         "3. Use `/global/library` for system guides.\n";
 }
 
 fn defaultGlobalLibraryTopicServiceDiscovery() []const u8 {
-    return "# Service Discovery\n\n" ++
-        "- Node services: `/nodes/<node_id>/services/<service_id>`\n" ++
-        "- Project namespaces: `/global/<service_id>`\n" ++
-        "- Global namespaces: `/global/<service_id>`\n" ++
-        "- Start with `/global/services/SERVICES.json`.\n" ++
-        "- Common project namespaces include: memory, web_search, search_code, terminal, mounts, sub_brains, agents, projects.\n";
+    return "# Venom Discovery\n\n" ++
+        "- Node Venoms: `/nodes/<node_id>/venoms/<venom_id>`\n" ++
+        "- Project namespaces: `/global/<venom_id>`\n" ++
+        "- Global namespaces: `/global/<venom_id>`\n" ++
+        "- Start with `/global/venoms/VENOMS.json`.\n" ++
+        "- Common project Venoms include: memory, web_search, search_code, terminal, mounts, sub_brains, agents, projects.\n";
 }
 
 fn defaultGlobalLibraryTopicEventsAndWaits() []const u8 {
@@ -9365,6 +9999,93 @@ fn pathMatchesPrefixBoundary(path: []const u8, prefix: []const u8) bool {
     if (prefix.len == 0) return false;
     if (!std.mem.startsWith(u8, path, prefix)) return false;
     return path.len > prefix.len and path[prefix.len] == '/';
+}
+
+const ParsedScopedVenomAlias = struct {
+    venom_id: []const u8,
+    remote_path: []const u8,
+};
+
+const ParsedEntityScopedVenomAlias = struct {
+    entity_id: []const u8,
+    venom_id: []const u8,
+    remote_path: []const u8,
+};
+
+fn parseScopedVenomAliasPrefix(path: []const u8, prefix: []const u8) ?ParsedScopedVenomAlias {
+    if (!std.mem.startsWith(u8, path, prefix)) return null;
+    const tail = path[prefix.len..];
+    if (tail.len == 0) return null;
+    const slash_index = std.mem.indexOfScalar(u8, tail, '/') orelse tail.len;
+    const venom_id = tail[0..slash_index];
+    if (venom_id.len == 0) return null;
+    const remote_path = if (slash_index == tail.len) "/" else tail[slash_index..];
+    return .{
+        .venom_id = venom_id,
+        .remote_path = remote_path,
+    };
+}
+
+fn parseEntityScopedVenomAliasPrefix(
+    path: []const u8,
+    entity_prefix: []const u8,
+    venoms_segment: []const u8,
+) ?ParsedEntityScopedVenomAlias {
+    if (!std.mem.startsWith(u8, path, entity_prefix)) return null;
+    const after_prefix = path[entity_prefix.len..];
+    const entity_end = std.mem.indexOfScalar(u8, after_prefix, '/') orelse return null;
+    const entity_id = after_prefix[0..entity_end];
+    if (entity_id.len == 0) return null;
+    const after_entity = after_prefix[entity_end..];
+    if (!std.mem.startsWith(u8, after_entity, venoms_segment)) return null;
+    const after_venoms = after_entity[venoms_segment.len..];
+    if (after_venoms.len == 0) return null;
+    const venom_end = std.mem.indexOfScalar(u8, after_venoms, '/') orelse after_venoms.len;
+    const venom_id = after_venoms[0..venom_end];
+    if (venom_id.len == 0) return null;
+    const remote_path = if (venom_end == after_venoms.len) "/" else after_venoms[venom_end..];
+    return .{
+        .entity_id = entity_id,
+        .venom_id = venom_id,
+        .remote_path = remote_path,
+    };
+}
+
+fn boundVenomRemoteSuffix(allocator: std.mem.Allocator, absolute_path: []const u8, prefix: []const u8) ![]u8 {
+    if (!pathMatchesPrefixBoundary(absolute_path, prefix)) return error.InvalidPath;
+    if (std.mem.eql(u8, absolute_path, prefix)) return allocator.dupe(u8, "/");
+    return std.fmt.allocPrint(allocator, "{s}", .{absolute_path[prefix.len..]});
+}
+
+fn parseBoundVenomProxyAttr(attr_val: std.json.Value) ?BoundVenomProxyAttrSummary {
+    if (attr_val != .object) return null;
+
+    const mode: u32 = if (attr_val.object.get("m")) |value|
+        switch (value) {
+            .integer => if (value.integer >= 0) @intCast(value.integer) else return null,
+            else => return null,
+        }
+    else
+        0;
+
+    const kind: NodeKind = if (attr_val.object.get("k")) |value|
+        switch (value) {
+            .integer => switch (value.integer) {
+                2 => .dir,
+                1 => .file,
+                else => if ((mode & 0o170000) == 0o040000) .dir else .file,
+            },
+            else => if ((mode & 0o170000) == 0o040000) .dir else .file,
+        }
+    else if ((mode & 0o170000) == 0o040000)
+        .dir
+    else
+        .file;
+
+    return .{
+        .kind = kind,
+        .writable = kind == .file and (mode & 0o222) != 0,
+    };
 }
 
 fn writeJsonString(writer: anytype, value: []const u8) !void {
@@ -9998,6 +10719,25 @@ test "fsrpc_session: admin debug stream logs runtime frames as synthetic debug e
     try std.testing.expect(std.mem.indexOf(u8, stream_log, "\"frame_type\":\"session.receive\"") != null);
 }
 
+test "fsrpc_session: debug stream ingests debug.event lines from completed job logs" {
+    const allocator = std.testing.allocator;
+
+    var control_plane = fs_control_plane.ControlPlane.init(allocator);
+    defer control_plane.deinit();
+
+    try Session.appendDebugEventsFromLogText(allocator, &control_plane, "agent-debug-admin",
+        \\{"type":"agent.thought","content":"draft"}
+        \\{"type":"debug.event","timestamp":123,"category":"wasm.fixture","payload":{"message":"hello"}}
+        \\not-json
+    );
+
+    const snapshot = try control_plane.snapshotDebugStream(allocator, "agent-debug-admin");
+    defer allocator.free(snapshot);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"type\":\"debug.event\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"category\":\"wasm.fixture\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"type\":\"agent.thought\"") == null);
+}
+
 test "fsrpc_session: events wait returns next completed chat job" {
     const allocator = std.testing.allocator;
 
@@ -10550,8 +11290,11 @@ test "fsrpc_session: node services namespace exposes service descriptors" {
     const local_node = session.lookupChild(nodes_root, "local") orelse return error.TestExpectedResponse;
     const node_status = session.lookupChild(local_node, "STATUS.json") orelse return error.TestExpectedResponse;
     const services_root = session.lookupChild(local_node, "services") orelse return error.TestExpectedResponse;
+    const venoms_root = session.lookupChild(local_node, "venoms") orelse return error.TestExpectedResponse;
     const services_index_id = session.lookupChild(services_root, "SERVICES.json") orelse return error.TestExpectedResponse;
+    const venoms_index_id = session.lookupChild(venoms_root, "VENOMS.json") orelse return error.TestExpectedResponse;
     const fs_service = session.lookupChild(services_root, "fs") orelse return error.TestExpectedResponse;
+    const fs_venom = session.lookupChild(venoms_root, "fs") orelse return error.TestExpectedResponse;
     const terminal_service = session.lookupChild(services_root, "terminal-1") orelse return error.TestExpectedResponse;
 
     const fs_status = session.lookupChild(fs_service, "STATUS.json") orelse return error.TestExpectedResponse;
@@ -10567,19 +11310,26 @@ test "fsrpc_session: node services namespace exposes service descriptors" {
     const terminal_caps_node = session.nodes.get(terminal_caps) orelse return error.TestExpectedResponse;
     const node_status_node = session.nodes.get(node_status) orelse return error.TestExpectedResponse;
     const services_index_node = session.nodes.get(services_index_id) orelse return error.TestExpectedResponse;
+    const venoms_index_node = session.nodes.get(venoms_index_id) orelse return error.TestExpectedResponse;
     const self_services_index_node = session.nodes.get(self_services_index_id) orelse return error.TestExpectedResponse;
 
     try std.testing.expect(std.mem.indexOf(u8, node_status_node.content, "\"state\":\"configured\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, services_index_node.content, "\"service_id\":\"fs\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, services_index_node.content, "\"venom_id\":\"fs\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, services_index_node.content, "\"service_id\":\"terminal-1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, venoms_index_node.content, "\"venom_id\":\"fs\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, fs_status_node.content, "\"state\":\"online\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fs_status_node.content, "\"venom_id\":\"fs\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, fs_status_node.content, "/nodes/local/fs") != null);
     try std.testing.expect(std.mem.indexOf(u8, fs_caps_node.content, "\"rw\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, terminal_caps_node.content, "\"terminal_id\":\"1\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, self_services_index_node.content, "\"node_id\":\"local\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, self_services_index_node.content, "\"service_id\":\"fs\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, self_services_index_node.content, "\"venom_id\":\"fs\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, self_services_index_node.content, "\"service_path\":\"/nodes/local/services/fs\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, self_services_index_node.content, "\"venom_path\":\"/nodes/local/services/fs\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, self_services_index_node.content, "\"has_invoke\":false") != null);
+    _ = fs_venom;
 }
 
 test "fsrpc_session: protocol read exposes agent services discovery index" {
@@ -10606,6 +11356,7 @@ test "fsrpc_session: protocol read exposes agent services discovery index" {
 
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"node_id\":\"local\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"service_id\":\"fs\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_id\":\"fs\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"service_path\":\"/nodes/local/services/fs\"") != null);
 }
 
@@ -10632,6 +11383,7 @@ test "fsrpc_session: agent services index includes first-class namespaces only" 
     defer allocator.free(payload);
 
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"service_id\":\"memory\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_id\":\"memory\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"service_id\":\"web_search\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"service_id\":\"search_code\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"service_id\":\"terminal\"") != null);
@@ -10639,6 +11391,7 @@ test "fsrpc_session: agent services index includes first-class namespaces only" 
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"service_id\":\"projects\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"service_id\":\"library\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"service_path\":\"/global/search_code\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_path\":\"/global/search_code\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"service_path\":\"/global/mounts\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"service_path\":\"/global/projects\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"service_path\":\"/global/library\"") != null);
@@ -10647,6 +11400,279 @@ test "fsrpc_session: agent services index includes first-class namespaces only" 
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"service_path\":\"/global/services/contracts/") == null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"scope\":\"agent_contract\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"has_invoke\":true") != null);
+}
+
+test "fsrpc_session: global venoms index mirrors service discovery entries" {
+    const allocator = std.testing.allocator;
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.init(allocator, runtime_handle, &job_index, "default");
+    defer session.deinit();
+
+    const payload = try protocolReadFile(
+        &session,
+        allocator,
+        104,
+        105,
+        &.{ "global", "venoms", "VENOMS.json" },
+        781,
+    );
+    defer allocator.free(payload);
+
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_id\":\"memory\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_path\":\"/global/memory\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_id\":\"chat\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"invoke_path\":\"/global/chat/control/input\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_id\":\"events\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"invoke_path\":\"/global/events/control/wait.json\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_id\":\"fs\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_path\":\"/global/fs\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"endpoint_path\":\"/nodes/local/fs\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"provider_node_id\":\"local\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"provider_venom_path\":\"/nodes/local/venoms/fs\"") != null);
+}
+
+test "fsrpc_session: control-plane preferred fs provider drives global fs binding" {
+    const allocator = std.testing.allocator;
+
+    var control_plane = fs_control_plane.ControlPlane.init(allocator);
+    defer control_plane.deinit();
+
+    const local_joined = try control_plane.ensureNode("spiderweb-local", "ws://127.0.0.1:18891/v2/fs", 60_000);
+    defer allocator.free(local_joined);
+    var local_parsed = try std.json.parseFromSlice(std.json.Value, allocator, local_joined, .{});
+    defer local_parsed.deinit();
+    const local_node_id = local_parsed.value.object.get("node_id").?.string;
+    const local_node_secret = local_parsed.value.object.get("node_secret").?.string;
+
+    const remote_joined = try control_plane.ensureNode("edge-remote", "ws://127.0.0.1:28891/v2/fs", 60_000);
+    defer allocator.free(remote_joined);
+    var remote_parsed = try std.json.parseFromSlice(std.json.Value, allocator, remote_joined, .{});
+    defer remote_parsed.deinit();
+    const remote_node_id = remote_parsed.value.object.get("node_id").?.string;
+    const remote_node_secret = remote_parsed.value.object.get("node_secret").?.string;
+
+    const local_upsert = try std.fmt.allocPrint(
+        allocator,
+        "{{\"node_id\":\"{s}\",\"node_secret\":\"{s}\",\"venoms\":[{{\"venom_id\":\"fs\",\"kind\":\"fs\",\"version\":\"1\",\"state\":\"online\",\"endpoints\":[\"/nodes/{s}/fs\"],\"capabilities\":{{\"rw\":true}},\"mounts\":[{{\"mount_id\":\"fs\",\"mount_path\":\"/nodes/{s}/fs\",\"state\":\"online\"}}],\"ops\":{{\"model\":\"namespace\"}},\"runtime\":{{\"type\":\"builtin\",\"abi\":\"venom-driver-v1\"}},\"permissions\":{{\"default\":\"deny-by-default\",\"allow_roles\":[\"admin\",\"user\"]}},\"schema\":{{\"model\":\"namespace-mount\"}}}}]}}",
+        .{ local_node_id, local_node_secret, local_node_id, local_node_id },
+    );
+    defer allocator.free(local_upsert);
+    const local_upserted = try control_plane.nodeVenomUpsert(local_upsert);
+    defer allocator.free(local_upserted);
+
+    const remote_upsert = try std.fmt.allocPrint(
+        allocator,
+        "{{\"node_id\":\"{s}\",\"node_secret\":\"{s}\",\"venoms\":[{{\"venom_id\":\"fs\",\"kind\":\"fs\",\"version\":\"1\",\"state\":\"online\",\"endpoints\":[\"/nodes/{s}/fs\"],\"capabilities\":{{\"rw\":true}},\"mounts\":[{{\"mount_id\":\"fs\",\"mount_path\":\"/nodes/{s}/fs\",\"state\":\"online\"}}],\"ops\":{{\"model\":\"namespace\"}},\"runtime\":{{\"type\":\"builtin\",\"abi\":\"venom-driver-v1\"}},\"permissions\":{{\"default\":\"deny-by-default\",\"allow_roles\":[\"admin\",\"user\"]}},\"schema\":{{\"model\":\"namespace-mount\"}}}}]}}",
+        .{ remote_node_id, remote_node_secret, remote_node_id, remote_node_id },
+    );
+    defer allocator.free(remote_upsert);
+    const remote_upserted = try control_plane.nodeVenomUpsert(remote_upsert);
+    defer allocator.free(remote_upserted);
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "default",
+        .{
+            .control_plane = &control_plane,
+            .agents_dir = ".does-not-exist",
+            .projects_dir = ".does-not-exist",
+        },
+    );
+    defer session.deinit();
+
+    const payload = try protocolReadFile(
+        &session,
+        allocator,
+        204,
+        205,
+        &.{ "global", "venoms", "VENOMS.json" },
+        781,
+    );
+    defer allocator.free(payload);
+
+    const expected_endpoint = try std.fmt.allocPrint(allocator, "\"endpoint_path\":\"/nodes/{s}/fs\"", .{local_node_id});
+    defer allocator.free(expected_endpoint);
+    const expected_provider_node = try std.fmt.allocPrint(allocator, "\"provider_node_id\":\"{s}\"", .{local_node_id});
+    defer allocator.free(expected_provider_node);
+    const expected_provider_path = try std.fmt.allocPrint(allocator, "\"provider_venom_path\":\"/nodes/{s}/venoms/fs\"", .{local_node_id});
+    defer allocator.free(expected_provider_path);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_path\":\"/global/fs\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, expected_endpoint) != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, expected_provider_node) != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, expected_provider_path) != null);
+}
+
+test "fsrpc_session: agent and project venoms indexes surface scoped bindings" {
+    const allocator = std.testing.allocator;
+
+    var control_plane = fs_control_plane.ControlPlane.init(allocator);
+    defer control_plane.deinit();
+
+    const local_joined = try control_plane.ensureNode("spiderweb-local", "ws://127.0.0.1:18891/v2/fs", 60_000);
+    defer allocator.free(local_joined);
+    var local_parsed = try std.json.parseFromSlice(std.json.Value, allocator, local_joined, .{});
+    defer local_parsed.deinit();
+    const local_node_id = local_parsed.value.object.get("node_id").?.string;
+    const local_node_secret = local_parsed.value.object.get("node_secret").?.string;
+
+    const app_joined = try control_plane.ensureNode("spiderapp-default", "", 60_000);
+    defer allocator.free(app_joined);
+    var app_parsed = try std.json.parseFromSlice(std.json.Value, allocator, app_joined, .{});
+    defer app_parsed.deinit();
+    const app_node_id = app_parsed.value.object.get("node_id").?.string;
+    const app_node_secret = app_parsed.value.object.get("node_secret").?.string;
+
+    const local_upsert = try std.fmt.allocPrint(
+        allocator,
+        "{{\"node_id\":\"{s}\",\"node_secret\":\"{s}\",\"venoms\":[{{\"venom_id\":\"chat\",\"kind\":\"chat\",\"version\":\"1\",\"state\":\"online\",\"endpoints\":[\"/nodes/{s}/chat\"],\"capabilities\":{{\"invoke\":true}},\"mounts\":[{{\"mount_id\":\"chat\",\"mount_path\":\"/nodes/{s}/chat\",\"state\":\"online\"}}],\"ops\":{{\"model\":\"namespace\",\"invoke\":\"control/input\"}},\"runtime\":{{\"type\":\"builtin\",\"abi\":\"venom-driver-v1\"}},\"permissions\":{{\"default\":\"deny-by-default\",\"allow_roles\":[\"admin\",\"user\"]}},\"schema\":{{\"model\":\"namespace-chat-v1\"}}}},{{\"venom_id\":\"fs\",\"kind\":\"fs\",\"version\":\"1\",\"state\":\"online\",\"endpoints\":[\"/nodes/{s}/fs\"],\"capabilities\":{{\"rw\":true}},\"mounts\":[{{\"mount_id\":\"fs\",\"mount_path\":\"/nodes/{s}/fs\",\"state\":\"online\"}}],\"ops\":{{\"model\":\"namespace\"}},\"runtime\":{{\"type\":\"builtin\",\"abi\":\"venom-driver-v1\"}},\"permissions\":{{\"default\":\"deny-by-default\",\"allow_roles\":[\"admin\",\"user\"]}},\"schema\":{{\"model\":\"namespace-mount\"}}}}]}}",
+        .{ local_node_id, local_node_secret, local_node_id, local_node_id, local_node_id, local_node_id },
+    );
+    defer allocator.free(local_upsert);
+    _ = try control_plane.nodeVenomUpsert(local_upsert);
+
+    const app_upsert = try std.fmt.allocPrint(
+        allocator,
+        "{{\"node_id\":\"{s}\",\"node_secret\":\"{s}\",\"venoms\":[{{\"venom_id\":\"chat\",\"kind\":\"chat\",\"version\":\"1\",\"state\":\"online\",\"endpoints\":[\"/nodes/{s}/chat\"],\"capabilities\":{{\"invoke\":true}},\"mounts\":[{{\"mount_id\":\"chat\",\"mount_path\":\"/nodes/{s}/chat\",\"state\":\"online\"}}],\"ops\":{{\"model\":\"namespace\",\"invoke\":\"control/input\"}},\"runtime\":{{\"type\":\"builtin\",\"abi\":\"venom-driver-v1\"}},\"permissions\":{{\"default\":\"deny-by-default\",\"allow_roles\":[\"admin\",\"user\"]}},\"schema\":{{\"model\":\"namespace-chat-v1\"}}}},{{\"venom_id\":\"fs\",\"kind\":\"fs\",\"version\":\"1\",\"state\":\"online\",\"endpoints\":[\"/nodes/{s}/fs\"],\"capabilities\":{{\"rw\":true}},\"mounts\":[{{\"mount_id\":\"fs\",\"mount_path\":\"/nodes/{s}/fs\",\"state\":\"online\"}}],\"ops\":{{\"model\":\"namespace\"}},\"runtime\":{{\"type\":\"builtin\",\"abi\":\"venom-driver-v1\"}},\"permissions\":{{\"default\":\"deny-by-default\",\"allow_roles\":[\"admin\",\"user\"]}},\"schema\":{{\"model\":\"namespace-mount\"}}}}]}}",
+        .{ app_node_id, app_node_secret, app_node_id, app_node_id, app_node_id, app_node_id },
+    );
+    defer allocator.free(app_upsert);
+    _ = try control_plane.nodeVenomUpsert(app_upsert);
+
+    const bind_project = try std.fmt.allocPrint(
+        allocator,
+        "{{\"venom_id\":\"chat\",\"scope\":\"project\",\"project_id\":\"{s}\",\"node_id\":\"{s}\"}}",
+        .{ fs_control_plane.spider_web_project_id, app_node_id },
+    );
+    defer allocator.free(bind_project);
+    _ = try control_plane.bindPreferredVenomProvider(bind_project);
+
+    const bind_agent = try std.fmt.allocPrint(
+        allocator,
+        "{{\"venom_id\":\"chat\",\"scope\":\"agent\",\"agent_id\":\"default\",\"node_id\":\"{s}\"}}",
+        .{local_node_id},
+    );
+    defer allocator.free(bind_agent);
+    _ = try control_plane.bindPreferredVenomProvider(bind_agent);
+
+    const bind_global_fs = try std.fmt.allocPrint(
+        allocator,
+        "{{\"venom_id\":\"fs\",\"scope\":\"global\",\"node_id\":\"{s}\"}}",
+        .{app_node_id},
+    );
+    defer allocator.free(bind_global_fs);
+    _ = try control_plane.bindPreferredVenomProvider(bind_global_fs);
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "default",
+        .{
+            .control_plane = &control_plane,
+            .agents_dir = ".does-not-exist",
+            .projects_dir = ".does-not-exist",
+            .project_id = fs_control_plane.spider_web_project_id,
+        },
+    );
+    defer session.deinit();
+
+    const agent_payload = try protocolReadFile(
+        &session,
+        allocator,
+        304,
+        305,
+        &.{ "agents", "default", "venoms", "VENOMS.json" },
+        781,
+    );
+    defer allocator.free(agent_payload);
+    const expected_agent_provider = try std.fmt.allocPrint(allocator, "\"provider_node_id\":\"{s}\"", .{local_node_id});
+    defer allocator.free(expected_agent_provider);
+    try std.testing.expect(std.mem.indexOf(u8, agent_payload, "\"venom_path\":\"/agents/default/venoms/chat\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, agent_payload, expected_agent_provider) != null);
+
+    const project_payload = try protocolReadFile(
+        &session,
+        allocator,
+        306,
+        307,
+        &.{ "projects", fs_control_plane.spider_web_project_id, "venoms", "VENOMS.json" },
+        781,
+    );
+    defer allocator.free(project_payload);
+    const expected_project_provider = try std.fmt.allocPrint(allocator, "\"provider_node_id\":\"{s}\"", .{app_node_id});
+    defer allocator.free(expected_project_provider);
+    try std.testing.expect(std.mem.indexOf(u8, project_payload, "\"venom_path\":\"/projects/system/venoms/chat\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, project_payload, expected_project_provider) != null);
+}
+
+test "fsrpc_session: scoped venom aliases shape proxy paths and job result paths" {
+    const allocator = std.testing.allocator;
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "default",
+        .{
+            .agents_dir = ".does-not-exist",
+            .projects_dir = ".does-not-exist",
+            .project_id = fs_control_plane.spider_web_project_id,
+        },
+    );
+    defer session.deinit();
+
+    const global_chat_id = session.resolveAbsolutePathNoBinds("/global/chat") orelse return error.TestExpectedResponse;
+    const global_result_path = try session.buildJobResultPathForNode(global_chat_id, "job-global");
+    defer allocator.free(global_result_path);
+    try std.testing.expectEqualStrings("/global/jobs/job-global/result.txt", global_result_path);
+
+    const agent_chat_id = session.resolveAbsolutePathNoBinds("/agents/default/venoms/chat") orelse return error.TestExpectedResponse;
+    const agent_result_path = try session.buildJobResultPathForNode(agent_chat_id, "job-agent");
+    defer allocator.free(agent_result_path);
+    try std.testing.expectEqualStrings("/agents/default/venoms/jobs/job-agent/result.txt", agent_result_path);
+
+    const project_chat_id = session.resolveAbsolutePathNoBinds("/projects/system/venoms/chat") orelse return error.TestExpectedResponse;
+    const project_result_path = try session.buildJobResultPathForNode(project_chat_id, "job-project");
+    defer allocator.free(project_result_path);
+    try std.testing.expectEqualStrings("/projects/system/venoms/jobs/job-project/result.txt", project_result_path);
+
+    const parsed_agent = (try session.boundVenomProxyPathForAbsolutePath("/agents/default/venoms/fs/src/main.zig")) orelse return error.TestExpectedResponse;
+    defer allocator.free(parsed_agent.remote_path);
+    try std.testing.expectEqualStrings("fs", parsed_agent.venom_id);
+    try std.testing.expectEqualStrings("default", parsed_agent.agent_id.?);
+    try std.testing.expectEqualStrings("/src/main.zig", parsed_agent.remote_path);
+
+    const parsed_project = (try session.boundVenomProxyPathForAbsolutePath("/projects/system/venoms/events/control/wait.json")) orelse return error.TestExpectedResponse;
+    defer allocator.free(parsed_project.remote_path);
+    try std.testing.expectEqualStrings("events", parsed_project.venom_id);
+    try std.testing.expectEqualStrings("system", parsed_project.project_id.?);
+    try std.testing.expectEqualStrings("/control/wait.json", parsed_project.remote_path);
 }
 
 test "fsrpc_session: global library namespace exposes index and topic guides" {
@@ -11060,6 +12086,9 @@ test "fsrpc_session: agents namespace create/list provisions new agent when capa
     defer allocator.free(create_result);
     try std.testing.expect(std.mem.indexOf(u8, create_result, "\"operation\":\"create\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, create_result, "\"agent_id\":\"builder\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, create_result, "\"project_id\":null") != null);
+    try std.testing.expect(std.mem.indexOf(u8, create_result, "\"activated\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, create_result, "\"activation_error\":null") != null);
 
     const hatch_path = try std.fs.path.join(allocator, &.{ agents_dir, "builder", "HATCH.md" });
     defer allocator.free(hatch_path);
@@ -11094,6 +12123,154 @@ test "fsrpc_session: agents namespace create/list provisions new agent when capa
     defer allocator.free(list_result);
     try std.testing.expect(std.mem.indexOf(u8, list_result, "\"operation\":\"list\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, list_result, "\"agent_id\":\"builder\"") != null);
+}
+
+test "fsrpc_session: agents namespace create can activate a new agent into a requested project" {
+    const allocator = std.testing.allocator;
+
+    var control_plane = fs_control_plane.ControlPlane.init(allocator);
+    defer control_plane.deinit();
+    const created_project = try control_plane.createProject("{\"name\":\"Build Project\",\"vision\":\"Build Project\"}");
+    defer allocator.free(created_project);
+    var created_project_parsed = try std.json.parseFromSlice(std.json.Value, allocator, created_project, .{});
+    defer created_project_parsed.deinit();
+    const project_id_val = created_project_parsed.value.object.get("project_id") orelse return error.TestExpectedResponse;
+    if (project_id_val != .string) return error.TestExpectedResponse;
+    const project_id = project_id_val.string;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const root = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+    const agents_dir = try std.fmt.allocPrint(allocator, "{s}/agents", .{root});
+    defer allocator.free(agents_dir);
+    const projects_dir = try std.fmt.allocPrint(allocator, "{s}/projects", .{root});
+    defer allocator.free(projects_dir);
+    try std.fs.cwd().makePath(agents_dir);
+    try std.fs.cwd().makePath(projects_dir);
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "mother", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "mother",
+        .{
+            .agents_dir = agents_dir,
+            .projects_dir = projects_dir,
+            .control_plane = &control_plane,
+            .is_admin = true,
+        },
+    );
+    defer session.deinit();
+
+    const create_payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"agent_id\":\"builder-activation\",\"project_id\":\"{s}\"}}",
+        .{project_id},
+    );
+    defer allocator.free(create_payload);
+    try protocolWriteFile(
+        &session,
+        allocator,
+        283,
+        284,
+        &.{ "agents", "self", "agents", "control", "create.json" },
+        create_payload,
+        934,
+    );
+
+    const create_result = try protocolReadFile(
+        &session,
+        allocator,
+        285,
+        286,
+        &.{ "agents", "self", "agents", "result.json" },
+        935,
+    );
+    defer allocator.free(create_result);
+    try std.testing.expect(std.mem.indexOf(u8, create_result, "\"agent_id\":\"builder-activation\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, create_result, "\"activated\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, create_result, "\"activation_error\":null") != null);
+
+    const workspace_req = try std.fmt.allocPrint(allocator, "{{\"project_id\":\"{s}\"}}", .{project_id});
+    defer allocator.free(workspace_req);
+    const workspace_status = try control_plane.workspaceStatus("builder-activation", workspace_req);
+    defer allocator.free(workspace_status);
+    try std.testing.expect(std.mem.indexOf(u8, workspace_status, "\"project_id\":\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, workspace_status, project_id) != null);
+}
+
+test "fsrpc_session: agents namespace create reports activation errors without failing creation" {
+    const allocator = std.testing.allocator;
+
+    var control_plane = fs_control_plane.ControlPlane.init(allocator);
+    defer control_plane.deinit();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const root = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+    const agents_dir = try std.fmt.allocPrint(allocator, "{s}/agents", .{root});
+    defer allocator.free(agents_dir);
+    const projects_dir = try std.fmt.allocPrint(allocator, "{s}/projects", .{root});
+    defer allocator.free(projects_dir);
+    try std.fs.cwd().makePath(agents_dir);
+    try std.fs.cwd().makePath(projects_dir);
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "mother", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "mother",
+        .{
+            .agents_dir = agents_dir,
+            .projects_dir = projects_dir,
+            .control_plane = &control_plane,
+            .is_admin = true,
+        },
+    );
+    defer session.deinit();
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        287,
+        288,
+        &.{ "agents", "self", "agents", "control", "create.json" },
+        "{\"agent_id\":\"builder-missing-project\",\"project_id\":\"proj-missing\"}",
+        936,
+    );
+
+    const create_result = try protocolReadFile(
+        &session,
+        allocator,
+        289,
+        290,
+        &.{ "agents", "self", "agents", "result.json" },
+        937,
+    );
+    defer allocator.free(create_result);
+    try std.testing.expect(std.mem.indexOf(u8, create_result, "\"agent_id\":\"builder-missing-project\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, create_result, "\"activated\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, create_result, "\"activation_error\":\"ProjectNotFound\"") != null);
+
+    const hatch_path = try std.fs.path.join(allocator, &.{ agents_dir, "builder-missing-project", "HATCH.md" });
+    defer allocator.free(hatch_path);
+    const hatch_content = try std.fs.cwd().readFileAlloc(allocator, hatch_path, 64 * 1024);
+    defer allocator.free(hatch_content);
+    try std.testing.expect(hatch_content.len > 0);
 }
 
 test "fsrpc_session: agents namespace create denies invoke without capability" {
@@ -12148,7 +13325,7 @@ test "fsrpc_session: node services namespace prefers control-plane catalog" {
         .{ escaped_node_id, escaped_node_secret, escaped_node_id },
     );
     defer allocator.free(upsert_req);
-    const upserted = try control_plane.nodeServiceUpsert(upsert_req);
+    const upserted = try control_plane.nodeVenomUpsert(upsert_req);
     defer allocator.free(upserted);
 
     var tmp_dir = std.testing.tmpDir(.{});
@@ -12218,7 +13395,7 @@ test "fsrpc_session: node services namespace prefers control-plane catalog" {
         allocator,
         140,
         141,
-        &.{ "global", "services", "node-service-events.ndjson" },
+        &.{ "global", "services", "node-venom-events.ndjson" },
         142,
     );
     defer allocator.free(node_service_events_payload);
@@ -12240,7 +13417,7 @@ test "fsrpc_session: node service events file returns full retained feed" {
     const allocator = std.testing.allocator;
 
     var control_plane = fs_control_plane.ControlPlane.initWithOptions(allocator, .{
-        .node_service_event_history_max = 520,
+        .node_venom_event_history_max = 520,
     });
     defer control_plane.deinit();
 
@@ -12266,7 +13443,7 @@ test "fsrpc_session: node service events file returns full retained feed" {
             .{ escaped_node_id, escaped_node_secret, idx, escaped_node_id },
         );
         defer allocator.free(upsert_req);
-        const upserted = try control_plane.nodeServiceUpsert(upsert_req);
+        const upserted = try control_plane.nodeVenomUpsert(upsert_req);
         defer allocator.free(upserted);
     }
 
@@ -12293,7 +13470,7 @@ test "fsrpc_session: node service events file returns full retained feed" {
         allocator,
         240,
         241,
-        &.{ "global", "services", "node-service-events.ndjson" },
+        &.{ "global", "services", "node-venom-events.ndjson" },
         242,
     );
     defer allocator.free(node_service_events_payload);
@@ -12330,7 +13507,7 @@ test "fsrpc_session: empty control-plane service catalog suppresses policy fallb
         .{ escaped_node_id, escaped_node_secret },
     );
     defer allocator.free(upsert_req);
-    const upserted = try control_plane.nodeServiceUpsert(upsert_req);
+    const upserted = try control_plane.nodeVenomUpsert(upsert_req);
     defer allocator.free(upserted);
 
     var tmp_dir = std.testing.tmpDir(.{});
@@ -13095,7 +14272,7 @@ test "fsrpc_session: node roots are derived from control-plane service kinds" {
         .{ escaped_node_id, escaped_node_secret, escaped_node_id, escaped_node_id },
     );
     defer allocator.free(upsert_req);
-    const upserted = try control_plane.nodeServiceUpsert(upsert_req);
+    const upserted = try control_plane.nodeVenomUpsert(upsert_req);
     defer allocator.free(upserted);
 
     var tmp_dir = std.testing.tmpDir(.{});
@@ -13185,7 +14362,7 @@ test "fsrpc_session: control-plane mounts expose custom node roots and metadata 
         .{ escaped_node_id, escaped_node_secret, escaped_node_id, escaped_node_id },
     );
     defer allocator.free(upsert_req);
-    const upserted = try control_plane.nodeServiceUpsert(upsert_req);
+    const upserted = try control_plane.nodeVenomUpsert(upsert_req);
     defer allocator.free(upserted);
 
     var tmp_dir = std.testing.tmpDir(.{});
@@ -13283,7 +14460,7 @@ test "fsrpc_session: service permissions enforce deny-by-default with admin bypa
         .{ escaped_node_id, escaped_node_secret, escaped_node_id, escaped_node_id },
     );
     defer allocator.free(upsert_req);
-    const upserted = try control_plane.nodeServiceUpsert(upsert_req);
+    const upserted = try control_plane.nodeVenomUpsert(upsert_req);
     defer allocator.free(upserted);
 
     var tmp_dir = std.testing.tmpDir(.{});
@@ -13386,7 +14563,7 @@ test "fsrpc_session: project access policy gates invoke visibility per agent" {
         .{ escaped_node_id, escaped_node_secret, escaped_node_id, escaped_node_id },
     );
     defer allocator.free(upsert_req);
-    const upserted = try control_plane.nodeServiceUpsert(upsert_req);
+    const upserted = try control_plane.nodeVenomUpsert(upsert_req);
     defer allocator.free(upserted);
 
     const project_json = try control_plane.createProject(
@@ -13517,7 +14694,7 @@ test "fsrpc_session: node service invoke path uses OPS metadata with safe fallba
         },
     );
     defer allocator.free(upsert_req);
-    const upserted = try control_plane.nodeServiceUpsert(upsert_req);
+    const upserted = try control_plane.nodeVenomUpsert(upsert_req);
     defer allocator.free(upserted);
 
     const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
@@ -13754,7 +14931,7 @@ test "fsrpc_session: pairing catalog visibility and node invoke integration flow
         .{ escaped_node_id, escaped_node_secret, escaped_node_id, escaped_node_id },
     );
     defer allocator.free(upsert_req);
-    const upserted = try control_plane.nodeServiceUpsert(upsert_req);
+    const upserted = try control_plane.nodeVenomUpsert(upsert_req);
     defer allocator.free(upserted);
 
     const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
@@ -13990,7 +15167,7 @@ test "fsrpc_session: multi-node discovery invoke supervision reconnect flow" {
         .{ escaped_alpha_id, escaped_alpha_secret, escaped_alpha_id, escaped_alpha_id },
     );
     defer allocator.free(alpha_upsert);
-    const alpha_upserted = try control_plane.nodeServiceUpsert(alpha_upsert);
+    const alpha_upserted = try control_plane.nodeVenomUpsert(alpha_upsert);
     defer allocator.free(alpha_upserted);
 
     const beta_upsert = try std.fmt.allocPrint(
@@ -13999,7 +15176,7 @@ test "fsrpc_session: multi-node discovery invoke supervision reconnect flow" {
         .{ escaped_beta_id, escaped_beta_secret, escaped_beta_id, escaped_beta_id },
     );
     defer allocator.free(beta_upsert);
-    const beta_upserted = try control_plane.nodeServiceUpsert(beta_upsert);
+    const beta_upserted = try control_plane.nodeVenomUpsert(beta_upsert);
     defer allocator.free(beta_upserted);
 
     const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
@@ -14219,20 +15396,20 @@ test "fsrpc_session: multi-node discovery invoke supervision reconnect flow" {
 }
 
 test "fsrpc_session: runtime failure normalization redacts provider details" {
-    const normalized = Session.normalizeRuntimeFailureForAgent("provider_request_invalid", "provider request invalid");
+    const normalized = chat_runtime_job.normalizeRuntimeFailureForAgent("provider_request_invalid", "provider request invalid");
     try std.testing.expectEqualStrings("runtime_internal_limit", normalized.code);
     try std.testing.expectEqualStrings("Temporary internal runtime limit reached; retry this request.", normalized.message);
 }
 
 test "fsrpc_session: missing provider API key is surfaced directly" {
-    const normalized = Session.normalizeRuntimeFailureForAgent("execution_failed", "missing provider api key");
+    const normalized = chat_runtime_job.normalizeRuntimeFailureForAgent("execution_failed", "missing provider api key");
     try std.testing.expectEqualStrings("execution_failed", normalized.code);
     try std.testing.expectEqualStrings("missing provider api key", normalized.message);
 }
 
 test "fsrpc_session: runtime loop-guard text is classified as internal failure" {
-    try std.testing.expect(Session.isInternalRuntimeLoopGuardText("I hit an internal reasoning loop while preparing that response. Please retry."));
-    const normalized = Session.normalizeRuntimeFailureForAgent("execution_failed", "provider tool loop exceeded limits");
+    try std.testing.expect(chat_runtime_job.isInternalRuntimeLoopGuardText("I hit an internal reasoning loop while preparing that response. Please retry."));
+    const normalized = chat_runtime_job.normalizeRuntimeFailureForAgent("execution_failed", "provider tool loop exceeded limits");
     try std.testing.expectEqualStrings("runtime_protocol_error", normalized.code);
     try std.testing.expect(std.mem.indexOf(u8, normalized.message, "tool-call contract") != null);
 }

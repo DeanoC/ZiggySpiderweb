@@ -33,7 +33,7 @@ pub const POLICY_TEXT =
 
 pub const LOOP_CONTRACT_TEXT =
     \\Run cycle: Observe -> Decide -> Act -> Integrate -> Checkpoint.
-    \\When history is sparse, discover capabilities first via /global/services/SERVICES.json.
+    \\When history is sparse, discover capabilities first via /global/venoms/VENOMS.json.
     \\If blocked, continue using wait-capable filesystem operations.
     \\Prefer single-source blocking reads for waits (job status/result); use events/control/wait.json + events/next.json only for one-of-many sources.
     \\If tool output is invalid or includes error.code/error.message, emit the smallest corrective tool step.
@@ -46,7 +46,7 @@ pub const TOOL_CONTRACT_TEXT =
     \\Do not use talk_* tools.
     \\Do not call memory_* directly; use Acheron paths under /global/memory/control/*.json.
     \\Access web search, code search, terminal, sub-brains, and agent management via Acheron namespaces under /global.
-    \\Before claiming a capability is unavailable, check `/global/services/SERVICES.json` and relevant first-class namespaces.
+    \\Before claiming a capability is unavailable, check `/global/venoms/VENOMS.json` and relevant first-class namespaces.
     \\Use project_namespace for project-shared capabilities and node scope for node-specific capabilities.
     \\If `/global/web_search` exists, do not claim you cannot do web search; invoke the web search service.
     \\For "what projects/agents exist" requests, use `/global/projects/control/list.json` and `/global/agents/control/list.json` (or invoke.json), not directory-entry inference.

@@ -16,6 +16,7 @@ pub fn build(b: *std.Build) void {
     });
     const spider_protocol_module = spider_protocol_dep.module("spider-protocol");
     const spiderweb_node_module = spider_protocol_dep.module("spiderweb_node");
+    const spiderweb_fs_protocol_module = spider_protocol_dep.module("spiderweb_fs");
     const ziggy_memory_store_dep = b.dependency("ziggy_memory_store", .{
         .target = target,
         .optimize = optimize,
@@ -49,6 +50,8 @@ pub fn build(b: *std.Build) void {
     });
     spiderweb_fs_mod.addIncludePath(b.path("src/c"));
     spiderweb_fs_mod.addImport("spider-protocol", spider_protocol_module);
+    spiderweb_fs_mod.addImport("spiderweb_node", spiderweb_node_module);
+    spiderweb_fs_mod.addImport("spiderweb_fs", spiderweb_fs_protocol_module);
 
     // Example: embeddable filesystem service
     const embed_fs_node_example_mod = b.createModule(.{
@@ -113,6 +116,8 @@ pub fn build(b: *std.Build) void {
     spiderweb_mod.addIncludePath(b.path("src/c"));
     spiderweb_mod.addImport("ziggy-piai", ziggy_piai_module);
     spiderweb_mod.addImport("spider-protocol", spider_protocol_module);
+    spiderweb_mod.addImport("spiderweb_node", spiderweb_node_module);
+    spiderweb_mod.addImport("spiderweb_fs", spiderweb_fs_protocol_module);
     spiderweb_mod.addImport("ziggy-memory-store", ziggy_memory_store_module);
     spiderweb_mod.addImport("ziggy-tool-runtime", ziggy_tool_runtime_module);
     spiderweb_mod.addImport("ziggy-runtime-hooks", ziggy_runtime_hooks_module);
@@ -167,6 +172,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     fs_node_mod.addImport("spider-protocol", spider_protocol_module);
+    fs_node_mod.addImport("spiderweb_node", spiderweb_node_module);
     const spiderweb_fs_node = b.addExecutable(.{
         .name = "spiderweb-fs-node",
         .root_module = fs_node_mod,
@@ -243,6 +249,7 @@ pub fn build(b: *std.Build) void {
     test_mod.addImport("agent_config", agent_config_mod);
     test_mod.addImport("spider-protocol", spider_protocol_module);
     test_mod.addImport("spiderweb_node", spiderweb_node_module);
+    test_mod.addImport("spiderweb_fs", spiderweb_fs_protocol_module);
     test_mod.addImport("ziggy-memory-store", ziggy_memory_store_module);
     test_mod.addImport("ziggy-tool-runtime", ziggy_tool_runtime_module);
     test_mod.addImport("ziggy-runtime-hooks", ziggy_runtime_hooks_module);

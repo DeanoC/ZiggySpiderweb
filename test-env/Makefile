@@ -1,9 +1,9 @@
-# ZiggySpiderweb Test Environment Makefile
+# Spiderweb Test Environment Makefile
 
 .PHONY: help build up down shell test wipe logs status test-embed-multi-service test-distributed-workspace test-distributed-workspace-bootstrap test-distributed-workspace-drift test-distributed-workspace-matrix test-distributed-workspace-encrypted test-distributed-workspace-operator-token test-distributed-soak-chaos test-unified-v2-protocol
 
 help: ## Show this help message
-	@echo "ZiggySpiderweb Test Environment"
+	@echo "Spiderweb Test Environment"
 	@echo ""
 	@echo "Available commands:"
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-15s\033[0m %s\n", $$1, $$2}'
@@ -40,7 +40,7 @@ quick-test: build up ## Build, start, and enter container
 
 install-test: build up ## Test the install script
 	@echo "Testing install script..."
-	@docker exec -it spiderweb-test bash -c "curl -fsSL https://raw.githubusercontent.com/DeanoC/ZiggySpiderweb/main/install.sh | bash"
+	@docker exec -it spiderweb-test bash -c "curl -fsSL https://raw.githubusercontent.com/DeanoC/Spiderweb/main/install.sh | bash"
 
 local-install-test: build up ## Test local install.sh
 	@echo "Testing local install.sh..."

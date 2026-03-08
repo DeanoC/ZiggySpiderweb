@@ -1,6 +1,6 @@
 const std = @import("std");
 const ltm_store = @import("ziggy-memory-store").ltm_store;
-const node_service_catalog = @import("node_service_catalog.zig");
+const venom_catalog = @import("spiderweb_node").venom_catalog;
 
 const persistence_base_id = "spiderweb:control-plane:state";
 const persistence_kind = "control_plane_state_v1";
@@ -22,7 +22,7 @@ const default_platform_os = "unknown";
 const default_platform_arch = "unknown";
 const default_platform_runtime_kind = "unknown";
 const debug_stream_max_bytes: usize = 2 * 1024 * 1024;
-const node_service_event_history_max_default: usize = 1024;
+const node_venom_event_history_max_default: usize = 1024;
 
 const ProjectKind = enum {
     normal,
@@ -133,6 +133,42 @@ pub const SpiderWebMountSpec = struct {
     export_name: []const u8,
 };
 
+pub const PreferredVenomProvider = struct {
+    node_id: []u8,
+    node_name: []u8,
+    venom_id: []u8,
+    endpoint_path: []u8,
+
+    pub fn deinit(self: *PreferredVenomProvider, allocator: std.mem.Allocator) void {
+        allocator.free(self.node_id);
+        allocator.free(self.node_name);
+        allocator.free(self.venom_id);
+        allocator.free(self.endpoint_path);
+        self.* = undefined;
+    }
+};
+
+const PreferredVenomBindingScope = enum {
+    global,
+    project,
+    agent,
+
+    fn fromString(value: []const u8) ?PreferredVenomBindingScope {
+        if (std.mem.eql(u8, value, "global")) return .global;
+        if (std.mem.eql(u8, value, "project")) return .project;
+        if (std.mem.eql(u8, value, "agent")) return .agent;
+        return null;
+    }
+
+    fn asString(self: PreferredVenomBindingScope) []const u8 {
+        return switch (self) {
+            .global => "global",
+            .project => "project",
+            .agent => "agent",
+        };
+    }
+};
+
 const Invite = struct {
     id: []u8,
     token: []u8,
@@ -157,7 +193,7 @@ const Node = struct {
     platform_arch: []u8,
     platform_runtime_kind: []u8,
     labels: std.ArrayListUnmanaged(NodeLabel) = .{},
-    services: std.ArrayListUnmanaged(node_service_catalog.ServiceDescriptor) = .{},
+    venoms: std.ArrayListUnmanaged(venom_catalog.VenomDescriptor) = .{},
     joined_at_ms: i64,
     last_seen_ms: i64,
     lease_expires_at_ms: i64,
@@ -173,29 +209,29 @@ const Node = struct {
         allocator.free(self.platform_runtime_kind);
         for (self.labels.items) |*label| label.deinit(allocator);
         self.labels.deinit(allocator);
-        node_service_catalog.deinitServices(allocator, &self.services);
+        venom_catalog.deinitVenoms(allocator, &self.venoms);
         self.* = undefined;
     }
 };
 
-const NodeServiceDigest = struct {
-    service_id: []u8,
+const NodeVenomDigest = struct {
+    venom_id: []u8,
     version: []u8,
     digest: u64,
 
-    fn deinit(self: *NodeServiceDigest, allocator: std.mem.Allocator) void {
-        allocator.free(self.service_id);
+    fn deinit(self: *NodeVenomDigest, allocator: std.mem.Allocator) void {
+        allocator.free(self.venom_id);
         allocator.free(self.version);
         self.* = undefined;
     }
 };
 
-const NodeServiceEventRecord = struct {
+const NodeVenomEventRecord = struct {
     timestamp_ms: i64,
     node_id: []u8,
     payload_json: []u8,
 
-    fn deinit(self: *NodeServiceEventRecord, allocator: std.mem.Allocator) void {
+    fn deinit(self: *NodeVenomEventRecord, allocator: std.mem.Allocator) void {
         allocator.free(self.node_id);
         allocator.free(self.payload_json);
         self.* = undefined;
@@ -302,7 +338,7 @@ pub const ControlPlane = struct {
     allocator: std.mem.Allocator,
     primary_agent_id: []const u8 = default_primary_agent_id,
     spider_web_root: []const u8 = default_spider_web_root,
-    node_service_event_history_max: usize = node_service_event_history_max_default,
+    node_venom_event_history_max: usize = node_venom_event_history_max_default,
     store: ?*ltm_store.VersionedMemStore = null,
     state_encryption_key: ?[persistence_cipher.key_length]u8 = null,
     mutex: std.Thread.Mutex = .{},
@@ -312,8 +348,9 @@ pub const ControlPlane = struct {
     pending_joins: std.StringHashMapUnmanaged(PendingJoin) = .{},
     projects: std.StringHashMapUnmanaged(Project) = .{},
     active_project_by_agent: std.StringHashMapUnmanaged([]u8) = .{},
+    preferred_venom_provider_by_scope_venom: std.StringHashMapUnmanaged([]u8) = .{},
     debug_stream_by_agent: std.StringHashMapUnmanaged([]u8) = .{},
-    node_service_event_history: std.ArrayListUnmanaged(NodeServiceEventRecord) = .{},
+    node_venom_event_history: std.ArrayListUnmanaged(NodeVenomEventRecord) = .{},
 
     next_invite_id: u64 = 1,
     next_node_id: u64 = 1,
@@ -363,7 +400,7 @@ pub const ControlPlane = struct {
     pub const InitOptions = struct {
         primary_agent_id: []const u8 = default_primary_agent_id,
         spider_web_root: []const u8 = default_spider_web_root,
-        node_service_event_history_max: usize = node_service_event_history_max_default,
+        node_venom_event_history_max: usize = node_venom_event_history_max_default,
     };
 
     pub fn init(allocator: std.mem.Allocator) ControlPlane {
@@ -379,15 +416,15 @@ pub const ControlPlane = struct {
             options.spider_web_root
         else
             default_spider_web_root;
-        const node_service_event_history_max = if (options.node_service_event_history_max == 0)
-            node_service_event_history_max_default
+        const node_venom_event_history_max = if (options.node_venom_event_history_max == 0)
+            node_venom_event_history_max_default
         else
-            options.node_service_event_history_max;
+            options.node_venom_event_history_max;
         var plane: ControlPlane = .{
             .allocator = allocator,
             .primary_agent_id = primary_agent_id,
             .spider_web_root = spider_web_root,
-            .node_service_event_history_max = node_service_event_history_max,
+            .node_venom_event_history_max = node_venom_event_history_max,
         };
         plane.ensureBuiltinProjectBestEffortLocked(std.time.milliTimestamp());
         return plane;
@@ -647,7 +684,7 @@ pub const ControlPlane = struct {
         return true;
     }
 
-    pub fn projectAllowsNodeServiceEvent(
+    pub fn projectAllowsNodeVenomEvent(
         self: *ControlPlane,
         project_id: []const u8,
         agent_id: ?[]const u8,
@@ -724,11 +761,11 @@ pub const ControlPlane = struct {
         return allocator.dupe(u8, "");
     }
 
-    fn appendNodeServiceEventLocked(self: *ControlPlane, node_id: []const u8, payload_json: []const u8) void {
-        while (self.node_service_event_history.items.len >= self.node_service_event_history_max and
-            self.node_service_event_history.items.len > 0)
+    fn appendNodeVenomEventLocked(self: *ControlPlane, node_id: []const u8, payload_json: []const u8) void {
+        while (self.node_venom_event_history.items.len >= self.node_venom_event_history_max and
+            self.node_venom_event_history.items.len > 0)
         {
-            var dropped = self.node_service_event_history.orderedRemove(0);
+            var dropped = self.node_venom_event_history.orderedRemove(0);
             dropped.deinit(self.allocator);
         }
 
@@ -736,7 +773,7 @@ pub const ControlPlane = struct {
         errdefer self.allocator.free(node_copy);
         const payload_copy = self.allocator.dupe(u8, payload_json) catch return;
         errdefer self.allocator.free(payload_copy);
-        self.node_service_event_history.append(self.allocator, .{
+        self.node_venom_event_history.append(self.allocator, .{
             .timestamp_ms = std.time.milliTimestamp(),
             .node_id = node_copy,
             .payload_json = payload_copy,
@@ -746,7 +783,7 @@ pub const ControlPlane = struct {
         };
     }
 
-    pub fn snapshotNodeServiceEvents(
+    pub fn snapshotNodeVenomEvents(
         self: *ControlPlane,
         allocator: std.mem.Allocator,
         project_id: ?[]const u8,
@@ -755,7 +792,7 @@ pub const ControlPlane = struct {
         is_admin: bool,
         replay_limit: usize,
     ) ![]u8 {
-        var snapshot = std.ArrayListUnmanaged(NodeServiceEventRecord){};
+        var snapshot = std.ArrayListUnmanaged(NodeVenomEventRecord){};
         defer {
             for (snapshot.items) |*record| record.deinit(allocator);
             snapshot.deinit(allocator);
@@ -765,7 +802,7 @@ pub const ControlPlane = struct {
             self.mutex.lock();
             defer self.mutex.unlock();
             _ = self.reapExpiredLeasesLocked(std.time.milliTimestamp());
-            for (self.node_service_event_history.items) |record| {
+            for (self.node_venom_event_history.items) |record| {
                 try snapshot.append(allocator, .{
                     .timestamp_ms = record.timestamp_ms,
                     .node_id = try allocator.dupe(u8, record.node_id),
@@ -780,7 +817,7 @@ pub const ControlPlane = struct {
             if (!is_admin) {
                 const visible_project_id = project_id orelse continue;
                 const visible_agent_id = agent_id orelse continue;
-                if (!self.projectAllowsNodeServiceEvent(
+                if (!self.projectAllowsNodeVenomEvent(
                     visible_project_id,
                     visible_agent_id,
                     project_token,
@@ -848,6 +885,14 @@ pub const ControlPlane = struct {
         self.active_project_by_agent.deinit(self.allocator);
         self.active_project_by_agent = .{};
 
+        var preferred_venom_it = self.preferred_venom_provider_by_scope_venom.iterator();
+        while (preferred_venom_it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            self.allocator.free(entry.value_ptr.*);
+        }
+        self.preferred_venom_provider_by_scope_venom.deinit(self.allocator);
+        self.preferred_venom_provider_by_scope_venom = .{};
+
         var debug_it = self.debug_stream_by_agent.iterator();
         while (debug_it.next()) |entry| {
             self.allocator.free(entry.key_ptr.*);
@@ -856,9 +901,9 @@ pub const ControlPlane = struct {
         self.debug_stream_by_agent.deinit(self.allocator);
         self.debug_stream_by_agent = .{};
 
-        for (self.node_service_event_history.items) |*record| record.deinit(self.allocator);
-        self.node_service_event_history.deinit(self.allocator);
-        self.node_service_event_history = .{};
+        for (self.node_venom_event_history.items) |*record| record.deinit(self.allocator);
+        self.node_venom_event_history.deinit(self.allocator);
+        self.node_venom_event_history = .{};
 
         self.invites_created_total = 0;
         self.invites_redeemed_total = 0;
@@ -1119,7 +1164,7 @@ pub const ControlPlane = struct {
         );
     }
 
-    pub fn nodeServiceUpsert(self: *ControlPlane, payload_json: ?[]const u8) ![]u8 {
+    pub fn nodeVenomUpsert(self: *ControlPlane, payload_json: ?[]const u8) ![]u8 {
         self.mutex.lock();
         defer self.mutex.unlock();
         _ = self.reapExpiredLeasesLocked(std.time.milliTimestamp());
@@ -1136,9 +1181,9 @@ pub const ControlPlane = struct {
         const node = self.nodes.getPtr(node_id) orelse return ControlPlaneError.NodeNotFound;
         if (!std.mem.eql(u8, node.secret, node_secret)) return ControlPlaneError.NodeAuthFailed;
 
-        var previous = std.ArrayListUnmanaged(NodeServiceDigest){};
-        defer deinitNodeServiceDigests(self.allocator, &previous);
-        try snapshotNodeServiceDigests(self.allocator, node.services.items, &previous);
+        var previous = std.ArrayListUnmanaged(NodeVenomDigest){};
+        defer deinitNodeVenomDigests(self.allocator, &previous);
+        try snapshotNodeVenomDigests(self.allocator, node.venoms.items, &previous);
 
         if (obj.get("platform")) |platform_value| {
             applyPlatformUpdateFromValue(self.allocator, node, platform_value) catch return ControlPlaneError.InvalidPayload;
@@ -1146,24 +1191,24 @@ pub const ControlPlane = struct {
         if (obj.get("labels")) |labels_value| {
             replaceNodeLabelsFromValue(self.allocator, &node.labels, labels_value) catch return ControlPlaneError.InvalidPayload;
         }
-        if (obj.get("services")) |services_value| {
-            node_service_catalog.replaceServicesFromJsonValue(self.allocator, &node.services, services_value) catch return ControlPlaneError.InvalidPayload;
+        if (obj.get("venoms")) |venoms_value| {
+            venom_catalog.replaceVenomsFromJsonValue(self.allocator, &node.venoms, venoms_value) catch return ControlPlaneError.InvalidPayload;
         }
 
-        var current = std.ArrayListUnmanaged(NodeServiceDigest){};
-        defer deinitNodeServiceDigests(self.allocator, &current);
-        try snapshotNodeServiceDigests(self.allocator, node.services.items, &current);
-        const delta_json = try renderNodeServiceDeltaJson(self.allocator, &previous, &current);
+        var current = std.ArrayListUnmanaged(NodeVenomDigest){};
+        defer deinitNodeVenomDigests(self.allocator, &current);
+        try snapshotNodeVenomDigests(self.allocator, node.venoms.items, &current);
+        const delta_json = try renderNodeVenomDeltaJson(self.allocator, &previous, &current);
         defer self.allocator.free(delta_json);
 
-        const response_payload = try self.renderNodeServicePayload(node_id, delta_json);
+        const response_payload = try self.renderNodeVenomPayload(node_id, delta_json);
         errdefer self.allocator.free(response_payload);
-        self.appendNodeServiceEventLocked(node_id, response_payload);
+        self.appendNodeVenomEventLocked(node_id, response_payload);
         self.persistSnapshotBestEffortLocked();
         return response_payload;
     }
 
-    pub fn nodeServiceGet(self: *ControlPlane, payload_json: ?[]const u8) ![]u8 {
+    pub fn nodeVenomGet(self: *ControlPlane, payload_json: ?[]const u8) ![]u8 {
         self.mutex.lock();
         defer self.mutex.unlock();
         _ = self.reapExpiredLeasesLocked(std.time.milliTimestamp());
@@ -1175,7 +1220,154 @@ pub const ControlPlane = struct {
         const node_id = getRequiredString(obj, "node_id") catch return ControlPlaneError.MissingField;
         try validateIdentifier(node_id, 128);
         _ = self.nodes.get(node_id) orelse return ControlPlaneError.NodeNotFound;
-        return self.renderNodeServicePayload(node_id, null);
+        return self.renderNodeVenomPayload(node_id, null);
+    }
+
+    pub fn resolvePreferredVenomProvider(
+        self: *ControlPlane,
+        allocator: std.mem.Allocator,
+        venom_id: []const u8,
+        preferred_node_names: []const []const u8,
+    ) !?PreferredVenomProvider {
+        return self.resolvePreferredVenomProviderForContext(
+            allocator,
+            venom_id,
+            preferred_node_names,
+            null,
+            null,
+        );
+    }
+
+    pub fn resolvePreferredVenomProviderForContext(
+        self: *ControlPlane,
+        allocator: std.mem.Allocator,
+        venom_id: []const u8,
+        preferred_node_names: []const []const u8,
+        project_id: ?[]const u8,
+        agent_id: ?[]const u8,
+    ) !?PreferredVenomProvider {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        _ = self.reapExpiredLeasesLocked(std.time.milliTimestamp());
+
+        if (venom_id.len == 0) return null;
+
+        if (try self.cloneExplicitPreferredVenomProviderLocked(allocator, venom_id, .agent, agent_id)) |provider| {
+            return provider;
+        }
+        if (try self.cloneExplicitPreferredVenomProviderLocked(allocator, venom_id, .project, project_id)) |provider| {
+            return provider;
+        }
+        if (try self.cloneExplicitPreferredVenomProviderLocked(allocator, venom_id, .global, null)) |provider| {
+            return provider;
+        }
+
+        for (preferred_node_names) |preferred_name| {
+            if (preferred_name.len == 0) continue;
+            if (try self.clonePreferredVenomProviderLocked(allocator, venom_id, preferred_name, true)) |provider| {
+                return provider;
+            }
+        }
+        return try self.clonePreferredVenomProviderLocked(allocator, venom_id, "", false);
+    }
+
+    pub fn resolveExplicitPreferredVenomProvider(
+        self: *ControlPlane,
+        allocator: std.mem.Allocator,
+        venom_id: []const u8,
+    ) !?PreferredVenomProvider {
+        return self.resolveExplicitPreferredVenomProviderForScope(allocator, venom_id, .global, null);
+    }
+
+    fn resolveExplicitPreferredVenomProviderForScope(
+        self: *ControlPlane,
+        allocator: std.mem.Allocator,
+        venom_id: []const u8,
+        scope: PreferredVenomBindingScope,
+        scope_id: ?[]const u8,
+    ) !?PreferredVenomProvider {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        _ = self.reapExpiredLeasesLocked(std.time.milliTimestamp());
+        if (venom_id.len == 0) return null;
+        return try self.cloneExplicitPreferredVenomProviderLocked(allocator, venom_id, scope, scope_id);
+    }
+
+    pub fn bindPreferredVenomProvider(self: *ControlPlane, payload_json: ?[]const u8) ![]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        _ = self.reapExpiredLeasesLocked(std.time.milliTimestamp());
+
+        var payload = try parsePayload(self.allocator, payload_json);
+        defer payload.deinit();
+        const obj = payload.value.object;
+
+        const venom_id = getRequiredString(obj, "venom_id") catch return ControlPlaneError.MissingField;
+        try validateIdentifier(venom_id, 128);
+        const node_id = getOptionalString(obj, "node_id");
+        const scope = PreferredVenomBindingScope.fromString(getOptionalString(obj, "scope") orelse "global") orelse
+            return ControlPlaneError.InvalidPayload;
+        const project_id = getOptionalString(obj, "project_id");
+        const agent_id = getOptionalString(obj, "agent_id");
+        const scope_id = switch (scope) {
+            .global => blk: {
+                if (project_id != null or agent_id != null) return ControlPlaneError.InvalidPayload;
+                break :blk null;
+            },
+            .project => blk: {
+                const project = project_id orelse return ControlPlaneError.MissingField;
+                if (agent_id != null) return ControlPlaneError.InvalidPayload;
+                try validateIdentifier(project, 128);
+                _ = self.projects.get(project) orelse return ControlPlaneError.ProjectNotFound;
+                break :blk project;
+            },
+            .agent => blk: {
+                const agent = agent_id orelse return ControlPlaneError.MissingField;
+                if (project_id != null) return ControlPlaneError.InvalidPayload;
+                try validateIdentifier(agent, 128);
+                break :blk agent;
+            },
+        };
+        const preferred_key = try self.preferredVenomBindingKeyLocked(scope, scope_id, venom_id);
+        defer self.allocator.free(preferred_key);
+
+        if (node_id) |selected_node_id| {
+            try validateIdentifier(selected_node_id, 128);
+            const node = self.nodes.getPtr(selected_node_id) orelse return ControlPlaneError.NodeNotFound;
+            _ = findNodeVenom(node, venom_id) orelse return ControlPlaneError.NodeNotFound;
+
+            const venom_key = try self.allocator.dupe(u8, preferred_key);
+            errdefer self.allocator.free(venom_key);
+            const node_value = try self.allocator.dupe(u8, selected_node_id);
+            errdefer self.allocator.free(node_value);
+            const entry = try self.preferred_venom_provider_by_scope_venom.getOrPut(self.allocator, venom_key);
+            if (entry.found_existing) {
+                self.allocator.free(venom_key);
+                self.allocator.free(entry.value_ptr.*);
+                entry.value_ptr.* = node_value;
+            } else {
+                entry.value_ptr.* = node_value;
+            }
+        } else if (self.preferred_venom_provider_by_scope_venom.fetchRemove(preferred_key)) |removed| {
+            self.allocator.free(removed.key);
+            self.allocator.free(removed.value);
+        }
+
+        const node_json = if (node_id) |value|
+            try std.fmt.allocPrint(self.allocator, "\"{s}\"", .{value})
+        else
+            try self.allocator.dupe(u8, "null");
+        defer self.allocator.free(node_json);
+        const scope_id_json = if (scope_id) |value|
+            try std.fmt.allocPrint(self.allocator, "\"{s}\"", .{value})
+        else
+            try self.allocator.dupe(u8, "null");
+        defer self.allocator.free(scope_id_json);
+        return std.fmt.allocPrint(
+            self.allocator,
+            "{{\"venom_id\":\"{s}\",\"scope\":\"{s}\",\"scope_id\":{s},\"node_id\":{s}}}",
+            .{ venom_id, scope.asString(), scope_id_json, node_json },
+        );
     }
 
     pub fn nodeJoin(self: *ControlPlane, payload_json: ?[]const u8) ![]u8 {
@@ -1250,6 +1442,17 @@ pub const ControlPlane = struct {
         return self.renderNodeJoinPayload(node.id);
     }
 
+    pub fn nodeEnsure(self: *ControlPlane, payload_json: ?[]const u8) ![]u8 {
+        var payload = try parsePayload(self.allocator, payload_json);
+        defer payload.deinit();
+        const obj = payload.value.object;
+
+        const node_name = getRequiredString(obj, "node_name") catch return ControlPlaneError.MissingField;
+        const fs_url = getOptionalString(obj, "fs_url") orelse "";
+        const lease_ttl_ms = getOptionalUnsigned(obj, "lease_ttl_ms", 15 * 60 * 1000) catch return ControlPlaneError.InvalidPayload;
+        return self.ensureNode(node_name, fs_url, lease_ttl_ms);
+    }
+
     pub fn refreshNodeLease(self: *ControlPlane, payload_json: ?[]const u8) ![]u8 {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -1309,7 +1512,7 @@ pub const ControlPlane = struct {
 
         if (node_name.len == 0) return ControlPlaneError.InvalidPayload;
         try validateIdentifier(node_name, 128);
-        try validateFsUrl(fs_url);
+        if (fs_url.len > 0) try validateFsUrl(fs_url);
 
         const now = std.time.milliTimestamp();
         var existing_node: ?*Node = null;
@@ -3030,19 +3233,19 @@ pub const ControlPlane = struct {
         if (actor_is_admin) return true;
 
         const node = self.nodes.get(mount.node_id) orelse return true;
-        var matched_invoke_service = false;
-        for (node.services.items) |service| {
-            if (!serviceHasInvokePath(self.allocator, service)) continue;
-            if (!serviceMountIncludesPath(self.allocator, service, mount.mount_path)) continue;
-            matched_invoke_service = true;
+        var matched_invoke_venom = false;
+        for (node.venoms.items) |venom| {
+            if (!venomHasInvokePath(self.allocator, venom)) continue;
+            if (!venomMountIncludesPath(self.allocator, venom, mount.mount_path)) continue;
+            matched_invoke_venom = true;
             if (!servicePermissionsAllowActor(
                 self.allocator,
-                service.permissions_json,
+                venom.permissions_json,
                 actor_project_token != null,
                 false,
             )) return false;
         }
-        if (!matched_invoke_service) return true;
+        if (!matched_invoke_venom) return true;
         requireProjectActionAccess(&project, .invoke, actor_id, actor_project_token, false) catch return false;
         return true;
     }
@@ -3400,7 +3603,7 @@ pub const ControlPlane = struct {
         );
     }
 
-    fn renderNodeServicePayload(self: *ControlPlane, node_id: []const u8, delta_json: ?[]const u8) ![]u8 {
+    fn renderNodeVenomPayload(self: *ControlPlane, node_id: []const u8, delta_json: ?[]const u8) ![]u8 {
         const node = self.nodes.get(node_id) orelse return ControlPlaneError.NodeNotFound;
         const escaped_id = try jsonEscape(self.allocator, node.id);
         defer self.allocator.free(escaped_id);
@@ -3433,57 +3636,137 @@ pub const ControlPlane = struct {
             defer self.allocator.free(escaped_value);
             try out.writer(self.allocator).print("\"{s}\":\"{s}\"", .{ escaped_key, escaped_value });
         }
-        try out.appendSlice(self.allocator, "},\"services\":[");
-        for (node.services.items, 0..) |service, idx| {
+        try out.appendSlice(self.allocator, "},\"venoms\":[");
+        for (node.venoms.items, 0..) |venom, idx| {
             if (idx != 0) try out.append(self.allocator, ',');
-            try node_service_catalog.appendServiceJson(self.allocator, &out, service);
+            try venom_catalog.appendVenomJson(self.allocator, &out, venom);
         }
         try out.append(self.allocator, ']');
         if (delta_json) |delta| {
-            try out.appendSlice(self.allocator, ",\"service_delta\":");
+            try out.appendSlice(self.allocator, ",\"venom_delta\":");
             try out.appendSlice(self.allocator, delta);
         }
         try out.append(self.allocator, '}');
         return out.toOwnedSlice(self.allocator);
     }
 
-    fn snapshotNodeServiceDigests(
+    fn clonePreferredVenomProviderLocked(
+        self: *ControlPlane,
         allocator: std.mem.Allocator,
-        services: []const node_service_catalog.ServiceDescriptor,
-        out: *std.ArrayListUnmanaged(NodeServiceDigest),
+        venom_id: []const u8,
+        preferred_node_name: []const u8,
+        require_name_match: bool,
+    ) !?PreferredVenomProvider {
+        var selected_node: ?*const Node = null;
+        var selected_venom: ?*const venom_catalog.VenomDescriptor = null;
+
+        var it = self.nodes.valueIterator();
+        while (it.next()) |node| {
+            if (require_name_match and !std.mem.eql(u8, node.name, preferred_node_name)) continue;
+            const venom = findNodeVenom(node, venom_id) orelse continue;
+            if (selected_node == null or std.mem.order(u8, node.id, selected_node.?.id) == .lt) {
+                selected_node = node;
+                selected_venom = venom;
+            }
+        }
+
+        const node = selected_node orelse return null;
+        const venom = selected_venom orelse return null;
+        const endpoint_path = if (venom.endpoints.items.len > 0)
+            venom.endpoints.items[0]
+        else
+            return null;
+
+        return .{
+            .node_id = try allocator.dupe(u8, node.id),
+            .node_name = try allocator.dupe(u8, node.name),
+            .venom_id = try allocator.dupe(u8, venom.venom_id),
+            .endpoint_path = try allocator.dupe(u8, endpoint_path),
+        };
+    }
+
+    fn preferredVenomBindingKeyLocked(
+        self: *ControlPlane,
+        scope: PreferredVenomBindingScope,
+        scope_id: ?[]const u8,
+        venom_id: []const u8,
+    ) ![]u8 {
+        return switch (scope) {
+            .global => std.fmt.allocPrint(self.allocator, "global:{s}", .{venom_id}),
+            .project => std.fmt.allocPrint(self.allocator, "project:{s}:{s}", .{ scope_id orelse "", venom_id }),
+            .agent => std.fmt.allocPrint(self.allocator, "agent:{s}:{s}", .{ scope_id orelse "", venom_id }),
+        };
+    }
+
+    fn cloneExplicitPreferredVenomProviderLocked(
+        self: *ControlPlane,
+        allocator: std.mem.Allocator,
+        venom_id: []const u8,
+        scope: PreferredVenomBindingScope,
+        scope_id: ?[]const u8,
+    ) !?PreferredVenomProvider {
+        const preferred_key = try self.preferredVenomBindingKeyLocked(scope, scope_id, venom_id);
+        defer self.allocator.free(preferred_key);
+        const preferred_node_id = self.preferred_venom_provider_by_scope_venom.get(preferred_key) orelse return null;
+        const node = self.nodes.getPtr(preferred_node_id) orelse return null;
+        const venom = findNodeVenom(node, venom_id) orelse return null;
+        const endpoint_path = if (venom.endpoints.items.len > 0)
+            venom.endpoints.items[0]
+        else
+            return null;
+
+        return .{
+            .node_id = try allocator.dupe(u8, node.id),
+            .node_name = try allocator.dupe(u8, node.name),
+            .venom_id = try allocator.dupe(u8, venom.venom_id),
+            .endpoint_path = try allocator.dupe(u8, endpoint_path),
+        };
+    }
+
+    fn findNodeVenom(node: *const Node, venom_id: []const u8) ?*const venom_catalog.VenomDescriptor {
+        for (node.venoms.items) |*venom| {
+            if (std.mem.eql(u8, venom.venom_id, venom_id)) return venom;
+        }
+        return null;
+    }
+
+    fn snapshotNodeVenomDigests(
+        allocator: std.mem.Allocator,
+        venoms: []const venom_catalog.VenomDescriptor,
+        out: *std.ArrayListUnmanaged(NodeVenomDigest),
     ) !void {
-        for (services) |service| {
-            const service_id = try allocator.dupe(u8, service.service_id);
-            errdefer allocator.free(service_id);
-            const version = try allocator.dupe(u8, service.version);
+        for (venoms) |venom| {
+            const venom_id = try allocator.dupe(u8, venom.venom_id);
+            errdefer allocator.free(venom_id);
+            const version = try allocator.dupe(u8, venom.version);
             errdefer allocator.free(version);
             try out.append(allocator, .{
-                .service_id = service_id,
+                .venom_id = venom_id,
                 .version = version,
-                .digest = node_service_catalog.serviceDigest64(service),
+                .digest = venom_catalog.venomDigest64(venom),
             });
         }
     }
 
-    fn deinitNodeServiceDigests(
+    fn deinitNodeVenomDigests(
         allocator: std.mem.Allocator,
-        digests: *std.ArrayListUnmanaged(NodeServiceDigest),
+        digests: *std.ArrayListUnmanaged(NodeVenomDigest),
     ) void {
         for (digests.items) |*entry| entry.deinit(allocator);
         digests.deinit(allocator);
         digests.* = .{};
     }
 
-    fn renderNodeServiceDeltaJson(
+    fn renderNodeVenomDeltaJson(
         allocator: std.mem.Allocator,
-        previous: *const std.ArrayListUnmanaged(NodeServiceDigest),
-        current: *const std.ArrayListUnmanaged(NodeServiceDigest),
+        previous: *const std.ArrayListUnmanaged(NodeVenomDigest),
+        current: *const std.ArrayListUnmanaged(NodeVenomDigest),
     ) ![]u8 {
         var previous_index = std.StringHashMapUnmanaged(usize){};
         defer previous_index.deinit(allocator);
 
         for (previous.items, 0..) |entry, idx| {
-            try previous_index.put(allocator, entry.service_id, idx);
+            try previous_index.put(allocator, entry.venom_id, idx);
         }
 
         const seen_previous = try allocator.alloc(bool, previous.items.len);
@@ -3492,7 +3775,7 @@ pub const ControlPlane = struct {
 
         var changed = false;
         for (current.items) |entry| {
-            if (previous_index.get(entry.service_id)) |idx| {
+            if (previous_index.get(entry.venom_id)) |idx| {
                 seen_previous[idx] = true;
                 const before = previous.items[idx];
                 if (before.digest != entry.digest) changed = true;
@@ -3517,23 +3800,23 @@ pub const ControlPlane = struct {
         try out.appendSlice(allocator, ",\"added\":[");
         var first_added = true;
         for (current.items) |entry| {
-            if (previous_index.contains(entry.service_id)) continue;
+            if (previous_index.contains(entry.venom_id)) continue;
             if (!first_added) try out.append(allocator, ',');
             first_added = false;
-            try appendNodeServiceDigestJson(allocator, &out, entry.service_id, entry.version, entry.digest);
+            try appendNodeVenomDigestJson(allocator, &out, entry.venom_id, entry.version, entry.digest);
         }
         try out.appendSlice(allocator, "],\"updated\":[");
         var first_updated = true;
         for (current.items) |entry| {
-            const prev_idx = previous_index.get(entry.service_id) orelse continue;
+            const prev_idx = previous_index.get(entry.venom_id) orelse continue;
             const before = previous.items[prev_idx];
             if (before.digest == entry.digest) continue;
             if (!first_updated) try out.append(allocator, ',');
             first_updated = false;
-            try appendNodeServiceUpdateJson(
+            try appendNodeVenomUpdateJson(
                 allocator,
                 &out,
-                entry.service_id,
+                entry.venom_id,
                 entry.version,
                 entry.digest,
                 before.version,
@@ -3546,47 +3829,47 @@ pub const ControlPlane = struct {
             if (seen_previous[idx]) continue;
             if (!first_removed) try out.append(allocator, ',');
             first_removed = false;
-            try appendNodeServiceDigestJson(allocator, &out, entry.service_id, entry.version, entry.digest);
+            try appendNodeVenomDigestJson(allocator, &out, entry.venom_id, entry.version, entry.digest);
         }
         try out.appendSlice(allocator, "]}");
         return out.toOwnedSlice(allocator);
     }
 
-    fn appendNodeServiceDigestJson(
+    fn appendNodeVenomDigestJson(
         allocator: std.mem.Allocator,
         out: *std.ArrayListUnmanaged(u8),
-        service_id: []const u8,
+        venom_id: []const u8,
         version: []const u8,
         digest: u64,
     ) !void {
-        const escaped_service = try jsonEscape(allocator, service_id);
-        defer allocator.free(escaped_service);
+        const escaped_venom = try jsonEscape(allocator, venom_id);
+        defer allocator.free(escaped_venom);
         const escaped_version = try jsonEscape(allocator, version);
         defer allocator.free(escaped_version);
         try out.writer(allocator).print(
-            "{{\"service_id\":\"{s}\",\"version\":\"{s}\",\"hash\":\"0x{x:0>16}\"}}",
-            .{ escaped_service, escaped_version, digest },
+            "{{\"venom_id\":\"{s}\",\"version\":\"{s}\",\"hash\":\"0x{x:0>16}\"}}",
+            .{ escaped_venom, escaped_version, digest },
         );
     }
 
-    fn appendNodeServiceUpdateJson(
+    fn appendNodeVenomUpdateJson(
         allocator: std.mem.Allocator,
         out: *std.ArrayListUnmanaged(u8),
-        service_id: []const u8,
+        venom_id: []const u8,
         version: []const u8,
         digest: u64,
         previous_version: []const u8,
         previous_digest: u64,
     ) !void {
-        const escaped_service = try jsonEscape(allocator, service_id);
-        defer allocator.free(escaped_service);
+        const escaped_venom = try jsonEscape(allocator, venom_id);
+        defer allocator.free(escaped_venom);
         const escaped_version = try jsonEscape(allocator, version);
         defer allocator.free(escaped_version);
         const escaped_previous_version = try jsonEscape(allocator, previous_version);
         defer allocator.free(escaped_previous_version);
         try out.writer(allocator).print(
-            "{{\"service_id\":\"{s}\",\"version\":\"{s}\",\"hash\":\"0x{x:0>16}\",\"previous_version\":\"{s}\",\"previous_hash\":\"0x{x:0>16}\"}}",
-            .{ escaped_service, escaped_version, digest, escaped_previous_version, previous_digest },
+            "{{\"venom_id\":\"{s}\",\"version\":\"{s}\",\"hash\":\"0x{x:0>16}\",\"previous_version\":\"{s}\",\"previous_hash\":\"0x{x:0>16}\"}}",
+            .{ escaped_venom, escaped_version, digest, escaped_previous_version, previous_digest },
         );
     }
 
@@ -3731,9 +4014,9 @@ pub const ControlPlane = struct {
                 try out.writer(self.allocator).print("\"{s}\":\"{s}\"", .{ escaped_key, escaped_value });
             }
             try out.appendSlice(self.allocator, "},\"services\":[");
-            for (node.services.items, 0..) |service, idx| {
+            for (node.venoms.items, 0..) |venom, idx| {
                 if (idx != 0) try out.append(self.allocator, ',');
-                try node_service_catalog.appendServiceJson(self.allocator, &out, service);
+                try venom_catalog.appendVenomJson(self.allocator, &out, venom);
             }
             try out.writer(self.allocator).print(
                 "],\"joined_at_ms\":{d},\"last_seen_ms\":{d},\"lease_expires_at_ms\":{d}}}",
@@ -3960,7 +4243,7 @@ pub const ControlPlane = struct {
                     replaceNodeLabelsFromValue(self.allocator, &node.labels, labels_val) catch return error.InvalidSnapshot;
                 }
                 if (item.object.get("services")) |services_val| {
-                    node_service_catalog.replaceServicesFromJsonValue(self.allocator, &node.services, services_val) catch return error.InvalidSnapshot;
+                    venom_catalog.replaceVenomsFromJsonValue(self.allocator, &node.venoms, services_val) catch return error.InvalidSnapshot;
                 }
                 if (self.nodes.contains(node.id)) return error.InvalidSnapshot;
                 try self.nodes.put(self.allocator, node.id, node);
@@ -4348,7 +4631,7 @@ fn appendNodeJson(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8)
             escaped_platform_os,
             escaped_platform_arch,
             escaped_platform_runtime,
-            node.services.items.len,
+            node.venoms.items.len,
             node.joined_at_ms,
             node.last_seen_ms,
             node.lease_expires_at_ms,
@@ -4431,8 +4714,8 @@ fn hashMountAvailabilityItem(mount: ProjectMount, state_rank: u8) u64 {
     return hasher.final();
 }
 
-fn serviceHasInvokePath(allocator: std.mem.Allocator, service: node_service_catalog.ServiceDescriptor) bool {
-    var caps_parsed = std.json.parseFromSlice(std.json.Value, allocator, service.capabilities_json, .{}) catch null;
+fn venomHasInvokePath(allocator: std.mem.Allocator, venom: venom_catalog.VenomDescriptor) bool {
+    var caps_parsed = std.json.parseFromSlice(std.json.Value, allocator, venom.capabilities_json, .{}) catch null;
     if (caps_parsed) |*parsed| {
         defer parsed.deinit();
         if (parsed.value == .object) {
@@ -4442,7 +4725,7 @@ fn serviceHasInvokePath(allocator: std.mem.Allocator, service: node_service_cata
         }
     }
 
-    var ops_parsed = std.json.parseFromSlice(std.json.Value, allocator, service.ops_json, .{}) catch null;
+    var ops_parsed = std.json.parseFromSlice(std.json.Value, allocator, venom.ops_json, .{}) catch null;
     if (ops_parsed) |*parsed| {
         defer parsed.deinit();
         if (parsed.value == .object) {
@@ -4461,12 +4744,12 @@ fn serviceHasInvokePath(allocator: std.mem.Allocator, service: node_service_cata
     return false;
 }
 
-fn serviceMountIncludesPath(
+fn venomMountIncludesPath(
     allocator: std.mem.Allocator,
-    service: node_service_catalog.ServiceDescriptor,
+    venom: venom_catalog.VenomDescriptor,
     mount_path: []const u8,
 ) bool {
-    var mounts_parsed = std.json.parseFromSlice(std.json.Value, allocator, service.mounts_json, .{}) catch null;
+    var mounts_parsed = std.json.parseFromSlice(std.json.Value, allocator, venom.mounts_json, .{}) catch null;
     if (mounts_parsed) |*parsed| {
         defer parsed.deinit();
         if (parsed.value == .array) {
@@ -4479,7 +4762,7 @@ fn serviceMountIncludesPath(
         }
     }
 
-    for (service.endpoints.items) |endpoint| {
+    for (venom.endpoints.items) |endpoint| {
         if (std.mem.eql(u8, endpoint, mount_path)) return true;
     }
     return false;
@@ -5859,8 +6142,8 @@ test "fs_control_plane: access policy enforces action modes and per-agent overri
     defer allocator.free(mounted_req);
     const mounted_json = try plane.setProjectMount(mounted_req);
     defer allocator.free(mounted_json);
-    try std.testing.expect(plane.projectAllowsNodeServiceEvent(project_id, "bob", null, node_id, false));
-    try std.testing.expect(!plane.projectAllowsNodeServiceEvent(project_id, "alice", null, node_id, false));
+    try std.testing.expect(plane.projectAllowsNodeVenomEvent(project_id, "bob", null, node_id, false));
+    try std.testing.expect(!plane.projectAllowsNodeVenomEvent(project_id, "alice", null, node_id, false));
 
     const rotate_req = try std.fmt.allocPrint(allocator, "{{\"project_id\":\"{s}\"}}", .{project_id});
     defer allocator.free(rotate_req);
@@ -5875,8 +6158,8 @@ test "fs_control_plane: access policy enforces action modes and per-agent overri
     try std.testing.expect(!plane.projectAllowsAction(project_id, "bob", .observe, null, false));
     try std.testing.expect(plane.projectAllowsAction(project_id, "bob", .observe, project_token, false));
     try std.testing.expect(!plane.projectAllowsAction(project_id, "alice", .mount, project_token, false));
-    try std.testing.expect(plane.projectAllowsNodeServiceEvent(project_id, "bob", project_token, node_id, false));
-    try std.testing.expect(!plane.projectAllowsNodeServiceEvent(project_id, "bob", null, node_id, false));
+    try std.testing.expect(plane.projectAllowsNodeVenomEvent(project_id, "bob", project_token, node_id, false));
+    try std.testing.expect(!plane.projectAllowsNodeVenomEvent(project_id, "bob", null, node_id, false));
 }
 
 test "fs_control_plane: access policy action matrix honors token admin and per-agent override" {
@@ -5938,9 +6221,9 @@ test "fs_control_plane: workspace status filters invoke service mounts when invo
     defer allocator.free(escaped_node_secret);
     const upsert_req = try std.fmt.allocPrint(
         allocator,
-        "{{\"node_id\":\"{s}\",\"node_secret\":\"{s}\",\"services\":[" ++
-            "{{\"service_id\":\"fs-main\",\"kind\":\"fs\",\"version\":\"1\",\"state\":\"online\",\"endpoints\":[\"/nodes/{s}/fs\"],\"capabilities\":{{\"rw\":true}},\"mounts\":[{{\"mount_id\":\"fs-main\",\"mount_path\":\"/nodes/{s}/fs\",\"state\":\"online\"}}],\"ops\":{{\"model\":\"namespace\"}},\"runtime\":{{\"type\":\"native_proc\"}},\"permissions\":{{\"default\":\"allow-by-default\",\"allow_roles\":[\"user\"]}},\"schema\":{{\"model\":\"namespace-service-v1\"}}}}," ++
-            "{{\"service_id\":\"tool-main\",\"kind\":\"tool\",\"version\":\"1\",\"state\":\"online\",\"endpoints\":[\"/nodes/{s}/tool/main\"],\"capabilities\":{{\"invoke\":true}},\"mounts\":[{{\"mount_id\":\"tool-main\",\"mount_path\":\"/nodes/{s}/tool/main\",\"state\":\"online\"}}],\"ops\":{{\"model\":\"namespace\",\"invoke\":\"control/invoke.json\"}},\"runtime\":{{\"type\":\"native_proc\"}},\"permissions\":{{\"default\":\"allow-by-default\",\"allow_roles\":[\"user\"]}},\"schema\":{{\"model\":\"namespace-service-v1\"}}}}" ++
+        "{{\"node_id\":\"{s}\",\"node_secret\":\"{s}\",\"venoms\":[" ++
+            "{{\"venom_id\":\"fs-main\",\"kind\":\"fs\",\"version\":\"1\",\"state\":\"online\",\"endpoints\":[\"/nodes/{s}/fs\"],\"capabilities\":{{\"rw\":true}},\"mounts\":[{{\"mount_id\":\"fs-main\",\"mount_path\":\"/nodes/{s}/fs\",\"state\":\"online\"}}],\"ops\":{{\"model\":\"namespace\"}},\"runtime\":{{\"type\":\"native_proc\"}},\"permissions\":{{\"default\":\"allow-by-default\",\"allow_roles\":[\"user\"]}},\"schema\":{{\"model\":\"namespace-service-v1\"}}}}," ++
+            "{{\"venom_id\":\"tool-main\",\"kind\":\"tool\",\"version\":\"1\",\"state\":\"online\",\"endpoints\":[\"/nodes/{s}/tool/main\"],\"capabilities\":{{\"invoke\":true}},\"mounts\":[{{\"mount_id\":\"tool-main\",\"mount_path\":\"/nodes/{s}/tool/main\",\"state\":\"online\"}}],\"ops\":{{\"model\":\"namespace\",\"invoke\":\"control/invoke.json\"}},\"runtime\":{{\"type\":\"native_proc\"}},\"permissions\":{{\"default\":\"allow-by-default\",\"allow_roles\":[\"user\"]}},\"schema\":{{\"model\":\"namespace-service-v1\"}}}}" ++
             "]}}",
         .{
             escaped_node_id,
@@ -5952,7 +6235,7 @@ test "fs_control_plane: workspace status filters invoke service mounts when invo
         },
     );
     defer allocator.free(upsert_req);
-    const upserted = try plane.nodeServiceUpsert(upsert_req);
+    const upserted = try plane.nodeVenomUpsert(upsert_req);
     defer allocator.free(upserted);
 
     const project_json = try plane.createProject(
@@ -6631,7 +6914,7 @@ test "fs_control_plane: pending join request list approve and deny flow works" {
     );
 }
 
-test "fs_control_plane: node service upsert and get stores catalog metadata" {
+test "fs_control_plane: node venom upsert and get stores catalog metadata" {
     const allocator = std.testing.allocator;
     var plane = ControlPlane.init(allocator);
     defer plane.deinit();
@@ -6657,30 +6940,30 @@ test "fs_control_plane: node service upsert and get stores catalog metadata" {
 
     const upsert_req = try std.fmt.allocPrint(
         allocator,
-        "{{\"node_id\":\"{s}\",\"node_secret\":\"{s}\",\"platform\":{{\"os\":\"linux\",\"arch\":\"amd64\",\"runtime_kind\":\"native\"}},\"labels\":{{\"site\":\"home-lab\",\"tier\":\"edge\"}},\"services\":[{{\"service_id\":\"camera\",\"kind\":\"camera\",\"version\":\"1\",\"state\":\"online\",\"endpoints\":[\"/nodes/svc-node/camera\"],\"capabilities\":{{\"still\":true}}}},{{\"service_id\":\"terminal\",\"kind\":\"terminal\",\"version\":\"1\",\"state\":\"degraded\",\"endpoints\":[\"/nodes/svc-node/terminal/1\"],\"capabilities\":{{\"pty\":true}}}}]}}",
+        "{{\"node_id\":\"{s}\",\"node_secret\":\"{s}\",\"platform\":{{\"os\":\"linux\",\"arch\":\"amd64\",\"runtime_kind\":\"native\"}},\"labels\":{{\"site\":\"home-lab\",\"tier\":\"edge\"}},\"venoms\":[{{\"venom_id\":\"camera\",\"kind\":\"camera\",\"version\":\"1\",\"state\":\"online\",\"endpoints\":[\"/nodes/svc-node/camera\"],\"capabilities\":{{\"still\":true}}}},{{\"venom_id\":\"terminal\",\"kind\":\"terminal\",\"version\":\"1\",\"state\":\"degraded\",\"endpoints\":[\"/nodes/svc-node/terminal/1\"],\"capabilities\":{{\"pty\":true}}}}]}}",
         .{ node_id, node_secret },
     );
     defer allocator.free(upsert_req);
-    const upserted = try plane.nodeServiceUpsert(upsert_req);
+    const upserted = try plane.nodeVenomUpsert(upsert_req);
     defer allocator.free(upserted);
-    try std.testing.expect(std.mem.indexOf(u8, upserted, "\"service_id\":\"camera\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, upserted, "\"venom_id\":\"camera\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, upserted, "\"site\":\"home-lab\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, upserted, "\"service_delta\":{\"changed\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, upserted, "\"venom_delta\":{\"changed\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, upserted, "\"added\":[") != null);
     try std.testing.expect(std.mem.indexOf(u8, upserted, "\"updated\":[") != null);
     try std.testing.expect(std.mem.indexOf(u8, upserted, "\"removed\":[") != null);
 
     const get_req = try std.fmt.allocPrint(allocator, "{{\"node_id\":\"{s}\"}}", .{node_id});
     defer allocator.free(get_req);
-    const fetched = try plane.nodeServiceGet(get_req);
+    const fetched = try plane.nodeVenomGet(get_req);
     defer allocator.free(fetched);
     try std.testing.expect(std.mem.indexOf(u8, fetched, "\"runtime_kind\":\"native\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, fetched, "\"service_id\":\"terminal\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fetched, "\"venom_id\":\"terminal\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, fetched, "\"state\":\"degraded\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, fetched, "\"service_delta\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, fetched, "\"venom_delta\"") == null);
 }
 
-test "fs_control_plane: node service upsert reports unchanged catalog delta" {
+test "fs_control_plane: node venom upsert reports unchanged catalog delta" {
     const allocator = std.testing.allocator;
     var plane = ControlPlane.init(allocator);
     defer plane.deinit();
@@ -6706,27 +6989,27 @@ test "fs_control_plane: node service upsert reports unchanged catalog delta" {
 
     const upsert_req = try std.fmt.allocPrint(
         allocator,
-        "{{\"node_id\":\"{s}\",\"node_secret\":\"{s}\",\"services\":[{{\"service_id\":\"camera\",\"kind\":\"camera\",\"version\":\"1\",\"state\":\"online\",\"endpoints\":[\"/nodes/svc-node/camera\"],\"capabilities\":{{\"still\":true}}}}]}}",
+        "{{\"node_id\":\"{s}\",\"node_secret\":\"{s}\",\"venoms\":[{{\"venom_id\":\"camera\",\"kind\":\"camera\",\"version\":\"1\",\"state\":\"online\",\"endpoints\":[\"/nodes/svc-node/camera\"],\"capabilities\":{{\"still\":true}}}}]}}",
         .{ node_id, node_secret },
     );
     defer allocator.free(upsert_req);
 
-    const first = try plane.nodeServiceUpsert(upsert_req);
+    const first = try plane.nodeVenomUpsert(upsert_req);
     defer allocator.free(first);
-    try std.testing.expect(std.mem.indexOf(u8, first, "\"service_delta\":{\"changed\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "\"venom_delta\":{\"changed\":true") != null);
 
-    const second = try plane.nodeServiceUpsert(upsert_req);
+    const second = try plane.nodeVenomUpsert(upsert_req);
     defer allocator.free(second);
-    try std.testing.expect(std.mem.indexOf(u8, second, "\"service_delta\":{\"changed\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, second, "\"venom_delta\":{\"changed\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, second, "\"added\":[]") != null);
     try std.testing.expect(std.mem.indexOf(u8, second, "\"updated\":[]") != null);
     try std.testing.expect(std.mem.indexOf(u8, second, "\"removed\":[]") != null);
 }
 
-test "fs_control_plane: node service event retention honors configured history max" {
+test "fs_control_plane: node venom event retention honors configured history max" {
     const allocator = std.testing.allocator;
     var plane = ControlPlane.initWithOptions(allocator, .{
-        .node_service_event_history_max = 2,
+        .node_venom_event_history_max = 2,
     });
     defer plane.deinit();
 
@@ -6740,15 +7023,15 @@ test "fs_control_plane: node service event retention honors configured history m
     inline for (0..3) |idx| {
         const upsert_req = try std.fmt.allocPrint(
             allocator,
-            "{{\"node_id\":\"{s}\",\"node_secret\":\"{s}\",\"services\":[{{\"service_id\":\"terminal-main\",\"kind\":\"terminal\",\"version\":\"{d}\",\"state\":\"online\",\"endpoints\":[\"/nodes/{s}/terminal/main\"],\"capabilities\":{{\"pty\":true}}}}]}}",
+            "{{\"node_id\":\"{s}\",\"node_secret\":\"{s}\",\"venoms\":[{{\"venom_id\":\"terminal-main\",\"kind\":\"terminal\",\"version\":\"{d}\",\"state\":\"online\",\"endpoints\":[\"/nodes/{s}/terminal/main\"],\"capabilities\":{{\"pty\":true}}}}]}}",
             .{ node_id, node_secret, idx, node_id },
         );
         defer allocator.free(upsert_req);
-        const upserted = try plane.nodeServiceUpsert(upsert_req);
+        const upserted = try plane.nodeVenomUpsert(upsert_req);
         defer allocator.free(upserted);
     }
 
-    const snapshot = try plane.snapshotNodeServiceEvents(allocator, null, null, null, true, 0);
+    const snapshot = try plane.snapshotNodeVenomEvents(allocator, null, null, null, true, 0);
     defer allocator.free(snapshot);
 
     const line_count: usize = if (snapshot.len == 0) 0 else std.mem.count(u8, snapshot, "\n") + 1;
@@ -6756,6 +7039,181 @@ test "fs_control_plane: node service event retention honors configured history m
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"version\":\"2\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"version\":\"1\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"version\":\"0\"") == null);
+}
+
+test "fs_control_plane: preferred venom provider favors spiderweb-local by node name" {
+    const allocator = std.testing.allocator;
+    var plane = ControlPlane.init(allocator);
+    defer plane.deinit();
+
+    const local_joined = try plane.ensureNode("spiderweb-local", "ws://127.0.0.1:18891/v2/fs", 60_000);
+    defer allocator.free(local_joined);
+    var local_parsed = try std.json.parseFromSlice(std.json.Value, allocator, local_joined, .{});
+    defer local_parsed.deinit();
+    const local_node_id = local_parsed.value.object.get("node_id").?.string;
+    const local_node_secret = local_parsed.value.object.get("node_secret").?.string;
+
+    const remote_joined = try plane.ensureNode("edge-remote", "ws://127.0.0.1:28891/v2/fs", 60_000);
+    defer allocator.free(remote_joined);
+    var remote_parsed = try std.json.parseFromSlice(std.json.Value, allocator, remote_joined, .{});
+    defer remote_parsed.deinit();
+    const remote_node_id = remote_parsed.value.object.get("node_id").?.string;
+    const remote_node_secret = remote_parsed.value.object.get("node_secret").?.string;
+
+    const local_upsert_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"node_id\":\"{s}\",\"node_secret\":\"{s}\",\"venoms\":[{{\"venom_id\":\"fs\",\"kind\":\"fs\",\"version\":\"1\",\"state\":\"online\",\"endpoints\":[\"/nodes/{s}/fs\"],\"capabilities\":{{\"rw\":true}},\"mounts\":[{{\"mount_id\":\"fs\",\"mount_path\":\"/nodes/{s}/fs\",\"state\":\"online\"}}],\"ops\":{{\"model\":\"namespace\"}},\"runtime\":{{\"type\":\"builtin\",\"abi\":\"venom-driver-v1\"}},\"permissions\":{{\"default\":\"deny-by-default\",\"allow_roles\":[\"admin\",\"user\"]}},\"schema\":{{\"model\":\"namespace-mount\"}}}}]}}",
+        .{ local_node_id, local_node_secret, local_node_id, local_node_id },
+    );
+    defer allocator.free(local_upsert_req);
+    const local_upserted = try plane.nodeVenomUpsert(local_upsert_req);
+    defer allocator.free(local_upserted);
+
+    const remote_upsert_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"node_id\":\"{s}\",\"node_secret\":\"{s}\",\"venoms\":[{{\"venom_id\":\"fs\",\"kind\":\"fs\",\"version\":\"1\",\"state\":\"online\",\"endpoints\":[\"/nodes/{s}/fs\"],\"capabilities\":{{\"rw\":true}},\"mounts\":[{{\"mount_id\":\"fs\",\"mount_path\":\"/nodes/{s}/fs\",\"state\":\"online\"}}],\"ops\":{{\"model\":\"namespace\"}},\"runtime\":{{\"type\":\"builtin\",\"abi\":\"venom-driver-v1\"}},\"permissions\":{{\"default\":\"deny-by-default\",\"allow_roles\":[\"admin\",\"user\"]}},\"schema\":{{\"model\":\"namespace-mount\"}}}}]}}",
+        .{ remote_node_id, remote_node_secret, remote_node_id, remote_node_id },
+    );
+    defer allocator.free(remote_upsert_req);
+    const remote_upserted = try plane.nodeVenomUpsert(remote_upsert_req);
+    defer allocator.free(remote_upserted);
+
+    var provider = (try plane.resolvePreferredVenomProvider(allocator, "fs", &.{ "spiderweb-local", "local" })) orelse return error.TestExpectedResponse;
+    defer provider.deinit(allocator);
+    const expected_endpoint = try std.fmt.allocPrint(allocator, "/nodes/{s}/fs", .{local_node_id});
+    defer allocator.free(expected_endpoint);
+
+    try std.testing.expectEqualStrings(local_node_id, provider.node_id);
+    try std.testing.expectEqualStrings("spiderweb-local", provider.node_name);
+    try std.testing.expectEqualStrings("fs", provider.venom_id);
+    try std.testing.expectEqualStrings(expected_endpoint, provider.endpoint_path);
+}
+
+test "fs_control_plane: explicit venom bind overrides heuristic provider selection" {
+    const allocator = std.testing.allocator;
+    var plane = ControlPlane.init(allocator);
+    defer plane.deinit();
+
+    const local_joined = try plane.ensureNode("spiderweb-local", "ws://127.0.0.1:18891/v2/fs", 60_000);
+    defer allocator.free(local_joined);
+    var local_parsed = try std.json.parseFromSlice(std.json.Value, allocator, local_joined, .{});
+    defer local_parsed.deinit();
+    const local_node_id = local_parsed.value.object.get("node_id").?.string;
+    const local_node_secret = local_parsed.value.object.get("node_secret").?.string;
+
+    const app_joined = try plane.ensureNode("spiderapp-default", "", 60_000);
+    defer allocator.free(app_joined);
+    var app_parsed = try std.json.parseFromSlice(std.json.Value, allocator, app_joined, .{});
+    defer app_parsed.deinit();
+    const app_node_id = app_parsed.value.object.get("node_id").?.string;
+    const app_node_secret = app_parsed.value.object.get("node_secret").?.string;
+
+    const local_upsert_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"node_id\":\"{s}\",\"node_secret\":\"{s}\",\"venoms\":[{{\"venom_id\":\"chat\",\"kind\":\"chat\",\"version\":\"1\",\"state\":\"online\",\"endpoints\":[\"/nodes/{s}/chat\"],\"capabilities\":{{\"invoke\":true}},\"mounts\":[{{\"mount_id\":\"chat\",\"mount_path\":\"/nodes/{s}/chat\",\"state\":\"online\"}}],\"ops\":{{\"model\":\"namespace\",\"invoke\":\"control/input\"}},\"runtime\":{{\"type\":\"builtin\",\"abi\":\"venom-driver-v1\"}},\"permissions\":{{\"default\":\"deny-by-default\",\"allow_roles\":[\"admin\",\"user\"]}},\"schema\":{{\"model\":\"namespace-chat-v1\"}}}}]}}",
+        .{ local_node_id, local_node_secret, local_node_id, local_node_id },
+    );
+    defer allocator.free(local_upsert_req);
+    _ = try plane.nodeVenomUpsert(local_upsert_req);
+
+    const app_upsert_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"node_id\":\"{s}\",\"node_secret\":\"{s}\",\"venoms\":[{{\"venom_id\":\"chat\",\"kind\":\"chat\",\"version\":\"1\",\"state\":\"online\",\"endpoints\":[\"/nodes/{s}/chat\"],\"capabilities\":{{\"invoke\":true}},\"mounts\":[{{\"mount_id\":\"chat\",\"mount_path\":\"/nodes/{s}/chat\",\"state\":\"online\"}}],\"ops\":{{\"model\":\"namespace\",\"invoke\":\"control/input\"}},\"runtime\":{{\"type\":\"builtin\",\"abi\":\"venom-driver-v1\"}},\"permissions\":{{\"default\":\"deny-by-default\",\"allow_roles\":[\"admin\",\"user\"]}},\"schema\":{{\"model\":\"namespace-chat-v1\"}}}}]}}",
+        .{ app_node_id, app_node_secret, app_node_id, app_node_id },
+    );
+    defer allocator.free(app_upsert_req);
+    _ = try plane.nodeVenomUpsert(app_upsert_req);
+
+    const bind_req = try std.fmt.allocPrint(allocator, "{{\"venom_id\":\"chat\",\"node_id\":\"{s}\"}}", .{app_node_id});
+    defer allocator.free(bind_req);
+    const bind_json = try plane.bindPreferredVenomProvider(bind_req);
+    defer allocator.free(bind_json);
+    try std.testing.expect(std.mem.indexOf(u8, bind_json, app_node_id) != null);
+
+    var provider = (try plane.resolvePreferredVenomProvider(allocator, "chat", &.{ "spiderweb-local", "local" })) orelse return error.TestExpectedResponse;
+    defer provider.deinit(allocator);
+    try std.testing.expectEqualStrings(app_node_id, provider.node_id);
+    try std.testing.expectEqualStrings("spiderapp-default", provider.node_name);
+}
+
+test "fs_control_plane: scoped venom binds resolve agent before project before global" {
+    const allocator = std.testing.allocator;
+    var plane = ControlPlane.init(allocator);
+    defer plane.deinit();
+
+    const local_joined = try plane.ensureNode("spiderweb-local", "ws://127.0.0.1:18891/v2/fs", 60_000);
+    defer allocator.free(local_joined);
+    var local_parsed = try std.json.parseFromSlice(std.json.Value, allocator, local_joined, .{});
+    defer local_parsed.deinit();
+    const local_node_id = local_parsed.value.object.get("node_id").?.string;
+    const local_node_secret = local_parsed.value.object.get("node_secret").?.string;
+
+    const app_joined = try plane.ensureNode("spiderapp-default", "", 60_000);
+    defer allocator.free(app_joined);
+    var app_parsed = try std.json.parseFromSlice(std.json.Value, allocator, app_joined, .{});
+    defer app_parsed.deinit();
+    const app_node_id = app_parsed.value.object.get("node_id").?.string;
+    const app_node_secret = app_parsed.value.object.get("node_secret").?.string;
+
+    const local_upsert_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"node_id\":\"{s}\",\"node_secret\":\"{s}\",\"venoms\":[{{\"venom_id\":\"chat\",\"kind\":\"chat\",\"version\":\"1\",\"state\":\"online\",\"endpoints\":[\"/nodes/{s}/chat\"],\"capabilities\":{{\"invoke\":true}},\"mounts\":[{{\"mount_id\":\"chat\",\"mount_path\":\"/nodes/{s}/chat\",\"state\":\"online\"}}],\"ops\":{{\"model\":\"namespace\",\"invoke\":\"control/input\"}},\"runtime\":{{\"type\":\"builtin\",\"abi\":\"venom-driver-v1\"}},\"permissions\":{{\"default\":\"deny-by-default\",\"allow_roles\":[\"admin\",\"user\"]}},\"schema\":{{\"model\":\"namespace-chat-v1\"}}}}]}}",
+        .{ local_node_id, local_node_secret, local_node_id, local_node_id },
+    );
+    defer allocator.free(local_upsert_req);
+    _ = try plane.nodeVenomUpsert(local_upsert_req);
+
+    const app_upsert_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"node_id\":\"{s}\",\"node_secret\":\"{s}\",\"venoms\":[{{\"venom_id\":\"chat\",\"kind\":\"chat\",\"version\":\"1\",\"state\":\"online\",\"endpoints\":[\"/nodes/{s}/chat\"],\"capabilities\":{{\"invoke\":true}},\"mounts\":[{{\"mount_id\":\"chat\",\"mount_path\":\"/nodes/{s}/chat\",\"state\":\"online\"}}],\"ops\":{{\"model\":\"namespace\",\"invoke\":\"control/input\"}},\"runtime\":{{\"type\":\"builtin\",\"abi\":\"venom-driver-v1\"}},\"permissions\":{{\"default\":\"deny-by-default\",\"allow_roles\":[\"admin\",\"user\"]}},\"schema\":{{\"model\":\"namespace-chat-v1\"}}}}]}}",
+        .{ app_node_id, app_node_secret, app_node_id, app_node_id },
+    );
+    defer allocator.free(app_upsert_req);
+    _ = try plane.nodeVenomUpsert(app_upsert_req);
+
+    const bind_global = try std.fmt.allocPrint(allocator, "{{\"venom_id\":\"chat\",\"scope\":\"global\",\"node_id\":\"{s}\"}}", .{local_node_id});
+    defer allocator.free(bind_global);
+    _ = try plane.bindPreferredVenomProvider(bind_global);
+
+    const bind_project = try std.fmt.allocPrint(allocator, "{{\"venom_id\":\"chat\",\"scope\":\"project\",\"project_id\":\"{s}\",\"node_id\":\"{s}\"}}", .{ spider_web_project_id, app_node_id });
+    defer allocator.free(bind_project);
+    _ = try plane.bindPreferredVenomProvider(bind_project);
+
+    const bind_agent = try std.fmt.allocPrint(allocator, "{{\"venom_id\":\"chat\",\"scope\":\"agent\",\"agent_id\":\"alice\",\"node_id\":\"{s}\"}}", .{local_node_id});
+    defer allocator.free(bind_agent);
+    _ = try plane.bindPreferredVenomProvider(bind_agent);
+
+    var project_provider = (try plane.resolvePreferredVenomProviderForContext(
+        allocator,
+        "chat",
+        &.{ "spiderweb-local", "local" },
+        spider_web_project_id,
+        null,
+    )) orelse return error.TestExpectedResponse;
+    defer project_provider.deinit(allocator);
+    try std.testing.expectEqualStrings(app_node_id, project_provider.node_id);
+
+    var agent_provider = (try plane.resolvePreferredVenomProviderForContext(
+        allocator,
+        "chat",
+        &.{ "spiderweb-local", "local" },
+        spider_web_project_id,
+        "alice",
+    )) orelse return error.TestExpectedResponse;
+    defer agent_provider.deinit(allocator);
+    try std.testing.expectEqualStrings(local_node_id, agent_provider.node_id);
+}
+
+test "fs_control_plane: node ensure allows empty fs_url for app-local nodes" {
+    const allocator = std.testing.allocator;
+    var plane = ControlPlane.init(allocator);
+    defer plane.deinit();
+
+    const ensured = try plane.nodeEnsure("{\"node_name\":\"spiderapp-default\"}");
+    defer allocator.free(ensured);
+
+    try std.testing.expect(std.mem.indexOf(u8, ensured, "\"node_id\":\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ensured, "\"node_secret\":\"") != null);
 }
 
 test "fs_control_plane: projectUp requires project_token for existing non-builtin project" {

@@ -1,7 +1,7 @@
 # Spiderweb Global Library
 
 - [Getting Started](/global/library/topics/getting-started.md)
-- [Service Discovery](/global/library/topics/service-discovery.md)
+- [Venom Discovery](/global/library/topics/service-discovery.md)
 - [Events and Waits](/global/library/topics/events-and-waits.md)
 - [Search Services](/global/library/topics/search-services.md)
 - [Terminal Workflows](/global/library/topics/terminal-workflows.md)

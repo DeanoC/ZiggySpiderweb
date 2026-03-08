@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# ZiggySpiderweb Full Reset Script
+# Spiderweb Full Reset Script
 # Removes all known user + system install/runtime artifacts.
 # Requires two confirmations before any cleanup begins.
 #
@@ -116,7 +116,7 @@ remove_path() {
 
 print_plan() {
     echo "========================================"
-    echo "  ZiggySpiderweb Full Reset"
+    echo "  Spiderweb Full Reset"
     echo "========================================"
     echo ""
     echo "This script will:"

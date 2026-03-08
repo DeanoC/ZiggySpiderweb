@@ -13,7 +13,7 @@ pub const Backend = enum {
     none,
 };
 
-const service_name = "ziggyspiderweb";
+const service_name = "spiderweb";
 const key_kind = "provider_api_key";
 
 pub const CredentialStore = struct {
@@ -120,7 +120,7 @@ fn lookupLinuxSecretTool(allocator: std.mem.Allocator, provider_name: []const u8
 }
 
 fn storeLinuxSecretTool(allocator: std.mem.Allocator, provider_name: []const u8, api_key: []const u8) !void {
-    const label = try std.fmt.allocPrint(allocator, "ZiggySpiderweb {s} API key", .{provider_name});
+    const label = try std.fmt.allocPrint(allocator, "Spiderweb {s} API key", .{provider_name});
     defer allocator.free(label);
 
     var child = std.process.Child.init(&[_][]const u8{

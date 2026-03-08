@@ -362,7 +362,7 @@ pub const AgentRegistry = struct {
                 // Fallback to embedded minimal template
                 return self.allocator.dupe(u8, "# HATCH.md — New Agent Initialization\n" ++
                     "\n" ++
-                    "Welcome, newborn agent. You are hatching in ZiggySpiderweb (ZSS).\n" ++
+                    "Welcome, newborn agent. You are hatching in Spiderweb (ZSS).\n" ++
                     "\n" ++
                     "## Your Task\n" ++
                     "Create your identity by writing SOUL.md, then respond with:\n" ++

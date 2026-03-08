@@ -1,12 +1,12 @@
 #!/bin/bash
-# ZiggySpiderweb Install Script
+# Spiderweb Install Script
 #
 # RECOMMENDED (interactive):
-#   curl -fsSL https://raw.githubusercontent.com/DeanoC/ZiggySpiderweb/main/install.sh -o /tmp/install.sh
+#   curl -fsSL https://raw.githubusercontent.com/DeanoC/Spiderweb/main/install.sh -o /tmp/install.sh
 #   bash /tmp/install.sh
 #
 # PIPED (non-interactive, uses defaults):
-#   curl -fsSL https://raw.githubusercontent.com/DeanoC/ZiggySpiderweb/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/DeanoC/Spiderweb/main/install.sh | bash
 #
 # NON-INTERACTIVE with options:
 #   curl ... | SPIDERWEB_PROVIDER=openai-codex SPIDERWEB_AGENT=ziggy bash
@@ -414,7 +414,7 @@ fi
 REPO_DIR="${HOME}/.local/share/ziggy-spiderweb"
 INSTALL_DIR="${HOME}/.local/bin"
 export PATH="${INSTALL_DIR}:${PATH}"
-SPIDERWEB_REPO_URL="${SPIDERWEB_REPO_URL:-https://github.com/DeanoC/ZiggySpiderweb.git}"
+SPIDERWEB_REPO_URL="${SPIDERWEB_REPO_URL:-https://github.com/DeanoC/Spiderweb.git}"
 SPIDERWEB_GIT_REF="${SPIDERWEB_GIT_REF:-main}"
 ZSS_REPO_URL="${ZSS_REPO_URL:-https://github.com/DeanoC/ZiggyStarSpider.git}"
 ZSS_GIT_REF="${ZSS_GIT_REF:-main}"
@@ -472,7 +472,7 @@ ensure_git_repo "${REPO_BASE_DIR}/ZiggyRunOrchestrator" "https://github.com/Dean
 
 cd "$REPO_DIR"
 
-log_info "Building ZiggySpiderweb..."
+log_info "Building Spiderweb..."
 zig build -Doptimize=ReleaseSafe
 
 log_info "Installing binaries..."
@@ -591,7 +591,7 @@ if [[ "$INSTALL_SYSTEMD" == "true" ]]; then
     # Create service file content
     if [[ "$SYSTEMD_SCOPE" == "system" ]]; then
         SERVICE_FILE="[Unit]
-Description=ZiggySpiderweb AI Agent Gateway
+Description=Spiderweb AI Agent Gateway
 After=network.target
 
 [Service]
@@ -611,7 +611,7 @@ WantedBy=multi-user.target"
         log_success "System service installed and started"
     else
         SERVICE_FILE="[Unit]
-Description=ZiggySpiderweb AI Agent Gateway
+Description=Spiderweb AI Agent Gateway
 After=network.target
 
 [Service]

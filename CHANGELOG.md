@@ -2,6 +2,22 @@
 
 All notable changes to this project are documented in this file.
 
+## Unreleased - 2026-03-08
+
+### Runtime Convergence
+- Converged Spiderweb’s built-in namespace surfaces onto the shared `spiderweb_node` runtime path, including the in-process FS host and embeddable `spiderweb_fs` facade.
+- Removed repo-local FS runtime ownership by replacing legacy `src/fs_node_*` and related adapter surfaces with compatibility shims over the shared runtime modules.
+
+### Venoms and Discovery
+- Promoted Venom naming to the primary discovery surface across docs and templates.
+- Added and documented Venom-first indexes at `/global/venoms/VENOMS.json` and `/nodes/<node_id>/venoms/*` while retaining legacy service aliases for compatibility.
+- Moved the node service catalog model into shared `SpiderProtocol` runtime code so Spiderweb and standalone nodes project the same catalog contract.
+
+### Chat, Jobs, Events, and Thoughts
+- Unified chat/job execution behind a shared runtime executor and removed split execution behavior between session and local-fs paths.
+- Added structured job telemetry for terminal job completion, `/global/events` waits, and `/global/thoughts/*` projection so sessions no longer reparse job logs on demand.
+- Moved `ChatJobIndex` into shared `spiderweb_node` runtime code and left Spiderweb’s local import path as a compatibility shim.
+
 ## 0.3.0 - 2026-02-22
 
 ### Protocol and Contract
