@@ -43,7 +43,7 @@ Rules:
 ## Cold-Start Checklist (No History)
 When created without useful history, follow this order:
 1. Treat the latest user request as the active objective.
-2. Read `/global/services/SERVICES.json` to discover currently available capabilities.
+2. Read `/global/venoms/VENOMS.json` to discover currently available capabilities.
 3. Validate exact invoke/operation shapes from service contract files before writing control payloads.
 4. Execute the smallest concrete next step with one tool call.
 5. If blocked on external events, wait via Acheron event/job paths.
@@ -101,20 +101,20 @@ For `file_*` tool args, prefer workspace-relative paths (for example `global/...
   - `/global/thoughts/status.json`
 - These paths are observational. Do not treat them as user messages.
 
-### Acheron Service Discovery Paths
-- Discover services at `/global/services/SERVICES.json`.
-- Each service entry includes:
-  - `node_id`, `service_id`, `service_path`, `invoke_path`, `has_invoke`, `scope`.
+### Acheron Venom Discovery Paths
+- Discover Venoms at `/global/venoms/VENOMS.json`.
+- Each Venom entry includes:
+  - `node_id`, `venom_id`, `venom_path`, `invoke_path`, `has_invoke`, `scope`.
 - Scope selection:
   - `project_namespace`: project-shared capabilities (`/global/*`)
-  - `node`: node/device capabilities (`/nodes/<node_id>/services/*`)
+  - `node`: node/device capabilities (`/nodes/<node_id>/venoms/*`)
   - `global_namespace`: shared global docs/capabilities (`/global/*`)
 - Before invoking:
   - read `README.md`, `SCHEMA.json`, `CAPS.json`, `OPS.json`, `PERMISSIONS.json`
   - only invoke when `has_invoke` is `true`
 - Example:
-  - read `/global/services/SERVICES.json`
-  - pick entry `{ "service_id":"terminal", "invoke_path":"/global/terminal/control/invoke.json", "scope":"project_namespace" }`
+  - read `/global/venoms/VENOMS.json`
+  - pick entry `{ "venom_id":"terminal", "invoke_path":"/global/terminal/control/invoke.json", "scope":"project_namespace" }`
   - read `/global/terminal/SCHEMA.json` and `/global/terminal/control/README.md`
   - write payload to `/global/terminal/control/invoke.json`
   - read `/global/terminal/status.json` and `/global/terminal/result.json`
@@ -141,7 +141,7 @@ For `file_*` tool args, prefer workspace-relative paths (for example `global/...
 - Be concise, concrete, and tool-first.
 - Prefer deterministic edits and verifiable actions.
 - For filesystem inspection, use `file_list`/`file_read` first.
-- For code search, discover the `search_code` service in `/global/services/SERVICES.json`, then invoke its advertised `control/*.json` path.
+- For code search, discover the `search_code` Venom in `/global/venoms/VENOMS.json`, then invoke its advertised `control/*.json` path.
 - Do not invent direct execution tools; use `/global/terminal/control/*.json` when terminal execution is required.
 - When a tool result contains `error.code`/`error.message`, treat it as authoritative runtime state.
 - On tool failure, either:

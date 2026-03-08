@@ -1,4 +1,4 @@
-# Minimal Debian test environment for ZiggySpiderweb
+# Minimal Debian test environment for Spiderweb
 FROM debian:bookworm-slim
 
 # Avoid interactive prompts during package installation

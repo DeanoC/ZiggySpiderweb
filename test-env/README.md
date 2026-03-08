@@ -1,6 +1,6 @@
-# ZiggySpiderweb Test Environment
+# Spiderweb Test Environment
 
-Docker-based testing environment for ZiggySpiderweb. This creates a clean, disposable Debian container for testing the install script and Spiderweb functionality without affecting your main server.
+Docker-based testing environment for Spiderweb. This creates a clean, disposable Debian container for testing the install script and Spiderweb functionality without affecting your main server.
 
 ## Quick Start
 
@@ -45,7 +45,7 @@ docker run -it --rm \
 
 ```bash
 # Test the full interactive install
-curl -fsSL https://raw.githubusercontent.com/DeanoC/ZiggySpiderweb/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/DeanoC/Spiderweb/main/install.sh | bash
 
 # Or run with pre-configured values (non-interactive mode coming soon)
 ```

@@ -1,14 +1,14 @@
-# Service Discovery
+# Venom Discovery
 
 Start at:
 
-- `/global/services/SERVICES.json`
+- `/global/venoms/VENOMS.json`
 
 Each entry provides:
 
 - `node_id`
-- `service_id`
-- `service_path`
+- `venom_id`
+- `venom_path`
 - `invoke_path`
 - `has_invoke`
 - `scope` (`node` | `project_namespace` | `global_namespace`)
@@ -16,14 +16,14 @@ Each entry provides:
 Scope guidance:
 
 - `project_namespace`: project-shared services under `/global/*`
-- `node`: node/device services under `/nodes/<node_id>/services/*`
+- `node`: node/device Venoms under `/nodes/<node_id>/venoms/*`
 - `global_namespace`: shared global resources under `/global/*`
 
 Contract check workflow:
 
-1. Read `SERVICES.json`.
-2. Select a candidate service entry.
-3. Read contract files under `service_path`:
+1. Read `VENOMS.json`.
+2. Select a candidate Venom entry.
+3. Read contract files under `venom_path`:
    - `README.md`
    - `SCHEMA.json`
    - `CAPS.json`
@@ -31,12 +31,12 @@ Contract check workflow:
    - `PERMISSIONS.json`
    - optional: `RUNTIME.json`, `MOUNTS.json`, `STATUS.json`
 4. If `has_invoke=true`, write to `invoke_path`.
-5. Read service `status.json` and `result.json`.
+5. Read Venom `status.json` and `result.json`.
 
 Example: invoke terminal
 
-1. Read `/global/services/SERVICES.json`.
-2. Select `{"service_id":"terminal","invoke_path":"/global/terminal/control/invoke.json"}`.
+1. Read `/global/venoms/VENOMS.json`.
+2. Select `{"venom_id":"terminal","invoke_path":"/global/terminal/control/invoke.json"}`.
 3. Read `/global/terminal/SCHEMA.json`.
 4. Write:
    - path: `/global/terminal/control/invoke.json`
@@ -56,3 +56,7 @@ Quick roots:
 - `/global/agents`
 - `/global/projects`
 - `/global/library`
+
+Node-scoped discovery root:
+
+- `/nodes/<node_id>/venoms/<venom_id>`

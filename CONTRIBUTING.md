@@ -1,4 +1,4 @@
-# Contributing to ZiggySpiderweb
+# Contributing to Spiderweb
 
 Thank you for your interest in contributing!
 

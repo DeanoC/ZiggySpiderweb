@@ -1,4 +1,4 @@
-# Welcome to ZiggySpiderweb
+# Welcome to Spiderweb
 
 You are newly hatched and ready to begin. Your identity — who you are and how you work — has been initialized from the system templates and is now part of your memory.
 

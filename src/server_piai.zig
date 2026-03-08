@@ -6,15 +6,17 @@ const memory = @import("ziggy-memory-store").memory;
 const protocol = @import("spider-protocol").protocol;
 const runtime_server_mod = @import("runtime_server.zig");
 const runtime_handle_mod = @import("runtime_handle.zig");
+const chat_runtime_job = @import("chat_runtime_job.zig");
 const sandbox_runtime_mod = @import("sandbox_runtime.zig");
 const websocket_transport = @import("websocket_transport.zig");
 const fsrpc_session = @import("fsrpc_session.zig");
 const fs_control_plane = @import("fs_control_plane.zig");
 const chat_job_index = @import("chat_job_index.zig");
-const fs_protocol = @import("fs_protocol.zig");
-const fs_node_ops = @import("fs_node_ops.zig");
-const fs_node_service = @import("fs_node_service.zig");
-const fs_watch_runtime = @import("fs_watch_runtime.zig");
+const fs_protocol = @import("spiderweb_fs").fs_protocol;
+const spiderweb_node = @import("spiderweb_node");
+const fs_node_ops = spiderweb_node.fs_node_ops;
+const fs_node_service = spiderweb_node.fs_node_service;
+const fs_watch_runtime = spiderweb_node.fs_watch_runtime;
 const agent_registry_mod = @import("agent_registry.zig");
 const tool_registry = @import("ziggy-tool-runtime").tool_registry;
 const unified = @import("spider-protocol").unified;
@@ -32,9 +34,9 @@ const debug_stream_archive_suffix = ".ndjson";
 const debug_stream_archive_suffix_gz = ".ndjson.gz";
 const debug_stream_rotate_max_bytes: u64 = 8 * 1024 * 1024;
 const debug_stream_archive_keep: usize = 8;
-const node_service_event_log_filename = "node-service-events.ndjson";
-const node_service_event_archive_prefix = "node-service-events-";
-const node_service_event_history_max_default: usize = 1024;
+const node_venom_event_log_filename = "node-venom-events.ndjson";
+const node_venom_event_archive_prefix = "node-venom-events-";
+const node_venom_event_history_max_default: usize = 1024;
 const local_node_export_path_env = "SPIDERWEB_LOCAL_NODE_EXPORT_PATH";
 const local_node_export_name_env = "SPIDERWEB_LOCAL_NODE_EXPORT_NAME";
 const local_node_export_ro_env = "SPIDERWEB_LOCAL_NODE_EXPORT_RO";
@@ -66,16 +68,16 @@ const legacy_local_node_mount_projects_system_agents_self_capabilities = "/nodes
 const control_operator_token_env = "SPIDERWEB_CONTROL_OPERATOR_TOKEN";
 const control_project_scope_token_env = "SPIDERWEB_CONTROL_PROJECT_SCOPE_TOKEN";
 const control_node_scope_token_env = "SPIDERWEB_CONTROL_NODE_SCOPE_TOKEN";
-const node_service_event_history_max_env = "SPIDERWEB_NODE_SERVICE_EVENT_HISTORY_MAX";
-const node_service_event_log_rotate_max_bytes_env = "SPIDERWEB_NODE_SERVICE_EVENT_LOG_ROTATE_MAX_BYTES";
-const node_service_event_log_archive_keep_env = "SPIDERWEB_NODE_SERVICE_EVENT_LOG_ARCHIVE_KEEP";
+const node_venom_event_history_max_env = "SPIDERWEB_NODE_VENOM_EVENT_HISTORY_MAX";
+const node_venom_event_log_rotate_max_bytes_env = "SPIDERWEB_NODE_VENOM_EVENT_LOG_ROTATE_MAX_BYTES";
+const node_venom_event_log_archive_keep_env = "SPIDERWEB_NODE_VENOM_EVENT_LOG_ARCHIVE_KEEP";
 const metrics_port_env = "SPIDERWEB_METRICS_PORT";
 const control_protocol_version = "unified-v2";
 const fsrpc_runtime_protocol_version = "acheron-1";
 const fsrpc_node_protocol_version = "unified-v2-fs";
 const fsrpc_node_proto_id: i64 = 2;
 const node_tunnel_reply_timeout_ms: i32 = 45_000;
-const service_presence_dispatch_queue_max: usize = 256;
+const venom_presence_dispatch_queue_max: usize = 256;
 // Each accepted websocket occupies a worker thread for its full lifetime.
 // Internal fs-mount/runtime fan-out can exceed 16 steady-state connections,
 // which starves new control/gui handshakes and appears as "can't connect".
@@ -544,14 +546,14 @@ fn parseOptionalEnvOwned(allocator: std.mem.Allocator, name: []const u8) ?[]u8 {
     return allocator.dupe(u8, trimmed) catch null;
 }
 
-fn initNodeServiceEventLogPath(
+fn initNodeVenomEventLogPath(
     allocator: std.mem.Allocator,
     ltm_directory: []const u8,
 ) !?[]u8 {
     const base = std.mem.trim(u8, ltm_directory, " \t\r\n");
     if (base.len == 0) return null;
     try ensureDirectoryExists(base);
-    const path = try std.fs.path.join(allocator, &.{ base, node_service_event_log_filename });
+    const path = try std.fs.path.join(allocator, &.{ base, node_venom_event_log_filename });
     errdefer allocator.free(path);
     var file = try openOrCreateAppendFile(path);
     defer file.close();
@@ -1026,19 +1028,19 @@ const NodeTunnelRegistry = struct {
     }
 };
 
-const NodeServiceEventRecord = struct {
+const NodeVenomEventRecord = struct {
     timestamp_ms: i64,
     node_id: ?[]u8 = null,
     payload_json: []u8,
 
-    fn deinit(self: *NodeServiceEventRecord, allocator: std.mem.Allocator) void {
+    fn deinit(self: *NodeVenomEventRecord, allocator: std.mem.Allocator) void {
         if (self.node_id) |value| allocator.free(value);
         allocator.free(self.payload_json);
         self.* = undefined;
     }
 };
 
-const NodeServiceEventMetricsSnapshot = struct {
+const NodeVenomEventMetricsSnapshot = struct {
     retained_events: usize = 0,
     retained_capacity: usize = 0,
     retained_oldest_ms: ?i64 = null,
@@ -1092,6 +1094,8 @@ const LocalFsNode = struct {
     node_name: []u8,
     mount_specs: std.ArrayListUnmanaged(LocalFsMountSpec) = .{},
     fs_url: []u8,
+    fs_export_count: usize,
+    fs_rw_export_count: usize,
     lease_ttl_ms: u64,
     heartbeat_interval_ms: u64,
     heartbeat_stop: bool = false,
@@ -1151,6 +1155,8 @@ const LocalFsNode = struct {
             .node_name = try allocator.dupe(u8, node_name),
             .mount_specs = owned_mount_specs,
             .fs_url = try allocator.dupe(u8, fs_url),
+            .fs_export_count = countLocalFsExports(export_specs),
+            .fs_rw_export_count = countLocalFsRwExports(export_specs),
             .lease_ttl_ms = lease_ttl_ms,
             .heartbeat_interval_ms = heartbeat_interval_ms,
         };
@@ -1275,6 +1281,7 @@ const LocalFsNode = struct {
                 self.allocator.free(registration.node_id);
                 self.allocator.free(registration.node_secret);
                 try self.ensureSpiderWebMounts(control_plane, mount_node_id);
+                try self.registerLocalVenoms(control_plane, mount_node_id, self.session_auth_token.?);
                 return;
             }
             self.allocator.free(prev);
@@ -1288,6 +1295,7 @@ const LocalFsNode = struct {
         unlock_needed = false;
         defer self.allocator.free(mount_node_id);
         try self.ensureSpiderWebMounts(control_plane, mount_node_id);
+        try self.registerLocalVenoms(control_plane, mount_node_id, self.session_auth_token.?);
     }
 
     fn ensureSpiderWebMounts(self: *LocalFsNode, control_plane: *fs_control_plane.ControlPlane, node_id: []const u8) !void {
@@ -1300,6 +1308,99 @@ const LocalFsNode = struct {
             };
         }
         try control_plane.ensureSpiderWebMounts(node_id, specs);
+    }
+
+    fn registerLocalVenoms(
+        self: *LocalFsNode,
+        control_plane: *fs_control_plane.ControlPlane,
+        node_id: []const u8,
+        node_secret: []const u8,
+    ) !void {
+        const payload_json = try self.buildLocalVenomUpsertPayload(node_id, node_secret);
+        defer self.allocator.free(payload_json);
+        const response_json = try control_plane.nodeVenomUpsert(payload_json);
+        defer self.allocator.free(response_json);
+    }
+
+    fn buildLocalVenomUpsertPayload(self: *LocalFsNode, node_id: []const u8, node_secret: []const u8) ![]u8 {
+        const escaped_node_id = try unified.jsonEscape(self.allocator, node_id);
+        defer self.allocator.free(escaped_node_id);
+        const escaped_node_secret = try unified.jsonEscape(self.allocator, node_secret);
+        defer self.allocator.free(escaped_node_secret);
+        const escaped_platform_os = try unified.jsonEscape(self.allocator, @tagName(builtin.os.tag));
+        defer self.allocator.free(escaped_platform_os);
+        const escaped_platform_arch = try unified.jsonEscape(self.allocator, @tagName(builtin.cpu.arch));
+        defer self.allocator.free(escaped_platform_arch);
+
+        var out = std.ArrayListUnmanaged(u8){};
+        errdefer out.deinit(self.allocator);
+        try out.writer(self.allocator).print(
+            "{{\"node_id\":\"{s}\",\"node_secret\":\"{s}\",\"platform\":{{\"os\":\"{s}\",\"arch\":\"{s}\",\"runtime_kind\":\"spiderweb\"}},\"venoms\":[",
+            .{ escaped_node_id, escaped_node_secret, escaped_platform_os, escaped_platform_arch },
+        );
+        try self.appendLocalFsVenomJson(&out, escaped_node_id);
+        try out.append(self.allocator, ',');
+        try self.appendLocalChatVenomJson(&out, escaped_node_id);
+        try out.append(self.allocator, ',');
+        try self.appendLocalJobsVenomJson(&out, escaped_node_id);
+        try out.appendSlice(self.allocator, "]}");
+        return out.toOwnedSlice(self.allocator);
+    }
+
+    fn appendLocalFsVenomJson(
+        self: *LocalFsNode,
+        out: *std.ArrayListUnmanaged(u8),
+        escaped_node_id: []const u8,
+    ) !void {
+        const endpoint_path = try std.fmt.allocPrint(self.allocator, "/nodes/{s}/fs", .{escaped_node_id});
+        defer self.allocator.free(endpoint_path);
+        const payload = try spiderweb_node.venom_contracts.fs.renderDescriptorJson(
+            self.allocator,
+            endpoint_path,
+            endpoint_path,
+            "spiderweb-local-fs",
+            self.fs_rw_export_count > 0,
+            self.fs_export_count,
+        );
+        defer self.allocator.free(payload);
+        try out.appendSlice(self.allocator, payload);
+    }
+
+    fn appendLocalChatVenomJson(
+        self: *LocalFsNode,
+        out: *std.ArrayListUnmanaged(u8),
+        escaped_node_id: []const u8,
+    ) !void {
+        const endpoint_path = try std.fmt.allocPrint(self.allocator, "/nodes/{s}/chat", .{escaped_node_id});
+        defer self.allocator.free(endpoint_path);
+        const jobs_root_path = try std.fmt.allocPrint(self.allocator, "/nodes/{s}/jobs", .{escaped_node_id});
+        defer self.allocator.free(jobs_root_path);
+        const payload = try spiderweb_node.venom_contracts.chat.renderDescriptorJson(
+            self.allocator,
+            endpoint_path,
+            endpoint_path,
+            jobs_root_path,
+            "spiderweb-local-chat",
+        );
+        defer self.allocator.free(payload);
+        try out.appendSlice(self.allocator, payload);
+    }
+
+    fn appendLocalJobsVenomJson(
+        self: *LocalFsNode,
+        out: *std.ArrayListUnmanaged(u8),
+        escaped_node_id: []const u8,
+    ) !void {
+        const endpoint_path = try std.fmt.allocPrint(self.allocator, "/nodes/{s}/jobs", .{escaped_node_id});
+        defer self.allocator.free(endpoint_path);
+        const payload = try spiderweb_node.venom_contracts.jobs.renderDescriptorJson(
+            self.allocator,
+            endpoint_path,
+            endpoint_path,
+            "spiderweb-local-jobs",
+        );
+        defer self.allocator.free(payload);
+        try out.appendSlice(self.allocator, payload);
     }
 
     fn requestHeartbeatStop(self: *LocalFsNode) void {
@@ -1421,6 +1522,24 @@ const LocalFsNode = struct {
     }
 };
 
+fn countLocalFsExports(specs: []const fs_node_ops.ExportSpec) usize {
+    var count: usize = 0;
+    for (specs) |spec| {
+        if (spec.source_kind != null and spec.source_kind.? == .namespace) continue;
+        count += 1;
+    }
+    return count;
+}
+
+fn countLocalFsRwExports(specs: []const fs_node_ops.ExportSpec) usize {
+    var count: usize = 0;
+    for (specs) |spec| {
+        if (spec.source_kind != null and spec.source_kind.? == .namespace) continue;
+        if (!spec.ro) count += 1;
+    }
+    return count;
+}
+
 const LocalFsChatJobContext = struct {
     allocator: std.mem.Allocator,
     node: *LocalFsNode,
@@ -1497,102 +1616,24 @@ fn executeLocalFsChatJob(
     const runtime = try node.runtime_registry.getOrCreate(system_agent_id, system_project_id, null);
     defer runtime.release();
 
-    const escaped = try unified.jsonEscape(node.allocator, input);
-    defer node.allocator.free(escaped);
-    const runtime_req = if (correlation_id) |value| blk: {
-        const escaped_corr = try unified.jsonEscape(node.allocator, value);
-        defer node.allocator.free(escaped_corr);
-        break :blk try std.fmt.allocPrint(
-            node.allocator,
-            "{{\"id\":\"{s}\",\"type\":\"session.send\",\"content\":\"{s}\",\"correlation_id\":\"{s}\"}}",
-            .{ job_id, escaped, escaped_corr },
-        );
-    } else try std.fmt.allocPrint(
-        node.allocator,
-        "{{\"id\":\"{s}\",\"type\":\"session.send\",\"content\":\"{s}\"}}",
-        .{ job_id, escaped },
-    );
-    defer node.allocator.free(runtime_req);
-
-    var log_buf = std.ArrayListUnmanaged(u8){};
-    defer log_buf.deinit(node.allocator);
-
-    var result_text = try node.allocator.dupe(u8, "");
-    defer node.allocator.free(result_text);
-    var failed = false;
-    var failure_message: ?[]u8 = null;
-    defer if (failure_message) |value| node.allocator.free(value);
-
-    const frames = try runtime.handleMessageFramesWithDebug(runtime_req, false);
-    defer runtime_server_mod.deinitResponseFrames(node.allocator, frames);
-    for (frames) |frame| {
-        try log_buf.appendSlice(node.allocator, frame);
-        try log_buf.append(node.allocator, '\n');
-
-        var parsed = std.json.parseFromSlice(std.json.Value, node.allocator, frame, .{}) catch continue;
-        defer parsed.deinit();
-        if (parsed.value != .object) continue;
-        const obj = parsed.value.object;
-        const type_value = obj.get("type") orelse continue;
-        if (type_value != .string) continue;
-
-        if (std.mem.eql(u8, type_value.string, "session.receive")) {
-            if (obj.get("content")) |content| {
-                if (content == .string) {
-                    node.allocator.free(result_text);
-                    result_text = try node.allocator.dupe(u8, content.string);
-                }
-            }
-            continue;
-        }
-
-        if (std.mem.eql(u8, type_value.string, "error")) {
-            failed = true;
-            if (obj.get("message")) |message| {
-                if (message == .string) {
-                    if (failure_message) |value| node.allocator.free(value);
-                    failure_message = try node.allocator.dupe(u8, message.string);
-                }
-            }
-        }
-    }
-
-    const log_content = try log_buf.toOwnedSlice(node.allocator);
-    defer node.allocator.free(log_content);
-
-    if (failed) {
-        const message = failure_message orelse "runtime error";
-        try node.runtime_registry.job_index.markCompleted(
-            job_id,
-            false,
-            message,
-            message,
-            log_content,
-        );
-        node.publishChatJobUpdate(.{
-            .job_id = job_id,
-            .state = .failed,
-            .correlation_id = correlation_id,
-            .error_text = message,
-            .result_text = message,
-            .log_text = log_content,
-        });
-        return;
-    }
-
-    try node.runtime_registry.job_index.markCompleted(
-        job_id,
-        true,
-        result_text,
-        null,
-        log_content,
-    );
+    var outcome = try chat_runtime_job.execute(.{
+        .allocator = node.allocator,
+        .runtime_handle = runtime,
+        .job_index = &node.runtime_registry.job_index,
+        .job_id = job_id,
+        .input = input,
+        .correlation_id = correlation_id,
+        .emit_debug = false,
+        .max_retries = chat_runtime_job.max_internal_retries,
+    });
+    defer outcome.deinit(node.allocator);
     node.publishChatJobUpdate(.{
         .job_id = job_id,
-        .state = .done,
+        .state = if (outcome.succeeded) .done else .failed,
         .correlation_id = correlation_id,
-        .result_text = result_text,
-        .log_text = log_content,
+        .error_text = outcome.error_text,
+        .result_text = outcome.result_text,
+        .log_text = outcome.log_text,
     });
 }
 
@@ -2459,35 +2500,35 @@ const SessionBinding = struct {
     }
 };
 
-const ServicePresenceDispatchJob = struct {
+const VenomPresenceDispatchJob = struct {
     agent_id: []u8,
     project_id: ?[]u8 = null,
     session_key: []u8,
-    service_id: []u8,
+    venom_id: []u8,
     attached: bool,
     payload_json: []u8,
 
-    fn deinit(self: *ServicePresenceDispatchJob, allocator: std.mem.Allocator) void {
+    fn deinit(self: *VenomPresenceDispatchJob, allocator: std.mem.Allocator) void {
         allocator.free(self.agent_id);
         if (self.project_id) |value| allocator.free(value);
         allocator.free(self.session_key);
-        allocator.free(self.service_id);
+        allocator.free(self.venom_id);
         allocator.free(self.payload_json);
         self.* = undefined;
     }
 
     fn matches(
-        self: *const ServicePresenceDispatchJob,
+        self: *const VenomPresenceDispatchJob,
         agent_id: []const u8,
         project_id: ?[]const u8,
         session_key: []const u8,
-        service_id: []const u8,
+        venom_id: []const u8,
         attached: bool,
     ) bool {
         return std.mem.eql(u8, self.agent_id, agent_id) and
             optionalStringsEqual(self.project_id, project_id) and
             std.mem.eql(u8, self.session_key, session_key) and
-            std.mem.eql(u8, self.service_id, service_id) and
+            std.mem.eql(u8, self.venom_id, venom_id) and
             self.attached == attached;
     }
 };
@@ -3226,50 +3267,21 @@ fn isValidProvisioningAgentId(agent_id: []const u8) bool {
 const RuntimeToolDispatchProxy = struct {
     allocator: std.mem.Allocator,
     sandbox_runtime: *sandbox_runtime_mod.SandboxRuntime,
-    control_plane: *fs_control_plane.ControlPlane,
-    agents_dir: []const u8,
-    assets_dir: []const u8,
-    runtime_agent_id: []u8,
-
-    const RuntimeFileListEntry = struct {
-        name: []const u8,
-        kind: []const u8,
-    };
-
-    const ProjectsOp = enum {
-        list,
-        get,
-        up,
-    };
-
-    const AgentsOp = enum {
-        list,
-        create,
-    };
 
     fn create(
         allocator: std.mem.Allocator,
         sandbox_runtime: *sandbox_runtime_mod.SandboxRuntime,
-        control_plane: *fs_control_plane.ControlPlane,
-        agents_dir: []const u8,
-        assets_dir: []const u8,
-        runtime_agent_id: []const u8,
     ) !*RuntimeToolDispatchProxy {
         const self = try allocator.create(RuntimeToolDispatchProxy);
         errdefer allocator.destroy(self);
         self.* = .{
             .allocator = allocator,
             .sandbox_runtime = sandbox_runtime,
-            .control_plane = control_plane,
-            .agents_dir = agents_dir,
-            .assets_dir = assets_dir,
-            .runtime_agent_id = try allocator.dupe(u8, runtime_agent_id),
         };
         return self;
     }
 
     fn destroy(self: *RuntimeToolDispatchProxy) void {
-        self.allocator.free(self.runtime_agent_id);
         self.allocator.destroy(self);
     }
 
@@ -3315,12 +3327,8 @@ const RuntimeToolDispatchProxy = struct {
         }
 
         const obj = parsed.value.object;
-        const path = requiredStringField(obj, "path") orelse
+        _ = requiredStringField(obj, "path") orelse
             return runtimeDispatchFailure(allocator, .invalid_params, "file_read path must be provided");
-
-        if (runtimeDispatchSyntheticReadContent(path)) |content| {
-            return runtimeDispatchFileReadSuccess(allocator, path, content);
-        }
         return self.sandbox_runtime.executeWorldTool(allocator, "file_read", args_json);
     }
 
@@ -3344,13 +3352,13 @@ const RuntimeToolDispatchProxy = struct {
             return runtimeDispatchFailure(allocator, .invalid_params, "file_write content must be provided");
 
         if (isProjectsControlPath(path)) {
-            return self.handleProjectsControlWrite(allocator, path, content);
+            return self.handleProjectsControlWrite(allocator, path, content, args_json);
         }
         if (isAgentsControlPath(path)) {
-            return self.handleAgentsControlWrite(allocator, path, content);
+            return self.handleAgentsControlWrite(allocator, path, content, args_json);
         }
         if (isTerminalControlPath(path)) {
-            return self.handleTerminalControlWrite(allocator, path, content);
+            return self.handleTerminalControlWrite(allocator, path, content, args_json);
         }
         return self.sandbox_runtime.executeWorldTool(allocator, "file_write", args_json);
     }
@@ -3367,88 +3375,6 @@ const RuntimeToolDispatchProxy = struct {
         if (parsed.value != .object) {
             return runtimeDispatchFailure(allocator, .invalid_params, "file_list arguments must be a JSON object");
         }
-        const obj = parsed.value.object;
-        const path = optionalStringField(obj, "path") orelse ".";
-
-        if (pathMatchesAnyControlTarget(path, &.{"global"})) {
-            return runtimeDispatchFileListSuccess(allocator, path, &.{
-                .{ .name = "services", .kind = "dir" },
-                .{ .name = "chat", .kind = "dir" },
-                .{ .name = "jobs", .kind = "dir" },
-                .{ .name = "terminal", .kind = "dir" },
-                .{ .name = "projects", .kind = "dir" },
-                .{ .name = "agents", .kind = "dir" },
-            });
-        }
-        if (pathMatchesAnyControlTarget(path, &.{"global/services"})) {
-            return runtimeDispatchFileListSuccess(allocator, path, &.{
-                .{ .name = "SERVICES.json", .kind = "file" },
-            });
-        }
-        if (pathMatchesAnyControlTarget(path, &.{"global/terminal"})) {
-            return runtimeDispatchFileListSuccess(allocator, path, &.{
-                .{ .name = "README.md", .kind = "file" },
-                .{ .name = "SCHEMA.json", .kind = "file" },
-                .{ .name = "CAPS.json", .kind = "file" },
-                .{ .name = "OPS.json", .kind = "file" },
-                .{ .name = "RUNTIME.json", .kind = "file" },
-                .{ .name = "PERMISSIONS.json", .kind = "file" },
-                .{ .name = "STATUS.json", .kind = "file" },
-                .{ .name = "status.json", .kind = "file" },
-                .{ .name = "result.json", .kind = "file" },
-                .{ .name = "control", .kind = "dir" },
-            });
-        }
-        if (pathMatchesAnyControlTarget(path, &.{"global/terminal/control"})) {
-            return runtimeDispatchFileListSuccess(allocator, path, &.{
-                .{ .name = "README.md", .kind = "file" },
-                .{ .name = "invoke.json", .kind = "file" },
-                .{ .name = "exec.json", .kind = "file" },
-            });
-        }
-        if (pathMatchesAnyControlTarget(path, &.{"global/projects"})) {
-            return runtimeDispatchFileListSuccess(allocator, path, &.{
-                .{ .name = "README.md", .kind = "file" },
-                .{ .name = "SCHEMA.json", .kind = "file" },
-                .{ .name = "CAPS.json", .kind = "file" },
-                .{ .name = "OPS.json", .kind = "file" },
-                .{ .name = "PERMISSIONS.json", .kind = "file" },
-                .{ .name = "STATUS.json", .kind = "file" },
-                .{ .name = "status.json", .kind = "file" },
-                .{ .name = "result.json", .kind = "file" },
-                .{ .name = "control", .kind = "dir" },
-            });
-        }
-        if (pathMatchesAnyControlTarget(path, &.{"global/projects/control"})) {
-            return runtimeDispatchFileListSuccess(allocator, path, &.{
-                .{ .name = "README.md", .kind = "file" },
-                .{ .name = "invoke.json", .kind = "file" },
-                .{ .name = "list.json", .kind = "file" },
-                .{ .name = "get.json", .kind = "file" },
-                .{ .name = "up.json", .kind = "file" },
-            });
-        }
-        if (pathMatchesAnyControlTarget(path, &.{"global/agents"})) {
-            return runtimeDispatchFileListSuccess(allocator, path, &.{
-                .{ .name = "README.md", .kind = "file" },
-                .{ .name = "SCHEMA.json", .kind = "file" },
-                .{ .name = "CAPS.json", .kind = "file" },
-                .{ .name = "OPS.json", .kind = "file" },
-                .{ .name = "PERMISSIONS.json", .kind = "file" },
-                .{ .name = "STATUS.json", .kind = "file" },
-                .{ .name = "status.json", .kind = "file" },
-                .{ .name = "result.json", .kind = "file" },
-                .{ .name = "control", .kind = "dir" },
-            });
-        }
-        if (pathMatchesAnyControlTarget(path, &.{"global/agents/control"})) {
-            return runtimeDispatchFileListSuccess(allocator, path, &.{
-                .{ .name = "README.md", .kind = "file" },
-                .{ .name = "invoke.json", .kind = "file" },
-                .{ .name = "list.json", .kind = "file" },
-                .{ .name = "create.json", .kind = "file" },
-            });
-        }
         return self.sandbox_runtime.executeWorldTool(allocator, "file_list", args_json);
     }
 
@@ -3457,46 +3383,9 @@ const RuntimeToolDispatchProxy = struct {
         allocator: std.mem.Allocator,
         path: []const u8,
         content: []const u8,
+        args_json: []const u8,
     ) tool_registry.ToolExecutionResult {
-        const mode = terminalWriteMode(path, content, allocator) catch {
-            return runtimeDispatchFailure(allocator, .invalid_params, "terminal payload must be a JSON object");
-        };
-        const exec_payload = normalizeTerminalExecPayload(path, content, allocator) catch {
-            return runtimeDispatchFailure(allocator, .invalid_params, "terminal payload must be a JSON object");
-        };
-        defer allocator.free(exec_payload);
-
-        return switch (mode) {
-            .exec => {
-                const exec_result = self.sandbox_runtime.executeWorldTool(allocator, "shell_exec", exec_payload);
-                return switch (exec_result) {
-                    .success => |success| runtimeDispatchFileWriteSuccess(allocator, path, content.len, success.payload_json),
-                    .failure => |failure| .{ .failure = .{
-                        .code = failure.code,
-                        .message = allocator.dupe(u8, failure.message) catch @panic("out of memory"),
-                    } },
-                };
-            },
-            .unsupported_session_op => runtimeDispatchFailure(
-                allocator,
-                .invalid_params,
-                "agent runtime terminal supports exec only; use /global/terminal/control/exec.json or invoke.json with op=exec",
-            ),
-        };
-    }
-
-    fn handleProjectsUpWrite(
-        self: *RuntimeToolDispatchProxy,
-        allocator: std.mem.Allocator,
-        path: []const u8,
-        content: []const u8,
-    ) tool_registry.ToolExecutionResult {
-        const is_admin = std.mem.eql(u8, self.runtime_agent_id, system_agent_id);
-        const up_result = self.control_plane.projectUpWithRole(self.runtime_agent_id, content, is_admin) catch |err| {
-            return runtimeDispatchFailure(allocator, runtimeDispatchErrorCode(err), @errorName(err));
-        };
-        defer self.control_plane.allocator.free(up_result);
-        return runtimeDispatchFileWriteSuccess(allocator, path, content.len, up_result);
+        return self.handleServiceControlWrite(allocator, path, content, args_json, "/global/terminal/result.json");
     }
 
     fn handleProjectsControlWrite(
@@ -3504,169 +3393,9 @@ const RuntimeToolDispatchProxy = struct {
         allocator: std.mem.Allocator,
         path: []const u8,
         content: []const u8,
+        args_json: []const u8,
     ) tool_registry.ToolExecutionResult {
-        var parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch {
-            return runtimeDispatchFailure(allocator, .invalid_params, "projects payload must be a JSON object");
-        };
-        defer parsed.deinit();
-        if (parsed.value != .object) {
-            return runtimeDispatchFailure(allocator, .invalid_params, "projects payload must be a JSON object");
-        }
-        const obj = parsed.value.object;
-
-        const op = if (pathMatchesAnyControlTarget(path, &.{"global/projects/control/list.json"}))
-            ProjectsOp.list
-        else if (pathMatchesAnyControlTarget(path, &.{"global/projects/control/get.json"}))
-            ProjectsOp.get
-        else if (pathMatchesAnyControlTarget(path, &.{"global/projects/control/up.json"}))
-            ProjectsOp.up
-        else if (pathMatchesAnyControlTarget(path, &.{"global/projects/control/invoke.json"}))
-            self.parseProjectsInvokeOp(obj) orelse
-                return runtimeDispatchFailure(allocator, .invalid_params, "projects invoke payload requires op=list|get|up")
-        else
-            return runtimeDispatchFailure(allocator, .invalid_params, "unsupported projects control path");
-
-        const args_value = if (obj.get("arguments")) |args| args else if (obj.get("args")) |args| args else parsed.value;
-        if (args_value != .object) {
-            return runtimeDispatchFailure(allocator, .invalid_params, "projects arguments must be a JSON object");
-        }
-        const args_obj = args_value.object;
-        const is_admin = std.mem.eql(u8, self.runtime_agent_id, system_agent_id);
-
-        switch (op) {
-            .up => {
-                if (pathMatchesAnyControlTarget(path, &.{"global/projects/control/up.json"})) {
-                    return self.handleProjectsUpWrite(allocator, path, content);
-                }
-                const up_payload = stringifyJsonValueAlloc(allocator, args_value) catch {
-                    return runtimeDispatchFailure(allocator, .execution_failed, "failed to serialize projects up payload");
-                };
-                defer allocator.free(up_payload);
-                return self.handleProjectsUpWrite(allocator, path, up_payload);
-            },
-            .list => {
-                const list_result = self.control_plane.listProjects() catch |err| {
-                    return runtimeDispatchFailure(allocator, runtimeDispatchErrorCode(err), @errorName(err));
-                };
-                defer self.control_plane.allocator.free(list_result);
-                return runtimeDispatchFileWriteSuccess(allocator, path, content.len, list_result);
-            },
-            .get => {
-                const project_id = optionalStringField(args_obj, "project_id") orelse
-                    return runtimeDispatchFailure(allocator, .invalid_params, "projects get requires project_id");
-                const project_token = optionalStringField(args_obj, "project_token");
-                const payload = buildProjectScopedPayload(allocator, project_id, project_token) catch {
-                    return runtimeDispatchFailure(allocator, .execution_failed, "failed to build projects get payload");
-                };
-                defer allocator.free(payload);
-                const get_result = self.control_plane.getProjectWithRole(payload, is_admin) catch |err| {
-                    return runtimeDispatchFailure(allocator, runtimeDispatchErrorCode(err), @errorName(err));
-                };
-                defer self.control_plane.allocator.free(get_result);
-                return runtimeDispatchFileWriteSuccess(allocator, path, content.len, get_result);
-            },
-        }
-    }
-
-    fn parseProjectsInvokeOp(self: *RuntimeToolDispatchProxy, obj: std.json.ObjectMap) ?ProjectsOp {
-        _ = self;
-        const raw = optionalStringField(obj, "op") orelse
-            optionalStringField(obj, "operation") orelse
-            optionalStringField(obj, "tool") orelse
-            optionalStringField(obj, "tool_name") orelse
-            return null;
-        const value = std.mem.trim(u8, raw, " \t\r\n");
-        if (std.mem.eql(u8, value, "list") or std.mem.eql(u8, value, "projects_list")) return .list;
-        if (std.mem.eql(u8, value, "get") or std.mem.eql(u8, value, "projects_get")) return .get;
-        if (std.mem.eql(u8, value, "up") or std.mem.eql(u8, value, "projects_up")) return .up;
-        return null;
-    }
-
-    fn handleAgentsCreateWrite(
-        self: *RuntimeToolDispatchProxy,
-        allocator: std.mem.Allocator,
-        path: []const u8,
-        content: []const u8,
-    ) tool_registry.ToolExecutionResult {
-        var parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch {
-            return runtimeDispatchFailure(allocator, .invalid_params, "agents create payload must be a JSON object");
-        };
-        defer parsed.deinit();
-        if (parsed.value != .object) {
-            return runtimeDispatchFailure(allocator, .invalid_params, "agents create payload must be a JSON object");
-        }
-        const obj = parsed.value.object;
-        const agent_id = requiredStringField(obj, "agent_id") orelse optionalStringField(obj, "id") orelse
-            return runtimeDispatchFailure(allocator, .invalid_params, "agents create payload requires agent_id (or id)");
-        if (!isValidProvisioningAgentId(agent_id)) {
-            return runtimeDispatchFailure(allocator, .invalid_params, "agent_id must be alphanumeric/underscore/hyphen and not self");
-        }
-
-        var registry = agent_registry_mod.AgentRegistry.init(
-            self.allocator,
-            ".",
-            self.agents_dir,
-            self.assets_dir,
-        );
-        defer registry.deinit();
-        registry.scan() catch |err| {
-            return runtimeDispatchFailure(allocator, .execution_failed, @errorName(err));
-        };
-
-        var created = false;
-        if (registry.getAgent(agent_id) == null) {
-            const template_path = optionalStringField(obj, "template_path") orelse optionalStringField(obj, "template");
-            registry.createAgent(agent_id, template_path) catch |err| {
-                return runtimeDispatchFailure(allocator, runtimeDispatchErrorCode(err), @errorName(err));
-            };
-            created = true;
-        }
-
-        const desired_project_id = optionalStringField(obj, "project_id");
-        var activated = false;
-        if (desired_project_id) |project_id| {
-            const escaped_project = unified.jsonEscape(self.control_plane.allocator, project_id) catch null;
-            if (escaped_project) |escaped| {
-                defer self.control_plane.allocator.free(escaped);
-                const activation_payload = std.fmt.allocPrint(self.control_plane.allocator, "{{\"project_id\":\"{s}\"}}", .{escaped}) catch null;
-                if (activation_payload) |payload| {
-                    defer self.control_plane.allocator.free(payload);
-                    const activation_is_admin = std.mem.eql(u8, self.runtime_agent_id, system_agent_id);
-                    if (self.control_plane.activateProjectWithRole(agent_id, payload, activation_is_admin)) |activation_result| {
-                        defer self.control_plane.allocator.free(activation_result);
-                        activated = true;
-                    } else |_| {}
-                }
-            }
-        }
-
-        const escaped_agent = unified.jsonEscape(allocator, agent_id) catch {
-            return runtimeDispatchFailure(allocator, .execution_failed, "failed to serialize agents create result");
-        };
-        defer allocator.free(escaped_agent);
-        const project_json = if (desired_project_id) |project_id| blk: {
-            const escaped_project = unified.jsonEscape(allocator, project_id) catch {
-                return runtimeDispatchFailure(allocator, .execution_failed, "failed to serialize project id");
-            };
-            defer allocator.free(escaped_project);
-            break :blk std.fmt.allocPrint(allocator, "\"{s}\"", .{escaped_project}) catch {
-                return runtimeDispatchFailure(allocator, .execution_failed, "failed to serialize project id");
-            };
-        } else allocator.dupe(u8, "null") catch {
-            return runtimeDispatchFailure(allocator, .execution_failed, "out of memory");
-        };
-        defer allocator.free(project_json);
-
-        const op_json = std.fmt.allocPrint(
-            allocator,
-            "{{\"agent_id\":\"{s}\",\"created\":{},\"project_id\":{s},\"activated\":{}}}",
-            .{ escaped_agent, created, project_json, activated },
-        ) catch {
-            return runtimeDispatchFailure(allocator, .execution_failed, "failed to build agents create result");
-        };
-        defer allocator.free(op_json);
-
-        return runtimeDispatchFileWriteSuccess(allocator, path, content.len, op_json);
+        return self.handleServiceControlWrite(allocator, path, content, args_json, "/global/projects/result.json");
     }
 
     fn handleAgentsControlWrite(
@@ -3674,96 +3403,56 @@ const RuntimeToolDispatchProxy = struct {
         allocator: std.mem.Allocator,
         path: []const u8,
         content: []const u8,
+        args_json: []const u8,
     ) tool_registry.ToolExecutionResult {
-        var parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch {
-            return runtimeDispatchFailure(allocator, .invalid_params, "agents payload must be a JSON object");
-        };
-        defer parsed.deinit();
-        if (parsed.value != .object) {
-            return runtimeDispatchFailure(allocator, .invalid_params, "agents payload must be a JSON object");
-        }
-        const obj = parsed.value.object;
-
-        const op = if (pathMatchesAnyControlTarget(path, &.{"global/agents/control/list.json"}))
-            AgentsOp.list
-        else if (pathMatchesAnyControlTarget(path, &.{"global/agents/control/create.json"}))
-            AgentsOp.create
-        else if (pathMatchesAnyControlTarget(path, &.{"global/agents/control/invoke.json"}))
-            self.parseAgentsInvokeOp(obj) orelse
-                return runtimeDispatchFailure(allocator, .invalid_params, "agents invoke payload requires op=list|create")
-        else
-            return runtimeDispatchFailure(allocator, .invalid_params, "unsupported agents control path");
-
-        const args_value = if (obj.get("arguments")) |args| args else if (obj.get("args")) |args| args else parsed.value;
-        if (args_value != .object) {
-            return runtimeDispatchFailure(allocator, .invalid_params, "agents arguments must be a JSON object");
-        }
-        switch (op) {
-            .create => {
-                if (pathMatchesAnyControlTarget(path, &.{"global/agents/control/create.json"})) {
-                    return self.handleAgentsCreateWrite(allocator, path, content);
-                }
-                const create_payload = stringifyJsonValueAlloc(allocator, args_value) catch {
-                    return runtimeDispatchFailure(allocator, .execution_failed, "failed to serialize agents create payload");
-                };
-                defer allocator.free(create_payload);
-                return self.handleAgentsCreateWrite(allocator, path, create_payload);
-            },
-            .list => {
-                const list_payload = self.buildAgentsListJson(allocator) catch |err| {
-                    return runtimeDispatchFailure(allocator, runtimeDispatchErrorCode(err), @errorName(err));
-                };
-                defer allocator.free(list_payload);
-                return runtimeDispatchFileWriteSuccess(allocator, path, content.len, list_payload);
-            },
-        }
+        return self.handleServiceControlWrite(allocator, path, content, args_json, "/global/agents/result.json");
     }
 
-    fn parseAgentsInvokeOp(self: *RuntimeToolDispatchProxy, obj: std.json.ObjectMap) ?AgentsOp {
-        _ = self;
-        const raw = optionalStringField(obj, "op") orelse
-            optionalStringField(obj, "operation") orelse
-            optionalStringField(obj, "tool") orelse
-            optionalStringField(obj, "tool_name") orelse
-            return null;
-        const value = std.mem.trim(u8, raw, " \t\r\n");
-        if (std.mem.eql(u8, value, "list") or std.mem.eql(u8, value, "agents_list")) return .list;
-        if (std.mem.eql(u8, value, "create") or std.mem.eql(u8, value, "agents_create")) return .create;
-        return null;
+    fn handleServiceControlWrite(
+        self: *RuntimeToolDispatchProxy,
+        allocator: std.mem.Allocator,
+        path: []const u8,
+        content: []const u8,
+        args_json: []const u8,
+        result_path: []const u8,
+    ) tool_registry.ToolExecutionResult {
+        var write_result = self.sandbox_runtime.executeWorldTool(allocator, "file_write", args_json);
+        switch (write_result) {
+            .failure => return write_result,
+            .success => {},
+        }
+
+        const op_result_json = self.readServiceOperationResultJson(allocator, result_path) catch return write_result;
+        defer write_result.deinit(allocator);
+        defer allocator.free(op_result_json);
+
+        return runtimeDispatchFileWriteSuccess(allocator, path, content.len, op_result_json);
     }
 
-    fn buildAgentsListJson(self: *RuntimeToolDispatchProxy, allocator: std.mem.Allocator) ![]u8 {
-        var registry = agent_registry_mod.AgentRegistry.init(
-            self.allocator,
-            ".",
-            self.agents_dir,
-            self.assets_dir,
+    fn readServiceOperationResultJson(
+        self: *RuntimeToolDispatchProxy,
+        allocator: std.mem.Allocator,
+        result_path: []const u8,
+    ) ![]u8 {
+        const args_json = try std.fmt.allocPrint(
+            allocator,
+            "{{\"path\":\"{s}\",\"max_bytes\":1048576}}",
+            .{result_path},
         );
-        defer registry.deinit();
-        try registry.scan();
+        defer allocator.free(args_json);
 
-        var out = std.ArrayListUnmanaged(u8){};
-        errdefer out.deinit(allocator);
-        try out.appendSlice(allocator, "{\"agents\":[");
-        var first = true;
-        for (registry.listAgents()) |agent| {
-            if (!first) try out.append(allocator, ',');
-            first = false;
-            try appendAgentInfoJson(allocator, &out, agent);
-        }
-        try out.appendSlice(allocator, "]}");
-        return out.toOwnedSlice(allocator);
+        var read_result = self.sandbox_runtime.executeWorldTool(allocator, "file_read", args_json);
+        defer read_result.deinit(allocator);
+        const payload_json = switch (read_result) {
+            .success => |success| success.payload_json,
+            .failure => |failure| return errorFromToolFailureCode(failure.code),
+        };
+
+        const content_json = try extractFileReadContentJson(allocator, payload_json);
+        defer allocator.free(content_json);
+        return try extractOperationResultJson(allocator, content_json);
     }
 };
-
-fn isProjectsControlPath(path: []const u8) bool {
-    return pathMatchesAnyControlTarget(path, &.{
-        "global/projects/control/invoke.json",
-        "global/projects/control/list.json",
-        "global/projects/control/get.json",
-        "global/projects/control/up.json",
-    });
-}
 
 fn isAgentsControlPath(path: []const u8) bool {
     return pathMatchesAnyControlTarget(path, &.{
@@ -3772,11 +3461,6 @@ fn isAgentsControlPath(path: []const u8) bool {
         "global/agents/control/create.json",
     });
 }
-
-const TerminalWriteMode = enum {
-    exec,
-    unsupported_session_op,
-};
 
 fn isTerminalControlPath(path: []const u8) bool {
     return pathMatchesAnyControlTarget(path, &.{
@@ -3791,76 +3475,20 @@ fn isTerminalControlPath(path: []const u8) bool {
     });
 }
 
-fn terminalWriteMode(path: []const u8, content: []const u8, allocator: std.mem.Allocator) !TerminalWriteMode {
-    if (pathMatchesAnyControlTarget(path, &.{"global/terminal/control/exec.json"})) return .exec;
-    if (pathMatchesAnyControlTarget(path, &.{
-        "global/terminal/control/create.json",
-        "global/terminal/control/resume.json",
-        "global/terminal/control/close.json",
-        "global/terminal/control/write.json",
-        "global/terminal/control/read.json",
-        "global/terminal/control/resize.json",
-    })) {
-        return .unsupported_session_op;
-    }
-    if (!pathMatchesAnyControlTarget(path, &.{"global/terminal/control/invoke.json"})) {
-        return .unsupported_session_op;
-    }
-
-    const trimmed = std.mem.trim(u8, content, " \t\r\n");
-    if (trimmed.len == 0) return error.InvalidPayload;
-
-    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, trimmed, .{});
-    defer parsed.deinit();
-    if (parsed.value != .object) return error.InvalidPayload;
-
-    const root = parsed.value.object;
-    const args_obj = if (root.get("arguments")) |value|
-        if (value == .object) value.object else return error.InvalidPayload
-    else if (root.get("args")) |value|
-        if (value == .object) value.object else return error.InvalidPayload
-    else
-        root;
-
-    const op = optionalStringField(args_obj, "op") orelse
-        optionalStringField(args_obj, "operation") orelse
-        optionalStringField(root, "op") orelse
-        optionalStringField(root, "operation") orelse
-        "exec";
-
-    if (std.mem.eql(u8, op, "exec") or std.mem.eql(u8, op, "shell_exec")) return .exec;
-    return .unsupported_session_op;
-}
-
-fn normalizeTerminalExecPayload(path: []const u8, content: []const u8, allocator: std.mem.Allocator) ![]u8 {
-    const trimmed = std.mem.trim(u8, content, " \t\r\n");
-    if (trimmed.len == 0) return error.InvalidPayload;
-    if (!pathMatchesAnyControlTarget(path, &.{"global/terminal/control/invoke.json"})) {
-        return allocator.dupe(u8, trimmed);
-    }
-
-    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, trimmed, .{});
-    defer parsed.deinit();
-    if (parsed.value != .object) return error.InvalidPayload;
-
-    const root = parsed.value.object;
-    if (root.get("arguments")) |value| {
-        if (value != .object) return error.InvalidPayload;
-        return std.json.Stringify.valueAlloc(allocator, value, .{});
-    }
-    if (root.get("args")) |value| {
-        if (value != .object) return error.InvalidPayload;
-        return std.json.Stringify.valueAlloc(allocator, value, .{});
-    }
-
-    return allocator.dupe(u8, trimmed);
-}
-
 fn pathMatchesAnyControlTarget(path: []const u8, targets: []const []const u8) bool {
     for (targets) |target| {
         if (pathMatchesControlTarget(path, target)) return true;
     }
     return false;
+}
+
+fn isProjectsControlPath(path: []const u8) bool {
+    return pathMatchesAnyControlTarget(path, &.{
+        "global/projects/control/invoke.json",
+        "global/projects/control/list.json",
+        "global/projects/control/get.json",
+        "global/projects/control/up.json",
+    });
 }
 
 fn runtimeDispatchErrorCode(err: anyerror) tool_registry.ToolErrorCode {
@@ -3915,187 +3543,33 @@ fn runtimeDispatchFileWriteSuccess(
     return .{ .success = .{ .payload_json = payload } };
 }
 
-fn runtimeDispatchFileReadSuccess(
-    allocator: std.mem.Allocator,
-    path: []const u8,
-    content: []const u8,
-) tool_registry.ToolExecutionResult {
-    const escaped_path = unified.jsonEscape(allocator, path) catch {
-        return runtimeDispatchFailure(allocator, .execution_failed, "failed to encode file_read path");
+fn errorFromToolFailureCode(code: tool_registry.ToolErrorCode) anyerror {
+    return switch (code) {
+        .permission_denied => error.AccessDenied,
+        .timeout => error.Timeout,
+        else => error.ExecutionFailed,
     };
-    defer allocator.free(escaped_path);
-    const escaped_content = unified.jsonEscape(allocator, content) catch {
-        return runtimeDispatchFailure(allocator, .execution_failed, "failed to encode file_read content");
-    };
-    defer allocator.free(escaped_content);
-
-    const payload = std.fmt.allocPrint(
-        allocator,
-        "{{\"path\":\"{s}\",\"bytes\":{d},\"truncated\":false,\"content\":\"{s}\",\"ready\":true,\"wait_until_ready\":true}}",
-        .{ escaped_path, content.len, escaped_content },
-    ) catch {
-        return runtimeDispatchFailure(allocator, .execution_failed, "failed to build file_read payload");
-    };
-    return .{ .success = .{ .payload_json = payload } };
-}
-
-fn runtimeDispatchFileListSuccess(
-    allocator: std.mem.Allocator,
-    path: []const u8,
-    entries: []const RuntimeToolDispatchProxy.RuntimeFileListEntry,
-) tool_registry.ToolExecutionResult {
-    var payload = std.ArrayListUnmanaged(u8){};
-    errdefer payload.deinit(allocator);
-
-    const escaped_path = unified.jsonEscape(allocator, path) catch {
-        return runtimeDispatchFailure(allocator, .execution_failed, "failed to encode file_list path");
-    };
-    defer allocator.free(escaped_path);
-    payload.writer(allocator).print("{{\"path\":\"{s}\",\"entries\":[", .{escaped_path}) catch {
-        return runtimeDispatchFailure(allocator, .execution_failed, "out of memory");
-    };
-    for (entries, 0..) |entry, idx| {
-        if (idx != 0) payload.append(allocator, ',') catch {
-            return runtimeDispatchFailure(allocator, .execution_failed, "out of memory");
-        };
-        const escaped_name = unified.jsonEscape(allocator, entry.name) catch {
-            return runtimeDispatchFailure(allocator, .execution_failed, "out of memory");
-        };
-        defer allocator.free(escaped_name);
-        const escaped_kind = unified.jsonEscape(allocator, entry.kind) catch {
-            return runtimeDispatchFailure(allocator, .execution_failed, "out of memory");
-        };
-        defer allocator.free(escaped_kind);
-        payload.writer(allocator).print("{{\"name\":\"{s}\",\"type\":\"{s}\"}}", .{ escaped_name, escaped_kind }) catch {
-            return runtimeDispatchFailure(allocator, .execution_failed, "out of memory");
-        };
-    }
-    payload.appendSlice(allocator, "],\"truncated\":false}") catch {
-        return runtimeDispatchFailure(allocator, .execution_failed, "out of memory");
-    };
-    return .{ .success = .{ .payload_json = payload.toOwnedSlice(allocator) catch return runtimeDispatchFailure(allocator, .execution_failed, "out of memory") } };
 }
 
 fn stringifyJsonValueAlloc(allocator: std.mem.Allocator, value: std.json.Value) ![]u8 {
     return std.json.Stringify.valueAlloc(allocator, value, .{});
 }
 
-fn runtimeDispatchSyntheticReadContent(path: []const u8) ?[]const u8 {
-    if (pathMatchesAnyControlTarget(path, &.{"global/services/SERVICES.json"})) {
-        return runtimeDispatchServicesIndexJson();
-    }
-
-    if (pathMatchesAnyControlTarget(path, &.{"global/terminal/README.md"})) {
-        return "# Terminal\n\nExec terminal namespace for agent runtime. Use `control/exec.json` or `control/invoke.json` with `op=exec` to run a command in the project sandbox.\n";
-    }
-    if (pathMatchesAnyControlTarget(path, &.{"global/terminal/SCHEMA.json"})) {
-        return "{\"kind\":\"service\",\"service_id\":\"terminal\",\"shape\":\"/global/terminal/{README.md,SCHEMA.json,CAPS.json,OPS.json,RUNTIME.json,PERMISSIONS.json,STATUS.json,status.json,result.json,control/*}\"}";
-    }
-    if (pathMatchesAnyControlTarget(path, &.{"global/terminal/CAPS.json"})) {
-        return "{\"invoke\":true,\"operations\":[\"shell_exec\"],\"discoverable\":true,\"interactive\":false,\"sessionized\":false,\"pty\":false}";
-    }
-    if (pathMatchesAnyControlTarget(path, &.{"global/terminal/OPS.json"})) {
-        return "{\"model\":\"local_bridge\",\"invoke\":\"control/invoke.json\",\"transport\":\"acheron-local\",\"paths\":{\"exec\":\"control/exec.json\"},\"operations\":{\"exec\":\"exec\"}}";
-    }
-    if (pathMatchesAnyControlTarget(path, &.{"global/terminal/RUNTIME.json"})) {
-        return "{\"type\":\"runtime_tool\",\"tool\":\"shell_exec\",\"session_model\":\"exec-only\"}";
-    }
-    if (pathMatchesAnyControlTarget(path, &.{"global/terminal/PERMISSIONS.json"})) {
-        return "{\"default\":\"allow-by-default\",\"allow_roles\":[\"admin\",\"user\"],\"scope\":\"project_namespace\"}";
-    }
-    if (pathMatchesAnyControlTarget(path, &.{"global/terminal/STATUS.json"})) {
-        return "{\"service_id\":\"terminal\",\"state\":\"namespace\",\"has_invoke\":true,\"sessionized\":false}";
-    }
-    if (pathMatchesAnyControlTarget(path, &.{"global/terminal/status.json"})) {
-        return "{\"state\":\"idle\",\"tool\":null,\"session_id\":null,\"updated_at_ms\":0,\"error\":null}";
-    }
-    if (pathMatchesAnyControlTarget(path, &.{"global/terminal/result.json"})) {
-        return "{\"ok\":false,\"result\":null,\"error\":null}";
-    }
-    if (pathMatchesAnyControlTarget(path, &.{"global/terminal/control/README.md"})) {
-        return "Use exec.json for direct command execution. invoke.json also accepts `{\\\"op\\\":\\\"exec\\\",\\\"args\\\":{...}}` envelopes.\n";
-    }
-
-    if (pathMatchesAnyControlTarget(path, &.{"global/projects/README.md"})) {
-        return "# Projects Management\n\nList, inspect, and create/update projects through Acheron control files.\n";
-    }
-    if (pathMatchesAnyControlTarget(path, &.{"global/projects/SCHEMA.json"})) {
-        return "{\"kind\":\"service\",\"service_id\":\"projects\",\"shape\":\"/global/projects/{README.md,SCHEMA.json,CAPS.json,OPS.json,PERMISSIONS.json,STATUS.json,status.json,result.json,control/*}\"}";
-    }
-    if (pathMatchesAnyControlTarget(path, &.{"global/projects/CAPS.json"})) {
-        return "{\"invoke\":true,\"operations\":[\"projects_list\",\"projects_get\",\"projects_up\"],\"discoverable\":true}";
-    }
-    if (pathMatchesAnyControlTarget(path, &.{"global/projects/OPS.json"})) {
-        return "{\"model\":\"local_bridge\",\"invoke\":\"control/invoke.json\",\"transport\":\"acheron-local\",\"paths\":{\"list\":\"control/list.json\",\"get\":\"control/get.json\",\"up\":\"control/up.json\"},\"operations\":{\"list\":\"projects_list\",\"get\":\"projects_get\",\"up\":\"projects_up\"}}";
-    }
-    if (pathMatchesAnyControlTarget(path, &.{"global/projects/PERMISSIONS.json"})) {
-        return "{\"default\":\"allow-by-default\",\"allow_roles\":[\"admin\",\"user\"],\"scope\":\"project_control_plane\"}";
-    }
-    if (pathMatchesAnyControlTarget(path, &.{"global/projects/STATUS.json"})) {
-        return "{\"service_id\":\"projects\",\"state\":\"namespace\",\"has_invoke\":true}";
-    }
-    if (pathMatchesAnyControlTarget(path, &.{"global/projects/status.json"})) {
-        return "{\"state\":\"idle\",\"tool\":null,\"updated_at_ms\":0,\"error\":null}";
-    }
-    if (pathMatchesAnyControlTarget(path, &.{"global/projects/result.json"})) {
-        return "{\"projects\":[]}";
-    }
-    if (pathMatchesAnyControlTarget(path, &.{"global/projects/control/README.md"})) {
-        return "Use list/get/up operation files, or invoke.json with op=list|get|up plus arguments. For Mother bootstrap provisioning, use up with activate=false.\n";
-    }
-
-    if (pathMatchesAnyControlTarget(path, &.{"global/agents/README.md"})) {
-        return "# Agents Management\n\nList and create agent workspaces through Acheron control files.\n";
-    }
-    if (pathMatchesAnyControlTarget(path, &.{"global/agents/SCHEMA.json"})) {
-        return "{\"kind\":\"service\",\"service_id\":\"agents\",\"shape\":\"/global/agents/{README.md,SCHEMA.json,CAPS.json,OPS.json,PERMISSIONS.json,STATUS.json,status.json,result.json,control/*}\"}";
-    }
-    if (pathMatchesAnyControlTarget(path, &.{"global/agents/CAPS.json"})) {
-        return "{\"invoke\":true,\"operations\":[\"agents_list\",\"agents_create\"],\"discoverable\":true,\"create_allowed\":true}";
-    }
-    if (pathMatchesAnyControlTarget(path, &.{"global/agents/OPS.json"})) {
-        return "{\"model\":\"local_bridge\",\"invoke\":\"control/invoke.json\",\"transport\":\"acheron-local\",\"paths\":{\"list\":\"control/list.json\",\"create\":\"control/create.json\"},\"operations\":{\"list\":\"agents_list\",\"create\":\"agents_create\"}}";
-    }
-    if (pathMatchesAnyControlTarget(path, &.{"global/agents/PERMISSIONS.json"})) {
-        return "{\"default\":\"allow-by-default\",\"allow_roles\":[\"admin\",\"user\"],\"scope\":\"agent\",\"project_token_required\":false}";
-    }
-    if (pathMatchesAnyControlTarget(path, &.{"global/agents/STATUS.json"})) {
-        return "{\"service_id\":\"agents\",\"state\":\"namespace\",\"has_invoke\":true}";
-    }
-    if (pathMatchesAnyControlTarget(path, &.{"global/agents/status.json"})) {
-        return "{\"state\":\"idle\",\"tool\":null,\"updated_at_ms\":0,\"error\":null}";
-    }
-    if (pathMatchesAnyControlTarget(path, &.{"global/agents/result.json"})) {
-        return "{\"agents\":[]}";
-    }
-    if (pathMatchesAnyControlTarget(path, &.{"global/agents/control/README.md"})) {
-        return "Use list/create operation files, or invoke.json with op=list|create plus arguments. Create requires agent provisioning capability.\n";
-    }
-
-    return null;
+fn extractFileReadContentJson(allocator: std.mem.Allocator, payload_json: []const u8) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload_json, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidPayload;
+    const content = parsed.value.object.get("content") orelse return error.InvalidPayload;
+    if (content != .string) return error.InvalidPayload;
+    return try allocator.dupe(u8, content.string);
 }
 
-fn runtimeDispatchServicesIndexJson() []const u8 {
-    return "[{\"node_id\":\"global\",\"service_id\":\"services\",\"service_path\":\"/global/services\",\"invoke_path\":null,\"has_invoke\":false,\"scope\":\"project_namespace\"},{\"node_id\":\"global\",\"service_id\":\"chat\",\"service_path\":\"/global/chat\",\"invoke_path\":null,\"has_invoke\":false,\"scope\":\"project_namespace\"},{\"node_id\":\"global\",\"service_id\":\"jobs\",\"service_path\":\"/global/jobs\",\"invoke_path\":null,\"has_invoke\":false,\"scope\":\"project_namespace\"},{\"node_id\":\"global\",\"service_id\":\"terminal\",\"service_path\":\"/global/terminal\",\"invoke_path\":\"/global/terminal/control/invoke.json\",\"has_invoke\":true,\"scope\":\"project_namespace\"},{\"node_id\":\"global\",\"service_id\":\"projects\",\"service_path\":\"/global/projects\",\"invoke_path\":\"/global/projects/control/invoke.json\",\"has_invoke\":true,\"scope\":\"project_namespace\"},{\"node_id\":\"global\",\"service_id\":\"agents\",\"service_path\":\"/global/agents\",\"invoke_path\":\"/global/agents/control/invoke.json\",\"has_invoke\":true,\"scope\":\"project_namespace\"},{\"node_id\":\"global\",\"service_id\":\"library\",\"service_path\":\"/global/library\",\"invoke_path\":null,\"has_invoke\":false,\"scope\":\"global_namespace\"}]";
-}
-
-fn buildProjectScopedPayload(allocator: std.mem.Allocator, project_id: []const u8, project_token: ?[]const u8) ![]u8 {
-    const escaped_project = try unified.jsonEscape(allocator, project_id);
-    defer allocator.free(escaped_project);
-    if (project_token) |token| {
-        const escaped_token = try unified.jsonEscape(allocator, token);
-        defer allocator.free(escaped_token);
-        return std.fmt.allocPrint(
-            allocator,
-            "{{\"project_id\":\"{s}\",\"project_token\":\"{s}\"}}",
-            .{ escaped_project, escaped_token },
-        );
-    }
-    return std.fmt.allocPrint(
-        allocator,
-        "{{\"project_id\":\"{s}\"}}",
-        .{escaped_project},
-    );
+fn extractOperationResultJson(allocator: std.mem.Allocator, content_json: []const u8) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, content_json, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return allocator.dupe(u8, content_json);
+    const result = parsed.value.object.get("result") orelse return allocator.dupe(u8, content_json);
+    return stringifyJsonValueAlloc(allocator, result);
 }
 
 const AgentRuntimeRegistry = struct {
@@ -4124,18 +3598,18 @@ const AgentRuntimeRegistry = struct {
     runtime_warmup_lifecycle_cond: std.Thread.Condition = .{},
     runtime_warmup_inflight: usize = 0,
     runtime_warmup_stopping: bool = false,
-    node_service_event_history_mutex: std.Thread.Mutex = .{},
-    node_service_event_history: std.ArrayListUnmanaged(NodeServiceEventRecord) = .{},
-    node_service_event_history_max: usize = node_service_event_history_max_default,
-    node_service_event_log_path: ?[]u8 = null,
-    node_service_event_log_rotate_max_bytes: u64 = 4 * 1024 * 1024,
-    node_service_event_log_archive_keep: usize = 8,
-    node_service_event_log_gzip_available: bool = false,
-    service_presence_worker_thread: ?std.Thread = null,
-    service_presence_worker_stop: bool = false,
-    service_presence_worker_mutex: std.Thread.Mutex = .{},
-    service_presence_worker_cond: std.Thread.Condition = .{},
-    service_presence_jobs: std.ArrayListUnmanaged(ServicePresenceDispatchJob) = .{},
+    node_venom_event_history_mutex: std.Thread.Mutex = .{},
+    node_venom_event_history: std.ArrayListUnmanaged(NodeVenomEventRecord) = .{},
+    node_venom_event_history_max: usize = node_venom_event_history_max_default,
+    node_venom_event_log_path: ?[]u8 = null,
+    node_venom_event_log_rotate_max_bytes: u64 = 4 * 1024 * 1024,
+    node_venom_event_log_archive_keep: usize = 8,
+    node_venom_event_log_gzip_available: bool = false,
+    venom_presence_worker_thread: ?std.Thread = null,
+    venom_presence_worker_stop: bool = false,
+    venom_presence_worker_mutex: std.Thread.Mutex = .{},
+    venom_presence_worker_cond: std.Thread.Condition = .{},
+    venom_presence_jobs: std.ArrayListUnmanaged(VenomPresenceDispatchJob) = .{},
     audit_records_mutex: std.Thread.Mutex = .{},
     audit_records: std.ArrayListUnmanaged(AuditRecord) = .{},
     next_audit_record_id: u64 = 1,
@@ -4190,22 +3664,22 @@ const AgentRuntimeRegistry = struct {
         }
         const history_max_raw = parseUnsignedEnv(
             allocator,
-            node_service_event_history_max_env,
-            @as(u64, node_service_event_history_max_default),
+            node_venom_event_history_max_env,
+            @as(u64, node_venom_event_history_max_default),
         );
         const history_max: usize = @intCast(@max(@as(u64, 64), @min(history_max_raw, 20_000)));
         const event_rotate_max_bytes = parseUnsignedEnv(
             allocator,
-            node_service_event_log_rotate_max_bytes_env,
+            node_venom_event_log_rotate_max_bytes_env,
             8 * 1024 * 1024,
         );
         const event_archive_keep_raw = parseUnsignedEnv(
             allocator,
-            node_service_event_log_archive_keep_env,
+            node_venom_event_log_archive_keep_env,
             8,
         );
         const event_archive_keep: usize = @intCast(@min(event_archive_keep_raw, 64));
-        const event_log_path = initNodeServiceEventLogPath(allocator, runtime_config.ltm_directory) catch |err| blk: {
+        const event_log_path = initNodeVenomEventLogPath(allocator, runtime_config.ltm_directory) catch |err| blk: {
             std.log.warn("node service event persistence disabled: {s}", .{@errorName(err)});
             break :blk null;
         };
@@ -4231,7 +3705,7 @@ const AgentRuntimeRegistry = struct {
                 .{
                     .primary_agent_id = system_agent_id,
                     .spider_web_root = effective_runtime_config.spider_web_root,
-                    .node_service_event_history_max = history_max,
+                    .node_venom_event_history_max = history_max,
                 },
             ),
             .job_index = chat_job_index.ChatJobIndex.init(
@@ -4242,30 +3716,30 @@ const AgentRuntimeRegistry = struct {
             .control_operator_token = operator_token,
             .control_project_scope_token = project_scope_token,
             .control_node_scope_token = node_scope_token,
-            .node_service_event_history_max = history_max,
-            .node_service_event_log_path = event_log_path,
-            .node_service_event_log_rotate_max_bytes = event_rotate_max_bytes,
-            .node_service_event_log_archive_keep = event_archive_keep,
-            .node_service_event_log_gzip_available = event_log_gzip_available,
+            .node_venom_event_history_max = history_max,
+            .node_venom_event_log_path = event_log_path,
+            .node_venom_event_log_rotate_max_bytes = event_rotate_max_bytes,
+            .node_venom_event_log_archive_keep = event_archive_keep,
+            .node_venom_event_log_gzip_available = event_log_gzip_available,
             .node_tunnels = .{ .allocator = allocator },
         };
-        registry.loadNodeServiceEventHistory() catch |err| {
+        registry.loadNodeVenomEventHistory() catch |err| {
             std.log.warn("failed to load node service event history: {s}", .{@errorName(err)});
         };
         return registry;
     }
 
     fn deinit(self: *AgentRuntimeRegistry) void {
-        self.requestServicePresenceWorkerStop();
-        if (self.service_presence_worker_thread) |thread| {
+        self.requestVenomPresenceWorkerStop();
+        if (self.venom_presence_worker_thread) |thread| {
             thread.join();
-            self.service_presence_worker_thread = null;
+            self.venom_presence_worker_thread = null;
         }
-        self.service_presence_worker_mutex.lock();
-        for (self.service_presence_jobs.items) |*job| job.deinit(self.allocator);
-        self.service_presence_jobs.deinit(self.allocator);
-        self.service_presence_jobs = .{};
-        self.service_presence_worker_mutex.unlock();
+        self.venom_presence_worker_mutex.lock();
+        for (self.venom_presence_jobs.items) |*job| job.deinit(self.allocator);
+        self.venom_presence_jobs.deinit(self.allocator);
+        self.venom_presence_jobs = .{};
+        self.venom_presence_worker_mutex.unlock();
 
         self.requestRuntimeResidencyWorkerStop();
         if (self.runtime_residency_worker_thread) |thread| {
@@ -4339,10 +3813,10 @@ const AgentRuntimeRegistry = struct {
             self.allocator.free(value);
             self.workspace_url = null;
         }
-        self.clearNodeServiceEventHistory();
-        if (self.node_service_event_log_path) |path| {
+        self.clearNodeVenomEventHistory();
+        if (self.node_venom_event_log_path) |path| {
             self.allocator.free(path);
-            self.node_service_event_log_path = null;
+            self.node_venom_event_log_path = null;
         }
         self.node_tunnels.deinit();
         self.audit_records_mutex.lock();
@@ -4625,11 +4099,11 @@ const AgentRuntimeRegistry = struct {
         return self.dispatchRuntimeAgentControlForTarget(binding.agent_id, binding.project_id, action, content_json);
     }
 
-    fn enqueueServicePresenceDispatch(
+    fn enqueueVenomPresenceDispatch(
         self: *AgentRuntimeRegistry,
         binding: SessionBinding,
         session_key: []const u8,
-        service_id: []const u8,
+        venom_id: []const u8,
         attached: bool,
         payload_json: []u8,
     ) !void {
@@ -4644,17 +4118,17 @@ const AgentRuntimeRegistry = struct {
         errdefer if (owned_project_id) |value| self.allocator.free(value);
         const owned_session_key = try self.allocator.dupe(u8, session_key);
         errdefer self.allocator.free(owned_session_key);
-        const owned_service_id = try self.allocator.dupe(u8, service_id);
-        errdefer self.allocator.free(owned_service_id);
+        const owned_venom_id = try self.allocator.dupe(u8, venom_id);
+        errdefer self.allocator.free(owned_venom_id);
 
-        self.service_presence_worker_mutex.lock();
-        defer self.service_presence_worker_mutex.unlock();
+        self.venom_presence_worker_mutex.lock();
+        defer self.venom_presence_worker_mutex.unlock();
 
-        if (self.service_presence_worker_stop) return error.ShuttingDown;
+        if (self.venom_presence_worker_stop) return error.ShuttingDown;
 
-        for (self.service_presence_jobs.items) |*job| {
-            if (job.matches(binding.agent_id, binding.project_id, session_key, service_id, attached)) {
-                self.allocator.free(owned_service_id);
+        for (self.venom_presence_jobs.items) |*job| {
+            if (job.matches(binding.agent_id, binding.project_id, session_key, venom_id, attached)) {
+                self.allocator.free(owned_venom_id);
                 self.allocator.free(owned_session_key);
                 if (owned_project_id) |value| self.allocator.free(value);
                 self.allocator.free(owned_agent_id);
@@ -4663,17 +4137,17 @@ const AgentRuntimeRegistry = struct {
             }
         }
 
-        if (self.service_presence_jobs.items.len >= service_presence_dispatch_queue_max) return error.QueueFull;
+        if (self.venom_presence_jobs.items.len >= venom_presence_dispatch_queue_max) return error.QueueFull;
 
-        try self.service_presence_jobs.append(self.allocator, .{
+        try self.venom_presence_jobs.append(self.allocator, .{
             .agent_id = owned_agent_id,
             .project_id = owned_project_id,
             .session_key = owned_session_key,
-            .service_id = owned_service_id,
+            .venom_id = owned_venom_id,
             .attached = attached,
             .payload_json = payload_json,
         });
-        self.service_presence_worker_cond.signal();
+        self.venom_presence_worker_cond.signal();
     }
 
     fn getRuntimeForBindingIfReady(
@@ -4745,12 +4219,12 @@ const AgentRuntimeRegistry = struct {
         return false;
     }
 
-    fn publishServicePresenceForBinding(
+    fn publishVenomPresenceForBinding(
         self: *AgentRuntimeRegistry,
         role: ConnectionRole,
         binding: SessionBinding,
         session_key: []const u8,
-        service_id: []const u8,
+        venom_id: []const u8,
         attached: bool,
     ) void {
         var setup_hint = ProjectSetupHint{};
@@ -4763,8 +4237,8 @@ const AgentRuntimeRegistry = struct {
             };
         }
 
-        const escaped_service = unified.jsonEscape(self.allocator, service_id) catch return;
-        defer self.allocator.free(escaped_service);
+        const escaped_venom = unified.jsonEscape(self.allocator, venom_id) catch return;
+        defer self.allocator.free(escaped_venom);
         const escaped_session = unified.jsonEscape(self.allocator, session_key) catch return;
         defer self.allocator.free(escaped_session);
         const escaped_role = unified.jsonEscape(self.allocator, connectionRoleName(role)) catch return;
@@ -4799,7 +4273,7 @@ const AgentRuntimeRegistry = struct {
         } else self.allocator.dupe(u8, "null") catch return;
         defer self.allocator.free(project_setup_vision_json);
         const project_setup_source_json = if (attached) blk: {
-            const escaped_source = unified.jsonEscape(self.allocator, "service.event") catch return;
+            const escaped_source = unified.jsonEscape(self.allocator, "venom.event") catch return;
             defer self.allocator.free(escaped_source);
             break :blk std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped_source}) catch return;
         } else self.allocator.dupe(u8, "null") catch return;
@@ -4807,9 +4281,9 @@ const AgentRuntimeRegistry = struct {
 
         const payload_json = std.fmt.allocPrint(
             self.allocator,
-            "{{\"service_id\":\"{s}\",\"status\":\"{s}\",\"session_key\":\"{s}\",\"role\":\"{s}\",\"actor_type\":\"{s}\",\"actor_id\":\"{s}\",\"project_id\":{s},\"project_setup_required\":{},\"project_setup_project_id\":{s},\"project_setup_message\":{s},\"project_setup_project_vision\":{s},\"project_setup_source\":{s}}}",
+            "{{\"venom_id\":\"{s}\",\"status\":\"{s}\",\"session_key\":\"{s}\",\"role\":\"{s}\",\"actor_type\":\"{s}\",\"actor_id\":\"{s}\",\"project_id\":{s},\"project_setup_required\":{},\"project_setup_project_id\":{s},\"project_setup_message\":{s},\"project_setup_project_vision\":{s},\"project_setup_source\":{s}}}",
             .{
-                escaped_service,
+                escaped_venom,
                 if (attached) "attached" else "detached",
                 escaped_session,
                 escaped_role,
@@ -4823,10 +4297,10 @@ const AgentRuntimeRegistry = struct {
                 project_setup_source_json,
             },
         ) catch return;
-        self.enqueueServicePresenceDispatch(
+        self.enqueueVenomPresenceDispatch(
             binding,
             session_key,
-            service_id,
+            venom_id,
             attached,
             payload_json,
         ) catch |err| {
@@ -5069,11 +4543,11 @@ const AgentRuntimeRegistry = struct {
         );
     }
 
-    fn startServicePresenceWorker(self: *AgentRuntimeRegistry) !void {
-        self.service_presence_worker_mutex.lock();
-        self.service_presence_worker_stop = false;
-        self.service_presence_worker_mutex.unlock();
-        self.service_presence_worker_thread = try std.Thread.spawn(
+    fn startVenomPresenceWorker(self: *AgentRuntimeRegistry) !void {
+        self.venom_presence_worker_mutex.lock();
+        self.venom_presence_worker_stop = false;
+        self.venom_presence_worker_mutex.unlock();
+        self.venom_presence_worker_thread = try std.Thread.spawn(
             .{},
             servicePresenceWorkerMain,
             .{self},
@@ -5097,11 +4571,11 @@ const AgentRuntimeRegistry = struct {
         self.reconcile_worker_mutex.unlock();
     }
 
-    fn requestServicePresenceWorkerStop(self: *AgentRuntimeRegistry) void {
-        self.service_presence_worker_mutex.lock();
-        self.service_presence_worker_stop = true;
-        self.service_presence_worker_cond.broadcast();
-        self.service_presence_worker_mutex.unlock();
+    fn requestVenomPresenceWorkerStop(self: *AgentRuntimeRegistry) void {
+        self.venom_presence_worker_mutex.lock();
+        self.venom_presence_worker_stop = true;
+        self.venom_presence_worker_cond.broadcast();
+        self.venom_presence_worker_mutex.unlock();
     }
 
     fn shouldStopReconcileWorker(self: *AgentRuntimeRegistry) bool {
@@ -5392,10 +4866,6 @@ const AgentRuntimeRegistry = struct {
             const tool_dispatch_proxy = try RuntimeToolDispatchProxy.create(
                 self.allocator,
                 sandbox_runtime,
-                &self.control_plane,
-                self.runtime_config.agents_dir,
-                self.runtime_config.assets_dir,
-                agent_id,
             );
             errdefer tool_dispatch_proxy.destroy();
 
@@ -6174,41 +5644,41 @@ const AgentRuntimeRegistry = struct {
         return out.toOwnedSlice(self.allocator);
     }
 
-    fn clearNodeServiceEventHistory(self: *AgentRuntimeRegistry) void {
-        self.node_service_event_history_mutex.lock();
-        defer self.node_service_event_history_mutex.unlock();
-        for (self.node_service_event_history.items) |*record| {
+    fn clearNodeVenomEventHistory(self: *AgentRuntimeRegistry) void {
+        self.node_venom_event_history_mutex.lock();
+        defer self.node_venom_event_history_mutex.unlock();
+        for (self.node_venom_event_history.items) |*record| {
             record.deinit(self.allocator);
         }
-        self.node_service_event_history.deinit(self.allocator);
-        self.node_service_event_history = .{};
+        self.node_venom_event_history.deinit(self.allocator);
+        self.node_venom_event_history = .{};
     }
 
-    fn appendNodeServiceEventHistoryRecord(
+    fn appendNodeVenomEventHistoryRecord(
         self: *AgentRuntimeRegistry,
-        record: NodeServiceEventRecord,
+        record: NodeVenomEventRecord,
     ) void {
-        self.node_service_event_history_mutex.lock();
-        defer self.node_service_event_history_mutex.unlock();
-        while (self.node_service_event_history.items.len >= self.node_service_event_history_max and
-            self.node_service_event_history.items.len > 0)
+        self.node_venom_event_history_mutex.lock();
+        defer self.node_venom_event_history_mutex.unlock();
+        while (self.node_venom_event_history.items.len >= self.node_venom_event_history_max and
+            self.node_venom_event_history.items.len > 0)
         {
-            var dropped = self.node_service_event_history.orderedRemove(0);
+            var dropped = self.node_venom_event_history.orderedRemove(0);
             dropped.deinit(self.allocator);
         }
-        self.node_service_event_history.append(self.allocator, record) catch {
+        self.node_venom_event_history.append(self.allocator, record) catch {
             var cleanup = record;
             cleanup.deinit(self.allocator);
         };
     }
 
-    fn persistNodeServiceEventRecord(
+    fn persistNodeVenomEventRecord(
         self: *AgentRuntimeRegistry,
         timestamp_ms: i64,
         node_id: ?[]const u8,
         payload_json: []const u8,
     ) void {
-        const path = self.node_service_event_log_path orelse return;
+        const path = self.node_venom_event_log_path orelse return;
         const escaped_payload = unified.jsonEscape(self.allocator, payload_json) catch return;
         defer self.allocator.free(escaped_payload);
         const line = if (node_id) |value| blk: {
@@ -6238,12 +5708,12 @@ const AgentRuntimeRegistry = struct {
         file.writeAll(line) catch |err| {
             std.log.warn("failed appending node service event log {s}: {s}", .{ path, @errorName(err) });
         };
-        self.maybeRotateNodeServiceEventLog();
+        self.maybeRotateNodeVenomEventLog();
     }
 
-    fn maybeRotateNodeServiceEventLog(self: *AgentRuntimeRegistry) void {
-        const path = self.node_service_event_log_path orelse return;
-        if (self.node_service_event_log_rotate_max_bytes == 0) return;
+    fn maybeRotateNodeVenomEventLog(self: *AgentRuntimeRegistry) void {
+        const path = self.node_venom_event_log_path orelse return;
+        if (self.node_venom_event_log_rotate_max_bytes == 0) return;
 
         const size = fileSize(path) catch |err| switch (err) {
             error.FileNotFound => return,
@@ -6252,12 +5722,12 @@ const AgentRuntimeRegistry = struct {
                 return;
             },
         };
-        if (size <= self.node_service_event_log_rotate_max_bytes) return;
+        if (size <= self.node_venom_event_log_rotate_max_bytes) return;
 
         const archive_path = allocateArchivePathWithPrefix(
             self.allocator,
             path,
-            node_service_event_archive_prefix,
+            node_venom_event_archive_prefix,
         ) catch |err| {
             std.log.warn("failed creating node service archive path for {s}: {s}", .{ path, @errorName(err) });
             return;
@@ -6273,7 +5743,7 @@ const AgentRuntimeRegistry = struct {
             return;
         };
 
-        if (self.node_service_event_log_gzip_available) {
+        if (self.node_venom_event_log_gzip_available) {
             compressArchiveGzip(self.allocator, archive_path) catch |err| {
                 std.log.warn("failed to gzip node service archive {s}: {s}", .{
                     archive_path,
@@ -6285,8 +5755,8 @@ const AgentRuntimeRegistry = struct {
         pruneArchivesWithPrefix(
             self.allocator,
             path,
-            node_service_event_archive_prefix,
-            self.node_service_event_log_archive_keep,
+            node_venom_event_archive_prefix,
+            self.node_venom_event_log_archive_keep,
         ) catch |err| {
             std.log.warn("failed pruning node service archives for {s}: {s}", .{
                 path,
@@ -6304,7 +5774,7 @@ const AgentRuntimeRegistry = struct {
         };
     }
 
-    fn recordNodeServiceEvent(
+    fn recordNodeVenomEvent(
         self: *AgentRuntimeRegistry,
         node_id: ?[]const u8,
         payload_json: []const u8,
@@ -6318,16 +5788,16 @@ const AgentRuntimeRegistry = struct {
             }
         else
             null;
-        self.appendNodeServiceEventHistoryRecord(.{
+        self.appendNodeVenomEventHistoryRecord(.{
             .timestamp_ms = timestamp_ms,
             .node_id = node_copy,
             .payload_json = payload_copy,
         });
-        self.persistNodeServiceEventRecord(timestamp_ms, node_id, payload_json);
+        self.persistNodeVenomEventRecord(timestamp_ms, node_id, payload_json);
     }
 
-    fn loadNodeServiceEventHistory(self: *AgentRuntimeRegistry) !void {
-        const path = self.node_service_event_log_path orelse return;
+    fn loadNodeVenomEventHistory(self: *AgentRuntimeRegistry) !void {
+        const path = self.node_venom_event_log_path orelse return;
         const raw = std.fs.cwd().readFileAlloc(self.allocator, path, 16 * 1024 * 1024) catch |err| switch (err) {
             error.FileNotFound => return,
             else => return err,
@@ -6361,7 +5831,7 @@ const AgentRuntimeRegistry = struct {
                 if (node_copy) |value| self.allocator.free(value);
                 continue;
             };
-            self.appendNodeServiceEventHistoryRecord(.{
+            self.appendNodeVenomEventHistoryRecord(.{
                 .timestamp_ms = timestamp_ms,
                 .node_id = node_copy,
                 .payload_json = payload_copy,
@@ -6369,28 +5839,28 @@ const AgentRuntimeRegistry = struct {
         }
     }
 
-    fn snapshotNodeServiceEventMetrics(self: *AgentRuntimeRegistry) NodeServiceEventMetricsSnapshot {
-        var snapshot = NodeServiceEventMetricsSnapshot{};
-        self.node_service_event_history_mutex.lock();
-        snapshot.retained_events = self.node_service_event_history.items.len;
-        snapshot.retained_capacity = self.node_service_event_history_max;
-        if (self.node_service_event_history.items.len > 0) {
-            snapshot.retained_oldest_ms = self.node_service_event_history.items[0].timestamp_ms;
-            snapshot.retained_newest_ms = self.node_service_event_history.items[self.node_service_event_history.items.len - 1].timestamp_ms;
+    fn snapshotNodeVenomEventMetrics(self: *AgentRuntimeRegistry) NodeVenomEventMetricsSnapshot {
+        var snapshot = NodeVenomEventMetricsSnapshot{};
+        self.node_venom_event_history_mutex.lock();
+        snapshot.retained_events = self.node_venom_event_history.items.len;
+        snapshot.retained_capacity = self.node_venom_event_history_max;
+        if (self.node_venom_event_history.items.len > 0) {
+            snapshot.retained_oldest_ms = self.node_venom_event_history.items[0].timestamp_ms;
+            snapshot.retained_newest_ms = self.node_venom_event_history.items[self.node_venom_event_history.items.len - 1].timestamp_ms;
             const oldest = snapshot.retained_oldest_ms.?;
             const newest = snapshot.retained_newest_ms.?;
             if (newest >= oldest) {
                 snapshot.retained_window_ms = @intCast(newest - oldest);
             }
         }
-        self.node_service_event_history_mutex.unlock();
+        self.node_venom_event_history_mutex.unlock();
         return snapshot;
     }
 
-    fn appendNodeServiceEventMetricsJson(
+    fn appendNodeVenomEventMetricsJson(
         self: *AgentRuntimeRegistry,
         out: *std.ArrayListUnmanaged(u8),
-        snapshot: NodeServiceEventMetricsSnapshot,
+        snapshot: NodeVenomEventMetricsSnapshot,
     ) !void {
         try out.writer(self.allocator).print(
             "{{\"retained\":{{\"events\":{d},\"capacity\":{d},\"oldest_ms\":",
@@ -6417,7 +5887,7 @@ const AgentRuntimeRegistry = struct {
         const base = try self.control_plane.metricsJson();
         defer self.allocator.free(base);
 
-        const snapshot = self.snapshotNodeServiceEventMetrics();
+        const snapshot = self.snapshotNodeVenomEventMetrics();
         const trimmed = std.mem.trimRight(u8, base, " \t\r\n");
         if (trimmed.len == 0 or trimmed[trimmed.len - 1] != '}') {
             return self.allocator.dupe(u8, base);
@@ -6427,7 +5897,7 @@ const AgentRuntimeRegistry = struct {
         errdefer out.deinit(self.allocator);
         try out.appendSlice(self.allocator, trimmed[0 .. trimmed.len - 1]);
         try out.appendSlice(self.allocator, ",\"node_service_events\":");
-        try self.appendNodeServiceEventMetricsJson(&out, snapshot);
+        try self.appendNodeVenomEventMetricsJson(&out, snapshot);
         try out.append(self.allocator, '}');
         return out.toOwnedSlice(self.allocator);
     }
@@ -6436,7 +5906,7 @@ const AgentRuntimeRegistry = struct {
         const base = try self.control_plane.metricsPrometheus();
         defer self.allocator.free(base);
 
-        const snapshot = self.snapshotNodeServiceEventMetrics();
+        const snapshot = self.snapshotNodeVenomEventMetrics();
         var out = std.ArrayListUnmanaged(u8){};
         errdefer out.deinit(self.allocator);
         try out.appendSlice(self.allocator, base);
@@ -6461,12 +5931,12 @@ const AgentRuntimeRegistry = struct {
         return out.toOwnedSlice(self.allocator);
     }
 
-    fn emitNodeServiceEvent(
+    fn emitNodeVenomEvent(
         self: *AgentRuntimeRegistry,
         node_id: ?[]const u8,
         payload_json: []const u8,
     ) void {
-        self.recordNodeServiceEvent(node_id, payload_json);
+        self.recordNodeVenomEvent(node_id, payload_json);
     }
 
     fn pruneLegacySystemCapabilityMounts(self: *AgentRuntimeRegistry) void {
@@ -6848,22 +6318,22 @@ fn reconcileWorkerMain(runtime_registry: *AgentRuntimeRegistry) void {
 
 fn servicePresenceWorkerMain(runtime_registry: *AgentRuntimeRegistry) void {
     while (true) {
-        runtime_registry.service_presence_worker_mutex.lock();
-        while (runtime_registry.service_presence_jobs.items.len == 0 and !runtime_registry.service_presence_worker_stop) {
-            runtime_registry.service_presence_worker_cond.wait(&runtime_registry.service_presence_worker_mutex);
+        runtime_registry.venom_presence_worker_mutex.lock();
+        while (runtime_registry.venom_presence_jobs.items.len == 0 and !runtime_registry.venom_presence_worker_stop) {
+            runtime_registry.venom_presence_worker_cond.wait(&runtime_registry.venom_presence_worker_mutex);
         }
-        if (runtime_registry.service_presence_worker_stop and runtime_registry.service_presence_jobs.items.len == 0) {
-            runtime_registry.service_presence_worker_mutex.unlock();
+        if (runtime_registry.venom_presence_worker_stop and runtime_registry.venom_presence_jobs.items.len == 0) {
+            runtime_registry.venom_presence_worker_mutex.unlock();
             return;
         }
-        var job = runtime_registry.service_presence_jobs.orderedRemove(0);
-        runtime_registry.service_presence_worker_mutex.unlock();
+        var job = runtime_registry.venom_presence_jobs.orderedRemove(0);
+        runtime_registry.venom_presence_worker_mutex.unlock();
         defer job.deinit(runtime_registry.allocator);
 
         runtime_registry.dispatchRuntimeAgentControlForTarget(
             job.agent_id,
             job.project_id,
-            "service.event",
+            "venom.event",
             job.payload_json,
         ) catch |err| {
             std.log.warn(
@@ -6906,7 +6376,7 @@ pub fn run(
     ensureMotherAgentScaffoldBestEffort(allocator, runtime_registry.runtime_config);
 
     runtime_registry.workspace_url = try formatInternalWsUrl(allocator, bind_addr, port, "/");
-    try runtime_registry.startServicePresenceWorker();
+    try runtime_registry.startVenomPresenceWorker();
     try runtime_registry.startReconcileWorker();
 
     const metrics_port_raw = parseUnsignedEnv(allocator, metrics_port_env, 0);
@@ -7077,7 +6547,7 @@ fn handleWebSocketConnection(
     defer {
         if (control_service_attached) {
             if (session_bindings.get(active_session_key)) |binding| {
-                runtime_registry.publishServicePresenceForBinding(
+                runtime_registry.publishVenomPresenceForBinding(
                     principal.role,
                     binding,
                     active_session_key,
@@ -7299,7 +6769,7 @@ fn handleWebSocketConnection(
                                 defer allocator.free(response);
                                 try writeFrameLocked(stream, &connection_write_mutex, response, .text);
                                 control_service_attached = true;
-                                runtime_registry.publishServicePresenceForBinding(
+                                runtime_registry.publishVenomPresenceForBinding(
                                     principal.role,
                                     active_binding,
                                     active_session_key,
@@ -7864,7 +7334,7 @@ fn handleWebSocketConnection(
                                     const runtime_binding_changed = !std.mem.eql(u8, previous_active_binding.agent_id, active_binding.agent_id) or
                                         !optionalStringsEqual(previous_active_binding.project_id, active_binding.project_id);
                                     if (runtime_binding_changed) {
-                                        runtime_registry.publishServicePresenceForBinding(
+                                        runtime_registry.publishVenomPresenceForBinding(
                                             principal.role,
                                             previous_active_binding,
                                             previous_session_key,
@@ -7872,7 +7342,7 @@ fn handleWebSocketConnection(
                                             false,
                                         );
                                     }
-                                    runtime_registry.publishServicePresenceForBinding(
+                                    runtime_registry.publishVenomPresenceForBinding(
                                         principal.role,
                                         active_binding,
                                         session_key,
@@ -8069,7 +7539,7 @@ fn handleWebSocketConnection(
                                     const runtime_binding_changed = !std.mem.eql(u8, previous_binding.agent_id, binding.agent_id) or
                                         !optionalStringsEqual(previous_binding.project_id, binding.project_id);
                                     if (runtime_binding_changed) {
-                                        runtime_registry.publishServicePresenceForBinding(
+                                        runtime_registry.publishVenomPresenceForBinding(
                                             principal.role,
                                             previous_binding,
                                             previous_session_key,
@@ -8077,7 +7547,7 @@ fn handleWebSocketConnection(
                                             false,
                                         );
                                     }
-                                    runtime_registry.publishServicePresenceForBinding(
+                                    runtime_registry.publishVenomPresenceForBinding(
                                         principal.role,
                                         binding,
                                         session_key,
@@ -8368,7 +7838,7 @@ fn handleWebSocketConnection(
                                     const runtime_binding_changed = !std.mem.eql(u8, old_binding.agent_id, main_binding.agent_id) or
                                         !optionalStringsEqual(old_binding.project_id, main_binding.project_id);
                                     if (runtime_binding_changed) {
-                                        runtime_registry.publishServicePresenceForBinding(
+                                        runtime_registry.publishVenomPresenceForBinding(
                                             principal.role,
                                             old_binding,
                                             previous_active_session_key.?,
@@ -8376,7 +7846,7 @@ fn handleWebSocketConnection(
                                             false,
                                         );
                                     }
-                                    runtime_registry.publishServicePresenceForBinding(
+                                    runtime_registry.publishVenomPresenceForBinding(
                                         principal.role,
                                         main_binding,
                                         active_session_key,
@@ -8407,9 +7877,11 @@ fn handleWebSocketConnection(
                             .node_join_approve,
                             .node_join_deny,
                             .node_join,
+                            .node_ensure,
                             .node_lease_refresh,
-                            .node_service_upsert,
-                            .node_service_get,
+                            .venom_bind,
+                            .venom_upsert,
+                            .venom_get,
                             .agent_list,
                             .agent_get,
                             .node_list,
@@ -8547,10 +8019,10 @@ fn handleWebSocketConnection(
                                 );
                                 defer allocator.free(response);
                                 try writeFrameLocked(stream, &connection_write_mutex, response, .text);
-                                if (control_type == .node_service_upsert) {
+                                if (control_type == .venom_upsert) {
                                     const event_node_id = extractNodeIdFromControlPayload(allocator, payload_json) catch null;
                                     defer if (event_node_id) |value| allocator.free(value);
-                                    runtime_registry.emitNodeServiceEvent(
+                                    runtime_registry.emitNodeVenomEvent(
                                         if (event_node_id) |value| value else null,
                                         payload_json,
                                     );
@@ -8835,7 +8307,7 @@ fn handleWebSocketConnection(
                         };
                         defer target_runtime.release();
                         if (fsrpc_type == .t_write and control_service_attached) {
-                            runtime_registry.publishServicePresenceForBinding(
+                            runtime_registry.publishVenomPresenceForBinding(
                                 principal.role,
                                 target_binding,
                                 target_session_key,
@@ -9307,9 +8779,11 @@ fn isControlAdminOnly(control_type: unified.ControlType) bool {
         .node_join_approve,
         .node_join_deny,
         .node_join,
+        .node_ensure,
         .node_lease_refresh,
-        .node_service_upsert,
-        .node_service_get,
+        .venom_bind,
+        .venom_upsert,
+        .venom_get,
         .node_list,
         .node_get,
         .node_delete,
@@ -9394,6 +8868,7 @@ fn isWorkspaceTopologyMutation(control_type: unified.ControlType) bool {
         .node_join_approve,
         .node_join_deny,
         .node_join,
+        .node_ensure,
         .node_delete,
         .project_create,
         .project_update,
@@ -9462,7 +8937,9 @@ fn extractProjectTokenFromControlPayload(allocator: std.mem.Allocator, payload_j
 fn controlMutationScope(control_type: unified.ControlType) ControlMutationScope {
     return switch (control_type) {
         .node_invite_create,
+        .node_ensure,
         .node_delete,
+        .venom_bind,
         => .node,
         .node_join_pending_list,
         .node_join_approve,
@@ -9637,9 +9114,11 @@ fn handleControlPlaneCommand(
         .node_join_approve => runtime_registry.control_plane.approvePendingNodeJoin(payload_json),
         .node_join_deny => runtime_registry.control_plane.denyPendingNodeJoin(payload_json),
         .node_join => runtime_registry.control_plane.nodeJoin(payload_json),
+        .node_ensure => runtime_registry.control_plane.nodeEnsure(payload_json),
         .node_lease_refresh => runtime_registry.control_plane.refreshNodeLease(payload_json),
-        .node_service_upsert => runtime_registry.control_plane.nodeServiceUpsert(payload_json),
-        .node_service_get => runtime_registry.control_plane.nodeServiceGet(payload_json),
+        .venom_bind => runtime_registry.control_plane.bindPreferredVenomProvider(payload_json),
+        .venom_upsert => runtime_registry.control_plane.nodeVenomUpsert(payload_json),
+        .venom_get => runtime_registry.control_plane.nodeVenomGet(payload_json),
         .agent_list => runtime_registry.listAgentsPayloadWithRole(is_admin),
         .agent_get => runtime_registry.getAgentPayloadWithRole(payload_json, is_admin),
         .node_list => runtime_registry.control_plane.listNodes(),
@@ -11817,28 +11296,25 @@ test "server_piai: pathMatchesControlTarget only matches control namespace root 
     try std.testing.expect(!pathMatchesControlTarget("workspace/global/projects/control/up.json", "global/projects/control/up.json"));
 }
 
-test "server_piai: runtime dispatch synthetic service docs are discoverable" {
-    const services_index = runtimeDispatchSyntheticReadContent("/global/services/SERVICES.json") orelse return error.TestExpectedResult;
-    try std.testing.expect(std.mem.indexOf(u8, services_index, "\"service_id\":\"projects\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, services_index, "\"service_id\":\"agents\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, services_index, "\"service_id\":\"terminal\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, services_index, "\"invoke_path\":\"/global/terminal/control/invoke.json\"") != null);
-
-    const projects_schema = runtimeDispatchSyntheticReadContent("/global/projects/SCHEMA.json") orelse return error.TestExpectedResult;
-    try std.testing.expect(std.mem.indexOf(u8, projects_schema, "\"service_id\":\"projects\"") != null);
-
-    const terminal_schema = runtimeDispatchSyntheticReadContent("/global/terminal/SCHEMA.json") orelse return error.TestExpectedResult;
-    try std.testing.expect(std.mem.indexOf(u8, terminal_schema, "\"service_id\":\"terminal\"") != null);
-
-    const terminal_ops = runtimeDispatchSyntheticReadContent("/global/terminal/OPS.json") orelse return error.TestExpectedResult;
-    try std.testing.expect(std.mem.indexOf(u8, terminal_ops, "\"exec\":\"control/exec.json\"") != null);
-}
-
-test "server_piai: projects control path matcher is global-only" {
+test "server_piai: project control path matcher is global-only" {
     try std.testing.expect(isProjectsControlPath("/global/projects/control/up.json"));
     try std.testing.expect(isProjectsControlPath("global/projects/control/list.json"));
     try std.testing.expect(!isProjectsControlPath("/agents/self/projects/control/invoke.json"));
     try std.testing.expect(!isProjectsControlPath("/global/mounts/control/up.json"));
+}
+
+test "server_piai: operation result extraction unwraps session-backed result envelope" {
+    const allocator = std.testing.allocator;
+
+    const file_read_payload =
+        "{\"path\":\"/global/projects/result.json\",\"bytes\":93,\"truncated\":false,\"content\":\"{\\\"ok\\\":true,\\\"operation\\\":\\\"up\\\",\\\"result\\\":{\\\"project_id\\\":\\\"proj-7\\\"},\\\"error\\\":null}\",\"ready\":true,\"wait_until_ready\":true}";
+    const content_json = try extractFileReadContentJson(allocator, file_read_payload);
+    defer allocator.free(content_json);
+    try std.testing.expect(std.mem.indexOf(u8, content_json, "\"project_id\":\"proj-7\"") != null);
+
+    const operation_json = try extractOperationResultJson(allocator, content_json);
+    defer allocator.free(operation_json);
+    try std.testing.expectEqualStrings("{\"project_id\":\"proj-7\"}", operation_json);
 }
 
 test "server_piai: agents control path matcher is global-only" {
@@ -11851,53 +11327,9 @@ test "server_piai: agents control path matcher is global-only" {
 test "server_piai: terminal control path matcher is global-only" {
     try std.testing.expect(isTerminalControlPath("/global/terminal/control/invoke.json"));
     try std.testing.expect(isTerminalControlPath("global/terminal/control/exec.json"));
+    try std.testing.expect(isTerminalControlPath("/global/terminal/control/create.json"));
     try std.testing.expect(!isTerminalControlPath("/agents/self/terminal/control/invoke.json"));
     try std.testing.expect(!isTerminalControlPath("/global/projects/control/exec.json"));
-}
-
-test "server_piai: terminal invoke mode accepts exec and rejects session ops" {
-    const allocator = std.testing.allocator;
-
-    try std.testing.expectEqual(
-        TerminalWriteMode.exec,
-        try terminalWriteMode(
-            "/global/terminal/control/invoke.json",
-            "{\"op\":\"exec\",\"args\":{\"command\":\"git status\"}}",
-            allocator,
-        ),
-    );
-    try std.testing.expectEqual(
-        TerminalWriteMode.exec,
-        try terminalWriteMode(
-            "/global/terminal/control/exec.json",
-            "{\"command\":\"git status\"}",
-            allocator,
-        ),
-    );
-    try std.testing.expectEqual(
-        TerminalWriteMode.unsupported_session_op,
-        try terminalWriteMode(
-            "/global/terminal/control/invoke.json",
-            "{\"op\":\"create\",\"args\":{}}",
-            allocator,
-        ),
-    );
-}
-
-test "server_piai: terminal invoke payload unwraps arguments envelope" {
-    const allocator = std.testing.allocator;
-
-    const payload = try normalizeTerminalExecPayload(
-        "/global/terminal/control/invoke.json",
-        "{\"op\":\"exec\",\"arguments\":{\"command\":\"git status\",\"cwd\":\"/agents/bob\"}}",
-        allocator,
-    );
-    defer allocator.free(payload);
-
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"command\":\"git status\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"cwd\":\"/agents/bob\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"arguments\"") == null);
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"op\"") == null);
 }
 
 test "server_piai: parseHttpRequestPath parses GET line" {
@@ -11996,21 +11428,21 @@ test "server_piai: user node service visibility is project mounted-node scoped" 
     const mount_result = try runtime_registry.control_plane.setProjectMountWithRole(mount_payload, false);
     defer allocator.free(mount_result);
 
-    try std.testing.expect(runtime_registry.control_plane.projectAllowsNodeServiceEvent(
+    try std.testing.expect(runtime_registry.control_plane.projectAllowsNodeVenomEvent(
         project_id.?,
         "bob",
         null,
         node_registration.node_id,
         false,
     ));
-    try std.testing.expect(!runtime_registry.control_plane.projectAllowsNodeServiceEvent(
+    try std.testing.expect(!runtime_registry.control_plane.projectAllowsNodeVenomEvent(
         project_id.?,
         "bob",
         null,
         "node-missing",
         false,
     ));
-    try std.testing.expect(!runtime_registry.control_plane.projectAllowsNodeServiceEvent(
+    try std.testing.expect(!runtime_registry.control_plane.projectAllowsNodeVenomEvent(
         project_id.?,
         "bob",
         null,
@@ -12099,4 +11531,77 @@ test "server_piai: parseArchiveTimestamp accepts rotated debug archive names" {
     try std.testing.expectEqual(@as(?u64, 1771674073992), parseArchiveTimestamp("debug-stream-1771674073992-1.ndjson"));
     try std.testing.expectEqual(@as(?u64, null), parseArchiveTimestamp("debug-stream.ndjson"));
     try std.testing.expectEqual(@as(?u64, null), parseArchiveTimestamp("debug-stream-abc.ndjson"));
+}
+
+test "server_piai: local fs node registration upserts fs chat and jobs venoms" {
+    const allocator = std.testing.allocator;
+
+    var runtime_config = Config.RuntimeConfig{};
+    runtime_config.spider_web_root = ".";
+    var registry = AgentRuntimeRegistry.initWithLimits(allocator, runtime_config, null, 2);
+    defer registry.deinit();
+
+    const export_specs = [_]fs_node_ops.ExportSpec{
+        .{
+            .name = "workspace",
+            .path = ".",
+            .ro = false,
+            .desc = "test-workspace",
+        },
+        .{
+            .name = local_node_chat_export_name,
+            .path = "chat",
+            .ro = false,
+            .desc = "test-chat",
+            .source_kind = .namespace,
+            .source_id = "capabilities",
+        },
+        .{
+            .name = local_node_jobs_export_name,
+            .path = "jobs",
+            .ro = false,
+            .desc = "test-jobs",
+            .source_kind = .namespace,
+            .source_id = "jobs",
+        },
+    };
+    const mount_specs = [_]fs_control_plane.SpiderWebMountSpec{
+        .{ .mount_path = "/global/chat", .export_name = local_node_chat_export_name },
+        .{ .mount_path = "/global/jobs", .export_name = local_node_jobs_export_name },
+        .{ .mount_path = "/nodes/local/fs", .export_name = "workspace" },
+    };
+
+    const local_node = try LocalFsNode.create(
+        allocator,
+        &registry,
+        &export_specs,
+        &mount_specs,
+        "spiderweb-local",
+        "ws://127.0.0.1:18891/v2/fs",
+        60_000,
+        30_000,
+        false,
+    );
+    defer local_node.deinit(&registry.control_plane);
+
+    try local_node.refreshRegistration(&registry.control_plane);
+
+    local_node.registration_mutex.lock();
+    const node_id = local_node.registered_node_id orelse {
+        local_node.registration_mutex.unlock();
+        return error.TestExpectedResponse;
+    };
+    const node_id_copy = try allocator.dupe(u8, node_id);
+    local_node.registration_mutex.unlock();
+    defer allocator.free(node_id_copy);
+
+    const get_req = try std.fmt.allocPrint(allocator, "{{\"node_id\":\"{s}\"}}", .{node_id_copy});
+    defer allocator.free(get_req);
+    const catalog_json = try registry.control_plane.nodeVenomGet(get_req);
+    defer allocator.free(catalog_json);
+
+    try std.testing.expect(std.mem.indexOf(u8, catalog_json, "\"venom_id\":\"fs\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, catalog_json, "\"venom_id\":\"chat\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, catalog_json, "\"venom_id\":\"jobs\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, catalog_json, "\"node_name\":\"spiderweb-local\"") != null);
 }

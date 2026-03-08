@@ -1,6 +1,6 @@
 # Deployment Scripts
 
-SystemD-based deployment scripts for ZiggySpiderWeb.
+SystemD-based deployment scripts for Spiderweb.
 
 ## Quick Install
 

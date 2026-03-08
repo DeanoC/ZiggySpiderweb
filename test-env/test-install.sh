@@ -1,5 +1,5 @@
 #!/bin/bash
-# Automated test script for ZiggySpiderweb install
+# Automated test script for Spiderweb install
 # Usage: ./test-install.sh [provider] [model] [api_key]
 
 set -euo pipefail
@@ -31,7 +31,7 @@ log_warn() {
 }
 
 echo "=========================================="
-echo "ZiggySpiderweb Install Test"
+echo "Spiderweb Install Test"
 echo "=========================================="
 echo "Provider: $PROVIDER"
 echo "Model: $MODEL"
@@ -82,7 +82,7 @@ if [[ -f /tmp/install.sh ]]; then
     cp /tmp/install.sh /tmp/install-test.sh
 else
     log_info "Downloading install script..."
-    curl -fsSL https://raw.githubusercontent.com/DeanoC/ZiggySpiderweb/main/install.sh -o /tmp/install-test.sh
+    curl -fsSL https://raw.githubusercontent.com/DeanoC/Spiderweb/main/install.sh -o /tmp/install-test.sh
 fi
 chmod +x /tmp/install-test.sh
 
@@ -142,7 +142,7 @@ log_success "Test config created"
 if [[ -n "$API_KEY" ]]; then
     log_info "Test 8: Storing API key..."
     if command -v secret-tool &> /dev/null; then
-        echo "$API_KEY" | secret-tool store --label="ZiggySpiderweb $PROVIDER API Key" service ziggyspiderweb kind provider_api_key provider "$PROVIDER"
+        echo "$API_KEY" | secret-tool store --label="Spiderweb $PROVIDER API Key" service spiderweb kind provider_api_key provider "$PROVIDER"
         log_success "API key stored in secret-tool"
     else
         log_warn "secret-tool not available, storing in config"

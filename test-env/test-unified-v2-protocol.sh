@@ -555,9 +555,10 @@ def run_source_guard(root_dir: str) -> None:
         ("src/fs_mount_main.zig", '\\"channel\\":\\"control\\",\\"type\\":\\"control.version\\"'),
         ("src/fs_mount_main.zig", '\\"channel\\":\\"control\\",\\"type\\":\\"control.connect\\"'),
         ("src/fs_mount_main.zig", '\\"channel\\":\\"control\\",\\"type\\":\\"control.workspace_status\\"'),
-        ("src/fs_node_main.zig", '\\"channel\\":\\"control\\",\\"type\\":\\"control.version\\"'),
-        ("src/fs_node_main.zig", '\\"channel\\":\\"control\\",\\"type\\":\\"control.connect\\"'),
-        ("src/fs_node_main.zig", '\\"channel\\":\\"acheron\\",\\"type\\":\\"acheron.t_fs_hello\\"'),
+        ("src/fs_node_main.zig", 'const node = @import("spiderweb_node").fs_node_main;'),
+        ("deps/spider-protocol/src/spiderweb_node/fs_node_main.zig", '\\"channel\\":\\"control\\",\\"type\\":\\"control.version\\"'),
+        ("deps/spider-protocol/src/spiderweb_node/fs_node_main.zig", '\\"channel\\":\\"control\\",\\"type\\":\\"control.connect\\"'),
+        ("deps/spider-protocol/src/spiderweb_node/fs_node_main.zig", '\\"channel\\":\\"acheron\\",\\"type\\":\\"acheron.t_fs_hello\\"'),
     ]
 
     for rel_path, snippet in checks:

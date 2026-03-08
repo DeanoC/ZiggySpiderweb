@@ -602,6 +602,22 @@ pub const Router = struct {
         return bytes_written;
     }
 
+    pub fn writeResult(self: *Router, open_file: OpenFile, off: u64, data: []const u8) ![]u8 {
+        self.drainPendingInvalidations();
+        const encoded = try encodeBase64(self.allocator, data);
+        defer self.allocator.free(encoded);
+
+        const args = try std.fmt.allocPrint(self.allocator, "{{\"off\":{d},\"data_b64\":\"{s}\"}}", .{ off, encoded });
+        defer self.allocator.free(args);
+
+        const response = try self.callEndpoint(open_file.endpoint_index, .WRITE, null, open_file.handle_id, args);
+        defer response.deinit(self.allocator);
+        if (!response.ok) return mapErrno(response.err_no);
+
+        self.read_cache.invalidateHandle(open_file.endpoint_index, open_file.handle_id);
+        return self.allocator.dupe(u8, response.result_json);
+    }
+
     pub fn truncate(self: *Router, path: []const u8, size: u64) !void {
         self.drainPendingInvalidations();
         const node = try self.resolvePath(path, true, .write_data);

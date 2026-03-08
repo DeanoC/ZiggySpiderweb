@@ -35,8 +35,8 @@ const BASE_CORE_PROMPT_KIND = "core.base_prompt";
 const BASE_CORE_PROMPT_NAME = "core.system.base_instructions";
 const CORE_CAPABILITIES_PROMPT_NAME = "core.system.capabilities";
 const CORE_IDENTITY_GUIDANCE_PROMPT_NAME = "core.system.identity_guidance";
-const SERVICE_PRESENCE_MEM_NAME_PREFIX = "service.presence.";
-const SERVICE_PRESENCE_MEM_KIND = "presence.service";
+const VENOM_PRESENCE_MEM_NAME_PREFIX = "service.presence.";
+const VENOM_PRESENCE_MEM_KIND = "presence.venom";
 const PROJECT_SETUP_GATE_PROMPT_MEM_NAME = "project.setup_gate.instructions";
 const PROJECT_SETUP_GATE_PROMPT_MEM_KIND = "core.system_prompt";
 
@@ -63,7 +63,7 @@ const RuntimeOperationClass = run_orchestration.OperationClass;
 fn isChatLikeControlAction(action: ?[]const u8) bool {
     const control_action = action orelse "";
     return run_orchestration.isChatLikeControlAction(action) or
-        std.mem.eql(u8, control_action, "service.event");
+        std.mem.eql(u8, control_action, "venom.event");
 }
 
 const RuntimeQueueJob = struct {
@@ -105,19 +105,19 @@ const ControlToolCallRequest = struct {
     }
 };
 
-const ServiceEventStatus = enum {
+const VenomEventStatus = enum {
     attached,
     detached,
 };
 
-const ControlServiceEventRequest = struct {
+const ControlVenomEventRequest = struct {
     brain_name: []u8,
-    service_id: []u8,
+    venom_id: []u8,
     session_key: []u8,
     role: []u8,
     actor_type: []u8,
     actor_id: []u8,
-    status: ServiceEventStatus,
+    status: VenomEventStatus,
     project_id: ?[]u8,
     project_setup_required: bool,
     project_setup_project_id: ?[]u8,
@@ -125,9 +125,9 @@ const ControlServiceEventRequest = struct {
     project_setup_vision: ?[]u8,
     project_setup_source: ?[]u8,
 
-    fn deinit(self: *ControlServiceEventRequest, allocator: std.mem.Allocator) void {
+    fn deinit(self: *ControlVenomEventRequest, allocator: std.mem.Allocator) void {
         allocator.free(self.brain_name);
-        allocator.free(self.service_id);
+        allocator.free(self.venom_id);
         allocator.free(self.session_key);
         allocator.free(self.role);
         allocator.free(self.actor_type);
@@ -1263,14 +1263,14 @@ pub const RuntimeServer = struct {
             return self.handleControlToolCall(job, request_id, payload);
         }
 
-        if (std.mem.eql(u8, control_action, "service.event")) {
+        if (std.mem.eql(u8, control_action, "venom.event")) {
             const payload = content orelse return self.wrapSingleFrame(try protocol.buildErrorWithCode(
                 self.allocator,
                 request_id,
                 .missing_content,
-                "agent.control service.event requires content",
+                "agent.control venom.event requires content",
             ));
-            return self.handleControlServiceEvent(job, request_id, payload);
+            return self.handleControlVenomEvent(job, request_id, payload);
         }
 
         return self.wrapSingleFrame(try protocol.buildErrorWithCode(
@@ -1333,19 +1333,19 @@ pub const RuntimeServer = struct {
         return self.wrapSingleFrame(try protocol.buildSessionReceive(self.allocator, request_id, payload));
     }
 
-    fn handleControlServiceEvent(
+    fn handleControlVenomEvent(
         self: *RuntimeServer,
         job: *RuntimeQueueJob,
         request_id: []const u8,
         content: []const u8,
     ) ![][]u8 {
         _ = job;
-        var request = self.parseControlServiceEventPayload(content) catch {
+        var request = self.parseControlVenomEventPayload(content) catch {
             return self.wrapSingleFrame(try protocol.buildErrorWithCode(
                 self.allocator,
                 request_id,
                 .invalid_envelope,
-                "service.event content must include service_id and status",
+                "venom.event content must include venom_id and status",
             ));
         };
         defer request.deinit(self.allocator);
@@ -1353,7 +1353,7 @@ pub const RuntimeServer = struct {
         const mem_name = try std.fmt.allocPrint(
             self.allocator,
             "{s}{s}",
-            .{ SERVICE_PRESENCE_MEM_NAME_PREFIX, request.service_id },
+            .{ VENOM_PRESENCE_MEM_NAME_PREFIX, request.venom_id },
         );
         defer self.allocator.free(mem_name);
 
@@ -1363,8 +1363,8 @@ pub const RuntimeServer = struct {
             return self.wrapSingleFrame(try protocol.buildSessionReceive(self.allocator, request_id, "{\"ok\":true,\"status\":\"detached\"}"));
         }
 
-        const escaped_service_id = try protocol.jsonEscape(self.allocator, request.service_id);
-        defer self.allocator.free(escaped_service_id);
+        const escaped_venom_id = try protocol.jsonEscape(self.allocator, request.venom_id);
+        defer self.allocator.free(escaped_venom_id);
         const escaped_session_key = try protocol.jsonEscape(self.allocator, request.session_key);
         defer self.allocator.free(escaped_session_key);
         const escaped_role = try protocol.jsonEscape(self.allocator, request.role);
@@ -1406,9 +1406,9 @@ pub const RuntimeServer = struct {
 
         const payload = try std.fmt.allocPrint(
             self.allocator,
-            "{{\"service_id\":\"{s}\",\"status\":\"attached\",\"session_key\":\"{s}\",\"role\":\"{s}\",\"actor_type\":\"{s}\",\"actor_id\":\"{s}\",\"project_id\":{s},\"project_setup_required\":{},\"project_setup_project_id\":{s},\"project_setup_message\":{s},\"project_setup_project_vision\":{s},\"project_setup_source\":{s},\"updated_at_ms\":{d}}}",
+            "{{\"venom_id\":\"{s}\",\"status\":\"attached\",\"session_key\":\"{s}\",\"role\":\"{s}\",\"actor_type\":\"{s}\",\"actor_id\":\"{s}\",\"project_id\":{s},\"project_setup_required\":{},\"project_setup_project_id\":{s},\"project_setup_message\":{s},\"project_setup_project_vision\":{s},\"project_setup_source\":{s},\"updated_at_ms\":{d}}}",
             .{
-                escaped_service_id,
+                escaped_venom_id,
                 escaped_session_key,
                 escaped_role,
                 escaped_actor_type,
@@ -1424,7 +1424,7 @@ pub const RuntimeServer = struct {
         );
         defer self.allocator.free(payload);
 
-        try self.upsertNamedMemory(request.brain_name, mem_name, SERVICE_PRESENCE_MEM_KIND, payload, true);
+        try self.upsertNamedMemory(request.brain_name, mem_name, VENOM_PRESENCE_MEM_KIND, payload, true);
         try self.refreshProjectSetupGatePrompt(request.brain_name);
         return self.wrapSingleFrame(try protocol.buildSessionReceive(self.allocator, request_id, "{\"ok\":true,\"status\":\"attached\"}"));
     }
@@ -1438,8 +1438,8 @@ pub const RuntimeServer = struct {
 
         var required_count: usize = 0;
         for (snapshot) |item| {
-            if (!std.mem.eql(u8, item.kind, SERVICE_PRESENCE_MEM_KIND)) continue;
-            if (!servicePresenceRequiresProjectSetup(self.allocator, item.content_json)) continue;
+            if (!std.mem.eql(u8, item.kind, VENOM_PRESENCE_MEM_KIND)) continue;
+            if (!venomPresenceRequiresProjectSetup(self.allocator, item.content_json)) continue;
             if (required_count == 0) {
                 try prompt.appendSlice(
                     self.allocator,
@@ -1447,7 +1447,7 @@ pub const RuntimeServer = struct {
                         "One or more attached services report incomplete project setup state.\n" ++
                         "Before normal assistance, run a setup interview with the operator.\n" ++
                         "Prioritize collecting missing setup details and asking targeted follow-ups.\n" ++
-                        "Use `project_setup_*` fields from `presence.service` entries as ground truth.\n" ++
+                        "Use `project_setup_*` fields from `presence.venom` entries as ground truth.\n" ++
                         "Required interview fields: project_name, project_vision, first_agent_name, first_agent_role.\n" ++
                         "Treat any non-empty short role phrase as valid (do not repeatedly re-ask the same role question).\n" ++
                         "If the operator repeats the same role answer, treat it as confirmed and continue provisioning.\n" ++
@@ -1540,7 +1540,7 @@ pub const RuntimeServer = struct {
         return true;
     }
 
-    fn servicePresenceRequiresProjectSetup(allocator: std.mem.Allocator, content_json: []const u8) bool {
+    fn venomPresenceRequiresProjectSetup(allocator: std.mem.Allocator, content_json: []const u8) bool {
         var parsed = std.json.parseFromSlice(std.json.Value, allocator, content_json, .{}) catch return false;
         defer parsed.deinit();
         if (parsed.value != .object) return false;
@@ -1549,7 +1549,7 @@ pub const RuntimeServer = struct {
         return required_val.bool;
     }
 
-    fn parseControlServiceEventPayload(self: *RuntimeServer, content: []const u8) !ControlServiceEventRequest {
+    fn parseControlVenomEventPayload(self: *RuntimeServer, content: []const u8) !ControlVenomEventRequest {
         const trimmed = std.mem.trim(u8, content, " \t\r\n");
         if (trimmed.len == 0) return error.InvalidPayload;
 
@@ -1558,8 +1558,8 @@ pub const RuntimeServer = struct {
         if (parsed.value != .object) return error.InvalidPayload;
         const obj = parsed.value.object;
 
-        const service_id = blk: {
-            const value = obj.get("service_id") orelse return error.InvalidPayload;
+        const venom_id = blk: {
+            const value = obj.get("venom_id") orelse return error.InvalidPayload;
             if (value != .string or value.string.len == 0) return error.InvalidPayload;
             if (!isValidControlMemorySegment(value.string)) return error.InvalidPayload;
             break :blk value.string;
@@ -1605,8 +1605,8 @@ pub const RuntimeServer = struct {
         const status = blk: {
             const value = obj.get("status") orelse return error.InvalidPayload;
             if (value != .string or value.string.len == 0) return error.InvalidPayload;
-            if (std.mem.eql(u8, value.string, "attached")) break :blk ServiceEventStatus.attached;
-            if (std.mem.eql(u8, value.string, "detached")) break :blk ServiceEventStatus.detached;
+            if (std.mem.eql(u8, value.string, "attached")) break :blk VenomEventStatus.attached;
+            if (std.mem.eql(u8, value.string, "detached")) break :blk VenomEventStatus.detached;
             return error.InvalidPayload;
         };
 
@@ -1679,7 +1679,7 @@ pub const RuntimeServer = struct {
 
         return .{
             .brain_name = try self.allocator.dupe(u8, brain_name),
-            .service_id = try self.allocator.dupe(u8, service_id),
+            .venom_id = try self.allocator.dupe(u8, venom_id),
             .session_key = try self.allocator.dupe(u8, session_key),
             .role = try self.allocator.dupe(u8, role),
             .actor_type = try self.allocator.dupe(u8, actor_type),
@@ -3753,7 +3753,7 @@ pub const RuntimeServer = struct {
         var selected_payload: ?[]const u8 = null;
         var selected_updated_at_ms: i64 = std.math.minInt(i64);
         for (snapshot) |item| {
-            if (!std.mem.eql(u8, item.kind, SERVICE_PRESENCE_MEM_KIND)) continue;
+            if (!std.mem.eql(u8, item.kind, VENOM_PRESENCE_MEM_KIND)) continue;
 
             var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, item.content_json, .{}) catch continue;
             defer parsed.deinit();
@@ -8572,7 +8572,7 @@ test "runtime_server: agent.control tool.call executes allowed filesystem runtim
     try std.testing.expect(std.mem.indexOf(u8, response, "\"entries\"") != null);
 }
 
-test "runtime_server: agent.control service.event tracks attach and detach presence memory" {
+test "runtime_server: agent.control venom.event tracks attach and detach presence memory" {
     const allocator = std.testing.allocator;
     const server = try RuntimeServer.create(allocator, "agent-test", .{
         .ltm_directory = "",
@@ -8581,7 +8581,7 @@ test "runtime_server: agent.control service.event tracks attach and detach prese
     defer server.destroy();
 
     const attach_request =
-        "{\"id\":\"req-service-attach\",\"type\":\"agent.control\",\"action\":\"service.event\",\"content\":\"{\\\"service_id\\\":\\\"gui_ws_1\\\",\\\"status\\\":\\\"attached\\\",\\\"session_key\\\":\\\"main\\\",\\\"role\\\":\\\"user\\\",\\\"actor_type\\\":\\\"user\\\",\\\"actor_id\\\":\\\"user\\\",\\\"project_id\\\":\\\"proj-alpha\\\"}\"}";
+        "{\"id\":\"req-venom-attach\",\"type\":\"agent.control\",\"action\":\"venom.event\",\"content\":\"{\\\"venom_id\\\":\\\"gui_ws_1\\\",\\\"status\\\":\\\"attached\\\",\\\"session_key\\\":\\\"main\\\",\\\"role\\\":\\\"user\\\",\\\"actor_type\\\":\\\"user\\\",\\\"actor_id\\\":\\\"user\\\",\\\"project_id\\\":\\\"proj-alpha\\\"}\"}";
     const attach_response = try server.handleMessage(attach_request);
     defer allocator.free(attach_response);
     try std.testing.expect(std.mem.indexOf(u8, attach_response, "\"type\":\"session.receive\"") != null);
@@ -8591,7 +8591,7 @@ test "runtime_server: agent.control service.event tracks attach and detach prese
     const attached_json = try memory.toActiveMemoryJson(allocator, "primary", attached_snapshot);
     defer allocator.free(attached_json);
     try std.testing.expect(std.mem.indexOf(u8, attached_json, "service.presence.gui_ws_1") != null);
-    try std.testing.expect(std.mem.indexOf(u8, attached_json, "\"kind\":\"presence.service\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, attached_json, "\"kind\":\"presence.venom\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, attached_json, "\"actor_type\":\"user\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, attached_json, "\"actor_id\":\"user\"") != null);
     const attached_board = try server.buildDynamicCoreInfoBoard("primary", "core", "active", 128_000, 0);
@@ -8602,7 +8602,7 @@ test "runtime_server: agent.control service.event tracks attach and detach prese
     try std.testing.expect(std.mem.indexOf(u8, attached_board, "- actor: /users/user") != null);
 
     const detach_request =
-        "{\"id\":\"req-service-detach\",\"type\":\"agent.control\",\"action\":\"service.event\",\"content\":\"{\\\"service_id\\\":\\\"gui_ws_1\\\",\\\"status\\\":\\\"detached\\\",\\\"session_key\\\":\\\"main\\\",\\\"role\\\":\\\"user\\\",\\\"project_id\\\":\\\"proj-alpha\\\"}\"}";
+        "{\"id\":\"req-venom-detach\",\"type\":\"agent.control\",\"action\":\"venom.event\",\"content\":\"{\\\"venom_id\\\":\\\"gui_ws_1\\\",\\\"status\\\":\\\"detached\\\",\\\"session_key\\\":\\\"main\\\",\\\"role\\\":\\\"user\\\",\\\"project_id\\\":\\\"proj-alpha\\\"}\"}";
     const detach_response = try server.handleMessage(detach_request);
     defer allocator.free(detach_response);
     try std.testing.expect(std.mem.indexOf(u8, detach_response, "\"type\":\"session.receive\"") != null);
@@ -8619,7 +8619,7 @@ test "runtime_server: agent.control service.event tracks attach and detach prese
     try std.testing.expect(std.mem.indexOf(u8, detached_board, "- actor: /users/user") == null);
 }
 
-test "runtime_server: service.event setup metadata drives project setup gate prompt" {
+test "runtime_server: venom.event setup metadata drives project setup gate prompt" {
     const allocator = std.testing.allocator;
     const server = try RuntimeServer.create(allocator, "agent-test", .{
         .ltm_directory = "",
@@ -8628,7 +8628,7 @@ test "runtime_server: service.event setup metadata drives project setup gate pro
     defer server.destroy();
 
     const required_request =
-        "{\"id\":\"req-setup-required\",\"type\":\"agent.control\",\"action\":\"service.event\",\"content\":\"{\\\"service_id\\\":\\\"gui_ws_setup\\\",\\\"status\\\":\\\"attached\\\",\\\"session_key\\\":\\\"main\\\",\\\"role\\\":\\\"admin\\\",\\\"project_id\\\":\\\"proj-alpha\\\",\\\"project_setup_required\\\":true,\\\"project_setup_project_id\\\":\\\"proj-alpha\\\",\\\"project_setup_message\\\":\\\"Need project setup details\\\",\\\"project_setup_project_vision\\\":\\\"Build spider web\\\",\\\"project_setup_source\\\":\\\"control.connect\\\"}\"}";
+        "{\"id\":\"req-setup-required\",\"type\":\"agent.control\",\"action\":\"venom.event\",\"content\":\"{\\\"venom_id\\\":\\\"gui_ws_setup\\\",\\\"status\\\":\\\"attached\\\",\\\"session_key\\\":\\\"main\\\",\\\"role\\\":\\\"admin\\\",\\\"project_id\\\":\\\"proj-alpha\\\",\\\"project_setup_required\\\":true,\\\"project_setup_project_id\\\":\\\"proj-alpha\\\",\\\"project_setup_message\\\":\\\"Need project setup details\\\",\\\"project_setup_project_vision\\\":\\\"Build spider web\\\",\\\"project_setup_source\\\":\\\"control.connect\\\"}\"}";
     const required_response = try server.handleMessage(required_request);
     defer allocator.free(required_response);
     try std.testing.expect(std.mem.indexOf(u8, required_response, "\"type\":\"session.receive\"") != null);
@@ -8649,7 +8649,7 @@ test "runtime_server: service.event setup metadata drives project setup gate pro
     try std.testing.expect(std.mem.indexOf(u8, required_prompt, "Do not offer to begin repo setup, PR preparation, coding, or execution from Mother") != null);
 
     const complete_request =
-        "{\"id\":\"req-setup-complete\",\"type\":\"agent.control\",\"action\":\"service.event\",\"content\":\"{\\\"service_id\\\":\\\"gui_ws_setup\\\",\\\"status\\\":\\\"attached\\\",\\\"session_key\\\":\\\"main\\\",\\\"role\\\":\\\"admin\\\",\\\"project_id\\\":\\\"proj-alpha\\\",\\\"project_setup_required\\\":false,\\\"project_setup_project_id\\\":\\\"proj-alpha\\\",\\\"project_setup_source\\\":\\\"control.session_attach\\\"}\"}";
+        "{\"id\":\"req-setup-complete\",\"type\":\"agent.control\",\"action\":\"venom.event\",\"content\":\"{\\\"venom_id\\\":\\\"gui_ws_setup\\\",\\\"status\\\":\\\"attached\\\",\\\"session_key\\\":\\\"main\\\",\\\"role\\\":\\\"admin\\\",\\\"project_id\\\":\\\"proj-alpha\\\",\\\"project_setup_required\\\":false,\\\"project_setup_project_id\\\":\\\"proj-alpha\\\",\\\"project_setup_source\\\":\\\"control.session_attach\\\"}\"}";
     const complete_response = try server.handleMessage(complete_request);
     defer allocator.free(complete_response);
     try std.testing.expect(std.mem.indexOf(u8, complete_response, "\"type\":\"session.receive\"") != null);
@@ -8742,7 +8742,7 @@ test "runtime_server: queued control request times out with runtime_timeout code
     try std.testing.expect(std.mem.indexOf(u8, ctx.response.?, "\"code\":\"runtime_timeout\"") != null);
 }
 
-test "runtime_server: agent.control goal/plan/service.event use chat timeout class" {
+test "runtime_server: agent.control goal/plan/venom.event use chat timeout class" {
     const allocator = std.testing.allocator;
     const server = try RuntimeServer.create(allocator, "agent-test", .{
         .chat_operation_timeout_ms = 120,
@@ -8755,7 +8755,7 @@ test "runtime_server: agent.control goal/plan/service.event use chat timeout cla
     const requests = [_][]const u8{
         "{\"id\":\"req-goal-timeout-class\",\"type\":\"agent.control\",\"action\":\"goal\",\"content\":\"hello\"}",
         "{\"id\":\"req-plan-timeout-class\",\"type\":\"agent.control\",\"action\":\"plan\",\"content\":\"hello\"}",
-        "{\"id\":\"req-service-timeout-class\",\"type\":\"agent.control\",\"action\":\"service.event\",\"content\":\"{\\\"service_id\\\":\\\"gui_ws_1\\\",\\\"status\\\":\\\"attached\\\",\\\"session_key\\\":\\\"main\\\",\\\"role\\\":\\\"user\\\",\\\"actor_type\\\":\\\"user\\\",\\\"actor_id\\\":\\\"user\\\",\\\"project_id\\\":\\\"proj-alpha\\\"}\"}",
+        "{\"id\":\"req-venom-timeout-class\",\"type\":\"agent.control\",\"action\":\"venom.event\",\"content\":\"{\\\"venom_id\\\":\\\"gui_ws_1\\\",\\\"status\\\":\\\"attached\\\",\\\"session_key\\\":\\\"main\\\",\\\"role\\\":\\\"user\\\",\\\"actor_type\\\":\\\"user\\\",\\\"actor_id\\\":\\\"user\\\",\\\"project_id\\\":\\\"proj-alpha\\\"}\"}",
     };
 
     for (requests) |request_json| {

@@ -44,7 +44,7 @@ pub fn runFirstRun(allocator: std.mem.Allocator, args: []const []const u8) !void
     try std.fs.File.stdout().writeAll("\n");
     try std.fs.File.stdout().writeAll("╔═══════════════════════════════════════════════════════════════╗\n");
     try std.fs.File.stdout().writeAll("║                                                               ║\n");
-    try std.fs.File.stdout().writeAll("║   ZiggySpiderweb - First Time Setup                           ║\n");
+    try std.fs.File.stdout().writeAll("║   Spiderweb - First Time Setup                           ║\n");
     try std.fs.File.stdout().writeAll("║                                                               ║\n");
     try std.fs.File.stdout().writeAll("╚═══════════════════════════════════════════════════════════════╝\n");
     try std.fs.File.stdout().writeAll("\n");
@@ -123,7 +123,7 @@ pub fn runFirstRun(allocator: std.mem.Allocator, args: []const []const u8) !void
             defer if (line) |value| allocator.free(value);
 
             if (line == null or line.?.len == 0 or (line.?[0] != 'n' and line.?[0] != 'N')) {
-                try std.fs.File.stdout().writeAll("\nStarting ZiggySpiderweb...\n");
+                try std.fs.File.stdout().writeAll("\nStarting Spiderweb...\n");
 
                 // Check if systemd user service exists
                 const systemd_user_exists = blk: {

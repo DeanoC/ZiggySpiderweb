@@ -34,7 +34,7 @@ pub fn main() !void {
     };
     defer config.deinit();
 
-    std.log.info("Starting ZiggySpiderweb v0.3.0 (Pi AI)", .{});
+    std.log.info("Starting Spiderweb v0.3.0 (Pi AI)", .{});
     std.log.info("Config: {s}", .{config.config_path});
     std.log.info("Provider: {s}/{s}", .{ config.provider.name, config.provider.model orelse "default" });
     std.log.info("Default agent route: {s}", .{config.runtime.default_agent_id});
@@ -61,7 +61,7 @@ pub fn main() !void {
             }
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             const help =
-                "ZiggySpiderweb v0.3.0 - Pi AI Gateway for OpenClaw Protocol\n" ++
+                "Spiderweb v0.3.0 - Pi AI Gateway for OpenClaw Protocol\n" ++
                 "\n" ++
                 "A WebSocket gateway that proxies OpenClaw protocol messages to Pi AI providers.\n" ++
                 "\n" ++
