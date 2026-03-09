@@ -3568,8 +3568,6 @@ pub const Session = struct {
         session.updated_at_ms = now_ms;
         session.last_read_at_ms = now_ms;
         session.read_count +%= 1;
-        if (session.buffered_result) |old| self.allocator.free(old);
-        session.buffered_result = null;
         try self.setCurrentTerminalSession(session_id);
         try self.refreshTerminalV2StateFiles();
 
