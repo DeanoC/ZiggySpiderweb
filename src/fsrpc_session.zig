@@ -3181,7 +3181,15 @@ pub const Session = struct {
         eof: bool,
     };
 
+    fn ensureTerminalV2InvokeAllowed(self: *Session, control_node_id: u32) !void {
+        const control_node = self.nodes.get(control_node_id) orelse return error.MissingNode;
+        const control_dir_id = control_node.parent orelse return error.MissingNode;
+        const service_dir_id = (self.nodes.get(control_dir_id) orelse return error.MissingNode).parent orelse return error.MissingNode;
+        if (!self.canInvokeServiceDirectory(service_dir_id)) return error.AccessDenied;
+    }
+
     fn handleTerminalV2InvokeWrite(self: *Session, invoke_node_id: u32, raw_input: []const u8) anyerror!WriteOutcome {
+        try self.ensureTerminalV2InvokeAllowed(invoke_node_id);
         const input = std.mem.trim(u8, raw_input, " \t\r\n");
         if (input.len == 0) return error.InvalidPayload;
         try self.setFileContent(invoke_node_id, input);
@@ -3212,6 +3220,7 @@ pub const Session = struct {
     }
 
     fn handleTerminalV2CreateWrite(self: *Session, create_node_id: u32, raw_input: []const u8) anyerror!WriteOutcome {
+        try self.ensureTerminalV2InvokeAllowed(create_node_id);
         const input = std.mem.trim(u8, raw_input, " \t\r\n");
         const payload = if (input.len == 0) "{}" else input;
         try self.setFileContent(create_node_id, payload);
@@ -3219,6 +3228,7 @@ pub const Session = struct {
     }
 
     fn handleTerminalV2ResumeWrite(self: *Session, resume_node_id: u32, raw_input: []const u8) anyerror!WriteOutcome {
+        try self.ensureTerminalV2InvokeAllowed(resume_node_id);
         const input = std.mem.trim(u8, raw_input, " \t\r\n");
         if (input.len == 0) return error.InvalidPayload;
         try self.setFileContent(resume_node_id, input);
@@ -3226,6 +3236,7 @@ pub const Session = struct {
     }
 
     fn handleTerminalV2CloseWrite(self: *Session, close_node_id: u32, raw_input: []const u8) anyerror!WriteOutcome {
+        try self.ensureTerminalV2InvokeAllowed(close_node_id);
         const input = std.mem.trim(u8, raw_input, " \t\r\n");
         const payload = if (input.len == 0) "{}" else input;
         try self.setFileContent(close_node_id, payload);
@@ -3233,6 +3244,7 @@ pub const Session = struct {
     }
 
     fn handleTerminalV2WriteWrite(self: *Session, write_node_id: u32, raw_input: []const u8) anyerror!WriteOutcome {
+        try self.ensureTerminalV2InvokeAllowed(write_node_id);
         const input = std.mem.trim(u8, raw_input, " \t\r\n");
         if (input.len == 0) return error.InvalidPayload;
         try self.setFileContent(write_node_id, input);
@@ -3240,6 +3252,7 @@ pub const Session = struct {
     }
 
     fn handleTerminalV2ReadWrite(self: *Session, read_node_id: u32, raw_input: []const u8) anyerror!WriteOutcome {
+        try self.ensureTerminalV2InvokeAllowed(read_node_id);
         const input = std.mem.trim(u8, raw_input, " \t\r\n");
         const payload = if (input.len == 0) "{}" else input;
         try self.setFileContent(read_node_id, payload);
@@ -3247,6 +3260,7 @@ pub const Session = struct {
     }
 
     fn handleTerminalV2ResizeWrite(self: *Session, resize_node_id: u32, raw_input: []const u8) anyerror!WriteOutcome {
+        try self.ensureTerminalV2InvokeAllowed(resize_node_id);
         const input = std.mem.trim(u8, raw_input, " \t\r\n");
         if (input.len == 0) return error.InvalidPayload;
         try self.setFileContent(resize_node_id, input);
@@ -3254,6 +3268,7 @@ pub const Session = struct {
     }
 
     fn handleTerminalV2ExecWrite(self: *Session, exec_node_id: u32, raw_input: []const u8) anyerror!WriteOutcome {
+        try self.ensureTerminalV2InvokeAllowed(exec_node_id);
         const input = std.mem.trim(u8, raw_input, " \t\r\n");
         if (input.len == 0) return error.InvalidPayload;
         try self.setFileContent(exec_node_id, input);
