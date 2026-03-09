@@ -5176,7 +5176,7 @@ pub const Session = struct {
         try self.addDirectoryDescriptors(
             venoms_root,
             "Node Venoms",
-            "{\"kind\":\"collection\",\"entries\":\"venom_id\",\"shape\":\"/nodes/<node_id>/venoms/<venom_id>/{SCHEMA.json,STATUS.json,CAPS.json,MOUNTS.json,OPS.json,RUNTIME.json,PERMISSIONS.json}\"}",
+            "{\"kind\":\"collection\",\"entries\":\"venom_id\",\"shape\":\"/nodes/<node_id>/venoms/<venom_id>/{README.md,SCHEMA.json,TEMPLATE.json,CAPS.json,MOUNTS.json,OPS.json,RUNTIME.json,HOST.json,PERMISSIONS.json,STATUS.json}\"}",
             "{\"read\":true,\"write\":false}",
             "Node Venom descriptors mirrored from the node Venom catalog.",
         );
@@ -5203,6 +5203,7 @@ pub const Session = struct {
                         venom.runtime_json,
                         venom.permissions_json,
                         venom.schema_json,
+                        venom.invoke_template_json,
                         venom.help_md,
                     );
                     try view.observe(
@@ -5262,6 +5263,7 @@ pub const Session = struct {
                     "{\"type\":\"builtin\"}",
                     permissions,
                     "{\"model\":\"filesystem\"}",
+                    null,
                     "Project node filesystem export.",
                 );
                 try self.addNodeVenomEntry(
@@ -5276,6 +5278,7 @@ pub const Session = struct {
                     "{\"type\":\"builtin\"}",
                     permissions,
                     "{\"model\":\"filesystem\"}",
+                    null,
                     "Project node filesystem export.",
                 );
                 try view.observe(self.allocator, node.id, "fs", "fs", endpoint, mounts);
@@ -5306,6 +5309,7 @@ pub const Session = struct {
                     "{\"type\":\"builtin\"}",
                     permissions,
                     "{\"model\":\"camera\"}",
+                    null,
                     "Camera capture namespace.",
                 );
                 try self.addNodeVenomEntry(
@@ -5320,6 +5324,7 @@ pub const Session = struct {
                     "{\"type\":\"builtin\"}",
                     permissions,
                     "{\"model\":\"camera\"}",
+                    null,
                     "Camera capture namespace.",
                 );
                 try view.observe(self.allocator, node.id, "camera", "camera", endpoint, mounts);
@@ -5350,6 +5355,7 @@ pub const Session = struct {
                     "{\"type\":\"builtin\"}",
                     permissions,
                     "{\"model\":\"screen\"}",
+                    null,
                     "Screen capture namespace.",
                 );
                 try self.addNodeVenomEntry(
@@ -5364,6 +5370,7 @@ pub const Session = struct {
                     "{\"type\":\"builtin\"}",
                     permissions,
                     "{\"model\":\"screen\"}",
+                    null,
                     "Screen capture namespace.",
                 );
                 try view.observe(self.allocator, node.id, "screen", "screen", endpoint, mounts);
@@ -5394,6 +5401,7 @@ pub const Session = struct {
                     "{\"type\":\"builtin\"}",
                     permissions,
                     "{\"model\":\"user\"}",
+                    null,
                     "User interaction namespace.",
                 );
                 try self.addNodeVenomEntry(
@@ -5408,6 +5416,7 @@ pub const Session = struct {
                     "{\"type\":\"builtin\"}",
                     permissions,
                     "{\"model\":\"user\"}",
+                    null,
                     "User interaction namespace.",
                 );
                 try view.observe(self.allocator, node.id, "user", "user", endpoint, mounts);
@@ -5448,6 +5457,7 @@ pub const Session = struct {
                     "{\"type\":\"builtin\"}",
                     permissions,
                     "{\"model\":\"terminal\"}",
+                    null,
                     "Interactive terminal namespace.",
                 );
                 try self.addNodeVenomEntry(
@@ -5462,6 +5472,7 @@ pub const Session = struct {
                     "{\"type\":\"builtin\"}",
                     permissions,
                     "{\"model\":\"terminal\"}",
+                    null,
                     "Interactive terminal namespace.",
                 );
                 try view.observe(self.allocator, node.id, "terminal", venom_id, endpoint, mounts);
@@ -5488,6 +5499,7 @@ pub const Session = struct {
             runtime_json: []u8,
             permissions_json: []u8,
             schema_json: []u8,
+            invoke_template_json: ?[]u8 = null,
             help_md: ?[]u8 = null,
 
             fn deinit(self: *Entry, allocator: std.mem.Allocator) void {
@@ -5501,6 +5513,7 @@ pub const Session = struct {
                 allocator.free(self.runtime_json);
                 allocator.free(self.permissions_json);
                 allocator.free(self.schema_json);
+                if (self.invoke_template_json) |value| allocator.free(value);
                 if (self.help_md) |value| allocator.free(value);
                 self.* = undefined;
             }
@@ -5628,6 +5641,15 @@ pub const Session = struct {
                 try self.allocator.dupe(u8, "{}");
             errdefer self.allocator.free(schema_json);
 
+            const invoke_template_json = if (item.object.get("invoke_template")) |invoke_template|
+                if (invoke_template == .object)
+                    try std.fmt.allocPrint(self.allocator, "{f}", .{std.json.fmt(invoke_template, .{})})
+                else
+                    null
+            else
+                null;
+            errdefer if (invoke_template_json) |value| self.allocator.free(value);
+
             const help_md = if (item.object.get("help_md")) |help|
                 if (help == .string and help.string.len > 0)
                     try self.allocator.dupe(u8, help.string)
@@ -5648,6 +5670,7 @@ pub const Session = struct {
                 .runtime_json = runtime_json,
                 .permissions_json = permissions_json,
                 .schema_json = schema_json,
+                .invoke_template_json = invoke_template_json,
                 .help_md = help_md,
             });
         }
@@ -5672,6 +5695,7 @@ pub const Session = struct {
         runtime_json: []const u8,
         permissions_json: []const u8,
         schema_json: []const u8,
+        invoke_template_json: ?[]const u8,
         help_md: ?[]const u8,
     ) !void {
         const venom_dir = try self.addDir(services_root, venom_id, false);
@@ -5695,6 +5719,12 @@ pub const Session = struct {
         _ = try self.addFile(venom_dir, "MOUNTS.json", mounts_json, false, .none);
         _ = try self.addFile(venom_dir, "OPS.json", ops_json, false, .none);
         _ = try self.addFile(venom_dir, "RUNTIME.json", runtime_json, false, .none);
+        if (invoke_template_json) |value| {
+            _ = try self.addFile(venom_dir, "TEMPLATE.json", value, false, .none);
+        }
+        const host_json = try self.renderNodeVenomHostJson(runtime_json);
+        defer self.allocator.free(host_json);
+        _ = try self.addFile(venom_dir, "HOST.json", host_json, false, .none);
         _ = try self.addFile(venom_dir, "PERMISSIONS.json", permissions_json, false, .none);
 
         const status = try std.fmt.allocPrint(
@@ -5704,6 +5734,22 @@ pub const Session = struct {
         );
         defer self.allocator.free(status);
         _ = try self.addFile(venom_dir, "STATUS.json", status, false, .none);
+    }
+
+    fn renderNodeVenomHostJson(self: *Session, runtime_json: []const u8) ![]u8 {
+        var runtime_kind: []const u8 = "builtin";
+        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, runtime_json, .{}) catch {
+            return shared_node.service_runtime_host.renderMetadataJson(self.allocator, runtime_kind);
+        };
+        defer parsed.deinit();
+        if (parsed.value == .object) {
+            if (parsed.value.object.get("type")) |runtime_type| {
+                if (runtime_type == .string and runtime_type.string.len > 0) {
+                    runtime_kind = runtime_type.string;
+                }
+            }
+        }
+        return shared_node.service_runtime_host.renderMetadataJson(self.allocator, runtime_kind);
     }
 
     fn copyOptionalServiceFile(self: *Session, source_dir_id: u32, target_dir_id: u32, name: []const u8) !void {
@@ -5817,6 +5863,8 @@ pub const Session = struct {
         try self.copyOptionalServiceFile(provider_dir_id, alias_dir_id, "MOUNTS.json");
         try self.copyOptionalServiceFile(provider_dir_id, alias_dir_id, "OPS.json");
         try self.copyOptionalServiceFile(provider_dir_id, alias_dir_id, "RUNTIME.json");
+        try self.copyOptionalServiceFile(provider_dir_id, alias_dir_id, "TEMPLATE.json");
+        try self.copyOptionalServiceFile(provider_dir_id, alias_dir_id, "HOST.json");
         try self.copyOptionalServiceFile(provider_dir_id, alias_dir_id, "PERMISSIONS.json");
         try self.copyOptionalServiceFile(provider_dir_id, alias_dir_id, "STATUS.json");
 
@@ -10923,7 +10971,7 @@ fn defaultGlobalLibraryIndexMd() []const u8 {
 fn defaultGlobalLibraryTopicGettingStarted() []const u8 {
     return "# Getting Started\n\n" ++
         "1. Discover Venoms in `/global/venoms/VENOMS.json`.\n" ++
-        "2. Read each Venom `README.md`, `SCHEMA.json`, and `CAPS.json` before using it.\n" ++
+        "2. Read each Venom `README.md`, `SCHEMA.json`, `TEMPLATE.json`, `HOST.json`, and `CAPS.json` before using it.\n" ++
         "3. Use `/global/library` for system guides.\n";
 }
 
@@ -10933,6 +10981,7 @@ fn defaultGlobalLibraryTopicServiceDiscovery() []const u8 {
         "- Project namespaces: `/global/<venom_id>`\n" ++
         "- Global namespaces: `/global/<venom_id>`\n" ++
         "- Start with `/global/venoms/VENOMS.json`.\n" ++
+        "- Service Venoms should expose `TEMPLATE.json` and `HOST.json` alongside `SCHEMA.json`, `OPS.json`, and `STATUS.json`.\n" ++
         "- Common project Venoms include: memory, web_search, search_code, terminal, mounts, sub_brains, agents, projects.\n";
 }
 
@@ -12858,6 +12907,56 @@ test "acheron_session: scoped venom aliases fail closed without control plane" {
         null,
     ));
     try std.testing.expectEqual(previous_len, session.scoped_venom_bindings.items.len);
+}
+
+test "acheron_session: scoped venom aliases preserve template and host metadata" {
+    const allocator = std.testing.allocator;
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "default",
+        .{
+            .agents_dir = ".does-not-exist",
+            .projects_dir = ".does-not-exist",
+        },
+    );
+    defer session.deinit();
+
+    const nodes_root = session.lookupChild(session.root_id, "nodes") orelse return error.TestExpectedResponse;
+    const node_dir = try session.addDir(nodes_root, "edge-1", false);
+    const venoms_root = try session.addDir(node_dir, "venoms", false);
+    const tool_dir = try session.addDir(venoms_root, "tool-main", false);
+    _ = try session.addFile(tool_dir, "STATUS.json", "{\"endpoint\":\"/nodes/edge-1/venoms/tool-main\"}", false, .none);
+    _ = try session.addFile(tool_dir, "OPS.json", "{\"model\":\"namespace\",\"invoke\":\"control/invoke.json\"}", false, .none);
+    _ = try session.addFile(tool_dir, "RUNTIME.json", "{\"type\":\"native_proc\"}", false, .none);
+    _ = try session.addFile(tool_dir, "TEMPLATE.json", "{\"tool_name\":\"shell_exec\",\"arguments\":{\"command\":\"pwd\"}}", false, .none);
+    _ = try session.addFile(tool_dir, "HOST.json", "{\"runtime_kind\":\"native_proc\"}", false, .none);
+
+    const alias_root = try session.addDir(session.root_id, "alias-tests", false);
+    try std.testing.expect(try session.seedBoundNodeVenomNamespaceAt(
+        alias_root,
+        "/alias-tests",
+        "tool-main",
+        "global_binding",
+        "edge-1",
+    ));
+
+    const alias_dir = session.lookupChild(alias_root, "tool-main") orelse return error.TestExpectedResponse;
+    const template_id = session.lookupChild(alias_dir, "TEMPLATE.json") orelse return error.TestExpectedResponse;
+    const host_id = session.lookupChild(alias_dir, "HOST.json") orelse return error.TestExpectedResponse;
+    const template_node = session.nodes.get(template_id) orelse return error.TestExpectedResponse;
+    const host_node = session.nodes.get(host_id) orelse return error.TestExpectedResponse;
+
+    try std.testing.expect(std.mem.indexOf(u8, template_node.content, "\"shell_exec\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, host_node.content, "\"native_proc\"") != null);
 }
 
 test "acheron_session: scoped venom aliases shape proxy paths and job result paths" {
@@ -16490,7 +16589,7 @@ test "acheron_session: control-plane mounts expose custom node roots and metadat
     defer allocator.free(escaped_node_secret);
     const upsert_req = try std.fmt.allocPrint(
         allocator,
-        "{{\"node_id\":\"{s}\",\"node_secret\":\"{s}\",\"venoms\":[{{\"venom_id\":\"gdrive-main\",\"kind\":\"gdrive\",\"version\":\"1\",\"state\":\"online\",\"endpoints\":[\"/nodes/{s}/venoms/gdrive-main\"],\"capabilities\":{{\"provider\":\"google\"}},\"mounts\":[{{\"mount_id\":\"drive-main\",\"mount_path\":\"/nodes/{s}/drive/main\",\"state\":\"online\"}}],\"ops\":{{\"model\":\"namespace\"}},\"runtime\":{{\"type\":\"native_proc\"}},\"permissions\":{{\"default\":\"deny-by-default\",\"allow_roles\":[\"admin\",\"user\"]}},\"schema\":{{\"model\":\"namespace-mount\"}},\"help_md\":\"Google Drive namespace mount\"}}]}}",
+        "{{\"node_id\":\"{s}\",\"node_secret\":\"{s}\",\"venoms\":[{{\"venom_id\":\"gdrive-main\",\"kind\":\"gdrive\",\"version\":\"1\",\"state\":\"online\",\"endpoints\":[\"/nodes/{s}/venoms/gdrive-main\"],\"capabilities\":{{\"provider\":\"google\"}},\"mounts\":[{{\"mount_id\":\"drive-main\",\"mount_path\":\"/nodes/{s}/drive/main\",\"state\":\"online\"}}],\"ops\":{{\"model\":\"namespace\"}},\"runtime\":{{\"type\":\"native_proc\"}},\"permissions\":{{\"default\":\"deny-by-default\",\"allow_roles\":[\"admin\",\"user\"]}},\"schema\":{{\"model\":\"namespace-mount\"}},\"invoke_template\":{{\"tool_name\":\"gdrive_sync\",\"arguments\":{{\"drive\":\"main\"}}}},\"help_md\":\"Google Drive namespace mount\"}}]}}",
         .{ escaped_node_id, escaped_node_secret, escaped_node_id, escaped_node_id },
     );
     defer allocator.free(upsert_req);
@@ -16551,17 +16650,23 @@ test "acheron_session: control-plane mounts expose custom node roots and metadat
     const mounts_id = session.lookupChild(gdrive_service, "MOUNTS.json") orelse return error.TestExpectedResponse;
     const ops_id = session.lookupChild(gdrive_service, "OPS.json") orelse return error.TestExpectedResponse;
     const runtime_id = session.lookupChild(gdrive_service, "RUNTIME.json") orelse return error.TestExpectedResponse;
+    const template_id = session.lookupChild(gdrive_service, "TEMPLATE.json") orelse return error.TestExpectedResponse;
+    const host_id = session.lookupChild(gdrive_service, "HOST.json") orelse return error.TestExpectedResponse;
     const permissions_id = session.lookupChild(gdrive_service, "PERMISSIONS.json") orelse return error.TestExpectedResponse;
     const readme_id = session.lookupChild(gdrive_service, "README.md") orelse return error.TestExpectedResponse;
     const mounts_node = session.nodes.get(mounts_id) orelse return error.TestExpectedResponse;
     const ops_node = session.nodes.get(ops_id) orelse return error.TestExpectedResponse;
     const runtime_node = session.nodes.get(runtime_id) orelse return error.TestExpectedResponse;
+    const template_node = session.nodes.get(template_id) orelse return error.TestExpectedResponse;
+    const host_node = session.nodes.get(host_id) orelse return error.TestExpectedResponse;
     const permissions_node = session.nodes.get(permissions_id) orelse return error.TestExpectedResponse;
     const readme_node = session.nodes.get(readme_id) orelse return error.TestExpectedResponse;
 
     try std.testing.expect(std.mem.indexOf(u8, mounts_node.content, "\"mount_path\":\"/nodes/") != null);
     try std.testing.expect(std.mem.indexOf(u8, ops_node.content, "\"model\":\"namespace\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, runtime_node.content, "\"type\":\"native_proc\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, template_node.content, "\"tool_name\":\"gdrive_sync\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, host_node.content, "\"runtime_kind\":\"native_proc\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, permissions_node.content, "\"deny-by-default\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, readme_node.content, "Google Drive namespace mount") != null);
 }
