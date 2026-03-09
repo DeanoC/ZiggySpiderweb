@@ -535,17 +535,40 @@ fn fileWriteEscalatesToShellExec(allocator: std.mem.Allocator, args_json: []cons
     defer invoke_payload.deinit();
     if (invoke_payload.value != .object) return false;
 
-    const invoke_obj = invoke_payload.value.object;
-    const raw_op = if (invoke_obj.get("op")) |value|
+    const op = terminalInvokeOperation(invoke_payload.value.object) orelse return false;
+    return std.mem.eql(u8, op, "exec") or std.mem.eql(u8, op, "shell_exec");
+}
+
+fn terminalInvokeOperation(obj: std.json.ObjectMap) ?[]const u8 {
+    if (extractTerminalInvokeOperationString(obj)) |op| return op;
+    if (obj.get("command") != null or obj.get("argv") != null) return "exec";
+    if (extractTerminalInvokeArgumentsObject(obj)) |arguments| {
+        if (extractTerminalInvokeOperationString(arguments)) |op| return op;
+        if (arguments.get("command") != null or arguments.get("argv") != null) return "exec";
+    }
+    return null;
+}
+
+fn extractTerminalInvokeOperationString(obj: std.json.ObjectMap) ?[]const u8 {
+    const raw_op = if (obj.get("op")) |value|
         value
-    else if (invoke_obj.get("operation")) |value|
+    else if (obj.get("operation")) |value|
         value
     else
-        return false;
-    if (raw_op != .string) return false;
+        return null;
+    if (raw_op != .string) return null;
+    return std.mem.trim(u8, raw_op.string, " \t\r\n");
+}
 
-    const op = std.mem.trim(u8, raw_op.string, " \t\r\n");
-    return std.mem.eql(u8, op, "exec") or std.mem.eql(u8, op, "shell_exec");
+fn extractTerminalInvokeArgumentsObject(obj: std.json.ObjectMap) ?std.json.ObjectMap {
+    const raw_args = if (obj.get("arguments")) |value|
+        value
+    else if (obj.get("args")) |value|
+        value
+    else
+        return null;
+    if (raw_args != .object) return null;
+    return raw_args.object;
 }
 
 /// Pre-mutate hook that filters tools based on allow/deny rules
@@ -830,6 +853,14 @@ test "brain_specialization: file_write escalation maps terminal exec leaves to s
     try std.testing.expect(fileWriteEscalatesToShellExec(
         allocator,
         "{\"path\":\"/global/terminal/control/invoke.json\",\"content\":\"{\\\"operation\\\":\\\" shell_exec \\\",\\\"arguments\\\":{}}\"}",
+    ));
+    try std.testing.expect(fileWriteEscalatesToShellExec(
+        allocator,
+        "{\"path\":\"/global/terminal/control/invoke.json\",\"content\":\"{\\\"arguments\\\":{\\\"command\\\":\\\"echo hi\\\"}}\"}",
+    ));
+    try std.testing.expect(fileWriteEscalatesToShellExec(
+        allocator,
+        "{\"path\":\"/global/terminal/control/invoke.json\",\"content\":\"{\\\"args\\\":{\\\"operation\\\":\\\" exec \\\",\\\"argv\\\":[\\\"echo\\\",\\\"hi\\\"]}}\"}",
     ));
     try std.testing.expect(!fileWriteEscalatesToShellExec(
         allocator,
