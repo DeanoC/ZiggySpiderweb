@@ -6269,11 +6269,6 @@ pub const Session = struct {
         const payload = std.mem.trim(u8, raw_input, " \t\r\n");
         if (!self.isPairingActionAuthorized(action, payload)) {
             try self.setPairingResultError(action, "OperatorAuthFailed");
-            switch (action) {
-                .refresh, .approve, .deny => try self.refreshPairingPendingSnapshot(),
-                .invites_refresh => try self.refreshPairingInvitesSnapshot(),
-                .invites_create => {},
-            }
             return .{ .written = written };
         }
         const plane = self.control_plane orelse {
@@ -11256,6 +11251,33 @@ test "acheron_session: debug pairing approve requires operator token when config
     try std.testing.expect(std.mem.indexOf(u8, last_result_after_denied.content, "\"ok\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, last_result_after_denied.content, "OperatorAuthFailed") != null);
 
+    const req_refresh_json = try control_plane.nodeJoinRequest(
+        "{\"node_name\":\"desk-refresh\",\"fs_url\":\"ws://127.0.0.1:28891/v2/fs\",\"platform\":{\"os\":\"linux\",\"arch\":\"amd64\",\"runtime_kind\":\"native\"}}",
+    );
+    defer allocator.free(req_refresh_json);
+    var req_refresh = try std.json.parseFromSlice(std.json.Value, allocator, req_refresh_json, .{});
+    defer req_refresh.deinit();
+    if (req_refresh.value != .object) return error.TestExpectedResponse;
+    const refresh_request = req_refresh.value.object.get("request_id") orelse return error.TestExpectedResponse;
+    if (refresh_request != .string) return error.TestExpectedResponse;
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        74,
+        75,
+        &.{ "debug", "pairing", "control", "refresh" },
+        "{}",
+        605,
+    );
+
+    const pending_after_unauthorized_refresh = session.nodes.get(pending_id) orelse return error.TestExpectedResponse;
+    try std.testing.expect(std.mem.indexOf(u8, pending_after_unauthorized_refresh.content, refresh_request.string) == null);
+    const last_result_after_refresh_denied = session.nodes.get(last_result_id) orelse return error.TestExpectedResponse;
+    try std.testing.expect(std.mem.indexOf(u8, last_result_after_refresh_denied.content, "\"ok\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, last_result_after_refresh_denied.content, "\"action\":\"refresh\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, last_result_after_refresh_denied.content, "OperatorAuthFailed") != null);
+
     const approve_with_token = try std.fmt.allocPrint(
         allocator,
         "{{\"request_id\":\"{s}\",\"lease_ttl_ms\":900000,\"operator_token\":\"operator-secret\"}}",
@@ -11265,8 +11287,8 @@ test "acheron_session: debug pairing approve requires operator token when config
     try protocolWriteFile(
         &session,
         allocator,
-        72,
-        73,
+        76,
+        77,
         &.{ "debug", "pairing", "control", "approve.json" },
         approve_with_token,
         610,
