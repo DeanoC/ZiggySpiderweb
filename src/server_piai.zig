@@ -17,6 +17,7 @@ const spiderweb_node = @import("spiderweb_node");
 const fs_node_ops = spiderweb_node.fs_node_ops;
 const fs_node_service = spiderweb_node.fs_node_service;
 const fs_watch_runtime = spiderweb_node.fs_watch_runtime;
+const agent_config_mod = @import("agents/agent_config.zig");
 const agent_registry_mod = @import("agents/agent_registry.zig");
 const tool_registry = @import("ziggy-tool-runtime").tool_registry;
 const unified = @import("spider-protocol").unified;
@@ -87,6 +88,16 @@ const runtime_warmup_error_retry_backoff_ms: i64 = 10_000;
 const runtime_residency_worker_interval_ms_default: u64 = 1_000;
 const session_heartbeat_ttl_ms: i64 = 5 * 60 * 1000;
 const agent_heartbeat_ttl_ms: i64 = 5 * 60 * 1000;
+
+const agent_create_capabilities = [_][]const u8{
+    "agents.create",
+    "agent.create",
+    "agents.manage",
+    "agent_manage",
+    "agent_admin",
+    "provision_agents",
+    "plan",
+};
 
 const DebugStreamFileSink = struct {
     allocator: std.mem.Allocator,
@@ -3405,7 +3416,52 @@ const RuntimeToolDispatchProxy = struct {
         content: []const u8,
         args_json: []const u8,
     ) tool_registry.ToolExecutionResult {
+        if (pathMatchesControlTarget(path, "global/agents/control/create.json") and !self.canRuntimeAgentCreateAgents()) {
+            return runtimeDispatchFailure(allocator, .permission_denied, "agent provisioning capability required");
+        }
         return self.handleServiceControlWrite(allocator, path, content, args_json, "/global/agents/result.json");
+    }
+
+    fn canRuntimeAgentCreateAgents(self: *RuntimeToolDispatchProxy) bool {
+        var can_create = std.mem.eql(u8, self.sandbox_runtime.agent_id, system_agent_id);
+
+        if (agent_config_mod.loadAgentConfigFromDir(
+            self.allocator,
+            self.sandbox_runtime.runtime_cfg.agents_dir,
+            self.sandbox_runtime.agent_id,
+        ) catch null) |config| {
+            defer {
+                var owned = config;
+                owned.deinit();
+            }
+            if (config.primary.capabilities) |caps| {
+                for (caps.items) |capability| {
+                    if (capabilityMatchesAny(capability, &agent_create_capabilities)) {
+                        can_create = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        var registry = agent_registry_mod.AgentRegistry.init(
+            self.allocator,
+            ".",
+            self.sandbox_runtime.runtime_cfg.agents_dir,
+            self.sandbox_runtime.runtime_cfg.assets_dir,
+        );
+        defer registry.deinit();
+        registry.scan() catch return can_create;
+        if (registry.getAgent(self.sandbox_runtime.agent_id)) |info| {
+            for (info.capabilities.items) |capability| {
+                switch (capability) {
+                    .plan => return true,
+                    else => {},
+                }
+            }
+        }
+
+        return can_create;
     }
 
     fn handleServiceControlWrite(
@@ -3478,6 +3534,13 @@ fn isTerminalControlPath(path: []const u8) bool {
 fn pathMatchesAnyControlTarget(path: []const u8, targets: []const []const u8) bool {
     for (targets) |target| {
         if (pathMatchesControlTarget(path, target)) return true;
+    }
+    return false;
+}
+
+fn capabilityMatchesAny(capability: []const u8, accepted: []const []const u8) bool {
+    for (accepted) |candidate| {
+        if (std.ascii.eqlIgnoreCase(capability, candidate)) return true;
     }
     return false;
 }
@@ -11299,6 +11362,98 @@ test "server_piai: agents control path matcher is global-only" {
     try std.testing.expect(isAgentsControlPath("global/agents/control/list.json"));
     try std.testing.expect(!isAgentsControlPath("/agents/self/agents/control/invoke.json"));
     try std.testing.expect(!isAgentsControlPath("/global/projects/control/create.json"));
+}
+
+test "server_piai: sandbox proxy denies agent create without provisioning capability" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const tmp_root = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_root);
+    const agents_dir = try std.fs.path.join(allocator, &.{ tmp_root, "agents" });
+    defer allocator.free(agents_dir);
+    const assets_dir = try std.fs.path.join(allocator, &.{ tmp_root, "templates" });
+    defer allocator.free(assets_dir);
+    try std.fs.cwd().makePath(agents_dir);
+    try std.fs.cwd().makePath(assets_dir);
+
+    const agent_id = try allocator.dupe(u8, "worker");
+    defer allocator.free(agent_id);
+
+    var sandbox_runtime: sandbox_runtime_mod.SandboxRuntime = undefined;
+    sandbox_runtime.agent_id = agent_id;
+    sandbox_runtime.runtime_cfg = .{
+        .agents_dir = agents_dir,
+        .assets_dir = assets_dir,
+    };
+
+    var proxy = RuntimeToolDispatchProxy{
+        .allocator = allocator,
+        .sandbox_runtime = &sandbox_runtime,
+    };
+
+    var result = proxy.handleAgentsControlWrite(
+        allocator,
+        "/global/agents/control/create.json",
+        "{\"agent_id\":\"child\"}",
+        "{\"path\":\"/global/agents/control/create.json\",\"content\":\"{\\\"agent_id\\\":\\\"child\\\"}\"}",
+    );
+    defer result.deinit(allocator);
+
+    switch (result) {
+        .failure => |failure| {
+            try std.testing.expectEqual(tool_registry.ToolErrorCode.permission_denied, failure.code);
+            try std.testing.expectEqualStrings("agent provisioning capability required", failure.message);
+        },
+        .success => return error.TestUnexpectedResult,
+    }
+}
+
+test "server_piai: sandbox proxy recognizes configured provisioning capability" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const tmp_root = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_root);
+    const agents_dir = try std.fs.path.join(allocator, &.{ tmp_root, "agents" });
+    defer allocator.free(agents_dir);
+    const assets_dir = try std.fs.path.join(allocator, &.{ tmp_root, "templates" });
+    defer allocator.free(assets_dir);
+    try std.fs.cwd().makePath(agents_dir);
+    try std.fs.cwd().makePath(assets_dir);
+
+    const config_path = try std.fs.path.join(allocator, &.{ agents_dir, "worker_config.json" });
+    defer allocator.free(config_path);
+    try std.fs.cwd().writeFile(.{
+        .sub_path = config_path,
+        .data =
+        \\{
+        \\  "agent_id": "worker",
+        \\  "primary": {
+        \\    "capabilities": ["agents.create"]
+        \\  }
+        \\}
+        ,
+    });
+
+    const agent_id = try allocator.dupe(u8, "worker");
+    defer allocator.free(agent_id);
+
+    var sandbox_runtime: sandbox_runtime_mod.SandboxRuntime = undefined;
+    sandbox_runtime.agent_id = agent_id;
+    sandbox_runtime.runtime_cfg = .{
+        .agents_dir = agents_dir,
+        .assets_dir = assets_dir,
+    };
+
+    var proxy = RuntimeToolDispatchProxy{
+        .allocator = allocator,
+        .sandbox_runtime = &sandbox_runtime,
+    };
+
+    try std.testing.expect(proxy.canRuntimeAgentCreateAgents());
 }
 
 test "server_piai: terminal control path matcher is global-only" {
