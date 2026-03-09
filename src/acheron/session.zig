@@ -6362,7 +6362,7 @@ pub const Session = struct {
         node_id: []const u8,
     ) bool {
         const scoped_project_id = project_id orelse return true;
-        const plane = self.control_plane orelse return true;
+        const plane = self.control_plane orelse return false;
         return plane.projectAllowsNodeVenomEvent(
             scoped_project_id,
             if (agent_id) |value| value else self.agent_id,
@@ -12054,7 +12054,7 @@ test "acheron_session: scoped venom bindings skip disallowed project nodes" {
     try std.testing.expectEqualStrings(local_node_id, router.endpointName(0) orelse return error.TestExpectedResponse);
 }
 
-test "acheron_session: scoped venom aliases keep local bindings without control plane" {
+test "acheron_session: scoped venom aliases fail closed without control plane" {
     const allocator = std.testing.allocator;
 
     const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
@@ -12084,7 +12084,7 @@ test "acheron_session: scoped venom aliases keep local bindings without control 
     _ = try session.addFile(chat_dir, "STATUS.json", "{\"endpoint\":\"/nodes/spiderweb-local/venoms/chat\"}", false, .none);
 
     const previous_len = session.scoped_venom_bindings.items.len;
-    try std.testing.expect(try session.registerBoundVenomAliasOnly(
+    try std.testing.expect(!try session.registerBoundVenomAliasOnly(
         "/projects/offline-project/venoms",
         "chat",
         "project_binding",
@@ -12092,13 +12092,7 @@ test "acheron_session: scoped venom aliases keep local bindings without control 
         project_id,
         null,
     ));
-    try std.testing.expectEqual(previous_len + 1, session.scoped_venom_bindings.items.len);
-
-    const binding = session.scoped_venom_bindings.items[session.scoped_venom_bindings.items.len - 1];
-    try std.testing.expectEqualStrings("project_binding", binding.scope);
-    try std.testing.expectEqualStrings("/projects/offline-project/venoms/chat", binding.venom_path);
-    try std.testing.expectEqualStrings("spiderweb-local", binding.provider_node_id orelse return error.TestExpectedResponse);
-    try std.testing.expectEqualStrings("/nodes/spiderweb-local/venoms/chat", binding.provider_venom_path orelse return error.TestExpectedResponse);
+    try std.testing.expectEqual(previous_len, session.scoped_venom_bindings.items.len);
 }
 
 test "acheron_session: scoped venom aliases shape proxy paths and job result paths" {
