@@ -1,6 +1,6 @@
 const std = @import("std");
 const AgentRuntime = @import("agent_runtime.zig").AgentRuntime;
-const brain_tools = @import("brain_tools.zig");
+const capability_engine = @import("capability_engine.zig");
 const primitives = @import("ziggy-runtime-hooks").hook_primitives;
 const engine = @import("ziggy-runtime-hooks").hook_registry_engine;
 
@@ -17,7 +17,7 @@ pub const HookData = union(HookPhase) {
     pre_observe: *CorePrompt,
     post_observe: *ObserveResult,
     pre_mutate: *PendingTools,
-    post_mutate: *ToolResults,
+    post_mutate: *CapabilityResults,
     pre_results: *ResultsData,
     post_results: *CheckpointData,
 };
@@ -93,12 +93,12 @@ pub const ObserveResult = struct {
 
 pub const PendingTools = primitives.PendingTools;
 
-pub const ToolResults = struct {
-    results: []const brain_tools.ToolResult,
+pub const CapabilityResults = struct {
+    results: []const capability_engine.CapabilityResult,
 };
 
 pub const ResultsData = struct {
-    tool_results: *const ToolResults,
+    tool_results: *const CapabilityResults,
 };
 
 pub const CheckpointData = struct {
@@ -112,14 +112,14 @@ pub const HookFn = *const fn (
 ) HookError!void;
 
 pub const Hook = engine.Hook(HookContext, HookData);
-const HookRegistryEngine = engine.HookRegistry(HookContext, HookData);
+const HookRegistryCapabilityEngine = engine.HookRegistry(HookContext, HookData);
 
 /// Adapter layer: Spiderweb-specific context/data types around shared engine.
 pub const HookRegistry = struct {
-    inner: HookRegistryEngine,
+    inner: HookRegistryCapabilityEngine,
 
     pub fn init(allocator: std.mem.Allocator) HookRegistry {
-        return .{ .inner = HookRegistryEngine.init(allocator) };
+        return .{ .inner = HookRegistryCapabilityEngine.init(allocator) };
     }
 
     pub fn deinit(self: *HookRegistry) void {

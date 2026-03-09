@@ -1,16 +1,16 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const Config = @import("config.zig");
+const Config = @import("../config.zig");
 const protocol = @import("spider-protocol").protocol;
 const agent_runtime = @import("agent_runtime.zig");
-const brain_tools = @import("brain_tools.zig");
+const capability_engine = @import("capability_engine.zig");
 const brain_specialization = @import("brain_specialization.zig");
-const credential_store = @import("credential_store.zig");
+const credential_store = @import("../credential_store.zig");
 const memory_schema = @import("memory_schema.zig");
-const provider_models = @import("provider_models.zig");
+const provider_models = @import("../provider_models.zig");
 const memory = @import("ziggy-memory-store").memory;
 const memid = @import("ziggy-memory-store").memid;
-const prompt_compiler = @import("prompt_compiler.zig");
+const prompt_compiler = @import("../prompt_compiler.zig");
 const run_engine = @import("ziggy-run-orchestrator").run_engine;
 const run_orchestration = @import("ziggy-run-orchestrator").run_orchestration_helpers;
 const system_hooks = @import("system_hooks.zig");
@@ -178,7 +178,7 @@ var streamByModelFn: StreamByModelFn = ziggy_piai.stream.streamByModel;
 
 const GetEnvApiKeyFn = *const fn (std.mem.Allocator, []const u8) ?[]const u8;
 var getEnvApiKeyFn: GetEnvApiKeyFn = ziggy_piai.env_api_keys.getEnvApiKey;
-const RemoteToolDispatchFn = brain_tools.RemoteToolDispatchFn;
+const RemoteCapabilityDispatchFn = capability_engine.RemoteCapabilityDispatchFn;
 
 const ProviderRuntime = struct {
     model_registry: ziggy_piai.models.ModelRegistry,
@@ -266,7 +266,7 @@ pub const RuntimeServer = struct {
     stopping: bool = false,
     test_ltm_directory: ?[]u8 = null,
     remote_tool_dispatch_ctx: ?*anyopaque = null,
-    remote_tool_dispatch_fn: ?RemoteToolDispatchFn = null,
+    remote_tool_dispatch_fn: ?RemoteCapabilityDispatchFn = null,
 
     pub fn create(allocator: std.mem.Allocator, agent_id: []const u8, runtime_cfg: Config.RuntimeConfig) !*RuntimeServer {
         return createInternal(allocator, agent_id, runtime_cfg, null, null, null);
@@ -277,7 +277,7 @@ pub const RuntimeServer = struct {
         agent_id: []const u8,
         runtime_cfg: Config.RuntimeConfig,
         dispatch_ctx: ?*anyopaque,
-        dispatch_fn: RemoteToolDispatchFn,
+        dispatch_fn: RemoteCapabilityDispatchFn,
     ) !*RuntimeServer {
         return createInternal(allocator, agent_id, runtime_cfg, null, dispatch_ctx, dispatch_fn);
     }
@@ -297,7 +297,7 @@ pub const RuntimeServer = struct {
         runtime_cfg: Config.RuntimeConfig,
         provider_cfg: Config.ProviderConfig,
         dispatch_ctx: ?*anyopaque,
-        dispatch_fn: RemoteToolDispatchFn,
+        dispatch_fn: RemoteCapabilityDispatchFn,
     ) !*RuntimeServer {
         return createInternal(
             allocator,
@@ -315,7 +315,7 @@ pub const RuntimeServer = struct {
         runtime_cfg: Config.RuntimeConfig,
         provider_cfg: ?Config.ProviderConfig,
         dispatch_ctx: ?*anyopaque,
-        dispatch_fn: ?RemoteToolDispatchFn,
+        dispatch_fn: ?RemoteCapabilityDispatchFn,
     ) !*RuntimeServer {
         const worker_count = if (runtime_cfg.runtime_worker_threads == 0) 1 else runtime_cfg.runtime_worker_threads;
 
@@ -376,7 +376,7 @@ pub const RuntimeServer = struct {
             effective_ltm_filename,
             runtime_cfg,
         );
-        runtime.setWorldToolDispatch(dispatch_ctx, dispatch_fn);
+        runtime.setCapabilityDispatch(dispatch_ctx, dispatch_fn);
         var runtime_owned_by_self = false;
         errdefer if (!runtime_owned_by_self) runtime.deinit();
 
@@ -2846,17 +2846,17 @@ pub const RuntimeServer = struct {
 
         const primary_model = selectModel(provider_runtime, provider_name, model_name) orelse return RuntimeServerError.ProviderModelNotFound;
 
-        const brain_tool_specs = try buildProviderBrainTools(self.allocator);
-        defer tool_registry.deinitProviderTools(self.allocator, brain_tool_specs);
-        const world_tool_specs = try self.runtime.world_tools.exportProviderWorldTools(self.allocator);
-        defer tool_registry.deinitProviderTools(self.allocator, world_tool_specs);
+        const capability_specs = try buildProviderCapabilities(self.allocator);
+        defer tool_registry.deinitProviderTools(self.allocator, capability_specs);
+        const provider_capability_specs = try self.runtime.capability_registry.exportProviderWorldTools(self.allocator);
+        defer tool_registry.deinitProviderTools(self.allocator, provider_capability_specs);
 
-        var direct_world_tool_count: usize = 0;
-        for (world_tool_specs) |spec| {
-            if (isDirectProviderWorldToolName(spec.name)) direct_world_tool_count += 1;
+        var direct_provider_capability_count: usize = 0;
+        for (provider_capability_specs) |spec| {
+            if (isDirectProviderCapabilityName(spec.name)) direct_provider_capability_count += 1;
         }
 
-        const total_tool_count = brain_tool_specs.len + direct_world_tool_count;
+        const total_tool_count = capability_specs.len + direct_provider_capability_count;
         const provider_tools = try self.allocator.alloc(ziggy_piai.types.Tool, total_tool_count);
         defer self.allocator.free(provider_tools);
         const provider_tool_name_map = try self.allocator.alloc(ProviderToolNameMapEntry, total_tool_count);
@@ -2867,7 +2867,7 @@ pub const RuntimeServer = struct {
         }
 
         var provider_idx: usize = 0;
-        for (brain_tool_specs) |spec| {
+        for (capability_specs) |spec| {
             const provider_tool_name = try providerToolNameFromRuntime(
                 self.allocator,
                 spec.name,
@@ -2886,8 +2886,8 @@ pub const RuntimeServer = struct {
             provider_idx += 1;
         }
 
-        for (world_tool_specs) |spec| {
-            if (!isDirectProviderWorldToolName(spec.name)) continue;
+        for (provider_capability_specs) |spec| {
+            if (!isDirectProviderCapabilityName(spec.name)) continue;
             const provider_tool_name = try providerToolNameFromRuntime(
                 self.allocator,
                 spec.name,
@@ -3342,7 +3342,7 @@ pub const RuntimeServer = struct {
                     };
                     if (structured_tool_payloads.items.len > 0) saw_tool_result_this_turn = true;
                     if (job.emit_debug) {
-                        try self.appendToolResultDebugFrames(
+                        try self.appendCapabilityResultDebugFrames(
                             &debug_frames,
                             job.request_id,
                             round,
@@ -3551,7 +3551,7 @@ pub const RuntimeServer = struct {
             };
             if (tool_payloads.items.len > 0) saw_tool_result_this_turn = true;
             if (job.emit_debug) {
-                try self.appendToolResultDebugFrames(
+                try self.appendCapabilityResultDebugFrames(
                     &debug_frames,
                     job.request_id,
                     round,
@@ -3957,7 +3957,7 @@ pub const RuntimeServer = struct {
         );
     }
 
-    fn buildProviderBrainTools(allocator: std.mem.Allocator) ![]tool_registry.ProviderTool {
+    fn buildProviderCapabilities(allocator: std.mem.Allocator) ![]tool_registry.ProviderTool {
         return allocator.alloc(tool_registry.ProviderTool, 0);
     }
 
@@ -4163,14 +4163,14 @@ pub const RuntimeServer = struct {
         return false;
     }
 
-    fn isDirectProviderWorldToolName(runtime_name: []const u8) bool {
+    fn isDirectProviderCapabilityName(runtime_name: []const u8) bool {
         return std.mem.eql(u8, runtime_name, "file_read") or
             std.mem.eql(u8, runtime_name, "file_write") or
             std.mem.eql(u8, runtime_name, "file_list");
     }
 
     fn isAllowedControlRuntimeToolName(runtime_name: []const u8) bool {
-        return isDirectProviderWorldToolName(runtime_name);
+        return isDirectProviderCapabilityName(runtime_name);
     }
 
     fn providerToolNameFromRuntime(
@@ -4544,7 +4544,7 @@ pub const RuntimeServer = struct {
         created.deinit(self.allocator);
     }
 
-    fn appendToolResultDebugFrames(
+    fn appendCapabilityResultDebugFrames(
         self: *RuntimeServer,
         debug_frames: *std.ArrayListUnmanaged([]u8),
         request_id: []const u8,
@@ -5268,7 +5268,7 @@ fn writeAgentJsonForTest(allocator: std.mem.Allocator, agent_id: []const u8, bra
     });
 }
 
-fn mockWorldToolOk(allocator: std.mem.Allocator, _: std.json.ObjectMap) tool_registry.ToolExecutionResult {
+fn mockCapabilityOk(allocator: std.mem.Allocator, _: std.json.ObjectMap) tool_registry.ToolExecutionResult {
     const payload = allocator.dupe(u8, "{\"ok\":true}") catch {
         const msg = allocator.dupe(u8, "out of memory") catch @panic("out of memory");
         return .{ .failure = .{ .code = .execution_failed, .message = msg } };
@@ -5276,7 +5276,7 @@ fn mockWorldToolOk(allocator: std.mem.Allocator, _: std.json.ObjectMap) tool_reg
     return .{ .success = .{ .payload_json = payload } };
 }
 
-fn mockWorldToolFilesystemUnavailable(allocator: std.mem.Allocator, _: std.json.ObjectMap) tool_registry.ToolExecutionResult {
+fn mockCapabilityFilesystemUnavailable(allocator: std.mem.Allocator, _: std.json.ObjectMap) tool_registry.ToolExecutionResult {
     const message = allocator.dupe(u8, "filesystem_unavailable: project mount unavailable (input/output error)") catch {
         const msg = allocator.dupe(u8, "out of memory") catch @panic("out of memory");
         return .{ .failure = .{ .code = .execution_failed, .message = msg } };
@@ -5284,7 +5284,7 @@ fn mockWorldToolFilesystemUnavailable(allocator: std.mem.Allocator, _: std.json.
     return .{ .failure = .{ .code = .execution_failed, .message = message } };
 }
 
-fn mockDispatchWorldToolOk(
+fn mockDispatchCapabilityOk(
     _: *anyopaque,
     allocator: std.mem.Allocator,
     tool_name: []const u8,
@@ -6478,7 +6478,7 @@ test "runtime_server: agent.run.start marks completed when provider emits task_c
     try std.testing.expect(std.mem.indexOf(u8, status, "\"state\":\"completed\"") != null);
 }
 
-test "runtime_server: agent.run.start preserves wait_for directive message" {
+test "runtime_server: agent.run.start preserves waiting-for-user directive message" {
     const allocator = std.testing.allocator;
     const original_stream_fn = streamByModelFn;
     defer streamByModelFn = original_stream_fn;
@@ -7090,21 +7090,21 @@ test "runtime_server: compactRuntimeStateForProviderRequest truncates oversized 
     try std.testing.expect(std.mem.indexOf(u8, compacted, "<runtime_state_truncated") != null);
 }
 
-test "runtime_server: provider brain tools are disabled in acheron strict mode" {
+test "runtime_server: provider agent capabilities are disabled in acheron strict mode" {
     const allocator = std.testing.allocator;
-    const specs = try RuntimeServer.buildProviderBrainTools(allocator);
+    const specs = try RuntimeServer.buildProviderCapabilities(allocator);
     defer tool_registry.deinitProviderTools(allocator, specs);
     try std.testing.expectEqual(@as(usize, 0), specs.len);
 }
 
-test "runtime_server: provider brain tool schemas are empty" {
+test "runtime_server: provider capability schemas are empty" {
     const allocator = std.testing.allocator;
-    const specs = try RuntimeServer.buildProviderBrainTools(allocator);
+    const specs = try RuntimeServer.buildProviderCapabilities(allocator);
     defer tool_registry.deinitProviderTools(allocator, specs);
     try std.testing.expectEqual(@as(usize, 0), specs.len);
 }
 
-test "runtime_server: non-direct world tools are not exposed to provider schemas" {
+test "runtime_server: non-direct capabilities are not exposed to provider schemas" {
     const allocator = std.testing.allocator;
     const server = try RuntimeServer.createWithProvider(allocator, "agent-test", .{
         .ltm_directory = "",
@@ -7116,11 +7116,11 @@ test "runtime_server: non-direct world tools are not exposed to provider schemas
     });
     defer server.destroy();
 
-    try server.runtime.world_tools.registerWorldTool(
+    try server.runtime.capability_registry.registerWorldTool(
         "custom_non_file_tool",
         "custom non-file tool should not be provider-exposed",
         &[_]tool_registry.ToolParam{},
-        mockWorldToolOk,
+        mockCapabilityOk,
     );
 
     const response = try server.handleMessage("{\"id\":\"req-non-direct-world-tool\",\"type\":\"session.send\",\"content\":\"hello\"}");
@@ -7653,7 +7653,7 @@ test "runtime_server: runtime override supersedes and can clear file provider sp
     try std.testing.expectEqualStrings("low", mockCapturedReasoning.?);
 }
 
-test "runtime_server: provider tool loop executes world tool and returns final response" {
+test "runtime_server: provider tool loop executes capability and returns final response" {
     const allocator = std.testing.allocator;
     const original_stream_fn = streamByModelFn;
     defer streamByModelFn = original_stream_fn;
@@ -7710,7 +7710,7 @@ test "runtime_server: file_write chat reply payload short-circuits provider loop
             .api_key = "test-key",
         },
         &mockDispatchContextByte,
-        mockDispatchWorldToolOk,
+        mockDispatchCapabilityOk,
     );
     defer server.destroy();
 
@@ -7729,7 +7729,7 @@ test "runtime_server: file_write chat reply payload short-circuits provider loop
     try std.testing.expectEqual(@as(usize, 1), mockChatReplyToolCallCount);
 }
 
-test "runtime_server: explicit json tool_calls envelope executes world tool and returns final response" {
+test "runtime_server: explicit json tool_calls envelope executes capability and returns final response" {
     const allocator = std.testing.allocator;
     const original_stream_fn = streamByModelFn;
     defer streamByModelFn = original_stream_fn;
@@ -8090,7 +8090,7 @@ test "runtime_server: message-only JSON response triggers followup instead of ta
     try std.testing.expectEqual(@as(usize, 2), mockJsonMessageOnlyFollowupCallCount);
 }
 
-test "runtime_server: wait_for after tool failure triggers followup instead of stopping" {
+test "runtime_server: waiting-for-user after tool failure triggers followup instead of stopping" {
     const allocator = std.testing.allocator;
     const original_stream_fn = streamByModelFn;
     defer streamByModelFn = original_stream_fn;
@@ -8139,11 +8139,11 @@ test "runtime_server: filesystem-unavailable tool failure short-circuits provide
     });
     defer server.destroy();
 
-    try server.runtime.world_tools.registerWorldTool(
+    try server.runtime.capability_registry.registerWorldTool(
         "fs_probe",
         "filesystem probe",
         &[_]tool_registry.ToolParam{},
-        mockWorldToolFilesystemUnavailable,
+        mockCapabilityFilesystemUnavailable,
     );
 
     const response = try server.handleMessage("{\"id\":\"req-provider-filesystem-unavailable\",\"type\":\"session.send\",\"content\":\"list files\"}");

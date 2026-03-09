@@ -4013,7 +4013,7 @@ pub const ControlPlane = struct {
                 defer self.allocator.free(escaped_value);
                 try out.writer(self.allocator).print("\"{s}\":\"{s}\"", .{ escaped_key, escaped_value });
             }
-            try out.appendSlice(self.allocator, "},\"services\":[");
+            try out.appendSlice(self.allocator, "},\"venoms\":[");
             for (node.venoms.items, 0..) |venom, idx| {
                 if (idx != 0) try out.append(self.allocator, ',');
                 try venom_catalog.appendVenomJson(self.allocator, &out, venom);
@@ -4242,8 +4242,8 @@ pub const ControlPlane = struct {
                 if (item.object.get("labels")) |labels_val| {
                     replaceNodeLabelsFromValue(self.allocator, &node.labels, labels_val) catch return error.InvalidSnapshot;
                 }
-                if (item.object.get("services")) |services_val| {
-                    venom_catalog.replaceVenomsFromJsonValue(self.allocator, &node.venoms, services_val) catch return error.InvalidSnapshot;
+                if (item.object.get("venoms")) |venoms_val| {
+                    venom_catalog.replaceVenomsFromJsonValue(self.allocator, &node.venoms, venoms_val) catch return error.InvalidSnapshot;
                 }
                 if (self.nodes.contains(node.id)) return error.InvalidSnapshot;
                 try self.nodes.put(self.allocator, node.id, node);
@@ -4623,7 +4623,7 @@ fn appendNodeJson(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8)
     const escaped_platform_runtime = try jsonEscape(allocator, node.platform_runtime_kind);
     defer allocator.free(escaped_platform_runtime);
     try out.writer(allocator).print(
-        "{{\"node_id\":\"{s}\",\"node_name\":\"{s}\",\"fs_url\":\"{s}\",\"platform\":{{\"os\":\"{s}\",\"arch\":\"{s}\",\"runtime_kind\":\"{s}\"}},\"service_count\":{d},\"joined_at_ms\":{d},\"last_seen_ms\":{d},\"lease_expires_at_ms\":{d}}}",
+        "{{\"node_id\":\"{s}\",\"node_name\":\"{s}\",\"fs_url\":\"{s}\",\"platform\":{{\"os\":\"{s}\",\"arch\":\"{s}\",\"runtime_kind\":\"{s}\"}},\"venom_count\":{d},\"joined_at_ms\":{d},\"last_seen_ms\":{d},\"lease_expires_at_ms\":{d}}}",
         .{
             escaped_id,
             escaped_name,
@@ -5593,7 +5593,7 @@ fn decodeBase64(allocator: std.mem.Allocator, data: []const u8) ![]u8 {
     return out;
 }
 
-test "fs_control_plane: builtin system project is protected and primary-only" {
+test "acheron_control_plane: builtin system project is protected and primary-only" {
     const allocator = std.testing.allocator;
     var plane = ControlPlane.init(allocator);
     defer plane.deinit();
@@ -5677,7 +5677,7 @@ test "fs_control_plane: builtin system project is protected and primary-only" {
     try std.testing.expect(std.mem.indexOf(u8, admin_status, expected_project_id) != null);
 }
 
-test "fs_control_plane: builtin system mount can be bound from local node" {
+test "acheron_control_plane: builtin system mount can be bound from local node" {
     const allocator = std.testing.allocator;
     var plane = ControlPlane.init(allocator);
     defer plane.deinit();
@@ -5697,7 +5697,7 @@ test "fs_control_plane: builtin system mount can be bound from local node" {
     try std.testing.expect(std.mem.indexOf(u8, status, "\"export_name\":\"system-root\"") != null);
 }
 
-test "fs_control_plane: builtin system mounts support namespace topology" {
+test "acheron_control_plane: builtin system mounts support namespace topology" {
     const allocator = std.testing.allocator;
     var plane = ControlPlane.init(allocator);
     defer plane.deinit();
@@ -5738,7 +5738,7 @@ test "fs_control_plane: builtin system mounts support namespace topology" {
     try std.testing.expect(std.mem.indexOf(u8, status, "\"mount_path\":\"/nodes/local/projects/system/fs/local::fs\"") != null);
 }
 
-test "fs_control_plane: admin can set and remove builtin system mounts" {
+test "acheron_control_plane: admin can set and remove builtin system mounts" {
     const allocator = std.testing.allocator;
     var plane = ControlPlane.init(allocator);
     defer plane.deinit();
@@ -5777,7 +5777,7 @@ test "fs_control_plane: admin can set and remove builtin system mounts" {
     try std.testing.expect(std.mem.indexOf(u8, remove_json, "\"mount_path\":\"/nodes/clawz/fs\"") == null);
 }
 
-test "fs_control_plane: ensureSpiderWebMounts preserves extra builtin mounts" {
+test "acheron_control_plane: ensureSpiderWebMounts preserves extra builtin mounts" {
     const allocator = std.testing.allocator;
     var plane = ControlPlane.init(allocator);
     defer plane.deinit();
@@ -5814,7 +5814,7 @@ test "fs_control_plane: ensureSpiderWebMounts preserves extra builtin mounts" {
     try std.testing.expect(std.mem.indexOf(u8, status, "\"mount_path\":\"/nodes/clawz/fs\"") != null);
 }
 
-test "fs_control_plane: invite join lease flow works" {
+test "acheron_control_plane: invite join lease flow works" {
     const allocator = std.testing.allocator;
     var plane = ControlPlane.init(allocator);
     defer plane.deinit();
@@ -5855,7 +5855,7 @@ test "fs_control_plane: invite join lease flow works" {
     try std.testing.expect(std.mem.indexOf(u8, refresh_json, "\"fs_url\":\"ws://127.0.0.1:28891/v2/fs\"") != null);
 }
 
-test "fs_control_plane: project mount conflict is rejected" {
+test "acheron_control_plane: project mount conflict is rejected" {
     const allocator = std.testing.allocator;
     var plane = ControlPlane.init(allocator);
     defer plane.deinit();
@@ -5899,7 +5899,7 @@ test "fs_control_plane: project mount conflict is rejected" {
     try std.testing.expectError(ControlPlaneError.MountConflict, plane.setProjectMount(mount_b));
 }
 
-test "fs_control_plane: project bind lifecycle resolves bound paths" {
+test "acheron_control_plane: project bind lifecycle resolves bound paths" {
     const allocator = std.testing.allocator;
     var plane = ControlPlane.init(allocator);
     defer plane.deinit();
@@ -5968,7 +5968,7 @@ test "fs_control_plane: project bind lifecycle resolves bound paths" {
     try std.testing.expect(std.mem.indexOf(u8, unbound, "\"binds\":[]") != null);
 }
 
-test "fs_control_plane: bind conflicts with existing mount path" {
+test "acheron_control_plane: bind conflicts with existing mount path" {
     const allocator = std.testing.allocator;
     var plane = ControlPlane.init(allocator);
     defer plane.deinit();
@@ -6004,7 +6004,7 @@ test "fs_control_plane: bind conflicts with existing mount path" {
     try std.testing.expectError(ControlPlaneError.BindConflict, plane.setProjectBind(bind_req));
 }
 
-test "fs_control_plane: bind target must remain within mounted authority" {
+test "acheron_control_plane: bind target must remain within mounted authority" {
     const allocator = std.testing.allocator;
     var plane = ControlPlane.init(allocator);
     defer plane.deinit();
@@ -6040,7 +6040,7 @@ test "fs_control_plane: bind target must remain within mounted authority" {
     try std.testing.expectError(ControlPlaneError.BindConflict, plane.setProjectBind(bind_req));
 }
 
-test "fs_control_plane: project mutation requires valid project_token" {
+test "acheron_control_plane: project mutation requires valid project_token" {
     const allocator = std.testing.allocator;
     var plane = ControlPlane.init(allocator);
     defer plane.deinit();
@@ -6080,7 +6080,7 @@ test "fs_control_plane: project mutation requires valid project_token" {
     try std.testing.expect(std.mem.indexOf(u8, mounted, "\"mount_path\":\"/src\"") != null);
 }
 
-test "fs_control_plane: access policy enforces action modes and per-agent overrides" {
+test "acheron_control_plane: access policy enforces action modes and per-agent overrides" {
     const allocator = std.testing.allocator;
     var plane = ControlPlane.init(allocator);
     defer plane.deinit();
@@ -6162,7 +6162,7 @@ test "fs_control_plane: access policy enforces action modes and per-agent overri
     try std.testing.expect(!plane.projectAllowsNodeVenomEvent(project_id, "bob", null, node_id, false));
 }
 
-test "fs_control_plane: access policy action matrix honors token admin and per-agent override" {
+test "acheron_control_plane: access policy action matrix honors token admin and per-agent override" {
     const allocator = std.testing.allocator;
     var plane = ControlPlane.init(allocator);
     defer plane.deinit();
@@ -6202,7 +6202,7 @@ test "fs_control_plane: access policy action matrix honors token admin and per-a
     try std.testing.expect(plane.projectAllowsAction(project_id, "bob", .admin, null, true));
 }
 
-test "fs_control_plane: workspace status filters invoke service mounts when invoke is denied" {
+test "acheron_control_plane: workspace status filters invoke service mounts when invoke is denied" {
     const allocator = std.testing.allocator;
     var plane = ControlPlane.init(allocator);
     defer plane.deinit();
@@ -6279,7 +6279,7 @@ test "fs_control_plane: workspace status filters invoke service mounts when invo
     try std.testing.expect(std.mem.indexOf(u8, admin_status, "/tool/main\"") != null);
 }
 
-test "fs_control_plane: invalid access policy payload is rejected" {
+test "acheron_control_plane: invalid access policy payload is rejected" {
     const allocator = std.testing.allocator;
     var plane = ControlPlane.init(allocator);
     defer plane.deinit();
@@ -6290,7 +6290,7 @@ test "fs_control_plane: invalid access policy payload is rejected" {
     );
 }
 
-test "fs_control_plane: identical mount path can be used for failover nodes" {
+test "acheron_control_plane: identical mount path can be used for failover nodes" {
     const allocator = std.testing.allocator;
     var plane = ControlPlane.init(allocator);
     defer plane.deinit();
@@ -6360,7 +6360,7 @@ test "fs_control_plane: identical mount path can be used for failover nodes" {
     try std.testing.expect(std.mem.indexOf(u8, second, "\"node_id\":\"node-2\"") != null);
 }
 
-test "fs_control_plane: removeProjectMount supports path-wide and targeted failover removal" {
+test "acheron_control_plane: removeProjectMount supports path-wide and targeted failover removal" {
     const allocator = std.testing.allocator;
     var plane = ControlPlane.init(allocator);
     defer plane.deinit();
@@ -6452,7 +6452,7 @@ test "fs_control_plane: removeProjectMount supports path-wide and targeted failo
     try std.testing.expect(std.mem.indexOf(u8, all_removed, "\"mounts\":[]") != null);
 }
 
-test "fs_control_plane: lease reaper removes expired nodes and project mounts" {
+test "acheron_control_plane: lease reaper removes expired nodes and project mounts" {
     const allocator = std.testing.allocator;
     var plane = ControlPlane.init(allocator);
     defer plane.deinit();
@@ -6513,7 +6513,7 @@ test "fs_control_plane: lease reaper removes expired nodes and project mounts" {
     try std.testing.expect(std.mem.indexOf(u8, project_after, "\"mounts\":[]") != null);
 }
 
-test "fs_control_plane: ensureNode upserts by node name" {
+test "acheron_control_plane: ensureNode upserts by node name" {
     const allocator = std.testing.allocator;
     var plane = ControlPlane.init(allocator);
     defer plane.deinit();
@@ -6533,7 +6533,7 @@ test "fs_control_plane: ensureNode upserts by node name" {
     try std.testing.expect(std.mem.indexOf(u8, nodes_json, "\"node_id\":\"node-2\"") == null);
 }
 
-test "fs_control_plane: metricsJson reports mutation counters" {
+test "acheron_control_plane: metricsJson reports mutation counters" {
     const allocator = std.testing.allocator;
     var plane = ControlPlane.init(allocator);
     defer plane.deinit();
@@ -6589,7 +6589,7 @@ test "fs_control_plane: metricsJson reports mutation counters" {
     try std.testing.expect(std.mem.indexOf(u8, metrics_json, "\"activations_total\":1") != null);
 }
 
-test "fs_control_plane: rotate and revoke project tokens invalidate previous token" {
+test "acheron_control_plane: rotate and revoke project tokens invalidate previous token" {
     const allocator = std.testing.allocator;
     var plane = ControlPlane.init(allocator);
     defer plane.deinit();
@@ -6680,7 +6680,7 @@ test "fs_control_plane: rotate and revoke project tokens invalidate previous tok
     defer allocator.free(removed);
 }
 
-test "fs_control_plane: workspaceStatus supports explicit project selection" {
+test "acheron_control_plane: workspaceStatus supports explicit project selection" {
     const allocator = std.testing.allocator;
     var plane = ControlPlane.init(allocator);
     defer plane.deinit();
@@ -6756,7 +6756,7 @@ test "fs_control_plane: workspaceStatus supports explicit project selection" {
     );
 }
 
-test "fs_control_plane: workspace topology prefers best available candidate and marks degraded mounts" {
+test "acheron_control_plane: workspace topology prefers best available candidate and marks degraded mounts" {
     const allocator = std.testing.allocator;
     var plane = ControlPlane.init(allocator);
     defer plane.deinit();
@@ -6858,7 +6858,7 @@ test "fs_control_plane: workspace topology prefers best available candidate and 
     try std.testing.expectEqual(@as(i64, 0), availability_missing.get("missing").?.integer);
 }
 
-test "fs_control_plane: pending join request list approve and deny flow works" {
+test "acheron_control_plane: pending join request list approve and deny flow works" {
     const allocator = std.testing.allocator;
     var plane = ControlPlane.init(allocator);
     defer plane.deinit();
@@ -6914,7 +6914,7 @@ test "fs_control_plane: pending join request list approve and deny flow works" {
     );
 }
 
-test "fs_control_plane: node venom upsert and get stores catalog metadata" {
+test "acheron_control_plane: node venom upsert and get stores catalog metadata" {
     const allocator = std.testing.allocator;
     var plane = ControlPlane.init(allocator);
     defer plane.deinit();
@@ -6963,7 +6963,7 @@ test "fs_control_plane: node venom upsert and get stores catalog metadata" {
     try std.testing.expect(std.mem.indexOf(u8, fetched, "\"venom_delta\"") == null);
 }
 
-test "fs_control_plane: node venom upsert reports unchanged catalog delta" {
+test "acheron_control_plane: node venom upsert reports unchanged catalog delta" {
     const allocator = std.testing.allocator;
     var plane = ControlPlane.init(allocator);
     defer plane.deinit();
@@ -7006,7 +7006,7 @@ test "fs_control_plane: node venom upsert reports unchanged catalog delta" {
     try std.testing.expect(std.mem.indexOf(u8, second, "\"removed\":[]") != null);
 }
 
-test "fs_control_plane: node venom event retention honors configured history max" {
+test "acheron_control_plane: node venom event retention honors configured history max" {
     const allocator = std.testing.allocator;
     var plane = ControlPlane.initWithOptions(allocator, .{
         .node_venom_event_history_max = 2,
@@ -7041,7 +7041,7 @@ test "fs_control_plane: node venom event retention honors configured history max
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"version\":\"0\"") == null);
 }
 
-test "fs_control_plane: preferred venom provider favors spiderweb-local by node name" {
+test "acheron_control_plane: preferred venom provider favors spiderweb-local by node name" {
     const allocator = std.testing.allocator;
     var plane = ControlPlane.init(allocator);
     defer plane.deinit();
@@ -7089,7 +7089,7 @@ test "fs_control_plane: preferred venom provider favors spiderweb-local by node 
     try std.testing.expectEqualStrings(expected_endpoint, provider.endpoint_path);
 }
 
-test "fs_control_plane: explicit venom bind overrides heuristic provider selection" {
+test "acheron_control_plane: explicit venom bind overrides heuristic provider selection" {
     const allocator = std.testing.allocator;
     var plane = ControlPlane.init(allocator);
     defer plane.deinit();
@@ -7136,7 +7136,7 @@ test "fs_control_plane: explicit venom bind overrides heuristic provider selecti
     try std.testing.expectEqualStrings("spiderapp-default", provider.node_name);
 }
 
-test "fs_control_plane: scoped venom binds resolve agent before project before global" {
+test "acheron_control_plane: scoped venom binds resolve agent before project before global" {
     const allocator = std.testing.allocator;
     var plane = ControlPlane.init(allocator);
     defer plane.deinit();
@@ -7204,7 +7204,7 @@ test "fs_control_plane: scoped venom binds resolve agent before project before g
     try std.testing.expectEqualStrings(local_node_id, agent_provider.node_id);
 }
 
-test "fs_control_plane: node ensure allows empty fs_url for app-local nodes" {
+test "acheron_control_plane: node ensure allows empty fs_url for app-local nodes" {
     const allocator = std.testing.allocator;
     var plane = ControlPlane.init(allocator);
     defer plane.deinit();
@@ -7216,7 +7216,7 @@ test "fs_control_plane: node ensure allows empty fs_url for app-local nodes" {
     try std.testing.expect(std.mem.indexOf(u8, ensured, "\"node_secret\":\"") != null);
 }
 
-test "fs_control_plane: projectUp requires project_token for existing non-builtin project" {
+test "acheron_control_plane: projectUp requires project_token for existing non-builtin project" {
     const allocator = std.testing.allocator;
     var plane = ControlPlane.init(allocator);
     defer plane.deinit();
@@ -7278,7 +7278,7 @@ test "fs_control_plane: projectUp requires project_token for existing non-builti
     try std.testing.expect(std.mem.indexOf(u8, get_json, "\"status\":\"paused\"") != null);
 }
 
-test "fs_control_plane: primary agent can upsert existing non-system project by name without token" {
+test "acheron_control_plane: primary agent can upsert existing non-system project by name without token" {
     const allocator = std.testing.allocator;
     var plane = ControlPlane.init(allocator);
     defer plane.deinit();
@@ -7304,7 +7304,7 @@ test "fs_control_plane: primary agent can upsert existing non-system project by 
     try std.testing.expect(std.mem.indexOf(u8, get_json, "\"vision\":\"Help review PRs\"") != null);
 }
 
-test "fs_control_plane: primary agent bypasses project invoke token gates" {
+test "acheron_control_plane: primary agent bypasses project invoke token gates" {
     const allocator = std.testing.allocator;
     var plane = ControlPlane.init(allocator);
     defer plane.deinit();
@@ -7324,7 +7324,7 @@ test "fs_control_plane: primary agent bypasses project invoke token gates" {
     try std.testing.expect(plane.projectAllowsAction(project_id, "mother", .invoke, null, false));
 }
 
-test "fs_control_plane: project create/up require non-empty vision" {
+test "acheron_control_plane: project create/up require non-empty vision" {
     const allocator = std.testing.allocator;
     var plane = ControlPlane.init(allocator);
     defer plane.deinit();
@@ -7367,7 +7367,7 @@ test "fs_control_plane: project create/up require non-empty vision" {
     );
 }
 
-test "fs_control_plane: projectUp auto-provisions default /nodes/local/fs mount for new projects" {
+test "acheron_control_plane: projectUp auto-provisions default /nodes/local/fs mount for new projects" {
     const allocator = std.testing.allocator;
     var plane = ControlPlane.init(allocator);
     defer plane.deinit();
@@ -7399,7 +7399,7 @@ test "fs_control_plane: projectUp auto-provisions default /nodes/local/fs mount 
     try std.testing.expect(std.mem.indexOf(u8, get_json, "\"export_name\":\"bootstrap-workspace\"") != null);
 }
 
-test "fs_control_plane: default mount migration replaces legacy /workspace-only mounts" {
+test "acheron_control_plane: default mount migration replaces legacy /workspace-only mounts" {
     const allocator = std.testing.allocator;
     var plane = ControlPlane.init(allocator);
     defer plane.deinit();
@@ -7435,7 +7435,7 @@ test "fs_control_plane: default mount migration replaces legacy /workspace-only 
     try std.testing.expectEqualStrings(default_project_up_export_name, project.mounts.items[0].export_name);
 }
 
-test "fs_control_plane: builtin ensure prunes legacy workspace alias when canonical mount exists" {
+test "acheron_control_plane: builtin ensure prunes legacy workspace alias when canonical mount exists" {
     const allocator = std.testing.allocator;
     var plane = ControlPlane.init(allocator);
     defer plane.deinit();
@@ -7461,7 +7461,7 @@ test "fs_control_plane: builtin ensure prunes legacy workspace alias when canoni
     try std.testing.expectEqualStrings("node-canonical", project.mounts.items[0].node_id);
 }
 
-test "fs_control_plane: snapshot encryption envelope roundtrip" {
+test "acheron_control_plane: snapshot encryption envelope roundtrip" {
     const allocator = std.testing.allocator;
     const sample = "{\"schema\":1,\"hello\":\"world\"}";
     const key = [_]u8{0x5A} ** persistence_cipher.key_length;
@@ -7474,7 +7474,7 @@ test "fs_control_plane: snapshot encryption envelope roundtrip" {
     try std.testing.expectEqualStrings(sample, decrypted);
 }
 
-test "fs_control_plane: persistence restores nodes projects mounts and active workspace" {
+test "acheron_control_plane: persistence restores nodes projects mounts and active workspace" {
     const allocator = std.testing.allocator;
     const dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/fs-control-plane-{d}", .{std.time.nanoTimestamp()});
     defer allocator.free(dir);
@@ -7577,7 +7577,66 @@ test "fs_control_plane: persistence restores nodes projects mounts and active wo
     }
 }
 
-test "fs_control_plane: persistence keeps primary active project override" {
+test "acheron_control_plane: persistence restores node venom catalogs" {
+    const allocator = std.testing.allocator;
+    const dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/fs-control-plane-venoms-{d}", .{std.time.nanoTimestamp()});
+    defer allocator.free(dir);
+    defer std.fs.cwd().deleteTree(dir) catch {};
+
+    try std.fs.cwd().makePath(dir);
+
+    var expected_node_id: ?[]u8 = null;
+    defer if (expected_node_id) |id| allocator.free(id);
+
+    {
+        var plane = ControlPlane.initWithPersistence(allocator, dir, "control-plane.db");
+        defer plane.deinit();
+
+        const invite_json = try plane.createNodeInvite(null);
+        defer allocator.free(invite_json);
+        var invite_parsed = try std.json.parseFromSlice(std.json.Value, allocator, invite_json, .{});
+        defer invite_parsed.deinit();
+        const token = invite_parsed.value.object.get("invite_token").?.string;
+
+        const join_req = try std.fmt.allocPrint(
+            allocator,
+            "{{\"invite_token\":\"{s}\",\"node_name\":\"alpha\",\"fs_url\":\"ws://127.0.0.1:38891/v2/fs\"}}",
+            .{token},
+        );
+        defer allocator.free(join_req);
+        const join_json = try plane.nodeJoin(join_req);
+        defer allocator.free(join_json);
+        var join_parsed = try std.json.parseFromSlice(std.json.Value, allocator, join_json, .{});
+        defer join_parsed.deinit();
+        const node_id = join_parsed.value.object.get("node_id").?.string;
+        const node_secret = join_parsed.value.object.get("node_secret").?.string;
+        expected_node_id = try allocator.dupe(u8, node_id);
+
+        const upsert_req = try std.fmt.allocPrint(
+            allocator,
+            "{{\"node_id\":\"{s}\",\"node_secret\":\"{s}\",\"venoms\":[{{\"venom_id\":\"camera\",\"kind\":\"camera\",\"version\":\"1\",\"state\":\"online\",\"endpoints\":[\"/nodes/{s}/venoms/camera\"],\"capabilities\":{{\"still\":true}}}}]}}",
+            .{ node_id, node_secret, node_id },
+        );
+        defer allocator.free(upsert_req);
+        const upserted = try plane.nodeVenomUpsert(upsert_req);
+        defer allocator.free(upserted);
+        try std.testing.expect(std.mem.indexOf(u8, upserted, "\"venom_id\":\"camera\"") != null);
+    }
+
+    {
+        var plane = ControlPlane.initWithPersistence(allocator, dir, "control-plane.db");
+        defer plane.deinit();
+
+        const get_req = try std.fmt.allocPrint(allocator, "{{\"node_id\":\"{s}\"}}", .{expected_node_id.?});
+        defer allocator.free(get_req);
+        const fetched = try plane.nodeVenomGet(get_req);
+        defer allocator.free(fetched);
+        try std.testing.expect(std.mem.indexOf(u8, fetched, "\"venom_id\":\"camera\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, fetched, "\"/nodes/") != null);
+    }
+}
+
+test "acheron_control_plane: persistence keeps primary active project override" {
     const allocator = std.testing.allocator;
     const dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/fs-control-plane-primary-{d}", .{std.time.nanoTimestamp()});
     defer allocator.free(dir);

@@ -42,9 +42,41 @@ pub fn build(b: *std.Build) void {
     ziggy_runtime_hooks_module.addImport("ziggy-memory-store", ziggy_memory_store_module);
     ziggy_runtime_hooks_module.addImport("ziggy-run-orchestrator", ziggy_run_orchestrator_module);
 
+    const acheron_fs_client_mod = b.createModule(.{
+        .root_source_file = b.path("src/acheron/client.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    acheron_fs_client_mod.addImport("spider-protocol", spider_protocol_module);
+    const spiderweb_fs_cache_mod = b.createModule(.{
+        .root_source_file = b.path("src/venoms/fs/fs_cache.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const spiderweb_fs_source_policy_mod = b.createModule(.{
+        .root_source_file = b.path("src/venoms/fs/fs_source_policy.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const acheron_fs_router_mod = b.createModule(.{
+        .root_source_file = b.path("src/acheron/router.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    acheron_fs_router_mod.addImport("spider-protocol", spider_protocol_module);
+    acheron_fs_router_mod.addImport("spiderweb_fs_cache", spiderweb_fs_cache_mod);
+    acheron_fs_router_mod.addImport("spiderweb_fs_source_policy", spiderweb_fs_source_policy_mod);
+    const spiderweb_fs_fuse_adapter_mod = b.createModule(.{
+        .root_source_file = b.path("src/venoms/fs/fs_fuse_adapter.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    spiderweb_fs_fuse_adapter_mod.addIncludePath(b.path("src/c"));
+    spiderweb_fs_fuse_adapter_mod.addImport("acheron_fs_router", acheron_fs_router_mod);
+
     // Embeddable distributed filesystem module
     const spiderweb_fs_mod = b.addModule("spiderweb_fs", .{
-        .root_source_file = b.path("src/fs_lib.zig"),
+        .root_source_file = b.path("src/venoms/fs/fs_lib.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -52,6 +84,9 @@ pub fn build(b: *std.Build) void {
     spiderweb_fs_mod.addImport("spider-protocol", spider_protocol_module);
     spiderweb_fs_mod.addImport("spiderweb_node", spiderweb_node_module);
     spiderweb_fs_mod.addImport("spiderweb_fs", spiderweb_fs_protocol_module);
+    spiderweb_fs_mod.addImport("spiderweb_fs_cache", spiderweb_fs_cache_mod);
+    spiderweb_fs_mod.addImport("acheron_fs_router", acheron_fs_router_mod);
+    spiderweb_fs_mod.addImport("spiderweb_fs_fuse_adapter", spiderweb_fs_fuse_adapter_mod);
 
     // Example: embeddable filesystem service
     const embed_fs_node_example_mod = b.createModule(.{
@@ -118,6 +153,8 @@ pub fn build(b: *std.Build) void {
     spiderweb_mod.addImport("spider-protocol", spider_protocol_module);
     spiderweb_mod.addImport("spiderweb_node", spiderweb_node_module);
     spiderweb_mod.addImport("spiderweb_fs", spiderweb_fs_protocol_module);
+    spiderweb_mod.addImport("spiderweb_fs_cache", spiderweb_fs_cache_mod);
+    spiderweb_mod.addImport("spiderweb_fs_source_policy", spiderweb_fs_source_policy_mod);
     spiderweb_mod.addImport("ziggy-memory-store", ziggy_memory_store_module);
     spiderweb_mod.addImport("ziggy-tool-runtime", ziggy_tool_runtime_module);
     spiderweb_mod.addImport("ziggy-runtime-hooks", ziggy_runtime_hooks_module);
@@ -125,7 +162,7 @@ pub fn build(b: *std.Build) void {
 
     // Add agent_config module for flat config loading
     const agent_config_mod = b.createModule(.{
-        .root_source_file = b.path("src/agent_config.zig"),
+        .root_source_file = b.path("src/agents/agent_config.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -143,7 +180,7 @@ pub fn build(b: *std.Build) void {
 
     // Agent runtime child executable (sandbox target)
     const agent_runtime_child_mod = b.createModule(.{
-        .root_source_file = b.path("src/agent_runtime_child_main.zig"),
+        .root_source_file = b.path("src/agents/agent_runtime_child_main.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -167,7 +204,7 @@ pub fn build(b: *std.Build) void {
 
     // Distributed filesystem node executable
     const fs_node_mod = b.createModule(.{
-        .root_source_file = b.path("src/fs_node_main.zig"),
+        .root_source_file = b.path("src/venoms/fs/shared/fs_node_main.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -182,12 +219,14 @@ pub fn build(b: *std.Build) void {
 
     // Distributed filesystem mount/router executable
     const fs_mount_mod = b.createModule(.{
-        .root_source_file = b.path("src/fs_mount_main.zig"),
+        .root_source_file = b.path("src/acheron/mount_main.zig"),
         .target = target,
         .optimize = optimize,
     });
     fs_mount_mod.addIncludePath(b.path("src/c"));
     fs_mount_mod.addImport("spider-protocol", spider_protocol_module);
+    fs_mount_mod.addImport("acheron_fs_router", acheron_fs_router_mod);
+    fs_mount_mod.addImport("spiderweb_fs_fuse_adapter", spiderweb_fs_fuse_adapter_mod);
     const spiderweb_fs_mount = b.addExecutable(.{
         .name = "spiderweb-fs-mount",
         .root_module = fs_mount_mod,
@@ -250,6 +289,8 @@ pub fn build(b: *std.Build) void {
     test_mod.addImport("spider-protocol", spider_protocol_module);
     test_mod.addImport("spiderweb_node", spiderweb_node_module);
     test_mod.addImport("spiderweb_fs", spiderweb_fs_protocol_module);
+    test_mod.addImport("spiderweb_fs_cache", spiderweb_fs_cache_mod);
+    test_mod.addImport("spiderweb_fs_source_policy", spiderweb_fs_source_policy_mod);
     test_mod.addImport("ziggy-memory-store", ziggy_memory_store_module);
     test_mod.addImport("ziggy-tool-runtime", ziggy_tool_runtime_module);
     test_mod.addImport("ziggy-runtime-hooks", ziggy_runtime_hooks_module);

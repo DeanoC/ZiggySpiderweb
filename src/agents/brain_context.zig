@@ -20,7 +20,6 @@ pub const BrainContext = struct {
     inbox: std.ArrayListUnmanaged(event_bus.Event) = .{},
     outbox: std.ArrayListUnmanaged(event_bus.Event) = .{},
     pending_tool_uses: std.ArrayListUnmanaged(ToolUse) = .{},
-    pending_wait_json: ?[]u8 = null,
     next_talk_id: event_bus.TalkId = 1,
 
     pub fn init(allocator: std.mem.Allocator, brain_name: []const u8) !BrainContext {
@@ -47,7 +46,6 @@ pub const BrainContext = struct {
 
         for (self.pending_tool_uses.items) |*tool_use| tool_use.deinit(self.allocator);
         self.pending_tool_uses.deinit(self.allocator);
-        if (self.pending_wait_json) |pending| self.allocator.free(pending);
     }
 
     pub fn queueToolUse(self: *BrainContext, name: []const u8, args_json: []const u8) !void {
@@ -80,47 +78,6 @@ pub const BrainContext = struct {
         self.pending_tool_uses.clearRetainingCapacity();
     }
 
-    pub fn consumeInboxIndices(self: *BrainContext, matched_indices: []const usize) void {
-        if (matched_indices.len == 0) return;
-
-        const sorted = self.allocator.alloc(usize, matched_indices.len) catch return;
-        defer self.allocator.free(sorted);
-        @memcpy(sorted, matched_indices);
-
-        std.sort.pdq(
-            usize,
-            sorted,
-            {},
-            struct {
-                fn lessThan(_: void, lhs: usize, rhs: usize) bool {
-                    return lhs > rhs;
-                }
-            }.lessThan,
-        );
-
-        for (sorted) |index| {
-            if (index >= self.inbox.items.len) continue;
-            var event = self.inbox.orderedRemove(index);
-            event.deinit(self.allocator);
-        }
-    }
-
-    pub fn setPendingWait(self: *BrainContext, wait_json: []const u8) !void {
-        self.clearPendingWait();
-        self.pending_wait_json = try self.allocator.dupe(u8, wait_json);
-    }
-
-    pub fn clearPendingWait(self: *BrainContext) void {
-        if (self.pending_wait_json) |pending| {
-            self.allocator.free(pending);
-            self.pending_wait_json = null;
-        }
-    }
-
-    pub fn hasPendingWait(self: *const BrainContext) bool {
-        return self.pending_wait_json != null;
-    }
-
     pub fn nextTalkId(self: *BrainContext) event_bus.TalkId {
         const talk_id = self.next_talk_id;
         self.next_talk_id +%= 1;
@@ -142,30 +99,4 @@ test "brain_context: talk id is monotonic and skips zero" {
 
     try std.testing.expectEqual(std.math.maxInt(event_bus.TalkId), first);
     try std.testing.expectEqual(@as(event_bus.TalkId, 1), second);
-}
-
-test "brain_context: consumeInboxIndices handles unsorted indices safely" {
-    const allocator = std.testing.allocator;
-    var context = try BrainContext.init(allocator, "primary");
-    defer context.deinit();
-
-    try context.pushInbox(.{
-        .event_type = .user,
-        .source_brain = try allocator.dupe(u8, "user"),
-        .target_brain = try allocator.dupe(u8, "primary"),
-        .talk_id = null,
-        .payload = try allocator.dupe(u8, "a"),
-        .created_at_ms = 1,
-    });
-    try context.pushInbox(.{
-        .event_type = .user,
-        .source_brain = try allocator.dupe(u8, "user"),
-        .target_brain = try allocator.dupe(u8, "primary"),
-        .talk_id = null,
-        .payload = try allocator.dupe(u8, "b"),
-        .created_at_ms = 2,
-    });
-
-    context.consumeInboxIndices(&[_]usize{ 1, 0 });
-    try std.testing.expectEqual(@as(usize, 0), context.inbox.items.len);
 }

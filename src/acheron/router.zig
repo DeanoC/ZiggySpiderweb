@@ -1,10 +1,10 @@
 const std = @import("std");
-const fs_protocol = @import("fs_protocol.zig");
-const fs_client = @import("fs_client.zig");
-const fs_cache = @import("fs_cache.zig");
-const fs_source_policy = @import("fs_source_policy.zig");
-const fsrpc_node_protocol_version = "unified-v2-fs";
-const fsrpc_node_proto_id: i64 = 2;
+pub const acheron_protocol = @import("protocol.zig");
+const acheron_client = @import("client.zig");
+const fs_cache = @import("spiderweb_fs_cache");
+const fs_source_policy = @import("spiderweb_fs_source_policy");
+const acheron_node_protocol_version = "unified-v2-fs";
+const acheron_node_proto_id: i64 = 2;
 
 const RouterError = error{
     InvalidPath,
@@ -53,7 +53,7 @@ const Endpoint = struct {
     source_id: ?[]u8 = null,
     caps_native_watch: ?bool = null,
     caps_case_sensitive: ?bool = null,
-    client: ?fs_client.FsClient = null,
+    client: ?acheron_client.FsClient = null,
     client_mutex: std.Thread.Mutex = .{},
     event_thread: ?std.Thread = null,
     event_stop: bool = false,
@@ -123,7 +123,7 @@ const PathCandidate = struct {
 
 const PendingInvalidation = struct {
     endpoint_index: u16,
-    event: fs_protocol.InvalidationEvent,
+    event: acheron_protocol.InvalidationEvent,
 };
 
 pub const Router = struct {
@@ -274,22 +274,22 @@ pub const Router = struct {
         for (self.endpoints.items, 0..) |endpoint, endpoint_index| {
             if (endpoint_index != 0) try out.append(self.allocator, ',');
 
-            const escaped_name = try fs_protocol.jsonEscape(self.allocator, endpoint.name);
+            const escaped_name = try acheron_protocol.jsonEscape(self.allocator, endpoint.name);
             defer self.allocator.free(escaped_name);
-            const escaped_url = try fs_protocol.jsonEscape(self.allocator, endpoint.url);
+            const escaped_url = try acheron_protocol.jsonEscape(self.allocator, endpoint.url);
             defer self.allocator.free(escaped_url);
-            const escaped_export = try fs_protocol.jsonEscape(self.allocator, endpoint.export_name orelse "");
+            const escaped_export = try acheron_protocol.jsonEscape(self.allocator, endpoint.export_name orelse "");
             defer self.allocator.free(escaped_export);
-            const escaped_mount = try fs_protocol.jsonEscape(self.allocator, endpoint.mount_path);
+            const escaped_mount = try acheron_protocol.jsonEscape(self.allocator, endpoint.mount_path);
             defer self.allocator.free(escaped_mount);
             const source_kind_json = if (endpoint.source_kind) |value| blk: {
-                const escaped = try fs_protocol.jsonEscape(self.allocator, value);
+                const escaped = try acheron_protocol.jsonEscape(self.allocator, value);
                 defer self.allocator.free(escaped);
                 break :blk try std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped});
             } else try self.allocator.dupe(u8, "null");
             defer self.allocator.free(source_kind_json);
             const source_id_json = if (endpoint.source_id) |value| blk: {
-                const escaped = try fs_protocol.jsonEscape(self.allocator, value);
+                const escaped = try acheron_protocol.jsonEscape(self.allocator, value);
                 defer self.allocator.free(escaped);
                 break :blk try std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped});
             } else try self.allocator.dupe(u8, "null");
@@ -409,9 +409,9 @@ pub const Router = struct {
         const split = try splitParentChild(link_path);
         const parent = try self.resolvePath(split.parent_path, true, .symlink);
 
-        const escaped_name = try fs_protocol.jsonEscape(self.allocator, split.name);
+        const escaped_name = try acheron_protocol.jsonEscape(self.allocator, split.name);
         defer self.allocator.free(escaped_name);
-        const escaped_target = try fs_protocol.jsonEscape(self.allocator, target);
+        const escaped_target = try acheron_protocol.jsonEscape(self.allocator, target);
         defer self.allocator.free(escaped_target);
         const args = try std.fmt.allocPrint(
             self.allocator,
@@ -433,7 +433,7 @@ pub const Router = struct {
     pub fn setxattr(self: *Router, path: []const u8, name: []const u8, value: []const u8, flags: u32) !void {
         self.drainPendingInvalidations();
         const node = try self.resolvePath(path, true, .xattr);
-        const escaped_name = try fs_protocol.jsonEscape(self.allocator, name);
+        const escaped_name = try acheron_protocol.jsonEscape(self.allocator, name);
         defer self.allocator.free(escaped_name);
         const encoded = try encodeBase64(self.allocator, value);
         defer self.allocator.free(encoded);
@@ -453,7 +453,7 @@ pub const Router = struct {
     pub fn getxattr(self: *Router, path: []const u8, name: []const u8) ![]u8 {
         self.drainPendingInvalidations();
         const node = try self.resolvePath(path, false, .xattr);
-        const escaped_name = try fs_protocol.jsonEscape(self.allocator, name);
+        const escaped_name = try acheron_protocol.jsonEscape(self.allocator, name);
         defer self.allocator.free(escaped_name);
         const args = try std.fmt.allocPrint(self.allocator, "{{\"name\":\"{s}\"}}", .{escaped_name});
         defer self.allocator.free(args);
@@ -476,7 +476,7 @@ pub const Router = struct {
     pub fn removexattr(self: *Router, path: []const u8, name: []const u8) !void {
         self.drainPendingInvalidations();
         const node = try self.resolvePath(path, true, .xattr);
-        const escaped_name = try fs_protocol.jsonEscape(self.allocator, name);
+        const escaped_name = try acheron_protocol.jsonEscape(self.allocator, name);
         defer self.allocator.free(escaped_name);
         const args = try std.fmt.allocPrint(self.allocator, "{{\"name\":\"{s}\"}}", .{escaped_name});
         defer self.allocator.free(args);
@@ -563,7 +563,7 @@ pub const Router = struct {
         const split = try splitParentChild(path);
         const parent = try self.resolvePath(split.parent_path, true, .create);
 
-        const escaped_name = try fs_protocol.jsonEscape(self.allocator, split.name);
+        const escaped_name = try acheron_protocol.jsonEscape(self.allocator, split.name);
         defer self.allocator.free(escaped_name);
         const args = try std.fmt.allocPrint(
             self.allocator,
@@ -635,7 +635,7 @@ pub const Router = struct {
         const split = try splitParentChild(path);
         const parent = try self.resolvePath(split.parent_path, true, .remove);
 
-        const escaped_name = try fs_protocol.jsonEscape(self.allocator, split.name);
+        const escaped_name = try acheron_protocol.jsonEscape(self.allocator, split.name);
         defer self.allocator.free(escaped_name);
         const args = try std.fmt.allocPrint(self.allocator, "{{\"name\":\"{s}\"}}", .{escaped_name});
         defer self.allocator.free(args);
@@ -655,7 +655,7 @@ pub const Router = struct {
         const split = try splitParentChild(path);
         const parent = try self.resolvePath(split.parent_path, true, .create);
 
-        const escaped_name = try fs_protocol.jsonEscape(self.allocator, split.name);
+        const escaped_name = try acheron_protocol.jsonEscape(self.allocator, split.name);
         defer self.allocator.free(escaped_name);
         const args = try std.fmt.allocPrint(self.allocator, "{{\"name\":\"{s}\"}}", .{escaped_name});
         defer self.allocator.free(args);
@@ -675,7 +675,7 @@ pub const Router = struct {
         const split = try splitParentChild(path);
         const parent = try self.resolvePath(split.parent_path, true, .remove);
 
-        const escaped_name = try fs_protocol.jsonEscape(self.allocator, split.name);
+        const escaped_name = try acheron_protocol.jsonEscape(self.allocator, split.name);
         defer self.allocator.free(escaped_name);
         const args = try std.fmt.allocPrint(self.allocator, "{{\"name\":\"{s}\"}}", .{escaped_name});
         defer self.allocator.free(args);
@@ -721,9 +721,9 @@ pub const Router = struct {
             return;
         }
 
-        const escaped_old = try fs_protocol.jsonEscape(self.allocator, old_split.name);
+        const escaped_old = try acheron_protocol.jsonEscape(self.allocator, old_split.name);
         defer self.allocator.free(escaped_old);
-        const escaped_new = try fs_protocol.jsonEscape(self.allocator, new_split.name);
+        const escaped_new = try acheron_protocol.jsonEscape(self.allocator, new_split.name);
         defer self.allocator.free(escaped_new);
         const args = try std.fmt.allocPrint(
             self.allocator,
@@ -820,9 +820,9 @@ pub const Router = struct {
 
         const temp_name = std.fs.path.basename(temp_path.?);
         const new_split = try splitParentChild(new_path);
-        const escaped_old = try fs_protocol.jsonEscape(self.allocator, temp_name);
+        const escaped_old = try acheron_protocol.jsonEscape(self.allocator, temp_name);
         defer self.allocator.free(escaped_old);
-        const escaped_new = try fs_protocol.jsonEscape(self.allocator, new_split.name);
+        const escaped_new = try acheron_protocol.jsonEscape(self.allocator, new_split.name);
         defer self.allocator.free(escaped_new);
         const args = try std.fmt.allocPrint(
             self.allocator,
@@ -1104,7 +1104,7 @@ pub const Router = struct {
             return RouterError.FileNotFound;
         }
 
-        const escaped_name = try fs_protocol.jsonEscape(self.allocator, name);
+        const escaped_name = try acheron_protocol.jsonEscape(self.allocator, name);
         defer self.allocator.free(escaped_name);
         const args = try std.fmt.allocPrint(self.allocator, "{{\"name\":\"{s}\"}}", .{escaped_name});
         defer self.allocator.free(args);
@@ -1112,7 +1112,7 @@ pub const Router = struct {
         const response = try self.callEndpoint(endpoint_u16, .LOOKUP, parent_id, null, args);
         defer response.deinit(self.allocator);
         if (!response.ok) {
-            if (response.err_no == fs_protocol.Errno.ENOENT) {
+            if (response.err_no == acheron_protocol.Errno.ENOENT) {
                 try self.negative_cache.put(endpoint_u16, parent_id, normalized_name, std.time.milliTimestamp());
             }
             return mapErrno(response.err_no);
@@ -1151,11 +1151,11 @@ pub const Router = struct {
     fn callEndpoint(
         self: *Router,
         endpoint_index: u16,
-        op: fs_protocol.Op,
+        op: acheron_protocol.Op,
         node: ?u64,
         handle: ?u64,
         args_json: ?[]const u8,
-    ) !fs_client.ClientResponse {
+    ) !acheron_client.ClientResponse {
         self.armEventPumps();
         self.drainPendingInvalidations();
         const endpoint_usize: usize = endpoint_index;
@@ -1245,12 +1245,12 @@ pub const Router = struct {
     fn callEndpointClientLocked(
         self: *Router,
         endpoint: *Endpoint,
-        op: fs_protocol.Op,
+        op: acheron_protocol.Op,
         node: ?u64,
         handle: ?u64,
         args_json: ?[]const u8,
         event_ctx: *EventDispatchContext,
-    ) !fs_client.ClientResponse {
+    ) !acheron_client.ClientResponse {
         _ = self;
         endpoint.client_mutex.lock();
         defer endpoint.client_mutex.unlock();
@@ -1269,7 +1269,7 @@ pub const Router = struct {
 
     fn reconnectEndpoint(self: *Router, endpoint_index: usize) !void {
         const endpoint = &self.endpoints.items[endpoint_index];
-        var replacement = try fs_client.FsClient.connect(self.allocator, endpoint.url);
+        var replacement = try acheron_client.FsClient.connect(self.allocator, endpoint.url);
         errdefer replacement.deinit();
 
         const hello_payload = try self.buildFsHelloPayload(endpoint, true);
@@ -1313,13 +1313,13 @@ pub const Router = struct {
         endpoint_index: u16,
     };
 
-    fn handleClientEvent(ctx: ?*anyopaque, event: fs_protocol.InvalidationEvent) void {
+    fn handleClientEvent(ctx: ?*anyopaque, event: acheron_protocol.InvalidationEvent) void {
         const raw = ctx orelse return;
         const event_ctx: *EventDispatchContext = @ptrCast(@alignCast(raw));
         event_ctx.router.queueInvalidation(event_ctx.endpoint_index, event);
     }
 
-    fn queueInvalidation(self: *Router, endpoint_index: u16, event: fs_protocol.InvalidationEvent) void {
+    fn queueInvalidation(self: *Router, endpoint_index: u16, event: acheron_protocol.InvalidationEvent) void {
         self.pending_invalidations_mutex.lock();
         defer self.pending_invalidations_mutex.unlock();
         self.pending_invalidations.append(self.allocator, .{
@@ -1431,7 +1431,7 @@ pub const Router = struct {
         }
     }
 
-    fn applyInvalidationEvent(self: *Router, endpoint_index: u16, event: fs_protocol.InvalidationEvent) void {
+    fn applyInvalidationEvent(self: *Router, endpoint_index: u16, event: acheron_protocol.InvalidationEvent) void {
         switch (event) {
             .INVAL => |ev| {
                 self.attr_cache.invalidateNode(.{
@@ -1489,14 +1489,14 @@ pub const Router = struct {
 
     fn buildFsHelloPayload(self: *Router, endpoint: *const Endpoint, subscribe_invalidations: bool) ![]u8 {
         if (endpoint.auth_token) |auth_token| {
-            const escaped_auth = try fs_protocol.jsonEscape(self.allocator, auth_token);
+            const escaped_auth = try acheron_protocol.jsonEscape(self.allocator, auth_token);
             defer self.allocator.free(escaped_auth);
             return std.fmt.allocPrint(
                 self.allocator,
                 "{{\"protocol\":\"{s}\",\"proto\":{d},\"auth_token\":\"{s}\",\"subscribe_invalidations\":{s}}}",
                 .{
-                    fsrpc_node_protocol_version,
-                    fsrpc_node_proto_id,
+                    acheron_node_protocol_version,
+                    acheron_node_proto_id,
                     escaped_auth,
                     if (subscribe_invalidations) "true" else "false",
                 },
@@ -1507,8 +1507,8 @@ pub const Router = struct {
             self.allocator,
             "{{\"protocol\":\"{s}\",\"proto\":{d},\"subscribe_invalidations\":{s}}}",
             .{
-                fsrpc_node_protocol_version,
-                fsrpc_node_proto_id,
+                acheron_node_protocol_version,
+                acheron_node_proto_id,
                 if (subscribe_invalidations) "true" else "false",
             },
         );
@@ -1624,7 +1624,7 @@ pub const Router = struct {
         for (children.items[start..end], start..) |name, idx| {
             if (idx != start) try out.append(self.allocator, ',');
 
-            const escaped_name = try fs_protocol.jsonEscape(self.allocator, name);
+            const escaped_name = try acheron_protocol.jsonEscape(self.allocator, name);
             defer self.allocator.free(escaped_name);
             const child_path = try joinPath(normalized_path, name, self.allocator);
             defer self.allocator.free(child_path);
@@ -1760,19 +1760,19 @@ fn isEndpointFailureError(err: anyerror) bool {
     };
 }
 
-fn shouldRetryEndpointErrnoAfterReconnect(op: fs_protocol.Op, err_no: i32) bool {
+fn shouldRetryEndpointErrnoAfterReconnect(op: acheron_protocol.Op, err_no: i32) bool {
     if (!isIdempotentEndpointOp(op)) return false;
     return switch (err_no) {
-        fs_protocol.Errno.EIO,
-        fs_protocol.Errno.ETIMEDOUT,
-        fs_protocol.Errno.EAGAIN,
-        fs_protocol.Errno.EBADF,
+        acheron_protocol.Errno.EIO,
+        acheron_protocol.Errno.ETIMEDOUT,
+        acheron_protocol.Errno.EAGAIN,
+        acheron_protocol.Errno.EBADF,
         => true,
         else => false,
     };
 }
 
-fn isIdempotentEndpointOp(op: fs_protocol.Op) bool {
+fn isIdempotentEndpointOp(op: acheron_protocol.Op) bool {
     return switch (op) {
         .LOOKUP,
         .GETATTR,
@@ -1789,18 +1789,18 @@ fn isIdempotentEndpointOp(op: fs_protocol.Op) bool {
 
 fn mapErrno(errno_no: i32) RouterError {
     return switch (errno_no) {
-        fs_protocol.Errno.ENOENT => RouterError.FileNotFound,
-        fs_protocol.Errno.ENODATA => RouterError.NoData,
-        fs_protocol.Errno.EAGAIN => RouterError.WouldBlock,
-        fs_protocol.Errno.ERANGE => RouterError.Range,
-        fs_protocol.Errno.EACCES => RouterError.PermissionDenied,
-        fs_protocol.Errno.ENOTDIR => RouterError.NotDirectory,
-        fs_protocol.Errno.EISDIR => RouterError.IsDirectory,
-        fs_protocol.Errno.EEXIST => RouterError.AlreadyExists,
-        fs_protocol.Errno.ENOSPC => RouterError.NoSpace,
-        fs_protocol.Errno.ENOSYS => RouterError.OperationNotSupported,
-        fs_protocol.Errno.EXDEV => RouterError.CrossEndpointRename,
-        fs_protocol.Errno.EROFS => RouterError.ReadOnlyFilesystem,
+        acheron_protocol.Errno.ENOENT => RouterError.FileNotFound,
+        acheron_protocol.Errno.ENODATA => RouterError.NoData,
+        acheron_protocol.Errno.EAGAIN => RouterError.WouldBlock,
+        acheron_protocol.Errno.ERANGE => RouterError.Range,
+        acheron_protocol.Errno.EACCES => RouterError.PermissionDenied,
+        acheron_protocol.Errno.ENOTDIR => RouterError.NotDirectory,
+        acheron_protocol.Errno.EISDIR => RouterError.IsDirectory,
+        acheron_protocol.Errno.EEXIST => RouterError.AlreadyExists,
+        acheron_protocol.Errno.ENOSPC => RouterError.NoSpace,
+        acheron_protocol.Errno.ENOSYS => RouterError.OperationNotSupported,
+        acheron_protocol.Errno.EXDEV => RouterError.CrossEndpointRename,
+        acheron_protocol.Errno.EROFS => RouterError.ReadOnlyFilesystem,
         else => RouterError.IOError,
     };
 }
@@ -2177,7 +2177,7 @@ fn decodeBase64(allocator: std.mem.Allocator, data: []const u8) ![]u8 {
     return out;
 }
 
-test "fs_router: writable requirement matcher handles optional readonly metadata" {
+test "acheron_router: writable requirement matcher handles optional readonly metadata" {
     try std.testing.expect(endpointMatchesWriteRequirement(null, false));
     try std.testing.expect(endpointMatchesWriteRequirement(false, false));
     try std.testing.expect(endpointMatchesWriteRequirement(true, false));
@@ -2187,7 +2187,7 @@ test "fs_router: writable requirement matcher handles optional readonly metadata
     try std.testing.expect(!endpointMatchesWriteRequirement(true, true));
 }
 
-test "fs_router: cross-endpoint move decision maps readonly distinctly" {
+test "acheron_router: cross-endpoint move decision maps readonly distinctly" {
     try std.testing.expectEqual(
         @as(CrossEndpointMoveDecision, .allowed),
         decideCrossEndpointMove(.{ .read_only = false }, .{ .read_only = false }),
@@ -2202,14 +2202,14 @@ test "fs_router: cross-endpoint move decision maps readonly distinctly" {
     );
 }
 
-test "fs_router: flagsRequireWrite detects write access flags" {
+test "acheron_router: flagsRequireWrite detects write access flags" {
     try std.testing.expect(!flagsRequireWrite(0));
     try std.testing.expect(flagsRequireWrite(1));
     try std.testing.expect(flagsRequireWrite(2));
     try std.testing.expect(!flagsRequireWrite(3));
 }
 
-test "fs_router: pickExportInfo parses source metadata" {
+test "acheron_router: pickExportInfo parses source metadata" {
     const allocator = std.testing.allocator;
     const payload =
         \\{"exports":[
@@ -2232,13 +2232,13 @@ test "fs_router: pickExportInfo parses source metadata" {
     try std.testing.expectEqual(true, selected.case_sensitive.?);
 }
 
-test "fs_router: splitParentChild handles nested path" {
+test "acheron_router: splitParentChild handles nested path" {
     const split = try splitParentChild("/a/src/main.zig");
     try std.testing.expectEqualStrings("/a/src", split.parent_path);
     try std.testing.expectEqualStrings("main.zig", split.name);
 }
 
-test "fs_router: splitParentChild supports root children and rejects root itself" {
+test "acheron_router: splitParentChild supports root children and rejects root itself" {
     const child = try splitParentChild("/main.zig");
     try std.testing.expectEqualStrings("/", child.parent_path);
     try std.testing.expectEqualStrings("main.zig", child.name);
@@ -2247,7 +2247,7 @@ test "fs_router: splitParentChild supports root children and rejects root itself
     try std.testing.expectError(RouterError.InvalidPath, splitParentChild("/main.zig/"));
 }
 
-test "fs_router: normalizeNameForCache honors case sensitivity" {
+test "acheron_router: normalizeNameForCache honors case sensitivity" {
     const allocator = std.testing.allocator;
     const strict = try normalizeNameForCache(allocator, true, "ReadMe.TXT");
     defer allocator.free(strict);
@@ -2258,13 +2258,13 @@ test "fs_router: normalizeNameForCache honors case sensitivity" {
     try std.testing.expectEqualStrings("readme.txt", folded);
 }
 
-test "fs_router: case-only rename guard applies on case-insensitive sources" {
+test "acheron_router: case-only rename guard applies on case-insensitive sources" {
     try std.testing.expect(!isCaseOnlyRenameGuard(true, true, "README.md", "readme.md"));
     try std.testing.expect(!isCaseOnlyRenameGuard(false, false, "README.md", "readme.md"));
     try std.testing.expect(isCaseOnlyRenameGuard(false, true, "README.md", "readme.md"));
 }
 
-test "fs_router: matchPathToMount handles exact and nested paths" {
+test "acheron_router: matchPathToMount handles exact and nested paths" {
     const root = matchPathToMount("/a", "/a") orelse return error.TestExpectedResult;
     try std.testing.expectEqual(@as(usize, 2), root.mount_path_len);
     try std.testing.expectEqualStrings("", root.relative_path);
@@ -2276,19 +2276,19 @@ test "fs_router: matchPathToMount handles exact and nested paths" {
     try std.testing.expect(matchPathToMount("/abc", "/a") == null);
 }
 
-test "fs_router: childSegmentForVirtualDir returns next mount component" {
+test "acheron_router: childSegmentForVirtualDir returns next mount component" {
     try std.testing.expectEqualStrings("project", childSegmentForVirtualDir("/", "/project/src") orelse return error.TestExpectedResult);
     try std.testing.expectEqualStrings("src", childSegmentForVirtualDir("/project", "/project/src") orelse return error.TestExpectedResult);
     try std.testing.expect(childSegmentForVirtualDir("/project/src", "/project/src") == null);
 }
 
-test "fs_router: virtualDirNodeId stays within signed integer range" {
+test "acheron_router: virtualDirNodeId stays within signed integer range" {
     const node_id = virtualDirNodeId("/agents");
     try std.testing.expect(node_id > 0);
     try std.testing.expect(node_id <= std.math.maxInt(i64));
 }
 
-test "fs_router: virtual directory listing reflects mount prefixes" {
+test "acheron_router: virtual directory listing reflects mount prefixes" {
     const allocator = std.testing.allocator;
     var router = try Router.init(allocator, &[_]EndpointConfig{});
     defer router.deinit();
@@ -2329,7 +2329,7 @@ test "fs_router: virtual directory listing reflects mount prefixes" {
     try std.testing.expect(std.mem.indexOf(u8, project_attr, "\"k\":2") != null);
 }
 
-test "fs_router: virtual directories handle trailing slashes" {
+test "acheron_router: virtual directories handle trailing slashes" {
     const allocator = std.testing.allocator;
     var router = try Router.init(allocator, &[_]EndpointConfig{});
     defer router.deinit();
@@ -2376,7 +2376,7 @@ test "fs_router: virtual directories handle trailing slashes" {
     try std.testing.expect(std.mem.indexOf(u8, projects_listing, "\"name\":\"system\"") != null);
 }
 
-test "fs_router: root path is not virtual when an endpoint is mounted at slash" {
+test "acheron_router: root path is not virtual when an endpoint is mounted at slash" {
     const allocator = std.testing.allocator;
     var router = try Router.init(allocator, &[_]EndpointConfig{});
     defer router.deinit();
@@ -2398,7 +2398,7 @@ test "fs_router: root path is not virtual when an endpoint is mounted at slash" 
     try std.testing.expect(!router.isVirtualDirectoryPath("/"));
 }
 
-test "fs_router: resolvePath honors explicit mount_path overlays" {
+test "acheron_router: resolvePath honors explicit mount_path overlays" {
     const allocator = std.testing.allocator;
     var router = try Router.init(allocator, &[_]EndpointConfig{});
     defer router.deinit();
@@ -2427,7 +2427,7 @@ test "fs_router: resolvePath honors explicit mount_path overlays" {
     try std.testing.expectError(RouterError.UnknownEndpoint, router.resolvePath("/project/main.zig", false, .read_data));
 }
 
-test "fs_router: lookupChild treats missing entry as negative when full readdir cache is present" {
+test "acheron_router: lookupChild treats missing entry as negative when full readdir cache is present" {
     const allocator = std.testing.allocator;
     var router = try Router.init(allocator, &[_]EndpointConfig{});
     defer router.deinit();
@@ -2451,7 +2451,7 @@ test "fs_router: lookupChild treats missing entry as negative when full readdir 
     try std.testing.expect(router.negative_cache.containsFresh(0, 1, "bar", now));
 }
 
-test "fs_router: resolvePath allows advanced ops before source metadata hydration" {
+test "acheron_router: resolvePath allows advanced ops before source metadata hydration" {
     const allocator = std.testing.allocator;
     var router = try Router.init(allocator, &[_]EndpointConfig{});
     defer router.deinit();
@@ -2480,7 +2480,7 @@ test "fs_router: resolvePath allows advanced ops before source metadata hydratio
     try std.testing.expectEqual(@as(u64, 101), resolved.node_id);
 }
 
-test "fs_router: parseAttrSummary detects kind from explicit kind and mode bits" {
+test "acheron_router: parseAttrSummary detects kind from explicit kind and mode bits" {
     const explicit_dir = try parseAttrSummary("{\"id\":1,\"k\":2,\"m\":16877}");
     try std.testing.expectEqual(@as(AttrKind, .dir), explicit_dir.kind);
     try std.testing.expectEqual(@as(u32, 16877), explicit_dir.mode);
@@ -2490,14 +2490,14 @@ test "fs_router: parseAttrSummary detects kind from explicit kind and mode bits"
     try std.testing.expectEqual(@as(u32, 33188), inferred_file.mode);
 }
 
-test "fs_router: parseGetxattrResult decodes payload" {
+test "acheron_router: parseGetxattrResult decodes payload" {
     const allocator = std.testing.allocator;
     const out = try parseGetxattrResult(allocator, "{\"value_b64\":\"aGVsbG8=\"}");
     defer allocator.free(out);
     try std.testing.expectEqualStrings("hello", out);
 }
 
-test "fs_router: parseListxattrResult builds nul separated names" {
+test "acheron_router: parseListxattrResult builds nul separated names" {
     const allocator = std.testing.allocator;
     const out = try parseListxattrResult(allocator, "{\"names\":[\"user.a\",\"user.b\"]}");
     defer allocator.free(out);
@@ -2506,22 +2506,22 @@ test "fs_router: parseListxattrResult builds nul separated names" {
     try std.testing.expectEqual(@as(u8, 0), out["user.a".len]);
 }
 
-test "fs_router: mapErrno covers xattr and lock errnos" {
-    try std.testing.expect(mapErrno(fs_protocol.Errno.ENODATA) == RouterError.NoData);
-    try std.testing.expect(mapErrno(fs_protocol.Errno.EAGAIN) == RouterError.WouldBlock);
-    try std.testing.expect(mapErrno(fs_protocol.Errno.ERANGE) == RouterError.Range);
-    try std.testing.expect(mapErrno(fs_protocol.Errno.ENOSYS) == RouterError.OperationNotSupported);
+test "acheron_router: mapErrno covers xattr and lock errnos" {
+    try std.testing.expect(mapErrno(acheron_protocol.Errno.ENODATA) == RouterError.NoData);
+    try std.testing.expect(mapErrno(acheron_protocol.Errno.EAGAIN) == RouterError.WouldBlock);
+    try std.testing.expect(mapErrno(acheron_protocol.Errno.ERANGE) == RouterError.Range);
+    try std.testing.expect(mapErrno(acheron_protocol.Errno.ENOSYS) == RouterError.OperationNotSupported);
 }
 
-test "fs_router: response retry policy only retries idempotent operations" {
-    try std.testing.expect(shouldRetryEndpointErrnoAfterReconnect(.READ, fs_protocol.Errno.EIO));
-    try std.testing.expect(shouldRetryEndpointErrnoAfterReconnect(.GETATTR, fs_protocol.Errno.ETIMEDOUT));
-    try std.testing.expect(!shouldRetryEndpointErrnoAfterReconnect(.WRITE, fs_protocol.Errno.EIO));
-    try std.testing.expect(!shouldRetryEndpointErrnoAfterReconnect(.RENAME, fs_protocol.Errno.EIO));
-    try std.testing.expect(!shouldRetryEndpointErrnoAfterReconnect(.READ, fs_protocol.Errno.ENOENT));
+test "acheron_router: response retry policy only retries idempotent operations" {
+    try std.testing.expect(shouldRetryEndpointErrnoAfterReconnect(.READ, acheron_protocol.Errno.EIO));
+    try std.testing.expect(shouldRetryEndpointErrnoAfterReconnect(.GETATTR, acheron_protocol.Errno.ETIMEDOUT));
+    try std.testing.expect(!shouldRetryEndpointErrnoAfterReconnect(.WRITE, acheron_protocol.Errno.EIO));
+    try std.testing.expect(!shouldRetryEndpointErrnoAfterReconnect(.RENAME, acheron_protocol.Errno.EIO));
+    try std.testing.expect(!shouldRetryEndpointErrnoAfterReconnect(.READ, acheron_protocol.Errno.ENOENT));
 }
 
-test "fs_router: endpointRoutingScore prefers healthy endpoints with recent success" {
+test "acheron_router: endpointRoutingScore prefers healthy endpoints with recent success" {
     var healthy_name = [_]u8{'a'};
     var healthy_url = [_]u8{'u'};
     var degraded_name = [_]u8{'a'};
@@ -2562,7 +2562,7 @@ test "fs_router: endpointRoutingScore prefers healthy endpoints with recent succ
     try std.testing.expect(healthy_score > degraded_score);
 }
 
-test "fs_router: endpointRoutingScore penalizes capability mismatch" {
+test "acheron_router: endpointRoutingScore penalizes capability mismatch" {
     var linux_name = [_]u8{'a'};
     var linux_url = [_]u8{'u'};
     var gdrive_name = [_]u8{'a'};
@@ -2599,14 +2599,14 @@ test "fs_router: endpointRoutingScore penalizes capability mismatch" {
     try std.testing.expect(linux_score > gdrive_score);
 }
 
-test "fs_router: endpoint failure classifier covers transport and protocol errors" {
+test "acheron_router: endpoint failure classifier covers transport and protocol errors" {
     try std.testing.expect(isEndpointFailureError(error.ConnectionClosed));
     try std.testing.expect(isEndpointFailureError(error.HandshakeRejected));
     try std.testing.expect(isEndpointFailureError(error.ConnectionRefused));
     try std.testing.expect(!isEndpointFailureError(error.OutOfMemory));
 }
 
-test "fs_router: statusJson renders empty endpoint list" {
+test "acheron_router: statusJson renders empty endpoint list" {
     const allocator = std.testing.allocator;
     var router = try Router.init(allocator, &[_]EndpointConfig{});
     defer router.deinit();
@@ -2616,7 +2616,7 @@ test "fs_router: statusJson renders empty endpoint list" {
     try std.testing.expectEqualStrings("{\"metrics\":{\"failover_events_total\":0},\"endpoints\":[]}", status);
 }
 
-test "fs_router: applyInvalidationEvent clears affected caches" {
+test "acheron_router: applyInvalidationEvent clears affected caches" {
     const allocator = std.testing.allocator;
     var router = try Router.init(allocator, &[_]EndpointConfig{});
     defer router.deinit();
@@ -2654,7 +2654,7 @@ test "fs_router: applyInvalidationEvent clears affected caches" {
     try std.testing.expect(!router.negative_cache.containsFresh(0, 77, "missing", 1000));
 }
 
-test "fs_router: queued invalidations apply on drain" {
+test "acheron_router: queued invalidations apply on drain" {
     const allocator = std.testing.allocator;
     var router = try Router.init(allocator, &[_]EndpointConfig{});
     defer router.deinit();
@@ -2682,7 +2682,7 @@ test "fs_router: queued invalidations apply on drain" {
     try std.testing.expect(router.attr_cache.getFresh(.{ .endpoint_index = 0, .node_id = 22 }, 1000) == null);
 }
 
-test "fs_router: invalidation plus endpoint failure falls back to sibling alias" {
+test "acheron_router: invalidation plus endpoint failure falls back to sibling alias" {
     const allocator = std.testing.allocator;
     var router = try Router.init(allocator, &[_]EndpointConfig{});
     defer router.deinit();
@@ -2745,7 +2745,7 @@ test "fs_router: invalidation plus endpoint failure falls back to sibling alias"
     try std.testing.expectEqual(@as(u64, 1), router.failover_events_total);
 }
 
-test "fs_router: replaceEndpoints swaps mount topology and clears caches" {
+test "acheron_router: replaceEndpoints swaps mount topology and clears caches" {
     const allocator = std.testing.allocator;
     var router = try Router.init(allocator, &[_]EndpointConfig{});
     defer router.deinit();

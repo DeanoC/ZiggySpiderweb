@@ -4,7 +4,7 @@ const HookContext = hook_registry.HookContext;
 const HookData = hook_registry.HookData;
 const HookError = hook_registry.HookError;
 const AgentRuntime = @import("agent_runtime.zig").AgentRuntime;
-const brain_tools = @import("brain_tools.zig");
+const capability_engine = @import("capability_engine.zig");
 const agent_config = @import("agent_config.zig");
 
 /// Brain specialization configuration from agent.json

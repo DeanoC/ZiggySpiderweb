@@ -1,7 +1,7 @@
 const std = @import("std");
 const protocol = @import("spider-protocol").protocol;
 const runtime_server_mod = @import("runtime_server.zig");
-const sandbox_runtime = @import("sandbox_runtime.zig");
+const sandbox_runtime = @import("../sandbox_runtime.zig");
 
 pub const Kind = enum {
     local,

@@ -1,6 +1,6 @@
 const std = @import("std");
-const fs_protocol = @import("fs_protocol.zig");
-const fs_router = @import("fs_router.zig");
+const fs_router = @import("acheron_fs_router");
+const fs_protocol = fs_router.acheron_protocol;
 
 const c = @cImport({
     @cInclude("fuse_compat.h");

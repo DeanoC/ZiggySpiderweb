@@ -1,7 +1,7 @@
 const std = @import("std");
 const unified = @import("spider-protocol").unified;
 
-const chat_job_index = @import("chat_job_index.zig");
+const chat_job_index = @import("../agents/chat_job_index.zig");
 
 pub fn buildJobWaitEventPayload(
     allocator: std.mem.Allocator,
