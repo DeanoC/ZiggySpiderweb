@@ -336,6 +336,7 @@ pub const Session = struct {
         projects_dir: []const u8 = "projects",
         local_fs_export_root: ?[]const u8 = null,
         control_plane: ?*control_plane_mod.ControlPlane = null,
+        control_operator_token: ?[]const u8 = null,
         actor_type: ?[]const u8 = null,
         actor_id: ?[]const u8 = null,
         is_admin: bool = false,
@@ -355,6 +356,7 @@ pub const Session = struct {
     projects_dir: []u8,
     local_fs_export_root: ?[]u8 = null,
     control_plane: ?*control_plane_mod.ControlPlane = null,
+    control_operator_token: ?[]u8 = null,
     is_admin: bool = false,
 
     nodes: std.AutoHashMapUnmanaged(u32, Node) = .{},
@@ -450,6 +452,11 @@ pub const Session = struct {
         else
             null;
         errdefer if (owned_local_fs_export_root) |value| allocator.free(value);
+        const owned_control_operator_token = if (options.control_operator_token) |value|
+            try allocator.dupe(u8, value)
+        else
+            null;
+        errdefer if (owned_control_operator_token) |value| allocator.free(value);
         runtime_handle.retain();
         errdefer runtime_handle.release();
 
@@ -467,6 +474,7 @@ pub const Session = struct {
             .projects_dir = owned_projects_dir,
             .local_fs_export_root = owned_local_fs_export_root,
             .control_plane = options.control_plane,
+            .control_operator_token = owned_control_operator_token,
             .is_admin = options.is_admin,
         };
         try self.seedNamespace();
@@ -497,6 +505,7 @@ pub const Session = struct {
         self.allocator.free(self.assets_dir);
         self.allocator.free(self.projects_dir);
         if (self.local_fs_export_root) |value| self.allocator.free(value);
+        if (self.control_operator_token) |value| self.allocator.free(value);
         self.runtime_handle.release();
         self.* = undefined;
     }
@@ -517,6 +526,7 @@ pub const Session = struct {
                 .projects_dir = self.projects_dir,
                 .local_fs_export_root = self.local_fs_export_root,
                 .control_plane = self.control_plane,
+                .control_operator_token = self.control_operator_token,
                 .actor_type = self.actor_type,
                 .actor_id = self.actor_id,
                 .is_admin = self.is_admin,
@@ -6257,6 +6267,15 @@ pub const Session = struct {
     fn handlePairingControlWrite(self: *Session, action: PairingAction, raw_input: []const u8) !WriteOutcome {
         const written = raw_input.len;
         const payload = std.mem.trim(u8, raw_input, " \t\r\n");
+        if (!self.isPairingActionAuthorized(action, payload)) {
+            try self.setPairingResultError(action, "OperatorAuthFailed");
+            switch (action) {
+                .refresh, .approve, .deny => try self.refreshPairingPendingSnapshot(),
+                .invites_refresh => try self.refreshPairingInvitesSnapshot(),
+                .invites_create => {},
+            }
+            return .{ .written = written };
+        }
         const plane = self.control_plane orelse {
             try self.setPairingResultError(action, "ControlPlaneUnavailable");
             return .{ .written = written };
@@ -6319,6 +6338,28 @@ pub const Session = struct {
                 return .{ .written = written };
             },
         }
+    }
+
+    fn isPairingActionAuthorized(self: *const Session, action: PairingAction, payload: []const u8) bool {
+        const operator_token = self.control_operator_token orelse return true;
+        if (action == .invites_create or action == .invites_refresh) return true;
+        if (payload.len == 0) return false;
+
+        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, payload, .{}) catch return false;
+        defer parsed.deinit();
+        if (parsed.value != .object) return false;
+        const token_value = parsed.value.object.get("operator_token") orelse return false;
+        if (token_value != .string or token_value.string.len == 0) return false;
+        return secureTokenEql(operator_token, token_value.string);
+    }
+
+    fn secureTokenEql(expected: []const u8, candidate: []const u8) bool {
+        if (expected.len != candidate.len) return false;
+        var diff: u8 = 0;
+        for (expected, candidate) |lhs, rhs| {
+            diff |= lhs ^ rhs;
+        }
+        return diff == 0;
     }
 
     fn pairingActionName(action: PairingAction) []const u8 {
@@ -11150,6 +11191,93 @@ test "acheron_session: debug pairing queue supports refresh approve deny actions
     try std.testing.expect(std.mem.indexOf(u8, last_error_after_repeat_deny.content, "\"ok\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, last_error_after_repeat_deny.content, "\"action\":\"deny\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, last_error_after_repeat_deny.content, "PendingJoinNotFound") != null);
+}
+
+test "acheron_session: debug pairing approve requires operator token when configured" {
+    const allocator = std.testing.allocator;
+
+    var control_plane = control_plane_mod.ControlPlane.init(allocator);
+    defer control_plane.deinit();
+
+    const req_json = try control_plane.nodeJoinRequest(
+        "{\"node_name\":\"desk-auth\",\"fs_url\":\"ws://127.0.0.1:18891/v2/fs\",\"platform\":{\"os\":\"linux\",\"arch\":\"amd64\",\"runtime_kind\":\"native\"}}",
+    );
+    defer allocator.free(req_json);
+    var req = try std.json.parseFromSlice(std.json.Value, allocator, req_json, .{});
+    defer req.deinit();
+    if (req.value != .object) return error.TestExpectedResponse;
+    const request = req.value.object.get("request_id") orelse return error.TestExpectedResponse;
+    if (request != .string) return error.TestExpectedResponse;
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "mother", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "mother",
+        .{
+            .control_plane = &control_plane,
+            .control_operator_token = "operator-secret",
+        },
+    );
+    defer session.deinit();
+
+    const debug_root = session.lookupChild(session.root_id, "debug") orelse return error.TestExpectedResponse;
+    const pairing_dir = session.lookupChild(debug_root, "pairing") orelse return error.TestExpectedResponse;
+    const pending_id = session.lookupChild(pairing_dir, "pending.json") orelse return error.TestExpectedResponse;
+    const last_result_id = session.lookupChild(pairing_dir, "last_result.json") orelse return error.TestExpectedResponse;
+
+    const escaped_request = try unified.jsonEscape(allocator, request.string);
+    defer allocator.free(escaped_request);
+    const approve_no_token = try std.fmt.allocPrint(
+        allocator,
+        "{{\"request_id\":\"{s}\",\"lease_ttl_ms\":900000}}",
+        .{escaped_request},
+    );
+    defer allocator.free(approve_no_token);
+    try protocolWriteFile(
+        &session,
+        allocator,
+        70,
+        71,
+        &.{ "debug", "pairing", "control", "approve.json" },
+        approve_no_token,
+        600,
+    );
+
+    const pending_after_denied = session.nodes.get(pending_id) orelse return error.TestExpectedResponse;
+    try std.testing.expect(std.mem.indexOf(u8, pending_after_denied.content, request.string) != null);
+    const last_result_after_denied = session.nodes.get(last_result_id) orelse return error.TestExpectedResponse;
+    try std.testing.expect(std.mem.indexOf(u8, last_result_after_denied.content, "\"ok\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, last_result_after_denied.content, "OperatorAuthFailed") != null);
+
+    const approve_with_token = try std.fmt.allocPrint(
+        allocator,
+        "{{\"request_id\":\"{s}\",\"lease_ttl_ms\":900000,\"operator_token\":\"operator-secret\"}}",
+        .{escaped_request},
+    );
+    defer allocator.free(approve_with_token);
+    try protocolWriteFile(
+        &session,
+        allocator,
+        72,
+        73,
+        &.{ "debug", "pairing", "control", "approve.json" },
+        approve_with_token,
+        610,
+    );
+
+    const pending_after_approved = session.nodes.get(pending_id) orelse return error.TestExpectedResponse;
+    try std.testing.expect(std.mem.indexOf(u8, pending_after_approved.content, request.string) == null);
+    const last_result_after_approved = session.nodes.get(last_result_id) orelse return error.TestExpectedResponse;
+    try std.testing.expect(std.mem.indexOf(u8, last_result_after_approved.content, "\"ok\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, last_result_after_approved.content, "\"action\":\"approve\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, last_result_after_approved.content, "\"node_name\":\"desk-auth\"") != null);
 }
 
 test "acheron_session: debug pairing invites support create and refresh actions" {
