@@ -17,7 +17,7 @@ const default_project_up_export_name = "work";
 const spider_web_project_kind_name = "system_builtin";
 const normal_project_kind_name = "normal";
 const default_primary_agent_id = "mother";
-const default_spider_web_root = "/";
+const default_spider_web_root = "";
 const default_platform_os = "unknown";
 const default_platform_arch = "unknown";
 const default_platform_runtime_kind = "unknown";
@@ -2323,10 +2323,13 @@ pub const ControlPlane = struct {
         if (project.kind == .spider_web_builtin and !(is_primary_agent or is_admin)) return ControlPlaneError.ProjectAssignmentForbidden;
 
         const maybe_project_token = getOptionalString(obj, "project_token");
-        if (project.kind != .spider_web_builtin) {
+        if (project.kind == .spider_web_builtin and !is_admin) {
+            const project_token = maybe_project_token orelse return ControlPlaneError.MissingField;
+            try validateSecretToken(project_token, 256);
+            if (!secureTokenEql(project.mutation_token, project_token)) return ControlPlaneError.ProjectAuthFailed;
+        } else if (project.kind != .spider_web_builtin) {
             try requireProjectActionAccess(project, .read, agent_id, maybe_project_token, is_admin);
         } else if (maybe_project_token) |project_token| {
-            // Optional explicit validation when selecting the system project with a token provided.
             try validateSecretToken(project_token, 256);
             if (!secureTokenEql(project.mutation_token, project_token)) return ControlPlaneError.ProjectAuthFailed;
         }
@@ -2512,6 +2515,10 @@ pub const ControlPlane = struct {
                         return ControlPlaneError.ProjectAuthFailed;
                     }
                 }
+            } else if (!is_admin) {
+                const project_token = requested_project_token orelse return ControlPlaneError.MissingField;
+                try validateSecretToken(project_token, 256);
+                if (!secureTokenEql(project.mutation_token, project_token)) return ControlPlaneError.ProjectAuthFailed;
             } else if (requested_project_token) |project_token| {
                 try validateSecretToken(project_token, 256);
                 if (!secureTokenEql(project.mutation_token, project_token)) return ControlPlaneError.ProjectAuthFailed;
@@ -5646,11 +5653,28 @@ test "acheron_control_plane: builtin system project is protected and primary-onl
         plane.workspaceStatus("agent-worker", "{\"project_id\":\"system\"}"),
     );
 
-    const activated = try plane.activateProject("mother", "{\"project_id\":\"system\"}");
+    const activate_missing_token = try std.fmt.allocPrint(
+        allocator,
+        "{{\"project_id\":\"{s}\"}}",
+        .{spider_web_project_id},
+    );
+    defer allocator.free(activate_missing_token);
+    try std.testing.expectError(
+        ControlPlaneError.MissingField,
+        plane.activateProject("mother", activate_missing_token),
+    );
+
+    const activated_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"project_id\":\"{s}\",\"project_token\":\"{s}\"}}",
+        .{ spider_web_project_id, spider_token.? },
+    );
+    defer allocator.free(activated_req);
+    const activated = try plane.activateProject("mother", activated_req);
     defer allocator.free(activated);
     try std.testing.expect(std.mem.indexOf(u8, activated, "\"project_id\":\"system\"") != null);
 
-    const status = try plane.workspaceStatus("mother", "{\"project_id\":\"system\"}");
+    const status = try plane.workspaceStatus("mother", activated_req);
     defer allocator.free(status);
     try std.testing.expect(std.mem.indexOf(u8, status, "\"project_id\":\"system\"") != null);
 
@@ -7276,6 +7300,60 @@ test "acheron_control_plane: projectUp requires project_token for existing non-b
     const get_json = try plane.getProject(get_req);
     defer allocator.free(get_json);
     try std.testing.expect(std.mem.indexOf(u8, get_json, "\"status\":\"paused\"") != null);
+}
+
+test "acheron_control_plane: projectUp requires project_token for builtin system project activation" {
+    const allocator = std.testing.allocator;
+    var plane = ControlPlane.init(allocator);
+    defer plane.deinit();
+
+    const state_json = try plane.dumpState();
+    defer allocator.free(state_json);
+    var parsed_state = try std.json.parseFromSlice(std.json.Value, allocator, state_json, .{});
+    defer parsed_state.deinit();
+    const projects_val = parsed_state.value.object.get("projects").?;
+    try std.testing.expect(projects_val == .array);
+
+    var spider_token: ?[]const u8 = null;
+    for (projects_val.array.items) |item| {
+        if (item != .object) continue;
+        const id_val = item.object.get("id") orelse continue;
+        if (id_val != .string) continue;
+        if (!std.mem.eql(u8, id_val.string, spider_web_project_id)) continue;
+        const token_val = item.object.get("mutation_token") orelse continue;
+        if (token_val == .string) {
+            spider_token = token_val.string;
+            break;
+        }
+    }
+    try std.testing.expect(spider_token != null);
+
+    const missing_token_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"project_id\":\"{s}\"}}",
+        .{spider_web_project_id},
+    );
+    defer allocator.free(missing_token_req);
+    try std.testing.expectError(ControlPlaneError.MissingField, plane.projectUp("mother", missing_token_req));
+
+    const bad_token_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"project_id\":\"{s}\",\"project_token\":\"bad-token\"}}",
+        .{spider_web_project_id},
+    );
+    defer allocator.free(bad_token_req);
+    try std.testing.expectError(ControlPlaneError.ProjectAuthFailed, plane.projectUp("mother", bad_token_req));
+
+    const ok_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"project_id\":\"{s}\",\"project_token\":\"{s}\"}}",
+        .{ spider_web_project_id, spider_token.? },
+    );
+    defer allocator.free(ok_req);
+    const ok_json = try plane.projectUp("mother", ok_req);
+    defer allocator.free(ok_json);
+    try std.testing.expect(std.mem.indexOf(u8, ok_json, "\"created\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ok_json, "\"activated\":true") != null);
 }
 
 test "acheron_control_plane: primary agent can upsert existing non-system project by name without token" {
