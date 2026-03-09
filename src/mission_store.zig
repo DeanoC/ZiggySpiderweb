@@ -140,6 +140,51 @@ pub const MissionEvent = struct {
     }
 };
 
+pub const MissionContract = struct {
+    contract_id: []u8,
+    context_path: ?[]u8 = null,
+    state_path: ?[]u8 = null,
+    artifact_root: ?[]u8 = null,
+
+    fn deinit(self: *MissionContract, allocator: std.mem.Allocator) void {
+        allocator.free(self.contract_id);
+        if (self.context_path) |value| allocator.free(value);
+        if (self.state_path) |value| allocator.free(value);
+        if (self.artifact_root) |value| allocator.free(value);
+        self.* = undefined;
+    }
+
+    fn cloneOwned(self: MissionContract, allocator: std.mem.Allocator) !MissionContract {
+        return .{
+            .contract_id = try allocator.dupe(u8, self.contract_id),
+            .context_path = if (self.context_path) |value| try allocator.dupe(u8, value) else null,
+            .state_path = if (self.state_path) |value| try allocator.dupe(u8, value) else null,
+            .artifact_root = if (self.artifact_root) |value| try allocator.dupe(u8, value) else null,
+        };
+    }
+
+    fn applyUpdate(self: *MissionContract, allocator: std.mem.Allocator, input: MissionContractUpdateInput) !void {
+        if (input.contract_id) |value| try replaceOptionalString(allocator, &self.contract_id, value);
+        if (input.context_path) |value| try replaceOptionalOwnedString(allocator, &self.context_path, value);
+        if (input.state_path) |value| try replaceOptionalOwnedString(allocator, &self.state_path, value);
+        if (input.artifact_root) |value| try replaceOptionalOwnedString(allocator, &self.artifact_root, value);
+    }
+};
+
+pub const MissionContractInput = struct {
+    contract_id: []const u8,
+    context_path: ?[]const u8 = null,
+    state_path: ?[]const u8 = null,
+    artifact_root: ?[]const u8 = null,
+};
+
+pub const MissionContractUpdateInput = struct {
+    contract_id: ?[]const u8 = null,
+    context_path: ?[]const u8 = null,
+    state_path: ?[]const u8 = null,
+    artifact_root: ?[]const u8 = null,
+};
+
 pub const MissionRecord = struct {
     mission_id: []u8,
     use_case: []u8,
@@ -161,6 +206,7 @@ pub const MissionRecord = struct {
     blocked_reason: ?[]u8 = null,
     summary: ?[]u8 = null,
     next_event_seq: u64 = 1,
+    contract: ?MissionContract = null,
     pending_approval: ?MissionApproval = null,
     artifacts: std.ArrayListUnmanaged(MissionArtifact) = .{},
     events: std.ArrayListUnmanaged(MissionEvent) = .{},
@@ -179,6 +225,7 @@ pub const MissionRecord = struct {
         if (self.recovery_reason) |value| allocator.free(value);
         if (self.blocked_reason) |value| allocator.free(value);
         if (self.summary) |value| allocator.free(value);
+        if (self.contract) |*value| value.deinit(allocator);
         if (self.pending_approval) |*value| value.deinit(allocator);
         for (self.artifacts.items) |*item| item.deinit(allocator);
         self.artifacts.deinit(allocator);
@@ -209,6 +256,7 @@ pub const MissionRecord = struct {
             .blocked_reason = if (self.blocked_reason) |value| try allocator.dupe(u8, value) else null,
             .summary = if (self.summary) |value| try allocator.dupe(u8, value) else null,
             .next_event_seq = self.next_event_seq,
+            .contract = if (self.contract) |value| try value.cloneOwned(allocator) else null,
             .pending_approval = if (self.pending_approval) |value| try value.cloneOwned(allocator) else null,
         };
         errdefer cloned.deinit(allocator);
@@ -235,6 +283,7 @@ pub const CreateMissionInput = struct {
     run_id: ?[]const u8 = null,
     workspace_root: ?[]const u8 = null,
     worktree_name: ?[]const u8 = null,
+    contract: ?MissionContractInput = null,
     created_by: MissionActorInput,
 };
 
@@ -242,6 +291,7 @@ pub const CheckpointInput = struct {
     stage: ?[]const u8 = null,
     summary: ?[]const u8 = null,
     artifact: ?MissionArtifactInput = null,
+    contract: ?MissionContractUpdateInput = null,
 };
 
 pub const ServiceInvocationInput = struct {
@@ -253,6 +303,7 @@ pub const ServiceInvocationInput = struct {
     result_payload_json: ?[]const u8 = null,
     status_payload_json: ?[]const u8 = null,
     artifact: MissionArtifactInput,
+    contract: ?MissionContractUpdateInput = null,
     actor: MissionActorInput,
 };
 
@@ -280,6 +331,7 @@ pub const TransitionInput = struct {
     stage: ?[]const u8 = null,
     reason: ?[]const u8 = null,
     summary: ?[]const u8 = null,
+    contract: ?MissionContractUpdateInput = null,
     actor: MissionActorInput,
 };
 
@@ -362,6 +414,7 @@ pub const MissionStore = struct {
             },
             .created_at_ms = now_ms,
             .updated_at_ms = now_ms,
+            .contract = if (input.contract) |value| try cloneMissionContractInput(self.allocator, value) else null,
         };
         errdefer record.deinit(self.allocator);
 
@@ -442,6 +495,10 @@ pub const MissionStore = struct {
         if (input.stage) |value| try replaceOptionalString(self.allocator, &record.stage, value);
         if (input.summary) |value| try replaceOptionalOwnedString(self.allocator, &record.summary, value);
         if (input.artifact) |artifact| try appendArtifactLocked(self.allocator, record, artifact, now_ms);
+        if (input.contract) |value| {
+            var contract = try requireContractLocked(record);
+            try contract.applyUpdate(self.allocator, value);
+        }
 
         const artifact_json = if (input.artifact) |artifact| blk: {
             const kind = try jsonStringOrNull(self.allocator, artifact.kind);
@@ -495,6 +552,10 @@ pub const MissionStore = struct {
         if (input.stage) |value| try replaceOptionalString(self.allocator, &record.stage, value);
         if (input.summary) |value| try replaceOptionalOwnedString(self.allocator, &record.summary, value);
         try appendArtifactLocked(self.allocator, record, input.artifact, now_ms);
+        if (input.contract) |value| {
+            var contract = try requireContractLocked(record);
+            try contract.applyUpdate(self.allocator, value);
+        }
 
         const service_path_json = try jsonStringOrNull(self.allocator, input.service_path);
         defer self.allocator.free(service_path_json);
@@ -723,6 +784,10 @@ pub const MissionStore = struct {
         record.updated_at_ms = now_ms;
         if (input.stage) |value| try replaceOptionalString(self.allocator, &record.stage, value);
         if (input.summary) |value| try replaceOptionalOwnedString(self.allocator, &record.summary, value);
+        if (input.contract) |value| {
+            var contract = try requireContractLocked(record);
+            try contract.applyUpdate(self.allocator, value);
+        }
 
         switch (input.next_state) {
             .blocked => {
@@ -798,6 +863,12 @@ pub const MissionStore = struct {
             resolution_note: ?[]const u8 = null,
             resolution: ?[]const u8 = null,
         };
+        const PersistedMissionContract = struct {
+            contract_id: []const u8,
+            context_path: ?[]const u8 = null,
+            state_path: ?[]const u8 = null,
+            artifact_root: ?[]const u8 = null,
+        };
         const PersistedMissionRecord = struct {
             mission_id: []const u8,
             use_case: []const u8,
@@ -820,12 +891,13 @@ pub const MissionStore = struct {
             blocked_reason: ?[]const u8 = null,
             summary: ?[]const u8 = null,
             next_event_seq: u64 = 1,
+            contract: ?PersistedMissionContract = null,
             pending_approval: ?PersistedMissionApproval = null,
             artifacts: ?[]PersistedMissionArtifact = null,
             events: ?[]PersistedMissionEvent = null,
         };
         const Persisted = struct {
-            schema: u32 = 1,
+            schema: u32 = 2,
             next_mission_seq: u64 = 1,
             next_approval_seq: u64 = 1,
             missions: ?[]PersistedMissionRecord = null,
@@ -865,6 +937,7 @@ pub const MissionStore = struct {
                 .blocked_reason = if (item.blocked_reason) |value| try self.allocator.dupe(u8, value) else null,
                 .summary = if (item.summary) |value| try self.allocator.dupe(u8, value) else null,
                 .next_event_seq = item.next_event_seq,
+                .contract = if (item.contract) |value| try clonePersistedMissionContract(self.allocator, value) else null,
             };
             errdefer record.deinit(self.allocator);
 
@@ -942,6 +1015,12 @@ pub const MissionStore = struct {
             resolution_note: ?[]const u8 = null,
             resolution: ?[]const u8 = null,
         };
+        const PersistedMissionContract = struct {
+            contract_id: []const u8,
+            context_path: ?[]const u8 = null,
+            state_path: ?[]const u8 = null,
+            artifact_root: ?[]const u8 = null,
+        };
         const PersistedMissionRecord = struct {
             mission_id: []const u8,
             use_case: []const u8,
@@ -964,12 +1043,13 @@ pub const MissionStore = struct {
             blocked_reason: ?[]const u8 = null,
             summary: ?[]const u8 = null,
             next_event_seq: u64 = 1,
+            contract: ?PersistedMissionContract = null,
             pending_approval: ?PersistedMissionApproval = null,
             artifacts: ?[]PersistedMissionArtifact = null,
             events: ?[]PersistedMissionEvent = null,
         };
         const Persisted = struct {
-            schema: u32 = 1,
+            schema: u32 = 2,
             next_mission_seq: u64,
             next_approval_seq: u64,
             missions: ?[]PersistedMissionRecord = null,
@@ -1038,6 +1118,12 @@ pub const MissionStore = struct {
                     .blocked_reason = mission.blocked_reason,
                     .summary = mission.summary,
                     .next_event_seq = mission.next_event_seq,
+                    .contract = if (mission.contract) |contract| .{
+                        .contract_id = contract.contract_id,
+                        .context_path = contract.context_path,
+                        .state_path = contract.state_path,
+                        .artifact_root = contract.artifact_root,
+                    } else null,
                     .pending_approval = if (mission.pending_approval) |approval| .{
                         .approval_id = approval.approval_id,
                         .action_kind = approval.action_kind,
@@ -1088,6 +1174,27 @@ pub const MissionStore = struct {
     }
 };
 
+fn cloneMissionContractInput(allocator: std.mem.Allocator, input: MissionContractInput) !MissionContract {
+    return .{
+        .contract_id = try allocator.dupe(u8, input.contract_id),
+        .context_path = if (input.context_path) |value| try allocator.dupe(u8, value) else null,
+        .state_path = if (input.state_path) |value| try allocator.dupe(u8, value) else null,
+        .artifact_root = if (input.artifact_root) |value| try allocator.dupe(u8, value) else null,
+    };
+}
+
+fn clonePersistedMissionContract(
+    allocator: std.mem.Allocator,
+    input: anytype,
+) !MissionContract {
+    return .{
+        .contract_id = try allocator.dupe(u8, input.contract_id),
+        .context_path = if (input.context_path) |value| try allocator.dupe(u8, value) else null,
+        .state_path = if (input.state_path) |value| try allocator.dupe(u8, value) else null,
+        .artifact_root = if (input.artifact_root) |value| try allocator.dupe(u8, value) else null,
+    };
+}
+
 pub fn missionStateName(state: MissionState) []const u8 {
     return @tagName(state);
 }
@@ -1127,6 +1234,11 @@ fn matchesFilter(record: MissionRecord, filter: MissionFilter) bool {
         if (record.project_id == null or !std.mem.eql(u8, record.project_id.?, value)) return false;
     }
     return true;
+}
+
+fn requireContractLocked(record: *MissionRecord) !*MissionContract {
+    if (record.contract) |*value| return value;
+    return MissionStoreError.InvalidMissionRecord;
 }
 
 fn findMissionIndexLocked(items: []MissionRecord, mission_id: []const u8) ?usize {
@@ -1241,26 +1353,40 @@ test "mission_store: create checkpoint recover and transition records state" {
     var created = try store.create(allocator, .{
         .use_case = "pr_review",
         .title = "Review PR #123",
+        .contract = .{
+            .contract_id = "spider_monkey/pr_review@v1",
+            .context_path = "/workspace/pr-review/state/pr-123/context.json",
+        },
         .created_by = .{ .actor_type = "agent", .actor_id = "worker-a" },
     });
     defer created.deinit(allocator);
     try std.testing.expectEqual(MissionState.planning, created.state);
+    try std.testing.expect(created.contract != null);
+    try std.testing.expectEqualStrings("spider_monkey/pr_review@v1", created.contract.?.contract_id);
 
     var running = try store.transition(allocator, created.mission_id, .{
         .next_state = .running,
         .stage = "collecting_context",
+        .contract = .{
+            .state_path = "/workspace/pr-review/state/pr-123/state.json",
+        },
         .actor = .{ .actor_type = "agent", .actor_id = "worker-a" },
     });
     defer running.deinit(allocator);
     try std.testing.expectEqual(MissionState.running, running.state);
+    try std.testing.expectEqualStrings("/workspace/pr-review/state/pr-123/state.json", running.contract.?.state_path.?);
 
     var checkpointed = try store.recordCheckpoint(allocator, created.mission_id, .{
         .summary = "Scanned changed files",
         .artifact = .{ .kind = "notes", .summary = "review notes" },
+        .contract = .{
+            .artifact_root = "/workspace/pr-review/runs/pr-123",
+        },
     });
     defer checkpointed.deinit(allocator);
     try std.testing.expectEqual(@as(u64, 1), checkpointed.checkpoint_seq);
     try std.testing.expectEqual(@as(usize, 1), checkpointed.artifacts.items.len);
+    try std.testing.expectEqualStrings("/workspace/pr-review/runs/pr-123", checkpointed.contract.?.artifact_root.?);
 
     var recovering = try store.recordRecovery(allocator, created.mission_id, .{
         .reason = "runtime_restart",
@@ -1334,6 +1460,10 @@ test "mission_store: service invocation records artifact and event" {
 
     var created = try store.create(allocator, .{
         .use_case = "pr_review",
+        .contract = .{
+            .contract_id = "spider_monkey/pr_review@v1",
+            .context_path = "/workspace/pr-review/state/pr-456/context.json",
+        },
         .created_by = .{ .actor_type = "agent", .actor_id = "planner" },
     });
     defer created.deinit(allocator);
@@ -1358,6 +1488,9 @@ test "mission_store: service invocation records artifact and event" {
             .path = "/global/memory/result.json",
             .summary = "Created review note",
         },
+        .contract = .{
+            .artifact_root = "/workspace/pr-review/runs/pr-456",
+        },
         .actor = .{ .actor_type = "agent", .actor_id = "planner" },
     });
     defer invoked.deinit(allocator);
@@ -1367,6 +1500,8 @@ test "mission_store: service invocation records artifact and event" {
     try std.testing.expect(std.mem.eql(u8, invoked.summary.?, "Created memory note"));
     try std.testing.expectEqualStrings("service_result", invoked.artifacts.items[0].kind);
     try std.testing.expectEqualStrings("/global/memory/result.json", invoked.artifacts.items[0].path.?);
+    try std.testing.expect(invoked.contract != null);
+    try std.testing.expectEqualStrings("/workspace/pr-review/runs/pr-456", invoked.contract.?.artifact_root.?);
     try std.testing.expect(invoked.events.items.len >= 3);
     const latest_event = invoked.events.items[invoked.events.items.len - 1];
     try std.testing.expectEqualStrings("mission.service_invoked", latest_event.event_type);
@@ -1390,6 +1525,10 @@ test "mission_store: persists records across restart" {
         var created = try first.create(allocator, .{
             .use_case = "pr_review",
             .title = "Persistent mission",
+            .contract = .{
+                .contract_id = "spider_monkey/pr_review@v1",
+                .context_path = "/workspace/pr-review/state/pr-789/context.json",
+            },
             .created_by = .{ .actor_type = "agent", .actor_id = "builder" },
         });
         defer created.deinit(allocator);
@@ -1401,6 +1540,9 @@ test "mission_store: persists records across restart" {
         defer running.deinit(allocator);
         var checkpoint = try first.recordCheckpoint(allocator, created.mission_id, .{
             .summary = "checkpoint one",
+            .contract = .{
+                .artifact_root = "/workspace/pr-review/runs/pr-789",
+            },
         });
         defer checkpoint.deinit(allocator);
     }
@@ -1413,4 +1555,7 @@ test "mission_store: persists records across restart" {
     try std.testing.expectEqual(MissionState.running, list[0].state);
     try std.testing.expectEqual(@as(u64, 1), list[0].checkpoint_seq);
     try std.testing.expect(std.mem.eql(u8, list[0].stage, "working"));
+    try std.testing.expect(list[0].contract != null);
+    try std.testing.expectEqualStrings("spider_monkey/pr_review@v1", list[0].contract.?.contract_id);
+    try std.testing.expectEqualStrings("/workspace/pr-review/runs/pr-789", list[0].contract.?.artifact_root.?);
 }
