@@ -15,7 +15,12 @@
     "findings": "findings.json",
     "validation": "validation.json",
     "recommendation": "recommendation.json",
-    "thread_actions": "thread-actions.json"
+    "thread_actions": "thread-actions.json",
+    "provider_sync": "services/provider-sync.json",
+    "checkout": "services/checkout.json",
+    "repo_status": "services/repo-status.json",
+    "diff_range": "services/diff-range.json",
+    "publish_review": "services/publish-review.json"
   },
   "notes": []
 }

@@ -52,6 +52,13 @@ const SpecialKind = enum {
     projects_list,
     projects_get,
     projects_up,
+    git_invoke,
+    git_sync_checkout,
+    git_status,
+    git_diff_range,
+    github_pr_invoke,
+    github_pr_sync,
+    github_pr_publish_review,
     pr_review_invoke,
     pr_review_start,
     pr_review_sync,
@@ -429,6 +436,10 @@ pub const Session = struct {
     agents_result_id: u32 = 0,
     projects_status_id: u32 = 0,
     projects_result_id: u32 = 0,
+    git_status_id: u32 = 0,
+    git_result_id: u32 = 0,
+    github_pr_status_id: u32 = 0,
+    github_pr_result_id: u32 = 0,
     pr_review_status_id: u32 = 0,
     pr_review_result_id: u32 = 0,
     missions_status_id: u32 = 0,
@@ -1263,6 +1274,41 @@ pub const Session = struct {
                 };
                 written = outcome.written;
             },
+            .git_invoke,
+            .git_sync_checkout,
+            .git_status,
+            .git_diff_range,
+            => {
+                const outcome = self.handleGitNamespaceWrite(node.special, state.node_id, data) catch |err| switch (err) {
+                    error.InvalidPayload => {
+                        return unified.buildFsrpcError(
+                            self.allocator,
+                            msg.tag,
+                            "invalid",
+                            "git payload is invalid for requested operation",
+                        );
+                    },
+                    else => return err,
+                };
+                written = outcome.written;
+            },
+            .github_pr_invoke,
+            .github_pr_sync,
+            .github_pr_publish_review,
+            => {
+                const outcome = self.handleGitHubPrNamespaceWrite(node.special, state.node_id, data) catch |err| switch (err) {
+                    error.InvalidPayload => {
+                        return unified.buildFsrpcError(
+                            self.allocator,
+                            msg.tag,
+                            "invalid",
+                            "github_pr payload is invalid for requested operation",
+                        );
+                    },
+                    else => return err,
+                };
+                written = outcome.written;
+            },
             .pr_review_invoke,
             .pr_review_start,
             .pr_review_sync,
@@ -1881,6 +1927,12 @@ pub const Session = struct {
         try self.seedAgentSearchCodeNamespace(search_code_dir);
         const terminal_dir = try self.addDir(global_root, "terminal", false);
         try self.seedAgentTerminalNamespace(terminal_dir);
+        if (self.local_fs_export_root != null) {
+            const git_dir = try self.addDir(global_root, "git", false);
+            try self.seedAgentGitNamespace(git_dir);
+            const github_pr_dir = try self.addDir(global_root, "github_pr", false);
+            try self.seedAgentGitHubPrNamespace(github_pr_dir);
+        }
         const mounts_dir = try self.addDir(global_root, "mounts", false);
         try self.seedAgentMountsNamespace(mounts_dir);
         const sub_brains_dir = try self.addDir(global_root, "sub_brains", false);
@@ -3065,6 +3117,163 @@ pub const Session = struct {
         _ = try self.addFile(control_dir, "read.json", "", true, .terminal_v2_read);
         _ = try self.addFile(control_dir, "resize.json", "", true, .terminal_v2_resize);
         _ = try self.addFile(control_dir, "exec.json", "", true, .terminal_v2_exec);
+    }
+
+    fn seedAgentGitNamespace(self: *Session, git_dir: u32) !void {
+        try self.addDirectoryDescriptors(
+            git_dir,
+            "Git",
+            "{\"kind\":\"venom\",\"venom_id\":\"git\",\"shape\":\"/global/git/{README.md,SCHEMA.json,TEMPLATE.json,CAPS.json,OPS.json,RUNTIME.json,HOST.json,PERMISSIONS.json,STATUS.json,status.json,result.json,control/*}\"}",
+            "{\"invoke\":true,\"operations\":[\"git_sync_checkout\",\"git_status\",\"git_diff_range\"],\"discoverable\":true,\"workspace_fs\":true}",
+            "Repository checkout and diff helpers backed by the runtime shell_exec tool. Prefer these high-level operations over ad-hoc git shell commands.",
+        );
+        _ = try self.addFile(
+            git_dir,
+            "OPS.json",
+            "{\"model\":\"local_bridge\",\"invoke\":\"control/invoke.json\",\"transport\":\"acheron-local\",\"paths\":{\"sync_checkout\":\"control/sync_checkout.json\",\"status\":\"control/status.json\",\"diff_range\":\"control/diff_range.json\"},\"operations\":{\"sync_checkout\":\"git_sync_checkout\",\"status\":\"git_status\",\"diff_range\":\"git_diff_range\"}}",
+            false,
+            .none,
+        );
+        _ = try self.addFile(
+            git_dir,
+            "RUNTIME.json",
+            "{\"type\":\"acheron_local\",\"component\":\"acheron_session\",\"subject\":\"git_repo_service\",\"tool_backend\":\"shell_exec\"}",
+            false,
+            .none,
+        );
+        _ = try self.addFile(
+            git_dir,
+            "HOST.json",
+            "{\"runtime_kind\":\"acheron_local\",\"component\":\"acheron_session\",\"subject\":\"git_repo_service\",\"tool_backend\":\"shell_exec\"}",
+            false,
+            .none,
+        );
+        _ = try self.addFile(
+            git_dir,
+            "TEMPLATE.json",
+            "{\"op\":\"sync_checkout\",\"arguments\":{\"repo_key\":\"owner/repo\",\"pr_number\":123,\"checkout_path\":\"/nodes/local/fs/pr-review/repos/owner__repo\"}}",
+            false,
+            .none,
+        );
+        _ = try self.addFile(
+            git_dir,
+            "PERMISSIONS.json",
+            "{\"default\":\"allow-by-default\",\"allow_roles\":[\"admin\",\"user\"],\"scope\":\"agent\"}",
+            false,
+            .none,
+        );
+        _ = try self.addFile(
+            git_dir,
+            "STATUS.json",
+            "{\"venom_id\":\"git\",\"state\":\"namespace\",\"has_invoke\":true}",
+            false,
+            .none,
+        );
+        self.git_status_id = try self.addFile(
+            git_dir,
+            "status.json",
+            "{\"state\":\"idle\",\"tool\":null,\"updated_at_ms\":0,\"error\":null}",
+            false,
+            .none,
+        );
+        self.git_result_id = try self.addFile(
+            git_dir,
+            "result.json",
+            "{\"ok\":false,\"operation\":null,\"result\":null,\"error\":null}",
+            false,
+            .none,
+        );
+
+        const control_dir = try self.addDir(git_dir, "control", false);
+        _ = try self.addFile(
+            control_dir,
+            "README.md",
+            "Use sync_checkout.json to clone/fetch and align a repo checkout, status.json to inspect repository state, diff_range.json to list changed files, or invoke.json with op plus arguments.\n",
+            false,
+            .none,
+        );
+        _ = try self.addFile(control_dir, "invoke.json", "", true, .git_invoke);
+        _ = try self.addFile(control_dir, "sync_checkout.json", "", true, .git_sync_checkout);
+        _ = try self.addFile(control_dir, "status.json", "", true, .git_status);
+        _ = try self.addFile(control_dir, "diff_range.json", "", true, .git_diff_range);
+    }
+
+    fn seedAgentGitHubPrNamespace(self: *Session, github_pr_dir: u32) !void {
+        try self.addDirectoryDescriptors(
+            github_pr_dir,
+            "GitHub PR",
+            "{\"kind\":\"venom\",\"venom_id\":\"github_pr\",\"shape\":\"/global/github_pr/{README.md,SCHEMA.json,TEMPLATE.json,CAPS.json,OPS.json,RUNTIME.json,HOST.json,PERMISSIONS.json,STATUS.json,status.json,result.json,control/*}\"}",
+            "{\"invoke\":true,\"operations\":[\"github_pr_sync\",\"github_pr_publish_review\"],\"discoverable\":true,\"network\":true}",
+            "GitHub pull-request helpers backed by the gh CLI through the runtime shell_exec tool. Use sync to load provider PR metadata and publish_review for top-level review submission.",
+        );
+        _ = try self.addFile(
+            github_pr_dir,
+            "OPS.json",
+            "{\"model\":\"local_bridge\",\"invoke\":\"control/invoke.json\",\"transport\":\"acheron-local\",\"paths\":{\"sync\":\"control/sync.json\",\"publish_review\":\"control/publish_review.json\"},\"operations\":{\"sync\":\"github_pr_sync\",\"publish_review\":\"github_pr_publish_review\"}}",
+            false,
+            .none,
+        );
+        _ = try self.addFile(
+            github_pr_dir,
+            "RUNTIME.json",
+            "{\"type\":\"acheron_local\",\"component\":\"acheron_session\",\"subject\":\"github_pr_service\",\"tool_backend\":\"shell_exec\",\"cli\":\"gh\"}",
+            false,
+            .none,
+        );
+        _ = try self.addFile(
+            github_pr_dir,
+            "HOST.json",
+            "{\"runtime_kind\":\"acheron_local\",\"component\":\"acheron_session\",\"subject\":\"github_pr_service\",\"tool_backend\":\"shell_exec\",\"cli\":\"gh\"}",
+            false,
+            .none,
+        );
+        _ = try self.addFile(
+            github_pr_dir,
+            "TEMPLATE.json",
+            "{\"op\":\"sync\",\"arguments\":{\"repo_key\":\"owner/repo\",\"pr_number\":123}}",
+            false,
+            .none,
+        );
+        _ = try self.addFile(
+            github_pr_dir,
+            "PERMISSIONS.json",
+            "{\"default\":\"allow-by-default\",\"allow_roles\":[\"admin\",\"user\"],\"scope\":\"agent\"}",
+            false,
+            .none,
+        );
+        _ = try self.addFile(
+            github_pr_dir,
+            "STATUS.json",
+            "{\"venom_id\":\"github_pr\",\"state\":\"namespace\",\"has_invoke\":true}",
+            false,
+            .none,
+        );
+        self.github_pr_status_id = try self.addFile(
+            github_pr_dir,
+            "status.json",
+            "{\"state\":\"idle\",\"tool\":null,\"updated_at_ms\":0,\"error\":null}",
+            false,
+            .none,
+        );
+        self.github_pr_result_id = try self.addFile(
+            github_pr_dir,
+            "result.json",
+            "{\"ok\":false,\"operation\":null,\"result\":null,\"error\":null}",
+            false,
+            .none,
+        );
+
+        const control_dir = try self.addDir(github_pr_dir, "control", false);
+        _ = try self.addFile(
+            control_dir,
+            "README.md",
+            "Use sync.json to load provider metadata for a PR and publish_review.json to submit a top-level review through gh. invoke.json accepts op=sync|publish_review plus arguments.\n",
+            false,
+            .none,
+        );
+        _ = try self.addFile(control_dir, "invoke.json", "", true, .github_pr_invoke);
+        _ = try self.addFile(control_dir, "sync.json", "", true, .github_pr_sync);
+        _ = try self.addFile(control_dir, "publish_review.json", "", true, .github_pr_publish_review);
     }
 
     fn seedAgentMountsNamespace(self: *Session, mounts_dir: u32) !void {
@@ -9110,6 +9319,17 @@ pub const Session = struct {
         up,
     };
 
+    const GitOp = enum {
+        sync_checkout,
+        status,
+        diff_range,
+    };
+
+    const GitHubPrOp = enum {
+        sync,
+        publish_review,
+    };
+
     const PrReviewOp = enum {
         start,
         sync,
@@ -9331,6 +9551,963 @@ pub const Session = struct {
         };
     }
 
+    const ParsedShellExecResult = struct {
+        exit_code: i32,
+        stdout: []u8,
+        stderr: []u8,
+
+        fn deinit(self: *ParsedShellExecResult, allocator: std.mem.Allocator) void {
+            allocator.free(self.stdout);
+            allocator.free(self.stderr);
+            self.* = undefined;
+        }
+    };
+
+    const ShellExecOutcome = union(enum) {
+        success: ParsedShellExecResult,
+        failure: ToolPayloadErrorInfo,
+
+        fn deinit(self: *ShellExecOutcome, allocator: std.mem.Allocator) void {
+            switch (self.*) {
+                .success => |*value| value.deinit(allocator),
+                .failure => |*value| value.deinit(allocator),
+            }
+            self.* = undefined;
+        }
+    };
+
+    fn handleGitNamespaceWrite(self: *Session, special: SpecialKind, node_id: u32, raw_input: []const u8) !WriteOutcome {
+        const input = std.mem.trim(u8, raw_input, " \t\r\n");
+        const payload = if (input.len == 0) "{}" else input;
+        try self.setFileContent(node_id, payload);
+
+        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, payload, .{}) catch return error.InvalidPayload;
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidPayload;
+        const obj = parsed.value.object;
+
+        const op = switch (special) {
+            .git_sync_checkout => GitOp.sync_checkout,
+            .git_status => GitOp.status,
+            .git_diff_range => GitOp.diff_range,
+            .git_invoke => blk: {
+                const op_raw = blk2: {
+                    if (obj.get("op")) |value| if (value == .string and value.string.len > 0) break :blk2 value.string;
+                    if (obj.get("operation")) |value| if (value == .string and value.string.len > 0) break :blk2 value.string;
+                    if (obj.get("tool")) |value| if (value == .string and value.string.len > 0) break :blk2 value.string;
+                    if (obj.get("tool_name")) |value| if (value == .string and value.string.len > 0) break :blk2 value.string;
+                    break :blk2 null;
+                } orelse return error.InvalidPayload;
+                break :blk parseGitOp(op_raw) orelse return error.InvalidPayload;
+            },
+            else => return error.InvalidPayload,
+        };
+
+        const args_obj = blk: {
+            if (obj.get("arguments")) |value| {
+                if (value != .object) return error.InvalidPayload;
+                break :blk value.object;
+            }
+            if (obj.get("args")) |value| {
+                if (value != .object) return error.InvalidPayload;
+                break :blk value.object;
+            }
+            break :blk obj;
+        };
+
+        return self.executeGitOp(op, args_obj, raw_input.len);
+    }
+
+    fn handleGitHubPrNamespaceWrite(self: *Session, special: SpecialKind, node_id: u32, raw_input: []const u8) !WriteOutcome {
+        const input = std.mem.trim(u8, raw_input, " \t\r\n");
+        const payload = if (input.len == 0) "{}" else input;
+        try self.setFileContent(node_id, payload);
+
+        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, payload, .{}) catch return error.InvalidPayload;
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidPayload;
+        const obj = parsed.value.object;
+
+        const op = switch (special) {
+            .github_pr_sync => GitHubPrOp.sync,
+            .github_pr_publish_review => GitHubPrOp.publish_review,
+            .github_pr_invoke => blk: {
+                const op_raw = blk2: {
+                    if (obj.get("op")) |value| if (value == .string and value.string.len > 0) break :blk2 value.string;
+                    if (obj.get("operation")) |value| if (value == .string and value.string.len > 0) break :blk2 value.string;
+                    if (obj.get("tool")) |value| if (value == .string and value.string.len > 0) break :blk2 value.string;
+                    if (obj.get("tool_name")) |value| if (value == .string and value.string.len > 0) break :blk2 value.string;
+                    break :blk2 null;
+                } orelse return error.InvalidPayload;
+                break :blk parseGitHubPrOp(op_raw) orelse return error.InvalidPayload;
+            },
+            else => return error.InvalidPayload,
+        };
+
+        const args_obj = blk: {
+            if (obj.get("arguments")) |value| {
+                if (value != .object) return error.InvalidPayload;
+                break :blk value.object;
+            }
+            if (obj.get("args")) |value| {
+                if (value != .object) return error.InvalidPayload;
+                break :blk value.object;
+            }
+            break :blk obj;
+        };
+
+        return self.executeGitHubPrOp(op, args_obj, raw_input.len);
+    }
+
+    fn parseGitOp(raw: []const u8) ?GitOp {
+        const value = std.mem.trim(u8, raw, " \t\r\n");
+        if (std.mem.eql(u8, value, "sync_checkout") or std.mem.eql(u8, value, "git_sync_checkout")) return .sync_checkout;
+        if (std.mem.eql(u8, value, "status") or std.mem.eql(u8, value, "git_status")) return .status;
+        if (std.mem.eql(u8, value, "diff_range") or std.mem.eql(u8, value, "git_diff_range")) return .diff_range;
+        return null;
+    }
+
+    fn parseGitHubPrOp(raw: []const u8) ?GitHubPrOp {
+        const value = std.mem.trim(u8, raw, " \t\r\n");
+        if (std.mem.eql(u8, value, "sync") or std.mem.eql(u8, value, "github_pr_sync")) return .sync;
+        if (std.mem.eql(u8, value, "publish_review") or std.mem.eql(u8, value, "github_pr_publish_review")) return .publish_review;
+        return null;
+    }
+
+    fn gitOperationName(op: GitOp) []const u8 {
+        return switch (op) {
+            .sync_checkout => "sync_checkout",
+            .status => "status",
+            .diff_range => "diff_range",
+        };
+    }
+
+    fn gitStatusToolName(op: GitOp) []const u8 {
+        return switch (op) {
+            .sync_checkout => "git_sync_checkout",
+            .status => "git_status",
+            .diff_range => "git_diff_range",
+        };
+    }
+
+    fn gitHubPrOperationName(op: GitHubPrOp) []const u8 {
+        return switch (op) {
+            .sync => "sync",
+            .publish_review => "publish_review",
+        };
+    }
+
+    fn gitHubPrStatusToolName(op: GitHubPrOp) []const u8 {
+        return switch (op) {
+            .sync => "github_pr_sync",
+            .publish_review => "github_pr_publish_review",
+        };
+    }
+
+    fn executeGitOp(self: *Session, op: GitOp, args_obj: std.json.ObjectMap, written: usize) !WriteOutcome {
+        const tool_name = gitStatusToolName(op);
+        const running_status = try self.buildServiceInvokeStatusJson("running", tool_name, null);
+        defer self.allocator.free(running_status);
+        if (self.git_status_id != 0) try self.setFileContent(self.git_status_id, running_status);
+
+        const result_payload = self.executeGitOpPayload(op, args_obj) catch |err| {
+            const error_message = @errorName(err);
+            const failed_status = try self.buildServiceInvokeStatusJson("failed", tool_name, error_message);
+            defer self.allocator.free(failed_status);
+            if (self.git_status_id != 0) try self.setFileContent(self.git_status_id, failed_status);
+            const failed_result = try self.buildGitFailureResultJson(op, "invalid_payload", error_message);
+            defer self.allocator.free(failed_result);
+            if (self.git_result_id != 0) try self.setFileContent(self.git_result_id, failed_result);
+            return err;
+        };
+        defer self.allocator.free(result_payload);
+
+        if (try self.extractErrorMessageFromToolPayload(result_payload)) |message| {
+            defer self.allocator.free(message);
+            const failed_status = try self.buildServiceInvokeStatusJson("failed", tool_name, message);
+            defer self.allocator.free(failed_status);
+            if (self.git_status_id != 0) try self.setFileContent(self.git_status_id, failed_status);
+        } else {
+            const done_status = try self.buildServiceInvokeStatusJson("done", tool_name, null);
+            defer self.allocator.free(done_status);
+            if (self.git_status_id != 0) try self.setFileContent(self.git_status_id, done_status);
+        }
+        if (self.git_result_id != 0) try self.setFileContent(self.git_result_id, result_payload);
+        return .{ .written = written };
+    }
+
+    fn executeGitHubPrOp(self: *Session, op: GitHubPrOp, args_obj: std.json.ObjectMap, written: usize) !WriteOutcome {
+        const tool_name = gitHubPrStatusToolName(op);
+        const running_status = try self.buildServiceInvokeStatusJson("running", tool_name, null);
+        defer self.allocator.free(running_status);
+        if (self.github_pr_status_id != 0) try self.setFileContent(self.github_pr_status_id, running_status);
+
+        const result_payload = self.executeGitHubPrOpPayload(op, args_obj) catch |err| {
+            const error_message = @errorName(err);
+            const failed_status = try self.buildServiceInvokeStatusJson("failed", tool_name, error_message);
+            defer self.allocator.free(failed_status);
+            if (self.github_pr_status_id != 0) try self.setFileContent(self.github_pr_status_id, failed_status);
+            const failed_result = try self.buildGitHubPrFailureResultJson(op, "invalid_payload", error_message);
+            defer self.allocator.free(failed_result);
+            if (self.github_pr_result_id != 0) try self.setFileContent(self.github_pr_result_id, failed_result);
+            return err;
+        };
+        defer self.allocator.free(result_payload);
+
+        if (try self.extractErrorMessageFromToolPayload(result_payload)) |message| {
+            defer self.allocator.free(message);
+            const failed_status = try self.buildServiceInvokeStatusJson("failed", tool_name, message);
+            defer self.allocator.free(failed_status);
+            if (self.github_pr_status_id != 0) try self.setFileContent(self.github_pr_status_id, failed_status);
+        } else {
+            const done_status = try self.buildServiceInvokeStatusJson("done", tool_name, null);
+            defer self.allocator.free(done_status);
+            if (self.github_pr_status_id != 0) try self.setFileContent(self.github_pr_status_id, done_status);
+        }
+        if (self.github_pr_result_id != 0) try self.setFileContent(self.github_pr_result_id, result_payload);
+        return .{ .written = written };
+    }
+
+    fn executeGitOpPayload(self: *Session, op: GitOp, args_obj: std.json.ObjectMap) ![]u8 {
+        return switch (op) {
+            .sync_checkout => self.executeGitSyncCheckoutOp(args_obj),
+            .status => self.executeGitStatusOp(args_obj),
+            .diff_range => self.executeGitDiffRangeOp(args_obj),
+        };
+    }
+
+    fn executeGitHubPrOpPayload(self: *Session, op: GitHubPrOp, args_obj: std.json.ObjectMap) ![]u8 {
+        return switch (op) {
+            .sync => self.executeGitHubPrSyncOp(args_obj),
+            .publish_review => self.executeGitHubPrPublishReviewOp(args_obj),
+        };
+    }
+
+    fn executeGitSyncCheckoutOp(self: *Session, args_obj: std.json.ObjectMap) ![]u8 {
+        const checkout_path = try self.normalizeLocalWorkspaceAbsolutePath(
+            extractOptionalStringByNames(args_obj, &[_][]const u8{"checkout_path"}) orelse return error.InvalidPayload,
+        );
+        defer self.allocator.free(checkout_path);
+
+        const provider = std.mem.trim(u8, extractOptionalStringByNames(args_obj, &[_][]const u8{"provider"}) orelse "github", " \t\r\n");
+        if (provider.len == 0) return error.InvalidPayload;
+        const repo_url = if (extractOptionalStringByNames(args_obj, &[_][]const u8{"repo_url"})) |value|
+            try self.allocator.dupe(u8, std.mem.trim(u8, value, " \t\r\n"))
+        else if (extractOptionalStringByNames(args_obj, &[_][]const u8{"repo_key"})) |repo_key_raw|
+            try self.buildRepoRemoteUrl(provider, repo_key_raw)
+        else
+            return error.InvalidPayload;
+        defer self.allocator.free(repo_url);
+
+        const base_branch = std.mem.trim(u8, extractOptionalStringByNames(args_obj, &[_][]const u8{"base_branch"}) orelse "main", " \t\r\n");
+        const head_branch = std.mem.trim(u8, extractOptionalStringByNames(args_obj, &[_][]const u8{"head_branch"}) orelse "", " \t\r\n");
+        const head_sha = std.mem.trim(u8, extractOptionalStringByNames(args_obj, &[_][]const u8{"head_sha"}) orelse "", " \t\r\n");
+        const timeout_ms = (try jsonObjectOptionalU64(args_obj, "timeout_ms")) orelse 120_000;
+        const pr_number = try jsonObjectOptionalU64(args_obj, "pr_number");
+
+        const checkout_host_path = try self.resolveMissionContractHostPath(checkout_path);
+        defer self.allocator.free(checkout_host_path);
+        const parent = std.fs.path.dirname(checkout_host_path) orelse return error.InvalidPayload;
+        try ensurePathExists(parent);
+
+        const git_dir_host = try std.fs.path.join(self.allocator, &.{ checkout_host_path, ".git" });
+        defer self.allocator.free(git_dir_host);
+        const had_checkout = try pathExistsAsDirectory(git_dir_host);
+
+        if (had_checkout) {
+            const dirty_command = try self.buildCliCommand("git", &.{ "-C", checkout_host_path, "status", "--porcelain" });
+            defer self.allocator.free(dirty_command);
+            var dirty_outcome = try self.runShellExecCommand(dirty_command, null, timeout_ms);
+            defer dirty_outcome.deinit(self.allocator);
+            switch (dirty_outcome) {
+                .failure => |info| {
+                    return self.buildGitFailureResultJson(.sync_checkout, info.code, info.message);
+                },
+                .success => |result| {
+                    if (result.exit_code != 0) {
+                        const message = if (std.mem.trim(u8, result.stderr, " \t\r\n").len > 0) result.stderr else "git status failed";
+                        return self.buildGitFailureResultJson(.sync_checkout, "execution_failed", message);
+                    }
+                    if (std.mem.trim(u8, result.stdout, " \t\r\n").len > 0) {
+                        return self.buildGitFailureResultJson(.sync_checkout, "dirty_checkout", "existing checkout has local changes");
+                    }
+                },
+            }
+        }
+
+        if (!had_checkout) {
+            const clone_command = try self.buildCliCommand("git", &.{ "clone", "--no-checkout", repo_url, checkout_host_path });
+            defer self.allocator.free(clone_command);
+            var clone_outcome = try self.runShellExecCommand(clone_command, null, timeout_ms);
+            defer clone_outcome.deinit(self.allocator);
+            switch (clone_outcome) {
+                .failure => |info| return self.buildGitFailureResultJson(.sync_checkout, info.code, info.message),
+                .success => |result| if (result.exit_code != 0) {
+                    const message = if (std.mem.trim(u8, result.stderr, " \t\r\n").len > 0) result.stderr else "git clone failed";
+                    return self.buildGitFailureResultJson(.sync_checkout, "execution_failed", message);
+                },
+            }
+        } else {
+            const set_url_command = try self.buildCliCommand("git", &.{ "-C", checkout_host_path, "remote", "set-url", "origin", repo_url });
+            defer self.allocator.free(set_url_command);
+            var set_url_outcome = try self.runShellExecCommand(set_url_command, null, timeout_ms);
+            defer set_url_outcome.deinit(self.allocator);
+            switch (set_url_outcome) {
+                .failure => |info| return self.buildGitFailureResultJson(.sync_checkout, info.code, info.message),
+                .success => |result| if (result.exit_code != 0) {
+                    const message = if (std.mem.trim(u8, result.stderr, " \t\r\n").len > 0) result.stderr else "git remote set-url failed";
+                    return self.buildGitFailureResultJson(.sync_checkout, "execution_failed", message);
+                },
+            }
+        }
+
+        const fetch_command = if (pr_number) |value|
+            try self.buildGitHubPrFetchCommand(checkout_host_path, value)
+        else if (head_branch.len > 0) blk: {
+            const fetch_head_ref = try std.fmt.allocPrint(self.allocator, "{s}:refs/remotes/origin/{s}", .{ head_branch, head_branch });
+            defer self.allocator.free(fetch_head_ref);
+            break :blk try self.buildCliCommand("git", &.{ "-C", checkout_host_path, "fetch", "--prune", "origin", fetch_head_ref });
+        } else try self.buildCliCommand("git", &.{ "-C", checkout_host_path, "fetch", "--prune", "origin" });
+        defer self.allocator.free(fetch_command);
+        var fetch_outcome = try self.runShellExecCommand(fetch_command, null, timeout_ms);
+        defer fetch_outcome.deinit(self.allocator);
+        switch (fetch_outcome) {
+            .failure => |info| return self.buildGitFailureResultJson(.sync_checkout, info.code, info.message),
+            .success => |result| if (result.exit_code != 0) {
+                const message = if (std.mem.trim(u8, result.stderr, " \t\r\n").len > 0) result.stderr else "git fetch failed";
+                return self.buildGitFailureResultJson(.sync_checkout, "execution_failed", message);
+            },
+        }
+
+        if (base_branch.len > 0) {
+            const fetch_base_ref = try std.fmt.allocPrint(self.allocator, "{s}:refs/remotes/origin/{s}", .{ base_branch, base_branch });
+            defer self.allocator.free(fetch_base_ref);
+            const fetch_base_command = try self.buildCliCommand("git", &.{ "-C", checkout_host_path, "fetch", "origin", fetch_base_ref });
+            defer self.allocator.free(fetch_base_command);
+            var fetch_base_outcome = try self.runShellExecCommand(fetch_base_command, null, timeout_ms);
+            defer fetch_base_outcome.deinit(self.allocator);
+            switch (fetch_base_outcome) {
+                .failure => |info| return self.buildGitFailureResultJson(.sync_checkout, info.code, info.message),
+                .success => |result| if (result.exit_code != 0) {
+                    const message = if (std.mem.trim(u8, result.stderr, " \t\r\n").len > 0) result.stderr else "git fetch base failed";
+                    return self.buildGitFailureResultJson(.sync_checkout, "execution_failed", message);
+                },
+            }
+        }
+
+        const checkout_target = if (pr_number) |value|
+            try std.fmt.allocPrint(self.allocator, "refs/remotes/origin/pr/{d}/head", .{value})
+        else if (head_sha.len > 0)
+            try self.allocator.dupe(u8, head_sha)
+        else if (head_branch.len > 0)
+            try std.fmt.allocPrint(self.allocator, "refs/remotes/origin/{s}", .{head_branch})
+        else if (base_branch.len > 0)
+            try std.fmt.allocPrint(self.allocator, "refs/remotes/origin/{s}", .{base_branch})
+        else
+            return error.InvalidPayload;
+        defer self.allocator.free(checkout_target);
+
+        const checkout_command = try self.buildCliCommand("git", &.{ "-C", checkout_host_path, "checkout", "--force", "--detach", checkout_target });
+        defer self.allocator.free(checkout_command);
+        var checkout_outcome = try self.runShellExecCommand(checkout_command, null, timeout_ms);
+        defer checkout_outcome.deinit(self.allocator);
+        switch (checkout_outcome) {
+            .failure => |info| return self.buildGitFailureResultJson(.sync_checkout, info.code, info.message),
+            .success => |result| if (result.exit_code != 0) {
+                const message = if (std.mem.trim(u8, result.stderr, " \t\r\n").len > 0) result.stderr else "git checkout failed";
+                return self.buildGitFailureResultJson(.sync_checkout, "execution_failed", message);
+            },
+        }
+
+        const head_rev = try self.runGitCaptureStdout(checkout_host_path, &.{ "rev-parse", "HEAD" }, timeout_ms);
+        defer self.allocator.free(head_rev);
+        const head_rev_trimmed = std.mem.trim(u8, head_rev, " \t\r\n");
+        const base_rev = if (base_branch.len > 0) blk: {
+            const base_ref = try std.fmt.allocPrint(self.allocator, "refs/remotes/origin/{s}", .{base_branch});
+            defer self.allocator.free(base_ref);
+            break :blk self.runGitCaptureStdout(checkout_host_path, &.{ "rev-parse", base_ref }, timeout_ms) catch try self.allocator.dupe(u8, "");
+        } else try self.allocator.dupe(u8, "");
+        defer self.allocator.free(base_rev);
+
+        const detail = try self.buildGitSyncCheckoutDetailJson(
+            provider,
+            repo_url,
+            checkout_path,
+            had_checkout,
+            checkout_target,
+            std.mem.trim(u8, head_rev_trimmed, " \t\r\n"),
+            std.mem.trim(u8, base_rev, " \t\r\n"),
+            base_branch,
+            head_branch,
+        );
+        defer self.allocator.free(detail);
+        return self.buildGitSuccessResultJson(.sync_checkout, detail);
+    }
+
+    fn executeGitStatusOp(self: *Session, args_obj: std.json.ObjectMap) ![]u8 {
+        const checkout_path = try self.normalizeLocalWorkspaceAbsolutePath(
+            extractOptionalStringByNames(args_obj, &[_][]const u8{"checkout_path"}) orelse return error.InvalidPayload,
+        );
+        defer self.allocator.free(checkout_path);
+        const timeout_ms = (try jsonObjectOptionalU64(args_obj, "timeout_ms")) orelse 30_000;
+        const checkout_host_path = try self.resolveMissionContractHostPath(checkout_path);
+        defer self.allocator.free(checkout_host_path);
+
+        const head_sha = try self.runGitCaptureStdout(checkout_host_path, &.{ "rev-parse", "HEAD" }, timeout_ms) catch |err| switch (err) {
+            error.InvalidPayload => return error.InvalidPayload,
+            else => return self.buildGitFailureResultJson(.status, "execution_failed", @errorName(err)),
+        };
+        defer self.allocator.free(head_sha);
+        const branch_name = try self.runGitCaptureStdout(checkout_host_path, &.{ "rev-parse", "--abbrev-ref", "HEAD" }, timeout_ms) catch |err| switch (err) {
+            error.InvalidPayload => return error.InvalidPayload,
+            else => return self.buildGitFailureResultJson(.status, "execution_failed", @errorName(err)),
+        };
+        defer self.allocator.free(branch_name);
+        const status_short = try self.runGitCaptureStdout(checkout_host_path, &.{ "status", "--short" }, timeout_ms) catch |err| switch (err) {
+            error.InvalidPayload => return error.InvalidPayload,
+            else => return self.buildGitFailureResultJson(.status, "execution_failed", @errorName(err)),
+        };
+        defer self.allocator.free(status_short);
+
+        const base_ref = if (extractOptionalStringByNames(args_obj, &[_][]const u8{"base_ref"})) |value|
+            try self.allocator.dupe(u8, std.mem.trim(u8, value, " \t\r\n"))
+        else if (extractOptionalStringByNames(args_obj, &[_][]const u8{"base_branch"})) |value|
+            try std.fmt.allocPrint(self.allocator, "refs/remotes/origin/{s}", .{std.mem.trim(u8, value, " \t\r\n")})
+        else
+            null;
+        defer if (base_ref) |value| self.allocator.free(value);
+
+        const changed_files_json = if (base_ref) |value|
+            try self.runGitDiffNamesJson(checkout_host_path, value, "HEAD", true, timeout_ms)
+        else
+            try self.allocator.dupe(u8, "[]");
+        defer self.allocator.free(changed_files_json);
+
+        const detail = try self.buildGitStatusDetailJson(
+            checkout_path,
+            std.mem.trim(u8, head_sha, " \t\r\n"),
+            std.mem.trim(u8, branch_name, " \t\r\n"),
+            std.mem.trim(u8, status_short, " \t\r\n"),
+            changed_files_json,
+            base_ref,
+        );
+        defer self.allocator.free(detail);
+        return self.buildGitSuccessResultJson(.status, detail);
+    }
+
+    fn executeGitDiffRangeOp(self: *Session, args_obj: std.json.ObjectMap) ![]u8 {
+        const checkout_path = try self.normalizeLocalWorkspaceAbsolutePath(
+            extractOptionalStringByNames(args_obj, &[_][]const u8{"checkout_path"}) orelse return error.InvalidPayload,
+        );
+        defer self.allocator.free(checkout_path);
+        const checkout_host_path = try self.resolveMissionContractHostPath(checkout_path);
+        defer self.allocator.free(checkout_host_path);
+        const timeout_ms = (try jsonObjectOptionalU64(args_obj, "timeout_ms")) orelse 30_000;
+
+        const base_ref = if (extractOptionalStringByNames(args_obj, &[_][]const u8{"base_ref"})) |value|
+            try self.allocator.dupe(u8, std.mem.trim(u8, value, " \t\r\n"))
+        else if (extractOptionalStringByNames(args_obj, &[_][]const u8{"base_branch"})) |value|
+            try std.fmt.allocPrint(self.allocator, "refs/remotes/origin/{s}", .{std.mem.trim(u8, value, " \t\r\n")})
+        else
+            return error.InvalidPayload;
+        defer self.allocator.free(base_ref);
+
+        const head_ref = std.mem.trim(u8, extractOptionalStringByNames(args_obj, &[_][]const u8{"head_ref"}) orelse "HEAD", " \t\r\n");
+        const symmetric = (try jsonObjectOptionalBool(args_obj, "symmetric")) orelse true;
+        const changed_files_json = try self.runGitDiffNamesJson(checkout_host_path, base_ref, head_ref, symmetric, timeout_ms);
+        defer self.allocator.free(changed_files_json);
+        const diff_stat = try self.runGitDiffStat(checkout_host_path, base_ref, head_ref, symmetric, timeout_ms);
+        defer self.allocator.free(diff_stat);
+
+        const detail = try self.buildGitDiffRangeDetailJson(
+            checkout_path,
+            base_ref,
+            head_ref,
+            symmetric,
+            changed_files_json,
+            std.mem.trim(u8, diff_stat, " \t\r\n"),
+        );
+        defer self.allocator.free(detail);
+        return self.buildGitSuccessResultJson(.diff_range, detail);
+    }
+
+    fn executeGitHubPrSyncOp(self: *Session, args_obj: std.json.ObjectMap) ![]u8 {
+        const repo_key = std.mem.trim(u8, extractOptionalStringByNames(args_obj, &[_][]const u8{"repo_key"}) orelse return error.InvalidPayload, " \t\r\n");
+        if (repo_key.len == 0) return error.InvalidPayload;
+        const pr_number = (try jsonObjectOptionalU64(args_obj, "pr_number")) orelse return error.InvalidPayload;
+        const dry_run = (try jsonObjectOptionalBool(args_obj, "dry_run")) orelse false;
+        const timeout_ms = (try jsonObjectOptionalU64(args_obj, "timeout_ms")) orelse 60_000;
+        const fields = "number,title,body,url,isDraft,state,mergeStateStatus,reviewDecision,baseRefName,baseRefOid,headRefName,headRefOid,files";
+        const pr_number_text = try std.fmt.allocPrint(self.allocator, "{d}", .{pr_number});
+        defer self.allocator.free(pr_number_text);
+        const command = try self.buildCliCommand("gh", &.{ "pr", "view", pr_number_text, "--repo", repo_key, "--json", fields });
+        defer self.allocator.free(command);
+
+        if (dry_run) {
+            const detail = try self.buildGitHubPrSyncDryRunDetailJson(repo_key, pr_number, command);
+            defer self.allocator.free(detail);
+            return self.buildGitHubPrSuccessResultJson(.sync, detail);
+        }
+
+        var outcome = try self.runShellExecCommand(command, null, timeout_ms);
+        defer outcome.deinit(self.allocator);
+        switch (outcome) {
+            .failure => |info| return self.buildGitHubPrFailureResultJson(.sync, info.code, info.message),
+            .success => |result| {
+                if (result.exit_code != 0) {
+                    const message = if (std.mem.trim(u8, result.stderr, " \t\r\n").len > 0) result.stderr else "gh pr view failed";
+                    return self.buildGitHubPrFailureResultJson(.sync, "execution_failed", message);
+                }
+                const provider_json = try self.normalizeJsonText(result.stdout);
+                defer self.allocator.free(provider_json);
+                const detail = try self.buildGitHubPrSyncDetailJson(repo_key, pr_number, command, provider_json);
+                defer self.allocator.free(detail);
+                return self.buildGitHubPrSuccessResultJson(.sync, detail);
+            },
+        }
+    }
+
+    fn executeGitHubPrPublishReviewOp(self: *Session, args_obj: std.json.ObjectMap) ![]u8 {
+        const repo_key = std.mem.trim(u8, extractOptionalStringByNames(args_obj, &[_][]const u8{"repo_key"}) orelse return error.InvalidPayload, " \t\r\n");
+        if (repo_key.len == 0) return error.InvalidPayload;
+        const pr_number = (try jsonObjectOptionalU64(args_obj, "pr_number")) orelse return error.InvalidPayload;
+        const decision = std.mem.trim(u8, extractOptionalStringByNames(args_obj, &[_][]const u8{"decision"}) orelse "comment", " \t\r\n");
+        if (!std.mem.eql(u8, decision, "comment") and !std.mem.eql(u8, decision, "approve") and !std.mem.eql(u8, decision, "request_changes")) {
+            return error.InvalidPayload;
+        }
+        const body = std.mem.trim(u8, extractOptionalStringByNames(args_obj, &[_][]const u8{ "body", "review_comment" }) orelse "", " \t\r\n");
+        const dry_run = (try jsonObjectOptionalBool(args_obj, "dry_run")) orelse false;
+        const timeout_ms = (try jsonObjectOptionalU64(args_obj, "timeout_ms")) orelse 60_000;
+        const thread_actions_count = blk: {
+            if (args_obj.get("thread_actions")) |value| {
+                if (value != .array) return error.InvalidPayload;
+                break :blk value.array.items.len;
+            }
+            break :blk @as(usize, 0);
+        };
+
+        const pr_number_text = try std.fmt.allocPrint(self.allocator, "{d}", .{pr_number});
+        defer self.allocator.free(pr_number_text);
+        const decision_flag = if (std.mem.eql(u8, decision, "approve"))
+            "--approve"
+        else if (std.mem.eql(u8, decision, "request_changes"))
+            "--request-changes"
+        else
+            "--comment";
+        const command = if (body.len > 0)
+            try self.buildCliCommand("gh", &.{ "pr", "review", pr_number_text, "--repo", repo_key, decision_flag, "--body", body })
+        else
+            try self.buildCliCommand("gh", &.{ "pr", "review", pr_number_text, "--repo", repo_key, decision_flag });
+        defer self.allocator.free(command);
+
+        if (dry_run) {
+            const detail = try self.buildGitHubPrPublishDryRunDetailJson(repo_key, pr_number, decision, command, thread_actions_count);
+            defer self.allocator.free(detail);
+            return self.buildGitHubPrSuccessResultJson(.publish_review, detail);
+        }
+
+        var outcome = try self.runShellExecCommand(command, null, timeout_ms);
+        defer outcome.deinit(self.allocator);
+        switch (outcome) {
+            .failure => |info| return self.buildGitHubPrFailureResultJson(.publish_review, info.code, info.message),
+            .success => |result| {
+                if (result.exit_code != 0) {
+                    const message = if (std.mem.trim(u8, result.stderr, " \t\r\n").len > 0) result.stderr else "gh pr review failed";
+                    return self.buildGitHubPrFailureResultJson(.publish_review, "execution_failed", message);
+                }
+                const detail = try self.buildGitHubPrPublishDetailJson(repo_key, pr_number, decision, command, thread_actions_count);
+                defer self.allocator.free(detail);
+                return self.buildGitHubPrSuccessResultJson(.publish_review, detail);
+            },
+        }
+    }
+
+    fn buildRepoRemoteUrl(self: *Session, provider: []const u8, repo_key_raw: []const u8) ![]u8 {
+        const repo_key = std.mem.trim(u8, repo_key_raw, " \t\r\n");
+        if (repo_key.len == 0) return error.InvalidPayload;
+        if (std.mem.eql(u8, provider, "github")) {
+            return std.fmt.allocPrint(self.allocator, "https://github.com/{s}.git", .{repo_key});
+        }
+        return error.InvalidPayload;
+    }
+
+    fn buildGitHubPrFetchCommand(self: *Session, checkout_host_path: []const u8, pr_number: u64) ![]u8 {
+        const refspec = try std.fmt.allocPrint(
+            self.allocator,
+            "+refs/pull/{d}/head:refs/remotes/origin/pr/{d}/head",
+            .{ pr_number, pr_number },
+        );
+        defer self.allocator.free(refspec);
+        return self.buildCliCommand("git", &.{ "-C", checkout_host_path, "fetch", "--prune", "origin", refspec });
+    }
+
+    fn buildCliCommand(self: *Session, program: []const u8, argv: []const []const u8) ![]u8 {
+        var out = std.ArrayListUnmanaged(u8){};
+        errdefer out.deinit(self.allocator);
+        try self.appendShellSingleQuoted(&out, program);
+        for (argv) |arg| {
+            try out.append(self.allocator, ' ');
+            try self.appendShellSingleQuoted(&out, arg);
+        }
+        return out.toOwnedSlice(self.allocator);
+    }
+
+    fn runShellExecCommand(self: *Session, command: []const u8, cwd: ?[]const u8, timeout_ms: u64) !ShellExecOutcome {
+        const args_json = try self.buildShellExecArgsJson(command, cwd, timeout_ms);
+        defer self.allocator.free(args_json);
+        const payload_json = try self.executeServiceToolCall("shell_exec", args_json);
+        defer self.allocator.free(payload_json);
+
+        if (try self.extractErrorInfoFromToolPayload(payload_json)) |info| {
+            return .{ .failure = info };
+        }
+        return .{ .success = try self.parseShellExecPayload(payload_json) };
+    }
+
+    fn buildShellExecArgsJson(self: *Session, command: []const u8, cwd: ?[]const u8, timeout_ms: u64) ![]u8 {
+        const escaped_command = try unified.jsonEscape(self.allocator, command);
+        defer self.allocator.free(escaped_command);
+        const cwd_json = if (cwd) |value| blk: {
+            const escaped = try unified.jsonEscape(self.allocator, value);
+            defer self.allocator.free(escaped);
+            break :blk try std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped});
+        } else try self.allocator.dupe(u8, "null");
+        defer self.allocator.free(cwd_json);
+        return std.fmt.allocPrint(
+            self.allocator,
+            "{{\"command\":\"{s}\",\"cwd\":{s},\"timeout_ms\":{d}}}",
+            .{ escaped_command, cwd_json, timeout_ms },
+        );
+    }
+
+    fn parseShellExecPayload(self: *Session, payload_json: []const u8) !ParsedShellExecResult {
+        var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, payload_json, .{});
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidPayload;
+        const obj = parsed.value.object;
+        const exit_code_value = obj.get("exit_code") orelse return error.InvalidPayload;
+        if (exit_code_value != .integer) return error.InvalidPayload;
+        const stdout_value = obj.get("stdout") orelse return error.InvalidPayload;
+        if (stdout_value != .string) return error.InvalidPayload;
+        const stderr_value = obj.get("stderr") orelse return error.InvalidPayload;
+        if (stderr_value != .string) return error.InvalidPayload;
+        return .{
+            .exit_code = @intCast(exit_code_value.integer),
+            .stdout = try self.allocator.dupe(u8, stdout_value.string),
+            .stderr = try self.allocator.dupe(u8, stderr_value.string),
+        };
+    }
+
+    fn runGitCaptureStdout(self: *Session, checkout_host_path: []const u8, git_args: []const []const u8, timeout_ms: u64) ![]u8 {
+        var argv = std.ArrayListUnmanaged([]const u8){};
+        defer argv.deinit(self.allocator);
+        try argv.append(self.allocator, "-C");
+        try argv.append(self.allocator, checkout_host_path);
+        for (git_args) |arg| try argv.append(self.allocator, arg);
+        const command = try self.buildCliCommand("git", argv.items);
+        defer self.allocator.free(command);
+        var outcome = try self.runShellExecCommand(command, null, timeout_ms);
+        defer outcome.deinit(self.allocator);
+        switch (outcome) {
+            .failure => |info| {
+                _ = info;
+                return error.ExecutionFailed;
+            },
+            .success => |result| {
+                if (result.exit_code != 0) return error.ExecutionFailed;
+                return self.allocator.dupe(u8, result.stdout);
+            },
+        }
+    }
+
+    fn runGitDiffNamesJson(
+        self: *Session,
+        checkout_host_path: []const u8,
+        base_ref: []const u8,
+        head_ref: []const u8,
+        symmetric: bool,
+        timeout_ms: u64,
+    ) ![]u8 {
+        const range = if (symmetric)
+            try std.fmt.allocPrint(self.allocator, "{s}...{s}", .{ base_ref, head_ref })
+        else
+            try std.fmt.allocPrint(self.allocator, "{s}..{s}", .{ base_ref, head_ref });
+        defer self.allocator.free(range);
+        const output = try self.runGitCaptureStdout(checkout_host_path, &.{ "diff", "--name-only", range }, timeout_ms);
+        defer self.allocator.free(output);
+        return self.renderJsonStringArrayFromLines(output);
+    }
+
+    fn runGitDiffStat(
+        self: *Session,
+        checkout_host_path: []const u8,
+        base_ref: []const u8,
+        head_ref: []const u8,
+        symmetric: bool,
+        timeout_ms: u64,
+    ) ![]u8 {
+        const range = if (symmetric)
+            try std.fmt.allocPrint(self.allocator, "{s}...{s}", .{ base_ref, head_ref })
+        else
+            try std.fmt.allocPrint(self.allocator, "{s}..{s}", .{ base_ref, head_ref });
+        defer self.allocator.free(range);
+        return self.runGitCaptureStdout(checkout_host_path, &.{ "diff", "--stat", range }, timeout_ms);
+    }
+
+    fn renderJsonStringArrayFromLines(self: *Session, raw: []const u8) ![]u8 {
+        var out = std.ArrayListUnmanaged(u8){};
+        errdefer out.deinit(self.allocator);
+        const writer = out.writer(self.allocator);
+        try writer.writeByte('[');
+        var first = true;
+        var lines = std.mem.splitScalar(u8, raw, '\n');
+        while (lines.next()) |line| {
+            const trimmed = std.mem.trim(u8, line, " \t\r\n");
+            if (trimmed.len == 0) continue;
+            if (!first) try writer.writeByte(',');
+            first = false;
+            try writeJsonString(writer, trimmed);
+        }
+        try writer.writeByte(']');
+        return out.toOwnedSlice(self.allocator);
+    }
+
+    fn normalizeJsonText(self: *Session, raw: []const u8) ![]u8 {
+        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+        if (trimmed.len == 0) return error.InvalidPayload;
+        var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, trimmed, .{});
+        defer parsed.deinit();
+        return std.fmt.allocPrint(self.allocator, "{f}", .{std.json.fmt(parsed.value, .{})});
+    }
+
+    fn buildGitSuccessResultJson(self: *Session, op: GitOp, result_json: []const u8) ![]u8 {
+        const escaped_operation = try unified.jsonEscape(self.allocator, gitOperationName(op));
+        defer self.allocator.free(escaped_operation);
+        return std.fmt.allocPrint(
+            self.allocator,
+            "{{\"ok\":true,\"operation\":\"{s}\",\"result\":{s},\"error\":null}}",
+            .{ escaped_operation, result_json },
+        );
+    }
+
+    fn buildGitFailureResultJson(self: *Session, op: GitOp, code: []const u8, message: []const u8) ![]u8 {
+        const escaped_operation = try unified.jsonEscape(self.allocator, gitOperationName(op));
+        defer self.allocator.free(escaped_operation);
+        const escaped_code = try unified.jsonEscape(self.allocator, code);
+        defer self.allocator.free(escaped_code);
+        const escaped_message = try unified.jsonEscape(self.allocator, message);
+        defer self.allocator.free(escaped_message);
+        return std.fmt.allocPrint(
+            self.allocator,
+            "{{\"ok\":false,\"operation\":\"{s}\",\"result\":null,\"error\":{{\"code\":\"{s}\",\"message\":\"{s}\"}}}}",
+            .{ escaped_operation, escaped_code, escaped_message },
+        );
+    }
+
+    fn buildGitHubPrSuccessResultJson(self: *Session, op: GitHubPrOp, result_json: []const u8) ![]u8 {
+        const escaped_operation = try unified.jsonEscape(self.allocator, gitHubPrOperationName(op));
+        defer self.allocator.free(escaped_operation);
+        return std.fmt.allocPrint(
+            self.allocator,
+            "{{\"ok\":true,\"operation\":\"{s}\",\"result\":{s},\"error\":null}}",
+            .{ escaped_operation, result_json },
+        );
+    }
+
+    fn buildGitHubPrFailureResultJson(self: *Session, op: GitHubPrOp, code: []const u8, message: []const u8) ![]u8 {
+        const escaped_operation = try unified.jsonEscape(self.allocator, gitHubPrOperationName(op));
+        defer self.allocator.free(escaped_operation);
+        const escaped_code = try unified.jsonEscape(self.allocator, code);
+        defer self.allocator.free(escaped_code);
+        const escaped_message = try unified.jsonEscape(self.allocator, message);
+        defer self.allocator.free(escaped_message);
+        return std.fmt.allocPrint(
+            self.allocator,
+            "{{\"ok\":false,\"operation\":\"{s}\",\"result\":null,\"error\":{{\"code\":\"{s}\",\"message\":\"{s}\"}}}}",
+            .{ escaped_operation, escaped_code, escaped_message },
+        );
+    }
+
+    fn buildGitSyncCheckoutDetailJson(
+        self: *Session,
+        provider: []const u8,
+        repo_url: []const u8,
+        checkout_path: []const u8,
+        reused_checkout: bool,
+        target_ref: []const u8,
+        head_sha: []const u8,
+        base_sha: []const u8,
+        base_branch: []const u8,
+        head_branch: []const u8,
+    ) ![]u8 {
+        const escaped_provider = try unified.jsonEscape(self.allocator, provider);
+        defer self.allocator.free(escaped_provider);
+        const escaped_repo_url = try unified.jsonEscape(self.allocator, repo_url);
+        defer self.allocator.free(escaped_repo_url);
+        const escaped_checkout_path = try unified.jsonEscape(self.allocator, checkout_path);
+        defer self.allocator.free(escaped_checkout_path);
+        const escaped_target_ref = try unified.jsonEscape(self.allocator, target_ref);
+        defer self.allocator.free(escaped_target_ref);
+        const escaped_head_sha = try unified.jsonEscape(self.allocator, head_sha);
+        defer self.allocator.free(escaped_head_sha);
+        const escaped_base_sha = try unified.jsonEscape(self.allocator, base_sha);
+        defer self.allocator.free(escaped_base_sha);
+        const escaped_base_branch = try unified.jsonEscape(self.allocator, base_branch);
+        defer self.allocator.free(escaped_base_branch);
+        const escaped_head_branch = try unified.jsonEscape(self.allocator, head_branch);
+        defer self.allocator.free(escaped_head_branch);
+        return std.fmt.allocPrint(
+            self.allocator,
+            "{{\"provider\":\"{s}\",\"repo_url\":\"{s}\",\"checkout_path\":\"{s}\",\"reused_checkout\":{s},\"target_ref\":\"{s}\",\"head_sha\":\"{s}\",\"base_sha\":\"{s}\",\"base_branch\":\"{s}\",\"head_branch\":\"{s}\"}}",
+            .{
+                escaped_provider,
+                escaped_repo_url,
+                escaped_checkout_path,
+                if (reused_checkout) "true" else "false",
+                escaped_target_ref,
+                escaped_head_sha,
+                escaped_base_sha,
+                escaped_base_branch,
+                escaped_head_branch,
+            },
+        );
+    }
+
+    fn buildGitStatusDetailJson(
+        self: *Session,
+        checkout_path: []const u8,
+        head_sha: []const u8,
+        branch_name: []const u8,
+        status_short: []const u8,
+        changed_files_json: []const u8,
+        base_ref: ?[]const u8,
+    ) ![]u8 {
+        const escaped_checkout_path = try unified.jsonEscape(self.allocator, checkout_path);
+        defer self.allocator.free(escaped_checkout_path);
+        const escaped_head_sha = try unified.jsonEscape(self.allocator, head_sha);
+        defer self.allocator.free(escaped_head_sha);
+        const escaped_branch_name = try unified.jsonEscape(self.allocator, branch_name);
+        defer self.allocator.free(escaped_branch_name);
+        const escaped_status_short = try unified.jsonEscape(self.allocator, status_short);
+        defer self.allocator.free(escaped_status_short);
+        const base_ref_json = if (base_ref) |value| blk: {
+            const escaped = try unified.jsonEscape(self.allocator, value);
+            defer self.allocator.free(escaped);
+            break :blk try std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped});
+        } else try self.allocator.dupe(u8, "null");
+        defer self.allocator.free(base_ref_json);
+        return std.fmt.allocPrint(
+            self.allocator,
+            "{{\"checkout_path\":\"{s}\",\"head_sha\":\"{s}\",\"branch\":\"{s}\",\"dirty\":{s},\"status_short\":\"{s}\",\"base_ref\":{s},\"changed_files\":{s}}}",
+            .{
+                escaped_checkout_path,
+                escaped_head_sha,
+                escaped_branch_name,
+                if (status_short.len > 0) "true" else "false",
+                escaped_status_short,
+                base_ref_json,
+                changed_files_json,
+            },
+        );
+    }
+
+    fn buildGitDiffRangeDetailJson(
+        self: *Session,
+        checkout_path: []const u8,
+        base_ref: []const u8,
+        head_ref: []const u8,
+        symmetric: bool,
+        changed_files_json: []const u8,
+        diff_stat: []const u8,
+    ) ![]u8 {
+        const escaped_checkout_path = try unified.jsonEscape(self.allocator, checkout_path);
+        defer self.allocator.free(escaped_checkout_path);
+        const escaped_base_ref = try unified.jsonEscape(self.allocator, base_ref);
+        defer self.allocator.free(escaped_base_ref);
+        const escaped_head_ref = try unified.jsonEscape(self.allocator, head_ref);
+        defer self.allocator.free(escaped_head_ref);
+        const escaped_diff_stat = try unified.jsonEscape(self.allocator, diff_stat);
+        defer self.allocator.free(escaped_diff_stat);
+        return std.fmt.allocPrint(
+            self.allocator,
+            "{{\"checkout_path\":\"{s}\",\"base_ref\":\"{s}\",\"head_ref\":\"{s}\",\"symmetric\":{s},\"changed_files\":{s},\"diff_stat\":\"{s}\"}}",
+            .{
+                escaped_checkout_path,
+                escaped_base_ref,
+                escaped_head_ref,
+                if (symmetric) "true" else "false",
+                changed_files_json,
+                escaped_diff_stat,
+            },
+        );
+    }
+
+    fn buildGitHubPrSyncDryRunDetailJson(self: *Session, repo_key: []const u8, pr_number: u64, command: []const u8) ![]u8 {
+        const escaped_repo_key = try unified.jsonEscape(self.allocator, repo_key);
+        defer self.allocator.free(escaped_repo_key);
+        const escaped_command = try unified.jsonEscape(self.allocator, command);
+        defer self.allocator.free(escaped_command);
+        return std.fmt.allocPrint(
+            self.allocator,
+            "{{\"repo_key\":\"{s}\",\"pr_number\":{d},\"dry_run\":true,\"command\":\"{s}\"}}",
+            .{ escaped_repo_key, pr_number, escaped_command },
+        );
+    }
+
+    fn buildGitHubPrSyncDetailJson(self: *Session, repo_key: []const u8, pr_number: u64, command: []const u8, provider_json: []const u8) ![]u8 {
+        const escaped_repo_key = try unified.jsonEscape(self.allocator, repo_key);
+        defer self.allocator.free(escaped_repo_key);
+        const escaped_command = try unified.jsonEscape(self.allocator, command);
+        defer self.allocator.free(escaped_command);
+        return std.fmt.allocPrint(
+            self.allocator,
+            "{{\"repo_key\":\"{s}\",\"pr_number\":{d},\"dry_run\":false,\"command\":\"{s}\",\"provider\":{s}}}",
+            .{ escaped_repo_key, pr_number, escaped_command, provider_json },
+        );
+    }
+
+    fn buildGitHubPrPublishDryRunDetailJson(
+        self: *Session,
+        repo_key: []const u8,
+        pr_number: u64,
+        decision: []const u8,
+        command: []const u8,
+        thread_actions_count: usize,
+    ) ![]u8 {
+        const escaped_repo_key = try unified.jsonEscape(self.allocator, repo_key);
+        defer self.allocator.free(escaped_repo_key);
+        const escaped_decision = try unified.jsonEscape(self.allocator, decision);
+        defer self.allocator.free(escaped_decision);
+        const escaped_command = try unified.jsonEscape(self.allocator, command);
+        defer self.allocator.free(escaped_command);
+        return std.fmt.allocPrint(
+            self.allocator,
+            "{{\"repo_key\":\"{s}\",\"pr_number\":{d},\"decision\":\"{s}\",\"dry_run\":true,\"command\":\"{s}\",\"thread_actions_count\":{d},\"thread_actions_supported\":false}}",
+            .{ escaped_repo_key, pr_number, escaped_decision, escaped_command, thread_actions_count },
+        );
+    }
+
+    fn buildGitHubPrPublishDetailJson(
+        self: *Session,
+        repo_key: []const u8,
+        pr_number: u64,
+        decision: []const u8,
+        command: []const u8,
+        thread_actions_count: usize,
+    ) ![]u8 {
+        const escaped_repo_key = try unified.jsonEscape(self.allocator, repo_key);
+        defer self.allocator.free(escaped_repo_key);
+        const escaped_decision = try unified.jsonEscape(self.allocator, decision);
+        defer self.allocator.free(escaped_decision);
+        const escaped_command = try unified.jsonEscape(self.allocator, command);
+        defer self.allocator.free(escaped_command);
+        return std.fmt.allocPrint(
+            self.allocator,
+            "{{\"repo_key\":\"{s}\",\"pr_number\":{d},\"decision\":\"{s}\",\"published\":true,\"command\":\"{s}\",\"thread_actions_count\":{d},\"thread_actions_supported\":false}}",
+            .{ escaped_repo_key, pr_number, escaped_decision, escaped_command, thread_actions_count },
+        );
+    }
+
     fn handlePrReviewNamespaceWrite(self: *Session, special: SpecialKind, node_id: u32, raw_input: []const u8) !WriteOutcome {
         const input = std.mem.trim(u8, raw_input, " \t\r\n");
         const payload = if (input.len == 0) "{}" else input;
@@ -9401,9 +10578,16 @@ pub const Session = struct {
         };
         defer self.allocator.free(result_payload);
 
-        const done_status = try self.buildServiceInvokeStatusJson("done", tool_name, null);
-        defer self.allocator.free(done_status);
-        if (self.pr_review_status_id != 0) try self.setFileContent(self.pr_review_status_id, done_status);
+        if (try self.extractErrorMessageFromToolPayload(result_payload)) |message| {
+            defer self.allocator.free(message);
+            const failed_status = try self.buildServiceInvokeStatusJson("failed", tool_name, message);
+            defer self.allocator.free(failed_status);
+            if (self.pr_review_status_id != 0) try self.setFileContent(self.pr_review_status_id, failed_status);
+        } else {
+            const done_status = try self.buildServiceInvokeStatusJson("done", tool_name, null);
+            defer self.allocator.free(done_status);
+            if (self.pr_review_status_id != 0) try self.setFileContent(self.pr_review_status_id, done_status);
+        }
         if (self.pr_review_result_id != 0) try self.setFileContent(self.pr_review_result_id, result_payload);
         return .{ .written = written };
     }
@@ -9424,6 +10608,36 @@ pub const Session = struct {
         artifact_root: []const u8,
     };
 
+    const PrReviewContextSnapshot = struct {
+        provider: []u8,
+        repo_key: []u8,
+        pr_number: u64,
+        pr_url: []u8,
+        base_branch: []u8,
+        base_sha: []u8,
+        head_branch: []u8,
+        head_sha: []u8,
+        checkout_path: []u8,
+        review_policy_paths_json: []u8,
+        default_review_commands_json: []u8,
+        approval_policy_json: []u8,
+
+        fn deinit(self: *PrReviewContextSnapshot, allocator: std.mem.Allocator) void {
+            allocator.free(self.provider);
+            allocator.free(self.repo_key);
+            allocator.free(self.pr_url);
+            allocator.free(self.base_branch);
+            allocator.free(self.base_sha);
+            allocator.free(self.head_branch);
+            allocator.free(self.head_sha);
+            allocator.free(self.checkout_path);
+            allocator.free(self.review_policy_paths_json);
+            allocator.free(self.default_review_commands_json);
+            allocator.free(self.approval_policy_json);
+            self.* = undefined;
+        }
+    };
+
     const PrReviewStateSnapshot = struct {
         phase: []u8,
         last_synced_head_sha: []u8,
@@ -9437,6 +10651,11 @@ pub const Session = struct {
         validation_artifact: []u8,
         recommendation_artifact: []u8,
         thread_actions_artifact: []u8,
+        provider_sync_artifact: []u8,
+        checkout_sync_artifact: []u8,
+        repo_status_artifact: []u8,
+        diff_range_artifact: []u8,
+        publish_review_artifact: []u8,
         notes_json: []u8,
 
         fn deinit(self: *PrReviewStateSnapshot, allocator: std.mem.Allocator) void {
@@ -9452,6 +10671,11 @@ pub const Session = struct {
             allocator.free(self.validation_artifact);
             allocator.free(self.recommendation_artifact);
             allocator.free(self.thread_actions_artifact);
+            allocator.free(self.provider_sync_artifact);
+            allocator.free(self.checkout_sync_artifact);
+            allocator.free(self.repo_status_artifact);
+            allocator.free(self.diff_range_artifact);
+            allocator.free(self.publish_review_artifact);
             allocator.free(self.notes_json);
             self.* = undefined;
         }
@@ -9618,6 +10842,8 @@ pub const Session = struct {
         defer mission.deinit(self.allocator);
         const contract = try self.resolvePrReviewMissionContract(mission);
 
+        var context = try self.loadPrReviewContextSnapshot(contract.context_path);
+        defer context.deinit(self.allocator);
         var state = try self.loadPrReviewStateSnapshot(contract.state_path);
         defer state.deinit(self.allocator);
         try self.applyPrReviewCommonStateFields(args_obj, &state);
@@ -9628,18 +10854,156 @@ pub const Session = struct {
             thread_actions_path = try self.writePrReviewJsonArtifact(contract.artifact_root, state.thread_actions_artifact, value);
         }
 
+        const provider_sync_input = try parsePrReviewOptionalServiceArgs(args_obj, "provider_sync");
+        const sync_checkout_input = try parsePrReviewOptionalServiceArgs(args_obj, "sync_checkout");
+        const repo_status_input = try parsePrReviewOptionalServiceArgs(args_obj, "repo_status");
+        const diff_range_input = try parsePrReviewOptionalServiceArgs(args_obj, "diff_range");
+        const checkpoint_stage = extractOptionalStringByNames(args_obj, &[_][]const u8{"stage"}) orelse state.phase;
+
+        var provider_sync_capture: ?PrReviewServiceCapture = null;
+        defer if (provider_sync_capture) |*value| value.deinit(self.allocator);
+        var checkout_sync_capture: ?PrReviewServiceCapture = null;
+        defer if (checkout_sync_capture) |*value| value.deinit(self.allocator);
+        var repo_status_capture: ?PrReviewServiceCapture = null;
+        defer if (repo_status_capture) |*value| value.deinit(self.allocator);
+        var diff_range_capture: ?PrReviewServiceCapture = null;
+        defer if (diff_range_capture) |*value| value.deinit(self.allocator);
+
+        var service_error: ?ToolPayloadErrorInfo = null;
+        defer if (service_error) |*value| value.deinit(self.allocator);
+
+        if (provider_sync_input.enabled) {
+            const request_payload = try self.buildPrReviewGitHubSyncRequestJson(context, provider_sync_input.overrides);
+            defer self.allocator.free(request_payload);
+            provider_sync_capture = try self.invokePrReviewServiceCapture(
+                store,
+                mission_id,
+                checkpoint_stage,
+                "Synced provider PR metadata",
+                "/global/github_pr",
+                "/global/github_pr/control/sync.json",
+                request_payload,
+                contract.artifact_root,
+                state.provider_sync_artifact,
+                "provider_sync",
+            );
+            if (try self.extractErrorInfoFromToolPayload(provider_sync_capture.?.result_payload)) |info|
+                service_error = info
+            else
+                try self.applyPrReviewContextFromGitHubSyncPayload(&context, &state, provider_sync_capture.?.result_payload);
+        }
+
+        if (service_error == null and sync_checkout_input.enabled) {
+            const request_payload = try self.buildPrReviewGitSyncCheckoutRequestJson(context, sync_checkout_input.overrides);
+            defer self.allocator.free(request_payload);
+            checkout_sync_capture = try self.invokePrReviewServiceCapture(
+                store,
+                mission_id,
+                checkpoint_stage,
+                "Synced PR checkout",
+                "/global/git",
+                "/global/git/control/sync_checkout.json",
+                request_payload,
+                contract.artifact_root,
+                state.checkout_sync_artifact,
+                "checkout_sync",
+            );
+            if (try self.extractErrorInfoFromToolPayload(checkout_sync_capture.?.result_payload)) |info|
+                service_error = info
+            else
+                try self.applyPrReviewContextFromGitSyncPayload(&context, &state, checkout_sync_capture.?.result_payload);
+        }
+
+        if (service_error == null and repo_status_input.enabled) {
+            const request_payload = try self.buildPrReviewGitStatusRequestJson(context, repo_status_input.overrides);
+            defer self.allocator.free(request_payload);
+            repo_status_capture = try self.invokePrReviewServiceCapture(
+                store,
+                mission_id,
+                checkpoint_stage,
+                "Captured repository status for PR review",
+                "/global/git",
+                "/global/git/control/status.json",
+                request_payload,
+                contract.artifact_root,
+                state.repo_status_artifact,
+                "repo_status",
+            );
+            if (try self.extractErrorInfoFromToolPayload(repo_status_capture.?.result_payload)) |info|
+                service_error = info
+            else
+                try self.applyPrReviewContextFromGitStatusPayload(&context, &state, repo_status_capture.?.result_payload);
+        }
+
+        if (service_error == null and diff_range_input.enabled) {
+            const request_payload = try self.buildPrReviewGitDiffRangeRequestJson(context, diff_range_input.overrides);
+            defer self.allocator.free(request_payload);
+            diff_range_capture = try self.invokePrReviewServiceCapture(
+                store,
+                mission_id,
+                checkpoint_stage,
+                "Captured changed files for PR review",
+                "/global/git",
+                "/global/git/control/diff_range.json",
+                request_payload,
+                contract.artifact_root,
+                state.diff_range_artifact,
+                "diff_range",
+            );
+            if (try self.extractErrorInfoFromToolPayload(diff_range_capture.?.result_payload)) |info| {
+                service_error = info;
+            }
+        }
+
+        const context_payload = try self.buildPrReviewContextPayloadJson(
+            context.provider,
+            context.repo_key,
+            context.pr_number,
+            context.pr_url,
+            context.base_branch,
+            context.base_sha,
+            context.head_branch,
+            context.head_sha,
+            context.checkout_path,
+            context.review_policy_paths_json,
+            context.default_review_commands_json,
+            context.approval_policy_json,
+        );
+        defer self.allocator.free(context_payload);
+        try self.writeMissionContractFile(contract.context_path, context_payload);
+
         const state_payload = try self.buildPrReviewStatePayloadJson(state);
         defer self.allocator.free(state_payload);
         try self.writeMissionContractFile(contract.state_path, state_payload);
 
-        const checkpoint_summary = extractOptionalStringByNames(args_obj, &[_][]const u8{"summary"}) orelse "Synced PR review state";
+        const checkpoint_summary = if (service_error) |value|
+            value.message
+        else
+            extractOptionalStringByNames(args_obj, &[_][]const u8{"summary"}) orelse "Synced PR review state";
+        const checkpoint_artifact = blk: {
+            if (service_error != null) {
+                if (diff_range_capture) |value| break :blk .{ .kind = "diff_range", .path = value.artifact_path, .summary = "PR review diff-range capture" };
+                if (repo_status_capture) |value| break :blk .{ .kind = "repo_status", .path = value.artifact_path, .summary = "PR review repo-status capture" };
+                if (checkout_sync_capture) |value| break :blk .{ .kind = "checkout_sync", .path = value.artifact_path, .summary = "PR checkout capture" };
+                if (provider_sync_capture) |value| break :blk .{ .kind = "provider_sync", .path = value.artifact_path, .summary = "PR provider sync capture" };
+                if (thread_actions_path) |value| break :blk .{ .kind = "thread_actions", .path = value, .summary = "PR review thread action snapshot" };
+                break :blk .{ .kind = "state_sync", .path = contract.state_path, .summary = "PR review state file" };
+            }
+            if (diff_range_capture) |value| break :blk .{ .kind = "diff_range", .path = value.artifact_path, .summary = "PR review diff-range capture" };
+            if (repo_status_capture) |value| break :blk .{ .kind = "repo_status", .path = value.artifact_path, .summary = "PR review repo-status capture" };
+            if (checkout_sync_capture) |value| break :blk .{ .kind = "checkout_sync", .path = value.artifact_path, .summary = "PR checkout capture" };
+            if (provider_sync_capture) |value| break :blk .{ .kind = "provider_sync", .path = value.artifact_path, .summary = "PR provider sync capture" };
+            if (thread_actions_path) |value| break :blk .{ .kind = "thread_actions", .path = value, .summary = "PR review thread action snapshot" };
+            break :blk .{ .kind = "state_sync", .path = contract.state_path, .summary = "PR review state file" };
+        };
         var checkpointed = try store.recordCheckpoint(self.allocator, mission_id, .{
-            .stage = extractOptionalStringByNames(args_obj, &[_][]const u8{"stage"}) orelse state.phase,
+            .stage = checkpoint_stage,
             .summary = checkpoint_summary,
-            .artifact = if (thread_actions_path) |value|
-                .{ .kind = "thread_actions", .path = value, .summary = "PR review thread action snapshot" }
-            else
-                .{ .kind = "state_sync", .path = contract.state_path, .summary = "PR review state file" },
+            .artifact = .{
+                .kind = checkpoint_artifact.kind,
+                .path = checkpoint_artifact.path,
+                .summary = checkpoint_artifact.summary,
+            },
         });
         defer checkpointed.deinit(self.allocator);
 
@@ -9650,8 +11014,15 @@ pub const Session = struct {
             state.phase,
             contract.state_path,
             thread_actions_path,
+            if (provider_sync_capture) |value| value.artifact_path else null,
+            if (checkout_sync_capture) |value| value.artifact_path else null,
+            if (repo_status_capture) |value| value.artifact_path else null,
+            if (diff_range_capture) |value| value.artifact_path else null,
         );
         defer self.allocator.free(detail);
+        if (service_error) |value| {
+            return self.buildPrReviewPartialFailureResultJson(.sync, detail, value.code, value.message);
+        }
         return self.buildPrReviewSuccessResultJson(.sync, detail);
     }
 
@@ -9728,6 +11099,8 @@ pub const Session = struct {
         defer mission.deinit(self.allocator);
         const contract = try self.resolvePrReviewMissionContract(mission);
 
+        var context = try self.loadPrReviewContextSnapshot(contract.context_path);
+        defer context.deinit(self.allocator);
         var state = try self.loadPrReviewStateSnapshot(contract.state_path);
         defer state.deinit(self.allocator);
         try self.applyPrReviewCommonStateFields(args_obj, &state);
@@ -9766,13 +11139,51 @@ pub const Session = struct {
             thread_actions_path = try self.writePrReviewJsonArtifact(contract.artifact_root, state.thread_actions_artifact, value);
         }
 
+        const publish_review_input = try parsePrReviewOptionalServiceArgs(args_obj, "publish_review");
+        const checkpoint_stage = extractOptionalStringByNames(args_obj, &[_][]const u8{"stage"}) orelse state.phase;
+
+        var publish_review_capture: ?PrReviewServiceCapture = null;
+        defer if (publish_review_capture) |*value| value.deinit(self.allocator);
+        var service_error: ?ToolPayloadErrorInfo = null;
+        defer if (service_error) |*value| value.deinit(self.allocator);
+
+        if (publish_review_input.enabled) {
+            const review_comment_text = try jsonObjectOptionalString(args_obj, "review_comment");
+            const request_payload = try self.buildPrReviewGitHubPublishRequestJson(
+                context,
+                recommendation_value,
+                review_comment_text,
+                args_obj.get("thread_actions"),
+                publish_review_input.overrides,
+            );
+            defer self.allocator.free(request_payload);
+            publish_review_capture = try self.invokePrReviewServiceCapture(
+                store,
+                mission_id,
+                checkpoint_stage,
+                "Published PR review through provider",
+                "/global/github_pr",
+                "/global/github_pr/control/publish_review.json",
+                request_payload,
+                contract.artifact_root,
+                state.publish_review_artifact,
+                "publish_review",
+            );
+            if (try self.extractErrorInfoFromToolPayload(publish_review_capture.?.result_payload)) |info| {
+                service_error = info;
+            }
+        }
+
         const state_payload = try self.buildPrReviewStatePayloadJson(state);
         defer self.allocator.free(state_payload);
         try self.writeMissionContractFile(contract.state_path, state_payload);
 
-        const checkpoint_summary = recommendation_summary orelse "Recorded PR review recommendation";
+        const checkpoint_summary = if (service_error) |value|
+            value.message
+        else
+            recommendation_summary orelse "Recorded PR review recommendation";
         var checkpointed = try store.recordCheckpoint(self.allocator, mission_id, .{
-            .stage = extractOptionalStringByNames(args_obj, &[_][]const u8{"stage"}) orelse state.phase,
+            .stage = checkpoint_stage,
             .summary = checkpoint_summary,
             .artifact = .{
                 .kind = "recommendation",
@@ -9792,8 +11203,12 @@ pub const Session = struct {
             recommendation_path,
             review_comment_path,
             thread_actions_path,
+            if (publish_review_capture) |value| value.artifact_path else null,
         );
         defer self.allocator.free(detail);
+        if (service_error) |value| {
+            return self.buildPrReviewPartialFailureResultJson(.record_review, detail, value.code, value.message);
+        }
         return self.buildPrReviewSuccessResultJson(.record_review, detail);
     }
 
@@ -9846,6 +11261,38 @@ pub const Session = struct {
         return std.fs.cwd().readFileAlloc(self.allocator, host_path, max_bytes);
     }
 
+    fn loadPrReviewContextSnapshot(self: *Session, context_path: []const u8) !PrReviewContextSnapshot {
+        const raw = try self.readMissionContractFile(context_path, 512 * 1024);
+        defer self.allocator.free(raw);
+        var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, raw, .{});
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidPayload;
+        const obj = parsed.value.object;
+
+        const provider = std.mem.trim(u8, (try jsonObjectOptionalString(obj, "provider")) orelse "github", " \t\r\n");
+        const repo_key = std.mem.trim(u8, (try jsonObjectOptionalString(obj, "repo_key")) orelse return error.InvalidPayload, " \t\r\n");
+        if (provider.len == 0 or repo_key.len == 0) return error.InvalidPayload;
+
+        return .{
+            .provider = try self.allocator.dupe(u8, provider),
+            .repo_key = try self.allocator.dupe(u8, repo_key),
+            .pr_number = (try jsonObjectOptionalU64(obj, "pr_number")) orelse return error.InvalidPayload,
+            .pr_url = try self.allocator.dupe(u8, (try jsonObjectOptionalString(obj, "pr_url")) orelse ""),
+            .base_branch = try self.allocator.dupe(u8, (try jsonObjectOptionalString(obj, "base_branch")) orelse "main"),
+            .base_sha = try self.allocator.dupe(u8, (try jsonObjectOptionalString(obj, "base_sha")) orelse ""),
+            .head_branch = try self.allocator.dupe(u8, (try jsonObjectOptionalString(obj, "head_branch")) orelse ""),
+            .head_sha = try self.allocator.dupe(u8, (try jsonObjectOptionalString(obj, "head_sha")) orelse ""),
+            .checkout_path = try self.allocator.dupe(u8, (try jsonObjectOptionalString(obj, "checkout_path")) orelse return error.InvalidPayload),
+            .review_policy_paths_json = try self.renderJsonFieldOrDefault(obj, "review_policy_paths", "[]"),
+            .default_review_commands_json = try self.renderJsonFieldOrDefault(obj, "default_review_commands", "[]"),
+            .approval_policy_json = try self.renderJsonFieldOrDefault(
+                obj,
+                "approval_policy",
+                "{\"push_fix_requires_approval\":false,\"merge_requires_approval\":true}",
+            ),
+        };
+    }
+
     fn loadPrReviewStateSnapshot(self: *Session, state_path: []const u8) !PrReviewStateSnapshot {
         const raw = try self.readMissionContractFile(state_path, 512 * 1024);
         defer self.allocator.free(raw);
@@ -9889,6 +11336,11 @@ pub const Session = struct {
             .validation_artifact = try self.allocator.dupe(u8, if (artifacts_obj) |value| (try jsonObjectOptionalString(value, "validation")) orelse "validation.json" else "validation.json"),
             .recommendation_artifact = try self.allocator.dupe(u8, if (artifacts_obj) |value| (try jsonObjectOptionalString(value, "recommendation")) orelse "recommendation.json" else "recommendation.json"),
             .thread_actions_artifact = try self.allocator.dupe(u8, if (artifacts_obj) |value| (try jsonObjectOptionalString(value, "thread_actions")) orelse "thread-actions.json" else "thread-actions.json"),
+            .provider_sync_artifact = try self.allocator.dupe(u8, if (artifacts_obj) |value| (try jsonObjectOptionalString(value, "provider_sync")) orelse "services/provider-sync.json" else "services/provider-sync.json"),
+            .checkout_sync_artifact = try self.allocator.dupe(u8, if (artifacts_obj) |value| (try jsonObjectOptionalString(value, "checkout")) orelse "services/checkout.json" else "services/checkout.json"),
+            .repo_status_artifact = try self.allocator.dupe(u8, if (artifacts_obj) |value| (try jsonObjectOptionalString(value, "repo_status")) orelse "services/repo-status.json" else "services/repo-status.json"),
+            .diff_range_artifact = try self.allocator.dupe(u8, if (artifacts_obj) |value| (try jsonObjectOptionalString(value, "diff_range")) orelse "services/diff-range.json" else "services/diff-range.json"),
+            .publish_review_artifact = try self.allocator.dupe(u8, if (artifacts_obj) |value| (try jsonObjectOptionalString(value, "publish_review")) orelse "services/publish-review.json" else "services/publish-review.json"),
             .notes_json = try self.renderJsonFieldOrDefault(obj, "notes", "[]"),
         };
     }
@@ -9919,6 +11371,440 @@ pub const Session = struct {
             try self.renderJsonValue(value);
         self.allocator.free(target.*);
         target.* = rendered;
+    }
+
+    const PrReviewOptionalServiceArgs = struct {
+        enabled: bool = false,
+        overrides: ?std.json.ObjectMap = null,
+    };
+
+    const PrReviewServiceCapture = struct {
+        artifact_path: []u8,
+        result_payload: []u8,
+        status_payload: ?[]u8 = null,
+
+        fn deinit(self: *PrReviewServiceCapture, allocator: std.mem.Allocator) void {
+            allocator.free(self.artifact_path);
+            allocator.free(self.result_payload);
+            if (self.status_payload) |value| allocator.free(value);
+            self.* = undefined;
+        }
+    };
+
+    fn parsePrReviewOptionalServiceArgs(args_obj: std.json.ObjectMap, key: []const u8) !PrReviewOptionalServiceArgs {
+        if (args_obj.get(key)) |value| {
+            return switch (value) {
+                .null => .{},
+                .bool => .{ .enabled = value.bool },
+                .object => .{ .enabled = true, .overrides = value.object },
+                else => error.InvalidPayload,
+            };
+        }
+        return .{};
+    }
+
+    fn findJsonObjectFieldByNames(obj: std.json.ObjectMap, names: []const []const u8) ?std.json.Value {
+        for (names) |name| {
+            if (obj.get(name)) |value| return value;
+        }
+        return null;
+    }
+
+    fn formatJsonString(self: *Session, value: []const u8) ![]u8 {
+        const escaped = try unified.jsonEscape(self.allocator, value);
+        defer self.allocator.free(escaped);
+        return std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped});
+    }
+
+    fn renderPrReviewStringArg(
+        self: *Session,
+        overrides: ?std.json.ObjectMap,
+        names: []const []const u8,
+        default: ?[]const u8,
+    ) ![]u8 {
+        if (overrides) |obj| {
+            if (findJsonObjectFieldByNames(obj, names)) |value| {
+                if (value == .null) return self.allocator.dupe(u8, "null");
+                if (value != .string) return error.InvalidPayload;
+                return self.formatJsonString(std.mem.trim(u8, value.string, " \t\r\n"));
+            }
+        }
+        if (default) |value| return self.formatJsonString(value);
+        return self.allocator.dupe(u8, "null");
+    }
+
+    fn renderPrReviewU64Arg(
+        self: *Session,
+        overrides: ?std.json.ObjectMap,
+        names: []const []const u8,
+        default: ?u64,
+    ) ![]u8 {
+        if (overrides) |obj| {
+            if (findJsonObjectFieldByNames(obj, names)) |value| {
+                if (value == .null) return self.allocator.dupe(u8, "null");
+                return switch (value) {
+                    .integer => |signed| blk: {
+                        if (signed < 0) return error.InvalidPayload;
+                        break :blk std.fmt.allocPrint(self.allocator, "{d}", .{@as(u64, @intCast(signed))});
+                    },
+                    .float => |float_value| blk: {
+                        if (float_value < 0 or std.math.floor(float_value) != float_value) return error.InvalidPayload;
+                        break :blk std.fmt.allocPrint(self.allocator, "{d}", .{@as(u64, @intFromFloat(float_value))});
+                    },
+                    else => error.InvalidPayload,
+                };
+            }
+        }
+        if (default) |value| return std.fmt.allocPrint(self.allocator, "{d}", .{value});
+        return self.allocator.dupe(u8, "null");
+    }
+
+    fn renderPrReviewBoolArg(
+        self: *Session,
+        overrides: ?std.json.ObjectMap,
+        names: []const []const u8,
+        default: ?bool,
+    ) ![]u8 {
+        if (overrides) |obj| {
+            if (findJsonObjectFieldByNames(obj, names)) |value| {
+                if (value == .null) return self.allocator.dupe(u8, "null");
+                if (value != .bool) return error.InvalidPayload;
+                return self.allocator.dupe(u8, if (value.bool) "true" else "false");
+            }
+        }
+        if (default) |value| return self.allocator.dupe(u8, if (value) "true" else "false");
+        return self.allocator.dupe(u8, "null");
+    }
+
+    fn buildPrReviewGitHubSyncRequestJson(
+        self: *Session,
+        context: PrReviewContextSnapshot,
+        overrides: ?std.json.ObjectMap,
+    ) ![]u8 {
+        const repo_key_json = try self.renderPrReviewStringArg(overrides, &.{"repo_key"}, context.repo_key);
+        defer self.allocator.free(repo_key_json);
+        const pr_number_json = try self.renderPrReviewU64Arg(overrides, &.{"pr_number"}, context.pr_number);
+        defer self.allocator.free(pr_number_json);
+        const dry_run_json = try self.renderPrReviewBoolArg(overrides, &.{"dry_run"}, false);
+        defer self.allocator.free(dry_run_json);
+        const timeout_ms_json = try self.renderPrReviewU64Arg(overrides, &.{"timeout_ms"}, null);
+        defer self.allocator.free(timeout_ms_json);
+        return std.fmt.allocPrint(
+            self.allocator,
+            "{{\"repo_key\":{s},\"pr_number\":{s},\"dry_run\":{s},\"timeout_ms\":{s}}}",
+            .{ repo_key_json, pr_number_json, dry_run_json, timeout_ms_json },
+        );
+    }
+
+    fn buildPrReviewGitSyncCheckoutRequestJson(
+        self: *Session,
+        context: PrReviewContextSnapshot,
+        overrides: ?std.json.ObjectMap,
+    ) ![]u8 {
+        const provider_json = try self.renderPrReviewStringArg(overrides, &.{"provider"}, context.provider);
+        defer self.allocator.free(provider_json);
+        const repo_key_json = try self.renderPrReviewStringArg(overrides, &.{"repo_key"}, context.repo_key);
+        defer self.allocator.free(repo_key_json);
+        const repo_url_json = try self.renderPrReviewStringArg(overrides, &.{"repo_url"}, null);
+        defer self.allocator.free(repo_url_json);
+        const checkout_path_json = try self.renderPrReviewStringArg(overrides, &.{"checkout_path"}, context.checkout_path);
+        defer self.allocator.free(checkout_path_json);
+        const base_branch_json = try self.renderPrReviewStringArg(overrides, &.{"base_branch"}, context.base_branch);
+        defer self.allocator.free(base_branch_json);
+        const head_branch_json = try self.renderPrReviewStringArg(overrides, &.{"head_branch"}, context.head_branch);
+        defer self.allocator.free(head_branch_json);
+        const head_sha_json = try self.renderPrReviewStringArg(overrides, &.{"head_sha"}, context.head_sha);
+        defer self.allocator.free(head_sha_json);
+        const pr_number_json = try self.renderPrReviewU64Arg(overrides, &.{"pr_number"}, context.pr_number);
+        defer self.allocator.free(pr_number_json);
+        const timeout_ms_json = try self.renderPrReviewU64Arg(overrides, &.{"timeout_ms"}, null);
+        defer self.allocator.free(timeout_ms_json);
+        return std.fmt.allocPrint(
+            self.allocator,
+            "{{\"provider\":{s},\"repo_key\":{s},\"repo_url\":{s},\"checkout_path\":{s},\"base_branch\":{s},\"head_branch\":{s},\"head_sha\":{s},\"pr_number\":{s},\"timeout_ms\":{s}}}",
+            .{
+                provider_json,
+                repo_key_json,
+                repo_url_json,
+                checkout_path_json,
+                base_branch_json,
+                head_branch_json,
+                head_sha_json,
+                pr_number_json,
+                timeout_ms_json,
+            },
+        );
+    }
+
+    fn buildPrReviewGitStatusRequestJson(
+        self: *Session,
+        context: PrReviewContextSnapshot,
+        overrides: ?std.json.ObjectMap,
+    ) ![]u8 {
+        const checkout_path_json = try self.renderPrReviewStringArg(overrides, &.{"checkout_path"}, context.checkout_path);
+        defer self.allocator.free(checkout_path_json);
+        const base_ref_json = try self.renderPrReviewStringArg(overrides, &.{"base_ref"}, null);
+        defer self.allocator.free(base_ref_json);
+        const base_branch_json = try self.renderPrReviewStringArg(overrides, &.{"base_branch"}, context.base_branch);
+        defer self.allocator.free(base_branch_json);
+        const timeout_ms_json = try self.renderPrReviewU64Arg(overrides, &.{"timeout_ms"}, null);
+        defer self.allocator.free(timeout_ms_json);
+        return std.fmt.allocPrint(
+            self.allocator,
+            "{{\"checkout_path\":{s},\"base_ref\":{s},\"base_branch\":{s},\"timeout_ms\":{s}}}",
+            .{ checkout_path_json, base_ref_json, base_branch_json, timeout_ms_json },
+        );
+    }
+
+    fn buildPrReviewGitDiffRangeRequestJson(
+        self: *Session,
+        context: PrReviewContextSnapshot,
+        overrides: ?std.json.ObjectMap,
+    ) ![]u8 {
+        const checkout_path_json = try self.renderPrReviewStringArg(overrides, &.{"checkout_path"}, context.checkout_path);
+        defer self.allocator.free(checkout_path_json);
+        const base_ref_json = try self.renderPrReviewStringArg(overrides, &.{"base_ref"}, null);
+        defer self.allocator.free(base_ref_json);
+        const base_branch_json = try self.renderPrReviewStringArg(overrides, &.{"base_branch"}, context.base_branch);
+        defer self.allocator.free(base_branch_json);
+        const head_ref_json = try self.renderPrReviewStringArg(overrides, &.{"head_ref"}, "HEAD");
+        defer self.allocator.free(head_ref_json);
+        const symmetric_json = try self.renderPrReviewBoolArg(overrides, &.{"symmetric"}, true);
+        defer self.allocator.free(symmetric_json);
+        const timeout_ms_json = try self.renderPrReviewU64Arg(overrides, &.{"timeout_ms"}, null);
+        defer self.allocator.free(timeout_ms_json);
+        return std.fmt.allocPrint(
+            self.allocator,
+            "{{\"checkout_path\":{s},\"base_ref\":{s},\"base_branch\":{s},\"head_ref\":{s},\"symmetric\":{s},\"timeout_ms\":{s}}}",
+            .{ checkout_path_json, base_ref_json, base_branch_json, head_ref_json, symmetric_json, timeout_ms_json },
+        );
+    }
+
+    fn buildPrReviewGitHubPublishRequestJson(
+        self: *Session,
+        context: PrReviewContextSnapshot,
+        recommendation_value: std.json.Value,
+        review_comment: ?[]const u8,
+        thread_actions_value: ?std.json.Value,
+        overrides: ?std.json.ObjectMap,
+    ) ![]u8 {
+        const repo_key_json = try self.renderPrReviewStringArg(overrides, &.{"repo_key"}, context.repo_key);
+        defer self.allocator.free(repo_key_json);
+        const pr_number_json = try self.renderPrReviewU64Arg(overrides, &.{"pr_number"}, context.pr_number);
+        defer self.allocator.free(pr_number_json);
+        const default_decision = if (recommendation_value == .object)
+            (try jsonObjectOptionalString(recommendation_value.object, "decision")) orelse "comment"
+        else
+            "comment";
+        const decision_json = try self.renderPrReviewStringArg(overrides, &.{"decision"}, default_decision);
+        defer self.allocator.free(decision_json);
+        const body_json = try self.renderPrReviewStringArg(overrides, &.{ "body", "review_comment" }, review_comment);
+        defer self.allocator.free(body_json);
+        const dry_run_json = try self.renderPrReviewBoolArg(overrides, &.{"dry_run"}, false);
+        defer self.allocator.free(dry_run_json);
+        const timeout_ms_json = try self.renderPrReviewU64Arg(overrides, &.{"timeout_ms"}, null);
+        defer self.allocator.free(timeout_ms_json);
+        const thread_actions_json = if (overrides) |obj|
+            if (findJsonObjectFieldByNames(obj, &.{"thread_actions"})) |value|
+                if (value == .null)
+                    try self.allocator.dupe(u8, "null")
+                else if (value == .array)
+                    try self.renderJsonValue(value)
+                else
+                    return error.InvalidPayload
+            else if (thread_actions_value) |value|
+                try self.renderJsonValue(value)
+            else
+                try self.allocator.dupe(u8, "null")
+        else if (thread_actions_value) |value|
+            try self.renderJsonValue(value)
+        else
+            try self.allocator.dupe(u8, "null");
+        defer self.allocator.free(thread_actions_json);
+
+        return std.fmt.allocPrint(
+            self.allocator,
+            "{{\"repo_key\":{s},\"pr_number\":{s},\"decision\":{s},\"body\":{s},\"dry_run\":{s},\"timeout_ms\":{s},\"thread_actions\":{s}}}",
+            .{ repo_key_json, pr_number_json, decision_json, body_json, dry_run_json, timeout_ms_json, thread_actions_json },
+        );
+    }
+
+    fn buildPrReviewServiceArtifactPayloadJson(
+        self: *Session,
+        service_path: []const u8,
+        invoke_path: []const u8,
+        request_payload_json: []const u8,
+        result_payload_json: []const u8,
+        status_payload_json: ?[]const u8,
+    ) ![]u8 {
+        const escaped_service_path = try unified.jsonEscape(self.allocator, service_path);
+        defer self.allocator.free(escaped_service_path);
+        const escaped_invoke_path = try unified.jsonEscape(self.allocator, invoke_path);
+        defer self.allocator.free(escaped_invoke_path);
+        const status_json = if (status_payload_json) |value|
+            try self.allocator.dupe(u8, value)
+        else
+            try self.allocator.dupe(u8, "null");
+        defer self.allocator.free(status_json);
+        return std.fmt.allocPrint(
+            self.allocator,
+            "{{\"service_path\":\"{s}\",\"invoke_path\":\"{s}\",\"request\":{s},\"result\":{s},\"status\":{s}}}",
+            .{ escaped_service_path, escaped_invoke_path, request_payload_json, result_payload_json, status_json },
+        );
+    }
+
+    fn invokePrReviewServiceCapture(
+        self: *Session,
+        store: *mission_store_mod.MissionStore,
+        mission_id: []const u8,
+        stage: []const u8,
+        summary: []const u8,
+        service_path: []const u8,
+        invoke_path: []const u8,
+        request_payload: []const u8,
+        artifact_root: []const u8,
+        artifact_relative_path: []const u8,
+        artifact_kind: []const u8,
+    ) !PrReviewServiceCapture {
+        const status_path = try self.pathWithInvokeTarget(service_path, "status.json");
+        defer self.allocator.free(status_path);
+        const result_path = try self.pathWithInvokeTarget(service_path, "result.json");
+        defer self.allocator.free(result_path);
+
+        var write_error: ?InternalFsrpcErrorInfo = try self.writeInternalPath(invoke_path, request_payload);
+        defer if (write_error) |*value| value.deinit(self.allocator);
+
+        const status_payload = if (write_error == null)
+            try self.tryReadInternalPath(status_path)
+        else
+            null;
+        errdefer if (status_payload) |value| self.allocator.free(value);
+        const service_result_payload = if (write_error == null)
+            try self.tryReadInternalPath(result_path)
+        else
+            null;
+        defer if (service_result_payload) |value| self.allocator.free(value);
+
+        const effective_result_payload = blk: {
+            if (write_error) |value| break :blk try self.buildServiceInvokeFailureResultJson(value.code, value.message);
+            if (service_result_payload) |value| break :blk try self.allocator.dupe(u8, value);
+            break :blk try self.buildServiceInvokeFailureResultJson("missing_result", "service produced no result payload");
+        };
+        errdefer self.allocator.free(effective_result_payload);
+
+        const artifact_payload = try self.buildPrReviewServiceArtifactPayloadJson(
+            service_path,
+            invoke_path,
+            request_payload,
+            effective_result_payload,
+            status_payload,
+        );
+        defer self.allocator.free(artifact_payload);
+
+        const artifact_path = try self.writePrReviewArtifactPayload(artifact_root, artifact_relative_path, artifact_payload);
+        errdefer self.allocator.free(artifact_path);
+
+        var mission = store.recordServiceInvocation(self.allocator, mission_id, .{
+            .stage = stage,
+            .summary = summary,
+            .service_path = service_path,
+            .invoke_path = invoke_path,
+            .request_payload_json = request_payload,
+            .result_payload_json = effective_result_payload,
+            .status_payload_json = status_payload,
+            .artifact = .{
+                .kind = artifact_kind,
+                .path = artifact_path,
+                .summary = summary,
+            },
+            .actor = .{ .actor_type = self.actor_type, .actor_id = self.actor_id },
+        }) catch |err| switch (err) {
+            mission_store_mod.MissionStoreError.MissionNotFound => return error.NotFound,
+            else => return error.InvalidPayload,
+        };
+        mission.deinit(self.allocator);
+
+        return .{
+            .artifact_path = artifact_path,
+            .result_payload = effective_result_payload,
+            .status_payload = status_payload,
+        };
+    }
+
+    fn applyPrReviewContextFromGitHubSyncPayload(
+        self: *Session,
+        context: *PrReviewContextSnapshot,
+        state: *PrReviewStateSnapshot,
+        payload_json: []const u8,
+    ) !void {
+        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, payload_json, .{}) catch return;
+        defer parsed.deinit();
+        if (parsed.value != .object) return;
+        const root = parsed.value.object;
+        const result_value = root.get("result") orelse return;
+        if (result_value != .object) return;
+        const provider_value = result_value.object.get("provider") orelse return;
+        if (provider_value != .object) return;
+        const provider_obj = provider_value.object;
+
+        if (try jsonObjectOptionalString(provider_obj, "url")) |value| if (value.len > 0) try self.replaceOwnedString(&context.pr_url, value);
+        if (try jsonObjectOptionalString(provider_obj, "baseRefName")) |value| if (value.len > 0) try self.replaceOwnedString(&context.base_branch, value);
+        if (try jsonObjectOptionalString(provider_obj, "baseRefOid")) |value| if (value.len > 0) try self.replaceOwnedString(&context.base_sha, value);
+        if (try jsonObjectOptionalString(provider_obj, "headRefName")) |value| if (value.len > 0) try self.replaceOwnedString(&context.head_branch, value);
+        if (try jsonObjectOptionalString(provider_obj, "headRefOid")) |value| {
+            if (value.len > 0) {
+                try self.replaceOwnedString(&context.head_sha, value);
+                try self.replaceOwnedString(&state.last_synced_head_sha, value);
+            }
+        }
+    }
+
+    fn applyPrReviewContextFromGitSyncPayload(
+        self: *Session,
+        context: *PrReviewContextSnapshot,
+        state: *PrReviewStateSnapshot,
+        payload_json: []const u8,
+    ) !void {
+        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, payload_json, .{}) catch return;
+        defer parsed.deinit();
+        if (parsed.value != .object) return;
+        const root = parsed.value.object;
+        const result_value = root.get("result") orelse return;
+        if (result_value != .object) return;
+        const result_obj = result_value.object;
+
+        if (try jsonObjectOptionalString(result_obj, "checkout_path")) |value| if (value.len > 0) try self.replaceOwnedString(&context.checkout_path, value);
+        if (try jsonObjectOptionalString(result_obj, "base_branch")) |value| if (value.len > 0) try self.replaceOwnedString(&context.base_branch, value);
+        if (try jsonObjectOptionalString(result_obj, "head_branch")) |value| if (value.len > 0) try self.replaceOwnedString(&context.head_branch, value);
+        if (try jsonObjectOptionalString(result_obj, "base_sha")) |value| if (value.len > 0) try self.replaceOwnedString(&context.base_sha, value);
+        if (try jsonObjectOptionalString(result_obj, "head_sha")) |value| {
+            if (value.len > 0) {
+                try self.replaceOwnedString(&context.head_sha, value);
+                try self.replaceOwnedString(&state.last_synced_head_sha, value);
+            }
+        }
+    }
+
+    fn applyPrReviewContextFromGitStatusPayload(
+        self: *Session,
+        context: *PrReviewContextSnapshot,
+        state: *PrReviewStateSnapshot,
+        payload_json: []const u8,
+    ) !void {
+        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, payload_json, .{}) catch return;
+        defer parsed.deinit();
+        if (parsed.value != .object) return;
+        const root = parsed.value.object;
+        const result_value = root.get("result") orelse return;
+        if (result_value != .object) return;
+        const result_obj = result_value.object;
+
+        if (try jsonObjectOptionalString(result_obj, "head_sha")) |value| {
+            if (value.len > 0) {
+                try self.replaceOwnedString(&context.head_sha, value);
+                try self.replaceOwnedString(&state.last_synced_head_sha, value);
+            }
+        }
     }
 
     fn applyPrReviewCommonStateFields(self: *Session, args_obj: std.json.ObjectMap, state: *PrReviewStateSnapshot) !void {
@@ -9967,6 +11853,13 @@ pub const Session = struct {
         const payload = try self.renderJsonValue(value);
         defer self.allocator.free(payload);
         try self.writeMissionContractFile(artifact_path, payload);
+        return artifact_path;
+    }
+
+    fn writePrReviewArtifactPayload(self: *Session, artifact_root: []const u8, artifact_relative_path: []const u8, payload_json: []const u8) ![]u8 {
+        const artifact_path = try self.resolvePrReviewArtifactPath(artifact_root, artifact_relative_path);
+        errdefer self.allocator.free(artifact_path);
+        try self.writeMissionContractFile(artifact_path, payload_json);
         return artifact_path;
     }
 
@@ -10034,7 +11927,7 @@ pub const Session = struct {
         defer self.allocator.free(escaped_head_sha);
         return std.fmt.allocPrint(
             self.allocator,
-            "{{\"phase\":\"discovered\",\"last_synced_head_sha\":\"{s}\",\"current_focus\":\"\",\"open_threads\":[],\"latest_validation\":{{\"status\":\"unknown\",\"summary\":null}},\"latest_recommendation\":{{\"status\":\"pending\",\"summary\":null}},\"artifacts\":{{\"findings\":\"findings.json\",\"validation\":\"validation.json\",\"recommendation\":\"recommendation.json\",\"thread_actions\":\"thread-actions.json\"}},\"notes\":[]}}",
+            "{{\"phase\":\"discovered\",\"last_synced_head_sha\":\"{s}\",\"current_focus\":\"\",\"open_threads\":[],\"latest_validation\":{{\"status\":\"unknown\",\"summary\":null}},\"latest_recommendation\":{{\"status\":\"pending\",\"summary\":null}},\"artifacts\":{{\"findings\":\"findings.json\",\"validation\":\"validation.json\",\"recommendation\":\"recommendation.json\",\"thread_actions\":\"thread-actions.json\",\"provider_sync\":\"services/provider-sync.json\",\"checkout\":\"services/checkout.json\",\"repo_status\":\"services/repo-status.json\",\"diff_range\":\"services/diff-range.json\",\"publish_review\":\"services/publish-review.json\"}},\"notes\":[]}}",
             .{escaped_head_sha},
         );
     }
@@ -10074,6 +11967,16 @@ pub const Session = struct {
         try writeJsonString(writer, state.recommendation_artifact);
         try writer.writeAll(",\"thread_actions\":");
         try writeJsonString(writer, state.thread_actions_artifact);
+        try writer.writeAll(",\"provider_sync\":");
+        try writeJsonString(writer, state.provider_sync_artifact);
+        try writer.writeAll(",\"checkout\":");
+        try writeJsonString(writer, state.checkout_sync_artifact);
+        try writer.writeAll(",\"repo_status\":");
+        try writeJsonString(writer, state.repo_status_artifact);
+        try writer.writeAll(",\"diff_range\":");
+        try writeJsonString(writer, state.diff_range_artifact);
+        try writer.writeAll(",\"publish_review\":");
+        try writeJsonString(writer, state.publish_review_artifact);
         try writer.writeByte('}');
         try writer.writeAll(",\"notes\":");
         try writer.writeAll(state.notes_json);
@@ -10131,6 +12034,10 @@ pub const Session = struct {
         phase: []const u8,
         state_path: []const u8,
         thread_actions_path: ?[]const u8,
+        provider_sync_path: ?[]const u8,
+        checkout_sync_path: ?[]const u8,
+        repo_status_path: ?[]const u8,
+        diff_range_path: ?[]const u8,
     ) ![]u8 {
         const escaped_phase = try unified.jsonEscape(self.allocator, phase);
         defer self.allocator.free(escaped_phase);
@@ -10142,10 +12049,43 @@ pub const Session = struct {
             break :blk try std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped});
         } else try self.allocator.dupe(u8, "null");
         defer self.allocator.free(thread_actions_json);
+        const provider_sync_json = if (provider_sync_path) |value| blk: {
+            const escaped = try unified.jsonEscape(self.allocator, value);
+            defer self.allocator.free(escaped);
+            break :blk try std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped});
+        } else try self.allocator.dupe(u8, "null");
+        defer self.allocator.free(provider_sync_json);
+        const checkout_sync_json = if (checkout_sync_path) |value| blk: {
+            const escaped = try unified.jsonEscape(self.allocator, value);
+            defer self.allocator.free(escaped);
+            break :blk try std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped});
+        } else try self.allocator.dupe(u8, "null");
+        defer self.allocator.free(checkout_sync_json);
+        const repo_status_json = if (repo_status_path) |value| blk: {
+            const escaped = try unified.jsonEscape(self.allocator, value);
+            defer self.allocator.free(escaped);
+            break :blk try std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped});
+        } else try self.allocator.dupe(u8, "null");
+        defer self.allocator.free(repo_status_json);
+        const diff_range_json = if (diff_range_path) |value| blk: {
+            const escaped = try unified.jsonEscape(self.allocator, value);
+            defer self.allocator.free(escaped);
+            break :blk try std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped});
+        } else try self.allocator.dupe(u8, "null");
+        defer self.allocator.free(diff_range_json);
         return std.fmt.allocPrint(
             self.allocator,
-            "{{\"mission\":{s},\"review\":{{\"phase\":\"{s}\",\"state_path\":\"{s}\",\"thread_actions_path\":{s}}}}}",
-            .{ mission_json, escaped_phase, escaped_state_path, thread_actions_json },
+            "{{\"mission\":{s},\"review\":{{\"phase\":\"{s}\",\"state_path\":\"{s}\",\"thread_actions_path\":{s},\"services\":{{\"provider_sync_path\":{s},\"checkout_sync_path\":{s},\"repo_status_path\":{s},\"diff_range_path\":{s}}}}}}}",
+            .{
+                mission_json,
+                escaped_phase,
+                escaped_state_path,
+                thread_actions_json,
+                provider_sync_json,
+                checkout_sync_json,
+                repo_status_json,
+                diff_range_json,
+            },
         );
     }
 
@@ -10178,6 +12118,7 @@ pub const Session = struct {
         recommendation_path: []const u8,
         review_comment_path: ?[]const u8,
         thread_actions_path: ?[]const u8,
+        publish_review_path: ?[]const u8,
     ) ![]u8 {
         const escaped_phase = try unified.jsonEscape(self.allocator, phase);
         defer self.allocator.free(escaped_phase);
@@ -10199,9 +12140,15 @@ pub const Session = struct {
             break :blk try std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped});
         } else try self.allocator.dupe(u8, "null");
         defer self.allocator.free(thread_actions_json);
+        const publish_review_json = if (publish_review_path) |value| blk: {
+            const escaped = try unified.jsonEscape(self.allocator, value);
+            defer self.allocator.free(escaped);
+            break :blk try std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped});
+        } else try self.allocator.dupe(u8, "null");
+        defer self.allocator.free(publish_review_json);
         return std.fmt.allocPrint(
             self.allocator,
-            "{{\"mission\":{s},\"review\":{{\"phase\":\"{s}\",\"state_path\":\"{s}\",\"findings_path\":\"{s}\",\"recommendation_path\":\"{s}\",\"review_comment_path\":{s},\"thread_actions_path\":{s}}}}}",
+            "{{\"mission\":{s},\"review\":{{\"phase\":\"{s}\",\"state_path\":\"{s}\",\"findings_path\":\"{s}\",\"recommendation_path\":\"{s}\",\"review_comment_path\":{s},\"thread_actions_path\":{s},\"services\":{{\"publish_review_path\":{s}}}}}}",
             .{
                 mission_json,
                 escaped_phase,
@@ -10210,6 +12157,7 @@ pub const Session = struct {
                 escaped_recommendation_path,
                 review_comment_json,
                 thread_actions_json,
+                publish_review_json,
             },
         );
     }
@@ -10221,6 +12169,26 @@ pub const Session = struct {
             self.allocator,
             "{{\"ok\":true,\"operation\":\"{s}\",\"result\":{s},\"error\":null}}",
             .{ escaped_operation, result_json },
+        );
+    }
+
+    fn buildPrReviewPartialFailureResultJson(
+        self: *Session,
+        op: PrReviewOp,
+        result_json: []const u8,
+        code: []const u8,
+        message: []const u8,
+    ) ![]u8 {
+        const escaped_operation = try unified.jsonEscape(self.allocator, prReviewOperationName(op));
+        defer self.allocator.free(escaped_operation);
+        const escaped_code = try unified.jsonEscape(self.allocator, code);
+        defer self.allocator.free(escaped_code);
+        const escaped_message = try unified.jsonEscape(self.allocator, message);
+        defer self.allocator.free(escaped_message);
+        return std.fmt.allocPrint(
+            self.allocator,
+            "{{\"ok\":false,\"operation\":\"{s}\",\"result\":{s},\"error\":{{\"code\":\"{s}\",\"message\":\"{s}\"}}}}",
+            .{ escaped_operation, result_json, escaped_code, escaped_message },
         );
     }
 
@@ -13279,6 +15247,30 @@ fn protocolReadFile(
     return decodeReadResponseData(allocator, read_res);
 }
 
+fn runTestCommandCapture(
+    allocator: std.mem.Allocator,
+    cwd: ?[]const u8,
+    argv: []const []const u8,
+) ![]u8 {
+    const result = try std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = argv,
+        .cwd = cwd,
+    });
+    defer allocator.free(result.stderr);
+    switch (result.term) {
+        .Exited => |code| {
+            if (code == 0) return result.stdout;
+            allocator.free(result.stdout);
+            return error.TestExpectedResponse;
+        },
+        else => {
+            allocator.free(result.stdout);
+            return error.TestExpectedResponse;
+        },
+    }
+}
+
 fn extractMissionIdFromResultPayload(
     allocator: std.mem.Allocator,
     result_payload: []const u8,
@@ -15915,6 +17907,207 @@ test "acheron_session: pr_review venom syncs state and records review artifacts"
     try std.testing.expect(std.mem.indexOf(u8, thread_actions_content, "\"action\":\"comment\"") != null);
 }
 
+test "acheron_session: pr_review venom orchestrates repo services and review publication" {
+    const allocator = std.testing.allocator;
+
+    var mission_store = try mission_store_mod.MissionStore.initWithPath(allocator, null);
+    defer mission_store.deinit();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const root = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+    const exports_dir = try std.fmt.allocPrint(allocator, "{s}/exports", .{root});
+    defer allocator.free(exports_dir);
+    const seed_dir = try std.fmt.allocPrint(allocator, "{s}/seed", .{root});
+    defer allocator.free(seed_dir);
+    const remote_dir = try std.fmt.allocPrint(allocator, "{s}/remote.git", .{root});
+    defer allocator.free(remote_dir);
+    try std.fs.cwd().makePath(exports_dir);
+
+    _ = try runTestCommandCapture(allocator, root, &.{ "git", "init", "seed" });
+    _ = try runTestCommandCapture(allocator, root, &.{ "git", "-C", seed_dir, "config", "user.email", "spider@example.com" });
+    _ = try runTestCommandCapture(allocator, root, &.{ "git", "-C", seed_dir, "config", "user.name", "Spider Monkey" });
+
+    const readme_path = try std.fmt.allocPrint(allocator, "{s}/README.md", .{seed_dir});
+    defer allocator.free(readme_path);
+    try std.fs.cwd().writeFile(.{ .sub_path = readme_path, .data = "hello\n" });
+    _ = try runTestCommandCapture(allocator, root, &.{ "git", "-C", seed_dir, "add", "README.md" });
+    _ = try runTestCommandCapture(allocator, root, &.{ "git", "-C", seed_dir, "commit", "-m", "initial" });
+    _ = try runTestCommandCapture(allocator, root, &.{ "git", "-C", seed_dir, "branch", "-M", "main" });
+
+    const first_sha_raw = try runTestCommandCapture(allocator, root, &.{ "git", "-C", seed_dir, "rev-parse", "HEAD" });
+    defer allocator.free(first_sha_raw);
+    const first_sha = std.mem.trim(u8, first_sha_raw, " \t\r\n");
+
+    const src_dir = try std.fmt.allocPrint(allocator, "{s}/src", .{seed_dir});
+    defer allocator.free(src_dir);
+    try std.fs.cwd().makePath(src_dir);
+    const app_path = try std.fmt.allocPrint(allocator, "{s}/src/app.txt", .{seed_dir});
+    defer allocator.free(app_path);
+    try std.fs.cwd().writeFile(.{ .sub_path = app_path, .data = "second\n" });
+    _ = try runTestCommandCapture(allocator, root, &.{ "git", "-C", seed_dir, "add", "src/app.txt" });
+    _ = try runTestCommandCapture(allocator, root, &.{ "git", "-C", seed_dir, "commit", "-m", "second" });
+
+    const second_sha_raw = try runTestCommandCapture(allocator, root, &.{ "git", "-C", seed_dir, "rev-parse", "HEAD" });
+    defer allocator.free(second_sha_raw);
+    const second_sha = std.mem.trim(u8, second_sha_raw, " \t\r\n");
+
+    _ = try runTestCommandCapture(allocator, root, &.{ "git", "init", "--bare", "remote.git" });
+    _ = try runTestCommandCapture(allocator, root, &.{ "git", "-C", seed_dir, "remote", "add", "origin", remote_dir });
+    _ = try runTestCommandCapture(allocator, root, &.{ "git", "-C", seed_dir, "push", "-u", "origin", "main" });
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "default",
+        .{
+            .mission_store = &mission_store,
+            .local_fs_export_root = exports_dir,
+            .actor_type = "agent",
+            .actor_id = "reviewer-b",
+        },
+    );
+    defer session.deinit();
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        700,
+        701,
+        &.{ "agents", "self", "pr_review", "control", "start.json" },
+        "{\"repo_key\":\"DeanoC/Spiderweb\",\"pr_number\":77,\"head_sha\":\"pending\"}",
+        1800,
+    );
+
+    const start_result = try protocolReadFile(
+        &session,
+        allocator,
+        702,
+        703,
+        &.{ "agents", "self", "pr_review", "result.json" },
+        1801,
+    );
+    defer allocator.free(start_result);
+    const mission_id = try extractMissionIdFromResultPayload(allocator, start_result);
+    defer allocator.free(mission_id);
+
+    const sync_payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"mission_id\":\"{s}\",\"phase\":\"ready_for_checkout\",\"current_focus\":\"Sync repo services\",\"provider_sync\":{{\"dry_run\":true}},\"sync_checkout\":{{\"repo_url\":\"{s}\",\"pr_number\":null,\"head_branch\":\"main\"}},\"repo_status\":{{\"base_ref\":\"{s}\"}},\"diff_range\":{{\"base_ref\":\"{s}\",\"head_ref\":\"HEAD\"}}}}",
+        .{ mission_id, remote_dir, first_sha, first_sha },
+    );
+    defer allocator.free(sync_payload);
+    try protocolWriteFile(
+        &session,
+        allocator,
+        704,
+        705,
+        &.{ "agents", "self", "pr_review", "control", "sync.json" },
+        sync_payload,
+        1802,
+    );
+
+    const sync_result = try protocolReadFile(
+        &session,
+        allocator,
+        706,
+        707,
+        &.{ "agents", "self", "pr_review", "result.json" },
+        1803,
+    );
+    defer allocator.free(sync_result);
+    try std.testing.expect(std.mem.indexOf(u8, sync_result, "\"operation\":\"sync\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sync_result, "\"provider_sync_path\":\"/nodes/local/fs/pr-review/runs/DeanoC__Spiderweb/pr-77/services/provider-sync.json\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sync_result, "\"checkout_sync_path\":\"/nodes/local/fs/pr-review/runs/DeanoC__Spiderweb/pr-77/services/checkout.json\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sync_result, "\"repo_status_path\":\"/nodes/local/fs/pr-review/runs/DeanoC__Spiderweb/pr-77/services/repo-status.json\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sync_result, "\"diff_range_path\":\"/nodes/local/fs/pr-review/runs/DeanoC__Spiderweb/pr-77/services/diff-range.json\"") != null);
+
+    const context_host_path = try std.fs.path.join(allocator, &.{ exports_dir, "pr-review", "state", "DeanoC__Spiderweb", "pr-77", "context.json" });
+    defer allocator.free(context_host_path);
+    const context_content = try std.fs.cwd().readFileAlloc(allocator, context_host_path, 64 * 1024);
+    defer allocator.free(context_content);
+    try std.testing.expect(std.mem.indexOf(u8, context_content, "\"head_branch\":\"main\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, context_content, second_sha) != null);
+
+    const state_host_path = try std.fs.path.join(allocator, &.{ exports_dir, "pr-review", "state", "DeanoC__Spiderweb", "pr-77", "state.json" });
+    defer allocator.free(state_host_path);
+    const state_content = try std.fs.cwd().readFileAlloc(allocator, state_host_path, 64 * 1024);
+    defer allocator.free(state_content);
+    try std.testing.expect(std.mem.indexOf(u8, state_content, second_sha) != null);
+    try std.testing.expect(std.mem.indexOf(u8, state_content, "\"provider_sync\":\"services/provider-sync.json\"") != null);
+
+    const provider_sync_path = try std.fs.path.join(allocator, &.{ exports_dir, "pr-review", "runs", "DeanoC__Spiderweb", "pr-77", "services", "provider-sync.json" });
+    defer allocator.free(provider_sync_path);
+    const provider_sync_content = try std.fs.cwd().readFileAlloc(allocator, provider_sync_path, 64 * 1024);
+    defer allocator.free(provider_sync_content);
+    try std.testing.expect(std.mem.indexOf(u8, provider_sync_content, "\"service_path\":\"/global/github_pr\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, provider_sync_content, "\"dry_run\":true") != null);
+
+    const checkout_capture_path = try std.fs.path.join(allocator, &.{ exports_dir, "pr-review", "runs", "DeanoC__Spiderweb", "pr-77", "services", "checkout.json" });
+    defer allocator.free(checkout_capture_path);
+    const checkout_capture_content = try std.fs.cwd().readFileAlloc(allocator, checkout_capture_path, 64 * 1024);
+    defer allocator.free(checkout_capture_content);
+    try std.testing.expect(std.mem.indexOf(u8, checkout_capture_content, "\"service_path\":\"/global/git\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, checkout_capture_content, second_sha) != null);
+
+    const repo_status_capture_path = try std.fs.path.join(allocator, &.{ exports_dir, "pr-review", "runs", "DeanoC__Spiderweb", "pr-77", "services", "repo-status.json" });
+    defer allocator.free(repo_status_capture_path);
+    const repo_status_capture_content = try std.fs.cwd().readFileAlloc(allocator, repo_status_capture_path, 64 * 1024);
+    defer allocator.free(repo_status_capture_content);
+    try std.testing.expect(std.mem.indexOf(u8, repo_status_capture_content, "\"changed_files\":[\"src/app.txt\"]") != null);
+
+    const diff_range_capture_path = try std.fs.path.join(allocator, &.{ exports_dir, "pr-review", "runs", "DeanoC__Spiderweb", "pr-77", "services", "diff-range.json" });
+    defer allocator.free(diff_range_capture_path);
+    const diff_range_capture_content = try std.fs.cwd().readFileAlloc(allocator, diff_range_capture_path, 64 * 1024);
+    defer allocator.free(diff_range_capture_content);
+    try std.testing.expect(std.mem.indexOf(u8, diff_range_capture_content, "\"changed_files\":[\"src/app.txt\"]") != null);
+
+    const review_payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"mission_id\":\"{s}\",\"findings\":[{{\"severity\":\"medium\",\"type\":\"maintainability\",\"path\":\"src/app.txt\",\"line\":1,\"message\":\"Add coverage for PR review orchestration\"}}],\"recommendation\":{{\"decision\":\"request_changes\",\"summary\":\"Capture the missing regression tests\"}},\"review_comment\":\"Please add regression coverage before merging.\",\"thread_actions\":[{{\"thread_id\":\"t-77\",\"action\":\"comment\"}}],\"publish_review\":{{\"dry_run\":true}}}}",
+        .{mission_id},
+    );
+    defer allocator.free(review_payload);
+    try protocolWriteFile(
+        &session,
+        allocator,
+        708,
+        709,
+        &.{ "agents", "self", "pr_review", "control", "record_review.json" },
+        review_payload,
+        1804,
+    );
+
+    const review_result = try protocolReadFile(
+        &session,
+        allocator,
+        710,
+        711,
+        &.{ "agents", "self", "pr_review", "result.json" },
+        1805,
+    );
+    defer allocator.free(review_result);
+    try std.testing.expect(std.mem.indexOf(u8, review_result, "\"operation\":\"record_review\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, review_result, "\"publish_review_path\":\"/nodes/local/fs/pr-review/runs/DeanoC__Spiderweb/pr-77/services/publish-review.json\"") != null);
+
+    const publish_review_capture_path = try std.fs.path.join(allocator, &.{ exports_dir, "pr-review", "runs", "DeanoC__Spiderweb", "pr-77", "services", "publish-review.json" });
+    defer allocator.free(publish_review_capture_path);
+    const publish_review_capture_content = try std.fs.cwd().readFileAlloc(allocator, publish_review_capture_path, 64 * 1024);
+    defer allocator.free(publish_review_capture_content);
+    try std.testing.expect(std.mem.indexOf(u8, publish_review_capture_content, "\"service_path\":\"/global/github_pr\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, publish_review_capture_content, "\"decision\":\"request_changes\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, publish_review_capture_content, "\"thread_actions_count\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, publish_review_capture_content, "\"dry_run\":true") != null);
+}
+
 test "acheron_session: missions invoke_service records downstream service failures" {
     const allocator = std.testing.allocator;
 
@@ -16019,6 +18212,264 @@ test "acheron_session: missions invoke_service records downstream service failur
     try std.testing.expect(std.mem.indexOf(u8, mission_result, "\"code\":\"invalid\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, mission_result, "\"service_path\":\"/global/memory\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, mission_result, "\"event_type\":\"mission.service_invoked\"") != null);
+}
+
+test "acheron_session: git venom syncs checkout and reports changed files" {
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const root = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+    const exports_dir = try std.fmt.allocPrint(allocator, "{s}/exports", .{root});
+    defer allocator.free(exports_dir);
+    const seed_dir = try std.fmt.allocPrint(allocator, "{s}/seed", .{root});
+    defer allocator.free(seed_dir);
+    const remote_dir = try std.fmt.allocPrint(allocator, "{s}/remote.git", .{root});
+    defer allocator.free(remote_dir);
+    try std.fs.cwd().makePath(exports_dir);
+
+    _ = try runTestCommandCapture(allocator, root, &.{ "git", "init", "seed" });
+    _ = try runTestCommandCapture(allocator, root, &.{ "git", "-C", seed_dir, "config", "user.email", "spider@example.com" });
+    _ = try runTestCommandCapture(allocator, root, &.{ "git", "-C", seed_dir, "config", "user.name", "Spider Monkey" });
+
+    const readme_path = try std.fmt.allocPrint(allocator, "{s}/README.md", .{seed_dir});
+    defer allocator.free(readme_path);
+    try std.fs.cwd().writeFile(.{ .sub_path = readme_path, .data = "hello\n" });
+    _ = try runTestCommandCapture(allocator, root, &.{ "git", "-C", seed_dir, "add", "README.md" });
+    _ = try runTestCommandCapture(allocator, root, &.{ "git", "-C", seed_dir, "commit", "-m", "initial" });
+    _ = try runTestCommandCapture(allocator, root, &.{ "git", "-C", seed_dir, "branch", "-M", "main" });
+
+    const first_sha_raw = try runTestCommandCapture(allocator, root, &.{ "git", "-C", seed_dir, "rev-parse", "HEAD" });
+    defer allocator.free(first_sha_raw);
+    const first_sha = std.mem.trim(u8, first_sha_raw, " \t\r\n");
+
+    const src_dir = try std.fmt.allocPrint(allocator, "{s}/src", .{seed_dir});
+    defer allocator.free(src_dir);
+    try std.fs.cwd().makePath(src_dir);
+    const app_path = try std.fmt.allocPrint(allocator, "{s}/src/app.txt", .{seed_dir});
+    defer allocator.free(app_path);
+    try std.fs.cwd().writeFile(.{ .sub_path = app_path, .data = "second\n" });
+    _ = try runTestCommandCapture(allocator, root, &.{ "git", "-C", seed_dir, "add", "src/app.txt" });
+    _ = try runTestCommandCapture(allocator, root, &.{ "git", "-C", seed_dir, "commit", "-m", "second" });
+
+    const second_sha_raw = try runTestCommandCapture(allocator, root, &.{ "git", "-C", seed_dir, "rev-parse", "HEAD" });
+    defer allocator.free(second_sha_raw);
+    const second_sha = std.mem.trim(u8, second_sha_raw, " \t\r\n");
+
+    _ = try runTestCommandCapture(allocator, root, &.{ "git", "init", "--bare", "remote.git" });
+    _ = try runTestCommandCapture(allocator, root, &.{ "git", "-C", seed_dir, "remote", "add", "origin", remote_dir });
+    _ = try runTestCommandCapture(allocator, root, &.{ "git", "-C", seed_dir, "push", "-u", "origin", "main" });
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "default",
+        .{
+            .local_fs_export_root = exports_dir,
+        },
+    );
+    defer session.deinit();
+
+    const checkout_world_path = "/nodes/local/fs/pr-review/repos/test-repo";
+    const sync_payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"repo_url\":\"{s}\",\"checkout_path\":\"{s}\",\"base_branch\":\"main\"}}",
+        .{ remote_dir, checkout_world_path },
+    );
+    defer allocator.free(sync_payload);
+    try protocolWriteFile(
+        &session,
+        allocator,
+        600,
+        601,
+        &.{ "agents", "self", "git", "control", "sync_checkout.json" },
+        sync_payload,
+        1600,
+    );
+
+    const git_status = try protocolReadFile(
+        &session,
+        allocator,
+        602,
+        603,
+        &.{ "agents", "self", "git", "status.json" },
+        1601,
+    );
+    defer allocator.free(git_status);
+    try std.testing.expect(std.mem.indexOf(u8, git_status, "\"state\":\"done\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, git_status, "\"tool\":\"git_sync_checkout\"") != null);
+
+    const sync_result = try protocolReadFile(
+        &session,
+        allocator,
+        604,
+        605,
+        &.{ "agents", "self", "git", "result.json" },
+        1602,
+    );
+    defer allocator.free(sync_result);
+    try std.testing.expect(std.mem.indexOf(u8, sync_result, "\"operation\":\"sync_checkout\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sync_result, second_sha) != null);
+    try std.testing.expect(std.mem.indexOf(u8, sync_result, "\"reused_checkout\":false") != null);
+
+    const host_checkout_file = try std.fs.path.join(allocator, &.{ exports_dir, "pr-review", "repos", "test-repo", "src", "app.txt" });
+    defer allocator.free(host_checkout_file);
+    const host_checkout_content = try std.fs.cwd().readFileAlloc(allocator, host_checkout_file, 64 * 1024);
+    defer allocator.free(host_checkout_content);
+    try std.testing.expectEqualStrings("second\n", host_checkout_content);
+
+    const status_payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"checkout_path\":\"{s}\",\"base_ref\":\"{s}\"}}",
+        .{ checkout_world_path, first_sha },
+    );
+    defer allocator.free(status_payload);
+    try protocolWriteFile(
+        &session,
+        allocator,
+        606,
+        607,
+        &.{ "agents", "self", "git", "control", "status.json" },
+        status_payload,
+        1603,
+    );
+
+    const status_result = try protocolReadFile(
+        &session,
+        allocator,
+        608,
+        609,
+        &.{ "agents", "self", "git", "result.json" },
+        1604,
+    );
+    defer allocator.free(status_result);
+    try std.testing.expect(std.mem.indexOf(u8, status_result, "\"operation\":\"status\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status_result, "\"changed_files\":[\"src/app.txt\"]") != null);
+
+    const diff_payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"checkout_path\":\"{s}\",\"base_ref\":\"{s}\",\"head_ref\":\"HEAD\"}}",
+        .{ checkout_world_path, first_sha },
+    );
+    defer allocator.free(diff_payload);
+    try protocolWriteFile(
+        &session,
+        allocator,
+        610,
+        611,
+        &.{ "agents", "self", "git", "control", "diff_range.json" },
+        diff_payload,
+        1605,
+    );
+
+    const diff_result = try protocolReadFile(
+        &session,
+        allocator,
+        612,
+        613,
+        &.{ "agents", "self", "git", "result.json" },
+        1606,
+    );
+    defer allocator.free(diff_result);
+    try std.testing.expect(std.mem.indexOf(u8, diff_result, "\"operation\":\"diff_range\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diff_result, "\"changed_files\":[\"src/app.txt\"]") != null);
+}
+
+test "acheron_session: github_pr venom dry run surfaces provider commands" {
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const root = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+    const exports_dir = try std.fmt.allocPrint(allocator, "{s}/exports", .{root});
+    defer allocator.free(exports_dir);
+    try std.fs.cwd().makePath(exports_dir);
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "default",
+        .{
+            .local_fs_export_root = exports_dir,
+        },
+    );
+    defer session.deinit();
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        620,
+        621,
+        &.{ "agents", "self", "github_pr", "control", "sync.json" },
+        "{\"repo_key\":\"DeanoC/Spiderweb\",\"pr_number\":42,\"dry_run\":true}",
+        1610,
+    );
+
+    const github_status = try protocolReadFile(
+        &session,
+        allocator,
+        622,
+        623,
+        &.{ "agents", "self", "github_pr", "status.json" },
+        1611,
+    );
+    defer allocator.free(github_status);
+    try std.testing.expect(std.mem.indexOf(u8, github_status, "\"state\":\"done\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, github_status, "\"tool\":\"github_pr_sync\"") != null);
+
+    const sync_result = try protocolReadFile(
+        &session,
+        allocator,
+        624,
+        625,
+        &.{ "agents", "self", "github_pr", "result.json" },
+        1612,
+    );
+    defer allocator.free(sync_result);
+    try std.testing.expect(std.mem.indexOf(u8, sync_result, "\"operation\":\"sync\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sync_result, "\"dry_run\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sync_result, "gh pr view") != null);
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        626,
+        627,
+        &.{ "agents", "self", "github_pr", "control", "publish_review.json" },
+        "{\"repo_key\":\"DeanoC/Spiderweb\",\"pr_number\":42,\"decision\":\"request_changes\",\"review_comment\":\"Please fix the regression.\",\"dry_run\":true,\"thread_actions\":[{\"thread_id\":\"t1\",\"action\":\"comment\"}]}",
+        1613,
+    );
+
+    const publish_result = try protocolReadFile(
+        &session,
+        allocator,
+        628,
+        629,
+        &.{ "agents", "self", "github_pr", "result.json" },
+        1614,
+    );
+    defer allocator.free(publish_result);
+    try std.testing.expect(std.mem.indexOf(u8, publish_result, "\"operation\":\"publish_review\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, publish_result, "\"decision\":\"request_changes\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, publish_result, "\"thread_actions_count\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, publish_result, "\"thread_actions_supported\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, publish_result, "gh pr review") != null);
 }
 
 test "acheron_session: mother can upsert project from system context without project token" {
