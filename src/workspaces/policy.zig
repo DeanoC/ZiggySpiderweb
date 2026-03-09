@@ -67,11 +67,16 @@ pub fn loadWorkspacePolicy(allocator: std.mem.Allocator, options: LoadOptions) !
 
     const agent_policy_path = try std.fs.path.join(allocator, &.{ options.agents_dir, options.agent_id, "agent_policy.json" });
     defer allocator.free(agent_policy_path);
+
+    // Apply the agent policy once up front so it can steer project selection,
+    // then re-apply it last so agent-specific restrictions remain authoritative.
     try applyWorkspacePolicyFile(allocator, &policy, options.agent_id, agent_policy_path);
 
     const project_policy_path = try std.fs.path.join(allocator, &.{ options.projects_dir, policy.project_id, "project_policy.json" });
     defer allocator.free(project_policy_path);
     try applyWorkspacePolicyFile(allocator, &policy, options.agent_id, project_policy_path);
+
+    try applyWorkspacePolicyFile(allocator, &policy, options.agent_id, agent_policy_path);
 
     try ensureDefaults(allocator, &policy, options.agent_id);
     return policy;
@@ -352,7 +357,7 @@ test "workspace_policy: defaults provide a usable workspace view" {
     try std.testing.expect(policy.visible_agents.items.len > 0);
 }
 
-test "workspace_policy: load applies agent policy before project policy" {
+test "workspace_policy: load reapplies agent policy after project policy" {
     const allocator = std.testing.allocator;
 
     var tmp_dir = std.testing.tmpDir(.{});
@@ -373,6 +378,7 @@ test "workspace_policy: load applies agent policy before project policy" {
     try std.fs.cwd().writeFile(.{
         .sub_path = agent_policy_path,
         .data = "{" ++
+            "\"project_id\":\"project-alpha\"," ++
             "\"visible_agents\":[\"agent-only\"]," ++
             "\"nodes\":[{" ++
             "\"id\":\"agent-node\"," ++
@@ -417,9 +423,11 @@ test "workspace_policy: load applies agent policy before project policy" {
     );
     defer policy.deinit(allocator);
 
+    try std.testing.expectEqualStrings(project_id, policy.project_id);
     try std.testing.expectEqual(@as(usize, 1), policy.nodes.items.len);
-    try std.testing.expectEqualStrings("project-node", policy.nodes.items[0].id);
-    try std.testing.expect(sliceListContains(policy.visible_agents.items, "project-only"));
+    try std.testing.expectEqualStrings("agent-node", policy.nodes.items[0].id);
+    try std.testing.expect(!sliceListContains(policy.visible_agents.items, "project-only"));
     try std.testing.expect(sliceListContains(policy.visible_agents.items, agent_id));
-    try std.testing.expect(!sliceListContains(policy.visible_agents.items, "agent-only"));
+    try std.testing.expect(sliceListContains(policy.visible_agents.items, "agent-only"));
+    try std.testing.expectEqual(@as(usize, 0), policy.project_links.items.len);
 }
