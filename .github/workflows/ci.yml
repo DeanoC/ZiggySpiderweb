@@ -60,5 +60,5 @@ jobs:
 
       - name: Run router and node ops tests
         run: |
-          zig test src/fs_router.zig
-          zig test src/fs_node_ops.zig --test-filter "windows source"
+          zig build test
+          zig test src/venoms/fs/shared/fs_node_ops.zig --test-filter "windows source"
