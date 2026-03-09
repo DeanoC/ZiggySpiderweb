@@ -573,6 +573,25 @@ fn extractTerminalInvokeArgumentsObject(obj: std.json.ObjectMap) ?std.json.Objec
     return raw_args.object;
 }
 
+fn toolListContains(list: std.ArrayListUnmanaged([]const u8), tool_name: []const u8) bool {
+    for (list.items) |item| {
+        if (std.mem.eql(u8, item, tool_name)) return true;
+    }
+    return false;
+}
+
+fn toolIsDenied(
+    denied: std.ArrayListUnmanaged([]const u8),
+    tool_name: []const u8,
+    effective_tool_name: []const u8,
+) bool {
+    if (toolListContains(denied, tool_name)) return true;
+    if (!std.mem.eql(u8, tool_name, effective_tool_name) and toolListContains(denied, effective_tool_name)) {
+        return true;
+    }
+    return false;
+}
+
 /// Pre-mutate hook that filters tools based on allow/deny rules
 pub fn filterToolsHook(ctx: *HookContext, data: HookData) HookError!void {
     const pending_tools = data.pre_mutate;
@@ -641,24 +660,14 @@ pub fn filterToolsHook(ctx: *HookContext, data: HookData) HookError!void {
 
         // Check denied list first
         if (denied_list) |denied| {
-            for (denied.items) |denied_tool| {
-                if (std.mem.eql(u8, denied_tool, effective_tool_name)) {
-                    allowed = false;
-                    break;
-                }
+            if (toolIsDenied(denied, tool_name, effective_tool_name)) {
+                allowed = false;
             }
         }
 
         // Check allowed list
         if (allowed and allowed_list != null) {
-            var in_allowed = false;
-            for (allowed_list.?.items) |allowed_tool| {
-                if (std.mem.eql(u8, allowed_tool, effective_tool_name)) {
-                    in_allowed = true;
-                    break;
-                }
-            }
-            allowed = in_allowed;
+            allowed = toolListContains(allowed_list.?, effective_tool_name);
         }
 
         if (!allowed) {
@@ -881,4 +890,16 @@ test "brain_specialization: file_write escalation maps terminal exec leaves to s
         allocator,
         "{\"path\":\"/tmp/file.txt\",\"content\":\"hello\"}",
     ));
+}
+
+test "brain_specialization: remapped terminal exec honors file_write denies" {
+    var denied = std.ArrayListUnmanaged([]const u8){};
+    defer denied.deinit(std.testing.allocator);
+
+    try denied.append(std.testing.allocator, try std.testing.allocator.dupe(u8, "file_write"));
+    defer std.testing.allocator.free(denied.items[0]);
+
+    try std.testing.expect(toolIsDenied(denied, "file_write", "shell_exec"));
+    try std.testing.expect(toolIsDenied(denied, "file_write", "file_write"));
+    try std.testing.expect(!toolIsDenied(denied, "shell_exec", "shell_exec"));
 }
