@@ -6,6 +6,11 @@ Contract id:
 
 This use case reviews a pull request using workspace-mounted services and records its detailed state in workspace files referenced by the mission `contract`.
 
+Service entrypoint:
+
+- `/global/pr_review/control/start.json`
+- `/global/pr_review/control/invoke.json` with `{"op":"start","arguments":{...}}`
+
 Recommended contract file roles:
 
 - `context_path`: repository identity, PR metadata, review policy, checkout root, default commands
@@ -24,8 +29,8 @@ Recommended artifact layout under `artifact_root`:
 
 Suggested loop:
 
-1. Read the mission `contract`, then load `context_path` and `state_path`.
-2. On the first pass, materialize those files with `/global/missions/control/bootstrap_contract.json`.
+1. Start a fresh review through `/global/pr_review/control/start.json` so the mission and contract files are created together.
+2. Read the mission `contract`, then load `context_path` and `state_path`.
 3. Discover available services through `/global/venoms/VENOMS.json`.
 4. Use mounted Git/GitHub, terminal, search, and memory services to inspect the PR.
 5. Persist intermediate conclusions into `state_path` instead of relying on chat context alone.

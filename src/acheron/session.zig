@@ -52,6 +52,8 @@ const SpecialKind = enum {
     projects_list,
     projects_get,
     projects_up,
+    pr_review_invoke,
+    pr_review_start,
     missions_invoke,
     missions_invoke_service,
     missions_create,
@@ -424,6 +426,8 @@ pub const Session = struct {
     agents_result_id: u32 = 0,
     projects_status_id: u32 = 0,
     projects_result_id: u32 = 0,
+    pr_review_status_id: u32 = 0,
+    pr_review_result_id: u32 = 0,
     missions_status_id: u32 = 0,
     missions_result_id: u32 = 0,
     mounts_status_id: u32 = 0,
@@ -1256,6 +1260,38 @@ pub const Session = struct {
                 };
                 written = outcome.written;
             },
+            .pr_review_invoke,
+            .pr_review_start,
+            => {
+                const outcome = self.handlePrReviewNamespaceWrite(node.special, state.node_id, data) catch |err| switch (err) {
+                    error.InvalidPayload => {
+                        return unified.buildFsrpcError(
+                            self.allocator,
+                            msg.tag,
+                            "invalid",
+                            "pr_review payload is invalid for requested operation",
+                        );
+                    },
+                    error.AccessDenied => {
+                        return unified.buildFsrpcError(
+                            self.allocator,
+                            msg.tag,
+                            "eperm",
+                            "pr_review operation denied by policy",
+                        );
+                    },
+                    error.NotFound => {
+                        return unified.buildFsrpcError(
+                            self.allocator,
+                            msg.tag,
+                            "enoent",
+                            "pr_review mission not found",
+                        );
+                    },
+                    else => return err,
+                };
+                written = outcome.written;
+            },
             .missions_invoke,
             .missions_invoke_service,
             .missions_create,
@@ -1847,6 +1883,10 @@ pub const Session = struct {
         try self.seedAgentAgentsNamespace(agents_control_dir);
         const projects_control_dir = try self.addDir(global_root, "projects", false);
         try self.seedAgentProjectsNamespace(projects_control_dir);
+        if (self.mission_store != null and self.local_fs_export_root != null) {
+            const pr_review_dir = try self.addDir(global_root, "pr_review", false);
+            try self.seedAgentPrReviewNamespace(pr_review_dir);
+        }
         if (self.mission_store != null) {
             const missions_dir = try self.addDir(global_root, "missions", false);
             try self.seedAgentMissionsNamespace(missions_dir);
@@ -3300,6 +3340,69 @@ pub const Session = struct {
         _ = try self.addFile(control_dir, "list.json", "", true, .projects_list);
         _ = try self.addFile(control_dir, "get.json", "", true, .projects_get);
         _ = try self.addFile(control_dir, "up.json", "", true, .projects_up);
+    }
+
+    fn seedAgentPrReviewNamespace(self: *Session, pr_review_dir: u32) !void {
+        try self.addDirectoryDescriptors(
+            pr_review_dir,
+            "PR Review",
+            "{\"kind\":\"venom\",\"venom_id\":\"pr_review\",\"shape\":\"/global/pr_review/{README.md,SCHEMA.json,CAPS.json,OPS.json,PERMISSIONS.json,STATUS.json,status.json,result.json,control/*}\"}",
+            "{\"invoke\":true,\"operations\":[\"pr_review_start\"],\"discoverable\":true,\"persistent\":true}",
+            "Start PR review missions as a thin use-case venom layered over /global/missions.",
+        );
+        _ = try self.addFile(
+            pr_review_dir,
+            "OPS.json",
+            "{\"model\":\"local_bridge\",\"invoke\":\"control/invoke.json\",\"transport\":\"acheron-local\",\"paths\":{\"start\":\"control/start.json\"},\"operations\":{\"start\":\"pr_review_start\"}}",
+            false,
+            .none,
+        );
+        _ = try self.addFile(
+            pr_review_dir,
+            "RUNTIME.json",
+            "{\"type\":\"acheron_local\",\"component\":\"acheron_session\",\"subject\":\"pr_review_use_case\"}",
+            false,
+            .none,
+        );
+        _ = try self.addFile(
+            pr_review_dir,
+            "PERMISSIONS.json",
+            "{\"default\":\"allow-by-default\",\"allow_roles\":[\"admin\",\"user\"],\"scope\":\"mission_use_case\"}",
+            false,
+            .none,
+        );
+        _ = try self.addFile(
+            pr_review_dir,
+            "STATUS.json",
+            "{\"venom_id\":\"pr_review\",\"state\":\"namespace\",\"has_invoke\":true}",
+            false,
+            .none,
+        );
+        self.pr_review_status_id = try self.addFile(
+            pr_review_dir,
+            "status.json",
+            "{\"state\":\"idle\",\"tool\":null,\"updated_at_ms\":0,\"error\":null}",
+            false,
+            .none,
+        );
+        self.pr_review_result_id = try self.addFile(
+            pr_review_dir,
+            "result.json",
+            "{\"ok\":true,\"operation\":null,\"result\":null,\"error\":null}",
+            false,
+            .none,
+        );
+
+        const control_dir = try self.addDir(pr_review_dir, "control", false);
+        _ = try self.addFile(
+            control_dir,
+            "README.md",
+            "Use start.json, or invoke.json with op=start, to create a PR review mission, derive contract paths, and bootstrap the initial context/state files.\n",
+            false,
+            .none,
+        );
+        _ = try self.addFile(control_dir, "invoke.json", "", true, .pr_review_invoke);
+        _ = try self.addFile(control_dir, "start.json", "", true, .pr_review_start);
     }
 
     fn seedGlobalLibraryNamespace(self: *Session, library_dir: u32) !void {
@@ -8998,6 +9101,10 @@ pub const Session = struct {
         up,
     };
 
+    const PrReviewOp = enum {
+        start,
+    };
+
     fn handleProjectsNamespaceWrite(self: *Session, special: SpecialKind, node_id: u32, raw_input: []const u8) !WriteOutcome {
         const input = std.mem.trim(u8, raw_input, " \t\r\n");
         const payload = if (input.len == 0) "{}" else input;
@@ -9209,6 +9316,404 @@ pub const Session = struct {
             .list => "projects_list",
             .get => "projects_get",
             .up => "projects_up",
+        };
+    }
+
+    fn handlePrReviewNamespaceWrite(self: *Session, special: SpecialKind, node_id: u32, raw_input: []const u8) !WriteOutcome {
+        const input = std.mem.trim(u8, raw_input, " \t\r\n");
+        const payload = if (input.len == 0) "{}" else input;
+        try self.setFileContent(node_id, payload);
+
+        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, payload, .{}) catch return error.InvalidPayload;
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidPayload;
+        const obj = parsed.value.object;
+
+        const op = switch (special) {
+            .pr_review_start => PrReviewOp.start,
+            .pr_review_invoke => blk: {
+                const op_raw = blk2: {
+                    if (obj.get("op")) |value| if (value == .string and value.string.len > 0) break :blk2 value.string;
+                    if (obj.get("operation")) |value| if (value == .string and value.string.len > 0) break :blk2 value.string;
+                    if (obj.get("tool")) |value| if (value == .string and value.string.len > 0) break :blk2 value.string;
+                    if (obj.get("tool_name")) |value| if (value == .string and value.string.len > 0) break :blk2 value.string;
+                    break :blk2 null;
+                } orelse return error.InvalidPayload;
+                break :blk parsePrReviewOp(op_raw) orelse return error.InvalidPayload;
+            },
+            else => return error.InvalidPayload,
+        };
+
+        const args_obj = blk: {
+            if (obj.get("arguments")) |value| {
+                if (value != .object) return error.InvalidPayload;
+                break :blk value.object;
+            }
+            if (obj.get("args")) |value| {
+                if (value != .object) return error.InvalidPayload;
+                break :blk value.object;
+            }
+            break :blk obj;
+        };
+
+        return self.executePrReviewOp(op, args_obj, raw_input.len);
+    }
+
+    fn parsePrReviewOp(raw: []const u8) ?PrReviewOp {
+        const value = std.mem.trim(u8, raw, " \t\r\n");
+        if (std.mem.eql(u8, value, "start") or std.mem.eql(u8, value, "pr_review_start")) return .start;
+        return null;
+    }
+
+    fn executePrReviewOp(self: *Session, op: PrReviewOp, args_obj: std.json.ObjectMap, written: usize) !WriteOutcome {
+        const tool_name = prReviewStatusToolName(op);
+        const running_status = try self.buildServiceInvokeStatusJson("running", tool_name, null);
+        defer self.allocator.free(running_status);
+        if (self.pr_review_status_id != 0) try self.setFileContent(self.pr_review_status_id, running_status);
+
+        const result_payload = self.executePrReviewOpPayload(op, args_obj) catch |err| {
+            const error_message = @errorName(err);
+            const failed_status = try self.buildServiceInvokeStatusJson("failed", tool_name, error_message);
+            defer self.allocator.free(failed_status);
+            if (self.pr_review_status_id != 0) try self.setFileContent(self.pr_review_status_id, failed_status);
+            const failed_result = try self.buildPrReviewFailureResultJson(op, "invalid_payload", error_message);
+            defer self.allocator.free(failed_result);
+            if (self.pr_review_result_id != 0) try self.setFileContent(self.pr_review_result_id, failed_result);
+            return err;
+        };
+        defer self.allocator.free(result_payload);
+
+        const done_status = try self.buildServiceInvokeStatusJson("done", tool_name, null);
+        defer self.allocator.free(done_status);
+        if (self.pr_review_status_id != 0) try self.setFileContent(self.pr_review_status_id, done_status);
+        if (self.pr_review_result_id != 0) try self.setFileContent(self.pr_review_result_id, result_payload);
+        return .{ .written = written };
+    }
+
+    fn executePrReviewOpPayload(self: *Session, op: PrReviewOp, args_obj: std.json.ObjectMap) ![]u8 {
+        return switch (op) {
+            .start => self.executePrReviewStartOp(args_obj),
+        };
+    }
+
+    fn executePrReviewStartOp(self: *Session, args_obj: std.json.ObjectMap) ![]u8 {
+        const store = self.mission_store orelse return error.InvalidPayload;
+        if (self.local_fs_export_root == null) return error.InvalidPayload;
+
+        const repo_key_raw = extractOptionalStringByNames(args_obj, &[_][]const u8{"repo_key"}) orelse return error.InvalidPayload;
+        const repo_key = std.mem.trim(u8, repo_key_raw, " \t\r\n");
+        if (repo_key.len == 0) return error.InvalidPayload;
+        const pr_number = (try jsonObjectOptionalU64(args_obj, "pr_number")) orelse return error.InvalidPayload;
+        const repo_slug = try self.buildRepoKeySlug(repo_key);
+        defer self.allocator.free(repo_slug);
+
+        const provider = std.mem.trim(u8, extractOptionalStringByNames(args_obj, &[_][]const u8{"provider"}) orelse "github", " \t\r\n");
+        if (provider.len == 0) return error.InvalidPayload;
+        const pr_url = if (extractOptionalStringByNames(args_obj, &[_][]const u8{"pr_url"})) |value|
+            try self.allocator.dupe(u8, std.mem.trim(u8, value, " \t\r\n"))
+        else if (std.mem.eql(u8, provider, "github"))
+            try std.fmt.allocPrint(self.allocator, "https://github.com/{s}/pull/{d}", .{ repo_key, pr_number })
+        else
+            return error.InvalidPayload;
+        defer self.allocator.free(pr_url);
+
+        const checkout_path = if (extractOptionalStringByNames(args_obj, &[_][]const u8{"checkout_path"})) |value|
+            try self.normalizeLocalWorkspaceAbsolutePath(value)
+        else
+            try std.fmt.allocPrint(self.allocator, "/nodes/local/fs/pr-review/repos/{s}", .{repo_slug});
+        defer self.allocator.free(checkout_path);
+
+        const context_path = try std.fmt.allocPrint(self.allocator, "/nodes/local/fs/pr-review/state/{s}/pr-{d}/context.json", .{ repo_slug, pr_number });
+        defer self.allocator.free(context_path);
+        const state_path = try std.fmt.allocPrint(self.allocator, "/nodes/local/fs/pr-review/state/{s}/pr-{d}/state.json", .{ repo_slug, pr_number });
+        defer self.allocator.free(state_path);
+        const artifact_root = try std.fmt.allocPrint(self.allocator, "/nodes/local/fs/pr-review/runs/{s}/pr-{d}", .{ repo_slug, pr_number });
+        defer self.allocator.free(artifact_root);
+
+        const review_policy_paths_json = blk: {
+            if (args_obj.get("review_policy_paths")) |value| {
+                if (value != .array) return error.InvalidPayload;
+                break :blk try self.renderJsonValue(value);
+            }
+            break :blk try self.allocator.dupe(u8, "[]");
+        };
+        defer self.allocator.free(review_policy_paths_json);
+
+        const default_review_commands_json = blk: {
+            if (args_obj.get("default_review_commands")) |value| {
+                if (value != .array) return error.InvalidPayload;
+                break :blk try self.renderJsonValue(value);
+            }
+            break :blk try self.allocator.dupe(u8, "[]");
+        };
+        defer self.allocator.free(default_review_commands_json);
+
+        const approval_policy_json = blk: {
+            if (args_obj.get("approval_policy")) |value| {
+                if (value != .object) return error.InvalidPayload;
+                break :blk try self.renderJsonValue(value);
+            }
+            break :blk try self.allocator.dupe(
+                u8,
+                "{\"push_fix_requires_approval\":false,\"merge_requires_approval\":true}",
+            );
+        };
+        defer self.allocator.free(approval_policy_json);
+
+        const base_branch = std.mem.trim(u8, extractOptionalStringByNames(args_obj, &[_][]const u8{"base_branch"}) orelse "main", " \t\r\n");
+        const base_sha = std.mem.trim(u8, extractOptionalStringByNames(args_obj, &[_][]const u8{"base_sha"}) orelse "", " \t\r\n");
+        const head_branch = std.mem.trim(u8, extractOptionalStringByNames(args_obj, &[_][]const u8{"head_branch"}) orelse "", " \t\r\n");
+        const head_sha = std.mem.trim(u8, extractOptionalStringByNames(args_obj, &[_][]const u8{"head_sha"}) orelse "", " \t\r\n");
+        const title = if (extractOptionalStringByNames(args_obj, &[_][]const u8{"title"})) |value|
+            std.mem.trim(u8, value, " \t\r\n")
+        else
+            null;
+        const mission_title = if (title) |value|
+            if (value.len > 0) value else null
+        else
+            null;
+        const mission_title_fallback = try std.fmt.allocPrint(self.allocator, "Review PR #{d} ({s})", .{ pr_number, repo_key });
+        defer self.allocator.free(mission_title_fallback);
+
+        var mission = try store.create(self.allocator, .{
+            .use_case = "pr_review",
+            .title = mission_title orelse mission_title_fallback,
+            .stage = "planning",
+            .agent_id = extractOptionalStringByNames(args_obj, &[_][]const u8{"agent_id"}) orelse self.agent_id,
+            .project_id = extractOptionalStringByNames(args_obj, &[_][]const u8{"project_id"}) orelse self.project_id,
+            .run_id = extractOptionalStringByNames(args_obj, &[_][]const u8{"run_id"}),
+            .workspace_root = extractOptionalStringByNames(args_obj, &[_][]const u8{"workspace_root"}) orelse checkout_path,
+            .worktree_name = extractOptionalStringByNames(args_obj, &[_][]const u8{"worktree_name"}),
+            .contract = .{
+                .contract_id = "spider_monkey/pr_review@v1",
+                .context_path = context_path,
+                .state_path = state_path,
+                .artifact_root = artifact_root,
+            },
+            .created_by = .{ .actor_type = self.actor_type, .actor_id = self.actor_id },
+        });
+        defer mission.deinit(self.allocator);
+
+        const context_payload = try self.buildPrReviewContextPayloadJson(
+            provider,
+            repo_key,
+            pr_number,
+            pr_url,
+            base_branch,
+            base_sha,
+            head_branch,
+            head_sha,
+            checkout_path,
+            review_policy_paths_json,
+            default_review_commands_json,
+            approval_policy_json,
+        );
+        defer self.allocator.free(context_payload);
+        const state_payload = try self.buildPrReviewStatePayloadJson(head_sha);
+        defer self.allocator.free(state_payload);
+
+        try self.ensureMissionContractDirectory(artifact_root);
+        try self.writeMissionContractFile(context_path, context_payload);
+        try self.writeMissionContractFile(state_path, state_payload);
+
+        var bootstrapped = try store.recordCheckpoint(self.allocator, mission.mission_id, .{
+            .stage = "bootstrap_context",
+            .summary = "Bootstrapped PR review contract",
+            .artifact = .{
+                .kind = "contract_state",
+                .path = state_path,
+                .summary = "PR review state file",
+            },
+            .contract = .{
+                .contract_id = "spider_monkey/pr_review@v1",
+                .context_path = context_path,
+                .state_path = state_path,
+                .artifact_root = artifact_root,
+            },
+        });
+        defer bootstrapped.deinit(self.allocator);
+
+        const mission_json = try self.buildMissionRecordJson(bootstrapped);
+        defer self.allocator.free(mission_json);
+        const detail = try self.buildPrReviewStartDetailJson(
+            mission_json,
+            provider,
+            repo_key,
+            pr_number,
+            pr_url,
+            checkout_path,
+            context_path,
+            state_path,
+            artifact_root,
+        );
+        defer self.allocator.free(detail);
+        return self.buildPrReviewSuccessResultJson(.start, detail);
+    }
+
+    fn buildRepoKeySlug(self: *Session, repo_key: []const u8) ![]u8 {
+        var out = std.ArrayListUnmanaged(u8){};
+        errdefer out.deinit(self.allocator);
+        var token_it = std.mem.tokenizeScalar(u8, repo_key, '/');
+        var count: usize = 0;
+        while (token_it.next()) |segment| {
+            const trimmed = std.mem.trim(u8, segment, " \t\r\n");
+            if (trimmed.len == 0 or std.mem.eql(u8, trimmed, ".") or std.mem.eql(u8, trimmed, "..")) return error.InvalidPayload;
+            if (std.mem.indexOfAny(u8, trimmed, "\\:") != null) return error.InvalidPayload;
+            if (count > 0) try out.appendSlice(self.allocator, "__");
+            try out.appendSlice(self.allocator, trimmed);
+            count += 1;
+        }
+        if (count == 0) return error.InvalidPayload;
+        return out.toOwnedSlice(self.allocator);
+    }
+
+    fn normalizeLocalWorkspaceAbsolutePath(self: *Session, raw_path: []const u8) ![]u8 {
+        const normalized = try self.normalizeMissionAbsolutePath(raw_path);
+        errdefer self.allocator.free(normalized);
+        const host_path = try self.resolveMissionContractHostPath(normalized);
+        self.allocator.free(host_path);
+        return normalized;
+    }
+
+    fn buildPrReviewContextPayloadJson(
+        self: *Session,
+        provider: []const u8,
+        repo_key: []const u8,
+        pr_number: u64,
+        pr_url: []const u8,
+        base_branch: []const u8,
+        base_sha: []const u8,
+        head_branch: []const u8,
+        head_sha: []const u8,
+        checkout_path: []const u8,
+        review_policy_paths_json: []const u8,
+        default_review_commands_json: []const u8,
+        approval_policy_json: []const u8,
+    ) ![]u8 {
+        const escaped_provider = try unified.jsonEscape(self.allocator, provider);
+        defer self.allocator.free(escaped_provider);
+        const escaped_repo_key = try unified.jsonEscape(self.allocator, repo_key);
+        defer self.allocator.free(escaped_repo_key);
+        const escaped_pr_url = try unified.jsonEscape(self.allocator, pr_url);
+        defer self.allocator.free(escaped_pr_url);
+        const escaped_base_branch = try unified.jsonEscape(self.allocator, base_branch);
+        defer self.allocator.free(escaped_base_branch);
+        const escaped_base_sha = try unified.jsonEscape(self.allocator, base_sha);
+        defer self.allocator.free(escaped_base_sha);
+        const escaped_head_branch = try unified.jsonEscape(self.allocator, head_branch);
+        defer self.allocator.free(escaped_head_branch);
+        const escaped_head_sha = try unified.jsonEscape(self.allocator, head_sha);
+        defer self.allocator.free(escaped_head_sha);
+        const escaped_checkout_path = try unified.jsonEscape(self.allocator, checkout_path);
+        defer self.allocator.free(escaped_checkout_path);
+
+        return std.fmt.allocPrint(
+            self.allocator,
+            "{{\"contract_id\":\"spider_monkey/pr_review@v1\",\"provider\":\"{s}\",\"repo_key\":\"{s}\",\"pr_number\":{d},\"pr_url\":\"{s}\",\"base_branch\":\"{s}\",\"base_sha\":\"{s}\",\"head_branch\":\"{s}\",\"head_sha\":\"{s}\",\"checkout_path\":\"{s}\",\"review_policy_paths\":{s},\"default_review_commands\":{s},\"approval_policy\":{s}}}",
+            .{
+                escaped_provider,
+                escaped_repo_key,
+                pr_number,
+                escaped_pr_url,
+                escaped_base_branch,
+                escaped_base_sha,
+                escaped_head_branch,
+                escaped_head_sha,
+                escaped_checkout_path,
+                review_policy_paths_json,
+                default_review_commands_json,
+                approval_policy_json,
+            },
+        );
+    }
+
+    fn buildPrReviewStatePayloadJson(self: *Session, head_sha: []const u8) ![]u8 {
+        const escaped_head_sha = try unified.jsonEscape(self.allocator, head_sha);
+        defer self.allocator.free(escaped_head_sha);
+        return std.fmt.allocPrint(
+            self.allocator,
+            "{{\"phase\":\"discovered\",\"last_synced_head_sha\":\"{s}\",\"current_focus\":\"\",\"open_threads\":[],\"latest_validation\":{{\"status\":\"unknown\",\"summary\":null}},\"latest_recommendation\":{{\"status\":\"pending\",\"summary\":null}},\"artifacts\":{{\"findings\":\"findings.json\",\"validation\":\"validation.json\",\"recommendation\":\"recommendation.json\",\"thread_actions\":\"thread-actions.json\"}},\"notes\":[]}}",
+            .{escaped_head_sha},
+        );
+    }
+
+    fn buildPrReviewStartDetailJson(
+        self: *Session,
+        mission_json: []const u8,
+        provider: []const u8,
+        repo_key: []const u8,
+        pr_number: u64,
+        pr_url: []const u8,
+        checkout_path: []const u8,
+        context_path: []const u8,
+        state_path: []const u8,
+        artifact_root: []const u8,
+    ) ![]u8 {
+        const escaped_provider = try unified.jsonEscape(self.allocator, provider);
+        defer self.allocator.free(escaped_provider);
+        const escaped_repo_key = try unified.jsonEscape(self.allocator, repo_key);
+        defer self.allocator.free(escaped_repo_key);
+        const escaped_pr_url = try unified.jsonEscape(self.allocator, pr_url);
+        defer self.allocator.free(escaped_pr_url);
+        const escaped_checkout_path = try unified.jsonEscape(self.allocator, checkout_path);
+        defer self.allocator.free(escaped_checkout_path);
+        const escaped_context_path = try unified.jsonEscape(self.allocator, context_path);
+        defer self.allocator.free(escaped_context_path);
+        const escaped_state_path = try unified.jsonEscape(self.allocator, state_path);
+        defer self.allocator.free(escaped_state_path);
+        const escaped_artifact_root = try unified.jsonEscape(self.allocator, artifact_root);
+        defer self.allocator.free(escaped_artifact_root);
+
+        return std.fmt.allocPrint(
+            self.allocator,
+            "{{\"mission\":{s},\"review\":{{\"provider\":\"{s}\",\"repo_key\":\"{s}\",\"pr_number\":{d},\"pr_url\":\"{s}\",\"checkout_path\":\"{s}\",\"context_path\":\"{s}\",\"state_path\":\"{s}\",\"artifact_root\":\"{s}\"}}}}",
+            .{
+                mission_json,
+                escaped_provider,
+                escaped_repo_key,
+                pr_number,
+                escaped_pr_url,
+                escaped_checkout_path,
+                escaped_context_path,
+                escaped_state_path,
+                escaped_artifact_root,
+            },
+        );
+    }
+
+    fn buildPrReviewSuccessResultJson(self: *Session, op: PrReviewOp, result_json: []const u8) ![]u8 {
+        const escaped_operation = try unified.jsonEscape(self.allocator, prReviewOperationName(op));
+        defer self.allocator.free(escaped_operation);
+        return std.fmt.allocPrint(
+            self.allocator,
+            "{{\"ok\":true,\"operation\":\"{s}\",\"result\":{s},\"error\":null}}",
+            .{ escaped_operation, result_json },
+        );
+    }
+
+    fn buildPrReviewFailureResultJson(self: *Session, op: PrReviewOp, code: []const u8, message: []const u8) ![]u8 {
+        const escaped_operation = try unified.jsonEscape(self.allocator, prReviewOperationName(op));
+        defer self.allocator.free(escaped_operation);
+        const escaped_code = try unified.jsonEscape(self.allocator, code);
+        defer self.allocator.free(escaped_code);
+        const escaped_message = try unified.jsonEscape(self.allocator, message);
+        defer self.allocator.free(escaped_message);
+        return std.fmt.allocPrint(
+            self.allocator,
+            "{{\"ok\":false,\"operation\":\"{s}\",\"result\":null,\"error\":{{\"code\":\"{s}\",\"message\":\"{s}\"}}}}",
+            .{ escaped_operation, escaped_code, escaped_message },
+        );
+    }
+
+    fn prReviewOperationName(op: PrReviewOp) []const u8 {
+        return switch (op) {
+            .start => "start",
+        };
+    }
+
+    fn prReviewStatusToolName(op: PrReviewOp) []const u8 {
+        return switch (op) {
+            .start => "pr_review_start",
         };
     }
 
@@ -14586,6 +15091,109 @@ test "acheron_session: missions bootstrap_contract materializes contract files i
     try std.testing.expect(std.mem.indexOf(u8, state_content, "\"artifacts\":[]") != null);
 
     const artifact_root_host_path = try std.fs.path.join(allocator, &.{ local_export_root, "pr-review", "runs", "pr-77" });
+    defer allocator.free(artifact_root_host_path);
+    var artifact_root_dir = try std.fs.openDirAbsolute(artifact_root_host_path, .{});
+    artifact_root_dir.close();
+}
+
+test "acheron_session: pr_review venom starts a mission and bootstraps contract files" {
+    const allocator = std.testing.allocator;
+
+    var mission_store = try mission_store_mod.MissionStore.initWithPath(allocator, null);
+    defer mission_store.deinit();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const local_export_root = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(local_export_root);
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "default",
+        .{
+            .mission_store = &mission_store,
+            .local_fs_export_root = local_export_root,
+            .actor_type = "agent",
+            .actor_id = "reviewer-a",
+        },
+    );
+    defer session.deinit();
+
+    const venoms_payload = try protocolReadFile(
+        &session,
+        allocator,
+        362,
+        363,
+        &.{ "agents", "self", "venoms", "VENOMS.json" },
+        970,
+    );
+    defer allocator.free(venoms_payload);
+    try std.testing.expect(std.mem.indexOf(u8, venoms_payload, "\"venom_path\":\"/global/pr_review\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, venoms_payload, "\"invoke_path\":\"/global/pr_review/control/invoke.json\"") != null);
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        364,
+        365,
+        &.{ "agents", "self", "pr_review", "control", "start.json" },
+        "{\"repo_key\":\"DeanoC/Spiderweb\",\"pr_number\":123,\"head_sha\":\"abc123\",\"default_review_commands\":[\"zig build\",\"zig build test\"]}",
+        971,
+    );
+
+    const pr_review_status = try protocolReadFile(
+        &session,
+        allocator,
+        366,
+        367,
+        &.{ "agents", "self", "pr_review", "status.json" },
+        972,
+    );
+    defer allocator.free(pr_review_status);
+    try std.testing.expect(std.mem.indexOf(u8, pr_review_status, "\"state\":\"done\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pr_review_status, "\"tool\":\"pr_review_start\"") != null);
+
+    const pr_review_result = try protocolReadFile(
+        &session,
+        allocator,
+        368,
+        369,
+        &.{ "agents", "self", "pr_review", "result.json" },
+        973,
+    );
+    defer allocator.free(pr_review_result);
+    try std.testing.expect(std.mem.indexOf(u8, pr_review_result, "\"operation\":\"start\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pr_review_result, "\"use_case\":\"pr_review\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pr_review_result, "\"repo_key\":\"DeanoC/Spiderweb\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pr_review_result, "\"checkout_path\":\"/nodes/local/fs/pr-review/repos/DeanoC__Spiderweb\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pr_review_result, "\"context_path\":\"/nodes/local/fs/pr-review/state/DeanoC__Spiderweb/pr-123/context.json\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pr_review_result, "\"state_path\":\"/nodes/local/fs/pr-review/state/DeanoC__Spiderweb/pr-123/state.json\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pr_review_result, "\"artifact_root\":\"/nodes/local/fs/pr-review/runs/DeanoC__Spiderweb/pr-123\"") != null);
+
+    const context_host_path = try std.fs.path.join(allocator, &.{ local_export_root, "pr-review", "state", "DeanoC__Spiderweb", "pr-123", "context.json" });
+    defer allocator.free(context_host_path);
+    const context_content = try std.fs.cwd().readFileAlloc(allocator, context_host_path, 64 * 1024);
+    defer allocator.free(context_content);
+    try std.testing.expect(std.mem.indexOf(u8, context_content, "\"repo_key\":\"DeanoC/Spiderweb\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, context_content, "\"pr_url\":\"https://github.com/DeanoC/Spiderweb/pull/123\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, context_content, "\"default_review_commands\":[\"zig build\",\"zig build test\"]") != null);
+
+    const state_host_path = try std.fs.path.join(allocator, &.{ local_export_root, "pr-review", "state", "DeanoC__Spiderweb", "pr-123", "state.json" });
+    defer allocator.free(state_host_path);
+    const state_content = try std.fs.cwd().readFileAlloc(allocator, state_host_path, 64 * 1024);
+    defer allocator.free(state_content);
+    try std.testing.expect(std.mem.indexOf(u8, state_content, "\"last_synced_head_sha\":\"abc123\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, state_content, "\"latest_recommendation\":{\"status\":\"pending\"") != null);
+
+    const artifact_root_host_path = try std.fs.path.join(allocator, &.{ local_export_root, "pr-review", "runs", "DeanoC__Spiderweb", "pr-123" });
     defer allocator.free(artifact_root_host_path);
     var artifact_root_dir = try std.fs.openDirAbsolute(artifact_root_host_path, .{});
     artifact_root_dir.close();
