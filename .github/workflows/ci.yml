@@ -56,7 +56,7 @@ jobs:
         run: zig version
 
       - name: Run Windows FS adapter tests
-        run: zig test src/fs_windows_source_adapter.zig
+        run: zig test src/venoms/fs/shared/fs_windows_source_adapter.zig
 
       - name: Run router and node ops tests
         run: |
