@@ -3520,8 +3520,7 @@ pub const Session = struct {
 
         const runtime_payload = try self.executeServiceToolCall("shell_exec", runtime_args.items);
         defer self.allocator.free(runtime_payload);
-        if (session.buffered_result) |old| self.allocator.free(old);
-        session.buffered_result = try self.allocator.dupe(u8, runtime_payload);
+        try self.appendTerminalBufferedResult(session, runtime_payload);
 
         const now_ms = std.time.milliTimestamp();
         session.updated_at_ms = now_ms;
@@ -3562,12 +3561,8 @@ pub const Session = struct {
         };
 
         _ = timeout_ms;
-        const bytes = if (session.buffered_result) |value|
-            try self.allocator.dupe(u8, value)
-        else
-            try self.allocator.dupe(u8, "");
-        defer self.allocator.free(bytes);
-        const visible_bytes = if (bytes.len > max_bytes) bytes[0..max_bytes] else bytes;
+        const visible_bytes = try self.consumeTerminalBufferedResult(session, max_bytes);
+        defer self.allocator.free(visible_bytes);
 
         const now_ms = std.time.milliTimestamp();
         session.updated_at_ms = now_ms;
@@ -3649,8 +3644,7 @@ pub const Session = struct {
                 if (session.cwd) |old| self.allocator.free(old);
                 session.cwd = try self.allocator.dupe(u8, next_cwd);
             }
-            if (session.buffered_result) |old| self.allocator.free(old);
-            session.buffered_result = try self.allocator.dupe(u8, runtime_payload);
+            try self.appendTerminalBufferedResult(session, runtime_payload);
             try self.setCurrentTerminalSession(session_id);
             try self.refreshTerminalV2StateFiles();
 
@@ -3660,6 +3654,36 @@ pub const Session = struct {
 
         // Acheron terminal-v2 requires an explicit or current session context.
         return error.InvalidPayload;
+    }
+
+    fn appendTerminalBufferedResult(self: *Session, session: *TerminalSession, payload: []const u8) !void {
+        if (payload.len == 0) return;
+        if (session.buffered_result) |existing| {
+            const merged = try self.allocator.alloc(u8, existing.len + payload.len);
+            @memcpy(merged[0..existing.len], existing);
+            @memcpy(merged[existing.len..], payload);
+            self.allocator.free(existing);
+            session.buffered_result = merged;
+            return;
+        }
+        session.buffered_result = try self.allocator.dupe(u8, payload);
+    }
+
+    fn consumeTerminalBufferedResult(self: *Session, session: *TerminalSession, max_bytes: usize) ![]u8 {
+        const existing = session.buffered_result orelse return self.allocator.dupe(u8, "");
+        const visible_len = @min(existing.len, max_bytes);
+        const visible = try self.allocator.dupe(u8, existing[0..visible_len]);
+
+        if (visible_len == existing.len) {
+            self.allocator.free(existing);
+            session.buffered_result = null;
+            return visible;
+        }
+
+        const tail = try self.allocator.dupe(u8, existing[visible_len..]);
+        self.allocator.free(existing);
+        session.buffered_result = tail;
+        return visible;
     }
 
     fn parseTerminalWriteBytes(self: *Session, obj: std.json.ObjectMap) ![]u8 {
@@ -13049,6 +13073,129 @@ test "acheron_session: terminal-v2 write read resize operations update status an
         "{\"session_id\":\"io\"}",
         938,
     );
+}
+
+test "acheron_session: terminal-v2 buffered output survives partial reads and multiple writes" {
+    const allocator = std.testing.allocator;
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.init(allocator, runtime_handle, &job_index, "default");
+    defer session.deinit();
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        340,
+        341,
+        &.{ "agents", "self", "terminal", "control", "create.json" },
+        "{\"session_id\":\"buf\"}",
+        939,
+    );
+
+    const terminal_session = session.terminal_sessions.getPtr("buf") orelse return error.TestExpectedResponse;
+    try session.appendTerminalBufferedResult(terminal_session, "abcdef");
+    try session.appendTerminalBufferedResult(terminal_session, "gh");
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        342,
+        343,
+        &.{ "agents", "self", "terminal", "control", "read.json" },
+        "{\"session_id\":\"buf\",\"max_bytes\":3}",
+        940,
+    );
+
+    const first_read_payload = try protocolReadFile(
+        &session,
+        allocator,
+        344,
+        345,
+        &.{ "agents", "self", "terminal", "result.json" },
+        941,
+    );
+    defer allocator.free(first_read_payload);
+
+    var first_parsed = try std.json.parseFromSlice(std.json.Value, allocator, first_read_payload, .{});
+    defer first_parsed.deinit();
+    const first_result = first_parsed.value.object.get("result") orelse return error.TestExpectedResponse;
+    if (first_result != .object) return error.TestExpectedResponse;
+    const first_b64 = first_result.object.get("data_b64") orelse return error.TestExpectedResponse;
+    if (first_b64 != .string) return error.TestExpectedResponse;
+    const first_decoded_len = try std.base64.standard.Decoder.calcSizeForSlice(first_b64.string);
+    const first_decoded = try allocator.alloc(u8, first_decoded_len);
+    defer allocator.free(first_decoded);
+    try std.base64.standard.Decoder.decode(first_decoded, first_b64.string);
+    try std.testing.expectEqualStrings("abc", first_decoded);
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        346,
+        347,
+        &.{ "agents", "self", "terminal", "control", "read.json" },
+        "{\"session_id\":\"buf\",\"max_bytes\":3}",
+        942,
+    );
+
+    const second_read_payload = try protocolReadFile(
+        &session,
+        allocator,
+        348,
+        349,
+        &.{ "agents", "self", "terminal", "result.json" },
+        943,
+    );
+    defer allocator.free(second_read_payload);
+
+    var second_parsed = try std.json.parseFromSlice(std.json.Value, allocator, second_read_payload, .{});
+    defer second_parsed.deinit();
+    const second_result = second_parsed.value.object.get("result") orelse return error.TestExpectedResponse;
+    if (second_result != .object) return error.TestExpectedResponse;
+    const second_b64 = second_result.object.get("data_b64") orelse return error.TestExpectedResponse;
+    if (second_b64 != .string) return error.TestExpectedResponse;
+    const second_decoded_len = try std.base64.standard.Decoder.calcSizeForSlice(second_b64.string);
+    const second_decoded = try allocator.alloc(u8, second_decoded_len);
+    defer allocator.free(second_decoded);
+    try std.base64.standard.Decoder.decode(second_decoded, second_b64.string);
+    try std.testing.expectEqualStrings("def", second_decoded);
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        350,
+        351,
+        &.{ "agents", "self", "terminal", "control", "read.json" },
+        "{\"session_id\":\"buf\",\"max_bytes\":8}",
+        944,
+    );
+
+    const third_read_payload = try protocolReadFile(
+        &session,
+        allocator,
+        352,
+        353,
+        &.{ "agents", "self", "terminal", "result.json" },
+        945,
+    );
+    defer allocator.free(third_read_payload);
+
+    var third_parsed = try std.json.parseFromSlice(std.json.Value, allocator, third_read_payload, .{});
+    defer third_parsed.deinit();
+    const third_result = third_parsed.value.object.get("result") orelse return error.TestExpectedResponse;
+    if (third_result != .object) return error.TestExpectedResponse;
+    const third_b64 = third_result.object.get("data_b64") orelse return error.TestExpectedResponse;
+    if (third_b64 != .string) return error.TestExpectedResponse;
+    const third_decoded_len = try std.base64.standard.Decoder.calcSizeForSlice(third_b64.string);
+    const third_decoded = try allocator.alloc(u8, third_decoded_len);
+    defer allocator.free(third_decoded);
+    try std.base64.standard.Decoder.decode(third_decoded, third_b64.string);
+    try std.testing.expectEqualStrings("gh", third_decoded);
 }
 
 test "acheron_session: first-class memory namespace rejects unknown invoke op" {
