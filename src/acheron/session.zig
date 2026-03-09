@@ -3503,22 +3503,11 @@ pub const Session = struct {
         const write_bytes = try self.parseTerminalWriteBytes(obj);
         defer self.allocator.free(write_bytes);
         if (write_bytes.len == 0) return error.InvalidPayload;
-        if (!std.unicode.utf8ValidateSlice(write_bytes)) return error.InvalidPayload;
 
-        const escaped_command = try unified.jsonEscape(self.allocator, write_bytes);
-        defer self.allocator.free(escaped_command);
+        const runtime_args = try self.buildTerminalWriteArgsJson(session.cwd, write_bytes);
+        defer self.allocator.free(runtime_args);
 
-        var runtime_args = std.ArrayListUnmanaged(u8){};
-        defer runtime_args.deinit(self.allocator);
-        try runtime_args.writer(self.allocator).print("{{\"command\":\"{s}\"", .{escaped_command});
-        if (session.cwd) |cwd| {
-            const escaped_cwd = try unified.jsonEscape(self.allocator, cwd);
-            defer self.allocator.free(escaped_cwd);
-            try runtime_args.writer(self.allocator).print(",\"cwd\":\"{s}\"", .{escaped_cwd});
-        }
-        try runtime_args.append(self.allocator, '}');
-
-        const runtime_payload = try self.executeServiceToolCall("shell_exec", runtime_args.items);
+        const runtime_payload = try self.executeServiceToolCall("shell_exec", runtime_args);
         defer self.allocator.free(runtime_payload);
         if (try self.extractErrorMessageFromToolPayload(runtime_payload)) |message| {
             defer self.allocator.free(message);
@@ -3528,7 +3517,9 @@ pub const Session = struct {
             try self.updateTerminalV2StatusAndResult("failed", "terminal_session_write", session_id, message, "write", "null");
             return .{ .written = payload.len };
         }
-        try self.appendTerminalBufferedResult(session, runtime_payload);
+        const terminal_output = try self.extractTerminalOutputBytesFromToolPayload(runtime_payload);
+        defer self.allocator.free(terminal_output);
+        try self.appendTerminalBufferedResult(session, terminal_output);
 
         const now_ms = std.time.milliTimestamp();
         session.updated_at_ms = now_ms;
@@ -3579,18 +3570,7 @@ pub const Session = struct {
         try self.setCurrentTerminalSession(session_id);
         try self.refreshTerminalV2StateFiles();
 
-        const output_b64 = try unified.encodeDataB64(self.allocator, visible_bytes);
-        defer self.allocator.free(output_b64);
-        const escaped_b64 = try unified.jsonEscape(self.allocator, output_b64);
-        defer self.allocator.free(escaped_b64);
-        const read_result = try std.fmt.allocPrint(
-            self.allocator,
-            "{{\"n\":{d},\"data_b64\":\"{s}\",\"eof\":false}}",
-            .{
-                visible_bytes.len,
-                escaped_b64,
-            },
-        );
+        const read_result = try self.buildTerminalOutputResultJson(visible_bytes, false);
         defer self.allocator.free(read_result);
         try self.updateTerminalV2StatusAndResult("done", "terminal_session_read", session_id, null, "read", read_result);
         return .{ .written = payload.len };
@@ -3657,11 +3637,15 @@ pub const Session = struct {
                 try self.updateTerminalV2StatusAndResult("failed", "shell_exec", session_id, message, "exec", "null");
                 return .{ .written = payload.len };
             }
-            try self.appendTerminalBufferedResult(session, runtime_payload);
+            const terminal_output = try self.extractTerminalOutputBytesFromToolPayload(runtime_payload);
+            defer self.allocator.free(terminal_output);
+            try self.appendTerminalBufferedResult(session, terminal_output);
             try self.setCurrentTerminalSession(session_id);
             try self.refreshTerminalV2StateFiles();
 
-            try self.updateTerminalV2StatusAndResult("done", "shell_exec", session_id, null, "exec", runtime_payload);
+            const exec_result = try self.buildTerminalOutputResultJson(terminal_output, false);
+            defer self.allocator.free(exec_result);
+            try self.updateTerminalV2StatusAndResult("done", "shell_exec", session_id, null, "exec", exec_result);
             return .{ .written = payload.len };
         }
 
@@ -3680,6 +3664,79 @@ pub const Session = struct {
             return;
         }
         session.buffered_result = try self.allocator.dupe(u8, payload);
+    }
+
+    fn buildTerminalWriteArgsJson(self: *Session, cwd: ?[]const u8, write_bytes: []const u8) ![]u8 {
+        const shell_command = try self.buildTerminalWriteShellCommand(write_bytes);
+        defer self.allocator.free(shell_command);
+        const escaped_command = try unified.jsonEscape(self.allocator, shell_command);
+        defer self.allocator.free(escaped_command);
+
+        var runtime_args = std.ArrayListUnmanaged(u8){};
+        errdefer runtime_args.deinit(self.allocator);
+        try runtime_args.writer(self.allocator).print("{{\"command\":\"{s}\"", .{escaped_command});
+        if (cwd) |value| {
+            const escaped_cwd = try unified.jsonEscape(self.allocator, value);
+            defer self.allocator.free(escaped_cwd);
+            try runtime_args.writer(self.allocator).print(",\"cwd\":\"{s}\"", .{escaped_cwd});
+        }
+        try runtime_args.append(self.allocator, '}');
+        return runtime_args.toOwnedSlice(self.allocator);
+    }
+
+    fn buildTerminalWriteShellCommand(self: *Session, write_bytes: []const u8) ![]u8 {
+        var out = std.ArrayListUnmanaged(u8){};
+        errdefer out.deinit(self.allocator);
+        try out.appendSlice(self.allocator, "eval $'");
+        for (write_bytes) |byte| {
+            switch (byte) {
+                '\\' => try out.appendSlice(self.allocator, "\\\\"),
+                '\'' => try out.appendSlice(self.allocator, "\\'"),
+                '\n' => try out.appendSlice(self.allocator, "\\n"),
+                '\r' => try out.appendSlice(self.allocator, "\\r"),
+                '\t' => try out.appendSlice(self.allocator, "\\t"),
+                0x20...0x26, 0x28...0x5b, 0x5d...0x7e => try out.append(self.allocator, byte),
+                else => try out.writer(self.allocator).print("\\x{x:0>2}", .{byte}),
+            }
+        }
+        try out.append(self.allocator, '\'');
+        return out.toOwnedSlice(self.allocator);
+    }
+
+    fn extractTerminalOutputBytesFromToolPayload(self: *Session, payload_json: []const u8) ![]u8 {
+        var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, payload_json, .{});
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidPayload;
+        const obj = parsed.value.object;
+        const stdout = if (obj.get("stdout")) |value|
+            if (value == .string) value.string else return error.InvalidPayload
+        else
+            "";
+        const stderr = if (obj.get("stderr")) |value|
+            if (value == .string) value.string else return error.InvalidPayload
+        else
+            "";
+
+        const merged = try self.allocator.alloc(u8, stdout.len + stderr.len);
+        @memcpy(merged[0..stdout.len], stdout);
+        @memcpy(merged[stdout.len..], stderr);
+        return merged;
+    }
+
+    fn buildTerminalOutputResultJson(self: *Session, output: []const u8, eof: bool) ![]u8 {
+        const output_b64 = try unified.encodeDataB64(self.allocator, output);
+        defer self.allocator.free(output_b64);
+        const escaped_b64 = try unified.jsonEscape(self.allocator, output_b64);
+        defer self.allocator.free(escaped_b64);
+        return std.fmt.allocPrint(
+            self.allocator,
+            "{{\"n\":{d},\"data_b64\":\"{s}\",\"eof\":{s}}}",
+            .{
+                output.len,
+                escaped_b64,
+                if (eof) "true" else "false",
+            },
+        );
     }
 
     fn consumeTerminalBufferedResult(self: *Session, session: *TerminalSession, max_bytes: usize) ![]u8 {
@@ -12898,6 +12955,19 @@ test "acheron_session: terminal-v2 session lifecycle updates current and session
     );
     defer allocator.free(result_payload);
     try std.testing.expect(std.mem.indexOf(u8, result_payload, "\"operation\":\"exec\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result_payload, "\"data_b64\":") != null);
+
+    var result_parsed = try std.json.parseFromSlice(std.json.Value, allocator, result_payload, .{});
+    defer result_parsed.deinit();
+    const result_obj = result_parsed.value.object.get("result") orelse return error.TestExpectedResponse;
+    if (result_obj != .object) return error.TestExpectedResponse;
+    const data_b64 = result_obj.object.get("data_b64") orelse return error.TestExpectedResponse;
+    if (data_b64 != .string) return error.TestExpectedResponse;
+    const decoded_len = try std.base64.standard.Decoder.calcSizeForSlice(data_b64.string);
+    const decoded = try allocator.alloc(u8, decoded_len);
+    defer allocator.free(decoded);
+    try std.base64.standard.Decoder.decode(decoded, data_b64.string);
+    try std.testing.expect(std.mem.indexOf(u8, decoded, "terminal-v2") != null);
 
     try protocolWriteFile(
         &session,
@@ -13076,6 +13146,7 @@ test "acheron_session: terminal-v2 write read resize operations update status an
     const decoded = try allocator.alloc(u8, decoded_len);
     defer allocator.free(decoded);
     try std.base64.standard.Decoder.decode(decoded, data_b64_value.string);
+    try std.testing.expect(std.mem.indexOf(u8, decoded, "wr-marker") != null);
 
     try protocolWriteFile(
         &session,
@@ -13209,6 +13280,61 @@ test "acheron_session: terminal-v2 buffered output survives partial reads and mu
     defer allocator.free(third_decoded);
     try std.base64.standard.Decoder.decode(third_decoded, third_b64.string);
     try std.testing.expectEqualStrings("gh", third_decoded);
+}
+
+test "acheron_session: terminal-v2 write accepts binary-safe data_b64 input" {
+    const allocator = std.testing.allocator;
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.init(allocator, runtime_handle, &job_index, "default");
+    defer session.deinit();
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        368,
+        369,
+        &.{ "agents", "self", "terminal", "control", "create.json" },
+        "{\"session_id\":\"bin\"}",
+        953,
+    );
+
+    const raw_bytes = [_]u8{ ':', ' ', '#', 0xff, '\n' };
+    const encoded = try std.base64.standard.Encoder.allocEncode(allocator, &raw_bytes);
+    defer allocator.free(encoded);
+    const write_payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"session_id\":\"bin\",\"data_b64\":\"{s}\"}}",
+        .{encoded},
+    );
+    defer allocator.free(write_payload);
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        370,
+        371,
+        &.{ "agents", "self", "terminal", "control", "write.json" },
+        write_payload,
+        954,
+    );
+
+    const status_payload = try protocolReadFile(
+        &session,
+        allocator,
+        372,
+        373,
+        &.{ "agents", "self", "terminal", "status.json" },
+        955,
+    );
+    defer allocator.free(status_payload);
+    try std.testing.expect(std.mem.indexOf(u8, status_payload, "\"state\":\"done\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status_payload, "\"session_id\":\"bin\"") != null);
 }
 
 test "acheron_session: terminal-v2 write and exec surface shell_exec failures" {
