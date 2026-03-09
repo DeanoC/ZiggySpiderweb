@@ -918,6 +918,14 @@ pub const Session = struct {
         defer if (job_name) |value| self.allocator.free(value);
         defer if (correlation_id) |value| self.allocator.free(value);
         defer if (chat_reply_content) |value| self.allocator.free(value);
+        if (isTerminalV2Special(node.special) and !self.canInvokeTerminalNamespace(state.node_id)) {
+            return unified.buildFsrpcError(
+                self.allocator,
+                msg.tag,
+                "eperm",
+                "terminal invoke access denied by permissions",
+            );
+        }
         if (try self.tryWriteBoundVenomProxyFile(state.node_id, offset, data)) |proxied| {
             written = proxied.written;
             job_name = proxied.job_name;
@@ -4940,6 +4948,30 @@ pub const Session = struct {
             return self.canAccessVenomWithPermissions("");
         };
         return self.canAccessVenomWithPermissions(permissions_node.content);
+    }
+
+    fn canInvokeTerminalNamespace(self: *Session, terminal_node_id: u32) bool {
+        const terminal_node = self.nodes.get(terminal_node_id) orelse return false;
+        const control_dir_id = terminal_node.parent orelse return false;
+        const venom_dir_id = (self.nodes.get(control_dir_id) orelse return false).parent orelse return false;
+        if (!self.canInvokeVenomDirectory(venom_dir_id)) return false;
+        if (!self.is_admin and std.mem.eql(u8, self.actor_type, "user")) return false;
+        return true;
+    }
+
+    fn isTerminalV2Special(special: SpecialKind) bool {
+        return switch (special) {
+            .terminal_v2_invoke,
+            .terminal_v2_create,
+            .terminal_v2_resume,
+            .terminal_v2_close,
+            .terminal_v2_exec,
+            .terminal_v2_write,
+            .terminal_v2_read,
+            .terminal_v2_resize,
+            => true,
+            else => false,
+        };
     }
 
     fn appendVenomIndexEntry(
@@ -12880,6 +12912,40 @@ test "acheron_session: first-class terminal namespace operation file maps to run
     );
     defer allocator.free(result_payload);
     try std.testing.expect(std.mem.indexOf(u8, result_payload, "terminal-namespace") != null);
+}
+
+test "acheron_session: first-class terminal namespace denies user actor shell access" {
+    const allocator = std.testing.allocator;
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "default",
+        .{
+            .actor_type = "user",
+        },
+    );
+    defer session.deinit();
+
+    const response = try protocolWriteFileExpectError(
+        &session,
+        allocator,
+        240,
+        241,
+        &.{ "agents", "self", "terminal", "control", "exec.json" },
+        "{\"command\":\"echo terminal-namespace\"}",
+        909,
+        "eperm",
+    );
+    defer allocator.free(response);
+    try std.testing.expect(std.mem.indexOf(u8, response, "terminal invoke access denied by permissions") != null);
 }
 
 test "acheron_session: terminal-v2 session lifecycle updates current and sessions state" {
