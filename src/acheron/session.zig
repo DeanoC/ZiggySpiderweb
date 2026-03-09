@@ -256,32 +256,12 @@ const TerminalInvokeOp = enum {
     resize_session,
 };
 
-const TerminalPtyProcess = struct {
-    child: std.process.Child,
-
-    fn deinit(self: *TerminalPtyProcess) void {
-        if (self.child.stdin) |*stdin_pipe| {
-            stdin_pipe.close();
-            self.child.stdin = null;
-        }
-        if (self.child.stdout) |*stdout_pipe| {
-            stdout_pipe.close();
-            self.child.stdout = null;
-        }
-        if (self.child.stderr) |*stderr_pipe| {
-            stderr_pipe.close();
-            self.child.stderr = null;
-        }
-        _ = self.child.kill() catch {};
-        _ = self.child.wait() catch {};
-        self.* = undefined;
-    }
-};
-
 const TerminalSession = struct {
     label: ?[]u8 = null,
     cwd: ?[]u8 = null,
-    pty_process: ?TerminalPtyProcess = null,
+    buffered_result: ?[]u8 = null,
+    replay_script: ?[]u8 = null,
+    pending_input: ?[]u8 = null,
     created_at_ms: i64 = 0,
     updated_at_ms: i64 = 0,
     last_exec_at_ms: i64 = 0,
@@ -294,7 +274,9 @@ const TerminalSession = struct {
     fn deinit(self: *TerminalSession, allocator: std.mem.Allocator) void {
         if (self.label) |value| allocator.free(value);
         if (self.cwd) |value| allocator.free(value);
-        if (self.pty_process) |*process| process.deinit();
+        if (self.buffered_result) |value| allocator.free(value);
+        if (self.replay_script) |value| allocator.free(value);
+        if (self.pending_input) |value| allocator.free(value);
         self.* = undefined;
     }
 
@@ -3346,11 +3328,6 @@ pub const Session = struct {
         );
     }
 
-    const TerminalReadOutcome = struct {
-        bytes: []u8,
-        eof: bool,
-    };
-
     fn handleTerminalV2InvokeWrite(self: *Session, invoke_node_id: u32, raw_input: []const u8) anyerror!WriteOutcome {
         const input = std.mem.trim(u8, raw_input, " \t\r\n");
         if (input.len == 0) return error.InvalidPayload;
@@ -3441,7 +3418,7 @@ pub const Session = struct {
         const maybe_session_id = try jsonObjectOptionalString(obj, "session_id");
         const label = try jsonObjectOptionalString(obj, "label");
         const cwd = try jsonObjectOptionalString(obj, "cwd");
-        const shell = try jsonObjectOptionalString(obj, "shell");
+        _ = try jsonObjectOptionalString(obj, "shell");
 
         const session_id_owned = if (maybe_session_id) |value|
             try self.allocator.dupe(u8, value)
@@ -3455,7 +3432,6 @@ pub const Session = struct {
             .cwd = if (cwd) |value| try self.allocator.dupe(u8, value) else null,
             .created_at_ms = std.time.milliTimestamp(),
             .updated_at_ms = std.time.milliTimestamp(),
-            .pty_process = try self.spawnTerminalPtyProcess(if (cwd) |value| value else null, if (shell) |value| value else null),
         };
         errdefer session.deinit(self.allocator);
 
@@ -3468,7 +3444,7 @@ pub const Session = struct {
             session_id_owned,
             null,
             "create",
-            "{\"state\":\"open\",\"backend\":\"script\"}",
+            "{\"state\":\"open\",\"backend\":\"runtime_tool\"}",
         );
         return .{ .written = payload.len };
     }
@@ -3480,7 +3456,7 @@ pub const Session = struct {
         const obj = parsed.value.object;
         const session_id = (try jsonObjectOptionalString(obj, "session_id")) orelse return error.InvalidPayload;
         var session = self.terminal_sessions.getPtr(session_id) orelse return error.TerminalSessionNotFound;
-        if (session.isClosed() or session.pty_process == null) return error.TerminalSessionClosed;
+        if (session.isClosed()) return error.TerminalSessionClosed;
 
         session.updated_at_ms = std.time.milliTimestamp();
         try self.setCurrentTerminalSession(session_id);
@@ -3502,9 +3478,9 @@ pub const Session = struct {
 
         var session = self.terminal_sessions.getPtr(selected_id) orelse return error.TerminalSessionNotFound;
         const now_ms = std.time.milliTimestamp();
-        if (session.pty_process) |*process| {
-            process.deinit();
-            session.pty_process = null;
+        if (session.buffered_result) |old| {
+            self.allocator.free(old);
+            session.buffered_result = null;
         }
         session.closed_at_ms = now_ms;
         session.updated_at_ms = now_ms;
@@ -3526,14 +3502,25 @@ pub const Session = struct {
 
         const session_id = try self.resolveTerminalSessionIdForPayload(obj) orelse return error.InvalidPayload;
         var session = self.terminal_sessions.getPtr(session_id) orelse return error.TerminalSessionNotFound;
-        if (session.isClosed() or session.pty_process == null) return error.TerminalSessionClosed;
+        if (session.isClosed()) return error.TerminalSessionClosed;
 
         const write_bytes = try self.parseTerminalWriteBytes(obj);
         defer self.allocator.free(write_bytes);
         if (write_bytes.len == 0) return error.InvalidPayload;
+        try self.appendTerminalPendingInput(session, write_bytes);
 
-        const stdin_pipe = session.pty_process.?.child.stdin orelse return error.TerminalSessionClosed;
-        try stdin_pipe.writeAll(write_bytes);
+        if (self.hasTerminalPendingCommand(session)) {
+            var exec_outcome = try self.executeTerminalSessionInput(session);
+            defer exec_outcome.deinit(self.allocator);
+            if (exec_outcome.error_message) |message| {
+                session.updated_at_ms = std.time.milliTimestamp();
+                try self.setCurrentTerminalSession(session_id);
+                try self.refreshTerminalV2StateFiles();
+                try self.updateTerminalV2StatusAndResult("failed", "terminal_session_write", session_id, message, "write", "null");
+                return .{ .written = payload.len };
+            }
+            try self.appendTerminalBufferedResult(session, exec_outcome.output);
+        }
 
         const now_ms = std.time.milliTimestamp();
         session.updated_at_ms = now_ms;
@@ -3543,11 +3530,7 @@ pub const Session = struct {
         try self.setCurrentTerminalSession(session_id);
         try self.refreshTerminalV2StateFiles();
 
-        const write_result = try std.fmt.allocPrint(
-            self.allocator,
-            "{{\"written\":{d}}}",
-            .{write_bytes.len},
-        );
+        const write_result = try std.fmt.allocPrint(self.allocator, "{{\"written\":{d}}}", .{write_bytes.len});
         defer self.allocator.free(write_result);
         try self.updateTerminalV2StatusAndResult("done", "terminal_session_write", session_id, null, "write", write_result);
         return .{ .written = payload.len };
@@ -3563,7 +3546,7 @@ pub const Session = struct {
 
         const session_id = try self.resolveTerminalSessionIdForPayload(obj) orelse return error.InvalidPayload;
         var session = self.terminal_sessions.getPtr(session_id) orelse return error.TerminalSessionNotFound;
-        if (session.isClosed() or session.pty_process == null) return error.TerminalSessionClosed;
+        if (session.isClosed()) return error.TerminalSessionClosed;
 
         const timeout_ms = blk: {
             if (try jsonObjectOptionalU64(obj, "timeout_ms")) |value| break :blk @as(i32, @intCast(@min(value, @as(u64, std.math.maxInt(i32)))));
@@ -3577,40 +3560,35 @@ pub const Session = struct {
             break :blk @as(usize, 64 * 1024);
         };
 
-        const read_outcome = try self.readFromTerminalSession(session, max_bytes, timeout_ms);
-        defer self.allocator.free(read_outcome.bytes);
+        var remaining_timeout_ms = timeout_ms;
+        while (session.buffered_result == null and !self.hasTerminalPendingCommand(session) and remaining_timeout_ms > 0) {
+            const wait_ms = @min(remaining_timeout_ms, 25);
+            std.Thread.sleep(@as(u64, @intCast(wait_ms)) * std.time.ns_per_ms);
+            remaining_timeout_ms -= wait_ms;
+        }
+        if (session.buffered_result == null and self.hasTerminalPendingCommand(session)) {
+            var exec_outcome = try self.executeTerminalSessionInput(session);
+            defer exec_outcome.deinit(self.allocator);
+            if (exec_outcome.error_message) |message| {
+                session.updated_at_ms = std.time.milliTimestamp();
+                try self.setCurrentTerminalSession(session_id);
+                try self.refreshTerminalV2StateFiles();
+                try self.updateTerminalV2StatusAndResult("failed", "terminal_session_read", session_id, message, "read", "null");
+                return .{ .written = payload.len };
+            }
+            try self.appendTerminalBufferedResult(session, exec_outcome.output);
+        }
+        const visible_bytes = try self.consumeTerminalBufferedResult(session, max_bytes);
+        defer self.allocator.free(visible_bytes);
 
         const now_ms = std.time.milliTimestamp();
         session.updated_at_ms = now_ms;
         session.last_read_at_ms = now_ms;
         session.read_count +%= 1;
-        if (read_outcome.eof) {
-            if (session.pty_process) |*process| {
-                process.deinit();
-                session.pty_process = null;
-            }
-            session.closed_at_ms = now_ms;
-            if (self.current_terminal_session_id) |current| {
-                if (std.mem.eql(u8, current, session_id)) try self.setCurrentTerminalSession(null);
-            }
-        } else {
-            try self.setCurrentTerminalSession(session_id);
-        }
+        try self.setCurrentTerminalSession(session_id);
         try self.refreshTerminalV2StateFiles();
 
-        const output_b64 = try unified.encodeDataB64(self.allocator, read_outcome.bytes);
-        defer self.allocator.free(output_b64);
-        const escaped_b64 = try unified.jsonEscape(self.allocator, output_b64);
-        defer self.allocator.free(escaped_b64);
-        const read_result = try std.fmt.allocPrint(
-            self.allocator,
-            "{{\"n\":{d},\"data_b64\":\"{s}\",\"eof\":{s}}}",
-            .{
-                read_outcome.bytes.len,
-                escaped_b64,
-                if (read_outcome.eof) "true" else "false",
-            },
-        );
+        const read_result = try self.buildTerminalOutputResultJson(visible_bytes, false);
         defer self.allocator.free(read_result);
         try self.updateTerminalV2StatusAndResult("done", "terminal_session_read", session_id, null, "read", read_result);
         return .{ .written = payload.len };
@@ -3630,12 +3608,7 @@ pub const Session = struct {
 
         const session_id = try self.resolveTerminalSessionIdForPayload(obj) orelse return error.InvalidPayload;
         var session = self.terminal_sessions.getPtr(session_id) orelse return error.TerminalSessionNotFound;
-        if (session.isClosed() or session.pty_process == null) return error.TerminalSessionClosed;
-
-        const resize_cmd = try std.fmt.allocPrint(self.allocator, "stty cols {d} rows {d}\n", .{ cols, rows });
-        defer self.allocator.free(resize_cmd);
-        const stdin_pipe = session.pty_process.?.child.stdin orelse return error.TerminalSessionClosed;
-        try stdin_pipe.writeAll(resize_cmd);
+        if (session.isClosed()) return error.TerminalSessionClosed;
 
         session.updated_at_ms = std.time.milliTimestamp();
         try self.setCurrentTerminalSession(session_id);
@@ -3658,73 +3631,31 @@ pub const Session = struct {
 
         if (selected_session_id) |session_id| {
             var session = self.terminal_sessions.getPtr(session_id) orelse return error.TerminalSessionNotFound;
-            if (session.isClosed() or session.pty_process == null) return error.TerminalSessionClosed;
-            if (builtin.os.tag != .linux) return error.UnsupportedPlatform;
+            if (session.isClosed()) return error.TerminalSessionClosed;
 
-            const command = (try jsonObjectOptionalString(obj, "command")) orelse return error.InvalidPayload;
-            const escaped_command = try self.allocator.dupe(u8, command);
-            defer self.allocator.free(escaped_command);
-            var command_line = try std.ArrayListUnmanaged(u8).initCapacity(self.allocator, escaped_command.len + 1);
-            defer command_line.deinit(self.allocator);
-            try command_line.appendSlice(self.allocator, escaped_command);
-            if (escaped_command.len == 0 or escaped_command[escaped_command.len - 1] != '\n') {
-                try command_line.append(self.allocator, '\n');
-            }
-            const stdin_pipe = session.pty_process.?.child.stdin orelse return error.TerminalSessionClosed;
-            try stdin_pipe.writeAll(command_line.items);
-
-            const timeout_ms = blk: {
-                if (try jsonObjectOptionalU64(obj, "timeout_ms")) |value| break :blk @as(i32, @intCast(@min(value, @as(u64, std.math.maxInt(i32)))));
-                break :blk @as(i32, 250);
-            };
-            const max_output_bytes = blk: {
-                if (try jsonObjectOptionalU64(obj, "max_output_bytes")) |value| {
-                    const clamped = @max(@as(u64, 1), @min(value, @as(u64, 1024 * 1024)));
-                    break :blk @as(usize, @intCast(clamped));
-                }
-                break :blk @as(usize, 64 * 1024);
-            };
-
-            const read_outcome = try self.readFromTerminalSession(session, max_output_bytes, timeout_ms);
-            defer self.allocator.free(read_outcome.bytes);
+            const command_bytes = try self.buildTerminalExecCommandBytes(obj);
+            defer self.allocator.free(command_bytes);
+            var exec_outcome = try self.executeTerminalSessionCommand(session, command_bytes);
+            defer exec_outcome.deinit(self.allocator);
 
             const now_ms = std.time.milliTimestamp();
             session.updated_at_ms = now_ms;
             session.last_exec_at_ms = now_ms;
             session.exec_count +%= 1;
-            session.write_count +%= 1;
-            session.read_count +%= 1;
             if (try jsonObjectOptionalString(obj, "cwd")) |next_cwd| {
                 if (session.cwd) |old| self.allocator.free(old);
                 session.cwd = try self.allocator.dupe(u8, next_cwd);
             }
-            if (read_outcome.eof) {
-                if (session.pty_process) |*process| {
-                    process.deinit();
-                    session.pty_process = null;
-                }
-                session.closed_at_ms = now_ms;
-                if (self.current_terminal_session_id) |current| {
-                    if (std.mem.eql(u8, current, session_id)) try self.setCurrentTerminalSession(null);
-                }
-            } else {
+            if (exec_outcome.error_message) |message| {
                 try self.setCurrentTerminalSession(session_id);
+                try self.refreshTerminalV2StateFiles();
+                try self.updateTerminalV2StatusAndResult("failed", "shell_exec", session_id, message, "exec", "null");
+                return .{ .written = payload.len };
             }
+            try self.setCurrentTerminalSession(session_id);
             try self.refreshTerminalV2StateFiles();
 
-            const output_b64 = try unified.encodeDataB64(self.allocator, read_outcome.bytes);
-            defer self.allocator.free(output_b64);
-            const escaped_b64 = try unified.jsonEscape(self.allocator, output_b64);
-            defer self.allocator.free(escaped_b64);
-            const exec_result = try std.fmt.allocPrint(
-                self.allocator,
-                "{{\"n\":{d},\"data_b64\":\"{s}\",\"eof\":{s}}}",
-                .{
-                    read_outcome.bytes.len,
-                    escaped_b64,
-                    if (read_outcome.eof) "true" else "false",
-                },
-            );
+            const exec_result = try self.buildTerminalOutputResultJson(exec_outcome.output, false);
             defer self.allocator.free(exec_result);
             try self.updateTerminalV2StatusAndResult("done", "shell_exec", session_id, null, "exec", exec_result);
             return .{ .written = payload.len };
@@ -3734,35 +3665,231 @@ pub const Session = struct {
         return error.InvalidPayload;
     }
 
-    fn readFromTerminalSession(
-        self: *Session,
-        session: *TerminalSession,
-        max_bytes: usize,
-        timeout_ms: i32,
-    ) !TerminalReadOutcome {
-        const process = &(session.pty_process orelse return error.TerminalSessionClosed);
-        const stdout_pipe = process.child.stdout orelse return error.TerminalSessionClosed;
+    fn appendTerminalBufferedResult(self: *Session, session: *TerminalSession, payload: []const u8) !void {
+        if (payload.len == 0) return;
+        if (session.buffered_result) |existing| {
+            const merged = try self.allocator.alloc(u8, existing.len + payload.len);
+            @memcpy(merged[0..existing.len], existing);
+            @memcpy(merged[existing.len..], payload);
+            self.allocator.free(existing);
+            session.buffered_result = merged;
+            return;
+        }
+        session.buffered_result = try self.allocator.dupe(u8, payload);
+    }
 
+    const TerminalExecOutcome = struct {
+        output: []u8,
+        error_message: ?[]u8 = null,
+
+        fn deinit(self: *TerminalExecOutcome, allocator: std.mem.Allocator) void {
+            allocator.free(self.output);
+            if (self.error_message) |value| allocator.free(value);
+            self.* = undefined;
+        }
+    };
+
+    fn appendTerminalReplayScript(self: *Session, session: *TerminalSession, payload: []const u8) !void {
+        if (payload.len == 0) return;
+        if (session.replay_script) |existing| {
+            const merged = try self.allocator.alloc(u8, existing.len + payload.len);
+            @memcpy(merged[0..existing.len], existing);
+            @memcpy(merged[existing.len..], payload);
+            self.allocator.free(existing);
+            session.replay_script = merged;
+            return;
+        }
+        session.replay_script = try self.allocator.dupe(u8, payload);
+    }
+
+    fn appendTerminalPendingInput(self: *Session, session: *TerminalSession, payload: []const u8) !void {
+        if (payload.len == 0) return;
+        if (session.pending_input) |existing| {
+            const merged = try self.allocator.alloc(u8, existing.len + payload.len);
+            @memcpy(merged[0..existing.len], existing);
+            @memcpy(merged[existing.len..], payload);
+            self.allocator.free(existing);
+            session.pending_input = merged;
+            return;
+        }
+        session.pending_input = try self.allocator.dupe(u8, payload);
+    }
+
+    fn hasTerminalPendingCommand(self: *Session, session: *TerminalSession) bool {
+        _ = self;
+        const pending = session.pending_input orelse return false;
+        return pending.len > 0 and pending[pending.len - 1] == '\n';
+    }
+
+    fn executeTerminalSessionInput(self: *Session, session: *TerminalSession) !TerminalExecOutcome {
+        const pending = session.pending_input orelse return .{
+            .output = try self.allocator.alloc(u8, 0),
+        };
+        defer {
+            self.allocator.free(pending);
+            session.pending_input = null;
+        }
+        return self.executeTerminalSessionCommand(session, pending);
+    }
+
+    fn executeTerminalSessionCommand(self: *Session, session: *TerminalSession, command_bytes: []const u8) !TerminalExecOutcome {
+        const runtime_args = try self.buildTerminalWriteArgsJson(session.cwd, session.replay_script, command_bytes);
+        defer self.allocator.free(runtime_args);
+
+        const runtime_payload = try self.executeServiceToolCall("shell_exec", runtime_args);
+        defer self.allocator.free(runtime_payload);
+        if (try self.extractErrorMessageFromToolPayload(runtime_payload)) |message| {
+            return .{
+                .output = try self.allocator.alloc(u8, 0),
+                .error_message = message,
+            };
+        }
+        const terminal_output = try self.extractTerminalOutputBytesFromToolPayload(runtime_payload);
+        errdefer self.allocator.free(terminal_output);
+        try self.appendTerminalReplayScript(session, command_bytes);
+        return .{
+            .output = terminal_output,
+        };
+    }
+
+    fn buildTerminalWriteArgsJson(self: *Session, cwd: ?[]const u8, replay_script: ?[]const u8, write_bytes: []const u8) ![]u8 {
+        const shell_command = try self.buildTerminalWriteShellCommand(replay_script, write_bytes);
+        defer self.allocator.free(shell_command);
+        const escaped_command = try unified.jsonEscape(self.allocator, shell_command);
+        defer self.allocator.free(escaped_command);
+
+        var runtime_args = std.ArrayListUnmanaged(u8){};
+        errdefer runtime_args.deinit(self.allocator);
+        try runtime_args.writer(self.allocator).print("{{\"command\":\"{s}\"", .{escaped_command});
+        if (cwd) |value| {
+            const escaped_cwd = try unified.jsonEscape(self.allocator, value);
+            defer self.allocator.free(escaped_cwd);
+            try runtime_args.writer(self.allocator).print(",\"cwd\":\"{s}\"", .{escaped_cwd});
+        }
+        try runtime_args.append(self.allocator, '}');
+        return runtime_args.toOwnedSlice(self.allocator);
+    }
+
+    fn buildTerminalWriteShellCommand(self: *Session, replay_script: ?[]const u8, write_bytes: []const u8) ![]u8 {
         var out = std.ArrayListUnmanaged(u8){};
         errdefer out.deinit(self.allocator);
-
-        var remaining_timeout = timeout_ms;
-        while (out.items.len < max_bytes) {
-            if (!try pollFileReadable(stdout_pipe, remaining_timeout)) break;
-            remaining_timeout = 0;
-
-            var buf: [4096]u8 = undefined;
-            const chunk_len = @min(buf.len, max_bytes - out.items.len);
-            const n = stdout_pipe.read(buf[0..chunk_len]) catch |err| switch (err) {
-                error.WouldBlock => break,
-                else => return err,
-            };
-            if (n == 0) {
-                return .{ .bytes = try out.toOwnedSlice(self.allocator), .eof = true };
+        if (replay_script) |history| {
+            if (history.len > 0) {
+                try out.appendSlice(self.allocator, "{ eval $'");
+                try self.appendTerminalAnsiCShellLiteral(&out, history);
+                try out.appendSlice(self.allocator, "'; } >/dev/null 2>&1\n");
             }
-            try out.appendSlice(self.allocator, buf[0..n]);
         }
-        return .{ .bytes = try out.toOwnedSlice(self.allocator), .eof = false };
+        try out.appendSlice(self.allocator, "eval $'");
+        try self.appendTerminalAnsiCShellLiteral(&out, write_bytes);
+        try out.append(self.allocator, '\'');
+        return out.toOwnedSlice(self.allocator);
+    }
+
+    fn appendTerminalAnsiCShellLiteral(self: *Session, out: *std.ArrayListUnmanaged(u8), bytes: []const u8) !void {
+        for (bytes) |byte| {
+            switch (byte) {
+                '\\' => try out.appendSlice(self.allocator, "\\\\"),
+                '\'' => try out.appendSlice(self.allocator, "\\'"),
+                '\n' => try out.appendSlice(self.allocator, "\\n"),
+                '\r' => try out.appendSlice(self.allocator, "\\r"),
+                '\t' => try out.appendSlice(self.allocator, "\\t"),
+                0x20...0x26, 0x28...0x5b, 0x5d...0x7e => try out.append(self.allocator, byte),
+                else => try out.writer(self.allocator).print("\\x{x:0>2}", .{byte}),
+            }
+        }
+    }
+
+    fn buildTerminalExecCommandBytes(self: *Session, obj: std.json.ObjectMap) ![]u8 {
+        if (try jsonObjectOptionalString(obj, "command")) |command| {
+            var buf = std.ArrayListUnmanaged(u8){};
+            errdefer buf.deinit(self.allocator);
+            try buf.appendSlice(self.allocator, command);
+            if (command.len == 0 or command[command.len - 1] != '\n') try buf.append(self.allocator, '\n');
+            return buf.toOwnedSlice(self.allocator);
+        }
+        if (obj.get("argv")) |value| {
+            if (value != .array or value.array.items.len == 0) return error.InvalidPayload;
+            var buf = std.ArrayListUnmanaged(u8){};
+            errdefer buf.deinit(self.allocator);
+            for (value.array.items, 0..) |item, idx| {
+                if (item != .string) return error.InvalidPayload;
+                if (idx != 0) try buf.append(self.allocator, ' ');
+                try self.appendShellSingleQuoted(&buf, item.string);
+            }
+            try buf.append(self.allocator, '\n');
+            return buf.toOwnedSlice(self.allocator);
+        }
+        return error.InvalidPayload;
+    }
+
+    fn appendShellSingleQuoted(self: *Session, out: *std.ArrayListUnmanaged(u8), value: []const u8) !void {
+        try out.append(self.allocator, '\'');
+        var start: usize = 0;
+        while (start < value.len) {
+            if (std.mem.indexOfScalarPos(u8, value, start, '\'')) |idx| {
+                if (idx > start) try out.appendSlice(self.allocator, value[start..idx]);
+                try out.appendSlice(self.allocator, "'\\''");
+                start = idx + 1;
+                continue;
+            }
+            try out.appendSlice(self.allocator, value[start..]);
+            break;
+        }
+        try out.append(self.allocator, '\'');
+    }
+
+    fn extractTerminalOutputBytesFromToolPayload(self: *Session, payload_json: []const u8) ![]u8 {
+        var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, payload_json, .{});
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidPayload;
+        const obj = parsed.value.object;
+        const stdout = if (obj.get("stdout")) |value|
+            if (value == .string) value.string else return error.InvalidPayload
+        else
+            "";
+        const stderr = if (obj.get("stderr")) |value|
+            if (value == .string) value.string else return error.InvalidPayload
+        else
+            "";
+
+        const merged = try self.allocator.alloc(u8, stdout.len + stderr.len);
+        @memcpy(merged[0..stdout.len], stdout);
+        @memcpy(merged[stdout.len..], stderr);
+        return merged;
+    }
+
+    fn buildTerminalOutputResultJson(self: *Session, output: []const u8, eof: bool) ![]u8 {
+        const output_b64 = try unified.encodeDataB64(self.allocator, output);
+        defer self.allocator.free(output_b64);
+        const escaped_b64 = try unified.jsonEscape(self.allocator, output_b64);
+        defer self.allocator.free(escaped_b64);
+        return std.fmt.allocPrint(
+            self.allocator,
+            "{{\"n\":{d},\"data_b64\":\"{s}\",\"eof\":{s}}}",
+            .{
+                output.len,
+                escaped_b64,
+                if (eof) "true" else "false",
+            },
+        );
+    }
+
+    fn consumeTerminalBufferedResult(self: *Session, session: *TerminalSession, max_bytes: usize) ![]u8 {
+        const existing = session.buffered_result orelse return self.allocator.dupe(u8, "");
+        const visible_len = @min(existing.len, max_bytes);
+        const visible = try self.allocator.dupe(u8, existing[0..visible_len]);
+
+        if (visible_len == existing.len) {
+            self.allocator.free(existing);
+            session.buffered_result = null;
+            return visible;
+        }
+
+        const tail = try self.allocator.dupe(u8, existing[visible_len..]);
+        self.allocator.free(existing);
+        session.buffered_result = tail;
+        return visible;
     }
 
     fn parseTerminalWriteBytes(self: *Session, obj: std.json.ObjectMap) ![]u8 {
@@ -3801,36 +3928,6 @@ pub const Session = struct {
         if (try jsonObjectOptionalString(obj, "session_id")) |value| return value;
         if (self.current_terminal_session_id) |value| return value;
         return null;
-    }
-
-    fn spawnTerminalPtyProcess(
-        self: *Session,
-        cwd: ?[]const u8,
-        shell_override: ?[]const u8,
-    ) !TerminalPtyProcess {
-        if (builtin.os.tag != .linux) return error.UnsupportedPlatform;
-
-        const shell = shell_override orelse blk: {
-            if (std.posix.getenv("SHELL")) |value| break :blk value;
-            break :blk "/bin/bash";
-        };
-        const command = try std.fmt.allocPrint(self.allocator, "{s} -i", .{shell});
-        defer self.allocator.free(command);
-
-        var child = std.process.Child.init(
-            &[_][]const u8{ "script", "-q", "-f", "/dev/null", "-c", command },
-            self.allocator,
-        );
-        child.stdin_behavior = .Pipe;
-        child.stdout_behavior = .Pipe;
-        child.stderr_behavior = .Ignore;
-        if (cwd) |root| child.cwd = root;
-        child.spawn() catch |err| switch (err) {
-            error.FileNotFound => return error.TerminalPtyUnavailable,
-            else => return err,
-        };
-        child.argv = &.{};
-        return .{ .child = child };
     }
 
     fn buildTerminalExecArgsJson(
@@ -10301,25 +10398,6 @@ fn jsonObjectOptionalU64(obj: std.json.ObjectMap, key: []const u8) !?u64 {
     return null;
 }
 
-fn pollFileReadable(file: std.fs.File, timeout_ms: i32) !bool {
-    if (builtin.os.tag == .windows) return error.UnsupportedPlatform;
-
-    var fds = [_]std.posix.pollfd{
-        .{
-            .fd = file.handle,
-            .events = std.posix.POLL.IN,
-            .revents = 0,
-        },
-    };
-    const ready = try std.posix.poll(&fds, timeout_ms);
-    if (ready == 0) return false;
-
-    const revents = fds[0].revents;
-    if ((revents & std.posix.POLL.NVAL) != 0) return false;
-    if ((revents & std.posix.POLL.ERR) != 0) return error.Unexpected;
-    return (revents & (std.posix.POLL.IN | std.posix.POLL.HUP)) != 0;
-}
-
 fn kindName(kind: NodeKind) []const u8 {
     return switch (kind) {
         .dir => "dir",
@@ -13012,8 +13090,20 @@ test "acheron_session: terminal-v2 session lifecycle updates current and session
         924,
     );
     defer allocator.free(result_payload);
-    try std.testing.expect(std.mem.indexOf(u8, result_payload, "terminal-v2") != null);
     try std.testing.expect(std.mem.indexOf(u8, result_payload, "\"operation\":\"exec\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result_payload, "\"data_b64\":") != null);
+
+    var result_parsed = try std.json.parseFromSlice(std.json.Value, allocator, result_payload, .{});
+    defer result_parsed.deinit();
+    const result_obj = result_parsed.value.object.get("result") orelse return error.TestExpectedResponse;
+    if (result_obj != .object) return error.TestExpectedResponse;
+    const data_b64 = result_obj.object.get("data_b64") orelse return error.TestExpectedResponse;
+    if (data_b64 != .string) return error.TestExpectedResponse;
+    const decoded_len = try std.base64.standard.Decoder.calcSizeForSlice(data_b64.string);
+    const decoded = try allocator.alloc(u8, decoded_len);
+    defer allocator.free(decoded);
+    try std.base64.standard.Decoder.decode(decoded, data_b64.string);
+    try std.testing.expect(std.mem.indexOf(u8, decoded, "terminal-v2") != null);
 
     try protocolWriteFile(
         &session,
@@ -13103,7 +13193,6 @@ test "acheron_session: terminal-v2 invoke envelope routes create and exec operat
     );
     defer allocator.free(result_payload);
     try std.testing.expect(std.mem.indexOf(u8, result_payload, "\"operation\":\"exec\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result_payload, "invoke-v2") != null);
 }
 
 test "acheron_session: terminal-v2 write read resize operations update status and result" {
@@ -13193,6 +13282,7 @@ test "acheron_session: terminal-v2 write read resize operations update status an
     const decoded = try allocator.alloc(u8, decoded_len);
     defer allocator.free(decoded);
     try std.base64.standard.Decoder.decode(decoded, data_b64_value.string);
+    try std.testing.expect(std.mem.indexOf(u8, decoded, "wr-marker") != null);
 
     try protocolWriteFile(
         &session,
@@ -13203,6 +13293,451 @@ test "acheron_session: terminal-v2 write read resize operations update status an
         "{\"session_id\":\"io\"}",
         938,
     );
+}
+
+test "acheron_session: terminal-v2 buffered output survives partial reads and multiple writes" {
+    const allocator = std.testing.allocator;
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.init(allocator, runtime_handle, &job_index, "default");
+    defer session.deinit();
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        340,
+        341,
+        &.{ "agents", "self", "terminal", "control", "create.json" },
+        "{\"session_id\":\"buf\"}",
+        939,
+    );
+
+    const terminal_session = session.terminal_sessions.getPtr("buf") orelse return error.TestExpectedResponse;
+    try session.appendTerminalBufferedResult(terminal_session, "abcdef");
+    try session.appendTerminalBufferedResult(terminal_session, "gh");
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        342,
+        343,
+        &.{ "agents", "self", "terminal", "control", "read.json" },
+        "{\"session_id\":\"buf\",\"max_bytes\":3}",
+        940,
+    );
+
+    const first_read_payload = try protocolReadFile(
+        &session,
+        allocator,
+        344,
+        345,
+        &.{ "agents", "self", "terminal", "result.json" },
+        941,
+    );
+    defer allocator.free(first_read_payload);
+
+    var first_parsed = try std.json.parseFromSlice(std.json.Value, allocator, first_read_payload, .{});
+    defer first_parsed.deinit();
+    const first_result = first_parsed.value.object.get("result") orelse return error.TestExpectedResponse;
+    if (first_result != .object) return error.TestExpectedResponse;
+    const first_b64 = first_result.object.get("data_b64") orelse return error.TestExpectedResponse;
+    if (first_b64 != .string) return error.TestExpectedResponse;
+    const first_decoded_len = try std.base64.standard.Decoder.calcSizeForSlice(first_b64.string);
+    const first_decoded = try allocator.alloc(u8, first_decoded_len);
+    defer allocator.free(first_decoded);
+    try std.base64.standard.Decoder.decode(first_decoded, first_b64.string);
+    try std.testing.expectEqualStrings("abc", first_decoded);
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        346,
+        347,
+        &.{ "agents", "self", "terminal", "control", "read.json" },
+        "{\"session_id\":\"buf\",\"max_bytes\":3}",
+        942,
+    );
+
+    const second_read_payload = try protocolReadFile(
+        &session,
+        allocator,
+        348,
+        349,
+        &.{ "agents", "self", "terminal", "result.json" },
+        943,
+    );
+    defer allocator.free(second_read_payload);
+
+    var second_parsed = try std.json.parseFromSlice(std.json.Value, allocator, second_read_payload, .{});
+    defer second_parsed.deinit();
+    const second_result = second_parsed.value.object.get("result") orelse return error.TestExpectedResponse;
+    if (second_result != .object) return error.TestExpectedResponse;
+    const second_b64 = second_result.object.get("data_b64") orelse return error.TestExpectedResponse;
+    if (second_b64 != .string) return error.TestExpectedResponse;
+    const second_decoded_len = try std.base64.standard.Decoder.calcSizeForSlice(second_b64.string);
+    const second_decoded = try allocator.alloc(u8, second_decoded_len);
+    defer allocator.free(second_decoded);
+    try std.base64.standard.Decoder.decode(second_decoded, second_b64.string);
+    try std.testing.expectEqualStrings("def", second_decoded);
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        350,
+        351,
+        &.{ "agents", "self", "terminal", "control", "read.json" },
+        "{\"session_id\":\"buf\",\"max_bytes\":8}",
+        944,
+    );
+
+    const third_read_payload = try protocolReadFile(
+        &session,
+        allocator,
+        352,
+        353,
+        &.{ "agents", "self", "terminal", "result.json" },
+        945,
+    );
+    defer allocator.free(third_read_payload);
+
+    var third_parsed = try std.json.parseFromSlice(std.json.Value, allocator, third_read_payload, .{});
+    defer third_parsed.deinit();
+    const third_result = third_parsed.value.object.get("result") orelse return error.TestExpectedResponse;
+    if (third_result != .object) return error.TestExpectedResponse;
+    const third_b64 = third_result.object.get("data_b64") orelse return error.TestExpectedResponse;
+    if (third_b64 != .string) return error.TestExpectedResponse;
+    const third_decoded_len = try std.base64.standard.Decoder.calcSizeForSlice(third_b64.string);
+    const third_decoded = try allocator.alloc(u8, third_decoded_len);
+    defer allocator.free(third_decoded);
+    try std.base64.standard.Decoder.decode(third_decoded, third_b64.string);
+    try std.testing.expectEqualStrings("gh", third_decoded);
+}
+
+test "acheron_session: terminal-v2 write accepts binary-safe data_b64 input" {
+    const allocator = std.testing.allocator;
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.init(allocator, runtime_handle, &job_index, "default");
+    defer session.deinit();
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        368,
+        369,
+        &.{ "agents", "self", "terminal", "control", "create.json" },
+        "{\"session_id\":\"bin\"}",
+        953,
+    );
+
+    const raw_bytes = [_]u8{ ':', ' ', '#', 0xff, '\n' };
+    const encoded = try std.base64.standard.Encoder.allocEncode(allocator, &raw_bytes);
+    defer allocator.free(encoded);
+    const write_payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"session_id\":\"bin\",\"data_b64\":\"{s}\"}}",
+        .{encoded},
+    );
+    defer allocator.free(write_payload);
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        370,
+        371,
+        &.{ "agents", "self", "terminal", "control", "write.json" },
+        write_payload,
+        954,
+    );
+
+    const status_payload = try protocolReadFile(
+        &session,
+        allocator,
+        372,
+        373,
+        &.{ "agents", "self", "terminal", "status.json" },
+        955,
+    );
+    defer allocator.free(status_payload);
+    try std.testing.expect(std.mem.indexOf(u8, status_payload, "\"state\":\"done\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status_payload, "\"session_id\":\"bin\"") != null);
+}
+
+test "acheron_session: terminal-v2 preserves shell state across writes" {
+    const allocator = std.testing.allocator;
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.init(allocator, runtime_handle, &job_index, "default");
+    defer session.deinit();
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        374,
+        375,
+        &.{ "agents", "self", "terminal", "control", "create.json" },
+        "{\"session_id\":\"state\",\"cwd\":\".\"}",
+        956,
+    );
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        376,
+        377,
+        &.{ "agents", "self", "terminal", "control", "write.json" },
+        "{\"session_id\":\"state\",\"input\":\"cd src\",\"append_newline\":true}",
+        957,
+    );
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        378,
+        379,
+        &.{ "agents", "self", "terminal", "control", "write.json" },
+        "{\"session_id\":\"state\",\"input\":\"pwd\",\"append_newline\":true}",
+        958,
+    );
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        380,
+        381,
+        &.{ "agents", "self", "terminal", "control", "read.json" },
+        "{\"session_id\":\"state\",\"timeout_ms\":100,\"max_bytes\":65536}",
+        959,
+    );
+
+    const result_payload = try protocolReadFile(
+        &session,
+        allocator,
+        382,
+        383,
+        &.{ "agents", "self", "terminal", "result.json" },
+        960,
+    );
+    defer allocator.free(result_payload);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, result_payload, .{});
+    defer parsed.deinit();
+    const result_obj = parsed.value.object.get("result") orelse return error.TestExpectedResponse;
+    if (result_obj != .object) return error.TestExpectedResponse;
+    const data_b64 = result_obj.object.get("data_b64") orelse return error.TestExpectedResponse;
+    if (data_b64 != .string) return error.TestExpectedResponse;
+    const decoded_len = try std.base64.standard.Decoder.calcSizeForSlice(data_b64.string);
+    const decoded = try allocator.alloc(u8, decoded_len);
+    defer allocator.free(decoded);
+    try std.base64.standard.Decoder.decode(decoded, data_b64.string);
+    try std.testing.expect(std.mem.indexOf(u8, decoded, "/src") != null);
+}
+
+test "acheron_session: terminal-v2 exec output is not replayed by read" {
+    const allocator = std.testing.allocator;
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.init(allocator, runtime_handle, &job_index, "default");
+    defer session.deinit();
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        384,
+        385,
+        &.{ "agents", "self", "terminal", "control", "create.json" },
+        "{\"session_id\":\"execdup\"}",
+        961,
+    );
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        386,
+        387,
+        &.{ "agents", "self", "terminal", "control", "exec.json" },
+        "{\"session_id\":\"execdup\",\"command\":\"echo once\"}",
+        962,
+    );
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        388,
+        389,
+        &.{ "agents", "self", "terminal", "control", "read.json" },
+        "{\"session_id\":\"execdup\",\"timeout_ms\":50,\"max_bytes\":65536}",
+        963,
+    );
+
+    const result_payload = try protocolReadFile(
+        &session,
+        allocator,
+        390,
+        391,
+        &.{ "agents", "self", "terminal", "result.json" },
+        964,
+    );
+    defer allocator.free(result_payload);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, result_payload, .{});
+    defer parsed.deinit();
+    const result_obj = parsed.value.object.get("result") orelse return error.TestExpectedResponse;
+    if (result_obj != .object) return error.TestExpectedResponse;
+    const data_b64 = result_obj.object.get("data_b64") orelse return error.TestExpectedResponse;
+    if (data_b64 != .string) return error.TestExpectedResponse;
+    const decoded_len = try std.base64.standard.Decoder.calcSizeForSlice(data_b64.string);
+    const decoded = try allocator.alloc(u8, decoded_len);
+    defer allocator.free(decoded);
+    try std.base64.standard.Decoder.decode(decoded, data_b64.string);
+    try std.testing.expectEqual(@as(usize, 0), decoded.len);
+}
+
+test "acheron_session: terminal-v2 read honors timeout_ms when idle" {
+    const allocator = std.testing.allocator;
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.init(allocator, runtime_handle, &job_index, "default");
+    defer session.deinit();
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        392,
+        393,
+        &.{ "agents", "self", "terminal", "control", "create.json" },
+        "{\"session_id\":\"idle\"}",
+        965,
+    );
+
+    const started_at_ms = std.time.milliTimestamp();
+    try protocolWriteFile(
+        &session,
+        allocator,
+        394,
+        395,
+        &.{ "agents", "self", "terminal", "control", "read.json" },
+        "{\"session_id\":\"idle\",\"timeout_ms\":150,\"max_bytes\":65536}",
+        966,
+    );
+    const elapsed_ms = std.time.milliTimestamp() - started_at_ms;
+    try std.testing.expect(elapsed_ms >= 100);
+}
+
+test "acheron_session: terminal-v2 write and exec surface shell_exec failures" {
+    const allocator = std.testing.allocator;
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.init(allocator, runtime_handle, &job_index, "default");
+    defer session.deinit();
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        354,
+        355,
+        &.{ "agents", "self", "terminal", "control", "create.json" },
+        "{\"session_id\":\"fail\",\"cwd\":\"/definitely/not/a/real/dir\"}",
+        946,
+    );
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        356,
+        357,
+        &.{ "agents", "self", "terminal", "control", "write.json" },
+        "{\"session_id\":\"fail\",\"input\":\"echo should-fail\",\"append_newline\":true}",
+        947,
+    );
+
+    const write_status_payload = try protocolReadFile(
+        &session,
+        allocator,
+        358,
+        359,
+        &.{ "agents", "self", "terminal", "status.json" },
+        948,
+    );
+    defer allocator.free(write_status_payload);
+    try std.testing.expect(std.mem.indexOf(u8, write_status_payload, "\"state\":\"failed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, write_status_payload, "\"tool\":\"terminal_session_write\"") != null);
+
+    const write_result_payload = try protocolReadFile(
+        &session,
+        allocator,
+        360,
+        361,
+        &.{ "agents", "self", "terminal", "result.json" },
+        949,
+    );
+    defer allocator.free(write_result_payload);
+    try std.testing.expect(std.mem.indexOf(u8, write_result_payload, "\"ok\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, write_result_payload, "\"operation\":\"write\"") != null);
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        362,
+        363,
+        &.{ "agents", "self", "terminal", "control", "exec.json" },
+        "{\"session_id\":\"fail\",\"command\":\"echo still-fails\"}",
+        950,
+    );
+
+    const exec_status_payload = try protocolReadFile(
+        &session,
+        allocator,
+        364,
+        365,
+        &.{ "agents", "self", "terminal", "status.json" },
+        951,
+    );
+    defer allocator.free(exec_status_payload);
+    try std.testing.expect(std.mem.indexOf(u8, exec_status_payload, "\"state\":\"failed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, exec_status_payload, "\"tool\":\"shell_exec\"") != null);
+
+    const exec_result_payload = try protocolReadFile(
+        &session,
+        allocator,
+        366,
+        367,
+        &.{ "agents", "self", "terminal", "result.json" },
+        952,
+    );
+    defer allocator.free(exec_result_payload);
+    try std.testing.expect(std.mem.indexOf(u8, exec_result_payload, "\"ok\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, exec_result_payload, "\"operation\":\"exec\"") != null);
 }
 
 test "acheron_session: first-class memory namespace rejects unknown invoke op" {
