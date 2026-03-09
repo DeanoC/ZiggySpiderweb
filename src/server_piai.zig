@@ -4,20 +4,20 @@ const Config = @import("config.zig");
 const connection_dispatcher = @import("connection_dispatcher.zig");
 const memory = @import("ziggy-memory-store").memory;
 const protocol = @import("spider-protocol").protocol;
-const runtime_server_mod = @import("runtime_server.zig");
-const runtime_handle_mod = @import("runtime_handle.zig");
-const chat_runtime_job = @import("chat_runtime_job.zig");
+const runtime_server_mod = @import("agents/runtime_server.zig");
+const runtime_handle_mod = @import("agents/runtime_handle.zig");
+const chat_runtime_job = @import("agents/chat_runtime_job.zig");
 const sandbox_runtime_mod = @import("sandbox_runtime.zig");
 const websocket_transport = @import("websocket_transport.zig");
-const fsrpc_session = @import("fsrpc_session.zig");
-const fs_control_plane = @import("fs_control_plane.zig");
-const chat_job_index = @import("chat_job_index.zig");
+const acheron_session_mod = @import("acheron/session.zig");
+const control_plane_mod = @import("acheron/control_plane.zig");
+const chat_job_index = @import("agents/chat_job_index.zig");
 const fs_protocol = @import("spiderweb_fs").fs_protocol;
 const spiderweb_node = @import("spiderweb_node");
 const fs_node_ops = spiderweb_node.fs_node_ops;
 const fs_node_service = spiderweb_node.fs_node_service;
 const fs_watch_runtime = spiderweb_node.fs_watch_runtime;
-const agent_registry_mod = @import("agent_registry.zig");
+const agent_registry_mod = @import("agents/agent_registry.zig");
 const tool_registry = @import("ziggy-tool-runtime").tool_registry;
 const unified = @import("spider-protocol").unified;
 
@@ -46,7 +46,7 @@ const local_node_lease_ttl_env = "SPIDERWEB_LOCAL_NODE_LEASE_TTL_MS";
 const local_node_heartbeat_ms_env = "SPIDERWEB_LOCAL_NODE_HEARTBEAT_MS";
 const local_node_watcher_enabled_env = "SPIDERWEB_LOCAL_NODE_WATCHER_ENABLED";
 const system_agent_id = "mother";
-const system_project_id = fs_control_plane.spider_web_project_id;
+const system_project_id = control_plane_mod.spider_web_project_id;
 const local_node_default_workspace_export_name = "system-workspace";
 const local_node_agents_export_name = "system-agents";
 const local_node_meta_export_name = "system-meta";
@@ -73,9 +73,9 @@ const node_venom_event_log_rotate_max_bytes_env = "SPIDERWEB_NODE_VENOM_EVENT_LO
 const node_venom_event_log_archive_keep_env = "SPIDERWEB_NODE_VENOM_EVENT_LOG_ARCHIVE_KEEP";
 const metrics_port_env = "SPIDERWEB_METRICS_PORT";
 const control_protocol_version = "unified-v2";
-const fsrpc_runtime_protocol_version = "acheron-1";
-const fsrpc_node_protocol_version = "unified-v2-fs";
-const fsrpc_node_proto_id: i64 = 2;
+const acheron_runtime_protocol_version = "acheron-1";
+const acheron_node_protocol_version = "unified-v2-fs";
+const acheron_node_proto_id: i64 = 2;
 const node_tunnel_reply_timeout_ms: i32 = 45_000;
 const venom_presence_dispatch_queue_max: usize = 256;
 // Each accepted websocket occupies a worker thread for its full lifetime.
@@ -1113,7 +1113,7 @@ const LocalFsNode = struct {
         allocator: std.mem.Allocator,
         runtime_registry: *AgentRuntimeRegistry,
         export_specs: []const fs_node_ops.ExportSpec,
-        mount_specs: []const fs_control_plane.SpiderWebMountSpec,
+        mount_specs: []const control_plane_mod.SpiderWebMountSpec,
         node_name: []const u8,
         fs_url: []const u8,
         lease_ttl_ms: u64,
@@ -1195,7 +1195,7 @@ const LocalFsNode = struct {
         return endpoint;
     }
 
-    fn deinit(self: *LocalFsNode, control_plane: *fs_control_plane.ControlPlane) void {
+    fn deinit(self: *LocalFsNode, control_plane: *control_plane_mod.ControlPlane) void {
         self.stopAndWaitForChatJobWorkers();
         self.requestHeartbeatStop();
         if (self.heartbeat_thread) |thread| {
@@ -1258,12 +1258,12 @@ const LocalFsNode = struct {
         self.chat_jobs_mutex.unlock();
     }
 
-    fn startRegistrationAndHeartbeat(self: *LocalFsNode, control_plane: *fs_control_plane.ControlPlane) !void {
+    fn startRegistrationAndHeartbeat(self: *LocalFsNode, control_plane: *control_plane_mod.ControlPlane) !void {
         try self.refreshRegistration(control_plane);
         self.heartbeat_thread = try std.Thread.spawn(.{}, localFsHeartbeatThreadMain, .{ self, control_plane });
     }
 
-    fn refreshRegistration(self: *LocalFsNode, control_plane: *fs_control_plane.ControlPlane) !void {
+    fn refreshRegistration(self: *LocalFsNode, control_plane: *control_plane_mod.ControlPlane) !void {
         const payload_json = try control_plane.ensureNode(self.node_name, self.fs_url, self.lease_ttl_ms);
         defer self.allocator.free(payload_json);
         const registration = try parseNodeRegistrationFromJoinPayload(self.allocator, payload_json);
@@ -1298,8 +1298,8 @@ const LocalFsNode = struct {
         try self.registerLocalVenoms(control_plane, mount_node_id, self.session_auth_token.?);
     }
 
-    fn ensureSpiderWebMounts(self: *LocalFsNode, control_plane: *fs_control_plane.ControlPlane, node_id: []const u8) !void {
-        const specs = try self.allocator.alloc(fs_control_plane.SpiderWebMountSpec, self.mount_specs.items.len);
+    fn ensureSpiderWebMounts(self: *LocalFsNode, control_plane: *control_plane_mod.ControlPlane, node_id: []const u8) !void {
+        const specs = try self.allocator.alloc(control_plane_mod.SpiderWebMountSpec, self.mount_specs.items.len);
         defer self.allocator.free(specs);
         for (self.mount_specs.items, 0..) |spec, idx| {
             specs[idx] = .{
@@ -1312,7 +1312,7 @@ const LocalFsNode = struct {
 
     fn registerLocalVenoms(
         self: *LocalFsNode,
-        control_plane: *fs_control_plane.ControlPlane,
+        control_plane: *control_plane_mod.ControlPlane,
         node_id: []const u8,
         node_secret: []const u8,
     ) !void {
@@ -1704,7 +1704,7 @@ fn handleLocalFsConnection(
     var connection: ?*FsHubConnection = null;
     defer if (connection) |conn| local_node.hub.unregister(conn);
     var connection_write_mutex: std.Thread.Mutex = .{};
-    var fsrpc_negotiated = false;
+    var acheron_negotiated = false;
     var hello_allow_invalidations = false;
 
     while (true) {
@@ -1735,7 +1735,7 @@ fn handleLocalFsConnection(
                 defer parsed.deinit(allocator);
 
                 var register_after_response = false;
-                if (!fsrpc_negotiated) {
+                if (!acheron_negotiated) {
                     if (parsed.channel == .control) {
                         const response = try unified.buildControlError(
                             allocator,
@@ -1773,7 +1773,7 @@ fn handleLocalFsConnection(
                         return;
                     };
                     hello_allow_invalidations = hello_opts.allow_invalidations;
-                    fsrpc_negotiated = true;
+                    acheron_negotiated = true;
                     register_after_response = true;
                 } else if (parsed.acheron_type == .fs_t_hello) {
                     const hello_opts = validateFsNodeHelloPayload(allocator, parsed.payload_json, required_auth_token) catch |err| {
@@ -1902,8 +1902,8 @@ fn parseFsHelloAuthToken(allocator: std.mem.Allocator, payload_json: ?[]const u8
 
 fn controlNodeErrorToErrno(err: anyerror) i32 {
     return switch (err) {
-        fs_control_plane.ControlPlaneError.NodeNotFound => fs_protocol.Errno.ENOENT,
-        fs_control_plane.ControlPlaneError.NodeAuthFailed => fs_protocol.Errno.EACCES,
+        control_plane_mod.ControlPlaneError.NodeNotFound => fs_protocol.Errno.ENOENT,
+        control_plane_mod.ControlPlaneError.NodeAuthFailed => fs_protocol.Errno.EACCES,
         else => fs_protocol.Errno.EIO,
     };
 }
@@ -1997,7 +1997,7 @@ fn handleNodeTunnelConnection(
                     const ack_payload = try std.fmt.allocPrint(
                         allocator,
                         "{{\"protocol\":\"{s}\",\"proto\":{d},\"node_id\":\"{s}\"}}",
-                        .{ fsrpc_node_protocol_version, fsrpc_node_proto_id, attachment.?.node_id },
+                        .{ acheron_node_protocol_version, acheron_node_proto_id, attachment.?.node_id },
                     );
                     defer allocator.free(ack_payload);
                     const response = try unified.buildFsrpcResponse(
@@ -2097,7 +2097,7 @@ fn handleRoutedNodeFsConnection(
     stream: *std.net.Stream,
 ) !void {
     var connection_write_mutex: std.Thread.Mutex = .{};
-    var fsrpc_negotiated = false;
+    var acheron_negotiated = false;
     var connection_client_id: ?u64 = null;
     defer if (connection_client_id) |client_id| {
         runtime_registry.node_tunnels.unregisterClient(node_id, client_id);
@@ -2143,7 +2143,7 @@ fn handleRoutedNodeFsConnection(
                     return;
                 }
 
-                const fsrpc_type = parsed.acheron_type orelse {
+                const acheron_type = parsed.acheron_type orelse {
                     const response = try unified.buildFsrpcFsError(
                         allocator,
                         parsed.tag,
@@ -2166,8 +2166,8 @@ fn handleRoutedNodeFsConnection(
                     continue;
                 };
 
-                if (!fsrpc_negotiated) {
-                    if (fsrpc_type != .fs_t_hello) {
+                if (!acheron_negotiated) {
+                    if (acheron_type != .fs_t_hello) {
                         const response = try unified.buildFsrpcFsError(
                             allocator,
                             parsed.tag,
@@ -2246,8 +2246,8 @@ fn handleRoutedNodeFsConnection(
                         try writeFrameLocked(stream, &connection_write_mutex, "", .close);
                         return;
                     };
-                    fsrpc_negotiated = true;
-                } else if (fsrpc_type == .fs_t_hello) {
+                    acheron_negotiated = true;
+                } else if (acheron_type == .fs_t_hello) {
                     const hello_opts = validateFsNodeHelloPayload(allocator, parsed.payload_json, null) catch |err| {
                         const response = try unified.buildFsrpcFsError(
                             allocator,
@@ -2352,7 +2352,7 @@ fn rewriteAcheronTag(
     return std.fmt.allocPrint(allocator, "{f}", .{std.json.fmt(parsed.value, .{})});
 }
 
-fn localFsHeartbeatThreadMain(local_node: *LocalFsNode, control_plane: *fs_control_plane.ControlPlane) void {
+fn localFsHeartbeatThreadMain(local_node: *LocalFsNode, control_plane: *control_plane_mod.ControlPlane) void {
     while (true) {
         var elapsed: u64 = 0;
         while (elapsed < local_node.heartbeat_interval_ms) {
@@ -3579,7 +3579,7 @@ const AgentRuntimeRegistry = struct {
     default_agent_id: []const u8,
     max_runtimes: usize,
     debug_stream_sink: DebugStreamFileSink,
-    control_plane: fs_control_plane.ControlPlane,
+    control_plane: control_plane_mod.ControlPlane,
     job_index: chat_job_index.ChatJobIndex,
     auth_tokens: AuthTokenStore,
     control_operator_token: ?[]u8 = null,
@@ -3698,7 +3698,7 @@ const AgentRuntimeRegistry = struct {
             .default_agent_id = effective_default,
             .max_runtimes = if (max_runtimes == 0) 1 else max_runtimes,
             .debug_stream_sink = debug_stream_sink,
-            .control_plane = fs_control_plane.ControlPlane.initWithPersistenceOptions(
+            .control_plane = control_plane_mod.ControlPlane.initWithPersistenceOptions(
                 allocator,
                 effective_runtime_config.ltm_directory,
                 effective_runtime_config.ltm_filename,
@@ -5957,7 +5957,7 @@ const AgentRuntimeRegistry = struct {
             defer self.allocator.free(payload);
 
             const result = self.control_plane.removeProjectMountWithRole(payload, true) catch |err| switch (err) {
-                fs_control_plane.ControlPlaneError.MountNotFound => continue,
+                control_plane_mod.ControlPlaneError.MountNotFound => continue,
                 else => {
                     std.log.warn(
                         "failed pruning legacy system mount {s}: {s}",
@@ -6097,7 +6097,7 @@ const AgentRuntimeRegistry = struct {
                 .source_id = "jobs",
             },
         };
-        const mount_specs = [_]fs_control_plane.SpiderWebMountSpec{
+        const mount_specs = [_]control_plane_mod.SpiderWebMountSpec{
             .{ .mount_path = local_node_mount_agents_root, .export_name = local_node_agents_export_name },
             .{ .mount_path = local_node_mount_meta, .export_name = local_node_meta_export_name },
             .{ .mount_path = local_node_mount_agents_self_chat, .export_name = local_node_chat_export_name },
@@ -6530,19 +6530,19 @@ fn handleWebSocketConnection(
     );
     var active_session_key = try allocator.dupe(u8, "main");
     defer allocator.free(active_session_key);
-    var fsrpc: ?fsrpc_session.Session = null;
-    defer if (fsrpc) |*session| session.deinit();
-    var fsrpc_bound_session_key = try allocator.dupe(u8, "main");
-    defer allocator.free(fsrpc_bound_session_key);
+    var acheron_session: ?acheron_session_mod.Session = null;
+    defer if (acheron_session) |*session| session.deinit();
+    var acheron_bound_session_key = try allocator.dupe(u8, "main");
+    defer allocator.free(acheron_bound_session_key);
     var control_protocol_negotiated = false;
-    var runtime_fsrpc_version_negotiated = false;
+    var runtime_acheron_version_negotiated = false;
     var connection_write_mutex: std.Thread.Mutex = .{};
-    const connection_service_id = try std.fmt.allocPrint(
+    const connection_venom_id = try std.fmt.allocPrint(
         allocator,
         "ws.{s}.{d}",
         .{ connectionRoleName(principal.role), std.time.nanoTimestamp() },
     );
-    defer allocator.free(connection_service_id);
+    defer allocator.free(connection_venom_id);
     var control_service_attached = false;
     defer {
         if (control_service_attached) {
@@ -6551,7 +6551,7 @@ fn handleWebSocketConnection(
                     principal.role,
                     binding,
                     active_session_key,
-                    connection_service_id,
+                    connection_venom_id,
                     false,
                 );
             }
@@ -6650,12 +6650,12 @@ fn handleWebSocketConnection(
                                 control_protocol_negotiated = true;
                                 const payload = try std.fmt.allocPrint(
                                     allocator,
-                                    "{{\"protocol\":\"{s}\",\"fsrpc_runtime\":\"{s}\",\"fsrpc_node\":\"{s}\",\"fsrpc_node_proto\":{d}}}",
+                                    "{{\"protocol\":\"{s}\",\"acheron_runtime\":\"{s}\",\"acheron_node\":\"{s}\",\"acheron_node_proto\":{d}}}",
                                     .{
                                         control_protocol_version,
-                                        fsrpc_runtime_protocol_version,
-                                        fsrpc_node_protocol_version,
-                                        fsrpc_node_proto_id,
+                                        acheron_runtime_protocol_version,
+                                        acheron_node_protocol_version,
+                                        acheron_node_proto_id,
                                     },
                                 );
                                 defer allocator.free(payload);
@@ -6773,7 +6773,7 @@ fn handleWebSocketConnection(
                                     principal.role,
                                     active_binding,
                                     active_session_key,
-                                    connection_service_id,
+                                    connection_venom_id,
                                     true,
                                 );
                                 continue;
@@ -7338,7 +7338,7 @@ fn handleWebSocketConnection(
                                             principal.role,
                                             previous_active_binding,
                                             previous_session_key,
-                                            connection_service_id,
+                                            connection_venom_id,
                                             false,
                                         );
                                     }
@@ -7346,7 +7346,7 @@ fn handleWebSocketConnection(
                                         principal.role,
                                         active_binding,
                                         session_key,
-                                        connection_service_id,
+                                        connection_venom_id,
                                         true,
                                     );
                                 }
@@ -7543,7 +7543,7 @@ fn handleWebSocketConnection(
                                             principal.role,
                                             previous_binding,
                                             previous_session_key,
-                                            connection_service_id,
+                                            connection_venom_id,
                                             false,
                                         );
                                     }
@@ -7551,7 +7551,7 @@ fn handleWebSocketConnection(
                                         principal.role,
                                         binding,
                                         session_key,
-                                        connection_service_id,
+                                        connection_venom_id,
                                         true,
                                     );
                                 }
@@ -7717,7 +7717,7 @@ fn handleWebSocketConnection(
                                 if (std.mem.eql(u8, active_session_key, session_key)) {
                                     allocator.free(active_session_key);
                                     active_session_key = try allocator.dupe(u8, "main");
-                                    if (fsrpc) |*session| {
+                                    if (acheron_session) |*session| {
                                         const main_binding = session_bindings.get("main") orelse return error.InvalidState;
                                         const main_runtime = runtime_registry.getOrCreate(
                                             main_binding.agent_id,
@@ -7842,7 +7842,7 @@ fn handleWebSocketConnection(
                                             principal.role,
                                             old_binding,
                                             previous_active_session_key.?,
-                                            connection_service_id,
+                                            connection_venom_id,
                                             false,
                                         );
                                     }
@@ -7850,7 +7850,7 @@ fn handleWebSocketConnection(
                                         principal.role,
                                         main_binding,
                                         active_session_key,
-                                        connection_service_id,
+                                        connection_venom_id,
                                         true,
                                     );
                                 }
@@ -8029,7 +8029,7 @@ fn handleWebSocketConnection(
                                 }
                                 const availability_after = runtime_registry.control_plane.availabilitySnapshot();
                                 const topology_mutation = isWorkspaceTopologyMutation(control_type);
-                                const availability_changed = !fs_control_plane.ControlPlane.AvailabilitySnapshot.eql(
+                                const availability_changed = !control_plane_mod.ControlPlane.AvailabilitySnapshot.eql(
                                     availability_before,
                                     availability_after,
                                 );
@@ -8068,7 +8068,7 @@ fn handleWebSocketConnection(
                             try writeFrameLocked(stream, &connection_write_mutex, response, .text);
                             continue;
                         }
-                        const fsrpc_type = parsed.acheron_type orelse {
+                        const acheron_type = parsed.acheron_type orelse {
                             const response = try unified.buildFsrpcError(
                                 allocator,
                                 parsed.tag,
@@ -8080,8 +8080,8 @@ fn handleWebSocketConnection(
                             try writeFrameLocked(stream, &connection_write_mutex, "", .close);
                             return;
                         };
-                        if (!runtime_fsrpc_version_negotiated) {
-                            if (fsrpc_type != .t_version) {
+                        if (!runtime_acheron_version_negotiated) {
+                            if (acheron_type != .t_version) {
                                 const response = try unified.buildFsrpcError(
                                     allocator,
                                     parsed.tag,
@@ -8093,7 +8093,7 @@ fn handleWebSocketConnection(
                                 try writeFrameLocked(stream, &connection_write_mutex, "", .close);
                                 return;
                             }
-                            if (parsed.version == null or !std.mem.eql(u8, parsed.version.?, fsrpc_runtime_protocol_version)) {
+                            if (parsed.version == null or !std.mem.eql(u8, parsed.version.?, acheron_runtime_protocol_version)) {
                                 const response = try unified.buildFsrpcError(
                                     allocator,
                                     parsed.tag,
@@ -8105,9 +8105,9 @@ fn handleWebSocketConnection(
                                 try writeFrameLocked(stream, &connection_write_mutex, "", .close);
                                 return;
                             }
-                            runtime_fsrpc_version_negotiated = true;
-                        } else if (fsrpc_type == .t_version) {
-                            if (parsed.version == null or !std.mem.eql(u8, parsed.version.?, fsrpc_runtime_protocol_version)) {
+                            runtime_acheron_version_negotiated = true;
+                        } else if (acheron_type == .t_version) {
+                            if (parsed.version == null or !std.mem.eql(u8, parsed.version.?, acheron_runtime_protocol_version)) {
                                 const response = try unified.buildFsrpcError(
                                     allocator,
                                     parsed.tag,
@@ -8120,12 +8120,12 @@ fn handleWebSocketConnection(
                                 return;
                             }
                         }
-                        if (fsrpc_type == .t_version) {
+                        if (acheron_type == .t_version) {
                             const negotiated_msize = parsed.msize orelse 1_048_576;
                             const payload = try std.fmt.allocPrint(
                                 allocator,
                                 "{{\"msize\":{d},\"version\":\"{s}\"}}",
-                                .{ negotiated_msize, fsrpc_runtime_protocol_version },
+                                .{ negotiated_msize, acheron_runtime_protocol_version },
                             );
                             defer allocator.free(payload);
                             const response = try unified.buildFsrpcResponse(
@@ -8151,7 +8151,7 @@ fn handleWebSocketConnection(
                             try writeFrameLocked(stream, &connection_write_mutex, response, .text);
                             continue;
                         };
-                        if (fsrpc_type == .t_write and target_binding.project_id != null) {
+                        if (acheron_type == .t_write and target_binding.project_id != null) {
                             runtime_registry.auth_tokens.recordSessionActivity(
                                 principal.role,
                                 target_session_key,
@@ -8306,19 +8306,19 @@ fn handleWebSocketConnection(
                             else => return err,
                         };
                         defer target_runtime.release();
-                        if (fsrpc_type == .t_write and control_service_attached) {
+                        if (acheron_type == .t_write and control_service_attached) {
                             runtime_registry.publishVenomPresenceForBinding(
                                 principal.role,
                                 target_binding,
                                 target_session_key,
-                                connection_service_id,
+                                connection_venom_id,
                                 true,
                             );
                         }
                         const local_fs_workspace_root = try runtime_registry.copyLocalFsWorkspaceRoot(allocator);
                         defer if (local_fs_workspace_root) |value| allocator.free(value);
-                        if (fsrpc == null) {
-                            fsrpc = try fsrpc_session.Session.initWithOptions(
+                        if (acheron_session == null) {
+                            acheron_session = try acheron_session_mod.Session.initWithOptions(
                                 allocator,
                                 target_runtime,
                                 &runtime_registry.job_index,
@@ -8337,13 +8337,13 @@ fn handleWebSocketConnection(
                                 },
                             );
                             const next_bound_session_key = try allocator.dupe(u8, target_session_key);
-                            allocator.free(fsrpc_bound_session_key);
-                            fsrpc_bound_session_key = next_bound_session_key;
+                            allocator.free(acheron_bound_session_key);
+                            acheron_bound_session_key = next_bound_session_key;
                         } else {
-                            const needs_rebind = !std.mem.eql(u8, fsrpc_bound_session_key, target_session_key) or
-                                !std.mem.eql(u8, fsrpc.?.agent_id, target_binding.agent_id);
+                            const needs_rebind = !std.mem.eql(u8, acheron_bound_session_key, target_session_key) or
+                                !std.mem.eql(u8, acheron_session.?.agent_id, target_binding.agent_id);
                             if (needs_rebind) {
-                                try fsrpc.?.setRuntimeBindingWithOptions(
+                                try acheron_session.?.setRuntimeBindingWithOptions(
                                     target_runtime,
                                     target_binding.agent_id,
                                     .{
@@ -8360,11 +8360,11 @@ fn handleWebSocketConnection(
                                     },
                                 );
                                 const next_bound_session_key = try allocator.dupe(u8, target_session_key);
-                                allocator.free(fsrpc_bound_session_key);
-                                fsrpc_bound_session_key = next_bound_session_key;
+                                allocator.free(acheron_bound_session_key);
+                                acheron_bound_session_key = next_bound_session_key;
                             }
                         }
-                        const response = try fsrpc.?.handle(&parsed);
+                        const response = try acheron_session.?.handle(&parsed);
                         defer allocator.free(response);
                         try writeFrameLocked(stream, &connection_write_mutex, response, .text);
                         continue;
@@ -8831,11 +8831,11 @@ fn validateFsNodeHelloPayload(
 
     const protocol_value = parsed.value.object.get("protocol") orelse return error.MissingField;
     if (protocol_value != .string) return error.InvalidType;
-    if (!std.mem.eql(u8, protocol_value.string, fsrpc_node_protocol_version)) return error.ProtocolMismatch;
+    if (!std.mem.eql(u8, protocol_value.string, acheron_node_protocol_version)) return error.ProtocolMismatch;
 
     const proto_value = parsed.value.object.get("proto") orelse return error.MissingField;
     if (proto_value != .integer) return error.InvalidType;
-    if (proto_value.integer != fsrpc_node_proto_id) return error.ProtocolMismatch;
+    if (proto_value.integer != acheron_node_proto_id) return error.ProtocolMismatch;
 
     if (required_auth_token) |expected| {
         const auth_value = parsed.value.object.get("auth_token") orelse return error.AuthMissing;
@@ -8885,7 +8885,7 @@ fn isWorkspaceTopologyMutation(control_type: unified.ControlType) bool {
 fn appendAvailabilitySnapshotJson(
     allocator: std.mem.Allocator,
     out: *std.ArrayListUnmanaged(u8),
-    snapshot: fs_control_plane.ControlPlane.AvailabilitySnapshot,
+    snapshot: control_plane_mod.ControlPlane.AvailabilitySnapshot,
 ) !void {
     try out.appendSlice(allocator, "{\"nodes\":{\"online\":");
     try out.writer(allocator).print("{d}", .{snapshot.nodes_online});
@@ -9145,22 +9145,22 @@ fn handleControlPlaneCommand(
 
 fn controlPlaneErrorCode(err: anyerror) []const u8 {
     return switch (err) {
-        fs_control_plane.ControlPlaneError.InvalidPayload => "invalid_payload",
-        fs_control_plane.ControlPlaneError.MissingField => "missing_field",
-        fs_control_plane.ControlPlaneError.InviteNotFound => "invite_not_found",
-        fs_control_plane.ControlPlaneError.InviteExpired => "invite_expired",
-        fs_control_plane.ControlPlaneError.InviteRedeemed => "invite_redeemed",
-        fs_control_plane.ControlPlaneError.NodeNotFound => "node_not_found",
+        control_plane_mod.ControlPlaneError.InvalidPayload => "invalid_payload",
+        control_plane_mod.ControlPlaneError.MissingField => "missing_field",
+        control_plane_mod.ControlPlaneError.InviteNotFound => "invite_not_found",
+        control_plane_mod.ControlPlaneError.InviteExpired => "invite_expired",
+        control_plane_mod.ControlPlaneError.InviteRedeemed => "invite_redeemed",
+        control_plane_mod.ControlPlaneError.NodeNotFound => "node_not_found",
         error.AgentNotFound => "agent_not_found",
-        fs_control_plane.ControlPlaneError.NodeAuthFailed => "node_auth_failed",
-        fs_control_plane.ControlPlaneError.PendingJoinNotFound => "pending_join_not_found",
-        fs_control_plane.ControlPlaneError.ProjectNotFound => "project_not_found",
-        fs_control_plane.ControlPlaneError.ProjectAuthFailed => "project_auth_failed",
-        fs_control_plane.ControlPlaneError.ProjectProtected => "project_protected",
-        fs_control_plane.ControlPlaneError.ProjectAssignmentForbidden => "project_assignment_forbidden",
-        fs_control_plane.ControlPlaneError.ProjectPolicyForbidden => "project_policy_forbidden",
-        fs_control_plane.ControlPlaneError.MountConflict => "mount_conflict",
-        fs_control_plane.ControlPlaneError.MountNotFound => "mount_not_found",
+        control_plane_mod.ControlPlaneError.NodeAuthFailed => "node_auth_failed",
+        control_plane_mod.ControlPlaneError.PendingJoinNotFound => "pending_join_not_found",
+        control_plane_mod.ControlPlaneError.ProjectNotFound => "project_not_found",
+        control_plane_mod.ControlPlaneError.ProjectAuthFailed => "project_auth_failed",
+        control_plane_mod.ControlPlaneError.ProjectProtected => "project_protected",
+        control_plane_mod.ControlPlaneError.ProjectAssignmentForbidden => "project_assignment_forbidden",
+        control_plane_mod.ControlPlaneError.ProjectPolicyForbidden => "project_policy_forbidden",
+        control_plane_mod.ControlPlaneError.MountConflict => "mount_conflict",
+        control_plane_mod.ControlPlaneError.MountNotFound => "mount_not_found",
         else => "control_plane_error",
     };
 }
@@ -10919,55 +10919,6 @@ test "server_piai: debug subscription control operations are unsupported in ache
     try std.testing.expect(server_ctx.err_name == null);
 }
 
-test "server_piai: node service watch control path is deprecated" {
-    const allocator = std.testing.allocator;
-    var runtime_registry = AgentRuntimeRegistry.init(allocator, .{
-        .ltm_directory = "",
-        .ltm_filename = "",
-    }, null);
-    defer runtime_registry.deinit();
-    try setAuthTokensForTests(&runtime_registry, "admin-secret", "user-secret");
-
-    var listener = try (try std.net.Address.parseIp("127.0.0.1", 0)).listen(.{ .reuse_address = true });
-    defer listener.deinit();
-
-    var server_ctx = WsTestServerCtx{
-        .allocator = allocator,
-        .runtime_registry = &runtime_registry,
-        .listener = &listener,
-    };
-    defer server_ctx.deinit();
-
-    const server_thread = try std.Thread.spawn(.{}, runSingleWsConnection, .{&server_ctx});
-    defer server_thread.join();
-
-    var subscriber = try std.net.tcpConnectToAddress(listener.listen_address);
-    defer subscriber.close();
-    try performClientHandshakeWithBearerToken(allocator, &subscriber, "/", "admin-secret");
-    try writeClientTextFrameMasked(&subscriber, "{\"channel\":\"control\",\"type\":\"control.version\",\"id\":\"sub-version\",\"payload\":{\"protocol\":\"unified-v2\"}}");
-    var sub_version_ack = try readServerFrame(allocator, &subscriber);
-    defer sub_version_ack.deinit(allocator);
-    try std.testing.expect(std.mem.indexOf(u8, sub_version_ack.payload, "\"type\":\"control.version_ack\"") != null);
-    try writeClientTextFrameMasked(&subscriber, "{\"channel\":\"control\",\"type\":\"control.connect\",\"id\":\"sub-connect\"}");
-    var sub_connect_ack = try readServerFrame(allocator, &subscriber);
-    defer sub_connect_ack.deinit(allocator);
-    try std.testing.expect(std.mem.indexOf(u8, sub_connect_ack.payload, "\"type\":\"control.connect_ack\"") != null);
-
-    try writeClientTextFrameMasked(&subscriber, "{\"channel\":\"control\",\"type\":\"control.node_service_watch\",\"id\":\"sub-watch\",\"payload\":{}}");
-    var sub_watch_ack = try readServerFrame(allocator, &subscriber);
-    defer sub_watch_ack.deinit(allocator);
-    try std.testing.expect(std.mem.indexOf(u8, sub_watch_ack.payload, "\"type\":\"control.error\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, sub_watch_ack.payload, "\"code\":\"unsupported_legacy_api\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, sub_watch_ack.payload, "UnsupportedType") != null);
-
-    try websocket_transport.writeFrame(&subscriber, "", .close);
-    var sub_close = try readServerFrame(allocator, &subscriber);
-    defer sub_close.deinit(allocator);
-    try std.testing.expectEqual(@as(u8, 0x8), sub_close.opcode);
-
-    try std.testing.expect(server_ctx.err_name == null);
-}
-
 test "server_piai: base path routes all connections to default runtime" {
     const allocator = std.testing.allocator;
     var runtime_registry = AgentRuntimeRegistry.init(allocator, .{
@@ -11385,13 +11336,13 @@ test "server_piai: extract project payload helpers parse id and token" {
 
 test "server_piai: extract node id helper parses valid payload" {
     const allocator = std.testing.allocator;
-    const payload = "{\"node_id\":\"node-7\",\"service_delta\":{\"changed\":true}}";
+    const payload = "{\"node_id\":\"node-7\",\"venom_delta\":{\"changed\":true}}";
     const node_id = try extractNodeIdFromControlPayload(allocator, payload);
     defer if (node_id) |value| allocator.free(value);
     try std.testing.expect(node_id != null);
     try std.testing.expectEqualStrings("node-7", node_id.?);
 
-    const missing = try extractNodeIdFromControlPayload(allocator, "{\"service_delta\":{}}");
+    const missing = try extractNodeIdFromControlPayload(allocator, "{\"venom_delta\":{}}");
     try std.testing.expect(missing == null);
 }
 
@@ -11565,7 +11516,7 @@ test "server_piai: local fs node registration upserts fs chat and jobs venoms" {
             .source_id = "jobs",
         },
     };
-    const mount_specs = [_]fs_control_plane.SpiderWebMountSpec{
+    const mount_specs = [_]control_plane_mod.SpiderWebMountSpec{
         .{ .mount_path = "/global/chat", .export_name = local_node_chat_export_name },
         .{ .mount_path = "/global/jobs", .export_name = local_node_jobs_export_name },
         .{ .mount_path = "/nodes/local/fs", .export_name = "workspace" },

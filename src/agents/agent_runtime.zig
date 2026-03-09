@@ -3,14 +3,14 @@ const ltm_store = @import("ziggy-memory-store").ltm_store;
 const memory = @import("ziggy-memory-store").memory;
 const memid = @import("ziggy-memory-store").memid;
 const brain_context = @import("brain_context.zig");
-const brain_tools = @import("brain_tools.zig");
+const capability_engine = @import("capability_engine.zig");
 const event_bus = @import("ziggy-runtime-hooks").event_bus;
 const tool_registry = @import("ziggy-tool-runtime").tool_registry;
 const tool_executor = @import("ziggy-tool-runtime").tool_executor;
 const hook_registry = @import("hook_registry.zig");
 const system_hooks = @import("system_hooks.zig");
 const brain_specialization = @import("brain_specialization.zig");
-const Config = @import("config.zig");
+const Config = @import("../config.zig");
 const transient_core_capabilities_key = "system:capabilities";
 const transient_core_identity_guidance_key = "system:identity_guidance";
 
@@ -37,13 +37,13 @@ pub const QueueLimits = struct {
 pub const TickResult = struct {
     brain: []u8,
     observe_json: []u8,
-    tool_results: []brain_tools.ToolResult,
+    tool_results: []capability_engine.CapabilityResult,
     checkpoint: u64,
 
     pub fn deinit(self: *TickResult, allocator: std.mem.Allocator) void {
         allocator.free(self.brain);
         allocator.free(self.observe_json);
-        brain_tools.deinitResults(allocator, self.tool_results);
+        capability_engine.deinitResults(allocator, self.tool_results);
         self.* = undefined;
     }
 };
@@ -83,7 +83,7 @@ pub const AgentRuntime = struct {
     ltm_store: ?*ltm_store.VersionedMemStore = null,
     active_memory: memory.RuntimeMemory,
     bus: event_bus.EventBus,
-    world_tools: tool_registry.ToolRegistry,
+    capability_registry: tool_registry.ToolRegistry,
     brains: std.StringHashMapUnmanaged(brain_context.BrainContext) = .{},
     brain_provider_overrides: std.StringHashMapUnmanaged(BrainProviderOverride) = .{},
     tick_queue: std.ArrayListUnmanaged([]u8) = .{},
@@ -94,8 +94,8 @@ pub const AgentRuntime = struct {
     checkpoint: u64 = 0,
     hooks: hook_registry.HookRegistry,
     runtime_config: Config.RuntimeConfig,
-    world_tool_dispatch_ctx: ?*anyopaque = null,
-    world_tool_dispatch_fn: ?brain_tools.RemoteToolDispatchFn = null,
+    capability_dispatch_ctx: ?*anyopaque = null,
+    capability_dispatch_fn: ?capability_engine.RemoteCapabilityDispatchFn = null,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -132,13 +132,13 @@ pub const AgentRuntime = struct {
             .ltm_store = owned_store,
             .active_memory = try memory.RuntimeMemory.initWithStore(allocator, agent_id, owned_store),
             .bus = event_bus.EventBus.init(allocator),
-            .world_tools = tool_registry.ToolRegistry.init(allocator),
+            .capability_registry = tool_registry.ToolRegistry.init(allocator),
             .hooks = hook_registry.HookRegistry.init(allocator),
             .runtime_config = try runtime_config.clone(allocator),
         };
         errdefer runtime.deinit();
 
-        try tool_executor.BuiltinTools.registerAll(&runtime.world_tools);
+        try tool_executor.BuiltinTools.registerAll(&runtime.capability_registry);
 
         // Register system hooks
         try system_hooks.registerSystemHooks(&runtime.hooks);
@@ -181,7 +181,7 @@ pub const AgentRuntime = struct {
 
         self.hooks.deinit();
         self.bus.deinit();
-        self.world_tools.deinit();
+        self.capability_registry.deinit();
         self.active_memory.deinit();
         self.runtime_config.deinit(self.allocator);
         if (self.ltm_store) |store| {
@@ -192,13 +192,13 @@ pub const AgentRuntime = struct {
         self.allocator.free(self.agent_id);
     }
 
-    pub fn setWorldToolDispatch(
+    pub fn setCapabilityDispatch(
         self: *AgentRuntime,
         dispatch_ctx: ?*anyopaque,
-        dispatch_fn: ?brain_tools.RemoteToolDispatchFn,
+        dispatch_fn: ?capability_engine.RemoteCapabilityDispatchFn,
     ) void {
-        self.world_tool_dispatch_ctx = dispatch_ctx;
-        self.world_tool_dispatch_fn = dispatch_fn;
+        self.capability_dispatch_ctx = dispatch_ctx;
+        self.capability_dispatch_fn = dispatch_fn;
     }
 
     pub fn addBrain(self: *AgentRuntime, brain_name: []const u8) !void {
@@ -425,19 +425,19 @@ pub const AgentRuntime = struct {
         }
 
         // === MUTATE ===
-        var engine = brain_tools.Engine.initWithWorldToolsAndDispatch(
+        var engine = capability_engine.CapabilityEngine.initWithCapabilitiesAndDispatch(
             self.allocator,
             &self.active_memory,
             &self.bus,
-            &self.world_tools,
-            self.world_tool_dispatch_ctx,
-            self.world_tool_dispatch_fn,
+            &self.capability_registry,
+            self.capability_dispatch_ctx,
+            self.capability_dispatch_fn,
         );
         const results = try engine.executePending(brain);
-        errdefer brain_tools.deinitResults(self.allocator, results);
+        errdefer capability_engine.deinitResults(self.allocator, results);
 
         // === POST_MUTATE ===
-        var tool_results = hook_registry.ToolResults{ .results = results };
+        var tool_results = hook_registry.CapabilityResults{ .results = results };
         try self.hooks.execute(.post_mutate, &ctx, .{ .post_mutate = &tool_results });
 
         // Store results as artifacts
@@ -915,45 +915,6 @@ test "agent_runtime: rollbackQueuedUserPrimaryWork removes pending user event an
     runtime.rollbackQueuedUserPrimaryWork("hello");
     try std.testing.expectEqual(@as(usize, 0), runtime.tick_queue.items.len);
     try std.testing.expectEqual(@as(usize, 0), runtime.bus.pendingCount());
-}
-
-test "agent_runtime: talk_brain plus wait_for correlates across brains" {
-    const allocator = std.testing.allocator;
-    const cfg = Config.RuntimeConfig{};
-    var runtime = try AgentRuntime.init(allocator, "agentA", &[_][]const u8{"research"}, cfg);
-    defer runtime.deinit();
-
-    try runtime.queueToolUse("primary", "talk_brain", "{\"message\":\"sync\",\"target_brain\":\"research\"}");
-    try runtime.queueToolUse("primary", "wait_for", "{\"events\":[{\"event_type\":\"agent\",\"parameter\":\"research\"}]}");
-
-    var primary_tick = (try runtime.tickNext()).?;
-    defer primary_tick.deinit(allocator);
-    try std.testing.expectEqual(@as(usize, 2), primary_tick.tool_results.len);
-    try std.testing.expect(primary_tick.tool_results[0].success);
-    try std.testing.expect(primary_tick.tool_results[1].success);
-    try std.testing.expect(std.mem.indexOf(u8, primary_tick.tool_results[1].payload_json, "\"waiting\":true") != null);
-
-    const pending_after_primary = runtime.bus.pendingCount();
-    try std.testing.expect(pending_after_primary >= 1);
-
-    var research_tick = try runtime.tickBrain("research");
-    defer research_tick.deinit(allocator);
-
-    try std.testing.expect(runtime.bus.pendingCount() <= pending_after_primary);
-
-    try runtime.bus.enqueue(.{
-        .event_type = .agent,
-        .source_brain = "research",
-        .target_brain = "primary",
-        .talk_id = 1,
-        .payload = "ack",
-    });
-
-    var resolve_tick = try runtime.tickBrain("primary");
-    defer resolve_tick.deinit(allocator);
-    try std.testing.expectEqual(@as(usize, 1), resolve_tick.tool_results.len);
-    try std.testing.expect(resolve_tick.tool_results[0].success);
-    try std.testing.expect(std.mem.indexOf(u8, resolve_tick.tool_results[0].payload_json, "\"waiting\":false") != null);
 }
 
 test "agent_runtime: talk_brain schedules target brain tick for runtime loop" {

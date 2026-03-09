@@ -1,6 +1,6 @@
 const std = @import("std");
-const fs_router = @import("fs_router.zig");
-const fs_fuse_adapter = @import("fs_fuse_adapter.zig");
+const fs_router = @import("acheron_fs_router");
+const fs_fuse_adapter = @import("spiderweb_fs_fuse_adapter");
 
 const control_reply_timeout_ms: i32 = 45_000;
 const control_handshake_timeout_ms: i32 = 10_000;
@@ -980,7 +980,7 @@ fn jsonEscape(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
     return out.toOwnedSlice(allocator);
 }
 
-test "fs_mount_main: parseEndpointFlag supports explicit mount path" {
+test "acheron_mount_main: parseEndpointFlag supports explicit mount path" {
     const parsed = try parseEndpointFlag("a=ws://127.0.0.1:18891/v2/fs#work@/src");
     try std.testing.expectEqualStrings("a", parsed.name);
     try std.testing.expectEqualStrings("ws://127.0.0.1:18891/v2/fs", parsed.url);
@@ -988,7 +988,7 @@ test "fs_mount_main: parseEndpointFlag supports explicit mount path" {
     try std.testing.expectEqualStrings("/src", parsed.mount_path.?);
 }
 
-test "fs_mount_main: parseEndpointFlag defaults mount path to endpoint name" {
+test "acheron_mount_main: parseEndpointFlag defaults mount path to endpoint name" {
     const parsed = try parseEndpointFlag("alpha=ws://127.0.0.1:18891/v2/fs#work");
     try std.testing.expectEqualStrings("alpha", parsed.name);
     try std.testing.expectEqualStrings("ws://127.0.0.1:18891/v2/fs", parsed.url);
@@ -996,7 +996,7 @@ test "fs_mount_main: parseEndpointFlag defaults mount path to endpoint name" {
     try std.testing.expect(parsed.mount_path == null);
 }
 
-test "fs_mount_main: shouldFetchWorkspaceStatusFromControl only falls back when needed" {
+test "acheron_mount_main: shouldFetchWorkspaceStatusFromControl only falls back when needed" {
     try std.testing.expect(!shouldFetchWorkspaceStatusFromControl(null, null, "proj-a", true));
     try std.testing.expect(shouldFetchWorkspaceStatusFromControl(null, null, "proj-a", false));
 
@@ -1006,7 +1006,7 @@ test "fs_mount_main: shouldFetchWorkspaceStatusFromControl only falls back when 
     try std.testing.expect(shouldFetchWorkspaceStatusFromControl("proj-a", "token-a", "proj-a", true));
 }
 
-test "fs_mount_main: connectWorkspaceHasMounts requires non-empty mounts array" {
+test "acheron_mount_main: connectWorkspaceHasMounts requires non-empty mounts array" {
     const allocator = std.testing.allocator;
 
     var parsed_empty = try std.json.parseFromSlice(std.json.Value, allocator, "{\"workspace\":{}}", .{});

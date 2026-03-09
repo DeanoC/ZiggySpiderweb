@@ -4,17 +4,17 @@ const server = @import("server_piai.zig");
 const Config = @import("config.zig");
 
 comptime {
-    _ = @import("agent_runtime.zig");
-    _ = @import("brain_context.zig");
-    _ = @import("brain_tools.zig");
-    _ = @import("brain_specialization.zig");
+    _ = @import("agents/agent_runtime.zig");
+    _ = @import("agents/brain_context.zig");
+    _ = @import("agents/capability_engine.zig");
+    _ = @import("agents/brain_specialization.zig");
     _ = @import("ziggy-runtime-hooks").event_bus;
     _ = @import("ziggy-run-orchestrator").run_engine;
-    _ = @import("hook_registry.zig");
-    _ = @import("system_hooks.zig");
+    _ = @import("agents/hook_registry.zig");
+    _ = @import("agents/system_hooks.zig");
     _ = @import("ziggy-memory-store").ltm_store;
     _ = @import("ziggy-memory-store").memory;
-    _ = @import("memory_schema.zig");
+    _ = @import("agents/memory_schema.zig");
     _ = @import("ziggy-memory-store").memid;
     _ = @import("prompt_compiler.zig");
     _ = @import("spider-protocol").protocol;

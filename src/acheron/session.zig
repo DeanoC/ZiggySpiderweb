@@ -2,17 +2,17 @@ const std = @import("std");
 const builtin = @import("builtin");
 const unified = @import("spider-protocol").unified;
 const protocol = @import("spider-protocol").protocol;
-const runtime_server_mod = @import("runtime_server.zig");
-const runtime_handle_mod = @import("runtime_handle.zig");
-const chat_job_index = @import("chat_job_index.zig");
-const chat_runtime_job = @import("chat_runtime_job.zig");
-const fsrpc_job_projection = @import("fsrpc_job_projection.zig");
+const runtime_server_mod = @import("../agents/runtime_server.zig");
+const runtime_handle_mod = @import("../agents/runtime_handle.zig");
+const chat_job_index = @import("../agents/chat_job_index.zig");
+const chat_runtime_job = @import("../agents/chat_runtime_job.zig");
+const job_projection = @import("job_projection.zig");
 const shared_node = @import("spiderweb_node");
-const world_policy = @import("world_policy.zig");
-const fs_control_plane = @import("fs_control_plane.zig");
-const fs_router = @import("fs_router.zig");
-const agent_config = @import("agent_config.zig");
-const agent_registry = @import("agent_registry.zig");
+const workspace_policy = @import("../workspaces/policy.zig");
+const control_plane_mod = @import("control_plane.zig");
+const acheron_router = @import("router.zig");
+const agent_config = @import("../agents/agent_config.zig");
+const agent_registry = @import("../agents/agent_registry.zig");
 
 const NodeKind = enum {
     dir,
@@ -189,7 +189,7 @@ const AsyncChatRuntimeContext = struct {
     allocator: std.mem.Allocator,
     runtime_handle: *runtime_handle_mod.RuntimeHandle,
     job_index: *chat_job_index.ChatJobIndex,
-    control_plane: ?*fs_control_plane.ControlPlane = null,
+    control_plane: ?*control_plane_mod.ControlPlane = null,
     emit_debug: bool = false,
     agent_id: ?[]u8 = null,
     job_name: ?[]u8 = null,
@@ -335,7 +335,7 @@ pub const Session = struct {
         assets_dir: []const u8 = "templates",
         projects_dir: []const u8 = "projects",
         local_fs_export_root: ?[]const u8 = null,
-        control_plane: ?*fs_control_plane.ControlPlane = null,
+        control_plane: ?*control_plane_mod.ControlPlane = null,
         actor_type: ?[]const u8 = null,
         actor_id: ?[]const u8 = null,
         is_admin: bool = false,
@@ -354,7 +354,7 @@ pub const Session = struct {
     assets_dir: []u8,
     projects_dir: []u8,
     local_fs_export_root: ?[]u8 = null,
-    control_plane: ?*fs_control_plane.ControlPlane = null,
+    control_plane: ?*control_plane_mod.ControlPlane = null,
     is_admin: bool = false,
 
     nodes: std.AutoHashMapUnmanaged(u32, Node) = .{},
@@ -621,7 +621,7 @@ pub const Session = struct {
 
     fn appendDebugEventsFromLogText(
         allocator: std.mem.Allocator,
-        plane: *fs_control_plane.ControlPlane,
+        plane: *control_plane_mod.ControlPlane,
         agent_id: []const u8,
         log_text: []const u8,
     ) !void {
@@ -1600,7 +1600,7 @@ pub const Session = struct {
     }
 
     fn seedNamespace(self: *Session) !void {
-        var policy = try world_policy.load(
+        var policy = try workspace_policy.loadWorkspacePolicy(
             self.allocator,
             .{
                 .agent_id = self.agent_id,
@@ -1650,7 +1650,7 @@ pub const Session = struct {
         try self.addDirectoryDescriptors(
             global_root,
             "Global",
-            "{\"kind\":\"collection\",\"entries\":\"global namespaces\",\"shape\":\"/global/<service_id>\"}",
+            "{\"kind\":\"collection\",\"entries\":\"global namespaces\",\"shape\":\"/global/<venom_id>\"}",
             "{\"read\":true,\"write\":false}",
             "System-wide stable namespaces shared across agents/projects.",
         );
@@ -2067,7 +2067,7 @@ pub const Session = struct {
     fn addProjectMetaFiles(
         self: *Session,
         project_meta_dir: u32,
-        policy: world_policy.Policy,
+        policy: workspace_policy.WorkspacePolicy,
         workspace_status_json: ?[]const u8,
         loaded_live_mounts: bool,
         loaded_live_nodes: bool,
@@ -2314,7 +2314,7 @@ pub const Session = struct {
                 break :blk false;
             };
 
-            var discovered = world_policy.NodePolicy{
+            var discovered = workspace_policy.WorkspaceNodePolicy{
                 .id = try self.allocator.dupe(u8, node_id_value.string),
                 .resources = .{
                     .fs = fs_available,
@@ -2335,7 +2335,7 @@ pub const Session = struct {
     fn addProjectFsLinksFromPolicy(
         self: *Session,
         project_fs_dir: u32,
-        policy: world_policy.Policy,
+        policy: workspace_policy.WorkspacePolicy,
     ) !void {
         for (policy.project_links.items) |link| {
             const target = try std.fmt.allocPrint(self.allocator, "/nodes/{s}/{s}\n", .{ link.node_id, link.resource });
@@ -2380,7 +2380,7 @@ pub const Session = struct {
     fn addProjectNodeLinksFromPolicy(
         self: *Session,
         project_nodes_dir: u32,
-        policy: world_policy.Policy,
+        policy: workspace_policy.WorkspacePolicy,
     ) !void {
         for (policy.nodes.items) |node| {
             if (self.lookupChild(project_nodes_dir, node.id) != null) continue;
@@ -2427,7 +2427,7 @@ pub const Session = struct {
             return;
         }
 
-        var discovered = world_policy.NodePolicy{
+        var discovered = workspace_policy.WorkspaceNodePolicy{
             .id = try self.allocator.dupe(u8, node_id),
             .resources = .{
                 .fs = true,
@@ -2447,7 +2447,7 @@ pub const Session = struct {
     fn addNodeDirectory(
         self: *Session,
         nodes_root: u32,
-        node: world_policy.NodePolicy,
+        node: workspace_policy.WorkspaceNodePolicy,
         discovered_from_workspace: bool,
     ) !void {
         const node_dir = try self.addDir(nodes_root, node.id, false);
@@ -2632,7 +2632,7 @@ pub const Session = struct {
         try self.addDirectoryDescriptors(
             memory_dir,
             "Memory",
-            "{\"kind\":\"service\",\"service_id\":\"memory\",\"shape\":\"/global/memory/{README.md,SCHEMA.json,CAPS.json,OPS.json,PERMISSIONS.json,STATUS.json,status.json,result.json,control/*}\"}",
+            "{\"kind\":\"venom\",\"venom_id\":\"memory\",\"shape\":\"/global/memory/{README.md,SCHEMA.json,CAPS.json,OPS.json,PERMISSIONS.json,STATUS.json,status.json,result.json,control/*}\"}",
             "{\"invoke\":true,\"operations\":[\"memory_create\",\"memory_load\",\"memory_versions\",\"memory_mutate\",\"memory_evict\",\"memory_search\"],\"discoverable\":true}",
             "First-class memory namespace. Write operation payloads to control/*.json, then read status.json/result.json.",
         );
@@ -2646,7 +2646,7 @@ pub const Session = struct {
         _ = try self.addFile(
             memory_dir,
             "RUNTIME.json",
-            "{\"type\":\"acheron_local\",\"component\":\"fsrpc_session\",\"subject\":\"agent_memory\"}",
+            "{\"type\":\"acheron_local\",\"component\":\"acheron_session\",\"subject\":\"agent_memory\"}",
             false,
             .none,
         );
@@ -2660,7 +2660,7 @@ pub const Session = struct {
         _ = try self.addFile(
             memory_dir,
             "STATUS.json",
-            "{\"service_id\":\"memory\",\"state\":\"namespace\",\"has_invoke\":true}",
+            "{\"venom_id\":\"memory\",\"state\":\"namespace\",\"has_invoke\":true}",
             false,
             .none,
         );
@@ -2700,7 +2700,7 @@ pub const Session = struct {
         try self.addDirectoryDescriptors(
             web_search_dir,
             "Web Search",
-            "{\"kind\":\"service\",\"service_id\":\"web_search\",\"shape\":\"/global/web_search/{README.md,SCHEMA.json,CAPS.json,OPS.json,RUNTIME.json,PERMISSIONS.json,STATUS.json,status.json,result.json,control/*}\"}",
+            "{\"kind\":\"venom\",\"venom_id\":\"web_search\",\"shape\":\"/global/web_search/{README.md,SCHEMA.json,CAPS.json,OPS.json,RUNTIME.json,PERMISSIONS.json,STATUS.json,status.json,result.json,control/*}\"}",
             "{\"invoke\":true,\"operations\":[\"web_search\"],\"discoverable\":true,\"network\":true}",
             "First-class web search namespace. Write search payloads to control/search.json (or invoke.json), then read status.json/result.json.",
         );
@@ -2714,7 +2714,7 @@ pub const Session = struct {
         _ = try self.addFile(
             web_search_dir,
             "RUNTIME.json",
-            "{\"type\":\"acheron_local\",\"component\":\"fsrpc_session\",\"subject\":\"web_search\"}",
+            "{\"type\":\"acheron_local\",\"component\":\"acheron_session\",\"subject\":\"web_search\"}",
             false,
             .none,
         );
@@ -2728,7 +2728,7 @@ pub const Session = struct {
         _ = try self.addFile(
             web_search_dir,
             "STATUS.json",
-            "{\"service_id\":\"web_search\",\"state\":\"namespace\",\"has_invoke\":true}",
+            "{\"venom_id\":\"web_search\",\"state\":\"namespace\",\"has_invoke\":true}",
             false,
             .none,
         );
@@ -2763,7 +2763,7 @@ pub const Session = struct {
         try self.addDirectoryDescriptors(
             search_code_dir,
             "Search Code",
-            "{\"kind\":\"service\",\"service_id\":\"search_code\",\"shape\":\"/global/search_code/{README.md,SCHEMA.json,CAPS.json,OPS.json,RUNTIME.json,PERMISSIONS.json,STATUS.json,status.json,result.json,control/*}\"}",
+            "{\"kind\":\"venom\",\"venom_id\":\"search_code\",\"shape\":\"/global/search_code/{README.md,SCHEMA.json,CAPS.json,OPS.json,RUNTIME.json,PERMISSIONS.json,STATUS.json,status.json,result.json,control/*}\"}",
             "{\"invoke\":true,\"operations\":[\"search_code\"],\"discoverable\":true}",
             "First-class code search namespace. Write search payloads to control/search.json (or invoke.json), then read status.json/result.json.",
         );
@@ -2777,7 +2777,7 @@ pub const Session = struct {
         _ = try self.addFile(
             search_code_dir,
             "RUNTIME.json",
-            "{\"type\":\"acheron_local\",\"component\":\"fsrpc_session\",\"subject\":\"search_code\"}",
+            "{\"type\":\"acheron_local\",\"component\":\"acheron_session\",\"subject\":\"search_code\"}",
             false,
             .none,
         );
@@ -2791,7 +2791,7 @@ pub const Session = struct {
         _ = try self.addFile(
             search_code_dir,
             "STATUS.json",
-            "{\"service_id\":\"search_code\",\"state\":\"namespace\",\"has_invoke\":true}",
+            "{\"venom_id\":\"search_code\",\"state\":\"namespace\",\"has_invoke\":true}",
             false,
             .none,
         );
@@ -2826,7 +2826,7 @@ pub const Session = struct {
         try self.addDirectoryDescriptors(
             terminal_dir,
             "Terminal",
-            "{\"kind\":\"service\",\"service_id\":\"terminal-v2\",\"shape\":\"/global/terminal/{README.md,SCHEMA.json,CAPS.json,OPS.json,RUNTIME.json,PERMISSIONS.json,STATUS.json,status.json,result.json,sessions.json,current.json,control/*}\"}",
+            "{\"kind\":\"venom\",\"venom_id\":\"terminal-v2\",\"shape\":\"/global/terminal/{README.md,SCHEMA.json,CAPS.json,OPS.json,RUNTIME.json,PERMISSIONS.json,STATUS.json,status.json,result.json,sessions.json,current.json,control/*}\"}",
             "{\"invoke\":true,\"operations\":[\"terminal_session_create\",\"terminal_session_resume\",\"terminal_session_close\",\"terminal_session_write\",\"terminal_session_read\",\"terminal_session_resize\",\"shell_exec\"],\"discoverable\":true,\"interactive\":true,\"sessionized\":true,\"pty\":true}",
             "Sessionized terminal namespace. Create/resume/close PTY sessions and use write/read/resize for interactive workflows.",
         );
@@ -2854,7 +2854,7 @@ pub const Session = struct {
         _ = try self.addFile(
             terminal_dir,
             "STATUS.json",
-            "{\"service_id\":\"terminal-v2\",\"state\":\"namespace\",\"has_invoke\":true,\"sessionized\":true}",
+            "{\"venom_id\":\"terminal-v2\",\"state\":\"namespace\",\"has_invoke\":true,\"sessionized\":true}",
             false,
             .none,
         );
@@ -2909,7 +2909,7 @@ pub const Session = struct {
         try self.addDirectoryDescriptors(
             mounts_dir,
             "Mounts and Binds",
-            "{\"kind\":\"service\",\"service_id\":\"mounts\",\"shape\":\"/global/mounts/{README.md,SCHEMA.json,CAPS.json,OPS.json,RUNTIME.json,PERMISSIONS.json,STATUS.json,status.json,result.json,control/*}\"}",
+            "{\"kind\":\"venom\",\"venom_id\":\"mounts\",\"shape\":\"/global/mounts/{README.md,SCHEMA.json,CAPS.json,OPS.json,RUNTIME.json,PERMISSIONS.json,STATUS.json,status.json,result.json,control/*}\"}",
             "{\"invoke\":true,\"operations\":[\"list\",\"mount\",\"mkdir\",\"unmount\",\"bind\",\"unbind\",\"resolve\"],\"discoverable\":true,\"project_scope\":true}",
             "Manage project mounts and path binds through Acheron control files.",
         );
@@ -2923,7 +2923,7 @@ pub const Session = struct {
         _ = try self.addFile(
             mounts_dir,
             "RUNTIME.json",
-            "{\"type\":\"acheron_local\",\"component\":\"fsrpc_session\",\"subject\":\"project_mounts_binds\"}",
+            "{\"type\":\"acheron_local\",\"component\":\"acheron_session\",\"subject\":\"project_mounts_binds\"}",
             false,
             .none,
         );
@@ -2937,7 +2937,7 @@ pub const Session = struct {
         _ = try self.addFile(
             mounts_dir,
             "STATUS.json",
-            "{\"service_id\":\"mounts\",\"state\":\"namespace\",\"has_invoke\":true}",
+            "{\"venom_id\":\"mounts\",\"state\":\"namespace\",\"has_invoke\":true}",
             false,
             .none,
         );
@@ -2985,7 +2985,7 @@ pub const Session = struct {
         try self.addDirectoryDescriptors(
             sub_brains_dir,
             "Sub-Brains",
-            "{\"kind\":\"service\",\"service_id\":\"sub_brains\",\"shape\":\"/global/sub_brains/{README.md,SCHEMA.json,CAPS.json,OPS.json,PERMISSIONS.json,STATUS.json,status.json,result.json,control/*}\"}",
+            "{\"kind\":\"venom\",\"venom_id\":\"sub_brains\",\"shape\":\"/global/sub_brains/{README.md,SCHEMA.json,CAPS.json,OPS.json,PERMISSIONS.json,STATUS.json,status.json,result.json,control/*}\"}",
             caps_json,
             "Manage sub-brain configuration for this agent through Acheron control files.",
         );
@@ -2999,7 +2999,7 @@ pub const Session = struct {
         _ = try self.addFile(
             sub_brains_dir,
             "RUNTIME.json",
-            "{\"type\":\"acheron_local\",\"component\":\"fsrpc_session\",\"subject\":\"agent_sub_brains\"}",
+            "{\"type\":\"acheron_local\",\"component\":\"acheron_session\",\"subject\":\"agent_sub_brains\"}",
             false,
             .none,
         );
@@ -3013,7 +3013,7 @@ pub const Session = struct {
         _ = try self.addFile(
             sub_brains_dir,
             "STATUS.json",
-            "{\"service_id\":\"sub_brains\",\"state\":\"namespace\",\"has_invoke\":true}",
+            "{\"venom_id\":\"sub_brains\",\"state\":\"namespace\",\"has_invoke\":true}",
             false,
             .none,
         );
@@ -3057,7 +3057,7 @@ pub const Session = struct {
         try self.addDirectoryDescriptors(
             agents_dir,
             "Agents Management",
-            "{\"kind\":\"service\",\"service_id\":\"agents\",\"shape\":\"/global/agents/{README.md,SCHEMA.json,CAPS.json,OPS.json,PERMISSIONS.json,STATUS.json,status.json,result.json,control/*}\"}",
+            "{\"kind\":\"venom\",\"venom_id\":\"agents\",\"shape\":\"/global/agents/{README.md,SCHEMA.json,CAPS.json,OPS.json,PERMISSIONS.json,STATUS.json,status.json,result.json,control/*}\"}",
             caps_json,
             "List and create agent workspaces through Acheron control files.",
         );
@@ -3071,7 +3071,7 @@ pub const Session = struct {
         _ = try self.addFile(
             agents_dir,
             "RUNTIME.json",
-            "{\"type\":\"acheron_local\",\"component\":\"fsrpc_session\",\"subject\":\"agent_registry\"}",
+            "{\"type\":\"acheron_local\",\"component\":\"acheron_session\",\"subject\":\"agent_registry\"}",
             false,
             .none,
         );
@@ -3085,7 +3085,7 @@ pub const Session = struct {
         _ = try self.addFile(
             agents_dir,
             "STATUS.json",
-            "{\"service_id\":\"agents\",\"state\":\"namespace\",\"has_invoke\":true}",
+            "{\"venom_id\":\"agents\",\"state\":\"namespace\",\"has_invoke\":true}",
             false,
             .none,
         );
@@ -3123,7 +3123,7 @@ pub const Session = struct {
         try self.addDirectoryDescriptors(
             projects_dir,
             "Projects Management",
-            "{\"kind\":\"service\",\"service_id\":\"projects\",\"shape\":\"/global/projects/{README.md,SCHEMA.json,CAPS.json,OPS.json,PERMISSIONS.json,STATUS.json,status.json,result.json,control/*}\"}",
+            "{\"kind\":\"venom\",\"venom_id\":\"projects\",\"shape\":\"/global/projects/{README.md,SCHEMA.json,CAPS.json,OPS.json,PERMISSIONS.json,STATUS.json,status.json,result.json,control/*}\"}",
             "{\"invoke\":true,\"operations\":[\"projects_list\",\"projects_get\",\"projects_up\"],\"discoverable\":true}",
             "List, inspect, and create/update projects through Acheron control files.",
         );
@@ -3137,7 +3137,7 @@ pub const Session = struct {
         _ = try self.addFile(
             projects_dir,
             "RUNTIME.json",
-            "{\"type\":\"acheron_local\",\"component\":\"fsrpc_session\",\"subject\":\"control_plane_projects\"}",
+            "{\"type\":\"acheron_local\",\"component\":\"acheron_session\",\"subject\":\"control_plane_projects\"}",
             false,
             .none,
         );
@@ -3151,7 +3151,7 @@ pub const Session = struct {
         _ = try self.addFile(
             projects_dir,
             "STATUS.json",
-            "{\"service_id\":\"projects\",\"state\":\"namespace\",\"has_invoke\":true}",
+            "{\"venom_id\":\"projects\",\"state\":\"namespace\",\"has_invoke\":true}",
             false,
             .none,
         );
@@ -3190,7 +3190,7 @@ pub const Session = struct {
         try self.addDirectoryDescriptors(
             library_dir,
             "Global Library",
-            "{\"kind\":\"service\",\"service_id\":\"library\",\"shape\":\"/global/library/{Index.md,README.md,SCHEMA.json,CAPS.json,OPS.json,PERMISSIONS.json,STATUS.json,topics/*}\"}",
+            "{\"kind\":\"venom\",\"venom_id\":\"library\",\"shape\":\"/global/library/{Index.md,README.md,SCHEMA.json,CAPS.json,OPS.json,PERMISSIONS.json,STATUS.json,topics/*}\"}",
             "{\"invoke\":false,\"operations\":[],\"discoverable\":true,\"read_only\":true}",
             "Stable, system-wide documentation for common Spiderweb/Acheron operations.",
         );
@@ -3211,7 +3211,7 @@ pub const Session = struct {
         _ = try self.addFile(
             library_dir,
             "STATUS.json",
-            "{\"service_id\":\"library\",\"state\":\"namespace\",\"has_invoke\":false}",
+            "{\"venom_id\":\"library\",\"state\":\"namespace\",\"has_invoke\":false}",
             false,
             .none,
         );
@@ -4066,7 +4066,7 @@ pub const Session = struct {
         return id;
     }
 
-    fn buildProjectTopologyJson(self: *Session, policy: world_policy.Policy) ![]u8 {
+    fn buildProjectTopologyJson(self: *Session, policy: workspace_policy.WorkspacePolicy) ![]u8 {
         const escaped_project = try unified.jsonEscape(self.allocator, policy.project_id);
         defer self.allocator.free(escaped_project);
         const escaped_agent = try unified.jsonEscape(self.allocator, self.agent_id);
@@ -4122,7 +4122,7 @@ pub const Session = struct {
         return out.toOwnedSlice(self.allocator);
     }
 
-    fn buildFallbackProjectNodesJson(self: *Session, policy: world_policy.Policy) ![]u8 {
+    fn buildFallbackProjectNodesJson(self: *Session, policy: workspace_policy.WorkspacePolicy) ![]u8 {
         var out = std.ArrayListUnmanaged(u8){};
         errdefer out.deinit(self.allocator);
         try out.appendSlice(self.allocator, "[");
@@ -4139,7 +4139,7 @@ pub const Session = struct {
         return out.toOwnedSlice(self.allocator);
     }
 
-    fn buildProjectAgentsJson(self: *Session, policy: world_policy.Policy) ![]u8 {
+    fn buildProjectAgentsJson(self: *Session, policy: workspace_policy.WorkspacePolicy) ![]u8 {
         var out = std.ArrayListUnmanaged(u8){};
         errdefer out.deinit(self.allocator);
         try out.appendSlice(self.allocator, "[");
@@ -4181,7 +4181,7 @@ pub const Session = struct {
         );
     }
 
-    fn buildProjectPathsJson(self: *Session, policy: world_policy.Policy) ![]u8 {
+    fn buildProjectPathsJson(self: *Session, policy: workspace_policy.WorkspacePolicy) ![]u8 {
         const escaped_project_id = try unified.jsonEscape(self.allocator, policy.project_id);
         defer self.allocator.free(escaped_project_id);
         return std.fmt.allocPrint(
@@ -4219,7 +4219,7 @@ pub const Session = struct {
 
     fn buildProjectSummaryJson(
         self: *Session,
-        policy: world_policy.Policy,
+        policy: workspace_policy.WorkspacePolicy,
         workspace_status_json: ?[]const u8,
         loaded_live_mounts: bool,
         loaded_live_nodes: bool,
@@ -4713,7 +4713,7 @@ pub const Session = struct {
         return rendered;
     }
 
-    fn buildFallbackWorkspaceStatusJson(self: *Session, policy: world_policy.Policy) ![]u8 {
+    fn buildFallbackWorkspaceStatusJson(self: *Session, policy: workspace_policy.WorkspacePolicy) ![]u8 {
         const escaped_agent = try unified.jsonEscape(self.allocator, self.agent_id);
         defer self.allocator.free(escaped_agent);
         const escaped_project = try unified.jsonEscape(self.allocator, policy.project_id);
@@ -4860,13 +4860,13 @@ pub const Session = struct {
         return id;
     }
 
-    fn projectAllowsAction(self: *Session, action: fs_control_plane.ProjectAction) bool {
+    fn projectAllowsAction(self: *Session, action: control_plane_mod.ProjectAction) bool {
         const plane = self.control_plane orelse return true;
         const project_id = self.project_id orelse return true;
         return plane.projectAllowsAction(project_id, self.agent_id, action, self.project_token, self.is_admin);
     }
 
-    fn canAccessServiceWithPermissions(self: *Session, permissions_json: []const u8) bool {
+    fn canAccessVenomWithPermissions(self: *Session, permissions_json: []const u8) bool {
         if (!self.projectAllowsAction(.invoke)) return false;
         if (self.is_admin) return true;
         if (permissions_json.len == 0) return true;
@@ -4910,14 +4910,14 @@ pub const Session = struct {
         return true;
     }
 
-    fn canInvokeServiceDirectory(self: *Session, service_dir_id: u32) bool {
-        const permissions_id = self.lookupChild(service_dir_id, "PERMISSIONS.json") orelse {
-            return self.canAccessServiceWithPermissions("");
+    fn canInvokeVenomDirectory(self: *Session, venom_dir_id: u32) bool {
+        const permissions_id = self.lookupChild(venom_dir_id, "PERMISSIONS.json") orelse {
+            return self.canAccessVenomWithPermissions("");
         };
         const permissions_node = self.nodes.get(permissions_id) orelse {
-            return self.canAccessServiceWithPermissions("");
+            return self.canAccessVenomWithPermissions("");
         };
-        return self.canAccessServiceWithPermissions(permissions_node.content);
+        return self.canAccessVenomWithPermissions(permissions_node.content);
     }
 
     fn appendVenomIndexEntry(
@@ -4945,7 +4945,7 @@ pub const Session = struct {
         );
     }
 
-    fn addNodeVenoms(self: *Session, node_dir: u32, node: world_policy.NodePolicy) !NodeResourceView {
+    fn addNodeVenoms(self: *Session, node_dir: u32, node: workspace_policy.WorkspaceNodePolicy) !NodeResourceView {
         var view = NodeResourceView{};
         errdefer view.deinit(self.allocator);
 
@@ -4967,7 +4967,7 @@ pub const Session = struct {
                 var catalog = catalog_value;
                 defer catalog.deinit(self.allocator);
                 for (catalog.items.items) |venom| {
-                    if (!self.canAccessServiceWithPermissions(venom.permissions_json)) continue;
+                    if (!self.canAccessVenomWithPermissions(venom.permissions_json)) continue;
                     try self.addNodeVenomEntry(
                         venoms_root,
                         venom.venom_id,
@@ -5026,7 +5026,7 @@ pub const Session = struct {
             const endpoint = try std.fmt.allocPrint(self.allocator, "/nodes/{s}/fs", .{node.id});
             defer self.allocator.free(endpoint);
             const permissions = "{\"default\":\"allow-by-default\",\"allow_roles\":[\"admin\",\"user\"],\"scope\":\"project\"}";
-            if (self.canAccessServiceWithPermissions(permissions)) {
+            if (self.canAccessVenomWithPermissions(permissions)) {
                 try self.addNodeVenomEntry(
                     venoms_root,
                     "fs",
@@ -5070,7 +5070,7 @@ pub const Session = struct {
             const endpoint = try std.fmt.allocPrint(self.allocator, "/nodes/{s}/camera", .{node.id});
             defer self.allocator.free(endpoint);
             const permissions = "{\"default\":\"allow-by-default\",\"allow_roles\":[\"admin\",\"user\"],\"scope\":\"node\"}";
-            if (self.canAccessServiceWithPermissions(permissions)) {
+            if (self.canAccessVenomWithPermissions(permissions)) {
                 try self.addNodeVenomEntry(
                     venoms_root,
                     "camera",
@@ -5114,7 +5114,7 @@ pub const Session = struct {
             const endpoint = try std.fmt.allocPrint(self.allocator, "/nodes/{s}/screen", .{node.id});
             defer self.allocator.free(endpoint);
             const permissions = "{\"default\":\"allow-by-default\",\"allow_roles\":[\"admin\",\"user\"],\"scope\":\"node\"}";
-            if (self.canAccessServiceWithPermissions(permissions)) {
+            if (self.canAccessVenomWithPermissions(permissions)) {
                 try self.addNodeVenomEntry(
                     venoms_root,
                     "screen",
@@ -5158,7 +5158,7 @@ pub const Session = struct {
             const endpoint = try std.fmt.allocPrint(self.allocator, "/nodes/{s}/user", .{node.id});
             defer self.allocator.free(endpoint);
             const permissions = "{\"default\":\"allow-by-default\",\"allow_roles\":[\"admin\",\"user\"],\"scope\":\"node\"}";
-            if (self.canAccessServiceWithPermissions(permissions)) {
+            if (self.canAccessVenomWithPermissions(permissions)) {
                 try self.addNodeVenomEntry(
                     venoms_root,
                     "user",
@@ -5193,8 +5193,8 @@ pub const Session = struct {
         }
 
         for (node.terminals.items) |terminal_id| {
-            const service_id = try std.fmt.allocPrint(self.allocator, "terminal-{s}", .{terminal_id});
-            defer self.allocator.free(service_id);
+            const venom_id = try std.fmt.allocPrint(self.allocator, "terminal-{s}", .{terminal_id});
+            defer self.allocator.free(venom_id);
             const endpoint = try std.fmt.allocPrint(self.allocator, "/nodes/{s}/terminal/{s}", .{ node.id, terminal_id });
             defer self.allocator.free(endpoint);
             const escaped_terminal_id = try unified.jsonEscape(self.allocator, terminal_id);
@@ -5208,14 +5208,14 @@ pub const Session = struct {
             const mounts = try std.fmt.allocPrint(
                 self.allocator,
                 "[{{\"mount_id\":\"{s}\",\"mount_path\":\"/nodes/{s}/terminal/{s}\",\"state\":\"online\"}}]",
-                .{ service_id, node.id, terminal_id },
+                .{ venom_id, node.id, terminal_id },
             );
             defer self.allocator.free(mounts);
             const permissions = "{\"default\":\"allow-by-default\",\"allow_roles\":[\"admin\",\"user\"],\"scope\":\"node\"}";
-            if (self.canAccessServiceWithPermissions(permissions)) {
+            if (self.canAccessVenomWithPermissions(permissions)) {
                 try self.addNodeVenomEntry(
                     venoms_root,
-                    service_id,
+                    venom_id,
                     "terminal",
                     "online",
                     endpoint,
@@ -5229,7 +5229,7 @@ pub const Session = struct {
                 );
                 try self.addNodeVenomEntry(
                     venoms_root,
-                    service_id,
+                    venom_id,
                     "terminal",
                     "online",
                     endpoint,
@@ -5241,8 +5241,8 @@ pub const Session = struct {
                     "{\"model\":\"terminal\"}",
                     "Interactive terminal namespace.",
                 );
-                try view.observe(self.allocator, node.id, "terminal", service_id, endpoint, mounts);
-                try self.appendVenomIndexEntry(&services_index, &services_index_first, service_id, "terminal", "online", endpoint);
+                try view.observe(self.allocator, node.id, "terminal", venom_id, endpoint, mounts);
+                try self.appendVenomIndexEntry(&services_index, &services_index_first, venom_id, "terminal", "online", endpoint);
             }
         }
 
@@ -5324,8 +5324,8 @@ pub const Session = struct {
 
         for (venoms_val.array.items) |item| {
             if (item != .object) continue;
-            const service_id_val = item.object.get("venom_id") orelse continue;
-            if (service_id_val != .string or service_id_val.string.len == 0) continue;
+            const venom_id_val = item.object.get("venom_id") orelse continue;
+            if (venom_id_val != .string or venom_id_val.string.len == 0) continue;
             const kind_val = item.object.get("kind") orelse continue;
             if (kind_val != .string or kind_val.string.len == 0) continue;
             const state_val = item.object.get("state");
@@ -5348,7 +5348,7 @@ pub const Session = struct {
             const resolved_endpoint = if (endpoint.len > 0)
                 try self.allocator.dupe(u8, endpoint)
             else
-                try std.fmt.allocPrint(self.allocator, "/nodes/{s}/venoms/{s}", .{ node_id, service_id_val.string });
+                try std.fmt.allocPrint(self.allocator, "/nodes/{s}/venoms/{s}", .{ node_id, venom_id_val.string });
             errdefer self.allocator.free(resolved_endpoint);
 
             const caps_json = if (item.object.get("capabilities")) |caps|
@@ -5415,7 +5415,7 @@ pub const Session = struct {
             errdefer if (help_md) |value| self.allocator.free(value);
 
             try catalog.items.append(self.allocator, .{
-                .venom_id = try self.allocator.dupe(u8, service_id_val.string),
+                .venom_id = try self.allocator.dupe(u8, venom_id_val.string),
                 .kind = try self.allocator.dupe(u8, kind_val.string),
                 .state = try self.allocator.dupe(u8, state),
                 .endpoint = resolved_endpoint,
@@ -5451,7 +5451,7 @@ pub const Session = struct {
         schema_json: []const u8,
         help_md: ?[]const u8,
     ) !void {
-        const service_dir = try self.addDir(services_root, venom_id, false);
+        const venom_dir = try self.addDir(services_root, venom_id, false);
 
         const escaped_venom_id = try unified.jsonEscape(self.allocator, venom_id);
         defer self.allocator.free(escaped_venom_id);
@@ -5466,13 +5466,13 @@ pub const Session = struct {
             value
         else
             "# Venom metadata for this node capability.\n";
-        _ = try self.addFile(service_dir, "README.md", readme, false, .none);
-        _ = try self.addFile(service_dir, "SCHEMA.json", schema_json, false, .none);
-        _ = try self.addFile(service_dir, "CAPS.json", caps_json, false, .none);
-        _ = try self.addFile(service_dir, "MOUNTS.json", mounts_json, false, .none);
-        _ = try self.addFile(service_dir, "OPS.json", ops_json, false, .none);
-        _ = try self.addFile(service_dir, "RUNTIME.json", runtime_json, false, .none);
-        _ = try self.addFile(service_dir, "PERMISSIONS.json", permissions_json, false, .none);
+        _ = try self.addFile(venom_dir, "README.md", readme, false, .none);
+        _ = try self.addFile(venom_dir, "SCHEMA.json", schema_json, false, .none);
+        _ = try self.addFile(venom_dir, "CAPS.json", caps_json, false, .none);
+        _ = try self.addFile(venom_dir, "MOUNTS.json", mounts_json, false, .none);
+        _ = try self.addFile(venom_dir, "OPS.json", ops_json, false, .none);
+        _ = try self.addFile(venom_dir, "RUNTIME.json", runtime_json, false, .none);
+        _ = try self.addFile(venom_dir, "PERMISSIONS.json", permissions_json, false, .none);
 
         const status = try std.fmt.allocPrint(
             self.allocator,
@@ -5480,7 +5480,7 @@ pub const Session = struct {
             .{ escaped_venom_id, escaped_kind, escaped_state, escaped_endpoint },
         );
         defer self.allocator.free(status);
-        _ = try self.addFile(service_dir, "STATUS.json", status, false, .none);
+        _ = try self.addFile(venom_dir, "STATUS.json", status, false, .none);
     }
 
     fn copyOptionalServiceFile(self: *Session, source_dir_id: u32, target_dir_id: u32, name: []const u8) !void {
@@ -5602,8 +5602,8 @@ pub const Session = struct {
         );
         defer self.allocator.free(provider_venom_path);
         const endpoint_path = blk: {
-            if (try self.firstServiceMountPath(provider_dir_id)) |value| break :blk value;
-            break :blk try self.serviceEndpointPath(provider_dir_id);
+            if (try self.firstVenomMountPath(provider_dir_id)) |value| break :blk value;
+            break :blk try self.venomEndpointPath(provider_dir_id);
         };
         defer if (endpoint_path) |value| self.allocator.free(value);
         const invoke_path = try self.deriveVenomInvokePath(provider_node_id, venom_id, provider_dir_id);
@@ -6134,7 +6134,7 @@ pub const Session = struct {
         venom_id: []const u8,
         project_id: ?[]const u8,
         agent_id: ?[]const u8,
-    ) !?fs_router.Router {
+    ) !?acheron_router.Router {
         const plane = self.control_plane orelse return null;
         var provider = (try plane.resolvePreferredVenomProviderForContext(
             self.allocator,
@@ -6156,7 +6156,7 @@ pub const Session = struct {
         const fs_url_val = parsed.value.object.get("fs_url") orelse return null;
         if (fs_url_val != .string or fs_url_val.string.len == 0) return null;
 
-        return try fs_router.Router.init(self.allocator, &[_]fs_router.EndpointConfig{.{
+        return try acheron_router.Router.init(self.allocator, &[_]acheron_router.EndpointConfig{.{
             .name = provider.node_id,
             .url = fs_url_val.string,
             .export_name = venom_id,
@@ -6223,8 +6223,8 @@ pub const Session = struct {
         );
         defer self.allocator.free(provider_venom_path);
         const endpoint_path = blk: {
-            if (try self.firstServiceMountPath(provider_dir_id)) |value| break :blk value;
-            break :blk try self.serviceEndpointPath(provider_dir_id);
+            if (try self.firstVenomMountPath(provider_dir_id)) |value| break :blk value;
+            break :blk try self.venomEndpointPath(provider_dir_id);
         };
         defer if (endpoint_path) |value| self.allocator.free(value);
         const invoke_path = try self.deriveVenomInvokePath(provider_node_id, venom_id, provider_dir_id);
@@ -6677,10 +6677,10 @@ pub const Session = struct {
     ) !WriteOutcome {
         const invoke_node = self.nodes.get(node_id) orelse return error.MissingNode;
         const control_dir_id = invoke_node.parent orelse return error.MissingNode;
-        const service_dir_id = (self.nodes.get(control_dir_id) orelse return error.MissingNode).parent orelse return error.MissingNode;
-        if (!self.canInvokeServiceDirectory(service_dir_id)) return error.AccessDenied;
-        const status_runtime_id = self.lookupChild(service_dir_id, "status.json") orelse return error.MissingNode;
-        const result_id = self.lookupChild(service_dir_id, "result.json") orelse return error.MissingNode;
+        const venom_dir_id = (self.nodes.get(control_dir_id) orelse return error.MissingNode).parent orelse return error.MissingNode;
+        if (!self.canInvokeVenomDirectory(venom_dir_id)) return error.AccessDenied;
+        const status_runtime_id = self.lookupChild(venom_dir_id, "status.json") orelse return error.MissingNode;
+        const result_id = self.lookupChild(venom_dir_id, "result.json") orelse return error.MissingNode;
 
         var request = self.parseSearchRequest(special, invoke_node.name, raw_input) catch return error.InvalidPayload;
         defer request.deinit(self.allocator);
@@ -6786,10 +6786,10 @@ pub const Session = struct {
     fn handleMemoryNamespaceWrite(self: *Session, special: SpecialKind, node_id: u32, raw_input: []const u8) !WriteOutcome {
         const invoke_node = self.nodes.get(node_id) orelse return error.MissingNode;
         const control_dir_id = invoke_node.parent orelse return error.MissingNode;
-        const service_dir_id = (self.nodes.get(control_dir_id) orelse return error.MissingNode).parent orelse return error.MissingNode;
-        if (!self.canInvokeServiceDirectory(service_dir_id)) return error.AccessDenied;
-        const status_runtime_id = self.lookupChild(service_dir_id, "status.json") orelse return error.MissingNode;
-        const result_id = self.lookupChild(service_dir_id, "result.json") orelse return error.MissingNode;
+        const venom_dir_id = (self.nodes.get(control_dir_id) orelse return error.MissingNode).parent orelse return error.MissingNode;
+        if (!self.canInvokeVenomDirectory(venom_dir_id)) return error.AccessDenied;
+        const status_runtime_id = self.lookupChild(venom_dir_id, "status.json") orelse return error.MissingNode;
+        const result_id = self.lookupChild(venom_dir_id, "result.json") orelse return error.MissingNode;
 
         const parsed = self.parseMemoryRequest(special, invoke_node.name, raw_input) catch return error.InvalidPayload;
         defer {
@@ -7231,13 +7231,13 @@ pub const Session = struct {
                 defer self.allocator.free(payload);
                 const plane = self.control_plane orelse return error.InvalidPayload;
                 const result = plane.setProjectMountWithRole(payload, self.is_admin) catch |err| switch (err) {
-                    fs_control_plane.ControlPlaneError.ProjectPolicyForbidden,
-                    fs_control_plane.ControlPlaneError.ProjectAuthFailed,
-                    fs_control_plane.ControlPlaneError.ProjectProtected,
-                    fs_control_plane.ControlPlaneError.ProjectAssignmentForbidden,
+                    control_plane_mod.ControlPlaneError.ProjectPolicyForbidden,
+                    control_plane_mod.ControlPlaneError.ProjectAuthFailed,
+                    control_plane_mod.ControlPlaneError.ProjectProtected,
+                    control_plane_mod.ControlPlaneError.ProjectAssignmentForbidden,
                     => return error.AccessDenied,
-                    fs_control_plane.ControlPlaneError.MissingField,
-                    fs_control_plane.ControlPlaneError.InvalidPayload,
+                    control_plane_mod.ControlPlaneError.MissingField,
+                    control_plane_mod.ControlPlaneError.InvalidPayload,
                     => return error.InvalidPayload,
                     else => return err,
                 };
@@ -7253,14 +7253,14 @@ pub const Session = struct {
                 defer self.allocator.free(payload);
                 const plane = self.control_plane orelse return error.InvalidPayload;
                 const result = plane.removeProjectMountWithRole(payload, self.is_admin) catch |err| switch (err) {
-                    fs_control_plane.ControlPlaneError.ProjectPolicyForbidden,
-                    fs_control_plane.ControlPlaneError.ProjectAuthFailed,
-                    fs_control_plane.ControlPlaneError.ProjectProtected,
-                    fs_control_plane.ControlPlaneError.ProjectAssignmentForbidden,
+                    control_plane_mod.ControlPlaneError.ProjectPolicyForbidden,
+                    control_plane_mod.ControlPlaneError.ProjectAuthFailed,
+                    control_plane_mod.ControlPlaneError.ProjectProtected,
+                    control_plane_mod.ControlPlaneError.ProjectAssignmentForbidden,
                     => return error.AccessDenied,
-                    fs_control_plane.ControlPlaneError.MissingField,
-                    fs_control_plane.ControlPlaneError.InvalidPayload,
-                    fs_control_plane.ControlPlaneError.MountNotFound,
+                    control_plane_mod.ControlPlaneError.MissingField,
+                    control_plane_mod.ControlPlaneError.InvalidPayload,
+                    control_plane_mod.ControlPlaneError.MountNotFound,
                     => return error.InvalidPayload,
                     else => return err,
                 };
@@ -7274,14 +7274,14 @@ pub const Session = struct {
                 defer self.allocator.free(payload);
                 const plane = self.control_plane orelse return error.InvalidPayload;
                 const result = plane.setProjectBindWithRole(payload, self.is_admin) catch |err| switch (err) {
-                    fs_control_plane.ControlPlaneError.ProjectPolicyForbidden,
-                    fs_control_plane.ControlPlaneError.ProjectAuthFailed,
-                    fs_control_plane.ControlPlaneError.ProjectProtected,
-                    fs_control_plane.ControlPlaneError.ProjectAssignmentForbidden,
+                    control_plane_mod.ControlPlaneError.ProjectPolicyForbidden,
+                    control_plane_mod.ControlPlaneError.ProjectAuthFailed,
+                    control_plane_mod.ControlPlaneError.ProjectProtected,
+                    control_plane_mod.ControlPlaneError.ProjectAssignmentForbidden,
                     => return error.AccessDenied,
-                    fs_control_plane.ControlPlaneError.MissingField,
-                    fs_control_plane.ControlPlaneError.InvalidPayload,
-                    fs_control_plane.ControlPlaneError.BindConflict,
+                    control_plane_mod.ControlPlaneError.MissingField,
+                    control_plane_mod.ControlPlaneError.InvalidPayload,
+                    control_plane_mod.ControlPlaneError.BindConflict,
                     => return error.InvalidPayload,
                     else => return err,
                 };
@@ -7295,14 +7295,14 @@ pub const Session = struct {
                 defer self.allocator.free(payload);
                 const plane = self.control_plane orelse return error.InvalidPayload;
                 const result = plane.removeProjectBindWithRole(payload, self.is_admin) catch |err| switch (err) {
-                    fs_control_plane.ControlPlaneError.ProjectPolicyForbidden,
-                    fs_control_plane.ControlPlaneError.ProjectAuthFailed,
-                    fs_control_plane.ControlPlaneError.ProjectProtected,
-                    fs_control_plane.ControlPlaneError.ProjectAssignmentForbidden,
+                    control_plane_mod.ControlPlaneError.ProjectPolicyForbidden,
+                    control_plane_mod.ControlPlaneError.ProjectAuthFailed,
+                    control_plane_mod.ControlPlaneError.ProjectProtected,
+                    control_plane_mod.ControlPlaneError.ProjectAssignmentForbidden,
                     => return error.AccessDenied,
-                    fs_control_plane.ControlPlaneError.MissingField,
-                    fs_control_plane.ControlPlaneError.InvalidPayload,
-                    fs_control_plane.ControlPlaneError.BindNotFound,
+                    control_plane_mod.ControlPlaneError.MissingField,
+                    control_plane_mod.ControlPlaneError.InvalidPayload,
+                    control_plane_mod.ControlPlaneError.BindNotFound,
                     => return error.InvalidPayload,
                     else => return err,
                 };
@@ -7354,12 +7354,12 @@ pub const Session = struct {
                 defer self.allocator.free(payload);
                 const plane = self.control_plane orelse return error.InvalidPayload;
                 const result = plane.resolveProjectPathWithRole(payload, self.is_admin) catch |err| switch (err) {
-                    fs_control_plane.ControlPlaneError.ProjectPolicyForbidden,
-                    fs_control_plane.ControlPlaneError.ProjectAuthFailed,
-                    fs_control_plane.ControlPlaneError.ProjectAssignmentForbidden,
+                    control_plane_mod.ControlPlaneError.ProjectPolicyForbidden,
+                    control_plane_mod.ControlPlaneError.ProjectAuthFailed,
+                    control_plane_mod.ControlPlaneError.ProjectAssignmentForbidden,
                     => return error.AccessDenied,
-                    fs_control_plane.ControlPlaneError.MissingField,
-                    fs_control_plane.ControlPlaneError.InvalidPayload,
+                    control_plane_mod.ControlPlaneError.MissingField,
+                    control_plane_mod.ControlPlaneError.InvalidPayload,
                     => return error.InvalidPayload,
                     else => return err,
                 };
@@ -7557,17 +7557,17 @@ pub const Session = struct {
         defer self.allocator.free(payload);
 
         const mounts_json = plane.listProjectMountsWithRole(payload, self.is_admin) catch |err| switch (err) {
-            fs_control_plane.ControlPlaneError.ProjectPolicyForbidden,
-            fs_control_plane.ControlPlaneError.ProjectAuthFailed,
-            fs_control_plane.ControlPlaneError.ProjectAssignmentForbidden,
+            control_plane_mod.ControlPlaneError.ProjectPolicyForbidden,
+            control_plane_mod.ControlPlaneError.ProjectAuthFailed,
+            control_plane_mod.ControlPlaneError.ProjectAssignmentForbidden,
             => return error.AccessDenied,
             else => return err,
         };
         defer self.allocator.free(mounts_json);
         const binds_json = plane.listProjectBindsWithRole(payload, self.is_admin) catch |err| switch (err) {
-            fs_control_plane.ControlPlaneError.ProjectPolicyForbidden,
-            fs_control_plane.ControlPlaneError.ProjectAuthFailed,
-            fs_control_plane.ControlPlaneError.ProjectAssignmentForbidden,
+            control_plane_mod.ControlPlaneError.ProjectPolicyForbidden,
+            control_plane_mod.ControlPlaneError.ProjectAuthFailed,
+            control_plane_mod.ControlPlaneError.ProjectAssignmentForbidden,
             => return error.AccessDenied,
             else => return err,
         };
@@ -8668,13 +8668,13 @@ pub const Session = struct {
                 );
                 defer self.allocator.free(payload);
                 const result = plane.getProjectWithRole(payload, self.is_admin) catch |err| switch (err) {
-                    fs_control_plane.ControlPlaneError.ProjectPolicyForbidden,
-                    fs_control_plane.ControlPlaneError.ProjectAuthFailed,
-                    fs_control_plane.ControlPlaneError.ProjectAssignmentForbidden,
+                    control_plane_mod.ControlPlaneError.ProjectPolicyForbidden,
+                    control_plane_mod.ControlPlaneError.ProjectAuthFailed,
+                    control_plane_mod.ControlPlaneError.ProjectAssignmentForbidden,
                     => return error.AccessDenied,
-                    fs_control_plane.ControlPlaneError.MissingField,
-                    fs_control_plane.ControlPlaneError.InvalidPayload,
-                    fs_control_plane.ControlPlaneError.ProjectNotFound,
+                    control_plane_mod.ControlPlaneError.MissingField,
+                    control_plane_mod.ControlPlaneError.InvalidPayload,
+                    control_plane_mod.ControlPlaneError.ProjectNotFound,
                     => return error.InvalidPayload,
                     else => return err,
                 };
@@ -8685,16 +8685,16 @@ pub const Session = struct {
                 const payload = try self.renderProjectUpPayload(args_obj);
                 defer self.allocator.free(payload);
                 const result = plane.projectUpWithRole(self.agent_id, payload, self.is_admin) catch |err| switch (err) {
-                    fs_control_plane.ControlPlaneError.ProjectPolicyForbidden,
-                    fs_control_plane.ControlPlaneError.ProjectAuthFailed,
-                    fs_control_plane.ControlPlaneError.ProjectAssignmentForbidden,
-                    fs_control_plane.ControlPlaneError.ProjectProtected,
+                    control_plane_mod.ControlPlaneError.ProjectPolicyForbidden,
+                    control_plane_mod.ControlPlaneError.ProjectAuthFailed,
+                    control_plane_mod.ControlPlaneError.ProjectAssignmentForbidden,
+                    control_plane_mod.ControlPlaneError.ProjectProtected,
                     => return error.AccessDenied,
-                    fs_control_plane.ControlPlaneError.MissingField,
-                    fs_control_plane.ControlPlaneError.InvalidPayload,
-                    fs_control_plane.ControlPlaneError.ProjectNotFound,
-                    fs_control_plane.ControlPlaneError.NodeNotFound,
-                    fs_control_plane.ControlPlaneError.MountConflict,
+                    control_plane_mod.ControlPlaneError.MissingField,
+                    control_plane_mod.ControlPlaneError.InvalidPayload,
+                    control_plane_mod.ControlPlaneError.ProjectNotFound,
+                    control_plane_mod.ControlPlaneError.NodeNotFound,
+                    control_plane_mod.ControlPlaneError.MountConflict,
                     => return error.InvalidPayload,
                     else => return err,
                 };
@@ -9310,7 +9310,7 @@ pub const Session = struct {
             else => unreachable,
         };
         defer self.allocator.free(event_path);
-        const payload = try fsrpc_job_projection.buildJobWaitEventPayload(
+        const payload = try job_projection.buildJobWaitEventPayload(
             self.allocator,
             self.nextWaitEventId(),
             source.raw_path,
@@ -9341,7 +9341,7 @@ pub const Session = struct {
 
         const event_path = try std.fmt.allocPrint(self.allocator, "/global/jobs/{s}/status.json", .{event.job_id});
         defer self.allocator.free(event_path);
-        const payload = try fsrpc_job_projection.buildTerminalJobWaitEventPayload(
+        const payload = try job_projection.buildTerminalJobWaitEventPayload(
             self.allocator,
             self.nextWaitEventId(),
             source.raw_path,
@@ -9577,33 +9577,33 @@ pub const Session = struct {
             const services_root = self.nodes.get(services_root_id) orelse continue;
             if (services_root.kind != .dir) continue;
 
-            var service_it = services_root.children.iterator();
-            while (service_it.next()) |service_entry| {
-                const service_id = service_entry.key_ptr.*;
-                const service_dir_id = service_entry.value_ptr.*;
-                const service_dir = self.nodes.get(service_dir_id) orelse continue;
-                if (service_dir.kind != .dir) continue;
+            var venom_it = services_root.children.iterator();
+            while (venom_it.next()) |venom_entry| {
+                const venom_id = venom_entry.key_ptr.*;
+                const venom_dir_id = venom_entry.value_ptr.*;
+                const venom_dir = self.nodes.get(venom_dir_id) orelse continue;
+                if (venom_dir.kind != .dir) continue;
 
-                const service_path = try std.fmt.allocPrint(
+                const venom_path = try std.fmt.allocPrint(
                     self.allocator,
                     "/nodes/{s}/venoms/{s}",
-                    .{ node_id, service_id },
+                    .{ node_id, venom_id },
                 );
-                defer self.allocator.free(service_path);
+                defer self.allocator.free(venom_path);
                 const endpoint_path = blk: {
-                    if (try self.firstServiceMountPath(service_dir_id)) |value| break :blk value;
-                    break :blk try self.serviceEndpointPath(service_dir_id);
+                    if (try self.firstVenomMountPath(venom_dir_id)) |value| break :blk value;
+                    break :blk try self.venomEndpointPath(venom_dir_id);
                 };
                 defer if (endpoint_path) |value| self.allocator.free(value);
-                const invoke_path = try self.deriveVenomInvokePath(node_id, service_id, service_dir_id);
+                const invoke_path = try self.deriveVenomInvokePath(node_id, venom_id, venom_dir_id);
                 defer if (invoke_path) |value| self.allocator.free(value);
 
                 try self.appendAgentVenomIndexEntry(
                     &out,
                     &first,
                     node_id,
-                    service_id,
-                    service_path,
+                    venom_id,
+                    venom_path,
                     endpoint_path,
                     invoke_path,
                     "node",
@@ -9624,7 +9624,7 @@ pub const Session = struct {
         first: *bool,
         node_id: []const u8,
         venom_id: []const u8,
-        service_path: []const u8,
+        venom_path: []const u8,
         endpoint_path: ?[]const u8,
         invoke_path: ?[]const u8,
         scope: []const u8,
@@ -9635,8 +9635,8 @@ pub const Session = struct {
         defer self.allocator.free(escaped_node_id);
         const escaped_venom_id = try unified.jsonEscape(self.allocator, venom_id);
         defer self.allocator.free(escaped_venom_id);
-        const escaped_service_path = try unified.jsonEscape(self.allocator, service_path);
-        defer self.allocator.free(escaped_service_path);
+        const escaped_venom_path = try unified.jsonEscape(self.allocator, venom_path);
+        defer self.allocator.free(escaped_venom_path);
         const escaped_scope = try unified.jsonEscape(self.allocator, scope);
         defer self.allocator.free(escaped_scope);
 
@@ -9675,7 +9675,7 @@ pub const Session = struct {
             .{
                 escaped_node_id,
                 escaped_venom_id,
-                escaped_service_path,
+                escaped_venom_path,
                 endpoint_json,
                 invoke_json,
                 if (invoke_path != null) "true" else "false",
@@ -9737,14 +9737,14 @@ pub const Session = struct {
         venom_id: []const u8,
         scope: []const u8,
     ) !void {
-        const service_dir_id = self.lookupChild(global_root, venom_id) orelse return;
-        const service_dir = self.nodes.get(service_dir_id) orelse return;
-        if (service_dir.kind != .dir) return;
+        const venom_dir_id = self.lookupChild(global_root, venom_id) orelse return;
+        const venom_dir = self.nodes.get(venom_dir_id) orelse return;
+        if (venom_dir.kind != .dir) return;
 
         const venom_path = try std.fmt.allocPrint(self.allocator, "/global/{s}", .{venom_id});
         defer self.allocator.free(venom_path);
-        const invoke_path = if (self.serviceCapsInvoke(service_dir_id)) blk: {
-            const invoke_target = try self.resolveNodeServiceInvokeTarget(service_dir_id);
+        const invoke_path = if (self.venomCapsInvoke(venom_dir_id)) blk: {
+            const invoke_target = try self.resolveNodeVenomInvokeTarget(venom_dir_id);
             defer self.allocator.free(invoke_target);
             break :blk try self.pathWithInvokeTarget(venom_path, invoke_target);
         } else null;
@@ -9790,11 +9790,11 @@ pub const Session = struct {
         self: *Session,
         node_id: []const u8,
         venom_id: []const u8,
-        service_dir_id: u32,
+        venom_dir_id: u32,
     ) !?[]u8 {
-        if (!self.serviceCapsInvoke(service_dir_id)) return null;
+        if (!self.venomCapsInvoke(venom_dir_id)) return null;
 
-        const invoke_target = try self.resolveNodeServiceInvokeTarget(service_dir_id);
+        const invoke_target = try self.resolveNodeVenomInvokeTarget(venom_dir_id);
         defer self.allocator.free(invoke_target);
 
         if (isWorldAbsolutePath(invoke_target)) {
@@ -9803,12 +9803,12 @@ pub const Session = struct {
         const invoke_suffix = std.mem.trimLeft(u8, invoke_target, "/");
         if (invoke_suffix.len == 0) return null;
 
-        if (try self.firstServiceMountPath(service_dir_id)) |mount_path| {
+        if (try self.firstVenomMountPath(venom_dir_id)) |mount_path| {
             defer self.allocator.free(mount_path);
             return try self.pathWithInvokeTarget(mount_path, invoke_suffix);
         }
 
-        if (try self.serviceEndpointPath(service_dir_id)) |endpoint_path| {
+        if (try self.venomEndpointPath(venom_dir_id)) |endpoint_path| {
             defer self.allocator.free(endpoint_path);
             return try self.pathWithInvokeTarget(endpoint_path, invoke_suffix);
         }
@@ -9838,9 +9838,9 @@ pub const Session = struct {
         return std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ base_trimmed, invoke_suffix });
     }
 
-    fn resolveNodeServiceInvokeTarget(self: *Session, service_dir_id: u32) ![]u8 {
+    fn resolveNodeVenomInvokeTarget(self: *Session, venom_dir_id: u32) ![]u8 {
         const default_target = "/control/invoke.json";
-        const ops_id = self.lookupChild(service_dir_id, "OPS.json") orelse return self.allocator.dupe(u8, default_target);
+        const ops_id = self.lookupChild(venom_dir_id, "OPS.json") orelse return self.allocator.dupe(u8, default_target);
         const ops_node = self.nodes.get(ops_id) orelse return self.allocator.dupe(u8, default_target);
 
         var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, ops_node.content, .{}) catch return self.allocator.dupe(u8, default_target);
@@ -9872,8 +9872,8 @@ pub const Session = struct {
         return self.allocator.dupe(u8, default_target);
     }
 
-    fn firstServiceMountPath(self: *Session, service_dir_id: u32) !?[]u8 {
-        const mounts_id = self.lookupChild(service_dir_id, "MOUNTS.json") orelse return null;
+    fn firstVenomMountPath(self: *Session, venom_dir_id: u32) !?[]u8 {
+        const mounts_id = self.lookupChild(venom_dir_id, "MOUNTS.json") orelse return null;
         const mounts_node = self.nodes.get(mounts_id) orelse return null;
         var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, mounts_node.content, .{}) catch return null;
         defer parsed.deinit();
@@ -9888,8 +9888,8 @@ pub const Session = struct {
         return null;
     }
 
-    fn serviceEndpointPath(self: *Session, service_dir_id: u32) !?[]u8 {
-        const status_id = self.lookupChild(service_dir_id, "STATUS.json") orelse return null;
+    fn venomEndpointPath(self: *Session, venom_dir_id: u32) !?[]u8 {
+        const status_id = self.lookupChild(venom_dir_id, "STATUS.json") orelse return null;
         const status_node = self.nodes.get(status_id) orelse return null;
         var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, status_node.content, .{}) catch return null;
         defer parsed.deinit();
@@ -9899,8 +9899,8 @@ pub const Session = struct {
         return try self.allocator.dupe(u8, endpoint_value.string);
     }
 
-    fn serviceCapsInvoke(self: *Session, service_dir_id: u32) bool {
-        const caps_id = self.lookupChild(service_dir_id, "CAPS.json") orelse return false;
+    fn venomCapsInvoke(self: *Session, venom_dir_id: u32) bool {
+        const caps_id = self.lookupChild(venom_dir_id, "CAPS.json") orelse return false;
         const caps_node = self.nodes.get(caps_id) orelse return false;
         var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, caps_node.content, .{}) catch return false;
         defer parsed.deinit();
@@ -10513,7 +10513,7 @@ fn delayedCompleteJob(ctx: *DelayedJobCompletion) void {
     };
 }
 
-test "fsrpc_session: attach walk open read capability help" {
+test "acheron_session: attach walk open read capability help" {
     const allocator = std.testing.allocator;
 
     const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
@@ -10559,7 +10559,7 @@ test "fsrpc_session: attach walk open read capability help" {
     try std.testing.expect(std.mem.indexOf(u8, walk_res, "acheron.r_walk") != null);
 }
 
-test "fsrpc_session: thoughts namespace exposes latest history and status files" {
+test "acheron_session: thoughts namespace exposes latest history and status files" {
     const allocator = std.testing.allocator;
 
     const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
@@ -10605,7 +10605,7 @@ test "fsrpc_session: thoughts namespace exposes latest history and status files"
     try std.testing.expectEqualStrings("", history_payload);
 }
 
-test "fsrpc_session: job log thought frames refresh thoughts namespace once" {
+test "acheron_session: job log thought frames refresh thoughts namespace once" {
     const allocator = std.testing.allocator;
 
     const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
@@ -10681,7 +10681,7 @@ test "fsrpc_session: job log thought frames refresh thoughts namespace once" {
     try std.testing.expect(std.mem.indexOf(u8, thought_status_payload_second, "\"count\":1") != null);
 }
 
-test "fsrpc_session: admin debug stream logs runtime frames as synthetic debug events" {
+test "acheron_session: admin debug stream logs runtime frames as synthetic debug events" {
     const allocator = std.testing.allocator;
 
     const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
@@ -10719,10 +10719,10 @@ test "fsrpc_session: admin debug stream logs runtime frames as synthetic debug e
     try std.testing.expect(std.mem.indexOf(u8, stream_log, "\"frame_type\":\"session.receive\"") != null);
 }
 
-test "fsrpc_session: debug stream ingests debug.event lines from completed job logs" {
+test "acheron_session: debug stream ingests debug.event lines from completed job logs" {
     const allocator = std.testing.allocator;
 
-    var control_plane = fs_control_plane.ControlPlane.init(allocator);
+    var control_plane = control_plane_mod.ControlPlane.init(allocator);
     defer control_plane.deinit();
 
     try Session.appendDebugEventsFromLogText(allocator, &control_plane, "agent-debug-admin",
@@ -10738,7 +10738,7 @@ test "fsrpc_session: debug stream ingests debug.event lines from completed job l
     try std.testing.expect(std.mem.indexOf(u8, snapshot, "\"type\":\"agent.thought\"") == null);
 }
 
-test "fsrpc_session: events wait returns next completed chat job" {
+test "acheron_session: events wait returns next completed chat job" {
     const allocator = std.testing.allocator;
 
     const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
@@ -10786,7 +10786,7 @@ test "fsrpc_session: events wait returns next completed chat job" {
     try std.testing.expect(std.mem.indexOf(u8, next_payload, "\"job_id\":\"job-") != null);
 }
 
-test "fsrpc_session: events wait reports timeout when no source event is available" {
+test "acheron_session: events wait reports timeout when no source event is available" {
     const allocator = std.testing.allocator;
 
     const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
@@ -10821,7 +10821,7 @@ test "fsrpc_session: events wait reports timeout when no source event is availab
     try std.testing.expect(std.mem.indexOf(u8, next_payload, "\"timeout\":true") != null);
 }
 
-test "fsrpc_session: events wait supports time source selectors" {
+test "acheron_session: events wait supports time source selectors" {
     const allocator = std.testing.allocator;
 
     const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
@@ -10858,7 +10858,7 @@ test "fsrpc_session: events wait supports time source selectors" {
     try std.testing.expect(std.mem.indexOf(u8, next_payload, "\"time\":{") != null);
 }
 
-test "fsrpc_session: events wait supports agent signal source selectors" {
+test "acheron_session: events wait supports agent signal source selectors" {
     const allocator = std.testing.allocator;
 
     const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
@@ -10905,7 +10905,7 @@ test "fsrpc_session: events wait supports agent signal source selectors" {
     try std.testing.expect(std.mem.indexOf(u8, next_payload, "\"payload\":{\"status\":\"ok\"}") != null);
 }
 
-test "fsrpc_session: job status read returns current state without waiting for terminal state" {
+test "acheron_session: job status read returns current state without waiting for terminal state" {
     const allocator = std.testing.allocator;
 
     const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
@@ -10949,7 +10949,7 @@ test "fsrpc_session: job status read returns current state without waiting for t
     try std.testing.expect(std.mem.indexOf(u8, status_payload, "\"state\":\"running\"") != null);
 }
 
-test "fsrpc_session: blocking read on job result waits for terminal payload" {
+test "acheron_session: blocking read on job result waits for terminal payload" {
     const allocator = std.testing.allocator;
 
     const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
@@ -10993,10 +10993,10 @@ test "fsrpc_session: blocking read on job result waits for terminal payload" {
     try std.testing.expectEqualStrings("delayed-result-text", result_payload);
 }
 
-test "fsrpc_session: debug pairing queue supports refresh approve deny actions" {
+test "acheron_session: debug pairing queue supports refresh approve deny actions" {
     const allocator = std.testing.allocator;
 
-    var control_plane = fs_control_plane.ControlPlane.init(allocator);
+    var control_plane = control_plane_mod.ControlPlane.init(allocator);
     defer control_plane.deinit();
 
     const req_a_json = try control_plane.nodeJoinRequest(
@@ -11140,10 +11140,10 @@ test "fsrpc_session: debug pairing queue supports refresh approve deny actions" 
     try std.testing.expect(std.mem.indexOf(u8, last_error_after_repeat_deny.content, "PendingJoinNotFound") != null);
 }
 
-test "fsrpc_session: debug pairing invites support create and refresh actions" {
+test "acheron_session: debug pairing invites support create and refresh actions" {
     const allocator = std.testing.allocator;
 
-    var control_plane = fs_control_plane.ControlPlane.init(allocator);
+    var control_plane = control_plane_mod.ControlPlane.init(allocator);
     defer control_plane.deinit();
 
     const invite_seed_json = try control_plane.createNodeInvite("{\"expires_in_ms\":900000}");
@@ -11231,7 +11231,7 @@ test "fsrpc_session: debug pairing invites support create and refresh actions" {
     try std.testing.expect(std.mem.indexOf(u8, last_error_after_invalid.content, "InvalidPayload") != null);
 }
 
-test "fsrpc_session: setRuntimeBinding reseeds namespace and clears stale state" {
+test "acheron_session: setRuntimeBinding reseeds namespace and clears stale state" {
     const allocator = std.testing.allocator;
 
     const runtime_server_a = try runtime_server_mod.RuntimeServer.create(allocator, "agent-a", .{});
@@ -11274,7 +11274,7 @@ test "fsrpc_session: setRuntimeBinding reseeds namespace and clears stale state"
     try std.testing.expect(session.lookupChild(session.jobs_root_id, job_b) != null);
 }
 
-test "fsrpc_session: node services namespace exposes service descriptors" {
+test "acheron_session: node services namespace exposes service descriptors" {
     const allocator = std.testing.allocator;
 
     const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
@@ -11289,9 +11289,9 @@ test "fsrpc_session: node services namespace exposes service descriptors" {
     const nodes_root = session.lookupChild(session.root_id, "nodes") orelse return error.TestExpectedResponse;
     const local_node = session.lookupChild(nodes_root, "local") orelse return error.TestExpectedResponse;
     const node_status = session.lookupChild(local_node, "STATUS.json") orelse return error.TestExpectedResponse;
-    const services_root = session.lookupChild(local_node, "services") orelse return error.TestExpectedResponse;
+    const services_root = session.lookupChild(local_node, "venoms") orelse return error.TestExpectedResponse;
     const venoms_root = session.lookupChild(local_node, "venoms") orelse return error.TestExpectedResponse;
-    const services_index_id = session.lookupChild(services_root, "SERVICES.json") orelse return error.TestExpectedResponse;
+    const services_index_id = session.lookupChild(services_root, "VENOMS.json") orelse return error.TestExpectedResponse;
     const venoms_index_id = session.lookupChild(venoms_root, "VENOMS.json") orelse return error.TestExpectedResponse;
     const fs_service = session.lookupChild(services_root, "fs") orelse return error.TestExpectedResponse;
     const fs_venom = session.lookupChild(venoms_root, "fs") orelse return error.TestExpectedResponse;
@@ -11302,8 +11302,8 @@ test "fsrpc_session: node services namespace exposes service descriptors" {
     const terminal_caps = session.lookupChild(terminal_service, "CAPS.json") orelse return error.TestExpectedResponse;
     const agents_root = session.lookupChild(session.root_id, "agents") orelse return error.TestExpectedResponse;
     const self_agent = session.lookupChild(agents_root, "self") orelse return error.TestExpectedResponse;
-    const self_services_dir = session.lookupChild(self_agent, "services") orelse return error.TestExpectedResponse;
-    const self_services_index_id = session.lookupChild(self_services_dir, "SERVICES.json") orelse return error.TestExpectedResponse;
+    const self_services_dir = session.lookupChild(self_agent, "venoms") orelse return error.TestExpectedResponse;
+    const self_services_index_id = session.lookupChild(self_services_dir, "VENOMS.json") orelse return error.TestExpectedResponse;
 
     const fs_status_node = session.nodes.get(fs_status) orelse return error.TestExpectedResponse;
     const fs_caps_node = session.nodes.get(fs_caps) orelse return error.TestExpectedResponse;
@@ -11314,9 +11314,9 @@ test "fsrpc_session: node services namespace exposes service descriptors" {
     const self_services_index_node = session.nodes.get(self_services_index_id) orelse return error.TestExpectedResponse;
 
     try std.testing.expect(std.mem.indexOf(u8, node_status_node.content, "\"state\":\"configured\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, services_index_node.content, "\"service_id\":\"fs\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, services_index_node.content, "\"venom_id\":\"fs\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, services_index_node.content, "\"service_id\":\"terminal-1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, services_index_node.content, "\"venom_id\":\"fs\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, services_index_node.content, "\"venom_id\":\"terminal-1\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, venoms_index_node.content, "\"venom_id\":\"fs\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, fs_status_node.content, "\"state\":\"online\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, fs_status_node.content, "\"venom_id\":\"fs\"") != null);
@@ -11324,15 +11324,15 @@ test "fsrpc_session: node services namespace exposes service descriptors" {
     try std.testing.expect(std.mem.indexOf(u8, fs_caps_node.content, "\"rw\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, terminal_caps_node.content, "\"terminal_id\":\"1\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, self_services_index_node.content, "\"node_id\":\"local\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, self_services_index_node.content, "\"service_id\":\"fs\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, self_services_index_node.content, "\"venom_id\":\"fs\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, self_services_index_node.content, "\"service_path\":\"/nodes/local/services/fs\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, self_services_index_node.content, "\"venom_path\":\"/nodes/local/services/fs\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, self_services_index_node.content, "\"venom_id\":\"fs\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, self_services_index_node.content, "\"venom_path\":\"/nodes/local/venoms/fs\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, self_services_index_node.content, "\"venom_path\":\"/nodes/local/venoms/fs\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, self_services_index_node.content, "\"has_invoke\":false") != null);
     _ = fs_venom;
 }
 
-test "fsrpc_session: protocol read exposes agent services discovery index" {
+test "acheron_session: protocol read exposes agent services discovery index" {
     const allocator = std.testing.allocator;
 
     const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
@@ -11349,18 +11349,18 @@ test "fsrpc_session: protocol read exposes agent services discovery index" {
         allocator,
         100,
         101,
-        &.{ "agents", "self", "services", "SERVICES.json" },
+        &.{ "agents", "self", "venoms", "VENOMS.json" },
         770,
     );
     defer allocator.free(payload);
 
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"node_id\":\"local\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"service_id\":\"fs\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_id\":\"fs\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"service_path\":\"/nodes/local/services/fs\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_id\":\"fs\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_path\":\"/nodes/local/venoms/fs\"") != null);
 }
 
-test "fsrpc_session: agent services index includes first-class namespaces only" {
+test "acheron_session: agent services index includes first-class namespaces only" {
     const allocator = std.testing.allocator;
 
     const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
@@ -11377,32 +11377,32 @@ test "fsrpc_session: agent services index includes first-class namespaces only" 
         allocator,
         102,
         103,
-        &.{ "agents", "self", "services", "SERVICES.json" },
+        &.{ "agents", "self", "venoms", "VENOMS.json" },
         780,
     );
     defer allocator.free(payload);
 
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"service_id\":\"memory\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_id\":\"memory\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"service_id\":\"web_search\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"service_id\":\"search_code\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"service_id\":\"terminal\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"service_id\":\"mounts\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"service_id\":\"projects\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"service_id\":\"library\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"service_path\":\"/global/search_code\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_id\":\"memory\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_id\":\"web_search\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_id\":\"search_code\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_id\":\"terminal\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_id\":\"mounts\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_id\":\"projects\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_id\":\"library\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_path\":\"/global/search_code\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"service_path\":\"/global/mounts\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"service_path\":\"/global/projects\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"service_path\":\"/global/library\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_path\":\"/global/search_code\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_path\":\"/global/mounts\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_path\":\"/global/projects\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_path\":\"/global/library\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"scope\":\"global_namespace\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"has_invoke\":false") != null);
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"service_path\":\"/global/services/contracts/") == null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_path\":\"/global/venoms/contracts/") == null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"scope\":\"agent_contract\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"has_invoke\":true") != null);
 }
 
-test "fsrpc_session: global venoms index mirrors service discovery entries" {
+test "acheron_session: global venoms index mirrors Venom discovery entries" {
     const allocator = std.testing.allocator;
 
     const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
@@ -11437,10 +11437,10 @@ test "fsrpc_session: global venoms index mirrors service discovery entries" {
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"provider_venom_path\":\"/nodes/local/venoms/fs\"") != null);
 }
 
-test "fsrpc_session: control-plane preferred fs provider drives global fs binding" {
+test "acheron_session: control-plane preferred fs provider drives global fs binding" {
     const allocator = std.testing.allocator;
 
-    var control_plane = fs_control_plane.ControlPlane.init(allocator);
+    var control_plane = control_plane_mod.ControlPlane.init(allocator);
     defer control_plane.deinit();
 
     const local_joined = try control_plane.ensureNode("spiderweb-local", "ws://127.0.0.1:18891/v2/fs", 60_000);
@@ -11516,10 +11516,10 @@ test "fsrpc_session: control-plane preferred fs provider drives global fs bindin
     try std.testing.expect(std.mem.indexOf(u8, payload, expected_provider_path) != null);
 }
 
-test "fsrpc_session: agent and project venoms indexes surface scoped bindings" {
+test "acheron_session: agent and project venoms indexes surface scoped bindings" {
     const allocator = std.testing.allocator;
 
-    var control_plane = fs_control_plane.ControlPlane.init(allocator);
+    var control_plane = control_plane_mod.ControlPlane.init(allocator);
     defer control_plane.deinit();
 
     const local_joined = try control_plane.ensureNode("spiderweb-local", "ws://127.0.0.1:18891/v2/fs", 60_000);
@@ -11555,7 +11555,7 @@ test "fsrpc_session: agent and project venoms indexes surface scoped bindings" {
     const bind_project = try std.fmt.allocPrint(
         allocator,
         "{{\"venom_id\":\"chat\",\"scope\":\"project\",\"project_id\":\"{s}\",\"node_id\":\"{s}\"}}",
-        .{ fs_control_plane.spider_web_project_id, app_node_id },
+        .{ control_plane_mod.spider_web_project_id, app_node_id },
     );
     defer allocator.free(bind_project);
     _ = try control_plane.bindPreferredVenomProvider(bind_project);
@@ -11591,7 +11591,7 @@ test "fsrpc_session: agent and project venoms indexes surface scoped bindings" {
             .control_plane = &control_plane,
             .agents_dir = ".does-not-exist",
             .projects_dir = ".does-not-exist",
-            .project_id = fs_control_plane.spider_web_project_id,
+            .project_id = control_plane_mod.spider_web_project_id,
         },
     );
     defer session.deinit();
@@ -11615,7 +11615,7 @@ test "fsrpc_session: agent and project venoms indexes surface scoped bindings" {
         allocator,
         306,
         307,
-        &.{ "projects", fs_control_plane.spider_web_project_id, "venoms", "VENOMS.json" },
+        &.{ "projects", control_plane_mod.spider_web_project_id, "venoms", "VENOMS.json" },
         781,
     );
     defer allocator.free(project_payload);
@@ -11625,7 +11625,7 @@ test "fsrpc_session: agent and project venoms indexes surface scoped bindings" {
     try std.testing.expect(std.mem.indexOf(u8, project_payload, expected_project_provider) != null);
 }
 
-test "fsrpc_session: scoped venom aliases shape proxy paths and job result paths" {
+test "acheron_session: scoped venom aliases shape proxy paths and job result paths" {
     const allocator = std.testing.allocator;
 
     const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
@@ -11642,7 +11642,7 @@ test "fsrpc_session: scoped venom aliases shape proxy paths and job result paths
         .{
             .agents_dir = ".does-not-exist",
             .projects_dir = ".does-not-exist",
-            .project_id = fs_control_plane.spider_web_project_id,
+            .project_id = control_plane_mod.spider_web_project_id,
         },
     );
     defer session.deinit();
@@ -11675,7 +11675,7 @@ test "fsrpc_session: scoped venom aliases shape proxy paths and job result paths
     try std.testing.expectEqualStrings("/control/wait.json", parsed_project.remote_path);
 }
 
-test "fsrpc_session: global library namespace exposes index and topic guides" {
+test "acheron_session: global library namespace exposes index and topic guides" {
     const allocator = std.testing.allocator;
 
     const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
@@ -11708,11 +11708,11 @@ test "fsrpc_session: global library namespace exposes index and topic guides" {
         782,
     );
     defer allocator.free(topic_payload);
-    try std.testing.expect(std.mem.indexOf(u8, topic_payload, "/global/<service_id>") != null);
-    try std.testing.expect(std.mem.indexOf(u8, topic_payload, "SERVICES.json") != null);
+    try std.testing.expect(std.mem.indexOf(u8, topic_payload, "/global/<venom_id>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, topic_payload, "VENOMS.json") != null);
 }
 
-test "fsrpc_session: global library loads guides from assets_dir filesystem" {
+test "acheron_session: global library loads guides from assets_dir filesystem" {
     const allocator = std.testing.allocator;
 
     var tmp_dir = std.testing.tmpDir(.{});
@@ -11789,7 +11789,7 @@ test "fsrpc_session: global library loads guides from assets_dir filesystem" {
     try std.testing.expect(std.mem.indexOf(u8, topic_payload, "loaded from assets_dir") != null);
 }
 
-test "fsrpc_session: agent services index includes first-class memory namespace entry" {
+test "acheron_session: agent services index includes first-class memory namespace entry" {
     const allocator = std.testing.allocator;
 
     const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
@@ -11806,17 +11806,17 @@ test "fsrpc_session: agent services index includes first-class memory namespace 
         allocator,
         110,
         111,
-        &.{ "agents", "self", "services", "SERVICES.json" },
+        &.{ "agents", "self", "venoms", "VENOMS.json" },
         820,
     );
     defer allocator.free(payload);
 
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"scope\":\"project_namespace\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"service_path\":\"/global/memory\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_path\":\"/global/memory\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"invoke_path\":\"/global/memory/control/invoke.json\"") != null);
 }
 
-test "fsrpc_session: agent services index includes first-class web_search namespace entry" {
+test "acheron_session: agent services index includes first-class web_search namespace entry" {
     const allocator = std.testing.allocator;
 
     const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
@@ -11833,17 +11833,17 @@ test "fsrpc_session: agent services index includes first-class web_search namesp
         allocator,
         132,
         133,
-        &.{ "agents", "self", "services", "SERVICES.json" },
+        &.{ "agents", "self", "venoms", "VENOMS.json" },
         855,
     );
     defer allocator.free(payload);
 
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"scope\":\"project_namespace\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"service_path\":\"/global/web_search\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_path\":\"/global/web_search\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"invoke_path\":\"/global/web_search/control/invoke.json\"") != null);
 }
 
-test "fsrpc_session: agent services index includes first-class terminal namespace entry" {
+test "acheron_session: agent services index includes first-class terminal namespace entry" {
     const allocator = std.testing.allocator;
 
     const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
@@ -11860,17 +11860,17 @@ test "fsrpc_session: agent services index includes first-class terminal namespac
         allocator,
         232,
         233,
-        &.{ "agents", "self", "services", "SERVICES.json" },
+        &.{ "agents", "self", "venoms", "VENOMS.json" },
         905,
     );
     defer allocator.free(payload);
 
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"scope\":\"project_namespace\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"service_path\":\"/global/terminal\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_path\":\"/global/terminal\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"invoke_path\":\"/global/terminal/control/invoke.json\"") != null);
 }
 
-test "fsrpc_session: agent services index includes first-class sub_brains namespace entry" {
+test "acheron_session: agent services index includes first-class sub_brains namespace entry" {
     const allocator = std.testing.allocator;
 
     const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
@@ -11887,17 +11887,17 @@ test "fsrpc_session: agent services index includes first-class sub_brains namesp
         allocator,
         248,
         249,
-        &.{ "agents", "self", "services", "SERVICES.json" },
+        &.{ "agents", "self", "venoms", "VENOMS.json" },
         916,
     );
     defer allocator.free(payload);
 
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"scope\":\"project_namespace\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"service_path\":\"/global/sub_brains\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_path\":\"/global/sub_brains\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"invoke_path\":\"/global/sub_brains/control/invoke.json\"") != null);
 }
 
-test "fsrpc_session: agent services index includes first-class agents namespace entry" {
+test "acheron_session: agent services index includes first-class agents namespace entry" {
     const allocator = std.testing.allocator;
 
     const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
@@ -11914,17 +11914,17 @@ test "fsrpc_session: agent services index includes first-class agents namespace 
         allocator,
         272,
         273,
-        &.{ "agents", "self", "services", "SERVICES.json" },
+        &.{ "agents", "self", "venoms", "VENOMS.json" },
         926,
     );
     defer allocator.free(payload);
 
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"scope\":\"project_namespace\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"service_path\":\"/global/agents\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_path\":\"/global/agents\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"invoke_path\":\"/global/agents/control/invoke.json\"") != null);
 }
 
-test "fsrpc_session: agent services index includes first-class projects namespace entry" {
+test "acheron_session: agent services index includes first-class projects namespace entry" {
     const allocator = std.testing.allocator;
 
     const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
@@ -11941,20 +11941,20 @@ test "fsrpc_session: agent services index includes first-class projects namespac
         allocator,
         272,
         273,
-        &.{ "agents", "self", "services", "SERVICES.json" },
+        &.{ "agents", "self", "venoms", "VENOMS.json" },
         926,
     );
     defer allocator.free(payload);
 
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"scope\":\"project_namespace\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"service_path\":\"/global/projects\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_path\":\"/global/projects\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"invoke_path\":\"/global/projects/control/invoke.json\"") != null);
 }
 
-test "fsrpc_session: mother can upsert project from system context without project token" {
+test "acheron_session: mother can upsert project from system context without project token" {
     const allocator = std.testing.allocator;
 
-    var control_plane = fs_control_plane.ControlPlane.init(allocator);
+    var control_plane = control_plane_mod.ControlPlane.init(allocator);
     defer control_plane.deinit();
 
     const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "mother", .{});
@@ -11969,7 +11969,7 @@ test "fsrpc_session: mother can upsert project from system context without proje
         &job_index,
         "mother",
         .{
-            .project_id = fs_control_plane.spider_web_project_id,
+            .project_id = control_plane_mod.spider_web_project_id,
             .control_plane = &control_plane,
             .is_admin = false,
         },
@@ -12011,7 +12011,7 @@ test "fsrpc_session: mother can upsert project from system context without proje
     try std.testing.expect(std.mem.indexOf(u8, result, "\"operation\":\"up\"") != null);
 }
 
-test "fsrpc_session: agents namespace create/list provisions new agent when capability is present" {
+test "acheron_session: agents namespace create/list provisions new agent when capability is present" {
     const allocator = std.testing.allocator;
 
     var tmp_dir = std.testing.tmpDir(.{});
@@ -12125,10 +12125,10 @@ test "fsrpc_session: agents namespace create/list provisions new agent when capa
     try std.testing.expect(std.mem.indexOf(u8, list_result, "\"agent_id\":\"builder\"") != null);
 }
 
-test "fsrpc_session: agents namespace create can activate a new agent into a requested project" {
+test "acheron_session: agents namespace create can activate a new agent into a requested project" {
     const allocator = std.testing.allocator;
 
-    var control_plane = fs_control_plane.ControlPlane.init(allocator);
+    var control_plane = control_plane_mod.ControlPlane.init(allocator);
     defer control_plane.deinit();
     const created_project = try control_plane.createProject("{\"name\":\"Build Project\",\"vision\":\"Build Project\"}");
     defer allocator.free(created_project);
@@ -12206,10 +12206,10 @@ test "fsrpc_session: agents namespace create can activate a new agent into a req
     try std.testing.expect(std.mem.indexOf(u8, workspace_status, project_id) != null);
 }
 
-test "fsrpc_session: agents namespace create reports activation errors without failing creation" {
+test "acheron_session: agents namespace create reports activation errors without failing creation" {
     const allocator = std.testing.allocator;
 
-    var control_plane = fs_control_plane.ControlPlane.init(allocator);
+    var control_plane = control_plane_mod.ControlPlane.init(allocator);
     defer control_plane.deinit();
 
     var tmp_dir = std.testing.tmpDir(.{});
@@ -12273,7 +12273,7 @@ test "fsrpc_session: agents namespace create reports activation errors without f
     try std.testing.expect(hatch_content.len > 0);
 }
 
-test "fsrpc_session: agents namespace create denies invoke without capability" {
+test "acheron_session: agents namespace create denies invoke without capability" {
     const allocator = std.testing.allocator;
 
     var tmp_dir = std.testing.tmpDir(.{});
@@ -12329,7 +12329,7 @@ test "fsrpc_session: agents namespace create denies invoke without capability" {
     try std.testing.expect(std.mem.indexOf(u8, result, "\"code\":\"forbidden\"") != null);
 }
 
-test "fsrpc_session: sub_brains namespace upsert/list/delete persists config and updates state" {
+test "acheron_session: sub_brains namespace upsert/list/delete persists config and updates state" {
     const allocator = std.testing.allocator;
 
     var tmp_dir = std.testing.tmpDir(.{});
@@ -12455,7 +12455,7 @@ test "fsrpc_session: sub_brains namespace upsert/list/delete persists config and
     try std.testing.expect(std.mem.indexOf(u8, delete_result, "\"removed\":true") != null);
 }
 
-test "fsrpc_session: sub_brains namespace mutation denies invoke without capability" {
+test "acheron_session: sub_brains namespace mutation denies invoke without capability" {
     const allocator = std.testing.allocator;
 
     var tmp_dir = std.testing.tmpDir(.{});
@@ -12511,7 +12511,7 @@ test "fsrpc_session: sub_brains namespace mutation denies invoke without capabil
     try std.testing.expect(std.mem.indexOf(u8, result, "\"code\":\"forbidden\"") != null);
 }
 
-test "fsrpc_session: first-class memory namespace operation file maps to runtime tool" {
+test "acheron_session: first-class memory namespace operation file maps to runtime tool" {
     const allocator = std.testing.allocator;
 
     const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
@@ -12559,7 +12559,7 @@ test "fsrpc_session: first-class memory namespace operation file maps to runtime
     try std.testing.expect(std.mem.indexOf(u8, status_payload, "\"error\":null") != null);
 }
 
-test "fsrpc_session: memory load accepts memory_path identity" {
+test "acheron_session: memory load accepts memory_path identity" {
     const allocator = std.testing.allocator;
 
     const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
@@ -12628,7 +12628,7 @@ test "fsrpc_session: memory load accepts memory_path identity" {
     try std.testing.expect(std.mem.indexOf(u8, loaded_payload, memory_path_value.string) != null);
 }
 
-test "fsrpc_session: first-class web_search namespace operation file maps to runtime tool" {
+test "acheron_session: first-class web_search namespace operation file maps to runtime tool" {
     const allocator = std.testing.allocator;
 
     const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
@@ -12675,7 +12675,7 @@ test "fsrpc_session: first-class web_search namespace operation file maps to run
     try std.testing.expect(result_payload[0] == '{');
 }
 
-test "fsrpc_session: first-class terminal namespace operation file maps to runtime tool" {
+test "acheron_session: first-class terminal namespace operation file maps to runtime tool" {
     const allocator = std.testing.allocator;
 
     const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
@@ -12720,7 +12720,7 @@ test "fsrpc_session: first-class terminal namespace operation file maps to runti
     try std.testing.expect(std.mem.indexOf(u8, result_payload, "terminal-namespace") != null);
 }
 
-test "fsrpc_session: terminal-v2 session lifecycle updates current and sessions state" {
+test "acheron_session: terminal-v2 session lifecycle updates current and sessions state" {
     const allocator = std.testing.allocator;
 
     const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
@@ -12821,7 +12821,7 @@ test "fsrpc_session: terminal-v2 session lifecycle updates current and sessions 
     try std.testing.expect(std.mem.indexOf(u8, sessions_payload, "\"state\":\"closed\"") != null);
 }
 
-test "fsrpc_session: terminal-v2 invoke envelope routes create and exec operations" {
+test "acheron_session: terminal-v2 invoke envelope routes create and exec operations" {
     const allocator = std.testing.allocator;
 
     const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
@@ -12878,7 +12878,7 @@ test "fsrpc_session: terminal-v2 invoke envelope routes create and exec operatio
     try std.testing.expect(std.mem.indexOf(u8, result_payload, "invoke-v2") != null);
 }
 
-test "fsrpc_session: terminal-v2 write read resize operations update status and result" {
+test "acheron_session: terminal-v2 write read resize operations update status and result" {
     const allocator = std.testing.allocator;
 
     const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
@@ -12977,7 +12977,7 @@ test "fsrpc_session: terminal-v2 write read resize operations update status and 
     );
 }
 
-test "fsrpc_session: first-class memory namespace rejects unknown invoke op" {
+test "acheron_session: first-class memory namespace rejects unknown invoke op" {
     const allocator = std.testing.allocator;
 
     const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
@@ -13003,7 +13003,7 @@ test "fsrpc_session: first-class memory namespace rejects unknown invoke op" {
     try std.testing.expect(std.mem.indexOf(u8, response, "memory payload is invalid") != null);
 }
 
-test "fsrpc_session: first-class memory namespace invoke does not accept non-memory tool aliases" {
+test "acheron_session: first-class memory namespace invoke does not accept non-memory tool aliases" {
     const allocator = std.testing.allocator;
 
     const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
@@ -13029,7 +13029,7 @@ test "fsrpc_session: first-class memory namespace invoke does not accept non-mem
     try std.testing.expect(std.mem.indexOf(u8, response, "memory payload is invalid") != null);
 }
 
-test "fsrpc_session: first-class namespace invoke honors PERMISSIONS policy" {
+test "acheron_session: first-class namespace invoke honors PERMISSIONS policy" {
     const allocator = std.testing.allocator;
 
     const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
@@ -13061,10 +13061,10 @@ test "fsrpc_session: first-class namespace invoke honors PERMISSIONS policy" {
     try std.testing.expect(std.mem.indexOf(u8, response, "memory invoke access denied by permissions") != null);
 }
 
-test "fsrpc_session: mounts namespace manages mount bind and resolve operations" {
+test "acheron_session: mounts namespace manages mount bind and resolve operations" {
     const allocator = std.testing.allocator;
 
-    var control_plane = fs_control_plane.ControlPlane.init(allocator);
+    var control_plane = control_plane_mod.ControlPlane.init(allocator);
     defer control_plane.deinit();
 
     const joined = try control_plane.ensureNode("mounts-node", "ws://127.0.0.1:18891/v2/fs", 60_000);
@@ -13177,10 +13177,10 @@ test "fsrpc_session: mounts namespace manages mount bind and resolve operations"
     defer allocator.free(repo_listing);
 }
 
-test "fsrpc_session: mounts namespace mkdir creates local export folders" {
+test "acheron_session: mounts namespace mkdir creates local export folders" {
     const allocator = std.testing.allocator;
 
-    var control_plane = fs_control_plane.ControlPlane.init(allocator);
+    var control_plane = control_plane_mod.ControlPlane.init(allocator);
     defer control_plane.deinit();
 
     const project_json = try control_plane.createProject("{\"name\":\"MountMkdir\",\"vision\":\"MountMkdir\"}");
@@ -13299,10 +13299,10 @@ test "fsrpc_session: mounts namespace mkdir creates local export folders" {
     defer allocator.free(invalid_response);
 }
 
-test "fsrpc_session: node services namespace prefers control-plane catalog" {
+test "acheron_session: node services namespace prefers control-plane catalog" {
     const allocator = std.testing.allocator;
 
-    var control_plane = fs_control_plane.ControlPlane.init(allocator);
+    var control_plane = control_plane_mod.ControlPlane.init(allocator);
     defer control_plane.deinit();
 
     const ensured = try control_plane.ensureNode("edge-a", "ws://127.0.0.1:18891/v2/fs", 60_000);
@@ -13321,7 +13321,7 @@ test "fsrpc_session: node services namespace prefers control-plane catalog" {
     defer allocator.free(escaped_node_secret);
     const upsert_req = try std.fmt.allocPrint(
         allocator,
-        "{{\"node_id\":\"{s}\",\"node_secret\":\"{s}\",\"services\":[{{\"service_id\":\"terminal-9\",\"kind\":\"terminal\",\"version\":\"1\",\"state\":\"degraded\",\"endpoints\":[\"/nodes/{s}/terminal/9\"],\"capabilities\":{{\"pty\":true,\"terminal_id\":\"9\"}}}}]}}",
+        "{{\"node_id\":\"{s}\",\"node_secret\":\"{s}\",\"venoms\":[{{\"venom_id\":\"terminal-9\",\"kind\":\"terminal\",\"version\":\"1\",\"state\":\"degraded\",\"endpoints\":[\"/nodes/{s}/terminal/9\"],\"capabilities\":{{\"pty\":true,\"terminal_id\":\"9\"}}}}]}}",
         .{ escaped_node_id, escaped_node_secret, escaped_node_id },
     );
     defer allocator.free(upsert_req);
@@ -13377,8 +13377,8 @@ test "fsrpc_session: node services namespace prefers control-plane catalog" {
     const node_dir = session.lookupChild(nodes_root, node_id.string) orelse return error.TestExpectedResponse;
     const node_caps_id = session.lookupChild(node_dir, "CAPS.json") orelse return error.TestExpectedResponse;
     const node_caps = session.nodes.get(node_caps_id) orelse return error.TestExpectedResponse;
-    const services_root = session.lookupChild(node_dir, "services") orelse return error.TestExpectedResponse;
-    const services_index_id = session.lookupChild(services_root, "SERVICES.json") orelse return error.TestExpectedResponse;
+    const services_root = session.lookupChild(node_dir, "venoms") orelse return error.TestExpectedResponse;
+    const services_index_id = session.lookupChild(services_root, "VENOMS.json") orelse return error.TestExpectedResponse;
     const services_index = session.nodes.get(services_index_id) orelse return error.TestExpectedResponse;
     const terminal = session.lookupChild(services_root, "terminal-9") orelse return error.TestExpectedResponse;
     const status_id = session.lookupChild(terminal, "STATUS.json") orelse return error.TestExpectedResponse;
@@ -13387,36 +13387,36 @@ test "fsrpc_session: node services namespace prefers control-plane catalog" {
     const caps_node = session.nodes.get(caps_id) orelse return error.TestExpectedResponse;
     const agents_root = session.lookupChild(session.root_id, "agents") orelse return error.TestExpectedResponse;
     const self_agent = session.lookupChild(agents_root, "self") orelse return error.TestExpectedResponse;
-    const self_services_dir = session.lookupChild(self_agent, "services") orelse return error.TestExpectedResponse;
-    const self_services_index_id = session.lookupChild(self_services_dir, "SERVICES.json") orelse return error.TestExpectedResponse;
+    const self_services_dir = session.lookupChild(self_agent, "venoms") orelse return error.TestExpectedResponse;
+    const self_services_index_id = session.lookupChild(self_services_dir, "VENOMS.json") orelse return error.TestExpectedResponse;
     const self_services_index = session.nodes.get(self_services_index_id) orelse return error.TestExpectedResponse;
     const node_service_events_payload = try protocolReadFile(
         &session,
         allocator,
         140,
         141,
-        &.{ "global", "services", "node-venom-events.ndjson" },
+        &.{ "global", "venoms", "node-venom-events.ndjson" },
         142,
     );
     defer allocator.free(node_service_events_payload);
 
     try std.testing.expect(std.mem.indexOf(u8, node_caps.content, "\"fs\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, node_caps.content, "\"terminal\":true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, services_index.content, "\"service_id\":\"terminal-9\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, services_index.content, "\"venom_id\":\"terminal-9\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, status_node.content, "\"state\":\"degraded\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, status_node.content, "/nodes/") != null);
     try std.testing.expect(std.mem.indexOf(u8, caps_node.content, "\"terminal_id\":\"9\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, self_services_index.content, "\"node_id\":\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, self_services_index.content, "\"service_id\":\"terminal-9\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, self_services_index.content, "\"venom_id\":\"terminal-9\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, node_service_events_payload, "\"node_id\":\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, node_service_events_payload, "\"service_delta\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, node_service_events_payload, "\"service_id\":\"terminal-9\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, node_service_events_payload, "\"venom_delta\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, node_service_events_payload, "\"venom_id\":\"terminal-9\"") != null);
 }
 
-test "fsrpc_session: node service events file returns full retained feed" {
+test "acheron_session: node Venom events file returns full retained feed" {
     const allocator = std.testing.allocator;
 
-    var control_plane = fs_control_plane.ControlPlane.initWithOptions(allocator, .{
+    var control_plane = control_plane_mod.ControlPlane.initWithOptions(allocator, .{
         .node_venom_event_history_max = 520,
     });
     defer control_plane.deinit();
@@ -13439,7 +13439,7 @@ test "fsrpc_session: node service events file returns full retained feed" {
     for (0..513) |idx| {
         const upsert_req = try std.fmt.allocPrint(
             allocator,
-            "{{\"node_id\":\"{s}\",\"node_secret\":\"{s}\",\"services\":[{{\"service_id\":\"terminal-main\",\"kind\":\"terminal\",\"version\":\"{d}\",\"state\":\"online\",\"endpoints\":[\"/nodes/{s}/terminal/main\"],\"capabilities\":{{\"pty\":true}}}}]}}",
+            "{{\"node_id\":\"{s}\",\"node_secret\":\"{s}\",\"venoms\":[{{\"venom_id\":\"terminal-main\",\"kind\":\"terminal\",\"version\":\"{d}\",\"state\":\"online\",\"endpoints\":[\"/nodes/{s}/terminal/main\"],\"capabilities\":{{\"pty\":true}}}}]}}",
             .{ escaped_node_id, escaped_node_secret, idx, escaped_node_id },
         );
         defer allocator.free(upsert_req);
@@ -13470,7 +13470,7 @@ test "fsrpc_session: node service events file returns full retained feed" {
         allocator,
         240,
         241,
-        &.{ "global", "services", "node-venom-events.ndjson" },
+        &.{ "global", "venoms", "node-venom-events.ndjson" },
         242,
     );
     defer allocator.free(node_service_events_payload);
@@ -13481,10 +13481,10 @@ test "fsrpc_session: node service events file returns full retained feed" {
     try std.testing.expect(std.mem.indexOf(u8, node_service_events_payload, "\"version\":\"0\"") != null);
 }
 
-test "fsrpc_session: empty control-plane service catalog suppresses policy fallback roots" {
+test "acheron_session: empty control-plane Venom catalog suppresses policy fallback roots" {
     const allocator = std.testing.allocator;
 
-    var control_plane = fs_control_plane.ControlPlane.init(allocator);
+    var control_plane = control_plane_mod.ControlPlane.init(allocator);
     defer control_plane.deinit();
 
     const ensured = try control_plane.ensureNode("edge-empty-services", "ws://127.0.0.1:18891/v2/fs", 60_000);
@@ -13503,7 +13503,7 @@ test "fsrpc_session: empty control-plane service catalog suppresses policy fallb
     defer allocator.free(escaped_node_secret);
     const upsert_req = try std.fmt.allocPrint(
         allocator,
-        "{{\"node_id\":\"{s}\",\"node_secret\":\"{s}\",\"services\":[]}}",
+        "{{\"node_id\":\"{s}\",\"node_secret\":\"{s}\",\"venoms\":[]}}",
         .{ escaped_node_id, escaped_node_secret },
     );
     defer allocator.free(upsert_req);
@@ -13559,8 +13559,8 @@ test "fsrpc_session: empty control-plane service catalog suppresses policy fallb
     const node_dir = session.lookupChild(nodes_root, node_id.string) orelse return error.TestExpectedResponse;
     const node_caps_id = session.lookupChild(node_dir, "CAPS.json") orelse return error.TestExpectedResponse;
     const node_caps = session.nodes.get(node_caps_id) orelse return error.TestExpectedResponse;
-    const services_root = session.lookupChild(node_dir, "services") orelse return error.TestExpectedResponse;
-    const services_index_id = session.lookupChild(services_root, "SERVICES.json") orelse return error.TestExpectedResponse;
+    const services_root = session.lookupChild(node_dir, "venoms") orelse return error.TestExpectedResponse;
+    const services_index_id = session.lookupChild(services_root, "VENOMS.json") orelse return error.TestExpectedResponse;
     const services_index = session.nodes.get(services_index_id) orelse return error.TestExpectedResponse;
 
     try std.testing.expect(session.lookupChild(services_root, "fs") == null);
@@ -13572,10 +13572,10 @@ test "fsrpc_session: empty control-plane service catalog suppresses policy fallb
     try std.testing.expect(std.mem.indexOf(u8, node_caps.content, "\"terminal\":false") != null);
 }
 
-test "fsrpc_session: project meta includes control-plane workspace status" {
+test "acheron_session: project meta includes control-plane workspace status" {
     const allocator = std.testing.allocator;
 
-    var control_plane = fs_control_plane.ControlPlane.init(allocator);
+    var control_plane = control_plane_mod.ControlPlane.init(allocator);
     defer control_plane.deinit();
 
     const ensured = try control_plane.ensureNode("edge-meta", "ws://127.0.0.1:18891/v2/fs", 60_000);
@@ -13800,10 +13800,10 @@ test "fsrpc_session: project meta includes control-plane workspace status" {
     try std.testing.expect(std.mem.indexOf(u8, health_node.content, "\"drift_count\":0") != null);
 }
 
-test "fsrpc_session: project workspace mount nodes are discovered outside policy" {
+test "acheron_session: project workspace mount nodes are discovered outside policy" {
     const allocator = std.testing.allocator;
 
-    var control_plane = fs_control_plane.ControlPlane.init(allocator);
+    var control_plane = control_plane_mod.ControlPlane.init(allocator);
     defer control_plane.deinit();
 
     const ensured = try control_plane.ensureNode("edge-discovered", "ws://127.0.0.1:18891/v2/fs", 60_000);
@@ -13896,10 +13896,10 @@ test "fsrpc_session: project workspace mount nodes are discovered outside policy
     try std.testing.expect(std.mem.indexOf(u8, mount_link_node.content, "/fs") != null);
 }
 
-test "fsrpc_session: project meta summary and alerts reflect degraded and missing mounts" {
+test "acheron_session: project meta summary and alerts reflect degraded and missing mounts" {
     const allocator = std.testing.allocator;
 
-    var control_plane = fs_control_plane.ControlPlane.init(allocator);
+    var control_plane = control_plane_mod.ControlPlane.init(allocator);
     defer control_plane.deinit();
 
     const ensured = try control_plane.ensureNode("edge-alerts", "ws://127.0.0.1:18891/v2/fs", 60_000);
@@ -14067,10 +14067,10 @@ test "fsrpc_session: project meta summary and alerts reflect degraded and missin
     }
 }
 
-test "fsrpc_session: project workspace fallback is scoped to requested project" {
+test "acheron_session: project workspace fallback is scoped to requested project" {
     const allocator = std.testing.allocator;
 
-    var control_plane = fs_control_plane.ControlPlane.init(allocator);
+    var control_plane = control_plane_mod.ControlPlane.init(allocator);
     defer control_plane.deinit();
 
     const ensured = try control_plane.ensureNode("edge-leak-test", "ws://127.0.0.1:18891/v2/fs", 60_000);
@@ -14246,10 +14246,10 @@ test "fsrpc_session: project workspace fallback is scoped to requested project" 
     try std.testing.expect(std.mem.indexOf(u8, workspace_node.content, project_b_id.string) == null);
 }
 
-test "fsrpc_session: node roots are derived from control-plane service kinds" {
+test "acheron_session: node roots are derived from control-plane service kinds" {
     const allocator = std.testing.allocator;
 
-    var control_plane = fs_control_plane.ControlPlane.init(allocator);
+    var control_plane = control_plane_mod.ControlPlane.init(allocator);
     defer control_plane.deinit();
 
     const ensured = try control_plane.ensureNode("edge-service-roots", "ws://127.0.0.1:18891/v2/fs", 60_000);
@@ -14268,7 +14268,7 @@ test "fsrpc_session: node roots are derived from control-plane service kinds" {
     defer allocator.free(escaped_node_secret);
     const upsert_req = try std.fmt.allocPrint(
         allocator,
-        "{{\"node_id\":\"{s}\",\"node_secret\":\"{s}\",\"services\":[{{\"service_id\":\"camera\",\"kind\":\"camera\",\"version\":\"1\",\"state\":\"online\",\"endpoints\":[\"/nodes/{s}/camera\"],\"capabilities\":{{\"still\":true}}}},{{\"service_id\":\"terminal-3\",\"kind\":\"terminal\",\"version\":\"1\",\"state\":\"online\",\"endpoints\":[\"/nodes/{s}/terminal/3\"],\"capabilities\":{{\"pty\":true}}}}]}}",
+        "{{\"node_id\":\"{s}\",\"node_secret\":\"{s}\",\"venoms\":[{{\"venom_id\":\"camera\",\"kind\":\"camera\",\"version\":\"1\",\"state\":\"online\",\"endpoints\":[\"/nodes/{s}/camera\"],\"capabilities\":{{\"still\":true}}}},{{\"venom_id\":\"terminal-3\",\"kind\":\"terminal\",\"version\":\"1\",\"state\":\"online\",\"endpoints\":[\"/nodes/{s}/terminal/3\"],\"capabilities\":{{\"pty\":true}}}}]}}",
         .{ escaped_node_id, escaped_node_secret, escaped_node_id, escaped_node_id },
     );
     defer allocator.free(upsert_req);
@@ -14336,10 +14336,10 @@ test "fsrpc_session: node roots are derived from control-plane service kinds" {
     try std.testing.expect(fs_dir == null);
 }
 
-test "fsrpc_session: control-plane mounts expose custom node roots and metadata files" {
+test "acheron_session: control-plane mounts expose custom node roots and metadata files" {
     const allocator = std.testing.allocator;
 
-    var control_plane = fs_control_plane.ControlPlane.init(allocator);
+    var control_plane = control_plane_mod.ControlPlane.init(allocator);
     defer control_plane.deinit();
 
     const ensured = try control_plane.ensureNode("edge-custom-mounts", "ws://127.0.0.1:18891/v2/fs", 60_000);
@@ -14358,7 +14358,7 @@ test "fsrpc_session: control-plane mounts expose custom node roots and metadata 
     defer allocator.free(escaped_node_secret);
     const upsert_req = try std.fmt.allocPrint(
         allocator,
-        "{{\"node_id\":\"{s}\",\"node_secret\":\"{s}\",\"services\":[{{\"service_id\":\"gdrive-main\",\"kind\":\"gdrive\",\"version\":\"1\",\"state\":\"online\",\"endpoints\":[\"/nodes/{s}/services/gdrive-main\"],\"capabilities\":{{\"provider\":\"google\"}},\"mounts\":[{{\"mount_id\":\"drive-main\",\"mount_path\":\"/nodes/{s}/drive/main\",\"state\":\"online\"}}],\"ops\":{{\"model\":\"namespace\"}},\"runtime\":{{\"type\":\"native_proc\"}},\"permissions\":{{\"default\":\"deny-by-default\",\"allow_roles\":[\"admin\",\"user\"]}},\"schema\":{{\"model\":\"namespace-mount\"}},\"help_md\":\"Google Drive namespace mount\"}}]}}",
+        "{{\"node_id\":\"{s}\",\"node_secret\":\"{s}\",\"venoms\":[{{\"venom_id\":\"gdrive-main\",\"kind\":\"gdrive\",\"version\":\"1\",\"state\":\"online\",\"endpoints\":[\"/nodes/{s}/venoms/gdrive-main\"],\"capabilities\":{{\"provider\":\"google\"}},\"mounts\":[{{\"mount_id\":\"drive-main\",\"mount_path\":\"/nodes/{s}/drive/main\",\"state\":\"online\"}}],\"ops\":{{\"model\":\"namespace\"}},\"runtime\":{{\"type\":\"native_proc\"}},\"permissions\":{{\"default\":\"deny-by-default\",\"allow_roles\":[\"admin\",\"user\"]}},\"schema\":{{\"model\":\"namespace-mount\"}},\"help_md\":\"Google Drive namespace mount\"}}]}}",
         .{ escaped_node_id, escaped_node_secret, escaped_node_id, escaped_node_id },
     );
     defer allocator.free(upsert_req);
@@ -14414,7 +14414,7 @@ test "fsrpc_session: control-plane mounts expose custom node roots and metadata 
     const node_dir = session.lookupChild(nodes_root, node_id.string) orelse return error.TestExpectedResponse;
     const drive_root = session.lookupChild(node_dir, "drive") orelse return error.TestExpectedResponse;
     _ = drive_root;
-    const services_root = session.lookupChild(node_dir, "services") orelse return error.TestExpectedResponse;
+    const services_root = session.lookupChild(node_dir, "venoms") orelse return error.TestExpectedResponse;
     const gdrive_service = session.lookupChild(services_root, "gdrive-main") orelse return error.TestExpectedResponse;
     const mounts_id = session.lookupChild(gdrive_service, "MOUNTS.json") orelse return error.TestExpectedResponse;
     const ops_id = session.lookupChild(gdrive_service, "OPS.json") orelse return error.TestExpectedResponse;
@@ -14434,10 +14434,10 @@ test "fsrpc_session: control-plane mounts expose custom node roots and metadata 
     try std.testing.expect(std.mem.indexOf(u8, readme_node.content, "Google Drive namespace mount") != null);
 }
 
-test "fsrpc_session: service permissions enforce deny-by-default with admin bypass" {
+test "acheron_session: service permissions enforce deny-by-default with admin bypass" {
     const allocator = std.testing.allocator;
 
-    var control_plane = fs_control_plane.ControlPlane.init(allocator);
+    var control_plane = control_plane_mod.ControlPlane.init(allocator);
     defer control_plane.deinit();
 
     const ensured = try control_plane.ensureNode("edge-secure-service", "ws://127.0.0.1:18891/v2/fs", 60_000);
@@ -14456,7 +14456,7 @@ test "fsrpc_session: service permissions enforce deny-by-default with admin bypa
     defer allocator.free(escaped_node_secret);
     const upsert_req = try std.fmt.allocPrint(
         allocator,
-        "{{\"node_id\":\"{s}\",\"node_secret\":\"{s}\",\"services\":[{{\"service_id\":\"secure-main\",\"kind\":\"secure\",\"version\":\"1\",\"state\":\"online\",\"endpoints\":[\"/nodes/{s}/secure/main\"],\"capabilities\":{{\"invoke\":true}},\"mounts\":[{{\"mount_id\":\"secure-main\",\"mount_path\":\"/nodes/{s}/secure/main\",\"state\":\"online\"}}],\"ops\":{{\"model\":\"namespace\"}},\"runtime\":{{\"type\":\"native_proc\"}},\"permissions\":{{\"default\":\"deny-by-default\"}},\"schema\":{{\"model\":\"namespace-mount\"}},\"help_md\":\"Secure namespace mount\"}}]}}",
+        "{{\"node_id\":\"{s}\",\"node_secret\":\"{s}\",\"venoms\":[{{\"venom_id\":\"secure-main\",\"kind\":\"secure\",\"version\":\"1\",\"state\":\"online\",\"endpoints\":[\"/nodes/{s}/secure/main\"],\"capabilities\":{{\"invoke\":true}},\"mounts\":[{{\"mount_id\":\"secure-main\",\"mount_path\":\"/nodes/{s}/secure/main\",\"state\":\"online\"}}],\"ops\":{{\"model\":\"namespace\"}},\"runtime\":{{\"type\":\"native_proc\"}},\"permissions\":{{\"default\":\"deny-by-default\"}},\"schema\":{{\"model\":\"namespace-mount\"}},\"help_md\":\"Secure namespace mount\"}}]}}",
         .{ escaped_node_id, escaped_node_secret, escaped_node_id, escaped_node_id },
     );
     defer allocator.free(upsert_req);
@@ -14511,7 +14511,7 @@ test "fsrpc_session: service permissions enforce deny-by-default with admin bypa
 
     const user_nodes_root = user_session.lookupChild(user_session.root_id, "nodes") orelse return error.TestExpectedResponse;
     const user_node_dir = user_session.lookupChild(user_nodes_root, node_id.string) orelse return error.TestExpectedResponse;
-    const user_services_root = user_session.lookupChild(user_node_dir, "services") orelse return error.TestExpectedResponse;
+    const user_services_root = user_session.lookupChild(user_node_dir, "venoms") orelse return error.TestExpectedResponse;
     try std.testing.expect(user_session.lookupChild(user_services_root, "secure-main") == null);
     try std.testing.expect(user_session.lookupChild(user_node_dir, "secure") == null);
 
@@ -14532,15 +14532,15 @@ test "fsrpc_session: service permissions enforce deny-by-default with admin bypa
 
     const admin_nodes_root = admin_session.lookupChild(admin_session.root_id, "nodes") orelse return error.TestExpectedResponse;
     const admin_node_dir = admin_session.lookupChild(admin_nodes_root, node_id.string) orelse return error.TestExpectedResponse;
-    const admin_services_root = admin_session.lookupChild(admin_node_dir, "services") orelse return error.TestExpectedResponse;
+    const admin_services_root = admin_session.lookupChild(admin_node_dir, "venoms") orelse return error.TestExpectedResponse;
     try std.testing.expect(admin_session.lookupChild(admin_services_root, "secure-main") != null);
     try std.testing.expect(admin_session.lookupChild(admin_node_dir, "secure") != null);
 }
 
-test "fsrpc_session: project access policy gates invoke visibility per agent" {
+test "acheron_session: project access policy gates invoke visibility per agent" {
     const allocator = std.testing.allocator;
 
-    var control_plane = fs_control_plane.ControlPlane.init(allocator);
+    var control_plane = control_plane_mod.ControlPlane.init(allocator);
     defer control_plane.deinit();
 
     const ensured = try control_plane.ensureNode("edge-policy-invoke", "ws://127.0.0.1:18891/v2/fs", 60_000);
@@ -14559,7 +14559,7 @@ test "fsrpc_session: project access policy gates invoke visibility per agent" {
     defer allocator.free(escaped_node_secret);
     const upsert_req = try std.fmt.allocPrint(
         allocator,
-        "{{\"node_id\":\"{s}\",\"node_secret\":\"{s}\",\"services\":[{{\"service_id\":\"tool-main\",\"kind\":\"tool\",\"version\":\"1\",\"state\":\"online\",\"endpoints\":[\"/nodes/{s}/tool/main\"],\"capabilities\":{{\"invoke\":true}},\"mounts\":[{{\"mount_id\":\"tool-main\",\"mount_path\":\"/nodes/{s}/tool/main\",\"state\":\"online\"}}],\"ops\":{{\"model\":\"namespace\"}},\"runtime\":{{\"type\":\"native_proc\"}},\"permissions\":{{\"default\":\"allow-by-default\",\"allow_roles\":[\"admin\",\"user\"]}},\"schema\":{{\"model\":\"namespace-service-v1\"}},\"help_md\":\"Policy-gated invoke service\"}}]}}",
+        "{{\"node_id\":\"{s}\",\"node_secret\":\"{s}\",\"venoms\":[{{\"venom_id\":\"tool-main\",\"kind\":\"tool\",\"version\":\"1\",\"state\":\"online\",\"endpoints\":[\"/nodes/{s}/tool/main\"],\"capabilities\":{{\"invoke\":true}},\"mounts\":[{{\"mount_id\":\"tool-main\",\"mount_path\":\"/nodes/{s}/tool/main\",\"state\":\"online\"}}],\"ops\":{{\"model\":\"namespace\"}},\"runtime\":{{\"type\":\"native_proc\"}},\"permissions\":{{\"default\":\"allow-by-default\",\"allow_roles\":[\"admin\",\"user\"]}},\"schema\":{{\"model\":\"namespace-service-v1\"}},\"help_md\":\"Policy-gated invoke service\"}}]}}",
         .{ escaped_node_id, escaped_node_secret, escaped_node_id, escaped_node_id },
     );
     defer allocator.free(upsert_req);
@@ -14599,7 +14599,7 @@ test "fsrpc_session: project access policy gates invoke visibility per agent" {
 
     const default_nodes_root = default_session.lookupChild(default_session.root_id, "nodes") orelse return error.TestExpectedResponse;
     const default_node_dir = default_session.lookupChild(default_nodes_root, node_id.string) orelse return error.TestExpectedResponse;
-    const default_services_root = default_session.lookupChild(default_node_dir, "services") orelse return error.TestExpectedResponse;
+    const default_services_root = default_session.lookupChild(default_node_dir, "venoms") orelse return error.TestExpectedResponse;
     try std.testing.expect(default_session.lookupChild(default_services_root, "tool-main") == null);
     try std.testing.expect(default_session.lookupChild(default_node_dir, "tool") == null);
     const default_index_payload = try protocolReadFile(
@@ -14607,11 +14607,11 @@ test "fsrpc_session: project access policy gates invoke visibility per agent" {
         allocator,
         220,
         221,
-        &.{ "agents", "self", "services", "SERVICES.json" },
+        &.{ "agents", "self", "venoms", "VENOMS.json" },
         830,
     );
     defer allocator.free(default_index_payload);
-    try std.testing.expect(std.mem.indexOf(u8, default_index_payload, "\"service_id\":\"tool-main\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, default_index_payload, "\"venom_id\":\"tool-main\"") == null);
 
     var worker_session = try Session.initWithOptions(
         allocator,
@@ -14630,7 +14630,7 @@ test "fsrpc_session: project access policy gates invoke visibility per agent" {
 
     const worker_nodes_root = worker_session.lookupChild(worker_session.root_id, "nodes") orelse return error.TestExpectedResponse;
     const worker_node_dir = worker_session.lookupChild(worker_nodes_root, node_id.string) orelse return error.TestExpectedResponse;
-    const worker_services_root = worker_session.lookupChild(worker_node_dir, "services") orelse return error.TestExpectedResponse;
+    const worker_services_root = worker_session.lookupChild(worker_node_dir, "venoms") orelse return error.TestExpectedResponse;
     try std.testing.expect(worker_session.lookupChild(worker_services_root, "tool-main") != null);
     try std.testing.expect(worker_session.lookupChild(worker_node_dir, "tool") != null);
     const worker_index_payload = try protocolReadFile(
@@ -14638,7 +14638,7 @@ test "fsrpc_session: project access policy gates invoke visibility per agent" {
         allocator,
         222,
         223,
-        &.{ "agents", "self", "services", "SERVICES.json" },
+        &.{ "agents", "self", "venoms", "VENOMS.json" },
         840,
     );
     defer allocator.free(worker_index_payload);
@@ -14648,15 +14648,15 @@ test "fsrpc_session: project access policy gates invoke visibility per agent" {
         .{node_id.string},
     );
     defer allocator.free(expected_invoke_path);
-    try std.testing.expect(std.mem.indexOf(u8, worker_index_payload, "\"service_id\":\"tool-main\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, worker_index_payload, "\"venom_id\":\"tool-main\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, worker_index_payload, "\"has_invoke\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, worker_index_payload, expected_invoke_path) != null);
 }
 
-test "fsrpc_session: node service invoke path uses OPS metadata with safe fallback" {
+test "acheron_session: node service invoke path uses OPS metadata with safe fallback" {
     const allocator = std.testing.allocator;
 
-    var control_plane = fs_control_plane.ControlPlane.init(allocator);
+    var control_plane = control_plane_mod.ControlPlane.init(allocator);
     defer control_plane.deinit();
 
     const ensured = try control_plane.ensureNode("edge-ops-invoke", "ws://127.0.0.1:18891/v2/fs", 60_000);
@@ -14675,10 +14675,10 @@ test "fsrpc_session: node service invoke path uses OPS metadata with safe fallba
     defer allocator.free(escaped_node_secret);
     const upsert_req = try std.fmt.allocPrint(
         allocator,
-        "{{\"node_id\":\"{s}\",\"node_secret\":\"{s}\",\"services\":[" ++
-            "{{\"service_id\":\"tool-rel\",\"kind\":\"tool\",\"version\":\"1\",\"state\":\"online\",\"endpoints\":[\"/nodes/{s}/tool/rel\"],\"capabilities\":{{\"invoke\":true}},\"mounts\":[{{\"mount_id\":\"tool-rel\",\"mount_path\":\"/nodes/{s}/tool/rel\",\"state\":\"online\"}}],\"ops\":{{\"model\":\"namespace\",\"invoke\":\"control/run.json\"}},\"runtime\":{{\"type\":\"native_proc\"}},\"permissions\":{{\"default\":\"allow-by-default\",\"allow_roles\":[\"admin\",\"user\"]}},\"schema\":{{\"model\":\"namespace-service-v1\"}},\"help_md\":\"Relative invoke target\"}}," ++
-            "{{\"service_id\":\"tool-abs\",\"kind\":\"tool\",\"version\":\"1\",\"state\":\"online\",\"endpoints\":[\"/nodes/{s}/tool/abs\"],\"capabilities\":{{\"invoke\":true}},\"mounts\":[{{\"mount_id\":\"tool-abs\",\"mount_path\":\"/nodes/{s}/tool/abs\",\"state\":\"online\"}}],\"ops\":{{\"model\":\"namespace\",\"invoke\":\"/nodes/{s}/tool/abs/custom/exec.json\"}},\"runtime\":{{\"type\":\"native_proc\"}},\"permissions\":{{\"default\":\"allow-by-default\",\"allow_roles\":[\"admin\",\"user\"]}},\"schema\":{{\"model\":\"namespace-service-v1\"}},\"help_md\":\"Absolute invoke target\"}}," ++
-            "{{\"service_id\":\"tool-fallback\",\"kind\":\"tool\",\"version\":\"1\",\"state\":\"online\",\"endpoints\":[\"/nodes/{s}/tool/fallback\"],\"capabilities\":{{\"invoke\":true}},\"mounts\":[{{\"mount_id\":\"tool-fallback\",\"mount_path\":\"/nodes/{s}/tool/fallback\",\"state\":\"online\"}}],\"ops\":{{\"model\":\"namespace\",\"invoke\":123}},\"runtime\":{{\"type\":\"native_proc\"}},\"permissions\":{{\"default\":\"allow-by-default\",\"allow_roles\":[\"admin\",\"user\"]}},\"schema\":{{\"model\":\"namespace-service-v1\"}},\"help_md\":\"Fallback invoke target\"}}" ++
+        "{{\"node_id\":\"{s}\",\"node_secret\":\"{s}\",\"venoms\":[" ++
+            "{{\"venom_id\":\"tool-rel\",\"kind\":\"tool\",\"version\":\"1\",\"state\":\"online\",\"endpoints\":[\"/nodes/{s}/tool/rel\"],\"capabilities\":{{\"invoke\":true}},\"mounts\":[{{\"mount_id\":\"tool-rel\",\"mount_path\":\"/nodes/{s}/tool/rel\",\"state\":\"online\"}}],\"ops\":{{\"model\":\"namespace\",\"invoke\":\"control/run.json\"}},\"runtime\":{{\"type\":\"native_proc\"}},\"permissions\":{{\"default\":\"allow-by-default\",\"allow_roles\":[\"admin\",\"user\"]}},\"schema\":{{\"model\":\"namespace-service-v1\"}},\"help_md\":\"Relative invoke target\"}}," ++
+            "{{\"venom_id\":\"tool-abs\",\"kind\":\"tool\",\"version\":\"1\",\"state\":\"online\",\"endpoints\":[\"/nodes/{s}/tool/abs\"],\"capabilities\":{{\"invoke\":true}},\"mounts\":[{{\"mount_id\":\"tool-abs\",\"mount_path\":\"/nodes/{s}/tool/abs\",\"state\":\"online\"}}],\"ops\":{{\"model\":\"namespace\",\"invoke\":\"/nodes/{s}/tool/abs/custom/exec.json\"}},\"runtime\":{{\"type\":\"native_proc\"}},\"permissions\":{{\"default\":\"allow-by-default\",\"allow_roles\":[\"admin\",\"user\"]}},\"schema\":{{\"model\":\"namespace-service-v1\"}},\"help_md\":\"Absolute invoke target\"}}," ++
+            "{{\"venom_id\":\"tool-fallback\",\"kind\":\"tool\",\"version\":\"1\",\"state\":\"online\",\"endpoints\":[\"/nodes/{s}/tool/fallback\"],\"capabilities\":{{\"invoke\":true}},\"mounts\":[{{\"mount_id\":\"tool-fallback\",\"mount_path\":\"/nodes/{s}/tool/fallback\",\"state\":\"online\"}}],\"ops\":{{\"model\":\"namespace\",\"invoke\":123}},\"runtime\":{{\"type\":\"native_proc\"}},\"permissions\":{{\"default\":\"allow-by-default\",\"allow_roles\":[\"admin\",\"user\"]}},\"schema\":{{\"model\":\"namespace-service-v1\"}},\"help_md\":\"Fallback invoke target\"}}" ++
             "]}}",
         .{
             escaped_node_id,
@@ -14722,7 +14722,7 @@ test "fsrpc_session: node service invoke path uses OPS metadata with safe fallba
         allocator,
         224,
         225,
-        &.{ "agents", "self", "services", "SERVICES.json" },
+        &.{ "agents", "self", "venoms", "VENOMS.json" },
         850,
     );
     defer allocator.free(index_payload);
@@ -14746,18 +14746,18 @@ test "fsrpc_session: node service invoke path uses OPS metadata with safe fallba
     );
     defer allocator.free(expected_fallback);
 
-    try std.testing.expect(std.mem.indexOf(u8, index_payload, "\"service_id\":\"tool-rel\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_payload, "\"venom_id\":\"tool-rel\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, index_payload, expected_rel) != null);
-    try std.testing.expect(std.mem.indexOf(u8, index_payload, "\"service_id\":\"tool-abs\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_payload, "\"venom_id\":\"tool-abs\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, index_payload, expected_abs) != null);
-    try std.testing.expect(std.mem.indexOf(u8, index_payload, "\"service_id\":\"tool-fallback\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, index_payload, "\"venom_id\":\"tool-fallback\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, index_payload, expected_fallback) != null);
 }
 
-test "fsrpc_session: control-plane registered nodes appear under global nodes namespace" {
+test "acheron_session: control-plane registered nodes appear under global nodes namespace" {
     const allocator = std.testing.allocator;
 
-    var control_plane = fs_control_plane.ControlPlane.init(allocator);
+    var control_plane = control_plane_mod.ControlPlane.init(allocator);
     defer control_plane.deinit();
 
     const ensured = try control_plane.ensureNode("edge-global-node", "ws://127.0.0.1:18891/v2/fs", 60_000);
@@ -14803,10 +14803,10 @@ test "fsrpc_session: control-plane registered nodes appear under global nodes na
     try std.testing.expect(system_project_node_link == null);
 }
 
-test "fsrpc_session: global nodes directory discovers late control-plane nodes on read" {
+test "acheron_session: global nodes directory discovers late control-plane nodes on read" {
     const allocator = std.testing.allocator;
 
-    var control_plane = fs_control_plane.ControlPlane.init(allocator);
+    var control_plane = control_plane_mod.ControlPlane.init(allocator);
     defer control_plane.deinit();
 
     const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
@@ -14902,13 +14902,13 @@ test "fsrpc_session: global nodes directory discovers late control-plane nodes o
     try std.testing.expect(session.lookupChild(nodes_root, node_id.string) != null);
 }
 
-test "fsrpc_session: pairing catalog visibility and node invoke integration flow" {
+test "acheron_session: pairing catalog visibility and node invoke integration flow" {
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
 
     const allocator = std.testing.allocator;
     const spiderweb_node = @import("spiderweb_node");
 
-    var control_plane = fs_control_plane.ControlPlane.init(allocator);
+    var control_plane = control_plane_mod.ControlPlane.init(allocator);
     defer control_plane.deinit();
 
     const ensured = try control_plane.ensureNode("edge-integration", "ws://127.0.0.1:18891/v2/fs", 60_000);
@@ -14927,7 +14927,7 @@ test "fsrpc_session: pairing catalog visibility and node invoke integration flow
     defer allocator.free(escaped_node_secret);
     const upsert_req = try std.fmt.allocPrint(
         allocator,
-        "{{\"node_id\":\"{s}\",\"node_secret\":\"{s}\",\"services\":[{{\"service_id\":\"echo-main\",\"kind\":\"utility\",\"version\":\"1\",\"state\":\"online\",\"endpoints\":[\"/nodes/{s}/echo\"],\"capabilities\":{{\"invoke\":true}},\"mounts\":[{{\"mount_id\":\"echo-main\",\"mount_path\":\"/nodes/{s}/echo\",\"state\":\"online\"}}],\"ops\":{{\"model\":\"namespace\",\"style\":\"plan9\"}},\"runtime\":{{\"type\":\"native_proc\",\"abi\":\"namespace-driver-v1\"}},\"permissions\":{{\"default\":\"deny-by-default\",\"allow_roles\":[\"admin\",\"user\"]}},\"schema\":{{\"model\":\"namespace-service-v1\"}},\"help_md\":\"Echo integration service\"}}]}}",
+        "{{\"node_id\":\"{s}\",\"node_secret\":\"{s}\",\"venoms\":[{{\"venom_id\":\"echo-main\",\"kind\":\"utility\",\"version\":\"1\",\"state\":\"online\",\"endpoints\":[\"/nodes/{s}/echo\"],\"capabilities\":{{\"invoke\":true}},\"mounts\":[{{\"mount_id\":\"echo-main\",\"mount_path\":\"/nodes/{s}/echo\",\"state\":\"online\"}}],\"ops\":{{\"model\":\"namespace\",\"style\":\"plan9\"}},\"runtime\":{{\"type\":\"native_proc\",\"abi\":\"namespace-driver-v1\"}},\"permissions\":{{\"default\":\"deny-by-default\",\"allow_roles\":[\"admin\",\"user\"]}},\"schema\":{{\"model\":\"namespace-service-v1\"}},\"help_md\":\"Echo integration service\"}}]}}",
         .{ escaped_node_id, escaped_node_secret, escaped_node_id, escaped_node_id },
     );
     defer allocator.free(upsert_req);
@@ -14956,7 +14956,7 @@ test "fsrpc_session: pairing catalog visibility and node invoke integration flow
 
     const nodes_root = session.lookupChild(session.root_id, "nodes") orelse return error.TestExpectedResponse;
     const node_dir = session.lookupChild(nodes_root, node_id.string) orelse return error.TestExpectedResponse;
-    const services_root = session.lookupChild(node_dir, "services") orelse return error.TestExpectedResponse;
+    const services_root = session.lookupChild(node_dir, "venoms") orelse return error.TestExpectedResponse;
     const echo_service = session.lookupChild(services_root, "echo-main") orelse return error.TestExpectedResponse;
     _ = echo_service;
     const echo_root = session.lookupChild(node_dir, "echo") orelse return error.TestExpectedResponse;
@@ -14971,8 +14971,8 @@ test "fsrpc_session: pairing catalog visibility and node invoke integration flow
                 .source_kind = .namespace,
                 .source_id = "service:echo-main",
                 .ro = false,
-                .namespace_service = .{
-                    .service_id = "echo-main",
+                .namespace_venom = .{
+                    .venom_id = "echo-main",
                     .runtime_kind = .native_proc,
                     .executable_path = "/bin/cat",
                     .args = &.{},
@@ -15125,13 +15125,13 @@ test "fsrpc_session: pairing catalog visibility and node invoke integration flow
     try std.testing.expect(std.mem.indexOf(u8, status_decoded, "\"state\":\"ok\"") != null);
 }
 
-test "fsrpc_session: multi-node discovery invoke supervision reconnect flow" {
+test "acheron_session: multi-node discovery invoke supervision reconnect flow" {
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
 
     const allocator = std.testing.allocator;
     const spiderweb_node = @import("spiderweb_node");
 
-    var control_plane = fs_control_plane.ControlPlane.init(allocator);
+    var control_plane = control_plane_mod.ControlPlane.init(allocator);
     defer control_plane.deinit();
 
     const ensured_alpha = try control_plane.ensureNode("edge-alpha", "ws://127.0.0.1:18891/v2/fs", 60_000);
@@ -15163,7 +15163,7 @@ test "fsrpc_session: multi-node discovery invoke supervision reconnect flow" {
 
     const alpha_upsert = try std.fmt.allocPrint(
         allocator,
-        "{{\"node_id\":\"{s}\",\"node_secret\":\"{s}\",\"services\":[{{\"service_id\":\"echo-main\",\"kind\":\"utility\",\"version\":\"1\",\"state\":\"online\",\"endpoints\":[\"/nodes/{s}/echo\"],\"capabilities\":{{\"invoke\":true}},\"mounts\":[{{\"mount_id\":\"echo-main\",\"mount_path\":\"/nodes/{s}/echo\",\"state\":\"online\"}}],\"ops\":{{\"model\":\"namespace\",\"style\":\"plan9\"}},\"runtime\":{{\"type\":\"native_proc\",\"abi\":\"namespace-driver-v1\"}},\"permissions\":{{\"default\":\"deny-by-default\",\"allow_roles\":[\"admin\",\"user\"]}},\"schema\":{{\"model\":\"namespace-service-v1\"}},\"help_md\":\"Echo main service\"}}]}}",
+        "{{\"node_id\":\"{s}\",\"node_secret\":\"{s}\",\"venoms\":[{{\"venom_id\":\"echo-main\",\"kind\":\"utility\",\"version\":\"1\",\"state\":\"online\",\"endpoints\":[\"/nodes/{s}/echo\"],\"capabilities\":{{\"invoke\":true}},\"mounts\":[{{\"mount_id\":\"echo-main\",\"mount_path\":\"/nodes/{s}/echo\",\"state\":\"online\"}}],\"ops\":{{\"model\":\"namespace\",\"style\":\"plan9\"}},\"runtime\":{{\"type\":\"native_proc\",\"abi\":\"namespace-driver-v1\"}},\"permissions\":{{\"default\":\"deny-by-default\",\"allow_roles\":[\"admin\",\"user\"]}},\"schema\":{{\"model\":\"namespace-service-v1\"}},\"help_md\":\"Echo main service\"}}]}}",
         .{ escaped_alpha_id, escaped_alpha_secret, escaped_alpha_id, escaped_alpha_id },
     );
     defer allocator.free(alpha_upsert);
@@ -15172,7 +15172,7 @@ test "fsrpc_session: multi-node discovery invoke supervision reconnect flow" {
 
     const beta_upsert = try std.fmt.allocPrint(
         allocator,
-        "{{\"node_id\":\"{s}\",\"node_secret\":\"{s}\",\"services\":[{{\"service_id\":\"fail-main\",\"kind\":\"utility\",\"version\":\"1\",\"state\":\"online\",\"endpoints\":[\"/nodes/{s}/fail\"],\"capabilities\":{{\"invoke\":true,\"supervision\":true}},\"mounts\":[{{\"mount_id\":\"fail-main\",\"mount_path\":\"/nodes/{s}/fail\",\"state\":\"online\"}}],\"ops\":{{\"model\":\"namespace\",\"style\":\"plan9\"}},\"runtime\":{{\"type\":\"native_proc\",\"abi\":\"namespace-driver-v1\"}},\"permissions\":{{\"default\":\"deny-by-default\",\"allow_roles\":[\"admin\",\"user\"]}},\"schema\":{{\"model\":\"namespace-service-v1\"}},\"help_md\":\"Failing service\"}}]}}",
+        "{{\"node_id\":\"{s}\",\"node_secret\":\"{s}\",\"venoms\":[{{\"venom_id\":\"fail-main\",\"kind\":\"utility\",\"version\":\"1\",\"state\":\"online\",\"endpoints\":[\"/nodes/{s}/fail\"],\"capabilities\":{{\"invoke\":true,\"supervision\":true}},\"mounts\":[{{\"mount_id\":\"fail-main\",\"mount_path\":\"/nodes/{s}/fail\",\"state\":\"online\"}}],\"ops\":{{\"model\":\"namespace\",\"style\":\"plan9\"}},\"runtime\":{{\"type\":\"native_proc\",\"abi\":\"namespace-driver-v1\"}},\"permissions\":{{\"default\":\"deny-by-default\",\"allow_roles\":[\"admin\",\"user\"]}},\"schema\":{{\"model\":\"namespace-service-v1\"}},\"help_md\":\"Failing service\"}}]}}",
         .{ escaped_beta_id, escaped_beta_secret, escaped_beta_id, escaped_beta_id },
     );
     defer allocator.free(beta_upsert);
@@ -15202,8 +15202,8 @@ test "fsrpc_session: multi-node discovery invoke supervision reconnect flow" {
     const nodes_root = discovered_session.lookupChild(discovered_session.root_id, "nodes") orelse return error.TestExpectedResponse;
     const alpha_dir = discovered_session.lookupChild(nodes_root, alpha_node_id.string) orelse return error.TestExpectedResponse;
     const beta_dir = discovered_session.lookupChild(nodes_root, beta_node_id.string) orelse return error.TestExpectedResponse;
-    const alpha_services = discovered_session.lookupChild(alpha_dir, "services") orelse return error.TestExpectedResponse;
-    const beta_services = discovered_session.lookupChild(beta_dir, "services") orelse return error.TestExpectedResponse;
+    const alpha_services = discovered_session.lookupChild(alpha_dir, "venoms") orelse return error.TestExpectedResponse;
+    const beta_services = discovered_session.lookupChild(beta_dir, "venoms") orelse return error.TestExpectedResponse;
     try std.testing.expect(discovered_session.lookupChild(alpha_services, "echo-main") != null);
     try std.testing.expect(discovered_session.lookupChild(beta_services, "fail-main") != null);
 
@@ -15216,8 +15216,8 @@ test "fsrpc_session: multi-node discovery invoke supervision reconnect flow" {
                 .source_kind = .namespace,
                 .source_id = "service:fail-main",
                 .ro = false,
-                .namespace_service = .{
-                    .service_id = "fail-main",
+                .namespace_venom = .{
+                    .venom_id = "fail-main",
                     .runtime_kind = .native_proc,
                     .executable_path = "sh",
                     .args = &.{ "-lc", "exit 9" },
@@ -15395,19 +15395,19 @@ test "fsrpc_session: multi-node discovery invoke supervision reconnect flow" {
     try std.testing.expect(std.mem.indexOf(u8, recovered_status_node.content, "\"state\":\"online\"") != null);
 }
 
-test "fsrpc_session: runtime failure normalization redacts provider details" {
+test "acheron_session: runtime failure normalization redacts provider details" {
     const normalized = chat_runtime_job.normalizeRuntimeFailureForAgent("provider_request_invalid", "provider request invalid");
     try std.testing.expectEqualStrings("runtime_internal_limit", normalized.code);
     try std.testing.expectEqualStrings("Temporary internal runtime limit reached; retry this request.", normalized.message);
 }
 
-test "fsrpc_session: missing provider API key is surfaced directly" {
+test "acheron_session: missing provider API key is surfaced directly" {
     const normalized = chat_runtime_job.normalizeRuntimeFailureForAgent("execution_failed", "missing provider api key");
     try std.testing.expectEqualStrings("execution_failed", normalized.code);
     try std.testing.expectEqualStrings("missing provider api key", normalized.message);
 }
 
-test "fsrpc_session: runtime loop-guard text is classified as internal failure" {
+test "acheron_session: runtime loop-guard text is classified as internal failure" {
     try std.testing.expect(chat_runtime_job.isInternalRuntimeLoopGuardText("I hit an internal reasoning loop while preparing that response. Please retry."));
     const normalized = chat_runtime_job.normalizeRuntimeFailureForAgent("execution_failed", "provider tool loop exceeded limits");
     try std.testing.expectEqualStrings("runtime_protocol_error", normalized.code);

@@ -2,19 +2,19 @@ const std = @import("std");
 
 const max_policy_bytes: usize = 1024 * 1024;
 
-pub const ResourcePolicy = struct {
+pub const WorkspaceResourcePolicy = struct {
     fs: bool = true,
     camera: bool = false,
     screen: bool = false,
     user: bool = false,
 };
 
-pub const NodePolicy = struct {
+pub const WorkspaceNodePolicy = struct {
     id: []u8,
-    resources: ResourcePolicy = .{},
+    resources: WorkspaceResourcePolicy = .{},
     terminals: std.ArrayListUnmanaged([]u8) = .{},
 
-    fn deinit(self: *NodePolicy, allocator: std.mem.Allocator) void {
+    fn deinit(self: *WorkspaceNodePolicy, allocator: std.mem.Allocator) void {
         allocator.free(self.id);
         for (self.terminals.items) |terminal| allocator.free(terminal);
         self.terminals.deinit(allocator);
@@ -22,12 +22,12 @@ pub const NodePolicy = struct {
     }
 };
 
-pub const ProjectLink = struct {
+pub const WorkspaceProjectLink = struct {
     name: []u8,
     node_id: []u8,
     resource: []u8,
 
-    fn deinit(self: *ProjectLink, allocator: std.mem.Allocator) void {
+    fn deinit(self: *WorkspaceProjectLink, allocator: std.mem.Allocator) void {
         allocator.free(self.name);
         allocator.free(self.node_id);
         allocator.free(self.resource);
@@ -35,14 +35,14 @@ pub const ProjectLink = struct {
     }
 };
 
-pub const Policy = struct {
+pub const WorkspacePolicy = struct {
     show_debug: bool = false,
     project_id: []u8,
-    nodes: std.ArrayListUnmanaged(NodePolicy) = .{},
+    nodes: std.ArrayListUnmanaged(WorkspaceNodePolicy) = .{},
     visible_agents: std.ArrayListUnmanaged([]u8) = .{},
-    project_links: std.ArrayListUnmanaged(ProjectLink) = .{},
+    project_links: std.ArrayListUnmanaged(WorkspaceProjectLink) = .{},
 
-    pub fn deinit(self: *Policy, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *WorkspacePolicy, allocator: std.mem.Allocator) void {
         allocator.free(self.project_id);
         for (self.nodes.items) |*node| node.deinit(allocator);
         self.nodes.deinit(allocator);
@@ -61,23 +61,23 @@ pub const LoadOptions = struct {
     projects_dir: []const u8 = "projects",
 };
 
-pub fn load(allocator: std.mem.Allocator, options: LoadOptions) !Policy {
+pub fn loadWorkspacePolicy(allocator: std.mem.Allocator, options: LoadOptions) !WorkspacePolicy {
     var policy = try initDefaults(allocator, options);
     errdefer policy.deinit(allocator);
 
-    // Policy lookup is project-scoped so all actors in the same project share
+    // WorkspacePolicy lookup is project-scoped so all actors in the same project share
     // one namespace view regardless of active agent identity.
     const project_policy_path = try std.fs.path.join(allocator, &.{ options.projects_dir, policy.project_id, "project_policy.json" });
     defer allocator.free(project_policy_path);
-    try applyPolicyFile(allocator, &policy, options.agent_id, project_policy_path);
+    try applyWorkspacePolicyFile(allocator, &policy, options.agent_id, project_policy_path);
 
     try ensureDefaults(allocator, &policy, options.agent_id);
     return policy;
 }
 
-fn initDefaults(allocator: std.mem.Allocator, options: LoadOptions) !Policy {
+fn initDefaults(allocator: std.mem.Allocator, options: LoadOptions) !WorkspacePolicy {
     const project_seed = options.project_id orelse "system";
-    var policy = Policy{
+    var policy = WorkspacePolicy{
         .show_debug = std.mem.eql(u8, options.agent_id, "mother"),
         .project_id = try allocator.dupe(u8, project_seed),
     };
@@ -91,9 +91,9 @@ fn initDefaults(allocator: std.mem.Allocator, options: LoadOptions) !Policy {
 
 fn appendDefaultLocalNode(
     allocator: std.mem.Allocator,
-    nodes: *std.ArrayListUnmanaged(NodePolicy),
+    nodes: *std.ArrayListUnmanaged(WorkspaceNodePolicy),
 ) !void {
-    var node = NodePolicy{
+    var node = WorkspaceNodePolicy{
         .id = try allocator.dupe(u8, "local"),
         .resources = .{
             .fs = true,
@@ -107,12 +107,12 @@ fn appendDefaultLocalNode(
     try nodes.append(allocator, node);
 }
 
-fn appendDefaultProjectLinks(allocator: std.mem.Allocator, policy: *Policy) !void {
+fn appendDefaultProjectLinks(allocator: std.mem.Allocator, policy: *WorkspacePolicy) !void {
     for (policy.nodes.items) |node| {
         if (!node.resources.fs) continue;
         const link_name = try std.fmt.allocPrint(allocator, "{s}::fs", .{node.id});
         errdefer allocator.free(link_name);
-        var link = ProjectLink{
+        var link = WorkspaceProjectLink{
             .name = link_name,
             .node_id = try allocator.dupe(u8, node.id),
             .resource = try allocator.dupe(u8, "fs"),
@@ -124,7 +124,7 @@ fn appendDefaultProjectLinks(allocator: std.mem.Allocator, policy: *Policy) !voi
 
 fn ensureDefaults(
     allocator: std.mem.Allocator,
-    policy: *Policy,
+    policy: *WorkspacePolicy,
     agent_id: []const u8,
 ) !void {
     if (policy.nodes.items.len == 0) {
@@ -146,7 +146,7 @@ fn ensureDefaults(
     if (policy.project_links.items.len == 0 and policy.nodes.items.len > 0) {
         const link_name = try std.fmt.allocPrint(allocator, "{s}::fs", .{policy.nodes.items[0].id});
         errdefer allocator.free(link_name);
-        var link = ProjectLink{
+        var link = WorkspaceProjectLink{
             .name = link_name,
             .node_id = try allocator.dupe(u8, policy.nodes.items[0].id),
             .resource = try allocator.dupe(u8, "fs"),
@@ -156,29 +156,29 @@ fn ensureDefaults(
     }
 }
 
-fn applyPolicyFile(
+fn applyWorkspacePolicyFile(
     allocator: std.mem.Allocator,
-    policy: *Policy,
+    policy: *WorkspacePolicy,
     agent_id: []const u8,
     path: []const u8,
 ) !void {
     const raw = std.fs.cwd().readFileAlloc(allocator, path, max_policy_bytes) catch |err| switch (err) {
         error.FileNotFound => return,
         else => {
-            std.log.warn("world policy load skipped for {s}: {s}", .{ path, @errorName(err) });
+            std.log.warn("workspace policy load skipped for {s}: {s}", .{ path, @errorName(err) });
             return;
         },
     };
     defer allocator.free(raw);
 
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch |err| {
-        std.log.warn("world policy parse skipped for {s}: {s}", .{ path, @errorName(err) });
+        std.log.warn("workspace policy parse skipped for {s}: {s}", .{ path, @errorName(err) });
         return;
     };
     defer parsed.deinit();
 
     if (parsed.value != .object) {
-        std.log.warn("world policy parse skipped for {s}: root is not object", .{path});
+        std.log.warn("workspace policy parse skipped for {s}: root is not object", .{path});
         return;
     }
     const obj = parsed.value.object;
@@ -203,7 +203,7 @@ fn applyPolicyFile(
     }
 
     if (obj.get("project_links")) |raw_links| {
-        try replaceProjectLinksFromValue(allocator, &policy.project_links, raw_links);
+        try replaceWorkspaceProjectLinksFromValue(allocator, &policy.project_links, raw_links);
     }
 
     if (!sliceListContains(policy.visible_agents.items, agent_id)) {
@@ -213,7 +213,7 @@ fn applyPolicyFile(
 
 fn replaceNodesFromValue(
     allocator: std.mem.Allocator,
-    nodes: *std.ArrayListUnmanaged(NodePolicy),
+    nodes: *std.ArrayListUnmanaged(WorkspaceNodePolicy),
     value: std.json.Value,
 ) !void {
     if (value != .array) return;
@@ -227,7 +227,7 @@ fn replaceNodesFromValue(
         const raw_id = obj.get("id") orelse continue;
         if (raw_id != .string or raw_id.string.len == 0) continue;
 
-        var node = NodePolicy{
+        var node = WorkspaceNodePolicy{
             .id = try allocator.dupe(u8, raw_id.string),
             .resources = .{},
         };
@@ -283,9 +283,9 @@ fn replaceVisibleAgentsFromValue(
     }
 }
 
-fn replaceProjectLinksFromValue(
+fn replaceWorkspaceProjectLinksFromValue(
     allocator: std.mem.Allocator,
-    project_links: *std.ArrayListUnmanaged(ProjectLink),
+    project_links: *std.ArrayListUnmanaged(WorkspaceProjectLink),
     value: std.json.Value,
 ) !void {
     if (value != .array) return;
@@ -313,7 +313,7 @@ fn replaceProjectLinksFromValue(
             try std.fmt.allocPrint(allocator, "{s}::{s}", .{ raw_node_id.string, resource });
         errdefer allocator.free(resolved_name);
 
-        var link = ProjectLink{
+        var link = WorkspaceProjectLink{
             .name = resolved_name,
             .node_id = try allocator.dupe(u8, raw_node_id.string),
             .resource = try allocator.dupe(u8, resource),
@@ -330,9 +330,9 @@ fn sliceListContains(items: []const []u8, value: []const u8) bool {
     return false;
 }
 
-test "world_policy: defaults provide a usable world view" {
+test "workspace_policy: defaults provide a usable workspace view" {
     const allocator = std.testing.allocator;
-    var policy = try load(
+    var policy = try loadWorkspacePolicy(
         allocator,
         .{
             .agent_id = "mother",

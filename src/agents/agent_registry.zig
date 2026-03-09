@@ -1,5 +1,5 @@
 const std = @import("std");
-const identity = @import("identity.zig");
+const identity = @import("../identity.zig");
 
 pub const AgentCapability = enum {
     chat,

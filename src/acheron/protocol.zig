@@ -328,7 +328,7 @@ fn parseOptionalU64(root: std.json.ObjectMap, name: []const u8) !?u64 {
     return @intCast(value.integer);
 }
 
-test "fs_protocol: parseRequest reads envelope and args" {
+test "acheron_protocol: parseRequest reads envelope and args" {
     const allocator = std.testing.allocator;
     const payload =
         \\{"t":"req","id":7,"op":"LOOKUP","node":42,"a":{"name":"hello.txt"}}
@@ -342,7 +342,7 @@ test "fs_protocol: parseRequest reads envelope and args" {
     try std.testing.expectEqualStrings("hello.txt", getRequiredString(parsed.args, "name").?);
 }
 
-test "fs_protocol: parseRequest rejects unknown op" {
+test "acheron_protocol: parseRequest rejects unknown op" {
     const allocator = std.testing.allocator;
     const payload =
         \\{"t":"req","id":1,"op":"UNKNOWN"}
@@ -350,7 +350,7 @@ test "fs_protocol: parseRequest rejects unknown op" {
     try std.testing.expectError(RequestError.UnsupportedOperation, parseRequest(allocator, payload));
 }
 
-test "fs_protocol: parseRequest defaults missing args to empty object" {
+test "acheron_protocol: parseRequest defaults missing args to empty object" {
     const allocator = std.testing.allocator;
     const payload =
         \\{"t":"req","id":9,"op":"LOOKUP","node":42,"name":"hello.txt"}
@@ -362,7 +362,7 @@ test "fs_protocol: parseRequest defaults missing args to empty object" {
     try std.testing.expect(getRequiredString(parsed.args, "name") == null);
 }
 
-test "fs_protocol: buildErrorResponse escapes message" {
+test "acheron_protocol: buildErrorResponse escapes message" {
     const allocator = std.testing.allocator;
     const msg = "bad \"quote\"\n";
     const response = try buildErrorResponse(allocator, 1, Errno.EINVAL, msg);
@@ -372,7 +372,7 @@ test "fs_protocol: buildErrorResponse escapes message" {
     try std.testing.expect(std.mem.indexOf(u8, response, "\\\"quote\\\"") != null);
 }
 
-test "fs_protocol: invalidation event build + parse roundtrip" {
+test "acheron_protocol: invalidation event build + parse roundtrip" {
     const allocator = std.testing.allocator;
     const payload = try buildInvalidationEvent(allocator, .{
         .INVAL = .{

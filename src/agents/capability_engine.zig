@@ -6,101 +6,62 @@ const brain_context = @import("brain_context.zig");
 const event_bus = @import("ziggy-runtime-hooks").event_bus;
 const tool_registry = @import("ziggy-tool-runtime").tool_registry;
 
-pub const RemoteToolDispatchFn = *const fn (
+pub const RemoteCapabilityDispatchFn = *const fn (
     ctx: *anyopaque,
     allocator: std.mem.Allocator,
     tool_name: []const u8,
     args_json: []const u8,
 ) tool_registry.ToolExecutionResult;
 
-pub const ToolResult = struct {
+pub const CapabilityResult = struct {
     tool_name: []u8,
     success: bool,
     payload_json: []u8,
 
-    pub fn deinit(self: *ToolResult, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *CapabilityResult, allocator: std.mem.Allocator) void {
         allocator.free(self.tool_name);
         allocator.free(self.payload_json);
         self.* = undefined;
     }
 };
 
-pub const ToolSchema = struct {
+pub const CapabilitySchema = struct {
     name: []const u8,
     description: []const u8,
     required_fields: []const []const u8,
     optional_fields: []const []const u8 = &.{},
 };
 
-pub const brain_tool_schemas = [_]ToolSchema{
+pub const agent_capability_schemas = [_]CapabilitySchema{
     .{ .name = "memory_load", .description = "Load memory by mem_id and optional version", .required_fields = &[_][]const u8{"mem_id"}, .optional_fields = &[_][]const u8{"version"} },
     .{ .name = "memory_versions", .description = "List available versions for a memory", .required_fields = &[_][]const u8{"mem_id"}, .optional_fields = &[_][]const u8{"limit"} },
     .{ .name = "memory_evict", .description = "Evict memory by mem_id unless it is marked unevictable", .required_fields = &[_][]const u8{"mem_id"} },
     .{ .name = "memory_mutate", .description = "Mutate memory by mem_id unless it is write_protected", .required_fields = &[_][]const u8{ "mem_id", "content" } },
     .{ .name = "memory_create", .description = "Create memory entry. Optional flags: write_protected, unevictable.", .required_fields = &[_][]const u8{ "kind", "content" }, .optional_fields = &[_][]const u8{ "name", "write_protected", "unevictable" } },
     .{ .name = "memory_search", .description = "Keyword search memory entries", .required_fields = &[_][]const u8{"query"}, .optional_fields = &[_][]const u8{"limit"} },
-    .{ .name = "wait_for", .description = "Wait for correlated talk/event", .required_fields = &[_][]const u8{"events"} },
     .{ .name = "talk_user", .description = "Send message to user channel", .required_fields = &[_][]const u8{"message"} },
     .{ .name = "talk_agent", .description = "Send message to another agent channel", .required_fields = &[_][]const u8{ "message", "target_brain" } },
     .{ .name = "talk_brain", .description = "Send message to another brain", .required_fields = &[_][]const u8{ "message", "target_brain" } },
     .{ .name = "talk_log", .description = "Emit runtime log talk event", .required_fields = &[_][]const u8{"message"} },
 };
 
-const WaitEventSpec = struct {
-    event_type: event_bus.EventType,
-    parameter: []u8,
-    talk_id: ?event_bus.TalkId,
-
-    fn deinit(self: *WaitEventSpec, allocator: std.mem.Allocator) void {
-        allocator.free(self.parameter);
-        self.* = undefined;
-    }
-};
-
-const WaitEvaluation = struct {
-    requested_count: usize,
-    matched_indices: []usize,
-
-    fn deinit(self: *WaitEvaluation, allocator: std.mem.Allocator) void {
-        allocator.free(self.matched_indices);
-        self.* = undefined;
-    }
-
-    fn isSatisfied(self: *const WaitEvaluation) bool {
-        return self.matched_indices.len == self.requested_count;
-    }
-};
-
 const ExecuteOutcome = struct {
-    result: ToolResult,
-    blocked_on_wait: bool = false,
-    talk_id: ?event_bus.TalkId = null,
+    result: CapabilityResult,
 };
 
-const TalkOutcome = struct {
-    result: ToolResult,
-    talk_id: event_bus.TalkId,
-};
-
-const PendingWaitResolution = union(enum) {
-    none,
-    waiting,
-    resolved: ToolResult,
-};
-
-pub const Engine = struct {
+pub const CapabilityEngine = struct {
     allocator: std.mem.Allocator,
     runtime_memory: *memory.RuntimeMemory,
     bus: *event_bus.EventBus,
-    world_tools: ?*const tool_registry.ToolRegistry = null,
-    world_tool_dispatch_ctx: ?*anyopaque = null,
-    world_tool_dispatch_fn: ?RemoteToolDispatchFn = null,
+    capability_registry: ?*const tool_registry.ToolRegistry = null,
+    capability_dispatch_ctx: ?*anyopaque = null,
+    capability_dispatch_fn: ?RemoteCapabilityDispatchFn = null,
 
     pub fn init(
         allocator: std.mem.Allocator,
         runtime_memory: *memory.RuntimeMemory,
         bus: *event_bus.EventBus,
-    ) Engine {
+    ) CapabilityEngine {
         return .{
             .allocator = allocator,
             .runtime_memory = runtime_memory,
@@ -108,73 +69,62 @@ pub const Engine = struct {
         };
     }
 
-    pub fn initWithWorldTools(
+    pub fn initWithCapabilities(
         allocator: std.mem.Allocator,
         runtime_memory: *memory.RuntimeMemory,
         bus: *event_bus.EventBus,
-        world_tools: ?*const tool_registry.ToolRegistry,
-    ) Engine {
+        capability_registry: ?*const tool_registry.ToolRegistry,
+    ) CapabilityEngine {
         return .{
             .allocator = allocator,
             .runtime_memory = runtime_memory,
             .bus = bus,
-            .world_tools = world_tools,
+            .capability_registry = capability_registry,
         };
     }
 
-    pub fn initWithWorldToolsAndDispatch(
+    pub fn initWithCapabilitiesAndDispatch(
         allocator: std.mem.Allocator,
         runtime_memory: *memory.RuntimeMemory,
         bus: *event_bus.EventBus,
-        world_tools: ?*const tool_registry.ToolRegistry,
-        world_tool_dispatch_ctx: ?*anyopaque,
-        world_tool_dispatch_fn: ?RemoteToolDispatchFn,
-    ) Engine {
+        capability_registry: ?*const tool_registry.ToolRegistry,
+        capability_dispatch_ctx: ?*anyopaque,
+        capability_dispatch_fn: ?RemoteCapabilityDispatchFn,
+    ) CapabilityEngine {
         return .{
             .allocator = allocator,
             .runtime_memory = runtime_memory,
             .bus = bus,
-            .world_tools = world_tools,
-            .world_tool_dispatch_ctx = world_tool_dispatch_ctx,
-            .world_tool_dispatch_fn = world_tool_dispatch_fn,
+            .capability_registry = capability_registry,
+            .capability_dispatch_ctx = capability_dispatch_ctx,
+            .capability_dispatch_fn = capability_dispatch_fn,
         };
     }
 
-    pub fn executePending(self: *Engine, brain: *brain_context.BrainContext) ![]ToolResult {
-        var results = std.ArrayListUnmanaged(ToolResult){};
+    pub fn executePending(self: *CapabilityEngine, brain: *brain_context.BrainContext) ![]CapabilityResult {
+        var results = std.ArrayListUnmanaged(CapabilityResult){};
         errdefer {
             for (results.items) |*result| result.deinit(self.allocator);
             results.deinit(self.allocator);
         }
 
-        switch (try self.resolvePendingWait(brain)) {
-            .none => {},
-            .waiting => return results.toOwnedSlice(self.allocator),
-            .resolved => |resolved| try results.append(self.allocator, resolved),
-        }
-
-        var talk_ids = std.ArrayListUnmanaged(event_bus.TalkId){};
-        defer talk_ids.deinit(self.allocator);
-
         while (brain.pending_tool_uses.items.len > 0) {
             var tool_use = brain.pending_tool_uses.orderedRemove(0);
             defer tool_use.deinit(self.allocator);
 
-            const outcome = try self.executeOne(brain, tool_use, talk_ids.items);
+            const outcome = try self.executeOne(brain, tool_use);
             try results.append(self.allocator, outcome.result);
-            if (outcome.blocked_on_wait) break;
-            if (outcome.talk_id) |talk_id| try talk_ids.append(self.allocator, talk_id);
         }
 
         return results.toOwnedSlice(self.allocator);
     }
 
-    pub fn generateSchemasJson(self: *Engine) ![]u8 {
+    pub fn generateSchemasJson(self: *CapabilityEngine) ![]u8 {
         var out = std.ArrayListUnmanaged(u8){};
         defer out.deinit(self.allocator);
 
         try out.append(self.allocator, '[');
-        for (brain_tool_schemas, 0..) |schema, index| {
+        for (agent_capability_schemas, 0..) |schema, index| {
             if (index > 0) try out.append(self.allocator, ',');
 
             try out.appendSlice(self.allocator, "{\"name\":\"");
@@ -197,44 +147,10 @@ pub const Engine = struct {
         return out.toOwnedSlice(self.allocator);
     }
 
-    fn resolvePendingWait(self: *Engine, brain: *brain_context.BrainContext) !PendingWaitResolution {
-        const pending_wait_json = brain.pending_wait_json orelse return .none;
-
-        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, pending_wait_json, .{}) catch {
-            brain.clearPendingWait();
-            return .{ .resolved = try self.failure("wait_for", "invalid_state", "pending wait state is invalid") };
-        };
-        defer parsed.deinit();
-
-        if (parsed.value != .object) {
-            brain.clearPendingWait();
-            return .{ .resolved = try self.failure("wait_for", "invalid_state", "pending wait state must be an object") };
-        }
-
-        const specs = self.parseWaitSpecs(parsed.value.object, null) catch {
-            brain.clearPendingWait();
-            return .{ .resolved = try self.failure("wait_for", "invalid_state", "pending wait events are invalid") };
-        };
-        defer deinitWaitSpecs(self.allocator, specs);
-
-        var evaluation = try evaluateWaitSpecs(self.allocator, brain, specs);
-        defer evaluation.deinit(self.allocator);
-
-        if (!evaluation.isSatisfied()) {
-            return .waiting;
-        }
-
-        const payload = try buildWaitPayload(self.allocator, brain, specs, &evaluation, false);
-        brain.consumeInboxIndices(evaluation.matched_indices);
-        brain.clearPendingWait();
-        return .{ .resolved = try self.success("wait_for", payload) };
-    }
-
     fn executeOne(
-        self: *Engine,
+        self: *CapabilityEngine,
         brain: *brain_context.BrainContext,
         tool_use: brain_context.ToolUse,
-        talk_ids_in_batch: []const event_bus.TalkId,
     ) !ExecuteOutcome {
         var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, tool_use.args_json, .{}) catch {
             return .{ .result = try self.failure(tool_use.name, "invalid_args", "Tool args must be valid JSON object") };
@@ -264,31 +180,27 @@ pub const Engine = struct {
         if (std.mem.eql(u8, tool_use.name, "memory_search")) {
             return .{ .result = try self.execMemorySearch(tool_use.name, brain, args) };
         }
-        if (std.mem.eql(u8, tool_use.name, "wait_for")) {
-            return self.execWaitFor(tool_use.name, brain, args, talk_ids_in_batch);
-        }
         if (std.mem.eql(u8, tool_use.name, "talk_user") or
             std.mem.eql(u8, tool_use.name, "talk_agent") or
             std.mem.eql(u8, tool_use.name, "talk_brain") or
             std.mem.eql(u8, tool_use.name, "talk_log"))
         {
-            const talk = try self.execTalk(tool_use.name, brain, args);
-            return .{ .result = talk.result, .talk_id = talk.talk_id };
+            return .{ .result = try self.execTalk(tool_use.name, brain, args) };
         }
 
-        if (self.world_tools != null or self.world_tool_dispatch_fn != null) {
-            return .{ .result = try self.execWorldTool(tool_use.name, args) };
+        if (self.capability_registry != null or self.capability_dispatch_fn != null) {
+            return .{ .result = try self.execCapability(tool_use.name, args) };
         }
 
-        return .{ .result = try self.failure(tool_use.name, "unsupported_tool", "Unsupported brain tool") };
+        return .{ .result = try self.failure(tool_use.name, "unsupported_tool", "Unsupported agent capability") };
     }
 
-    fn execWorldTool(self: *Engine, tool_name: []const u8, args: std.json.ObjectMap) !ToolResult {
+    fn execCapability(self: *CapabilityEngine, tool_name: []const u8, args: std.json.ObjectMap) !CapabilityResult {
         const tool_call_id = if (args.get("_tool_call_id")) |value|
             if (value == .string) value.string else null
         else
             null;
-        const chat_reply_content = extractChatReplyContentForWorldTool(tool_name, args);
+        const chat_reply_content = extractChatReplyContentForCapability(tool_name, args);
         if (chat_reply_content) |reply| {
             const synthetic_payload = try buildSyntheticChatReplyPayload(self.allocator, args, reply);
             var synthetic_payload_owned = true;
@@ -310,10 +222,10 @@ pub const Engine = struct {
             return self.success(tool_name, synthetic_payload);
         }
         var outcome = blk: {
-            if (self.world_tool_dispatch_fn) |dispatch_fn| {
-                const dispatch_ctx = self.world_tool_dispatch_ctx orelse break :blk self.failureResult(
+            if (self.capability_dispatch_fn) |dispatch_fn| {
+                const dispatch_ctx = self.capability_dispatch_ctx orelse break :blk self.failureResult(
                     .execution_failed,
-                    "world tool dispatch context unavailable",
+                    "capability dispatch context unavailable",
                 );
 
                 const args_json = std.json.Stringify.valueAlloc(
@@ -325,24 +237,24 @@ pub const Engine = struct {
                     },
                 ) catch break :blk self.failureResult(
                     .execution_failed,
-                    "failed to serialize world tool arguments",
+                    "failed to serialize capability arguments",
                 );
                 defer self.allocator.free(args_json);
 
                 break :blk dispatch_fn(dispatch_ctx, self.allocator, tool_name, args_json);
             }
 
-            const world_tools = self.world_tools orelse break :blk self.failureResult(
+            const capability_registry = self.capability_registry orelse break :blk self.failureResult(
                 .tool_not_executable,
-                "Unsupported brain tool",
+                "Unsupported agent capability",
             );
-            break :blk world_tools.executeWorld(self.allocator, tool_name, args);
+            break :blk capability_registry.executeWorld(self.allocator, tool_name, args);
         };
         defer outcome.deinit(self.allocator);
 
         return switch (outcome) {
             .success => |ok| {
-                const success_payload = try decorateWorldToolSuccessPayload(
+                const success_payload = try decorateCapabilitySuccessPayload(
                     self.allocator,
                     ok.payload_json,
                     chat_reply_content,
@@ -384,7 +296,7 @@ pub const Engine = struct {
         };
     }
 
-    fn extractChatReplyContentForWorldTool(
+    fn extractChatReplyContentForCapability(
         tool_name: []const u8,
         args: std.json.ObjectMap,
     ) ?[]const u8 {
@@ -406,7 +318,7 @@ pub const Engine = struct {
         return std.mem.eql(u8, without_leading, "global/chat/control/reply");
     }
 
-    fn decorateWorldToolSuccessPayload(
+    fn decorateCapabilitySuccessPayload(
         allocator: std.mem.Allocator,
         payload_json: []const u8,
         chat_reply_content: ?[]const u8,
@@ -447,7 +359,7 @@ pub const Engine = struct {
     }
 
     fn failureResult(
-        self: *Engine,
+        self: *CapabilityEngine,
         code: tool_registry.ToolErrorCode,
         message: []const u8,
     ) tool_registry.ToolExecutionResult {
@@ -458,11 +370,11 @@ pub const Engine = struct {
     }
 
     fn execMemoryCreate(
-        self: *Engine,
+        self: *CapabilityEngine,
         tool_name: []const u8,
         brain: *brain_context.BrainContext,
         args: std.json.ObjectMap,
-    ) !ToolResult {
+    ) !CapabilityResult {
         const kind = getRequiredString(args, "kind") orelse {
             return self.failure(tool_name, "invalid_args", "memory_create requires 'kind'");
         };
@@ -501,7 +413,7 @@ pub const Engine = struct {
         return self.success(tool_name, payload);
     }
 
-    fn execMemoryLoad(self: *Engine, tool_name: []const u8, args: std.json.ObjectMap) !ToolResult {
+    fn execMemoryLoad(self: *CapabilityEngine, tool_name: []const u8, args: std.json.ObjectMap) !CapabilityResult {
         const mem_id = getRequiredString(args, "mem_id") orelse {
             return self.failure(tool_name, "invalid_args", "memory_load requires 'mem_id'");
         };
@@ -538,7 +450,7 @@ pub const Engine = struct {
         return self.success(tool_name, payload_json);
     }
 
-    fn execMemoryMutate(self: *Engine, tool_name: []const u8, args: std.json.ObjectMap) !ToolResult {
+    fn execMemoryMutate(self: *CapabilityEngine, tool_name: []const u8, args: std.json.ObjectMap) !CapabilityResult {
         const mem_id = getRequiredString(args, "mem_id") orelse {
             return self.failure(tool_name, "invalid_args", "memory_mutate requires 'mem_id'");
         };
@@ -561,7 +473,7 @@ pub const Engine = struct {
         return self.success(tool_name, payload);
     }
 
-    fn execMemoryVersions(self: *Engine, tool_name: []const u8, args: std.json.ObjectMap) !ToolResult {
+    fn execMemoryVersions(self: *CapabilityEngine, tool_name: []const u8, args: std.json.ObjectMap) !CapabilityResult {
         const mem_id = getRequiredString(args, "mem_id") orelse {
             return self.failure(tool_name, "invalid_args", "memory_versions requires 'mem_id'");
         };
@@ -602,7 +514,7 @@ pub const Engine = struct {
         return self.success(tool_name, try payload.toOwnedSlice(self.allocator));
     }
 
-    fn execMemoryEvict(self: *Engine, tool_name: []const u8, args: std.json.ObjectMap) !ToolResult {
+    fn execMemoryEvict(self: *CapabilityEngine, tool_name: []const u8, args: std.json.ObjectMap) !CapabilityResult {
         const mem_id = getRequiredString(args, "mem_id") orelse {
             return self.failure(tool_name, "invalid_args", "memory_evict requires 'mem_id'");
         };
@@ -621,11 +533,11 @@ pub const Engine = struct {
     }
 
     fn execMemorySearch(
-        self: *Engine,
+        self: *CapabilityEngine,
         tool_name: []const u8,
         brain: *brain_context.BrainContext,
         args: std.json.ObjectMap,
-    ) !ToolResult {
+    ) !CapabilityResult {
         const query = getRequiredString(args, "query") orelse {
             return self.failure(tool_name, "invalid_args", "memory_search requires 'query'");
         };
@@ -710,7 +622,7 @@ pub const Engine = struct {
     }
 
     fn appendMemorySearchResultRow(
-        self: *Engine,
+        self: *CapabilityEngine,
         payload: *std.ArrayListUnmanaged(u8),
         mem_id: []const u8,
         version: u64,
@@ -731,20 +643,20 @@ pub const Engine = struct {
         try payload.append(self.allocator, '}');
     }
 
-    fn markSeenMemId(self: *Engine, seen: *std.StringHashMapUnmanaged(void), mem_id: []const u8) !bool {
+    fn markSeenMemId(self: *CapabilityEngine, seen: *std.StringHashMapUnmanaged(void), mem_id: []const u8) !bool {
         if (seen.contains(mem_id)) return false;
         try seen.put(self.allocator, try self.allocator.dupe(u8, mem_id), {});
         return true;
     }
 
     fn execTalk(
-        self: *Engine,
+        self: *CapabilityEngine,
         tool_name: []const u8,
         brain: *brain_context.BrainContext,
         args: std.json.ObjectMap,
-    ) !TalkOutcome {
+    ) !CapabilityResult {
         const message = getRequiredString(args, "message") orelse {
-            return .{ .result = try self.failure(tool_name, "invalid_args", "talk_* requires 'message'"), .talk_id = 0 };
+            return self.failure(tool_name, "invalid_args", "talk_* requires 'message'");
         };
 
         const talk_id = brain.nextTalkId();
@@ -755,14 +667,14 @@ pub const Engine = struct {
             target_brain = "log";
         } else if (std.mem.eql(u8, tool_name, "talk_brain")) {
             target_brain = getRequiredString(args, "target_brain") orelse {
-                return .{ .result = try self.failure(tool_name, "invalid_args", "talk_brain requires 'target_brain'"), .talk_id = 0 };
+                return self.failure(tool_name, "invalid_args", "talk_brain requires 'target_brain'");
             };
         } else if (std.mem.eql(u8, tool_name, "talk_agent")) {
             target_brain = getRequiredString(args, "target_brain") orelse {
-                return .{ .result = try self.failure(tool_name, "invalid_args", "talk_agent requires 'target_brain'"), .talk_id = 0 };
+                return self.failure(tool_name, "invalid_args", "talk_agent requires 'target_brain'");
             };
             if (target_brain.len == 0 or std.mem.eql(u8, target_brain, "user")) {
-                return .{ .result = try self.failure(tool_name, "invalid_args", "talk_agent target_brain must be a non-user brain"), .talk_id = 0 };
+                return self.failure(tool_name, "invalid_args", "talk_agent target_brain must be a non-user brain");
             }
         }
 
@@ -773,7 +685,7 @@ pub const Engine = struct {
             .talk_id = talk_id,
             .payload = message,
         }) catch |err| {
-            return .{ .result = try self.failure(tool_name, "execution_failed", @errorName(err)), .talk_id = 0 };
+            return self.failure(tool_name, "execution_failed", @errorName(err));
         };
 
         var payload = std.ArrayListUnmanaged(u8){};
@@ -783,44 +695,10 @@ pub const Engine = struct {
         try payload.appendSlice(self.allocator, ",\"message\":\"");
         try appendJsonEscaped(self.allocator, &payload, message);
         try payload.appendSlice(self.allocator, "\"}");
-        return .{ .result = try self.success(tool_name, try payload.toOwnedSlice(self.allocator)), .talk_id = talk_id };
+        return self.success(tool_name, try payload.toOwnedSlice(self.allocator));
     }
 
-    fn execWaitFor(
-        self: *Engine,
-        tool_name: []const u8,
-        brain: *brain_context.BrainContext,
-        args: std.json.ObjectMap,
-        talk_ids_in_batch: []const event_bus.TalkId,
-    ) !ExecuteOutcome {
-        const default_talk_id: ?event_bus.TalkId = if (talk_ids_in_batch.len == 0) null else talk_ids_in_batch[talk_ids_in_batch.len - 1];
-        const specs = self.parseWaitSpecs(args, default_talk_id) catch {
-            return .{ .result = try self.failure(tool_name, "invalid_args", "wait_for requires non-empty 'events' with valid event_type/parameter/talk_id fields") };
-        };
-        defer deinitWaitSpecs(self.allocator, specs);
-
-        var evaluation = try evaluateWaitSpecs(self.allocator, brain, specs);
-        defer evaluation.deinit(self.allocator);
-
-        if (evaluation.isSatisfied()) {
-            const payload = try buildWaitPayload(self.allocator, brain, specs, &evaluation, false);
-            brain.consumeInboxIndices(evaluation.matched_indices);
-            brain.clearPendingWait();
-            return .{ .result = try self.success(tool_name, payload) };
-        }
-
-        const wait_json = try serializeWaitSpecs(self.allocator, specs);
-        defer self.allocator.free(wait_json);
-        try brain.setPendingWait(wait_json);
-
-        const waiting_payload = try buildWaitPayload(self.allocator, brain, specs, &evaluation, true);
-        return .{
-            .result = try self.success(tool_name, waiting_payload),
-            .blocked_on_wait = true,
-        };
-    }
-
-    fn success(self: *Engine, tool_name: []const u8, payload: []u8) !ToolResult {
+    fn success(self: *CapabilityEngine, tool_name: []const u8, payload: []u8) !CapabilityResult {
         return .{
             .tool_name = try self.allocator.dupe(u8, tool_name),
             .success = true,
@@ -828,7 +706,7 @@ pub const Engine = struct {
         };
     }
 
-    fn failure(self: *Engine, tool_name: []const u8, code: []const u8, message: []const u8) !ToolResult {
+    fn failure(self: *CapabilityEngine, tool_name: []const u8, code: []const u8, message: []const u8) !CapabilityResult {
         const payload = try std.fmt.allocPrint(
             self.allocator,
             "{{\"error\":{{\"code\":\"{s}\",\"message\":\"{s}\"}}}}",
@@ -841,226 +719,11 @@ pub const Engine = struct {
         };
     }
 
-    fn parseWaitSpecs(
-        self: *Engine,
-        args: std.json.ObjectMap,
-        default_talk_id: ?event_bus.TalkId,
-    ) ![]WaitEventSpec {
-        const events_value = args.get("events") orelse return error.InvalidWait;
-        if (events_value != .array or events_value.array.items.len == 0) return error.InvalidWait;
-
-        var specs = std.ArrayListUnmanaged(WaitEventSpec){};
-        errdefer {
-            for (specs.items) |*spec| spec.deinit(self.allocator);
-            specs.deinit(self.allocator);
-        }
-
-        for (events_value.array.items) |entry| {
-            if (entry != .object) return error.InvalidWait;
-            const event_obj = entry.object;
-
-            const event_type_raw = getRequiredString(event_obj, "event_type") orelse return error.InvalidWait;
-            const parsed_event_type = parseWaitEventType(event_type_raw) orelse return error.InvalidWait;
-
-            const parameter_raw = if (event_obj.get("parameter")) |value|
-                if (value == .string) value.string else return error.InvalidWait
-            else
-                "";
-
-            var talk_id = default_talk_id;
-            if (event_obj.get("talk_id")) |talk_value| {
-                if (talk_value == .null) {
-                    talk_id = null;
-                } else {
-                    if (talk_value != .integer or talk_value.integer < 0 or talk_value.integer > std.math.maxInt(event_bus.TalkId)) {
-                        return error.InvalidWait;
-                    }
-                    talk_id = if (talk_value.integer == 0) null else @intCast(talk_value.integer);
-                }
-            }
-
-            try specs.append(self.allocator, .{
-                .event_type = parsed_event_type,
-                .parameter = try self.allocator.dupe(u8, parameter_raw),
-                .talk_id = talk_id,
-            });
-        }
-
-        return specs.toOwnedSlice(self.allocator);
-    }
 };
 
-pub fn deinitResults(allocator: std.mem.Allocator, results: []ToolResult) void {
+pub fn deinitResults(allocator: std.mem.Allocator, results: []CapabilityResult) void {
     for (results) |*result| result.deinit(allocator);
     allocator.free(results);
-}
-
-fn evaluateWaitSpecs(
-    allocator: std.mem.Allocator,
-    brain: *brain_context.BrainContext,
-    specs: []const WaitEventSpec,
-) !WaitEvaluation {
-    var used = std.AutoHashMapUnmanaged(usize, void){};
-    defer used.deinit(allocator);
-
-    var matched_indices = std.ArrayListUnmanaged(usize){};
-    errdefer matched_indices.deinit(allocator);
-
-    for (specs) |spec| {
-        var found: ?usize = null;
-        for (brain.inbox.items, 0..) |event, index| {
-            if (used.contains(index)) continue;
-            if (!waitSpecMatchesEvent(&spec, &event)) continue;
-            found = index;
-            break;
-        }
-
-        if (found) |index| {
-            try matched_indices.append(allocator, index);
-            try used.put(allocator, index, {});
-        } else {
-            break;
-        }
-    }
-
-    return .{
-        .requested_count = specs.len,
-        .matched_indices = try matched_indices.toOwnedSlice(allocator),
-    };
-}
-
-fn waitSpecMatchesEvent(spec: *const WaitEventSpec, event: *const event_bus.Event) bool {
-    if (!waitEventTypeMatches(spec.event_type, event.event_type)) return false;
-
-    if (spec.talk_id) |required_talk_id| {
-        const event_talk_id = event.talk_id orelse return false;
-        if (event_talk_id != required_talk_id) return false;
-    }
-
-    return waitParameterMatches(spec, event);
-}
-
-fn waitEventTypeMatches(spec_type: event_bus.EventType, event_type: event_bus.EventType) bool {
-    return switch (spec_type) {
-        .user => event_type == .user,
-        .agent => event_type == .agent or event_type == .talk,
-        .time => event_type == .time,
-        .hook => event_type == .hook,
-        else => false,
-    };
-}
-
-fn waitParameterMatches(spec: *const WaitEventSpec, event: *const event_bus.Event) bool {
-    if (spec.parameter.len == 0) return true;
-
-    return switch (spec.event_type) {
-        .user => true,
-        .agent => std.mem.eql(u8, event.source_brain, spec.parameter) or std.mem.eql(u8, event.target_brain, spec.parameter),
-        .time => std.mem.eql(u8, event.payload, spec.parameter),
-        .hook => std.mem.eql(u8, event.payload, spec.parameter),
-        else => false,
-    };
-}
-
-fn serializeWaitSpecs(allocator: std.mem.Allocator, specs: []const WaitEventSpec) ![]u8 {
-    var out = std.ArrayListUnmanaged(u8){};
-    defer out.deinit(allocator);
-
-    try out.appendSlice(allocator, "{\"events\":[");
-    for (specs, 0..) |spec, index| {
-        if (index > 0) try out.append(allocator, ',');
-        try out.appendSlice(allocator, "{\"event_type\":\"");
-        try out.appendSlice(allocator, waitEventTypeName(spec.event_type));
-        try out.appendSlice(allocator, "\",\"parameter\":\"");
-        try appendJsonEscaped(allocator, &out, spec.parameter);
-        try out.appendSlice(allocator, "\",\"talk_id\":");
-        if (spec.talk_id) |talk_id| {
-            const text = try std.fmt.allocPrint(allocator, "{d}", .{talk_id});
-            defer allocator.free(text);
-            try out.appendSlice(allocator, text);
-        } else {
-            try out.appendSlice(allocator, "null");
-        }
-        try out.append(allocator, '}');
-    }
-    try out.appendSlice(allocator, "]}");
-
-    return out.toOwnedSlice(allocator);
-}
-
-fn buildWaitPayload(
-    allocator: std.mem.Allocator,
-    brain: *brain_context.BrainContext,
-    specs: []const WaitEventSpec,
-    evaluation: *const WaitEvaluation,
-    waiting: bool,
-) ![]u8 {
-    var out = std.ArrayListUnmanaged(u8){};
-    defer out.deinit(allocator);
-
-    try out.appendSlice(allocator, "{\"waiting\":");
-    try out.appendSlice(allocator, if (waiting) "true" else "false");
-
-    const matched_count_text = try std.fmt.allocPrint(allocator, "{d}", .{evaluation.matched_indices.len});
-    defer allocator.free(matched_count_text);
-    const requested_count_text = try std.fmt.allocPrint(allocator, "{d}", .{specs.len});
-    defer allocator.free(requested_count_text);
-
-    try out.appendSlice(allocator, ",\"matched_count\":");
-    try out.appendSlice(allocator, matched_count_text);
-    try out.appendSlice(allocator, ",\"requested_count\":");
-    try out.appendSlice(allocator, requested_count_text);
-    try out.appendSlice(allocator, ",\"matches\":[");
-
-    for (evaluation.matched_indices, 0..) |index, match_idx| {
-        if (match_idx > 0) try out.append(allocator, ',');
-
-        const event = brain.inbox.items[index];
-        try out.appendSlice(allocator, "{\"event_type\":\"");
-        try out.appendSlice(allocator, @tagName(event.event_type));
-        try out.appendSlice(allocator, "\",\"source\":\"");
-        try appendJsonEscaped(allocator, &out, event.source_brain);
-        try out.appendSlice(allocator, "\",\"target\":\"");
-        try appendJsonEscaped(allocator, &out, event.target_brain);
-        try out.appendSlice(allocator, "\",\"talk_id\":");
-        if (event.talk_id) |talk_id| {
-            const text = try std.fmt.allocPrint(allocator, "{d}", .{talk_id});
-            defer allocator.free(text);
-            try out.appendSlice(allocator, text);
-        } else {
-            try out.appendSlice(allocator, "null");
-        }
-        try out.appendSlice(allocator, ",\"payload\":\"");
-        try appendJsonEscaped(allocator, &out, event.payload);
-        try out.appendSlice(allocator, "\"}");
-    }
-
-    try out.appendSlice(allocator, "]}");
-    return out.toOwnedSlice(allocator);
-}
-
-fn deinitWaitSpecs(allocator: std.mem.Allocator, specs: []WaitEventSpec) void {
-    for (specs) |*spec| spec.deinit(allocator);
-    allocator.free(specs);
-}
-
-fn waitEventTypeName(event_type: event_bus.EventType) []const u8 {
-    return switch (event_type) {
-        .user => "user",
-        .agent => "agent",
-        .time => "time",
-        .hook => "hook",
-        .talk => "agent",
-        .tool => "hook",
-    };
-}
-
-fn parseWaitEventType(raw: []const u8) ?event_bus.EventType {
-    if (std.ascii.eqlIgnoreCase(raw, "user")) return .user;
-    if (std.ascii.eqlIgnoreCase(raw, "agent")) return .agent;
-    if (std.ascii.eqlIgnoreCase(raw, "time")) return .time;
-    if (std.ascii.eqlIgnoreCase(raw, "hook")) return .hook;
-    return null;
 }
 
 const BaseMemIdParts = struct {
@@ -1158,71 +821,8 @@ fn deinitEvents(allocator: std.mem.Allocator, events: []event_bus.Event) void {
     allocator.free(events);
 }
 
-test "brain_tools: wait_for without prior talk enters waiting state" {
-    const allocator = std.testing.allocator;
-    var mem = try memory.RuntimeMemory.init(allocator, "agentA");
-    defer mem.deinit();
-    var bus = event_bus.EventBus.init(allocator);
-    defer bus.deinit();
 
-    var brain = try brain_context.BrainContext.init(allocator, "primary");
-    defer brain.deinit();
-
-    try brain.queueToolUse("wait_for", "{\"events\":[{\"event_type\":\"agent\",\"parameter\":\"primary\"}]}");
-
-    var engine = Engine.init(allocator, &mem, &bus);
-    const results = try engine.executePending(&brain);
-    defer deinitResults(allocator, results);
-
-    try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expect(results[0].success);
-    try std.testing.expect(std.mem.indexOf(u8, results[0].payload_json, "\"waiting\":true") != null);
-    try std.testing.expect(brain.hasPendingWait());
-}
-
-test "brain_tools: talk then wait_for blocks until correlated event arrives" {
-    const allocator = std.testing.allocator;
-    var mem = try memory.RuntimeMemory.init(allocator, "agentA");
-    defer mem.deinit();
-    var bus = event_bus.EventBus.init(allocator);
-    defer bus.deinit();
-
-    var brain = try brain_context.BrainContext.init(allocator, "primary");
-    defer brain.deinit();
-
-    try brain.queueToolUse("talk_brain", "{\"message\":\"hello\",\"target_brain\":\"delegate\"}");
-    try brain.queueToolUse("wait_for", "{\"events\":[{\"event_type\":\"agent\",\"parameter\":\"delegate\"}]}");
-
-    var engine = Engine.init(allocator, &mem, &bus);
-    const first_results = try engine.executePending(&brain);
-    defer deinitResults(allocator, first_results);
-
-    try std.testing.expectEqual(@as(usize, 2), first_results.len);
-    try std.testing.expect(first_results[0].success);
-    try std.testing.expect(first_results[1].success);
-    try std.testing.expect(std.mem.indexOf(u8, first_results[1].payload_json, "\"waiting\":true") != null);
-    try std.testing.expect(brain.hasPendingWait());
-
-    try brain.pushInbox(.{
-        .event_type = .agent,
-        .source_brain = try allocator.dupe(u8, "delegate"),
-        .target_brain = try allocator.dupe(u8, "primary"),
-        .talk_id = 1,
-        .payload = try allocator.dupe(u8, "ack"),
-        .created_at_ms = std.time.milliTimestamp(),
-    });
-
-    const second_results = try engine.executePending(&brain);
-    defer deinitResults(allocator, second_results);
-
-    try std.testing.expectEqual(@as(usize, 1), second_results.len);
-    try std.testing.expect(second_results[0].success);
-    try std.testing.expect(std.mem.indexOf(u8, second_results[0].payload_json, "\"waiting\":false") != null);
-    try std.testing.expect(!brain.hasPendingWait());
-    try std.testing.expectEqual(@as(usize, 0), brain.inbox.items.len);
-}
-
-test "brain_tools: memory_mutate requires mem_id" {
+test "capability_engine: memory_mutate requires mem_id" {
     const allocator = std.testing.allocator;
     var mem = try memory.RuntimeMemory.init(allocator, "agentA");
     defer mem.deinit();
@@ -1234,7 +834,7 @@ test "brain_tools: memory_mutate requires mem_id" {
 
     try brain.queueToolUse("memory_mutate", "{\"content\":\"{}\"}");
 
-    var engine = Engine.init(allocator, &mem, &bus);
+    var engine = CapabilityEngine.init(allocator, &mem, &bus);
     const results = try engine.executePending(&brain);
     defer deinitResults(allocator, results);
 
@@ -1243,7 +843,7 @@ test "brain_tools: memory_mutate requires mem_id" {
     try std.testing.expect(std.mem.indexOf(u8, results[0].payload_json, "requires 'mem_id'") != null);
 }
 
-test "brain_tools: memory_create then memory_load succeeds" {
+test "capability_engine: memory_create then memory_load succeeds" {
     const allocator = std.testing.allocator;
     var mem = try memory.RuntimeMemory.init(allocator, "agentA");
     defer mem.deinit();
@@ -1255,7 +855,7 @@ test "brain_tools: memory_create then memory_load succeeds" {
 
     try brain.queueToolUse("memory_create", "{\"name\":\"draft\",\"kind\":\"note\",\"content\":{\"text\":\"draft content\"}}");
 
-    var engine = Engine.init(allocator, &mem, &bus);
+    var engine = CapabilityEngine.init(allocator, &mem, &bus);
     const create_results = try engine.executePending(&brain);
     defer deinitResults(allocator, create_results);
 
@@ -1278,7 +878,7 @@ test "brain_tools: memory_create then memory_load succeeds" {
     try std.testing.expect(std.mem.indexOf(u8, load_results[0].payload_json, "draft content") != null);
 }
 
-test "brain_tools: memory_versions returns latest-first history" {
+test "capability_engine: memory_versions returns latest-first history" {
     const allocator = std.testing.allocator;
     var mem = try memory.RuntimeMemory.init(allocator, "agentA");
     defer mem.deinit();
@@ -1300,7 +900,7 @@ test "brain_tools: memory_versions returns latest-first history" {
     defer allocator.free(args);
     try brain.queueToolUse("memory_versions", args);
 
-    var engine = Engine.init(allocator, &mem, &bus);
+    var engine = CapabilityEngine.init(allocator, &mem, &bus);
     const results = try engine.executePending(&brain);
     defer deinitResults(allocator, results);
 
@@ -1310,7 +910,7 @@ test "brain_tools: memory_versions returns latest-first history" {
     try std.testing.expect(std.mem.indexOf(u8, results[0].payload_json, "\"version\":1") != null);
 }
 
-test "brain_tools: memory_load escapes kind in JSON payload" {
+test "capability_engine: memory_load escapes kind in JSON payload" {
     const allocator = std.testing.allocator;
     var mem = try memory.RuntimeMemory.init(allocator, "agentA");
     defer mem.deinit();
@@ -1327,7 +927,7 @@ test "brain_tools: memory_load escapes kind in JSON payload" {
     defer allocator.free(load_args);
     try brain.queueToolUse("memory_load", load_args);
 
-    var engine = Engine.init(allocator, &mem, &bus);
+    var engine = CapabilityEngine.init(allocator, &mem, &bus);
     const load_results = try engine.executePending(&brain);
     defer deinitResults(allocator, load_results);
 
@@ -1339,7 +939,7 @@ test "brain_tools: memory_load escapes kind in JSON payload" {
     try std.testing.expectEqualStrings("note \"x\" \\ slash\nline", loaded_kind);
 }
 
-test "brain_tools: memory_mutate success bumps version" {
+test "capability_engine: memory_mutate success bumps version" {
     const allocator = std.testing.allocator;
     var mem = try memory.RuntimeMemory.init(allocator, "agentA");
     defer mem.deinit();
@@ -1356,7 +956,7 @@ test "brain_tools: memory_mutate success bumps version" {
     defer allocator.free(mutate_args);
     try brain.queueToolUse("memory_mutate", mutate_args);
 
-    var engine = Engine.init(allocator, &mem, &bus);
+    var engine = CapabilityEngine.init(allocator, &mem, &bus);
     const results = try engine.executePending(&brain);
     defer deinitResults(allocator, results);
 
@@ -1365,7 +965,7 @@ test "brain_tools: memory_mutate success bumps version" {
     try std.testing.expect(std.mem.indexOf(u8, results[0].payload_json, "\"version\":2") != null);
 }
 
-test "brain_tools: memory_evict success and missing mem_id failure" {
+test "capability_engine: memory_evict success and missing mem_id failure" {
     const allocator = std.testing.allocator;
     var mem = try memory.RuntimeMemory.init(allocator, "agentA");
     defer mem.deinit();
@@ -1383,7 +983,7 @@ test "brain_tools: memory_evict success and missing mem_id failure" {
     try brain.queueToolUse("memory_evict", evict_args);
     try brain.queueToolUse("memory_evict", "{}");
 
-    var engine = Engine.init(allocator, &mem, &bus);
+    var engine = CapabilityEngine.init(allocator, &mem, &bus);
     const results = try engine.executePending(&brain);
     defer deinitResults(allocator, results);
 
@@ -1394,7 +994,7 @@ test "brain_tools: memory_evict success and missing mem_id failure" {
     try std.testing.expect(std.mem.indexOf(u8, results[1].payload_json, "requires 'mem_id'") != null);
 }
 
-test "brain_tools: memory_search returns matching mem_id set" {
+test "capability_engine: memory_search returns matching mem_id set" {
     const allocator = std.testing.allocator;
     var mem = try memory.RuntimeMemory.init(allocator, "agentA");
     defer mem.deinit();
@@ -1411,7 +1011,7 @@ test "brain_tools: memory_search returns matching mem_id set" {
 
     try brain.queueToolUse("memory_search", "{\"query\":\"compile\",\"limit\":10}");
 
-    var engine = Engine.init(allocator, &mem, &bus);
+    var engine = CapabilityEngine.init(allocator, &mem, &bus);
     const results = try engine.executePending(&brain);
     defer deinitResults(allocator, results);
 
@@ -1421,7 +1021,7 @@ test "brain_tools: memory_search returns matching mem_id set" {
     try std.testing.expect(std.mem.indexOf(u8, results[0].payload_json, docs_item.mem_id) == null);
 }
 
-test "brain_tools: memory_search includes persisted matches after restart" {
+test "capability_engine: memory_search includes persisted matches after restart" {
     const allocator = std.testing.allocator;
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
@@ -1450,7 +1050,7 @@ test "brain_tools: memory_search includes persisted matches after restart" {
     defer brain.deinit();
     try brain.queueToolUse("memory_search", "{\"query\":\"persisted_compile\",\"limit\":10}");
 
-    var engine = Engine.init(allocator, &mem_reader, &bus);
+    var engine = CapabilityEngine.init(allocator, &mem_reader, &bus);
     const results = try engine.executePending(&brain);
     defer deinitResults(allocator, results);
 
@@ -1459,7 +1059,7 @@ test "brain_tools: memory_search includes persisted matches after restart" {
     try std.testing.expect(std.mem.indexOf(u8, results[0].payload_json, "persisted_compile") != null);
 }
 
-test "brain_tools: talk_user emits user-targeted event" {
+test "capability_engine: talk_user emits user-targeted event" {
     const allocator = std.testing.allocator;
     var mem = try memory.RuntimeMemory.init(allocator, "agentA");
     defer mem.deinit();
@@ -1470,7 +1070,7 @@ test "brain_tools: talk_user emits user-targeted event" {
     defer brain.deinit();
     try brain.queueToolUse("talk_user", "{\"message\":\"hello user\"}");
 
-    var engine = Engine.init(allocator, &mem, &bus);
+    var engine = CapabilityEngine.init(allocator, &mem, &bus);
     const results = try engine.executePending(&brain);
     defer deinitResults(allocator, results);
 
@@ -1485,7 +1085,7 @@ test "brain_tools: talk_user emits user-targeted event" {
     try std.testing.expectEqual(@as(?event_bus.TalkId, talk_id), user_events[0].talk_id);
 }
 
-test "brain_tools: talk payload preserves JSON validity for escaped content" {
+test "capability_engine: talk payload preserves JSON validity for escaped content" {
     const allocator = std.testing.allocator;
     var mem = try memory.RuntimeMemory.init(allocator, "agentA");
     defer mem.deinit();
@@ -1496,7 +1096,7 @@ test "brain_tools: talk payload preserves JSON validity for escaped content" {
     defer brain.deinit();
     try brain.queueToolUse("talk_user", "{\"message\":\"quote \\\"line\\\"\\\\path\\nnext\"}");
 
-    var engine = Engine.init(allocator, &mem, &bus);
+    var engine = CapabilityEngine.init(allocator, &mem, &bus);
     const results = try engine.executePending(&brain);
     defer deinitResults(allocator, results);
 
@@ -1508,7 +1108,7 @@ test "brain_tools: talk payload preserves JSON validity for escaped content" {
     try std.testing.expectEqualStrings("quote \"line\"\\path\nnext", payload_message);
 }
 
-test "brain_tools: talk_agent emits delegated event" {
+test "capability_engine: talk_agent emits delegated event" {
     const allocator = std.testing.allocator;
     var mem = try memory.RuntimeMemory.init(allocator, "agentA");
     defer mem.deinit();
@@ -1519,7 +1119,7 @@ test "brain_tools: talk_agent emits delegated event" {
     defer brain.deinit();
     try brain.queueToolUse("talk_agent", "{\"message\":\"handoff\",\"target_brain\":\"delegate\"}");
 
-    var engine = Engine.init(allocator, &mem, &bus);
+    var engine = CapabilityEngine.init(allocator, &mem, &bus);
     const results = try engine.executePending(&brain);
     defer deinitResults(allocator, results);
 
@@ -1533,7 +1133,7 @@ test "brain_tools: talk_agent emits delegated event" {
     try std.testing.expectEqual(@as(?event_bus.TalkId, talk_id), delegate_events[0].talk_id);
 }
 
-test "brain_tools: talk_agent requires explicit target_brain" {
+test "capability_engine: talk_agent requires explicit target_brain" {
     const allocator = std.testing.allocator;
     var mem = try memory.RuntimeMemory.init(allocator, "agentA");
     defer mem.deinit();
@@ -1544,7 +1144,7 @@ test "brain_tools: talk_agent requires explicit target_brain" {
     defer brain.deinit();
     try brain.queueToolUse("talk_agent", "{\"message\":\"handoff\"}");
 
-    var engine = Engine.init(allocator, &mem, &bus);
+    var engine = CapabilityEngine.init(allocator, &mem, &bus);
     const results = try engine.executePending(&brain);
     defer deinitResults(allocator, results);
 
@@ -1554,7 +1154,7 @@ test "brain_tools: talk_agent requires explicit target_brain" {
     try std.testing.expectEqual(@as(usize, 0), bus.pendingCount());
 }
 
-test "brain_tools: talk_agent rejects user target to avoid delivery leak" {
+test "capability_engine: talk_agent rejects user target to avoid delivery leak" {
     const allocator = std.testing.allocator;
     var mem = try memory.RuntimeMemory.init(allocator, "agentA");
     defer mem.deinit();
@@ -1565,7 +1165,7 @@ test "brain_tools: talk_agent rejects user target to avoid delivery leak" {
     defer brain.deinit();
     try brain.queueToolUse("talk_agent", "{\"message\":\"handoff\",\"target_brain\":\"user\"}");
 
-    var engine = Engine.init(allocator, &mem, &bus);
+    var engine = CapabilityEngine.init(allocator, &mem, &bus);
     const results = try engine.executePending(&brain);
     defer deinitResults(allocator, results);
 
@@ -1575,7 +1175,7 @@ test "brain_tools: talk_agent rejects user target to avoid delivery leak" {
     try std.testing.expectEqual(@as(usize, 0), bus.pendingCount());
 }
 
-test "brain_tools: talk_log emits log-targeted event" {
+test "capability_engine: talk_log emits log-targeted event" {
     const allocator = std.testing.allocator;
     var mem = try memory.RuntimeMemory.init(allocator, "agentA");
     defer mem.deinit();
@@ -1586,7 +1186,7 @@ test "brain_tools: talk_log emits log-targeted event" {
     defer brain.deinit();
     try brain.queueToolUse("talk_log", "{\"message\":\"log line\"}");
 
-    var engine = Engine.init(allocator, &mem, &bus);
+    var engine = CapabilityEngine.init(allocator, &mem, &bus);
     const results = try engine.executePending(&brain);
     defer deinitResults(allocator, results);
 
@@ -1600,7 +1200,7 @@ test "brain_tools: talk_log emits log-targeted event" {
     try std.testing.expectEqual(@as(?event_bus.TalkId, talk_id), log_events[0].talk_id);
 }
 
-test "brain_tools: talk_brain requires target_brain" {
+test "capability_engine: talk_brain requires target_brain" {
     const allocator = std.testing.allocator;
     var mem = try memory.RuntimeMemory.init(allocator, "agentA");
     defer mem.deinit();
@@ -1611,102 +1211,11 @@ test "brain_tools: talk_brain requires target_brain" {
     defer brain.deinit();
     try brain.queueToolUse("talk_brain", "{\"message\":\"missing target\"}");
 
-    var engine = Engine.init(allocator, &mem, &bus);
+    var engine = CapabilityEngine.init(allocator, &mem, &bus);
     const results = try engine.executePending(&brain);
     defer deinitResults(allocator, results);
 
     try std.testing.expectEqual(@as(usize, 1), results.len);
     try std.testing.expect(!results[0].success);
     try std.testing.expect(std.mem.indexOf(u8, results[0].payload_json, "talk_brain requires 'target_brain'") != null);
-}
-
-test "brain_tools: wait_for honors explicit talk_id correlation" {
-    const allocator = std.testing.allocator;
-    var mem = try memory.RuntimeMemory.init(allocator, "agentA");
-    defer mem.deinit();
-    var bus = event_bus.EventBus.init(allocator);
-    defer bus.deinit();
-
-    var brain = try brain_context.BrainContext.init(allocator, "primary");
-    defer brain.deinit();
-    brain.next_talk_id = 41;
-
-    try brain.queueToolUse("talk_user", "{\"message\":\"first\"}");
-    try brain.queueToolUse("talk_brain", "{\"message\":\"second\",\"target_brain\":\"delegate\"}");
-    try brain.queueToolUse("wait_for", "{\"events\":[{\"event_type\":\"agent\",\"parameter\":\"delegate\",\"talk_id\":42}]}");
-
-    var engine = Engine.init(allocator, &mem, &bus);
-    const first_results = try engine.executePending(&brain);
-    defer deinitResults(allocator, first_results);
-    try std.testing.expectEqual(@as(usize, 3), first_results.len);
-    try std.testing.expect(std.mem.indexOf(u8, first_results[2].payload_json, "\"waiting\":true") != null);
-    try std.testing.expect(brain.hasPendingWait());
-
-    try brain.pushInbox(.{
-        .event_type = .agent,
-        .source_brain = try allocator.dupe(u8, "delegate"),
-        .target_brain = try allocator.dupe(u8, "primary"),
-        .talk_id = 41,
-        .payload = try allocator.dupe(u8, "wrong"),
-        .created_at_ms = std.time.milliTimestamp(),
-    });
-
-    const unresolved = try engine.executePending(&brain);
-    defer deinitResults(allocator, unresolved);
-    try std.testing.expectEqual(@as(usize, 0), unresolved.len);
-    try std.testing.expect(brain.hasPendingWait());
-
-    try brain.pushInbox(.{
-        .event_type = .agent,
-        .source_brain = try allocator.dupe(u8, "delegate"),
-        .target_brain = try allocator.dupe(u8, "primary"),
-        .talk_id = 42,
-        .payload = try allocator.dupe(u8, "right"),
-        .created_at_ms = std.time.milliTimestamp(),
-    });
-
-    const resolved = try engine.executePending(&brain);
-    defer deinitResults(allocator, resolved);
-    try std.testing.expectEqual(@as(usize, 1), resolved.len);
-    try std.testing.expect(std.mem.indexOf(u8, resolved[0].payload_json, "\"waiting\":false") != null);
-    try std.testing.expect(!brain.hasPendingWait());
-    try std.testing.expectEqual(@as(usize, 1), brain.inbox.items.len);
-}
-
-test "brain_tools: wait_for talk_id zero disables default talk correlation" {
-    const allocator = std.testing.allocator;
-    var mem = try memory.RuntimeMemory.init(allocator, "agentA");
-    defer mem.deinit();
-    var bus = event_bus.EventBus.init(allocator);
-    defer bus.deinit();
-
-    var brain = try brain_context.BrainContext.init(allocator, "primary");
-    defer brain.deinit();
-    brain.next_talk_id = 41;
-
-    try brain.queueToolUse("talk_user", "{\"message\":\"first\"}");
-    try brain.queueToolUse("talk_brain", "{\"message\":\"second\",\"target_brain\":\"delegate\"}");
-    try brain.queueToolUse("wait_for", "{\"events\":[{\"event_type\":\"agent\",\"parameter\":\"delegate\",\"talk_id\":0}]}");
-
-    var engine = Engine.init(allocator, &mem, &bus);
-    const first_results = try engine.executePending(&brain);
-    defer deinitResults(allocator, first_results);
-    try std.testing.expectEqual(@as(usize, 3), first_results.len);
-    try std.testing.expect(std.mem.indexOf(u8, first_results[2].payload_json, "\"waiting\":true") != null);
-    try std.testing.expect(brain.hasPendingWait());
-
-    try brain.pushInbox(.{
-        .event_type = .agent,
-        .source_brain = try allocator.dupe(u8, "delegate"),
-        .target_brain = try allocator.dupe(u8, "primary"),
-        .talk_id = 41,
-        .payload = try allocator.dupe(u8, "from old talk"),
-        .created_at_ms = std.time.milliTimestamp(),
-    });
-
-    const resolved = try engine.executePending(&brain);
-    defer deinitResults(allocator, resolved);
-    try std.testing.expectEqual(@as(usize, 1), resolved.len);
-    try std.testing.expect(std.mem.indexOf(u8, resolved[0].payload_json, "\"waiting\":false") != null);
-    try std.testing.expect(!brain.hasPendingWait());
 }

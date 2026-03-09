@@ -1,5 +1,5 @@
 const std = @import("std");
-const fs_protocol = @import("fs_protocol.zig");
+const acheron_protocol = @import("protocol.zig");
 const unified = @import("spider-protocol").unified;
 
 const request_response_timeout_ms: i32 = 15_000;
@@ -8,7 +8,7 @@ const max_event_frames_per_pump: usize = 256;
 
 pub const ClientResponse = struct {
     ok: bool,
-    err_no: i32 = fs_protocol.Errno.SUCCESS,
+    err_no: i32 = acheron_protocol.Errno.SUCCESS,
     err_msg: []u8 = &.{},
     result_json: []u8 = &.{},
 
@@ -18,7 +18,7 @@ pub const ClientResponse = struct {
     }
 };
 
-pub const EventCallback = *const fn (ctx: ?*anyopaque, event: fs_protocol.InvalidationEvent) void;
+pub const EventCallback = *const fn (ctx: ?*anyopaque, event: acheron_protocol.InvalidationEvent) void;
 
 pub const FsClient = struct {
     allocator: std.mem.Allocator,
@@ -46,7 +46,7 @@ pub const FsClient = struct {
 
     pub fn call(
         self: *FsClient,
-        op: fs_protocol.Op,
+        op: acheron_protocol.Op,
         node: ?u64,
         handle: ?u64,
         args_json: ?[]const u8,
@@ -55,7 +55,7 @@ pub const FsClient = struct {
     ) !ClientResponse {
         const req_id = self.next_id;
         self.next_id +%= 1;
-        const expected_type = fsrpcResponseType(op);
+        const expected_type = acheronResponseType(op);
         const deadline_ms = std.time.milliTimestamp() + @as(i64, request_response_timeout_ms);
 
         const payload = try buildRequestJson(self.allocator, req_id, op, node, handle, args_json);
@@ -223,13 +223,13 @@ fn readHttpResponse(allocator: std.mem.Allocator, stream: *std.net.Stream, max_b
 fn buildRequestJson(
     allocator: std.mem.Allocator,
     req_id: u32,
-    op: fs_protocol.Op,
+    op: acheron_protocol.Op,
     node: ?u64,
     handle: ?u64,
     args_json: ?[]const u8,
 ) ![]u8 {
     const args = args_json orelse "{}";
-    const req_type = fsrpcRequestType(op);
+    const req_type = acheronRequestType(op);
     var payload = std.ArrayListUnmanaged(u8){};
     errdefer payload.deinit(allocator);
 
@@ -306,7 +306,7 @@ fn parseResponse(
     };
 }
 
-fn fsrpcRequestType(op: fs_protocol.Op) unified.FsrpcType {
+fn acheronRequestType(op: acheron_protocol.Op) unified.FsrpcType {
     return switch (op) {
         .HELLO => .fs_t_hello,
         .EXPORTS => .fs_t_exports,
@@ -334,7 +334,7 @@ fn fsrpcRequestType(op: fs_protocol.Op) unified.FsrpcType {
     };
 }
 
-fn fsrpcResponseType(op: fs_protocol.Op) unified.FsrpcType {
+fn acheronResponseType(op: acheron_protocol.Op) unified.FsrpcType {
     return switch (op) {
         .HELLO => .fs_r_hello,
         .EXPORTS => .fs_r_exports,
@@ -362,7 +362,7 @@ fn fsrpcResponseType(op: fs_protocol.Op) unified.FsrpcType {
     };
 }
 
-fn parseMaybeFsInvalidationEvent(allocator: std.mem.Allocator, payload: []const u8) !?fs_protocol.InvalidationEvent {
+fn parseMaybeFsInvalidationEvent(allocator: std.mem.Allocator, payload: []const u8) !?acheron_protocol.InvalidationEvent {
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
     defer parsed.deinit();
     if (parsed.value != .object) return null;
@@ -384,11 +384,11 @@ fn parseMaybeFsInvalidationEvent(allocator: std.mem.Allocator, payload: []const 
 
         const what = if (args.get("what")) |what_raw| blk: {
             if (what_raw != .string) return error.InvalidResponse;
-            if (std.mem.eql(u8, what_raw.string, "attr")) break :blk fs_protocol.InvalidationWhat.attr;
-            if (std.mem.eql(u8, what_raw.string, "data")) break :blk fs_protocol.InvalidationWhat.data;
-            if (std.mem.eql(u8, what_raw.string, "all")) break :blk fs_protocol.InvalidationWhat.all;
+            if (std.mem.eql(u8, what_raw.string, "attr")) break :blk acheron_protocol.InvalidationWhat.attr;
+            if (std.mem.eql(u8, what_raw.string, "data")) break :blk acheron_protocol.InvalidationWhat.data;
+            if (std.mem.eql(u8, what_raw.string, "all")) break :blk acheron_protocol.InvalidationWhat.all;
             return error.InvalidResponse;
-        } else fs_protocol.InvalidationWhat.all;
+        } else acheron_protocol.InvalidationWhat.all;
 
         const gen = if (args.get("gen")) |gen_raw| blk: {
             if (gen_raw != .integer or gen_raw.integer < 0) return error.InvalidResponse;
@@ -528,33 +528,33 @@ fn waitForReadable(stream: *std.net.Stream, timeout_ms: i32) !bool {
     return (revents & std.posix.POLL.IN) != 0;
 }
 
-test "fs_client: parseWsUrl supports explicit port" {
+test "acheron_client: parseWsUrl supports explicit port" {
     const parsed = try parseWsUrl("ws://127.0.0.1:18891/v2/fs");
     try std.testing.expectEqualStrings("127.0.0.1", parsed.host);
     try std.testing.expectEqual(@as(u16, 18891), parsed.port);
     try std.testing.expectEqualStrings("/v2/fs", parsed.path);
 }
 
-test "fs_client: parseWsUrl defaults path and port" {
+test "acheron_client: parseWsUrl defaults path and port" {
     const parsed = try parseWsUrl("ws://localhost");
     try std.testing.expectEqualStrings("localhost", parsed.host);
     try std.testing.expectEqual(@as(u16, 80), parsed.port);
     try std.testing.expectEqualStrings("/v2/fs", parsed.path);
 }
 
-test "fs_client: parseResponse rejects tag above u32 range" {
+test "acheron_client: parseResponse rejects tag above u32 range" {
     const allocator = std.testing.allocator;
     const payload = "{\"channel\":\"acheron\",\"type\":\"acheron.r_fs_hello\",\"tag\":4294967296,\"ok\":true,\"payload\":{}}";
     try std.testing.expectError(error.InvalidResponse, parseResponse(allocator, 1, .fs_r_hello, payload));
 }
 
-test "fs_client: parseResponse rejects fs error errno above i32 range" {
+test "acheron_client: parseResponse rejects fs error errno above i32 range" {
     const allocator = std.testing.allocator;
     const payload = "{\"channel\":\"acheron\",\"type\":\"acheron.err_fs\",\"tag\":1,\"ok\":false,\"error\":{\"errno\":2147483648,\"message\":\"boom\"}}";
     try std.testing.expectError(error.InvalidResponse, parseResponse(allocator, 1, .fs_r_hello, payload));
 }
 
-test "fs_client: parseResponse rejects fs error errno below i32 range" {
+test "acheron_client: parseResponse rejects fs error errno below i32 range" {
     const allocator = std.testing.allocator;
     const payload = "{\"channel\":\"acheron\",\"type\":\"acheron.err_fs\",\"tag\":1,\"ok\":false,\"error\":{\"errno\":-2147483649,\"message\":\"boom\"}}";
     try std.testing.expectError(error.InvalidResponse, parseResponse(allocator, 1, .fs_r_hello, payload));
