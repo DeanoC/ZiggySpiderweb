@@ -993,10 +993,8 @@ pub const RuntimeServer = struct {
         };
         if (try self.hasBootstrapCompleted(brain_name)) return null;
 
-        const template_name = if (std.mem.eql(u8, self.runtime.agent_id, self.default_agent_id))
-            "BOOTSTRAP.md"
-        else
-            "JUST_HATCHED.md";
+        if (!std.mem.eql(u8, self.runtime.agent_id, self.default_agent_id)) return null;
+        const template_name = "BOOTSTRAP.md";
         std.log.info("Using bootstrap template {s} for {s}/{s}", .{ template_name, self.runtime.agent_id, brain_name });
         const content = system_hooks.readTemplate(self.allocator, &self.runtime, template_name) catch |err| {
             std.log.warn("Failed to load bootstrap template {s}: {s}", .{ template_name, @errorName(err) });

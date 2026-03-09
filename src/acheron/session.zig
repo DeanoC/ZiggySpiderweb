@@ -13,6 +13,7 @@ const control_plane_mod = @import("control_plane.zig");
 const acheron_router = @import("router.zig");
 const agent_config = @import("../agents/agent_config.zig");
 const agent_registry = @import("../agents/agent_registry.zig");
+const memory_ownership = @import("../agents/memory_ownership.zig");
 
 const NodeKind = enum {
     dir,
@@ -7255,6 +7256,12 @@ pub const Session = struct {
                             first = false;
                             try writer.writeAll("\"memory_path\":");
                             try writeJsonString(writer, memory_path);
+
+                            if (memory_ownership.ownershipLabelFromMemId(entry.value_ptr.*.string)) |ownership| {
+                                try writer.writeByte(',');
+                                try writer.writeAll("\"ownership\":");
+                                try writeJsonString(writer, ownership);
+                            }
                             continue;
                         }
                     }
@@ -8142,7 +8149,14 @@ pub const Session = struct {
         if (!isValidManagedAgentId(new_agent_id)) return error.InvalidAgentId;
         if (std.mem.eql(u8, new_agent_id, "self")) return error.InvalidAgentId;
 
-        const template_path = extractOptionalStringByNames(args_obj, &.{ "template_path", "template" });
+        const metadata_obj = blk: {
+            if (args_obj.get("agent")) |value| {
+                if (value != .object) return error.InvalidPayload;
+                break :blk value.object;
+            }
+            break :blk args_obj;
+        };
+        const template_path = extractOptionalStringByNames(metadata_obj, &.{ "persona_pack", "persona", "template" });
         const desired_project_id = extractOptionalStringByNames(args_obj, &.{"project_id"});
         const desired_project_token = extractOptionalStringByNames(args_obj, &.{"project_token"});
 
@@ -8263,8 +8277,12 @@ pub const Session = struct {
             try writer.print("{}", .{agent.is_default});
             try writer.writeAll(",\"identity_loaded\":");
             try writer.print("{}", .{agent.identity_loaded});
-            try writer.writeAll(",\"needs_hatching\":");
-            try writer.print("{}", .{agent.needs_hatching});
+            try writer.writeAll(",\"persona_pack\":");
+            if (agent.persona_pack) |value| {
+                try writeJsonString(writer, value);
+            } else {
+                try writer.writeAll("null");
+            }
             try writer.writeAll(",\"capabilities\":[");
             for (agent.capabilities.items, 0..) |capability, cap_idx| {
                 if (cap_idx > 0) try writer.writeByte(',');
@@ -8322,12 +8340,45 @@ pub const Session = struct {
         var description_value: ?[]const u8 = null;
         var has_capabilities = false;
         var capabilities_value: ?std.json.Value = null;
+        var existing_persona_pack: ?[]u8 = null;
+        defer if (existing_persona_pack) |value| self.allocator.free(value);
+
+        const agent_dir = try std.fs.path.join(self.allocator, &.{ self.agents_dir, target_agent_id });
+        defer self.allocator.free(agent_dir);
+        const metadata_path = try std.fs.path.join(self.allocator, &.{ agent_dir, "agent.json" });
+        defer self.allocator.free(metadata_path);
+
+        const existing_content = std.fs.cwd().readFileAlloc(self.allocator, metadata_path, 128 * 1024) catch |err| switch (err) {
+            error.FileNotFound => null,
+            else => return err,
+        };
+        defer if (existing_content) |value| self.allocator.free(value);
+        if (existing_content) |value| {
+            var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, value, .{});
+            defer parsed.deinit();
+            if (parsed.value == .object) {
+                if (parsed.value.object.get("persona_pack")) |entry| {
+                    if (entry == .string) existing_persona_pack = try self.allocator.dupe(u8, entry.string);
+                }
+            }
+        }
 
         if (metadata_obj.get("name")) |value| {
             if (value == .string) name_value = value.string else if (value != .null) return error.InvalidPayload;
         }
         if (metadata_obj.get("description")) |value| {
             if (value == .string) description_value = value.string else if (value != .null) return error.InvalidPayload;
+        }
+        if (metadata_obj.get("persona_pack")) |value| {
+            if (value == .string) {
+                if (existing_persona_pack) |owned| self.allocator.free(owned);
+                existing_persona_pack = try self.allocator.dupe(u8, value.string);
+            } else if (value != .null) return error.InvalidPayload;
+        } else if (metadata_obj.get("persona")) |value| {
+            if (value == .string) {
+                if (existing_persona_pack) |owned| self.allocator.free(owned);
+                existing_persona_pack = try self.allocator.dupe(u8, value.string);
+            } else if (value != .null) return error.InvalidPayload;
         }
         if (metadata_obj.get("capabilities")) |value| {
             if (value == .array) {
@@ -8365,6 +8416,7 @@ pub const Session = struct {
         }
         if (has_capabilities) {
             if (!first) try writer.writeByte(',');
+            first = false;
             try writeJsonString(writer, "capabilities");
             try writer.writeByte(':');
             try writer.writeByte('[');
@@ -8377,15 +8429,17 @@ pub const Session = struct {
             }
             try writer.writeByte(']');
         }
+        if (existing_persona_pack) |value| {
+            if (!first) try writer.writeByte(',');
+            try writeJsonString(writer, "persona_pack");
+            try writer.writeByte(':');
+            try writeJsonString(writer, value);
+        }
         try writer.writeByte('}');
 
         const metadata_json = try out.toOwnedSlice(self.allocator);
         defer self.allocator.free(metadata_json);
-        const agent_dir = try std.fs.path.join(self.allocator, &.{ self.agents_dir, target_agent_id });
-        defer self.allocator.free(agent_dir);
         try std.fs.cwd().makePath(agent_dir);
-        const metadata_path = try std.fs.path.join(self.allocator, &.{ agent_dir, "agent.json" });
-        defer self.allocator.free(metadata_path);
         try std.fs.cwd().writeFile(.{
             .sub_path = metadata_path,
             .data = metadata_json,
@@ -12560,16 +12614,17 @@ test "acheron_session: agents namespace create/list provisions new agent when ca
     try std.testing.expect(std.mem.indexOf(u8, create_result, "\"activated\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, create_result, "\"activation_error\":null") != null);
 
-    const hatch_path = try std.fs.path.join(allocator, &.{ agents_dir, "builder", "HATCH.md" });
-    defer allocator.free(hatch_path);
-    const hatch_content = try std.fs.cwd().readFileAlloc(allocator, hatch_path, 64 * 1024);
-    defer allocator.free(hatch_content);
-    try std.testing.expect(hatch_content.len > 0);
+    const soul_path = try std.fs.path.join(allocator, &.{ agents_dir, "builder", "SOUL.md" });
+    defer allocator.free(soul_path);
+    const soul_content = try std.fs.cwd().readFileAlloc(allocator, soul_path, 64 * 1024);
+    defer allocator.free(soul_content);
+    try std.testing.expect(soul_content.len > 0);
 
     const metadata_path = try std.fs.path.join(allocator, &.{ agents_dir, "builder", "agent.json" });
     defer allocator.free(metadata_path);
     const metadata_content = try std.fs.cwd().readFileAlloc(allocator, metadata_path, 64 * 1024);
     defer allocator.free(metadata_content);
+    try std.testing.expect(std.mem.indexOf(u8, metadata_content, "\"persona_pack\":\"default\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, metadata_content, "\"name\":\"Builder\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, metadata_content, "\"capabilities\"") != null);
 
@@ -12593,6 +12648,7 @@ test "acheron_session: agents namespace create/list provisions new agent when ca
     defer allocator.free(list_result);
     try std.testing.expect(std.mem.indexOf(u8, list_result, "\"operation\":\"list\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, list_result, "\"agent_id\":\"builder\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, list_result, "\"persona_pack\":\"default\"") != null);
 }
 
 test "acheron_session: agents namespace create can activate a new agent into a requested project" {
@@ -12736,11 +12792,11 @@ test "acheron_session: agents namespace create reports activation errors without
     try std.testing.expect(std.mem.indexOf(u8, create_result, "\"activated\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, create_result, "\"activation_error\":\"ProjectNotFound\"") != null);
 
-    const hatch_path = try std.fs.path.join(allocator, &.{ agents_dir, "builder-missing-project", "HATCH.md" });
-    defer allocator.free(hatch_path);
-    const hatch_content = try std.fs.cwd().readFileAlloc(allocator, hatch_path, 64 * 1024);
-    defer allocator.free(hatch_content);
-    try std.testing.expect(hatch_content.len > 0);
+    const soul_path = try std.fs.path.join(allocator, &.{ agents_dir, "builder-missing-project", "SOUL.md" });
+    defer allocator.free(soul_path);
+    const soul_content = try std.fs.cwd().readFileAlloc(allocator, soul_path, 64 * 1024);
+    defer allocator.free(soul_content);
+    try std.testing.expect(soul_content.len > 0);
 }
 
 test "acheron_session: agents namespace create denies invoke without capability" {
@@ -13013,6 +13069,7 @@ test "acheron_session: first-class memory namespace operation file maps to runti
     );
     defer allocator.free(result_payload);
     try std.testing.expect(std.mem.indexOf(u8, result_payload, "\"memory_path\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result_payload, "\"ownership\":\"working_memory\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, result_payload, "\"name\":\"ns-memory\"") != null);
 
     const status_payload = try protocolReadFile(
@@ -13095,6 +13152,7 @@ test "acheron_session: memory load accepts memory_path identity" {
     );
     defer allocator.free(loaded_payload);
     try std.testing.expect(std.mem.indexOf(u8, loaded_payload, "\"memory_path\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, loaded_payload, "\"ownership\":\"working_memory\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, loaded_payload, memory_path_value.string) != null);
 }
 

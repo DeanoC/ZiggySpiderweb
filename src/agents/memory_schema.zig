@@ -1,19 +1,20 @@
 const std = @import("std");
 const agent_runtime = @import("agent_runtime.zig");
+const memory_ownership = @import("memory_ownership.zig");
 const memory = @import("ziggy-memory-store").memory;
 const memid = @import("ziggy-memory-store").memid;
 const protocol = @import("spider-protocol").protocol;
 
-pub const POLICY_MEM_NAME = "system.policy";
-pub const LOOP_CONTRACT_MEM_NAME = "system.loop_contract";
-pub const TOOL_CONTRACT_MEM_NAME = "system.tool_contract";
-pub const COMPLETION_CONTRACT_MEM_NAME = "system.completion_contract";
+pub const POLICY_MEM_NAME = memory_ownership.POLICY_MEM_NAME;
+pub const LOOP_CONTRACT_MEM_NAME = memory_ownership.LOOP_CONTRACT_MEM_NAME;
+pub const TOOL_CONTRACT_MEM_NAME = memory_ownership.TOOL_CONTRACT_MEM_NAME;
+pub const COMPLETION_CONTRACT_MEM_NAME = memory_ownership.COMPLETION_CONTRACT_MEM_NAME;
 
-pub const GOAL_ACTIVE_MEM_NAME = "goal.active";
-pub const PLAN_CURRENT_MEM_NAME = "plan.current";
-pub const RUN_PENDING_MEM_NAME = "run.pending";
-pub const CONTEXT_SUMMARY_MEM_NAME = "context.summary";
-pub const USER_PREFERENCES_MEM_NAME = "user.preferences";
+pub const GOAL_ACTIVE_MEM_NAME = memory_ownership.GOAL_ACTIVE_MEM_NAME;
+pub const PLAN_CURRENT_MEM_NAME = memory_ownership.PLAN_CURRENT_MEM_NAME;
+pub const RUN_PENDING_MEM_NAME = memory_ownership.RUN_PENDING_MEM_NAME;
+pub const CONTEXT_SUMMARY_MEM_NAME = memory_ownership.CONTEXT_SUMMARY_MEM_NAME;
+pub const USER_PREFERENCES_MEM_NAME = memory_ownership.USER_PREFERENCES_MEM_NAME;
 
 pub const POLICY_ROM_KEY = "policy:runtime";
 pub const LOOP_CONTRACT_ROM_KEY = "contract:loop";

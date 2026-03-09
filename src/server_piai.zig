@@ -6301,6 +6301,7 @@ fn ensureMotherAgentScaffold(allocator: std.mem.Allocator, runtime_config: Confi
         .sub_path = mother_json_path,
         .data =
         \\{
+        \\  "persona_pack": "default",
         \\  "name": "Mother",
         \\  "description": "System orchestration and bootstrap guardian",
         \\  "is_default": true,
@@ -9211,15 +9212,22 @@ fn appendAgentInfoJson(
     const escaped_description = try unified.jsonEscape(allocator, agent.description);
     defer allocator.free(escaped_description);
 
+    const persona_pack_json = if (agent.persona_pack) |value| blk: {
+        const escaped = try unified.jsonEscape(allocator, value);
+        defer allocator.free(escaped);
+        break :blk try std.fmt.allocPrint(allocator, "\"{s}\"", .{escaped});
+    } else try allocator.dupe(u8, "null");
+    defer allocator.free(persona_pack_json);
+
     try out.writer(allocator).print(
-        "{{\"id\":\"{s}\",\"name\":\"{s}\",\"description\":\"{s}\",\"is_default\":{s},\"identity_loaded\":{s},\"needs_hatching\":{s},\"capabilities\":[",
+        "{{\"id\":\"{s}\",\"name\":\"{s}\",\"description\":\"{s}\",\"is_default\":{s},\"identity_loaded\":{s},\"persona_pack\":{s},\"capabilities\":[",
         .{
             escaped_id,
             escaped_name,
             escaped_description,
             if (agent.is_default) "true" else "false",
             if (agent.identity_loaded) "true" else "false",
-            if (agent.needs_hatching) "true" else "false",
+            persona_pack_json,
         },
     );
 

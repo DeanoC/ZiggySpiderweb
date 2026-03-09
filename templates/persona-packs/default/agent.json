@@ -1,0 +1,5 @@
+{
+  "description": "Default Spider Monkey persona",
+  "capabilities": ["chat", "plan", "research"],
+  "persona_pack": "default"
+}
