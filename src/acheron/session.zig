@@ -260,6 +260,8 @@ const TerminalSession = struct {
     label: ?[]u8 = null,
     cwd: ?[]u8 = null,
     buffered_result: ?[]u8 = null,
+    replay_script: ?[]u8 = null,
+    pending_input: ?[]u8 = null,
     created_at_ms: i64 = 0,
     updated_at_ms: i64 = 0,
     last_exec_at_ms: i64 = 0,
@@ -273,6 +275,8 @@ const TerminalSession = struct {
         if (self.label) |value| allocator.free(value);
         if (self.cwd) |value| allocator.free(value);
         if (self.buffered_result) |value| allocator.free(value);
+        if (self.replay_script) |value| allocator.free(value);
+        if (self.pending_input) |value| allocator.free(value);
         self.* = undefined;
     }
 
@@ -3503,23 +3507,20 @@ pub const Session = struct {
         const write_bytes = try self.parseTerminalWriteBytes(obj);
         defer self.allocator.free(write_bytes);
         if (write_bytes.len == 0) return error.InvalidPayload;
+        try self.appendTerminalPendingInput(session, write_bytes);
 
-        const runtime_args = try self.buildTerminalWriteArgsJson(session.cwd, write_bytes);
-        defer self.allocator.free(runtime_args);
-
-        const runtime_payload = try self.executeServiceToolCall("shell_exec", runtime_args);
-        defer self.allocator.free(runtime_payload);
-        if (try self.extractErrorMessageFromToolPayload(runtime_payload)) |message| {
-            defer self.allocator.free(message);
-            session.updated_at_ms = std.time.milliTimestamp();
-            try self.setCurrentTerminalSession(session_id);
-            try self.refreshTerminalV2StateFiles();
-            try self.updateTerminalV2StatusAndResult("failed", "terminal_session_write", session_id, message, "write", "null");
-            return .{ .written = payload.len };
+        if (self.hasTerminalPendingCommand(session)) {
+            var exec_outcome = try self.executeTerminalSessionInput(session);
+            defer exec_outcome.deinit(self.allocator);
+            if (exec_outcome.error_message) |message| {
+                session.updated_at_ms = std.time.milliTimestamp();
+                try self.setCurrentTerminalSession(session_id);
+                try self.refreshTerminalV2StateFiles();
+                try self.updateTerminalV2StatusAndResult("failed", "terminal_session_write", session_id, message, "write", "null");
+                return .{ .written = payload.len };
+            }
+            try self.appendTerminalBufferedResult(session, exec_outcome.output);
         }
-        const terminal_output = try self.extractTerminalOutputBytesFromToolPayload(runtime_payload);
-        defer self.allocator.free(terminal_output);
-        try self.appendTerminalBufferedResult(session, terminal_output);
 
         const now_ms = std.time.milliTimestamp();
         session.updated_at_ms = now_ms;
@@ -3559,7 +3560,24 @@ pub const Session = struct {
             break :blk @as(usize, 64 * 1024);
         };
 
-        _ = timeout_ms;
+        var remaining_timeout_ms = timeout_ms;
+        while (session.buffered_result == null and !self.hasTerminalPendingCommand(session) and remaining_timeout_ms > 0) {
+            const wait_ms = @min(remaining_timeout_ms, 25);
+            std.Thread.sleep(@as(u64, @intCast(wait_ms)) * std.time.ns_per_ms);
+            remaining_timeout_ms -= wait_ms;
+        }
+        if (session.buffered_result == null and self.hasTerminalPendingCommand(session)) {
+            var exec_outcome = try self.executeTerminalSessionInput(session);
+            defer exec_outcome.deinit(self.allocator);
+            if (exec_outcome.error_message) |message| {
+                session.updated_at_ms = std.time.milliTimestamp();
+                try self.setCurrentTerminalSession(session_id);
+                try self.refreshTerminalV2StateFiles();
+                try self.updateTerminalV2StatusAndResult("failed", "terminal_session_read", session_id, message, "read", "null");
+                return .{ .written = payload.len };
+            }
+            try self.appendTerminalBufferedResult(session, exec_outcome.output);
+        }
         const visible_bytes = try self.consumeTerminalBufferedResult(session, max_bytes);
         defer self.allocator.free(visible_bytes);
 
@@ -3615,35 +3633,29 @@ pub const Session = struct {
             var session = self.terminal_sessions.getPtr(session_id) orelse return error.TerminalSessionNotFound;
             if (session.isClosed()) return error.TerminalSessionClosed;
 
-            const args_json = try self.buildTerminalExecArgsJson(obj, session.cwd);
-            defer self.allocator.free(args_json);
-            const runtime_payload = try self.executeServiceToolCall("shell_exec", args_json);
-            defer self.allocator.free(runtime_payload);
+            const command_bytes = try self.buildTerminalExecCommandBytes(obj);
+            defer self.allocator.free(command_bytes);
+            var exec_outcome = try self.executeTerminalSessionCommand(session, command_bytes);
+            defer exec_outcome.deinit(self.allocator);
 
             const now_ms = std.time.milliTimestamp();
             session.updated_at_ms = now_ms;
             session.last_exec_at_ms = now_ms;
             session.exec_count +%= 1;
-            session.write_count +%= 1;
-            session.read_count +%= 1;
             if (try jsonObjectOptionalString(obj, "cwd")) |next_cwd| {
                 if (session.cwd) |old| self.allocator.free(old);
                 session.cwd = try self.allocator.dupe(u8, next_cwd);
             }
-            if (try self.extractErrorMessageFromToolPayload(runtime_payload)) |message| {
-                defer self.allocator.free(message);
+            if (exec_outcome.error_message) |message| {
                 try self.setCurrentTerminalSession(session_id);
                 try self.refreshTerminalV2StateFiles();
                 try self.updateTerminalV2StatusAndResult("failed", "shell_exec", session_id, message, "exec", "null");
                 return .{ .written = payload.len };
             }
-            const terminal_output = try self.extractTerminalOutputBytesFromToolPayload(runtime_payload);
-            defer self.allocator.free(terminal_output);
-            try self.appendTerminalBufferedResult(session, terminal_output);
             try self.setCurrentTerminalSession(session_id);
             try self.refreshTerminalV2StateFiles();
 
-            const exec_result = try self.buildTerminalOutputResultJson(terminal_output, false);
+            const exec_result = try self.buildTerminalOutputResultJson(exec_outcome.output, false);
             defer self.allocator.free(exec_result);
             try self.updateTerminalV2StatusAndResult("done", "shell_exec", session_id, null, "exec", exec_result);
             return .{ .written = payload.len };
@@ -3666,8 +3678,82 @@ pub const Session = struct {
         session.buffered_result = try self.allocator.dupe(u8, payload);
     }
 
-    fn buildTerminalWriteArgsJson(self: *Session, cwd: ?[]const u8, write_bytes: []const u8) ![]u8 {
-        const shell_command = try self.buildTerminalWriteShellCommand(write_bytes);
+    const TerminalExecOutcome = struct {
+        output: []u8,
+        error_message: ?[]u8 = null,
+
+        fn deinit(self: *TerminalExecOutcome, allocator: std.mem.Allocator) void {
+            allocator.free(self.output);
+            if (self.error_message) |value| allocator.free(value);
+            self.* = undefined;
+        }
+    };
+
+    fn appendTerminalReplayScript(self: *Session, session: *TerminalSession, payload: []const u8) !void {
+        if (payload.len == 0) return;
+        if (session.replay_script) |existing| {
+            const merged = try self.allocator.alloc(u8, existing.len + payload.len);
+            @memcpy(merged[0..existing.len], existing);
+            @memcpy(merged[existing.len..], payload);
+            self.allocator.free(existing);
+            session.replay_script = merged;
+            return;
+        }
+        session.replay_script = try self.allocator.dupe(u8, payload);
+    }
+
+    fn appendTerminalPendingInput(self: *Session, session: *TerminalSession, payload: []const u8) !void {
+        if (payload.len == 0) return;
+        if (session.pending_input) |existing| {
+            const merged = try self.allocator.alloc(u8, existing.len + payload.len);
+            @memcpy(merged[0..existing.len], existing);
+            @memcpy(merged[existing.len..], payload);
+            self.allocator.free(existing);
+            session.pending_input = merged;
+            return;
+        }
+        session.pending_input = try self.allocator.dupe(u8, payload);
+    }
+
+    fn hasTerminalPendingCommand(self: *Session, session: *TerminalSession) bool {
+        _ = self;
+        const pending = session.pending_input orelse return false;
+        return pending.len > 0 and pending[pending.len - 1] == '\n';
+    }
+
+    fn executeTerminalSessionInput(self: *Session, session: *TerminalSession) !TerminalExecOutcome {
+        const pending = session.pending_input orelse return .{
+            .output = try self.allocator.alloc(u8, 0),
+        };
+        defer {
+            self.allocator.free(pending);
+            session.pending_input = null;
+        }
+        return self.executeTerminalSessionCommand(session, pending);
+    }
+
+    fn executeTerminalSessionCommand(self: *Session, session: *TerminalSession, command_bytes: []const u8) !TerminalExecOutcome {
+        const runtime_args = try self.buildTerminalWriteArgsJson(session.cwd, session.replay_script, command_bytes);
+        defer self.allocator.free(runtime_args);
+
+        const runtime_payload = try self.executeServiceToolCall("shell_exec", runtime_args);
+        defer self.allocator.free(runtime_payload);
+        if (try self.extractErrorMessageFromToolPayload(runtime_payload)) |message| {
+            return .{
+                .output = try self.allocator.alloc(u8, 0),
+                .error_message = message,
+            };
+        }
+        const terminal_output = try self.extractTerminalOutputBytesFromToolPayload(runtime_payload);
+        errdefer self.allocator.free(terminal_output);
+        try self.appendTerminalReplayScript(session, command_bytes);
+        return .{
+            .output = terminal_output,
+        };
+    }
+
+    fn buildTerminalWriteArgsJson(self: *Session, cwd: ?[]const u8, replay_script: ?[]const u8, write_bytes: []const u8) ![]u8 {
+        const shell_command = try self.buildTerminalWriteShellCommand(replay_script, write_bytes);
         defer self.allocator.free(shell_command);
         const escaped_command = try unified.jsonEscape(self.allocator, shell_command);
         defer self.allocator.free(escaped_command);
@@ -3684,11 +3770,24 @@ pub const Session = struct {
         return runtime_args.toOwnedSlice(self.allocator);
     }
 
-    fn buildTerminalWriteShellCommand(self: *Session, write_bytes: []const u8) ![]u8 {
+    fn buildTerminalWriteShellCommand(self: *Session, replay_script: ?[]const u8, write_bytes: []const u8) ![]u8 {
         var out = std.ArrayListUnmanaged(u8){};
         errdefer out.deinit(self.allocator);
+        if (replay_script) |history| {
+            if (history.len > 0) {
+                try out.appendSlice(self.allocator, "{ eval $'");
+                try self.appendTerminalAnsiCShellLiteral(&out, history);
+                try out.appendSlice(self.allocator, "'; } >/dev/null 2>&1\n");
+            }
+        }
         try out.appendSlice(self.allocator, "eval $'");
-        for (write_bytes) |byte| {
+        try self.appendTerminalAnsiCShellLiteral(&out, write_bytes);
+        try out.append(self.allocator, '\'');
+        return out.toOwnedSlice(self.allocator);
+    }
+
+    fn appendTerminalAnsiCShellLiteral(self: *Session, out: *std.ArrayListUnmanaged(u8), bytes: []const u8) !void {
+        for (bytes) |byte| {
             switch (byte) {
                 '\\' => try out.appendSlice(self.allocator, "\\\\"),
                 '\'' => try out.appendSlice(self.allocator, "\\'"),
@@ -3699,8 +3798,45 @@ pub const Session = struct {
                 else => try out.writer(self.allocator).print("\\x{x:0>2}", .{byte}),
             }
         }
+    }
+
+    fn buildTerminalExecCommandBytes(self: *Session, obj: std.json.ObjectMap) ![]u8 {
+        if (try jsonObjectOptionalString(obj, "command")) |command| {
+            var buf = std.ArrayListUnmanaged(u8){};
+            errdefer buf.deinit(self.allocator);
+            try buf.appendSlice(self.allocator, command);
+            if (command.len == 0 or command[command.len - 1] != '\n') try buf.append(self.allocator, '\n');
+            return buf.toOwnedSlice(self.allocator);
+        }
+        if (obj.get("argv")) |value| {
+            if (value != .array or value.array.items.len == 0) return error.InvalidPayload;
+            var buf = std.ArrayListUnmanaged(u8){};
+            errdefer buf.deinit(self.allocator);
+            for (value.array.items, 0..) |item, idx| {
+                if (item != .string) return error.InvalidPayload;
+                if (idx != 0) try buf.append(self.allocator, ' ');
+                try self.appendShellSingleQuoted(&buf, item.string);
+            }
+            try buf.append(self.allocator, '\n');
+            return buf.toOwnedSlice(self.allocator);
+        }
+        return error.InvalidPayload;
+    }
+
+    fn appendShellSingleQuoted(self: *Session, out: *std.ArrayListUnmanaged(u8), value: []const u8) !void {
         try out.append(self.allocator, '\'');
-        return out.toOwnedSlice(self.allocator);
+        var start: usize = 0;
+        while (start < value.len) {
+            if (std.mem.indexOfScalarPos(u8, value, start, '\'')) |idx| {
+                if (idx > start) try out.appendSlice(self.allocator, value[start..idx]);
+                try out.appendSlice(self.allocator, "'\\''");
+                start = idx + 1;
+                continue;
+            }
+            try out.appendSlice(self.allocator, value[start..]);
+            break;
+        }
+        try out.append(self.allocator, '\'');
     }
 
     fn extractTerminalOutputBytesFromToolPayload(self: *Session, payload_json: []const u8) ![]u8 {
@@ -13335,6 +13471,182 @@ test "acheron_session: terminal-v2 write accepts binary-safe data_b64 input" {
     defer allocator.free(status_payload);
     try std.testing.expect(std.mem.indexOf(u8, status_payload, "\"state\":\"done\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, status_payload, "\"session_id\":\"bin\"") != null);
+}
+
+test "acheron_session: terminal-v2 preserves shell state across writes" {
+    const allocator = std.testing.allocator;
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.init(allocator, runtime_handle, &job_index, "default");
+    defer session.deinit();
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        374,
+        375,
+        &.{ "agents", "self", "terminal", "control", "create.json" },
+        "{\"session_id\":\"state\",\"cwd\":\".\"}",
+        956,
+    );
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        376,
+        377,
+        &.{ "agents", "self", "terminal", "control", "write.json" },
+        "{\"session_id\":\"state\",\"input\":\"cd src\",\"append_newline\":true}",
+        957,
+    );
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        378,
+        379,
+        &.{ "agents", "self", "terminal", "control", "write.json" },
+        "{\"session_id\":\"state\",\"input\":\"pwd\",\"append_newline\":true}",
+        958,
+    );
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        380,
+        381,
+        &.{ "agents", "self", "terminal", "control", "read.json" },
+        "{\"session_id\":\"state\",\"timeout_ms\":100,\"max_bytes\":65536}",
+        959,
+    );
+
+    const result_payload = try protocolReadFile(
+        &session,
+        allocator,
+        382,
+        383,
+        &.{ "agents", "self", "terminal", "result.json" },
+        960,
+    );
+    defer allocator.free(result_payload);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, result_payload, .{});
+    defer parsed.deinit();
+    const result_obj = parsed.value.object.get("result") orelse return error.TestExpectedResponse;
+    if (result_obj != .object) return error.TestExpectedResponse;
+    const data_b64 = result_obj.object.get("data_b64") orelse return error.TestExpectedResponse;
+    if (data_b64 != .string) return error.TestExpectedResponse;
+    const decoded_len = try std.base64.standard.Decoder.calcSizeForSlice(data_b64.string);
+    const decoded = try allocator.alloc(u8, decoded_len);
+    defer allocator.free(decoded);
+    try std.base64.standard.Decoder.decode(decoded, data_b64.string);
+    try std.testing.expect(std.mem.indexOf(u8, decoded, "/src") != null);
+}
+
+test "acheron_session: terminal-v2 exec output is not replayed by read" {
+    const allocator = std.testing.allocator;
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.init(allocator, runtime_handle, &job_index, "default");
+    defer session.deinit();
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        384,
+        385,
+        &.{ "agents", "self", "terminal", "control", "create.json" },
+        "{\"session_id\":\"execdup\"}",
+        961,
+    );
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        386,
+        387,
+        &.{ "agents", "self", "terminal", "control", "exec.json" },
+        "{\"session_id\":\"execdup\",\"command\":\"echo once\"}",
+        962,
+    );
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        388,
+        389,
+        &.{ "agents", "self", "terminal", "control", "read.json" },
+        "{\"session_id\":\"execdup\",\"timeout_ms\":50,\"max_bytes\":65536}",
+        963,
+    );
+
+    const result_payload = try protocolReadFile(
+        &session,
+        allocator,
+        390,
+        391,
+        &.{ "agents", "self", "terminal", "result.json" },
+        964,
+    );
+    defer allocator.free(result_payload);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, result_payload, .{});
+    defer parsed.deinit();
+    const result_obj = parsed.value.object.get("result") orelse return error.TestExpectedResponse;
+    if (result_obj != .object) return error.TestExpectedResponse;
+    const data_b64 = result_obj.object.get("data_b64") orelse return error.TestExpectedResponse;
+    if (data_b64 != .string) return error.TestExpectedResponse;
+    const decoded_len = try std.base64.standard.Decoder.calcSizeForSlice(data_b64.string);
+    const decoded = try allocator.alloc(u8, decoded_len);
+    defer allocator.free(decoded);
+    try std.base64.standard.Decoder.decode(decoded, data_b64.string);
+    try std.testing.expectEqual(@as(usize, 0), decoded.len);
+}
+
+test "acheron_session: terminal-v2 read honors timeout_ms when idle" {
+    const allocator = std.testing.allocator;
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.init(allocator, runtime_handle, &job_index, "default");
+    defer session.deinit();
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        392,
+        393,
+        &.{ "agents", "self", "terminal", "control", "create.json" },
+        "{\"session_id\":\"idle\"}",
+        965,
+    );
+
+    const started_at_ms = std.time.milliTimestamp();
+    try protocolWriteFile(
+        &session,
+        allocator,
+        394,
+        395,
+        &.{ "agents", "self", "terminal", "control", "read.json" },
+        "{\"session_id\":\"idle\",\"timeout_ms\":150,\"max_bytes\":65536}",
+        966,
+    );
+    const elapsed_ms = std.time.milliTimestamp() - started_at_ms;
+    try std.testing.expect(elapsed_ms >= 100);
 }
 
 test "acheron_session: terminal-v2 write and exec surface shell_exec failures" {
