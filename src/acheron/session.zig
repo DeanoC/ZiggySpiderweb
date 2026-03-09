@@ -53,6 +53,7 @@ const SpecialKind = enum {
     projects_get,
     projects_up,
     missions_invoke,
+    missions_invoke_service,
     missions_create,
     missions_list,
     missions_get,
@@ -326,6 +327,34 @@ const FidState = struct {
     mode: []const u8 = "r",
 };
 
+const ToolPayloadErrorInfo = struct {
+    code: []u8,
+    message: []u8,
+
+    fn deinit(self: *ToolPayloadErrorInfo, allocator: std.mem.Allocator) void {
+        allocator.free(self.code);
+        allocator.free(self.message);
+        self.* = undefined;
+    }
+};
+
+const InternalFsrpcErrorInfo = struct {
+    code: []u8,
+    message: []u8,
+
+    fn deinit(self: *InternalFsrpcErrorInfo, allocator: std.mem.Allocator) void {
+        allocator.free(self.code);
+        allocator.free(self.message);
+        self.* = undefined;
+    }
+};
+
+const InternalFsrpcIds = struct {
+    attach_fid: u32,
+    walk_fid: u32,
+    tag_base: u32,
+};
+
 pub const Session = struct {
     pub const NamespaceOptions = struct {
         project_id: ?[]const u8 = null,
@@ -363,6 +392,7 @@ pub const Session = struct {
     nodes: std.AutoHashMapUnmanaged(u32, Node) = .{},
     fids: std.AutoHashMapUnmanaged(u32, FidState) = .{},
     next_node_id: u32 = 1,
+    next_internal_fsrpc_seq: u32 = 1,
 
     root_id: u32 = 0,
     nodes_root_id: u32 = 0,
@@ -1226,6 +1256,7 @@ pub const Session = struct {
                 written = outcome.written;
             },
             .missions_invoke,
+            .missions_invoke_service,
             .missions_create,
             .missions_list,
             .missions_get,
@@ -9185,13 +9216,13 @@ pub const Session = struct {
             missions_dir,
             "Missions",
             "{\"kind\":\"venom\",\"venom_id\":\"missions\",\"shape\":\"/global/missions/{README.md,SCHEMA.json,CAPS.json,OPS.json,RUNTIME.json,PERMISSIONS.json,STATUS.json,status.json,result.json,control/*}\"}",
-            "{\"invoke\":true,\"operations\":[\"missions_create\",\"missions_list\",\"missions_get\",\"missions_heartbeat\",\"missions_checkpoint\",\"missions_recover\",\"missions_request_approval\",\"missions_approve\",\"missions_reject\",\"missions_resume\",\"missions_block\",\"missions_complete\",\"missions_fail\",\"missions_cancel\"],\"discoverable\":true,\"persistent\":true}",
-            "Long-running mission records. Create/list/get missions, checkpoint progress, request approvals, and track recovery/state transitions.",
+            "{\"invoke\":true,\"operations\":[\"missions_create\",\"missions_list\",\"missions_get\",\"missions_heartbeat\",\"missions_checkpoint\",\"missions_invoke_service\",\"missions_recover\",\"missions_request_approval\",\"missions_approve\",\"missions_reject\",\"missions_resume\",\"missions_block\",\"missions_complete\",\"missions_fail\",\"missions_cancel\"],\"discoverable\":true,\"persistent\":true}",
+            "Long-running mission records. Create/list/get missions, invoke workspace services through mission steps, request approvals, and track recovery/state transitions.",
         );
         _ = try self.addFile(
             missions_dir,
             "OPS.json",
-            "{\"model\":\"local_bridge\",\"invoke\":\"control/invoke.json\",\"transport\":\"acheron-local\",\"paths\":{\"create\":\"control/create.json\",\"list\":\"control/list.json\",\"get\":\"control/get.json\",\"heartbeat\":\"control/heartbeat.json\",\"checkpoint\":\"control/checkpoint.json\",\"recover\":\"control/recover.json\",\"request_approval\":\"control/request_approval.json\",\"approve\":\"control/approve.json\",\"reject\":\"control/reject.json\",\"resume\":\"control/resume.json\",\"block\":\"control/block.json\",\"complete\":\"control/complete.json\",\"fail\":\"control/fail.json\",\"cancel\":\"control/cancel.json\"},\"operations\":{\"create\":\"create\",\"list\":\"list\",\"get\":\"get\",\"heartbeat\":\"heartbeat\",\"checkpoint\":\"checkpoint\",\"recover\":\"recover\",\"request_approval\":\"request_approval\",\"approve\":\"approve\",\"reject\":\"reject\",\"resume\":\"resume\",\"block\":\"block\",\"complete\":\"complete\",\"fail\":\"fail\",\"cancel\":\"cancel\"}}",
+            "{\"model\":\"local_bridge\",\"invoke\":\"control/invoke.json\",\"transport\":\"acheron-local\",\"paths\":{\"create\":\"control/create.json\",\"list\":\"control/list.json\",\"get\":\"control/get.json\",\"heartbeat\":\"control/heartbeat.json\",\"checkpoint\":\"control/checkpoint.json\",\"invoke_service\":\"control/invoke_service.json\",\"recover\":\"control/recover.json\",\"request_approval\":\"control/request_approval.json\",\"approve\":\"control/approve.json\",\"reject\":\"control/reject.json\",\"resume\":\"control/resume.json\",\"block\":\"control/block.json\",\"complete\":\"control/complete.json\",\"fail\":\"control/fail.json\",\"cancel\":\"control/cancel.json\"},\"operations\":{\"create\":\"create\",\"list\":\"list\",\"get\":\"get\",\"heartbeat\":\"heartbeat\",\"checkpoint\":\"checkpoint\",\"invoke_service\":\"invoke_service\",\"recover\":\"recover\",\"request_approval\":\"request_approval\",\"approve\":\"approve\",\"reject\":\"reject\",\"resume\":\"resume\",\"block\":\"block\",\"complete\":\"complete\",\"fail\":\"fail\",\"cancel\":\"cancel\"}}",
             false,
             .none,
         );
@@ -9235,11 +9266,12 @@ pub const Session = struct {
         _ = try self.addFile(
             control_dir,
             "README.md",
-            "Write JSON payloads to mission control files. invoke.json accepts op=create|list|get|heartbeat|checkpoint|recover|request_approval|approve|reject|resume|block|complete|fail|cancel envelopes.\n",
+            "Write JSON payloads to mission control files. invoke.json accepts op=create|list|get|heartbeat|checkpoint|invoke_service|recover|request_approval|approve|reject|resume|block|complete|fail|cancel envelopes.\n",
             false,
             .none,
         );
         _ = try self.addFile(control_dir, "invoke.json", "", true, .missions_invoke);
+        _ = try self.addFile(control_dir, "invoke_service.json", "", true, .missions_invoke_service);
         _ = try self.addFile(control_dir, "create.json", "", true, .missions_create);
         _ = try self.addFile(control_dir, "list.json", "", true, .missions_list);
         _ = try self.addFile(control_dir, "get.json", "", true, .missions_get);
@@ -9262,6 +9294,7 @@ pub const Session = struct {
         get,
         heartbeat,
         checkpoint,
+        invoke_service,
         recover,
         request_approval,
         approve,
@@ -9289,6 +9322,7 @@ pub const Session = struct {
             .missions_get => MissionOp.get,
             .missions_heartbeat => MissionOp.heartbeat,
             .missions_checkpoint => MissionOp.checkpoint,
+            .missions_invoke_service => MissionOp.invoke_service,
             .missions_recover => MissionOp.recover,
             .missions_request_approval => MissionOp.request_approval,
             .missions_approve => MissionOp.approve,
@@ -9332,6 +9366,7 @@ pub const Session = struct {
         if (std.mem.eql(u8, value, "get") or std.mem.eql(u8, value, "missions_get")) return .get;
         if (std.mem.eql(u8, value, "heartbeat") or std.mem.eql(u8, value, "missions_heartbeat")) return .heartbeat;
         if (std.mem.eql(u8, value, "checkpoint") or std.mem.eql(u8, value, "missions_checkpoint")) return .checkpoint;
+        if (std.mem.eql(u8, value, "invoke_service") or std.mem.eql(u8, value, "missions_invoke_service")) return .invoke_service;
         if (std.mem.eql(u8, value, "recover") or std.mem.eql(u8, value, "missions_recover")) return .recover;
         if (std.mem.eql(u8, value, "request_approval") or std.mem.eql(u8, value, "missions_request_approval")) return .request_approval;
         if (std.mem.eql(u8, value, "approve") or std.mem.eql(u8, value, "missions_approve")) return .approve;
@@ -9351,6 +9386,7 @@ pub const Session = struct {
             .get => "missions_get",
             .heartbeat => "missions_heartbeat",
             .checkpoint => "missions_checkpoint",
+            .invoke_service => "missions_invoke_service",
             .recover => "missions_recover",
             .request_approval => "missions_request_approval",
             .approve => "missions_approve",
@@ -9370,6 +9406,7 @@ pub const Session = struct {
             .get => "get",
             .heartbeat => "heartbeat",
             .checkpoint => "checkpoint",
+            .invoke_service => "invoke_service",
             .recover => "recover",
             .request_approval => "request_approval",
             .approve => "approve",
@@ -9405,9 +9442,16 @@ pub const Session = struct {
         };
         defer self.allocator.free(result_payload);
 
-        const done_status = try self.buildServiceInvokeStatusJson("done", tool_name, null);
-        defer self.allocator.free(done_status);
-        if (self.missions_status_id != 0) try self.setFileContent(self.missions_status_id, done_status);
+        if (try self.extractErrorMessageFromToolPayload(result_payload)) |message| {
+            defer self.allocator.free(message);
+            const failed_status = try self.buildServiceInvokeStatusJson("failed", tool_name, message);
+            defer self.allocator.free(failed_status);
+            if (self.missions_status_id != 0) try self.setFileContent(self.missions_status_id, failed_status);
+        } else {
+            const done_status = try self.buildServiceInvokeStatusJson("done", tool_name, null);
+            defer self.allocator.free(done_status);
+            if (self.missions_status_id != 0) try self.setFileContent(self.missions_status_id, done_status);
+        }
         if (self.missions_result_id != 0) try self.setFileContent(self.missions_result_id, result_payload);
         return .{ .written = written };
     }
@@ -9517,6 +9561,7 @@ pub const Session = struct {
                 defer self.allocator.free(detail);
                 break :blk self.buildMissionSuccessResultJson(.checkpoint, detail);
             },
+            .invoke_service => self.executeMissionInvokeServiceOp(args_obj),
             .recover => blk: {
                 const mission_id = extractOptionalStringByNames(args_obj, &[_][]const u8{ "mission_id", "id" }) orelse return error.InvalidPayload;
                 const reason = extractOptionalStringByNames(args_obj, &[_][]const u8{ "reason", "message" }) orelse return error.InvalidPayload;
@@ -9610,6 +9655,199 @@ pub const Session = struct {
         };
     }
 
+    fn executeMissionInvokeServiceOp(self: *Session, args_obj: std.json.ObjectMap) ![]u8 {
+        const store = self.mission_store orelse return error.InvalidPayload;
+        const mission_id = extractOptionalStringByNames(args_obj, &[_][]const u8{ "mission_id", "id" }) orelse return error.InvalidPayload;
+        var existing = (try store.getOwned(self.allocator, mission_id)) orelse return error.NotFound;
+        defer existing.deinit(self.allocator);
+
+        const service_path = try self.normalizeMissionAbsolutePath(
+            extractOptionalStringByNames(args_obj, &[_][]const u8{ "service_path", "venom_path" }) orelse return error.InvalidPayload,
+        );
+        defer self.allocator.free(service_path);
+
+        const invoke_path = if (extractOptionalStringByNames(args_obj, &[_][]const u8{"invoke_path"})) |raw|
+            try self.normalizeMissionAbsolutePath(raw)
+        else
+            self.deriveMissionServiceInvokePath(service_path) catch |err| switch (err) {
+                error.NotFound => try self.pathWithInvokeSuffix(service_path),
+                else => return err,
+            };
+        defer self.allocator.free(invoke_path);
+
+        const request_payload = try self.buildMissionServiceInvokeRequestPayload(args_obj);
+        defer self.allocator.free(request_payload);
+
+        const status_path = try self.pathWithInvokeTarget(service_path, "status.json");
+        defer self.allocator.free(status_path);
+        const result_path = try self.pathWithInvokeTarget(service_path, "result.json");
+        defer self.allocator.free(result_path);
+
+        var write_error: ?InternalFsrpcErrorInfo = try self.writeInternalPath(invoke_path, request_payload);
+        defer if (write_error) |*value| value.deinit(self.allocator);
+
+        const status_payload = if (write_error == null)
+            try self.tryReadInternalPath(status_path)
+        else
+            null;
+        defer if (status_payload) |value| self.allocator.free(value);
+        const service_result_payload = if (write_error == null)
+            try self.tryReadInternalPath(result_path)
+        else
+            null;
+        defer if (service_result_payload) |value| self.allocator.free(value);
+
+        const effective_result_payload = blk: {
+            if (write_error) |value| break :blk try self.buildServiceInvokeFailureResultJson(value.code, value.message);
+            if (service_result_payload) |value| break :blk try self.allocator.dupe(u8, value);
+            break :blk try self.buildServiceInvokeFailureResultJson("missing_result", "service produced no result payload");
+        };
+        defer self.allocator.free(effective_result_payload);
+
+        const artifact_path = if (args_obj.get("artifact")) |value| blk: {
+            if (value != .object) return error.InvalidPayload;
+            break :blk if (extractOptionalStringByNames(value.object, &[_][]const u8{"path"})) |raw_path|
+                try self.normalizeMissionAbsolutePath(raw_path)
+            else
+                try self.allocator.dupe(u8, result_path);
+        } else try self.allocator.dupe(u8, result_path);
+        defer self.allocator.free(artifact_path);
+
+        const artifact_summary = if (args_obj.get("artifact")) |value| blk: {
+            if (value != .object) return error.InvalidPayload;
+            break :blk extractOptionalStringByNames(value.object, &[_][]const u8{"summary"});
+        } else extractOptionalStringByNames(args_obj, &[_][]const u8{"summary"});
+
+        const artifact_kind = if (args_obj.get("artifact")) |value| blk: {
+            if (value != .object) return error.InvalidPayload;
+            break :blk extractOptionalStringByNames(value.object, &[_][]const u8{"kind"}) orelse "service_result";
+        } else "service_result";
+
+        var mission = store.recordServiceInvocation(self.allocator, mission_id, .{
+            .stage = extractOptionalStringByNames(args_obj, &[_][]const u8{"stage"}),
+            .summary = extractOptionalStringByNames(args_obj, &[_][]const u8{"summary"}),
+            .service_path = service_path,
+            .invoke_path = invoke_path,
+            .request_payload_json = request_payload,
+            .result_payload_json = effective_result_payload,
+            .status_payload_json = status_payload,
+            .artifact = .{
+                .kind = artifact_kind,
+                .path = artifact_path,
+                .summary = artifact_summary,
+            },
+            .actor = .{ .actor_type = self.actor_type, .actor_id = self.actor_id },
+        }) catch |err| switch (err) {
+            mission_store_mod.MissionStoreError.MissionNotFound => return error.NotFound,
+            else => return error.InvalidPayload,
+        };
+        defer mission.deinit(self.allocator);
+
+        const mission_json = try self.buildMissionRecordJson(mission);
+        defer self.allocator.free(mission_json);
+        const detail = try self.buildMissionServiceInvocationDetailJson(
+            mission_json,
+            service_path,
+            invoke_path,
+            request_payload,
+            effective_result_payload,
+            status_payload,
+        );
+        defer self.allocator.free(detail);
+
+        if (try self.extractErrorInfoFromToolPayload(effective_result_payload)) |service_error| {
+            var owned_service_error = service_error;
+            defer owned_service_error.deinit(self.allocator);
+            return self.buildMissionPartialFailureResultJson(
+                .invoke_service,
+                detail,
+                owned_service_error.code,
+                owned_service_error.message,
+            );
+        }
+        return self.buildMissionSuccessResultJson(.invoke_service, detail);
+    }
+
+    fn normalizeMissionAbsolutePath(self: *Session, raw: []const u8) ![]u8 {
+        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+        if (trimmed.len == 0 or trimmed[0] != '/') return error.InvalidPayload;
+        const normalized = if (trimmed.len > 1)
+            std.mem.trimRight(u8, trimmed, "/")
+        else
+            trimmed;
+        return self.allocator.dupe(u8, normalized);
+    }
+
+    fn deriveMissionServiceInvokePath(self: *Session, service_path: []const u8) ![]u8 {
+        if (parseNodeVenomServicePath(service_path)) |parsed| {
+            const venom_dir_id = self.resolveAbsolutePathNoBinds(service_path) orelse return error.NotFound;
+            return (try self.deriveVenomInvokePath(parsed.node_id, parsed.venom_id, venom_dir_id)) orelse error.NotFound;
+        }
+
+        const service_dir_id = self.resolveAbsolutePathNoBinds(service_path) orelse return error.NotFound;
+        const service_node = self.nodes.get(service_dir_id) orelse return error.NotFound;
+        if (service_node.kind != .dir) return error.InvalidPayload;
+
+        const invoke_target = try self.resolveNodeVenomInvokeTarget(service_dir_id);
+        defer self.allocator.free(invoke_target);
+        if (isWorldAbsolutePath(invoke_target)) return self.allocator.dupe(u8, invoke_target);
+        return self.pathWithInvokeTarget(service_path, std.mem.trimLeft(u8, invoke_target, "/"));
+    }
+
+    fn buildMissionServiceInvokeRequestPayload(self: *Session, args_obj: std.json.ObjectMap) ![]u8 {
+        if (args_obj.get("payload")) |value| return self.renderJsonValue(value);
+        if (args_obj.get("request")) |value| return self.renderJsonValue(value);
+
+        const op_name = extractOptionalStringByNames(args_obj, &[_][]const u8{ "op", "operation", "tool", "tool_name" }) orelse return error.InvalidPayload;
+        const escaped_op = try unified.jsonEscape(self.allocator, op_name);
+        defer self.allocator.free(escaped_op);
+        const arguments_json = if (args_obj.get("arguments")) |value|
+            try self.renderJsonValue(value)
+        else if (args_obj.get("args")) |value|
+            try self.renderJsonValue(value)
+        else
+            try self.allocator.dupe(u8, "{}");
+        defer self.allocator.free(arguments_json);
+
+        return std.fmt.allocPrint(
+            self.allocator,
+            "{{\"op\":\"{s}\",\"arguments\":{s}}}",
+            .{ escaped_op, arguments_json },
+        );
+    }
+
+    fn buildMissionServiceInvocationDetailJson(
+        self: *Session,
+        mission_json: []const u8,
+        service_path: []const u8,
+        invoke_path: []const u8,
+        request_payload_json: []const u8,
+        result_payload_json: []const u8,
+        status_payload_json: ?[]const u8,
+    ) ![]u8 {
+        const escaped_service_path = try unified.jsonEscape(self.allocator, service_path);
+        defer self.allocator.free(escaped_service_path);
+        const escaped_invoke_path = try unified.jsonEscape(self.allocator, invoke_path);
+        defer self.allocator.free(escaped_invoke_path);
+        const status_json = if (status_payload_json) |value|
+            try self.allocator.dupe(u8, value)
+        else
+            try self.allocator.dupe(u8, "null");
+        defer self.allocator.free(status_json);
+        return std.fmt.allocPrint(
+            self.allocator,
+            "{{\"mission\":{s},\"service\":{{\"service_path\":\"{s}\",\"invoke_path\":\"{s}\",\"request\":{s},\"result\":{s},\"status\":{s}}}}}",
+            .{
+                mission_json,
+                escaped_service_path,
+                escaped_invoke_path,
+                request_payload_json,
+                result_payload_json,
+                status_json,
+            },
+        );
+    }
+
     fn buildMissionSuccessResultJson(self: *Session, op: MissionOp, result_json: []const u8) ![]u8 {
         const escaped_operation = try unified.jsonEscape(self.allocator, missionOperationName(op));
         defer self.allocator.free(escaped_operation);
@@ -9617,6 +9855,26 @@ pub const Session = struct {
             self.allocator,
             "{{\"ok\":true,\"operation\":\"{s}\",\"result\":{s},\"error\":null}}",
             .{ escaped_operation, result_json },
+        );
+    }
+
+    fn buildMissionPartialFailureResultJson(
+        self: *Session,
+        op: MissionOp,
+        result_json: []const u8,
+        code: []const u8,
+        message: []const u8,
+    ) ![]u8 {
+        const escaped_operation = try unified.jsonEscape(self.allocator, missionOperationName(op));
+        defer self.allocator.free(escaped_operation);
+        const escaped_code = try unified.jsonEscape(self.allocator, code);
+        defer self.allocator.free(escaped_code);
+        const escaped_message = try unified.jsonEscape(self.allocator, message);
+        defer self.allocator.free(escaped_message);
+        return std.fmt.allocPrint(
+            self.allocator,
+            "{{\"ok\":false,\"operation\":\"{s}\",\"result\":{s},\"error\":{{\"code\":\"{s}\",\"message\":\"{s}\"}}}}",
+            .{ escaped_operation, result_json, escaped_code, escaped_message },
         );
     }
 
@@ -9808,6 +10066,219 @@ pub const Session = struct {
         return std.fmt.allocPrint(self.allocator, "{f}", .{std.json.fmt(value, .{})});
     }
 
+    fn nextInternalFsrpcIds(self: *Session) InternalFsrpcIds {
+        const seq = self.next_internal_fsrpc_seq;
+        self.next_internal_fsrpc_seq +%= 1;
+        if (self.next_internal_fsrpc_seq == 0) self.next_internal_fsrpc_seq = 1;
+        return .{
+            .attach_fid = 0x7000_0000 +% (seq *% 2),
+            .walk_fid = 0x7000_0001 +% (seq *% 2),
+            .tag_base = 0x7100_0000 +% (seq *% 8),
+        };
+    }
+
+    fn allocAbsolutePathSegments(self: *Session, absolute_path: []const u8) anyerror![][]u8 {
+        if (absolute_path.len == 0 or absolute_path[0] != '/') return error.InvalidPayload;
+        var count: usize = 0;
+        var iter = std.mem.splitScalar(u8, absolute_path, '/');
+        while (iter.next()) |segment| {
+            if (segment.len == 0) continue;
+            count += 1;
+        }
+
+        var segments = try self.allocator.alloc([]u8, count);
+        errdefer self.allocator.free(segments);
+
+        var index: usize = 0;
+        errdefer {
+            var cleanup_index: usize = 0;
+            while (cleanup_index < index) : (cleanup_index += 1) self.allocator.free(segments[cleanup_index]);
+        }
+
+        iter = std.mem.splitScalar(u8, absolute_path, '/');
+        while (iter.next()) |segment| {
+            if (segment.len == 0) continue;
+            segments[index] = try self.allocator.dupe(u8, segment);
+            index += 1;
+        }
+        return segments;
+    }
+
+    fn internalClunk(self: *Session, fid: u32, tag: u32) void {
+        var clunk = unified.ParsedMessage{
+            .channel = .acheron,
+            .acheron_type = .t_clunk,
+            .tag = tag,
+            .fid = fid,
+        };
+        const frame = self.handle(&clunk) catch return;
+        self.allocator.free(frame);
+    }
+
+    fn parseInternalFsrpcError(self: *Session, frame: []const u8) anyerror!?InternalFsrpcErrorInfo {
+        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, frame, .{}) catch return error.InvalidPayload;
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidPayload;
+        const ok_value = parsed.value.object.get("ok") orelse return error.InvalidPayload;
+        if (ok_value == .bool and ok_value.bool) return null;
+
+        const error_value = parsed.value.object.get("error") orelse return error.InvalidPayload;
+        if (error_value != .object) return error.InvalidPayload;
+        const code = if (error_value.object.get("code")) |value|
+            if (value == .string and value.string.len > 0) value.string else "internal_error"
+        else
+            "internal_error";
+        const message = if (error_value.object.get("message")) |value|
+            if (value == .string and value.string.len > 0) value.string else "internal fsrpc request failed"
+        else
+            "internal fsrpc request failed";
+        return .{
+            .code = try self.allocator.dupe(u8, code),
+            .message = try self.allocator.dupe(u8, message),
+        };
+    }
+
+    fn writeInternalPath(self: *Session, absolute_path: []const u8, data: []const u8) anyerror!?InternalFsrpcErrorInfo {
+        const ids = self.nextInternalFsrpcIds();
+        const segments = try self.allocAbsolutePathSegments(absolute_path);
+        defer freePathSegments(self.allocator, segments);
+        defer self.internalClunk(ids.walk_fid, ids.tag_base + 4);
+        defer self.internalClunk(ids.attach_fid, ids.tag_base + 5);
+
+        var attach = unified.ParsedMessage{
+            .channel = .acheron,
+            .acheron_type = .t_attach,
+            .tag = ids.tag_base,
+            .fid = ids.attach_fid,
+        };
+        const attach_frame = try self.handle(&attach);
+        defer self.allocator.free(attach_frame);
+        if (try self.parseInternalFsrpcError(attach_frame)) |err| return err;
+
+        var walk = unified.ParsedMessage{
+            .channel = .acheron,
+            .acheron_type = .t_walk,
+            .tag = ids.tag_base + 1,
+            .fid = ids.attach_fid,
+            .newfid = ids.walk_fid,
+            .path = segments,
+        };
+        const walk_frame = try self.handle(&walk);
+        defer self.allocator.free(walk_frame);
+        if (try self.parseInternalFsrpcError(walk_frame)) |err| return err;
+
+        var open = unified.ParsedMessage{
+            .channel = .acheron,
+            .acheron_type = .t_open,
+            .tag = ids.tag_base + 2,
+            .fid = ids.walk_fid,
+            .mode = @constCast("w"),
+        };
+        const open_frame = try self.handle(&open);
+        defer self.allocator.free(open_frame);
+        if (try self.parseInternalFsrpcError(open_frame)) |err| return err;
+
+        var write = unified.ParsedMessage{
+            .channel = .acheron,
+            .acheron_type = .t_write,
+            .tag = ids.tag_base + 3,
+            .fid = ids.walk_fid,
+            .offset = 0,
+            .data = @constCast(data),
+        };
+        const write_frame = try self.handle(&write);
+        defer self.allocator.free(write_frame);
+        if (try self.parseInternalFsrpcError(write_frame)) |err| return err;
+        return null;
+    }
+
+    fn tryReadInternalPath(self: *Session, absolute_path: []const u8) anyerror!?[]u8 {
+        const ids = self.nextInternalFsrpcIds();
+        const segments = try self.allocAbsolutePathSegments(absolute_path);
+        defer freePathSegments(self.allocator, segments);
+        defer self.internalClunk(ids.walk_fid, ids.tag_base + 4);
+        defer self.internalClunk(ids.attach_fid, ids.tag_base + 5);
+
+        var attach = unified.ParsedMessage{
+            .channel = .acheron,
+            .acheron_type = .t_attach,
+            .tag = ids.tag_base,
+            .fid = ids.attach_fid,
+        };
+        const attach_frame = try self.handle(&attach);
+        defer self.allocator.free(attach_frame);
+        if (try self.parseInternalFsrpcError(attach_frame)) |err| {
+            var owned_err = err;
+            owned_err.deinit(self.allocator);
+            return null;
+        }
+
+        var walk = unified.ParsedMessage{
+            .channel = .acheron,
+            .acheron_type = .t_walk,
+            .tag = ids.tag_base + 1,
+            .fid = ids.attach_fid,
+            .newfid = ids.walk_fid,
+            .path = segments,
+        };
+        const walk_frame = try self.handle(&walk);
+        defer self.allocator.free(walk_frame);
+        if (try self.parseInternalFsrpcError(walk_frame)) |err| {
+            var owned_err = err;
+            owned_err.deinit(self.allocator);
+            return null;
+        }
+
+        var open = unified.ParsedMessage{
+            .channel = .acheron,
+            .acheron_type = .t_open,
+            .tag = ids.tag_base + 2,
+            .fid = ids.walk_fid,
+            .mode = @constCast("r"),
+        };
+        const open_frame = try self.handle(&open);
+        defer self.allocator.free(open_frame);
+        if (try self.parseInternalFsrpcError(open_frame)) |err| {
+            var owned_err = err;
+            owned_err.deinit(self.allocator);
+            return null;
+        }
+
+        var read = unified.ParsedMessage{
+            .channel = .acheron,
+            .acheron_type = .t_read,
+            .tag = ids.tag_base + 3,
+            .fid = ids.walk_fid,
+            .offset = 0,
+            .count = 1_048_576,
+        };
+        const read_frame = try self.handle(&read);
+        defer self.allocator.free(read_frame);
+        if (try self.parseInternalFsrpcError(read_frame)) |err| {
+            var owned_err = err;
+            owned_err.deinit(self.allocator);
+            return null;
+        }
+        return try self.decodeAcheronReadPayload(read_frame);
+    }
+
+    fn decodeAcheronReadPayload(self: *Session, frame: []const u8) anyerror![]u8 {
+        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, frame, .{}) catch return error.InvalidPayload;
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidPayload;
+
+        const payload = parsed.value.object.get("payload") orelse return error.InvalidPayload;
+        if (payload != .object) return error.InvalidPayload;
+        const data_b64 = payload.object.get("data_b64") orelse return error.InvalidPayload;
+        if (data_b64 != .string) return error.InvalidPayload;
+
+        const decoded_len = try std.base64.standard.Decoder.calcSizeForSlice(data_b64.string);
+        const decoded = try self.allocator.alloc(u8, decoded_len);
+        errdefer self.allocator.free(decoded);
+        try std.base64.standard.Decoder.decode(decoded, data_b64.string);
+        return decoded;
+    }
+
     fn executeServiceToolCall(self: *Session, tool_name: []const u8, args_json: []const u8) ![]u8 {
         const escaped_tool_name = try unified.jsonEscape(self.allocator, tool_name);
         defer self.allocator.free(escaped_tool_name);
@@ -9932,17 +10403,39 @@ pub const Session = struct {
         );
     }
 
-    fn extractErrorMessageFromToolPayload(self: *Session, payload_json: []const u8) !?[]u8 {
+    fn extractErrorInfoFromToolPayload(self: *Session, payload_json: []const u8) !?ToolPayloadErrorInfo {
         var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, payload_json, .{}) catch return null;
         defer parsed.deinit();
         if (parsed.value != .object) return null;
         const error_value = parsed.value.object.get("error") orelse return null;
-        if (error_value == .string) return @as(?[]u8, try self.allocator.dupe(u8, error_value.string));
-        if (error_value != .object) return null;
-        if (error_value.object.get("message")) |message| {
-            if (message == .string) return @as(?[]u8, try self.allocator.dupe(u8, message.string));
+        if (error_value == .null) return null;
+        if (error_value == .string) {
+            return .{
+                .code = try self.allocator.dupe(u8, "service_error"),
+                .message = try self.allocator.dupe(u8, error_value.string),
+            };
         }
-        return @as(?[]u8, try self.allocator.dupe(u8, "tool returned error"));
+        if (error_value != .object) return null;
+        const code = if (error_value.object.get("code")) |code_value|
+            if (code_value == .string and code_value.string.len > 0) code_value.string else "service_error"
+        else
+            "service_error";
+        const message = if (error_value.object.get("message")) |message_value|
+            if (message_value == .string and message_value.string.len > 0) message_value.string else "tool returned error"
+        else
+            "tool returned error";
+        return .{
+            .code = try self.allocator.dupe(u8, code),
+            .message = try self.allocator.dupe(u8, message),
+        };
+    }
+
+    fn extractErrorMessageFromToolPayload(self: *Session, payload_json: []const u8) !?[]u8 {
+        if (try self.extractErrorInfoFromToolPayload(payload_json)) |info| {
+            defer self.allocator.free(info.code);
+            return info.message;
+        }
+        return null;
     }
 
     fn clearWaitSources(self: *Session) void {
@@ -11039,6 +11532,11 @@ const ParsedEntityScopedVenomAlias = struct {
     remote_path: []const u8,
 };
 
+const ParsedNodeVenomServicePath = struct {
+    node_id: []const u8,
+    venom_id: []const u8,
+};
+
 fn parseScopedVenomAliasPrefix(path: []const u8, prefix: []const u8) ?ParsedScopedVenomAlias {
     if (!std.mem.startsWith(u8, path, prefix)) return null;
     const tail = path[prefix.len..];
@@ -11075,6 +11573,25 @@ fn parseEntityScopedVenomAliasPrefix(
         .entity_id = entity_id,
         .venom_id = venom_id,
         .remote_path = remote_path,
+    };
+}
+
+fn parseNodeVenomServicePath(path: []const u8) ?ParsedNodeVenomServicePath {
+    if (!std.mem.startsWith(u8, path, "/nodes/")) return null;
+    const after_prefix = path["/nodes/".len..];
+    const node_end = std.mem.indexOfScalar(u8, after_prefix, '/') orelse return null;
+    const node_id = after_prefix[0..node_end];
+    if (node_id.len == 0) return null;
+    const after_node = after_prefix[node_end..];
+    if (!std.mem.startsWith(u8, after_node, "/venoms/")) return null;
+    const after_venoms = after_node["/venoms/".len..];
+    if (after_venoms.len == 0) return null;
+    const venom_end = std.mem.indexOfScalar(u8, after_venoms, '/') orelse after_venoms.len;
+    const venom_id = after_venoms[0..venom_end];
+    if (venom_id.len == 0) return null;
+    return .{
+        .node_id = node_id,
+        .venom_id = venom_id,
     };
 }
 
@@ -13611,6 +14128,221 @@ test "acheron_session: missions namespace requires admin approval for resolution
     try std.testing.expect(std.mem.indexOf(u8, admin_result, "\"operation\":\"approve\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, admin_result, "\"state\":\"running\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, admin_result, "\"pending_approval\":null") != null);
+}
+
+test "acheron_session: missions invoke_service records successful venom step" {
+    const allocator = std.testing.allocator;
+
+    var mission_store = try mission_store_mod.MissionStore.initWithPath(allocator, null);
+    defer mission_store.deinit();
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "default",
+        .{
+            .mission_store = &mission_store,
+            .actor_type = "agent",
+            .actor_id = "worker-a",
+        },
+    );
+    defer session.deinit();
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        328,
+        329,
+        &.{ "agents", "self", "missions", "control", "create.json" },
+        "{\"use_case\":\"pr_review\",\"title\":\"Review PR 48\"}",
+        953,
+    );
+    const create_result = try protocolReadFile(
+        &session,
+        allocator,
+        330,
+        331,
+        &.{ "agents", "self", "missions", "result.json" },
+        954,
+    );
+    defer allocator.free(create_result);
+    const mission_id = try extractMissionIdFromResultPayload(allocator, create_result);
+    defer allocator.free(mission_id);
+
+    const resume_payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"mission_id\":\"{s}\",\"stage\":\"running_review\"}}",
+        .{mission_id},
+    );
+    defer allocator.free(resume_payload);
+    try protocolWriteFile(
+        &session,
+        allocator,
+        332,
+        333,
+        &.{ "agents", "self", "missions", "control", "resume.json" },
+        resume_payload,
+        955,
+    );
+
+    const invoke_payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"mission_id\":\"{s}\",\"service_path\":\"/global/memory\",\"stage\":\"collecting_context\",\"summary\":\"Created review memory\",\"op\":\"create\",\"arguments\":{{\"name\":\"mission-review-note\",\"kind\":\"note\",\"content\":{{\"text\":\"mission bridge ok\"}}}}}}",
+        .{mission_id},
+    );
+    defer allocator.free(invoke_payload);
+    try protocolWriteFile(
+        &session,
+        allocator,
+        334,
+        335,
+        &.{ "agents", "self", "missions", "control", "invoke_service.json" },
+        invoke_payload,
+        956,
+    );
+
+    const mission_status = try protocolReadFile(
+        &session,
+        allocator,
+        336,
+        337,
+        &.{ "agents", "self", "missions", "status.json" },
+        957,
+    );
+    defer allocator.free(mission_status);
+    try std.testing.expect(std.mem.indexOf(u8, mission_status, "\"state\":\"done\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mission_status, "\"tool\":\"missions_invoke_service\"") != null);
+
+    const mission_result = try protocolReadFile(
+        &session,
+        allocator,
+        338,
+        339,
+        &.{ "agents", "self", "missions", "result.json" },
+        958,
+    );
+    defer allocator.free(mission_result);
+    try std.testing.expect(std.mem.indexOf(u8, mission_result, "\"operation\":\"invoke_service\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mission_result, "\"ok\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mission_result, "\"service_path\":\"/global/memory\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mission_result, "\"invoke_path\":\"/global/memory/control/invoke.json\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mission_result, "\"mission_id\":\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mission_result, "\"memory_path\":\"/global/memory/items/mission-review-note\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mission_result, "\"event_type\":\"mission.service_invoked\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mission_result, "\"kind\":\"service_result\"") != null);
+}
+
+test "acheron_session: missions invoke_service records downstream service failures" {
+    const allocator = std.testing.allocator;
+
+    var mission_store = try mission_store_mod.MissionStore.initWithPath(allocator, null);
+    defer mission_store.deinit();
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "default",
+        .{
+            .mission_store = &mission_store,
+            .actor_type = "agent",
+            .actor_id = "worker-a",
+        },
+    );
+    defer session.deinit();
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        340,
+        341,
+        &.{ "agents", "self", "missions", "control", "create.json" },
+        "{\"use_case\":\"pr_review\",\"title\":\"Review PR 49\"}",
+        959,
+    );
+    const create_result = try protocolReadFile(
+        &session,
+        allocator,
+        342,
+        343,
+        &.{ "agents", "self", "missions", "result.json" },
+        960,
+    );
+    defer allocator.free(create_result);
+    const mission_id = try extractMissionIdFromResultPayload(allocator, create_result);
+    defer allocator.free(mission_id);
+
+    const resume_payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"mission_id\":\"{s}\",\"stage\":\"running_review\"}}",
+        .{mission_id},
+    );
+    defer allocator.free(resume_payload);
+    try protocolWriteFile(
+        &session,
+        allocator,
+        344,
+        345,
+        &.{ "agents", "self", "missions", "control", "resume.json" },
+        resume_payload,
+        961,
+    );
+
+    const invoke_payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"mission_id\":\"{s}\",\"service_path\":\"/global/memory\",\"stage\":\"collecting_context\",\"summary\":\"Tried invalid memory request\",\"payload\":{{}}}}",
+        .{mission_id},
+    );
+    defer allocator.free(invoke_payload);
+    try protocolWriteFile(
+        &session,
+        allocator,
+        346,
+        347,
+        &.{ "agents", "self", "missions", "control", "invoke_service.json" },
+        invoke_payload,
+        962,
+    );
+
+    const mission_status = try protocolReadFile(
+        &session,
+        allocator,
+        348,
+        349,
+        &.{ "agents", "self", "missions", "status.json" },
+        963,
+    );
+    defer allocator.free(mission_status);
+    try std.testing.expect(std.mem.indexOf(u8, mission_status, "\"state\":\"failed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mission_status, "\"tool\":\"missions_invoke_service\"") != null);
+
+    const mission_result = try protocolReadFile(
+        &session,
+        allocator,
+        350,
+        351,
+        &.{ "agents", "self", "missions", "result.json" },
+        964,
+    );
+    defer allocator.free(mission_result);
+    try std.testing.expect(std.mem.indexOf(u8, mission_result, "\"operation\":\"invoke_service\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mission_result, "\"ok\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mission_result, "\"code\":\"invalid\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mission_result, "\"service_path\":\"/global/memory\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mission_result, "\"event_type\":\"mission.service_invoked\"") != null);
 }
 
 test "acheron_session: mother can upsert project from system context without project token" {

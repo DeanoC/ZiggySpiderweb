@@ -244,6 +244,18 @@ pub const CheckpointInput = struct {
     artifact: ?MissionArtifactInput = null,
 };
 
+pub const ServiceInvocationInput = struct {
+    stage: ?[]const u8 = null,
+    summary: ?[]const u8 = null,
+    service_path: []const u8,
+    invoke_path: []const u8,
+    request_payload_json: []const u8,
+    result_payload_json: ?[]const u8 = null,
+    status_payload_json: ?[]const u8 = null,
+    artifact: MissionArtifactInput,
+    actor: MissionActorInput,
+};
+
 pub const RecoveryInput = struct {
     reason: []const u8,
     stage: ?[]const u8 = null,
@@ -459,6 +471,87 @@ pub const MissionStore = struct {
         );
         defer self.allocator.free(payload);
         try appendEventLocked(self.allocator, record, "mission.checkpoint", payload, now_ms);
+        try self.persistCurrentStateLocked();
+        return record.cloneOwned(allocator);
+    }
+
+    pub fn recordServiceInvocation(
+        self: *MissionStore,
+        allocator: std.mem.Allocator,
+        mission_id: []const u8,
+        input: ServiceInvocationInput,
+    ) !MissionRecord {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const index = findMissionIndexLocked(self.missions.items, mission_id) orelse return MissionStoreError.MissionNotFound;
+        const record = &self.missions.items[index];
+        if (isTerminalState(record.state) or record.state == .waiting_for_approval) {
+            return MissionStoreError.InvalidStateTransition;
+        }
+
+        const now_ms = std.time.milliTimestamp();
+        record.updated_at_ms = now_ms;
+        if (input.stage) |value| try replaceOptionalString(self.allocator, &record.stage, value);
+        if (input.summary) |value| try replaceOptionalOwnedString(self.allocator, &record.summary, value);
+        try appendArtifactLocked(self.allocator, record, input.artifact, now_ms);
+
+        const service_path_json = try jsonStringOrNull(self.allocator, input.service_path);
+        defer self.allocator.free(service_path_json);
+        const invoke_path_json = try jsonStringOrNull(self.allocator, input.invoke_path);
+        defer self.allocator.free(invoke_path_json);
+        const summary_json = if (record.summary) |value|
+            try jsonStringOrNull(self.allocator, value)
+        else
+            try self.allocator.dupe(u8, "null");
+        defer self.allocator.free(summary_json);
+        const result_json = if (input.result_payload_json) |value|
+            try self.allocator.dupe(u8, value)
+        else
+            try self.allocator.dupe(u8, "null");
+        defer self.allocator.free(result_json);
+        const status_json = if (input.status_payload_json) |value|
+            try self.allocator.dupe(u8, value)
+        else
+            try self.allocator.dupe(u8, "null");
+        defer self.allocator.free(status_json);
+        const actor_type_json = try jsonStringOrNull(self.allocator, input.actor.actor_type);
+        defer self.allocator.free(actor_type_json);
+        const actor_id_json = try jsonStringOrNull(self.allocator, input.actor.actor_id);
+        defer self.allocator.free(actor_id_json);
+        const artifact_kind_json = try jsonStringOrNull(self.allocator, input.artifact.kind);
+        defer self.allocator.free(artifact_kind_json);
+        const artifact_path_json = if (input.artifact.path) |value|
+            try jsonStringOrNull(self.allocator, value)
+        else
+            try self.allocator.dupe(u8, "null");
+        defer self.allocator.free(artifact_path_json);
+        const artifact_summary_json = if (input.artifact.summary) |value|
+            try jsonStringOrNull(self.allocator, value)
+        else
+            try self.allocator.dupe(u8, "null");
+        defer self.allocator.free(artifact_summary_json);
+
+        const payload = try std.fmt.allocPrint(
+            self.allocator,
+            "{{\"stage\":\"{s}\",\"summary\":{s},\"service_path\":{s},\"invoke_path\":{s},\"request\":{s},\"result\":{s},\"status\":{s},\"artifact\":{{\"kind\":{s},\"path\":{s},\"summary\":{s}}},\"actor\":{{\"actor_type\":{s},\"actor_id\":{s}}}}}",
+            .{
+                record.stage,
+                summary_json,
+                service_path_json,
+                invoke_path_json,
+                input.request_payload_json,
+                result_json,
+                status_json,
+                artifact_kind_json,
+                artifact_path_json,
+                artifact_summary_json,
+                actor_type_json,
+                actor_id_json,
+            },
+        );
+        defer self.allocator.free(payload);
+        try appendEventLocked(self.allocator, record, "mission.service_invoked", payload, now_ms);
         try self.persistCurrentStateLocked();
         return record.cloneOwned(allocator);
     }
@@ -1232,6 +1325,53 @@ test "mission_store: approval flow gates transition and persists resolution" {
     defer approved.deinit(allocator);
     try std.testing.expectEqual(MissionState.running, approved.state);
     try std.testing.expect(approved.pending_approval == null);
+}
+
+test "mission_store: service invocation records artifact and event" {
+    const allocator = std.testing.allocator;
+    var store = try MissionStore.initWithPath(allocator, null);
+    defer store.deinit();
+
+    var created = try store.create(allocator, .{
+        .use_case = "pr_review",
+        .created_by = .{ .actor_type = "agent", .actor_id = "planner" },
+    });
+    defer created.deinit(allocator);
+
+    var running = try store.transition(allocator, created.mission_id, .{
+        .next_state = .running,
+        .stage = "collecting_context",
+        .actor = .{ .actor_type = "agent", .actor_id = "planner" },
+    });
+    defer running.deinit(allocator);
+
+    var invoked = try store.recordServiceInvocation(allocator, created.mission_id, .{
+        .stage = "reviewing",
+        .summary = "Created memory note",
+        .service_path = "/global/memory",
+        .invoke_path = "/global/memory/control/invoke.json",
+        .request_payload_json = "{\"op\":\"create\",\"arguments\":{\"name\":\"review-note\"}}",
+        .result_payload_json = "{\"ok\":true,\"result\":{\"memory_path\":\"/global/memory/items/review-note\"},\"error\":null}",
+        .status_payload_json = "{\"state\":\"done\",\"tool\":\"memory_create\",\"updated_at_ms\":1,\"error\":null}",
+        .artifact = .{
+            .kind = "service_result",
+            .path = "/global/memory/result.json",
+            .summary = "Created review note",
+        },
+        .actor = .{ .actor_type = "agent", .actor_id = "planner" },
+    });
+    defer invoked.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), invoked.artifacts.items.len);
+    try std.testing.expect(std.mem.eql(u8, invoked.stage, "reviewing"));
+    try std.testing.expect(std.mem.eql(u8, invoked.summary.?, "Created memory note"));
+    try std.testing.expectEqualStrings("service_result", invoked.artifacts.items[0].kind);
+    try std.testing.expectEqualStrings("/global/memory/result.json", invoked.artifacts.items[0].path.?);
+    try std.testing.expect(invoked.events.items.len >= 3);
+    const latest_event = invoked.events.items[invoked.events.items.len - 1];
+    try std.testing.expectEqualStrings("mission.service_invoked", latest_event.event_type);
+    try std.testing.expect(std.mem.indexOf(u8, latest_event.payload_json, "\"service_path\":\"/global/memory\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, latest_event.payload_json, "\"actor_type\":\"agent\"") != null);
 }
 
 test "mission_store: persists records across restart" {
