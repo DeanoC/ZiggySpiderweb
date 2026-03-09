@@ -511,7 +511,9 @@ fn writeJsonString(writer: anytype, str: []const u8) !void {
 }
 
 fn isGlobalTerminalControlPath(path: []const u8) bool {
-    const trimmed = std.mem.trimLeft(u8, path, "/");
+    const normalized = std.mem.trim(u8, path, " \t\r\n");
+    const no_leading = std.mem.trimLeft(u8, normalized, "/");
+    const trimmed = std.mem.trimRight(u8, no_leading, "/");
     if (!std.mem.startsWith(u8, trimmed, "global/terminal/control/")) return false;
     const leaf = trimmed["global/terminal/control/".len..];
     return std.mem.eql(u8, leaf, "exec.json") or std.mem.eql(u8, leaf, "invoke.json");
@@ -528,7 +530,7 @@ fn fileWriteEscalatesToShellExec(allocator: std.mem.Allocator, args_json: []cons
     if (path_value != .string or content_value != .string) return false;
     if (!isGlobalTerminalControlPath(path_value.string)) return false;
 
-    const normalized_path = std.mem.trimLeft(u8, path_value.string, "/");
+    const normalized_path = std.mem.trimRight(u8, std.mem.trimLeft(u8, std.mem.trim(u8, path_value.string, " \t\r\n"), "/"), "/");
     if (std.mem.eql(u8, normalized_path, "global/terminal/control/exec.json")) return true;
 
     const invoke_payload = std.json.parseFromSlice(std.json.Value, allocator, content_value.string, .{}) catch return false;
@@ -835,6 +837,7 @@ pub fn registerBrainSpecialization(
 test "brain_specialization: detects terminal exec control paths" {
     try std.testing.expect(isGlobalTerminalControlPath("/global/terminal/control/exec.json"));
     try std.testing.expect(isGlobalTerminalControlPath("global/terminal/control/invoke.json"));
+    try std.testing.expect(isGlobalTerminalControlPath(" /global/terminal/control/exec.json/ \n"));
     try std.testing.expect(!isGlobalTerminalControlPath("/global/terminal/control/write.json"));
     try std.testing.expect(!isGlobalTerminalControlPath("/agents/self/terminal/control/exec.json"));
 }
@@ -845,6 +848,10 @@ test "brain_specialization: file_write escalation maps terminal exec leaves to s
     try std.testing.expect(fileWriteEscalatesToShellExec(
         allocator,
         "{\"path\":\"/global/terminal/control/exec.json\",\"content\":\"{\\\"command\\\":\\\"echo hi\\\"}\"}",
+    ));
+    try std.testing.expect(fileWriteEscalatesToShellExec(
+        allocator,
+        "{\"path\":\" /global/terminal/control/exec.json/ \",\"content\":\"{\\\"command\\\":\\\"echo hi\\\"}\"}",
     ));
     try std.testing.expect(fileWriteEscalatesToShellExec(
         allocator,
