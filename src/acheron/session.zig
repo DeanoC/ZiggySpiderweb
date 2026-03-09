@@ -1936,13 +1936,13 @@ pub const Session = struct {
         const workspace_status_json = try self.loadProjectWorkspaceStatus(policy.project_id);
         defer if (workspace_status_json) |value| self.allocator.free(value);
         const loaded_live_mounts = if (workspace_status_json) |json|
-            try self.addProjectFsLinksFromWorkspaceStatus(project_fs_dir, nodes_root, json)
+            try self.addProjectFsLinksFromWorkspaceStatus(project_fs_dir, policy, json)
         else
             false;
         if (!loaded_live_mounts) try self.addProjectFsLinksFromPolicy(project_fs_dir, policy);
         try self.addProjectNodeLinksFromPolicy(project_nodes_dir, policy);
         const loaded_live_nodes = if (workspace_status_json) |json|
-            try self.addProjectNodeLinksFromWorkspaceStatus(project_nodes_dir, json)
+            try self.addProjectNodeLinksFromWorkspaceStatus(project_nodes_dir, policy, json)
         else
             false;
 
@@ -2347,7 +2347,7 @@ pub const Session = struct {
     fn addProjectFsLinksFromWorkspaceStatus(
         self: *Session,
         project_fs_dir: u32,
-        nodes_root: u32,
+        policy: workspace_policy.WorkspacePolicy,
         workspace_status_json: []const u8,
     ) !bool {
         var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, workspace_status_json, .{}) catch return false;
@@ -2361,10 +2361,10 @@ pub const Session = struct {
             if (mount_value != .object) continue;
             const node_id_value = mount_value.object.get("node_id") orelse continue;
             if (node_id_value != .string or node_id_value.string.len == 0) continue;
+            if (!policyAllowsNodeFs(policy, node_id_value.string)) continue;
             const mount_path_value = mount_value.object.get("mount_path") orelse continue;
             if (mount_path_value != .string or mount_path_value.string.len == 0) continue;
 
-            try self.ensureWorkspaceNodeForProjectMount(nodes_root, node_id_value.string);
             const link_name = try projectMountPathToLinkName(self.allocator, mount_path_value.string);
             defer self.allocator.free(link_name);
             if (self.lookupChild(project_fs_dir, link_name) != null) continue;
@@ -2393,6 +2393,7 @@ pub const Session = struct {
     fn addProjectNodeLinksFromWorkspaceStatus(
         self: *Session,
         project_nodes_dir: u32,
+        policy: workspace_policy.WorkspacePolicy,
         workspace_status_json: []const u8,
     ) !bool {
         var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, workspace_status_json, .{}) catch return false;
@@ -2406,6 +2407,7 @@ pub const Session = struct {
             if (mount_value != .object) continue;
             const node_id_value = mount_value.object.get("node_id") orelse continue;
             if (node_id_value != .string or node_id_value.string.len == 0) continue;
+            if (!policyIncludesNode(policy, node_id_value.string)) continue;
             if (self.lookupChild(project_nodes_dir, node_id_value.string) != null) continue;
             const target = try std.fmt.allocPrint(self.allocator, "/nodes/{s}\n", .{node_id_value.string});
             defer self.allocator.free(target);
@@ -2415,33 +2417,19 @@ pub const Session = struct {
         return added;
     }
 
-    fn ensureWorkspaceNodeForProjectMount(
-        self: *Session,
-        nodes_root: u32,
-        node_id: []const u8,
-    ) !void {
-        if (self.lookupChild(nodes_root, node_id)) |node_dir| {
-            if (self.lookupChild(node_dir, "fs") == null) {
-                _ = try self.addDir(node_dir, "fs", false);
-            }
-            return;
+    fn policyAllowsNodeFs(policy: workspace_policy.WorkspacePolicy, node_id: []const u8) bool {
+        for (policy.nodes.items) |node| {
+            if (!std.mem.eql(u8, node.id, node_id)) continue;
+            return node.resources.fs;
         }
+        return false;
+    }
 
-        var discovered = workspace_policy.WorkspaceNodePolicy{
-            .id = try self.allocator.dupe(u8, node_id),
-            .resources = .{
-                .fs = true,
-                .camera = false,
-                .screen = false,
-                .user = false,
-            },
-        };
-        defer {
-            self.allocator.free(discovered.id);
-            for (discovered.terminals.items) |terminal_id| self.allocator.free(terminal_id);
-            discovered.terminals.deinit(self.allocator);
+    fn policyIncludesNode(policy: workspace_policy.WorkspacePolicy, node_id: []const u8) bool {
+        for (policy.nodes.items) |node| {
+            if (std.mem.eql(u8, node.id, node_id)) return true;
         }
-        try self.addNodeDirectory(nodes_root, discovered, true);
+        return false;
     }
 
     fn addNodeDirectory(
@@ -13800,7 +13788,7 @@ test "acheron_session: project meta includes control-plane workspace status" {
     try std.testing.expect(std.mem.indexOf(u8, health_node.content, "\"drift_count\":0") != null);
 }
 
-test "acheron_session: project workspace mount nodes are discovered outside policy" {
+test "acheron_session: project workspace mount links are filtered by policy" {
     const allocator = std.testing.allocator;
 
     var control_plane = control_plane_mod.ControlPlane.init(allocator);
@@ -13871,29 +13859,32 @@ test "acheron_session: project workspace mount nodes are discovered outside poli
     defer session.deinit();
 
     const nodes_root = session.lookupChild(session.root_id, "nodes") orelse return error.TestExpectedResponse;
-    const discovered_node_dir = session.lookupChild(nodes_root, node_id.string) orelse return error.TestExpectedResponse;
-    const discovered_fs = session.lookupChild(discovered_node_dir, "fs") orelse return error.TestExpectedResponse;
-    _ = discovered_fs;
-    const discovered_readme_id = session.lookupChild(discovered_node_dir, "README.md") orelse return error.TestExpectedResponse;
-    const discovered_status_id = session.lookupChild(discovered_node_dir, "STATUS.json") orelse return error.TestExpectedResponse;
-    const discovered_node_meta_id = session.lookupChild(discovered_node_dir, "NODE.json") orelse return error.TestExpectedResponse;
-    const discovered_readme = session.nodes.get(discovered_readme_id) orelse return error.TestExpectedResponse;
-    const discovered_status = session.nodes.get(discovered_status_id) orelse return error.TestExpectedResponse;
-    const discovered_node_meta = session.nodes.get(discovered_node_meta_id) orelse return error.TestExpectedResponse;
+    try std.testing.expect(session.lookupChild(nodes_root, node_id.string) == null);
 
     const projects_root = session.lookupChild(session.root_id, "projects") orelse return error.TestExpectedResponse;
     const project_node = session.lookupChild(projects_root, project_id.string) orelse return error.TestExpectedResponse;
     const project_fs_node = session.lookupChild(project_node, "fs") orelse return error.TestExpectedResponse;
-    const mount_link_id = session.lookupChild(project_fs_node, "mount::code") orelse return error.TestExpectedResponse;
-    const mount_link_node = session.nodes.get(mount_link_id) orelse return error.TestExpectedResponse;
+    try std.testing.expect(session.lookupChild(project_fs_node, "mount::code") == null);
+    const project_nodes_node = session.lookupChild(project_node, "nodes") orelse return error.TestExpectedResponse;
+    try std.testing.expect(session.lookupChild(project_nodes_node, node_id.string) == null);
 
-    try std.testing.expect(std.mem.indexOf(u8, discovered_readme.content, "discovered from live project workspace mounts") != null);
-    try std.testing.expect(std.mem.indexOf(u8, discovered_status.content, "\"state\":\"online\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, discovered_status.content, "\"source\":\"control_plane\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, discovered_node_meta.content, "\"node\":") != null);
-    try std.testing.expect(std.mem.indexOf(u8, discovered_node_meta.content, node_id.string) != null);
-    try std.testing.expect(std.mem.indexOf(u8, mount_link_node.content, "/nodes/") != null);
-    try std.testing.expect(std.mem.indexOf(u8, mount_link_node.content, "/fs") != null);
+    const meta_node = session.lookupChild(project_node, "meta") orelse return error.TestExpectedResponse;
+    const sources_id = session.lookupChild(meta_node, "sources.json") orelse return error.TestExpectedResponse;
+    const summary_id = session.lookupChild(meta_node, "summary.json") orelse return error.TestExpectedResponse;
+    const mounts_id = session.lookupChild(meta_node, "mounts.json") orelse return error.TestExpectedResponse;
+    const workspace_id = session.lookupChild(meta_node, "workspace_status.json") orelse return error.TestExpectedResponse;
+    const sources_node = session.nodes.get(sources_id) orelse return error.TestExpectedResponse;
+    const summary_node = session.nodes.get(summary_id) orelse return error.TestExpectedResponse;
+    const mounts_node = session.nodes.get(mounts_id) orelse return error.TestExpectedResponse;
+    const workspace_node = session.nodes.get(workspace_id) orelse return error.TestExpectedResponse;
+
+    try std.testing.expect(std.mem.indexOf(u8, sources_node.content, "\"workspace_status\":\"control_plane\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sources_node.content, "\"project_fs\":\"policy_links\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sources_node.content, "\"project_nodes\":\"policy_nodes\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, summary_node.content, "\"project_mount_links\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, summary_node.content, "\"project_node_links\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mounts_node.content, "\"mount_path\":\"/code\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, workspace_node.content, node_id.string) != null);
 }
 
 test "acheron_session: project meta summary and alerts reflect degraded and missing mounts" {
