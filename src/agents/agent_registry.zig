@@ -298,7 +298,7 @@ pub const AgentRegistry = struct {
     pub fn createAgent(self: *AgentRegistry, agent_id: []const u8, template_path: ?[]const u8) !void {
         // Load template source FIRST (before any filesystem mutation)
         const template_source = if (template_path) |tp|
-            try std.fs.cwd().readFileAlloc(self.allocator, tp, 64 * 1024)
+            try self.loadTemplateFromAllowedPath(tp)
         else
             try self.loadDefaultHatchTemplate();
         defer self.allocator.free(template_source);
@@ -322,6 +322,43 @@ pub const AgentRegistry = struct {
 
         // Reload agents to include the new one
         try self.scan();
+    }
+
+    fn loadTemplateFromAllowedPath(self: *AgentRegistry, template_path: []const u8) ![]u8 {
+        if (template_path.len == 0) return error.InvalidTemplatePath;
+        if (containsParentTraversal(template_path)) return error.InvalidTemplatePath;
+
+        const candidate_path = try resolveConfiguredPath(self.allocator, self.base_dir, template_path);
+        defer self.allocator.free(candidate_path);
+
+        const candidate_real = std.fs.cwd().realpathAlloc(self.allocator, candidate_path) catch |err| switch (err) {
+            error.FileNotFound, error.NotDir => return err,
+            else => return err,
+        };
+        defer self.allocator.free(candidate_real);
+
+        const assets_dir_path = try self.resolveAssetsDirPath();
+        defer self.allocator.free(assets_dir_path);
+        if (try self.isTemplatePathUnderRoot(candidate_real, assets_dir_path)) {
+            return std.fs.cwd().readFileAlloc(self.allocator, candidate_real, 64 * 1024);
+        }
+
+        const agents_dir_path = try self.resolveAgentsDirPath();
+        defer self.allocator.free(agents_dir_path);
+        if (try self.isTemplatePathUnderRoot(candidate_real, agents_dir_path)) {
+            return std.fs.cwd().readFileAlloc(self.allocator, candidate_real, 64 * 1024);
+        }
+
+        return error.InvalidTemplatePath;
+    }
+
+    fn isTemplatePathUnderRoot(self: *AgentRegistry, candidate_real: []const u8, root_path: []const u8) !bool {
+        const root_real = std.fs.cwd().realpathAlloc(self.allocator, root_path) catch |err| switch (err) {
+            error.FileNotFound => return false,
+            else => return err,
+        };
+        defer self.allocator.free(root_real);
+        return isPathWithinRoot(root_real, candidate_real);
     }
 
     /// Complete hatching - delete HATCH.md and update agent
@@ -461,6 +498,20 @@ fn resolveConfiguredPath(allocator: std.mem.Allocator, base_dir: []const u8, con
     return std.fs.path.join(allocator, &.{ base_dir, configured_path });
 }
 
+fn containsParentTraversal(path: []const u8) bool {
+    var parts = std.mem.tokenizeAny(u8, path, "/\\");
+    while (parts.next()) |part| {
+        if (std.mem.eql(u8, part, "..")) return true;
+    }
+    return false;
+}
+
+fn isPathWithinRoot(root: []const u8, candidate: []const u8) bool {
+    if (std.mem.eql(u8, root, candidate)) return true;
+    if (!std.mem.startsWith(u8, candidate, root)) return false;
+    return candidate.len > root.len and std.fs.path.isSep(candidate[root.len]);
+}
+
 fn parseCapability(str: []const u8) !AgentCapability {
     if (std.mem.eql(u8, str, "chat")) return .chat;
     if (std.mem.eql(u8, str, "code")) return .code;
@@ -508,4 +559,99 @@ test "agent_registry: scan supports absolute agents_dir path" {
     try std.testing.expect(mother != null);
     try std.testing.expect(mother.?.is_default);
     try std.testing.expectEqualStrings("Mother", mother.?.name);
+}
+
+test "agent_registry: createAgent loads custom template from configured assets dir" {
+    const allocator = std.testing.allocator;
+    const nonce = std.crypto.random.int(u64);
+    const rel_root = try std.fmt.allocPrint(allocator, ".tmp-agent-registry-template-ok-{d}", .{nonce});
+    defer allocator.free(rel_root);
+    defer std.fs.cwd().deleteTree(rel_root) catch {};
+    try std.fs.cwd().makePath(rel_root);
+
+    const assets_dir = try std.fs.path.join(allocator, &.{ rel_root, "templates" });
+    defer allocator.free(assets_dir);
+    const agents_dir = try std.fs.path.join(allocator, &.{ rel_root, "agents" });
+    defer allocator.free(agents_dir);
+    try std.fs.cwd().makePath(assets_dir);
+    try std.fs.cwd().makePath(agents_dir);
+
+    const custom_template_path = try std.fs.path.join(allocator, &.{ assets_dir, "custom.md" });
+    defer allocator.free(custom_template_path);
+    try std.fs.cwd().writeFile(.{
+        .sub_path = custom_template_path,
+        .data = "# custom hatch template\n",
+    });
+
+    var registry = AgentRegistry.init(allocator, rel_root, "agents", "templates");
+    defer registry.deinit();
+    try registry.createAgent("alpha", "templates/custom.md");
+
+    const hatch_path = try std.fs.path.join(allocator, &.{ agents_dir, "alpha", "HATCH.md" });
+    defer allocator.free(hatch_path);
+    const hatch = try std.fs.cwd().readFileAlloc(allocator, hatch_path, 1024);
+    defer allocator.free(hatch);
+    try std.testing.expectEqualStrings("# custom hatch template\n", hatch);
+}
+
+test "agent_registry: createAgent loads custom template from absolute configured assets dir" {
+    const allocator = std.testing.allocator;
+    const nonce = std.crypto.random.int(u64);
+    const rel_root = try std.fmt.allocPrint(allocator, ".tmp-agent-registry-template-abs-{d}", .{nonce});
+    defer allocator.free(rel_root);
+    defer std.fs.cwd().deleteTree(rel_root) catch {};
+    try std.fs.cwd().makePath(rel_root);
+
+    const agents_dir = try std.fs.path.join(allocator, &.{ rel_root, "agents" });
+    defer allocator.free(agents_dir);
+    const assets_dir = try std.fs.path.join(allocator, &.{ rel_root, "templates" });
+    defer allocator.free(assets_dir);
+    try std.fs.cwd().makePath(agents_dir);
+    try std.fs.cwd().makePath(assets_dir);
+
+    const abs_root = try std.fs.cwd().realpathAlloc(allocator, rel_root);
+    defer allocator.free(abs_root);
+    const abs_assets_dir = try std.fs.path.join(allocator, &.{ abs_root, "templates" });
+    defer allocator.free(abs_assets_dir);
+    const abs_agents_dir = try std.fs.path.join(allocator, &.{ abs_root, "agents" });
+    defer allocator.free(abs_agents_dir);
+
+    const custom_template_path = try std.fs.path.join(allocator, &.{ abs_assets_dir, "custom.md" });
+    defer allocator.free(custom_template_path);
+    try std.fs.cwd().writeFile(.{
+        .sub_path = custom_template_path,
+        .data = "# absolute custom hatch template\n",
+    });
+
+    var registry = AgentRegistry.init(allocator, rel_root, abs_agents_dir, abs_assets_dir);
+    defer registry.deinit();
+
+    try registry.createAgent("alpha", custom_template_path);
+
+    const hatch_path = try std.fs.path.join(allocator, &.{ abs_agents_dir, "alpha", "HATCH.md" });
+    defer allocator.free(hatch_path);
+    const hatch = try std.fs.cwd().readFileAlloc(allocator, hatch_path, 1024);
+    defer allocator.free(hatch);
+    try std.testing.expectEqualStrings("# absolute custom hatch template\n", hatch);
+}
+
+test "agent_registry: createAgent rejects traversal template path" {
+    const allocator = std.testing.allocator;
+    const nonce = std.crypto.random.int(u64);
+    const rel_root = try std.fmt.allocPrint(allocator, ".tmp-agent-registry-template-traversal-{d}", .{nonce});
+    defer allocator.free(rel_root);
+    defer std.fs.cwd().deleteTree(rel_root) catch {};
+    try std.fs.cwd().makePath(rel_root);
+
+    const agents_dir = try std.fs.path.join(allocator, &.{ rel_root, "agents" });
+    defer allocator.free(agents_dir);
+    const assets_dir = try std.fs.path.join(allocator, &.{ rel_root, "templates" });
+    defer allocator.free(assets_dir);
+    try std.fs.cwd().makePath(agents_dir);
+    try std.fs.cwd().makePath(assets_dir);
+
+    var registry = AgentRegistry.init(allocator, rel_root, "agents", "templates");
+    defer registry.deinit();
+
+    try std.testing.expectError(error.InvalidTemplatePath, registry.createAgent("beta", "templates/../../etc/passwd"));
 }
