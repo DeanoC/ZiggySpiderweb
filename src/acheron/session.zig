@@ -5665,6 +5665,8 @@ pub const Session = struct {
                 venom_id,
                 "agent_binding",
                 preferred_agent_node_id,
+                active_project_id,
+                self.agent_id,
             );
 
             const preferred_project_node_id = try self.resolvePreferredBoundVenomNodeIdForContext(
@@ -5679,6 +5681,8 @@ pub const Session = struct {
                 venom_id,
                 "project_binding",
                 preferred_project_node_id,
+                active_project_id,
+                self.agent_id,
             );
         }
     }
@@ -6293,10 +6297,36 @@ pub const Session = struct {
             &.{ "spiderapp-default", "spiderweb-local", "local" },
             project_id,
             agent_id,
-        )) orelse return null;
-        defer provider.deinit(self.allocator);
+        ));
+        defer if (provider) |*value| value.deinit(self.allocator);
+        if (provider) |value| {
+            if (self.isBoundVenomNodeAllowed(project_id, agent_id, value.node_id)) {
+                if (try self.boundVenomRouterForNode(plane, venom_id, value.node_id)) |router| return router;
+            }
+        }
 
-        const node_payload_req = try std.fmt.allocPrint(self.allocator, "{{\"node_id\":\"{s}\"}}", .{provider.node_id});
+        const nodes_root = self.lookupChild(self.root_id, "nodes") orelse return null;
+        const nodes_root_node = self.nodes.get(nodes_root) orelse return null;
+        var node_it = nodes_root_node.children.iterator();
+        while (node_it.next()) |entry| {
+            const node_name = entry.key_ptr.*;
+            const node_dir_id = entry.value_ptr.*;
+            const venoms_root_id = self.lookupChild(node_dir_id, "venoms") orelse continue;
+            _ = self.lookupChild(venoms_root_id, venom_id) orelse continue;
+            if (!self.isBoundVenomNodeAllowed(project_id, agent_id, node_name)) continue;
+            if (try self.boundVenomRouterForNode(plane, venom_id, node_name)) |router| return router;
+        }
+
+        return null;
+    }
+
+    fn boundVenomRouterForNode(
+        self: *Session,
+        plane: *control_plane_mod.ControlPlane,
+        venom_id: []const u8,
+        node_id: []const u8,
+    ) !?acheron_router.Router {
+        const node_payload_req = try std.fmt.allocPrint(self.allocator, "{{\"node_id\":\"{s}\"}}", .{node_id});
         defer self.allocator.free(node_payload_req);
         const node_payload = plane.getNode(node_payload_req) catch return null;
         defer self.allocator.free(node_payload);
@@ -6308,7 +6338,7 @@ pub const Session = struct {
         if (fs_url_val != .string or fs_url_val.string.len == 0) return null;
 
         return try acheron_router.Router.init(self.allocator, &[_]acheron_router.EndpointConfig{.{
-            .name = provider.node_id,
+            .name = node_id,
             .url = fs_url_val.string,
             .export_name = venom_id,
             .mount_path = "/",
@@ -6322,7 +6352,24 @@ pub const Session = struct {
     ) !bool {
         const alias_dir_id = try self.addDir(global_root, "fs", false);
         _ = alias_dir_id;
-        return self.registerBoundVenomAliasOnly("/global", "fs", "global_binding", preferred_node_id);
+        return self.registerBoundVenomAliasOnly("/global", "fs", "global_binding", preferred_node_id, null, null);
+    }
+
+    fn isBoundVenomNodeAllowed(
+        self: *Session,
+        project_id: ?[]const u8,
+        agent_id: ?[]const u8,
+        node_id: []const u8,
+    ) bool {
+        const scoped_project_id = project_id orelse return true;
+        const plane = self.control_plane orelse return true;
+        return plane.projectAllowsNodeVenomEvent(
+            scoped_project_id,
+            if (agent_id) |value| value else self.agent_id,
+            self.project_token,
+            node_id,
+            self.is_admin,
+        );
     }
 
     fn registerBoundVenomAliasOnly(
@@ -6331,6 +6378,8 @@ pub const Session = struct {
         venom_id: []const u8,
         scope: []const u8,
         preferred_node_id: ?[]const u8,
+        project_id: ?[]const u8,
+        agent_id: ?[]const u8,
     ) !bool {
         const nodes_root = self.lookupChild(self.root_id, "nodes") orelse return false;
 
@@ -6342,8 +6391,10 @@ pub const Session = struct {
             if (preferred_node_dir_id) |node_dir_id| {
                 if (self.lookupChild(node_dir_id, "venoms")) |venoms_root_id| {
                     if (self.lookupChild(venoms_root_id, venom_id)) |venom_dir_id| {
-                        selected_node_id = selected;
-                        selected_venom_dir_id = venom_dir_id;
+                        if (self.isBoundVenomNodeAllowed(project_id, agent_id, selected)) {
+                            selected_node_id = selected;
+                            selected_venom_dir_id = venom_dir_id;
+                        }
                     }
                 }
             }
@@ -6357,6 +6408,7 @@ pub const Session = struct {
                 const node_dir_id = entry.value_ptr.*;
                 const venoms_root_id = self.lookupChild(node_dir_id, "venoms") orelse continue;
                 const venom_dir_id = self.lookupChild(venoms_root_id, venom_id) orelse continue;
+                if (!self.isBoundVenomNodeAllowed(project_id, agent_id, node_name)) continue;
                 selected_node_id = node_name;
                 selected_venom_dir_id = venom_dir_id;
                 break;
@@ -11895,6 +11947,158 @@ test "acheron_session: agent and project venoms indexes surface scoped bindings"
     defer allocator.free(expected_project_provider);
     try std.testing.expect(std.mem.indexOf(u8, project_payload, "\"venom_path\":\"/projects/system/venoms/chat\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, project_payload, expected_project_provider) != null);
+}
+
+test "acheron_session: scoped venom bindings skip disallowed project nodes" {
+    const allocator = std.testing.allocator;
+
+    var control_plane = control_plane_mod.ControlPlane.init(allocator);
+    defer control_plane.deinit();
+
+    const local_joined = try control_plane.ensureNode("spiderweb-local", "ws://127.0.0.1:18891/v2/fs", 60_000);
+    defer allocator.free(local_joined);
+    var local_parsed = try std.json.parseFromSlice(std.json.Value, allocator, local_joined, .{});
+    defer local_parsed.deinit();
+    const local_node_id = local_parsed.value.object.get("node_id").?.string;
+    const local_node_secret = local_parsed.value.object.get("node_secret").?.string;
+
+    const app_joined = try control_plane.ensureNode("spiderapp-default", "", 60_000);
+    defer allocator.free(app_joined);
+    var app_parsed = try std.json.parseFromSlice(std.json.Value, allocator, app_joined, .{});
+    defer app_parsed.deinit();
+    const app_node_id = app_parsed.value.object.get("node_id").?.string;
+    const app_node_secret = app_parsed.value.object.get("node_secret").?.string;
+
+    const local_upsert = try std.fmt.allocPrint(
+        allocator,
+        "{{\"node_id\":\"{s}\",\"node_secret\":\"{s}\",\"venoms\":[{{\"venom_id\":\"chat\",\"kind\":\"chat\",\"version\":\"1\",\"state\":\"online\",\"endpoints\":[\"/nodes/{s}/chat\"],\"capabilities\":{{\"invoke\":true}},\"mounts\":[{{\"mount_id\":\"chat\",\"mount_path\":\"/nodes/{s}/chat\",\"state\":\"online\"}}],\"ops\":{{\"model\":\"namespace\",\"invoke\":\"control/input\"}},\"runtime\":{{\"type\":\"builtin\",\"abi\":\"venom-driver-v1\"}},\"permissions\":{{\"default\":\"deny-by-default\",\"allow_roles\":[\"admin\",\"user\"]}},\"schema\":{{\"model\":\"namespace-chat-v1\"}}}},{{\"venom_id\":\"fs\",\"kind\":\"fs\",\"version\":\"1\",\"state\":\"online\",\"endpoints\":[\"/nodes/{s}/fs\"],\"capabilities\":{{\"rw\":true}},\"mounts\":[{{\"mount_id\":\"fs\",\"mount_path\":\"/nodes/{s}/fs\",\"state\":\"online\"}}],\"ops\":{{\"model\":\"namespace\"}},\"runtime\":{{\"type\":\"builtin\",\"abi\":\"venom-driver-v1\"}},\"permissions\":{{\"default\":\"deny-by-default\",\"allow_roles\":[\"admin\",\"user\"]}},\"schema\":{{\"model\":\"namespace-mount\"}}}}]}}",
+        .{ local_node_id, local_node_secret, local_node_id, local_node_id, local_node_id, local_node_id },
+    );
+    defer allocator.free(local_upsert);
+    _ = try control_plane.nodeVenomUpsert(local_upsert);
+
+    const app_upsert = try std.fmt.allocPrint(
+        allocator,
+        "{{\"node_id\":\"{s}\",\"node_secret\":\"{s}\",\"venoms\":[{{\"venom_id\":\"chat\",\"kind\":\"chat\",\"version\":\"1\",\"state\":\"online\",\"endpoints\":[\"/nodes/{s}/chat\"],\"capabilities\":{{\"invoke\":true}},\"mounts\":[{{\"mount_id\":\"chat\",\"mount_path\":\"/nodes/{s}/chat\",\"state\":\"online\"}}],\"ops\":{{\"model\":\"namespace\",\"invoke\":\"control/input\"}},\"runtime\":{{\"type\":\"builtin\",\"abi\":\"venom-driver-v1\"}},\"permissions\":{{\"default\":\"deny-by-default\",\"allow_roles\":[\"admin\",\"user\"]}},\"schema\":{{\"model\":\"namespace-chat-v1\"}}}},{{\"venom_id\":\"fs\",\"kind\":\"fs\",\"version\":\"1\",\"state\":\"online\",\"endpoints\":[\"/nodes/{s}/fs\"],\"capabilities\":{{\"rw\":true}},\"mounts\":[{{\"mount_id\":\"fs\",\"mount_path\":\"/nodes/{s}/fs\",\"state\":\"online\"}}],\"ops\":{{\"model\":\"namespace\"}},\"runtime\":{{\"type\":\"builtin\",\"abi\":\"venom-driver-v1\"}},\"permissions\":{{\"default\":\"deny-by-default\",\"allow_roles\":[\"admin\",\"user\"]}},\"schema\":{{\"model\":\"namespace-mount\"}}}}]}}",
+        .{ app_node_id, app_node_secret, app_node_id, app_node_id, app_node_id, app_node_id },
+    );
+    defer allocator.free(app_upsert);
+    _ = try control_plane.nodeVenomUpsert(app_upsert);
+
+    const project_created = try control_plane.createProject(
+        "{\"name\":\"ScopedVenomProject\",\"vision\":\"ScopedVenomProject\",\"access_policy\":{\"actions\":{\"observe\":\"open\"}}}",
+    );
+    defer allocator.free(project_created);
+    var project_parsed = try std.json.parseFromSlice(std.json.Value, allocator, project_created, .{});
+    defer project_parsed.deinit();
+    const project_id_value = project_parsed.value.object.get("project_id") orelse return error.TestExpectedResponse;
+    if (project_id_value != .string) return error.TestExpectedResponse;
+    const project_id = try allocator.dupe(u8, project_id_value.string);
+    defer allocator.free(project_id);
+
+    const mount_payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"project_id\":\"{s}\",\"mount_path\":\"/nodes/{s}/fs\",\"node_id\":\"{s}\",\"export_name\":\"fs\"}}",
+        .{ project_id, local_node_id, local_node_id },
+    );
+    defer allocator.free(mount_payload);
+    const mount_result = try control_plane.setProjectMountWithRole(mount_payload, true);
+    defer allocator.free(mount_result);
+
+    const bind_project = try std.fmt.allocPrint(
+        allocator,
+        "{{\"venom_id\":\"chat\",\"scope\":\"project\",\"project_id\":\"{s}\",\"node_id\":\"{s}\"}}",
+        .{ project_id, app_node_id },
+    );
+    defer allocator.free(bind_project);
+    _ = try control_plane.bindPreferredVenomProvider(bind_project);
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "default",
+        .{
+            .control_plane = &control_plane,
+            .agents_dir = ".does-not-exist",
+            .projects_dir = ".does-not-exist",
+            .project_id = project_id,
+        },
+    );
+    defer session.deinit();
+
+    const project_payload = try protocolReadFile(
+        &session,
+        allocator,
+        308,
+        309,
+        &.{ "projects", project_id, "venoms", "VENOMS.json" },
+        782,
+    );
+    defer allocator.free(project_payload);
+    const expected_provider = try std.fmt.allocPrint(allocator, "\"provider_node_id\":\"{s}\"", .{local_node_id});
+    defer allocator.free(expected_provider);
+    const forbidden_provider = try std.fmt.allocPrint(allocator, "\"provider_node_id\":\"{s}\"", .{app_node_id});
+    defer allocator.free(forbidden_provider);
+    try std.testing.expect(std.mem.indexOf(u8, project_payload, expected_provider) != null);
+    try std.testing.expect(std.mem.indexOf(u8, project_payload, forbidden_provider) == null);
+
+    var router = (try session.boundVenomRouter("chat", project_id, null)) orelse return error.TestExpectedResponse;
+    defer router.deinit();
+    try std.testing.expectEqualStrings(local_node_id, router.endpointName(0) orelse return error.TestExpectedResponse);
+}
+
+test "acheron_session: scoped venom aliases keep local bindings without control plane" {
+    const allocator = std.testing.allocator;
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    const project_id = "offline-project";
+    var session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "default",
+        .{
+            .agents_dir = ".does-not-exist",
+            .projects_dir = ".does-not-exist",
+            .project_id = project_id,
+        },
+    );
+    defer session.deinit();
+
+    const nodes_root = session.lookupChild(session.root_id, "nodes") orelse return error.TestExpectedResponse;
+    const local_node_dir = try session.addDir(nodes_root, "spiderweb-local", false);
+    const venoms_root = try session.addDir(local_node_dir, "venoms", false);
+    const chat_dir = try session.addDir(venoms_root, "chat", false);
+    _ = try session.addFile(chat_dir, "STATUS.json", "{\"endpoint\":\"/nodes/spiderweb-local/venoms/chat\"}", false, .none);
+
+    const previous_len = session.scoped_venom_bindings.items.len;
+    try std.testing.expect(try session.registerBoundVenomAliasOnly(
+        "/projects/offline-project/venoms",
+        "chat",
+        "project_binding",
+        "spiderweb-local",
+        project_id,
+        null,
+    ));
+    try std.testing.expectEqual(previous_len + 1, session.scoped_venom_bindings.items.len);
+
+    const binding = session.scoped_venom_bindings.items[session.scoped_venom_bindings.items.len - 1];
+    try std.testing.expectEqualStrings("project_binding", binding.scope);
+    try std.testing.expectEqualStrings("/projects/offline-project/venoms/chat", binding.venom_path);
+    try std.testing.expectEqualStrings("spiderweb-local", binding.provider_node_id orelse return error.TestExpectedResponse);
+    try std.testing.expectEqualStrings("/nodes/spiderweb-local/venoms/chat", binding.provider_venom_path orelse return error.TestExpectedResponse);
 }
 
 test "acheron_session: scoped venom aliases shape proxy paths and job result paths" {
