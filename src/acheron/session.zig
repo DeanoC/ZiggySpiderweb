@@ -3520,6 +3520,14 @@ pub const Session = struct {
 
         const runtime_payload = try self.executeServiceToolCall("shell_exec", runtime_args.items);
         defer self.allocator.free(runtime_payload);
+        if (try self.extractErrorMessageFromToolPayload(runtime_payload)) |message| {
+            defer self.allocator.free(message);
+            session.updated_at_ms = std.time.milliTimestamp();
+            try self.setCurrentTerminalSession(session_id);
+            try self.refreshTerminalV2StateFiles();
+            try self.updateTerminalV2StatusAndResult("failed", "terminal_session_write", session_id, message, "write", "null");
+            return .{ .written = payload.len };
+        }
         try self.appendTerminalBufferedResult(session, runtime_payload);
 
         const now_ms = std.time.milliTimestamp();
@@ -3641,6 +3649,13 @@ pub const Session = struct {
             if (try jsonObjectOptionalString(obj, "cwd")) |next_cwd| {
                 if (session.cwd) |old| self.allocator.free(old);
                 session.cwd = try self.allocator.dupe(u8, next_cwd);
+            }
+            if (try self.extractErrorMessageFromToolPayload(runtime_payload)) |message| {
+                defer self.allocator.free(message);
+                try self.setCurrentTerminalSession(session_id);
+                try self.refreshTerminalV2StateFiles();
+                try self.updateTerminalV2StatusAndResult("failed", "shell_exec", session_id, message, "exec", "null");
+                return .{ .written = payload.len };
             }
             try self.appendTerminalBufferedResult(session, runtime_payload);
             try self.setCurrentTerminalSession(session_id);
@@ -13194,6 +13209,97 @@ test "acheron_session: terminal-v2 buffered output survives partial reads and mu
     defer allocator.free(third_decoded);
     try std.base64.standard.Decoder.decode(third_decoded, third_b64.string);
     try std.testing.expectEqualStrings("gh", third_decoded);
+}
+
+test "acheron_session: terminal-v2 write and exec surface shell_exec failures" {
+    const allocator = std.testing.allocator;
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.init(allocator, runtime_handle, &job_index, "default");
+    defer session.deinit();
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        354,
+        355,
+        &.{ "agents", "self", "terminal", "control", "create.json" },
+        "{\"session_id\":\"fail\",\"cwd\":\"/definitely/not/a/real/dir\"}",
+        946,
+    );
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        356,
+        357,
+        &.{ "agents", "self", "terminal", "control", "write.json" },
+        "{\"session_id\":\"fail\",\"input\":\"echo should-fail\",\"append_newline\":true}",
+        947,
+    );
+
+    const write_status_payload = try protocolReadFile(
+        &session,
+        allocator,
+        358,
+        359,
+        &.{ "agents", "self", "terminal", "status.json" },
+        948,
+    );
+    defer allocator.free(write_status_payload);
+    try std.testing.expect(std.mem.indexOf(u8, write_status_payload, "\"state\":\"failed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, write_status_payload, "\"tool\":\"terminal_session_write\"") != null);
+
+    const write_result_payload = try protocolReadFile(
+        &session,
+        allocator,
+        360,
+        361,
+        &.{ "agents", "self", "terminal", "result.json" },
+        949,
+    );
+    defer allocator.free(write_result_payload);
+    try std.testing.expect(std.mem.indexOf(u8, write_result_payload, "\"ok\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, write_result_payload, "\"operation\":\"write\"") != null);
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        362,
+        363,
+        &.{ "agents", "self", "terminal", "control", "exec.json" },
+        "{\"session_id\":\"fail\",\"command\":\"echo still-fails\"}",
+        950,
+    );
+
+    const exec_status_payload = try protocolReadFile(
+        &session,
+        allocator,
+        364,
+        365,
+        &.{ "agents", "self", "terminal", "status.json" },
+        951,
+    );
+    defer allocator.free(exec_status_payload);
+    try std.testing.expect(std.mem.indexOf(u8, exec_status_payload, "\"state\":\"failed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, exec_status_payload, "\"tool\":\"shell_exec\"") != null);
+
+    const exec_result_payload = try protocolReadFile(
+        &session,
+        allocator,
+        366,
+        367,
+        &.{ "agents", "self", "terminal", "result.json" },
+        952,
+    );
+    defer allocator.free(exec_result_payload);
+    try std.testing.expect(std.mem.indexOf(u8, exec_result_payload, "\"ok\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, exec_result_payload, "\"operation\":\"exec\"") != null);
 }
 
 test "acheron_session: first-class memory namespace rejects unknown invoke op" {
