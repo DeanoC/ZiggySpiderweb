@@ -8,9 +8,9 @@
   "base_sha": "",
   "head_branch": "feature/example",
   "head_sha": "",
-  "checkout_path": "/workspace/pr-review/repos/owner__repo",
+  "checkout_path": "/nodes/local/fs/pr-review/repos/owner__repo",
   "review_policy_paths": [
-    "/workspace/repo/docs/review-policy.md"
+    "/nodes/local/fs/pr-review/repos/owner__repo/docs/review-policy.md"
   ],
   "default_review_commands": [
     "zig build",

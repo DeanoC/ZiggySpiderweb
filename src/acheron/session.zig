@@ -59,6 +59,7 @@ const SpecialKind = enum {
     missions_get,
     missions_heartbeat,
     missions_checkpoint,
+    missions_bootstrap_contract,
     missions_recover,
     missions_request_approval,
     missions_approve,
@@ -9216,13 +9217,13 @@ pub const Session = struct {
             missions_dir,
             "Missions",
             "{\"kind\":\"venom\",\"venom_id\":\"missions\",\"shape\":\"/global/missions/{README.md,SCHEMA.json,CAPS.json,OPS.json,RUNTIME.json,PERMISSIONS.json,STATUS.json,status.json,result.json,control/*}\"}",
-            "{\"invoke\":true,\"operations\":[\"missions_create\",\"missions_list\",\"missions_get\",\"missions_heartbeat\",\"missions_checkpoint\",\"missions_invoke_service\",\"missions_recover\",\"missions_request_approval\",\"missions_approve\",\"missions_reject\",\"missions_resume\",\"missions_block\",\"missions_complete\",\"missions_fail\",\"missions_cancel\"],\"discoverable\":true,\"persistent\":true}",
+            "{\"invoke\":true,\"operations\":[\"missions_create\",\"missions_list\",\"missions_get\",\"missions_heartbeat\",\"missions_checkpoint\",\"missions_bootstrap_contract\",\"missions_invoke_service\",\"missions_recover\",\"missions_request_approval\",\"missions_approve\",\"missions_reject\",\"missions_resume\",\"missions_block\",\"missions_complete\",\"missions_fail\",\"missions_cancel\"],\"discoverable\":true,\"persistent\":true}",
             "Long-running mission records. Create/list/get missions, invoke workspace services through mission steps, request approvals, and track recovery/state transitions.",
         );
         _ = try self.addFile(
             missions_dir,
             "OPS.json",
-            "{\"model\":\"local_bridge\",\"invoke\":\"control/invoke.json\",\"transport\":\"acheron-local\",\"paths\":{\"create\":\"control/create.json\",\"list\":\"control/list.json\",\"get\":\"control/get.json\",\"heartbeat\":\"control/heartbeat.json\",\"checkpoint\":\"control/checkpoint.json\",\"invoke_service\":\"control/invoke_service.json\",\"recover\":\"control/recover.json\",\"request_approval\":\"control/request_approval.json\",\"approve\":\"control/approve.json\",\"reject\":\"control/reject.json\",\"resume\":\"control/resume.json\",\"block\":\"control/block.json\",\"complete\":\"control/complete.json\",\"fail\":\"control/fail.json\",\"cancel\":\"control/cancel.json\"},\"operations\":{\"create\":\"create\",\"list\":\"list\",\"get\":\"get\",\"heartbeat\":\"heartbeat\",\"checkpoint\":\"checkpoint\",\"invoke_service\":\"invoke_service\",\"recover\":\"recover\",\"request_approval\":\"request_approval\",\"approve\":\"approve\",\"reject\":\"reject\",\"resume\":\"resume\",\"block\":\"block\",\"complete\":\"complete\",\"fail\":\"fail\",\"cancel\":\"cancel\"}}",
+            "{\"model\":\"local_bridge\",\"invoke\":\"control/invoke.json\",\"transport\":\"acheron-local\",\"paths\":{\"create\":\"control/create.json\",\"list\":\"control/list.json\",\"get\":\"control/get.json\",\"heartbeat\":\"control/heartbeat.json\",\"checkpoint\":\"control/checkpoint.json\",\"bootstrap_contract\":\"control/bootstrap_contract.json\",\"invoke_service\":\"control/invoke_service.json\",\"recover\":\"control/recover.json\",\"request_approval\":\"control/request_approval.json\",\"approve\":\"control/approve.json\",\"reject\":\"control/reject.json\",\"resume\":\"control/resume.json\",\"block\":\"control/block.json\",\"complete\":\"control/complete.json\",\"fail\":\"control/fail.json\",\"cancel\":\"control/cancel.json\"},\"operations\":{\"create\":\"create\",\"list\":\"list\",\"get\":\"get\",\"heartbeat\":\"heartbeat\",\"checkpoint\":\"checkpoint\",\"bootstrap_contract\":\"bootstrap_contract\",\"invoke_service\":\"invoke_service\",\"recover\":\"recover\",\"request_approval\":\"request_approval\",\"approve\":\"approve\",\"reject\":\"reject\",\"resume\":\"resume\",\"block\":\"block\",\"complete\":\"complete\",\"fail\":\"fail\",\"cancel\":\"cancel\"}}",
             false,
             .none,
         );
@@ -9266,11 +9267,12 @@ pub const Session = struct {
         _ = try self.addFile(
             control_dir,
             "README.md",
-            "Write JSON payloads to mission control files. invoke.json accepts op=create|list|get|heartbeat|checkpoint|invoke_service|recover|request_approval|approve|reject|resume|block|complete|fail|cancel envelopes.\n",
+            "Write JSON payloads to mission control files. invoke.json accepts op=create|list|get|heartbeat|checkpoint|bootstrap_contract|invoke_service|recover|request_approval|approve|reject|resume|block|complete|fail|cancel envelopes.\n",
             false,
             .none,
         );
         _ = try self.addFile(control_dir, "invoke.json", "", true, .missions_invoke);
+        _ = try self.addFile(control_dir, "bootstrap_contract.json", "", true, .missions_bootstrap_contract);
         _ = try self.addFile(control_dir, "invoke_service.json", "", true, .missions_invoke_service);
         _ = try self.addFile(control_dir, "create.json", "", true, .missions_create);
         _ = try self.addFile(control_dir, "list.json", "", true, .missions_list);
@@ -9294,6 +9296,7 @@ pub const Session = struct {
         get,
         heartbeat,
         checkpoint,
+        bootstrap_contract,
         invoke_service,
         recover,
         request_approval,
@@ -9322,6 +9325,7 @@ pub const Session = struct {
             .missions_get => MissionOp.get,
             .missions_heartbeat => MissionOp.heartbeat,
             .missions_checkpoint => MissionOp.checkpoint,
+            .missions_bootstrap_contract => MissionOp.bootstrap_contract,
             .missions_invoke_service => MissionOp.invoke_service,
             .missions_recover => MissionOp.recover,
             .missions_request_approval => MissionOp.request_approval,
@@ -9366,6 +9370,7 @@ pub const Session = struct {
         if (std.mem.eql(u8, value, "get") or std.mem.eql(u8, value, "missions_get")) return .get;
         if (std.mem.eql(u8, value, "heartbeat") or std.mem.eql(u8, value, "missions_heartbeat")) return .heartbeat;
         if (std.mem.eql(u8, value, "checkpoint") or std.mem.eql(u8, value, "missions_checkpoint")) return .checkpoint;
+        if (std.mem.eql(u8, value, "bootstrap_contract") or std.mem.eql(u8, value, "missions_bootstrap_contract")) return .bootstrap_contract;
         if (std.mem.eql(u8, value, "invoke_service") or std.mem.eql(u8, value, "missions_invoke_service")) return .invoke_service;
         if (std.mem.eql(u8, value, "recover") or std.mem.eql(u8, value, "missions_recover")) return .recover;
         if (std.mem.eql(u8, value, "request_approval") or std.mem.eql(u8, value, "missions_request_approval")) return .request_approval;
@@ -9386,6 +9391,7 @@ pub const Session = struct {
             .get => "missions_get",
             .heartbeat => "missions_heartbeat",
             .checkpoint => "missions_checkpoint",
+            .bootstrap_contract => "missions_bootstrap_contract",
             .invoke_service => "missions_invoke_service",
             .recover => "missions_recover",
             .request_approval => "missions_request_approval",
@@ -9406,6 +9412,7 @@ pub const Session = struct {
             .get => "get",
             .heartbeat => "heartbeat",
             .checkpoint => "checkpoint",
+            .bootstrap_contract => "bootstrap_contract",
             .invoke_service => "invoke_service",
             .recover => "recover",
             .request_approval => "request_approval",
@@ -9458,6 +9465,77 @@ pub const Session = struct {
         const value = raw orelse return null;
         if (value.len == 0 or value[0] != '/') return error.InvalidPayload;
         return value;
+    }
+
+    const ResolvedMissionBootstrapContract = struct {
+        contract_id: []const u8,
+        context_path: []const u8,
+        state_path: []const u8,
+        artifact_root: []const u8,
+    };
+
+    fn resolveMissionBootstrapContract(
+        self: *Session,
+        mission: mission_store_mod.MissionRecord,
+        args_obj: std.json.ObjectMap,
+    ) !ResolvedMissionBootstrapContract {
+        if (mission.contract) |contract| {
+            const update = try self.parseMissionContractUpdateInput(args_obj);
+            return .{
+                .contract_id = if (update) |value| value.contract_id orelse contract.contract_id else contract.contract_id,
+                .context_path = if (update) |value| value.context_path orelse (contract.context_path orelse return error.InvalidPayload) else contract.context_path orelse return error.InvalidPayload,
+                .state_path = if (update) |value| value.state_path orelse (contract.state_path orelse return error.InvalidPayload) else contract.state_path orelse return error.InvalidPayload,
+                .artifact_root = if (update) |value| value.artifact_root orelse (contract.artifact_root orelse return error.InvalidPayload) else contract.artifact_root orelse return error.InvalidPayload,
+            };
+        }
+
+        const contract = (try self.parseMissionContractInput(args_obj)) orelse return error.InvalidPayload;
+        return .{
+            .contract_id = contract.contract_id,
+            .context_path = contract.context_path orelse return error.InvalidPayload,
+            .state_path = contract.state_path orelse return error.InvalidPayload,
+            .artifact_root = contract.artifact_root orelse return error.InvalidPayload,
+        };
+    }
+
+    fn resolveMissionContractHostPath(self: *Session, absolute_path: []const u8) ![]u8 {
+        const local_root = self.local_fs_export_root orelse return error.InvalidPayload;
+        const relative_path = try self.normalizeLocalFsRelativePath(absolute_path);
+        defer self.allocator.free(relative_path);
+        return std.fs.path.join(self.allocator, &.{ local_root, relative_path });
+    }
+
+    fn ensureMissionContractDirectory(self: *Session, absolute_path: []const u8) !void {
+        const host_path = try self.resolveMissionContractHostPath(absolute_path);
+        defer self.allocator.free(host_path);
+        ensurePathExists(host_path) catch |err| switch (err) {
+            error.PathAlreadyExists,
+            error.NotDir,
+            error.AccessDenied,
+            => return error.InvalidPayload,
+            else => return err,
+        };
+    }
+
+    fn writeMissionContractFile(self: *Session, absolute_path: []const u8, content: []const u8) !void {
+        const host_path = try self.resolveMissionContractHostPath(absolute_path);
+        defer self.allocator.free(host_path);
+
+        const parent = std.fs.path.dirname(host_path) orelse return error.InvalidPayload;
+        ensurePathExists(parent) catch |err| switch (err) {
+            error.PathAlreadyExists,
+            error.NotDir,
+            error.AccessDenied,
+            => return error.InvalidPayload,
+            else => return err,
+        };
+
+        const file = if (std.fs.path.isAbsolute(host_path))
+            try std.fs.createFileAbsolute(host_path, .{ .truncate = true })
+        else
+            try std.fs.cwd().createFile(host_path, .{ .truncate = true });
+        defer file.close();
+        try file.writeAll(content);
     }
 
     fn executeMissionOp(self: *Session, op: MissionOp, args_obj: std.json.ObjectMap, written: usize) !WriteOutcome {
@@ -9604,6 +9682,7 @@ pub const Session = struct {
                 defer self.allocator.free(detail);
                 break :blk self.buildMissionSuccessResultJson(.checkpoint, detail);
             },
+            .bootstrap_contract => self.executeMissionBootstrapContractOp(args_obj),
             .invoke_service => self.executeMissionInvokeServiceOp(args_obj),
             .recover => blk: {
                 const mission_id = extractOptionalStringByNames(args_obj, &[_][]const u8{ "mission_id", "id" }) orelse return error.InvalidPayload;
@@ -9813,6 +9892,62 @@ pub const Session = struct {
         return self.buildMissionSuccessResultJson(.invoke_service, detail);
     }
 
+    fn executeMissionBootstrapContractOp(self: *Session, args_obj: std.json.ObjectMap) ![]u8 {
+        const store = self.mission_store orelse return error.InvalidPayload;
+        const mission_id = extractOptionalStringByNames(args_obj, &[_][]const u8{ "mission_id", "id" }) orelse return error.InvalidPayload;
+        var existing = (try store.getOwned(self.allocator, mission_id)) orelse return error.NotFound;
+        defer existing.deinit(self.allocator);
+
+        const contract = try self.resolveMissionBootstrapContract(existing, args_obj);
+
+        const context_payload = if (args_obj.get("context")) |value|
+            try self.renderJsonValue(value)
+        else
+            return error.InvalidPayload;
+        defer self.allocator.free(context_payload);
+
+        const state_payload = if (args_obj.get("state")) |value|
+            try self.renderJsonValue(value)
+        else
+            return error.InvalidPayload;
+        defer self.allocator.free(state_payload);
+
+        try self.ensureMissionContractDirectory(contract.artifact_root);
+        try self.writeMissionContractFile(contract.context_path, context_payload);
+        try self.writeMissionContractFile(contract.state_path, state_payload);
+
+        var mission = store.recordCheckpoint(self.allocator, mission_id, .{
+            .stage = extractOptionalStringByNames(args_obj, &[_][]const u8{"stage"}) orelse "bootstrap_contract",
+            .summary = extractOptionalStringByNames(args_obj, &[_][]const u8{"summary"}) orelse "Materialized mission contract files",
+            .artifact = .{
+                .kind = "contract_state",
+                .path = contract.state_path,
+                .summary = "Mission contract state file",
+            },
+            .contract = .{
+                .contract_id = contract.contract_id,
+                .context_path = contract.context_path,
+                .state_path = contract.state_path,
+                .artifact_root = contract.artifact_root,
+            },
+        }) catch |err| switch (err) {
+            mission_store_mod.MissionStoreError.MissionNotFound => return error.NotFound,
+            else => return error.InvalidPayload,
+        };
+        defer mission.deinit(self.allocator);
+
+        const mission_json = try self.buildMissionRecordJson(mission);
+        defer self.allocator.free(mission_json);
+        const detail = try self.buildMissionBootstrapContractDetailJson(
+            mission_json,
+            contract.context_path,
+            contract.state_path,
+            contract.artifact_root,
+        );
+        defer self.allocator.free(detail);
+        return self.buildMissionSuccessResultJson(.bootstrap_contract, detail);
+    }
+
     fn normalizeMissionAbsolutePath(self: *Session, raw: []const u8) ![]u8 {
         const trimmed = std.mem.trim(u8, raw, " \t\r\n");
         if (trimmed.len == 0 or trimmed[0] != '/') return error.InvalidPayload;
@@ -9890,6 +10025,26 @@ pub const Session = struct {
                 result_payload_json,
                 status_json,
             },
+        );
+    }
+
+    fn buildMissionBootstrapContractDetailJson(
+        self: *Session,
+        mission_json: []const u8,
+        context_path: []const u8,
+        state_path: []const u8,
+        artifact_root: []const u8,
+    ) ![]u8 {
+        const escaped_context_path = try unified.jsonEscape(self.allocator, context_path);
+        defer self.allocator.free(escaped_context_path);
+        const escaped_state_path = try unified.jsonEscape(self.allocator, state_path);
+        defer self.allocator.free(escaped_state_path);
+        const escaped_artifact_root = try unified.jsonEscape(self.allocator, artifact_root);
+        defer self.allocator.free(escaped_artifact_root);
+        return std.fmt.allocPrint(
+            self.allocator,
+            "{{\"mission\":{s},\"materialized\":{{\"context_path\":\"{s}\",\"state_path\":\"{s}\",\"artifact_root\":\"{s}\"}}}}",
+            .{ mission_json, escaped_context_path, escaped_state_path, escaped_artifact_root },
         );
     }
 
@@ -13946,7 +14101,7 @@ test "acheron_session: missions namespace tracks lifecycle checkpoint and recove
         296,
         297,
         &.{ "agents", "self", "missions", "control", "create.json" },
-        "{\"use_case\":\"pr_review\",\"title\":\"Review PR 15\",\"stage\":\"planning\",\"contract\":{\"contract_id\":\"spider_monkey/pr_review@v1\",\"context_path\":\"/workspace/pr-review/state/pr-15/context.json\"}}",
+        "{\"use_case\":\"pr_review\",\"title\":\"Review PR 15\",\"stage\":\"planning\",\"contract\":{\"contract_id\":\"spider_monkey/pr_review@v1\",\"context_path\":\"/nodes/local/fs/pr-review/state/pr-15/context.json\"}}",
         937,
     );
 
@@ -13966,7 +14121,7 @@ test "acheron_session: missions namespace tracks lifecycle checkpoint and recove
 
     const resume_payload = try std.fmt.allocPrint(
         allocator,
-        "{{\"mission_id\":\"{s}\",\"stage\":\"collecting_context\",\"contract\":{{\"state_path\":\"/workspace/pr-review/state/pr-15/state.json\"}}}}",
+        "{{\"mission_id\":\"{s}\",\"stage\":\"collecting_context\",\"contract\":{{\"state_path\":\"/nodes/local/fs/pr-review/state/pr-15/state.json\"}}}}",
         .{mission_id},
     );
     defer allocator.free(resume_payload);
@@ -13982,7 +14137,7 @@ test "acheron_session: missions namespace tracks lifecycle checkpoint and recove
 
     const checkpoint_payload = try std.fmt.allocPrint(
         allocator,
-        "{{\"mission_id\":\"{s}\",\"stage\":\"reviewing\",\"summary\":\"Scanned changed files\",\"artifact\":{{\"kind\":\"notes\",\"path\":\"artifacts/review.md\",\"summary\":\"review notes\"}},\"contract\":{{\"artifact_root\":\"/workspace/pr-review/runs/pr-15\"}}}}",
+        "{{\"mission_id\":\"{s}\",\"stage\":\"reviewing\",\"summary\":\"Scanned changed files\",\"artifact\":{{\"kind\":\"notes\",\"path\":\"artifacts/review.md\",\"summary\":\"review notes\"}},\"contract\":{{\"artifact_root\":\"/nodes/local/fs/pr-review/runs/pr-15\"}}}}",
         .{mission_id},
     );
     defer allocator.free(checkpoint_payload);
@@ -14045,9 +14200,9 @@ test "acheron_session: missions namespace tracks lifecycle checkpoint and recove
     try std.testing.expect(std.mem.indexOf(u8, get_result, "\"stage\":\"restoring_context\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, get_result, "\"kind\":\"notes\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, get_result, "\"contract_id\":\"spider_monkey/pr_review@v1\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, get_result, "\"context_path\":\"/workspace/pr-review/state/pr-15/context.json\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, get_result, "\"state_path\":\"/workspace/pr-review/state/pr-15/state.json\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, get_result, "\"artifact_root\":\"/workspace/pr-review/runs/pr-15\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, get_result, "\"context_path\":\"/nodes/local/fs/pr-review/state/pr-15/context.json\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, get_result, "\"state_path\":\"/nodes/local/fs/pr-review/state/pr-15/state.json\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, get_result, "\"artifact_root\":\"/nodes/local/fs/pr-review/runs/pr-15\"") != null);
 
     try protocolWriteFile(
         &session,
@@ -14240,7 +14395,7 @@ test "acheron_session: missions invoke_service records successful venom step" {
         328,
         329,
         &.{ "agents", "self", "missions", "control", "create.json" },
-        "{\"use_case\":\"pr_review\",\"title\":\"Review PR 48\",\"contract\":{\"contract_id\":\"spider_monkey/pr_review@v1\",\"context_path\":\"/workspace/pr-review/state/pr-48/context.json\"}}",
+        "{\"use_case\":\"pr_review\",\"title\":\"Review PR 48\",\"contract\":{\"contract_id\":\"spider_monkey/pr_review@v1\",\"context_path\":\"/nodes/local/fs/pr-review/state/pr-48/context.json\"}}",
         953,
     );
     const create_result = try protocolReadFile(
@@ -14273,7 +14428,7 @@ test "acheron_session: missions invoke_service records successful venom step" {
 
     const invoke_payload = try std.fmt.allocPrint(
         allocator,
-        "{{\"mission_id\":\"{s}\",\"service_path\":\"/global/memory\",\"stage\":\"collecting_context\",\"summary\":\"Created review memory\",\"op\":\"create\",\"arguments\":{{\"name\":\"mission-review-note\",\"kind\":\"note\",\"content\":{{\"text\":\"mission bridge ok\"}}}},\"contract\":{{\"artifact_root\":\"/workspace/pr-review/runs/pr-48\"}}}}",
+        "{{\"mission_id\":\"{s}\",\"service_path\":\"/global/memory\",\"stage\":\"collecting_context\",\"summary\":\"Created review memory\",\"op\":\"create\",\"arguments\":{{\"name\":\"mission-review-note\",\"kind\":\"note\",\"content\":{{\"text\":\"mission bridge ok\"}}}},\"contract\":{{\"artifact_root\":\"/nodes/local/fs/pr-review/runs/pr-48\"}}}}",
         .{mission_id},
     );
     defer allocator.free(invoke_payload);
@@ -14316,7 +14471,124 @@ test "acheron_session: missions invoke_service records successful venom step" {
     try std.testing.expect(std.mem.indexOf(u8, mission_result, "\"memory_path\":\"/global/memory/items/mission-review-note\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, mission_result, "\"event_type\":\"mission.service_invoked\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, mission_result, "\"kind\":\"service_result\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, mission_result, "\"artifact_root\":\"/workspace/pr-review/runs/pr-48\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mission_result, "\"artifact_root\":\"/nodes/local/fs/pr-review/runs/pr-48\"") != null);
+}
+
+test "acheron_session: missions bootstrap_contract materializes contract files in local export root" {
+    const allocator = std.testing.allocator;
+
+    var mission_store = try mission_store_mod.MissionStore.initWithPath(allocator, null);
+    defer mission_store.deinit();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const local_export_root = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(local_export_root);
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "default",
+        .{
+            .mission_store = &mission_store,
+            .local_fs_export_root = local_export_root,
+            .actor_type = "agent",
+            .actor_id = "worker-a",
+        },
+    );
+    defer session.deinit();
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        352,
+        353,
+        &.{ "agents", "self", "missions", "control", "create.json" },
+        "{\"use_case\":\"pr_review\",\"title\":\"Review PR 77\",\"contract\":{\"contract_id\":\"spider_monkey/pr_review@v1\",\"context_path\":\"/nodes/local/fs/pr-review/state/pr-77/context.json\",\"state_path\":\"/nodes/local/fs/pr-review/state/pr-77/state.json\",\"artifact_root\":\"/nodes/local/fs/pr-review/runs/pr-77\"}}",
+        965,
+    );
+    const create_result = try protocolReadFile(
+        &session,
+        allocator,
+        354,
+        355,
+        &.{ "agents", "self", "missions", "result.json" },
+        966,
+    );
+    defer allocator.free(create_result);
+    const mission_id = try extractMissionIdFromResultPayload(allocator, create_result);
+    defer allocator.free(mission_id);
+
+    const bootstrap_payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"mission_id\":\"{s}\",\"stage\":\"bootstrap_context\",\"context\":{{\"repo\":\"DeanoC/Spiderweb\",\"pr_number\":77}},\"state\":{{\"stage\":\"intake\",\"artifacts\":[]}}}}",
+        .{mission_id},
+    );
+    defer allocator.free(bootstrap_payload);
+    try protocolWriteFile(
+        &session,
+        allocator,
+        356,
+        357,
+        &.{ "agents", "self", "missions", "control", "bootstrap_contract.json" },
+        bootstrap_payload,
+        967,
+    );
+
+    const mission_status = try protocolReadFile(
+        &session,
+        allocator,
+        358,
+        359,
+        &.{ "agents", "self", "missions", "status.json" },
+        968,
+    );
+    defer allocator.free(mission_status);
+    try std.testing.expect(std.mem.indexOf(u8, mission_status, "\"state\":\"done\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mission_status, "\"tool\":\"missions_bootstrap_contract\"") != null);
+
+    const mission_result = try protocolReadFile(
+        &session,
+        allocator,
+        360,
+        361,
+        &.{ "agents", "self", "missions", "result.json" },
+        969,
+    );
+    defer allocator.free(mission_result);
+    try std.testing.expect(std.mem.indexOf(u8, mission_result, "\"operation\":\"bootstrap_contract\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mission_result, "\"ok\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mission_result, "\"stage\":\"bootstrap_context\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mission_result, "\"contract_id\":\"spider_monkey/pr_review@v1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mission_result, "\"context_path\":\"/nodes/local/fs/pr-review/state/pr-77/context.json\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mission_result, "\"state_path\":\"/nodes/local/fs/pr-review/state/pr-77/state.json\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mission_result, "\"artifact_root\":\"/nodes/local/fs/pr-review/runs/pr-77\"") != null);
+
+    const context_host_path = try std.fs.path.join(allocator, &.{ local_export_root, "pr-review", "state", "pr-77", "context.json" });
+    defer allocator.free(context_host_path);
+    const context_content = try std.fs.cwd().readFileAlloc(allocator, context_host_path, 64 * 1024);
+    defer allocator.free(context_content);
+    try std.testing.expect(std.mem.indexOf(u8, context_content, "\"repo\":\"DeanoC/Spiderweb\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, context_content, "\"pr_number\":77") != null);
+
+    const state_host_path = try std.fs.path.join(allocator, &.{ local_export_root, "pr-review", "state", "pr-77", "state.json" });
+    defer allocator.free(state_host_path);
+    const state_content = try std.fs.cwd().readFileAlloc(allocator, state_host_path, 64 * 1024);
+    defer allocator.free(state_content);
+    try std.testing.expect(std.mem.indexOf(u8, state_content, "\"stage\":\"intake\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, state_content, "\"artifacts\":[]") != null);
+
+    const artifact_root_host_path = try std.fs.path.join(allocator, &.{ local_export_root, "pr-review", "runs", "pr-77" });
+    defer allocator.free(artifact_root_host_path);
+    var artifact_root_dir = try std.fs.openDirAbsolute(artifact_root_host_path, .{});
+    artifact_root_dir.close();
 }
 
 test "acheron_session: missions invoke_service records downstream service failures" {

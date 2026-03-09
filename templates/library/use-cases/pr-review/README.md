@@ -25,10 +25,11 @@ Recommended artifact layout under `artifact_root`:
 Suggested loop:
 
 1. Read the mission `contract`, then load `context_path` and `state_path`.
-2. Discover available services through `/global/venoms/VENOMS.json`.
-3. Use mounted Git/GitHub, terminal, search, and memory services to inspect the PR.
-4. Persist intermediate conclusions into `state_path` instead of relying on chat context alone.
-5. Write durable outputs into `artifact_root`.
-6. Request approval through `/global/missions/control/request_approval.json` before push or merge when policy requires it.
+2. On the first pass, materialize those files with `/global/missions/control/bootstrap_contract.json`.
+3. Discover available services through `/global/venoms/VENOMS.json`.
+4. Use mounted Git/GitHub, terminal, search, and memory services to inspect the PR.
+5. Persist intermediate conclusions into `state_path` instead of relying on chat context alone.
+6. Write durable outputs into `artifact_root`.
+7. Request approval through `/global/missions/control/request_approval.json` before push or merge when policy requires it.
 
 The mission record should track lifecycle and approvals. PR-specific reasoning, review state, and outputs belong in the workspace files.

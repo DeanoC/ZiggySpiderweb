@@ -1355,7 +1355,7 @@ test "mission_store: create checkpoint recover and transition records state" {
         .title = "Review PR #123",
         .contract = .{
             .contract_id = "spider_monkey/pr_review@v1",
-            .context_path = "/workspace/pr-review/state/pr-123/context.json",
+            .context_path = "/nodes/local/fs/pr-review/state/pr-123/context.json",
         },
         .created_by = .{ .actor_type = "agent", .actor_id = "worker-a" },
     });
@@ -1368,25 +1368,25 @@ test "mission_store: create checkpoint recover and transition records state" {
         .next_state = .running,
         .stage = "collecting_context",
         .contract = .{
-            .state_path = "/workspace/pr-review/state/pr-123/state.json",
+            .state_path = "/nodes/local/fs/pr-review/state/pr-123/state.json",
         },
         .actor = .{ .actor_type = "agent", .actor_id = "worker-a" },
     });
     defer running.deinit(allocator);
     try std.testing.expectEqual(MissionState.running, running.state);
-    try std.testing.expectEqualStrings("/workspace/pr-review/state/pr-123/state.json", running.contract.?.state_path.?);
+    try std.testing.expectEqualStrings("/nodes/local/fs/pr-review/state/pr-123/state.json", running.contract.?.state_path.?);
 
     var checkpointed = try store.recordCheckpoint(allocator, created.mission_id, .{
         .summary = "Scanned changed files",
         .artifact = .{ .kind = "notes", .summary = "review notes" },
         .contract = .{
-            .artifact_root = "/workspace/pr-review/runs/pr-123",
+            .artifact_root = "/nodes/local/fs/pr-review/runs/pr-123",
         },
     });
     defer checkpointed.deinit(allocator);
     try std.testing.expectEqual(@as(u64, 1), checkpointed.checkpoint_seq);
     try std.testing.expectEqual(@as(usize, 1), checkpointed.artifacts.items.len);
-    try std.testing.expectEqualStrings("/workspace/pr-review/runs/pr-123", checkpointed.contract.?.artifact_root.?);
+    try std.testing.expectEqualStrings("/nodes/local/fs/pr-review/runs/pr-123", checkpointed.contract.?.artifact_root.?);
 
     var recovering = try store.recordRecovery(allocator, created.mission_id, .{
         .reason = "runtime_restart",
@@ -1462,7 +1462,7 @@ test "mission_store: service invocation records artifact and event" {
         .use_case = "pr_review",
         .contract = .{
             .contract_id = "spider_monkey/pr_review@v1",
-            .context_path = "/workspace/pr-review/state/pr-456/context.json",
+            .context_path = "/nodes/local/fs/pr-review/state/pr-456/context.json",
         },
         .created_by = .{ .actor_type = "agent", .actor_id = "planner" },
     });
@@ -1489,7 +1489,7 @@ test "mission_store: service invocation records artifact and event" {
             .summary = "Created review note",
         },
         .contract = .{
-            .artifact_root = "/workspace/pr-review/runs/pr-456",
+            .artifact_root = "/nodes/local/fs/pr-review/runs/pr-456",
         },
         .actor = .{ .actor_type = "agent", .actor_id = "planner" },
     });
@@ -1501,7 +1501,7 @@ test "mission_store: service invocation records artifact and event" {
     try std.testing.expectEqualStrings("service_result", invoked.artifacts.items[0].kind);
     try std.testing.expectEqualStrings("/global/memory/result.json", invoked.artifacts.items[0].path.?);
     try std.testing.expect(invoked.contract != null);
-    try std.testing.expectEqualStrings("/workspace/pr-review/runs/pr-456", invoked.contract.?.artifact_root.?);
+    try std.testing.expectEqualStrings("/nodes/local/fs/pr-review/runs/pr-456", invoked.contract.?.artifact_root.?);
     try std.testing.expect(invoked.events.items.len >= 3);
     const latest_event = invoked.events.items[invoked.events.items.len - 1];
     try std.testing.expectEqualStrings("mission.service_invoked", latest_event.event_type);
@@ -1527,7 +1527,7 @@ test "mission_store: persists records across restart" {
             .title = "Persistent mission",
             .contract = .{
                 .contract_id = "spider_monkey/pr_review@v1",
-                .context_path = "/workspace/pr-review/state/pr-789/context.json",
+                .context_path = "/nodes/local/fs/pr-review/state/pr-789/context.json",
             },
             .created_by = .{ .actor_type = "agent", .actor_id = "builder" },
         });
@@ -1541,7 +1541,7 @@ test "mission_store: persists records across restart" {
         var checkpoint = try first.recordCheckpoint(allocator, created.mission_id, .{
             .summary = "checkpoint one",
             .contract = .{
-                .artifact_root = "/workspace/pr-review/runs/pr-789",
+                .artifact_root = "/nodes/local/fs/pr-review/runs/pr-789",
             },
         });
         defer checkpoint.deinit(allocator);
@@ -1557,5 +1557,5 @@ test "mission_store: persists records across restart" {
     try std.testing.expect(std.mem.eql(u8, list[0].stage, "working"));
     try std.testing.expect(list[0].contract != null);
     try std.testing.expectEqualStrings("spider_monkey/pr_review@v1", list[0].contract.?.contract_id);
-    try std.testing.expectEqualStrings("/workspace/pr-review/runs/pr-789", list[0].contract.?.artifact_root.?);
+    try std.testing.expectEqualStrings("/nodes/local/fs/pr-review/runs/pr-789", list[0].contract.?.artifact_root.?);
 }
