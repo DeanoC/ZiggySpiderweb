@@ -1,0 +1,21 @@
+{
+  "phase": "discovered",
+  "last_synced_head_sha": "",
+  "current_focus": "",
+  "open_threads": [],
+  "latest_validation": {
+    "status": "unknown",
+    "summary": null
+  },
+  "latest_recommendation": {
+    "status": "pending",
+    "summary": null
+  },
+  "artifacts": {
+    "findings": "findings.json",
+    "validation": "validation.json",
+    "recommendation": "recommendation.json",
+    "thread_actions": "thread-actions.json"
+  },
+  "notes": []
+}

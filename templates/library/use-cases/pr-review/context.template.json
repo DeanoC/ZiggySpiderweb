@@ -1,0 +1,23 @@
+{
+  "contract_id": "spider_monkey/pr_review@v1",
+  "provider": "github",
+  "repo_key": "owner/repo",
+  "pr_number": 123,
+  "pr_url": "https://github.com/owner/repo/pull/123",
+  "base_branch": "main",
+  "base_sha": "",
+  "head_branch": "feature/example",
+  "head_sha": "",
+  "checkout_path": "/workspace/pr-review/repos/owner__repo",
+  "review_policy_paths": [
+    "/workspace/repo/docs/review-policy.md"
+  ],
+  "default_review_commands": [
+    "zig build",
+    "zig build test"
+  ],
+  "approval_policy": {
+    "push_fix_requires_approval": false,
+    "merge_requires_approval": true
+  }
+}
