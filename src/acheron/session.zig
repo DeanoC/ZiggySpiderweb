@@ -54,6 +54,9 @@ const SpecialKind = enum {
     projects_up,
     pr_review_invoke,
     pr_review_start,
+    pr_review_sync,
+    pr_review_record_validation,
+    pr_review_record_review,
     missions_invoke,
     missions_invoke_service,
     missions_create,
@@ -1262,6 +1265,9 @@ pub const Session = struct {
             },
             .pr_review_invoke,
             .pr_review_start,
+            .pr_review_sync,
+            .pr_review_record_validation,
+            .pr_review_record_review,
             => {
                 const outcome = self.handlePrReviewNamespaceWrite(node.special, state.node_id, data) catch |err| switch (err) {
                     error.InvalidPayload => {
@@ -3347,13 +3353,13 @@ pub const Session = struct {
             pr_review_dir,
             "PR Review",
             "{\"kind\":\"venom\",\"venom_id\":\"pr_review\",\"shape\":\"/global/pr_review/{README.md,SCHEMA.json,CAPS.json,OPS.json,PERMISSIONS.json,STATUS.json,status.json,result.json,control/*}\"}",
-            "{\"invoke\":true,\"operations\":[\"pr_review_start\"],\"discoverable\":true,\"persistent\":true}",
+            "{\"invoke\":true,\"operations\":[\"pr_review_start\",\"pr_review_sync\",\"pr_review_record_validation\",\"pr_review_record_review\"],\"discoverable\":true,\"persistent\":true}",
             "Start PR review missions as a thin use-case venom layered over /global/missions.",
         );
         _ = try self.addFile(
             pr_review_dir,
             "OPS.json",
-            "{\"model\":\"local_bridge\",\"invoke\":\"control/invoke.json\",\"transport\":\"acheron-local\",\"paths\":{\"start\":\"control/start.json\"},\"operations\":{\"start\":\"pr_review_start\"}}",
+            "{\"model\":\"local_bridge\",\"invoke\":\"control/invoke.json\",\"transport\":\"acheron-local\",\"paths\":{\"start\":\"control/start.json\",\"sync\":\"control/sync.json\",\"record_validation\":\"control/record_validation.json\",\"record_review\":\"control/record_review.json\"},\"operations\":{\"start\":\"pr_review_start\",\"sync\":\"pr_review_sync\",\"record_validation\":\"pr_review_record_validation\",\"record_review\":\"pr_review_record_review\"}}",
             false,
             .none,
         );
@@ -3397,12 +3403,15 @@ pub const Session = struct {
         _ = try self.addFile(
             control_dir,
             "README.md",
-            "Use start.json, or invoke.json with op=start, to create a PR review mission, derive contract paths, and bootstrap the initial context/state files.\n",
+            "Use start.json, sync.json, record_validation.json, record_review.json, or invoke.json with the same op names to drive the PR review use-case venom over Acheron.\n",
             false,
             .none,
         );
         _ = try self.addFile(control_dir, "invoke.json", "", true, .pr_review_invoke);
         _ = try self.addFile(control_dir, "start.json", "", true, .pr_review_start);
+        _ = try self.addFile(control_dir, "sync.json", "", true, .pr_review_sync);
+        _ = try self.addFile(control_dir, "record_validation.json", "", true, .pr_review_record_validation);
+        _ = try self.addFile(control_dir, "record_review.json", "", true, .pr_review_record_review);
     }
 
     fn seedGlobalLibraryNamespace(self: *Session, library_dir: u32) !void {
@@ -9103,6 +9112,9 @@ pub const Session = struct {
 
     const PrReviewOp = enum {
         start,
+        sync,
+        record_validation,
+        record_review,
     };
 
     fn handleProjectsNamespaceWrite(self: *Session, special: SpecialKind, node_id: u32, raw_input: []const u8) !WriteOutcome {
@@ -9331,6 +9343,9 @@ pub const Session = struct {
 
         const op = switch (special) {
             .pr_review_start => PrReviewOp.start,
+            .pr_review_sync => PrReviewOp.sync,
+            .pr_review_record_validation => PrReviewOp.record_validation,
+            .pr_review_record_review => PrReviewOp.record_review,
             .pr_review_invoke => blk: {
                 const op_raw = blk2: {
                     if (obj.get("op")) |value| if (value == .string and value.string.len > 0) break :blk2 value.string;
@@ -9362,6 +9377,9 @@ pub const Session = struct {
     fn parsePrReviewOp(raw: []const u8) ?PrReviewOp {
         const value = std.mem.trim(u8, raw, " \t\r\n");
         if (std.mem.eql(u8, value, "start") or std.mem.eql(u8, value, "pr_review_start")) return .start;
+        if (std.mem.eql(u8, value, "sync") or std.mem.eql(u8, value, "pr_review_sync")) return .sync;
+        if (std.mem.eql(u8, value, "record_validation") or std.mem.eql(u8, value, "pr_review_record_validation")) return .record_validation;
+        if (std.mem.eql(u8, value, "record_review") or std.mem.eql(u8, value, "pr_review_record_review")) return .record_review;
         return null;
     }
 
@@ -9393,8 +9411,51 @@ pub const Session = struct {
     fn executePrReviewOpPayload(self: *Session, op: PrReviewOp, args_obj: std.json.ObjectMap) ![]u8 {
         return switch (op) {
             .start => self.executePrReviewStartOp(args_obj),
+            .sync => self.executePrReviewSyncOp(args_obj),
+            .record_validation => self.executePrReviewRecordValidationOp(args_obj),
+            .record_review => self.executePrReviewRecordReviewOp(args_obj),
         };
     }
+
+    const PrReviewResolvedContract = struct {
+        contract_id: []const u8,
+        context_path: []const u8,
+        state_path: []const u8,
+        artifact_root: []const u8,
+    };
+
+    const PrReviewStateSnapshot = struct {
+        phase: []u8,
+        last_synced_head_sha: []u8,
+        current_focus: []u8,
+        open_threads_json: []u8,
+        latest_validation_status: []u8,
+        latest_validation_summary: ?[]u8 = null,
+        latest_recommendation_status: []u8,
+        latest_recommendation_summary: ?[]u8 = null,
+        findings_artifact: []u8,
+        validation_artifact: []u8,
+        recommendation_artifact: []u8,
+        thread_actions_artifact: []u8,
+        notes_json: []u8,
+
+        fn deinit(self: *PrReviewStateSnapshot, allocator: std.mem.Allocator) void {
+            allocator.free(self.phase);
+            allocator.free(self.last_synced_head_sha);
+            allocator.free(self.current_focus);
+            allocator.free(self.open_threads_json);
+            allocator.free(self.latest_validation_status);
+            if (self.latest_validation_summary) |value| allocator.free(value);
+            allocator.free(self.latest_recommendation_status);
+            if (self.latest_recommendation_summary) |value| allocator.free(value);
+            allocator.free(self.findings_artifact);
+            allocator.free(self.validation_artifact);
+            allocator.free(self.recommendation_artifact);
+            allocator.free(self.thread_actions_artifact);
+            allocator.free(self.notes_json);
+            self.* = undefined;
+        }
+    };
 
     fn executePrReviewStartOp(self: *Session, args_obj: std.json.ObjectMap) ![]u8 {
         const store = self.mission_store orelse return error.InvalidPayload;
@@ -9509,7 +9570,7 @@ pub const Session = struct {
             approval_policy_json,
         );
         defer self.allocator.free(context_payload);
-        const state_payload = try self.buildPrReviewStatePayloadJson(head_sha);
+        const state_payload = try self.buildDefaultPrReviewStatePayloadJson(head_sha);
         defer self.allocator.free(state_payload);
 
         try self.ensureMissionContractDirectory(artifact_root);
@@ -9550,6 +9611,205 @@ pub const Session = struct {
         return self.buildPrReviewSuccessResultJson(.start, detail);
     }
 
+    fn executePrReviewSyncOp(self: *Session, args_obj: std.json.ObjectMap) ![]u8 {
+        const store = self.mission_store orelse return error.InvalidPayload;
+        const mission_id = extractOptionalStringByNames(args_obj, &[_][]const u8{ "mission_id", "id" }) orelse return error.InvalidPayload;
+        var mission = (try store.getOwned(self.allocator, mission_id)) orelse return error.NotFound;
+        defer mission.deinit(self.allocator);
+        const contract = try self.resolvePrReviewMissionContract(mission);
+
+        var state = try self.loadPrReviewStateSnapshot(contract.state_path);
+        defer state.deinit(self.allocator);
+        try self.applyPrReviewCommonStateFields(args_obj, &state);
+
+        var thread_actions_path: ?[]u8 = null;
+        defer if (thread_actions_path) |value| self.allocator.free(value);
+        if (args_obj.get("thread_actions")) |value| {
+            thread_actions_path = try self.writePrReviewJsonArtifact(contract.artifact_root, state.thread_actions_artifact, value);
+        }
+
+        const state_payload = try self.buildPrReviewStatePayloadJson(state);
+        defer self.allocator.free(state_payload);
+        try self.writeMissionContractFile(contract.state_path, state_payload);
+
+        const checkpoint_summary = extractOptionalStringByNames(args_obj, &[_][]const u8{"summary"}) orelse "Synced PR review state";
+        var checkpointed = try store.recordCheckpoint(self.allocator, mission_id, .{
+            .stage = extractOptionalStringByNames(args_obj, &[_][]const u8{"stage"}) orelse state.phase,
+            .summary = checkpoint_summary,
+            .artifact = if (thread_actions_path) |value|
+                .{ .kind = "thread_actions", .path = value, .summary = "PR review thread action snapshot" }
+            else
+                .{ .kind = "state_sync", .path = contract.state_path, .summary = "PR review state file" },
+        });
+        defer checkpointed.deinit(self.allocator);
+
+        const mission_json = try self.buildMissionRecordJson(checkpointed);
+        defer self.allocator.free(mission_json);
+        const detail = try self.buildPrReviewSyncDetailJson(
+            mission_json,
+            state.phase,
+            contract.state_path,
+            thread_actions_path,
+        );
+        defer self.allocator.free(detail);
+        return self.buildPrReviewSuccessResultJson(.sync, detail);
+    }
+
+    fn executePrReviewRecordValidationOp(self: *Session, args_obj: std.json.ObjectMap) ![]u8 {
+        const store = self.mission_store orelse return error.InvalidPayload;
+        const mission_id = extractOptionalStringByNames(args_obj, &[_][]const u8{ "mission_id", "id" }) orelse return error.InvalidPayload;
+        const validation_value = args_obj.get("validation") orelse return error.InvalidPayload;
+
+        var mission = (try store.getOwned(self.allocator, mission_id)) orelse return error.NotFound;
+        defer mission.deinit(self.allocator);
+        const contract = try self.resolvePrReviewMissionContract(mission);
+
+        var state = try self.loadPrReviewStateSnapshot(contract.state_path);
+        defer state.deinit(self.allocator);
+        try self.applyPrReviewCommonStateFields(args_obj, &state);
+        if (args_obj.get("phase") == null) try self.replaceOwnedString(&state.phase, "validating");
+
+        const validation_status = if (jsonObjectOptionalString(args_obj, "status")) |value|
+            value
+        else if (validation_value == .object)
+            (try jsonObjectOptionalString(validation_value.object, "status")) orelse state.latest_validation_status
+        else
+            state.latest_validation_status;
+        try self.replaceOwnedString(&state.latest_validation_status, validation_status);
+
+        const validation_summary = if (jsonObjectOptionalString(args_obj, "summary")) |value|
+            value
+        else if (validation_value == .object)
+            try jsonObjectOptionalString(validation_value.object, "summary")
+        else
+            null;
+        try self.replaceOptionalOwnedString(&state.latest_validation_summary, validation_summary);
+
+        const validation_path = try self.writePrReviewJsonArtifact(contract.artifact_root, state.validation_artifact, validation_value);
+        defer self.allocator.free(validation_path);
+
+        const state_payload = try self.buildPrReviewStatePayloadJson(state);
+        defer self.allocator.free(state_payload);
+        try self.writeMissionContractFile(contract.state_path, state_payload);
+
+        const checkpoint_summary = validation_summary orelse "Recorded PR review validation";
+        var checkpointed = try store.recordCheckpoint(self.allocator, mission_id, .{
+            .stage = extractOptionalStringByNames(args_obj, &[_][]const u8{"stage"}) orelse state.phase,
+            .summary = checkpoint_summary,
+            .artifact = .{
+                .kind = "validation",
+                .path = validation_path,
+                .summary = checkpoint_summary,
+            },
+        });
+        defer checkpointed.deinit(self.allocator);
+
+        const mission_json = try self.buildMissionRecordJson(checkpointed);
+        defer self.allocator.free(mission_json);
+        const detail = try self.buildPrReviewValidationDetailJson(
+            mission_json,
+            state.phase,
+            contract.state_path,
+            validation_path,
+        );
+        defer self.allocator.free(detail);
+        return self.buildPrReviewSuccessResultJson(.record_validation, detail);
+    }
+
+    fn executePrReviewRecordReviewOp(self: *Session, args_obj: std.json.ObjectMap) ![]u8 {
+        const store = self.mission_store orelse return error.InvalidPayload;
+        const mission_id = extractOptionalStringByNames(args_obj, &[_][]const u8{ "mission_id", "id" }) orelse return error.InvalidPayload;
+        const findings_value = args_obj.get("findings") orelse return error.InvalidPayload;
+        if (findings_value != .array) return error.InvalidPayload;
+        const recommendation_value = args_obj.get("recommendation") orelse return error.InvalidPayload;
+        if (recommendation_value != .object) return error.InvalidPayload;
+
+        var mission = (try store.getOwned(self.allocator, mission_id)) orelse return error.NotFound;
+        defer mission.deinit(self.allocator);
+        const contract = try self.resolvePrReviewMissionContract(mission);
+
+        var state = try self.loadPrReviewStateSnapshot(contract.state_path);
+        defer state.deinit(self.allocator);
+        try self.applyPrReviewCommonStateFields(args_obj, &state);
+
+        const recommendation_decision = (try jsonObjectOptionalString(recommendation_value.object, "decision")) orelse "comment";
+        if (args_obj.get("phase") == null) {
+            try self.replaceOwnedString(&state.phase, prReviewPhaseForDecision(recommendation_decision));
+        }
+
+        const recommendation_status = if (jsonObjectOptionalString(args_obj, "status")) |value|
+            value
+        else
+            (try jsonObjectOptionalString(recommendation_value.object, "status")) orelse recommendation_decision;
+        try self.replaceOwnedString(&state.latest_recommendation_status, recommendation_status);
+
+        const recommendation_summary = if (jsonObjectOptionalString(args_obj, "summary")) |value|
+            value
+        else
+            try jsonObjectOptionalString(recommendation_value.object, "summary");
+        try self.replaceOptionalOwnedString(&state.latest_recommendation_summary, recommendation_summary);
+
+        const findings_path = try self.writePrReviewJsonArtifact(contract.artifact_root, state.findings_artifact, findings_value);
+        defer self.allocator.free(findings_path);
+        const recommendation_path = try self.writePrReviewJsonArtifact(contract.artifact_root, state.recommendation_artifact, recommendation_value);
+        defer self.allocator.free(recommendation_path);
+
+        var review_comment_path: ?[]u8 = null;
+        defer if (review_comment_path) |value| self.allocator.free(value);
+        if (jsonObjectOptionalString(args_obj, "review_comment")) |value| {
+            review_comment_path = try self.writePrReviewTextArtifact(contract.artifact_root, "review-comment.md", value);
+        }
+
+        var thread_actions_path: ?[]u8 = null;
+        defer if (thread_actions_path) |value| self.allocator.free(value);
+        if (args_obj.get("thread_actions")) |value| {
+            thread_actions_path = try self.writePrReviewJsonArtifact(contract.artifact_root, state.thread_actions_artifact, value);
+        }
+
+        const state_payload = try self.buildPrReviewStatePayloadJson(state);
+        defer self.allocator.free(state_payload);
+        try self.writeMissionContractFile(contract.state_path, state_payload);
+
+        const checkpoint_summary = recommendation_summary orelse "Recorded PR review recommendation";
+        var checkpointed = try store.recordCheckpoint(self.allocator, mission_id, .{
+            .stage = extractOptionalStringByNames(args_obj, &[_][]const u8{"stage"}) orelse state.phase,
+            .summary = checkpoint_summary,
+            .artifact = .{
+                .kind = "recommendation",
+                .path = recommendation_path,
+                .summary = checkpoint_summary,
+            },
+        });
+        defer checkpointed.deinit(self.allocator);
+
+        const mission_json = try self.buildMissionRecordJson(checkpointed);
+        defer self.allocator.free(mission_json);
+        const detail = try self.buildPrReviewReviewDetailJson(
+            mission_json,
+            state.phase,
+            contract.state_path,
+            findings_path,
+            recommendation_path,
+            review_comment_path,
+            thread_actions_path,
+        );
+        defer self.allocator.free(detail);
+        return self.buildPrReviewSuccessResultJson(.record_review, detail);
+    }
+
+    fn resolvePrReviewMissionContract(self: *Session, mission: mission_store_mod.MissionRecord) !PrReviewResolvedContract {
+        _ = self;
+        if (!std.mem.eql(u8, mission.use_case, "pr_review")) return error.InvalidPayload;
+        const contract = mission.contract orelse return error.InvalidPayload;
+        if (!std.mem.eql(u8, contract.contract_id, "spider_monkey/pr_review@v1")) return error.InvalidPayload;
+        return .{
+            .contract_id = contract.contract_id,
+            .context_path = contract.context_path orelse return error.InvalidPayload,
+            .state_path = contract.state_path orelse return error.InvalidPayload,
+            .artifact_root = contract.artifact_root orelse return error.InvalidPayload,
+        };
+    }
+
     fn buildRepoKeySlug(self: *Session, repo_key: []const u8) ![]u8 {
         var out = std.ArrayListUnmanaged(u8){};
         errdefer out.deinit(self.allocator);
@@ -9573,6 +9833,148 @@ pub const Session = struct {
         const host_path = try self.resolveMissionContractHostPath(normalized);
         self.allocator.free(host_path);
         return normalized;
+    }
+
+    fn readMissionContractFile(self: *Session, absolute_path: []const u8, max_bytes: usize) ![]u8 {
+        const host_path = try self.resolveMissionContractHostPath(absolute_path);
+        defer self.allocator.free(host_path);
+        if (std.fs.path.isAbsolute(host_path)) {
+            const file = try std.fs.openFileAbsolute(host_path, .{});
+            defer file.close();
+            return file.readToEndAlloc(self.allocator, max_bytes);
+        }
+        return std.fs.cwd().readFileAlloc(self.allocator, host_path, max_bytes);
+    }
+
+    fn loadPrReviewStateSnapshot(self: *Session, state_path: []const u8) !PrReviewStateSnapshot {
+        const raw = try self.readMissionContractFile(state_path, 512 * 1024);
+        defer self.allocator.free(raw);
+        var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, raw, .{});
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidPayload;
+        const obj = parsed.value.object;
+
+        const validation_obj = if (obj.get("latest_validation")) |value| blk: {
+            if (value == .object) break :blk value.object;
+            if (value == .null) break :blk null;
+            return error.InvalidPayload;
+        } else null;
+        const recommendation_obj = if (obj.get("latest_recommendation")) |value| blk: {
+            if (value == .object) break :blk value.object;
+            if (value == .null) break :blk null;
+            return error.InvalidPayload;
+        } else null;
+        const artifacts_obj = if (obj.get("artifacts")) |value| blk: {
+            if (value == .object) break :blk value.object;
+            if (value == .null) break :blk null;
+            return error.InvalidPayload;
+        } else null;
+
+        return .{
+            .phase = try self.allocator.dupe(u8, (try jsonObjectOptionalString(obj, "phase")) orelse "discovered"),
+            .last_synced_head_sha = try self.allocator.dupe(u8, (try jsonObjectOptionalString(obj, "last_synced_head_sha")) orelse ""),
+            .current_focus = try self.allocator.dupe(u8, (try jsonObjectOptionalString(obj, "current_focus")) orelse ""),
+            .open_threads_json = try self.renderJsonFieldOrDefault(obj, "open_threads", "[]"),
+            .latest_validation_status = try self.allocator.dupe(u8, if (validation_obj) |value| (try jsonObjectOptionalString(value, "status")) orelse "unknown" else "unknown"),
+            .latest_validation_summary = if (validation_obj) |value|
+                if (try jsonObjectOptionalString(value, "summary")) |summary| try self.allocator.dupe(u8, summary) else null
+            else
+                null,
+            .latest_recommendation_status = try self.allocator.dupe(u8, if (recommendation_obj) |value| (try jsonObjectOptionalString(value, "status")) orelse "pending" else "pending"),
+            .latest_recommendation_summary = if (recommendation_obj) |value|
+                if (try jsonObjectOptionalString(value, "summary")) |summary| try self.allocator.dupe(u8, summary) else null
+            else
+                null,
+            .findings_artifact = try self.allocator.dupe(u8, if (artifacts_obj) |value| (try jsonObjectOptionalString(value, "findings")) orelse "findings.json" else "findings.json"),
+            .validation_artifact = try self.allocator.dupe(u8, if (artifacts_obj) |value| (try jsonObjectOptionalString(value, "validation")) orelse "validation.json" else "validation.json"),
+            .recommendation_artifact = try self.allocator.dupe(u8, if (artifacts_obj) |value| (try jsonObjectOptionalString(value, "recommendation")) orelse "recommendation.json" else "recommendation.json"),
+            .thread_actions_artifact = try self.allocator.dupe(u8, if (artifacts_obj) |value| (try jsonObjectOptionalString(value, "thread_actions")) orelse "thread-actions.json" else "thread-actions.json"),
+            .notes_json = try self.renderJsonFieldOrDefault(obj, "notes", "[]"),
+        };
+    }
+
+    fn renderJsonFieldOrDefault(self: *Session, obj: std.json.ObjectMap, key: []const u8, default_json: []const u8) ![]u8 {
+        if (obj.get(key)) |value| {
+            if (value == .null) return self.allocator.dupe(u8, default_json);
+            return self.renderJsonValue(value);
+        }
+        return self.allocator.dupe(u8, default_json);
+    }
+
+    fn replaceOwnedString(self: *Session, target: *[]u8, value: []const u8) !void {
+        const copy = try self.allocator.dupe(u8, value);
+        self.allocator.free(target.*);
+        target.* = copy;
+    }
+
+    fn replaceOptionalOwnedString(self: *Session, target: *?[]u8, value: ?[]const u8) !void {
+        if (target.*) |existing| self.allocator.free(existing);
+        target.* = if (value) |slice| try self.allocator.dupe(u8, slice) else null;
+    }
+
+    fn replaceOwnedJsonValue(self: *Session, target: *[]u8, value: std.json.Value, default_json: []const u8) !void {
+        const rendered = if (value == .null)
+            try self.allocator.dupe(u8, default_json)
+        else
+            try self.renderJsonValue(value);
+        self.allocator.free(target.*);
+        target.* = rendered;
+    }
+
+    fn applyPrReviewCommonStateFields(self: *Session, args_obj: std.json.ObjectMap, state: *PrReviewStateSnapshot) !void {
+        if (args_obj.get("phase")) |value| {
+            if (value != .string) return error.InvalidPayload;
+            const phase = std.mem.trim(u8, value.string, " \t\r\n");
+            if (phase.len == 0) return error.InvalidPayload;
+            try self.replaceOwnedString(&state.phase, phase);
+        }
+        if (args_obj.get("head_sha")) |value| {
+            if (value != .string) return error.InvalidPayload;
+            try self.replaceOwnedString(&state.last_synced_head_sha, std.mem.trim(u8, value.string, " \t\r\n"));
+        } else if (args_obj.get("last_synced_head_sha")) |value| {
+            if (value != .string) return error.InvalidPayload;
+            try self.replaceOwnedString(&state.last_synced_head_sha, std.mem.trim(u8, value.string, " \t\r\n"));
+        }
+        if (args_obj.get("current_focus")) |value| {
+            if (value != .string) return error.InvalidPayload;
+            try self.replaceOwnedString(&state.current_focus, value.string);
+        }
+        if (args_obj.get("open_threads")) |value| {
+            if (value != .array and value != .null) return error.InvalidPayload;
+            try self.replaceOwnedJsonValue(&state.open_threads_json, value, "[]");
+        }
+        if (args_obj.get("notes")) |value| {
+            if (value != .array and value != .null) return error.InvalidPayload;
+            try self.replaceOwnedJsonValue(&state.notes_json, value, "[]");
+        }
+    }
+
+    fn resolvePrReviewArtifactPath(self: *Session, artifact_root: []const u8, artifact_relative_path: []const u8) ![]u8 {
+        const normalized_relative = try self.normalizeLocalFsRelativePath(artifact_relative_path);
+        defer self.allocator.free(normalized_relative);
+        const base = try self.normalizeMissionAbsolutePath(artifact_root);
+        defer self.allocator.free(base);
+        return std.fmt.allocPrint(
+            self.allocator,
+            "{s}/{s}",
+            .{ std.mem.trimRight(u8, base, "/"), normalized_relative },
+        );
+    }
+
+    fn writePrReviewJsonArtifact(self: *Session, artifact_root: []const u8, artifact_relative_path: []const u8, value: std.json.Value) ![]u8 {
+        const artifact_path = try self.resolvePrReviewArtifactPath(artifact_root, artifact_relative_path);
+        errdefer self.allocator.free(artifact_path);
+        const payload = try self.renderJsonValue(value);
+        defer self.allocator.free(payload);
+        try self.writeMissionContractFile(artifact_path, payload);
+        return artifact_path;
+    }
+
+    fn writePrReviewTextArtifact(self: *Session, artifact_root: []const u8, artifact_relative_path: []const u8, content: []const u8) ![]u8 {
+        const artifact_path = try self.resolvePrReviewArtifactPath(artifact_root, artifact_relative_path);
+        errdefer self.allocator.free(artifact_path);
+        try self.writeMissionContractFile(artifact_path, content);
+        return artifact_path;
     }
 
     fn buildPrReviewContextPayloadJson(
@@ -9627,7 +10029,7 @@ pub const Session = struct {
         );
     }
 
-    fn buildPrReviewStatePayloadJson(self: *Session, head_sha: []const u8) ![]u8 {
+    fn buildDefaultPrReviewStatePayloadJson(self: *Session, head_sha: []const u8) ![]u8 {
         const escaped_head_sha = try unified.jsonEscape(self.allocator, head_sha);
         defer self.allocator.free(escaped_head_sha);
         return std.fmt.allocPrint(
@@ -9635,6 +10037,48 @@ pub const Session = struct {
             "{{\"phase\":\"discovered\",\"last_synced_head_sha\":\"{s}\",\"current_focus\":\"\",\"open_threads\":[],\"latest_validation\":{{\"status\":\"unknown\",\"summary\":null}},\"latest_recommendation\":{{\"status\":\"pending\",\"summary\":null}},\"artifacts\":{{\"findings\":\"findings.json\",\"validation\":\"validation.json\",\"recommendation\":\"recommendation.json\",\"thread_actions\":\"thread-actions.json\"}},\"notes\":[]}}",
             .{escaped_head_sha},
         );
+    }
+
+    fn buildPrReviewStatePayloadJson(self: *Session, state: PrReviewStateSnapshot) ![]u8 {
+        var out = std.ArrayListUnmanaged(u8){};
+        errdefer out.deinit(self.allocator);
+        const writer = out.writer(self.allocator);
+
+        try writer.writeByte('{');
+        try writer.writeAll("\"phase\":");
+        try writeJsonString(writer, state.phase);
+        try writer.writeAll(",\"last_synced_head_sha\":");
+        try writeJsonString(writer, state.last_synced_head_sha);
+        try writer.writeAll(",\"current_focus\":");
+        try writeJsonString(writer, state.current_focus);
+        try writer.writeAll(",\"open_threads\":");
+        try writer.writeAll(state.open_threads_json);
+        try writer.writeAll(",\"latest_validation\":{");
+        try writer.writeAll("\"status\":");
+        try writeJsonString(writer, state.latest_validation_status);
+        try writer.writeAll(",\"summary\":");
+        if (state.latest_validation_summary) |value| try writeJsonString(writer, value) else try writer.writeAll("null");
+        try writer.writeByte('}');
+        try writer.writeAll(",\"latest_recommendation\":{");
+        try writer.writeAll("\"status\":");
+        try writeJsonString(writer, state.latest_recommendation_status);
+        try writer.writeAll(",\"summary\":");
+        if (state.latest_recommendation_summary) |value| try writeJsonString(writer, value) else try writer.writeAll("null");
+        try writer.writeByte('}');
+        try writer.writeAll(",\"artifacts\":{");
+        try writer.writeAll("\"findings\":");
+        try writeJsonString(writer, state.findings_artifact);
+        try writer.writeAll(",\"validation\":");
+        try writeJsonString(writer, state.validation_artifact);
+        try writer.writeAll(",\"recommendation\":");
+        try writeJsonString(writer, state.recommendation_artifact);
+        try writer.writeAll(",\"thread_actions\":");
+        try writeJsonString(writer, state.thread_actions_artifact);
+        try writer.writeByte('}');
+        try writer.writeAll(",\"notes\":");
+        try writer.writeAll(state.notes_json);
+        try writer.writeByte('}');
+        return out.toOwnedSlice(self.allocator);
     }
 
     fn buildPrReviewStartDetailJson(
@@ -9681,6 +10125,95 @@ pub const Session = struct {
         );
     }
 
+    fn buildPrReviewSyncDetailJson(
+        self: *Session,
+        mission_json: []const u8,
+        phase: []const u8,
+        state_path: []const u8,
+        thread_actions_path: ?[]const u8,
+    ) ![]u8 {
+        const escaped_phase = try unified.jsonEscape(self.allocator, phase);
+        defer self.allocator.free(escaped_phase);
+        const escaped_state_path = try unified.jsonEscape(self.allocator, state_path);
+        defer self.allocator.free(escaped_state_path);
+        const thread_actions_json = if (thread_actions_path) |value| blk: {
+            const escaped = try unified.jsonEscape(self.allocator, value);
+            defer self.allocator.free(escaped);
+            break :blk try std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped});
+        } else try self.allocator.dupe(u8, "null");
+        defer self.allocator.free(thread_actions_json);
+        return std.fmt.allocPrint(
+            self.allocator,
+            "{{\"mission\":{s},\"review\":{{\"phase\":\"{s}\",\"state_path\":\"{s}\",\"thread_actions_path\":{s}}}}}",
+            .{ mission_json, escaped_phase, escaped_state_path, thread_actions_json },
+        );
+    }
+
+    fn buildPrReviewValidationDetailJson(
+        self: *Session,
+        mission_json: []const u8,
+        phase: []const u8,
+        state_path: []const u8,
+        validation_path: []const u8,
+    ) ![]u8 {
+        const escaped_phase = try unified.jsonEscape(self.allocator, phase);
+        defer self.allocator.free(escaped_phase);
+        const escaped_state_path = try unified.jsonEscape(self.allocator, state_path);
+        defer self.allocator.free(escaped_state_path);
+        const escaped_validation_path = try unified.jsonEscape(self.allocator, validation_path);
+        defer self.allocator.free(escaped_validation_path);
+        return std.fmt.allocPrint(
+            self.allocator,
+            "{{\"mission\":{s},\"review\":{{\"phase\":\"{s}\",\"state_path\":\"{s}\",\"validation_path\":\"{s}\"}}}}",
+            .{ mission_json, escaped_phase, escaped_state_path, escaped_validation_path },
+        );
+    }
+
+    fn buildPrReviewReviewDetailJson(
+        self: *Session,
+        mission_json: []const u8,
+        phase: []const u8,
+        state_path: []const u8,
+        findings_path: []const u8,
+        recommendation_path: []const u8,
+        review_comment_path: ?[]const u8,
+        thread_actions_path: ?[]const u8,
+    ) ![]u8 {
+        const escaped_phase = try unified.jsonEscape(self.allocator, phase);
+        defer self.allocator.free(escaped_phase);
+        const escaped_state_path = try unified.jsonEscape(self.allocator, state_path);
+        defer self.allocator.free(escaped_state_path);
+        const escaped_findings_path = try unified.jsonEscape(self.allocator, findings_path);
+        defer self.allocator.free(escaped_findings_path);
+        const escaped_recommendation_path = try unified.jsonEscape(self.allocator, recommendation_path);
+        defer self.allocator.free(escaped_recommendation_path);
+        const review_comment_json = if (review_comment_path) |value| blk: {
+            const escaped = try unified.jsonEscape(self.allocator, value);
+            defer self.allocator.free(escaped);
+            break :blk try std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped});
+        } else try self.allocator.dupe(u8, "null");
+        defer self.allocator.free(review_comment_json);
+        const thread_actions_json = if (thread_actions_path) |value| blk: {
+            const escaped = try unified.jsonEscape(self.allocator, value);
+            defer self.allocator.free(escaped);
+            break :blk try std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped});
+        } else try self.allocator.dupe(u8, "null");
+        defer self.allocator.free(thread_actions_json);
+        return std.fmt.allocPrint(
+            self.allocator,
+            "{{\"mission\":{s},\"review\":{{\"phase\":\"{s}\",\"state_path\":\"{s}\",\"findings_path\":\"{s}\",\"recommendation_path\":\"{s}\",\"review_comment_path\":{s},\"thread_actions_path\":{s}}}}}",
+            .{
+                mission_json,
+                escaped_phase,
+                escaped_state_path,
+                escaped_findings_path,
+                escaped_recommendation_path,
+                review_comment_json,
+                thread_actions_json,
+            },
+        );
+    }
+
     fn buildPrReviewSuccessResultJson(self: *Session, op: PrReviewOp, result_json: []const u8) ![]u8 {
         const escaped_operation = try unified.jsonEscape(self.allocator, prReviewOperationName(op));
         defer self.allocator.free(escaped_operation);
@@ -9708,13 +10241,25 @@ pub const Session = struct {
     fn prReviewOperationName(op: PrReviewOp) []const u8 {
         return switch (op) {
             .start => "start",
+            .sync => "sync",
+            .record_validation => "record_validation",
+            .record_review => "record_review",
         };
     }
 
     fn prReviewStatusToolName(op: PrReviewOp) []const u8 {
         return switch (op) {
             .start => "pr_review_start",
+            .sync => "pr_review_sync",
+            .record_validation => "pr_review_record_validation",
+            .record_review => "pr_review_record_review",
         };
+    }
+
+    fn prReviewPhaseForDecision(decision: []const u8) []const u8 {
+        if (std.mem.eql(u8, decision, "approve")) return "awaiting_ci";
+        if (std.mem.eql(u8, decision, "request_changes")) return "awaiting_author";
+        return "reviewing";
     }
 
     fn seedAgentMissionsNamespace(self: *Session, missions_dir: u32) !void {
@@ -15197,6 +15742,177 @@ test "acheron_session: pr_review venom starts a mission and bootstraps contract 
     defer allocator.free(artifact_root_host_path);
     var artifact_root_dir = try std.fs.openDirAbsolute(artifact_root_host_path, .{});
     artifact_root_dir.close();
+}
+
+test "acheron_session: pr_review venom syncs state and records review artifacts" {
+    const allocator = std.testing.allocator;
+
+    var mission_store = try mission_store_mod.MissionStore.initWithPath(allocator, null);
+    defer mission_store.deinit();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const local_export_root = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(local_export_root);
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "default",
+        .{
+            .mission_store = &mission_store,
+            .local_fs_export_root = local_export_root,
+            .actor_type = "agent",
+            .actor_id = "reviewer-a",
+        },
+    );
+    defer session.deinit();
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        370,
+        371,
+        &.{ "agents", "self", "pr_review", "control", "start.json" },
+        "{\"repo_key\":\"DeanoC/Spiderweb\",\"pr_number\":124,\"head_sha\":\"abc124\"}",
+        974,
+    );
+
+    const start_result = try protocolReadFile(
+        &session,
+        allocator,
+        372,
+        373,
+        &.{ "agents", "self", "pr_review", "result.json" },
+        975,
+    );
+    defer allocator.free(start_result);
+    const mission_id = try extractMissionIdFromResultPayload(allocator, start_result);
+    defer allocator.free(mission_id);
+
+    const sync_payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"mission_id\":\"{s}\",\"phase\":\"ready_for_checkout\",\"current_focus\":\"Fetch PR branch\",\"open_threads\":[{{\"id\":\"thread-1\",\"status\":\"open\"}}],\"notes\":[\"queued for checkout\"],\"thread_actions\":[{{\"thread_id\":\"thread-1\",\"action\":\"observe\"}}]}}",
+        .{mission_id},
+    );
+    defer allocator.free(sync_payload);
+    try protocolWriteFile(
+        &session,
+        allocator,
+        374,
+        375,
+        &.{ "agents", "self", "pr_review", "control", "sync.json" },
+        sync_payload,
+        976,
+    );
+
+    const validation_payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"mission_id\":\"{s}\",\"head_sha\":\"def456\",\"validation\":{{\"status\":\"passed\",\"summary\":\"zig build test passed\",\"commands\":[\"zig build test\"]}}}}",
+        .{mission_id},
+    );
+    defer allocator.free(validation_payload);
+    try protocolWriteFile(
+        &session,
+        allocator,
+        376,
+        377,
+        &.{ "agents", "self", "pr_review", "control", "record_validation.json" },
+        validation_payload,
+        977,
+    );
+
+    const review_payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"mission_id\":\"{s}\",\"findings\":[{{\"severity\":\"high\",\"type\":\"correctness\",\"path\":\"src/example.zig\",\"line\":42,\"message\":\"Handle null response\"}}],\"recommendation\":{{\"decision\":\"request_changes\",\"summary\":\"One correctness issue remains\"}},\"review_comment\":\"Please handle the null response before merging.\",\"thread_actions\":[{{\"thread_id\":\"thread-1\",\"action\":\"comment\"}}]}}",
+        .{mission_id},
+    );
+    defer allocator.free(review_payload);
+    try protocolWriteFile(
+        &session,
+        allocator,
+        378,
+        379,
+        &.{ "agents", "self", "pr_review", "control", "record_review.json" },
+        review_payload,
+        978,
+    );
+
+    const pr_review_status = try protocolReadFile(
+        &session,
+        allocator,
+        380,
+        381,
+        &.{ "agents", "self", "pr_review", "status.json" },
+        979,
+    );
+    defer allocator.free(pr_review_status);
+    try std.testing.expect(std.mem.indexOf(u8, pr_review_status, "\"state\":\"done\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pr_review_status, "\"tool\":\"pr_review_record_review\"") != null);
+
+    const pr_review_result = try protocolReadFile(
+        &session,
+        allocator,
+        382,
+        383,
+        &.{ "agents", "self", "pr_review", "result.json" },
+        980,
+    );
+    defer allocator.free(pr_review_result);
+    try std.testing.expect(std.mem.indexOf(u8, pr_review_result, "\"operation\":\"record_review\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pr_review_result, "\"phase\":\"awaiting_author\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pr_review_result, "\"findings_path\":\"/nodes/local/fs/pr-review/runs/DeanoC__Spiderweb/pr-124/findings.json\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pr_review_result, "\"recommendation_path\":\"/nodes/local/fs/pr-review/runs/DeanoC__Spiderweb/pr-124/recommendation.json\"") != null);
+
+    const state_host_path = try std.fs.path.join(allocator, &.{ local_export_root, "pr-review", "state", "DeanoC__Spiderweb", "pr-124", "state.json" });
+    defer allocator.free(state_host_path);
+    const state_content = try std.fs.cwd().readFileAlloc(allocator, state_host_path, 64 * 1024);
+    defer allocator.free(state_content);
+    try std.testing.expect(std.mem.indexOf(u8, state_content, "\"phase\":\"awaiting_author\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, state_content, "\"last_synced_head_sha\":\"def456\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, state_content, "\"current_focus\":\"Fetch PR branch\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, state_content, "\"latest_validation\":{\"status\":\"passed\",\"summary\":\"zig build test passed\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, state_content, "\"latest_recommendation\":{\"status\":\"request_changes\",\"summary\":\"One correctness issue remains\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, state_content, "\"open_threads\":[{\"id\":\"thread-1\",\"status\":\"open\"}]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, state_content, "\"notes\":[\"queued for checkout\"]") != null);
+
+    const validation_host_path = try std.fs.path.join(allocator, &.{ local_export_root, "pr-review", "runs", "DeanoC__Spiderweb", "pr-124", "validation.json" });
+    defer allocator.free(validation_host_path);
+    const validation_content = try std.fs.cwd().readFileAlloc(allocator, validation_host_path, 64 * 1024);
+    defer allocator.free(validation_content);
+    try std.testing.expect(std.mem.indexOf(u8, validation_content, "\"status\":\"passed\"") != null);
+
+    const findings_host_path = try std.fs.path.join(allocator, &.{ local_export_root, "pr-review", "runs", "DeanoC__Spiderweb", "pr-124", "findings.json" });
+    defer allocator.free(findings_host_path);
+    const findings_content = try std.fs.cwd().readFileAlloc(allocator, findings_host_path, 64 * 1024);
+    defer allocator.free(findings_content);
+    try std.testing.expect(std.mem.indexOf(u8, findings_content, "\"severity\":\"high\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, findings_content, "\"message\":\"Handle null response\"") != null);
+
+    const recommendation_host_path = try std.fs.path.join(allocator, &.{ local_export_root, "pr-review", "runs", "DeanoC__Spiderweb", "pr-124", "recommendation.json" });
+    defer allocator.free(recommendation_host_path);
+    const recommendation_content = try std.fs.cwd().readFileAlloc(allocator, recommendation_host_path, 64 * 1024);
+    defer allocator.free(recommendation_content);
+    try std.testing.expect(std.mem.indexOf(u8, recommendation_content, "\"decision\":\"request_changes\"") != null);
+
+    const review_comment_host_path = try std.fs.path.join(allocator, &.{ local_export_root, "pr-review", "runs", "DeanoC__Spiderweb", "pr-124", "review-comment.md" });
+    defer allocator.free(review_comment_host_path);
+    const review_comment_content = try std.fs.cwd().readFileAlloc(allocator, review_comment_host_path, 64 * 1024);
+    defer allocator.free(review_comment_content);
+    try std.testing.expectEqualStrings("Please handle the null response before merging.", review_comment_content);
+
+    const thread_actions_host_path = try std.fs.path.join(allocator, &.{ local_export_root, "pr-review", "runs", "DeanoC__Spiderweb", "pr-124", "thread-actions.json" });
+    defer allocator.free(thread_actions_host_path);
+    const thread_actions_content = try std.fs.cwd().readFileAlloc(allocator, thread_actions_host_path, 64 * 1024);
+    defer allocator.free(thread_actions_content);
+    try std.testing.expect(std.mem.indexOf(u8, thread_actions_content, "\"action\":\"comment\"") != null);
 }
 
 test "acheron_session: missions invoke_service records downstream service failures" {
