@@ -4013,7 +4013,7 @@ pub const ControlPlane = struct {
                 defer self.allocator.free(escaped_value);
                 try out.writer(self.allocator).print("\"{s}\":\"{s}\"", .{ escaped_key, escaped_value });
             }
-            try out.appendSlice(self.allocator, "},\"services\":[");
+            try out.appendSlice(self.allocator, "},\"venoms\":[");
             for (node.venoms.items, 0..) |venom, idx| {
                 if (idx != 0) try out.append(self.allocator, ',');
                 try venom_catalog.appendVenomJson(self.allocator, &out, venom);
@@ -7574,6 +7574,65 @@ test "acheron_control_plane: persistence restores nodes projects mounts and acti
         const invite2 = try plane.createNodeInvite(null);
         defer allocator.free(invite2);
         try std.testing.expect(std.mem.indexOf(u8, invite2, "\"invite_id\":\"invite-2\"") != null);
+    }
+}
+
+test "acheron_control_plane: persistence restores node venom catalogs" {
+    const allocator = std.testing.allocator;
+    const dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/fs-control-plane-venoms-{d}", .{std.time.nanoTimestamp()});
+    defer allocator.free(dir);
+    defer std.fs.cwd().deleteTree(dir) catch {};
+
+    try std.fs.cwd().makePath(dir);
+
+    var expected_node_id: ?[]u8 = null;
+    defer if (expected_node_id) |id| allocator.free(id);
+
+    {
+        var plane = ControlPlane.initWithPersistence(allocator, dir, "control-plane.db");
+        defer plane.deinit();
+
+        const invite_json = try plane.createNodeInvite(null);
+        defer allocator.free(invite_json);
+        var invite_parsed = try std.json.parseFromSlice(std.json.Value, allocator, invite_json, .{});
+        defer invite_parsed.deinit();
+        const token = invite_parsed.value.object.get("invite_token").?.string;
+
+        const join_req = try std.fmt.allocPrint(
+            allocator,
+            "{{\"invite_token\":\"{s}\",\"node_name\":\"alpha\",\"fs_url\":\"ws://127.0.0.1:38891/v2/fs\"}}",
+            .{token},
+        );
+        defer allocator.free(join_req);
+        const join_json = try plane.nodeJoin(join_req);
+        defer allocator.free(join_json);
+        var join_parsed = try std.json.parseFromSlice(std.json.Value, allocator, join_json, .{});
+        defer join_parsed.deinit();
+        const node_id = join_parsed.value.object.get("node_id").?.string;
+        const node_secret = join_parsed.value.object.get("node_secret").?.string;
+        expected_node_id = try allocator.dupe(u8, node_id);
+
+        const upsert_req = try std.fmt.allocPrint(
+            allocator,
+            "{{\"node_id\":\"{s}\",\"node_secret\":\"{s}\",\"venoms\":[{{\"venom_id\":\"camera\",\"kind\":\"camera\",\"version\":\"1\",\"state\":\"online\",\"endpoints\":[\"/nodes/{s}/venoms/camera\"],\"capabilities\":{{\"still\":true}}}}]}}",
+            .{ node_id, node_secret, node_id },
+        );
+        defer allocator.free(upsert_req);
+        const upserted = try plane.nodeVenomUpsert(upsert_req);
+        defer allocator.free(upserted);
+        try std.testing.expect(std.mem.indexOf(u8, upserted, "\"venom_id\":\"camera\"") != null);
+    }
+
+    {
+        var plane = ControlPlane.initWithPersistence(allocator, dir, "control-plane.db");
+        defer plane.deinit();
+
+        const get_req = try std.fmt.allocPrint(allocator, "{{\"node_id\":\"{s}\"}}", .{expected_node_id.?});
+        defer allocator.free(get_req);
+        const fetched = try plane.nodeVenomGet(get_req);
+        defer allocator.free(fetched);
+        try std.testing.expect(std.mem.indexOf(u8, fetched, "\"venom_id\":\"camera\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, fetched, "\"/nodes/") != null);
     }
 }
 
