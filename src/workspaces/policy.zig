@@ -65,8 +65,10 @@ pub fn loadWorkspacePolicy(allocator: std.mem.Allocator, options: LoadOptions) !
     var policy = try initDefaults(allocator, options);
     errdefer policy.deinit(allocator);
 
-    // WorkspacePolicy lookup is project-scoped so all actors in the same project share
-    // one namespace view regardless of active agent identity.
+    const agent_policy_path = try std.fs.path.join(allocator, &.{ options.agents_dir, options.agent_id, "agent_policy.json" });
+    defer allocator.free(agent_policy_path);
+    try applyWorkspacePolicyFile(allocator, &policy, options.agent_id, agent_policy_path);
+
     const project_policy_path = try std.fs.path.join(allocator, &.{ options.projects_dir, policy.project_id, "project_policy.json" });
     defer allocator.free(project_policy_path);
     try applyWorkspacePolicyFile(allocator, &policy, options.agent_id, project_policy_path);
@@ -348,4 +350,76 @@ test "workspace_policy: defaults provide a usable workspace view" {
     try std.testing.expect(policy.nodes.items.len > 0);
     try std.testing.expect(policy.project_links.items.len > 0);
     try std.testing.expect(policy.visible_agents.items.len > 0);
+}
+
+test "workspace_policy: load applies agent policy before project policy" {
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const tmp_root = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_root);
+
+    const agent_id = "agent-alpha";
+    const project_id = "project-alpha";
+
+    const agent_dir = try std.fs.path.join(allocator, &.{ tmp_root, "agents", agent_id });
+    defer allocator.free(agent_dir);
+    try std.fs.cwd().makePath(agent_dir);
+
+    const agent_policy_path = try std.fs.path.join(allocator, &.{ agent_dir, "agent_policy.json" });
+    defer allocator.free(agent_policy_path);
+    try std.fs.cwd().writeFile(.{
+        .sub_path = agent_policy_path,
+        .data = "{" ++
+            "\"visible_agents\":[\"agent-only\"]," ++
+            "\"nodes\":[{" ++
+            "\"id\":\"agent-node\"," ++
+            "\"resources\":{\"fs\":false,\"camera\":false,\"screen\":false,\"user\":false}," ++
+            "\"terminals\":[]" ++
+            "}]," ++
+            "\"project_links\":[]" ++
+            "}",
+    });
+
+    const project_dir = try std.fs.path.join(allocator, &.{ tmp_root, "projects", project_id });
+    defer allocator.free(project_dir);
+    try std.fs.cwd().makePath(project_dir);
+
+    const project_policy_path = try std.fs.path.join(allocator, &.{ project_dir, "project_policy.json" });
+    defer allocator.free(project_policy_path);
+    try std.fs.cwd().writeFile(.{
+        .sub_path = project_policy_path,
+        .data = "{" ++
+            "\"visible_agents\":[\"project-only\"]," ++
+            "\"nodes\":[{" ++
+            "\"id\":\"project-node\"," ++
+            "\"resources\":{\"fs\":true,\"camera\":false,\"screen\":false,\"user\":false}," ++
+            "\"terminals\":[\"1\"]" ++
+            "}]" ++
+            "}",
+    });
+
+    const agents_dir = try std.fs.path.join(allocator, &.{ tmp_root, "agents" });
+    defer allocator.free(agents_dir);
+    const projects_dir = try std.fs.path.join(allocator, &.{ tmp_root, "projects" });
+    defer allocator.free(projects_dir);
+
+    var policy = try loadWorkspacePolicy(
+        allocator,
+        .{
+            .agent_id = agent_id,
+            .project_id = project_id,
+            .agents_dir = agents_dir,
+            .projects_dir = projects_dir,
+        },
+    );
+    defer policy.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), policy.nodes.items.len);
+    try std.testing.expectEqualStrings("project-node", policy.nodes.items[0].id);
+    try std.testing.expect(sliceListContains(policy.visible_agents.items, "project-only"));
+    try std.testing.expect(sliceListContains(policy.visible_agents.items, agent_id));
+    try std.testing.expect(!sliceListContains(policy.visible_agents.items, "agent-only"));
 }
