@@ -4380,36 +4380,6 @@ const AgentRuntimeRegistry = struct {
         return self.control_plane.firstProjectAgent(project_id, include_primary) catch null;
     }
 
-    fn listNonSystemProjectIds(self: *AgentRuntimeRegistry) ![][]u8 {
-        const payload = try self.control_plane.listProjects();
-        defer self.allocator.free(payload);
-
-        var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, payload, .{});
-        defer parsed.deinit();
-        if (parsed.value != .object) return self.allocator.alloc([]u8, 0);
-        const projects_val = parsed.value.object.get("projects") orelse return self.allocator.alloc([]u8, 0);
-        if (projects_val != .array) return self.allocator.alloc([]u8, 0);
-
-        var project_ids = std.ArrayListUnmanaged([]u8){};
-        errdefer {
-            for (project_ids.items) |project_id| self.allocator.free(project_id);
-            project_ids.deinit(self.allocator);
-        }
-        for (projects_val.array.items) |item| {
-            if (item != .object) continue;
-            const id_val = item.object.get("project_id") orelse continue;
-            if (id_val != .string or id_val.string.len == 0) continue;
-            if (std.mem.eql(u8, id_val.string, system_project_id)) continue;
-            try project_ids.append(self.allocator, try self.allocator.dupe(u8, id_val.string));
-        }
-        std.mem.sort([]u8, project_ids.items, {}, struct {
-            fn lessThan(_: void, lhs: []u8, rhs: []u8) bool {
-                return std.mem.lessThan(u8, lhs, rhs);
-            }
-        }.lessThan);
-        return project_ids.toOwnedSlice(self.allocator);
-    }
-
     fn resolvePreferredBindingForRole(self: *AgentRuntimeRegistry, role: ConnectionRole) !?SessionBinding {
         const is_admin = role == .admin;
         if (try self.auth_tokens.rememberedTargetOwned(role)) |remembered| {
@@ -4441,27 +4411,6 @@ const AgentRuntimeRegistry = struct {
                 }
             } else {
                 self.auth_tokens.clearRememberedTarget(role) catch {};
-            }
-        }
-
-        const project_ids = try self.listNonSystemProjectIds();
-        defer {
-            for (project_ids) |project_id| self.allocator.free(project_id);
-            self.allocator.free(project_ids);
-        }
-        for (project_ids) |project_id| {
-            if (self.firstAgentForProject(role, project_id)) |agent_id| {
-                if (role == .user and std.mem.eql(u8, agent_id, system_agent_id)) {
-                    self.allocator.free(agent_id);
-                    continue;
-                }
-                return .{
-                    .agent_id = agent_id,
-                    .actor_type = try self.allocator.dupe(u8, defaultActorTypeForRole(role)),
-                    .actor_id = try self.allocator.dupe(u8, connectionRoleName(role)),
-                    .project_id = try self.allocator.dupe(u8, project_id),
-                    .project_token = null,
-                };
             }
         }
 
@@ -10420,6 +10369,80 @@ test "server_piai: user connect advertises provisioning gate when no remembered 
     try std.testing.expect(std.mem.indexOf(u8, attach_forbidden.payload, "\"type\":\"control.error\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, attach_forbidden.payload, "\"code\":\"missing_field\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, attach_forbidden.payload, "project_id is required") != null);
+
+    try websocket_transport.writeFrame(&user_client, "", .close);
+    var close_reply = try readServerFrame(allocator, &user_client);
+    defer close_reply.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0x8), close_reply.opcode);
+
+    try std.testing.expect(server_ctx.err_name == null);
+}
+
+test "server_piai: user connect requires session_attach even when another project is active" {
+    const allocator = std.testing.allocator;
+    var runtime_registry = AgentRuntimeRegistry.init(allocator, .{
+        .ltm_directory = "",
+        .ltm_filename = "",
+    }, null);
+    defer runtime_registry.deinit();
+    try setAuthTokensForTests(&runtime_registry, "admin-secret", "user-secret");
+
+    var registry = agent_registry_mod.AgentRegistry.init(
+        allocator,
+        ".",
+        runtime_registry.runtime_config.agents_dir,
+        runtime_registry.runtime_config.assets_dir,
+    );
+    defer registry.deinit();
+    try registry.scan();
+    if (registry.getAgent("alice") == null) try registry.createAgent("alice", null);
+
+    const project_up = try runtime_registry.control_plane.projectUpWithRole(
+        system_agent_id,
+        "{\"name\":\"Needs Attach\",\"vision\":\"Needs Attach\",\"activate\":false}",
+        true,
+    );
+    defer allocator.free(project_up);
+    const project_id = (try extractProjectIdFromControlPayload(allocator, project_up)) orelse return error.TestExpectedResult;
+    defer allocator.free(project_id);
+
+    const activate_payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"project_id\":\"{s}\"}}",
+        .{project_id},
+    );
+    defer allocator.free(activate_payload);
+    const activated = try runtime_registry.control_plane.activateProjectWithRole("alice", activate_payload, true);
+    defer allocator.free(activated);
+
+    var listener = try (try std.net.Address.parseIp("127.0.0.1", 0)).listen(.{ .reuse_address = true });
+    defer listener.deinit();
+
+    var server_ctx = WsTestServerCtx{
+        .allocator = allocator,
+        .runtime_registry = &runtime_registry,
+        .listener = &listener,
+    };
+    defer server_ctx.deinit();
+
+    const server_thread = try std.Thread.spawn(.{}, runSingleWsConnection, .{&server_ctx});
+    defer server_thread.join();
+
+    var user_client = try std.net.tcpConnectToAddress(listener.listen_address);
+    defer user_client.close();
+    try performClientHandshakeWithBearerToken(allocator, &user_client, "/", "user-secret");
+
+    try writeClientTextFrameMasked(&user_client, "{\"channel\":\"control\",\"type\":\"control.version\",\"id\":\"user-requires-attach-version\",\"payload\":{\"protocol\":\"unified-v2\"}}");
+    var version_ack = try readServerFrame(allocator, &user_client);
+    defer version_ack.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, version_ack.payload, "\"type\":\"control.version_ack\"") != null);
+
+    try writeClientTextFrameMasked(&user_client, "{\"channel\":\"control\",\"type\":\"control.connect\",\"id\":\"user-requires-attach-connect\"}");
+    var connect_ack = try readServerFrame(allocator, &user_client);
+    defer connect_ack.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, connect_ack.payload, "\"type\":\"control.connect_ack\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, connect_ack.payload, "\"requires_session_attach\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, connect_ack.payload, "\"connect_gate\":{\"code\":\"project_context_required\"") != null);
 
     try websocket_transport.writeFrame(&user_client, "", .close);
     var close_reply = try readServerFrame(allocator, &user_client);
