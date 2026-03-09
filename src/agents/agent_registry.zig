@@ -326,7 +326,6 @@ pub const AgentRegistry = struct {
 
     fn loadTemplateFromAllowedPath(self: *AgentRegistry, template_path: []const u8) ![]u8 {
         if (template_path.len == 0) return error.InvalidTemplatePath;
-        if (std.fs.path.isAbsolute(template_path)) return error.InvalidTemplatePath;
         if (containsParentTraversal(template_path)) return error.InvalidTemplatePath;
 
         const candidate_path = try resolveConfiguredPath(self.allocator, self.base_dir, template_path);
@@ -595,7 +594,7 @@ test "agent_registry: createAgent loads custom template from configured assets d
     try std.testing.expectEqualStrings("# custom hatch template\n", hatch);
 }
 
-test "agent_registry: createAgent rejects absolute template path" {
+test "agent_registry: createAgent loads custom template from absolute configured assets dir" {
     const allocator = std.testing.allocator;
     const nonce = std.crypto.random.int(u64);
     const rel_root = try std.fmt.allocPrint(allocator, ".tmp-agent-registry-template-abs-{d}", .{nonce});
@@ -610,14 +609,30 @@ test "agent_registry: createAgent rejects absolute template path" {
     try std.fs.cwd().makePath(agents_dir);
     try std.fs.cwd().makePath(assets_dir);
 
-    var registry = AgentRegistry.init(allocator, rel_root, "agents", "templates");
+    const abs_root = try std.fs.cwd().realpathAlloc(allocator, rel_root);
+    defer allocator.free(abs_root);
+    const abs_assets_dir = try std.fs.path.join(allocator, &.{ abs_root, "templates" });
+    defer allocator.free(abs_assets_dir);
+    const abs_agents_dir = try std.fs.path.join(allocator, &.{ abs_root, "agents" });
+    defer allocator.free(abs_agents_dir);
+
+    const custom_template_path = try std.fs.path.join(allocator, &.{ abs_assets_dir, "custom.md" });
+    defer allocator.free(custom_template_path);
+    try std.fs.cwd().writeFile(.{
+        .sub_path = custom_template_path,
+        .data = "# absolute custom hatch template\n",
+    });
+
+    var registry = AgentRegistry.init(allocator, rel_root, abs_agents_dir, abs_assets_dir);
     defer registry.deinit();
 
-    try std.testing.expectError(error.InvalidTemplatePath, registry.createAgent("alpha", "/etc/passwd"));
+    try registry.createAgent("alpha", custom_template_path);
 
-    const agent_path = try std.fs.path.join(allocator, &.{ agents_dir, "alpha" });
-    defer allocator.free(agent_path);
-    try std.testing.expectError(error.FileNotFound, std.fs.cwd().access(agent_path, .{}));
+    const hatch_path = try std.fs.path.join(allocator, &.{ abs_agents_dir, "alpha", "HATCH.md" });
+    defer allocator.free(hatch_path);
+    const hatch = try std.fs.cwd().readFileAlloc(allocator, hatch_path, 1024);
+    defer allocator.free(hatch);
+    try std.testing.expectEqualStrings("# absolute custom hatch template\n", hatch);
 }
 
 test "agent_registry: createAgent rejects traversal template path" {
