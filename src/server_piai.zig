@@ -21,6 +21,7 @@ const agent_config_mod = @import("agents/agent_config.zig");
 const agent_registry_mod = @import("agents/agent_registry.zig");
 const tool_registry = @import("ziggy-tool-runtime").tool_registry;
 const unified = @import("spider-protocol").unified;
+const mission_store_mod = @import("mission_store.zig");
 
 pub const RuntimeServer = runtime_server_mod.RuntimeServer;
 
@@ -3645,6 +3646,7 @@ const AgentRuntimeRegistry = struct {
     control_plane: control_plane_mod.ControlPlane,
     job_index: chat_job_index.ChatJobIndex,
     auth_tokens: AuthTokenStore,
+    missions: mission_store_mod.MissionStore,
     control_operator_token: ?[]u8 = null,
     control_project_scope_token: ?[]u8 = null,
     control_node_scope_token: ?[]u8 = null,
@@ -3776,6 +3778,7 @@ const AgentRuntimeRegistry = struct {
                 effective_runtime_config.ltm_directory,
             ),
             .auth_tokens = AuthTokenStore.init(allocator, effective_runtime_config),
+            .missions = mission_store_mod.MissionStore.init(allocator, effective_runtime_config),
             .control_operator_token = operator_token,
             .control_project_scope_token = project_scope_token,
             .control_node_scope_token = node_scope_token,
@@ -3892,6 +3895,7 @@ const AgentRuntimeRegistry = struct {
         self.control_plane.deinit();
         self.debug_stream_sink.deinit();
         self.auth_tokens.deinit();
+        self.missions.deinit();
     }
 
     fn authenticateConnection(self: *AgentRuntimeRegistry, authorization_header: ?[]const u8) ?ConnectionPrincipal {
@@ -7838,6 +7842,7 @@ fn handleWebSocketConnection(
                                                 .assets_dir = runtime_registry.runtime_config.assets_dir,
                                                 .projects_dir = "projects",
                                                 .control_plane = &runtime_registry.control_plane,
+                                                .mission_store = &runtime_registry.missions,
                                                 .control_operator_token = runtime_registry.control_operator_token,
                                                 .actor_type = main_binding.actor_type,
                                                 .actor_id = main_binding.actor_id,
@@ -8345,6 +8350,7 @@ fn handleWebSocketConnection(
                                     .projects_dir = "projects",
                                     .local_fs_export_root = local_fs_workspace_root,
                                     .control_plane = &runtime_registry.control_plane,
+                                    .mission_store = &runtime_registry.missions,
                                     .control_operator_token = runtime_registry.control_operator_token,
                                     .actor_type = target_binding.actor_type,
                                     .actor_id = target_binding.actor_id,
@@ -8369,6 +8375,7 @@ fn handleWebSocketConnection(
                                         .projects_dir = "projects",
                                         .local_fs_export_root = local_fs_workspace_root,
                                         .control_plane = &runtime_registry.control_plane,
+                                        .mission_store = &runtime_registry.missions,
                                         .control_operator_token = runtime_registry.control_operator_token,
                                         .actor_type = target_binding.actor_type,
                                         .actor_id = target_binding.actor_id,

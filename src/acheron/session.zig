@@ -14,6 +14,7 @@ const acheron_router = @import("router.zig");
 const agent_config = @import("../agents/agent_config.zig");
 const agent_registry = @import("../agents/agent_registry.zig");
 const memory_ownership = @import("../agents/memory_ownership.zig");
+const mission_store_mod = @import("../mission_store.zig");
 
 const NodeKind = enum {
     dir,
@@ -51,6 +52,21 @@ const SpecialKind = enum {
     projects_list,
     projects_get,
     projects_up,
+    missions_invoke,
+    missions_create,
+    missions_list,
+    missions_get,
+    missions_heartbeat,
+    missions_checkpoint,
+    missions_recover,
+    missions_request_approval,
+    missions_approve,
+    missions_reject,
+    missions_resume,
+    missions_block,
+    missions_complete,
+    missions_fail,
+    missions_cancel,
     mounts_invoke,
     mounts_list,
     mounts_mount,
@@ -319,6 +335,7 @@ pub const Session = struct {
         projects_dir: []const u8 = "projects",
         local_fs_export_root: ?[]const u8 = null,
         control_plane: ?*control_plane_mod.ControlPlane = null,
+        mission_store: ?*mission_store_mod.MissionStore = null,
         control_operator_token: ?[]const u8 = null,
         actor_type: ?[]const u8 = null,
         actor_id: ?[]const u8 = null,
@@ -339,6 +356,7 @@ pub const Session = struct {
     projects_dir: []u8,
     local_fs_export_root: ?[]u8 = null,
     control_plane: ?*control_plane_mod.ControlPlane = null,
+    mission_store: ?*mission_store_mod.MissionStore = null,
     control_operator_token: ?[]u8 = null,
     is_admin: bool = false,
 
@@ -375,6 +393,8 @@ pub const Session = struct {
     agents_result_id: u32 = 0,
     projects_status_id: u32 = 0,
     projects_result_id: u32 = 0,
+    missions_status_id: u32 = 0,
+    missions_result_id: u32 = 0,
     mounts_status_id: u32 = 0,
     mounts_result_id: u32 = 0,
     wait_sources: std.ArrayListUnmanaged(WaitSource) = .{},
@@ -457,6 +477,7 @@ pub const Session = struct {
             .projects_dir = owned_projects_dir,
             .local_fs_export_root = owned_local_fs_export_root,
             .control_plane = options.control_plane,
+            .mission_store = options.mission_store,
             .control_operator_token = owned_control_operator_token,
             .is_admin = options.is_admin,
         };
@@ -509,6 +530,7 @@ pub const Session = struct {
                 .projects_dir = self.projects_dir,
                 .local_fs_export_root = self.local_fs_export_root,
                 .control_plane = self.control_plane,
+                .mission_store = self.mission_store,
                 .control_operator_token = self.control_operator_token,
                 .actor_type = self.actor_type,
                 .actor_id = self.actor_id,
@@ -1203,6 +1225,51 @@ pub const Session = struct {
                 };
                 written = outcome.written;
             },
+            .missions_invoke,
+            .missions_create,
+            .missions_list,
+            .missions_get,
+            .missions_heartbeat,
+            .missions_checkpoint,
+            .missions_recover,
+            .missions_request_approval,
+            .missions_approve,
+            .missions_reject,
+            .missions_resume,
+            .missions_block,
+            .missions_complete,
+            .missions_fail,
+            .missions_cancel,
+            => {
+                const outcome = self.handleMissionsNamespaceWrite(node.special, state.node_id, data) catch |err| switch (err) {
+                    error.InvalidPayload => {
+                        return unified.buildFsrpcError(
+                            self.allocator,
+                            msg.tag,
+                            "invalid",
+                            "missions payload is invalid for requested operation",
+                        );
+                    },
+                    error.AccessDenied => {
+                        return unified.buildFsrpcError(
+                            self.allocator,
+                            msg.tag,
+                            "eperm",
+                            "missions operation requires admin approval privileges",
+                        );
+                    },
+                    error.NotFound => {
+                        return unified.buildFsrpcError(
+                            self.allocator,
+                            msg.tag,
+                            "enoent",
+                            "mission not found",
+                        );
+                    },
+                    else => return err,
+                };
+                written = outcome.written;
+            },
             .pairing_refresh => {
                 const outcome = try self.handlePairingControlWrite(.refresh, data);
                 written = outcome.written;
@@ -1748,6 +1815,10 @@ pub const Session = struct {
         try self.seedAgentAgentsNamespace(agents_control_dir);
         const projects_control_dir = try self.addDir(global_root, "projects", false);
         try self.seedAgentProjectsNamespace(projects_control_dir);
+        if (self.mission_store != null) {
+            const missions_dir = try self.addDir(global_root, "missions", false);
+            try self.seedAgentMissionsNamespace(missions_dir);
+        }
 
         self.jobs_root_id = try self.addDir(global_root, "jobs", false);
         try self.addDirectoryDescriptors(
@@ -9061,6 +9132,630 @@ pub const Session = struct {
         };
     }
 
+    fn seedAgentMissionsNamespace(self: *Session, missions_dir: u32) !void {
+        try self.addDirectoryDescriptors(
+            missions_dir,
+            "Missions",
+            "{\"kind\":\"venom\",\"venom_id\":\"missions\",\"shape\":\"/global/missions/{README.md,SCHEMA.json,CAPS.json,OPS.json,RUNTIME.json,PERMISSIONS.json,STATUS.json,status.json,result.json,control/*}\"}",
+            "{\"invoke\":true,\"operations\":[\"missions_create\",\"missions_list\",\"missions_get\",\"missions_heartbeat\",\"missions_checkpoint\",\"missions_recover\",\"missions_request_approval\",\"missions_approve\",\"missions_reject\",\"missions_resume\",\"missions_block\",\"missions_complete\",\"missions_fail\",\"missions_cancel\"],\"discoverable\":true,\"persistent\":true}",
+            "Long-running mission records. Create/list/get missions, checkpoint progress, request approvals, and track recovery/state transitions.",
+        );
+        _ = try self.addFile(
+            missions_dir,
+            "OPS.json",
+            "{\"model\":\"local_bridge\",\"invoke\":\"control/invoke.json\",\"transport\":\"acheron-local\",\"paths\":{\"create\":\"control/create.json\",\"list\":\"control/list.json\",\"get\":\"control/get.json\",\"heartbeat\":\"control/heartbeat.json\",\"checkpoint\":\"control/checkpoint.json\",\"recover\":\"control/recover.json\",\"request_approval\":\"control/request_approval.json\",\"approve\":\"control/approve.json\",\"reject\":\"control/reject.json\",\"resume\":\"control/resume.json\",\"block\":\"control/block.json\",\"complete\":\"control/complete.json\",\"fail\":\"control/fail.json\",\"cancel\":\"control/cancel.json\"},\"operations\":{\"create\":\"create\",\"list\":\"list\",\"get\":\"get\",\"heartbeat\":\"heartbeat\",\"checkpoint\":\"checkpoint\",\"recover\":\"recover\",\"request_approval\":\"request_approval\",\"approve\":\"approve\",\"reject\":\"reject\",\"resume\":\"resume\",\"block\":\"block\",\"complete\":\"complete\",\"fail\":\"fail\",\"cancel\":\"cancel\"}}",
+            false,
+            .none,
+        );
+        _ = try self.addFile(
+            missions_dir,
+            "RUNTIME.json",
+            "{\"type\":\"acheron_local\",\"component\":\"mission_store\",\"subject\":\"missions\"}",
+            false,
+            .none,
+        );
+        _ = try self.addFile(
+            missions_dir,
+            "PERMISSIONS.json",
+            "{\"default\":\"allow-by-default\",\"allow_roles\":[\"admin\",\"user\"],\"scope\":\"agent\",\"admin_actions\":[\"approve\",\"reject\"]}",
+            false,
+            .none,
+        );
+        _ = try self.addFile(
+            missions_dir,
+            "STATUS.json",
+            "{\"venom_id\":\"missions\",\"state\":\"namespace\",\"has_invoke\":true,\"persistent\":true}",
+            false,
+            .none,
+        );
+        self.missions_status_id = try self.addFile(
+            missions_dir,
+            "status.json",
+            "{\"state\":\"idle\",\"tool\":null,\"updated_at_ms\":0,\"error\":null}",
+            false,
+            .none,
+        );
+        self.missions_result_id = try self.addFile(
+            missions_dir,
+            "result.json",
+            "{\"ok\":false,\"result\":null,\"error\":null}",
+            false,
+            .none,
+        );
+
+        const control_dir = try self.addDir(missions_dir, "control", false);
+        _ = try self.addFile(
+            control_dir,
+            "README.md",
+            "Write JSON payloads to mission control files. invoke.json accepts op=create|list|get|heartbeat|checkpoint|recover|request_approval|approve|reject|resume|block|complete|fail|cancel envelopes.\n",
+            false,
+            .none,
+        );
+        _ = try self.addFile(control_dir, "invoke.json", "", true, .missions_invoke);
+        _ = try self.addFile(control_dir, "create.json", "", true, .missions_create);
+        _ = try self.addFile(control_dir, "list.json", "", true, .missions_list);
+        _ = try self.addFile(control_dir, "get.json", "", true, .missions_get);
+        _ = try self.addFile(control_dir, "heartbeat.json", "", true, .missions_heartbeat);
+        _ = try self.addFile(control_dir, "checkpoint.json", "", true, .missions_checkpoint);
+        _ = try self.addFile(control_dir, "recover.json", "", true, .missions_recover);
+        _ = try self.addFile(control_dir, "request_approval.json", "", true, .missions_request_approval);
+        _ = try self.addFile(control_dir, "approve.json", "", true, .missions_approve);
+        _ = try self.addFile(control_dir, "reject.json", "", true, .missions_reject);
+        _ = try self.addFile(control_dir, "resume.json", "", true, .missions_resume);
+        _ = try self.addFile(control_dir, "block.json", "", true, .missions_block);
+        _ = try self.addFile(control_dir, "complete.json", "", true, .missions_complete);
+        _ = try self.addFile(control_dir, "fail.json", "", true, .missions_fail);
+        _ = try self.addFile(control_dir, "cancel.json", "", true, .missions_cancel);
+    }
+
+    const MissionOp = enum {
+        create,
+        list,
+        get,
+        heartbeat,
+        checkpoint,
+        recover,
+        request_approval,
+        approve,
+        reject,
+        @"resume",
+        block,
+        complete,
+        fail,
+        cancel,
+    };
+
+    fn handleMissionsNamespaceWrite(self: *Session, special: SpecialKind, node_id: u32, raw_input: []const u8) !WriteOutcome {
+        const input = std.mem.trim(u8, raw_input, " \t\r\n");
+        const payload = if (input.len == 0) "{}" else input;
+        try self.setFileContent(node_id, payload);
+
+        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, payload, .{}) catch return error.InvalidPayload;
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidPayload;
+        const obj = parsed.value.object;
+
+        const op = switch (special) {
+            .missions_create => MissionOp.create,
+            .missions_list => MissionOp.list,
+            .missions_get => MissionOp.get,
+            .missions_heartbeat => MissionOp.heartbeat,
+            .missions_checkpoint => MissionOp.checkpoint,
+            .missions_recover => MissionOp.recover,
+            .missions_request_approval => MissionOp.request_approval,
+            .missions_approve => MissionOp.approve,
+            .missions_reject => MissionOp.reject,
+            .missions_resume => MissionOp.@"resume",
+            .missions_block => MissionOp.block,
+            .missions_complete => MissionOp.complete,
+            .missions_fail => MissionOp.fail,
+            .missions_cancel => MissionOp.cancel,
+            .missions_invoke => blk: {
+                const op_raw = blk2: {
+                    if (obj.get("op")) |value| if (value == .string and value.string.len > 0) break :blk2 value.string;
+                    if (obj.get("operation")) |value| if (value == .string and value.string.len > 0) break :blk2 value.string;
+                    if (obj.get("tool")) |value| if (value == .string and value.string.len > 0) break :blk2 value.string;
+                    if (obj.get("tool_name")) |value| if (value == .string and value.string.len > 0) break :blk2 value.string;
+                    break :blk2 null;
+                } orelse return error.InvalidPayload;
+                break :blk parseMissionOp(op_raw) orelse return error.InvalidPayload;
+            },
+            else => return error.InvalidPayload,
+        };
+
+        const args_obj = blk: {
+            if (obj.get("arguments")) |value| {
+                if (value != .object) return error.InvalidPayload;
+                break :blk value.object;
+            }
+            if (obj.get("args")) |value| {
+                if (value != .object) return error.InvalidPayload;
+                break :blk value.object;
+            }
+            break :blk obj;
+        };
+        return self.executeMissionOp(op, args_obj, raw_input.len);
+    }
+
+    fn parseMissionOp(raw: []const u8) ?MissionOp {
+        const value = std.mem.trim(u8, raw, " \t\r\n");
+        if (std.mem.eql(u8, value, "create") or std.mem.eql(u8, value, "missions_create")) return .create;
+        if (std.mem.eql(u8, value, "list") or std.mem.eql(u8, value, "missions_list")) return .list;
+        if (std.mem.eql(u8, value, "get") or std.mem.eql(u8, value, "missions_get")) return .get;
+        if (std.mem.eql(u8, value, "heartbeat") or std.mem.eql(u8, value, "missions_heartbeat")) return .heartbeat;
+        if (std.mem.eql(u8, value, "checkpoint") or std.mem.eql(u8, value, "missions_checkpoint")) return .checkpoint;
+        if (std.mem.eql(u8, value, "recover") or std.mem.eql(u8, value, "missions_recover")) return .recover;
+        if (std.mem.eql(u8, value, "request_approval") or std.mem.eql(u8, value, "missions_request_approval")) return .request_approval;
+        if (std.mem.eql(u8, value, "approve") or std.mem.eql(u8, value, "missions_approve")) return .approve;
+        if (std.mem.eql(u8, value, "reject") or std.mem.eql(u8, value, "missions_reject")) return .reject;
+        if (std.mem.eql(u8, value, "resume") or std.mem.eql(u8, value, "missions_resume")) return .@"resume";
+        if (std.mem.eql(u8, value, "block") or std.mem.eql(u8, value, "missions_block")) return .block;
+        if (std.mem.eql(u8, value, "complete") or std.mem.eql(u8, value, "missions_complete")) return .complete;
+        if (std.mem.eql(u8, value, "fail") or std.mem.eql(u8, value, "missions_fail")) return .fail;
+        if (std.mem.eql(u8, value, "cancel") or std.mem.eql(u8, value, "missions_cancel")) return .cancel;
+        return null;
+    }
+
+    fn missionToolName(op: MissionOp) []const u8 {
+        return switch (op) {
+            .create => "missions_create",
+            .list => "missions_list",
+            .get => "missions_get",
+            .heartbeat => "missions_heartbeat",
+            .checkpoint => "missions_checkpoint",
+            .recover => "missions_recover",
+            .request_approval => "missions_request_approval",
+            .approve => "missions_approve",
+            .reject => "missions_reject",
+            .@"resume" => "missions_resume",
+            .block => "missions_block",
+            .complete => "missions_complete",
+            .fail => "missions_fail",
+            .cancel => "missions_cancel",
+        };
+    }
+
+    fn missionOperationName(op: MissionOp) []const u8 {
+        return switch (op) {
+            .create => "create",
+            .list => "list",
+            .get => "get",
+            .heartbeat => "heartbeat",
+            .checkpoint => "checkpoint",
+            .recover => "recover",
+            .request_approval => "request_approval",
+            .approve => "approve",
+            .reject => "reject",
+            .@"resume" => "resume",
+            .block => "block",
+            .complete => "complete",
+            .fail => "fail",
+            .cancel => "cancel",
+        };
+    }
+
+    fn executeMissionOp(self: *Session, op: MissionOp, args_obj: std.json.ObjectMap, written: usize) !WriteOutcome {
+        const tool_name = missionToolName(op);
+        const running_status = try self.buildServiceInvokeStatusJson("running", tool_name, null);
+        defer self.allocator.free(running_status);
+        if (self.missions_status_id != 0) try self.setFileContent(self.missions_status_id, running_status);
+
+        const result_payload = self.executeMissionOpPayload(op, args_obj) catch |err| {
+            const error_message = @errorName(err);
+            const error_code = switch (err) {
+                error.AccessDenied => "forbidden",
+                error.NotFound => "mission_not_found",
+                else => "invalid_payload",
+            };
+            const failed_status = try self.buildServiceInvokeStatusJson("failed", tool_name, error_message);
+            defer self.allocator.free(failed_status);
+            if (self.missions_status_id != 0) try self.setFileContent(self.missions_status_id, failed_status);
+            const failed_result = try self.buildMissionFailureResultJson(op, error_code, error_message);
+            defer self.allocator.free(failed_result);
+            if (self.missions_result_id != 0) try self.setFileContent(self.missions_result_id, failed_result);
+            return err;
+        };
+        defer self.allocator.free(result_payload);
+
+        const done_status = try self.buildServiceInvokeStatusJson("done", tool_name, null);
+        defer self.allocator.free(done_status);
+        if (self.missions_status_id != 0) try self.setFileContent(self.missions_status_id, done_status);
+        if (self.missions_result_id != 0) try self.setFileContent(self.missions_result_id, result_payload);
+        return .{ .written = written };
+    }
+
+    fn executeMissionOpPayload(self: *Session, op: MissionOp, args_obj: std.json.ObjectMap) ![]u8 {
+        const store = self.mission_store orelse return error.InvalidPayload;
+        return switch (op) {
+            .create => blk: {
+                const use_case = extractOptionalStringByNames(args_obj, &[_][]const u8{ "use_case", "kind" }) orelse return error.InvalidPayload;
+                const allow_override = self.is_admin or std.mem.eql(u8, self.agent_id, "mother");
+                const agent_id = if (allow_override)
+                    extractOptionalStringByNames(args_obj, &[_][]const u8{"agent_id"})
+                else
+                    self.agent_id;
+                const project_id = if (allow_override)
+                    extractOptionalStringByNames(args_obj, &[_][]const u8{"project_id"})
+                else
+                    self.project_id;
+                var created = try store.create(self.allocator, .{
+                    .use_case = use_case,
+                    .title = extractOptionalStringByNames(args_obj, &[_][]const u8{ "title", "name" }),
+                    .stage = extractOptionalStringByNames(args_obj, &[_][]const u8{"stage"}),
+                    .agent_id = agent_id,
+                    .project_id = project_id,
+                    .run_id = extractOptionalStringByNames(args_obj, &[_][]const u8{"run_id"}),
+                    .workspace_root = extractOptionalStringByNames(args_obj, &[_][]const u8{"workspace_root"}),
+                    .worktree_name = extractOptionalStringByNames(args_obj, &[_][]const u8{"worktree_name"}),
+                    .created_by = .{ .actor_type = self.actor_type, .actor_id = self.actor_id },
+                });
+                defer created.deinit(self.allocator);
+                const mission_json = try self.buildMissionRecordJson(created);
+                defer self.allocator.free(mission_json);
+                const detail = try std.fmt.allocPrint(
+                    self.allocator,
+                    "{{\"mission\":{s}}}",
+                    .{mission_json},
+                );
+                defer self.allocator.free(detail);
+                break :blk self.buildMissionSuccessResultJson(.create, detail);
+            },
+            .list => blk: {
+                const state_filter = blk2: {
+                    const raw = extractOptionalStringByNames(args_obj, &[_][]const u8{"state"}) orelse break :blk2 null;
+                    break :blk2 mission_store_mod.parseMissionState(raw) orelse return error.InvalidPayload;
+                };
+                const missions = try store.listOwned(self.allocator, .{
+                    .state = state_filter,
+                    .use_case = extractOptionalStringByNames(args_obj, &[_][]const u8{"use_case"}),
+                    .agent_id = extractOptionalStringByNames(args_obj, &[_][]const u8{"agent_id"}),
+                    .project_id = extractOptionalStringByNames(args_obj, &[_][]const u8{"project_id"}),
+                });
+                defer mission_store_mod.deinitMissionList(self.allocator, missions);
+                const inventory = try self.buildMissionListJson(missions);
+                defer self.allocator.free(inventory);
+                break :blk self.buildMissionSuccessResultJson(.list, inventory);
+            },
+            .get => blk: {
+                const mission_id = extractOptionalStringByNames(args_obj, &[_][]const u8{ "mission_id", "id" }) orelse return error.InvalidPayload;
+                var mission = (try store.getOwned(self.allocator, mission_id)) orelse return error.NotFound;
+                defer mission.deinit(self.allocator);
+                const mission_json = try self.buildMissionRecordJson(mission);
+                defer self.allocator.free(mission_json);
+                const detail = try std.fmt.allocPrint(self.allocator, "{{\"mission\":{s}}}", .{mission_json});
+                defer self.allocator.free(detail);
+                break :blk self.buildMissionSuccessResultJson(.get, detail);
+            },
+            .heartbeat => blk: {
+                const mission_id = extractOptionalStringByNames(args_obj, &[_][]const u8{ "mission_id", "id" }) orelse return error.InvalidPayload;
+                var mission = store.recordHeartbeat(
+                    self.allocator,
+                    mission_id,
+                    extractOptionalStringByNames(args_obj, &[_][]const u8{"stage"}),
+                ) catch |err| switch (err) {
+                    mission_store_mod.MissionStoreError.MissionNotFound => return error.NotFound,
+                    else => return error.InvalidPayload,
+                };
+                defer mission.deinit(self.allocator);
+                const mission_json = try self.buildMissionRecordJson(mission);
+                defer self.allocator.free(mission_json);
+                const detail = try std.fmt.allocPrint(self.allocator, "{{\"mission\":{s}}}", .{mission_json});
+                defer self.allocator.free(detail);
+                break :blk self.buildMissionSuccessResultJson(.heartbeat, detail);
+            },
+            .checkpoint => blk: {
+                const mission_id = extractOptionalStringByNames(args_obj, &[_][]const u8{ "mission_id", "id" }) orelse return error.InvalidPayload;
+                const artifact_input = if (args_obj.get("artifact")) |value| blk2: {
+                    if (value != .object) return error.InvalidPayload;
+                    const kind = extractOptionalStringByNames(value.object, &[_][]const u8{"kind"}) orelse return error.InvalidPayload;
+                    break :blk2 mission_store_mod.MissionArtifactInput{
+                        .kind = kind,
+                        .path = extractOptionalStringByNames(value.object, &[_][]const u8{"path"}),
+                        .summary = extractOptionalStringByNames(value.object, &[_][]const u8{"summary"}),
+                    };
+                } else null;
+                var mission = store.recordCheckpoint(self.allocator, mission_id, .{
+                    .stage = extractOptionalStringByNames(args_obj, &[_][]const u8{"stage"}),
+                    .summary = extractOptionalStringByNames(args_obj, &[_][]const u8{"summary"}),
+                    .artifact = artifact_input,
+                }) catch |err| switch (err) {
+                    mission_store_mod.MissionStoreError.MissionNotFound => return error.NotFound,
+                    else => return error.InvalidPayload,
+                };
+                defer mission.deinit(self.allocator);
+                const mission_json = try self.buildMissionRecordJson(mission);
+                defer self.allocator.free(mission_json);
+                const detail = try std.fmt.allocPrint(self.allocator, "{{\"mission\":{s}}}", .{mission_json});
+                defer self.allocator.free(detail);
+                break :blk self.buildMissionSuccessResultJson(.checkpoint, detail);
+            },
+            .recover => blk: {
+                const mission_id = extractOptionalStringByNames(args_obj, &[_][]const u8{ "mission_id", "id" }) orelse return error.InvalidPayload;
+                const reason = extractOptionalStringByNames(args_obj, &[_][]const u8{ "reason", "message" }) orelse return error.InvalidPayload;
+                var mission = store.recordRecovery(self.allocator, mission_id, .{
+                    .reason = reason,
+                    .stage = extractOptionalStringByNames(args_obj, &[_][]const u8{"stage"}),
+                    .summary = extractOptionalStringByNames(args_obj, &[_][]const u8{"summary"}),
+                }) catch |err| switch (err) {
+                    mission_store_mod.MissionStoreError.MissionNotFound => return error.NotFound,
+                    else => return error.InvalidPayload,
+                };
+                defer mission.deinit(self.allocator);
+                const mission_json = try self.buildMissionRecordJson(mission);
+                defer self.allocator.free(mission_json);
+                const detail = try std.fmt.allocPrint(self.allocator, "{{\"mission\":{s}}}", .{mission_json});
+                defer self.allocator.free(detail);
+                break :blk self.buildMissionSuccessResultJson(.recover, detail);
+            },
+            .request_approval => blk: {
+                const mission_id = extractOptionalStringByNames(args_obj, &[_][]const u8{ "mission_id", "id" }) orelse return error.InvalidPayload;
+                const action_kind = extractOptionalStringByNames(args_obj, &[_][]const u8{ "action_kind", "action" }) orelse return error.InvalidPayload;
+                const message = extractOptionalStringByNames(args_obj, &[_][]const u8{ "message", "reason" }) orelse return error.InvalidPayload;
+                const payload_json = if (args_obj.get("payload")) |value|
+                    try self.renderJsonValue(value)
+                else
+                    null;
+                defer if (payload_json) |value| self.allocator.free(value);
+                var mission = store.requestApproval(self.allocator, mission_id, .{
+                    .action_kind = action_kind,
+                    .message = message,
+                    .payload_json = payload_json,
+                    .stage = extractOptionalStringByNames(args_obj, &[_][]const u8{"stage"}),
+                    .requested_by = .{ .actor_type = self.actor_type, .actor_id = self.actor_id },
+                }) catch |err| switch (err) {
+                    mission_store_mod.MissionStoreError.MissionNotFound => return error.NotFound,
+                    mission_store_mod.MissionStoreError.ApprovalPending => return error.InvalidPayload,
+                    else => return error.InvalidPayload,
+                };
+                defer mission.deinit(self.allocator);
+                const mission_json = try self.buildMissionRecordJson(mission);
+                defer self.allocator.free(mission_json);
+                const detail = try std.fmt.allocPrint(self.allocator, "{{\"mission\":{s}}}", .{mission_json});
+                defer self.allocator.free(detail);
+                break :blk self.buildMissionSuccessResultJson(.request_approval, detail);
+            },
+            .approve, .reject => blk: {
+                if (!self.is_admin) return error.AccessDenied;
+                const mission_id = extractOptionalStringByNames(args_obj, &[_][]const u8{ "mission_id", "id" }) orelse return error.InvalidPayload;
+                var mission = store.resolveApproval(self.allocator, mission_id, op == .approve, .{
+                    .note = extractOptionalStringByNames(args_obj, &[_][]const u8{ "note", "message" }),
+                    .resolved_by = .{ .actor_type = self.actor_type, .actor_id = self.actor_id },
+                }) catch |err| switch (err) {
+                    mission_store_mod.MissionStoreError.MissionNotFound => return error.NotFound,
+                    mission_store_mod.MissionStoreError.ApprovalNotPending => return error.InvalidPayload,
+                    else => return error.InvalidPayload,
+                };
+                defer mission.deinit(self.allocator);
+                const mission_json = try self.buildMissionRecordJson(mission);
+                defer self.allocator.free(mission_json);
+                const detail = try std.fmt.allocPrint(self.allocator, "{{\"mission\":{s}}}", .{mission_json});
+                defer self.allocator.free(detail);
+                break :blk self.buildMissionSuccessResultJson(op, detail);
+            },
+            .@"resume", .block, .complete, .fail, .cancel => blk: {
+                const mission_id = extractOptionalStringByNames(args_obj, &[_][]const u8{ "mission_id", "id" }) orelse return error.InvalidPayload;
+                const next_state: mission_store_mod.MissionState = switch (op) {
+                    .@"resume" => .running,
+                    .block => .blocked,
+                    .complete => .completed,
+                    .fail => .failed,
+                    .cancel => .cancelled,
+                    else => unreachable,
+                };
+                var mission = store.transition(self.allocator, mission_id, .{
+                    .next_state = next_state,
+                    .stage = extractOptionalStringByNames(args_obj, &[_][]const u8{"stage"}),
+                    .reason = extractOptionalStringByNames(args_obj, &[_][]const u8{ "reason", "message" }),
+                    .summary = extractOptionalStringByNames(args_obj, &[_][]const u8{"summary"}),
+                    .actor = .{ .actor_type = self.actor_type, .actor_id = self.actor_id },
+                }) catch |err| switch (err) {
+                    mission_store_mod.MissionStoreError.MissionNotFound => return error.NotFound,
+                    else => return error.InvalidPayload,
+                };
+                defer mission.deinit(self.allocator);
+                const mission_json = try self.buildMissionRecordJson(mission);
+                defer self.allocator.free(mission_json);
+                const detail = try std.fmt.allocPrint(self.allocator, "{{\"mission\":{s}}}", .{mission_json});
+                defer self.allocator.free(detail);
+                break :blk self.buildMissionSuccessResultJson(op, detail);
+            },
+        };
+    }
+
+    fn buildMissionSuccessResultJson(self: *Session, op: MissionOp, result_json: []const u8) ![]u8 {
+        const escaped_operation = try unified.jsonEscape(self.allocator, missionOperationName(op));
+        defer self.allocator.free(escaped_operation);
+        return std.fmt.allocPrint(
+            self.allocator,
+            "{{\"ok\":true,\"operation\":\"{s}\",\"result\":{s},\"error\":null}}",
+            .{ escaped_operation, result_json },
+        );
+    }
+
+    fn buildMissionFailureResultJson(self: *Session, op: MissionOp, code: []const u8, message: []const u8) ![]u8 {
+        const escaped_operation = try unified.jsonEscape(self.allocator, missionOperationName(op));
+        defer self.allocator.free(escaped_operation);
+        const escaped_code = try unified.jsonEscape(self.allocator, code);
+        defer self.allocator.free(escaped_code);
+        const escaped_message = try unified.jsonEscape(self.allocator, message);
+        defer self.allocator.free(escaped_message);
+        return std.fmt.allocPrint(
+            self.allocator,
+            "{{\"ok\":false,\"operation\":\"{s}\",\"result\":null,\"error\":{{\"code\":\"{s}\",\"message\":\"{s}\"}}}}",
+            .{ escaped_operation, escaped_code, escaped_message },
+        );
+    }
+
+    fn buildMissionListJson(self: *Session, missions: []const mission_store_mod.MissionRecord) ![]u8 {
+        var out = std.ArrayListUnmanaged(u8){};
+        errdefer out.deinit(self.allocator);
+        const writer = out.writer(self.allocator);
+        try writer.writeAll("{\"missions\":[");
+        for (missions, 0..) |mission, idx| {
+            if (idx > 0) try writer.writeByte(',');
+            const mission_json = try self.buildMissionRecordJson(mission);
+            defer self.allocator.free(mission_json);
+            try writer.writeAll(mission_json);
+        }
+        try writer.print("],\"count\":{d}}}", .{missions.len});
+        return out.toOwnedSlice(self.allocator);
+    }
+
+    fn buildMissionRecordJson(self: *Session, mission: mission_store_mod.MissionRecord) ![]u8 {
+        var out = std.ArrayListUnmanaged(u8){};
+        errdefer out.deinit(self.allocator);
+        const writer = out.writer(self.allocator);
+
+        try writer.writeByte('{');
+        try writer.writeAll("\"mission_id\":");
+        try writeJsonString(writer, mission.mission_id);
+        try writer.writeAll(",\"use_case\":");
+        try writeJsonString(writer, mission.use_case);
+        try writer.writeAll(",\"title\":");
+        if (mission.title) |value| try writeJsonString(writer, value) else try writer.writeAll("null");
+        try writer.writeAll(",\"stage\":");
+        try writeJsonString(writer, mission.stage);
+        try writer.writeAll(",\"state\":");
+        try writeJsonString(writer, mission_store_mod.missionStateName(mission.state));
+        try writer.writeAll(",\"agent_id\":");
+        if (mission.agent_id) |value| try writeJsonString(writer, value) else try writer.writeAll("null");
+        try writer.writeAll(",\"project_id\":");
+        if (mission.project_id) |value| try writeJsonString(writer, value) else try writer.writeAll("null");
+        try writer.writeAll(",\"run_id\":");
+        if (mission.run_id) |value| try writeJsonString(writer, value) else try writer.writeAll("null");
+        try writer.writeAll(",\"workspace_root\":");
+        if (mission.workspace_root) |value| try writeJsonString(writer, value) else try writer.writeAll("null");
+        try writer.writeAll(",\"worktree_name\":");
+        if (mission.worktree_name) |value| try writeJsonString(writer, value) else try writer.writeAll("null");
+        try writer.writeAll(",\"created_by\":{");
+        try writer.writeAll("\"actor_type\":");
+        try writeJsonString(writer, mission.created_by.actor_type);
+        try writer.writeAll(",\"actor_id\":");
+        try writeJsonString(writer, mission.created_by.actor_id);
+        try writer.writeByte('}');
+        try writer.print(",\"created_at_ms\":{d}", .{mission.created_at_ms});
+        try writer.print(",\"updated_at_ms\":{d}", .{mission.updated_at_ms});
+        try writer.print(",\"last_heartbeat_ms\":{d}", .{mission.last_heartbeat_ms});
+        try writer.print(",\"checkpoint_seq\":{d}", .{mission.checkpoint_seq});
+        try writer.print(",\"recovery_count\":{d}", .{mission.recovery_count});
+        try writer.writeAll(",\"recovery_reason\":");
+        if (mission.recovery_reason) |value| try writeJsonString(writer, value) else try writer.writeAll("null");
+        try writer.writeAll(",\"blocked_reason\":");
+        if (mission.blocked_reason) |value| try writeJsonString(writer, value) else try writer.writeAll("null");
+        try writer.writeAll(",\"summary\":");
+        if (mission.summary) |value| try writeJsonString(writer, value) else try writer.writeAll("null");
+        try writer.writeAll(",\"pending_approval\":");
+        if (mission.pending_approval) |value| {
+            const approval_json = try self.buildMissionApprovalJson(value);
+            defer self.allocator.free(approval_json);
+            try writer.writeAll(approval_json);
+        } else {
+            try writer.writeAll("null");
+        }
+        try writer.writeAll(",\"artifacts\":[");
+        for (mission.artifacts.items, 0..) |artifact, idx| {
+            if (idx > 0) try writer.writeByte(',');
+            const artifact_json = try self.buildMissionArtifactJson(artifact);
+            defer self.allocator.free(artifact_json);
+            try writer.writeAll(artifact_json);
+        }
+        try writer.writeAll("],\"events\":[");
+        for (mission.events.items, 0..) |event, idx| {
+            if (idx > 0) try writer.writeByte(',');
+            const event_json = try self.buildMissionEventJson(event);
+            defer self.allocator.free(event_json);
+            try writer.writeAll(event_json);
+        }
+        try writer.writeAll("]}");
+        return out.toOwnedSlice(self.allocator);
+    }
+
+    fn buildMissionArtifactJson(self: *Session, artifact: mission_store_mod.MissionArtifact) ![]u8 {
+        const kind_json = try self.formatJsonStringOrNull(artifact.kind);
+        defer self.allocator.free(kind_json);
+        const path_json = if (artifact.path) |value| try self.formatJsonStringOrNull(value) else try self.allocator.dupe(u8, "null");
+        defer self.allocator.free(path_json);
+        const summary_json = if (artifact.summary) |value| try self.formatJsonStringOrNull(value) else try self.allocator.dupe(u8, "null");
+        defer self.allocator.free(summary_json);
+        return std.fmt.allocPrint(
+            self.allocator,
+            "{{\"kind\":{s},\"path\":{s},\"summary\":{s},\"created_at_ms\":{d}}}",
+            .{
+                kind_json,
+                path_json,
+                summary_json,
+                artifact.created_at_ms,
+            },
+        );
+    }
+
+    fn buildMissionEventJson(self: *Session, event: mission_store_mod.MissionEvent) ![]u8 {
+        const event_type_json = try self.formatJsonStringOrNull(event.event_type);
+        defer self.allocator.free(event_type_json);
+        return std.fmt.allocPrint(
+            self.allocator,
+            "{{\"seq\":{d},\"event_type\":{s},\"payload\":{s},\"created_at_ms\":{d}}}",
+            .{ event.seq, event_type_json, event.payload_json, event.created_at_ms },
+        );
+    }
+
+    fn buildMissionApprovalJson(self: *Session, approval: mission_store_mod.MissionApproval) ![]u8 {
+        const approval_id_json = try self.formatJsonStringOrNull(approval.approval_id);
+        defer self.allocator.free(approval_id_json);
+        const action_json = try self.formatJsonStringOrNull(approval.action_kind);
+        defer self.allocator.free(action_json);
+        const message_json = try self.formatJsonStringOrNull(approval.message);
+        defer self.allocator.free(message_json);
+        const payload_json = if (approval.payload_json) |value| try self.allocator.dupe(u8, value) else try self.allocator.dupe(u8, "null");
+        defer self.allocator.free(payload_json);
+        const resolution_note_json = if (approval.resolution_note) |value| try self.formatJsonStringOrNull(value) else try self.allocator.dupe(u8, "null");
+        defer self.allocator.free(resolution_note_json);
+        const resolution_json = if (approval.resolution) |value| try self.formatJsonStringOrNull(value) else try self.allocator.dupe(u8, "null");
+        defer self.allocator.free(resolution_json);
+
+        var out = std.ArrayListUnmanaged(u8){};
+        errdefer out.deinit(self.allocator);
+        const writer = out.writer(self.allocator);
+        try writer.writeByte('{');
+        try writer.writeAll("\"approval_id\":");
+        try writer.writeAll(approval_id_json);
+        try writer.writeAll(",\"action_kind\":");
+        try writer.writeAll(action_json);
+        try writer.writeAll(",\"message\":");
+        try writer.writeAll(message_json);
+        try writer.writeAll(",\"payload\":");
+        try writer.writeAll(payload_json);
+        try writer.print(",\"requested_at_ms\":{d}", .{approval.requested_at_ms});
+        try writer.writeAll(",\"requested_by\":{");
+        try writer.writeAll("\"actor_type\":");
+        try writeJsonString(writer, approval.requested_by.actor_type);
+        try writer.writeAll(",\"actor_id\":");
+        try writeJsonString(writer, approval.requested_by.actor_id);
+        try writer.writeByte('}');
+        try writer.print(",\"resolved_at_ms\":{d}", .{approval.resolved_at_ms});
+        try writer.writeAll(",\"resolved_by\":");
+        if (approval.resolved_by) |value| {
+            try writer.writeByte('{');
+            try writer.writeAll("\"actor_type\":");
+            try writeJsonString(writer, value.actor_type);
+            try writer.writeAll(",\"actor_id\":");
+            try writeJsonString(writer, value.actor_id);
+            try writer.writeByte('}');
+        } else {
+            try writer.writeAll("null");
+        }
+        try writer.writeAll(",\"resolution_note\":");
+        try writer.writeAll(resolution_note_json);
+        try writer.writeAll(",\"resolution\":");
+        try writer.writeAll(resolution_json);
+        try writer.writeByte('}');
+        return out.toOwnedSlice(self.allocator);
+    }
+
+    fn formatJsonStringOrNull(self: *Session, value: []const u8) ![]u8 {
+        return std.json.Stringify.valueAlloc(self.allocator, value, .{});
+    }
+
     fn renderJsonValue(self: *Session, value: std.json.Value) ![]u8 {
         return std.fmt.allocPrint(self.allocator, "{f}", .{std.json.fmt(value, .{})});
     }
@@ -10736,6 +11431,22 @@ fn protocolReadFile(
     const read_res = try session.handle(&read);
     defer allocator.free(read_res);
     return decodeReadResponseData(allocator, read_res);
+}
+
+fn extractMissionIdFromResultPayload(
+    allocator: std.mem.Allocator,
+    result_payload: []const u8,
+) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, result_payload, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.TestExpectedResponse;
+    const result_value = parsed.value.object.get("result") orelse return error.TestExpectedResponse;
+    if (result_value != .object) return error.TestExpectedResponse;
+    const mission_value = result_value.object.get("mission") orelse return error.TestExpectedResponse;
+    if (mission_value != .object) return error.TestExpectedResponse;
+    const mission_id_value = mission_value.object.get("mission_id") orelse return error.TestExpectedResponse;
+    if (mission_id_value != .string or mission_id_value.string.len == 0) return error.TestExpectedResponse;
+    return allocator.dupe(u8, mission_id_value.string);
 }
 
 fn decodeReadResponseData(allocator: std.mem.Allocator, frame: []const u8) ![]u8 {
@@ -12473,6 +13184,334 @@ test "acheron_session: agent services index includes first-class projects namesp
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"scope\":\"project_namespace\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_path\":\"/global/projects\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"invoke_path\":\"/global/projects/control/invoke.json\"") != null);
+}
+
+test "acheron_session: agent services index includes first-class missions namespace entry" {
+    const allocator = std.testing.allocator;
+
+    var mission_store = try mission_store_mod.MissionStore.initWithPath(allocator, null);
+    defer mission_store.deinit();
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "default",
+        .{
+            .mission_store = &mission_store,
+        },
+    );
+    defer session.deinit();
+
+    const payload = try protocolReadFile(
+        &session,
+        allocator,
+        294,
+        295,
+        &.{ "agents", "self", "venoms", "VENOMS.json" },
+        936,
+    );
+    defer allocator.free(payload);
+
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"scope\":\"project_namespace\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_path\":\"/global/missions\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"invoke_path\":\"/global/missions/control/invoke.json\"") != null);
+}
+
+test "acheron_session: missions namespace tracks lifecycle checkpoint and recovery state" {
+    const allocator = std.testing.allocator;
+
+    var mission_store = try mission_store_mod.MissionStore.initWithPath(allocator, null);
+    defer mission_store.deinit();
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "default",
+        .{
+            .mission_store = &mission_store,
+            .actor_type = "agent",
+            .actor_id = "worker-a",
+        },
+    );
+    defer session.deinit();
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        296,
+        297,
+        &.{ "agents", "self", "missions", "control", "create.json" },
+        "{\"use_case\":\"pr_review\",\"title\":\"Review PR 15\",\"stage\":\"planning\"}",
+        937,
+    );
+
+    const create_result = try protocolReadFile(
+        &session,
+        allocator,
+        298,
+        299,
+        &.{ "agents", "self", "missions", "result.json" },
+        938,
+    );
+    defer allocator.free(create_result);
+    try std.testing.expect(std.mem.indexOf(u8, create_result, "\"operation\":\"create\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, create_result, "\"ok\":true") != null);
+    const mission_id = try extractMissionIdFromResultPayload(allocator, create_result);
+    defer allocator.free(mission_id);
+
+    const resume_payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"mission_id\":\"{s}\",\"stage\":\"collecting_context\"}}",
+        .{mission_id},
+    );
+    defer allocator.free(resume_payload);
+    try protocolWriteFile(
+        &session,
+        allocator,
+        300,
+        301,
+        &.{ "agents", "self", "missions", "control", "resume.json" },
+        resume_payload,
+        939,
+    );
+
+    const checkpoint_payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"mission_id\":\"{s}\",\"stage\":\"reviewing\",\"summary\":\"Scanned changed files\",\"artifact\":{{\"kind\":\"notes\",\"path\":\"artifacts/review.md\",\"summary\":\"review notes\"}}}}",
+        .{mission_id},
+    );
+    defer allocator.free(checkpoint_payload);
+    try protocolWriteFile(
+        &session,
+        allocator,
+        302,
+        303,
+        &.{ "agents", "self", "missions", "control", "checkpoint.json" },
+        checkpoint_payload,
+        940,
+    );
+
+    const recover_payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"mission_id\":\"{s}\",\"reason\":\"runtime_restart\",\"stage\":\"restoring_context\",\"summary\":\"Resuming review\"}}",
+        .{mission_id},
+    );
+    defer allocator.free(recover_payload);
+    try protocolWriteFile(
+        &session,
+        allocator,
+        304,
+        305,
+        &.{ "agents", "self", "missions", "control", "recover.json" },
+        recover_payload,
+        941,
+    );
+
+    const get_payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"mission_id\":\"{s}\"}}",
+        .{mission_id},
+    );
+    defer allocator.free(get_payload);
+    try protocolWriteFile(
+        &session,
+        allocator,
+        306,
+        307,
+        &.{ "agents", "self", "missions", "control", "get.json" },
+        get_payload,
+        942,
+    );
+
+    const get_result = try protocolReadFile(
+        &session,
+        allocator,
+        308,
+        309,
+        &.{ "agents", "self", "missions", "result.json" },
+        943,
+    );
+    defer allocator.free(get_result);
+    try std.testing.expect(std.mem.indexOf(u8, get_result, "\"operation\":\"get\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, get_result, mission_id) != null);
+    try std.testing.expect(std.mem.indexOf(u8, get_result, "\"state\":\"recovering\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, get_result, "\"checkpoint_seq\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, get_result, "\"recovery_count\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, get_result, "\"stage\":\"restoring_context\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, get_result, "\"kind\":\"notes\"") != null);
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        310,
+        311,
+        &.{ "agents", "self", "missions", "control", "list.json" },
+        "{\"state\":\"recovering\"}",
+        944,
+    );
+
+    const list_result = try protocolReadFile(
+        &session,
+        allocator,
+        312,
+        313,
+        &.{ "agents", "self", "missions", "result.json" },
+        945,
+    );
+    defer allocator.free(list_result);
+    try std.testing.expect(std.mem.indexOf(u8, list_result, "\"operation\":\"list\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, list_result, "\"count\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, list_result, mission_id) != null);
+}
+
+test "acheron_session: missions namespace requires admin approval for resolution" {
+    const allocator = std.testing.allocator;
+
+    var mission_store = try mission_store_mod.MissionStore.initWithPath(allocator, null);
+    defer mission_store.deinit();
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var user_session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "default",
+        .{
+            .mission_store = &mission_store,
+            .actor_type = "agent",
+            .actor_id = "worker-a",
+            .is_admin = false,
+        },
+    );
+    defer user_session.deinit();
+
+    try protocolWriteFile(
+        &user_session,
+        allocator,
+        314,
+        315,
+        &.{ "agents", "self", "missions", "control", "create.json" },
+        "{\"use_case\":\"pr_review\",\"title\":\"Review PR 22\"}",
+        946,
+    );
+    const create_result = try protocolReadFile(
+        &user_session,
+        allocator,
+        316,
+        317,
+        &.{ "agents", "self", "missions", "result.json" },
+        947,
+    );
+    defer allocator.free(create_result);
+    const mission_id = try extractMissionIdFromResultPayload(allocator, create_result);
+    defer allocator.free(mission_id);
+
+    const request_payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"mission_id\":\"{s}\",\"action_kind\":\"push_branch\",\"message\":\"Push review branch to origin\"}}",
+        .{mission_id},
+    );
+    defer allocator.free(request_payload);
+    try protocolWriteFile(
+        &user_session,
+        allocator,
+        318,
+        319,
+        &.{ "agents", "self", "missions", "control", "request_approval.json" },
+        request_payload,
+        948,
+    );
+
+    const approve_payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"mission_id\":\"{s}\",\"note\":\"ship it\"}}",
+        .{mission_id},
+    );
+    defer allocator.free(approve_payload);
+    const approve_error = try protocolWriteFileExpectError(
+        &user_session,
+        allocator,
+        320,
+        321,
+        &.{ "agents", "self", "missions", "control", "approve.json" },
+        approve_payload,
+        949,
+        "eperm",
+    );
+    defer allocator.free(approve_error);
+
+    const failed_result = try protocolReadFile(
+        &user_session,
+        allocator,
+        322,
+        323,
+        &.{ "agents", "self", "missions", "result.json" },
+        950,
+    );
+    defer allocator.free(failed_result);
+    try std.testing.expect(std.mem.indexOf(u8, failed_result, "\"code\":\"forbidden\"") != null);
+
+    const admin_runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const admin_runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, admin_runtime_server);
+    defer admin_runtime_handle.destroy();
+    var admin_job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer admin_job_index.deinit();
+
+    var admin_session = try Session.initWithOptions(
+        allocator,
+        admin_runtime_handle,
+        &admin_job_index,
+        "default",
+        .{
+            .mission_store = &mission_store,
+            .actor_type = "admin",
+            .actor_id = "operator-1",
+            .is_admin = true,
+        },
+    );
+    defer admin_session.deinit();
+
+    try protocolWriteFile(
+        &admin_session,
+        allocator,
+        324,
+        325,
+        &.{ "agents", "self", "missions", "control", "approve.json" },
+        approve_payload,
+        951,
+    );
+
+    const admin_result = try protocolReadFile(
+        &admin_session,
+        allocator,
+        326,
+        327,
+        &.{ "agents", "self", "missions", "result.json" },
+        952,
+    );
+    defer allocator.free(admin_result);
+    try std.testing.expect(std.mem.indexOf(u8, admin_result, "\"operation\":\"approve\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, admin_result, "\"state\":\"running\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, admin_result, "\"pending_approval\":null") != null);
 }
 
 test "acheron_session: mother can upsert project from system context without project token" {
