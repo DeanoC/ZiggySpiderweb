@@ -510,6 +510,88 @@ fn writeJsonString(writer: anytype, str: []const u8) !void {
     try writer.writeByte('"');
 }
 
+fn isGlobalTerminalControlPath(path: []const u8) bool {
+    const normalized = std.mem.trim(u8, path, " \t\r\n");
+    const no_leading = std.mem.trimLeft(u8, normalized, "/");
+    const trimmed = std.mem.trimRight(u8, no_leading, "/");
+    if (!std.mem.startsWith(u8, trimmed, "global/terminal/control/")) return false;
+    const leaf = trimmed["global/terminal/control/".len..];
+    return std.mem.eql(u8, leaf, "exec.json") or std.mem.eql(u8, leaf, "invoke.json");
+}
+
+fn fileWriteEscalatesToShellExec(allocator: std.mem.Allocator, args_json: []const u8) bool {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, args_json, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+
+    const obj = parsed.value.object;
+    const path_value = obj.get("path") orelse return false;
+    const content_value = obj.get("content") orelse return false;
+    if (path_value != .string or content_value != .string) return false;
+    if (!isGlobalTerminalControlPath(path_value.string)) return false;
+
+    const normalized_path = std.mem.trimRight(u8, std.mem.trimLeft(u8, std.mem.trim(u8, path_value.string, " \t\r\n"), "/"), "/");
+    if (std.mem.eql(u8, normalized_path, "global/terminal/control/exec.json")) return true;
+
+    const invoke_payload = std.json.parseFromSlice(std.json.Value, allocator, content_value.string, .{}) catch return false;
+    defer invoke_payload.deinit();
+    if (invoke_payload.value != .object) return false;
+
+    const op = terminalInvokeOperation(invoke_payload.value.object) orelse return false;
+    return std.mem.eql(u8, op, "exec") or std.mem.eql(u8, op, "shell_exec");
+}
+
+fn terminalInvokeOperation(obj: std.json.ObjectMap) ?[]const u8 {
+    if (extractTerminalInvokeOperationString(obj)) |op| return op;
+    if (obj.get("command") != null or obj.get("argv") != null) return "exec";
+    if (extractTerminalInvokeArgumentsObject(obj)) |arguments| {
+        if (extractTerminalInvokeOperationString(arguments)) |op| return op;
+        if (arguments.get("command") != null or arguments.get("argv") != null) return "exec";
+    }
+    return null;
+}
+
+fn extractTerminalInvokeOperationString(obj: std.json.ObjectMap) ?[]const u8 {
+    const raw_op = if (obj.get("op")) |value|
+        value
+    else if (obj.get("operation")) |value|
+        value
+    else
+        return null;
+    if (raw_op != .string) return null;
+    return std.mem.trim(u8, raw_op.string, " \t\r\n");
+}
+
+fn extractTerminalInvokeArgumentsObject(obj: std.json.ObjectMap) ?std.json.ObjectMap {
+    const raw_args = if (obj.get("arguments")) |value|
+        value
+    else if (obj.get("args")) |value|
+        value
+    else
+        return null;
+    if (raw_args != .object) return null;
+    return raw_args.object;
+}
+
+fn toolListContains(list: std.ArrayListUnmanaged([]const u8), tool_name: []const u8) bool {
+    for (list.items) |item| {
+        if (std.mem.eql(u8, item, tool_name)) return true;
+    }
+    return false;
+}
+
+fn toolIsDenied(
+    denied: std.ArrayListUnmanaged([]const u8),
+    tool_name: []const u8,
+    effective_tool_name: []const u8,
+) bool {
+    if (toolListContains(denied, tool_name)) return true;
+    if (!std.mem.eql(u8, tool_name, effective_tool_name) and toolListContains(denied, effective_tool_name)) {
+        return true;
+    }
+    return false;
+}
+
 /// Pre-mutate hook that filters tools based on allow/deny rules
 pub fn filterToolsHook(ctx: *HookContext, data: HookData) HookError!void {
     const pending_tools = data.pre_mutate;
@@ -570,28 +652,22 @@ pub fn filterToolsHook(ctx: *HookContext, data: HookData) HookError!void {
     var i: usize = 0;
     while (i < pending_tools.tools.items.len) {
         const tool_name = pending_tools.tools.items[i].name;
+        const effective_tool_name = if (std.mem.eql(u8, tool_name, "file_write") and fileWriteEscalatesToShellExec(allocator, pending_tools.tools.items[i].args_json))
+            "shell_exec"
+        else
+            tool_name;
         var allowed = true;
 
         // Check denied list first
         if (denied_list) |denied| {
-            for (denied.items) |denied_tool| {
-                if (std.mem.eql(u8, denied_tool, tool_name)) {
-                    allowed = false;
-                    break;
-                }
+            if (toolIsDenied(denied, tool_name, effective_tool_name)) {
+                allowed = false;
             }
         }
 
         // Check allowed list
         if (allowed and allowed_list != null) {
-            var in_allowed = false;
-            for (allowed_list.?.items) |allowed_tool| {
-                if (std.mem.eql(u8, allowed_tool, tool_name)) {
-                    in_allowed = true;
-                    break;
-                }
-            }
-            allowed = in_allowed;
+            allowed = toolListContains(allowed_list.?, effective_tool_name);
         }
 
         if (!allowed) {
@@ -765,4 +841,65 @@ pub fn registerBrainSpecialization(
         .priority = 0,
         .callback = filterToolsHook,
     });
+}
+
+test "brain_specialization: detects terminal exec control paths" {
+    try std.testing.expect(isGlobalTerminalControlPath("/global/terminal/control/exec.json"));
+    try std.testing.expect(isGlobalTerminalControlPath("global/terminal/control/invoke.json"));
+    try std.testing.expect(isGlobalTerminalControlPath(" /global/terminal/control/exec.json/ \n"));
+    try std.testing.expect(!isGlobalTerminalControlPath("/global/terminal/control/write.json"));
+    try std.testing.expect(!isGlobalTerminalControlPath("/agents/self/terminal/control/exec.json"));
+}
+
+test "brain_specialization: file_write escalation maps terminal exec leaves to shell_exec" {
+    const allocator = std.testing.allocator;
+
+    try std.testing.expect(fileWriteEscalatesToShellExec(
+        allocator,
+        "{\"path\":\"/global/terminal/control/exec.json\",\"content\":\"{\\\"command\\\":\\\"echo hi\\\"}\"}",
+    ));
+    try std.testing.expect(fileWriteEscalatesToShellExec(
+        allocator,
+        "{\"path\":\" /global/terminal/control/exec.json/ \",\"content\":\"{\\\"command\\\":\\\"echo hi\\\"}\"}",
+    ));
+    try std.testing.expect(fileWriteEscalatesToShellExec(
+        allocator,
+        "{\"path\":\"/global/terminal/control/invoke.json\",\"content\":\"{\\\"op\\\":\\\"exec\\\",\\\"arguments\\\":{\\\"command\\\":\\\"echo hi\\\"}}\"}",
+    ));
+    try std.testing.expect(fileWriteEscalatesToShellExec(
+        allocator,
+        "{\"path\":\"/global/terminal/control/invoke.json\",\"content\":\"{\\\"operation\\\":\\\" shell_exec \\\",\\\"arguments\\\":{}}\"}",
+    ));
+    try std.testing.expect(fileWriteEscalatesToShellExec(
+        allocator,
+        "{\"path\":\"/global/terminal/control/invoke.json\",\"content\":\"{\\\"arguments\\\":{\\\"command\\\":\\\"echo hi\\\"}}\"}",
+    ));
+    try std.testing.expect(fileWriteEscalatesToShellExec(
+        allocator,
+        "{\"path\":\"/global/terminal/control/invoke.json\",\"content\":\"{\\\"args\\\":{\\\"operation\\\":\\\" exec \\\",\\\"argv\\\":[\\\"echo\\\",\\\"hi\\\"]}}\"}",
+    ));
+    try std.testing.expect(!fileWriteEscalatesToShellExec(
+        allocator,
+        "{\"path\":\"/global/terminal/control/invoke.json\",\"content\":\"{\\\"op\\\":\\\"write\\\"}\"}",
+    ));
+    try std.testing.expect(!fileWriteEscalatesToShellExec(
+        allocator,
+        "{\"path\":\"/global/terminal/control/write.json\",\"content\":\"{}\"}",
+    ));
+    try std.testing.expect(!fileWriteEscalatesToShellExec(
+        allocator,
+        "{\"path\":\"/tmp/file.txt\",\"content\":\"hello\"}",
+    ));
+}
+
+test "brain_specialization: remapped terminal exec honors file_write denies" {
+    var denied = std.ArrayListUnmanaged([]const u8){};
+    defer denied.deinit(std.testing.allocator);
+
+    try denied.append(std.testing.allocator, try std.testing.allocator.dupe(u8, "file_write"));
+    defer std.testing.allocator.free(denied.items[0]);
+
+    try std.testing.expect(toolIsDenied(denied, "file_write", "shell_exec"));
+    try std.testing.expect(toolIsDenied(denied, "file_write", "file_write"));
+    try std.testing.expect(!toolIsDenied(denied, "shell_exec", "shell_exec"));
 }
