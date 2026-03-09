@@ -1936,7 +1936,7 @@ pub const Session = struct {
         const workspace_status_json = try self.loadProjectWorkspaceStatus(policy.project_id);
         defer if (workspace_status_json) |value| self.allocator.free(value);
         const loaded_live_mounts = if (workspace_status_json) |json|
-            try self.addProjectFsLinksFromWorkspaceStatus(project_fs_dir, policy, json)
+            try self.addProjectFsLinksFromWorkspaceStatus(project_fs_dir, nodes_root, policy, json)
         else
             false;
         if (!loaded_live_mounts) try self.addProjectFsLinksFromPolicy(project_fs_dir, policy);
@@ -2347,6 +2347,7 @@ pub const Session = struct {
     fn addProjectFsLinksFromWorkspaceStatus(
         self: *Session,
         project_fs_dir: u32,
+        nodes_root: u32,
         policy: workspace_policy.WorkspacePolicy,
         workspace_status_json: []const u8,
     ) !bool {
@@ -2361,7 +2362,7 @@ pub const Session = struct {
             if (mount_value != .object) continue;
             const node_id_value = mount_value.object.get("node_id") orelse continue;
             if (node_id_value != .string or node_id_value.string.len == 0) continue;
-            if (!policyAllowsNodeFs(policy, node_id_value.string)) continue;
+            if (!try self.ensurePolicyNodeFsTarget(nodes_root, policy, node_id_value.string)) continue;
             const mount_path_value = mount_value.object.get("mount_path") orelse continue;
             if (mount_path_value != .string or mount_path_value.string.len == 0) continue;
 
@@ -2375,6 +2376,29 @@ pub const Session = struct {
             added = true;
         }
         return added;
+    }
+
+    fn ensurePolicyNodeFsTarget(
+        self: *Session,
+        nodes_root: u32,
+        policy: workspace_policy.WorkspacePolicy,
+        node_id: []const u8,
+    ) !bool {
+        for (policy.nodes.items) |node| {
+            if (!std.mem.eql(u8, node.id, node_id)) continue;
+            if (!node.resources.fs) return false;
+
+            if (self.lookupChild(nodes_root, node_id)) |node_dir| {
+                if (self.lookupChild(node_dir, "fs") == null) {
+                    _ = try self.addDir(node_dir, "fs", false);
+                }
+                return true;
+            }
+
+            try self.addNodeDirectory(nodes_root, node, false);
+            return true;
+        }
+        return false;
     }
 
     fn addProjectNodeLinksFromPolicy(
@@ -13885,6 +13909,77 @@ test "acheron_session: project workspace mount links are filtered by policy" {
     try std.testing.expect(std.mem.indexOf(u8, summary_node.content, "\"project_node_links\":0") != null);
     try std.testing.expect(std.mem.indexOf(u8, mounts_node.content, "\"mount_path\":\"/code\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, workspace_node.content, node_id.string) != null);
+}
+
+test "acheron_session: workspace mount links backfill policy-approved fs targets" {
+    const allocator = std.testing.allocator;
+
+    var control_plane = control_plane_mod.ControlPlane.init(allocator);
+    defer control_plane.deinit();
+
+    const ensured = try control_plane.ensureNode("edge-no-fs-url", "", 60_000);
+    defer allocator.free(ensured);
+    var ensured_parsed = try std.json.parseFromSlice(std.json.Value, allocator, ensured, .{});
+    defer ensured_parsed.deinit();
+    if (ensured_parsed.value != .object) return error.TestExpectedResponse;
+    const node_id = ensured_parsed.value.object.get("node_id") orelse return error.TestExpectedResponse;
+    if (node_id != .string) return error.TestExpectedResponse;
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "default",
+        .{
+            .agents_dir = ".does-not-exist",
+            .projects_dir = ".does-not-exist",
+            .control_plane = &control_plane,
+        },
+    );
+    defer session.deinit();
+
+    const nodes_root = session.lookupChild(session.root_id, "nodes") orelse return error.TestExpectedResponse;
+    const node_dir = session.lookupChild(nodes_root, node_id.string) orelse return error.TestExpectedResponse;
+    try std.testing.expect(session.lookupChild(node_dir, "fs") == null);
+
+    const project_fs_dir = try session.addDir(session.root_id, "project-fs-test", false);
+    var policy = workspace_policy.WorkspacePolicy{
+        .project_id = try allocator.dupe(u8, "proj-fs-target"),
+    };
+    defer policy.deinit(allocator);
+    try policy.nodes.append(allocator, .{
+        .id = try allocator.dupe(u8, node_id.string),
+        .resources = .{
+            .fs = true,
+            .camera = false,
+            .screen = false,
+            .user = false,
+        },
+    });
+
+    const escaped_node_id = try unified.jsonEscape(allocator, node_id.string);
+    defer allocator.free(escaped_node_id);
+    const workspace_status_json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"project_id\":\"proj-fs-target\",\"mounts\":[{{\"node_id\":\"{s}\",\"mount_path\":\"/src\"}}]}}",
+        .{escaped_node_id},
+    );
+    defer allocator.free(workspace_status_json);
+
+    try std.testing.expect(try session.addProjectFsLinksFromWorkspaceStatus(project_fs_dir, nodes_root, policy, workspace_status_json));
+
+    const fs_dir = session.lookupChild(node_dir, "fs");
+    try std.testing.expect(fs_dir != null);
+    const mount_link = session.lookupChild(project_fs_dir, "mount::src") orelse return error.TestExpectedResponse;
+    const mount_link_node = session.nodes.get(mount_link) orelse return error.TestExpectedResponse;
+    try std.testing.expect(std.mem.indexOf(u8, mount_link_node.content, "/nodes/") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mount_link_node.content, "/fs") != null);
 }
 
 test "acheron_session: project meta summary and alerts reflect degraded and missing mounts" {
