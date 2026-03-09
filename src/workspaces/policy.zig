@@ -429,5 +429,6 @@ test "workspace_policy: load reapplies agent policy after project policy" {
     try std.testing.expect(!sliceListContains(policy.visible_agents.items, "project-only"));
     try std.testing.expect(sliceListContains(policy.visible_agents.items, agent_id));
     try std.testing.expect(sliceListContains(policy.visible_agents.items, "agent-only"));
-    try std.testing.expectEqual(@as(usize, 0), policy.project_links.items.len);
+    try std.testing.expectEqual(@as(usize, 1), policy.project_links.items.len);
+    try std.testing.expectEqualStrings("agent-node", policy.project_links.items[0].node_id);
 }
