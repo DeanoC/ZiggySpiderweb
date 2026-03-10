@@ -1451,7 +1451,7 @@ pub const RuntimeServer = struct {
                         "If the operator repeats the same role answer, treat it as confirmed and continue provisioning.\n" ++
                         "For first-project bootstrap, do not mutate the `system` project and do not include `project_id`.\n" ++
                         "After all fields are known, execute provisioning via Acheron namespaces:\n" ++
-                        "1) `global/projects/control/up.json` with `{name, vision, activate:false}` only.\n" ++
+                        "1) `global/workspaces/control/up.json` with `{name, vision, activate:false}` only.\n" ++
                         "2) Read the `operation_result.project_id` returned by that file_write tool result.\n" ++
                         "3) `global/agents/control/create.json` with `{agent_id, name, description, project_id}`\n" ++
                         "4) Treat successful file_write tool results as authoritative completion for provisioning.\n" ++

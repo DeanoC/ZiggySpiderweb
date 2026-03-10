@@ -24,7 +24,7 @@ If there are no non-system projects/agents, your first task is to help the admin
 6. Keep system maintenance and upgrade tasks on Mother/system only.
 
 Use Acheron namespaces for provisioning:
-- Create/update the project via `global/projects/control/up.json` with `{"name":"...","vision":"...","activate":false}`.
+- Create/update the workspace via `global/workspaces/control/up.json` with `{"name":"...","vision":"...","activate":false}`.
 - Create the first non-system agent via `global/agents/control/create.json`.
   Prefer including `project_id` and `project_token` when available so the new agent is created and immediately activated onto the target project in one step.
 - Verify both via each namespace `status.json` and `result.json` before confirming completion.

@@ -50,8 +50,8 @@ pub const TOOL_CONTRACT_TEXT =
     \\Before claiming a capability is unavailable, check `/meta/workspace_services.json`, `/projects/<project_id>/meta/mounted_services.json`, `/nodes/local/venoms/VENOMS.json`, and `/global/venoms/VENOMS.json`.
     \\Use project_namespace for project-shared capabilities and node scope for node-specific capabilities.
     \\If `/services/web_search` or `/nodes/local/venoms/web_search` exists, do not claim you cannot do web search; invoke the web search service.
-    \\For "what projects/agents exist" requests, use `/services/projects/control/list.json` or `/nodes/local/venoms/projects/control/list.json`, and `/services/agents/control/list.json` or `/nodes/local/venoms/agents/control/list.json`, not directory-entry inference.
-    \\When presenting projects/agents to users, prefer human labels first (`name`) and include stable ids (`project_id`/`id`) only as secondary identifiers.
+    \\For "what workspaces/agents exist" requests, use `/services/workspaces/control/list.json` or `/nodes/local/venoms/workspaces/control/list.json`, and `/services/agents/control/list.json` or `/nodes/local/venoms/agents/control/list.json`, not directory-entry inference.
+    \\When presenting workspaces/agents to users, prefer human labels first (`name`) and include stable ids (`project_id`/`id`) only as secondary identifiers.
     \\If you are Mother (`agent_id=mother`), your role is system orchestration and provisioning, not project delivery execution.
     \\After creating the first non-system project/agent, give handoff instructions and stop: confirm the created `{project_id,agent_id}` and tell the admin to switch to that new project/agent for project work.
     \\Do not include protocol-level or API instructions in that handoff message.

@@ -20,6 +20,7 @@ const memory_venom = @import("../venoms/memory.zig");
 const search_services_venom = @import("../venoms/search_services.zig");
 const terminal_venom = @import("../venoms/terminal.zig");
 const mounts_venom = @import("../venoms/mounts.zig");
+const workspaces_venom = @import("../venoms/workspaces.zig");
 const git_venom = @import("../venoms/git.zig");
 const github_pr_venom = @import("../venoms/github_pr.zig");
 const missions_venom = @import("../venoms/missions.zig");
@@ -1272,13 +1273,13 @@ pub const Session = struct {
             .projects_get,
             .projects_up,
             => {
-                const outcome = self.handleProjectsNamespaceWrite(node.special, state.node_id, data) catch |err| switch (err) {
+                const outcome = self.handleWorkspacesNamespaceWrite(node.special, state.node_id, data) catch |err| switch (err) {
                     error.InvalidPayload => {
                         return unified.buildFsrpcError(
                             self.allocator,
                             msg.tag,
                             "invalid",
-                            "projects payload is invalid for requested operation",
+                            "workspace payload is invalid for requested operation",
                         );
                     },
                     error.AccessDenied => {
@@ -1286,7 +1287,7 @@ pub const Session = struct {
                             self.allocator,
                             msg.tag,
                             "eperm",
-                            "projects operation denied by policy",
+                            "workspace operation denied by policy",
                         );
                     },
                     else => return err,
@@ -2104,7 +2105,7 @@ pub const Session = struct {
         try self.registerExistingGlobalVenomBinding(global_root, "mounts", "project_namespace");
         try self.registerExistingGlobalVenomBinding(global_root, "sub_brains", "project_namespace");
         try self.registerExistingGlobalVenomBinding(global_root, "agents", "project_namespace");
-        try self.registerExistingGlobalVenomBinding(global_root, "projects", "project_namespace");
+        try self.registerExistingGlobalVenomBinding(global_root, "workspaces", "project_namespace");
         try self.registerExistingGlobalVenomBinding(global_root, "thoughts", "project_namespace");
         try self.registerExistingGlobalVenomBinding(global_root, "git", "project_namespace");
         try self.registerExistingGlobalVenomBinding(global_root, "github_pr", "project_namespace");
@@ -2774,9 +2775,9 @@ pub const Session = struct {
         try self.seedAgentAgentsNamespaceAt(agents_dir, "/nodes/local/venoms/agents");
         _ = try self.cloneLocalCatalogVenomAlias(agents_dir, global_root, "agents");
 
-        const projects_dir = try self.addDir(local_venoms_root, "projects", false);
-        try self.seedAgentProjectsNamespaceAt(projects_dir, "/nodes/local/venoms/projects");
-        _ = try self.cloneLocalCatalogVenomAlias(projects_dir, global_root, "projects");
+        const workspaces_dir = try self.addDir(local_venoms_root, "workspaces", false);
+        try self.seedAgentWorkspacesNamespaceAt(workspaces_dir, "/nodes/local/venoms/workspaces");
+        _ = try self.cloneLocalCatalogVenomAlias(workspaces_dir, global_root, "workspaces");
 
         if (self.local_fs_export_root != null) {
             const git_dir = try self.addDir(local_venoms_root, "git", false);
@@ -2821,7 +2822,7 @@ pub const Session = struct {
         try self.registerLocalCatalogVenomBinding("mounts", "node_catalog");
         try self.registerLocalCatalogVenomBinding("sub_brains", "node_catalog");
         try self.registerLocalCatalogVenomBinding("agents", "node_catalog");
-        try self.registerLocalCatalogVenomBinding("projects", "node_catalog");
+        try self.registerLocalCatalogVenomBinding("workspaces", "node_catalog");
         if (self.local_fs_export_root != null) {
             try self.registerLocalCatalogVenomBinding("git", "node_catalog");
             try self.registerLocalCatalogVenomBinding("github_pr", "node_catalog");
@@ -3365,83 +3366,12 @@ pub const Session = struct {
         _ = try self.addFile(control_dir, "create.json", "", can_create_agents, .agents_create);
     }
 
-    fn seedAgentProjectsNamespace(self: *Session, projects_dir: u32) !void {
-        return self.seedAgentProjectsNamespaceAt(projects_dir, "/global/projects");
+    fn seedAgentWorkspacesNamespace(self: *Session, workspaces_dir: u32) !void {
+        return self.seedAgentWorkspacesNamespaceAt(workspaces_dir, "/global/workspaces");
     }
 
-    fn seedAgentProjectsNamespaceAt(self: *Session, projects_dir: u32, base_path: []const u8) !void {
-        const escaped_base_path = try unified.jsonEscape(self.allocator, base_path);
-        defer self.allocator.free(escaped_base_path);
-        const shape_json = try std.fmt.allocPrint(
-            self.allocator,
-            "{{\"kind\":\"venom\",\"venom_id\":\"projects\",\"shape\":\"{s}/{{README.md,SCHEMA.json,CAPS.json,OPS.json,PERMISSIONS.json,STATUS.json,status.json,result.json,control/*}}\"}}",
-            .{escaped_base_path},
-        );
-        defer self.allocator.free(shape_json);
-        try self.addDirectoryDescriptors(
-            projects_dir,
-            "Projects Management",
-            shape_json,
-            "{\"invoke\":true,\"operations\":[\"projects_list\",\"projects_get\",\"projects_up\"],\"discoverable\":true}",
-            "List, inspect, and create/update projects through Acheron control files.",
-        );
-        _ = try self.addFile(
-            projects_dir,
-            "OPS.json",
-            "{\"model\":\"local_bridge\",\"invoke\":\"control/invoke.json\",\"transport\":\"acheron-local\",\"paths\":{\"list\":\"control/list.json\",\"get\":\"control/get.json\",\"up\":\"control/up.json\"},\"operations\":{\"list\":\"projects_list\",\"get\":\"projects_get\",\"up\":\"projects_up\"}}",
-            false,
-            .none,
-        );
-        _ = try self.addFile(
-            projects_dir,
-            "RUNTIME.json",
-            "{\"type\":\"acheron_local\",\"component\":\"acheron_session\",\"subject\":\"control_plane_projects\"}",
-            false,
-            .none,
-        );
-        _ = try self.addFile(
-            projects_dir,
-            "PERMISSIONS.json",
-            "{\"default\":\"allow-by-default\",\"allow_roles\":[\"admin\",\"user\"],\"scope\":\"project_control_plane\"}",
-            false,
-            .none,
-        );
-        _ = try self.addFile(
-            projects_dir,
-            "STATUS.json",
-            "{\"venom_id\":\"projects\",\"state\":\"namespace\",\"has_invoke\":true}",
-            false,
-            .none,
-        );
-        self.projects_status_id = try self.addFile(
-            projects_dir,
-            "status.json",
-            "{\"state\":\"idle\",\"tool\":null,\"updated_at_ms\":0,\"error\":null}",
-            false,
-            .none,
-        );
-        const initial_result = try self.buildProjectListResultJson();
-        defer self.allocator.free(initial_result);
-        self.projects_result_id = try self.addFile(
-            projects_dir,
-            "result.json",
-            initial_result,
-            false,
-            .none,
-        );
-
-        const control_dir = try self.addDir(projects_dir, "control", false);
-        _ = try self.addFile(
-            control_dir,
-            "README.md",
-            "Use list/get/up operation files, or invoke.json with op=list|get|up plus arguments. For Mother bootstrap provisioning, use up with activate=false.\n",
-            false,
-            .none,
-        );
-        _ = try self.addFile(control_dir, "invoke.json", "", true, .projects_invoke);
-        _ = try self.addFile(control_dir, "list.json", "", true, .projects_list);
-        _ = try self.addFile(control_dir, "get.json", "", true, .projects_get);
-        _ = try self.addFile(control_dir, "up.json", "", true, .projects_up);
+    fn seedAgentWorkspacesNamespaceAt(self: *Session, workspaces_dir: u32, base_path: []const u8) !void {
+        return workspaces_venom.seedNamespaceAt(self, workspaces_dir, base_path);
     }
 
     fn seedChatNamespaceAt(self: *Session, chat_dir: u32, base_path: []const u8, jobs_path: []const u8) !void {
@@ -3917,7 +3847,7 @@ pub const Session = struct {
         defer self.allocator.free(escaped_project_id);
         return std.fmt.allocPrint(
             self.allocator,
-            "{{\"version\":\"acheron-namespace-project-contract-v2\",\"project_id\":\"{s}\",\"top_level_roots\":[\"/nodes\",\"/agents\",\"/global\",\"/services\"],\"project_metadata_files\":[\"topology.json\",\"nodes.json\",\"agents.json\",\"sources.json\",\"contracts.json\",\"paths.json\",\"summary.json\",\"alerts.json\",\"workspace_status.json\",\"mounts.json\",\"desired_mounts.json\",\"actual_mounts.json\",\"binds.json\",\"mounted_services.json\",\"drift.json\",\"reconcile.json\",\"availability.json\",\"health.json\"],\"links\":{{\"nodes_root\":\"/nodes\",\"agents_root\":\"/agents\",\"global_root\":\"/global\",\"services_root\":\"/services\",\"project_control\":\"/global/projects\",\"workspace_status\":\"/global/projects/control/invoke.json\",\"workspace_binds\":\"/projects/{s}/meta/binds.json\",\"workspace_services\":\"/projects/{s}/meta/mounted_services.json\"}}}}",
+            "{{\"version\":\"acheron-namespace-project-contract-v2\",\"project_id\":\"{s}\",\"top_level_roots\":[\"/nodes\",\"/agents\",\"/global\",\"/services\"],\"project_metadata_files\":[\"topology.json\",\"nodes.json\",\"agents.json\",\"sources.json\",\"contracts.json\",\"paths.json\",\"summary.json\",\"alerts.json\",\"workspace_status.json\",\"mounts.json\",\"desired_mounts.json\",\"actual_mounts.json\",\"binds.json\",\"mounted_services.json\",\"drift.json\",\"reconcile.json\",\"availability.json\",\"health.json\"],\"links\":{{\"nodes_root\":\"/nodes\",\"agents_root\":\"/agents\",\"global_root\":\"/global\",\"services_root\":\"/services\",\"workspace_control\":\"/global/workspaces\",\"workspace_status\":\"/global/workspaces/control/invoke.json\",\"workspace_binds\":\"/projects/{s}/meta/binds.json\",\"workspace_services\":\"/projects/{s}/meta/mounted_services.json\"}}}}",
             .{ escaped_project_id, escaped_project_id, escaped_project_id },
         );
     }
@@ -3927,7 +3857,7 @@ pub const Session = struct {
         defer self.allocator.free(escaped_project_id);
         return std.fmt.allocPrint(
             self.allocator,
-            "{{\"project_id\":\"{s}\",\"nodes_root\":\"/nodes\",\"agents_root\":\"/agents\",\"services\":{{\"root\":\"/services\",\"mounted_services_meta\":\"/projects/{s}/meta/mounted_services.json\"}},\"global\":{{\"root\":\"/global\",\"library\":\"/global/library\",\"projects\":\"/global/projects\",\"chat\":\"/global/chat\",\"jobs\":\"/global/jobs\",\"mounts\":\"/global/mounts\",\"debug\":{s}}}}}",
+            "{{\"project_id\":\"{s}\",\"nodes_root\":\"/nodes\",\"agents_root\":\"/agents\",\"services\":{{\"root\":\"/services\",\"mounted_services_meta\":\"/projects/{s}/meta/mounted_services.json\"}},\"global\":{{\"root\":\"/global\",\"library\":\"/global/library\",\"workspaces\":\"/global/workspaces\",\"chat\":\"/global/chat\",\"jobs\":\"/global/jobs\",\"mounts\":\"/global/mounts\",\"debug\":{s}}}}}",
             .{
                 escaped_project_id,
                 escaped_project_id,
@@ -7668,11 +7598,7 @@ pub const Session = struct {
         return null;
     }
 
-    const ProjectsOp = enum {
-        list,
-        get,
-        up,
-    };
+    pub const WorkspaceOp = workspaces_venom.Op;
 
     pub const GitOp = git_venom.Op;
 
@@ -7680,218 +7606,8 @@ pub const Session = struct {
 
     pub const PrReviewOp = pr_review_venom.Op;
 
-    fn handleProjectsNamespaceWrite(self: *Session, special: SpecialKind, node_id: u32, raw_input: []const u8) !WriteOutcome {
-        const input = std.mem.trim(u8, raw_input, " \t\r\n");
-        const payload = if (input.len == 0) "{}" else input;
-        try self.setFileContent(node_id, payload);
-
-        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, payload, .{}) catch return error.InvalidPayload;
-        defer parsed.deinit();
-        if (parsed.value != .object) return error.InvalidPayload;
-        const obj = parsed.value.object;
-
-        const op = switch (special) {
-            .projects_list => ProjectsOp.list,
-            .projects_get => ProjectsOp.get,
-            .projects_up => ProjectsOp.up,
-            .projects_invoke => blk: {
-                const op_raw = blk2: {
-                    if (obj.get("op")) |value| if (value == .string and value.string.len > 0) break :blk2 value.string;
-                    if (obj.get("operation")) |value| if (value == .string and value.string.len > 0) break :blk2 value.string;
-                    if (obj.get("tool")) |value| if (value == .string and value.string.len > 0) break :blk2 value.string;
-                    if (obj.get("tool_name")) |value| if (value == .string and value.string.len > 0) break :blk2 value.string;
-                    break :blk2 null;
-                } orelse return error.InvalidPayload;
-                break :blk parseProjectsOp(op_raw) orelse return error.InvalidPayload;
-            },
-            else => return error.InvalidPayload,
-        };
-
-        const args_obj = blk: {
-            if (obj.get("arguments")) |value| {
-                if (value != .object) return error.InvalidPayload;
-                break :blk value.object;
-            }
-            if (obj.get("args")) |value| {
-                if (value != .object) return error.InvalidPayload;
-                break :blk value.object;
-            }
-            break :blk obj;
-        };
-
-        return self.executeProjectsOp(op, args_obj, raw_input.len);
-    }
-
-    fn parseProjectsOp(raw: []const u8) ?ProjectsOp {
-        const value = std.mem.trim(u8, raw, " \t\r\n");
-        if (std.mem.eql(u8, value, "list") or std.mem.eql(u8, value, "projects_list")) return .list;
-        if (std.mem.eql(u8, value, "get") or std.mem.eql(u8, value, "projects_get")) return .get;
-        if (std.mem.eql(u8, value, "up") or std.mem.eql(u8, value, "project_up") or std.mem.eql(u8, value, "projects_up")) return .up;
-        return null;
-    }
-
-    fn executeProjectsOp(self: *Session, op: ProjectsOp, args_obj: std.json.ObjectMap, written: usize) !WriteOutcome {
-        const tool_name = projectsStatusToolName(op);
-        const running_status = try self.buildServiceInvokeStatusJson("running", tool_name, null);
-        defer self.allocator.free(running_status);
-        if (self.projects_status_id != 0) try self.setFileContent(self.projects_status_id, running_status);
-
-        const result_payload = self.executeProjectsOpPayload(op, args_obj) catch |err| {
-            const error_message = @errorName(err);
-            const error_code = switch (err) {
-                error.AccessDenied => "forbidden",
-                else => "invalid_payload",
-            };
-            const failed_status = try self.buildServiceInvokeStatusJson("failed", tool_name, error_message);
-            defer self.allocator.free(failed_status);
-            if (self.projects_status_id != 0) try self.setFileContent(self.projects_status_id, failed_status);
-            const failed_result = try self.buildProjectFailureResultJson(op, error_code, error_message);
-            defer self.allocator.free(failed_result);
-            if (self.projects_result_id != 0) try self.setFileContent(self.projects_result_id, failed_result);
-            return err;
-        };
-        defer self.allocator.free(result_payload);
-
-        const done_status = try self.buildServiceInvokeStatusJson("done", tool_name, null);
-        defer self.allocator.free(done_status);
-        if (self.projects_status_id != 0) try self.setFileContent(self.projects_status_id, done_status);
-        if (self.projects_result_id != 0) try self.setFileContent(self.projects_result_id, result_payload);
-        return .{ .written = written };
-    }
-
-    fn executeProjectsOpPayload(self: *Session, op: ProjectsOp, args_obj: std.json.ObjectMap) ![]u8 {
-        const plane = self.control_plane orelse return error.InvalidPayload;
-        return switch (op) {
-            .list => self.buildProjectListResultJson(),
-            .get => blk: {
-                const project_id = extractOptionalStringByNames(args_obj, &[_][]const u8{ "project_id", "id" }) orelse return error.InvalidPayload;
-                const escaped_project = try unified.jsonEscape(self.allocator, project_id);
-                defer self.allocator.free(escaped_project);
-                const token_fragment = if (extractOptionalStringByNames(args_obj, &[_][]const u8{"project_token"})) |token| blk2: {
-                    const escaped = try unified.jsonEscape(self.allocator, token);
-                    defer self.allocator.free(escaped);
-                    break :blk2 try std.fmt.allocPrint(self.allocator, ",\"project_token\":\"{s}\"", .{escaped});
-                } else if (self.project_token) |token| blk2: {
-                    const escaped = try unified.jsonEscape(self.allocator, token);
-                    defer self.allocator.free(escaped);
-                    break :blk2 try std.fmt.allocPrint(self.allocator, ",\"project_token\":\"{s}\"", .{escaped});
-                } else try self.allocator.dupe(u8, "");
-                defer self.allocator.free(token_fragment);
-                const payload = try std.fmt.allocPrint(
-                    self.allocator,
-                    "{{\"project_id\":\"{s}\"{s}}}",
-                    .{ escaped_project, token_fragment },
-                );
-                defer self.allocator.free(payload);
-                const result = plane.getProjectWithRole(payload, self.is_admin) catch |err| switch (err) {
-                    control_plane_mod.ControlPlaneError.ProjectPolicyForbidden,
-                    control_plane_mod.ControlPlaneError.ProjectAuthFailed,
-                    control_plane_mod.ControlPlaneError.ProjectAssignmentForbidden,
-                    => return error.AccessDenied,
-                    control_plane_mod.ControlPlaneError.MissingField,
-                    control_plane_mod.ControlPlaneError.InvalidPayload,
-                    control_plane_mod.ControlPlaneError.ProjectNotFound,
-                    => return error.InvalidPayload,
-                    else => return err,
-                };
-                defer self.allocator.free(result);
-                break :blk self.buildProjectSuccessResultJson(.get, result);
-            },
-            .up => blk: {
-                const payload = try self.renderProjectUpPayload(args_obj);
-                defer self.allocator.free(payload);
-                const result = plane.projectUpWithRole(self.agent_id, payload, self.is_admin) catch |err| switch (err) {
-                    control_plane_mod.ControlPlaneError.ProjectPolicyForbidden,
-                    control_plane_mod.ControlPlaneError.ProjectAuthFailed,
-                    control_plane_mod.ControlPlaneError.ProjectAssignmentForbidden,
-                    control_plane_mod.ControlPlaneError.ProjectProtected,
-                    => return error.AccessDenied,
-                    control_plane_mod.ControlPlaneError.MissingField,
-                    control_plane_mod.ControlPlaneError.InvalidPayload,
-                    control_plane_mod.ControlPlaneError.ProjectNotFound,
-                    control_plane_mod.ControlPlaneError.NodeNotFound,
-                    control_plane_mod.ControlPlaneError.MountConflict,
-                    => return error.InvalidPayload,
-                    else => return err,
-                };
-                defer self.allocator.free(result);
-                break :blk self.buildProjectSuccessResultJson(.up, result);
-            },
-        };
-    }
-
-    fn renderProjectUpPayload(self: *Session, args_obj: std.json.ObjectMap) ![]u8 {
-        if (!std.mem.eql(u8, self.agent_id, "mother")) {
-            return self.renderJsonValue(.{ .object = args_obj });
-        }
-        if (args_obj.get("activate") != null) {
-            return self.renderJsonValue(.{ .object = args_obj });
-        }
-
-        var out = std.ArrayListUnmanaged(u8){};
-        errdefer out.deinit(self.allocator);
-        const writer = out.writer(self.allocator);
-        try writer.writeByte('{');
-        var first = true;
-        var it = args_obj.iterator();
-        while (it.next()) |entry| {
-            if (!first) try writer.writeByte(',');
-            first = false;
-            try writeJsonString(writer, entry.key_ptr.*);
-            try writer.writeByte(':');
-            try writer.print("{f}", .{std.json.fmt(entry.value_ptr.*, .{})});
-        }
-        if (!first) try writer.writeByte(',');
-        try writer.writeAll("\"activate\":false");
-        try writer.writeByte('}');
-        return out.toOwnedSlice(self.allocator);
-    }
-
-    fn buildProjectListResultJson(self: *Session) ![]u8 {
-        const plane = self.control_plane orelse return self.buildProjectSuccessResultJson(.list, "{\"projects\":[]}");
-        const result = try plane.listProjects();
-        defer self.allocator.free(result);
-        return self.buildProjectSuccessResultJson(.list, result);
-    }
-
-    fn buildProjectSuccessResultJson(self: *Session, op: ProjectsOp, result_json: []const u8) ![]u8 {
-        const escaped_operation = try unified.jsonEscape(self.allocator, projectsOperationName(op));
-        defer self.allocator.free(escaped_operation);
-        return std.fmt.allocPrint(
-            self.allocator,
-            "{{\"ok\":true,\"operation\":\"{s}\",\"result\":{s},\"error\":null}}",
-            .{ escaped_operation, result_json },
-        );
-    }
-
-    fn buildProjectFailureResultJson(self: *Session, op: ProjectsOp, code: []const u8, message: []const u8) ![]u8 {
-        const escaped_operation = try unified.jsonEscape(self.allocator, projectsOperationName(op));
-        defer self.allocator.free(escaped_operation);
-        const escaped_code = try unified.jsonEscape(self.allocator, code);
-        defer self.allocator.free(escaped_code);
-        const escaped_message = try unified.jsonEscape(self.allocator, message);
-        defer self.allocator.free(escaped_message);
-        return std.fmt.allocPrint(
-            self.allocator,
-            "{{\"ok\":false,\"operation\":\"{s}\",\"result\":null,\"error\":{{\"code\":\"{s}\",\"message\":\"{s}\"}}}}",
-            .{ escaped_operation, escaped_code, escaped_message },
-        );
-    }
-
-    fn projectsOperationName(op: ProjectsOp) []const u8 {
-        return switch (op) {
-            .list => "list",
-            .get => "get",
-            .up => "up",
-        };
-    }
-
-    fn projectsStatusToolName(op: ProjectsOp) []const u8 {
-        return switch (op) {
-            .list => "projects_list",
-            .get => "projects_get",
-            .up => "projects_up",
-        };
+    fn handleWorkspacesNamespaceWrite(self: *Session, special: SpecialKind, node_id: u32, raw_input: []const u8) !WriteOutcome {
+        return .{ .written = try workspaces_venom.handleNamespaceWrite(self, special, node_id, raw_input) };
     }
 
     pub const ParsedShellExecResult = git_venom.ParsedShellExecResult;
@@ -10696,7 +10412,7 @@ fn defaultGlobalLibraryTopicServiceDiscovery() []const u8 {
         "- Compatibility aliases: `/global/<venom_id>`\n" ++
         "- Start with `/meta/workspace_services.json`, `/projects/<project_id>/meta/mounted_services.json`, or `/nodes/local/venoms/VENOMS.json`.\n" ++
         "- Service Venoms should expose `TEMPLATE.json` and `HOST.json` alongside `SCHEMA.json`, `OPS.json`, and `STATUS.json`.\n" ++
-        "- Common project Venoms include: memory, web_search, search_code, terminal, mounts, sub_brains, agents, projects.\n";
+        "- Common workspace Venoms include: memory, web_search, search_code, terminal, mounts, sub_brains, agents, workspaces.\n";
 }
 
 fn defaultGlobalLibraryTopicEventsAndWaits() []const u8 {
@@ -10732,7 +10448,7 @@ fn defaultGlobalLibraryTopicProjectMountsAndBinds() []const u8 {
 
 fn defaultGlobalLibraryTopicAgentManagementAndSubBrains() []const u8 {
     return "# Agent Management and Sub-Brains\n\n" ++
-        "Use `/global/agents` for list/create, `/global/sub_brains` for list/upsert/delete, and `/global/projects` for list/get/up.\n" ++
+        "Use `/global/agents` for list/create, `/global/sub_brains` for list/upsert/delete, and `/global/workspaces` for list/get/up.\n" ++
         "Mutation operations depend on capability flags and service permissions.\n";
 }
 
@@ -12228,11 +11944,11 @@ test "acheron_session: agent services index includes first-class namespaces only
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_id\":\"search_code\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_id\":\"terminal\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_id\":\"mounts\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_id\":\"projects\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_id\":\"workspaces\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_id\":\"library\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_path\":\"/nodes/local/venoms/search_code\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_path\":\"/nodes/local/venoms/mounts\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_path\":\"/nodes/local/venoms/projects\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_path\":\"/nodes/local/venoms/workspaces\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_path\":\"/nodes/local/venoms/library\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"scope\":\"node_catalog\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"has_invoke\":false") != null);
@@ -13006,8 +12722,8 @@ test "acheron_session: agent services index includes first-class projects namesp
     defer allocator.free(payload);
 
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"scope\":\"project_namespace\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_path\":\"/nodes/local/venoms/projects\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"invoke_path\":\"/nodes/local/venoms/projects/control/invoke.json\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_path\":\"/nodes/local/venoms/workspaces\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"invoke_path\":\"/nodes/local/venoms/workspaces/control/invoke.json\"") != null);
 }
 
 test "acheron_session: agent services index includes first-class missions namespace entry" {
@@ -15820,7 +15536,7 @@ test "acheron_session: mother can upsert project from system context without pro
         allocator,
         332,
         333,
-        &.{ "agents", "self", "projects", "control", "up.json" },
+        &.{ "agents", "self", "workspaces", "control", "up.json" },
         "{\"name\":\"ZiggyPR\",\"vision\":\"Bootstrap project setup\",\"activate\":false}",
         954,
     );
@@ -15830,19 +15546,19 @@ test "acheron_session: mother can upsert project from system context without pro
         allocator,
         334,
         335,
-        &.{ "agents", "self", "projects", "status.json" },
+        &.{ "agents", "self", "workspaces", "status.json" },
         955,
     );
     defer allocator.free(status);
     try std.testing.expect(std.mem.indexOf(u8, status, "\"state\":\"done\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, status, "\"tool\":\"projects_up\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status, "\"tool\":\"workspaces_up\"") != null);
 
     const result = try protocolReadFile(
         &session,
         allocator,
         336,
         337,
-        &.{ "agents", "self", "projects", "result.json" },
+        &.{ "agents", "self", "workspaces", "result.json" },
         956,
     );
     defer allocator.free(result);

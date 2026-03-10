@@ -3363,8 +3363,8 @@ const RuntimeToolDispatchProxy = struct {
         const content = requiredStringField(obj, "content") orelse
             return runtimeDispatchFailure(allocator, .invalid_params, "file_write content must be provided");
 
-        if (isProjectsControlPath(path)) {
-            return self.handleProjectsControlWrite(allocator, path, content, args_json);
+        if (isWorkspacesControlPath(path)) {
+            return self.handleWorkspacesControlWrite(allocator, path, content, args_json);
         }
         if (isAgentsControlPath(path)) {
             return self.handleAgentsControlWrite(allocator, path, content, args_json);
@@ -3400,14 +3400,14 @@ const RuntimeToolDispatchProxy = struct {
         return self.handleServiceControlWrite(allocator, path, content, args_json, "/global/terminal/result.json");
     }
 
-    fn handleProjectsControlWrite(
+    fn handleWorkspacesControlWrite(
         self: *RuntimeToolDispatchProxy,
         allocator: std.mem.Allocator,
         path: []const u8,
         content: []const u8,
         args_json: []const u8,
     ) tool_registry.ToolExecutionResult {
-        return self.handleServiceControlWrite(allocator, path, content, args_json, "/global/projects/result.json");
+        return self.handleServiceControlWrite(allocator, path, content, args_json, "/global/workspaces/result.json");
     }
 
     fn handleAgentsControlWrite(
@@ -3546,12 +3546,12 @@ fn capabilityMatchesAny(capability: []const u8, accepted: []const []const u8) bo
     return false;
 }
 
-fn isProjectsControlPath(path: []const u8) bool {
+fn isWorkspacesControlPath(path: []const u8) bool {
     return pathMatchesAnyControlTarget(path, &.{
-        "global/projects/control/invoke.json",
-        "global/projects/control/list.json",
-        "global/projects/control/get.json",
-        "global/projects/control/up.json",
+        "global/workspaces/control/invoke.json",
+        "global/workspaces/control/list.json",
+        "global/workspaces/control/get.json",
+        "global/workspaces/control/up.json",
     });
 }
 
@@ -11345,24 +11345,24 @@ test "server_piai: resolve connection path maps base URL to default agent" {
 }
 
 test "server_piai: pathMatchesControlTarget only matches control namespace root path" {
-    try std.testing.expect(pathMatchesControlTarget("global/projects/control/up.json", "global/projects/control/up.json"));
-    try std.testing.expect(pathMatchesControlTarget("/global/projects/control/up.json", "global/projects/control/up.json"));
-    try std.testing.expect(pathMatchesControlTarget("/global/projects/control/up.json/", "global/projects/control/up.json"));
-    try std.testing.expect(!pathMatchesControlTarget("workspace/global/projects/control/up.json", "global/projects/control/up.json"));
+    try std.testing.expect(pathMatchesControlTarget("global/workspaces/control/up.json", "global/workspaces/control/up.json"));
+    try std.testing.expect(pathMatchesControlTarget("/global/workspaces/control/up.json", "global/workspaces/control/up.json"));
+    try std.testing.expect(pathMatchesControlTarget("/global/workspaces/control/up.json/", "global/workspaces/control/up.json"));
+    try std.testing.expect(!pathMatchesControlTarget("workspace/global/workspaces/control/up.json", "global/workspaces/control/up.json"));
 }
 
-test "server_piai: project control path matcher is global-only" {
-    try std.testing.expect(isProjectsControlPath("/global/projects/control/up.json"));
-    try std.testing.expect(isProjectsControlPath("global/projects/control/list.json"));
-    try std.testing.expect(!isProjectsControlPath("/agents/self/projects/control/invoke.json"));
-    try std.testing.expect(!isProjectsControlPath("/global/mounts/control/up.json"));
+test "server_piai: workspace control path matcher is global-only" {
+    try std.testing.expect(isWorkspacesControlPath("/global/workspaces/control/up.json"));
+    try std.testing.expect(isWorkspacesControlPath("global/workspaces/control/list.json"));
+    try std.testing.expect(!isWorkspacesControlPath("/agents/self/workspaces/control/invoke.json"));
+    try std.testing.expect(!isWorkspacesControlPath("/global/mounts/control/up.json"));
 }
 
 test "server_piai: operation result extraction unwraps session-backed result envelope" {
     const allocator = std.testing.allocator;
 
     const file_read_payload =
-        "{\"path\":\"/global/projects/result.json\",\"bytes\":93,\"truncated\":false,\"content\":\"{\\\"ok\\\":true,\\\"operation\\\":\\\"up\\\",\\\"result\\\":{\\\"project_id\\\":\\\"proj-7\\\"},\\\"error\\\":null}\",\"ready\":true,\"wait_until_ready\":true}";
+        "{\"path\":\"/global/workspaces/result.json\",\"bytes\":95,\"truncated\":false,\"content\":\"{\\\"ok\\\":true,\\\"operation\\\":\\\"up\\\",\\\"result\\\":{\\\"project_id\\\":\\\"proj-7\\\"},\\\"error\\\":null}\",\"ready\":true,\"wait_until_ready\":true}";
     const content_json = try extractFileReadContentJson(allocator, file_read_payload);
     defer allocator.free(content_json);
     try std.testing.expect(std.mem.indexOf(u8, content_json, "\"project_id\":\"proj-7\"") != null);
@@ -11376,7 +11376,7 @@ test "server_piai: agents control path matcher is global-only" {
     try std.testing.expect(isAgentsControlPath("/global/agents/control/create.json"));
     try std.testing.expect(isAgentsControlPath("global/agents/control/list.json"));
     try std.testing.expect(!isAgentsControlPath("/agents/self/agents/control/invoke.json"));
-    try std.testing.expect(!isAgentsControlPath("/global/projects/control/create.json"));
+    try std.testing.expect(!isAgentsControlPath("/global/workspaces/control/create.json"));
 }
 
 test "server_piai: sandbox proxy denies agent create without provisioning capability" {
@@ -11476,7 +11476,7 @@ test "server_piai: terminal control path matcher is global-only" {
     try std.testing.expect(isTerminalControlPath("global/terminal/control/exec.json"));
     try std.testing.expect(isTerminalControlPath("/global/terminal/control/create.json"));
     try std.testing.expect(!isTerminalControlPath("/agents/self/terminal/control/invoke.json"));
-    try std.testing.expect(!isTerminalControlPath("/global/projects/control/exec.json"));
+    try std.testing.expect(!isTerminalControlPath("/global/workspaces/control/exec.json"));
 }
 
 test "server_piai: parseHttpRequestPath parses GET line" {
