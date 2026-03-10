@@ -149,6 +149,15 @@ const Args = struct {
     pr_number: u64 = 115,
     review_command: []const u8 = "zig build test",
     checkout_path: ?[]u8 = null,
+    repo_key_owned: bool = false,
+    review_command_owned: bool = false,
+
+    fn deinit(self: *Args, allocator: std.mem.Allocator) void {
+        if (self.repo_key_owned) allocator.free(self.repo_key);
+        if (self.review_command_owned) allocator.free(self.review_command);
+        if (self.checkout_path) |value| allocator.free(value);
+        self.* = undefined;
+    }
 };
 
 pub fn main() !void {
@@ -156,8 +165,8 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    const args = try parseArgs(allocator);
-    defer if (args.checkout_path) |value| allocator.free(value);
+    var args = try parseArgs(allocator);
+    defer args.deinit(allocator);
 
     var config = try Config.init(allocator, null);
     defer config.deinit();
@@ -408,12 +417,16 @@ pub fn main() !void {
 
 fn parseArgs(allocator: std.mem.Allocator) !Args {
     var result = Args{};
+    errdefer result.deinit(allocator);
     var iter = try std.process.argsWithAllocator(allocator);
     defer iter.deinit();
     _ = iter.next();
     while (iter.next()) |arg| {
         if (std.mem.eql(u8, arg, "--repo")) {
-            result.repo_key = iter.next() orelse return error.InvalidArgs;
+            const value = iter.next() orelse return error.InvalidArgs;
+            if (result.repo_key_owned) allocator.free(result.repo_key);
+            result.repo_key = try allocator.dupe(u8, value);
+            result.repo_key_owned = true;
             continue;
         }
         if (std.mem.eql(u8, arg, "--pr")) {
@@ -422,11 +435,15 @@ fn parseArgs(allocator: std.mem.Allocator) !Args {
             continue;
         }
         if (std.mem.eql(u8, arg, "--command")) {
-            result.review_command = iter.next() orelse return error.InvalidArgs;
+            const value = iter.next() orelse return error.InvalidArgs;
+            if (result.review_command_owned) allocator.free(result.review_command);
+            result.review_command = try allocator.dupe(u8, value);
+            result.review_command_owned = true;
             continue;
         }
         if (std.mem.eql(u8, arg, "--checkout")) {
             const value = iter.next() orelse return error.InvalidArgs;
+            if (result.checkout_path) |existing| allocator.free(existing);
             result.checkout_path = try allocator.dupe(u8, value);
             continue;
         }

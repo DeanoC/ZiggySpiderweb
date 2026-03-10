@@ -2734,6 +2734,7 @@ fn executeRunValidationOp(self: anytype, args_obj: std.json.ObjectMap) ![]u8 {
     defer freeOptionalOwnedString(self, &service_error_code);
     var service_error_message: ?[]u8 = null;
     defer freeOptionalOwnedString(self, &service_error_message);
+    var validation_terminal_needs_close = false;
 
     var command_results_json = std.ArrayListUnmanaged(u8){};
     defer command_results_json.deinit(self.allocator);
@@ -2772,6 +2773,25 @@ fn executeRunValidationOp(self: anytype, args_obj: std.json.ObjectMap) ![]u8 {
         &service_error_code,
         &service_error_message,
     );
+    validation_terminal_needs_close = service_error_code == null;
+    errdefer if (validation_terminal_needs_close) {
+        if (self.allocator.dupe(u8, "{}")) |cleanup_payload| {
+            defer self.allocator.free(cleanup_payload);
+            var cleanup_capture = self.invokePrReviewServiceCapture(
+                store,
+                mission_id,
+                checkpoint_stage,
+                "Closed validation terminal session after early validation failure",
+                terminal_service_path,
+                terminal_close_path,
+                cleanup_payload,
+                contract.artifact_root,
+                "services/validation-close.json",
+                "validation_close",
+            ) catch null;
+            if (cleanup_capture) |*value| value.deinit(self.allocator);
+        } else |_| {}
+    };
 
     if (service_error_code == null) {
         for (command_items, 0..) |command_value, idx| {
@@ -2871,6 +2891,7 @@ fn executeRunValidationOp(self: anytype, args_obj: std.json.ObjectMap) ![]u8 {
             "services/validation-close.json",
             "validation_close",
         ) catch null;
+        if (close_capture != null) validation_terminal_needs_close = false;
     }
 
     const validation_status = if (service_error_code == null) "passed" else "failed";

@@ -12128,6 +12128,100 @@ test "acheron_session: pr_review run_validation fails on non-zero command exits"
     try std.testing.expect(std.mem.indexOf(u8, validation_content, "\"code\":\"execution_failed\"") != null);
 }
 
+test "acheron_session: pr_review run_validation closes terminal after malformed command payload" {
+    const allocator = std.testing.allocator;
+
+    var mission_store = try mission_store_mod.MissionStore.initWithPath(allocator, null);
+    defer mission_store.deinit();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const local_export_root = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(local_export_root);
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "default",
+        .{
+            .mission_store = &mission_store,
+            .local_fs_export_root = local_export_root,
+            .actor_type = "agent",
+            .actor_id = "reviewer-validation-invalid",
+        },
+    );
+    defer session.deinit();
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        732,
+        733,
+        &.{ "agents", "self", "pr_review", "control", "start.json" },
+        "{\"repo_key\":\"DeanoC/Spiderweb\",\"pr_number\":128,\"default_review_commands\":[\"printf validation-ok\"]}",
+        1816,
+    );
+
+    const start_result = try protocolReadFile(
+        &session,
+        allocator,
+        734,
+        735,
+        &.{ "agents", "self", "pr_review", "result.json" },
+        1817,
+    );
+    defer allocator.free(start_result);
+    const mission_id = try extractMissionIdFromResultPayload(allocator, start_result);
+    defer allocator.free(mission_id);
+
+    const checkout_host_path = try std.fs.path.join(allocator, &.{ local_export_root, "pr-review", "repos", "DeanoC__Spiderweb" });
+    defer allocator.free(checkout_host_path);
+    try std.fs.cwd().makePath(checkout_host_path);
+
+    const validation_payload = try std.fmt.allocPrint(allocator, "{{\"mission_id\":\"{s}\",\"commands\":[123]}}", .{mission_id});
+    defer allocator.free(validation_payload);
+    const validation_error = try protocolWriteFileExpectError(
+        &session,
+        allocator,
+        736,
+        737,
+        &.{ "agents", "self", "pr_review", "control", "run_validation.json" },
+        validation_payload,
+        1818,
+        "",
+    );
+    defer allocator.free(validation_error);
+
+    const terminal_current = try protocolReadFile(
+        &session,
+        allocator,
+        738,
+        739,
+        &.{ "nodes", "local", "venoms", "terminal", "current.json" },
+        1819,
+    );
+    defer allocator.free(terminal_current);
+    try std.testing.expect(std.mem.indexOf(u8, terminal_current, "\"session\":null") != null);
+
+    const terminal_sessions = try protocolReadFile(
+        &session,
+        allocator,
+        740,
+        741,
+        &.{ "nodes", "local", "venoms", "terminal", "sessions.json" },
+        1820,
+    );
+    defer allocator.free(terminal_sessions);
+    try std.testing.expect(std.mem.indexOf(u8, terminal_sessions, "\"state\":\"closed\"") != null);
+}
+
 test "acheron_session: seeded pr_review eval propagates checkout failure" {
     const allocator = std.testing.allocator;
 
