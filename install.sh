@@ -543,6 +543,7 @@ mkdir -p "$REPO_DIR/agents/mother"
 if [[ ! -f "$REPO_DIR/agents/mother/agent.json" ]]; then
 cat > "$REPO_DIR/agents/mother/agent.json" <<'EOF'
 {
+  "persona_pack": "default",
   "name": "Mother",
   "description": "System orchestration and bootstrap guardian",
   "is_default": true,

@@ -620,18 +620,28 @@ AGENT_RESULT_JSON=$(ws_read_text_file "/global/agents/result.json" 30)
 ws_close
 json_assert "$AGENT_RESULT_JSON" '.ok == true and .operation == "create" and .result.agent_id == $id' 'agents/result.json did not confirm create' --arg id "$AGENT_ID"
 
-HATCH_PATH="$AGENTS_DIR/$AGENT_ID/HATCH.md"
+SOUL_PATH="$AGENTS_DIR/$AGENT_ID/SOUL.md"
+AGENT_PATH="$AGENTS_DIR/$AGENT_ID/AGENT.md"
+IDENTITY_PATH="$AGENTS_DIR/$AGENT_ID/IDENTITY.md"
 META_PATH="$AGENTS_DIR/$AGENT_ID/agent.json"
-if [[ ! -f "$HATCH_PATH" ]]; then
-  echo "error: expected HATCH file missing at $HATCH_PATH" >&2
+if [[ ! -f "$SOUL_PATH" ]]; then
+  echo "error: expected persona file missing at $SOUL_PATH" >&2
+  exit 1
+fi
+if [[ ! -f "$AGENT_PATH" ]]; then
+  echo "error: expected persona file missing at $AGENT_PATH" >&2
+  exit 1
+fi
+if [[ ! -f "$IDENTITY_PATH" ]]; then
+  echo "error: expected persona file missing at $IDENTITY_PATH" >&2
   exit 1
 fi
 if [[ ! -f "$META_PATH" ]]; then
   echo "error: expected agent metadata missing at $META_PATH" >&2
   exit 1
 fi
-if ! grep -q "Create your identity by writing SOUL.md" "$HATCH_PATH"; then
-  echo "error: HATCH.md did not contain expected hatching instruction text" >&2
+if ! grep -q '#' "$SOUL_PATH"; then
+  echo "error: SOUL.md did not contain seeded persona content" >&2
   exit 1
 fi
 

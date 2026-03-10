@@ -514,8 +514,18 @@ fn isGlobalTerminalControlPath(path: []const u8) bool {
     const normalized = std.mem.trim(u8, path, " \t\r\n");
     const no_leading = std.mem.trimLeft(u8, normalized, "/");
     const trimmed = std.mem.trimRight(u8, no_leading, "/");
-    if (!std.mem.startsWith(u8, trimmed, "global/terminal/control/")) return false;
-    const leaf = trimmed["global/terminal/control/".len..];
+    const leaf = blk: {
+        if (std.mem.startsWith(u8, trimmed, "global/terminal/control/")) {
+            break :blk trimmed["global/terminal/control/".len..];
+        }
+        if (std.mem.startsWith(u8, trimmed, "nodes/local/venoms/terminal/control/")) {
+            break :blk trimmed["nodes/local/venoms/terminal/control/".len..];
+        }
+        if (std.mem.startsWith(u8, trimmed, "services/terminal/control/")) {
+            break :blk trimmed["services/terminal/control/".len..];
+        }
+        return false;
+    };
     return std.mem.eql(u8, leaf, "exec.json") or std.mem.eql(u8, leaf, "invoke.json");
 }
 
@@ -847,6 +857,8 @@ test "brain_specialization: detects terminal exec control paths" {
     try std.testing.expect(isGlobalTerminalControlPath("/global/terminal/control/exec.json"));
     try std.testing.expect(isGlobalTerminalControlPath("global/terminal/control/invoke.json"));
     try std.testing.expect(isGlobalTerminalControlPath(" /global/terminal/control/exec.json/ \n"));
+    try std.testing.expect(isGlobalTerminalControlPath("/nodes/local/venoms/terminal/control/exec.json"));
+    try std.testing.expect(isGlobalTerminalControlPath("/services/terminal/control/invoke.json"));
     try std.testing.expect(!isGlobalTerminalControlPath("/global/terminal/control/write.json"));
     try std.testing.expect(!isGlobalTerminalControlPath("/agents/self/terminal/control/exec.json"));
 }
@@ -877,6 +889,14 @@ test "brain_specialization: file_write escalation maps terminal exec leaves to s
     try std.testing.expect(fileWriteEscalatesToShellExec(
         allocator,
         "{\"path\":\"/global/terminal/control/invoke.json\",\"content\":\"{\\\"args\\\":{\\\"operation\\\":\\\" exec \\\",\\\"argv\\\":[\\\"echo\\\",\\\"hi\\\"]}}\"}",
+    ));
+    try std.testing.expect(fileWriteEscalatesToShellExec(
+        allocator,
+        "{\"path\":\"/nodes/local/venoms/terminal/control/exec.json\",\"content\":\"{\\\"command\\\":\\\"echo hi\\\"}\"}",
+    ));
+    try std.testing.expect(fileWriteEscalatesToShellExec(
+        allocator,
+        "{\"path\":\"/services/terminal/control/invoke.json\",\"content\":\"{\\\"op\\\":\\\"exec\\\",\\\"arguments\\\":{\\\"command\\\":\\\"echo hi\\\"}}\"}",
     ));
     try std.testing.expect(!fileWriteEscalatesToShellExec(
         allocator,

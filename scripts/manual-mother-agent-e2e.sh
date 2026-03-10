@@ -804,8 +804,8 @@ echo "[mother-e2e] verify project_id: $PROJECT_ID"
 AGENT_LIST_JSON=$(control_retry "$CONTROL_RETRY_ATTEMPTS" "$CONTROL_RETRY_DELAY_SEC" agent_list)
 json_assert "$AGENT_LIST_JSON" '.payload.agents[]? | select((.id // "") == $id) | .id == $id' 'Mother did not create expected agent' --arg id "$AGENT_ID"
 
-if [[ ! -f "$AGENTS_DIR/$AGENT_ID/HATCH.md" ]]; then
-  echo "error: expected agent HATCH scaffold missing for $AGENT_ID" >&2
+if [[ ! -f "$AGENTS_DIR/$AGENT_ID/SOUL.md" ]]; then
+  echo "error: expected agent persona file missing for $AGENT_ID" >&2
   exit 1
 fi
 if [[ ! -f "$AGENTS_DIR/$AGENT_ID/agent.json" ]]; then

@@ -1,19 +1,20 @@
 const std = @import("std");
 const agent_runtime = @import("agent_runtime.zig");
+const memory_ownership = @import("memory_ownership.zig");
 const memory = @import("ziggy-memory-store").memory;
 const memid = @import("ziggy-memory-store").memid;
 const protocol = @import("spider-protocol").protocol;
 
-pub const POLICY_MEM_NAME = "system.policy";
-pub const LOOP_CONTRACT_MEM_NAME = "system.loop_contract";
-pub const TOOL_CONTRACT_MEM_NAME = "system.tool_contract";
-pub const COMPLETION_CONTRACT_MEM_NAME = "system.completion_contract";
+pub const POLICY_MEM_NAME = memory_ownership.POLICY_MEM_NAME;
+pub const LOOP_CONTRACT_MEM_NAME = memory_ownership.LOOP_CONTRACT_MEM_NAME;
+pub const TOOL_CONTRACT_MEM_NAME = memory_ownership.TOOL_CONTRACT_MEM_NAME;
+pub const COMPLETION_CONTRACT_MEM_NAME = memory_ownership.COMPLETION_CONTRACT_MEM_NAME;
 
-pub const GOAL_ACTIVE_MEM_NAME = "goal.active";
-pub const PLAN_CURRENT_MEM_NAME = "plan.current";
-pub const RUN_PENDING_MEM_NAME = "run.pending";
-pub const CONTEXT_SUMMARY_MEM_NAME = "context.summary";
-pub const USER_PREFERENCES_MEM_NAME = "user.preferences";
+pub const GOAL_ACTIVE_MEM_NAME = memory_ownership.GOAL_ACTIVE_MEM_NAME;
+pub const PLAN_CURRENT_MEM_NAME = memory_ownership.PLAN_CURRENT_MEM_NAME;
+pub const RUN_PENDING_MEM_NAME = memory_ownership.RUN_PENDING_MEM_NAME;
+pub const CONTEXT_SUMMARY_MEM_NAME = memory_ownership.CONTEXT_SUMMARY_MEM_NAME;
+pub const USER_PREFERENCES_MEM_NAME = memory_ownership.USER_PREFERENCES_MEM_NAME;
 
 pub const POLICY_ROM_KEY = "policy:runtime";
 pub const LOOP_CONTRACT_ROM_KEY = "contract:loop";
@@ -33,7 +34,7 @@ pub const POLICY_TEXT =
 
 pub const LOOP_CONTRACT_TEXT =
     \\Run cycle: Observe -> Decide -> Act -> Integrate -> Checkpoint.
-    \\When history is sparse, discover capabilities first via /global/venoms/VENOMS.json.
+    \\When history is sparse, discover capabilities first via /meta/workspace_services.json, /projects/<project_id>/meta/mounted_services.json, /nodes/local/venoms/VENOMS.json, and /global/venoms/VENOMS.json.
     \\If blocked, continue using wait-capable filesystem operations.
     \\Prefer single-source blocking reads for waits (job status/result); use events/control/wait.json + events/next.json only for one-of-many sources.
     \\If tool output is invalid or includes error.code/error.message, emit the smallest corrective tool step.
@@ -42,24 +43,24 @@ pub const LOOP_CONTRACT_TEXT =
 pub const TOOL_CONTRACT_TEXT =
     \\Use only these runtime tools: file_read, file_write, file_list.
     \\Use JSON object args that match the tool schema; file_read/file_write support wait_until_ready (default true).
-    \\For file_* tool args, use canonical absolute paths. Project sandboxes expose a full rootfs at `/`; use `/global/...` for Acheron service/control paths.
+    \\For file_* tool args, use canonical absolute paths. Project sandboxes expose a full rootfs at `/`; prefer `/services/*` for bound workspace venoms and `/nodes/local/venoms/*` for local catalog origins. `/global/*` is compatibility-only.
     \\Do not use talk_* tools.
-    \\Do not call memory_* directly; use Acheron paths under /global/memory/control/*.json.
-    \\Access web search, code search, terminal, sub-brains, and agent management via Acheron namespaces under /global.
-    \\Before claiming a capability is unavailable, check `/global/venoms/VENOMS.json` and relevant first-class namespaces.
+    \\Do not call memory_* directly; use Acheron paths under `/services/memory/control/*.json` when bound, otherwise `/nodes/local/venoms/memory/control/*.json`.
+    \\Access web search, code search, terminal, sub-brains, and agent management through `/services/*` when bound, otherwise `/nodes/local/venoms/*`.
+    \\Before claiming a capability is unavailable, check `/meta/workspace_services.json`, `/projects/<project_id>/meta/mounted_services.json`, `/nodes/local/venoms/VENOMS.json`, and `/global/venoms/VENOMS.json`.
     \\Use project_namespace for project-shared capabilities and node scope for node-specific capabilities.
-    \\If `/global/web_search` exists, do not claim you cannot do web search; invoke the web search service.
-    \\For "what projects/agents exist" requests, use `/global/projects/control/list.json` and `/global/agents/control/list.json` (or invoke.json), not directory-entry inference.
-    \\When presenting projects/agents to users, prefer human labels first (`name`) and include stable ids (`project_id`/`id`) only as secondary identifiers.
+    \\If `/services/web_search` or `/nodes/local/venoms/web_search` exists, do not claim you cannot do web search; invoke the web search service.
+    \\For "what workspaces/agents exist" requests, use `/services/workspaces/control/list.json` or `/nodes/local/venoms/workspaces/control/list.json`, and `/services/agents/control/list.json` or `/nodes/local/venoms/agents/control/list.json`, not directory-entry inference.
+    \\When presenting workspaces/agents to users, prefer human labels first (`name`) and include stable ids (`project_id`/`id`) only as secondary identifiers.
     \\If you are Mother (`agent_id=mother`), your role is system orchestration and provisioning, not project delivery execution.
     \\After creating the first non-system project/agent, give handoff instructions and stop: confirm the created `{project_id,agent_id}` and tell the admin to switch to that new project/agent for project work.
     \\Do not include protocol-level or API instructions in that handoff message.
     \\Do not volunteer to start repo setup, PR preparation, coding, or project implementation work from Mother after provisioning.
     \\Mother may still run project setup primitives when requested (project/agent create, mount/bind/resolve) to complete bootstrap.
-    \\To reply to user/admin, write text to /global/chat/control/reply.
-    \\Treat /global/chat/control/input as inbound user/admin input channel (do not use it for outbound replies).
-    \\Internal thought telemetry is exposed at /global/thoughts/* and is observational (not chat).
-    \\Use `/global/terminal/control/*.json` when terminal execution is required.
+    \\To reply to user/admin, write text to `/nodes/local/venoms/chat/control/reply`.
+    \\Treat `/nodes/local/venoms/chat/control/input` as inbound user/admin input channel (do not use it for outbound replies).
+    \\Internal thought telemetry is exposed at `/nodes/local/venoms/thoughts/*` and is observational (not chat).
+    \\Use `/services/terminal/control/*.json` when bound, otherwise `/nodes/local/venoms/terminal/control/*.json`, when terminal execution is required.
 ;
 
 pub const COMPLETION_CONTRACT_TEXT =

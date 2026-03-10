@@ -200,7 +200,7 @@ What it validates:
 - Mother-only first connect (`bootstrap_only=true`)
 - provider-backed Mother chat response over Acheron
 - first project provisioning with `vision`
-- first non-system agent create + `HATCH.md` scaffold
+- first non-system agent create + seeded persona files
 - successful `control.session_attach` to provisioned project/agent
 - bootstrap mode exit (`bootstrap_only=false`)
 

@@ -1,5 +1,5 @@
 const std = @import("std");
-const identity = @import("../identity.zig");
+const persona_pack = @import("persona_pack.zig");
 
 pub const AgentCapability = enum {
     chat,
@@ -15,12 +15,13 @@ pub const AgentInfo = struct {
     is_default: bool,
     capabilities: std.ArrayListUnmanaged(AgentCapability),
     identity_loaded: bool,
-    needs_hatching: bool,
+    persona_pack: ?[]u8,
 
     pub fn deinit(self: *AgentInfo, allocator: std.mem.Allocator) void {
         allocator.free(self.id);
         allocator.free(self.name);
         allocator.free(self.description);
+        if (self.persona_pack) |value| allocator.free(value);
         self.capabilities.deinit(allocator);
     }
 };
@@ -108,15 +109,15 @@ pub const AgentRegistry = struct {
     }
 
     /// Initialize first agent on first boot
-    pub fn initializeFirstAgent(self: *AgentRegistry, agent_id: []const u8, template_path: ?[]const u8) !void {
+    pub fn initializeFirstAgent(self: *AgentRegistry, agent_id: []const u8, persona_pack_path: ?[]const u8) !void {
         // Create the agents directory
         const agents_dir_path = try self.resolveAgentsDirPath();
         defer self.allocator.free(agents_dir_path);
 
         try std.fs.cwd().makePath(agents_dir_path);
 
-        // Create the first agent with HATCH.md
-        try self.createAgent(agent_id, template_path);
+        // Seed the first agent from the selected persona pack.
+        try self.createAgent(agent_id, persona_pack_path);
 
         // Mark it as default
         for (self.agents.items) |*a| {
@@ -193,11 +194,11 @@ pub const AgentRegistry = struct {
             }
         }
 
-        // Check if identity files exist
-        const identity_loaded = self.checkIdentityFiles(agent_path);
-
-        // Check if HATCH.md exists (needs hatching)
-        const needs_hatching = self.checkHatchFile(agent_path);
+        const persona_pack_id = if (root.get("persona_pack")) |value|
+            if (value == .string) try self.allocator.dupe(u8, value.string) else null
+        else
+            null;
+        const identity_loaded = self.checkIdentityFiles(agent_path) or self.checkPersonaPackAssets(persona_pack_id);
 
         return .{
             .id = try self.allocator.dupe(u8, agent_id),
@@ -206,7 +207,7 @@ pub const AgentRegistry = struct {
             .is_default = is_default,
             .capabilities = capabilities,
             .identity_loaded = identity_loaded,
-            .needs_hatching = needs_hatching,
+            .persona_pack = persona_pack_id,
         };
     }
 
@@ -216,9 +217,6 @@ pub const AgentRegistry = struct {
 
         // Check which identity files exist
         const identity_loaded = self.checkIdentityFiles(agent_path);
-
-        // Check if HATCH.md exists
-        const needs_hatching = self.checkHatchFile(agent_path);
 
         // Infer capabilities from agent_id
         var capabilities = std.ArrayListUnmanaged(AgentCapability){};
@@ -251,7 +249,7 @@ pub const AgentRegistry = struct {
             .is_default = false,
             .capabilities = capabilities,
             .identity_loaded = identity_loaded,
-            .needs_hatching = needs_hatching,
+            .persona_pack = null,
         };
     }
 
@@ -269,62 +267,61 @@ pub const AgentRegistry = struct {
         return false;
     }
 
-    fn checkHatchFile(self: *AgentRegistry, agent_path: []const u8) bool {
-        const hatch_path = std.fs.path.join(self.allocator, &.{ agent_path, "HATCH.md" }) catch return false;
-        defer self.allocator.free(hatch_path);
+    fn checkPersonaPackAssets(self: *AgentRegistry, maybe_pack_id: ?[]const u8) bool {
+        const pack_id = maybe_pack_id orelse return false;
+        if (!persona_pack.isValidPackId(pack_id)) return false;
 
-        std.fs.cwd().access(hatch_path, .{}) catch return false;
+        const assets_dir_path = self.resolveAssetsDirPath() catch return false;
+        defer self.allocator.free(assets_dir_path);
+
+        if (persona_pack.ensurePackExists(self.allocator, assets_dir_path, pack_id)) |_| {} else |_| return false;
+
+        for (required_persona_files) |filename| {
+            if (persona_pack.readOptionalPackFile(self.allocator, assets_dir_path, pack_id, filename, 128 * 1024)) |content| {
+                if (content) |value| {
+                    self.allocator.free(value);
+                    continue;
+                }
+                return false;
+            } else |_| return false;
+        }
         return true;
     }
 
-    /// Read HATCH.md content if it exists
-    pub fn readHatchFile(self: *AgentRegistry, agent_id: []const u8) !?[]u8 {
-        const agents_dir_path = try self.resolveAgentsDirPath();
-        defer self.allocator.free(agents_dir_path);
-        const agent_path = try std.fs.path.join(self.allocator, &.{ agents_dir_path, agent_id });
-        defer self.allocator.free(agent_path);
-
-        const hatch_path = try std.fs.path.join(self.allocator, &.{ agent_path, "HATCH.md" });
-        defer self.allocator.free(hatch_path);
-
-        const content = std.fs.cwd().readFileAlloc(self.allocator, hatch_path, 64 * 1024) catch |err| {
-            if (err == error.FileNotFound) return null;
-            return err;
+    /// Create a new agent by seeding identity files from a persona pack directory.
+    pub fn createAgent(self: *AgentRegistry, persona_agent_id: []const u8, persona_pack_path: ?[]const u8) !void {
+        const selected_pack_id = if (persona_pack_path) |tp| std.fs.path.basename(tp) else persona_pack.default_pack_id;
+        if (!persona_pack.isValidPackId(selected_pack_id)) return error.InvalidTemplatePath;
+        const resolved_persona_pack_path = if (persona_pack_path) |tp|
+            try self.resolvePersonaPackPath(tp)
+        else blk: {
+            const assets_dir_path = try self.resolveAssetsDirPath();
+            defer self.allocator.free(assets_dir_path);
+            try persona_pack.ensurePackExists(self.allocator, assets_dir_path, persona_pack.default_pack_id);
+            break :blk try persona_pack.resolvePackDir(self.allocator, assets_dir_path, persona_pack.default_pack_id);
         };
-        return content;
-    }
-
-    /// Create a new agent with HATCH.md
-    pub fn createAgent(self: *AgentRegistry, agent_id: []const u8, template_path: ?[]const u8) !void {
-        // Load template source FIRST (before any filesystem mutation)
-        const template_source = if (template_path) |tp|
-            try self.loadTemplateFromAllowedPath(tp)
-        else
-            try self.loadDefaultHatchTemplate();
-        defer self.allocator.free(template_source);
+        defer self.allocator.free(resolved_persona_pack_path);
 
         // Create agent directory
         const agents_dir_path = try self.resolveAgentsDirPath();
         defer self.allocator.free(agents_dir_path);
-        const agent_path = try std.fs.path.join(self.allocator, &.{ agents_dir_path, agent_id });
+        const agent_path = try std.fs.path.join(self.allocator, &.{ agents_dir_path, persona_agent_id });
         defer self.allocator.free(agent_path);
 
         try std.fs.cwd().makePath(agent_path);
-
-        // Write HATCH.md
-        const hatch_path = try std.fs.path.join(self.allocator, &.{ agent_path, "HATCH.md" });
-        defer self.allocator.free(hatch_path);
-
-        try std.fs.cwd().writeFile(.{
-            .sub_path = hatch_path,
-            .data = template_source,
-        });
+        try self.seedAgentFromPersonaPack(agent_path, resolved_persona_pack_path);
+        try self.ensurePersonaPackMetadata(agent_path, selected_pack_id);
 
         // Reload agents to include the new one
         try self.scan();
     }
 
-    fn loadTemplateFromAllowedPath(self: *AgentRegistry, template_path: []const u8) ![]u8 {
+    fn resolvePersonaPackPath(self: *AgentRegistry, template_path: []const u8) ![]u8 {
+        if (persona_pack.isValidPackId(template_path)) {
+            const assets_dir_path = try self.resolveAssetsDirPath();
+            defer self.allocator.free(assets_dir_path);
+            return persona_pack.resolvePackDir(self.allocator, assets_dir_path, template_path);
+        }
         if (template_path.len == 0) return error.InvalidTemplatePath;
         if (containsParentTraversal(template_path)) return error.InvalidTemplatePath;
 
@@ -340,13 +337,17 @@ pub const AgentRegistry = struct {
         const assets_dir_path = try self.resolveAssetsDirPath();
         defer self.allocator.free(assets_dir_path);
         if (try self.isTemplatePathUnderRoot(candidate_real, assets_dir_path)) {
-            return std.fs.cwd().readFileAlloc(self.allocator, candidate_real, 64 * 1024);
+            var dir = std.fs.cwd().openDir(candidate_real, .{}) catch return error.InvalidTemplatePath;
+            dir.close();
+            return self.allocator.dupe(u8, candidate_real);
         }
 
         const agents_dir_path = try self.resolveAgentsDirPath();
         defer self.allocator.free(agents_dir_path);
         if (try self.isTemplatePathUnderRoot(candidate_real, agents_dir_path)) {
-            return std.fs.cwd().readFileAlloc(self.allocator, candidate_real, 64 * 1024);
+            var dir = std.fs.cwd().openDir(candidate_real, .{}) catch return error.InvalidTemplatePath;
+            dir.close();
+            return self.allocator.dupe(u8, candidate_real);
         }
 
         return error.InvalidTemplatePath;
@@ -361,62 +362,98 @@ pub const AgentRegistry = struct {
         return isPathWithinRoot(root_real, candidate_real);
     }
 
-    /// Complete hatching - delete HATCH.md and update agent
-    pub fn completeHatching(self: *AgentRegistry, agent_id: []const u8) !void {
-        const agents_dir_path = try self.resolveAgentsDirPath();
-        defer self.allocator.free(agents_dir_path);
-        const agent_path = try std.fs.path.join(self.allocator, &.{ agents_dir_path, agent_id });
-        defer self.allocator.free(agent_path);
-
-        // Delete HATCH.md
-        const hatch_path = try std.fs.path.join(self.allocator, &.{ agent_path, "HATCH.md" });
-        defer self.allocator.free(hatch_path);
-
-        std.fs.cwd().deleteFile(hatch_path) catch |err| {
-            if (err != error.FileNotFound) return err;
-        };
-
-        // Reload to update agent state
-        try self.scan();
-    }
-
-    fn loadDefaultHatchTemplate(self: *AgentRegistry) ![]u8 {
-        // Try to load from templates/ first, then fallback to agents/ (legacy)
-        const assets_dir_path = try self.resolveAssetsDirPath();
-        defer self.allocator.free(assets_dir_path);
-        const templates_path = try std.fs.path.join(self.allocator, &.{ assets_dir_path, "HATCH.template.md" });
-        defer self.allocator.free(templates_path);
-
-        if (std.fs.cwd().readFileAlloc(self.allocator, templates_path, 64 * 1024)) |content| {
-            return content;
-        } else |_| {
-            const agents_dir_path = try self.resolveAgentsDirPath();
-            defer self.allocator.free(agents_dir_path);
-            const legacy_path = try std.fs.path.join(self.allocator, &.{ agents_dir_path, "HATCH.template.md" });
-            defer self.allocator.free(legacy_path);
-
-            return std.fs.cwd().readFileAlloc(self.allocator, legacy_path, 64 * 1024) catch {
-                // Fallback to embedded minimal template
-                return self.allocator.dupe(u8, "# HATCH.md — New Agent Initialization\n" ++
-                    "\n" ++
-                    "Welcome, newborn agent. You are hatching in Spiderweb (ZSS).\n" ++
-                    "\n" ++
-                    "## Your Task\n" ++
-                    "Create your identity by writing SOUL.md, then respond with:\n" ++
-                    "{\"type\":\"agent.hatch\",\"agent_id\":\"YourName\"}\n" ++
-                    "\n" ++
-                    "The server will confirm with agent.hatched and delete this HATCH.md.\n" ++
-                    "You won't need it again.\n");
-            };
-        }
-    }
-
     fn resolveAgentsDirPath(self: *const AgentRegistry) ![]u8 {
         return resolveConfiguredPath(self.allocator, self.base_dir, self.agents_dir_rel);
     }
 
     fn resolveAssetsDirPath(self: *const AgentRegistry) ![]u8 {
         return resolveConfiguredPath(self.allocator, self.base_dir, self.assets_dir_rel);
+    }
+
+    fn seedAgentFromPersonaPack(self: *AgentRegistry, agent_path: []const u8, persona_pack_path: []const u8) !void {
+        inline for (required_persona_files) |filename| {
+            try self.copyPersonaFile(agent_path, persona_pack_path, filename, true);
+        }
+        inline for (optional_persona_files) |filename| {
+            try self.copyPersonaFile(agent_path, persona_pack_path, filename, false);
+        }
+    }
+
+    fn copyPersonaFile(
+        self: *AgentRegistry,
+        agent_path: []const u8,
+        persona_pack_path: []const u8,
+        filename: []const u8,
+        required: bool,
+    ) !void {
+        const source_path = try std.fs.path.join(self.allocator, &.{ persona_pack_path, filename });
+        defer self.allocator.free(source_path);
+
+        const content = std.fs.cwd().readFileAlloc(self.allocator, source_path, 128 * 1024) catch |err| {
+            if (!required and err == error.FileNotFound) return;
+            if (err == error.FileNotFound) return error.InvalidTemplatePath;
+            return err;
+        };
+        defer self.allocator.free(content);
+
+        const target_path = try std.fs.path.join(self.allocator, &.{ agent_path, filename });
+        defer self.allocator.free(target_path);
+        try std.fs.cwd().writeFile(.{
+            .sub_path = target_path,
+            .data = content,
+        });
+    }
+
+    fn ensurePersonaPackMetadata(
+        self: *AgentRegistry,
+        agent_path: []const u8,
+        pack_id: []const u8,
+    ) !void {
+        if (!persona_pack.isValidPackId(pack_id)) return error.InvalidTemplatePath;
+
+        const metadata_path = try std.fs.path.join(self.allocator, &.{ agent_path, "agent.json" });
+        defer self.allocator.free(metadata_path);
+
+        const existing_json = std.fs.cwd().readFileAlloc(self.allocator, metadata_path, 128 * 1024) catch |err| switch (err) {
+            error.FileNotFound => null,
+            else => return err,
+        };
+        defer if (existing_json) |value| self.allocator.free(value);
+
+        var out = std.ArrayListUnmanaged(u8){};
+        defer out.deinit(self.allocator);
+        var writer = out.writer(self.allocator);
+        try writer.writeByte('{');
+        var wrote_field = false;
+
+        if (existing_json) |value| {
+            var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, value, .{});
+            defer parsed.deinit();
+            if (parsed.value == .object) {
+                var it = parsed.value.object.iterator();
+                while (it.next()) |entry| {
+                    if (std.mem.eql(u8, entry.key_ptr.*, "persona_pack")) continue;
+                    if (wrote_field) try writer.writeByte(',');
+                    wrote_field = true;
+                    try writer.print("{f}", .{std.json.fmt(entry.key_ptr.*, .{})});
+                    try writer.writeByte(':');
+                    try writer.print("{f}", .{std.json.fmt(entry.value_ptr.*, .{})});
+                }
+            }
+        }
+
+        if (wrote_field) try writer.writeByte(',');
+        try writer.print("{f}", .{std.json.fmt("persona_pack", .{})});
+        try writer.writeByte(':');
+        try writer.print("{f}", .{std.json.fmt(pack_id, .{})});
+        try writer.writeByte('}');
+
+        const metadata_json = try out.toOwnedSlice(self.allocator);
+        defer self.allocator.free(metadata_json);
+        try std.fs.cwd().writeFile(.{
+            .sub_path = metadata_path,
+            .data = metadata_json,
+        });
     }
 
     fn extractNameFromIdentity(self: *AgentRegistry, agent_path: []const u8) !?[]u8 {
@@ -512,6 +549,17 @@ fn isPathWithinRoot(root: []const u8, candidate: []const u8) bool {
     return candidate.len > root.len and std.fs.path.isSep(candidate[root.len]);
 }
 
+const required_persona_files = [_][]const u8{
+    "SOUL.md",
+    "AGENT.md",
+    "IDENTITY.md",
+};
+
+const optional_persona_files = [_][]const u8{
+    "USER.md",
+    "agent.json",
+};
+
 fn parseCapability(str: []const u8) !AgentCapability {
     if (std.mem.eql(u8, str, "chat")) return .chat;
     if (std.mem.eql(u8, str, "code")) return .code;
@@ -561,7 +609,7 @@ test "agent_registry: scan supports absolute agents_dir path" {
     try std.testing.expectEqualStrings("Mother", mother.?.name);
 }
 
-test "agent_registry: createAgent loads custom template from configured assets dir" {
+test "agent_registry: createAgent seeds identity files from configured persona pack" {
     const allocator = std.testing.allocator;
     const nonce = std.crypto.random.int(u64);
     const rel_root = try std.fmt.allocPrint(allocator, ".tmp-agent-registry-template-ok-{d}", .{nonce});
@@ -576,25 +624,30 @@ test "agent_registry: createAgent loads custom template from configured assets d
     try std.fs.cwd().makePath(assets_dir);
     try std.fs.cwd().makePath(agents_dir);
 
-    const custom_template_path = try std.fs.path.join(allocator, &.{ assets_dir, "custom.md" });
-    defer allocator.free(custom_template_path);
-    try std.fs.cwd().writeFile(.{
-        .sub_path = custom_template_path,
-        .data = "# custom hatch template\n",
-    });
+    const persona_pack_dir = try std.fs.path.join(allocator, &.{ assets_dir, "persona-packs", "custom-pack" });
+    defer allocator.free(persona_pack_dir);
+    try std.fs.cwd().makePath(persona_pack_dir);
+    inline for (required_persona_files) |filename| {
+        const path = try std.fs.path.join(allocator, &.{ persona_pack_dir, filename });
+        defer allocator.free(path);
+        try std.fs.cwd().writeFile(.{
+            .sub_path = path,
+            .data = "# custom persona file\n",
+        });
+    }
 
     var registry = AgentRegistry.init(allocator, rel_root, "agents", "templates");
     defer registry.deinit();
-    try registry.createAgent("alpha", "templates/custom.md");
+    try registry.createAgent("alpha", "templates/persona-packs/custom-pack");
 
-    const hatch_path = try std.fs.path.join(allocator, &.{ agents_dir, "alpha", "HATCH.md" });
-    defer allocator.free(hatch_path);
-    const hatch = try std.fs.cwd().readFileAlloc(allocator, hatch_path, 1024);
-    defer allocator.free(hatch);
-    try std.testing.expectEqualStrings("# custom hatch template\n", hatch);
+    const soul_path = try std.fs.path.join(allocator, &.{ agents_dir, "alpha", "SOUL.md" });
+    defer allocator.free(soul_path);
+    const soul = try std.fs.cwd().readFileAlloc(allocator, soul_path, 1024);
+    defer allocator.free(soul);
+    try std.testing.expectEqualStrings("# custom persona file\n", soul);
 }
 
-test "agent_registry: createAgent loads custom template from absolute configured assets dir" {
+test "agent_registry: createAgent seeds identity files from absolute persona pack path" {
     const allocator = std.testing.allocator;
     const nonce = std.crypto.random.int(u64);
     const rel_root = try std.fmt.allocPrint(allocator, ".tmp-agent-registry-template-abs-{d}", .{nonce});
@@ -616,26 +669,31 @@ test "agent_registry: createAgent loads custom template from absolute configured
     const abs_agents_dir = try std.fs.path.join(allocator, &.{ abs_root, "agents" });
     defer allocator.free(abs_agents_dir);
 
-    const custom_template_path = try std.fs.path.join(allocator, &.{ abs_assets_dir, "custom.md" });
-    defer allocator.free(custom_template_path);
-    try std.fs.cwd().writeFile(.{
-        .sub_path = custom_template_path,
-        .data = "# absolute custom hatch template\n",
-    });
+    const persona_pack_dir = try std.fs.path.join(allocator, &.{ abs_assets_dir, "persona-packs", "custom-pack" });
+    defer allocator.free(persona_pack_dir);
+    try std.fs.cwd().makePath(persona_pack_dir);
+    inline for (required_persona_files) |filename| {
+        const path = try std.fs.path.join(allocator, &.{ persona_pack_dir, filename });
+        defer allocator.free(path);
+        try std.fs.cwd().writeFile(.{
+            .sub_path = path,
+            .data = "# absolute custom persona file\n",
+        });
+    }
 
     var registry = AgentRegistry.init(allocator, rel_root, abs_agents_dir, abs_assets_dir);
     defer registry.deinit();
 
-    try registry.createAgent("alpha", custom_template_path);
+    try registry.createAgent("alpha", persona_pack_dir);
 
-    const hatch_path = try std.fs.path.join(allocator, &.{ abs_agents_dir, "alpha", "HATCH.md" });
-    defer allocator.free(hatch_path);
-    const hatch = try std.fs.cwd().readFileAlloc(allocator, hatch_path, 1024);
-    defer allocator.free(hatch);
-    try std.testing.expectEqualStrings("# absolute custom hatch template\n", hatch);
+    const soul_path = try std.fs.path.join(allocator, &.{ abs_agents_dir, "alpha", "SOUL.md" });
+    defer allocator.free(soul_path);
+    const soul = try std.fs.cwd().readFileAlloc(allocator, soul_path, 1024);
+    defer allocator.free(soul);
+    try std.testing.expectEqualStrings("# absolute custom persona file\n", soul);
 }
 
-test "agent_registry: createAgent rejects traversal template path" {
+test "agent_registry: createAgent rejects traversal persona pack path" {
     const allocator = std.testing.allocator;
     const nonce = std.crypto.random.int(u64);
     const rel_root = try std.fmt.allocPrint(allocator, ".tmp-agent-registry-template-traversal-{d}", .{nonce});
@@ -654,4 +712,26 @@ test "agent_registry: createAgent rejects traversal template path" {
     defer registry.deinit();
 
     try std.testing.expectError(error.InvalidTemplatePath, registry.createAgent("beta", "templates/../../etc/passwd"));
+}
+
+test "agent_registry: createAgent rejects persona pack missing required identity files" {
+    const allocator = std.testing.allocator;
+    const nonce = std.crypto.random.int(u64);
+    const rel_root = try std.fmt.allocPrint(allocator, ".tmp-agent-registry-persona-invalid-{d}", .{nonce});
+    defer allocator.free(rel_root);
+    defer std.fs.cwd().deleteTree(rel_root) catch {};
+    try std.fs.cwd().makePath(rel_root);
+
+    const agents_dir = try std.fs.path.join(allocator, &.{ rel_root, "agents" });
+    defer allocator.free(agents_dir);
+    const assets_dir = try std.fs.path.join(allocator, &.{ rel_root, "templates" });
+    defer allocator.free(assets_dir);
+    const persona_pack_dir = try std.fs.path.join(allocator, &.{ assets_dir, "persona-packs", "broken-pack" });
+    defer allocator.free(persona_pack_dir);
+    try std.fs.cwd().makePath(persona_pack_dir);
+
+    var registry = AgentRegistry.init(allocator, rel_root, "agents", "templates");
+    defer registry.deinit();
+
+    try std.testing.expectError(error.InvalidTemplatePath, registry.createAgent("beta", "templates/persona-packs/broken-pack"));
 }
