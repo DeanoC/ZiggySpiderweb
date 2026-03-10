@@ -5210,6 +5210,7 @@ var mockCapturedApiKey: ?[]u8 = null;
 var mockDispatchContextByte: u8 = 0;
 var mockPrReviewAgenticEvalCallCount: usize = 0;
 var mockPrReviewRunnerAgenticEvalCallCount: usize = 0;
+var mockPrReviewDraftAgenticEvalCallCount: usize = 0;
 
 fn mockProviderStreamCaptureConfig(
     allocator: std.mem.Allocator,
@@ -5413,7 +5414,7 @@ const MockPrReviewAcheronState = struct {
         );
         defer self.allocator.free(context_json);
         const state_json =
-            "{\"phase\":\"planning\",\"last_synced_head_sha\":\"def129\",\"current_focus\":\"\",\"open_threads\":[],\"latest_validation\":{\"status\":\"unknown\",\"summary\":null},\"latest_recommendation\":{\"status\":\"pending\",\"summary\":null},\"artifacts\":{\"findings\":\"findings.json\",\"validation\":\"validation.json\",\"recommendation\":\"recommendation.json\",\"thread_actions\":\"thread-actions.json\",\"provider_sync\":\"services/provider-sync.json\",\"checkout\":\"services/checkout.json\",\"repo_status\":\"services/repo-status.json\",\"diff_range\":\"services/diff-range.json\",\"publish_review\":\"services/publish-review.json\"},\"notes\":[]}";
+            "{\"phase\":\"planning\",\"last_synced_head_sha\":\"def129\",\"current_focus\":\"\",\"open_threads\":[],\"latest_validation\":{\"status\":\"unknown\",\"summary\":null},\"latest_draft\":{\"status\":\"pending\",\"summary\":null,\"revision\":0},\"latest_recommendation\":{\"status\":\"pending\",\"summary\":null},\"artifacts\":{\"draft_review\":\"draft-review.json\",\"draft_review_comment\":\"review-comment-draft.md\",\"draft_history_dir\":\"drafts\",\"findings\":\"findings.json\",\"validation\":\"validation.json\",\"recommendation\":\"recommendation.json\",\"thread_actions\":\"thread-actions.json\",\"provider_sync\":\"services/provider-sync.json\",\"checkout\":\"services/checkout.json\",\"repo_status\":\"services/repo-status.json\",\"diff_range\":\"services/diff-range.json\",\"publish_review\":\"services/publish-review.json\"},\"notes\":[]}";
 
         try self.setFile(path, content);
         try self.setFile("global/github_pr/status.json", "{\"state\":\"done\",\"tool\":\"github_pr_ingest_event\"}");
@@ -5455,7 +5456,7 @@ const MockPrReviewAcheronState = struct {
         if (self.getFile(state_path) == null) return error.InvalidPayload;
 
         const next_state =
-            "{\"phase\":\"reviewing\",\"last_synced_head_sha\":\"def129\",\"current_focus\":\"Inspect the validation output and diff artifacts.\",\"open_threads\":[],\"latest_validation\":{\"status\":\"passed\",\"summary\":\"1 review command passed\"},\"latest_recommendation\":{\"status\":\"pending\",\"summary\":null},\"artifacts\":{\"findings\":\"findings.json\",\"validation\":\"validation.json\",\"recommendation\":\"recommendation.json\",\"thread_actions\":\"thread-actions.json\",\"provider_sync\":\"services/provider-sync.json\",\"checkout\":\"services/checkout.json\",\"repo_status\":\"services/repo-status.json\",\"diff_range\":\"services/diff-range.json\",\"publish_review\":\"services/publish-review.json\"},\"notes\":[]}";
+            "{\"phase\":\"reviewing\",\"last_synced_head_sha\":\"def129\",\"current_focus\":\"Inspect the validation output and diff artifacts.\",\"open_threads\":[],\"latest_validation\":{\"status\":\"passed\",\"summary\":\"1 review command passed\"},\"latest_draft\":{\"status\":\"pending\",\"summary\":null,\"revision\":0},\"latest_recommendation\":{\"status\":\"pending\",\"summary\":null},\"artifacts\":{\"draft_review\":\"draft-review.json\",\"draft_review_comment\":\"review-comment-draft.md\",\"draft_history_dir\":\"drafts\",\"findings\":\"findings.json\",\"validation\":\"validation.json\",\"recommendation\":\"recommendation.json\",\"thread_actions\":\"thread-actions.json\",\"provider_sync\":\"services/provider-sync.json\",\"checkout\":\"services/checkout.json\",\"repo_status\":\"services/repo-status.json\",\"diff_range\":\"services/diff-range.json\",\"publish_review\":\"services/publish-review.json\"},\"notes\":[]}";
 
         try self.setFile(path, content);
         try self.setFile(state_path, next_state);
@@ -5465,6 +5466,65 @@ const MockPrReviewAcheronState = struct {
             self.allocator,
             "{{\"ok\":true,\"operation\":\"advance\",\"result\":{{\"mission\":{{\"mission_id\":\"{s}\",\"use_case\":\"pr_review\",\"state\":\"running\"}},\"review\":{{\"phase\":\"reviewing\",\"context_path\":\"/nodes/local/fs/pr-review/state/DeanoC__Spiderweb/pr-{d}/context.json\",\"state_path\":\"/nodes/local/fs/pr-review/state/DeanoC__Spiderweb/pr-{d}/state.json\",\"artifact_root\":\"/nodes/local/fs/pr-review/runs/DeanoC__Spiderweb/pr-{d}\"}},\"runner\":{{\"status\":\"ready_for_review\",\"next_action\":\"draft_review\",\"sync\":null,\"validation\":null,\"wait\":null,\"note\":\"Deterministic PR review runner steps are complete; Spider Monkey should inspect the workspace artifacts and continue the review draft.\"}}}},\"error\":null}}",
             .{ mission_id, pr_number, pr_number, pr_number },
+        );
+    }
+
+    fn handleSaveDraft(self: *MockPrReviewAcheronState, path: []const u8, content: []const u8) ![]u8 {
+        var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, content, .{});
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidPayload;
+        const obj = parsed.value.object;
+
+        const mission_id = if (obj.get("mission_id")) |value|
+            if (value == .string and value.string.len > 0) value.string else return error.InvalidPayload
+        else
+            return error.InvalidPayload;
+        if (!std.mem.startsWith(u8, mission_id, "mission-pr-")) return error.InvalidPayload;
+        const pr_number = std.fmt.parseInt(u64, mission_id["mission-pr-".len..], 10) catch return error.InvalidPayload;
+
+        const state_path = try std.fmt.allocPrint(
+            self.allocator,
+            "nodes/local/fs/pr-review/state/DeanoC__Spiderweb/pr-{d}/state.json",
+            .{pr_number},
+        );
+        defer self.allocator.free(state_path);
+        if (self.getFile(state_path) == null) return error.InvalidPayload;
+
+        const artifact_root = try std.fmt.allocPrint(
+            self.allocator,
+            "nodes/local/fs/pr-review/runs/DeanoC__Spiderweb/pr-{d}",
+            .{pr_number},
+        );
+        defer self.allocator.free(artifact_root);
+        const draft_path = try std.fmt.allocPrint(self.allocator, "{s}/draft-review.json", .{artifact_root});
+        defer self.allocator.free(draft_path);
+        const draft_history_path = try std.fmt.allocPrint(self.allocator, "{s}/drafts/review-draft-001.json", .{artifact_root});
+        defer self.allocator.free(draft_history_path);
+        const review_comment_path = try std.fmt.allocPrint(self.allocator, "{s}/review-comment-draft.md", .{artifact_root});
+        defer self.allocator.free(review_comment_path);
+        const review_comment_history_path = try std.fmt.allocPrint(self.allocator, "{s}/drafts/review-comment-001.md", .{artifact_root});
+        defer self.allocator.free(review_comment_history_path);
+
+        const review_comment = if (obj.get("review_comment")) |value|
+            if (value == .string and value.string.len > 0) value.string else "Please add regression coverage for the new path."
+        else
+            "Please add regression coverage for the new path.";
+        const draft_payload = "{\"revision\":1,\"phase\":\"reviewing\",\"status\":\"drafted\",\"summary\":\"Flagged missing regression coverage\",\"current_focus\":\"Write the operator-facing draft review.\",\"findings\":[{\"path\":\"src/feature.zig\",\"severity\":\"medium\",\"summary\":\"Missing regression coverage for the new path\"}],\"recommendation\":{\"decision\":\"request_changes\",\"summary\":\"Add regression coverage before merge\"},\"review_comment\":\"Please add regression coverage for the new path.\",\"thread_actions\":[],\"open_threads\":[],\"notes\":[]}";
+        const next_state =
+            "{\"phase\":\"reviewing\",\"last_synced_head_sha\":\"def129\",\"current_focus\":\"Write the operator-facing draft review.\",\"open_threads\":[],\"latest_validation\":{\"status\":\"passed\",\"summary\":\"1 review command passed\"},\"latest_draft\":{\"status\":\"drafted\",\"summary\":\"Flagged missing regression coverage\",\"revision\":1},\"latest_recommendation\":{\"status\":\"pending\",\"summary\":null},\"artifacts\":{\"draft_review\":\"draft-review.json\",\"draft_review_comment\":\"review-comment-draft.md\",\"draft_history_dir\":\"drafts\",\"findings\":\"findings.json\",\"validation\":\"validation.json\",\"recommendation\":\"recommendation.json\",\"thread_actions\":\"thread-actions.json\",\"provider_sync\":\"services/provider-sync.json\",\"checkout\":\"services/checkout.json\",\"repo_status\":\"services/repo-status.json\",\"diff_range\":\"services/diff-range.json\",\"publish_review\":\"services/publish-review.json\"},\"notes\":[]}";
+
+        try self.setFile(path, content);
+        try self.setFile(draft_path, draft_payload);
+        try self.setFile(draft_history_path, draft_payload);
+        try self.setFile(review_comment_path, review_comment);
+        try self.setFile(review_comment_history_path, review_comment);
+        try self.setFile(state_path, next_state);
+        try self.setFile("global/pr_review/status.json", "{\"state\":\"done\",\"tool\":\"pr_review_save_draft\"}");
+
+        return std.fmt.allocPrint(
+            self.allocator,
+            "{{\"ok\":true,\"operation\":\"save_draft\",\"result\":{{\"mission\":{{\"mission_id\":\"{s}\",\"use_case\":\"pr_review\",\"state\":\"running\"}},\"review\":{{\"phase\":\"reviewing\",\"state_path\":\"/nodes/local/fs/pr-review/state/DeanoC__Spiderweb/pr-{d}/state.json\",\"draft_path\":\"/nodes/local/fs/pr-review/runs/DeanoC__Spiderweb/pr-{d}/draft-review.json\",\"draft_history_path\":\"/nodes/local/fs/pr-review/runs/DeanoC__Spiderweb/pr-{d}/drafts/review-draft-001.json\",\"review_comment_path\":\"/nodes/local/fs/pr-review/runs/DeanoC__Spiderweb/pr-{d}/review-comment-draft.md\",\"review_comment_history_path\":\"/nodes/local/fs/pr-review/runs/DeanoC__Spiderweb/pr-{d}/drafts/review-comment-001.md\",\"draft_revision\":1}}}},\"error\":null}}",
+            .{ mission_id, pr_number, pr_number, pr_number, pr_number, pr_number },
         );
     }
 };
@@ -5571,6 +5631,11 @@ fn mockDispatchPrReviewAcheron(
             }
         else if (std.mem.eql(u8, normalizeMockAcheronPath(path), "global/pr_review/control/advance.json"))
             state.handleAdvance(path, content) catch |err| {
+                const msg = allocator.dupe(u8, @errorName(err)) catch @panic("out of memory");
+                return .{ .failure = .{ .code = .execution_failed, .message = msg } };
+            }
+        else if (std.mem.eql(u8, normalizeMockAcheronPath(path), "global/pr_review/control/save_draft.json"))
+            state.handleSaveDraft(path, content) catch |err| {
                 const msg = allocator.dupe(u8, @errorName(err)) catch @panic("out of memory");
                 return .{ .failure = .{ .code = .execution_failed, .message = msg } };
             }
@@ -5837,6 +5902,162 @@ fn mockProviderStreamByModelWithPrReviewRunnerAcheronLoop(
     try std.testing.expect(std.mem.indexOf(u8, context.messages[0].content, "\"phase\":\"reviewing\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, context.messages[0].content, "\"status\":\"passed\"") != null);
     const output = try buildMessageOnlyOutput(allocator, "advanced pr_review mission to ready_for_review");
+    try events.append(.{ .done = .{
+        .text = output,
+        .thinking = try allocator.dupe(u8, ""),
+        .tool_calls = &.{},
+        .api = model.api,
+        .provider = model.provider,
+        .model = model.id,
+        .usage = .{},
+        .stop_reason = .stop,
+        .error_message = null,
+    } });
+}
+
+fn mockProviderStreamByModelWithPrReviewDraftAcheronLoop(
+    allocator: std.mem.Allocator,
+    _: *std.http.Client,
+    _: *ziggy_piai.api_registry.ApiRegistry,
+    model: ziggy_piai.types.Model,
+    context: ziggy_piai.types.Context,
+    _: ziggy_piai.types.StreamOptions,
+    events: *std.array_list.Managed(ziggy_piai.types.AssistantMessageEvent),
+) anyerror!void {
+    if (mockPrReviewDraftAgenticEvalCallCount == 0) {
+        mockPrReviewDraftAgenticEvalCallCount += 1;
+        const tool_calls = try allocator.alloc(ziggy_piai.types.ToolCall, 1);
+        tool_calls[0] = .{
+            .id = try allocator.dupe(u8, "call-pr-review-draft-configure"),
+            .name = try allocator.dupe(u8, "file_write"),
+            .arguments_json = try allocator.dupe(
+                u8,
+                "{\"path\":\"global/pr_review/control/configure_repo.json\",\"content\":\"{\\\"repo_key\\\":\\\"DeanoC/Spiderweb\\\",\\\"default_branch\\\":\\\"stable\\\",\\\"checkout_path\\\":\\\"/nodes/local/fs/pr-review/repos/spiderweb-configured\\\",\\\"default_review_commands\\\":[\\\"zig build test\\\"],\\\"auto_intake\\\":true}\"}",
+            ),
+        };
+        try events.append(.{ .done = .{
+            .text = try allocator.dupe(u8, ""),
+            .thinking = try allocator.dupe(u8, ""),
+            .tool_calls = tool_calls,
+            .api = model.api,
+            .provider = model.provider,
+            .model = model.id,
+            .usage = .{},
+            .stop_reason = .tool_use,
+            .error_message = null,
+        } });
+        return;
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), context.messages.len);
+    if (mockPrReviewDraftAgenticEvalCallCount == 1) {
+        try std.testing.expect(std.mem.indexOf(u8, context.messages[0].content, "\"operation\":\"configure_repo\"") != null);
+        mockPrReviewDraftAgenticEvalCallCount += 1;
+        const tool_calls = try allocator.alloc(ziggy_piai.types.ToolCall, 1);
+        tool_calls[0] = .{
+            .id = try allocator.dupe(u8, "call-pr-review-draft-ingest"),
+            .name = try allocator.dupe(u8, "file_write"),
+            .arguments_json = try allocator.dupe(
+                u8,
+                "{\"path\":\"global/github_pr/control/ingest_event.json\",\"content\":\"{\\\"repo_key\\\":\\\"DeanoC/Spiderweb\\\",\\\"pr_number\\\":129,\\\"action\\\":\\\"opened\\\"}\"}",
+            ),
+        };
+        try events.append(.{ .done = .{
+            .text = try allocator.dupe(u8, ""),
+            .thinking = try allocator.dupe(u8, ""),
+            .tool_calls = tool_calls,
+            .api = model.api,
+            .provider = model.provider,
+            .model = model.id,
+            .usage = .{},
+            .stop_reason = .tool_use,
+            .error_message = null,
+        } });
+        return;
+    }
+
+    if (mockPrReviewDraftAgenticEvalCallCount == 2) {
+        try std.testing.expect(std.mem.indexOf(u8, context.messages[0].content, "\"mission_action\":\"created\"") != null);
+        mockPrReviewDraftAgenticEvalCallCount += 1;
+        const tool_calls = try allocator.alloc(ziggy_piai.types.ToolCall, 1);
+        tool_calls[0] = .{
+            .id = try allocator.dupe(u8, "call-pr-review-draft-advance"),
+            .name = try allocator.dupe(u8, "file_write"),
+            .arguments_json = try allocator.dupe(
+                u8,
+                "{\"path\":\"global/pr_review/control/advance.json\",\"content\":\"{\\\"mission_id\\\":\\\"mission-pr-129\\\",\\\"run_validation\\\":false,\\\"provider_sync\\\":false,\\\"sync_checkout\\\":false,\\\"repo_status\\\":false,\\\"diff_range\\\":false}\"}",
+            ),
+        };
+        try events.append(.{ .done = .{
+            .text = try allocator.dupe(u8, ""),
+            .thinking = try allocator.dupe(u8, ""),
+            .tool_calls = tool_calls,
+            .api = model.api,
+            .provider = model.provider,
+            .model = model.id,
+            .usage = .{},
+            .stop_reason = .tool_use,
+            .error_message = null,
+        } });
+        return;
+    }
+
+    if (mockPrReviewDraftAgenticEvalCallCount == 3) {
+        try std.testing.expect(std.mem.indexOf(u8, context.messages[0].content, "\"next_action\":\"draft_review\"") != null);
+        mockPrReviewDraftAgenticEvalCallCount += 1;
+        const tool_calls = try allocator.alloc(ziggy_piai.types.ToolCall, 1);
+        tool_calls[0] = .{
+            .id = try allocator.dupe(u8, "call-pr-review-draft-state"),
+            .name = try allocator.dupe(u8, "file_read"),
+            .arguments_json = try allocator.dupe(
+                u8,
+                "{\"path\":\"nodes/local/fs/pr-review/state/DeanoC__Spiderweb/pr-129/state.json\",\"max_bytes\":4096}",
+            ),
+        };
+        try events.append(.{ .done = .{
+            .text = try allocator.dupe(u8, ""),
+            .thinking = try allocator.dupe(u8, ""),
+            .tool_calls = tool_calls,
+            .api = model.api,
+            .provider = model.provider,
+            .model = model.id,
+            .usage = .{},
+            .stop_reason = .tool_use,
+            .error_message = null,
+        } });
+        return;
+    }
+
+    if (mockPrReviewDraftAgenticEvalCallCount == 4) {
+        try std.testing.expect(std.mem.indexOf(u8, context.messages[0].content, "\"phase\":\"reviewing\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, context.messages[0].content, "\"revision\":0") != null);
+        mockPrReviewDraftAgenticEvalCallCount += 1;
+        const tool_calls = try allocator.alloc(ziggy_piai.types.ToolCall, 1);
+        tool_calls[0] = .{
+            .id = try allocator.dupe(u8, "call-pr-review-draft-save"),
+            .name = try allocator.dupe(u8, "file_write"),
+            .arguments_json = try allocator.dupe(
+                u8,
+                "{\"path\":\"global/pr_review/control/save_draft.json\",\"content\":\"{\\\"mission_id\\\":\\\"mission-pr-129\\\",\\\"summary\\\":\\\"Flagged missing regression coverage\\\",\\\"findings\\\":[{\\\"path\\\":\\\"src/feature.zig\\\",\\\"severity\\\":\\\"medium\\\",\\\"summary\\\":\\\"Missing regression coverage for the new path\\\"}],\\\"recommendation\\\":{\\\"decision\\\":\\\"request_changes\\\",\\\"summary\\\":\\\"Add regression coverage before merge\\\"},\\\"review_comment\\\":\\\"Please add regression coverage for the new path.\\\",\\\"thread_actions\\\":[]}\"}",
+            ),
+        };
+        try events.append(.{ .done = .{
+            .text = try allocator.dupe(u8, ""),
+            .thinking = try allocator.dupe(u8, ""),
+            .tool_calls = tool_calls,
+            .api = model.api,
+            .provider = model.provider,
+            .model = model.id,
+            .usage = .{},
+            .stop_reason = .tool_use,
+            .error_message = null,
+        } });
+        return;
+    }
+
+    try std.testing.expect(std.mem.indexOf(u8, context.messages[0].content, "\"operation\":\"save_draft\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, context.messages[0].content, "\"draft_revision\":1") != null);
+    const output = try buildMessageOnlyOutput(allocator, "saved pr_review draft through save_draft.json");
     try events.append(.{ .done = .{
         .text = output,
         .thinking = try allocator.dupe(u8, ""),
@@ -8350,6 +8571,65 @@ test "runtime_server: agentic pr_review eval advances mission to ready_for_revie
     const state_json = acheron_state.getFile("nodes/local/fs/pr-review/state/DeanoC__Spiderweb/pr-129/state.json") orelse return error.TestExpectedResponse;
     try std.testing.expect(std.mem.indexOf(u8, state_json, "\"phase\":\"reviewing\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, state_json, "\"status\":\"passed\"") != null);
+}
+
+test "runtime_server: agentic pr_review eval persists a draft after ready_for_review" {
+    const allocator = std.testing.allocator;
+    const original_stream_fn = streamByModelFn;
+    defer streamByModelFn = original_stream_fn;
+    streamByModelFn = mockProviderStreamByModelWithPrReviewDraftAcheronLoop;
+    mockPrReviewDraftAgenticEvalCallCount = 0;
+
+    var acheron_state = MockPrReviewAcheronState.init(allocator);
+    defer acheron_state.deinit();
+
+    const server = try RuntimeServer.createWithProviderAndToolDispatch(
+        allocator,
+        "agent-pr-review-draft-eval",
+        .{
+            .ltm_directory = "",
+            .ltm_filename = "",
+        },
+        .{
+            .name = "openai",
+            .model = "gpt-4o-mini",
+            .api_key = "test-key",
+        },
+        &acheron_state,
+        mockDispatchPrReviewAcheron,
+    );
+    defer server.destroy();
+
+    const frames = try server.handleMessageFrames(
+        "{\"id\":\"req-agentic-pr-review-draft\",\"type\":\"agent.run.start\",\"content\":\"Onboard the repository, ingest the PR event, advance the mission, and save the draft review through Acheron.\"}",
+    );
+    defer deinitResponseFrames(allocator, frames);
+
+    var saw_completed_state = false;
+    var saw_final_message = false;
+    for (frames) |payload| {
+        if (std.mem.indexOf(u8, payload, "\"type\":\"agent.run.state\"") != null and
+            std.mem.indexOf(u8, payload, "\"state\":\"completed\"") != null)
+        {
+            saw_completed_state = true;
+        }
+        if (std.mem.indexOf(u8, payload, "saved pr_review draft through save_draft.json") != null) {
+            saw_final_message = true;
+        }
+    }
+
+    try std.testing.expect(saw_completed_state);
+    try std.testing.expect(saw_final_message);
+
+    const state_json = acheron_state.getFile("nodes/local/fs/pr-review/state/DeanoC__Spiderweb/pr-129/state.json") orelse return error.TestExpectedResponse;
+    try std.testing.expect(std.mem.indexOf(u8, state_json, "\"revision\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, state_json, "\"status\":\"drafted\"") != null);
+
+    const draft_json = acheron_state.getFile("nodes/local/fs/pr-review/runs/DeanoC__Spiderweb/pr-129/draft-review.json") orelse return error.TestExpectedResponse;
+    try std.testing.expect(std.mem.indexOf(u8, draft_json, "\"decision\":\"request_changes\"") != null);
+
+    const comment_md = acheron_state.getFile("nodes/local/fs/pr-review/runs/DeanoC__Spiderweb/pr-129/review-comment-draft.md") orelse return error.TestExpectedResponse;
+    try std.testing.expect(std.mem.indexOf(u8, comment_md, "regression coverage") != null);
 }
 
 test "runtime_server: file_write chat reply payload short-circuits provider loop to session.receive" {

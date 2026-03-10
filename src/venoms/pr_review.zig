@@ -11,6 +11,7 @@ pub const Op = enum {
     sync,
     run_validation,
     record_validation,
+    draft_review,
     save_draft,
     record_review,
     advance,
@@ -21,13 +22,13 @@ pub fn seedNamespace(self: anytype, pr_review_dir: u32) !void {
         pr_review_dir,
         "PR Review",
         "{\"kind\":\"venom\",\"venom_id\":\"pr_review\",\"shape\":\"/global/pr_review/{README.md,SCHEMA.json,CAPS.json,OPS.json,PERMISSIONS.json,STATUS.json,status.json,result.json,control/*}\"}",
-        "{\"invoke\":true,\"operations\":[\"pr_review_configure_repo\",\"pr_review_get_repo\",\"pr_review_list_repos\",\"pr_review_intake\",\"pr_review_start\",\"pr_review_sync\",\"pr_review_run_validation\",\"pr_review_record_validation\",\"pr_review_save_draft\",\"pr_review_record_review\",\"pr_review_advance\"],\"discoverable\":true,\"persistent\":true}",
+        "{\"invoke\":true,\"operations\":[\"pr_review_configure_repo\",\"pr_review_get_repo\",\"pr_review_list_repos\",\"pr_review_intake\",\"pr_review_start\",\"pr_review_sync\",\"pr_review_run_validation\",\"pr_review_record_validation\",\"pr_review_draft_review\",\"pr_review_save_draft\",\"pr_review_record_review\",\"pr_review_advance\"],\"discoverable\":true,\"persistent\":true}",
         "Start PR review missions as a thin use-case venom layered over /global/missions.",
     );
     _ = try self.addFile(
         pr_review_dir,
         "OPS.json",
-        "{\"model\":\"local_bridge\",\"invoke\":\"control/invoke.json\",\"transport\":\"acheron-local\",\"paths\":{\"configure_repo\":\"control/configure_repo.json\",\"get_repo\":\"control/get_repo.json\",\"list_repos\":\"control/list_repos.json\",\"intake\":\"control/intake.json\",\"start\":\"control/start.json\",\"sync\":\"control/sync.json\",\"run_validation\":\"control/run_validation.json\",\"record_validation\":\"control/record_validation.json\",\"save_draft\":\"control/save_draft.json\",\"record_review\":\"control/record_review.json\",\"advance\":\"control/advance.json\"},\"operations\":{\"configure_repo\":\"pr_review_configure_repo\",\"get_repo\":\"pr_review_get_repo\",\"list_repos\":\"pr_review_list_repos\",\"intake\":\"pr_review_intake\",\"start\":\"pr_review_start\",\"sync\":\"pr_review_sync\",\"run_validation\":\"pr_review_run_validation\",\"record_validation\":\"pr_review_record_validation\",\"save_draft\":\"pr_review_save_draft\",\"record_review\":\"pr_review_record_review\",\"advance\":\"pr_review_advance\"}}",
+        "{\"model\":\"local_bridge\",\"invoke\":\"control/invoke.json\",\"transport\":\"acheron-local\",\"paths\":{\"configure_repo\":\"control/configure_repo.json\",\"get_repo\":\"control/get_repo.json\",\"list_repos\":\"control/list_repos.json\",\"intake\":\"control/intake.json\",\"start\":\"control/start.json\",\"sync\":\"control/sync.json\",\"run_validation\":\"control/run_validation.json\",\"record_validation\":\"control/record_validation.json\",\"draft_review\":\"control/draft_review.json\",\"save_draft\":\"control/save_draft.json\",\"record_review\":\"control/record_review.json\",\"advance\":\"control/advance.json\"},\"operations\":{\"configure_repo\":\"pr_review_configure_repo\",\"get_repo\":\"pr_review_get_repo\",\"list_repos\":\"pr_review_list_repos\",\"intake\":\"pr_review_intake\",\"start\":\"pr_review_start\",\"sync\":\"pr_review_sync\",\"run_validation\":\"pr_review_run_validation\",\"record_validation\":\"pr_review_record_validation\",\"draft_review\":\"pr_review_draft_review\",\"save_draft\":\"pr_review_save_draft\",\"record_review\":\"pr_review_record_review\",\"advance\":\"pr_review_advance\"}}",
         false,
         .none,
     );
@@ -71,7 +72,7 @@ pub fn seedNamespace(self: anytype, pr_review_dir: u32) !void {
     _ = try self.addFile(
         control_dir,
         "README.md",
-        "Use configure_repo.json, get_repo.json, list_repos.json, intake.json, start.json, sync.json, run_validation.json, record_validation.json, save_draft.json, record_review.json, advance.json, or invoke.json with the same op names to drive the PR review use-case venom over Acheron.\n",
+        "Use configure_repo.json, get_repo.json, list_repos.json, intake.json, start.json, sync.json, run_validation.json, record_validation.json, draft_review.json, save_draft.json, record_review.json, advance.json, or invoke.json with the same op names to drive the PR review use-case venom over Acheron.\n",
         false,
         .none,
     );
@@ -84,6 +85,7 @@ pub fn seedNamespace(self: anytype, pr_review_dir: u32) !void {
     _ = try self.addFile(control_dir, "sync.json", "", true, .pr_review_sync);
     _ = try self.addFile(control_dir, "run_validation.json", "", true, .pr_review_run_validation);
     _ = try self.addFile(control_dir, "record_validation.json", "", true, .pr_review_record_validation);
+    _ = try self.addFile(control_dir, "draft_review.json", "", true, .pr_review_draft_review);
     _ = try self.addFile(control_dir, "save_draft.json", "", true, .pr_review_save_draft);
     _ = try self.addFile(control_dir, "record_review.json", "", true, .pr_review_record_review);
     _ = try self.addFile(control_dir, "advance.json", "", true, .pr_review_advance);
@@ -99,6 +101,7 @@ pub fn parseOp(raw: []const u8) ?Op {
     if (std.mem.eql(u8, value, "sync") or std.mem.eql(u8, value, "pr_review_sync")) return .sync;
     if (std.mem.eql(u8, value, "run_validation") or std.mem.eql(u8, value, "pr_review_run_validation")) return .run_validation;
     if (std.mem.eql(u8, value, "record_validation") or std.mem.eql(u8, value, "pr_review_record_validation")) return .record_validation;
+    if (std.mem.eql(u8, value, "draft_review") or std.mem.eql(u8, value, "pr_review_draft_review")) return .draft_review;
     if (std.mem.eql(u8, value, "save_draft") or std.mem.eql(u8, value, "pr_review_save_draft")) return .save_draft;
     if (std.mem.eql(u8, value, "record_review") or std.mem.eql(u8, value, "pr_review_record_review")) return .record_review;
     if (std.mem.eql(u8, value, "advance") or std.mem.eql(u8, value, "pr_review_advance")) return .advance;
@@ -115,6 +118,7 @@ pub fn operationName(op: Op) []const u8 {
         .sync => "sync",
         .run_validation => "run_validation",
         .record_validation => "record_validation",
+        .draft_review => "draft_review",
         .save_draft => "save_draft",
         .record_review => "record_review",
         .advance => "advance",
@@ -131,6 +135,7 @@ pub fn statusToolName(op: Op) []const u8 {
         .sync => "pr_review_sync",
         .run_validation => "pr_review_run_validation",
         .record_validation => "pr_review_record_validation",
+        .draft_review => "pr_review_draft_review",
         .save_draft => "pr_review_save_draft",
         .record_review => "pr_review_record_review",
         .advance => "pr_review_advance",
@@ -147,6 +152,7 @@ pub fn executeOpPayload(self: anytype, op: Op, args_obj: std.json.ObjectMap) ![]
         .sync => executeSyncOp(self, args_obj),
         .run_validation => executeRunValidationOp(self, args_obj),
         .record_validation => executeRecordValidationOp(self, args_obj),
+        .draft_review => executeDraftReviewOp(self, args_obj),
         .save_draft => executeSaveDraftOp(self, args_obj),
         .record_review => executeRecordReviewOp(self, args_obj),
         .advance => executeAdvanceOp(self, args_obj),
@@ -1890,6 +1896,77 @@ pub fn buildPrReviewDraftDetailJson(
     );
 }
 
+pub fn buildPrReviewAgenticDraftDetailJson(
+    self: anytype,
+    mission_json: []const u8,
+    phase: []const u8,
+    state_path: []const u8,
+    draft_status: []const u8,
+    draft_summary: ?[]const u8,
+    draft_path: ?[]const u8,
+    revision: u64,
+    action: []const u8,
+    run_id: ?[]const u8,
+    run_state: ?[]const u8,
+    assistant_output: ?[]const u8,
+) ![]u8 {
+    const draft_summary_json = if (draft_summary) |value|
+        try self.formatJsonString(value)
+    else
+        try self.allocator.dupe(u8, "null");
+    defer self.allocator.free(draft_summary_json);
+    const draft_path_json = if (draft_path) |value| blk: {
+        const escaped = try unified.jsonEscape(self.allocator, value);
+        defer self.allocator.free(escaped);
+        break :blk try std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped});
+    } else try self.allocator.dupe(u8, "null");
+    defer self.allocator.free(draft_path_json);
+    const run_id_json = if (run_id) |value| blk: {
+        const escaped = try unified.jsonEscape(self.allocator, value);
+        defer self.allocator.free(escaped);
+        break :blk try std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped});
+    } else try self.allocator.dupe(u8, "null");
+    defer self.allocator.free(run_id_json);
+    const run_state_json = if (run_state) |value| blk: {
+        const escaped = try unified.jsonEscape(self.allocator, value);
+        defer self.allocator.free(escaped);
+        break :blk try std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped});
+    } else try self.allocator.dupe(u8, "null");
+    defer self.allocator.free(run_state_json);
+    const assistant_output_json = if (assistant_output) |value|
+        try self.formatJsonString(value)
+    else
+        try self.allocator.dupe(u8, "null");
+    defer self.allocator.free(assistant_output_json);
+
+    var out = std.ArrayListUnmanaged(u8){};
+    errdefer out.deinit(self.allocator);
+    const writer = out.writer(self.allocator);
+    try writer.writeAll("{\"mission\":");
+    try writer.writeAll(mission_json);
+    try writer.writeAll(",\"review\":{\"phase\":");
+    try writeJsonString(writer, phase);
+    try writer.writeAll(",\"state_path\":");
+    try writeJsonString(writer, state_path);
+    try writer.writeAll(",\"draft_status\":");
+    try writeJsonString(writer, draft_status);
+    try writer.writeAll(",\"draft_summary\":");
+    try writer.writeAll(draft_summary_json);
+    try writer.writeAll(",\"draft_path\":");
+    try writer.writeAll(draft_path_json);
+    try writer.print(",\"draft_revision\":{d}", .{revision});
+    try writer.writeAll(",\"agentic_action\":");
+    try writeJsonString(writer, action);
+    try writer.writeAll("},\"runtime\":{\"run_id\":");
+    try writer.writeAll(run_id_json);
+    try writer.writeAll(",\"state\":");
+    try writer.writeAll(run_state_json);
+    try writer.writeAll(",\"assistant_output\":");
+    try writer.writeAll(assistant_output_json);
+    try writer.writeAll("}}");
+    return out.toOwnedSlice(self.allocator);
+}
+
 pub fn buildPrReviewReviewDetailJson(
     self: anytype,
     mission_json: []const u8,
@@ -2781,6 +2858,109 @@ fn executeRecordValidationOp(self: anytype, args_obj: std.json.ObjectMap) ![]u8 
     return self.buildPrReviewSuccessResultJson(.record_validation, detail);
 }
 
+fn executeDraftReviewOp(self: anytype, args_obj: std.json.ObjectMap) ![]u8 {
+    const store = self.mission_store orelse return error.InvalidPayload;
+    const mission_id = extractOptionalStringByNames(args_obj, &[_][]const u8{ "mission_id", "id" }) orelse return error.InvalidPayload;
+
+    var mission = (try store.getOwned(self.allocator, mission_id)) orelse return error.NotFound;
+    var contract = try self.resolvePrReviewMissionContract(mission);
+    var state = try self.loadPrReviewStateSnapshot(contract.state_path);
+    const prior_revision = state.latest_draft_revision;
+    const action = if (prior_revision > 0) "revise_review" else "draft_review";
+
+    const explicit_goal = extractOptionalStringByNames(args_obj, &[_][]const u8{ "goal", "content", "instructions" });
+    const goal = if (explicit_goal) |value|
+        try self.allocator.dupe(u8, std.mem.trim(u8, value, " \t\r\n"))
+    else
+        try buildPrReviewAgenticGoal(
+            self,
+            mission_id,
+            contract.context_path,
+            contract.state_path,
+            contract.artifact_root,
+            state,
+            action,
+        );
+    defer self.allocator.free(goal);
+    if (goal.len == 0) return error.InvalidPayload;
+
+    const resume_run_id = extractOptionalStringByNames(args_obj, &[_][]const u8{
+        "resume_run_id",
+        "agent_run_id",
+    });
+    var run = try self.executeAgentRun(goal, resume_run_id);
+
+    const refreshed_mission = (try store.getOwned(self.allocator, mission_id)) orelse return error.NotFound;
+    mission.deinit(self.allocator);
+    mission = refreshed_mission;
+
+    const refreshed_state = try self.loadPrReviewStateSnapshot(contract.state_path);
+    state.deinit(self.allocator);
+    state = refreshed_state;
+
+    const mission_json = try self.buildMissionRecordJson(mission);
+    defer self.allocator.free(mission_json);
+    const draft_path = if (state.latest_draft_revision > 0)
+        try resolvePrReviewArtifactPath(self, contract.artifact_root, state.draft_review_artifact)
+    else
+        null;
+    defer if (draft_path) |value| self.allocator.free(value);
+
+    const detail = switch (run) {
+        .success => |success| try buildPrReviewAgenticDraftDetailJson(
+            self,
+            mission_json,
+            state.phase,
+            contract.state_path,
+            state.latest_draft_status,
+            state.latest_draft_summary,
+            draft_path,
+            state.latest_draft_revision,
+            action,
+            success.run_id,
+            success.state,
+            success.assistant_output,
+        ),
+        .failure => |failure| try buildPrReviewAgenticDraftDetailJson(
+            self,
+            mission_json,
+            state.phase,
+            contract.state_path,
+            state.latest_draft_status,
+            state.latest_draft_summary,
+            draft_path,
+            state.latest_draft_revision,
+            action,
+            null,
+            null,
+            failure.message,
+        ),
+    };
+    defer self.allocator.free(detail);
+    defer contract.deinit(self.allocator);
+    defer state.deinit(self.allocator);
+    defer mission.deinit(self.allocator);
+    defer run.deinit(self.allocator);
+
+    switch (run) {
+        .failure => |failure| {
+            return self.buildPrReviewPartialFailureResultJson(.draft_review, detail, failure.code, failure.message);
+        },
+        .success => {},
+    }
+
+    if (state.latest_draft_revision <= prior_revision) {
+        return self.buildPrReviewPartialFailureResultJson(
+            .draft_review,
+            detail,
+            "draft_not_saved",
+            "Spider Monkey did not persist a PR review draft via save_draft.json",
+        );
+    }
+
+    return self.buildPrReviewSuccessResultJson(.draft_review, detail);
+}
+
 fn executeSaveDraftOp(self: anytype, args_obj: std.json.ObjectMap) ![]u8 {
     const store = self.mission_store orelse return error.InvalidPayload;
     const mission_id = extractOptionalStringByNames(args_obj, &[_][]const u8{ "mission_id", "id" }) orelse return error.InvalidPayload;
@@ -3328,6 +3508,53 @@ fn executeAdvanceOp(self: anytype, args_obj: std.json.ObjectMap) ![]u8 {
     );
     defer self.allocator.free(detail);
     return self.buildPrReviewSuccessResultJson(.advance, detail);
+}
+
+fn buildPrReviewAgenticGoal(
+    self: anytype,
+    mission_id: []const u8,
+    context_path: []const u8,
+    state_path: []const u8,
+    artifact_root: []const u8,
+    state: StateSnapshot,
+    action: []const u8,
+) ![]u8 {
+    const draft_path = try resolvePrReviewArtifactPath(self, artifact_root, state.draft_review_artifact);
+    defer self.allocator.free(draft_path);
+    const validation_path = try resolvePrReviewArtifactPath(self, artifact_root, state.validation_artifact);
+    defer self.allocator.free(validation_path);
+    const repo_status_path = try resolvePrReviewArtifactPath(self, artifact_root, state.repo_status_artifact);
+    defer self.allocator.free(repo_status_path);
+    const diff_range_path = try resolvePrReviewArtifactPath(self, artifact_root, state.diff_range_artifact);
+    defer self.allocator.free(diff_range_path);
+    const review_comment_path = try resolvePrReviewArtifactPath(self, artifact_root, state.draft_review_comment_artifact);
+    defer self.allocator.free(review_comment_path);
+
+    return std.fmt.allocPrint(
+        self.allocator,
+        "Continue PR review mission {s}.\n" ++
+            "Read {s} and {s} first.\n" ++
+            "Then read /global/library/use-cases/pr-review/README.md.\n" ++
+            "Inspect the latest review artifacts under {s}, especially {s}, {s}, and {s}.\n" ++
+            "Current phase: {s}. Current focus: {s}.\n" ++
+            "Use /global/pr_review/control/save_draft.json to {s} the review draft and update {s} plus {s}.\n" ++
+            "Persist concrete findings, a recommendation object, and a review_comment draft.\n" ++
+            "Do not publish or finalize the review yet. If evidence is missing, capture the blocker in the saved draft summary.",
+        .{
+            mission_id,
+            context_path,
+            state_path,
+            artifact_root,
+            validation_path,
+            repo_status_path,
+            diff_range_path,
+            state.phase,
+            state.current_focus,
+            action,
+            draft_path,
+            review_comment_path,
+        },
+    );
 }
 
 fn executeAdvanceSync(self: anytype, mission_id: []const u8, phase: []const u8, args_obj: std.json.ObjectMap) ![]u8 {

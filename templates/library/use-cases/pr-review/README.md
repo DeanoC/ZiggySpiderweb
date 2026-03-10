@@ -16,6 +16,7 @@ Service entrypoint:
 - `/global/pr_review/control/sync.json`
 - `/global/pr_review/control/run_validation.json`
 - `/global/pr_review/control/record_validation.json`
+- `/global/pr_review/control/draft_review.json`
 - `/global/pr_review/control/save_draft.json`
 - `/global/pr_review/control/record_review.json`
 - `/global/pr_review/control/advance.json`
@@ -66,15 +67,16 @@ Suggested loop:
 8. Use `/global/pr_review/control/sync.json` when you need lower-level control over provider/repo sync, or when a higher-level agent wants to override the deterministic runner step.
 9. Use `/global/pr_review/control/run_validation.json` to execute the configured review commands through `/global/terminal`, persist per-command service captures, and refresh the latest validation summary in state.
 10. Use `/global/pr_review/control/record_validation.json` only when a higher-level agent wants to write a custom validation artifact instead of running commands through the built-in validation runner.
-11. Use `/global/pr_review/control/save_draft.json` to persist an evolving review draft, keep the latest draft files current, and write immutable revision snapshots under `drafts/`.
-12. Use `/global/pr_review/control/record_review.json` to persist findings, recommendation, review-comment drafts, thread-action snapshots, and optionally `publish_review`.
-13. Discover available services through `/global/venoms/VENOMS.json`.
-14. Use `/global/git/control/sync_checkout.json` to create or refresh the repo checkout under the mission workspace.
-15. Use `/global/github_pr/control/sync.json` to load provider PR metadata when GitHub context needs to be refreshed.
-16. Use `/global/git/control/status.json` and `/global/git/control/diff_range.json` for deterministic changed-file and branch-state inspection.
-17. Use mounted terminal, search, and memory services to validate findings and gather supporting evidence.
-18. Use `/global/github_pr/control/publish_review.json` for top-level review publication when policy allows it.
-19. Request approval through `/global/missions/control/request_approval.json` before push or merge when policy requires it.
+11. Use `/global/pr_review/control/draft_review.json` when you want Spider Monkey to read the mission contract, inspect the saved artifacts, and persist the next review draft through Acheron.
+12. Use `/global/pr_review/control/save_draft.json` to persist an evolving review draft directly, keep the latest draft files current, and write immutable revision snapshots under `drafts/`.
+13. Use `/global/pr_review/control/record_review.json` to persist findings, recommendation, review-comment drafts, thread-action snapshots, and optionally `publish_review`.
+14. Discover available services through `/global/venoms/VENOMS.json`.
+15. Use `/global/git/control/sync_checkout.json` to create or refresh the repo checkout under the mission workspace.
+16. Use `/global/github_pr/control/sync.json` to load provider PR metadata when GitHub context needs to be refreshed.
+17. Use `/global/git/control/status.json` and `/global/git/control/diff_range.json` for deterministic changed-file and branch-state inspection.
+18. Use mounted terminal, search, and memory services to validate findings and gather supporting evidence.
+19. Use `/global/github_pr/control/publish_review.json` for top-level review publication when policy allows it.
+20. Request approval through `/global/missions/control/request_approval.json` before push or merge when policy requires it.
 
 Example orchestration payloads:
 
