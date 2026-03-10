@@ -4,7 +4,7 @@ Two namespaces cover agent topology management:
 
 - `/global/agents` for agent inventory and creation
 - `/global/sub_brains` for per-agent sub-brain lifecycle
-- `/global/projects` for project list/get/up bootstrap and lifecycle operations
+- `/global/workspaces` for workspace list/get/up bootstrap and lifecycle operations
 
 Common operation mapping:
 
@@ -12,7 +12,7 @@ Common operation mapping:
 - `create` (agents): create a new managed agent workspace
 - `upsert` (sub_brains): create or update a sub-brain config
 - `delete` (sub_brains): remove a sub-brain config
-- `up` (projects): create/update a project entry and optional activation settings
+- `up` (workspaces): create/update a workspace entry and optional activation settings
 
 Capability and permission notes:
 

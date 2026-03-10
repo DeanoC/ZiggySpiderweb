@@ -2,6 +2,7 @@ const std = @import("std");
 const unified = @import("spider-protocol").unified;
 
 const chat_job_index = @import("../agents/chat_job_index.zig");
+const local_jobs_root = "/nodes/local/venoms/jobs";
 
 pub fn buildJobWaitEventPayload(
     allocator: std.mem.Allocator,
@@ -18,9 +19,9 @@ pub fn buildJobWaitEventPayload(
     defer allocator.free(job_id_escaped);
     const state_escaped = try unified.jsonEscape(allocator, chat_job_index.jobStateName(view.state));
     defer allocator.free(state_escaped);
-    const status_path = try std.fmt.allocPrint(allocator, "/global/jobs/{s}/status.json", .{view.job_id});
+    const status_path = try std.fmt.allocPrint(allocator, "{s}/{s}/status.json", .{ local_jobs_root, view.job_id });
     defer allocator.free(status_path);
-    const result_path = try std.fmt.allocPrint(allocator, "/global/jobs/{s}/result.txt", .{view.job_id});
+    const result_path = try std.fmt.allocPrint(allocator, "{s}/{s}/result.txt", .{ local_jobs_root, view.job_id });
     defer allocator.free(result_path);
     const status_path_escaped = try unified.jsonEscape(allocator, status_path);
     defer allocator.free(status_path_escaped);
@@ -82,9 +83,9 @@ pub fn buildTerminalJobWaitEventPayload(
     defer allocator.free(job_id_escaped);
     const state_escaped = try unified.jsonEscape(allocator, chat_job_index.jobStateName(event.state));
     defer allocator.free(state_escaped);
-    const status_path = try std.fmt.allocPrint(allocator, "/global/jobs/{s}/status.json", .{event.job_id});
+    const status_path = try std.fmt.allocPrint(allocator, "{s}/{s}/status.json", .{ local_jobs_root, event.job_id });
     defer allocator.free(status_path);
-    const result_path = try std.fmt.allocPrint(allocator, "/global/jobs/{s}/result.txt", .{event.job_id});
+    const result_path = try std.fmt.allocPrint(allocator, "{s}/{s}/result.txt", .{ local_jobs_root, event.job_id });
     defer allocator.free(result_path);
     const status_path_escaped = try unified.jsonEscape(allocator, status_path);
     defer allocator.free(status_path_escaped);

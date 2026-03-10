@@ -6,6 +6,7 @@ const runtime_server_mod = @import("../agents/runtime_server.zig");
 const runtime_handle_mod = @import("../agents/runtime_handle.zig");
 const chat_job_index = @import("../agents/chat_job_index.zig");
 const chat_runtime_job = @import("../agents/chat_runtime_job.zig");
+const tool_executor_mod = @import("ziggy-tool-runtime").tool_executor;
 const job_projection = @import("job_projection.zig");
 const shared_node = @import("spiderweb_node");
 const workspace_policy = @import("../workspaces/policy.zig");
@@ -13,6 +14,23 @@ const control_plane_mod = @import("control_plane.zig");
 const acheron_router = @import("router.zig");
 const agent_config = @import("../agents/agent_config.zig");
 const agent_registry = @import("../agents/agent_registry.zig");
+const memory_ownership = @import("../agents/memory_ownership.zig");
+const mission_store_mod = @import("../mission_store.zig");
+const memory_venom = @import("../venoms/memory.zig");
+const search_services_venom = @import("../venoms/search_services.zig");
+const chat_venom = @import("../venoms/chat.zig");
+const events_venom = @import("../venoms/events.zig");
+const pairing_venom = @import("../venoms/pairing.zig");
+const jobs_venom = @import("../venoms/jobs.zig");
+const terminal_venom = @import("../venoms/terminal.zig");
+const mounts_venom = @import("../venoms/mounts.zig");
+const sub_brains_venom = @import("../venoms/sub_brains.zig");
+const agents_venom = @import("../venoms/agents.zig");
+const workspaces_venom = @import("../venoms/workspaces.zig");
+const git_venom = @import("../venoms/git.zig");
+const github_pr_venom = @import("../venoms/github_pr.zig");
+const missions_venom = @import("../venoms/missions.zig");
+const pr_review_venom = @import("../venoms/pr_review.zig");
 
 const NodeKind = enum {
     dir,
@@ -50,6 +68,44 @@ const SpecialKind = enum {
     projects_list,
     projects_get,
     projects_up,
+    git_invoke,
+    git_sync_checkout,
+    git_status,
+    git_diff_range,
+    github_pr_invoke,
+    github_pr_sync,
+    github_pr_ingest_event,
+    github_pr_publish_review,
+    pr_review_invoke,
+    pr_review_configure_repo,
+    pr_review_get_repo,
+    pr_review_list_repos,
+    pr_review_intake,
+    pr_review_start,
+    pr_review_sync,
+    pr_review_run_validation,
+    pr_review_record_validation,
+    pr_review_draft_review,
+    pr_review_save_draft,
+    pr_review_record_review,
+    pr_review_advance,
+    missions_invoke,
+    missions_invoke_service,
+    missions_create,
+    missions_list,
+    missions_get,
+    missions_heartbeat,
+    missions_checkpoint,
+    missions_bootstrap_contract,
+    missions_recover,
+    missions_request_approval,
+    missions_approve,
+    missions_reject,
+    missions_resume,
+    missions_block,
+    missions_complete,
+    missions_fail,
+    missions_cancel,
     mounts_invoke,
     mounts_list,
     mounts_mount,
@@ -76,11 +132,10 @@ const SpecialKind = enum {
     terminal_v2_resize,
 };
 
-const default_wait_timeout_ms: i64 = 60_000;
-const wait_poll_interval_ms: u64 = 100;
+const default_wait_timeout_ms: i64 = events_venom.default_wait_timeout_ms;
+const wait_poll_interval_ms: u64 = events_venom.wait_poll_interval_ms;
 const debug_stream_log_max_bytes: usize = 2 * 1024 * 1024;
-const max_agent_id_len: usize = 64;
-const max_signal_events: usize = 512;
+const max_signal_events: usize = events_venom.max_signal_events;
 const local_fs_world_prefix = "/nodes/local/fs";
 
 const sub_brains_manage_capabilities = [_][]const u8{
@@ -103,68 +158,11 @@ const agent_create_capabilities = [_][]const u8{
     "plan",
 };
 
-const WaitSourceKind = enum {
-    chat_input,
-    job_status,
-    job_result,
-    time_after,
-    time_at,
-    agent_signal,
-    hook_signal,
-    user_signal,
-};
-
-const WaitSource = struct {
-    raw_path: []u8,
-    kind: WaitSourceKind,
-    job_id: ?[]u8 = null,
-    parameter: ?[]u8 = null,
-    target_time_ms: i64 = 0,
-    last_seen_updated_at_ms: i64 = 0,
-    last_seen_job_event_seq: u64 = 0,
-    last_seen_signal_seq: u64 = 0,
-
-    fn deinit(self: *WaitSource, allocator: std.mem.Allocator) void {
-        allocator.free(self.raw_path);
-        if (self.job_id) |value| allocator.free(value);
-        if (self.parameter) |value| allocator.free(value);
-        self.* = undefined;
-    }
-};
-
-const SignalEventType = enum {
-    user,
-    agent,
-    hook,
-};
-
-const SignalEvent = struct {
-    seq: u64,
-    event_type: SignalEventType,
-    parameter: ?[]u8 = null,
-    payload_json: ?[]u8 = null,
-    created_at_ms: i64,
-
-    fn deinit(self: *SignalEvent, allocator: std.mem.Allocator) void {
-        if (self.parameter) |value| allocator.free(value);
-        if (self.payload_json) |value| allocator.free(value);
-        self.* = undefined;
-    }
-};
-
-const WaitCandidate = struct {
-    source_index: usize,
-    sort_key_ms: i64,
-    payload_json: []u8,
-    next_last_seen_updated_at_ms: ?i64 = null,
-    next_last_seen_job_event_seq: ?u64 = null,
-    next_last_seen_signal_seq: ?u64 = null,
-
-    fn deinit(self: *WaitCandidate, allocator: std.mem.Allocator) void {
-        allocator.free(self.payload_json);
-        self.* = undefined;
-    }
-};
+const WaitSourceKind = events_venom.WaitSourceKind;
+const WaitSource = events_venom.WaitSource;
+const SignalEventType = events_venom.SignalEventType;
+const SignalEvent = events_venom.SignalEvent;
+const WaitCandidate = events_venom.WaitCandidate;
 
 const WriteOutcome = struct {
     written: usize,
@@ -238,52 +236,9 @@ const ScopedVenomBinding = struct {
     }
 };
 
-const PairingAction = enum {
-    refresh,
-    approve,
-    deny,
-    invites_refresh,
-    invites_create,
-};
+const PairingAction = pairing_venom.Action;
 
-const TerminalInvokeOp = enum {
-    exec,
-    create_session,
-    resume_session,
-    close_session,
-    write_session,
-    read_session,
-    resize_session,
-};
-
-const TerminalSession = struct {
-    label: ?[]u8 = null,
-    cwd: ?[]u8 = null,
-    buffered_result: ?[]u8 = null,
-    replay_script: ?[]u8 = null,
-    pending_input: ?[]u8 = null,
-    created_at_ms: i64 = 0,
-    updated_at_ms: i64 = 0,
-    last_exec_at_ms: i64 = 0,
-    last_read_at_ms: i64 = 0,
-    closed_at_ms: i64 = 0,
-    exec_count: u64 = 0,
-    write_count: u64 = 0,
-    read_count: u64 = 0,
-
-    fn deinit(self: *TerminalSession, allocator: std.mem.Allocator) void {
-        if (self.label) |value| allocator.free(value);
-        if (self.cwd) |value| allocator.free(value);
-        if (self.buffered_result) |value| allocator.free(value);
-        if (self.replay_script) |value| allocator.free(value);
-        if (self.pending_input) |value| allocator.free(value);
-        self.* = undefined;
-    }
-
-    fn isClosed(self: TerminalSession) bool {
-        return self.closed_at_ms != 0;
-    }
-};
+const TerminalSession = terminal_venom.SessionState;
 
 const Node = struct {
     id: u32,
@@ -309,6 +264,60 @@ const FidState = struct {
     mode: []const u8 = "r",
 };
 
+pub const ToolPayloadErrorInfo = struct {
+    code: []u8,
+    message: []u8,
+
+    pub fn deinit(self: ToolPayloadErrorInfo, allocator: std.mem.Allocator) void {
+        allocator.free(self.code);
+        allocator.free(self.message);
+    }
+};
+
+pub const AgentRunSuccessInfo = struct {
+    run_id: []u8,
+    state: []u8,
+    assistant_output: ?[]u8 = null,
+    step_count: u64 = 0,
+    checkpoint_seq: u64 = 0,
+
+    pub fn deinit(self: *AgentRunSuccessInfo, allocator: std.mem.Allocator) void {
+        allocator.free(self.run_id);
+        allocator.free(self.state);
+        if (self.assistant_output) |value| allocator.free(value);
+        self.* = undefined;
+    }
+};
+
+pub const AgentRunOutcome = union(enum) {
+    success: AgentRunSuccessInfo,
+    failure: ToolPayloadErrorInfo,
+
+    pub fn deinit(self: *AgentRunOutcome, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .success => |*value| value.deinit(allocator),
+            .failure => |value| value.deinit(allocator),
+        }
+        self.* = undefined;
+    }
+};
+
+pub const InternalFsrpcErrorInfo = struct {
+    code: []u8,
+    message: []u8,
+
+    pub fn deinit(self: InternalFsrpcErrorInfo, allocator: std.mem.Allocator) void {
+        allocator.free(self.code);
+        allocator.free(self.message);
+    }
+};
+
+const InternalFsrpcIds = struct {
+    attach_fid: u32,
+    walk_fid: u32,
+    tag_base: u32,
+};
+
 pub const Session = struct {
     pub const NamespaceOptions = struct {
         project_id: ?[]const u8 = null,
@@ -318,6 +327,7 @@ pub const Session = struct {
         projects_dir: []const u8 = "projects",
         local_fs_export_root: ?[]const u8 = null,
         control_plane: ?*control_plane_mod.ControlPlane = null,
+        mission_store: ?*mission_store_mod.MissionStore = null,
         control_operator_token: ?[]const u8 = null,
         actor_type: ?[]const u8 = null,
         actor_id: ?[]const u8 = null,
@@ -338,12 +348,14 @@ pub const Session = struct {
     projects_dir: []u8,
     local_fs_export_root: ?[]u8 = null,
     control_plane: ?*control_plane_mod.ControlPlane = null,
+    mission_store: ?*mission_store_mod.MissionStore = null,
     control_operator_token: ?[]u8 = null,
     is_admin: bool = false,
 
     nodes: std.AutoHashMapUnmanaged(u32, Node) = .{},
     fids: std.AutoHashMapUnmanaged(u32, FidState) = .{},
     next_node_id: u32 = 1,
+    next_internal_fsrpc_seq: u32 = 1,
 
     root_id: u32 = 0,
     nodes_root_id: u32 = 0,
@@ -374,8 +386,26 @@ pub const Session = struct {
     agents_result_id: u32 = 0,
     projects_status_id: u32 = 0,
     projects_result_id: u32 = 0,
+    git_status_id: u32 = 0,
+    git_result_id: u32 = 0,
+    git_status_alias_id: u32 = 0,
+    git_result_alias_id: u32 = 0,
+    github_pr_status_id: u32 = 0,
+    github_pr_result_id: u32 = 0,
+    github_pr_status_alias_id: u32 = 0,
+    github_pr_result_alias_id: u32 = 0,
+    pr_review_status_id: u32 = 0,
+    pr_review_result_id: u32 = 0,
+    pr_review_status_alias_id: u32 = 0,
+    pr_review_result_alias_id: u32 = 0,
+    missions_status_id: u32 = 0,
+    missions_result_id: u32 = 0,
+    missions_status_alias_id: u32 = 0,
+    missions_result_alias_id: u32 = 0,
     mounts_status_id: u32 = 0,
     mounts_result_id: u32 = 0,
+    mounts_status_alias_id: u32 = 0,
+    mounts_result_alias_id: u32 = 0,
     wait_sources: std.ArrayListUnmanaged(WaitSource) = .{},
     wait_timeout_ms: i64 = default_wait_timeout_ms,
     wait_event_seq: u64 = 1,
@@ -388,6 +418,7 @@ pub const Session = struct {
     thought_job_sync_counts: std.StringHashMapUnmanaged(usize) = .{},
     project_binds: std.ArrayListUnmanaged(PathBind) = .{},
     scoped_venom_bindings: std.ArrayListUnmanaged(ScopedVenomBinding) = .{},
+    node_aliases: std.AutoHashMapUnmanaged(u32, u32) = .{},
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -456,6 +487,7 @@ pub const Session = struct {
             .projects_dir = owned_projects_dir,
             .local_fs_export_root = owned_local_fs_export_root,
             .control_plane = options.control_plane,
+            .mission_store = options.mission_store,
             .control_operator_token = owned_control_operator_token,
             .is_admin = options.is_admin,
         };
@@ -470,6 +502,7 @@ pub const Session = struct {
         self.clearProjectBinds();
         self.clearScopedVenomBindings();
         self.clearThoughtJobSyncCounts();
+        self.node_aliases.deinit(self.allocator);
         var it = self.nodes.iterator();
         while (it.next()) |entry| {
             var node = entry.value_ptr.*;
@@ -508,6 +541,7 @@ pub const Session = struct {
                 .projects_dir = self.projects_dir,
                 .local_fs_export_root = self.local_fs_export_root,
                 .control_plane = self.control_plane,
+                .mission_store = self.mission_store,
                 .control_operator_token = self.control_operator_token,
                 .actor_type = self.actor_type,
                 .actor_id = self.actor_id,
@@ -709,12 +743,14 @@ pub const Session = struct {
             try self.allocator.dupe(u8, "null");
         defer self.allocator.free(project_id_json);
         const debug_visible = self.lookupChild(self.root_id, "debug") != null;
+        const services_visible = self.lookupChild(self.root_id, "services") != null;
         const payload = try std.fmt.allocPrint(
             self.allocator,
-            "{{\"qid\":{{\"path\":{d},\"type\":\"dir\"}},\"layout\":\"unified-v2-fs\",\"project_id\":{s},\"roots\":[\"nodes\",\"agents\",\"global\"{s}],\"dynamic_bind_paths\":{s},\"bind_count\":{d}}}",
+            "{{\"qid\":{{\"path\":{d},\"type\":\"dir\"}},\"layout\":\"unified-v2-fs\",\"project_id\":{s},\"roots\":[\"nodes\",\"agents\",\"global\"{s}{s}],\"dynamic_bind_paths\":{s},\"bind_count\":{d}}}",
             .{
                 self.root_id,
                 project_id_json,
+                if (services_visible) ",\"services\"" else "",
                 if (debug_visible) ",\"debug\"" else "",
                 if (self.project_binds.items.len > 0) "true" else "false",
                 self.project_binds.items.len,
@@ -819,6 +855,7 @@ pub const Session = struct {
                     used_bound_proxy = true;
                 }
                 if (offset == 0 and !used_bound_proxy) {
+                    _ = try self.syncLocalFsFileNode(state.node_id);
                     if (state.node_id == self.debug_stream_log_id) {
                         try self.syncDebugStreamLogFromControlPlane();
                     }
@@ -880,7 +917,56 @@ pub const Session = struct {
         if (dir_id == self.nodes_root_id) {
             try self.addNodeDirectoriesFromControlPlane(self.nodes_root_id);
         }
+        try self.refreshLocalFsDirectory(dir_id);
         try self.refreshBoundVenomProxyDirectory(dir_id);
+    }
+
+    fn refreshLocalFsDirectory(self: *Session, dir_id: u32) !void {
+        const host_path = (try self.localFsNodeHostPath(dir_id)) orelse return;
+        defer self.allocator.free(host_path);
+
+        var host_dir = if (std.fs.path.isAbsolute(host_path))
+            std.fs.openDirAbsolute(host_path, .{ .iterate = true }) catch return
+        else
+            std.fs.cwd().openDir(host_path, .{ .iterate = true }) catch return;
+        defer host_dir.close();
+
+        var iterator = host_dir.iterate();
+        while (try iterator.next()) |entry| {
+            if (entry.name.len == 0) continue;
+            if (std.mem.eql(u8, entry.name, ".") or std.mem.eql(u8, entry.name, "..")) continue;
+            if (self.lookupChild(dir_id, entry.name) != null) continue;
+
+            switch (entry.kind) {
+                .directory => _ = try self.addDir(dir_id, entry.name, false),
+                .file, .sym_link, .unknown => _ = try self.addFile(dir_id, entry.name, "", true, .none),
+                else => {},
+            }
+        }
+    }
+
+    fn localFsNodeHostPath(self: *Session, node_id: u32) !?[]u8 {
+        if (self.local_fs_export_root == null) return null;
+        const absolute_path = try self.nodeAbsolutePath(node_id);
+        defer self.allocator.free(absolute_path);
+        if (!pathMatchesPrefixBoundary(absolute_path, local_fs_world_prefix)) return null;
+        return try self.resolveMissionContractHostPath(absolute_path);
+    }
+
+    fn syncLocalFsFileNode(self: *Session, node_id: u32) !bool {
+        const host_path = (try self.localFsNodeHostPath(node_id)) orelse return false;
+        defer self.allocator.free(host_path);
+
+        var file = if (std.fs.path.isAbsolute(host_path))
+            std.fs.openFileAbsolute(host_path, .{}) catch return false
+        else
+            std.fs.cwd().openFile(host_path, .{}) catch return false;
+        defer file.close();
+
+        const content = try file.readToEndAlloc(self.allocator, 1024 * 1024);
+        defer self.allocator.free(content);
+        try self.setFileContent(node_id, content);
+        return true;
     }
 
     fn handleWrite(self: *Session, msg: *const unified.ParsedMessage) ![]u8 {
@@ -1181,13 +1267,13 @@ pub const Session = struct {
             .projects_get,
             .projects_up,
             => {
-                const outcome = self.handleProjectsNamespaceWrite(node.special, state.node_id, data) catch |err| switch (err) {
+                const outcome = self.handleWorkspacesNamespaceWrite(node.special, state.node_id, data) catch |err| switch (err) {
                     error.InvalidPayload => {
                         return unified.buildFsrpcError(
                             self.allocator,
                             msg.tag,
                             "invalid",
-                            "projects payload is invalid for requested operation",
+                            "workspace payload is invalid for requested operation",
                         );
                     },
                     error.AccessDenied => {
@@ -1195,7 +1281,132 @@ pub const Session = struct {
                             self.allocator,
                             msg.tag,
                             "eperm",
-                            "projects operation denied by policy",
+                            "workspace operation denied by policy",
+                        );
+                    },
+                    else => return err,
+                };
+                written = outcome.written;
+            },
+            .git_invoke,
+            .git_sync_checkout,
+            .git_status,
+            .git_diff_range,
+            => {
+                const outcome = self.handleGitNamespaceWrite(node.special, state.node_id, data) catch |err| switch (err) {
+                    error.InvalidPayload => {
+                        return unified.buildFsrpcError(
+                            self.allocator,
+                            msg.tag,
+                            "invalid",
+                            "git payload is invalid for requested operation",
+                        );
+                    },
+                    else => return err,
+                };
+                written = outcome.written;
+            },
+            .github_pr_invoke,
+            .github_pr_sync,
+            .github_pr_ingest_event,
+            .github_pr_publish_review,
+            => {
+                const outcome = self.handleGitHubPrNamespaceWrite(node.special, state.node_id, data) catch |err| switch (err) {
+                    error.InvalidPayload => {
+                        return unified.buildFsrpcError(
+                            self.allocator,
+                            msg.tag,
+                            "invalid",
+                            "github_pr payload is invalid for requested operation",
+                        );
+                    },
+                    else => return err,
+                };
+                written = outcome.written;
+            },
+            .pr_review_invoke,
+            .pr_review_configure_repo,
+            .pr_review_get_repo,
+            .pr_review_list_repos,
+            .pr_review_intake,
+            .pr_review_start,
+            .pr_review_sync,
+            .pr_review_run_validation,
+            .pr_review_record_validation,
+            .pr_review_draft_review,
+            .pr_review_save_draft,
+            .pr_review_record_review,
+            .pr_review_advance,
+            => {
+                const outcome = self.handlePrReviewNamespaceWrite(node.special, state.node_id, data) catch |err| switch (err) {
+                    error.InvalidPayload => {
+                        return unified.buildFsrpcError(
+                            self.allocator,
+                            msg.tag,
+                            "invalid",
+                            "pr_review payload is invalid for requested operation",
+                        );
+                    },
+                    error.AccessDenied => {
+                        return unified.buildFsrpcError(
+                            self.allocator,
+                            msg.tag,
+                            "eperm",
+                            "pr_review operation denied by policy",
+                        );
+                    },
+                    error.NotFound => {
+                        return unified.buildFsrpcError(
+                            self.allocator,
+                            msg.tag,
+                            "enoent",
+                            "pr_review mission not found",
+                        );
+                    },
+                    else => return err,
+                };
+                written = outcome.written;
+            },
+            .missions_invoke,
+            .missions_invoke_service,
+            .missions_create,
+            .missions_list,
+            .missions_get,
+            .missions_heartbeat,
+            .missions_checkpoint,
+            .missions_recover,
+            .missions_request_approval,
+            .missions_approve,
+            .missions_reject,
+            .missions_resume,
+            .missions_block,
+            .missions_complete,
+            .missions_fail,
+            .missions_cancel,
+            => {
+                const outcome = self.handleMissionsNamespaceWrite(node.special, state.node_id, data) catch |err| switch (err) {
+                    error.InvalidPayload => {
+                        return unified.buildFsrpcError(
+                            self.allocator,
+                            msg.tag,
+                            "invalid",
+                            "missions payload is invalid for requested operation",
+                        );
+                    },
+                    error.AccessDenied => {
+                        return unified.buildFsrpcError(
+                            self.allocator,
+                            msg.tag,
+                            "eperm",
+                            "missions operation requires admin approval privileges",
+                        );
+                    },
+                    error.NotFound => {
+                        return unified.buildFsrpcError(
+                            self.allocator,
+                            msg.tag,
+                            "enoent",
+                            "mission not found",
                         );
                     },
                     else => return err,
@@ -1654,14 +1865,12 @@ pub const Session = struct {
             "{\"read\":true,\"write\":false}",
             "System-wide stable namespaces shared across agents/projects.",
         );
-        const global_library_dir = try self.addDir(global_root, "library", false);
-        try self.seedGlobalLibraryNamespace(global_library_dir);
-
         try self.addNodeDirectoriesFromControlPlane(nodes_root);
         for (policy.nodes.items) |node| {
             if (self.lookupChild(nodes_root, node.id) != null) continue;
             try self.addNodeDirectory(nodes_root, node, false);
         }
+        try self.seedLocalCatalogServiceNamespaces(global_root);
 
         const active_agent_dir = try self.addDir(agents_root, self.agent_id, false);
         _ = try self.addFile(active_agent_dir, "README.md", "Active agent identity in this project namespace.\n", false, .none);
@@ -1680,34 +1889,6 @@ pub const Session = struct {
             false,
             .agent_venoms_index,
         );
-        const chat = try self.addDir(global_root, "chat", false);
-        const control = try self.addDir(chat, "control", false);
-        const examples = try self.addDir(chat, "examples", false);
-        self.chat_input_id = try self.addFile(control, "input", "", true, .chat_input);
-        _ = try self.addFile(control, "reply", "", true, .chat_reply);
-        _ = try self.addFile(examples, "send.txt", shared_node.venom_contracts.chat.example_send_txt, false, .none);
-
-        const chat_schema_json = try shared_node.venom_contracts.chat.renderSchemaJson(self.allocator, "/global/jobs", "control/reply");
-        defer self.allocator.free(chat_schema_json);
-        const chat_ops_json = try shared_node.venom_contracts.chat.renderOpsJson(self.allocator, "control/input", "/global/jobs", "control/reply");
-        defer self.allocator.free(chat_ops_json);
-        const chat_status_json = try shared_node.venom_contracts.chat.renderStatusJson(self.allocator, "/global/chat", "/global/jobs");
-        defer self.allocator.free(chat_status_json);
-        _ = try self.addFile(chat, "README.md", shared_node.venom_contracts.chat.readme_md, false, .none);
-        _ = try self.addFile(chat, "SCHEMA.json", chat_schema_json, false, .none);
-        _ = try self.addFile(chat, "CAPS.json", shared_node.venom_contracts.chat.caps_json, false, .none);
-        _ = try self.addFile(chat, "OPS.json", chat_ops_json, false, .none);
-        _ = try self.addFile(chat, "STATUS.json", chat_status_json, false, .none);
-
-        const chat_meta_json = try shared_node.venom_contracts.chat.renderMetaJson(self.allocator, .{
-            .agent_id = self.agent_id,
-            .actor_type = self.actor_type,
-            .actor_id = self.actor_id,
-            .project_id = policy.project_id,
-        });
-        defer self.allocator.free(chat_meta_json);
-        _ = try self.addFile(chat, "meta.json", chat_meta_json, false, .none);
-
         const agent_venoms_dir = try self.addDir(global_root, "venoms", false);
         try self.addDirectoryDescriptors(
             agent_venoms_dir,
@@ -1729,142 +1910,6 @@ pub const Session = struct {
             "",
             false,
             .node_venom_events_log,
-        );
-
-        const memory_dir = try self.addDir(global_root, "memory", false);
-        try self.seedAgentMemoryNamespace(memory_dir);
-        const web_search_dir = try self.addDir(global_root, "web_search", false);
-        try self.seedAgentWebSearchNamespace(web_search_dir);
-        const search_code_dir = try self.addDir(global_root, "search_code", false);
-        try self.seedAgentSearchCodeNamespace(search_code_dir);
-        const terminal_dir = try self.addDir(global_root, "terminal", false);
-        try self.seedAgentTerminalNamespace(terminal_dir);
-        const mounts_dir = try self.addDir(global_root, "mounts", false);
-        try self.seedAgentMountsNamespace(mounts_dir);
-        const sub_brains_dir = try self.addDir(global_root, "sub_brains", false);
-        try self.seedAgentSubBrainsNamespace(sub_brains_dir);
-        const agents_control_dir = try self.addDir(global_root, "agents", false);
-        try self.seedAgentAgentsNamespace(agents_control_dir);
-        const projects_control_dir = try self.addDir(global_root, "projects", false);
-        try self.seedAgentProjectsNamespace(projects_control_dir);
-
-        self.jobs_root_id = try self.addDir(global_root, "jobs", false);
-        try self.addDirectoryDescriptors(
-            self.jobs_root_id,
-            "Jobs",
-            "{\"kind\":\"collection\",\"entries\":\"job_id\",\"files\":[\"status.json\",\"result.txt\",\"log.txt\"]}",
-            "{\"read\":true,\"write\":false}",
-            "Chat job status and outputs.",
-        );
-        const jobs_schema_json = try shared_node.venom_contracts.jobs.renderSchemaJson(self.allocator, "/global/jobs");
-        defer self.allocator.free(jobs_schema_json);
-        const jobs_status_json = try shared_node.venom_contracts.jobs.renderStatusJson(self.allocator, "/global/jobs");
-        defer self.allocator.free(jobs_status_json);
-        _ = try self.addFile(self.jobs_root_id, "README.md", shared_node.venom_contracts.jobs.readme_md, false, .none);
-        _ = try self.addFile(self.jobs_root_id, "SCHEMA.json", jobs_schema_json, false, .none);
-        _ = try self.addFile(self.jobs_root_id, "CAPS.json", shared_node.venom_contracts.jobs.caps_json, false, .none);
-        _ = try self.addFile(self.jobs_root_id, "OPS.json", shared_node.venom_contracts.jobs.ops_json, false, .none);
-        _ = try self.addFile(self.jobs_root_id, "STATUS.json", jobs_status_json, false, .none);
-        try self.seedJobsFromIndex();
-
-        const thoughts_dir = try self.addDir(global_root, "thoughts", false);
-        try self.addDirectoryDescriptors(
-            thoughts_dir,
-            "Thoughts",
-            "{\"kind\":\"stream\",\"files\":[\"latest.txt\",\"history.ndjson\",\"status.json\"]}",
-            "{\"read\":true,\"write\":false}",
-            "Runtime internal thought stream (not chat output).",
-        );
-        _ = try self.addFile(
-            thoughts_dir,
-            "README.md",
-            shared_node.venom_contracts.thoughts.readme_md,
-            false,
-            .none,
-        );
-        _ = try self.addFile(
-            thoughts_dir,
-            "SCHEMA.json",
-            shared_node.venom_contracts.thoughts.schema_json,
-            false,
-            .none,
-        );
-        _ = try self.addFile(
-            thoughts_dir,
-            "CAPS.json",
-            shared_node.venom_contracts.thoughts.caps_json,
-            false,
-            .none,
-        );
-        _ = try self.addFile(thoughts_dir, "OPS.json", shared_node.venom_contracts.thoughts.ops_json, false, .none);
-        self.thoughts_latest_id = try self.addFile(thoughts_dir, "latest.txt", "", false, .none);
-        self.thoughts_history_id = try self.addFile(thoughts_dir, "history.ndjson", "", false, .none);
-        self.thoughts_status_id = try self.addFile(
-            thoughts_dir,
-            "status.json",
-            shared_node.venom_contracts.thoughts.initial_status_json,
-            false,
-            .none,
-        );
-
-        const events_dir = try self.addDir(global_root, "events", false);
-        const events_control_dir = try self.addDir(events_dir, "control", false);
-        const events_sources_dir = try self.addDir(events_dir, "sources", false);
-        _ = try self.addFile(events_dir, "README.md", shared_node.venom_contracts.events.readme_md, false, .none);
-        _ = try self.addFile(
-            events_dir,
-            "SCHEMA.json",
-            shared_node.venom_contracts.events.schema_json,
-            false,
-            .none,
-        );
-        _ = try self.addFile(
-            events_dir,
-            "CAPS.json",
-            shared_node.venom_contracts.events.caps_json,
-            false,
-            .none,
-        );
-        _ = try self.addFile(events_dir, "OPS.json", shared_node.venom_contracts.events.ops_json, false, .none);
-        _ = try self.addFile(events_dir, "STATUS.json", shared_node.venom_contracts.events.status_json, false, .none);
-        _ = try self.addFile(
-            events_control_dir,
-            "README.md",
-            shared_node.venom_contracts.events.control_readme_md,
-            false,
-            .none,
-        );
-        _ = try self.addFile(
-            events_control_dir,
-            "wait.json",
-            shared_node.venom_contracts.events.default_wait_json,
-            true,
-            .event_wait_config,
-        );
-        _ = try self.addFile(
-            events_control_dir,
-            "signal.json",
-            shared_node.venom_contracts.events.default_signal_json,
-            true,
-            .event_signal,
-        );
-        _ = try self.addFile(
-            events_sources_dir,
-            "README.md",
-            shared_node.venom_contracts.events.sources_readme_md,
-            false,
-            .none,
-        );
-        _ = try self.addFile(events_sources_dir, "agent.json", shared_node.venom_contracts.events.agent_source_help_md, false, .none);
-        _ = try self.addFile(events_sources_dir, "hook.json", shared_node.venom_contracts.events.hook_source_help_md, false, .none);
-        _ = try self.addFile(events_sources_dir, "user.json", shared_node.venom_contracts.events.user_source_help_md, false, .none);
-        _ = try self.addFile(events_sources_dir, "time.json", shared_node.venom_contracts.events.time_source_help_md, false, .none);
-        self.event_next_id = try self.addFile(
-            events_dir,
-            "next.json",
-            shared_node.venom_contracts.events.initial_next_json,
-            false,
-            .event_next,
         );
 
         for (policy.visible_agents.items) |agent_name| {
@@ -1928,7 +1973,7 @@ pub const Session = struct {
         try self.addDirectoryDescriptors(
             project_meta_dir,
             "Project Metadata",
-            "{\"kind\":\"metadata\",\"files\":[\"topology.json\",\"nodes.json\",\"agents.json\",\"sources.json\",\"contracts.json\",\"paths.json\",\"summary.json\",\"alerts.json\",\"workspace_status.json\",\"mounts.json\",\"desired_mounts.json\",\"actual_mounts.json\",\"drift.json\",\"reconcile.json\",\"availability.json\",\"health.json\"]}",
+            "{\"kind\":\"metadata\",\"files\":[\"topology.json\",\"nodes.json\",\"agents.json\",\"sources.json\",\"contracts.json\",\"paths.json\",\"summary.json\",\"alerts.json\",\"workspace_status.json\",\"mounts.json\",\"desired_mounts.json\",\"actual_mounts.json\",\"binds.json\",\"mounted_services.json\",\"drift.json\",\"reconcile.json\",\"availability.json\",\"health.json\"]}",
             "{\"read\":true,\"write\":false}",
             "Project topology and availability metadata.",
         );
@@ -1988,7 +2033,7 @@ pub const Session = struct {
         try self.addDirectoryDescriptors(
             meta_root,
             "Meta",
-            "{\"kind\":\"meta\",\"entries\":[\"protocol.json\",\"view.json\",\"workspace_status.json\",\"workspace_availability.json\",\"workspace_health.json\",\"workspace_alerts.json\"]}",
+            "{\"kind\":\"meta\",\"entries\":[\"protocol.json\",\"view.json\",\"workspace_status.json\",\"workspace_availability.json\",\"workspace_health.json\",\"workspace_alerts.json\",\"workspace_binds.json\",\"workspace_services.json\"]}",
             "{\"read\":true,\"write\":false}",
             "Attached-session compatibility metadata.",
         );
@@ -2043,6 +2088,16 @@ pub const Session = struct {
         }
 
         try self.refreshProjectBindsFromControlPlane();
+        try self.materializeProjectBindPrefixDirectories();
+        if (self.lookupChild(self.root_id, "services")) |services_root| {
+            try self.addDirectoryDescriptors(
+                services_root,
+                "Services",
+                "{\"kind\":\"collection\",\"entries\":\"workspace service binds\",\"shape\":\"/services/<venom_id>/{README.md,SCHEMA.json,CAPS.json,OPS.json,STATUS.json,status.json,result.json,control/*}\"}",
+                "{\"read\":true,\"write\":false}",
+                "Workspace-bound service paths projected from the active workspace binds.",
+            );
+        }
 
         try self.registerExistingGlobalVenomBinding(global_root, "chat", "project_namespace");
         try self.registerExistingGlobalVenomBinding(global_root, "jobs", "project_namespace");
@@ -2054,14 +2109,19 @@ pub const Session = struct {
         try self.registerExistingGlobalVenomBinding(global_root, "mounts", "project_namespace");
         try self.registerExistingGlobalVenomBinding(global_root, "sub_brains", "project_namespace");
         try self.registerExistingGlobalVenomBinding(global_root, "agents", "project_namespace");
-        try self.registerExistingGlobalVenomBinding(global_root, "projects", "project_namespace");
+        try self.registerExistingGlobalVenomBinding(global_root, "workspaces", "project_namespace");
         try self.registerExistingGlobalVenomBinding(global_root, "thoughts", "project_namespace");
+        try self.registerExistingGlobalVenomBinding(global_root, "git", "project_namespace");
+        try self.registerExistingGlobalVenomBinding(global_root, "github_pr", "project_namespace");
+        try self.registerExistingGlobalVenomBinding(global_root, "missions", "project_namespace");
+        try self.registerExistingGlobalVenomBinding(global_root, "pr_review", "project_namespace");
         try self.registerExistingGlobalVenomBinding(global_root, "library", "global_namespace");
         const preferred_fs_node_id = try self.resolvePreferredBoundVenomNodeId("fs");
         defer if (preferred_fs_node_id) |value| self.allocator.free(value);
         _ = try self.seedBoundGlobalFsNamespace(global_root, preferred_fs_node_id orelse "local");
         try self.seedActiveScopedVenomBindings(active_agent_venoms_dir, project_venoms_dir, policy.project_id);
         try self.refreshScopedVenomIndexes();
+        try self.addWorkspaceServiceDiscoveryFiles(meta_root, project_meta_dir);
     }
 
     fn addProjectMetaFiles(
@@ -2188,72 +2248,194 @@ pub const Session = struct {
         _ = try self.addFile(project_meta_dir, "health.json", "{\"state\":\"unknown\",\"availability\":{\"mounts_total\":0,\"online\":0,\"degraded\":0,\"missing\":0},\"drift_count\":0,\"reconcile_state\":\"unknown\",\"queue_depth\":0}", false, .none);
     }
 
+    fn addWorkspaceServiceDiscoveryFiles(self: *Session, meta_root: u32, project_meta_dir: u32) !void {
+        const binds_json = try self.buildProjectBindsArrayJson();
+        defer self.allocator.free(binds_json);
+        _ = try self.addFile(project_meta_dir, "binds.json", binds_json, false, .none);
+        _ = try self.addFile(meta_root, "workspace_binds.json", binds_json, false, .none);
+
+        const services_json = try self.buildMountedServicesJson();
+        defer self.allocator.free(services_json);
+        _ = try self.addFile(project_meta_dir, "mounted_services.json", services_json, false, .none);
+        _ = try self.addFile(meta_root, "workspace_services.json", services_json, false, .none);
+    }
+
+    fn buildProjectBindsArrayJson(self: *Session) ![]u8 {
+        var out = std.ArrayListUnmanaged(u8){};
+        errdefer out.deinit(self.allocator);
+        try out.append(self.allocator, '[');
+        for (self.project_binds.items, 0..) |bind, idx| {
+            if (idx != 0) try out.append(self.allocator, ',');
+            const escaped_bind = try unified.jsonEscape(self.allocator, bind.bind_path);
+            defer self.allocator.free(escaped_bind);
+            const escaped_target = try unified.jsonEscape(self.allocator, bind.target_path);
+            defer self.allocator.free(escaped_target);
+            try out.writer(self.allocator).print(
+                "{{\"bind_path\":\"{s}\",\"target_path\":\"{s}\"}}",
+                .{ escaped_bind, escaped_target },
+            );
+        }
+        try out.append(self.allocator, ']');
+        return out.toOwnedSlice(self.allocator);
+    }
+
+    fn buildMountedServicesJson(self: *Session) ![]u8 {
+        var out = std.ArrayListUnmanaged(u8){};
+        errdefer out.deinit(self.allocator);
+        try out.append(self.allocator, '[');
+        var first = true;
+
+        for (self.project_binds.items) |bind| {
+            if (!first) try out.append(self.allocator, ',');
+            first = false;
+            try self.appendMountedServiceBindJson(&out, bind);
+        }
+
+        for (self.scoped_venom_bindings.items) |binding| {
+            if (!first) try out.append(self.allocator, ',');
+            first = false;
+            try self.appendDirectMountedServiceJson(&out, binding);
+        }
+
+        try out.append(self.allocator, ']');
+        return out.toOwnedSlice(self.allocator);
+    }
+
+    fn appendMountedServiceBindJson(self: *Session, out: *std.ArrayListUnmanaged(u8), bind: PathBind) !void {
+        var selected: ?*const ScopedVenomBinding = null;
+        for (self.scoped_venom_bindings.items) |*binding| {
+            if (!pathMatchesPrefixBoundary(bind.target_path, binding.venom_path)) continue;
+            if (selected == null or binding.venom_path.len > selected.?.venom_path.len) selected = binding;
+        }
+
+        const escaped_bind = try unified.jsonEscape(self.allocator, bind.bind_path);
+        defer self.allocator.free(escaped_bind);
+        const escaped_target = try unified.jsonEscape(self.allocator, bind.target_path);
+        defer self.allocator.free(escaped_target);
+
+        if (selected) |binding| {
+            const escaped_venom_id = try unified.jsonEscape(self.allocator, binding.venom_id);
+            defer self.allocator.free(escaped_venom_id);
+            const escaped_scope = try unified.jsonEscape(self.allocator, binding.scope);
+            defer self.allocator.free(escaped_scope);
+            const escaped_source = try unified.jsonEscape(self.allocator, binding.venom_path);
+            defer self.allocator.free(escaped_source);
+            const invoke_json = if (binding.invoke_path) |invoke_path| blk: {
+                if (try self.rebaseBoundServicePath(bind.bind_path, bind.target_path, invoke_path)) |rebased| {
+                    defer self.allocator.free(rebased);
+                    const escaped = try unified.jsonEscape(self.allocator, rebased);
+                    defer self.allocator.free(escaped);
+                    break :blk try std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped});
+                }
+                break :blk try self.allocator.dupe(u8, "null");
+            } else try self.allocator.dupe(u8, "null");
+            defer self.allocator.free(invoke_json);
+            const provider_node_json = if (binding.provider_node_id) |value| blk: {
+                const escaped = try unified.jsonEscape(self.allocator, value);
+                defer self.allocator.free(escaped);
+                break :blk try std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped});
+            } else try self.allocator.dupe(u8, "null");
+            defer self.allocator.free(provider_node_json);
+            const provider_path_json = if (binding.provider_venom_path) |value| blk: {
+                const escaped = try unified.jsonEscape(self.allocator, value);
+                defer self.allocator.free(escaped);
+                break :blk try std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped});
+            } else try self.allocator.dupe(u8, "null");
+            defer self.allocator.free(provider_path_json);
+            const endpoint_json = if (binding.endpoint_path) |value| blk: {
+                const escaped = try unified.jsonEscape(self.allocator, value);
+                defer self.allocator.free(escaped);
+                break :blk try std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped});
+            } else try self.allocator.dupe(u8, "null");
+            defer self.allocator.free(endpoint_json);
+
+            try out.writer(self.allocator).print(
+                "{{\"kind\":\"venom\",\"exposure\":\"project_bind\",\"venom_id\":\"{s}\",\"scope\":\"{s}\",\"path\":\"{s}\",\"target_path\":\"{s}\",\"source_path\":\"{s}\",\"provider_node_id\":{s},\"provider_venom_path\":{s},\"endpoint_path\":{s},\"invoke_path\":{s}}}",
+                .{
+                    escaped_venom_id,
+                    escaped_scope,
+                    escaped_bind,
+                    escaped_target,
+                    escaped_source,
+                    provider_node_json,
+                    provider_path_json,
+                    endpoint_json,
+                    invoke_json,
+                },
+            );
+            return;
+        }
+
+        try out.writer(self.allocator).print(
+            "{{\"kind\":\"path_bind\",\"exposure\":\"project_bind\",\"path\":\"{s}\",\"target_path\":\"{s}\"}}",
+            .{ escaped_bind, escaped_target },
+        );
+    }
+
+    fn appendDirectMountedServiceJson(self: *Session, out: *std.ArrayListUnmanaged(u8), binding: ScopedVenomBinding) !void {
+        const escaped_venom_id = try unified.jsonEscape(self.allocator, binding.venom_id);
+        defer self.allocator.free(escaped_venom_id);
+        const escaped_scope = try unified.jsonEscape(self.allocator, binding.scope);
+        defer self.allocator.free(escaped_scope);
+        const escaped_path = try unified.jsonEscape(self.allocator, binding.venom_path);
+        defer self.allocator.free(escaped_path);
+        const provider_node_json = if (binding.provider_node_id) |value| blk: {
+            const escaped = try unified.jsonEscape(self.allocator, value);
+            defer self.allocator.free(escaped);
+            break :blk try std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped});
+        } else try self.allocator.dupe(u8, "null");
+        defer self.allocator.free(provider_node_json);
+        const provider_path_json = if (binding.provider_venom_path) |value| blk: {
+            const escaped = try unified.jsonEscape(self.allocator, value);
+            defer self.allocator.free(escaped);
+            break :blk try std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped});
+        } else try self.allocator.dupe(u8, "null");
+        defer self.allocator.free(provider_path_json);
+        const endpoint_json = if (binding.endpoint_path) |value| blk: {
+            const escaped = try unified.jsonEscape(self.allocator, value);
+            defer self.allocator.free(escaped);
+            break :blk try std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped});
+        } else try self.allocator.dupe(u8, "null");
+        defer self.allocator.free(endpoint_json);
+        const invoke_json = if (binding.invoke_path) |value| blk: {
+            const escaped = try unified.jsonEscape(self.allocator, value);
+            defer self.allocator.free(escaped);
+            break :blk try std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped});
+        } else try self.allocator.dupe(u8, "null");
+        defer self.allocator.free(invoke_json);
+
+        try out.writer(self.allocator).print(
+            "{{\"kind\":\"venom\",\"exposure\":\"direct\",\"venom_id\":\"{s}\",\"scope\":\"{s}\",\"path\":\"{s}\",\"provider_node_id\":{s},\"provider_venom_path\":{s},\"endpoint_path\":{s},\"invoke_path\":{s}}}",
+            .{
+                escaped_venom_id,
+                escaped_scope,
+                escaped_path,
+                provider_node_json,
+                provider_path_json,
+                endpoint_json,
+                invoke_json,
+            },
+        );
+    }
+
+    fn rebaseBoundServicePath(
+        self: *Session,
+        bind_path: []const u8,
+        target_path: []const u8,
+        absolute_path: []const u8,
+    ) !?[]u8 {
+        if (!pathMatchesPrefixBoundary(absolute_path, target_path)) return null;
+        const suffix = absolute_path[target_path.len..];
+        if (suffix.len == 0) return try self.allocator.dupe(u8, bind_path);
+        if (std.mem.eql(u8, bind_path, "/")) return try std.fmt.allocPrint(self.allocator, "{s}", .{suffix});
+        return try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ bind_path, suffix });
+    }
+
     fn addDebugPairingSurface(self: *Session, debug_root: u32) !void {
-        const pairing_dir = try self.addDir(debug_root, "pairing", false);
-        const control_dir = try self.addDir(pairing_dir, "control", false);
-        const invites_dir = try self.addDir(pairing_dir, "invites", false);
-        const invites_control_dir = try self.addDir(invites_dir, "control", false);
-        try self.addDirectoryDescriptors(
-            pairing_dir,
-            "Pairing Queue",
-            "{\"kind\":\"pairing_queue\",\"entries\":[\"pending.json\",\"last_result.json\",\"last_error.json\",\"control\",\"invites\"]}",
-            "{\"read\":true,\"write\":false}",
-            "Node pairing review queue. Read pending requests and use control files to approve, deny, or refresh.",
-        );
-        try self.addDirectoryDescriptors(
-            control_dir,
-            "Pairing Control",
-            "{\"kind\":\"pairing_control\",\"writes\":{\"approve.json\":\"control.node_join_approve payload\",\"deny.json\":\"control.node_join_deny payload\",\"refresh\":\"refresh pending queue snapshot\"}}",
-            "{\"approve\":true,\"deny\":true,\"refresh\":true}",
-            "Write JSON payloads to approve/deny request IDs. Write any content to refresh the queue snapshot.",
-        );
-        try self.addDirectoryDescriptors(
-            invites_dir,
-            "Invite Tokens",
-            "{\"kind\":\"pairing_invites\",\"entries\":[\"active.json\",\"last_result.json\",\"last_error.json\",\"control\"]}",
-            "{\"read\":true,\"write\":false}",
-            "Invite-based pairing tokens. Create invite tokens and refresh active invite listings.",
-        );
-        try self.addDirectoryDescriptors(
-            invites_control_dir,
-            "Invite Control",
-            "{\"kind\":\"pairing_invite_control\",\"writes\":{\"create.json\":\"control.node_invite_create payload\",\"refresh\":\"refresh active invite snapshot\"}}",
-            "{\"create\":true,\"refresh\":true}",
-            "Write optional invite JSON payload to create tokens. Write any content to refresh active invite snapshot.",
-        );
-
-        const pending_json = try self.loadPendingNodeJoinsJson();
-        defer self.allocator.free(pending_json);
-        const invites_json = try self.loadActiveNodeInvitesJson();
-        defer self.allocator.free(invites_json);
-        self.pairing_pending_id = try self.addFile(pairing_dir, "pending.json", pending_json, false, .none);
-        self.pairing_last_result_id = try self.addFile(pairing_dir, "last_result.json", "{\"status\":\"idle\"}", false, .none);
-        self.pairing_last_error_id = try self.addFile(pairing_dir, "last_error.json", "null", false, .none);
-        _ = try self.addFile(control_dir, "approve.json", "", true, .pairing_approve);
-        _ = try self.addFile(control_dir, "deny.json", "", true, .pairing_deny);
-        _ = try self.addFile(control_dir, "refresh", "", true, .pairing_refresh);
-        self.pairing_invites_active_id = try self.addFile(invites_dir, "active.json", invites_json, false, .none);
-        self.pairing_invites_last_result_id = try self.addFile(invites_dir, "last_result.json", "{\"status\":\"idle\"}", false, .none);
-        self.pairing_invites_last_error_id = try self.addFile(invites_dir, "last_error.json", "null", false, .none);
-        _ = try self.addFile(invites_control_dir, "create.json", "", true, .pairing_invites_create);
-        _ = try self.addFile(invites_control_dir, "refresh", "", true, .pairing_invites_refresh);
+        return pairing_venom.seedDebugSurface(self, debug_root);
     }
 
-    fn loadPendingNodeJoinsJson(self: *Session) ![]u8 {
-        const plane = self.control_plane orelse return self.allocator.dupe(u8, "{\"pending\":[]}");
-        return plane.listPendingNodeJoins("{}") catch blk: {
-            break :blk try self.allocator.dupe(u8, "{\"pending\":[]}");
-        };
-    }
-
-    fn loadActiveNodeInvitesJson(self: *Session) ![]u8 {
-        const plane = self.control_plane orelse return self.allocator.dupe(u8, "{\"invites\":[]}");
-        return plane.listNodeInvites("{}") catch blk: {
-            break :blk try self.allocator.dupe(u8, "{\"invites\":[]}");
-        };
-    }
-
-    fn refreshProjectBindsFromControlPlane(self: *Session) !void {
+    pub fn refreshProjectBindsFromControlPlane(self: *Session) !void {
         self.clearProjectBinds();
         const plane = self.control_plane orelse return;
         const project_id = self.project_id orelse return;
@@ -2287,6 +2469,36 @@ pub const Session = struct {
                 .bind_path = try self.allocator.dupe(u8, bind_path.string),
                 .target_path = try self.allocator.dupe(u8, target_path.string),
             });
+        }
+    }
+
+    fn materializeProjectBindPrefixDirectories(self: *Session) !void {
+        for (self.project_binds.items) |bind| {
+            try self.materializeBindPrefixDirectories(bind.bind_path);
+        }
+    }
+
+    fn materializeBindPrefixDirectories(self: *Session, bind_path: []const u8) !void {
+        var segments = std.ArrayListUnmanaged([]const u8){};
+        defer segments.deinit(self.allocator);
+
+        var iter = std.mem.splitScalar(u8, bind_path, '/');
+        while (iter.next()) |segment| {
+            if (segment.len == 0) continue;
+            try segments.append(self.allocator, segment);
+        }
+        if (segments.items.len <= 1) return;
+
+        var parent_id = self.root_id;
+        for (segments.items[0 .. segments.items.len - 1]) |segment| {
+            const existing = self.lookupChild(parent_id, segment);
+            if (existing) |child_id| {
+                const child = self.nodes.get(child_id) orelse return error.MissingNode;
+                if (child.kind != .dir) return error.InvalidPayload;
+                parent_id = child_id;
+                continue;
+            }
+            parent_id = try self.addDir(parent_id, segment, false);
         }
     }
 
@@ -2329,6 +2541,270 @@ pub const Session = struct {
                 discovered.terminals.deinit(self.allocator);
             }
             try self.addNodeDirectory(nodes_root, discovered, false);
+        }
+    }
+
+    fn lookupLocalNodeVenomsRoot(self: *Session) ?u32 {
+        const nodes_root = self.lookupChild(self.root_id, "nodes") orelse return null;
+        const local_node_dir = self.lookupChild(nodes_root, "local") orelse return null;
+        return self.lookupChild(local_node_dir, "venoms");
+    }
+
+    fn buildNodeVenomsIndexJson(self: *Session, venoms_root_id: u32) ![]u8 {
+        const venoms_root = self.nodes.get(venoms_root_id) orelse return error.MissingNode;
+        if (venoms_root.kind != .dir) return error.NotDir;
+
+        var out = std.ArrayListUnmanaged(u8){};
+        errdefer out.deinit(self.allocator);
+        try out.append(self.allocator, '[');
+        var first = true;
+
+        var it = venoms_root.children.iterator();
+        while (it.next()) |entry| {
+            if (std.mem.eql(u8, entry.key_ptr.*, "VENOMS.json")) continue;
+
+            const venom_dir_id = entry.value_ptr.*;
+            const venom_dir = self.nodes.get(venom_dir_id) orelse continue;
+            if (venom_dir.kind != .dir) continue;
+            if (!self.canInvokeVenomDirectory(venom_dir_id)) continue;
+
+            const status_id = self.lookupChild(venom_dir_id, "STATUS.json") orelse continue;
+            const status_node = self.nodes.get(status_id) orelse continue;
+            var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, status_node.content, .{}) catch continue;
+            defer parsed.deinit();
+            if (parsed.value != .object) continue;
+
+            const status_obj = parsed.value.object;
+            const venom_id = if (status_obj.get("venom_id")) |value|
+                if (value == .string and value.string.len > 0) value.string else entry.key_ptr.*
+            else
+                entry.key_ptr.*;
+            const kind = if (status_obj.get("kind")) |value|
+                if (value == .string and value.string.len > 0) value.string else "service"
+            else
+                "service";
+            const state = if (status_obj.get("state")) |value|
+                if (value == .string and value.string.len > 0) value.string else "namespace"
+            else
+                "namespace";
+            const endpoint = if (status_obj.get("endpoint")) |value|
+                if (value == .string and value.string.len > 0) value.string else ""
+            else
+                "";
+            try self.appendVenomIndexEntry(&out, &first, venom_id, kind, state, endpoint);
+        }
+
+        try out.append(self.allocator, ']');
+        return out.toOwnedSlice(self.allocator);
+    }
+
+    fn refreshNodeVenomsIndex(self: *Session, node_id: []const u8) !void {
+        const nodes_root = self.lookupChild(self.root_id, "nodes") orelse return;
+        const node_dir_id = self.lookupChild(nodes_root, node_id) orelse return;
+        const venoms_root_id = self.lookupChild(node_dir_id, "venoms") orelse return;
+        const index_id = self.lookupChild(venoms_root_id, "VENOMS.json") orelse return;
+        const content = try self.buildNodeVenomsIndexJson(venoms_root_id);
+        defer self.allocator.free(content);
+        try self.setFileContent(index_id, content);
+    }
+
+    fn cloneNodeSubtree(self: *Session, source_id: u32, target_parent_id: u32, alias_name: ?[]const u8) !u32 {
+        const source = self.nodes.get(source_id) orelse return error.MissingNode;
+        const name = alias_name orelse source.name;
+        const target_id = switch (source.kind) {
+            .dir => try self.addDir(target_parent_id, name, source.writable),
+            .file => try self.addFile(target_parent_id, name, source.content, source.writable, source.special),
+        };
+        try self.registerNodeAliasPair(source_id, target_id);
+        if (source.kind == .dir) {
+            var it = source.children.iterator();
+            while (it.next()) |entry| {
+                _ = try self.cloneNodeSubtree(entry.value_ptr.*, target_id, null);
+            }
+        }
+        return target_id;
+    }
+
+    fn registerNodeAliasPair(self: *Session, source_id: u32, alias_id: u32) !void {
+        if (source_id == 0 or alias_id == 0 or source_id == alias_id) return;
+        try self.node_aliases.put(self.allocator, source_id, alias_id);
+        try self.node_aliases.put(self.allocator, alias_id, source_id);
+    }
+
+    pub fn ensureAliasedSubtree(self: *Session, source_id: u32) !void {
+        const source = self.nodes.get(source_id) orelse return error.MissingNode;
+        if (self.node_aliases.get(source_id)) |alias_id| {
+            if (source.kind == .file) {
+                try self.setFileContentRaw(alias_id, source.content);
+                return;
+            }
+            var existing_it = source.children.iterator();
+            while (existing_it.next()) |entry| {
+                try self.ensureAliasedSubtree(entry.value_ptr.*);
+            }
+            return;
+        }
+
+        const parent_id = source.parent orelse return;
+        const alias_parent_id = self.node_aliases.get(parent_id) orelse return;
+        const alias_id = if (self.lookupChild(alias_parent_id, source.name)) |existing|
+            existing
+        else switch (source.kind) {
+            .dir => try self.addDir(alias_parent_id, source.name, source.writable),
+            .file => try self.addFile(alias_parent_id, source.name, source.content, source.writable, source.special),
+        };
+        try self.registerNodeAliasPair(source_id, alias_id);
+
+        if (source.kind == .file) {
+            try self.setFileContentRaw(alias_id, source.content);
+            return;
+        }
+
+        var child_it = source.children.iterator();
+        while (child_it.next()) |entry| {
+            try self.ensureAliasedSubtree(entry.value_ptr.*);
+        }
+    }
+
+    fn registerLocalCatalogVenomBinding(self: *Session, venom_id: []const u8, scope: []const u8) !void {
+        const local_venoms_root = self.lookupLocalNodeVenomsRoot() orelse return;
+        const venom_dir_id = self.lookupChild(local_venoms_root, venom_id) orelse return;
+        const venom_path = try std.fmt.allocPrint(self.allocator, "/nodes/local/venoms/{s}", .{venom_id});
+        defer self.allocator.free(venom_path);
+        const endpoint_path = blk: {
+            if (try self.firstVenomMountPath(venom_dir_id)) |value| break :blk value;
+            break :blk try self.venomEndpointPath(venom_dir_id);
+        };
+        defer if (endpoint_path) |value| self.allocator.free(value);
+        const invoke_path = try self.deriveVenomInvokePath("local", venom_id, venom_dir_id);
+        defer if (invoke_path) |value| self.allocator.free(value);
+
+        try self.registerScopedVenomBinding(
+            venom_id,
+            scope,
+            venom_path,
+            "local",
+            venom_path,
+            endpoint_path,
+            invoke_path,
+        );
+    }
+
+    fn cloneLocalCatalogVenomAlias(self: *Session, source_dir: u32, global_root: u32, venom_id: []const u8) !u32 {
+        return self.cloneNodeSubtree(source_dir, global_root, venom_id);
+    }
+
+    fn seedLocalCatalogServiceNamespaces(self: *Session, global_root: u32) !void {
+        const local_venoms_root = self.lookupLocalNodeVenomsRoot() orelse return;
+
+        const library_dir = try self.addDir(local_venoms_root, "library", false);
+        try self.seedGlobalLibraryNamespaceAt(library_dir, "/nodes/local/venoms/library");
+        _ = try self.cloneLocalCatalogVenomAlias(library_dir, global_root, "library");
+
+        const chat_dir = try self.addDir(local_venoms_root, "chat", false);
+        try self.seedChatNamespaceAt(chat_dir, "/nodes/local/venoms/chat", "/nodes/local/venoms/jobs");
+        _ = try self.cloneLocalCatalogVenomAlias(chat_dir, global_root, "chat");
+
+        const jobs_dir = try self.addDir(local_venoms_root, "jobs", false);
+        try self.seedJobsNamespaceAt(jobs_dir, "/nodes/local/venoms/jobs");
+        try self.seedJobsFromIndex();
+        _ = try self.cloneLocalCatalogVenomAlias(jobs_dir, global_root, "jobs");
+
+        const thoughts_dir = try self.addDir(local_venoms_root, "thoughts", false);
+        try self.seedThoughtsNamespaceAt(thoughts_dir, "/nodes/local/venoms/thoughts");
+        _ = try self.cloneLocalCatalogVenomAlias(thoughts_dir, global_root, "thoughts");
+
+        const events_dir = try self.addDir(local_venoms_root, "events", false);
+        try self.seedEventsNamespaceAt(events_dir, "/nodes/local/venoms/events");
+        _ = try self.cloneLocalCatalogVenomAlias(events_dir, global_root, "events");
+
+        const memory_dir = try self.addDir(local_venoms_root, "memory", false);
+        try self.seedAgentMemoryNamespaceAt(memory_dir, "/nodes/local/venoms/memory");
+        _ = try self.cloneLocalCatalogVenomAlias(memory_dir, global_root, "memory");
+
+        const web_search_dir = try self.addDir(local_venoms_root, "web_search", false);
+        try self.seedAgentWebSearchNamespaceAt(web_search_dir, "/nodes/local/venoms/web_search");
+        _ = try self.cloneLocalCatalogVenomAlias(web_search_dir, global_root, "web_search");
+
+        const search_code_dir = try self.addDir(local_venoms_root, "search_code", false);
+        try self.seedAgentSearchCodeNamespaceAt(search_code_dir, "/nodes/local/venoms/search_code");
+        _ = try self.cloneLocalCatalogVenomAlias(search_code_dir, global_root, "search_code");
+
+        const terminal_dir = try self.addDir(local_venoms_root, "terminal", false);
+        try self.seedAgentTerminalNamespaceAt(terminal_dir, "/nodes/local/venoms/terminal");
+        _ = try self.cloneLocalCatalogVenomAlias(terminal_dir, global_root, "terminal");
+
+        const mounts_dir = try self.addDir(local_venoms_root, "mounts", false);
+        try self.seedAgentMountsNamespaceAt(mounts_dir, "/nodes/local/venoms/mounts");
+        const mounts_alias_dir = try self.cloneLocalCatalogVenomAlias(mounts_dir, global_root, "mounts");
+        self.mounts_status_alias_id = self.lookupChild(mounts_alias_dir, "status.json") orelse 0;
+        self.mounts_result_alias_id = self.lookupChild(mounts_alias_dir, "result.json") orelse 0;
+
+        const sub_brains_dir = try self.addDir(local_venoms_root, "sub_brains", false);
+        try self.seedAgentSubBrainsNamespaceAt(sub_brains_dir, "/nodes/local/venoms/sub_brains");
+        _ = try self.cloneLocalCatalogVenomAlias(sub_brains_dir, global_root, "sub_brains");
+
+        const agents_dir = try self.addDir(local_venoms_root, "agents", false);
+        try self.seedAgentAgentsNamespaceAt(agents_dir, "/nodes/local/venoms/agents");
+        _ = try self.cloneLocalCatalogVenomAlias(agents_dir, global_root, "agents");
+
+        const workspaces_dir = try self.addDir(local_venoms_root, "workspaces", false);
+        try self.seedAgentWorkspacesNamespaceAt(workspaces_dir, "/nodes/local/venoms/workspaces");
+        _ = try self.cloneLocalCatalogVenomAlias(workspaces_dir, global_root, "workspaces");
+
+        if (self.local_fs_export_root != null) {
+            const git_dir = try self.addDir(local_venoms_root, "git", false);
+            try self.seedAgentGitNamespaceAt(git_dir, "/nodes/local/venoms/git");
+            const git_alias_dir = try self.cloneLocalCatalogVenomAlias(git_dir, global_root, "git");
+            self.git_status_alias_id = self.lookupChild(git_alias_dir, "status.json") orelse 0;
+            self.git_result_alias_id = self.lookupChild(git_alias_dir, "result.json") orelse 0;
+
+            const github_pr_dir = try self.addDir(local_venoms_root, "github_pr", false);
+            try self.seedAgentGitHubPrNamespaceAt(github_pr_dir, "/nodes/local/venoms/github_pr");
+            const github_pr_alias_dir = try self.cloneLocalCatalogVenomAlias(github_pr_dir, global_root, "github_pr");
+            self.github_pr_status_alias_id = self.lookupChild(github_pr_alias_dir, "status.json") orelse 0;
+            self.github_pr_result_alias_id = self.lookupChild(github_pr_alias_dir, "result.json") orelse 0;
+        }
+
+        if (self.mission_store != null) {
+            const missions_dir = try self.addDir(local_venoms_root, "missions", false);
+            try self.seedAgentMissionsNamespaceAt(missions_dir, "/nodes/local/venoms/missions");
+            const missions_alias_dir = try self.cloneLocalCatalogVenomAlias(missions_dir, global_root, "missions");
+            self.missions_status_alias_id = self.lookupChild(missions_alias_dir, "status.json") orelse 0;
+            self.missions_result_alias_id = self.lookupChild(missions_alias_dir, "result.json") orelse 0;
+
+            if (self.local_fs_export_root != null) {
+                const pr_review_dir = try self.addDir(local_venoms_root, "pr_review", false);
+                try self.seedAgentPrReviewNamespaceAt(pr_review_dir, "/nodes/local/venoms/pr_review");
+                const pr_review_alias_dir = try self.cloneLocalCatalogVenomAlias(pr_review_dir, global_root, "pr_review");
+                self.pr_review_status_alias_id = self.lookupChild(pr_review_alias_dir, "status.json") orelse 0;
+                self.pr_review_result_alias_id = self.lookupChild(pr_review_alias_dir, "result.json") orelse 0;
+            }
+        }
+
+        try self.refreshNodeVenomsIndex("local");
+        try self.registerLocalCatalogVenomBinding("library", "node_catalog");
+        try self.registerLocalCatalogVenomBinding("chat", "node_catalog");
+        try self.registerLocalCatalogVenomBinding("jobs", "node_catalog");
+        try self.registerLocalCatalogVenomBinding("thoughts", "node_catalog");
+        try self.registerLocalCatalogVenomBinding("events", "node_catalog");
+        try self.registerLocalCatalogVenomBinding("memory", "node_catalog");
+        try self.registerLocalCatalogVenomBinding("web_search", "node_catalog");
+        try self.registerLocalCatalogVenomBinding("search_code", "node_catalog");
+        try self.registerLocalCatalogVenomBinding("terminal", "node_catalog");
+        try self.registerLocalCatalogVenomBinding("mounts", "node_catalog");
+        try self.registerLocalCatalogVenomBinding("sub_brains", "node_catalog");
+        try self.registerLocalCatalogVenomBinding("agents", "node_catalog");
+        try self.registerLocalCatalogVenomBinding("workspaces", "node_catalog");
+        if (self.local_fs_export_root != null) {
+            try self.registerLocalCatalogVenomBinding("git", "node_catalog");
+            try self.registerLocalCatalogVenomBinding("github_pr", "node_catalog");
+        }
+        if (self.mission_store != null) {
+            try self.registerLocalCatalogVenomBinding("missions", "node_catalog");
+            if (self.local_fs_export_root != null) {
+                try self.registerLocalCatalogVenomBinding("pr_review", "node_catalog");
+            }
         }
     }
 
@@ -2621,7 +3097,7 @@ pub const Session = struct {
         );
     }
 
-    fn addDirectoryDescriptors(
+    pub fn addDirectoryDescriptors(
         self: *Session,
         dir_id: u32,
         title: []const u8,
@@ -2641,575 +3117,178 @@ pub const Session = struct {
     }
 
     fn seedAgentMemoryNamespace(self: *Session, memory_dir: u32) !void {
-        try self.addDirectoryDescriptors(
-            memory_dir,
-            "Memory",
-            "{\"kind\":\"venom\",\"venom_id\":\"memory\",\"shape\":\"/global/memory/{README.md,SCHEMA.json,CAPS.json,OPS.json,PERMISSIONS.json,STATUS.json,status.json,result.json,control/*}\"}",
-            "{\"invoke\":true,\"operations\":[\"memory_create\",\"memory_load\",\"memory_versions\",\"memory_mutate\",\"memory_evict\",\"memory_search\"],\"discoverable\":true}",
-            "First-class memory namespace. Write operation payloads to control/*.json, then read status.json/result.json.",
-        );
-        _ = try self.addFile(
-            memory_dir,
-            "OPS.json",
-            "{\"model\":\"local_bridge\",\"invoke\":\"control/invoke.json\",\"transport\":\"acheron-local\",\"paths\":{\"create\":\"control/create.json\",\"load\":\"control/load.json\",\"versions\":\"control/versions.json\",\"mutate\":\"control/mutate.json\",\"evict\":\"control/evict.json\",\"search\":\"control/search.json\"},\"operations\":{\"create\":\"create\",\"load\":\"load\",\"versions\":\"versions\",\"mutate\":\"mutate\",\"evict\":\"evict\",\"search\":\"search\"}}",
-            false,
-            .none,
-        );
-        _ = try self.addFile(
-            memory_dir,
-            "RUNTIME.json",
-            "{\"type\":\"acheron_local\",\"component\":\"acheron_session\",\"subject\":\"agent_memory\"}",
-            false,
-            .none,
-        );
-        _ = try self.addFile(
-            memory_dir,
-            "PERMISSIONS.json",
-            "{\"default\":\"allow-by-default\",\"allow_roles\":[\"admin\",\"user\"],\"scope\":\"agent\"}",
-            false,
-            .none,
-        );
-        _ = try self.addFile(
-            memory_dir,
-            "STATUS.json",
-            "{\"venom_id\":\"memory\",\"state\":\"namespace\",\"has_invoke\":true}",
-            false,
-            .none,
-        );
-        _ = try self.addFile(
-            memory_dir,
-            "status.json",
-            "{\"state\":\"idle\",\"tool\":null,\"updated_at_ms\":0,\"error\":null}",
-            false,
-            .none,
-        );
-        _ = try self.addFile(
-            memory_dir,
-            "result.json",
-            "{\"ok\":false,\"result\":null,\"error\":null}",
-            false,
-            .none,
-        );
+        return memory_venom.seedNamespace(self, memory_dir);
+    }
 
-        const control_dir = try self.addDir(memory_dir, "control", false);
-        _ = try self.addFile(
-            control_dir,
-            "README.md",
-            "Write JSON payloads to operation files. Generic invoke is available at invoke.json.\n",
-            false,
-            .none,
-        );
-        _ = try self.addFile(control_dir, "invoke.json", "", true, .memory_invoke);
-        _ = try self.addFile(control_dir, "create.json", "", true, .memory_create);
-        _ = try self.addFile(control_dir, "load.json", "", true, .memory_load);
-        _ = try self.addFile(control_dir, "versions.json", "", true, .memory_versions);
-        _ = try self.addFile(control_dir, "mutate.json", "", true, .memory_mutate);
-        _ = try self.addFile(control_dir, "evict.json", "", true, .memory_evict);
-        _ = try self.addFile(control_dir, "search.json", "", true, .memory_search);
+    fn seedAgentMemoryNamespaceAt(self: *Session, memory_dir: u32, base_path: []const u8) !void {
+        return memory_venom.seedNamespaceAt(self, memory_dir, base_path);
     }
 
     fn seedAgentWebSearchNamespace(self: *Session, web_search_dir: u32) !void {
-        try self.addDirectoryDescriptors(
-            web_search_dir,
-            "Web Search",
-            "{\"kind\":\"venom\",\"venom_id\":\"web_search\",\"shape\":\"/global/web_search/{README.md,SCHEMA.json,CAPS.json,OPS.json,RUNTIME.json,PERMISSIONS.json,STATUS.json,status.json,result.json,control/*}\"}",
-            "{\"invoke\":true,\"operations\":[\"web_search\"],\"discoverable\":true,\"network\":true}",
-            "First-class web search namespace. Write search payloads to control/search.json (or invoke.json), then read status.json/result.json.",
-        );
-        _ = try self.addFile(
-            web_search_dir,
-            "OPS.json",
-            "{\"model\":\"local_bridge\",\"invoke\":\"control/invoke.json\",\"transport\":\"acheron-local\",\"paths\":{\"search\":\"control/search.json\"},\"operations\":{\"search\":\"search\"}}",
-            false,
-            .none,
-        );
-        _ = try self.addFile(
-            web_search_dir,
-            "RUNTIME.json",
-            "{\"type\":\"acheron_local\",\"component\":\"acheron_session\",\"subject\":\"web_search\"}",
-            false,
-            .none,
-        );
-        _ = try self.addFile(
-            web_search_dir,
-            "PERMISSIONS.json",
-            "{\"default\":\"allow-by-default\",\"allow_roles\":[\"admin\",\"user\"],\"scope\":\"agent\"}",
-            false,
-            .none,
-        );
-        _ = try self.addFile(
-            web_search_dir,
-            "STATUS.json",
-            "{\"venom_id\":\"web_search\",\"state\":\"namespace\",\"has_invoke\":true}",
-            false,
-            .none,
-        );
-        _ = try self.addFile(
-            web_search_dir,
-            "status.json",
-            "{\"state\":\"idle\",\"tool\":null,\"updated_at_ms\":0,\"error\":null}",
-            false,
-            .none,
-        );
-        _ = try self.addFile(
-            web_search_dir,
-            "result.json",
-            "{\"ok\":false,\"result\":null,\"error\":null}",
-            false,
-            .none,
-        );
+        return search_services_venom.seedWebSearchNamespace(self, web_search_dir);
+    }
 
-        const control_dir = try self.addDir(web_search_dir, "control", false);
-        _ = try self.addFile(
-            control_dir,
-            "README.md",
-            "Write search payloads to search.json (or explicit envelopes to invoke.json). Read result.json and status.json.\n",
-            false,
-            .none,
-        );
-        _ = try self.addFile(control_dir, "invoke.json", "", true, .web_search_invoke);
-        _ = try self.addFile(control_dir, "search.json", "", true, .web_search_search);
+    fn seedAgentWebSearchNamespaceAt(self: *Session, web_search_dir: u32, base_path: []const u8) !void {
+        return search_services_venom.seedWebSearchNamespaceAt(self, web_search_dir, base_path);
     }
 
     fn seedAgentSearchCodeNamespace(self: *Session, search_code_dir: u32) !void {
-        try self.addDirectoryDescriptors(
-            search_code_dir,
-            "Search Code",
-            "{\"kind\":\"venom\",\"venom_id\":\"search_code\",\"shape\":\"/global/search_code/{README.md,SCHEMA.json,CAPS.json,OPS.json,RUNTIME.json,PERMISSIONS.json,STATUS.json,status.json,result.json,control/*}\"}",
-            "{\"invoke\":true,\"operations\":[\"search_code\"],\"discoverable\":true}",
-            "First-class code search namespace. Write search payloads to control/search.json (or invoke.json), then read status.json/result.json.",
-        );
-        _ = try self.addFile(
-            search_code_dir,
-            "OPS.json",
-            "{\"model\":\"local_bridge\",\"invoke\":\"control/invoke.json\",\"transport\":\"acheron-local\",\"paths\":{\"search\":\"control/search.json\"},\"operations\":{\"search\":\"search\"}}",
-            false,
-            .none,
-        );
-        _ = try self.addFile(
-            search_code_dir,
-            "RUNTIME.json",
-            "{\"type\":\"acheron_local\",\"component\":\"acheron_session\",\"subject\":\"search_code\"}",
-            false,
-            .none,
-        );
-        _ = try self.addFile(
-            search_code_dir,
-            "PERMISSIONS.json",
-            "{\"default\":\"allow-by-default\",\"allow_roles\":[\"admin\",\"user\"],\"scope\":\"agent\"}",
-            false,
-            .none,
-        );
-        _ = try self.addFile(
-            search_code_dir,
-            "STATUS.json",
-            "{\"venom_id\":\"search_code\",\"state\":\"namespace\",\"has_invoke\":true}",
-            false,
-            .none,
-        );
-        _ = try self.addFile(
-            search_code_dir,
-            "status.json",
-            "{\"state\":\"idle\",\"tool\":null,\"updated_at_ms\":0,\"error\":null}",
-            false,
-            .none,
-        );
-        _ = try self.addFile(
-            search_code_dir,
-            "result.json",
-            "{\"ok\":false,\"result\":null,\"error\":null}",
-            false,
-            .none,
-        );
+        return search_services_venom.seedSearchCodeNamespace(self, search_code_dir);
+    }
 
-        const control_dir = try self.addDir(search_code_dir, "control", false);
-        _ = try self.addFile(
-            control_dir,
-            "README.md",
-            "Write search payloads to search.json (or explicit envelopes to invoke.json). Read result.json and status.json.\n",
-            false,
-            .none,
-        );
-        _ = try self.addFile(control_dir, "invoke.json", "", true, .search_code_invoke);
-        _ = try self.addFile(control_dir, "search.json", "", true, .search_code_search);
+    fn seedAgentSearchCodeNamespaceAt(self: *Session, search_code_dir: u32, base_path: []const u8) !void {
+        return search_services_venom.seedSearchCodeNamespaceAt(self, search_code_dir, base_path);
     }
 
     fn seedAgentTerminalNamespace(self: *Session, terminal_dir: u32) !void {
-        try self.addDirectoryDescriptors(
-            terminal_dir,
-            "Terminal",
-            "{\"kind\":\"venom\",\"venom_id\":\"terminal-v2\",\"shape\":\"/global/terminal/{README.md,SCHEMA.json,CAPS.json,OPS.json,RUNTIME.json,PERMISSIONS.json,STATUS.json,status.json,result.json,sessions.json,current.json,control/*}\"}",
-            "{\"invoke\":true,\"operations\":[\"terminal_session_create\",\"terminal_session_resume\",\"terminal_session_close\",\"terminal_session_write\",\"terminal_session_read\",\"terminal_session_resize\",\"shell_exec\"],\"discoverable\":true,\"interactive\":true,\"sessionized\":true,\"pty\":true}",
-            "Sessionized terminal namespace. Create/resume/close PTY sessions and use write/read/resize for interactive workflows.",
-        );
-        _ = try self.addFile(
-            terminal_dir,
-            "OPS.json",
-            "{\"model\":\"local_bridge\",\"invoke\":\"control/invoke.json\",\"transport\":\"acheron-local\",\"paths\":{\"create\":\"control/create.json\",\"resume\":\"control/resume.json\",\"close\":\"control/close.json\",\"write\":\"control/write.json\",\"read\":\"control/read.json\",\"resize\":\"control/resize.json\",\"exec\":\"control/exec.json\"},\"operations\":{\"create\":\"create\",\"resume\":\"resume\",\"close\":\"close\",\"write\":\"write\",\"read\":\"read\",\"resize\":\"resize\",\"exec\":\"exec\"}}",
-            false,
-            .none,
-        );
-        _ = try self.addFile(
-            terminal_dir,
-            "RUNTIME.json",
-            "{\"type\":\"runtime_tool\",\"tool\":\"shell_exec\",\"session_model\":\"terminal-v2\"}",
-            false,
-            .none,
-        );
-        _ = try self.addFile(
-            terminal_dir,
-            "PERMISSIONS.json",
-            "{\"default\":\"allow-by-default\",\"allow_roles\":[\"admin\",\"user\"],\"scope\":\"agent\"}",
-            false,
-            .none,
-        );
-        _ = try self.addFile(
-            terminal_dir,
-            "STATUS.json",
-            "{\"venom_id\":\"terminal-v2\",\"state\":\"namespace\",\"has_invoke\":true,\"sessionized\":true}",
-            false,
-            .none,
-        );
-        self.terminal_status_id = try self.addFile(
-            terminal_dir,
-            "status.json",
-            "{\"state\":\"idle\",\"tool\":null,\"session_id\":null,\"updated_at_ms\":0,\"error\":null}",
-            false,
-            .none,
-        );
-        self.terminal_result_id = try self.addFile(
-            terminal_dir,
-            "result.json",
-            "{\"ok\":false,\"result\":null,\"error\":null}",
-            false,
-            .none,
-        );
-        self.terminal_sessions_id = try self.addFile(
-            terminal_dir,
-            "sessions.json",
-            "{\"sessions\":[]}",
-            false,
-            .none,
-        );
-        self.terminal_current_id = try self.addFile(
-            terminal_dir,
-            "current.json",
-            "{\"session\":null}",
-            false,
-            .none,
-        );
+        return terminal_venom.seedNamespace(self, terminal_dir);
+    }
 
-        const control_dir = try self.addDir(terminal_dir, "control", false);
-        _ = try self.addFile(
-            control_dir,
-            "README.md",
-            "Use create/resume/close to manage PTY sessions. Use write/read/resize for interactive I/O. exec is a convenience write+read command path. invoke.json accepts op=create|resume|close|write|read|resize|exec envelopes.\n",
-            false,
-            .none,
-        );
-        _ = try self.addFile(control_dir, "invoke.json", "", true, .terminal_v2_invoke);
-        _ = try self.addFile(control_dir, "create.json", "", true, .terminal_v2_create);
-        _ = try self.addFile(control_dir, "resume.json", "", true, .terminal_v2_resume);
-        _ = try self.addFile(control_dir, "close.json", "", true, .terminal_v2_close);
-        _ = try self.addFile(control_dir, "write.json", "", true, .terminal_v2_write);
-        _ = try self.addFile(control_dir, "read.json", "", true, .terminal_v2_read);
-        _ = try self.addFile(control_dir, "resize.json", "", true, .terminal_v2_resize);
-        _ = try self.addFile(control_dir, "exec.json", "", true, .terminal_v2_exec);
+    fn seedAgentTerminalNamespaceAt(self: *Session, terminal_dir: u32, base_path: []const u8) !void {
+        return terminal_venom.seedNamespaceAt(self, terminal_dir, base_path);
+    }
+
+    fn seedAgentGitNamespace(self: *Session, git_dir: u32) !void {
+        return git_venom.seedNamespace(self, git_dir);
+    }
+
+    fn seedAgentGitNamespaceAt(self: *Session, git_dir: u32, base_path: []const u8) !void {
+        return git_venom.seedNamespaceAt(self, git_dir, base_path);
+    }
+
+    fn seedAgentGitHubPrNamespace(self: *Session, github_pr_dir: u32) !void {
+        return github_pr_venom.seedNamespace(self, github_pr_dir);
+    }
+
+    fn seedAgentGitHubPrNamespaceAt(self: *Session, github_pr_dir: u32, base_path: []const u8) !void {
+        return github_pr_venom.seedNamespaceAt(self, github_pr_dir, base_path);
     }
 
     fn seedAgentMountsNamespace(self: *Session, mounts_dir: u32) !void {
-        try self.addDirectoryDescriptors(
-            mounts_dir,
-            "Mounts and Binds",
-            "{\"kind\":\"venom\",\"venom_id\":\"mounts\",\"shape\":\"/global/mounts/{README.md,SCHEMA.json,CAPS.json,OPS.json,RUNTIME.json,PERMISSIONS.json,STATUS.json,status.json,result.json,control/*}\"}",
-            "{\"invoke\":true,\"operations\":[\"list\",\"mount\",\"mkdir\",\"unmount\",\"bind\",\"unbind\",\"resolve\"],\"discoverable\":true,\"project_scope\":true}",
-            "Manage project mounts and path binds through Acheron control files.",
-        );
-        _ = try self.addFile(
-            mounts_dir,
-            "OPS.json",
-            "{\"model\":\"local_bridge\",\"invoke\":\"control/invoke.json\",\"transport\":\"acheron-local\",\"paths\":{\"list\":\"control/list.json\",\"mount\":\"control/mount.json\",\"mkdir\":\"control/mkdir.json\",\"unmount\":\"control/unmount.json\",\"bind\":\"control/bind.json\",\"unbind\":\"control/unbind.json\",\"resolve\":\"control/resolve.json\"},\"operations\":{\"list\":\"list\",\"mount\":\"mount\",\"mkdir\":\"mkdir\",\"unmount\":\"unmount\",\"bind\":\"bind\",\"unbind\":\"unbind\",\"resolve\":\"resolve\"}}",
-            false,
-            .none,
-        );
-        _ = try self.addFile(
-            mounts_dir,
-            "RUNTIME.json",
-            "{\"type\":\"acheron_local\",\"component\":\"acheron_session\",\"subject\":\"project_mounts_binds\"}",
-            false,
-            .none,
-        );
-        _ = try self.addFile(
-            mounts_dir,
-            "PERMISSIONS.json",
-            "{\"default\":\"allow-by-default\",\"allow_roles\":[\"admin\",\"user\"],\"scope\":\"project\",\"project_token_required\":false}",
-            false,
-            .none,
-        );
-        _ = try self.addFile(
-            mounts_dir,
-            "STATUS.json",
-            "{\"venom_id\":\"mounts\",\"state\":\"namespace\",\"has_invoke\":true}",
-            false,
-            .none,
-        );
-        self.mounts_status_id = try self.addFile(
-            mounts_dir,
-            "status.json",
-            "{\"state\":\"idle\",\"tool\":null,\"updated_at_ms\":0,\"error\":null}",
-            false,
-            .none,
-        );
-        const initial_result = try self.buildMountsListResultJson(null, null);
-        defer self.allocator.free(initial_result);
-        self.mounts_result_id = try self.addFile(
-            mounts_dir,
-            "result.json",
-            initial_result,
-            false,
-            .none,
-        );
+        return mounts_venom.seedNamespace(self, mounts_dir);
+    }
 
-        const control_dir = try self.addDir(mounts_dir, "control", false);
-        _ = try self.addFile(
-            control_dir,
-            "README.md",
-            "Use list/mount/mkdir/unmount/bind/unbind/resolve operation files, or invoke.json with op plus arguments.\nMount, mkdir, and bind operations require project mount permission.\n",
-            false,
-            .none,
-        );
-        _ = try self.addFile(control_dir, "invoke.json", "", true, .mounts_invoke);
-        _ = try self.addFile(control_dir, "list.json", "", true, .mounts_list);
-        _ = try self.addFile(control_dir, "mount.json", "", true, .mounts_mount);
-        _ = try self.addFile(control_dir, "mkdir.json", "", true, .mounts_mkdir);
-        _ = try self.addFile(control_dir, "unmount.json", "", true, .mounts_unmount);
-        _ = try self.addFile(control_dir, "bind.json", "", true, .mounts_bind);
-        _ = try self.addFile(control_dir, "unbind.json", "", true, .mounts_unbind);
-        _ = try self.addFile(control_dir, "resolve.json", "", true, .mounts_resolve);
+    fn seedAgentMountsNamespaceAt(self: *Session, mounts_dir: u32, base_path: []const u8) !void {
+        return mounts_venom.seedNamespaceAt(self, mounts_dir, base_path);
     }
 
     fn seedAgentSubBrainsNamespace(self: *Session, sub_brains_dir: u32) !void {
-        const can_manage_sub_brains = self.canManageSubBrains();
-        const caps_json = if (can_manage_sub_brains)
-            "{\"invoke\":true,\"operations\":[\"sub_brains_list\",\"sub_brains_upsert\",\"sub_brains_delete\"],\"discoverable\":true,\"config_mutation\":true,\"manage_allowed\":true}"
-        else
-            "{\"invoke\":true,\"operations\":[\"sub_brains_list\"],\"discoverable\":true,\"config_mutation\":false,\"manage_allowed\":false}";
-        try self.addDirectoryDescriptors(
-            sub_brains_dir,
-            "Sub-Brains",
-            "{\"kind\":\"venom\",\"venom_id\":\"sub_brains\",\"shape\":\"/global/sub_brains/{README.md,SCHEMA.json,CAPS.json,OPS.json,PERMISSIONS.json,STATUS.json,status.json,result.json,control/*}\"}",
-            caps_json,
-            "Manage sub-brain configuration for this agent through Acheron control files.",
-        );
-        _ = try self.addFile(
-            sub_brains_dir,
-            "OPS.json",
-            "{\"model\":\"local_bridge\",\"invoke\":\"control/invoke.json\",\"transport\":\"acheron-local\",\"paths\":{\"list\":\"control/list.json\",\"upsert\":\"control/upsert.json\",\"delete\":\"control/delete.json\"},\"operations\":{\"list\":\"sub_brains_list\",\"upsert\":\"sub_brains_upsert\",\"delete\":\"sub_brains_delete\"}}",
-            false,
-            .none,
-        );
-        _ = try self.addFile(
-            sub_brains_dir,
-            "RUNTIME.json",
-            "{\"type\":\"acheron_local\",\"component\":\"acheron_session\",\"subject\":\"agent_sub_brains\"}",
-            false,
-            .none,
-        );
-        _ = try self.addFile(
-            sub_brains_dir,
-            "PERMISSIONS.json",
-            "{\"default\":\"allow-by-default\",\"allow_roles\":[\"admin\",\"user\"],\"scope\":\"agent\",\"project_token_required\":false}",
-            false,
-            .none,
-        );
-        _ = try self.addFile(
-            sub_brains_dir,
-            "STATUS.json",
-            "{\"venom_id\":\"sub_brains\",\"state\":\"namespace\",\"has_invoke\":true}",
-            false,
-            .none,
-        );
-        self.sub_brains_status_id = try self.addFile(
-            sub_brains_dir,
-            "status.json",
-            "{\"state\":\"idle\",\"tool\":null,\"updated_at_ms\":0,\"error\":null}",
-            false,
-            .none,
-        );
-        const initial_result = try self.buildSubBrainListResultJson();
-        defer self.allocator.free(initial_result);
-        self.sub_brains_result_id = try self.addFile(
-            sub_brains_dir,
-            "result.json",
-            initial_result,
-            false,
-            .none,
-        );
+        return self.seedAgentSubBrainsNamespaceAt(sub_brains_dir, "/global/sub_brains");
+    }
 
-        const control_dir = try self.addDir(sub_brains_dir, "control", false);
-        _ = try self.addFile(
-            control_dir,
-            "README.md",
-            "Use list/upsert/delete operation files, or invoke.json with op=list|upsert|delete plus arguments. Upsert/delete require sub-brain management capability.\n",
-            false,
-            .none,
-        );
-        _ = try self.addFile(control_dir, "invoke.json", "", true, .sub_brains_invoke);
-        _ = try self.addFile(control_dir, "list.json", "", true, .sub_brains_list);
-        _ = try self.addFile(control_dir, "upsert.json", "", can_manage_sub_brains, .sub_brains_upsert);
-        _ = try self.addFile(control_dir, "delete.json", "", can_manage_sub_brains, .sub_brains_delete);
+    fn seedAgentSubBrainsNamespaceAt(self: *Session, sub_brains_dir: u32, base_path: []const u8) !void {
+        return sub_brains_venom.seedNamespaceAt(self, sub_brains_dir, base_path);
     }
 
     fn seedAgentAgentsNamespace(self: *Session, agents_dir: u32) !void {
-        const can_create_agents = self.canCreateAgents();
-        const caps_json = if (can_create_agents)
-            "{\"invoke\":true,\"operations\":[\"agents_list\",\"agents_create\"],\"discoverable\":true,\"create_allowed\":true}"
-        else
-            "{\"invoke\":true,\"operations\":[\"agents_list\"],\"discoverable\":true,\"create_allowed\":false}";
-        try self.addDirectoryDescriptors(
-            agents_dir,
-            "Agents Management",
-            "{\"kind\":\"venom\",\"venom_id\":\"agents\",\"shape\":\"/global/agents/{README.md,SCHEMA.json,CAPS.json,OPS.json,PERMISSIONS.json,STATUS.json,status.json,result.json,control/*}\"}",
-            caps_json,
-            "List and create agent workspaces through Acheron control files.",
-        );
-        _ = try self.addFile(
-            agents_dir,
-            "OPS.json",
-            "{\"model\":\"local_bridge\",\"invoke\":\"control/invoke.json\",\"transport\":\"acheron-local\",\"paths\":{\"list\":\"control/list.json\",\"create\":\"control/create.json\"},\"operations\":{\"list\":\"agents_list\",\"create\":\"agents_create\"}}",
-            false,
-            .none,
-        );
-        _ = try self.addFile(
-            agents_dir,
-            "RUNTIME.json",
-            "{\"type\":\"acheron_local\",\"component\":\"acheron_session\",\"subject\":\"agent_registry\"}",
-            false,
-            .none,
-        );
-        _ = try self.addFile(
-            agents_dir,
-            "PERMISSIONS.json",
-            "{\"default\":\"allow-by-default\",\"allow_roles\":[\"admin\",\"user\"],\"scope\":\"agent\",\"project_token_required\":false}",
-            false,
-            .none,
-        );
-        _ = try self.addFile(
-            agents_dir,
-            "STATUS.json",
-            "{\"venom_id\":\"agents\",\"state\":\"namespace\",\"has_invoke\":true}",
-            false,
-            .none,
-        );
-        self.agents_status_id = try self.addFile(
-            agents_dir,
-            "status.json",
-            "{\"state\":\"idle\",\"tool\":null,\"updated_at_ms\":0,\"error\":null}",
-            false,
-            .none,
-        );
-        const initial_result = try self.buildAgentListResultJson();
-        defer self.allocator.free(initial_result);
-        self.agents_result_id = try self.addFile(
-            agents_dir,
-            "result.json",
-            initial_result,
-            false,
-            .none,
-        );
-
-        const control_dir = try self.addDir(agents_dir, "control", false);
-        _ = try self.addFile(
-            control_dir,
-            "README.md",
-            "Use list/create operation files, or invoke.json with op=list|create plus arguments. Create requires agent provisioning capability.\n",
-            false,
-            .none,
-        );
-        _ = try self.addFile(control_dir, "invoke.json", "", true, .agents_invoke);
-        _ = try self.addFile(control_dir, "list.json", "", true, .agents_list);
-        _ = try self.addFile(control_dir, "create.json", "", can_create_agents, .agents_create);
+        return self.seedAgentAgentsNamespaceAt(agents_dir, "/global/agents");
     }
 
-    fn seedAgentProjectsNamespace(self: *Session, projects_dir: u32) !void {
-        try self.addDirectoryDescriptors(
-            projects_dir,
-            "Projects Management",
-            "{\"kind\":\"venom\",\"venom_id\":\"projects\",\"shape\":\"/global/projects/{README.md,SCHEMA.json,CAPS.json,OPS.json,PERMISSIONS.json,STATUS.json,status.json,result.json,control/*}\"}",
-            "{\"invoke\":true,\"operations\":[\"projects_list\",\"projects_get\",\"projects_up\"],\"discoverable\":true}",
-            "List, inspect, and create/update projects through Acheron control files.",
-        );
-        _ = try self.addFile(
-            projects_dir,
-            "OPS.json",
-            "{\"model\":\"local_bridge\",\"invoke\":\"control/invoke.json\",\"transport\":\"acheron-local\",\"paths\":{\"list\":\"control/list.json\",\"get\":\"control/get.json\",\"up\":\"control/up.json\"},\"operations\":{\"list\":\"projects_list\",\"get\":\"projects_get\",\"up\":\"projects_up\"}}",
-            false,
-            .none,
-        );
-        _ = try self.addFile(
-            projects_dir,
-            "RUNTIME.json",
-            "{\"type\":\"acheron_local\",\"component\":\"acheron_session\",\"subject\":\"control_plane_projects\"}",
-            false,
-            .none,
-        );
-        _ = try self.addFile(
-            projects_dir,
-            "PERMISSIONS.json",
-            "{\"default\":\"allow-by-default\",\"allow_roles\":[\"admin\",\"user\"],\"scope\":\"project_control_plane\"}",
-            false,
-            .none,
-        );
-        _ = try self.addFile(
-            projects_dir,
-            "STATUS.json",
-            "{\"venom_id\":\"projects\",\"state\":\"namespace\",\"has_invoke\":true}",
-            false,
-            .none,
-        );
-        self.projects_status_id = try self.addFile(
-            projects_dir,
-            "status.json",
-            "{\"state\":\"idle\",\"tool\":null,\"updated_at_ms\":0,\"error\":null}",
-            false,
-            .none,
-        );
-        const initial_result = try self.buildProjectListResultJson();
-        defer self.allocator.free(initial_result);
-        self.projects_result_id = try self.addFile(
-            projects_dir,
-            "result.json",
-            initial_result,
-            false,
-            .none,
-        );
+    fn seedAgentAgentsNamespaceAt(self: *Session, agents_dir: u32, base_path: []const u8) !void {
+        return agents_venom.seedNamespaceAt(self, agents_dir, base_path);
+    }
 
-        const control_dir = try self.addDir(projects_dir, "control", false);
+    fn seedAgentWorkspacesNamespace(self: *Session, workspaces_dir: u32) !void {
+        return self.seedAgentWorkspacesNamespaceAt(workspaces_dir, "/global/workspaces");
+    }
+
+    fn seedAgentWorkspacesNamespaceAt(self: *Session, workspaces_dir: u32, base_path: []const u8) !void {
+        return workspaces_venom.seedNamespaceAt(self, workspaces_dir, base_path);
+    }
+
+    fn seedChatNamespaceAt(self: *Session, chat_dir: u32, base_path: []const u8, jobs_path: []const u8) !void {
+        return chat_venom.seedNamespaceAt(self, chat_dir, base_path, jobs_path);
+    }
+
+    fn seedJobsNamespaceAt(self: *Session, jobs_dir: u32, base_path: []const u8) !void {
+        return jobs_venom.seedNamespaceAt(self, jobs_dir, base_path);
+    }
+
+    fn seedThoughtsNamespaceAt(self: *Session, thoughts_dir: u32, base_path: []const u8) !void {
+        const escaped_base_path = try unified.jsonEscape(self.allocator, base_path);
+        defer self.allocator.free(escaped_base_path);
+        const shape_json = try std.fmt.allocPrint(
+            self.allocator,
+            "{{\"kind\":\"venom\",\"venom_id\":\"thoughts\",\"shape\":\"{s}/{{README.md,SCHEMA.json,CAPS.json,OPS.json,latest.txt,history.ndjson,status.json}}\"}}",
+            .{escaped_base_path},
+        );
+        defer self.allocator.free(shape_json);
+        try self.addDirectoryDescriptors(
+            thoughts_dir,
+            "Thoughts",
+            shape_json,
+            "{\"read\":true,\"write\":false,\"discoverable\":true}",
+            "Runtime internal thought stream (not chat output).",
+        );
         _ = try self.addFile(
-            control_dir,
+            thoughts_dir,
             "README.md",
-            "Use list/get/up operation files, or invoke.json with op=list|get|up plus arguments. For Mother bootstrap provisioning, use up with activate=false.\n",
+            shared_node.venom_contracts.thoughts.readme_md,
             false,
             .none,
         );
-        _ = try self.addFile(control_dir, "invoke.json", "", true, .projects_invoke);
-        _ = try self.addFile(control_dir, "list.json", "", true, .projects_list);
-        _ = try self.addFile(control_dir, "get.json", "", true, .projects_get);
-        _ = try self.addFile(control_dir, "up.json", "", true, .projects_up);
+        _ = try self.addFile(
+            thoughts_dir,
+            "SCHEMA.json",
+            shared_node.venom_contracts.thoughts.schema_json,
+            false,
+            .none,
+        );
+        _ = try self.addFile(
+            thoughts_dir,
+            "CAPS.json",
+            shared_node.venom_contracts.thoughts.caps_json,
+            false,
+            .none,
+        );
+        _ = try self.addFile(thoughts_dir, "OPS.json", shared_node.venom_contracts.thoughts.ops_json, false, .none);
+        self.thoughts_latest_id = try self.addFile(thoughts_dir, "latest.txt", "", false, .none);
+        self.thoughts_history_id = try self.addFile(thoughts_dir, "history.ndjson", "", false, .none);
+        self.thoughts_status_id = try self.addFile(
+            thoughts_dir,
+            "status.json",
+            shared_node.venom_contracts.thoughts.initial_status_json,
+            false,
+            .none,
+        );
+    }
+
+    fn seedEventsNamespaceAt(self: *Session, events_dir: u32, base_path: []const u8) !void {
+        return events_venom.seedNamespaceAt(self, events_dir, base_path);
+    }
+
+    fn seedAgentPrReviewNamespace(self: *Session, pr_review_dir: u32) !void {
+        return pr_review_venom.seedNamespace(self, pr_review_dir);
+    }
+
+    fn seedAgentPrReviewNamespaceAt(self: *Session, pr_review_dir: u32, base_path: []const u8) !void {
+        return pr_review_venom.seedNamespaceAt(self, pr_review_dir, base_path);
     }
 
     fn seedGlobalLibraryNamespace(self: *Session, library_dir: u32) !void {
+        return self.seedGlobalLibraryNamespaceAt(library_dir, "/global/library");
+    }
+
+    fn seedGlobalLibraryNamespaceAt(self: *Session, library_dir: u32, base_path: []const u8) !void {
+        const escaped_base_path = try unified.jsonEscape(self.allocator, base_path);
+        defer self.allocator.free(escaped_base_path);
+        const shape_json = try std.fmt.allocPrint(
+            self.allocator,
+            "{{\"kind\":\"venom\",\"venom_id\":\"library\",\"shape\":\"{s}/{{Index.md,README.md,SCHEMA.json,CAPS.json,OPS.json,PERMISSIONS.json,STATUS.json,topics/*,use-cases/*}}\"}}",
+            .{escaped_base_path},
+        );
+        defer self.allocator.free(shape_json);
         try self.addDirectoryDescriptors(
             library_dir,
             "Global Library",
-            "{\"kind\":\"venom\",\"venom_id\":\"library\",\"shape\":\"/global/library/{Index.md,README.md,SCHEMA.json,CAPS.json,OPS.json,PERMISSIONS.json,STATUS.json,topics/*}\"}",
+            shape_json,
             "{\"invoke\":false,\"operations\":[],\"discoverable\":true,\"read_only\":true}",
             "Stable, system-wide documentation for common Spiderweb/Acheron operations.",
         );
         _ = try self.addFile(
             library_dir,
             "OPS.json",
-            "{\"model\":\"static_docs\",\"transport\":\"filesystem\",\"paths\":{\"index\":\"Index.md\",\"topics\":\"topics/*\"},\"operations\":{}}",
+            "{\"model\":\"static_docs\",\"transport\":\"filesystem\",\"paths\":{\"index\":\"Index.md\",\"topics\":\"topics/*\",\"use_cases\":\"use-cases/*\"},\"operations\":{}}",
             false,
             .none,
         );
@@ -3240,6 +3319,9 @@ pub const Session = struct {
 
         const loaded_topics = try self.seedGlobalLibraryTopicsFromAssets(topics_dir);
         if (!loaded_topics) try self.seedDefaultGlobalLibraryTopics(topics_dir);
+
+        const use_cases_dir = try self.addDir(library_dir, "use-cases", false);
+        _ = try self.seedGlobalLibrarySubtreeFromAssets(use_cases_dir, "use-cases");
     }
 
     fn loadGlobalLibraryIndexFromAssets(self: *Session) ![]u8 {
@@ -3265,6 +3347,41 @@ pub const Session = struct {
             defer self.allocator.free(content);
             _ = try self.addFile(topics_dir, entry.name, content, false, .none);
             loaded_any = true;
+        }
+        return loaded_any;
+    }
+
+    fn seedGlobalLibrarySubtreeFromAssets(
+        self: *Session,
+        parent_dir: u32,
+        relative_subtree: []const u8,
+    ) !bool {
+        const host_path = try std.fs.path.join(self.allocator, &.{ self.assets_dir, "library", relative_subtree });
+        defer self.allocator.free(host_path);
+
+        var host_dir = std.fs.cwd().openDir(host_path, .{ .iterate = true }) catch return false;
+        defer host_dir.close();
+
+        var iterator = host_dir.iterate();
+        var loaded_any = false;
+        while (try iterator.next()) |entry| {
+            switch (entry.kind) {
+                .file => {
+                    const content = host_dir.readFileAlloc(self.allocator, entry.name, 512 * 1024) catch continue;
+                    defer self.allocator.free(content);
+                    _ = try self.addFile(parent_dir, entry.name, content, false, .none);
+                    loaded_any = true;
+                },
+                .directory => {
+                    const child_dir = try self.addDir(parent_dir, entry.name, false);
+                    const child_relative = try std.fs.path.join(self.allocator, &.{ relative_subtree, entry.name });
+                    defer self.allocator.free(child_relative);
+                    if (try self.seedGlobalLibrarySubtreeFromAssets(child_dir, child_relative)) {
+                        loaded_any = true;
+                    }
+                },
+                else => {},
+            }
         }
         return loaded_any;
     }
@@ -3329,868 +3446,62 @@ pub const Session = struct {
     }
 
     fn handleTerminalV2InvokeWrite(self: *Session, invoke_node_id: u32, raw_input: []const u8) anyerror!WriteOutcome {
-        const input = std.mem.trim(u8, raw_input, " \t\r\n");
-        if (input.len == 0) return error.InvalidPayload;
-        try self.setFileContent(invoke_node_id, input);
-
-        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, input, .{}) catch return error.InvalidPayload;
-        defer parsed.deinit();
-        if (parsed.value != .object) return error.InvalidPayload;
-        const obj = parsed.value.object;
-
-        const op = self.terminalInvokeOperationFromPayload(obj) orelse return error.InvalidPayload;
-
-        const operation_payload = blk: {
-            if (obj.get("arguments")) |value| break :blk try self.renderJsonValue(value);
-            if (obj.get("args")) |value| break :blk try self.renderJsonValue(value);
-            break :blk try self.allocator.dupe(u8, input);
-        };
-        defer self.allocator.free(operation_payload);
-
-        return switch (op) {
-            .create_session => self.terminalV2Create(operation_payload),
-            .resume_session => self.terminalV2Resume(operation_payload),
-            .close_session => self.terminalV2Close(operation_payload),
-            .write_session => self.terminalV2Write(operation_payload),
-            .read_session => self.terminalV2Read(operation_payload),
-            .resize_session => self.terminalV2Resize(operation_payload),
-            .exec => self.terminalV2Exec(operation_payload),
-        };
+        return .{ .written = try terminal_venom.handleInvokeWrite(self, invoke_node_id, raw_input) };
     }
 
     fn handleTerminalV2CreateWrite(self: *Session, create_node_id: u32, raw_input: []const u8) anyerror!WriteOutcome {
-        const input = std.mem.trim(u8, raw_input, " \t\r\n");
-        const payload = if (input.len == 0) "{}" else input;
-        try self.setFileContent(create_node_id, payload);
-        return self.terminalV2Create(payload);
+        return .{ .written = try terminal_venom.handleCreateWrite(self, create_node_id, raw_input) };
     }
 
     fn handleTerminalV2ResumeWrite(self: *Session, resume_node_id: u32, raw_input: []const u8) anyerror!WriteOutcome {
-        const input = std.mem.trim(u8, raw_input, " \t\r\n");
-        if (input.len == 0) return error.InvalidPayload;
-        try self.setFileContent(resume_node_id, input);
-        return self.terminalV2Resume(input);
+        return .{ .written = try terminal_venom.handleResumeWrite(self, resume_node_id, raw_input) };
     }
 
     fn handleTerminalV2CloseWrite(self: *Session, close_node_id: u32, raw_input: []const u8) anyerror!WriteOutcome {
-        const input = std.mem.trim(u8, raw_input, " \t\r\n");
-        const payload = if (input.len == 0) "{}" else input;
-        try self.setFileContent(close_node_id, payload);
-        return self.terminalV2Close(payload);
+        return .{ .written = try terminal_venom.handleCloseWrite(self, close_node_id, raw_input) };
     }
 
     fn handleTerminalV2WriteWrite(self: *Session, write_node_id: u32, raw_input: []const u8) anyerror!WriteOutcome {
-        const input = std.mem.trim(u8, raw_input, " \t\r\n");
-        if (input.len == 0) return error.InvalidPayload;
-        try self.setFileContent(write_node_id, input);
-        return self.terminalV2Write(input);
+        return .{ .written = try terminal_venom.handleWriteWrite(self, write_node_id, raw_input) };
     }
 
     fn handleTerminalV2ReadWrite(self: *Session, read_node_id: u32, raw_input: []const u8) anyerror!WriteOutcome {
-        const input = std.mem.trim(u8, raw_input, " \t\r\n");
-        const payload = if (input.len == 0) "{}" else input;
-        try self.setFileContent(read_node_id, payload);
-        return self.terminalV2Read(payload);
+        return .{ .written = try terminal_venom.handleReadWrite(self, read_node_id, raw_input) };
     }
 
     fn handleTerminalV2ResizeWrite(self: *Session, resize_node_id: u32, raw_input: []const u8) anyerror!WriteOutcome {
-        const input = std.mem.trim(u8, raw_input, " \t\r\n");
-        if (input.len == 0) return error.InvalidPayload;
-        try self.setFileContent(resize_node_id, input);
-        return self.terminalV2Resize(input);
+        return .{ .written = try terminal_venom.handleResizeWrite(self, resize_node_id, raw_input) };
     }
 
     fn handleTerminalV2ExecWrite(self: *Session, exec_node_id: u32, raw_input: []const u8) anyerror!WriteOutcome {
-        const input = std.mem.trim(u8, raw_input, " \t\r\n");
-        if (input.len == 0) return error.InvalidPayload;
-        try self.setFileContent(exec_node_id, input);
-        return self.terminalV2Exec(input);
+        return .{ .written = try terminal_venom.handleExecWrite(self, exec_node_id, raw_input) };
     }
 
-    fn terminalV2Create(self: *Session, payload: []const u8) !WriteOutcome {
-        if (builtin.os.tag != .linux) return error.UnsupportedPlatform;
-
-        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, payload, .{}) catch return error.InvalidPayload;
-        defer parsed.deinit();
-        if (parsed.value != .object) return error.InvalidPayload;
-        const obj = parsed.value.object;
-
-        const maybe_session_id = try jsonObjectOptionalString(obj, "session_id");
-        const label = try jsonObjectOptionalString(obj, "label");
-        const cwd = try jsonObjectOptionalString(obj, "cwd");
-        _ = try jsonObjectOptionalString(obj, "shell");
-
-        const session_id_owned = if (maybe_session_id) |value|
-            try self.allocator.dupe(u8, value)
-        else
-            try self.generateTerminalSessionId();
-        errdefer self.allocator.free(session_id_owned);
-        if (self.terminal_sessions.contains(session_id_owned)) return error.InvalidPayload;
-
-        var session = TerminalSession{
-            .label = if (label) |value| try self.allocator.dupe(u8, value) else null,
-            .cwd = if (cwd) |value| try self.allocator.dupe(u8, value) else null,
-            .created_at_ms = std.time.milliTimestamp(),
-            .updated_at_ms = std.time.milliTimestamp(),
-        };
-        errdefer session.deinit(self.allocator);
-
-        try self.terminal_sessions.putNoClobber(self.allocator, session_id_owned, session);
-        try self.setCurrentTerminalSession(session_id_owned);
-        try self.refreshTerminalV2StateFiles();
-        try self.updateTerminalV2StatusAndResult(
-            "done",
-            "terminal_session_create",
-            session_id_owned,
-            null,
-            "create",
-            "{\"state\":\"open\",\"backend\":\"runtime_tool\"}",
-        );
-        return .{ .written = payload.len };
-    }
-
-    fn terminalV2Resume(self: *Session, payload: []const u8) !WriteOutcome {
-        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, payload, .{}) catch return error.InvalidPayload;
-        defer parsed.deinit();
-        if (parsed.value != .object) return error.InvalidPayload;
-        const obj = parsed.value.object;
-        const session_id = (try jsonObjectOptionalString(obj, "session_id")) orelse return error.InvalidPayload;
-        var session = self.terminal_sessions.getPtr(session_id) orelse return error.TerminalSessionNotFound;
-        if (session.isClosed()) return error.TerminalSessionClosed;
-
-        session.updated_at_ms = std.time.milliTimestamp();
-        try self.setCurrentTerminalSession(session_id);
-        try self.refreshTerminalV2StateFiles();
-        try self.updateTerminalV2StatusAndResult("done", "terminal_session_resume", session_id, null, "resume", "{\"state\":\"open\"}");
-        return .{ .written = payload.len };
-    }
-
-    fn terminalV2Close(self: *Session, payload: []const u8) !WriteOutcome {
-        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, payload, .{}) catch return error.InvalidPayload;
-        defer parsed.deinit();
-        if (parsed.value != .object) return error.InvalidPayload;
-        const obj = parsed.value.object;
-        const selected_id = blk: {
-            if (try jsonObjectOptionalString(obj, "session_id")) |value| break :blk value;
-            if (self.current_terminal_session_id) |value| break :blk value;
-            break :blk null;
-        } orelse return error.InvalidPayload;
-
-        var session = self.terminal_sessions.getPtr(selected_id) orelse return error.TerminalSessionNotFound;
-        const now_ms = std.time.milliTimestamp();
-        if (session.buffered_result) |old| {
-            self.allocator.free(old);
-            session.buffered_result = null;
-        }
-        session.closed_at_ms = now_ms;
-        session.updated_at_ms = now_ms;
-        if (self.current_terminal_session_id) |current| {
-            if (std.mem.eql(u8, current, selected_id)) try self.setCurrentTerminalSession(null);
-        }
-        try self.refreshTerminalV2StateFiles();
-        try self.updateTerminalV2StatusAndResult("done", "terminal_session_close", selected_id, null, "close", "{\"state\":\"closed\"}");
-        return .{ .written = payload.len };
-    }
-
-    fn terminalV2Write(self: *Session, payload: []const u8) !WriteOutcome {
-        if (builtin.os.tag != .linux) return error.UnsupportedPlatform;
-
-        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, payload, .{}) catch return error.InvalidPayload;
-        defer parsed.deinit();
-        if (parsed.value != .object) return error.InvalidPayload;
-        const obj = parsed.value.object;
-
-        const session_id = try self.resolveTerminalSessionIdForPayload(obj) orelse return error.InvalidPayload;
-        var session = self.terminal_sessions.getPtr(session_id) orelse return error.TerminalSessionNotFound;
-        if (session.isClosed()) return error.TerminalSessionClosed;
-
-        const write_bytes = try self.parseTerminalWriteBytes(obj);
-        defer self.allocator.free(write_bytes);
-        if (write_bytes.len == 0) return error.InvalidPayload;
-        try self.appendTerminalPendingInput(session, write_bytes);
-
-        if (self.hasTerminalPendingCommand(session)) {
-            var exec_outcome = try self.executeTerminalSessionInput(session);
-            defer exec_outcome.deinit(self.allocator);
-            if (exec_outcome.error_message) |message| {
-                session.updated_at_ms = std.time.milliTimestamp();
-                try self.setCurrentTerminalSession(session_id);
-                try self.refreshTerminalV2StateFiles();
-                try self.updateTerminalV2StatusAndResult("failed", "terminal_session_write", session_id, message, "write", "null");
-                return .{ .written = payload.len };
-            }
-            try self.appendTerminalBufferedResult(session, exec_outcome.output);
-        }
-
-        const now_ms = std.time.milliTimestamp();
-        session.updated_at_ms = now_ms;
-        session.last_exec_at_ms = now_ms;
-        session.write_count +%= 1;
-        session.exec_count +%= 1;
-        try self.setCurrentTerminalSession(session_id);
-        try self.refreshTerminalV2StateFiles();
-
-        const write_result = try std.fmt.allocPrint(self.allocator, "{{\"written\":{d}}}", .{write_bytes.len});
-        defer self.allocator.free(write_result);
-        try self.updateTerminalV2StatusAndResult("done", "terminal_session_write", session_id, null, "write", write_result);
-        return .{ .written = payload.len };
-    }
-
-    fn terminalV2Read(self: *Session, payload: []const u8) !WriteOutcome {
-        if (builtin.os.tag != .linux) return error.UnsupportedPlatform;
-
-        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, payload, .{}) catch return error.InvalidPayload;
-        defer parsed.deinit();
-        if (parsed.value != .object) return error.InvalidPayload;
-        const obj = parsed.value.object;
-
-        const session_id = try self.resolveTerminalSessionIdForPayload(obj) orelse return error.InvalidPayload;
-        var session = self.terminal_sessions.getPtr(session_id) orelse return error.TerminalSessionNotFound;
-        if (session.isClosed()) return error.TerminalSessionClosed;
-
-        const timeout_ms = blk: {
-            if (try jsonObjectOptionalU64(obj, "timeout_ms")) |value| break :blk @as(i32, @intCast(@min(value, @as(u64, std.math.maxInt(i32)))));
-            break :blk @as(i32, 100);
-        };
-        const max_bytes = blk: {
-            if (try jsonObjectOptionalU64(obj, "max_bytes")) |value| {
-                const clamped = @max(@as(u64, 1), @min(value, @as(u64, 1024 * 1024)));
-                break :blk @as(usize, @intCast(clamped));
-            }
-            break :blk @as(usize, 64 * 1024);
-        };
-
-        var remaining_timeout_ms = timeout_ms;
-        while (session.buffered_result == null and !self.hasTerminalPendingCommand(session) and remaining_timeout_ms > 0) {
-            const wait_ms = @min(remaining_timeout_ms, 25);
-            std.Thread.sleep(@as(u64, @intCast(wait_ms)) * std.time.ns_per_ms);
-            remaining_timeout_ms -= wait_ms;
-        }
-        if (session.buffered_result == null and self.hasTerminalPendingCommand(session)) {
-            var exec_outcome = try self.executeTerminalSessionInput(session);
-            defer exec_outcome.deinit(self.allocator);
-            if (exec_outcome.error_message) |message| {
-                session.updated_at_ms = std.time.milliTimestamp();
-                try self.setCurrentTerminalSession(session_id);
-                try self.refreshTerminalV2StateFiles();
-                try self.updateTerminalV2StatusAndResult("failed", "terminal_session_read", session_id, message, "read", "null");
-                return .{ .written = payload.len };
-            }
-            try self.appendTerminalBufferedResult(session, exec_outcome.output);
-        }
-        const visible_bytes = try self.consumeTerminalBufferedResult(session, max_bytes);
-        defer self.allocator.free(visible_bytes);
-
-        const now_ms = std.time.milliTimestamp();
-        session.updated_at_ms = now_ms;
-        session.last_read_at_ms = now_ms;
-        session.read_count +%= 1;
-        try self.setCurrentTerminalSession(session_id);
-        try self.refreshTerminalV2StateFiles();
-
-        const read_result = try self.buildTerminalOutputResultJson(visible_bytes, false);
-        defer self.allocator.free(read_result);
-        try self.updateTerminalV2StatusAndResult("done", "terminal_session_read", session_id, null, "read", read_result);
-        return .{ .written = payload.len };
-    }
-
-    fn terminalV2Resize(self: *Session, payload: []const u8) !WriteOutcome {
-        if (builtin.os.tag != .linux) return error.UnsupportedPlatform;
-
-        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, payload, .{}) catch return error.InvalidPayload;
-        defer parsed.deinit();
-        if (parsed.value != .object) return error.InvalidPayload;
-        const obj = parsed.value.object;
-
-        const cols = (try jsonObjectOptionalU64(obj, "cols")) orelse return error.InvalidPayload;
-        const rows = (try jsonObjectOptionalU64(obj, "rows")) orelse return error.InvalidPayload;
-        if (cols == 0 or rows == 0) return error.InvalidPayload;
-
-        const session_id = try self.resolveTerminalSessionIdForPayload(obj) orelse return error.InvalidPayload;
-        var session = self.terminal_sessions.getPtr(session_id) orelse return error.TerminalSessionNotFound;
-        if (session.isClosed()) return error.TerminalSessionClosed;
-
-        session.updated_at_ms = std.time.milliTimestamp();
-        try self.setCurrentTerminalSession(session_id);
-        try self.refreshTerminalV2StateFiles();
-        const resize_result = try std.fmt.allocPrint(self.allocator, "{{\"cols\":{d},\"rows\":{d}}}", .{ cols, rows });
-        defer self.allocator.free(resize_result);
-        try self.updateTerminalV2StatusAndResult("done", "terminal_session_resize", session_id, null, "resize", resize_result);
-        return .{ .written = payload.len };
-    }
-
-    fn terminalV2Exec(self: *Session, payload: []const u8) !WriteOutcome {
-        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, payload, .{}) catch return error.InvalidPayload;
-        defer parsed.deinit();
-        if (parsed.value != .object) return error.InvalidPayload;
-        const obj = parsed.value.object;
-
-        const explicit_session_id = try jsonObjectOptionalString(obj, "session_id");
-        var selected_session_id: ?[]const u8 = explicit_session_id;
-        if (selected_session_id == null) selected_session_id = self.current_terminal_session_id;
-
-        if (selected_session_id) |session_id| {
-            var session = self.terminal_sessions.getPtr(session_id) orelse return error.TerminalSessionNotFound;
-            if (session.isClosed()) return error.TerminalSessionClosed;
-
-            const command_bytes = try self.buildTerminalExecCommandBytes(obj);
-            defer self.allocator.free(command_bytes);
-            var exec_outcome = try self.executeTerminalSessionCommand(session, command_bytes);
-            defer exec_outcome.deinit(self.allocator);
-
-            const now_ms = std.time.milliTimestamp();
-            session.updated_at_ms = now_ms;
-            session.last_exec_at_ms = now_ms;
-            session.exec_count +%= 1;
-            if (try jsonObjectOptionalString(obj, "cwd")) |next_cwd| {
-                if (session.cwd) |old| self.allocator.free(old);
-                session.cwd = try self.allocator.dupe(u8, next_cwd);
-            }
-            if (exec_outcome.error_message) |message| {
-                try self.setCurrentTerminalSession(session_id);
-                try self.refreshTerminalV2StateFiles();
-                try self.updateTerminalV2StatusAndResult("failed", "shell_exec", session_id, message, "exec", "null");
-                return .{ .written = payload.len };
-            }
-            try self.setCurrentTerminalSession(session_id);
-            try self.refreshTerminalV2StateFiles();
-
-            const exec_result = try self.buildTerminalOutputResultJson(exec_outcome.output, false);
-            defer self.allocator.free(exec_result);
-            try self.updateTerminalV2StatusAndResult("done", "shell_exec", session_id, null, "exec", exec_result);
-            return .{ .written = payload.len };
-        }
-
-        // Acheron terminal-v2 requires an explicit or current session context.
-        return error.InvalidPayload;
-    }
-
-    fn appendTerminalBufferedResult(self: *Session, session: *TerminalSession, payload: []const u8) !void {
-        if (payload.len == 0) return;
-        if (session.buffered_result) |existing| {
-            const merged = try self.allocator.alloc(u8, existing.len + payload.len);
-            @memcpy(merged[0..existing.len], existing);
-            @memcpy(merged[existing.len..], payload);
-            self.allocator.free(existing);
-            session.buffered_result = merged;
-            return;
-        }
-        session.buffered_result = try self.allocator.dupe(u8, payload);
-    }
-
-    const TerminalExecOutcome = struct {
-        output: []u8,
-        error_message: ?[]u8 = null,
-
-        fn deinit(self: *TerminalExecOutcome, allocator: std.mem.Allocator) void {
-            allocator.free(self.output);
-            if (self.error_message) |value| allocator.free(value);
-            self.* = undefined;
-        }
-    };
-
-    fn appendTerminalReplayScript(self: *Session, session: *TerminalSession, payload: []const u8) !void {
-        if (payload.len == 0) return;
-        if (session.replay_script) |existing| {
-            const merged = try self.allocator.alloc(u8, existing.len + payload.len);
-            @memcpy(merged[0..existing.len], existing);
-            @memcpy(merged[existing.len..], payload);
-            self.allocator.free(existing);
-            session.replay_script = merged;
-            return;
-        }
-        session.replay_script = try self.allocator.dupe(u8, payload);
-    }
-
-    fn appendTerminalPendingInput(self: *Session, session: *TerminalSession, payload: []const u8) !void {
-        if (payload.len == 0) return;
-        if (session.pending_input) |existing| {
-            const merged = try self.allocator.alloc(u8, existing.len + payload.len);
-            @memcpy(merged[0..existing.len], existing);
-            @memcpy(merged[existing.len..], payload);
-            self.allocator.free(existing);
-            session.pending_input = merged;
-            return;
-        }
-        session.pending_input = try self.allocator.dupe(u8, payload);
-    }
-
-    fn hasTerminalPendingCommand(self: *Session, session: *TerminalSession) bool {
-        _ = self;
-        const pending = session.pending_input orelse return false;
-        return pending.len > 0 and pending[pending.len - 1] == '\n';
-    }
-
-    fn executeTerminalSessionInput(self: *Session, session: *TerminalSession) !TerminalExecOutcome {
-        const pending = session.pending_input orelse return .{
-            .output = try self.allocator.alloc(u8, 0),
-        };
-        defer {
-            self.allocator.free(pending);
-            session.pending_input = null;
-        }
-        return self.executeTerminalSessionCommand(session, pending);
-    }
-
-    fn executeTerminalSessionCommand(self: *Session, session: *TerminalSession, command_bytes: []const u8) !TerminalExecOutcome {
-        const runtime_args = try self.buildTerminalWriteArgsJson(session.cwd, session.replay_script, command_bytes);
-        defer self.allocator.free(runtime_args);
-
-        const runtime_payload = try self.executeServiceToolCall("shell_exec", runtime_args);
-        defer self.allocator.free(runtime_payload);
-        if (try self.extractErrorMessageFromToolPayload(runtime_payload)) |message| {
-            return .{
-                .output = try self.allocator.alloc(u8, 0),
-                .error_message = message,
-            };
-        }
-        const terminal_output = try self.extractTerminalOutputBytesFromToolPayload(runtime_payload);
-        errdefer self.allocator.free(terminal_output);
-        try self.appendTerminalReplayScript(session, command_bytes);
-        return .{
-            .output = terminal_output,
-        };
-    }
-
-    fn buildTerminalWriteArgsJson(self: *Session, cwd: ?[]const u8, replay_script: ?[]const u8, write_bytes: []const u8) ![]u8 {
-        const shell_command = try self.buildTerminalWriteShellCommand(replay_script, write_bytes);
-        defer self.allocator.free(shell_command);
-        const escaped_command = try unified.jsonEscape(self.allocator, shell_command);
-        defer self.allocator.free(escaped_command);
-
-        var runtime_args = std.ArrayListUnmanaged(u8){};
-        errdefer runtime_args.deinit(self.allocator);
-        try runtime_args.writer(self.allocator).print("{{\"command\":\"{s}\"", .{escaped_command});
-        if (cwd) |value| {
-            const escaped_cwd = try unified.jsonEscape(self.allocator, value);
-            defer self.allocator.free(escaped_cwd);
-            try runtime_args.writer(self.allocator).print(",\"cwd\":\"{s}\"", .{escaped_cwd});
-        }
-        try runtime_args.append(self.allocator, '}');
-        return runtime_args.toOwnedSlice(self.allocator);
-    }
-
-    fn buildTerminalWriteShellCommand(self: *Session, replay_script: ?[]const u8, write_bytes: []const u8) ![]u8 {
-        var out = std.ArrayListUnmanaged(u8){};
-        errdefer out.deinit(self.allocator);
-        if (replay_script) |history| {
-            if (history.len > 0) {
-                try out.appendSlice(self.allocator, "{ eval $'");
-                try self.appendTerminalAnsiCShellLiteral(&out, history);
-                try out.appendSlice(self.allocator, "'; } >/dev/null 2>&1\n");
-            }
-        }
-        try out.appendSlice(self.allocator, "eval $'");
-        try self.appendTerminalAnsiCShellLiteral(&out, write_bytes);
-        try out.append(self.allocator, '\'');
-        return out.toOwnedSlice(self.allocator);
-    }
-
-    fn appendTerminalAnsiCShellLiteral(self: *Session, out: *std.ArrayListUnmanaged(u8), bytes: []const u8) !void {
-        for (bytes) |byte| {
-            switch (byte) {
-                '\\' => try out.appendSlice(self.allocator, "\\\\"),
-                '\'' => try out.appendSlice(self.allocator, "\\'"),
-                '\n' => try out.appendSlice(self.allocator, "\\n"),
-                '\r' => try out.appendSlice(self.allocator, "\\r"),
-                '\t' => try out.appendSlice(self.allocator, "\\t"),
-                0x20...0x26, 0x28...0x5b, 0x5d...0x7e => try out.append(self.allocator, byte),
-                else => try out.writer(self.allocator).print("\\x{x:0>2}", .{byte}),
-            }
-        }
-    }
-
-    fn buildTerminalExecCommandBytes(self: *Session, obj: std.json.ObjectMap) ![]u8 {
-        if (try jsonObjectOptionalString(obj, "command")) |command| {
-            var buf = std.ArrayListUnmanaged(u8){};
-            errdefer buf.deinit(self.allocator);
-            try buf.appendSlice(self.allocator, command);
-            if (command.len == 0 or command[command.len - 1] != '\n') try buf.append(self.allocator, '\n');
-            return buf.toOwnedSlice(self.allocator);
-        }
-        if (obj.get("argv")) |value| {
-            if (value != .array or value.array.items.len == 0) return error.InvalidPayload;
-            var buf = std.ArrayListUnmanaged(u8){};
-            errdefer buf.deinit(self.allocator);
-            for (value.array.items, 0..) |item, idx| {
-                if (item != .string) return error.InvalidPayload;
-                if (idx != 0) try buf.append(self.allocator, ' ');
-                try self.appendShellSingleQuoted(&buf, item.string);
-            }
-            try buf.append(self.allocator, '\n');
-            return buf.toOwnedSlice(self.allocator);
-        }
-        return error.InvalidPayload;
-    }
-
-    fn appendShellSingleQuoted(self: *Session, out: *std.ArrayListUnmanaged(u8), value: []const u8) !void {
-        try out.append(self.allocator, '\'');
-        var start: usize = 0;
-        while (start < value.len) {
-            if (std.mem.indexOfScalarPos(u8, value, start, '\'')) |idx| {
-                if (idx > start) try out.appendSlice(self.allocator, value[start..idx]);
-                try out.appendSlice(self.allocator, "'\\''");
-                start = idx + 1;
-                continue;
-            }
-            try out.appendSlice(self.allocator, value[start..]);
-            break;
-        }
-        try out.append(self.allocator, '\'');
-    }
-
-    fn extractTerminalOutputBytesFromToolPayload(self: *Session, payload_json: []const u8) ![]u8 {
-        var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, payload_json, .{});
-        defer parsed.deinit();
-        if (parsed.value != .object) return error.InvalidPayload;
-        const obj = parsed.value.object;
-        const stdout = if (obj.get("stdout")) |value|
-            if (value == .string) value.string else return error.InvalidPayload
-        else
-            "";
-        const stderr = if (obj.get("stderr")) |value|
-            if (value == .string) value.string else return error.InvalidPayload
-        else
-            "";
-
-        const merged = try self.allocator.alloc(u8, stdout.len + stderr.len);
-        @memcpy(merged[0..stdout.len], stdout);
-        @memcpy(merged[stdout.len..], stderr);
-        return merged;
-    }
-
-    fn buildTerminalOutputResultJson(self: *Session, output: []const u8, eof: bool) ![]u8 {
-        const output_b64 = try unified.encodeDataB64(self.allocator, output);
-        defer self.allocator.free(output_b64);
-        const escaped_b64 = try unified.jsonEscape(self.allocator, output_b64);
-        defer self.allocator.free(escaped_b64);
-        return std.fmt.allocPrint(
-            self.allocator,
-            "{{\"n\":{d},\"data_b64\":\"{s}\",\"eof\":{s}}}",
-            .{
-                output.len,
-                escaped_b64,
-                if (eof) "true" else "false",
-            },
-        );
-    }
-
-    fn consumeTerminalBufferedResult(self: *Session, session: *TerminalSession, max_bytes: usize) ![]u8 {
-        const existing = session.buffered_result orelse return self.allocator.dupe(u8, "");
-        const visible_len = @min(existing.len, max_bytes);
-        const visible = try self.allocator.dupe(u8, existing[0..visible_len]);
-
-        if (visible_len == existing.len) {
-            self.allocator.free(existing);
-            session.buffered_result = null;
-            return visible;
-        }
-
-        const tail = try self.allocator.dupe(u8, existing[visible_len..]);
-        self.allocator.free(existing);
-        session.buffered_result = tail;
-        return visible;
-    }
-
-    fn parseTerminalWriteBytes(self: *Session, obj: std.json.ObjectMap) ![]u8 {
-        const append_newline = (try jsonObjectOptionalBool(obj, "append_newline")) orelse false;
-        if (try jsonObjectOptionalString(obj, "command")) |command| {
-            var buf = std.ArrayListUnmanaged(u8){};
-            errdefer buf.deinit(self.allocator);
-            try buf.appendSlice(self.allocator, command);
-            if (command.len == 0 or command[command.len - 1] != '\n') try buf.append(self.allocator, '\n');
-            return buf.toOwnedSlice(self.allocator);
-        }
-        if (try jsonObjectOptionalString(obj, "input")) |input| {
-            var buf = std.ArrayListUnmanaged(u8){};
-            errdefer buf.deinit(self.allocator);
-            try buf.appendSlice(self.allocator, input);
-            if (append_newline and (input.len == 0 or input[input.len - 1] != '\n')) try buf.append(self.allocator, '\n');
-            return buf.toOwnedSlice(self.allocator);
-        }
-        if (try jsonObjectOptionalString(obj, "data_b64")) |data_b64| {
-            const decoded_len = try std.base64.standard.Decoder.calcSizeForSlice(data_b64);
-            const decoded = try self.allocator.alloc(u8, decoded_len);
-            errdefer self.allocator.free(decoded);
-            try std.base64.standard.Decoder.decode(decoded, data_b64);
-            if (!append_newline) return decoded;
-            var buf = std.ArrayListUnmanaged(u8){};
-            errdefer buf.deinit(self.allocator);
-            try buf.appendSlice(self.allocator, decoded);
-            self.allocator.free(decoded);
-            if (buf.items.len == 0 or buf.items[buf.items.len - 1] != '\n') try buf.append(self.allocator, '\n');
-            return buf.toOwnedSlice(self.allocator);
-        }
-        return error.InvalidPayload;
-    }
-
-    fn resolveTerminalSessionIdForPayload(self: *Session, obj: std.json.ObjectMap) !?[]const u8 {
-        if (try jsonObjectOptionalString(obj, "session_id")) |value| return value;
-        if (self.current_terminal_session_id) |value| return value;
-        return null;
-    }
-
-    fn buildTerminalExecArgsJson(
+    pub fn buildTerminalExecArgsJson(
         self: *Session,
         obj: std.json.ObjectMap,
         session_cwd: ?[]const u8,
     ) ![]u8 {
-        var out = std.ArrayListUnmanaged(u8){};
-        errdefer out.deinit(self.allocator);
-        try out.append(self.allocator, '{');
-        var first = true;
-        var has_command = false;
-        var has_argv = false;
-        var has_cwd = false;
-
-        var it = obj.iterator();
-        while (it.next()) |entry| {
-            const key = entry.key_ptr.*;
-            if (std.mem.eql(u8, key, "session_id") or
-                std.mem.eql(u8, key, "op") or
-                std.mem.eql(u8, key, "operation") or
-                std.mem.eql(u8, key, "tool") or
-                std.mem.eql(u8, key, "tool_name") or
-                std.mem.eql(u8, key, "arguments") or
-                std.mem.eql(u8, key, "args"))
-            {
-                continue;
-            }
-            if (std.mem.eql(u8, key, "command")) has_command = true;
-            if (std.mem.eql(u8, key, "argv")) has_argv = true;
-            if (std.mem.eql(u8, key, "cwd")) has_cwd = true;
-
-            if (!first) try out.append(self.allocator, ',');
-            first = false;
-            const escaped_key = try unified.jsonEscape(self.allocator, key);
-            defer self.allocator.free(escaped_key);
-            const value_json = try self.renderJsonValue(entry.value_ptr.*);
-            defer self.allocator.free(value_json);
-            try out.writer(self.allocator).print("\"{s}\":{s}", .{ escaped_key, value_json });
-        }
-
-        if (!has_cwd and session_cwd != null) {
-            if (!first) try out.append(self.allocator, ',');
-            const escaped_cwd = try unified.jsonEscape(self.allocator, session_cwd.?);
-            defer self.allocator.free(escaped_cwd);
-            try out.writer(self.allocator).print("\"cwd\":\"{s}\"", .{escaped_cwd});
-        }
-        try out.append(self.allocator, '}');
-        if (!has_command and !has_argv) return error.InvalidPayload;
-        return out.toOwnedSlice(self.allocator);
+        return terminal_venom.buildExecArgsJson(self, obj, session_cwd);
     }
 
-    fn terminalInvokeOperationFromPayload(self: *Session, obj: std.json.ObjectMap) ?TerminalInvokeOp {
+    pub fn appendShellSingleQuoted(self: *Session, out: *std.ArrayListUnmanaged(u8), value: []const u8) !void {
+        return terminal_venom.appendShellSingleQuoted(self, out, value);
+    }
+
+    pub fn sessionJsonObjectOptionalString(self: *Session, obj: std.json.ObjectMap, key: []const u8) !?[]const u8 {
         _ = self;
-        if (obj.get("op")) |value| {
-            if (value == .string) return parseTerminalInvokeOp(value.string);
-        }
-        if (obj.get("operation")) |value| {
-            if (value == .string) return parseTerminalInvokeOp(value.string);
-        }
-        if (obj.get("tool_name")) |value| {
-            if (value == .string and std.mem.eql(u8, value.string, "shell_exec")) return .exec;
-        }
-        if (obj.get("tool")) |value| {
-            if (value == .string and std.mem.eql(u8, value.string, "shell_exec")) return .exec;
-        }
-        if (obj.get("command") != null or obj.get("argv") != null) return .exec;
-        if (obj.get("arguments")) |value| {
-            if (value == .object) {
-                if (value.object.get("command") != null or value.object.get("argv") != null) return .exec;
-            }
-        }
-        if (obj.get("args")) |value| {
-            if (value == .object) {
-                if (value.object.get("command") != null or value.object.get("argv") != null) return .exec;
-            }
-        }
-        return null;
+        return jsonObjectOptionalString(obj, key);
     }
 
-    fn updateTerminalV2StatusAndResult(
-        self: *Session,
-        state: []const u8,
-        tool_name: []const u8,
-        session_id: ?[]const u8,
-        error_message: ?[]const u8,
-        operation: []const u8,
-        result_json: []const u8,
-    ) !void {
-        const status = try self.buildTerminalV2StatusJson(state, tool_name, session_id, error_message);
-        defer self.allocator.free(status);
-        try self.setFileContent(self.terminal_status_id, status);
-
-        const result = try self.buildTerminalV2ResultEnvelope(operation, session_id, error_message == null, result_json, error_message);
-        defer self.allocator.free(result);
-        try self.setFileContent(self.terminal_result_id, result);
+    pub fn sessionJsonObjectOptionalBool(self: *Session, obj: std.json.ObjectMap, key: []const u8) !?bool {
+        _ = self;
+        return jsonObjectOptionalBool(obj, key);
     }
 
-    fn buildTerminalV2StatusJson(
-        self: *Session,
-        state: []const u8,
-        tool_name: []const u8,
-        session_id: ?[]const u8,
-        error_message: ?[]const u8,
-    ) ![]u8 {
-        const escaped_state = try unified.jsonEscape(self.allocator, state);
-        defer self.allocator.free(escaped_state);
-        const escaped_tool = try unified.jsonEscape(self.allocator, tool_name);
-        defer self.allocator.free(escaped_tool);
-        const session_json = if (session_id) |value| blk: {
-            const escaped = try unified.jsonEscape(self.allocator, value);
-            defer self.allocator.free(escaped);
-            break :blk try std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped});
-        } else try self.allocator.dupe(u8, "null");
-        defer self.allocator.free(session_json);
-        const error_json = if (error_message) |value| blk: {
-            const escaped = try unified.jsonEscape(self.allocator, value);
-            defer self.allocator.free(escaped);
-            break :blk try std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped});
-        } else try self.allocator.dupe(u8, "null");
-        defer self.allocator.free(error_json);
-
-        return std.fmt.allocPrint(
-            self.allocator,
-            "{{\"state\":\"{s}\",\"tool\":\"{s}\",\"session_id\":{s},\"updated_at_ms\":{d},\"error\":{s}}}",
-            .{ escaped_state, escaped_tool, session_json, std.time.milliTimestamp(), error_json },
-        );
-    }
-
-    fn buildTerminalV2ResultEnvelope(
-        self: *Session,
-        operation: []const u8,
-        session_id: ?[]const u8,
-        ok: bool,
-        result_json: []const u8,
-        error_message: ?[]const u8,
-    ) ![]u8 {
-        const escaped_op = try unified.jsonEscape(self.allocator, operation);
-        defer self.allocator.free(escaped_op);
-        const session_json = if (session_id) |value| blk: {
-            const escaped = try unified.jsonEscape(self.allocator, value);
-            defer self.allocator.free(escaped);
-            break :blk try std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped});
-        } else try self.allocator.dupe(u8, "null");
-        defer self.allocator.free(session_json);
-
-        const error_json = if (error_message) |message| blk: {
-            const escaped = try unified.jsonEscape(self.allocator, message);
-            defer self.allocator.free(escaped);
-            break :blk try std.fmt.allocPrint(
-                self.allocator,
-                "{{\"code\":\"terminal_v2\",\"message\":\"{s}\"}}",
-                .{escaped},
-            );
-        } else try self.allocator.dupe(u8, "null");
-        defer self.allocator.free(error_json);
-
-        return std.fmt.allocPrint(
-            self.allocator,
-            "{{\"ok\":{s},\"operation\":\"{s}\",\"session_id\":{s},\"result\":{s},\"error\":{s}}}",
-            .{
-                if (ok) "true" else "false",
-                escaped_op,
-                session_json,
-                result_json,
-                error_json,
-            },
-        );
-    }
-
-    fn refreshTerminalV2StateFiles(self: *Session) !void {
-        if (self.terminal_sessions_id == 0 or self.terminal_current_id == 0) return;
-        const sessions_json = try self.buildTerminalSessionsJson();
-        defer self.allocator.free(sessions_json);
-        try self.setFileContent(self.terminal_sessions_id, sessions_json);
-
-        const current_json = try self.buildTerminalCurrentJson();
-        defer self.allocator.free(current_json);
-        try self.setFileContent(self.terminal_current_id, current_json);
-    }
-
-    fn buildTerminalSessionsJson(self: *Session) ![]u8 {
-        var out = std.ArrayListUnmanaged(u8){};
-        errdefer out.deinit(self.allocator);
-        try out.appendSlice(self.allocator, "{\"sessions\":[");
-        var first = true;
-        var it = self.terminal_sessions.iterator();
-        while (it.next()) |entry| {
-            if (!first) try out.append(self.allocator, ',');
-            first = false;
-            const session_id = entry.key_ptr.*;
-            const session = entry.value_ptr.*;
-            const escaped_id = try unified.jsonEscape(self.allocator, session_id);
-            defer self.allocator.free(escaped_id);
-            const state = if (session.isClosed()) "closed" else "open";
-            const escaped_state = try unified.jsonEscape(self.allocator, state);
-            defer self.allocator.free(escaped_state);
-            const label_json = if (session.label) |value| blk: {
-                const escaped = try unified.jsonEscape(self.allocator, value);
-                defer self.allocator.free(escaped);
-                break :blk try std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped});
-            } else try self.allocator.dupe(u8, "null");
-            defer self.allocator.free(label_json);
-            const cwd_json = if (session.cwd) |value| blk: {
-                const escaped = try unified.jsonEscape(self.allocator, value);
-                defer self.allocator.free(escaped);
-                break :blk try std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped});
-            } else try self.allocator.dupe(u8, "null");
-            defer self.allocator.free(cwd_json);
-            try out.writer(self.allocator).print(
-                "{{\"session_id\":\"{s}\",\"state\":\"{s}\",\"label\":{s},\"cwd\":{s},\"created_at_ms\":{d},\"updated_at_ms\":{d},\"last_exec_at_ms\":{d},\"closed_at_ms\":{d},\"exec_count\":{d}}}",
-                .{
-                    escaped_id,
-                    escaped_state,
-                    label_json,
-                    cwd_json,
-                    session.created_at_ms,
-                    session.updated_at_ms,
-                    session.last_exec_at_ms,
-                    session.closed_at_ms,
-                    session.exec_count,
-                },
-            );
-        }
-        try out.appendSlice(self.allocator, "]}");
-        return out.toOwnedSlice(self.allocator);
-    }
-
-    fn buildTerminalCurrentJson(self: *Session) ![]u8 {
-        if (self.current_terminal_session_id == null) return self.allocator.dupe(u8, "{\"session\":null}");
-        const session_id = self.current_terminal_session_id.?;
-        const session = self.terminal_sessions.get(session_id) orelse return self.allocator.dupe(u8, "{\"session\":null}");
-        const escaped_id = try unified.jsonEscape(self.allocator, session_id);
-        defer self.allocator.free(escaped_id);
-        const state = if (session.isClosed()) "closed" else "open";
-        const escaped_state = try unified.jsonEscape(self.allocator, state);
-        defer self.allocator.free(escaped_state);
-        const cwd_json = if (session.cwd) |value| blk: {
-            const escaped = try unified.jsonEscape(self.allocator, value);
-            defer self.allocator.free(escaped);
-            break :blk try std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped});
-        } else try self.allocator.dupe(u8, "null");
-        defer self.allocator.free(cwd_json);
-        return std.fmt.allocPrint(
-            self.allocator,
-            "{{\"session\":{{\"session_id\":\"{s}\",\"state\":\"{s}\",\"cwd\":{s},\"updated_at_ms\":{d}}}}}",
-            .{ escaped_id, escaped_state, cwd_json, session.updated_at_ms },
-        );
-    }
-
-    fn setCurrentTerminalSession(self: *Session, session_id: ?[]const u8) !void {
-        if (self.current_terminal_session_id) |existing| self.allocator.free(existing);
-        self.current_terminal_session_id = if (session_id) |value|
-            try self.allocator.dupe(u8, value)
-        else
-            null;
-    }
-
-    fn generateTerminalSessionId(self: *Session) ![]u8 {
-        const id = try std.fmt.allocPrint(self.allocator, "term-{d}", .{self.next_terminal_session_seq});
-        self.next_terminal_session_seq +%= 1;
-        if (self.next_terminal_session_seq == 0) self.next_terminal_session_seq = 1;
-        return id;
+    pub fn sessionJsonObjectOptionalU64(self: *Session, obj: std.json.ObjectMap, key: []const u8) !?u64 {
+        _ = self;
+        return jsonObjectOptionalU64(obj, key);
     }
 
     fn buildProjectTopologyJson(self: *Session, policy: workspace_policy.WorkspacePolicy) ![]u8 {
@@ -4303,8 +3614,8 @@ pub const Session = struct {
         defer self.allocator.free(escaped_project_id);
         return std.fmt.allocPrint(
             self.allocator,
-            "{{\"version\":\"acheron-namespace-project-contract-v2\",\"project_id\":\"{s}\",\"top_level_roots\":[\"/nodes\",\"/agents\",\"/global\"],\"project_metadata_files\":[\"topology.json\",\"nodes.json\",\"agents.json\",\"sources.json\",\"contracts.json\",\"paths.json\",\"summary.json\",\"alerts.json\",\"workspace_status.json\",\"mounts.json\",\"desired_mounts.json\",\"actual_mounts.json\",\"drift.json\",\"reconcile.json\",\"availability.json\",\"health.json\"],\"links\":{{\"nodes_root\":\"/nodes\",\"agents_root\":\"/agents\",\"global_root\":\"/global\",\"project_control\":\"/global/projects\",\"workspace_status\":\"/global/projects/control/invoke.json\"}}}}",
-            .{escaped_project_id},
+            "{{\"version\":\"acheron-namespace-project-contract-v2\",\"project_id\":\"{s}\",\"top_level_roots\":[\"/nodes\",\"/agents\",\"/global\",\"/services\"],\"project_metadata_files\":[\"topology.json\",\"nodes.json\",\"agents.json\",\"sources.json\",\"contracts.json\",\"paths.json\",\"summary.json\",\"alerts.json\",\"workspace_status.json\",\"mounts.json\",\"desired_mounts.json\",\"actual_mounts.json\",\"binds.json\",\"mounted_services.json\",\"drift.json\",\"reconcile.json\",\"availability.json\",\"health.json\"],\"links\":{{\"nodes_root\":\"/nodes\",\"agents_root\":\"/agents\",\"global_root\":\"/global\",\"services_root\":\"/services\",\"workspace_control\":\"/global/workspaces\",\"workspace_status\":\"/global/workspaces/control/invoke.json\",\"workspace_binds\":\"/projects/{s}/meta/binds.json\",\"workspace_services\":\"/projects/{s}/meta/mounted_services.json\"}}}}",
+            .{ escaped_project_id, escaped_project_id, escaped_project_id },
         );
     }
 
@@ -4313,8 +3624,9 @@ pub const Session = struct {
         defer self.allocator.free(escaped_project_id);
         return std.fmt.allocPrint(
             self.allocator,
-            "{{\"project_id\":\"{s}\",\"nodes_root\":\"/nodes\",\"agents_root\":\"/agents\",\"global\":{{\"root\":\"/global\",\"library\":\"/global/library\",\"projects\":\"/global/projects\",\"chat\":\"/global/chat\",\"jobs\":\"/global/jobs\",\"mounts\":\"/global/mounts\",\"debug\":{s}}}}}",
+            "{{\"project_id\":\"{s}\",\"nodes_root\":\"/nodes\",\"agents_root\":\"/agents\",\"services\":{{\"root\":\"/services\",\"mounted_services_meta\":\"/projects/{s}/meta/mounted_services.json\"}},\"global\":{{\"root\":\"/global\",\"library\":\"/global/library\",\"workspaces\":\"/global/workspaces\",\"chat\":\"/global/chat\",\"jobs\":\"/global/jobs\",\"mounts\":\"/global/mounts\",\"debug\":{s}}}}}",
             .{
+                escaped_project_id,
                 escaped_project_id,
                 if (policy.show_debug or self.is_admin) "\"/debug\"" else "null",
             },
@@ -4333,7 +3645,7 @@ pub const Session = struct {
         defer self.allocator.free(escaped_project_id);
         return std.fmt.allocPrint(
             self.allocator,
-            "{{\"project_id\":\"{s}\",\"workspace_status\":\"{s}\",\"project_fs\":\"{s}\",\"project_nodes\":\"{s}\",\"nodes_meta\":\"{s}\"}}",
+            "{{\"project_id\":\"{s}\",\"workspace_status\":\"{s}\",\"project_fs\":\"{s}\",\"project_nodes\":\"{s}\",\"nodes_meta\":\"{s}\",\"project_binds\":\"control_plane\",\"mounted_services\":\"namespace_projection\"}}",
             .{
                 escaped_project_id,
                 if (has_workspace_status) "control_plane" else "policy",
@@ -4848,7 +4160,7 @@ pub const Session = struct {
 
         return std.fmt.allocPrint(
             self.allocator,
-            "{{\"agent_id\":\"{s}\",\"project_id\":\"{s}\",\"source\":\"policy\",\"workspace_root\":null,\"mounts\":[],\"desired_mounts\":[],\"actual_mounts\":[],\"drift\":{{\"count\":0,\"items\":[]}},\"availability\":{{\"mounts_total\":0,\"online\":0,\"degraded\":0,\"missing\":0}},\"reconcile_state\":\"unknown\",\"last_reconcile_ms\":0,\"last_success_ms\":0,\"last_error\":null,\"queue_depth\":0}}",
+            "{{\"agent_id\":\"{s}\",\"project_id\":\"{s}\",\"template_id\":null,\"source\":\"policy\",\"workspace_root\":null,\"mounts\":[],\"desired_mounts\":[],\"actual_mounts\":[],\"drift\":{{\"count\":0,\"items\":[]}},\"availability\":{{\"mounts_total\":0,\"online\":0,\"degraded\":0,\"missing\":0}},\"reconcile_state\":\"unknown\",\"last_reconcile_ms\":0,\"last_success_ms\":0,\"last_error\":null,\"queue_depth\":0}}",
             .{ escaped_agent, escaped_project },
         );
     }
@@ -5037,7 +4349,7 @@ pub const Session = struct {
         return true;
     }
 
-    fn canInvokeVenomDirectory(self: *Session, venom_dir_id: u32) bool {
+    pub fn canInvokeVenomDirectory(self: *Session, venom_dir_id: u32) bool {
         const permissions_id = self.lookupChild(venom_dir_id, "PERMISSIONS.json") orelse {
             return self.canAccessVenomWithPermissions("");
         };
@@ -5104,7 +4416,7 @@ pub const Session = struct {
         try self.addDirectoryDescriptors(
             venoms_root,
             "Node Venoms",
-            "{\"kind\":\"collection\",\"entries\":\"venom_id\",\"shape\":\"/nodes/<node_id>/venoms/<venom_id>/{SCHEMA.json,STATUS.json,CAPS.json,MOUNTS.json,OPS.json,RUNTIME.json,PERMISSIONS.json}\"}",
+            "{\"kind\":\"collection\",\"entries\":\"venom_id\",\"shape\":\"/nodes/<node_id>/venoms/<venom_id>/{README.md,SCHEMA.json,TEMPLATE.json,CAPS.json,MOUNTS.json,OPS.json,RUNTIME.json,HOST.json,PERMISSIONS.json,STATUS.json}\"}",
             "{\"read\":true,\"write\":false}",
             "Node Venom descriptors mirrored from the node Venom catalog.",
         );
@@ -5131,6 +4443,7 @@ pub const Session = struct {
                         venom.runtime_json,
                         venom.permissions_json,
                         venom.schema_json,
+                        venom.invoke_template_json,
                         venom.help_md,
                     );
                     try view.observe(
@@ -5190,6 +4503,7 @@ pub const Session = struct {
                     "{\"type\":\"builtin\"}",
                     permissions,
                     "{\"model\":\"filesystem\"}",
+                    null,
                     "Project node filesystem export.",
                 );
                 try self.addNodeVenomEntry(
@@ -5204,6 +4518,7 @@ pub const Session = struct {
                     "{\"type\":\"builtin\"}",
                     permissions,
                     "{\"model\":\"filesystem\"}",
+                    null,
                     "Project node filesystem export.",
                 );
                 try view.observe(self.allocator, node.id, "fs", "fs", endpoint, mounts);
@@ -5234,6 +4549,7 @@ pub const Session = struct {
                     "{\"type\":\"builtin\"}",
                     permissions,
                     "{\"model\":\"camera\"}",
+                    null,
                     "Camera capture namespace.",
                 );
                 try self.addNodeVenomEntry(
@@ -5248,6 +4564,7 @@ pub const Session = struct {
                     "{\"type\":\"builtin\"}",
                     permissions,
                     "{\"model\":\"camera\"}",
+                    null,
                     "Camera capture namespace.",
                 );
                 try view.observe(self.allocator, node.id, "camera", "camera", endpoint, mounts);
@@ -5278,6 +4595,7 @@ pub const Session = struct {
                     "{\"type\":\"builtin\"}",
                     permissions,
                     "{\"model\":\"screen\"}",
+                    null,
                     "Screen capture namespace.",
                 );
                 try self.addNodeVenomEntry(
@@ -5292,6 +4610,7 @@ pub const Session = struct {
                     "{\"type\":\"builtin\"}",
                     permissions,
                     "{\"model\":\"screen\"}",
+                    null,
                     "Screen capture namespace.",
                 );
                 try view.observe(self.allocator, node.id, "screen", "screen", endpoint, mounts);
@@ -5322,6 +4641,7 @@ pub const Session = struct {
                     "{\"type\":\"builtin\"}",
                     permissions,
                     "{\"model\":\"user\"}",
+                    null,
                     "User interaction namespace.",
                 );
                 try self.addNodeVenomEntry(
@@ -5336,6 +4656,7 @@ pub const Session = struct {
                     "{\"type\":\"builtin\"}",
                     permissions,
                     "{\"model\":\"user\"}",
+                    null,
                     "User interaction namespace.",
                 );
                 try view.observe(self.allocator, node.id, "user", "user", endpoint, mounts);
@@ -5376,6 +4697,7 @@ pub const Session = struct {
                     "{\"type\":\"builtin\"}",
                     permissions,
                     "{\"model\":\"terminal\"}",
+                    null,
                     "Interactive terminal namespace.",
                 );
                 try self.addNodeVenomEntry(
@@ -5390,6 +4712,7 @@ pub const Session = struct {
                     "{\"type\":\"builtin\"}",
                     permissions,
                     "{\"model\":\"terminal\"}",
+                    null,
                     "Interactive terminal namespace.",
                 );
                 try view.observe(self.allocator, node.id, "terminal", venom_id, endpoint, mounts);
@@ -5416,6 +4739,7 @@ pub const Session = struct {
             runtime_json: []u8,
             permissions_json: []u8,
             schema_json: []u8,
+            invoke_template_json: ?[]u8 = null,
             help_md: ?[]u8 = null,
 
             fn deinit(self: *Entry, allocator: std.mem.Allocator) void {
@@ -5429,6 +4753,7 @@ pub const Session = struct {
                 allocator.free(self.runtime_json);
                 allocator.free(self.permissions_json);
                 allocator.free(self.schema_json);
+                if (self.invoke_template_json) |value| allocator.free(value);
                 if (self.help_md) |value| allocator.free(value);
                 self.* = undefined;
             }
@@ -5556,6 +4881,15 @@ pub const Session = struct {
                 try self.allocator.dupe(u8, "{}");
             errdefer self.allocator.free(schema_json);
 
+            const invoke_template_json = if (item.object.get("invoke_template")) |invoke_template|
+                if (invoke_template == .object)
+                    try std.fmt.allocPrint(self.allocator, "{f}", .{std.json.fmt(invoke_template, .{})})
+                else
+                    null
+            else
+                null;
+            errdefer if (invoke_template_json) |value| self.allocator.free(value);
+
             const help_md = if (item.object.get("help_md")) |help|
                 if (help == .string and help.string.len > 0)
                     try self.allocator.dupe(u8, help.string)
@@ -5576,6 +4910,7 @@ pub const Session = struct {
                 .runtime_json = runtime_json,
                 .permissions_json = permissions_json,
                 .schema_json = schema_json,
+                .invoke_template_json = invoke_template_json,
                 .help_md = help_md,
             });
         }
@@ -5600,6 +4935,7 @@ pub const Session = struct {
         runtime_json: []const u8,
         permissions_json: []const u8,
         schema_json: []const u8,
+        invoke_template_json: ?[]const u8,
         help_md: ?[]const u8,
     ) !void {
         const venom_dir = try self.addDir(services_root, venom_id, false);
@@ -5623,6 +4959,12 @@ pub const Session = struct {
         _ = try self.addFile(venom_dir, "MOUNTS.json", mounts_json, false, .none);
         _ = try self.addFile(venom_dir, "OPS.json", ops_json, false, .none);
         _ = try self.addFile(venom_dir, "RUNTIME.json", runtime_json, false, .none);
+        if (invoke_template_json) |value| {
+            _ = try self.addFile(venom_dir, "TEMPLATE.json", value, false, .none);
+        }
+        const host_json = try self.renderNodeVenomHostJson(runtime_json);
+        defer self.allocator.free(host_json);
+        _ = try self.addFile(venom_dir, "HOST.json", host_json, false, .none);
         _ = try self.addFile(venom_dir, "PERMISSIONS.json", permissions_json, false, .none);
 
         const status = try std.fmt.allocPrint(
@@ -5632,6 +4974,22 @@ pub const Session = struct {
         );
         defer self.allocator.free(status);
         _ = try self.addFile(venom_dir, "STATUS.json", status, false, .none);
+    }
+
+    fn renderNodeVenomHostJson(self: *Session, runtime_json: []const u8) ![]u8 {
+        var runtime_kind: []const u8 = "builtin";
+        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, runtime_json, .{}) catch {
+            return shared_node.service_runtime_host.renderMetadataJson(self.allocator, runtime_kind);
+        };
+        defer parsed.deinit();
+        if (parsed.value == .object) {
+            if (parsed.value.object.get("type")) |runtime_type| {
+                if (runtime_type == .string and runtime_type.string.len > 0) {
+                    runtime_kind = runtime_type.string;
+                }
+            }
+        }
+        return shared_node.service_runtime_host.renderMetadataJson(self.allocator, runtime_kind);
     }
 
     fn copyOptionalServiceFile(self: *Session, source_dir_id: u32, target_dir_id: u32, name: []const u8) !void {
@@ -5745,6 +5103,8 @@ pub const Session = struct {
         try self.copyOptionalServiceFile(provider_dir_id, alias_dir_id, "MOUNTS.json");
         try self.copyOptionalServiceFile(provider_dir_id, alias_dir_id, "OPS.json");
         try self.copyOptionalServiceFile(provider_dir_id, alias_dir_id, "RUNTIME.json");
+        try self.copyOptionalServiceFile(provider_dir_id, alias_dir_id, "TEMPLATE.json");
+        try self.copyOptionalServiceFile(provider_dir_id, alias_dir_id, "HOST.json");
         try self.copyOptionalServiceFile(provider_dir_id, alias_dir_id, "PERMISSIONS.json");
         try self.copyOptionalServiceFile(provider_dir_id, alias_dir_id, "STATUS.json");
 
@@ -5798,11 +5158,11 @@ pub const Session = struct {
         return try self.allocator.dupe(u8, provider.node_id);
     }
 
-    fn addDir(self: *Session, parent: ?u32, name: []const u8, writable: bool) !u32 {
+    pub fn addDir(self: *Session, parent: ?u32, name: []const u8, writable: bool) !u32 {
         return self.addNode(parent, name, .dir, "", writable, .none);
     }
 
-    fn addFile(self: *Session, parent: u32, name: []const u8, content: []const u8, writable: bool, special: SpecialKind) !u32 {
+    pub fn addFile(self: *Session, parent: u32, name: []const u8, content: []const u8, writable: bool, special: SpecialKind) !u32 {
         return self.addNode(parent, name, .file, content, writable, special);
     }
 
@@ -5839,7 +5199,7 @@ pub const Session = struct {
         return node_id;
     }
 
-    fn lookupChild(self: *Session, parent_id: u32, name: []const u8) ?u32 {
+    pub fn lookupChild(self: *Session, parent_id: u32, name: []const u8) ?u32 {
         const parent = self.nodes.get(parent_id) orelse return null;
         return parent.children.get(name);
     }
@@ -5878,7 +5238,35 @@ pub const Session = struct {
         return null;
     }
 
-    fn resolveAbsolutePathNoBinds(self: *Session, path: []const u8) ?u32 {
+    pub fn resolvePreferredServicePath(self: *Session, service_id: []const u8, suffix: []const u8) ![]u8 {
+        const workspace_path = if (suffix.len == 0)
+            try std.fmt.allocPrint(self.allocator, "/services/{s}", .{service_id})
+        else
+            try std.fmt.allocPrint(self.allocator, "/services/{s}{s}", .{ service_id, suffix });
+        errdefer self.allocator.free(workspace_path);
+
+        const rebound = try self.resolveBoundPath(workspace_path);
+        if (rebound) |value| {
+            self.allocator.free(value);
+            return workspace_path;
+        }
+
+        self.allocator.free(workspace_path);
+        const catalog_path = if (suffix.len == 0)
+            try std.fmt.allocPrint(self.allocator, "/nodes/local/venoms/{s}", .{service_id})
+        else
+            try std.fmt.allocPrint(self.allocator, "/nodes/local/venoms/{s}{s}", .{ service_id, suffix });
+        errdefer self.allocator.free(catalog_path);
+        if (self.resolveAbsolutePathNoBinds(catalog_path) != null) return catalog_path;
+
+        self.allocator.free(catalog_path);
+        return if (suffix.len == 0)
+            try std.fmt.allocPrint(self.allocator, "/global/{s}", .{service_id})
+        else
+            try std.fmt.allocPrint(self.allocator, "/global/{s}{s}", .{ service_id, suffix });
+    }
+
+    pub fn resolveAbsolutePathNoBinds(self: *Session, path: []const u8) ?u32 {
         if (!std.mem.startsWith(u8, path, "/")) return null;
         if (std.mem.eql(u8, path, "/")) return self.root_id;
         var node_id = self.root_id;
@@ -5933,7 +5321,7 @@ pub const Session = struct {
         return out.toOwnedSlice(self.allocator);
     }
 
-    fn writeFileContent(self: *Session, node_id: u32, offset: u64, data: []const u8) !void {
+    fn writeFileContentRaw(self: *Session, node_id: u32, offset: u64, data: []const u8) !void {
         const node_ptr = self.nodes.getPtr(node_id) orelse return error.MissingNode;
         if (node_ptr.kind != .file) return error.NotFile;
 
@@ -5955,11 +5343,33 @@ pub const Session = struct {
         node_ptr.content = next;
     }
 
-    fn setFileContent(self: *Session, node_id: u32, data: []const u8) !void {
+    fn writeFileContent(self: *Session, node_id: u32, offset: u64, data: []const u8) !void {
+        try self.writeFileContentRaw(node_id, offset, data);
+        if (self.node_aliases.get(node_id)) |alias_id| {
+            if (alias_id != node_id) {
+                const node = self.nodes.get(node_id) orelse return error.MissingNode;
+                try self.setFileContentRaw(alias_id, node.content);
+            }
+        }
+    }
+
+    fn setFileContentRaw(self: *Session, node_id: u32, data: []const u8) !void {
         const node_ptr = self.nodes.getPtr(node_id) orelse return error.MissingNode;
         if (node_ptr.kind != .file) return error.NotFile;
         self.allocator.free(node_ptr.content);
         node_ptr.content = try self.allocator.dupe(u8, data);
+    }
+
+    pub fn setFileContent(self: *Session, node_id: u32, data: []const u8) !void {
+        try self.setFileContentRaw(node_id, data);
+        if (self.node_aliases.get(node_id)) |alias_id| {
+            if (alias_id != node_id) try self.setFileContentRaw(alias_id, data);
+        }
+    }
+
+    pub fn setMirroredFileContent(self: *Session, primary_id: u32, alias_id: u32, data: []const u8) !void {
+        if (primary_id != 0) try self.setFileContent(primary_id, data);
+        if (alias_id != 0 and alias_id != primary_id) try self.setFileContent(alias_id, data);
     }
 
     fn tryReadBoundVenomProxyFile(self: *Session, node_id: u32) !?[]u8 {
@@ -6186,6 +5596,9 @@ pub const Session = struct {
         const absolute_path = try self.nodeAbsolutePath(node_id);
         defer self.allocator.free(absolute_path);
 
+        if (pathMatchesPrefixBoundary(absolute_path, "/nodes/local/venoms/chat")) {
+            return std.fmt.allocPrint(self.allocator, "/nodes/local/venoms/jobs/{s}/result.txt", .{job_id});
+        }
         if (parseEntityScopedVenomAliasPrefix(absolute_path, "/agents/", "/venoms/")) |parsed| {
             return std.fmt.allocPrint(
                 self.allocator,
@@ -6200,7 +5613,7 @@ pub const Session = struct {
                 .{ parsed.entity_id, job_id },
             );
         }
-        return std.fmt.allocPrint(self.allocator, "/global/jobs/{s}/result.txt", .{job_id});
+        return std.fmt.allocPrint(self.allocator, "/nodes/local/venoms/jobs/{s}/result.txt", .{job_id});
     }
 
     fn boundVenomProxyPathForAbsolutePath(self: *Session, absolute_path: []const u8) !?BoundVenomProxyPath {
@@ -6446,194 +5859,14 @@ pub const Session = struct {
     }
 
     fn handlePairingControlWrite(self: *Session, action: PairingAction, raw_input: []const u8) !WriteOutcome {
-        const written = raw_input.len;
-        const payload = std.mem.trim(u8, raw_input, " \t\r\n");
-        if (!self.isPairingActionAuthorized(action, payload)) {
-            try self.setPairingResultError(action, "OperatorAuthFailed");
-            return .{ .written = written };
-        }
-        const plane = self.control_plane orelse {
-            try self.setPairingResultError(action, "ControlPlaneUnavailable");
-            return .{ .written = written };
-        };
-
-        switch (action) {
-            .refresh => {
-                const list_json = plane.listPendingNodeJoins(if (payload.len == 0) "{}" else payload) catch |err| {
-                    try self.setPairingResultError(action, @errorName(err));
-                    try self.refreshPairingPendingSnapshot();
-                    return .{ .written = written };
-                };
-                defer self.allocator.free(list_json);
-                try self.setPairingResultSuccess(action, list_json);
-                try self.setPairingPendingContent(list_json);
-                return .{ .written = written };
-            },
-            .approve => {
-                const approve_json = plane.approvePendingNodeJoin(payload) catch |err| {
-                    try self.setPairingResultError(action, @errorName(err));
-                    try self.refreshPairingPendingSnapshot();
-                    return .{ .written = written };
-                };
-                defer self.allocator.free(approve_json);
-                try self.setPairingResultSuccess(action, approve_json);
-                try self.refreshPairingPendingSnapshot();
-                return .{ .written = written };
-            },
-            .deny => {
-                const deny_json = plane.denyPendingNodeJoin(payload) catch |err| {
-                    try self.setPairingResultError(action, @errorName(err));
-                    try self.refreshPairingPendingSnapshot();
-                    return .{ .written = written };
-                };
-                defer self.allocator.free(deny_json);
-                try self.setPairingResultSuccess(action, deny_json);
-                try self.refreshPairingPendingSnapshot();
-                return .{ .written = written };
-            },
-            .invites_refresh => {
-                const invites_json = plane.listNodeInvites(if (payload.len == 0) "{}" else payload) catch |err| {
-                    try self.setPairingResultError(action, @errorName(err));
-                    try self.refreshPairingInvitesSnapshot();
-                    return .{ .written = written };
-                };
-                defer self.allocator.free(invites_json);
-                try self.setPairingResultSuccess(action, invites_json);
-                try self.setPairingInvitesContent(invites_json);
-                return .{ .written = written };
-            },
-            .invites_create => {
-                const create_json = plane.createNodeInvite(if (payload.len == 0) "{}" else payload) catch |err| {
-                    try self.setPairingResultError(action, @errorName(err));
-                    try self.refreshPairingInvitesSnapshot();
-                    return .{ .written = written };
-                };
-                defer self.allocator.free(create_json);
-                try self.setPairingResultSuccess(action, create_json);
-                try self.refreshPairingInvitesSnapshot();
-                return .{ .written = written };
-            },
-        }
-    }
-
-    fn isPairingActionAuthorized(self: *const Session, action: PairingAction, payload: []const u8) bool {
-        const operator_token = self.control_operator_token orelse return true;
-        if (action == .invites_create or action == .invites_refresh) return true;
-        if (payload.len == 0) return false;
-
-        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, payload, .{}) catch return false;
-        defer parsed.deinit();
-        if (parsed.value != .object) return false;
-        const token_value = parsed.value.object.get("operator_token") orelse return false;
-        if (token_value != .string or token_value.string.len == 0) return false;
-        return secureTokenEql(operator_token, token_value.string);
-    }
-
-    fn secureTokenEql(expected: []const u8, candidate: []const u8) bool {
-        if (expected.len != candidate.len) return false;
-        var diff: u8 = 0;
-        for (expected, candidate) |lhs, rhs| {
-            diff |= lhs ^ rhs;
-        }
-        return diff == 0;
-    }
-
-    fn pairingActionName(action: PairingAction) []const u8 {
-        return switch (action) {
-            .refresh => "refresh",
-            .approve => "approve",
-            .deny => "deny",
-            .invites_refresh => "invites_refresh",
-            .invites_create => "invites_create",
-        };
-    }
-
-    fn setPairingPendingContent(self: *Session, payload: []const u8) !void {
-        if (self.pairing_pending_id == 0) return;
-        try self.setFileContent(self.pairing_pending_id, payload);
-    }
-
-    fn refreshPairingPendingSnapshot(self: *Session) !void {
-        if (self.pairing_pending_id == 0) return;
-        const payload = try self.loadPendingNodeJoinsJson();
-        defer self.allocator.free(payload);
-        try self.setPairingPendingContent(payload);
-    }
-
-    fn setPairingInvitesContent(self: *Session, payload: []const u8) !void {
-        if (self.pairing_invites_active_id == 0) return;
-        try self.setFileContent(self.pairing_invites_active_id, payload);
-    }
-
-    fn refreshPairingInvitesSnapshot(self: *Session) !void {
-        if (self.pairing_invites_active_id == 0) return;
-        const payload = try self.loadActiveNodeInvitesJson();
-        defer self.allocator.free(payload);
-        try self.setPairingInvitesContent(payload);
-    }
-
-    fn setPairingResultSuccess(self: *Session, action: PairingAction, payload: []const u8) !void {
-        const result_node_id, const error_node_id = switch (action) {
-            .refresh, .approve, .deny => .{ self.pairing_last_result_id, self.pairing_last_error_id },
-            .invites_refresh, .invites_create => .{ self.pairing_invites_last_result_id, self.pairing_invites_last_error_id },
-        };
-        if (result_node_id != 0) {
-            const action_name = pairingActionName(action);
-            const escaped_action = try unified.jsonEscape(self.allocator, action_name);
-            defer self.allocator.free(escaped_action);
-            const result_json = try std.fmt.allocPrint(
-                self.allocator,
-                "{{\"ok\":true,\"action\":\"{s}\",\"at_ms\":{d},\"response\":{s}}}",
-                .{ escaped_action, std.time.milliTimestamp(), payload },
-            );
-            defer self.allocator.free(result_json);
-            try self.setFileContent(result_node_id, result_json);
-        }
-        if (error_node_id != 0) {
-            try self.setFileContent(error_node_id, "null");
-        }
-    }
-
-    fn setPairingResultError(self: *Session, action: PairingAction, error_name: []const u8) !void {
-        const result_node_id, const error_node_id = switch (action) {
-            .refresh, .approve, .deny => .{ self.pairing_last_result_id, self.pairing_last_error_id },
-            .invites_refresh, .invites_create => .{ self.pairing_invites_last_result_id, self.pairing_invites_last_error_id },
-        };
-        const action_name = pairingActionName(action);
-        const escaped_action = try unified.jsonEscape(self.allocator, action_name);
-        defer self.allocator.free(escaped_action);
-        const escaped_error = try unified.jsonEscape(self.allocator, error_name);
-        defer self.allocator.free(escaped_error);
-        const payload = try std.fmt.allocPrint(
-            self.allocator,
-            "{{\"ok\":false,\"action\":\"{s}\",\"error\":\"{s}\",\"at_ms\":{d}}}",
-            .{ escaped_action, escaped_error, std.time.milliTimestamp() },
-        );
-        defer self.allocator.free(payload);
-        if (result_node_id != 0) {
-            try self.setFileContent(result_node_id, payload);
-        }
-        if (error_node_id != 0) {
-            try self.setFileContent(error_node_id, payload);
-        }
+        return .{ .written = try pairing_venom.handleControlWrite(self, action, raw_input) };
     }
 
     fn seedJobsFromIndex(self: *Session) !void {
-        const jobs = try self.job_index.listJobsForAgent(self.allocator, self.agent_id);
-        defer chat_job_index.deinitJobViews(self.allocator, jobs);
-
-        for (jobs) |job| {
-            if (self.lookupChild(self.jobs_root_id, job.job_id) != null) continue;
-            const job_dir = try self.addDir(self.jobs_root_id, job.job_id, false);
-            const status_json = try self.buildJobStatusJson(job.state, job.correlation_id, job.error_text);
-            defer self.allocator.free(status_json);
-            _ = try self.addFile(job_dir, "status.json", status_json, true, .job_status);
-            _ = try self.addFile(job_dir, "result.txt", job.result_text orelse "", true, .job_result);
-            _ = try self.addFile(job_dir, "log.txt", job.log_text orelse "", true, .job_log);
-        }
+        return jobs_venom.seedFromIndex(self);
     }
 
-    fn buildJobStatusJson(
+    pub fn buildJobStatusJson(
         self: *Session,
         state: chat_job_index.JobState,
         correlation_id: ?[]const u8,
@@ -6671,72 +5904,16 @@ pub const Session = struct {
     }
 
     fn handleChatInputWrite(self: *Session, msg: *const unified.ParsedMessage, raw_input: []const u8) !WriteOutcome {
-        const input = std.mem.trim(u8, raw_input, " \t\r\n");
-        if (input.len == 0) {
-            return .{ .written = 0, .job_name = null, .correlation_id = null };
-        }
-
-        const correlation_id = msg.correlation_id orelse msg.id;
-        const job_name = try self.job_index.createJob(self.agent_id, correlation_id);
-        defer self.allocator.free(job_name);
-
-        const job_dir = try self.addDir(self.jobs_root_id, job_name, false);
-        const queued_status = try self.buildJobStatusJson(.queued, correlation_id, null);
-        defer self.allocator.free(queued_status);
-        const status_id = try self.addFile(job_dir, "status.json", queued_status, true, .job_status);
-        const result_id = try self.addFile(job_dir, "result.txt", "", true, .job_result);
-        const log_id = try self.addFile(job_dir, "log.txt", "", true, .job_log);
-
-        try self.job_index.markRunning(job_name);
-        const running_status = try self.buildJobStatusJson(.running, correlation_id, null);
-        defer self.allocator.free(running_status);
-        try self.setFileContent(status_id, running_status);
-
-        self.spawnAsyncChatRuntimeJob(job_name, input, correlation_id) catch |spawn_err| {
-            const normalized = chat_runtime_job.normalizeRuntimeFailureForAgent("runtime_error", @errorName(spawn_err));
-            const failed_status = try self.buildJobStatusJson(.failed, correlation_id, normalized.message);
-            defer self.allocator.free(failed_status);
-
-            self.setFileContent(status_id, failed_status) catch |err| {
-                std.log.warn("failed to update chat status after spawn failure: {s}", .{@errorName(err)});
-            };
-            self.setFileContent(result_id, normalized.message) catch |err| {
-                std.log.warn("failed to update chat result after spawn failure: {s}", .{@errorName(err)});
-            };
-
-            const spawn_log_owned = std.fmt.allocPrint(
-                self.allocator,
-                "[runtime worker spawn failure] {s}\n",
-                .{@errorName(spawn_err)},
-            ) catch null;
-            defer if (spawn_log_owned) |value| self.allocator.free(value);
-            const spawn_log = if (spawn_log_owned) |value|
-                value
-            else
-                "[runtime worker spawn failure]\n";
-
-            self.setFileContent(log_id, spawn_log) catch |err| {
-                std.log.warn("failed to update chat log after spawn failure: {s}", .{@errorName(err)});
-            };
-            self.job_index.markCompleted(
-                job_name,
-                false,
-                normalized.message,
-                normalized.message,
-                spawn_log,
-            ) catch |err| {
-                std.log.warn("chat job index completion update failed after spawn failure: {s}", .{@errorName(err)});
-            };
-        };
-
+        const outcome = try chat_venom.handleInputWrite(self, msg, raw_input);
         return .{
-            .written = raw_input.len,
-            .job_name = try self.allocator.dupe(u8, job_name),
-            .correlation_id = if (correlation_id) |value| try self.allocator.dupe(u8, value) else null,
+            .written = outcome.written,
+            .job_name = outcome.job_name,
+            .correlation_id = outcome.correlation_id,
+            .chat_reply_content = outcome.chat_reply_content,
         };
     }
 
-    fn spawnAsyncChatRuntimeJob(
+    pub fn spawnAsyncChatRuntimeJob(
         self: *Session,
         job_name: []const u8,
         input: []const u8,
@@ -6824,11 +6001,12 @@ pub const Session = struct {
     }
 
     fn handleChatReplyWrite(self: *Session, node_id: u32, raw_input: []const u8) !WriteOutcome {
-        const reply = std.mem.trim(u8, raw_input, " \t\r\n");
-        try self.setFileContent(node_id, reply);
+        const outcome = try chat_venom.handleReplyWrite(self, node_id, raw_input);
         return .{
-            .written = raw_input.len,
-            .chat_reply_content = try self.allocator.dupe(u8, reply),
+            .written = outcome.written,
+            .job_name = outcome.job_name,
+            .correlation_id = outcome.correlation_id,
+            .chat_reply_content = outcome.chat_reply_content,
         };
     }
 
@@ -6883,323 +6061,22 @@ pub const Session = struct {
         try self.setFileContent(self.thoughts_status_id, status_json);
     }
 
-    const SearchNamespace = enum {
-        web_search,
-        search_code,
-    };
-
-    const SearchRequest = struct {
-        tool_name: []const u8,
-        args_json: []u8,
-
-        fn deinit(self: *SearchRequest, allocator: std.mem.Allocator) void {
-            allocator.free(self.args_json);
-            self.* = undefined;
-        }
-    };
-
     fn handleSearchNamespaceWrite(
         self: *Session,
         special: SpecialKind,
         node_id: u32,
         raw_input: []const u8,
     ) !WriteOutcome {
-        const invoke_node = self.nodes.get(node_id) orelse return error.MissingNode;
-        const control_dir_id = invoke_node.parent orelse return error.MissingNode;
-        const venom_dir_id = (self.nodes.get(control_dir_id) orelse return error.MissingNode).parent orelse return error.MissingNode;
-        if (!self.canInvokeVenomDirectory(venom_dir_id)) return error.AccessDenied;
-        const status_runtime_id = self.lookupChild(venom_dir_id, "status.json") orelse return error.MissingNode;
-        const result_id = self.lookupChild(venom_dir_id, "result.json") orelse return error.MissingNode;
-
-        var request = self.parseSearchRequest(special, invoke_node.name, raw_input) catch return error.InvalidPayload;
-        defer request.deinit(self.allocator);
-
-        const input = std.mem.trim(u8, raw_input, " \t\r\n");
-        try self.setFileContent(node_id, input);
-
-        const running_status = try self.buildServiceInvokeStatusJson("running", request.tool_name, null);
-        defer self.allocator.free(running_status);
-        try self.setFileContent(status_runtime_id, running_status);
-
-        const result_payload = try self.executeServiceToolCall(request.tool_name, request.args_json);
-        defer self.allocator.free(result_payload);
-        if (try self.extractErrorMessageFromToolPayload(result_payload)) |message| {
-            defer self.allocator.free(message);
-            const status = try self.buildServiceInvokeStatusJson("failed", request.tool_name, message);
-            defer self.allocator.free(status);
-            try self.setFileContent(status_runtime_id, status);
-        } else {
-            const status = try self.buildServiceInvokeStatusJson("done", request.tool_name, null);
-            defer self.allocator.free(status);
-            try self.setFileContent(status_runtime_id, status);
-        }
-        try self.setFileContent(result_id, result_payload);
-        return .{ .written = raw_input.len };
+        const written = try search_services_venom.handleNamespaceWrite(self, special, node_id, raw_input);
+        return .{ .written = written };
     }
-
-    fn parseSearchRequest(
-        self: *Session,
-        special: SpecialKind,
-        invoke_file_name: []const u8,
-        raw_input: []const u8,
-    ) !SearchRequest {
-        const input = std.mem.trim(u8, raw_input, " \t\r\n");
-        if (input.len == 0) return error.InvalidPayload;
-
-        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, input, .{}) catch return error.InvalidPayload;
-        defer parsed.deinit();
-        if (parsed.value != .object) return error.InvalidPayload;
-        const obj = parsed.value.object;
-
-        const service = searchNamespaceFromSpecial(special) orelse return error.InvalidPayload;
-        if (!searchNamespaceMatchesInvokeFile(special, invoke_file_name)) return error.InvalidPayload;
-
-        if (extractOptionalStringByNames(obj, &.{ "op", "operation", "tool", "tool_name" })) |raw_op| {
-            if (!isValidSearchNamespaceOperation(service, raw_op)) return error.InvalidPayload;
-        }
-
-        const args_json = if (obj.get("arguments")) |value| blk: {
-            if (value != .object) return error.InvalidPayload;
-            break :blk try self.renderJsonValue(value);
-        } else if (obj.get("args")) |value| blk: {
-            if (value != .object) return error.InvalidPayload;
-            break :blk try self.renderJsonValue(value);
-        } else try self.renderJsonValue(parsed.value);
-
-        return .{
-            .tool_name = searchNamespaceRuntimeTool(service),
-            .args_json = args_json,
-        };
-    }
-
-    fn searchNamespaceFromSpecial(special: SpecialKind) ?SearchNamespace {
-        return switch (special) {
-            .web_search_invoke, .web_search_search => .web_search,
-            .search_code_invoke, .search_code_search => .search_code,
-            else => null,
-        };
-    }
-
-    fn searchNamespaceMatchesInvokeFile(special: SpecialKind, invoke_file_name: []const u8) bool {
-        return switch (special) {
-            .web_search_invoke, .search_code_invoke => std.mem.eql(u8, invoke_file_name, "invoke.json"),
-            .web_search_search, .search_code_search => std.mem.eql(u8, invoke_file_name, "search.json"),
-            else => false,
-        };
-    }
-
-    fn searchNamespaceRuntimeTool(namespace: SearchNamespace) []const u8 {
-        return switch (namespace) {
-            .web_search => "web_search",
-            .search_code => "search_code",
-        };
-    }
-
-    fn isValidSearchNamespaceOperation(namespace: SearchNamespace, raw_operation: []const u8) bool {
-        const op = std.mem.trim(u8, raw_operation, " \t\r\n");
-        return switch (namespace) {
-            .web_search => std.mem.eql(u8, op, "search") or std.mem.eql(u8, op, "web_search"),
-            .search_code => std.mem.eql(u8, op, "search") or std.mem.eql(u8, op, "search_code"),
-        };
-    }
-
-    const MemoryOp = enum {
-        create,
-        load,
-        versions,
-        mutate,
-        evict,
-        search,
-    };
 
     fn handleMemoryNamespaceWrite(self: *Session, special: SpecialKind, node_id: u32, raw_input: []const u8) !WriteOutcome {
-        const invoke_node = self.nodes.get(node_id) orelse return error.MissingNode;
-        const control_dir_id = invoke_node.parent orelse return error.MissingNode;
-        const venom_dir_id = (self.nodes.get(control_dir_id) orelse return error.MissingNode).parent orelse return error.MissingNode;
-        if (!self.canInvokeVenomDirectory(venom_dir_id)) return error.AccessDenied;
-        const status_runtime_id = self.lookupChild(venom_dir_id, "status.json") orelse return error.MissingNode;
-        const result_id = self.lookupChild(venom_dir_id, "result.json") orelse return error.MissingNode;
-
-        const parsed = self.parseMemoryRequest(special, invoke_node.name, raw_input) catch return error.InvalidPayload;
-        defer {
-            self.allocator.free(parsed.args_json);
-        }
-
-        const input = std.mem.trim(u8, raw_input, " \t\r\n");
-        try self.setFileContent(node_id, if (input.len == 0) "{}" else input);
-
-        const tool_name = memoryRuntimeTool(parsed.op);
-        const running_status = try self.buildServiceInvokeStatusJson("running", tool_name, null);
-        defer self.allocator.free(running_status);
-        try self.setFileContent(status_runtime_id, running_status);
-
-        const runtime_args = try self.normalizeMemoryArgsForRuntime(parsed.op, parsed.args_json);
-        defer self.allocator.free(runtime_args);
-        const runtime_payload = try self.executeServiceToolCall(tool_name, runtime_args);
-        defer self.allocator.free(runtime_payload);
-        const transformed_payload = try self.transformMemoryResultPayload(runtime_payload);
-        defer self.allocator.free(transformed_payload);
-
-        if (try self.extractErrorMessageFromToolPayload(transformed_payload)) |message| {
-            defer self.allocator.free(message);
-            const status = try self.buildServiceInvokeStatusJson("failed", tool_name, message);
-            defer self.allocator.free(status);
-            try self.setFileContent(status_runtime_id, status);
-        } else {
-            const status = try self.buildServiceInvokeStatusJson("done", tool_name, null);
-            defer self.allocator.free(status);
-            try self.setFileContent(status_runtime_id, status);
-        }
-        try self.setFileContent(result_id, transformed_payload);
-        return .{ .written = raw_input.len };
+        const written = try memory_venom.handleNamespaceWrite(self, special, node_id, raw_input);
+        return .{ .written = written };
     }
 
-    const MemoryRequest = struct {
-        op: MemoryOp,
-        args_json: []u8,
-    };
-
-    fn parseMemoryRequest(
-        self: *Session,
-        special: SpecialKind,
-        invoke_file_name: []const u8,
-        raw_input: []const u8,
-    ) !MemoryRequest {
-        const input = std.mem.trim(u8, raw_input, " \t\r\n");
-        const payload = if (input.len == 0) "{}" else input;
-        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, payload, .{}) catch return error.InvalidPayload;
-        defer parsed.deinit();
-        if (parsed.value != .object) return error.InvalidPayload;
-        const obj = parsed.value.object;
-
-        const op = switch (special) {
-            .memory_create => MemoryOp.create,
-            .memory_load => MemoryOp.load,
-            .memory_versions => MemoryOp.versions,
-            .memory_mutate => MemoryOp.mutate,
-            .memory_evict => MemoryOp.evict,
-            .memory_search => MemoryOp.search,
-            .memory_invoke => blk: {
-                const op_raw = blk2: {
-                    if (obj.get("op")) |value| if (value == .string and value.string.len > 0) break :blk2 value.string;
-                    if (obj.get("operation")) |value| if (value == .string and value.string.len > 0) break :blk2 value.string;
-                    if (obj.get("tool")) |value| if (value == .string and value.string.len > 0) break :blk2 value.string;
-                    if (obj.get("tool_name")) |value| if (value == .string and value.string.len > 0) break :blk2 value.string;
-                    break :blk2 null;
-                } orelse return error.InvalidPayload;
-                break :blk parseMemoryOp(op_raw) orelse return error.InvalidPayload;
-            },
-            else => return error.InvalidPayload,
-        };
-
-        const args_json = if (obj.get("arguments")) |value|
-            try self.renderJsonValue(value)
-        else if (obj.get("args")) |value|
-            try self.renderJsonValue(value)
-        else if (special == .memory_invoke)
-            try self.renderJsonValue(parsed.value)
-        else
-            try self.renderJsonValue(parsed.value);
-
-        _ = invoke_file_name;
-        return .{ .op = op, .args_json = args_json };
-    }
-
-    fn parseMemoryOp(raw: []const u8) ?MemoryOp {
-        const value = std.mem.trim(u8, raw, " \t\r\n");
-        if (std.mem.eql(u8, value, "create") or std.mem.eql(u8, value, "memory_create")) return .create;
-        if (std.mem.eql(u8, value, "load") or std.mem.eql(u8, value, "memory_load")) return .load;
-        if (std.mem.eql(u8, value, "versions") or std.mem.eql(u8, value, "memory_versions")) return .versions;
-        if (std.mem.eql(u8, value, "mutate") or std.mem.eql(u8, value, "memory_mutate")) return .mutate;
-        if (std.mem.eql(u8, value, "evict") or std.mem.eql(u8, value, "memory_evict")) return .evict;
-        if (std.mem.eql(u8, value, "search") or std.mem.eql(u8, value, "memory_search")) return .search;
-        return null;
-    }
-
-    fn memoryRuntimeTool(op: MemoryOp) []const u8 {
-        return switch (op) {
-            .create => "memory_create",
-            .load => "memory_load",
-            .versions => "memory_versions",
-            .mutate => "memory_mutate",
-            .evict => "memory_evict",
-            .search => "memory_search",
-        };
-    }
-
-    fn memoryOpNeedsMemId(op: MemoryOp) bool {
-        return switch (op) {
-            .load, .versions, .mutate, .evict => true,
-            else => false,
-        };
-    }
-
-    fn normalizeMemoryArgsForRuntime(self: *Session, op: MemoryOp, args_json: []const u8) ![]u8 {
-        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, args_json, .{}) catch return error.InvalidPayload;
-        defer parsed.deinit();
-        if (parsed.value != .object) return error.InvalidPayload;
-        const obj = parsed.value.object;
-        if (!memoryOpNeedsMemId(op)) return self.allocator.dupe(u8, args_json);
-
-        var mem_id: ?[]const u8 = null;
-        var mem_id_owned = false;
-        if (obj.get("mem_id")) |value| {
-            if (value == .string and value.string.len > 0) mem_id = value.string;
-        }
-        if (mem_id == null) {
-            if (obj.get("memory_path")) |value| {
-                if (value != .string or value.string.len == 0) return error.InvalidPayload;
-                mem_id = try decodeMemIdFromPath(self.allocator, value.string);
-                mem_id_owned = true;
-            }
-        }
-        const resolved_mem_id = mem_id orelse return error.InvalidPayload;
-        defer if (mem_id_owned) self.allocator.free(resolved_mem_id);
-
-        var out = std.ArrayListUnmanaged(u8){};
-        errdefer out.deinit(self.allocator);
-        const writer = out.writer(self.allocator);
-        try writer.writeByte('{');
-        var first = true;
-        var has_mem_id = false;
-        var it = obj.iterator();
-        while (it.next()) |entry| {
-            if (std.mem.eql(u8, entry.key_ptr.*, "memory_path")) continue;
-            if (std.mem.eql(u8, entry.key_ptr.*, "mem_id")) {
-                has_mem_id = true;
-            }
-            if (!first) try writer.writeByte(',');
-            first = false;
-            try writeJsonString(writer, entry.key_ptr.*);
-            try writer.writeByte(':');
-            if (std.mem.eql(u8, entry.key_ptr.*, "mem_id")) {
-                try writeJsonString(writer, resolved_mem_id);
-            } else {
-                try self.renderJsonValueToWriter(writer, entry.value_ptr.*);
-            }
-        }
-        if (!has_mem_id) {
-            if (!first) try writer.writeByte(',');
-            try writer.writeAll("\"mem_id\":");
-            try writeJsonString(writer, resolved_mem_id);
-        }
-        try writer.writeByte('}');
-        return out.toOwnedSlice(self.allocator);
-    }
-
-    fn transformMemoryResultPayload(self: *Session, runtime_payload: []const u8) ![]u8 {
-        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, runtime_payload, .{}) catch {
-            return self.allocator.dupe(u8, runtime_payload);
-        };
-        defer parsed.deinit();
-        var out = std.ArrayListUnmanaged(u8){};
-        errdefer out.deinit(self.allocator);
-        const writer = out.writer(self.allocator);
-        try self.renderJsonValueWithMemoryPaths(writer, parsed.value);
-        return out.toOwnedSlice(self.allocator);
-    }
-
-    fn renderJsonValueToWriter(self: *Session, writer: anytype, value: std.json.Value) !void {
+    pub fn renderJsonValueToWriter(self: *Session, writer: anytype, value: std.json.Value) !void {
         switch (value) {
             .null => try writer.writeAll("null"),
             .bool => |v| try writer.writeAll(if (v) "true" else "false"),
@@ -7231,1166 +6108,44 @@ pub const Session = struct {
         }
     }
 
-    fn renderJsonValueWithMemoryPaths(self: *Session, writer: anytype, value: std.json.Value) !void {
-        switch (value) {
-            .null, .bool, .integer, .float, .number_string, .string => try self.renderJsonValueToWriter(writer, value),
-            .array => |arr| {
-                try writer.writeByte('[');
-                for (arr.items, 0..) |item, idx| {
-                    if (idx != 0) try writer.writeByte(',');
-                    try self.renderJsonValueWithMemoryPaths(writer, item);
-                }
-                try writer.writeByte(']');
-            },
-            .object => |obj| {
-                try writer.writeByte('{');
-                var first = true;
-                var it = obj.iterator();
-                while (it.next()) |entry| {
-                    if (std.mem.eql(u8, entry.key_ptr.*, "mem_id")) {
-                        if (entry.value_ptr.* == .string and entry.value_ptr.*.string.len > 0) {
-                            const memory_path = try buildMemoryPathFromMemId(self.allocator, entry.value_ptr.*.string);
-                            defer self.allocator.free(memory_path);
-                            if (!first) try writer.writeByte(',');
-                            first = false;
-                            try writer.writeAll("\"memory_path\":");
-                            try writeJsonString(writer, memory_path);
-                            continue;
-                        }
-                    }
-                    if (!first) try writer.writeByte(',');
-                    first = false;
-                    try writeJsonString(writer, entry.key_ptr.*);
-                    try writer.writeByte(':');
-                    try self.renderJsonValueWithMemoryPaths(writer, entry.value_ptr.*);
-                }
-                try writer.writeByte('}');
-            },
-        }
-    }
-
-    const MountsOp = enum {
-        list,
-        mount,
-        mkdir,
-        unmount,
-        bind,
-        unbind,
-        resolve,
-    };
-
     fn handleMountsNamespaceWrite(self: *Session, special: SpecialKind, node_id: u32, raw_input: []const u8) !WriteOutcome {
-        const input = std.mem.trim(u8, raw_input, " \t\r\n");
-        const payload = if (input.len == 0) "{}" else input;
-        try self.setFileContent(node_id, payload);
-
-        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, payload, .{}) catch return error.InvalidPayload;
-        defer parsed.deinit();
-        if (parsed.value != .object) return error.InvalidPayload;
-        const obj = parsed.value.object;
-
-        const op = switch (special) {
-            .mounts_list => MountsOp.list,
-            .mounts_mount => MountsOp.mount,
-            .mounts_mkdir => MountsOp.mkdir,
-            .mounts_unmount => MountsOp.unmount,
-            .mounts_bind => MountsOp.bind,
-            .mounts_unbind => MountsOp.unbind,
-            .mounts_resolve => MountsOp.resolve,
-            .mounts_invoke => blk: {
-                const op_raw = blk2: {
-                    if (obj.get("op")) |value| if (value == .string and value.string.len > 0) break :blk2 value.string;
-                    if (obj.get("operation")) |value| if (value == .string and value.string.len > 0) break :blk2 value.string;
-                    if (obj.get("tool")) |value| if (value == .string and value.string.len > 0) break :blk2 value.string;
-                    if (obj.get("tool_name")) |value| if (value == .string and value.string.len > 0) break :blk2 value.string;
-                    break :blk2 null;
-                } orelse return error.InvalidPayload;
-                break :blk parseMountsOp(op_raw) orelse return error.InvalidPayload;
-            },
-            else => return error.InvalidPayload,
-        };
-
-        const args_obj = blk: {
-            if (obj.get("arguments")) |value| {
-                if (value != .object) return error.InvalidPayload;
-                break :blk value.object;
-            }
-            if (obj.get("args")) |value| {
-                if (value != .object) return error.InvalidPayload;
-                break :blk value.object;
-            }
-            break :blk obj;
-        };
-        return self.executeMountsOp(op, args_obj, raw_input.len);
+        return .{ .written = try mounts_venom.handleNamespaceWrite(self, special, node_id, raw_input) };
     }
 
-    fn parseMountsOp(raw: []const u8) ?MountsOp {
-        const value = std.mem.trim(u8, raw, " \t\r\n");
-        if (std.mem.eql(u8, value, "list")) return .list;
-        if (std.mem.eql(u8, value, "mount")) return .mount;
-        if (std.mem.eql(u8, value, "mkdir") or std.mem.eql(u8, value, "create_folder")) return .mkdir;
-        if (std.mem.eql(u8, value, "unmount")) return .unmount;
-        if (std.mem.eql(u8, value, "bind")) return .bind;
-        if (std.mem.eql(u8, value, "unbind")) return .unbind;
-        if (std.mem.eql(u8, value, "resolve")) return .resolve;
-        return null;
+    pub fn normalizeLocalFsRelativePath(self: *Session, raw_path: []const u8) ![]u8 {
+        return mounts_venom.normalizeLocalFsRelativePath(self, raw_path);
     }
 
-    const MountProjectScope = struct {
-        project_id: []const u8,
-        project_token: ?[]const u8,
-    };
-
-    fn resolveMountProjectScope(self: *Session, args_obj: std.json.ObjectMap) !MountProjectScope {
-        _ = self;
-        const project_id_raw = extractOptionalStringByNames(args_obj, &[_][]const u8{"project_id"}) orelse
-            return error.InvalidPayload;
-        const project_id = std.mem.trim(u8, project_id_raw, " \t\r\n");
-        if (project_id.len == 0) return error.InvalidPayload;
-        return .{
-            .project_id = project_id,
-            .project_token = extractOptionalStringByNames(args_obj, &[_][]const u8{"project_token"}),
-        };
+    pub fn ensurePathExists(path: []const u8) !void {
+        return mounts_venom.ensurePathExists(path);
     }
-
-    fn normalizeLocalFsRelativePath(self: *Session, raw_path: []const u8) ![]u8 {
-        var path = std.mem.trim(u8, raw_path, " \t\r\n");
-        if (path.len == 0) return error.InvalidPayload;
-
-        if (std.mem.startsWith(u8, path, local_fs_world_prefix)) {
-            path = path[local_fs_world_prefix.len..];
-            if (path.len == 0) return error.InvalidPayload;
-            if (path[0] != '/') return error.InvalidPayload;
-            path = path[1..];
-        } else if (path[0] == '/') {
-            return error.InvalidPayload;
-        }
-
-        var normalized = std.ArrayListUnmanaged(u8){};
-        errdefer normalized.deinit(self.allocator);
-
-        var token_it = std.mem.tokenizeAny(u8, path, "/\\");
-        var first = true;
-        while (token_it.next()) |segment| {
-            if (segment.len == 0) continue;
-            if (std.mem.eql(u8, segment, ".") or std.mem.eql(u8, segment, "..")) return error.InvalidPayload;
-            if (std.mem.indexOfScalar(u8, segment, ':') != null) return error.InvalidPayload;
-            if (!first) try normalized.append(self.allocator, '/');
-            first = false;
-            try normalized.appendSlice(self.allocator, segment);
-        }
-
-        if (normalized.items.len == 0) return error.InvalidPayload;
-        return normalized.toOwnedSlice(self.allocator);
-    }
-
-    fn buildLocalFsWorldPath(allocator: std.mem.Allocator, relative_path: []const u8) ![]u8 {
-        return std.fmt.allocPrint(allocator, "{s}/{s}", .{ local_fs_world_prefix, relative_path });
-    }
-
-    fn pathExistsAsDirectory(path: []const u8) !bool {
-        if (std.fs.path.isAbsolute(path)) {
-            var dir = std.fs.openDirAbsolute(path, .{}) catch |err| switch (err) {
-                error.FileNotFound => return false,
-                else => return err,
-            };
-            defer dir.close();
-            return true;
-        }
-
-        var dir = std.fs.cwd().openDir(path, .{}) catch |err| switch (err) {
-            error.FileNotFound => return false,
-            else => return err,
-        };
-        defer dir.close();
-        return true;
-    }
-
-    fn ensurePathExists(path: []const u8) !void {
-        if (path.len == 0) return error.InvalidPath;
-        if (std.fs.path.isAbsolute(path)) {
-            var root_dir = try std.fs.openDirAbsolute("/", .{});
-            defer root_dir.close();
-            const rel_path = std.mem.trimLeft(u8, path, "/");
-            if (rel_path.len == 0) return;
-            try root_dir.makePath(rel_path);
-            return;
-        }
-        try std.fs.cwd().makePath(path);
-    }
-
-    fn executeMountsOp(self: *Session, op: MountsOp, args_obj: std.json.ObjectMap, written: usize) !WriteOutcome {
-        const status_tool = mountsStatusToolName(op);
-        const running_status = try self.buildServiceInvokeStatusJson("running", status_tool, null);
-        defer self.allocator.free(running_status);
-        if (self.mounts_status_id != 0) try self.setFileContent(self.mounts_status_id, running_status);
-
-        const result_payload = self.executeMountsOpPayload(op, args_obj) catch |err| {
-            const error_message = @errorName(err);
-            const code = switch (err) {
-                error.AccessDenied => "forbidden",
-                else => "invalid_payload",
-            };
-            const failed_status = try self.buildServiceInvokeStatusJson("failed", status_tool, error_message);
-            defer self.allocator.free(failed_status);
-            if (self.mounts_status_id != 0) try self.setFileContent(self.mounts_status_id, failed_status);
-            const failed_result = try self.buildMountsFailureResultJson(op, code, error_message);
-            defer self.allocator.free(failed_result);
-            if (self.mounts_result_id != 0) try self.setFileContent(self.mounts_result_id, failed_result);
-            return err;
-        };
-        defer self.allocator.free(result_payload);
-
-        const done_status = try self.buildServiceInvokeStatusJson("done", status_tool, null);
-        defer self.allocator.free(done_status);
-        if (self.mounts_status_id != 0) try self.setFileContent(self.mounts_status_id, done_status);
-        if (self.mounts_result_id != 0) try self.setFileContent(self.mounts_result_id, result_payload);
-        return .{ .written = written };
-    }
-
-    fn executeMountsOpPayload(self: *Session, op: MountsOp, args_obj: std.json.ObjectMap) ![]u8 {
-        const scope = try self.resolveMountProjectScope(args_obj);
-        switch (op) {
-            .list => return self.buildMountsListResultJson(scope.project_id, scope.project_token),
-            .mount => {
-                const node_id = extractOptionalStringByNames(args_obj, &[_][]const u8{"node_id"}) orelse return error.InvalidPayload;
-                const export_name = extractOptionalStringByNames(args_obj, &[_][]const u8{"export_name"}) orelse return error.InvalidPayload;
-                const mount_path = extractOptionalStringByNames(args_obj, &[_][]const u8{"mount_path"}) orelse return error.InvalidPayload;
-                const payload = try self.buildProjectScopedMountPayload(scope.project_id, scope.project_token, node_id, export_name, mount_path);
-                defer self.allocator.free(payload);
-                const plane = self.control_plane orelse return error.InvalidPayload;
-                const result = plane.setProjectMountWithRole(payload, self.is_admin) catch |err| switch (err) {
-                    control_plane_mod.ControlPlaneError.ProjectPolicyForbidden,
-                    control_plane_mod.ControlPlaneError.ProjectAuthFailed,
-                    control_plane_mod.ControlPlaneError.ProjectProtected,
-                    control_plane_mod.ControlPlaneError.ProjectAssignmentForbidden,
-                    => return error.AccessDenied,
-                    control_plane_mod.ControlPlaneError.MissingField,
-                    control_plane_mod.ControlPlaneError.InvalidPayload,
-                    => return error.InvalidPayload,
-                    else => return err,
-                };
-                defer self.allocator.free(result);
-                try self.refreshProjectBindsFromControlPlane();
-                return self.buildMountsSuccessResultJson(op, result);
-            },
-            .unmount => {
-                const mount_path = extractOptionalStringByNames(args_obj, &[_][]const u8{"mount_path"}) orelse return error.InvalidPayload;
-                const node_id = extractOptionalStringByNames(args_obj, &[_][]const u8{"node_id"});
-                const export_name = extractOptionalStringByNames(args_obj, &[_][]const u8{"export_name"});
-                const payload = try self.buildProjectScopedUnmountPayload(scope.project_id, scope.project_token, mount_path, node_id, export_name);
-                defer self.allocator.free(payload);
-                const plane = self.control_plane orelse return error.InvalidPayload;
-                const result = plane.removeProjectMountWithRole(payload, self.is_admin) catch |err| switch (err) {
-                    control_plane_mod.ControlPlaneError.ProjectPolicyForbidden,
-                    control_plane_mod.ControlPlaneError.ProjectAuthFailed,
-                    control_plane_mod.ControlPlaneError.ProjectProtected,
-                    control_plane_mod.ControlPlaneError.ProjectAssignmentForbidden,
-                    => return error.AccessDenied,
-                    control_plane_mod.ControlPlaneError.MissingField,
-                    control_plane_mod.ControlPlaneError.InvalidPayload,
-                    control_plane_mod.ControlPlaneError.MountNotFound,
-                    => return error.InvalidPayload,
-                    else => return err,
-                };
-                defer self.allocator.free(result);
-                return self.buildMountsSuccessResultJson(op, result);
-            },
-            .bind => {
-                const bind_path = extractOptionalStringByNames(args_obj, &[_][]const u8{"bind_path"}) orelse return error.InvalidPayload;
-                const target_path = extractOptionalStringByNames(args_obj, &[_][]const u8{"target_path"}) orelse return error.InvalidPayload;
-                const payload = try self.buildProjectScopedBindPayload(scope.project_id, scope.project_token, bind_path, target_path);
-                defer self.allocator.free(payload);
-                const plane = self.control_plane orelse return error.InvalidPayload;
-                const result = plane.setProjectBindWithRole(payload, self.is_admin) catch |err| switch (err) {
-                    control_plane_mod.ControlPlaneError.ProjectPolicyForbidden,
-                    control_plane_mod.ControlPlaneError.ProjectAuthFailed,
-                    control_plane_mod.ControlPlaneError.ProjectProtected,
-                    control_plane_mod.ControlPlaneError.ProjectAssignmentForbidden,
-                    => return error.AccessDenied,
-                    control_plane_mod.ControlPlaneError.MissingField,
-                    control_plane_mod.ControlPlaneError.InvalidPayload,
-                    control_plane_mod.ControlPlaneError.BindConflict,
-                    => return error.InvalidPayload,
-                    else => return err,
-                };
-                defer self.allocator.free(result);
-                try self.refreshProjectBindsFromControlPlane();
-                return self.buildMountsSuccessResultJson(op, result);
-            },
-            .unbind => {
-                const bind_path = extractOptionalStringByNames(args_obj, &[_][]const u8{"bind_path"}) orelse return error.InvalidPayload;
-                const payload = try self.buildProjectScopedUnbindPayload(scope.project_id, scope.project_token, bind_path);
-                defer self.allocator.free(payload);
-                const plane = self.control_plane orelse return error.InvalidPayload;
-                const result = plane.removeProjectBindWithRole(payload, self.is_admin) catch |err| switch (err) {
-                    control_plane_mod.ControlPlaneError.ProjectPolicyForbidden,
-                    control_plane_mod.ControlPlaneError.ProjectAuthFailed,
-                    control_plane_mod.ControlPlaneError.ProjectProtected,
-                    control_plane_mod.ControlPlaneError.ProjectAssignmentForbidden,
-                    => return error.AccessDenied,
-                    control_plane_mod.ControlPlaneError.MissingField,
-                    control_plane_mod.ControlPlaneError.InvalidPayload,
-                    control_plane_mod.ControlPlaneError.BindNotFound,
-                    => return error.InvalidPayload,
-                    else => return err,
-                };
-                defer self.allocator.free(result);
-                try self.refreshProjectBindsFromControlPlane();
-                return self.buildMountsSuccessResultJson(op, result);
-            },
-            .mkdir => {
-                const plane = self.control_plane orelse return error.InvalidPayload;
-                if (!plane.projectAllowsAction(scope.project_id, self.agent_id, .mount, scope.project_token, self.is_admin)) {
-                    return error.AccessDenied;
-                }
-                const path = extractOptionalStringByNames(args_obj, &[_][]const u8{ "path", "folder", "relative_path" }) orelse return error.InvalidPayload;
-                const local_root = self.local_fs_export_root orelse return error.InvalidPayload;
-                const relative_path = try self.normalizeLocalFsRelativePath(path);
-                defer self.allocator.free(relative_path);
-                const host_path = try std.fs.path.join(self.allocator, &.{ local_root, relative_path });
-                defer self.allocator.free(host_path);
-
-                const exists_before = pathExistsAsDirectory(host_path) catch |err| switch (err) {
-                    error.NotDir => return error.InvalidPayload,
-                    else => return err,
-                };
-                if (!exists_before) {
-                    ensurePathExists(host_path) catch |err| switch (err) {
-                        error.PathAlreadyExists,
-                        error.NotDir,
-                        error.AccessDenied,
-                        => return error.InvalidPayload,
-                        else => return err,
-                    };
-                }
-
-                const world_path = try buildLocalFsWorldPath(self.allocator, relative_path);
-                defer self.allocator.free(world_path);
-                const escaped_world_path = try unified.jsonEscape(self.allocator, world_path);
-                defer self.allocator.free(escaped_world_path);
-                const detail = try std.fmt.allocPrint(
-                    self.allocator,
-                    "{{\"path\":\"{s}\",\"created\":{}}}",
-                    .{ escaped_world_path, !exists_before },
-                );
-                defer self.allocator.free(detail);
-                return self.buildMountsSuccessResultJson(op, detail);
-            },
-            .resolve => {
-                const path = extractOptionalStringByNames(args_obj, &[_][]const u8{ "path", "mount_path", "bind_path" }) orelse return error.InvalidPayload;
-                const payload = try self.buildProjectScopedResolvePayload(scope.project_id, scope.project_token, path);
-                defer self.allocator.free(payload);
-                const plane = self.control_plane orelse return error.InvalidPayload;
-                const result = plane.resolveProjectPathWithRole(payload, self.is_admin) catch |err| switch (err) {
-                    control_plane_mod.ControlPlaneError.ProjectPolicyForbidden,
-                    control_plane_mod.ControlPlaneError.ProjectAuthFailed,
-                    control_plane_mod.ControlPlaneError.ProjectAssignmentForbidden,
-                    => return error.AccessDenied,
-                    control_plane_mod.ControlPlaneError.MissingField,
-                    control_plane_mod.ControlPlaneError.InvalidPayload,
-                    => return error.InvalidPayload,
-                    else => return err,
-                };
-                defer self.allocator.free(result);
-                return self.buildMountsSuccessResultJson(op, result);
-            },
-        }
-    }
-
-    fn buildProjectScopedMountPayload(
-        self: *Session,
-        project_id: []const u8,
-        project_token: ?[]const u8,
-        node_id: []const u8,
-        export_name: []const u8,
-        mount_path: []const u8,
-    ) ![]u8 {
-        const escaped_project = try unified.jsonEscape(self.allocator, project_id);
-        defer self.allocator.free(escaped_project);
-        const escaped_node = try unified.jsonEscape(self.allocator, node_id);
-        defer self.allocator.free(escaped_node);
-        const escaped_export = try unified.jsonEscape(self.allocator, export_name);
-        defer self.allocator.free(escaped_export);
-        const escaped_path = try unified.jsonEscape(self.allocator, mount_path);
-        defer self.allocator.free(escaped_path);
-        const token_fragment = if (project_token) |token| blk: {
-            const escaped_token = try unified.jsonEscape(self.allocator, token);
-            defer self.allocator.free(escaped_token);
-            break :blk try std.fmt.allocPrint(self.allocator, "\"project_token\":\"{s}\",", .{escaped_token});
-        } else try self.allocator.dupe(u8, "");
-        defer self.allocator.free(token_fragment);
-        return std.fmt.allocPrint(
-            self.allocator,
-            "{{\"project_id\":\"{s}\",{s}\"node_id\":\"{s}\",\"export_name\":\"{s}\",\"mount_path\":\"{s}\"}}",
-            .{ escaped_project, token_fragment, escaped_node, escaped_export, escaped_path },
-        );
-    }
-
-    fn buildProjectScopedBindPayload(self: *Session, project_id: []const u8, project_token: ?[]const u8, bind_path: []const u8, target_path: []const u8) ![]u8 {
-        const escaped_project = try unified.jsonEscape(self.allocator, project_id);
-        defer self.allocator.free(escaped_project);
-        const escaped_bind = try unified.jsonEscape(self.allocator, bind_path);
-        defer self.allocator.free(escaped_bind);
-        const escaped_target = try unified.jsonEscape(self.allocator, target_path);
-        defer self.allocator.free(escaped_target);
-        const token_fragment = if (project_token) |token| blk: {
-            const escaped_token = try unified.jsonEscape(self.allocator, token);
-            defer self.allocator.free(escaped_token);
-            break :blk try std.fmt.allocPrint(self.allocator, "\"project_token\":\"{s}\",", .{escaped_token});
-        } else try self.allocator.dupe(u8, "");
-        defer self.allocator.free(token_fragment);
-        return std.fmt.allocPrint(
-            self.allocator,
-            "{{\"project_id\":\"{s}\",{s}\"bind_path\":\"{s}\",\"target_path\":\"{s}\"}}",
-            .{ escaped_project, token_fragment, escaped_bind, escaped_target },
-        );
-    }
-
-    fn buildProjectScopedUnbindPayload(self: *Session, project_id: []const u8, project_token: ?[]const u8, bind_path: []const u8) ![]u8 {
-        const escaped_project = try unified.jsonEscape(self.allocator, project_id);
-        defer self.allocator.free(escaped_project);
-        const escaped_bind = try unified.jsonEscape(self.allocator, bind_path);
-        defer self.allocator.free(escaped_bind);
-        const token_fragment = if (project_token) |token| blk: {
-            const escaped_token = try unified.jsonEscape(self.allocator, token);
-            defer self.allocator.free(escaped_token);
-            break :blk try std.fmt.allocPrint(self.allocator, "\"project_token\":\"{s}\",", .{escaped_token});
-        } else try self.allocator.dupe(u8, "");
-        defer self.allocator.free(token_fragment);
-        return std.fmt.allocPrint(
-            self.allocator,
-            "{{\"project_id\":\"{s}\",{s}\"bind_path\":\"{s}\"}}",
-            .{ escaped_project, token_fragment, escaped_bind },
-        );
-    }
-
-    fn buildProjectScopedResolvePayload(self: *Session, project_id: []const u8, project_token: ?[]const u8, path: []const u8) ![]u8 {
-        const escaped_project = try unified.jsonEscape(self.allocator, project_id);
-        defer self.allocator.free(escaped_project);
-        const escaped_path = try unified.jsonEscape(self.allocator, path);
-        defer self.allocator.free(escaped_path);
-        const token_fragment = if (project_token) |token| blk: {
-            const escaped_token = try unified.jsonEscape(self.allocator, token);
-            defer self.allocator.free(escaped_token);
-            break :blk try std.fmt.allocPrint(self.allocator, "\"project_token\":\"{s}\",", .{escaped_token});
-        } else try self.allocator.dupe(u8, "");
-        defer self.allocator.free(token_fragment);
-        return std.fmt.allocPrint(
-            self.allocator,
-            "{{\"project_id\":\"{s}\",{s}\"path\":\"{s}\"}}",
-            .{ escaped_project, token_fragment, escaped_path },
-        );
-    }
-
-    fn buildProjectScopedUnmountPayload(
-        self: *Session,
-        project_id: []const u8,
-        project_token: ?[]const u8,
-        mount_path: []const u8,
-        node_id: ?[]const u8,
-        export_name: ?[]const u8,
-    ) ![]u8 {
-        const escaped_project = try unified.jsonEscape(self.allocator, project_id);
-        defer self.allocator.free(escaped_project);
-        const escaped_mount = try unified.jsonEscape(self.allocator, mount_path);
-        defer self.allocator.free(escaped_mount);
-        const token_fragment = if (project_token) |token| blk: {
-            const escaped_token = try unified.jsonEscape(self.allocator, token);
-            defer self.allocator.free(escaped_token);
-            break :blk try std.fmt.allocPrint(self.allocator, "\"project_token\":\"{s}\",", .{escaped_token});
-        } else try self.allocator.dupe(u8, "");
-        defer self.allocator.free(token_fragment);
-        const node_fragment = if (node_id) |value| blk: {
-            const escaped = try unified.jsonEscape(self.allocator, value);
-            defer self.allocator.free(escaped);
-            break :blk try std.fmt.allocPrint(self.allocator, ",\"node_id\":\"{s}\"", .{escaped});
-        } else try self.allocator.dupe(u8, "");
-        defer self.allocator.free(node_fragment);
-        const export_fragment = if (export_name) |value| blk: {
-            const escaped = try unified.jsonEscape(self.allocator, value);
-            defer self.allocator.free(escaped);
-            break :blk try std.fmt.allocPrint(self.allocator, ",\"export_name\":\"{s}\"", .{escaped});
-        } else try self.allocator.dupe(u8, "");
-        defer self.allocator.free(export_fragment);
-        return std.fmt.allocPrint(
-            self.allocator,
-            "{{\"project_id\":\"{s}\",{s}\"mount_path\":\"{s}\"{s}{s}}}",
-            .{ escaped_project, token_fragment, escaped_mount, node_fragment, export_fragment },
-        );
-    }
-
-    fn buildMountsSuccessResultJson(self: *Session, op: MountsOp, detail_json: []const u8) ![]u8 {
-        const escaped_operation = try unified.jsonEscape(self.allocator, mountsOperationName(op));
-        defer self.allocator.free(escaped_operation);
-        return std.fmt.allocPrint(
-            self.allocator,
-            "{{\"ok\":true,\"operation\":\"{s}\",\"result\":{s},\"error\":null}}",
-            .{ escaped_operation, detail_json },
-        );
-    }
-
-    fn buildMountsFailureResultJson(self: *Session, op: MountsOp, code: []const u8, message: []const u8) ![]u8 {
-        const escaped_operation = try unified.jsonEscape(self.allocator, mountsOperationName(op));
-        defer self.allocator.free(escaped_operation);
-        const escaped_code = try unified.jsonEscape(self.allocator, code);
-        defer self.allocator.free(escaped_code);
-        const escaped_message = try unified.jsonEscape(self.allocator, message);
-        defer self.allocator.free(escaped_message);
-        return std.fmt.allocPrint(
-            self.allocator,
-            "{{\"ok\":false,\"operation\":\"{s}\",\"result\":null,\"error\":{{\"code\":\"{s}\",\"message\":\"{s}\"}}}}",
-            .{ escaped_operation, escaped_code, escaped_message },
-        );
-    }
-
-    fn mountsOperationName(op: MountsOp) []const u8 {
-        return switch (op) {
-            .list => "list",
-            .mount => "mount",
-            .mkdir => "mkdir",
-            .unmount => "unmount",
-            .bind => "bind",
-            .unbind => "unbind",
-            .resolve => "resolve",
-        };
-    }
-
-    fn mountsStatusToolName(op: MountsOp) []const u8 {
-        return switch (op) {
-            .list => "mounts_list",
-            .mount => "mounts_mount",
-            .mkdir => "mounts_mkdir",
-            .unmount => "mounts_unmount",
-            .bind => "mounts_bind",
-            .unbind => "mounts_unbind",
-            .resolve => "mounts_resolve",
-        };
-    }
-
-    fn buildMountsListResultJson(self: *Session, project_id_override: ?[]const u8, project_token_override: ?[]const u8) ![]u8 {
-        const plane = self.control_plane orelse return self.buildMountsSuccessResultJson(.list, "{\"project_id\":null,\"mounts\":[],\"binds\":[]}");
-        const project_id = project_id_override orelse self.project_id orelse return self.buildMountsSuccessResultJson(.list, "{\"project_id\":null,\"mounts\":[],\"binds\":[]}");
-        const project_token = if (project_token_override) |value| value else self.project_token;
-        const escaped_project = try unified.jsonEscape(self.allocator, project_id);
-        defer self.allocator.free(escaped_project);
-        const payload = if (project_token) |token| blk: {
-            const escaped_token = try unified.jsonEscape(self.allocator, token);
-            defer self.allocator.free(escaped_token);
-            break :blk try std.fmt.allocPrint(
-                self.allocator,
-                "{{\"project_id\":\"{s}\",\"project_token\":\"{s}\"}}",
-                .{ escaped_project, escaped_token },
-            );
-        } else try std.fmt.allocPrint(self.allocator, "{{\"project_id\":\"{s}\"}}", .{escaped_project});
-        defer self.allocator.free(payload);
-
-        const mounts_json = plane.listProjectMountsWithRole(payload, self.is_admin) catch |err| switch (err) {
-            control_plane_mod.ControlPlaneError.ProjectPolicyForbidden,
-            control_plane_mod.ControlPlaneError.ProjectAuthFailed,
-            control_plane_mod.ControlPlaneError.ProjectAssignmentForbidden,
-            => return error.AccessDenied,
-            else => return err,
-        };
-        defer self.allocator.free(mounts_json);
-        const binds_json = plane.listProjectBindsWithRole(payload, self.is_admin) catch |err| switch (err) {
-            control_plane_mod.ControlPlaneError.ProjectPolicyForbidden,
-            control_plane_mod.ControlPlaneError.ProjectAuthFailed,
-            control_plane_mod.ControlPlaneError.ProjectAssignmentForbidden,
-            => return error.AccessDenied,
-            else => return err,
-        };
-        defer self.allocator.free(binds_json);
-
-        const mounts_array = try extractObjectArrayJson(self.allocator, mounts_json, "mounts");
-        defer self.allocator.free(mounts_array);
-        const binds_array = try extractObjectArrayJson(self.allocator, binds_json, "binds");
-        defer self.allocator.free(binds_array);
-        const result_json = try std.fmt.allocPrint(
-            self.allocator,
-            "{{\"project_id\":\"{s}\",\"mounts\":{s},\"binds\":{s}}}",
-            .{ escaped_project, mounts_array, binds_array },
-        );
-        defer self.allocator.free(result_json);
-        return self.buildMountsSuccessResultJson(.list, result_json);
-    }
-
-    fn extractObjectArrayJson(allocator: std.mem.Allocator, json_text: []const u8, field_name: []const u8) ![]u8 {
-        var parsed = std.json.parseFromSlice(std.json.Value, allocator, json_text, .{}) catch {
-            return allocator.dupe(u8, "[]");
-        };
-        defer parsed.deinit();
-        if (parsed.value != .object) return allocator.dupe(u8, "[]");
-        const field = parsed.value.object.get(field_name) orelse return allocator.dupe(u8, "[]");
-        if (field != .array) return allocator.dupe(u8, "[]");
-        return std.fmt.allocPrint(allocator, "{f}", .{std.json.fmt(field, .{})});
-    }
-
-    const SubBrainOp = enum {
-        list,
-        upsert,
-        delete,
-    };
 
     fn handleSubBrainsInvokeWrite(self: *Session, invoke_node_id: u32, raw_input: []const u8) !WriteOutcome {
-        const input = std.mem.trim(u8, raw_input, " \t\r\n");
-        if (input.len == 0) return error.InvalidPayload;
-        try self.setFileContent(invoke_node_id, input);
-
-        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, input, .{}) catch return error.InvalidPayload;
-        defer parsed.deinit();
-        if (parsed.value != .object) return error.InvalidPayload;
-        const obj = parsed.value.object;
-
-        const op_raw = blk: {
-            if (obj.get("op")) |value| if (value == .string and value.string.len > 0) break :blk value.string;
-            if (obj.get("operation")) |value| if (value == .string and value.string.len > 0) break :blk value.string;
-            if (obj.get("tool")) |value| if (value == .string and value.string.len > 0) break :blk value.string;
-            if (obj.get("tool_name")) |value| if (value == .string and value.string.len > 0) break :blk value.string;
-            break :blk null;
-        } orelse return error.InvalidPayload;
-        const op = parseSubBrainOp(op_raw) orelse return error.InvalidPayload;
-
-        const args_obj = blk: {
-            if (obj.get("arguments")) |value| {
-                if (value != .object) return error.InvalidPayload;
-                break :blk value.object;
-            }
-            if (obj.get("args")) |value| {
-                if (value != .object) return error.InvalidPayload;
-                break :blk value.object;
-            }
-            break :blk obj;
-        };
-        return self.executeSubBrainOp(op, args_obj, raw_input.len);
+        return .{ .written = try sub_brains_venom.handleInvokeWrite(self, invoke_node_id, raw_input) };
     }
 
     fn handleSubBrainsListWrite(self: *Session, list_node_id: u32, raw_input: []const u8) !WriteOutcome {
-        const input = std.mem.trim(u8, raw_input, " \t\r\n");
-        const payload = if (input.len == 0) "{}" else input;
-        try self.setFileContent(list_node_id, payload);
-
-        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, payload, .{}) catch return error.InvalidPayload;
-        defer parsed.deinit();
-        if (parsed.value != .object) return error.InvalidPayload;
-        return self.executeSubBrainOp(.list, parsed.value.object, raw_input.len);
+        return .{ .written = try sub_brains_venom.handleListWrite(self, list_node_id, raw_input) };
     }
 
     fn handleSubBrainsUpsertWrite(self: *Session, upsert_node_id: u32, raw_input: []const u8) !WriteOutcome {
-        const input = std.mem.trim(u8, raw_input, " \t\r\n");
-        if (input.len == 0) return error.InvalidPayload;
-        try self.setFileContent(upsert_node_id, input);
-
-        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, input, .{}) catch return error.InvalidPayload;
-        defer parsed.deinit();
-        if (parsed.value != .object) return error.InvalidPayload;
-        return self.executeSubBrainOp(.upsert, parsed.value.object, raw_input.len);
+        return .{ .written = try sub_brains_venom.handleUpsertWrite(self, upsert_node_id, raw_input) };
     }
 
     fn handleSubBrainsDeleteWrite(self: *Session, delete_node_id: u32, raw_input: []const u8) !WriteOutcome {
-        const input = std.mem.trim(u8, raw_input, " \t\r\n");
-        if (input.len == 0) return error.InvalidPayload;
-        try self.setFileContent(delete_node_id, input);
-
-        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, input, .{}) catch return error.InvalidPayload;
-        defer parsed.deinit();
-        if (parsed.value != .object) return error.InvalidPayload;
-        return self.executeSubBrainOp(.delete, parsed.value.object, raw_input.len);
+        return .{ .written = try sub_brains_venom.handleDeleteWrite(self, delete_node_id, raw_input) };
     }
-
-    fn executeSubBrainOp(
-        self: *Session,
-        op: SubBrainOp,
-        args_obj: std.json.ObjectMap,
-        written: usize,
-    ) !WriteOutcome {
-        const tool_name = subBrainToolName(op);
-        const running_status = try self.buildServiceInvokeStatusJson("running", tool_name, null);
-        defer self.allocator.free(running_status);
-        if (self.sub_brains_status_id != 0) try self.setFileContent(self.sub_brains_status_id, running_status);
-
-        const result_payload = self.executeSubBrainOpPayload(op, args_obj) catch |err| {
-            const error_message = @errorName(err);
-            const error_code = switch (err) {
-                error.AccessDenied => "forbidden",
-                else => "invalid_payload",
-            };
-            const failed_status = try self.buildServiceInvokeStatusJson("failed", tool_name, error_message);
-            defer self.allocator.free(failed_status);
-            if (self.sub_brains_status_id != 0) try self.setFileContent(self.sub_brains_status_id, failed_status);
-            const failed_result = try self.buildSubBrainFailureResultJson(op, error_code, error_message);
-            defer self.allocator.free(failed_result);
-            if (self.sub_brains_result_id != 0) try self.setFileContent(self.sub_brains_result_id, failed_result);
-            return err;
-        };
-        defer self.allocator.free(result_payload);
-
-        const done_status = try self.buildServiceInvokeStatusJson("done", tool_name, null);
-        defer self.allocator.free(done_status);
-        if (self.sub_brains_status_id != 0) try self.setFileContent(self.sub_brains_status_id, done_status);
-        if (self.sub_brains_result_id != 0) try self.setFileContent(self.sub_brains_result_id, result_payload);
-        return .{ .written = written };
-    }
-
-    fn executeSubBrainOpPayload(self: *Session, op: SubBrainOp, args_obj: std.json.ObjectMap) ![]u8 {
-        return switch (op) {
-            .list => self.executeSubBrainListOp(),
-            .upsert => self.executeSubBrainUpsertOp(args_obj),
-            .delete => self.executeSubBrainDeleteOp(args_obj),
-        };
-    }
-
-    fn executeSubBrainListOp(self: *Session) ![]u8 {
-        var config = try self.loadOrInitSelfAgentConfig();
-        defer config.deinit();
-        const inventory = try self.buildSubBrainInventoryJson(&config);
-        defer self.allocator.free(inventory);
-        return self.buildSubBrainSuccessResultJson(.list, inventory);
-    }
-
-    fn executeSubBrainUpsertOp(self: *Session, args_obj: std.json.ObjectMap) ![]u8 {
-        if (!self.canManageSubBrains()) return error.AccessDenied;
-        const brain_name = extractSubBrainName(args_obj) orelse return error.InvalidPayload;
-        if (std.mem.eql(u8, brain_name, "primary")) return error.InvalidPayload;
-
-        const config_obj = blk: {
-            if (args_obj.get("config")) |value| {
-                if (value != .object) return error.InvalidPayload;
-                break :blk value.object;
-            }
-            break :blk args_obj;
-        };
-
-        var new_sub = try self.parseSubBrainConfigFromObject(config_obj);
-        var new_sub_owned = true;
-        errdefer if (new_sub_owned) new_sub.deinit(self.allocator);
-
-        var config = try self.loadOrInitSelfAgentConfig();
-        defer config.deinit();
-
-        if (config.sub_brains.getPtr(brain_name)) |existing| {
-            existing.deinit(self.allocator);
-            existing.* = new_sub;
-            new_sub_owned = false;
-        } else {
-            const key = try self.allocator.dupe(u8, brain_name);
-            errdefer self.allocator.free(key);
-            try config.sub_brains.put(self.allocator, key, new_sub);
-            new_sub_owned = false;
-        }
-
-        try std.fs.cwd().makePath(self.agents_dir);
-        try agent_config.saveAgentConfig(self.allocator, self.agents_dir, self.agent_id, &config);
-
-        const inventory = try self.buildSubBrainInventoryJson(&config);
-        defer self.allocator.free(inventory);
-        const escaped_brain = try unified.jsonEscape(self.allocator, brain_name);
-        defer self.allocator.free(escaped_brain);
-        const detail = try std.fmt.allocPrint(
-            self.allocator,
-            "{{\"brain_name\":\"{s}\",\"updated\":true,\"inventory\":{s}}}",
-            .{ escaped_brain, inventory },
-        );
-        defer self.allocator.free(detail);
-        return self.buildSubBrainSuccessResultJson(.upsert, detail);
-    }
-
-    fn executeSubBrainDeleteOp(self: *Session, args_obj: std.json.ObjectMap) ![]u8 {
-        if (!self.canManageSubBrains()) return error.AccessDenied;
-        const brain_name = extractSubBrainName(args_obj) orelse return error.InvalidPayload;
-        if (std.mem.eql(u8, brain_name, "primary")) return error.InvalidPayload;
-
-        var config = try self.loadOrInitSelfAgentConfig();
-        defer config.deinit();
-
-        var removed = false;
-        if (config.sub_brains.fetchRemove(brain_name)) |entry| {
-            self.allocator.free(entry.key);
-            var value = entry.value;
-            value.deinit(self.allocator);
-            removed = true;
-        }
-
-        try std.fs.cwd().makePath(self.agents_dir);
-        try agent_config.saveAgentConfig(self.allocator, self.agents_dir, self.agent_id, &config);
-
-        const inventory = try self.buildSubBrainInventoryJson(&config);
-        defer self.allocator.free(inventory);
-        const escaped_brain = try unified.jsonEscape(self.allocator, brain_name);
-        defer self.allocator.free(escaped_brain);
-        const detail = try std.fmt.allocPrint(
-            self.allocator,
-            "{{\"brain_name\":\"{s}\",\"removed\":{},\"inventory\":{s}}}",
-            .{ escaped_brain, removed, inventory },
-        );
-        defer self.allocator.free(detail);
-        return self.buildSubBrainSuccessResultJson(.delete, detail);
-    }
-
-    const AgentOp = enum {
-        list,
-        create,
-    };
 
     fn handleAgentsInvokeWrite(self: *Session, invoke_node_id: u32, raw_input: []const u8) !WriteOutcome {
-        const input = std.mem.trim(u8, raw_input, " \t\r\n");
-        if (input.len == 0) return error.InvalidPayload;
-        try self.setFileContent(invoke_node_id, input);
-
-        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, input, .{}) catch return error.InvalidPayload;
-        defer parsed.deinit();
-        if (parsed.value != .object) return error.InvalidPayload;
-        const obj = parsed.value.object;
-
-        const op_raw = blk: {
-            if (obj.get("op")) |value| if (value == .string and value.string.len > 0) break :blk value.string;
-            if (obj.get("operation")) |value| if (value == .string and value.string.len > 0) break :blk value.string;
-            if (obj.get("tool")) |value| if (value == .string and value.string.len > 0) break :blk value.string;
-            if (obj.get("tool_name")) |value| if (value == .string and value.string.len > 0) break :blk value.string;
-            break :blk null;
-        } orelse return error.InvalidPayload;
-        const op = parseAgentOp(op_raw) orelse return error.InvalidPayload;
-
-        const args_obj = blk: {
-            if (obj.get("arguments")) |value| {
-                if (value != .object) return error.InvalidPayload;
-                break :blk value.object;
-            }
-            if (obj.get("args")) |value| {
-                if (value != .object) return error.InvalidPayload;
-                break :blk value.object;
-            }
-            break :blk obj;
-        };
-        return self.executeAgentOp(op, args_obj, raw_input.len);
+        return .{ .written = try agents_venom.handleInvokeWrite(self, invoke_node_id, raw_input) };
     }
 
     fn handleAgentsListWrite(self: *Session, list_node_id: u32, raw_input: []const u8) !WriteOutcome {
-        const input = std.mem.trim(u8, raw_input, " \t\r\n");
-        const payload = if (input.len == 0) "{}" else input;
-        try self.setFileContent(list_node_id, payload);
-
-        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, payload, .{}) catch return error.InvalidPayload;
-        defer parsed.deinit();
-        if (parsed.value != .object) return error.InvalidPayload;
-        return self.executeAgentOp(.list, parsed.value.object, raw_input.len);
+        return .{ .written = try agents_venom.handleListWrite(self, list_node_id, raw_input) };
     }
 
     fn handleAgentsCreateWrite(self: *Session, create_node_id: u32, raw_input: []const u8) !WriteOutcome {
-        const input = std.mem.trim(u8, raw_input, " \t\r\n");
-        if (input.len == 0) return error.InvalidPayload;
-        try self.setFileContent(create_node_id, input);
-
-        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, input, .{}) catch return error.InvalidPayload;
-        defer parsed.deinit();
-        if (parsed.value != .object) return error.InvalidPayload;
-        return self.executeAgentOp(.create, parsed.value.object, raw_input.len);
-    }
-
-    fn executeAgentOp(
-        self: *Session,
-        op: AgentOp,
-        args_obj: std.json.ObjectMap,
-        written: usize,
-    ) !WriteOutcome {
-        const tool_name = agentToolName(op);
-        const running_status = try self.buildServiceInvokeStatusJson("running", tool_name, null);
-        defer self.allocator.free(running_status);
-        if (self.agents_status_id != 0) try self.setFileContent(self.agents_status_id, running_status);
-
-        const result_payload = self.executeAgentOpPayload(op, args_obj) catch |err| {
-            const error_message = @errorName(err);
-            const error_code = switch (err) {
-                error.AccessDenied => "forbidden",
-                error.AlreadyExists => "already_exists",
-                error.InvalidAgentId => "invalid_agent_id",
-                else => "invalid_payload",
-            };
-            const failed_status = try self.buildServiceInvokeStatusJson("failed", tool_name, error_message);
-            defer self.allocator.free(failed_status);
-            if (self.agents_status_id != 0) try self.setFileContent(self.agents_status_id, failed_status);
-            const failed_result = try self.buildAgentFailureResultJson(op, error_code, error_message);
-            defer self.allocator.free(failed_result);
-            if (self.agents_result_id != 0) try self.setFileContent(self.agents_result_id, failed_result);
-            return err;
-        };
-        defer self.allocator.free(result_payload);
-
-        const done_status = try self.buildServiceInvokeStatusJson("done", tool_name, null);
-        defer self.allocator.free(done_status);
-        if (self.agents_status_id != 0) try self.setFileContent(self.agents_status_id, done_status);
-        if (self.agents_result_id != 0) try self.setFileContent(self.agents_result_id, result_payload);
-        return .{ .written = written };
-    }
-
-    fn executeAgentOpPayload(self: *Session, op: AgentOp, args_obj: std.json.ObjectMap) ![]u8 {
-        return switch (op) {
-            .list => self.executeAgentListOp(),
-            .create => self.executeAgentCreateOp(args_obj),
-        };
-    }
-
-    fn executeAgentListOp(self: *Session) ![]u8 {
-        const inventory = try self.buildAgentInventoryJson();
-        defer self.allocator.free(inventory);
-        return self.buildAgentSuccessResultJson(.list, inventory);
-    }
-
-    fn executeAgentCreateOp(self: *Session, args_obj: std.json.ObjectMap) ![]u8 {
-        if (!self.canCreateAgents()) return error.AccessDenied;
-        const new_agent_id = extractAgentId(args_obj) orelse return error.InvalidPayload;
-        if (!isValidManagedAgentId(new_agent_id)) return error.InvalidAgentId;
-        if (std.mem.eql(u8, new_agent_id, "self")) return error.InvalidAgentId;
-
-        const template_path = extractOptionalStringByNames(args_obj, &.{ "template_path", "template" });
-        const desired_project_id = extractOptionalStringByNames(args_obj, &.{"project_id"});
-        const desired_project_token = extractOptionalStringByNames(args_obj, &.{"project_token"});
-
-        var registry = agent_registry.AgentRegistry.init(
-            self.allocator,
-            ".",
-            self.agents_dir,
-            self.assets_dir,
-        );
-        defer registry.deinit();
-        try registry.scan();
-        if (registry.getAgent(new_agent_id) != null) return error.AlreadyExists;
-        try registry.createAgent(new_agent_id, template_path);
-
-        const metadata_written = try self.maybeWriteAgentMetadataFile(new_agent_id, args_obj);
-        var activated = false;
-        var activation_error: ?[]u8 = null;
-        defer if (activation_error) |value| self.allocator.free(value);
-
-        if (desired_project_id) |project_id| {
-            if (self.control_plane) |plane| {
-                const activation_payload = try buildAgentProjectActivationPayload(self.allocator, project_id, desired_project_token);
-                defer self.allocator.free(activation_payload);
-                const activation_result = plane.activateProjectWithRole(new_agent_id, activation_payload, self.is_admin) catch |err| blk: {
-                    activation_error = try self.allocator.dupe(u8, @errorName(err));
-                    break :blk null;
-                };
-                if (activation_result) |payload| {
-                    defer plane.allocator.free(payload);
-                    activated = true;
-                }
-            } else {
-                activation_error = try self.allocator.dupe(u8, "ControlPlaneUnavailable");
-            }
-        }
-
-        const inventory = try self.buildAgentInventoryJson();
-        defer self.allocator.free(inventory);
-        const escaped_agent = try unified.jsonEscape(self.allocator, new_agent_id);
-        defer self.allocator.free(escaped_agent);
-        const project_json = if (desired_project_id) |project_id| blk: {
-            const escaped = try unified.jsonEscape(self.allocator, project_id);
-            defer self.allocator.free(escaped);
-            break :blk try std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped});
-        } else try self.allocator.dupe(u8, "null");
-        defer self.allocator.free(project_json);
-        const activation_error_json = if (activation_error) |value| blk: {
-            const escaped = try unified.jsonEscape(self.allocator, value);
-            defer self.allocator.free(escaped);
-            break :blk try std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped});
-        } else try self.allocator.dupe(u8, "null");
-        defer self.allocator.free(activation_error_json);
-        const detail = try std.fmt.allocPrint(
-            self.allocator,
-            "{{\"agent_id\":\"{s}\",\"created\":true,\"metadata_updated\":{},\"project_id\":{s},\"activated\":{},\"activation_error\":{s},\"inventory\":{s}}}",
-            .{ escaped_agent, metadata_written, project_json, activated, activation_error_json, inventory },
-        );
-        defer self.allocator.free(detail);
-        return self.buildAgentSuccessResultJson(.create, detail);
-    }
-
-    fn buildAgentProjectActivationPayload(
-        allocator: std.mem.Allocator,
-        project_id: []const u8,
-        project_token: ?[]const u8,
-    ) ![]u8 {
-        const escaped_project = try unified.jsonEscape(allocator, project_id);
-        defer allocator.free(escaped_project);
-        if (project_token) |token| {
-            const escaped_token = try unified.jsonEscape(allocator, token);
-            defer allocator.free(escaped_token);
-            return std.fmt.allocPrint(
-                allocator,
-                "{{\"project_id\":\"{s}\",\"project_token\":\"{s}\"}}",
-                .{ escaped_project, escaped_token },
-            );
-        }
-        return std.fmt.allocPrint(
-            allocator,
-            "{{\"project_id\":\"{s}\"}}",
-            .{escaped_project},
-        );
-    }
-
-    fn buildAgentListResultJson(self: *Session) ![]u8 {
-        const inventory = try self.buildAgentInventoryJson();
-        defer self.allocator.free(inventory);
-        return self.buildAgentSuccessResultJson(.list, inventory);
-    }
-
-    fn buildAgentInventoryJson(self: *Session) ![]u8 {
-        const create_allowed = self.canCreateAgents();
-        var registry = agent_registry.AgentRegistry.init(
-            self.allocator,
-            ".",
-            self.agents_dir,
-            self.assets_dir,
-        );
-        defer registry.deinit();
-        try registry.scan();
-
-        var out = std.ArrayListUnmanaged(u8){};
-        errdefer out.deinit(self.allocator);
-        const writer = out.writer(self.allocator);
-
-        try writer.writeAll("{\"agents\":[");
-        const agents = registry.listAgents();
-        for (agents, 0..) |agent, idx| {
-            if (idx > 0) try writer.writeByte(',');
-            try writer.writeByte('{');
-            try writer.writeAll("\"agent_id\":");
-            try writeJsonString(writer, agent.id);
-            try writer.writeAll(",\"name\":");
-            try writeJsonString(writer, agent.name);
-            try writer.writeAll(",\"description\":");
-            try writeJsonString(writer, agent.description);
-            try writer.writeAll(",\"is_default\":");
-            try writer.print("{}", .{agent.is_default});
-            try writer.writeAll(",\"identity_loaded\":");
-            try writer.print("{}", .{agent.identity_loaded});
-            try writer.writeAll(",\"needs_hatching\":");
-            try writer.print("{}", .{agent.needs_hatching});
-            try writer.writeAll(",\"capabilities\":[");
-            for (agent.capabilities.items, 0..) |capability, cap_idx| {
-                if (cap_idx > 0) try writer.writeByte(',');
-                try writeJsonString(writer, managedAgentCapabilityName(capability));
-            }
-            try writer.writeAll("]}");
-        }
-        try writer.print("],\"count\":{d},\"create_allowed\":{}}}", .{ agents.len, create_allowed });
-        return out.toOwnedSlice(self.allocator);
-    }
-
-    fn buildAgentSuccessResultJson(self: *Session, op: AgentOp, result_json: []const u8) ![]u8 {
-        const escaped_operation = try unified.jsonEscape(self.allocator, agentOperationName(op));
-        defer self.allocator.free(escaped_operation);
-        return std.fmt.allocPrint(
-            self.allocator,
-            "{{\"ok\":true,\"operation\":\"{s}\",\"result\":{s},\"error\":null}}",
-            .{ escaped_operation, result_json },
-        );
-    }
-
-    fn buildAgentFailureResultJson(
-        self: *Session,
-        op: AgentOp,
-        code: []const u8,
-        message: []const u8,
-    ) ![]u8 {
-        const escaped_operation = try unified.jsonEscape(self.allocator, agentOperationName(op));
-        defer self.allocator.free(escaped_operation);
-        const escaped_code = try unified.jsonEscape(self.allocator, code);
-        defer self.allocator.free(escaped_code);
-        const escaped_message = try unified.jsonEscape(self.allocator, message);
-        defer self.allocator.free(escaped_message);
-        return std.fmt.allocPrint(
-            self.allocator,
-            "{{\"ok\":false,\"operation\":\"{s}\",\"result\":null,\"error\":{{\"code\":\"{s}\",\"message\":\"{s}\"}}}}",
-            .{ escaped_operation, escaped_code, escaped_message },
-        );
-    }
-
-    fn maybeWriteAgentMetadataFile(
-        self: *Session,
-        target_agent_id: []const u8,
-        args_obj: std.json.ObjectMap,
-    ) !bool {
-        const metadata_obj = blk: {
-            if (args_obj.get("agent")) |value| {
-                if (value != .object) return error.InvalidPayload;
-                break :blk value.object;
-            }
-            break :blk args_obj;
-        };
-
-        var name_value: ?[]const u8 = null;
-        var description_value: ?[]const u8 = null;
-        var has_capabilities = false;
-        var capabilities_value: ?std.json.Value = null;
-
-        if (metadata_obj.get("name")) |value| {
-            if (value == .string) name_value = value.string else if (value != .null) return error.InvalidPayload;
-        }
-        if (metadata_obj.get("description")) |value| {
-            if (value == .string) description_value = value.string else if (value != .null) return error.InvalidPayload;
-        }
-        if (metadata_obj.get("capabilities")) |value| {
-            if (value == .array) {
-                has_capabilities = true;
-                for (value.array.items) |entry| {
-                    if (entry != .string) return error.InvalidPayload;
-                }
-                capabilities_value = value;
-            } else if (value != .null) {
-                return error.InvalidPayload;
-            }
-        }
-
-        if (name_value == null and description_value == null and !has_capabilities) return false;
-
-        var out = std.ArrayListUnmanaged(u8){};
-        defer out.deinit(self.allocator);
-        const writer = out.writer(self.allocator);
-        try writer.writeByte('{');
-        var first = true;
-
-        if (name_value) |value| {
-            if (!first) try writer.writeByte(',');
-            first = false;
-            try writeJsonString(writer, "name");
-            try writer.writeByte(':');
-            try writeJsonString(writer, value);
-        }
-        if (description_value) |value| {
-            if (!first) try writer.writeByte(',');
-            first = false;
-            try writeJsonString(writer, "description");
-            try writer.writeByte(':');
-            try writeJsonString(writer, value);
-        }
-        if (has_capabilities) {
-            if (!first) try writer.writeByte(',');
-            try writeJsonString(writer, "capabilities");
-            try writer.writeByte(':');
-            try writer.writeByte('[');
-            if (capabilities_value) |caps_raw| {
-                const caps = caps_raw.array;
-                for (caps.items, 0..) |entry, idx| {
-                    if (idx > 0) try writer.writeByte(',');
-                    try writeJsonString(writer, entry.string);
-                }
-            }
-            try writer.writeByte(']');
-        }
-        try writer.writeByte('}');
-
-        const metadata_json = try out.toOwnedSlice(self.allocator);
-        defer self.allocator.free(metadata_json);
-        const agent_dir = try std.fs.path.join(self.allocator, &.{ self.agents_dir, target_agent_id });
-        defer self.allocator.free(agent_dir);
-        try std.fs.cwd().makePath(agent_dir);
-        const metadata_path = try std.fs.path.join(self.allocator, &.{ agent_dir, "agent.json" });
-        defer self.allocator.free(metadata_path);
-        try std.fs.cwd().writeFile(.{
-            .sub_path = metadata_path,
-            .data = metadata_json,
-        });
-        return true;
+        return .{ .written = try agents_venom.handleCreateWrite(self, create_node_id, raw_input) };
     }
 
     const AgentAbilities = struct {
@@ -8398,12 +6153,12 @@ pub const Session = struct {
         can_create_agents: bool,
     };
 
-    fn canManageSubBrains(self: *Session) bool {
+    pub fn canManageSubBrains(self: *Session) bool {
         const abilities = self.resolveAgentAbilities() catch return false;
         return abilities.can_manage_sub_brains;
     }
 
-    fn canCreateAgents(self: *Session) bool {
+    pub fn canCreateAgents(self: *Session) bool {
         const abilities = self.resolveAgentAbilities() catch return false;
         return abilities.can_create_agents;
     }
@@ -8459,322 +6214,6 @@ pub const Session = struct {
         return false;
     }
 
-    fn isValidManagedAgentId(agent_id: []const u8) bool {
-        if (agent_id.len == 0 or agent_id.len > max_agent_id_len) return false;
-        if (std.mem.eql(u8, agent_id, ".")) return false;
-        for (agent_id) |char| {
-            if (std.ascii.isAlphanumeric(char)) continue;
-            if (char == '_' or char == '-') continue;
-            return false;
-        }
-        return true;
-    }
-
-    fn managedAgentCapabilityName(value: agent_registry.AgentCapability) []const u8 {
-        return switch (value) {
-            .chat => "chat",
-            .code => "code",
-            .plan => "plan",
-            .research => "research",
-        };
-    }
-
-    fn loadOrInitSelfAgentConfig(self: *Session) !agent_config.AgentConfig {
-        if (try agent_config.loadAgentConfigFromDir(self.allocator, self.agents_dir, self.agent_id)) |config| {
-            return config;
-        }
-        var config = agent_config.AgentConfig.init(self.allocator);
-        config.agent_id = try self.allocator.dupe(u8, self.agent_id);
-        return config;
-    }
-
-    fn parseSubBrainConfigFromObject(self: *Session, obj: std.json.ObjectMap) !agent_config.SubBrainConfig {
-        var out = agent_config.SubBrainConfig.init(self.allocator);
-        errdefer out.deinit(self.allocator);
-
-        if (obj.get("template")) |value| {
-            if (value == .string) out.base.template = try self.allocator.dupe(u8, value.string) else if (value != .null) return error.InvalidPayload;
-        }
-        if (obj.get("provider")) |value| {
-            switch (value) {
-                .string => {
-                    out.base.provider.name = try self.allocator.dupe(u8, value.string);
-                },
-                .object => {
-                    if (value.object.get("name")) |field| {
-                        if (field == .string) out.base.provider.name = try self.allocator.dupe(u8, field.string) else if (field != .null) return error.InvalidPayload;
-                    }
-                    if (value.object.get("model")) |field| {
-                        if (field == .string) out.base.provider.model = try self.allocator.dupe(u8, field.string) else if (field != .null) return error.InvalidPayload;
-                    }
-                    if (value.object.get("think_level")) |field| {
-                        if (field == .string) out.base.provider.think_level = try self.allocator.dupe(u8, field.string) else if (field != .null) return error.InvalidPayload;
-                    }
-                },
-                .null => {},
-                else => return error.InvalidPayload,
-            }
-        }
-        if (obj.get("can_spawn_subbrains")) |value| {
-            if (value == .bool) out.base.can_spawn_subbrains = value.bool else if (value != .null) return error.InvalidPayload;
-        }
-
-        try self.copyStringArrayConfigField(obj, "allowed_tools", &(out.base.allowed_tools));
-        try self.copyStringArrayConfigField(obj, "denied_tools", &(out.base.denied_tools));
-        try self.copyStringArrayConfigField(obj, "capabilities", &(out.base.capabilities));
-        try self.copyRomOverridesConfigField(obj, "rom_overrides", &(out.base.rom_overrides));
-
-        if (obj.get("personality")) |value| {
-            if (value == .object) {
-                if (value.object.get("name")) |field| {
-                    if (field == .string) try self.setBrainRomOverride(&(out.base), "system:personality_name", field.string) else if (field != .null) return error.InvalidPayload;
-                }
-                if (value.object.get("description")) |field| {
-                    if (field == .string) try self.setBrainRomOverride(&(out.base), "system:personality_description", field.string) else if (field != .null) return error.InvalidPayload;
-                }
-                if (value.object.get("creature")) |field| {
-                    if (field == .string) try self.setBrainRomOverride(&(out.base), "system:personality_creature", field.string) else if (field != .null) return error.InvalidPayload;
-                }
-                if (value.object.get("vibe")) |field| {
-                    if (field == .string) try self.setBrainRomOverride(&(out.base), "system:personality_vibe", field.string) else if (field != .null) return error.InvalidPayload;
-                }
-                if (value.object.get("emoji")) |field| {
-                    if (field == .string) try self.setBrainRomOverride(&(out.base), "system:personality_emoji", field.string) else if (field != .null) return error.InvalidPayload;
-                }
-            } else if (value != .null) {
-                return error.InvalidPayload;
-            }
-        }
-        if (obj.get("creature")) |value| {
-            if (value == .string) try self.setBrainRomOverride(&(out.base), "system:personality_creature", value.string) else if (value != .null) return error.InvalidPayload;
-        }
-        if (obj.get("vibe")) |value| {
-            if (value == .string) try self.setBrainRomOverride(&(out.base), "system:personality_vibe", value.string) else if (value != .null) return error.InvalidPayload;
-        }
-        if (obj.get("emoji")) |value| {
-            if (value == .string) try self.setBrainRomOverride(&(out.base), "system:personality_emoji", value.string) else if (value != .null) return error.InvalidPayload;
-        }
-
-        return out;
-    }
-
-    fn copyStringArrayConfigField(
-        self: *Session,
-        obj: std.json.ObjectMap,
-        field_name: []const u8,
-        target: *?std.ArrayListUnmanaged([]u8),
-    ) !void {
-        const value = obj.get(field_name) orelse return;
-        if (value == .null) return;
-        if (value != .array) return error.InvalidPayload;
-        target.* = .{};
-        for (value.array.items) |entry| {
-            if (entry != .string) return error.InvalidPayload;
-            try target.*.?.append(self.allocator, try self.allocator.dupe(u8, entry.string));
-        }
-    }
-
-    fn copyRomOverridesConfigField(
-        self: *Session,
-        obj: std.json.ObjectMap,
-        field_name: []const u8,
-        target: *?std.ArrayListUnmanaged(agent_config.RomEntry),
-    ) !void {
-        const value = obj.get(field_name) orelse return;
-        if (value == .null) return;
-        if (value != .array) return error.InvalidPayload;
-        target.* = .{};
-        for (value.array.items) |entry| {
-            if (entry != .object) return error.InvalidPayload;
-            const key = entry.object.get("key") orelse return error.InvalidPayload;
-            const val = entry.object.get("value") orelse return error.InvalidPayload;
-            if (key != .string or val != .string) return error.InvalidPayload;
-            try target.*.?.append(self.allocator, .{
-                .key = try self.allocator.dupe(u8, key.string),
-                .value = try self.allocator.dupe(u8, val.string),
-            });
-        }
-    }
-
-    fn setBrainRomOverride(
-        self: *Session,
-        cfg: *agent_config.BrainConfig,
-        key: []const u8,
-        value: []const u8,
-    ) !void {
-        if (cfg.rom_overrides == null) cfg.rom_overrides = .{};
-        for (cfg.rom_overrides.?.items) |*entry| {
-            if (!std.mem.eql(u8, entry.key, key)) continue;
-            self.allocator.free(entry.value);
-            entry.value = try self.allocator.dupe(u8, value);
-            return;
-        }
-        try cfg.rom_overrides.?.append(self.allocator, .{
-            .key = try self.allocator.dupe(u8, key),
-            .value = try self.allocator.dupe(u8, value),
-        });
-    }
-
-    fn buildSubBrainInventoryJson(self: *Session, config: *const agent_config.AgentConfig) ![]u8 {
-        var out = std.ArrayListUnmanaged(u8){};
-        errdefer out.deinit(self.allocator);
-        const writer = out.writer(self.allocator);
-
-        try writer.writeAll("{\"sub_brains\":[");
-        var names = std.ArrayListUnmanaged([]const u8){};
-        defer names.deinit(self.allocator);
-        var it = config.sub_brains.iterator();
-        while (it.next()) |entry| try names.append(self.allocator, entry.key_ptr.*);
-        std.mem.sort([]const u8, names.items, {}, struct {
-            fn lessThan(_: void, lhs: []const u8, rhs: []const u8) bool {
-                return std.mem.lessThan(u8, lhs, rhs);
-            }
-        }.lessThan);
-
-        for (names.items, 0..) |name, idx| {
-            if (idx > 0) try writer.writeByte(',');
-            const sub = config.sub_brains.get(name) orelse continue;
-            try writer.writeByte('{');
-            try writer.writeAll("\"brain_name\":");
-            try writeJsonString(writer, name);
-            try writer.writeAll(",\"template\":");
-            if (sub.base.template) |value| {
-                try writeJsonString(writer, value);
-            } else {
-                try writer.writeAll("null");
-            }
-            try writer.writeAll(",\"can_spawn_subbrains\":");
-            try writer.print("{}", .{sub.base.can_spawn_subbrains});
-            try writer.writeAll(",\"provider\":{");
-            var provider_first = true;
-            if (sub.base.provider.name) |value| {
-                if (!provider_first) try writer.writeByte(',');
-                provider_first = false;
-                try writer.writeAll("\"name\":");
-                try writeJsonString(writer, value);
-            }
-            if (sub.base.provider.model) |value| {
-                if (!provider_first) try writer.writeByte(',');
-                provider_first = false;
-                try writer.writeAll("\"model\":");
-                try writeJsonString(writer, value);
-            }
-            if (sub.base.provider.think_level) |value| {
-                if (!provider_first) try writer.writeByte(',');
-                provider_first = false;
-                try writer.writeAll("\"think_level\":");
-                try writeJsonString(writer, value);
-            }
-            try writer.writeByte('}');
-            try writer.writeByte('}');
-        }
-
-        try writer.print("],\"count\":{d}}}", .{names.items.len});
-        return out.toOwnedSlice(self.allocator);
-    }
-
-    fn buildSubBrainSuccessResultJson(self: *Session, op: SubBrainOp, result_json: []const u8) ![]u8 {
-        const escaped_operation = try unified.jsonEscape(self.allocator, subBrainOperationName(op));
-        defer self.allocator.free(escaped_operation);
-        return std.fmt.allocPrint(
-            self.allocator,
-            "{{\"ok\":true,\"operation\":\"{s}\",\"result\":{s},\"error\":null}}",
-            .{ escaped_operation, result_json },
-        );
-    }
-
-    fn buildSubBrainFailureResultJson(
-        self: *Session,
-        op: SubBrainOp,
-        code: []const u8,
-        message: []const u8,
-    ) ![]u8 {
-        const escaped_operation = try unified.jsonEscape(self.allocator, subBrainOperationName(op));
-        defer self.allocator.free(escaped_operation);
-        const escaped_code = try unified.jsonEscape(self.allocator, code);
-        defer self.allocator.free(escaped_code);
-        const escaped_message = try unified.jsonEscape(self.allocator, message);
-        defer self.allocator.free(escaped_message);
-        return std.fmt.allocPrint(
-            self.allocator,
-            "{{\"ok\":false,\"operation\":\"{s}\",\"result\":null,\"error\":{{\"code\":\"{s}\",\"message\":\"{s}\"}}}}",
-            .{ escaped_operation, escaped_code, escaped_message },
-        );
-    }
-
-    fn buildSubBrainListResultJson(self: *Session) ![]u8 {
-        var config = try self.loadOrInitSelfAgentConfig();
-        defer config.deinit();
-        const inventory = try self.buildSubBrainInventoryJson(&config);
-        defer self.allocator.free(inventory);
-        return self.buildSubBrainSuccessResultJson(.list, inventory);
-    }
-
-    fn parseSubBrainOp(raw: []const u8) ?SubBrainOp {
-        const value = std.mem.trim(u8, raw, " \t\r\n");
-        if (std.mem.eql(u8, value, "list") or std.mem.eql(u8, value, "sub_brains_list")) return .list;
-        if (std.mem.eql(u8, value, "upsert") or std.mem.eql(u8, value, "sub_brains_upsert")) return .upsert;
-        if (std.mem.eql(u8, value, "delete") or std.mem.eql(u8, value, "sub_brains_delete")) return .delete;
-        return null;
-    }
-
-    fn subBrainToolName(op: SubBrainOp) []const u8 {
-        return switch (op) {
-            .list => "sub_brains_list",
-            .upsert => "sub_brains_upsert",
-            .delete => "sub_brains_delete",
-        };
-    }
-
-    fn subBrainOperationName(op: SubBrainOp) []const u8 {
-        return switch (op) {
-            .list => "list",
-            .upsert => "upsert",
-            .delete => "delete",
-        };
-    }
-
-    fn extractSubBrainName(obj: std.json.ObjectMap) ?[]const u8 {
-        const candidates = [_][]const u8{ "brain_name", "name", "brain_id", "id", "sub_brain", "sub_brain_id" };
-        inline for (candidates) |field| {
-            if (obj.get(field)) |value| {
-                if (value == .string and value.string.len > 0) return value.string;
-            }
-        }
-        return null;
-    }
-
-    fn parseAgentOp(raw: []const u8) ?AgentOp {
-        const value = std.mem.trim(u8, raw, " \t\r\n");
-        if (std.mem.eql(u8, value, "list") or std.mem.eql(u8, value, "agents_list")) return .list;
-        if (std.mem.eql(u8, value, "create") or std.mem.eql(u8, value, "agents_create")) return .create;
-        return null;
-    }
-
-    fn agentToolName(op: AgentOp) []const u8 {
-        return switch (op) {
-            .list => "agents_list",
-            .create => "agents_create",
-        };
-    }
-
-    fn agentOperationName(op: AgentOp) []const u8 {
-        return switch (op) {
-            .list => "list",
-            .create => "create",
-        };
-    }
-
-    fn extractAgentId(obj: std.json.ObjectMap) ?[]const u8 {
-        const candidates = [_][]const u8{ "agent_id", "id" };
-        inline for (candidates) |field| {
-            if (obj.get(field)) |value| {
-                if (value == .string and value.string.len > 0) return value.string;
-            }
-        }
-        return null;
-    }
-
     fn extractOptionalStringByNames(
         obj: std.json.ObjectMap,
         candidate_names: []const []const u8,
@@ -8787,13 +6226,34 @@ pub const Session = struct {
         return null;
     }
 
-    const ProjectsOp = enum {
-        list,
-        get,
-        up,
+    pub const WorkspaceOp = workspaces_venom.Op;
+
+    pub const GitOp = git_venom.Op;
+
+    pub const GitHubPrOp = github_pr_venom.Op;
+
+    pub const PrReviewOp = pr_review_venom.Op;
+
+    fn handleWorkspacesNamespaceWrite(self: *Session, special: SpecialKind, node_id: u32, raw_input: []const u8) !WriteOutcome {
+        return .{ .written = try workspaces_venom.handleNamespaceWrite(self, special, node_id, raw_input) };
+    }
+
+    pub const ParsedShellExecResult = git_venom.ParsedShellExecResult;
+
+    pub const ShellExecOutcome = union(enum) {
+        success: ParsedShellExecResult,
+        failure: ToolPayloadErrorInfo,
+
+        pub fn deinit(self: *ShellExecOutcome, allocator: std.mem.Allocator) void {
+            switch (self.*) {
+                .success => |*value| value.deinit(allocator),
+                .failure => |*value| value.deinit(allocator),
+            }
+            self.* = undefined;
+        }
     };
 
-    fn handleProjectsNamespaceWrite(self: *Session, special: SpecialKind, node_id: u32, raw_input: []const u8) !WriteOutcome {
+    fn handleGitNamespaceWrite(self: *Session, special: SpecialKind, node_id: u32, raw_input: []const u8) !WriteOutcome {
         const input = std.mem.trim(u8, raw_input, " \t\r\n");
         const payload = if (input.len == 0) "{}" else input;
         try self.setFileContent(node_id, payload);
@@ -8804,10 +6264,10 @@ pub const Session = struct {
         const obj = parsed.value.object;
 
         const op = switch (special) {
-            .projects_list => ProjectsOp.list,
-            .projects_get => ProjectsOp.get,
-            .projects_up => ProjectsOp.up,
-            .projects_invoke => blk: {
+            .git_sync_checkout => GitOp.sync_checkout,
+            .git_status => GitOp.status,
+            .git_diff_range => GitOp.diff_range,
+            .git_invoke => blk: {
                 const op_raw = blk2: {
                     if (obj.get("op")) |value| if (value == .string and value.string.len > 0) break :blk2 value.string;
                     if (obj.get("operation")) |value| if (value == .string and value.string.len > 0) break :blk2 value.string;
@@ -8815,7 +6275,7 @@ pub const Session = struct {
                     if (obj.get("tool_name")) |value| if (value == .string and value.string.len > 0) break :blk2 value.string;
                     break :blk2 null;
                 } orelse return error.InvalidPayload;
-                break :blk parseProjectsOp(op_raw) orelse return error.InvalidPayload;
+                break :blk parseGitOp(op_raw) orelse return error.InvalidPayload;
             },
             else => return error.InvalidPayload,
         };
@@ -8832,186 +6292,1037 @@ pub const Session = struct {
             break :blk obj;
         };
 
-        return self.executeProjectsOp(op, args_obj, raw_input.len);
+        return self.executeGitOp(op, args_obj, raw_input.len);
     }
 
-    fn parseProjectsOp(raw: []const u8) ?ProjectsOp {
-        const value = std.mem.trim(u8, raw, " \t\r\n");
-        if (std.mem.eql(u8, value, "list") or std.mem.eql(u8, value, "projects_list")) return .list;
-        if (std.mem.eql(u8, value, "get") or std.mem.eql(u8, value, "projects_get")) return .get;
-        if (std.mem.eql(u8, value, "up") or std.mem.eql(u8, value, "project_up") or std.mem.eql(u8, value, "projects_up")) return .up;
-        return null;
+    fn handleGitHubPrNamespaceWrite(self: *Session, special: SpecialKind, node_id: u32, raw_input: []const u8) !WriteOutcome {
+        return .{ .written = try github_pr_venom.handleNamespaceWrite(self, special, node_id, raw_input) };
     }
 
-    fn executeProjectsOp(self: *Session, op: ProjectsOp, args_obj: std.json.ObjectMap, written: usize) !WriteOutcome {
-        const tool_name = projectsStatusToolName(op);
+    fn parseGitOp(raw: []const u8) ?GitOp {
+        return git_venom.parseOp(raw);
+    }
+
+    fn gitOperationName(op: GitOp) []const u8 {
+        return git_venom.operationName(op);
+    }
+
+    fn gitStatusToolName(op: GitOp) []const u8 {
+        return git_venom.statusToolName(op);
+    }
+
+    fn executeGitOp(self: *Session, op: GitOp, args_obj: std.json.ObjectMap, written: usize) !WriteOutcome {
+        const tool_name = gitStatusToolName(op);
         const running_status = try self.buildServiceInvokeStatusJson("running", tool_name, null);
         defer self.allocator.free(running_status);
-        if (self.projects_status_id != 0) try self.setFileContent(self.projects_status_id, running_status);
+        try self.setMirroredFileContent(self.git_status_id, self.git_status_alias_id, running_status);
 
-        const result_payload = self.executeProjectsOpPayload(op, args_obj) catch |err| {
+        const result_payload = self.executeGitOpPayload(op, args_obj) catch |err| {
             const error_message = @errorName(err);
-            const error_code = switch (err) {
-                error.AccessDenied => "forbidden",
-                else => "invalid_payload",
-            };
             const failed_status = try self.buildServiceInvokeStatusJson("failed", tool_name, error_message);
             defer self.allocator.free(failed_status);
-            if (self.projects_status_id != 0) try self.setFileContent(self.projects_status_id, failed_status);
-            const failed_result = try self.buildProjectFailureResultJson(op, error_code, error_message);
+            try self.setMirroredFileContent(self.git_status_id, self.git_status_alias_id, failed_status);
+            const failed_result = try self.buildGitFailureResultJson(op, "invalid_payload", error_message);
             defer self.allocator.free(failed_result);
-            if (self.projects_result_id != 0) try self.setFileContent(self.projects_result_id, failed_result);
+            try self.setMirroredFileContent(self.git_result_id, self.git_result_alias_id, failed_result);
             return err;
         };
         defer self.allocator.free(result_payload);
 
-        const done_status = try self.buildServiceInvokeStatusJson("done", tool_name, null);
-        defer self.allocator.free(done_status);
-        if (self.projects_status_id != 0) try self.setFileContent(self.projects_status_id, done_status);
-        if (self.projects_result_id != 0) try self.setFileContent(self.projects_result_id, result_payload);
+        if (try self.extractErrorMessageFromToolPayload(result_payload)) |message| {
+            defer self.allocator.free(message);
+            const failed_status = try self.buildServiceInvokeStatusJson("failed", tool_name, message);
+            defer self.allocator.free(failed_status);
+            try self.setMirroredFileContent(self.git_status_id, self.git_status_alias_id, failed_status);
+        } else {
+            const done_status = try self.buildServiceInvokeStatusJson("done", tool_name, null);
+            defer self.allocator.free(done_status);
+            try self.setMirroredFileContent(self.git_status_id, self.git_status_alias_id, done_status);
+        }
+        try self.setMirroredFileContent(self.git_result_id, self.git_result_alias_id, result_payload);
         return .{ .written = written };
     }
 
-    fn executeProjectsOpPayload(self: *Session, op: ProjectsOp, args_obj: std.json.ObjectMap) ![]u8 {
-        const plane = self.control_plane orelse return error.InvalidPayload;
-        return switch (op) {
-            .list => self.buildProjectListResultJson(),
-            .get => blk: {
-                const project_id = extractOptionalStringByNames(args_obj, &[_][]const u8{ "project_id", "id" }) orelse return error.InvalidPayload;
-                const escaped_project = try unified.jsonEscape(self.allocator, project_id);
-                defer self.allocator.free(escaped_project);
-                const token_fragment = if (extractOptionalStringByNames(args_obj, &[_][]const u8{"project_token"})) |token| blk2: {
-                    const escaped = try unified.jsonEscape(self.allocator, token);
-                    defer self.allocator.free(escaped);
-                    break :blk2 try std.fmt.allocPrint(self.allocator, ",\"project_token\":\"{s}\"", .{escaped});
-                } else if (self.project_token) |token| blk2: {
-                    const escaped = try unified.jsonEscape(self.allocator, token);
-                    defer self.allocator.free(escaped);
-                    break :blk2 try std.fmt.allocPrint(self.allocator, ",\"project_token\":\"{s}\"", .{escaped});
-                } else try self.allocator.dupe(u8, "");
-                defer self.allocator.free(token_fragment);
-                const payload = try std.fmt.allocPrint(
-                    self.allocator,
-                    "{{\"project_id\":\"{s}\"{s}}}",
-                    .{ escaped_project, token_fragment },
-                );
-                defer self.allocator.free(payload);
-                const result = plane.getProjectWithRole(payload, self.is_admin) catch |err| switch (err) {
-                    control_plane_mod.ControlPlaneError.ProjectPolicyForbidden,
-                    control_plane_mod.ControlPlaneError.ProjectAuthFailed,
-                    control_plane_mod.ControlPlaneError.ProjectAssignmentForbidden,
-                    => return error.AccessDenied,
-                    control_plane_mod.ControlPlaneError.MissingField,
-                    control_plane_mod.ControlPlaneError.InvalidPayload,
-                    control_plane_mod.ControlPlaneError.ProjectNotFound,
-                    => return error.InvalidPayload,
-                    else => return err,
-                };
-                defer self.allocator.free(result);
-                break :blk self.buildProjectSuccessResultJson(.get, result);
-            },
-            .up => blk: {
-                const payload = try self.renderProjectUpPayload(args_obj);
-                defer self.allocator.free(payload);
-                const result = plane.projectUpWithRole(self.agent_id, payload, self.is_admin) catch |err| switch (err) {
-                    control_plane_mod.ControlPlaneError.ProjectPolicyForbidden,
-                    control_plane_mod.ControlPlaneError.ProjectAuthFailed,
-                    control_plane_mod.ControlPlaneError.ProjectAssignmentForbidden,
-                    control_plane_mod.ControlPlaneError.ProjectProtected,
-                    => return error.AccessDenied,
-                    control_plane_mod.ControlPlaneError.MissingField,
-                    control_plane_mod.ControlPlaneError.InvalidPayload,
-                    control_plane_mod.ControlPlaneError.ProjectNotFound,
-                    control_plane_mod.ControlPlaneError.NodeNotFound,
-                    control_plane_mod.ControlPlaneError.MountConflict,
-                    => return error.InvalidPayload,
-                    else => return err,
-                };
-                defer self.allocator.free(result);
-                break :blk self.buildProjectSuccessResultJson(.up, result);
-            },
-        };
+    fn executeGitOpPayload(self: *Session, op: GitOp, args_obj: std.json.ObjectMap) ![]u8 {
+        return git_venom.executeOpPayload(self, op, args_obj);
     }
 
-    fn renderProjectUpPayload(self: *Session, args_obj: std.json.ObjectMap) ![]u8 {
-        if (!std.mem.eql(u8, self.agent_id, "mother")) {
-            return self.renderJsonValue(.{ .object = args_obj });
-        }
-        if (args_obj.get("activate") != null) {
-            return self.renderJsonValue(.{ .object = args_obj });
-        }
-
-        var out = std.ArrayListUnmanaged(u8){};
-        errdefer out.deinit(self.allocator);
-        const writer = out.writer(self.allocator);
-        try writer.writeByte('{');
-        var first = true;
-        var it = args_obj.iterator();
-        while (it.next()) |entry| {
-            if (!first) try writer.writeByte(',');
-            first = false;
-            try writeJsonString(writer, entry.key_ptr.*);
-            try writer.writeByte(':');
-            try writer.print("{f}", .{std.json.fmt(entry.value_ptr.*, .{})});
-        }
-        if (!first) try writer.writeByte(',');
-        try writer.writeAll("\"activate\":false");
-        try writer.writeByte('}');
-        return out.toOwnedSlice(self.allocator);
+    pub fn buildCliCommand(self: *Session, program: []const u8, argv: []const []const u8) ![]u8 {
+        return git_venom.buildCliCommand(self, program, argv);
     }
 
-    fn buildProjectListResultJson(self: *Session) ![]u8 {
-        const plane = self.control_plane orelse return self.buildProjectSuccessResultJson(.list, "{\"projects\":[]}");
-        const result = try plane.listProjects();
-        defer self.allocator.free(result);
-        return self.buildProjectSuccessResultJson(.list, result);
+    pub fn runShellExecCommand(self: *Session, command: []const u8, cwd: ?[]const u8, timeout_ms: u64) !ShellExecOutcome {
+        const args_json = try self.buildShellExecArgsJson(command, cwd, timeout_ms);
+        defer self.allocator.free(args_json);
+        const payload_json = try self.executeServiceToolCall("shell_exec", args_json);
+        defer self.allocator.free(payload_json);
+
+        if (try self.extractErrorInfoFromToolPayload(payload_json)) |info| {
+            return .{ .failure = info };
+        }
+        return .{ .success = try self.parseShellExecPayload(payload_json) };
     }
 
-    fn buildProjectSuccessResultJson(self: *Session, op: ProjectsOp, result_json: []const u8) ![]u8 {
-        const escaped_operation = try unified.jsonEscape(self.allocator, projectsOperationName(op));
-        defer self.allocator.free(escaped_operation);
-        return std.fmt.allocPrint(
-            self.allocator,
-            "{{\"ok\":true,\"operation\":\"{s}\",\"result\":{s},\"error\":null}}",
-            .{ escaped_operation, result_json },
+    fn buildShellExecArgsJson(self: *Session, command: []const u8, cwd: ?[]const u8, timeout_ms: u64) ![]u8 {
+        return git_venom.buildShellExecArgsJson(self, command, cwd, timeout_ms);
+    }
+
+    pub fn parseShellExecPayload(self: *Session, payload_json: []const u8) !ParsedShellExecResult {
+        return git_venom.parseShellExecPayload(self, payload_json);
+    }
+
+    fn normalizeJsonText(self: *Session, raw: []const u8) ![]u8 {
+        return git_venom.normalizeJsonText(self, raw);
+    }
+
+    pub fn buildGitSuccessResultJson(self: *Session, op: GitOp, result_json: []const u8) ![]u8 {
+        return git_venom.buildGitSuccessResultJson(self, op, result_json);
+    }
+
+    pub fn buildGitFailureResultJson(self: *Session, op: GitOp, code: []const u8, message: []const u8) ![]u8 {
+        return git_venom.buildGitFailureResultJson(self, op, code, message);
+    }
+
+    pub fn buildGitHubPrSuccessResultJson(self: *Session, op: GitHubPrOp, result_json: []const u8) ![]u8 {
+        return github_pr_venom.buildGitHubPrSuccessResultJson(self, op, result_json);
+    }
+
+    pub fn buildGitHubPrFailureResultJson(self: *Session, op: GitHubPrOp, code: []const u8, message: []const u8) ![]u8 {
+        return github_pr_venom.buildGitHubPrFailureResultJson(self, op, code, message);
+    }
+
+    fn handlePrReviewNamespaceWrite(self: *Session, special: SpecialKind, node_id: u32, raw_input: []const u8) !WriteOutcome {
+        return .{ .written = try pr_review_venom.handleNamespaceWrite(self, special, node_id, raw_input) };
+    }
+
+    pub const PrReviewResolvedContract = pr_review_venom.ResolvedContract;
+    pub const PrReviewContextSnapshot = pr_review_venom.ContextSnapshot;
+    pub const PrReviewStateSnapshot = pr_review_venom.StateSnapshot;
+    pub const PrReviewRepoConfigSnapshot = pr_review_venom.RepoConfigSnapshot;
+
+    pub fn bootstrapPrReviewMission(self: *Session, args_obj: std.json.ObjectMap) !mission_store_mod.MissionRecord {
+        return pr_review_venom.bootstrapMission(self, args_obj);
+    }
+
+    pub fn resolvePrReviewMissionContract(self: *Session, mission: mission_store_mod.MissionRecord) !PrReviewResolvedContract {
+        return pr_review_venom.resolveMissionContract(self, mission);
+    }
+
+    pub fn buildPrReviewRunId(self: *Session, repo_key: []const u8, pr_number: u64) ![]u8 {
+        return pr_review_venom.buildRunId(self, repo_key, pr_number);
+    }
+
+    pub fn loadConfiguredPrReviewRepo(self: *Session, repo_key: []const u8) !?PrReviewRepoConfigSnapshot {
+        return pr_review_venom.loadConfiguredRepo(self, repo_key);
+    }
+
+    pub fn findActivePrReviewMissionByRunId(
+        self: *Session,
+        store: *mission_store_mod.MissionStore,
+        run_id: []const u8,
+        project_id: ?[]const u8,
+    ) !?mission_store_mod.MissionRecord {
+        return pr_review_venom.findActiveMissionByRunId(self, store, run_id, project_id);
+    }
+
+    pub fn normalizeLocalWorkspaceAbsolutePath(self: *Session, raw_path: []const u8) ![]u8 {
+        const normalized = try self.normalizeMissionAbsolutePath(raw_path);
+        errdefer self.allocator.free(normalized);
+        const host_path = try self.resolveMissionContractHostPath(normalized);
+        self.allocator.free(host_path);
+        return normalized;
+    }
+
+    pub fn readMissionContractFile(self: *Session, absolute_path: []const u8, max_bytes: usize) ![]u8 {
+        const host_path = try self.resolveMissionContractHostPath(absolute_path);
+        defer self.allocator.free(host_path);
+        if (std.fs.path.isAbsolute(host_path)) {
+            const file = try std.fs.openFileAbsolute(host_path, .{});
+            defer file.close();
+            return file.readToEndAlloc(self.allocator, max_bytes);
+        }
+        return std.fs.cwd().readFileAlloc(self.allocator, host_path, max_bytes);
+    }
+
+    pub fn loadPrReviewContextSnapshot(self: *Session, context_path: []const u8) !PrReviewContextSnapshot {
+        return pr_review_venom.loadContextSnapshot(self, context_path);
+    }
+
+    pub fn loadPrReviewStateSnapshot(self: *Session, state_path: []const u8) !PrReviewStateSnapshot {
+        return pr_review_venom.loadStateSnapshot(self, state_path);
+    }
+
+    pub fn replaceOwnedString(self: *Session, target: *[]u8, value: []const u8) !void {
+        const copy = try self.allocator.dupe(u8, value);
+        self.allocator.free(target.*);
+        target.* = copy;
+    }
+
+    pub fn replaceOptionalOwnedString(self: *Session, target: *?[]u8, value: ?[]const u8) !void {
+        if (target.*) |existing| self.allocator.free(existing);
+        target.* = if (value) |slice| try self.allocator.dupe(u8, slice) else null;
+    }
+
+    pub fn replaceOwnedJsonValue(self: *Session, target: *[]u8, value: std.json.Value, default_json: []const u8) !void {
+        const rendered = if (value == .null)
+            try self.allocator.dupe(u8, default_json)
+        else
+            try self.renderJsonValue(value);
+        self.allocator.free(target.*);
+        target.* = rendered;
+    }
+
+    pub fn findJsonObjectFieldByNames(_: *Session, obj: std.json.ObjectMap, names: []const []const u8) ?std.json.Value {
+        for (names) |name| {
+            if (obj.get(name)) |value| return value;
+        }
+        return null;
+    }
+
+    pub fn formatJsonString(self: *Session, value: []const u8) ![]u8 {
+        const escaped = try unified.jsonEscape(self.allocator, value);
+        defer self.allocator.free(escaped);
+        return std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped});
+    }
+
+    fn renderPrReviewStringArg(
+        self: *Session,
+        overrides: ?std.json.ObjectMap,
+        names: []const []const u8,
+        default: ?[]const u8,
+    ) ![]u8 {
+        return pr_review_venom.renderPrReviewStringArg(self, overrides, names, default);
+    }
+
+    fn renderPrReviewU64Arg(
+        self: *Session,
+        overrides: ?std.json.ObjectMap,
+        names: []const []const u8,
+        default: ?u64,
+    ) ![]u8 {
+        return pr_review_venom.renderPrReviewU64Arg(self, overrides, names, default);
+    }
+
+    fn renderPrReviewBoolArg(
+        self: *Session,
+        overrides: ?std.json.ObjectMap,
+        names: []const []const u8,
+        default: ?bool,
+    ) ![]u8 {
+        return pr_review_venom.renderPrReviewBoolArg(self, overrides, names, default);
+    }
+
+    pub fn buildPrReviewGitHubSyncRequestJson(
+        self: *Session,
+        context: PrReviewContextSnapshot,
+        overrides: ?std.json.ObjectMap,
+    ) ![]u8 {
+        return pr_review_venom.buildPrReviewGitHubSyncRequestJson(self, context, overrides);
+    }
+
+    pub fn buildPrReviewGitSyncCheckoutRequestJson(
+        self: *Session,
+        context: PrReviewContextSnapshot,
+        overrides: ?std.json.ObjectMap,
+    ) ![]u8 {
+        return pr_review_venom.buildPrReviewGitSyncCheckoutRequestJson(self, context, overrides);
+    }
+
+    pub fn buildPrReviewGitStatusRequestJson(
+        self: *Session,
+        context: PrReviewContextSnapshot,
+        overrides: ?std.json.ObjectMap,
+    ) ![]u8 {
+        return pr_review_venom.buildPrReviewGitStatusRequestJson(self, context, overrides);
+    }
+
+    pub fn buildPrReviewGitDiffRangeRequestJson(
+        self: *Session,
+        context: PrReviewContextSnapshot,
+        overrides: ?std.json.ObjectMap,
+    ) ![]u8 {
+        return pr_review_venom.buildPrReviewGitDiffRangeRequestJson(self, context, overrides);
+    }
+
+    pub fn buildPrReviewGitHubPublishRequestJson(
+        self: *Session,
+        context: PrReviewContextSnapshot,
+        recommendation_value: std.json.Value,
+        review_comment: ?[]const u8,
+        thread_actions_value: ?std.json.Value,
+        overrides: ?std.json.ObjectMap,
+    ) ![]u8 {
+        return pr_review_venom.buildPrReviewGitHubPublishRequestJson(
+            self,
+            context,
+            recommendation_value,
+            review_comment,
+            thread_actions_value,
+            overrides,
         );
     }
 
-    fn buildProjectFailureResultJson(self: *Session, op: ProjectsOp, code: []const u8, message: []const u8) ![]u8 {
-        const escaped_operation = try unified.jsonEscape(self.allocator, projectsOperationName(op));
-        defer self.allocator.free(escaped_operation);
-        const escaped_code = try unified.jsonEscape(self.allocator, code);
-        defer self.allocator.free(escaped_code);
-        const escaped_message = try unified.jsonEscape(self.allocator, message);
-        defer self.allocator.free(escaped_message);
-        return std.fmt.allocPrint(
-            self.allocator,
-            "{{\"ok\":false,\"operation\":\"{s}\",\"result\":null,\"error\":{{\"code\":\"{s}\",\"message\":\"{s}\"}}}}",
-            .{ escaped_operation, escaped_code, escaped_message },
+    pub fn buildPrReviewTerminalCreateRequestJson(self: *Session, checkout_path: []const u8) ![]u8 {
+        return pr_review_venom.buildPrReviewTerminalCreateRequestJson(self, checkout_path);
+    }
+
+    pub fn buildPrReviewValidationExecRequestJson(
+        self: *Session,
+        command_value: std.json.Value,
+        checkout_path: []const u8,
+    ) ![]u8 {
+        return pr_review_venom.buildPrReviewValidationExecRequestJson(self, command_value, checkout_path);
+    }
+
+    fn buildPrReviewServiceArtifactPayloadJson(
+        self: *Session,
+        service_path: []const u8,
+        invoke_path: []const u8,
+        request_payload_json: []const u8,
+        result_payload_json: []const u8,
+        status_payload_json: ?[]const u8,
+    ) ![]u8 {
+        return pr_review_venom.buildPrReviewServiceArtifactPayloadJson(
+            self,
+            service_path,
+            invoke_path,
+            request_payload_json,
+            result_payload_json,
+            status_payload_json,
         );
     }
 
-    fn projectsOperationName(op: ProjectsOp) []const u8 {
-        return switch (op) {
-            .list => "list",
-            .get => "get",
-            .up => "up",
+    pub fn invokePrReviewServiceCapture(
+        self: *Session,
+        store: *mission_store_mod.MissionStore,
+        mission_id: []const u8,
+        stage: []const u8,
+        summary: []const u8,
+        service_path: []const u8,
+        invoke_path: []const u8,
+        request_payload: []const u8,
+        artifact_root: []const u8,
+        artifact_relative_path: []const u8,
+        artifact_kind: []const u8,
+    ) !pr_review_venom.ServiceCapture {
+        return pr_review_venom.invokePrReviewServiceCapture(
+            self,
+            store,
+            mission_id,
+            stage,
+            summary,
+            service_path,
+            invoke_path,
+            request_payload,
+            artifact_root,
+            artifact_relative_path,
+            artifact_kind,
+        );
+    }
+
+    pub fn applyPrReviewContextFromGitHubSyncPayload(
+        self: *Session,
+        context: *PrReviewContextSnapshot,
+        state: *PrReviewStateSnapshot,
+        payload_json: []const u8,
+    ) !void {
+        return pr_review_venom.applyPrReviewContextFromGitHubSyncPayload(self, context, state, payload_json);
+    }
+
+    pub fn extractTerminalExitCodeFromToolPayload(self: *Session, payload_json: []const u8) !?i32 {
+        var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, payload_json, .{});
+        defer parsed.deinit();
+        if (parsed.value != .object) return null;
+        const result_value = parsed.value.object.get("result") orelse return null;
+        if (result_value != .object) return null;
+        const exit_code_value = result_value.object.get("exit_code") orelse return null;
+        return switch (exit_code_value) {
+            .integer => @intCast(exit_code_value.integer),
+            .float => |value| blk: {
+                if (std.math.floor(value) != value) return error.InvalidPayload;
+                break :blk @as(i32, @intFromFloat(value));
+            },
+            else => return error.InvalidPayload,
         };
     }
 
-    fn projectsStatusToolName(op: ProjectsOp) []const u8 {
-        return switch (op) {
-            .list => "projects_list",
-            .get => "projects_get",
-            .up => "projects_up",
-        };
+    pub fn applyPrReviewContextFromGitSyncPayload(
+        self: *Session,
+        context: *PrReviewContextSnapshot,
+        state: *PrReviewStateSnapshot,
+        payload_json: []const u8,
+    ) !void {
+        return pr_review_venom.applyPrReviewContextFromGitSyncPayload(self, context, state, payload_json);
     }
 
-    fn renderJsonValue(self: *Session, value: std.json.Value) ![]u8 {
+    pub fn applyPrReviewContextFromGitStatusPayload(
+        self: *Session,
+        context: *PrReviewContextSnapshot,
+        state: *PrReviewStateSnapshot,
+        payload_json: []const u8,
+    ) !void {
+        return pr_review_venom.applyPrReviewContextFromGitStatusPayload(self, context, state, payload_json);
+    }
+
+    pub fn applyPrReviewCommonStateFields(self: *Session, args_obj: std.json.ObjectMap, state: *PrReviewStateSnapshot) !void {
+        return pr_review_venom.applyPrReviewCommonStateFields(self, args_obj, state);
+    }
+
+    fn resolvePrReviewArtifactPath(self: *Session, artifact_root: []const u8, artifact_relative_path: []const u8) ![]u8 {
+        return pr_review_venom.resolvePrReviewArtifactPath(self, artifact_root, artifact_relative_path);
+    }
+
+    pub fn writePrReviewJsonArtifact(self: *Session, artifact_root: []const u8, artifact_relative_path: []const u8, value: std.json.Value) ![]u8 {
+        return pr_review_venom.writePrReviewJsonArtifact(self, artifact_root, artifact_relative_path, value);
+    }
+
+    pub fn writePrReviewArtifactPayload(self: *Session, artifact_root: []const u8, artifact_relative_path: []const u8, payload_json: []const u8) ![]u8 {
+        return pr_review_venom.writePrReviewArtifactPayload(self, artifact_root, artifact_relative_path, payload_json);
+    }
+
+    pub fn writePrReviewTextArtifact(self: *Session, artifact_root: []const u8, artifact_relative_path: []const u8, content: []const u8) ![]u8 {
+        return pr_review_venom.writePrReviewTextArtifact(self, artifact_root, artifact_relative_path, content);
+    }
+
+    pub fn buildPrReviewContextPayloadJson(
+        self: *Session,
+        provider: []const u8,
+        repo_key: []const u8,
+        pr_number: u64,
+        pr_url: []const u8,
+        base_branch: []const u8,
+        base_sha: []const u8,
+        head_branch: []const u8,
+        head_sha: []const u8,
+        checkout_path: []const u8,
+        review_policy_paths_json: []const u8,
+        default_review_commands_json: []const u8,
+        approval_policy_json: []const u8,
+    ) ![]u8 {
+        return pr_review_venom.buildPrReviewContextPayloadJson(
+            self,
+            provider,
+            repo_key,
+            pr_number,
+            pr_url,
+            base_branch,
+            base_sha,
+            head_branch,
+            head_sha,
+            checkout_path,
+            review_policy_paths_json,
+            default_review_commands_json,
+            approval_policy_json,
+        );
+    }
+
+    pub fn buildDefaultPrReviewStatePayloadJson(self: *Session, head_sha: []const u8) ![]u8 {
+        return pr_review_venom.buildDefaultPrReviewStatePayloadJson(self, head_sha);
+    }
+
+    pub fn buildPrReviewStatePayloadJson(self: *Session, state: PrReviewStateSnapshot) ![]u8 {
+        return pr_review_venom.buildPrReviewStatePayloadJson(self, state);
+    }
+
+    pub fn buildPrReviewStartDetailJson(
+        self: *Session,
+        mission_json: []const u8,
+        provider: []const u8,
+        repo_key: []const u8,
+        pr_number: u64,
+        pr_url: []const u8,
+        checkout_path: []const u8,
+        context_path: []const u8,
+        state_path: []const u8,
+        artifact_root: []const u8,
+    ) ![]u8 {
+        return pr_review_venom.buildPrReviewStartDetailJson(
+            self,
+            mission_json,
+            provider,
+            repo_key,
+            pr_number,
+            pr_url,
+            checkout_path,
+            context_path,
+            state_path,
+            artifact_root,
+        );
+    }
+
+    pub fn buildPrReviewIntakeDetailJson(
+        self: *Session,
+        mission_json: []const u8,
+        provider: []const u8,
+        repo_key: []const u8,
+        pr_number: u64,
+        pr_url: []const u8,
+        checkout_path: []const u8,
+        context_path: []const u8,
+        state_path: []const u8,
+        artifact_root: []const u8,
+        provider_sync_path: ?[]const u8,
+    ) ![]u8 {
+        return pr_review_venom.buildPrReviewIntakeDetailJson(
+            self,
+            mission_json,
+            provider,
+            repo_key,
+            pr_number,
+            pr_url,
+            checkout_path,
+            context_path,
+            state_path,
+            artifact_root,
+            provider_sync_path,
+        );
+    }
+
+    pub fn buildPrReviewSyncDetailJson(
+        self: *Session,
+        mission_json: []const u8,
+        phase: []const u8,
+        state_path: []const u8,
+        thread_actions_path: ?[]const u8,
+        provider_sync_path: ?[]const u8,
+        checkout_sync_path: ?[]const u8,
+        repo_status_path: ?[]const u8,
+        diff_range_path: ?[]const u8,
+    ) ![]u8 {
+        return pr_review_venom.buildPrReviewSyncDetailJson(
+            self,
+            mission_json,
+            phase,
+            state_path,
+            thread_actions_path,
+            provider_sync_path,
+            checkout_sync_path,
+            repo_status_path,
+            diff_range_path,
+        );
+    }
+
+    pub fn buildPrReviewValidationDetailJson(
+        self: *Session,
+        mission_json: []const u8,
+        phase: []const u8,
+        state_path: []const u8,
+        validation_path: []const u8,
+        session_create_path: ?[]const u8,
+        command_paths_json: []const u8,
+        session_close_path: ?[]const u8,
+    ) ![]u8 {
+        return pr_review_venom.buildPrReviewValidationDetailJson(
+            self,
+            mission_json,
+            phase,
+            state_path,
+            validation_path,
+            session_create_path,
+            command_paths_json,
+            session_close_path,
+        );
+    }
+
+    pub fn buildPrReviewReviewDetailJson(
+        self: *Session,
+        mission_json: []const u8,
+        phase: []const u8,
+        state_path: []const u8,
+        findings_path: []const u8,
+        recommendation_path: []const u8,
+        review_comment_path: ?[]const u8,
+        thread_actions_path: ?[]const u8,
+        publish_review_path: ?[]const u8,
+    ) ![]u8 {
+        return pr_review_venom.buildPrReviewReviewDetailJson(
+            self,
+            mission_json,
+            phase,
+            state_path,
+            findings_path,
+            recommendation_path,
+            review_comment_path,
+            thread_actions_path,
+            publish_review_path,
+        );
+    }
+
+    pub fn buildPrReviewSuccessResultJson(self: *Session, op: PrReviewOp, result_json: []const u8) ![]u8 {
+        return pr_review_venom.buildPrReviewSuccessResultJson(self, op, result_json);
+    }
+
+    pub fn buildPrReviewPartialFailureResultJson(
+        self: *Session,
+        op: PrReviewOp,
+        result_json: []const u8,
+        code: []const u8,
+        message: []const u8,
+    ) ![]u8 {
+        return pr_review_venom.buildPrReviewPartialFailureResultJson(self, op, result_json, code, message);
+    }
+
+    pub fn buildPrReviewFailureResultJson(self: *Session, op: PrReviewOp, code: []const u8, message: []const u8) ![]u8 {
+        return pr_review_venom.buildPrReviewFailureResultJson(self, op, code, message);
+    }
+
+    pub fn buildPrReviewValidationReportJson(
+        self: *Session,
+        status: []const u8,
+        summary: []const u8,
+        session_create_path: ?[]const u8,
+        commands_json: []const u8,
+        session_close_path: ?[]const u8,
+    ) ![]u8 {
+        return pr_review_venom.buildPrReviewValidationReportJson(
+            self,
+            status,
+            summary,
+            session_create_path,
+            commands_json,
+            session_close_path,
+        );
+    }
+
+    pub fn buildPrReviewValidationCommandEntryJson(
+        self: *Session,
+        index: usize,
+        request_payload_json: []const u8,
+        capture_path: []const u8,
+        result_payload_json: []const u8,
+        exit_code: ?i32,
+        error_code: ?[]const u8,
+        error_message: ?[]const u8,
+    ) ![]u8 {
+        return pr_review_venom.buildPrReviewValidationCommandEntryJson(
+            self,
+            index,
+            request_payload_json,
+            capture_path,
+            result_payload_json,
+            exit_code,
+            error_code,
+            error_message,
+        );
+    }
+
+    fn seedAgentMissionsNamespace(self: *Session, missions_dir: u32) !void {
+        return missions_venom.seedNamespace(self, missions_dir);
+    }
+
+    fn seedAgentMissionsNamespaceAt(self: *Session, missions_dir: u32, base_path: []const u8) !void {
+        return missions_venom.seedNamespaceAt(self, missions_dir, base_path);
+    }
+
+    pub const MissionOp = missions_venom.Op;
+
+    fn handleMissionsNamespaceWrite(self: *Session, special: SpecialKind, node_id: u32, raw_input: []const u8) !WriteOutcome {
+        return .{ .written = try missions_venom.handleNamespaceWrite(self, special, node_id, raw_input) };
+    }
+
+    const ResolvedMissionBootstrapContract = missions_venom.ResolvedBootstrapContract;
+
+    pub fn parseMissionContractInput(self: *Session, args_obj: std.json.ObjectMap) !?mission_store_mod.MissionContractInput {
+        return missions_venom.parseMissionContractInput(self, args_obj);
+    }
+
+    pub fn parseMissionContractUpdateInput(self: *Session, args_obj: std.json.ObjectMap) !?mission_store_mod.MissionContractUpdateInput {
+        return missions_venom.parseMissionContractUpdateInput(self, args_obj);
+    }
+
+    pub fn resolveMissionBootstrapContract(
+        self: *Session,
+        mission: mission_store_mod.MissionRecord,
+        args_obj: std.json.ObjectMap,
+    ) !ResolvedMissionBootstrapContract {
+        return missions_venom.resolveMissionBootstrapContract(self, mission, args_obj);
+    }
+
+    pub fn resolveMissionContractHostPath(self: *Session, absolute_path: []const u8) ![]u8 {
+        return missions_venom.resolveContractHostPath(self, absolute_path);
+    }
+
+    pub fn ensureMissionContractDirectory(self: *Session, absolute_path: []const u8) !void {
+        return missions_venom.ensureContractDirectory(self, absolute_path);
+    }
+
+    pub fn writeMissionContractFile(self: *Session, absolute_path: []const u8, content: []const u8) !void {
+        return missions_venom.writeContractFile(self, absolute_path, content);
+    }
+
+    pub fn normalizeMissionAbsolutePath(self: *Session, raw: []const u8) ![]u8 {
+        return missions_venom.normalizeMissionAbsolutePath(self, raw);
+    }
+
+    pub fn deriveMissionServiceInvokePath(self: *Session, service_path: []const u8) ![]u8 {
+        return missions_venom.deriveMissionServiceInvokePath(self, service_path);
+    }
+
+    pub fn buildMissionServiceInvokeRequestPayload(self: *Session, args_obj: std.json.ObjectMap) ![]u8 {
+        return missions_venom.buildMissionServiceInvokeRequestPayload(self, args_obj);
+    }
+
+    pub fn buildMissionServiceInvocationDetailJson(
+        self: *Session,
+        mission_json: []const u8,
+        service_path: []const u8,
+        invoke_path: []const u8,
+        request_payload_json: []const u8,
+        result_payload_json: []const u8,
+        status_payload_json: ?[]const u8,
+    ) ![]u8 {
+        return missions_venom.buildMissionServiceInvocationDetailJson(
+            self,
+            mission_json,
+            service_path,
+            invoke_path,
+            request_payload_json,
+            result_payload_json,
+            status_payload_json,
+        );
+    }
+
+    pub fn buildMissionBootstrapContractDetailJson(
+        self: *Session,
+        mission_json: []const u8,
+        context_path: []const u8,
+        state_path: []const u8,
+        artifact_root: []const u8,
+    ) ![]u8 {
+        return missions_venom.buildMissionBootstrapContractDetailJson(self, mission_json, context_path, state_path, artifact_root);
+    }
+
+    pub fn buildMissionSuccessResultJson(self: *Session, op: MissionOp, result_json: []const u8) ![]u8 {
+        return missions_venom.buildMissionSuccessResultJson(self, op, result_json);
+    }
+
+    pub fn buildMissionPartialFailureResultJson(
+        self: *Session,
+        op: MissionOp,
+        result_json: []const u8,
+        code: []const u8,
+        message: []const u8,
+    ) ![]u8 {
+        return missions_venom.buildMissionPartialFailureResultJson(self, op, result_json, code, message);
+    }
+
+    pub fn buildMissionListJson(self: *Session, missions: []const mission_store_mod.MissionRecord) ![]u8 {
+        return missions_venom.buildMissionListJson(self, missions);
+    }
+
+    pub fn buildMissionRecordJson(self: *Session, mission: mission_store_mod.MissionRecord) ![]u8 {
+        return missions_venom.buildMissionRecordJson(self, mission);
+    }
+
+    pub fn buildMissionContractJson(self: *Session, contract: mission_store_mod.MissionContract) ![]u8 {
+        return missions_venom.buildMissionContractJson(self, contract);
+    }
+
+    pub fn buildMissionArtifactJson(self: *Session, artifact: mission_store_mod.MissionArtifact) ![]u8 {
+        return missions_venom.buildMissionArtifactJson(self, artifact);
+    }
+
+    pub fn buildMissionEventJson(self: *Session, event: mission_store_mod.MissionEvent) ![]u8 {
+        return missions_venom.buildMissionEventJson(self, event);
+    }
+
+    pub fn buildMissionApprovalJson(self: *Session, approval: mission_store_mod.MissionApproval) ![]u8 {
+        return missions_venom.buildMissionApprovalJson(self, approval);
+    }
+
+    pub fn renderJsonValue(self: *Session, value: std.json.Value) ![]u8 {
         return std.fmt.allocPrint(self.allocator, "{f}", .{std.json.fmt(value, .{})});
     }
 
-    fn executeServiceToolCall(self: *Session, tool_name: []const u8, args_json: []const u8) ![]u8 {
+    fn nextInternalFsrpcIds(self: *Session) InternalFsrpcIds {
+        const seq = self.next_internal_fsrpc_seq;
+        self.next_internal_fsrpc_seq +%= 1;
+        if (self.next_internal_fsrpc_seq == 0) self.next_internal_fsrpc_seq = 1;
+        return .{
+            .attach_fid = 0x7000_0000 +% (seq *% 2),
+            .walk_fid = 0x7000_0001 +% (seq *% 2),
+            .tag_base = 0x7100_0000 +% (seq *% 8),
+        };
+    }
+
+    fn allocAbsolutePathSegments(self: *Session, absolute_path: []const u8) anyerror![][]u8 {
+        if (absolute_path.len == 0 or absolute_path[0] != '/') return error.InvalidPayload;
+        var count: usize = 0;
+        var iter = std.mem.splitScalar(u8, absolute_path, '/');
+        while (iter.next()) |segment| {
+            if (segment.len == 0) continue;
+            count += 1;
+        }
+
+        var segments = try self.allocator.alloc([]u8, count);
+        errdefer self.allocator.free(segments);
+
+        var index: usize = 0;
+        errdefer {
+            var cleanup_index: usize = 0;
+            while (cleanup_index < index) : (cleanup_index += 1) self.allocator.free(segments[cleanup_index]);
+        }
+
+        iter = std.mem.splitScalar(u8, absolute_path, '/');
+        while (iter.next()) |segment| {
+            if (segment.len == 0) continue;
+            segments[index] = try self.allocator.dupe(u8, segment);
+            index += 1;
+        }
+        return segments;
+    }
+
+    fn internalClunk(self: *Session, fid: u32, tag: u32) void {
+        var clunk = unified.ParsedMessage{
+            .channel = .acheron,
+            .acheron_type = .t_clunk,
+            .tag = tag,
+            .fid = fid,
+        };
+        const frame = self.handle(&clunk) catch return;
+        self.allocator.free(frame);
+    }
+
+    fn parseInternalFsrpcError(self: *Session, frame: []const u8) anyerror!?InternalFsrpcErrorInfo {
+        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, frame, .{}) catch return error.InvalidPayload;
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidPayload;
+        const ok_value = parsed.value.object.get("ok") orelse return error.InvalidPayload;
+        if (ok_value == .bool and ok_value.bool) return null;
+
+        const error_value = parsed.value.object.get("error") orelse return error.InvalidPayload;
+        if (error_value != .object) return error.InvalidPayload;
+        const code = if (error_value.object.get("code")) |value|
+            if (value == .string and value.string.len > 0) value.string else "internal_error"
+        else
+            "internal_error";
+        const message = if (error_value.object.get("message")) |value|
+            if (value == .string and value.string.len > 0) value.string else "internal fsrpc request failed"
+        else
+            "internal fsrpc request failed";
+        return .{
+            .code = try self.allocator.dupe(u8, code),
+            .message = try self.allocator.dupe(u8, message),
+        };
+    }
+
+    pub fn writeInternalPath(self: *Session, absolute_path: []const u8, data: []const u8) anyerror!?InternalFsrpcErrorInfo {
+        const ids = self.nextInternalFsrpcIds();
+        const segments = try self.allocAbsolutePathSegments(absolute_path);
+        defer freePathSegments(self.allocator, segments);
+        defer self.internalClunk(ids.walk_fid, ids.tag_base + 4);
+        defer self.internalClunk(ids.attach_fid, ids.tag_base + 5);
+
+        var attach = unified.ParsedMessage{
+            .channel = .acheron,
+            .acheron_type = .t_attach,
+            .tag = ids.tag_base,
+            .fid = ids.attach_fid,
+        };
+        const attach_frame = try self.handle(&attach);
+        defer self.allocator.free(attach_frame);
+        if (try self.parseInternalFsrpcError(attach_frame)) |err| return err;
+
+        var walk = unified.ParsedMessage{
+            .channel = .acheron,
+            .acheron_type = .t_walk,
+            .tag = ids.tag_base + 1,
+            .fid = ids.attach_fid,
+            .newfid = ids.walk_fid,
+            .path = segments,
+        };
+        const walk_frame = try self.handle(&walk);
+        defer self.allocator.free(walk_frame);
+        if (try self.parseInternalFsrpcError(walk_frame)) |err| return err;
+
+        var open = unified.ParsedMessage{
+            .channel = .acheron,
+            .acheron_type = .t_open,
+            .tag = ids.tag_base + 2,
+            .fid = ids.walk_fid,
+            .mode = @constCast("w"),
+        };
+        const open_frame = try self.handle(&open);
+        defer self.allocator.free(open_frame);
+        if (try self.parseInternalFsrpcError(open_frame)) |err| return err;
+
+        var write = unified.ParsedMessage{
+            .channel = .acheron,
+            .acheron_type = .t_write,
+            .tag = ids.tag_base + 3,
+            .fid = ids.walk_fid,
+            .offset = 0,
+            .data = @constCast(data),
+        };
+        const write_frame = try self.handle(&write);
+        defer self.allocator.free(write_frame);
+        if (try self.parseInternalFsrpcError(write_frame)) |err| return err;
+        return null;
+    }
+
+    pub fn tryReadInternalPath(self: *Session, absolute_path: []const u8) anyerror!?[]u8 {
+        const ids = self.nextInternalFsrpcIds();
+        const segments = try self.allocAbsolutePathSegments(absolute_path);
+        defer freePathSegments(self.allocator, segments);
+        defer self.internalClunk(ids.walk_fid, ids.tag_base + 4);
+        defer self.internalClunk(ids.attach_fid, ids.tag_base + 5);
+
+        var attach = unified.ParsedMessage{
+            .channel = .acheron,
+            .acheron_type = .t_attach,
+            .tag = ids.tag_base,
+            .fid = ids.attach_fid,
+        };
+        const attach_frame = try self.handle(&attach);
+        defer self.allocator.free(attach_frame);
+        if (try self.parseInternalFsrpcError(attach_frame)) |err| {
+            var owned_err = err;
+            owned_err.deinit(self.allocator);
+            return null;
+        }
+
+        var walk = unified.ParsedMessage{
+            .channel = .acheron,
+            .acheron_type = .t_walk,
+            .tag = ids.tag_base + 1,
+            .fid = ids.attach_fid,
+            .newfid = ids.walk_fid,
+            .path = segments,
+        };
+        const walk_frame = try self.handle(&walk);
+        defer self.allocator.free(walk_frame);
+        if (try self.parseInternalFsrpcError(walk_frame)) |err| {
+            var owned_err = err;
+            owned_err.deinit(self.allocator);
+            return null;
+        }
+
+        var open = unified.ParsedMessage{
+            .channel = .acheron,
+            .acheron_type = .t_open,
+            .tag = ids.tag_base + 2,
+            .fid = ids.walk_fid,
+            .mode = @constCast("r"),
+        };
+        const open_frame = try self.handle(&open);
+        defer self.allocator.free(open_frame);
+        if (try self.parseInternalFsrpcError(open_frame)) |err| {
+            var owned_err = err;
+            owned_err.deinit(self.allocator);
+            return null;
+        }
+
+        var read = unified.ParsedMessage{
+            .channel = .acheron,
+            .acheron_type = .t_read,
+            .tag = ids.tag_base + 3,
+            .fid = ids.walk_fid,
+            .offset = 0,
+            .count = 1_048_576,
+        };
+        const read_frame = try self.handle(&read);
+        defer self.allocator.free(read_frame);
+        if (try self.parseInternalFsrpcError(read_frame)) |err| {
+            var owned_err = err;
+            owned_err.deinit(self.allocator);
+            return null;
+        }
+        return try self.decodeAcheronReadPayload(read_frame);
+    }
+
+    fn decodeAcheronReadPayload(self: *Session, frame: []const u8) anyerror![]u8 {
+        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, frame, .{}) catch return error.InvalidPayload;
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidPayload;
+
+        const payload = parsed.value.object.get("payload") orelse return error.InvalidPayload;
+        if (payload != .object) return error.InvalidPayload;
+        const data_b64 = payload.object.get("data_b64") orelse return error.InvalidPayload;
+        if (data_b64 != .string) return error.InvalidPayload;
+
+        const decoded_len = try std.base64.standard.Decoder.calcSizeForSlice(data_b64.string);
+        const decoded = try self.allocator.alloc(u8, decoded_len);
+        errdefer self.allocator.free(decoded);
+        try std.base64.standard.Decoder.decode(decoded, data_b64.string);
+        return decoded;
+    }
+
+    fn executeDirectBuiltinToolCall(self: *Session, tool_name: []const u8, args_json: []const u8) !?[]u8 {
+        if (!std.mem.eql(u8, tool_name, "shell_exec")) return null;
+
+        var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, args_json, .{});
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidPayload;
+
+        const source_args = parsed.value.object;
+        const command = if (source_args.get("command")) |value|
+            if (value == .string) value.string else return error.InvalidPayload
+        else
+            return error.InvalidPayload;
+        const timeout_ms = if (source_args.get("timeout_ms")) |value| switch (value) {
+            .integer => |raw| blk: {
+                if (raw < 0) return error.InvalidPayload;
+                break :blk @as(u64, @intCast(raw));
+            },
+            .float => |raw| blk: {
+                if (raw < 0 or std.math.floor(raw) != raw) return error.InvalidPayload;
+                break :blk @as(u64, @intFromFloat(raw));
+            },
+            .null => null,
+            else => return error.InvalidPayload,
+        } else null;
+        const cwd = if (source_args.get("cwd")) |value|
+            if (value == .string) value.string else if (value == .null) null else return error.InvalidPayload
+        else
+            null;
+
+        const resolved_cwd = if (cwd) |value|
+            if (std.mem.startsWith(u8, value, local_fs_world_prefix))
+                try self.resolveMissionContractHostPath(value)
+            else
+                try self.allocator.dupe(u8, value)
+        else
+            null;
+        defer if (resolved_cwd) |value| self.allocator.free(value);
+
+        const escaped_command = try unified.jsonEscape(self.allocator, command);
+        defer self.allocator.free(escaped_command);
+        const cwd_fragment = if (resolved_cwd) |value| blk: {
+            const escaped_cwd = try unified.jsonEscape(self.allocator, value);
+            defer self.allocator.free(escaped_cwd);
+            break :blk try std.fmt.allocPrint(self.allocator, ",\"cwd\":\"{s}\"", .{escaped_cwd});
+        } else try self.allocator.dupe(u8, "");
+        defer self.allocator.free(cwd_fragment);
+        const timeout_fragment = if (timeout_ms) |value|
+            try std.fmt.allocPrint(self.allocator, ",\"timeout_ms\":{d}", .{value})
+        else
+            try self.allocator.dupe(u8, "");
+        defer self.allocator.free(timeout_fragment);
+
+        const direct_args_json = try std.fmt.allocPrint(
+            self.allocator,
+            "{{\"command\":\"{s}\"{s}{s}}}",
+            .{ escaped_command, timeout_fragment, cwd_fragment },
+        );
+        defer self.allocator.free(direct_args_json);
+
+        var direct_parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, direct_args_json, .{});
+        defer direct_parsed.deinit();
+        if (direct_parsed.value != .object) return error.InvalidPayload;
+
+        var result = tool_executor_mod.BuiltinTools.shellExec(self.allocator, direct_parsed.value.object);
+        defer result.deinit(self.allocator);
+        return switch (result) {
+            .success => |success| try self.allocator.dupe(u8, success.payload_json),
+            .failure => |failure| try self.buildServiceInvokeFailureResultJson(@tagName(failure.code), failure.message),
+        };
+    }
+
+    pub fn executeServiceToolCall(self: *Session, tool_name: []const u8, args_json: []const u8) ![]u8 {
+        if (try self.executeDirectBuiltinToolCall(tool_name, args_json)) |payload| {
+            return payload;
+        }
+
         const escaped_tool_name = try unified.jsonEscape(self.allocator, tool_name);
         defer self.allocator.free(escaped_tool_name);
         const control_payload = try std.fmt.allocPrint(
@@ -9096,7 +7407,150 @@ pub const Session = struct {
         return self.buildServiceInvokeFailureResultJson("missing_result", "tool call produced no session.receive payload");
     }
 
-    fn buildServiceInvokeStatusJson(
+    pub fn executeAgentRun(self: *Session, goal: []const u8, resume_run_id: ?[]const u8) !AgentRunOutcome {
+        const trimmed_goal = std.mem.trim(u8, goal, " \t\r\n");
+        if (trimmed_goal.len == 0) {
+            return .{ .failure = .{
+                .code = try self.allocator.dupe(u8, "invalid_goal"),
+                .message = try self.allocator.dupe(u8, "agent run goal must not be empty"),
+            } };
+        }
+
+        const request_id = try std.fmt.allocPrint(self.allocator, "agent-run-{d}", .{std.time.milliTimestamp()});
+        defer self.allocator.free(request_id);
+        const escaped_request_id = try unified.jsonEscape(self.allocator, request_id);
+        defer self.allocator.free(escaped_request_id);
+        const escaped_goal = try unified.jsonEscape(self.allocator, trimmed_goal);
+        defer self.allocator.free(escaped_goal);
+
+        const runtime_req = if (resume_run_id) |run_id| blk: {
+            const escaped_run_id = try unified.jsonEscape(self.allocator, run_id);
+            defer self.allocator.free(escaped_run_id);
+            break :blk try std.fmt.allocPrint(
+                self.allocator,
+                "{{\"id\":\"{s}\",\"type\":\"agent.run.resume\",\"action\":\"{s}\",\"content\":\"{s}\"}}",
+                .{ escaped_request_id, escaped_run_id, escaped_goal },
+            );
+        } else try std.fmt.allocPrint(
+            self.allocator,
+            "{{\"id\":\"{s}\",\"type\":\"agent.run.start\",\"content\":\"{s}\"}}",
+            .{ escaped_request_id, escaped_goal },
+        );
+        defer self.allocator.free(runtime_req);
+
+        const frames = self.runtime_handle.handleMessageFramesWithDebug(runtime_req, self.shouldEmitRuntimeDebugFrames()) catch |err| {
+            const normalized = chat_runtime_job.normalizeRuntimeFailureForAgent("runtime_error", @errorName(err));
+            return .{ .failure = .{
+                .code = try self.allocator.dupe(u8, normalized.code),
+                .message = try self.allocator.dupe(u8, normalized.message),
+            } };
+        };
+        defer runtime_server_mod.deinitResponseFrames(self.allocator, frames);
+
+        var run_id: ?[]u8 = null;
+        defer if (run_id) |value| self.allocator.free(value);
+        var state: ?[]u8 = null;
+        defer if (state) |value| self.allocator.free(value);
+        var assistant_output: ?[]u8 = null;
+        defer if (assistant_output) |value| self.allocator.free(value);
+        var step_count: u64 = 0;
+        var checkpoint_seq: u64 = 0;
+
+        for (frames) |frame| {
+            try self.recordRuntimeFrameForDebug(request_id, frame);
+
+            var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, frame, .{}) catch continue;
+            defer parsed.deinit();
+            if (parsed.value != .object) continue;
+            const obj = parsed.value.object;
+            const type_value = obj.get("type") orelse continue;
+            if (type_value != .string) continue;
+
+            if (std.mem.eql(u8, type_value.string, "error")) {
+                const code = if (obj.get("code")) |value|
+                    if (value == .string and value.string.len > 0) value.string else "runtime_error"
+                else
+                    "runtime_error";
+                const message = if (obj.get("message")) |value|
+                    if (value == .string and value.string.len > 0) value.string else "runtime agent run failed"
+                else
+                    "runtime agent run failed";
+                const normalized = chat_runtime_job.normalizeRuntimeFailureForAgent(code, message);
+                return .{ .failure = .{
+                    .code = try self.allocator.dupe(u8, normalized.code),
+                    .message = try self.allocator.dupe(u8, normalized.message),
+                } };
+            }
+
+            if (std.mem.eql(u8, type_value.string, "agent.run.ack") or std.mem.eql(u8, type_value.string, "agent.run.state")) {
+                if (obj.get("run_id")) |value| {
+                    if (value == .string and value.string.len > 0) {
+                        if (run_id) |old| self.allocator.free(old);
+                        run_id = try self.allocator.dupe(u8, value.string);
+                    }
+                }
+                if (obj.get("state")) |value| {
+                    if (value == .string and value.string.len > 0) {
+                        if (state) |old| self.allocator.free(old);
+                        state = try self.allocator.dupe(u8, value.string);
+                    }
+                }
+                if (obj.get("step_count")) |value| {
+                    if (value == .integer and value.integer >= 0) step_count = @intCast(value.integer);
+                }
+                if (obj.get("checkpoint_seq")) |value| {
+                    if (value == .integer and value.integer >= 0) checkpoint_seq = @intCast(value.integer);
+                }
+                continue;
+            }
+
+            if (std.mem.eql(u8, type_value.string, "agent.run.event")) {
+                const event_type = if (obj.get("event_type")) |value|
+                    if (value == .string) value.string else ""
+                else
+                    "";
+                if (!std.mem.eql(u8, event_type, "assistant.output")) continue;
+                const payload = obj.get("payload") orelse continue;
+                if (payload != .object) continue;
+                const assistant = payload.object.get("assistant") orelse continue;
+                if (assistant != .string) continue;
+                if (assistant_output) |old| self.allocator.free(old);
+                assistant_output = try self.allocator.dupe(u8, assistant.string);
+            }
+        }
+
+        const owned_run_id = if (run_id) |value|
+            try self.allocator.dupe(u8, value)
+        else
+            return .{ .failure = .{
+                .code = try self.allocator.dupe(u8, "missing_run_id"),
+                .message = try self.allocator.dupe(u8, "runtime agent run produced no run_id"),
+            } };
+        errdefer self.allocator.free(owned_run_id);
+        const owned_state = if (state) |value|
+            try self.allocator.dupe(u8, value)
+        else
+            return .{ .failure = .{
+                .code = try self.allocator.dupe(u8, "missing_run_state"),
+                .message = try self.allocator.dupe(u8, "runtime agent run produced no state"),
+            } };
+        errdefer self.allocator.free(owned_state);
+        const owned_assistant_output = if (assistant_output) |value|
+            try self.allocator.dupe(u8, value)
+        else
+            null;
+        errdefer if (owned_assistant_output) |value| self.allocator.free(value);
+
+        return .{ .success = .{
+            .run_id = owned_run_id,
+            .state = owned_state,
+            .assistant_output = owned_assistant_output,
+            .step_count = step_count,
+            .checkpoint_seq = checkpoint_seq,
+        } };
+    }
+
+    pub fn buildServiceInvokeStatusJson(
         self: *Session,
         state: []const u8,
         tool_name: ?[]const u8,
@@ -9123,7 +7577,7 @@ pub const Session = struct {
         );
     }
 
-    fn buildServiceInvokeFailureResultJson(self: *Session, code: []const u8, message: []const u8) ![]u8 {
+    pub fn buildServiceInvokeFailureResultJson(self: *Session, code: []const u8, message: []const u8) ![]u8 {
         const escaped_code = try unified.jsonEscape(self.allocator, code);
         defer self.allocator.free(escaped_code);
         const escaped_message = try unified.jsonEscape(self.allocator, message);
@@ -9135,29 +7589,47 @@ pub const Session = struct {
         );
     }
 
-    fn extractErrorMessageFromToolPayload(self: *Session, payload_json: []const u8) !?[]u8 {
+    pub fn extractErrorInfoFromToolPayload(self: *Session, payload_json: []const u8) !?ToolPayloadErrorInfo {
         var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, payload_json, .{}) catch return null;
         defer parsed.deinit();
         if (parsed.value != .object) return null;
         const error_value = parsed.value.object.get("error") orelse return null;
-        if (error_value == .string) return @as(?[]u8, try self.allocator.dupe(u8, error_value.string));
-        if (error_value != .object) return null;
-        if (error_value.object.get("message")) |message| {
-            if (message == .string) return @as(?[]u8, try self.allocator.dupe(u8, message.string));
+        if (error_value == .null) return null;
+        if (error_value == .string) {
+            return .{
+                .code = try self.allocator.dupe(u8, "service_error"),
+                .message = try self.allocator.dupe(u8, error_value.string),
+            };
         }
-        return @as(?[]u8, try self.allocator.dupe(u8, "tool returned error"));
+        if (error_value != .object) return null;
+        const code = if (error_value.object.get("code")) |code_value|
+            if (code_value == .string and code_value.string.len > 0) code_value.string else "service_error"
+        else
+            "service_error";
+        const message = if (error_value.object.get("message")) |message_value|
+            if (message_value == .string and message_value.string.len > 0) message_value.string else "tool returned error"
+        else
+            "tool returned error";
+        return .{
+            .code = try self.allocator.dupe(u8, code),
+            .message = try self.allocator.dupe(u8, message),
+        };
+    }
+
+    pub fn extractErrorMessageFromToolPayload(self: *Session, payload_json: []const u8) !?[]u8 {
+        if (try self.extractErrorInfoFromToolPayload(payload_json)) |info| {
+            defer self.allocator.free(info.code);
+            return info.message;
+        }
+        return null;
     }
 
     fn clearWaitSources(self: *Session) void {
-        for (self.wait_sources.items) |*source| source.deinit(self.allocator);
-        self.wait_sources.deinit(self.allocator);
-        self.wait_sources = .{};
+        return events_venom.clearWaitSources(self);
     }
 
     fn clearSignalEvents(self: *Session) void {
-        for (self.signal_events.items) |*event| event.deinit(self.allocator);
-        self.signal_events.deinit(self.allocator);
-        self.signal_events = .{};
+        return events_venom.clearSignalEvents(self);
     }
 
     fn clearProjectBinds(self: *Session) void {
@@ -9180,565 +7652,22 @@ pub const Session = struct {
     }
 
     fn handleEventWaitConfigWrite(self: *Session, node_id: u32, raw_input: []const u8) !WriteOutcome {
-        const written = raw_input.len;
-        const trimmed = std.mem.trim(u8, raw_input, " \t\r\n");
-        if (trimmed.len == 0) {
-            self.clearWaitSources();
-            self.wait_timeout_ms = default_wait_timeout_ms;
-            try self.setFileContent(node_id, "{\"paths\":[],\"timeout_ms\":60000}");
-            return .{ .written = written };
-        }
-
-        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, trimmed, .{}) catch return error.InvalidPayload;
-        defer parsed.deinit();
-        if (parsed.value != .object) return error.InvalidPayload;
-
-        const obj = parsed.value.object;
-        const paths_value = obj.get("paths") orelse return error.InvalidPayload;
-        if (paths_value != .array or paths_value.array.items.len == 0) return error.InvalidPayload;
-
-        var next_sources = std.ArrayListUnmanaged(WaitSource){};
-        errdefer {
-            for (next_sources.items) |*source| source.deinit(self.allocator);
-            next_sources.deinit(self.allocator);
-        }
-
-        for (paths_value.array.items) |entry| {
-            if (entry != .string or entry.string.len == 0) return error.InvalidPayload;
-            var source = try self.parseWaitSourcePath(entry.string);
-            try self.initializeWaitSourceCursor(&source);
-            next_sources.append(self.allocator, source) catch |err| {
-                source.deinit(self.allocator);
-                return err;
-            };
-        }
-
-        const timeout_ms = blk: {
-            if (obj.get("timeout_ms")) |value| {
-                if (value != .integer or value.integer < 0) return error.InvalidPayload;
-                break :blk value.integer;
-            }
-            break :blk default_wait_timeout_ms;
-        };
-
-        self.clearWaitSources();
-        self.wait_sources = next_sources;
-        self.wait_timeout_ms = timeout_ms;
-        self.wait_event_seq = 1;
-
-        try self.setFileContent(node_id, trimmed);
-        if (self.event_next_id != 0) {
-            try self.setFileContent(self.event_next_id, "{\"configured\":true,\"waiting\":false}");
-        }
-        return .{ .written = written };
+        return .{ .written = try events_venom.handleWaitConfigWrite(self, node_id, raw_input) };
     }
 
     fn handleEventSignalWrite(self: *Session, node_id: u32, raw_input: []const u8) !WriteOutcome {
-        const written = raw_input.len;
-        const input = std.mem.trim(u8, raw_input, " \t\r\n");
-        if (input.len == 0) return error.InvalidPayload;
-
-        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, input, .{}) catch return error.InvalidPayload;
-        defer parsed.deinit();
-        if (parsed.value != .object) return error.InvalidPayload;
-        const obj = parsed.value.object;
-
-        const type_raw = if (obj.get("event_type")) |value|
-            if (value == .string and value.string.len > 0) value.string else return error.InvalidPayload
-        else
-            return error.InvalidPayload;
-        const event_type = parseSignalEventType(type_raw) orelse return error.InvalidPayload;
-
-        const parameter = if (obj.get("parameter")) |value| blk: {
-            if (value == .string and value.string.len > 0) break :blk try self.allocator.dupe(u8, value.string);
-            if (value == .null) break :blk null;
-            return error.InvalidPayload;
-        } else null;
-        errdefer if (parameter) |value| self.allocator.free(value);
-
-        const payload_json = if (obj.get("payload")) |value|
-            try self.renderJsonValue(value)
-        else
-            null;
-        errdefer if (payload_json) |value| self.allocator.free(value);
-
-        if (self.signal_events.items.len >= max_signal_events) {
-            var oldest = self.signal_events.orderedRemove(0);
-            oldest.deinit(self.allocator);
-        }
-
-        const seq = self.next_signal_seq;
-        self.next_signal_seq +%= 1;
-        if (self.next_signal_seq == 0) self.next_signal_seq = 1;
-        try self.signal_events.append(self.allocator, .{
-            .seq = seq,
-            .event_type = event_type,
-            .parameter = parameter,
-            .payload_json = payload_json,
-            .created_at_ms = std.time.milliTimestamp(),
-        });
-
-        try self.setFileContent(node_id, input);
-        return .{ .written = written };
-    }
-
-    fn parseSignalEventType(raw: []const u8) ?SignalEventType {
-        if (std.ascii.eqlIgnoreCase(raw, "user")) return .user;
-        if (std.ascii.eqlIgnoreCase(raw, "agent")) return .agent;
-        if (std.ascii.eqlIgnoreCase(raw, "hook")) return .hook;
-        return null;
-    }
-
-    fn signalEventTypeName(kind: SignalEventType) []const u8 {
-        return switch (kind) {
-            .user => "user",
-            .agent => "agent",
-            .hook => "hook",
-        };
-    }
-
-    fn parseWaitSourcePath(self: *Session, path: []const u8) !WaitSource {
-        if (std.mem.eql(u8, path, "/global/chat/control/input") or
-            std.mem.endsWith(u8, path, "/global/chat/control/input"))
-        {
-            return .{
-                .raw_path = try self.allocator.dupe(u8, path),
-                .kind = .chat_input,
-            };
-        }
-
-        if (std.mem.eql(u8, path, "/global/events/sources/agent.json") or
-            std.mem.endsWith(u8, path, "/global/events/sources/agent.json"))
-        {
-            return .{
-                .raw_path = try self.allocator.dupe(u8, path),
-                .kind = .agent_signal,
-            };
-        }
-        if (std.mem.eql(u8, path, "/global/events/sources/hook.json") or
-            std.mem.endsWith(u8, path, "/global/events/sources/hook.json"))
-        {
-            return .{
-                .raw_path = try self.allocator.dupe(u8, path),
-                .kind = .hook_signal,
-            };
-        }
-        if (std.mem.eql(u8, path, "/global/events/sources/user.json") or
-            std.mem.endsWith(u8, path, "/global/events/sources/user.json"))
-        {
-            return .{
-                .raw_path = try self.allocator.dupe(u8, path),
-                .kind = .user_signal,
-            };
-        }
-        if (std.mem.indexOf(u8, path, "/global/events/sources/agent/")) |prefix_index| {
-            const marker = "/global/events/sources/agent/";
-            const token = path[prefix_index + marker.len ..];
-            const parameter = try self.parseWaitSelectorToken(token);
-            errdefer self.allocator.free(parameter);
-            return .{
-                .raw_path = try self.allocator.dupe(u8, path),
-                .kind = .agent_signal,
-                .parameter = parameter,
-            };
-        }
-        if (std.mem.indexOf(u8, path, "/global/events/sources/hook/")) |prefix_index| {
-            const marker = "/global/events/sources/hook/";
-            const token = path[prefix_index + marker.len ..];
-            const parameter = try self.parseWaitSelectorToken(token);
-            errdefer self.allocator.free(parameter);
-            return .{
-                .raw_path = try self.allocator.dupe(u8, path),
-                .kind = .hook_signal,
-                .parameter = parameter,
-            };
-        }
-        if (std.mem.indexOf(u8, path, "/global/events/sources/user/")) |prefix_index| {
-            const marker = "/global/events/sources/user/";
-            const token = path[prefix_index + marker.len ..];
-            const parameter = try self.parseWaitSelectorToken(token);
-            errdefer self.allocator.free(parameter);
-            return .{
-                .raw_path = try self.allocator.dupe(u8, path),
-                .kind = .user_signal,
-                .parameter = parameter,
-            };
-        }
-        if (std.mem.indexOf(u8, path, "/global/events/sources/time/after/")) |prefix_index| {
-            const marker = "/global/events/sources/time/after/";
-            const token = path[prefix_index + marker.len ..];
-            const delay_ms = try self.parseWaitSelectorMillis(token);
-            const target_time_ms = std.math.add(i64, std.time.milliTimestamp(), delay_ms) catch return error.InvalidPayload;
-            return .{
-                .raw_path = try self.allocator.dupe(u8, path),
-                .kind = .time_after,
-                .target_time_ms = target_time_ms,
-            };
-        }
-        if (std.mem.indexOf(u8, path, "/global/events/sources/time/at/")) |prefix_index| {
-            const marker = "/global/events/sources/time/at/";
-            const token = path[prefix_index + marker.len ..];
-            const target_ms = try self.parseWaitSelectorMillis(token);
-            return .{
-                .raw_path = try self.allocator.dupe(u8, path),
-                .kind = .time_at,
-                .target_time_ms = target_ms,
-            };
-        }
-
-        if (std.mem.indexOf(u8, path, "/global/jobs/")) |prefix_index| {
-            const prefix = "/global/jobs/";
-            const tail = path[prefix_index + prefix.len ..];
-            var tokens = std.mem.tokenizeScalar(u8, tail, '/');
-            const job_id = tokens.next() orelse return error.InvalidPayload;
-            const leaf = tokens.next() orelse return error.InvalidPayload;
-            if (tokens.next() != null) return error.InvalidPayload;
-
-            const kind: WaitSourceKind = if (std.mem.eql(u8, leaf, "status.json"))
-                .job_status
-            else if (std.mem.eql(u8, leaf, "result.txt"))
-                .job_result
-            else
-                return error.InvalidPayload;
-
-            return .{
-                .raw_path = try self.allocator.dupe(u8, path),
-                .kind = kind,
-                .job_id = try self.allocator.dupe(u8, job_id),
-            };
-        }
-
-        return error.InvalidPayload;
-    }
-
-    fn parseWaitSelectorToken(self: *Session, raw: []const u8) ![]u8 {
-        var token = raw;
-        if (std.mem.endsWith(u8, token, ".json")) token = token[0 .. token.len - ".json".len];
-        if (token.len == 0) return error.InvalidPayload;
-        if (std.mem.indexOfScalar(u8, token, '/')) |_| return error.InvalidPayload;
-        return self.allocator.dupe(u8, token);
-    }
-
-    fn parseWaitSelectorMillis(self: *Session, raw: []const u8) !i64 {
-        var token = raw;
-        if (std.mem.endsWith(u8, token, ".json")) token = token[0 .. token.len - ".json".len];
-        if (token.len == 0) return error.InvalidPayload;
-        const value = std.fmt.parseInt(i64, token, 10) catch return error.InvalidPayload;
-        if (value < 0) return error.InvalidPayload;
-        _ = self;
-        return value;
-    }
-
-    fn initializeWaitSourceCursor(self: *Session, source: *WaitSource) !void {
-        source.last_seen_updated_at_ms = 0;
-        switch (source.kind) {
-            .chat_input => {
-                source.last_seen_job_event_seq = try self.job_index.latestTerminalEventSeqForAgent(self.agent_id);
-            },
-            .job_status, .job_result => {
-                const job_id = source.job_id orelse return;
-                const view = try self.job_index.getJob(self.allocator, job_id);
-                if (view) |owned| {
-                    var job = owned;
-                    defer job.deinit(self.allocator);
-                    source.last_seen_updated_at_ms = job.updated_at_ms;
-                }
-            },
-            .time_after, .time_at => {},
-            .agent_signal, .hook_signal, .user_signal => {
-                source.last_seen_signal_seq = if (self.signal_events.items.len == 0)
-                    0
-                else
-                    self.signal_events.items[self.signal_events.items.len - 1].seq;
-            },
-        }
+        return .{ .written = try events_venom.handleSignalWrite(self, node_id, raw_input) };
     }
 
     fn handleEventNextRead(self: *Session) ![]u8 {
-        if (self.wait_sources.items.len == 0) {
-            return self.allocator.dupe(
-                u8,
-                "{\"configured\":false,\"waiting\":false,\"error\":\"wait_not_configured\"}",
-            );
-        }
-
-        const timeout_ms = if (self.wait_timeout_ms < 0) default_wait_timeout_ms else self.wait_timeout_ms;
-        const start_ms = std.time.milliTimestamp();
-        while (true) {
-            if (try self.pollWaitSources()) |candidate| {
-                var source = &self.wait_sources.items[candidate.source_index];
-                if (candidate.next_last_seen_updated_at_ms) |value| source.last_seen_updated_at_ms = value;
-                if (candidate.next_last_seen_job_event_seq) |value| source.last_seen_job_event_seq = value;
-                if (candidate.next_last_seen_signal_seq) |value| source.last_seen_signal_seq = value;
-                return candidate.payload_json;
-            }
-
-            if (timeout_ms == 0) break;
-            const elapsed_ms = std.time.milliTimestamp() - start_ms;
-            if (elapsed_ms >= timeout_ms) break;
-            const remaining_ms = timeout_ms - elapsed_ms;
-            const poll_ms = @as(i64, @intCast(wait_poll_interval_ms));
-            const sleep_ms = if (remaining_ms < poll_ms) remaining_ms else poll_ms;
-            std.Thread.sleep(@as(u64, @intCast(sleep_ms)) * std.time.ns_per_ms);
-        }
-
-        const waited_ms = std.time.milliTimestamp() - start_ms;
-        return std.fmt.allocPrint(
-            self.allocator,
-            "{{\"configured\":true,\"waiting\":true,\"timeout\":true,\"waited_ms\":{d}}}",
-            .{waited_ms},
-        );
-    }
-
-    fn pollWaitSources(self: *Session) !?WaitCandidate {
-        var best: ?WaitCandidate = null;
-        errdefer if (best) |*candidate| candidate.deinit(self.allocator);
-
-        for (self.wait_sources.items, 0..) |source, source_index| {
-            if (try self.buildWaitCandidate(source, source_index)) |candidate| {
-                if (best) |*current| {
-                    if (candidate.sort_key_ms < current.sort_key_ms) {
-                        current.deinit(self.allocator);
-                        best = candidate;
-                    } else {
-                        var drop = candidate;
-                        drop.deinit(self.allocator);
-                    }
-                } else {
-                    best = candidate;
-                }
-            }
-        }
-        return best;
-    }
-
-    fn buildWaitCandidate(self: *Session, source: WaitSource, source_index: usize) !?WaitCandidate {
-        return switch (source.kind) {
-            .job_status, .job_result => self.buildJobPathCandidate(source, source_index),
-            .chat_input => self.buildChatInputCandidate(source, source_index),
-            .time_after, .time_at => self.buildTimeCandidate(source, source_index),
-            .agent_signal, .hook_signal, .user_signal => self.buildSignalCandidate(source, source_index),
-        };
-    }
-
-    fn buildJobPathCandidate(self: *Session, source: WaitSource, source_index: usize) !?WaitCandidate {
-        const job_id = source.job_id orelse return null;
-        const owned_view = try self.job_index.getJob(self.allocator, job_id);
-        if (owned_view == null) return null;
-
-        var view = owned_view.?;
-        errdefer view.deinit(self.allocator);
-        if (!std.mem.eql(u8, view.agent_id, self.agent_id)) return null;
-        if (!chat_job_index.isTerminalState(view.state)) return null;
-        if (view.updated_at_ms <= source.last_seen_updated_at_ms) return null;
-        try self.syncThoughtFramesFromJobTelemetry(job_id);
-
-        const event_path = switch (source.kind) {
-            .job_status => try std.fmt.allocPrint(self.allocator, "/global/jobs/{s}/status.json", .{view.job_id}),
-            .job_result => try std.fmt.allocPrint(self.allocator, "/global/jobs/{s}/result.txt", .{view.job_id}),
-            else => unreachable,
-        };
-        defer self.allocator.free(event_path);
-        const payload = try job_projection.buildJobWaitEventPayload(
-            self.allocator,
-            self.nextWaitEventId(),
-            source.raw_path,
-            event_path,
-            view,
-        );
-        const updated_at_ms = view.updated_at_ms;
-        view.deinit(self.allocator);
-        return .{
-            .source_index = source_index,
-            .sort_key_ms = updated_at_ms,
-            .payload_json = payload,
-            .next_last_seen_updated_at_ms = updated_at_ms,
-        };
-    }
-
-    fn buildChatInputCandidate(self: *Session, source: WaitSource, source_index: usize) !?WaitCandidate {
-        const owned_event = try self.job_index.firstTerminalEventForAgentAfter(
-            self.allocator,
-            self.agent_id,
-            source.last_seen_job_event_seq,
-        );
-        if (owned_event == null) return null;
-
-        var event = owned_event.?;
-        defer event.deinit(self.allocator);
-        try self.syncThoughtFramesFromJobTelemetry(event.job_id);
-
-        const event_path = try std.fmt.allocPrint(self.allocator, "/global/jobs/{s}/status.json", .{event.job_id});
-        defer self.allocator.free(event_path);
-        const payload = try job_projection.buildTerminalJobWaitEventPayload(
-            self.allocator,
-            self.nextWaitEventId(),
-            source.raw_path,
-            event_path,
-            event,
-        );
-        return .{
-            .source_index = source_index,
-            .sort_key_ms = event.created_at_ms,
-            .payload_json = payload,
-            .next_last_seen_job_event_seq = event.seq,
-        };
-    }
-
-    fn buildTimeCandidate(self: *Session, source: WaitSource, source_index: usize) !?WaitCandidate {
-        if (source.last_seen_updated_at_ms >= source.target_time_ms) return null;
-        const now_ms = std.time.milliTimestamp();
-        if (now_ms < source.target_time_ms) return null;
-        const payload = try self.buildTimeWaitEventPayload(source.raw_path, source.target_time_ms, now_ms);
-        return .{
-            .source_index = source_index,
-            .sort_key_ms = source.target_time_ms,
-            .payload_json = payload,
-            .next_last_seen_updated_at_ms = source.target_time_ms,
-        };
-    }
-
-    fn buildSignalCandidate(self: *Session, source: WaitSource, source_index: usize) !?WaitCandidate {
-        const target_type = switch (source.kind) {
-            .agent_signal => SignalEventType.agent,
-            .hook_signal => SignalEventType.hook,
-            .user_signal => SignalEventType.user,
-            else => return null,
-        };
-
-        var selected: ?*const SignalEvent = null;
-        for (self.signal_events.items) |*event| {
-            if (event.seq <= source.last_seen_signal_seq) continue;
-            if (event.event_type != target_type) continue;
-            if (source.parameter) |required| {
-                const actual = event.parameter orelse continue;
-                if (!std.mem.eql(u8, actual, required)) continue;
-            }
-            selected = event;
-            break;
-        }
-        if (selected == null) return null;
-
-        const event = selected.?;
-        const event_path = switch (source.kind) {
-            .agent_signal => if (event.parameter) |value|
-                try std.fmt.allocPrint(self.allocator, "/global/events/sources/agent/{s}.json", .{value})
-            else
-                try self.allocator.dupe(u8, "/global/events/sources/agent.json"),
-            .hook_signal => if (event.parameter) |value|
-                try std.fmt.allocPrint(self.allocator, "/global/events/sources/hook/{s}.json", .{value})
-            else
-                try self.allocator.dupe(u8, "/global/events/sources/hook.json"),
-            .user_signal => if (event.parameter) |value|
-                try std.fmt.allocPrint(self.allocator, "/global/events/sources/user/{s}.json", .{value})
-            else
-                try self.allocator.dupe(u8, "/global/events/sources/user.json"),
-            else => unreachable,
-        };
-        defer self.allocator.free(event_path);
-        const payload = try self.buildSignalWaitEventPayload(source.raw_path, event_path, event.*);
-        return .{
-            .source_index = source_index,
-            .sort_key_ms = event.created_at_ms,
-            .payload_json = payload,
-            .next_last_seen_signal_seq = event.seq,
-        };
-    }
-
-    fn nextWaitEventId(self: *Session) u64 {
-        const event_id = self.wait_event_seq;
-        self.wait_event_seq +%= 1;
-        if (self.wait_event_seq == 0) self.wait_event_seq = 1;
-        return event_id;
-    }
-
-    fn buildTimeWaitEventPayload(
-        self: *Session,
-        source_path: []const u8,
-        target_ms: i64,
-        now_ms: i64,
-    ) ![]u8 {
-        const source_path_escaped = try unified.jsonEscape(self.allocator, source_path);
-        defer self.allocator.free(source_path_escaped);
-        const event_id = self.nextWaitEventId();
-        return std.fmt.allocPrint(
-            self.allocator,
-            "{{\"configured\":true,\"waiting\":false,\"event_id\":{d},\"source_path\":\"{s}\",\"event_path\":\"/global/events/sources/time\",\"updated_at_ms\":{d},\"time\":{{\"target_ms\":{d},\"now_ms\":{d},\"fired\":true}}}}",
-            .{ event_id, source_path_escaped, now_ms, target_ms, now_ms },
-        );
-    }
-
-    fn buildSignalWaitEventPayload(
-        self: *Session,
-        source_path: []const u8,
-        event_path: []const u8,
-        signal: SignalEvent,
-    ) ![]u8 {
-        const source_path_escaped = try unified.jsonEscape(self.allocator, source_path);
-        defer self.allocator.free(source_path_escaped);
-        const event_path_escaped = try unified.jsonEscape(self.allocator, event_path);
-        defer self.allocator.free(event_path_escaped);
-        const type_escaped = try unified.jsonEscape(self.allocator, signalEventTypeName(signal.event_type));
-        defer self.allocator.free(type_escaped);
-        const parameter_json = if (signal.parameter) |value| blk: {
-            const escaped = try unified.jsonEscape(self.allocator, value);
-            defer self.allocator.free(escaped);
-            break :blk try std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped});
-        } else try self.allocator.dupe(u8, "null");
-        defer self.allocator.free(parameter_json);
-        const payload_json = if (signal.payload_json) |value|
-            try self.allocator.dupe(u8, value)
-        else
-            try self.allocator.dupe(u8, "null");
-        defer self.allocator.free(payload_json);
-
-        const event_id = self.nextWaitEventId();
-        return std.fmt.allocPrint(
-            self.allocator,
-            "{{\"configured\":true,\"waiting\":false,\"event_id\":{d},\"source_path\":\"{s}\",\"event_path\":\"{s}\",\"updated_at_ms\":{d},\"signal\":{{\"seq\":{d},\"event_type\":\"{s}\",\"parameter\":{s},\"payload\":{s}}}}}",
-            .{
-                event_id,
-                source_path_escaped,
-                event_path_escaped,
-                signal.created_at_ms,
-                signal.seq,
-                type_escaped,
-                parameter_json,
-                payload_json,
-            },
-        );
+        return events_venom.handleNextRead(self);
     }
 
     fn refreshJobNodeFromIndex(self: *Session, node_id: u32, special: SpecialKind) !void {
-        const node = self.nodes.get(node_id) orelse return error.MissingNode;
-        const job_dir_id = node.parent orelse return;
-        const job_dir = self.nodes.get(job_dir_id) orelse return error.MissingNode;
-        const job_id = job_dir.name;
-        const owned_view = try self.job_index.getJob(self.allocator, job_id);
-        if (owned_view == null) return;
-
-        var view = owned_view.?;
-        defer view.deinit(self.allocator);
-        if (!std.mem.eql(u8, view.agent_id, self.agent_id)) return;
-        try self.syncThoughtFramesFromJobTelemetry(job_id);
-
-        switch (special) {
-            .job_status => {
-                const status_json = try self.buildJobStatusJson(view.state, view.correlation_id, view.error_text);
-                defer self.allocator.free(status_json);
-                try self.setFileContent(node_id, status_json);
-            },
-            .job_result => {
-                try self.setFileContent(node_id, view.result_text orelse "");
-            },
-            .job_log => {
-                try self.setFileContent(node_id, view.log_text orelse "");
-            },
-            else => {},
-        }
+        return jobs_venom.refreshNodeFromIndex(self, node_id, special);
     }
 
-    fn syncThoughtFramesFromJobTelemetry(self: *Session, job_id: []const u8) !void {
+    pub fn syncThoughtFramesFromJobTelemetry(self: *Session, job_id: []const u8) !void {
         const thought_frames = try self.job_index.listThoughtFramesForJob(self.allocator, job_id);
         defer chat_job_index.deinitThoughtFrames(self.allocator, thought_frames);
         if (thought_frames.len == 0) return;
@@ -9979,13 +7908,20 @@ pub const Session = struct {
         } else null;
         defer if (invoke_path) |value| self.allocator.free(value);
 
-        var explicit_provider = blk: {
+        const local_provider_dir_id = blk: {
+            const local_venoms_root = self.lookupLocalNodeVenomsRoot() orelse break :blk null;
+            break :blk self.lookupChild(local_venoms_root, venom_id);
+        };
+
+        var explicit_provider = if (local_provider_dir_id == null) blk: {
             const plane = self.control_plane orelse break :blk null;
             break :blk try plane.resolveExplicitPreferredVenomProvider(self.allocator, venom_id);
-        };
+        } else null;
         defer if (explicit_provider) |*value| value.deinit(self.allocator);
 
-        const provider_node_id = if (explicit_provider) |provider|
+        const provider_node_id = if (local_provider_dir_id != null)
+            try self.allocator.dupe(u8, "local")
+        else if (explicit_provider) |provider|
             try self.allocator.dupe(u8, provider.node_id)
         else
             null;
@@ -9995,7 +7931,9 @@ pub const Session = struct {
         else
             null;
         defer if (provider_venom_path) |value| self.allocator.free(value);
-        const provider_invoke_path = if (explicit_provider) |provider| blk: {
+        const provider_invoke_path = if (local_provider_dir_id) |provider_dir_id|
+            try self.deriveVenomInvokePath("local", venom_id, provider_dir_id)
+        else if (explicit_provider) |provider| blk: {
             const nodes_root = self.lookupChild(self.root_id, "nodes") orelse break :blk null;
             const node_dir_id = self.lookupChild(nodes_root, provider.node_id) orelse break :blk null;
             const venoms_root_id = self.lookupChild(node_dir_id, "venoms") orelse break :blk null;
@@ -10015,7 +7953,7 @@ pub const Session = struct {
         );
     }
 
-    fn deriveVenomInvokePath(
+    pub fn deriveVenomInvokePath(
         self: *Session,
         node_id: []const u8,
         venom_id: []const u8,
@@ -10049,7 +7987,7 @@ pub const Session = struct {
         );
     }
 
-    fn pathWithInvokeSuffix(self: *Session, base_path: []const u8) ![]u8 {
+    pub fn pathWithInvokeSuffix(self: *Session, base_path: []const u8) ![]u8 {
         const trimmed = std.mem.trimRight(u8, base_path, "/");
         if (trimmed.len == 0) return self.allocator.dupe(u8, "/control/invoke.json");
         if (std.mem.endsWith(u8, trimmed, "/control/invoke.json")) {
@@ -10058,7 +7996,7 @@ pub const Session = struct {
         return std.fmt.allocPrint(self.allocator, "{s}/control/invoke.json", .{trimmed});
     }
 
-    fn pathWithInvokeTarget(self: *Session, base_path: []const u8, invoke_suffix: []const u8) ![]u8 {
+    pub fn pathWithInvokeTarget(self: *Session, base_path: []const u8, invoke_suffix: []const u8) ![]u8 {
         const base_trimmed = std.mem.trimRight(u8, base_path, "/");
         if (invoke_suffix.len == 0) return self.allocator.dupe(u8, base_trimmed);
         if (base_trimmed.len == 0) {
@@ -10067,7 +8005,7 @@ pub const Session = struct {
         return std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ base_trimmed, invoke_suffix });
     }
 
-    fn resolveNodeVenomInvokeTarget(self: *Session, venom_dir_id: u32) ![]u8 {
+    pub fn resolveNodeVenomInvokeTarget(self: *Session, venom_dir_id: u32) ![]u8 {
         const default_target = "/control/invoke.json";
         const ops_id = self.lookupChild(venom_dir_id, "OPS.json") orelse return self.allocator.dupe(u8, default_target);
         const ops_node = self.nodes.get(ops_id) orelse return self.allocator.dupe(u8, default_target);
@@ -10155,71 +8093,77 @@ pub const Session = struct {
 fn isWorldAbsolutePath(path: []const u8) bool {
     return std.mem.startsWith(u8, path, "/nodes/") or
         std.mem.startsWith(u8, path, "/agents/") or
+        std.mem.startsWith(u8, path, "/services/") or
         std.mem.startsWith(u8, path, "/global/") or
         std.mem.startsWith(u8, path, "/debug/");
 }
 
 fn defaultGlobalLibraryIndexMd() []const u8 {
     return "# Spiderweb Global Library\n\n" ++
-        "- [Getting Started](/global/library/topics/getting-started.md)\n" ++
-        "- [Service Discovery](/global/library/topics/service-discovery.md)\n" ++
-        "- [Events and Waits](/global/library/topics/events-and-waits.md)\n" ++
-        "- [Search Services](/global/library/topics/search-services.md)\n" ++
-        "- [Terminal Workflows](/global/library/topics/terminal-workflows.md)\n" ++
-        "- [Memory Workflows](/global/library/topics/memory-workflows.md)\n" ++
-        "- [Project Mounts and Binds](/global/library/topics/project-mounts-and-binds.md)\n" ++
-        "- [Agent Management and Sub-Brains](/global/library/topics/agent-management-and-sub-brains.md)\n";
+        "- [Getting Started](/nodes/local/venoms/library/topics/getting-started.md)\n" ++
+        "- [Service Discovery](/nodes/local/venoms/library/topics/service-discovery.md)\n" ++
+        "- [Events and Waits](/nodes/local/venoms/library/topics/events-and-waits.md)\n" ++
+        "- [Search Services](/nodes/local/venoms/library/topics/search-services.md)\n" ++
+        "- [Terminal Workflows](/nodes/local/venoms/library/topics/terminal-workflows.md)\n" ++
+        "- [Memory Workflows](/nodes/local/venoms/library/topics/memory-workflows.md)\n" ++
+        "- [Project Mounts and Binds](/nodes/local/venoms/library/topics/project-mounts-and-binds.md)\n" ++
+        "- [Agent Management and Sub-Brains](/nodes/local/venoms/library/topics/agent-management-and-sub-brains.md)\n";
 }
 
 fn defaultGlobalLibraryTopicGettingStarted() []const u8 {
     return "# Getting Started\n\n" ++
-        "1. Discover Venoms in `/global/venoms/VENOMS.json`.\n" ++
-        "2. Read each Venom `README.md`, `SCHEMA.json`, and `CAPS.json` before using it.\n" ++
-        "3. Use `/global/library` for system guides.\n";
+        "1. Discover mounted workspace services in `/meta/workspace_services.json` or `/projects/<project_id>/meta/mounted_services.json`.\n" ++
+        "2. Use `/services/<venom_id>` when the workspace binds a service, then fall back to `/nodes/local/venoms/<venom_id>` for local catalog access.\n" ++
+        "3. Treat `/global/*` as a compatibility alias when older workflows still reference it.\n" ++
+        "4. Read each Venom `README.md`, `SCHEMA.json`, `TEMPLATE.json`, `HOST.json`, and `CAPS.json` before using it.\n" ++
+        "5. Use `/services/library` when bound, otherwise `/nodes/local/venoms/library`, for system guides.\n";
 }
 
 fn defaultGlobalLibraryTopicServiceDiscovery() []const u8 {
     return "# Venom Discovery\n\n" ++
         "- Node Venoms: `/nodes/<node_id>/venoms/<venom_id>`\n" ++
-        "- Project namespaces: `/global/<venom_id>`\n" ++
-        "- Global namespaces: `/global/<venom_id>`\n" ++
-        "- Start with `/global/venoms/VENOMS.json`.\n" ++
-        "- Common project Venoms include: memory, web_search, search_code, terminal, mounts, sub_brains, agents, projects.\n";
+        "- Local built-in Venoms: `/nodes/local/venoms/<venom_id>`\n" ++
+        "- Workspace service namespaces: `/services/<venom_id>`\n" ++
+        "- Compatibility aliases: `/global/<venom_id>`\n" ++
+        "- Start with `/meta/workspace_services.json`, `/projects/<project_id>/meta/mounted_services.json`, or `/nodes/local/venoms/VENOMS.json`.\n" ++
+        "- Service Venoms should expose `TEMPLATE.json` and `HOST.json` alongside `SCHEMA.json`, `OPS.json`, and `STATUS.json`.\n" ++
+        "- Common workspace Venoms include: memory, web_search, search_code, terminal, mounts, sub_brains, agents, workspaces.\n";
 }
 
 fn defaultGlobalLibraryTopicEventsAndWaits() []const u8 {
     return "# Events and Waits\n\n" ++
         "Use single-source blocking reads first for deterministic waits.\n" ++
-        "Use `/global/events/control/wait.json` + `/global/events/next.json` for one-of-many waits.\n";
+        "Use `/services/events/control/wait.json` + `/services/events/next.json` when the workspace binds events, otherwise use `/nodes/local/venoms/events/control/wait.json` + `/nodes/local/venoms/events/next.json`.\n";
 }
 
 fn defaultGlobalLibraryTopicSearchServices() []const u8 {
     return "# Search Services\n\n" ++
-        "Use `/global/search_code` for repository-local search and `/global/web_search` for external lookup.\n" ++
+        "Use `/services/search_code` for repository-local search and `/services/web_search` for external lookup when bound, otherwise use `/nodes/local/venoms/search_code` and `/nodes/local/venoms/web_search`.\n" ++
         "Drive both through `control/search.json` or `control/invoke.json`, then check `status.json` and `result.json`.\n";
 }
 
 fn defaultGlobalLibraryTopicTerminalWorkflows() []const u8 {
     return "# Terminal Workflows\n\n" ++
-        "Use `/global/terminal/control/*.json` for sessionized shell execution.\n" ++
+        "Use `/services/terminal/control/*.json` for sessionized shell execution when bound, otherwise use `/nodes/local/venoms/terminal/control/*.json`.\n" ++
         "Prefer `create` + `write/read` for interactive loops and `exec` for single command tasks.\n";
 }
 
 fn defaultGlobalLibraryTopicMemoryWorkflows() []const u8 {
     return "# Memory Workflows\n\n" ++
-        "Use `/global/memory/control/*.json` and pass `memory_path` for targeted operations.\n" ++
+        "Use `/services/memory/control/*.json` when the workspace binds memory, otherwise use `/nodes/local/venoms/memory/control/*.json`, and pass `memory_path` for targeted operations.\n" ++
         "Use `search` before creating duplicate memories.\n";
 }
 
 fn defaultGlobalLibraryTopicProjectMountsAndBinds() []const u8 {
     return "# Project Mounts and Binds\n\n" ++
-        "Use `/global/mounts/control/mount.json`, `mkdir.json`, and `unmount.json` for project mounts.\n" ++
-        "Use `/global/mounts/control/bind.json` and `resolve.json` for stable project paths.\n";
+        "Use `/services/mounts/control/mount.json`, `mkdir.json`, and `unmount.json` for project mounts when the workspace binds the mounts service.\n" ++
+        "The canonical local origin is `/nodes/local/venoms/mounts/*`, with `/global/mounts/*` retained as a compatibility alias.\n" ++
+        "Use `/services/mounts/control/bind.json` and `resolve.json` for stable project paths.\n";
 }
 
 fn defaultGlobalLibraryTopicAgentManagementAndSubBrains() []const u8 {
     return "# Agent Management and Sub-Brains\n\n" ++
-        "Use `/global/agents` for list/create, `/global/sub_brains` for list/upsert/delete, and `/global/projects` for list/get/up.\n" ++
+        "Use `/global/agents` for list/create, `/global/sub_brains` for list/upsert/delete, and `/global/workspaces` for list/get/up.\n" ++
         "Mutation operations depend on capability flags and service permissions.\n";
 }
 
@@ -10239,6 +8183,11 @@ const ParsedEntityScopedVenomAlias = struct {
     entity_id: []const u8,
     venom_id: []const u8,
     remote_path: []const u8,
+};
+
+const ParsedNodeVenomServicePath = struct {
+    node_id: []const u8,
+    venom_id: []const u8,
 };
 
 fn parseScopedVenomAliasPrefix(path: []const u8, prefix: []const u8) ?ParsedScopedVenomAlias {
@@ -10277,6 +8226,25 @@ fn parseEntityScopedVenomAliasPrefix(
         .entity_id = entity_id,
         .venom_id = venom_id,
         .remote_path = remote_path,
+    };
+}
+
+fn parseNodeVenomServicePath(path: []const u8) ?ParsedNodeVenomServicePath {
+    if (!std.mem.startsWith(u8, path, "/nodes/")) return null;
+    const after_prefix = path["/nodes/".len..];
+    const node_end = std.mem.indexOfScalar(u8, after_prefix, '/') orelse return null;
+    const node_id = after_prefix[0..node_end];
+    if (node_id.len == 0) return null;
+    const after_node = after_prefix[node_end..];
+    if (!std.mem.startsWith(u8, after_node, "/venoms/")) return null;
+    const after_venoms = after_node["/venoms/".len..];
+    if (after_venoms.len == 0) return null;
+    const venom_end = std.mem.indexOfScalar(u8, after_venoms, '/') orelse after_venoms.len;
+    const venom_id = after_venoms[0..venom_end];
+    if (venom_id.len == 0) return null;
+    return .{
+        .node_id = node_id,
+        .venom_id = venom_id,
     };
 }
 
@@ -10336,82 +8304,6 @@ fn writeJsonString(writer: anytype, value: []const u8) !void {
     try writer.writeByte('"');
 }
 
-fn hexDigitUpper(value: u8) u8 {
-    return if (value < 10) ('0' + value) else ('A' + (value - 10));
-}
-
-fn parseHexNibble(value: u8) ?u8 {
-    if (value >= '0' and value <= '9') return value - '0';
-    if (value >= 'A' and value <= 'F') return value - 'A' + 10;
-    if (value >= 'a' and value <= 'f') return value - 'a' + 10;
-    return null;
-}
-
-fn urlPathEncode(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
-    var out = std.ArrayListUnmanaged(u8){};
-    errdefer out.deinit(allocator);
-    for (value) |char| {
-        if (std.ascii.isAlphanumeric(char) or char == '-' or char == '_' or char == '.' or char == '~') {
-            try out.append(allocator, char);
-            continue;
-        }
-        try out.append(allocator, '%');
-        try out.append(allocator, hexDigitUpper((char >> 4) & 0x0F));
-        try out.append(allocator, hexDigitUpper(char & 0x0F));
-    }
-    return out.toOwnedSlice(allocator);
-}
-
-fn urlPathDecode(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
-    var out = std.ArrayListUnmanaged(u8){};
-    errdefer out.deinit(allocator);
-    var i: usize = 0;
-    while (i < value.len) {
-        const char = value[i];
-        if (char == '%') {
-            if (i + 2 >= value.len) return error.InvalidPayload;
-            const hi = parseHexNibble(value[i + 1]) orelse return error.InvalidPayload;
-            const lo = parseHexNibble(value[i + 2]) orelse return error.InvalidPayload;
-            try out.append(allocator, (hi << 4) | lo);
-            i += 3;
-            continue;
-        }
-        try out.append(allocator, char);
-        i += 1;
-    }
-    return out.toOwnedSlice(allocator);
-}
-
-fn buildMemoryPathFromMemId(allocator: std.mem.Allocator, mem_id: []const u8) ![]u8 {
-    const encoded = try urlPathEncode(allocator, mem_id);
-    defer allocator.free(encoded);
-    return std.fmt.allocPrint(allocator, "/global/memory/items/{s}", .{encoded});
-}
-
-fn decodeMemIdFromPath(allocator: std.mem.Allocator, path_or_mem_id: []const u8) ![]u8 {
-    const prefix = "/global/memory/items/";
-    if (!std.mem.startsWith(u8, path_or_mem_id, prefix)) {
-        return allocator.dupe(u8, path_or_mem_id);
-    }
-    const tail = path_or_mem_id[prefix.len..];
-    if (tail.len == 0) return error.InvalidPayload;
-    const slash = std.mem.indexOfScalar(u8, tail, '/') orelse tail.len;
-    if (slash == 0) return error.InvalidPayload;
-    return urlPathDecode(allocator, tail[0..slash]);
-}
-
-fn parseTerminalInvokeOp(raw: []const u8) ?TerminalInvokeOp {
-    const value = std.mem.trim(u8, raw, " \t\r\n");
-    if (std.mem.eql(u8, value, "exec") or std.mem.eql(u8, value, "shell_exec")) return .exec;
-    if (std.mem.eql(u8, value, "create") or std.mem.eql(u8, value, "terminal_session_create")) return .create_session;
-    if (std.mem.eql(u8, value, "resume") or std.mem.eql(u8, value, "terminal_session_resume")) return .resume_session;
-    if (std.mem.eql(u8, value, "close") or std.mem.eql(u8, value, "terminal_session_close")) return .close_session;
-    if (std.mem.eql(u8, value, "write") or std.mem.eql(u8, value, "terminal_session_write")) return .write_session;
-    if (std.mem.eql(u8, value, "read") or std.mem.eql(u8, value, "terminal_session_read")) return .read_session;
-    if (std.mem.eql(u8, value, "resize") or std.mem.eql(u8, value, "terminal_session_resize")) return .resize_session;
-    return null;
-}
-
 fn jsonObjectOptionalString(obj: std.json.ObjectMap, key: []const u8) !?[]const u8 {
     if (obj.get(key)) |value| {
         if (value == .null) return null;
@@ -10448,6 +8340,21 @@ fn jsonObjectOptionalU64(obj: std.json.ObjectMap, key: []const u8) !?u64 {
         };
     }
     return null;
+}
+
+fn sameOptionalString(left: ?[]const u8, right: ?[]const u8) bool {
+    if (left) |left_value| {
+        const right_value = right orelse return false;
+        return std.mem.eql(u8, left_value, right_value);
+    }
+    return right == null;
+}
+
+fn isActiveMissionState(state: mission_store_mod.MissionState) bool {
+    return switch (state) {
+        .completed, .failed, .cancelled => false,
+        else => true,
+    };
 }
 
 fn kindName(kind: NodeKind) []const u8 {
@@ -10682,6 +8589,46 @@ fn protocolReadFile(
     const read_res = try session.handle(&read);
     defer allocator.free(read_res);
     return decodeReadResponseData(allocator, read_res);
+}
+
+fn runTestCommandCapture(
+    allocator: std.mem.Allocator,
+    cwd: ?[]const u8,
+    argv: []const []const u8,
+) ![]u8 {
+    const result = try std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = argv,
+        .cwd = cwd,
+    });
+    defer allocator.free(result.stderr);
+    switch (result.term) {
+        .Exited => |code| {
+            if (code == 0) return result.stdout;
+            allocator.free(result.stdout);
+            return error.TestExpectedResponse;
+        },
+        else => {
+            allocator.free(result.stdout);
+            return error.TestExpectedResponse;
+        },
+    }
+}
+
+fn extractMissionIdFromResultPayload(
+    allocator: std.mem.Allocator,
+    result_payload: []const u8,
+) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, result_payload, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.TestExpectedResponse;
+    const result_value = parsed.value.object.get("result") orelse return error.TestExpectedResponse;
+    if (result_value != .object) return error.TestExpectedResponse;
+    const mission_value = result_value.object.get("mission") orelse return error.TestExpectedResponse;
+    if (mission_value != .object) return error.TestExpectedResponse;
+    const mission_id_value = mission_value.object.get("mission_id") orelse return error.TestExpectedResponse;
+    if (mission_id_value != .string or mission_id_value.string.len == 0) return error.TestExpectedResponse;
+    return allocator.dupe(u8, mission_id_value.string);
 }
 
 fn decodeReadResponseData(allocator: std.mem.Allocator, frame: []const u8) ![]u8 {
@@ -10992,7 +8939,7 @@ test "acheron_session: events wait returns next completed chat job" {
 
     try std.testing.expect(std.mem.indexOf(u8, next_payload, "\"configured\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, next_payload, "\"source_path\":\"/global/chat/control/input\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, next_payload, "\"event_path\":\"/global/jobs/job-") != null);
+    try std.testing.expect(std.mem.indexOf(u8, next_payload, "\"event_path\":\"/nodes/local/venoms/jobs/job-") != null);
     try std.testing.expect(std.mem.indexOf(u8, next_payload, "\"job_id\":\"job-") != null);
 }
 
@@ -11014,7 +8961,7 @@ test "acheron_session: events wait reports timeout when no source event is avail
         90,
         91,
         &.{ "agents", "self", "events", "control", "wait.json" },
-        "{\"paths\":[\"/global/jobs/job-missing/status.json\"],\"timeout_ms\":0}",
+        "{\"paths\":[\"/nodes/local/venoms/jobs/job-missing/status.json\"],\"timeout_ms\":0}",
         730,
     );
 
@@ -11049,7 +8996,7 @@ test "acheron_session: events wait supports time source selectors" {
         94,
         95,
         &.{ "agents", "self", "events", "control", "wait.json" },
-        "{\"paths\":[\"/global/events/sources/time/after/0.json\"],\"timeout_ms\":0}",
+        "{\"paths\":[\"/nodes/local/venoms/events/sources/time/after/0.json\"],\"timeout_ms\":0}",
         745,
     );
 
@@ -11064,7 +9011,7 @@ test "acheron_session: events wait supports time source selectors" {
     defer allocator.free(next_payload);
 
     try std.testing.expect(std.mem.indexOf(u8, next_payload, "\"configured\":true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, next_payload, "\"event_path\":\"/global/events/sources/time\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, next_payload, "\"event_path\":\"/nodes/local/venoms/events/sources/time\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, next_payload, "\"time\":{") != null);
 }
 
@@ -11712,14 +9659,13 @@ test "acheron_session: agent services index includes first-class namespaces only
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_id\":\"search_code\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_id\":\"terminal\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_id\":\"mounts\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_id\":\"projects\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_id\":\"workspaces\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_id\":\"library\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_path\":\"/global/search_code\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_path\":\"/global/search_code\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_path\":\"/global/mounts\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_path\":\"/global/projects\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_path\":\"/global/library\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"scope\":\"global_namespace\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_path\":\"/nodes/local/venoms/search_code\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_path\":\"/nodes/local/venoms/mounts\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_path\":\"/nodes/local/venoms/workspaces\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_path\":\"/nodes/local/venoms/library\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"scope\":\"node_catalog\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"has_invoke\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_path\":\"/global/venoms/contracts/") == null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"scope\":\"agent_contract\"") == null);
@@ -12095,6 +10041,56 @@ test "acheron_session: scoped venom aliases fail closed without control plane" {
     try std.testing.expectEqual(previous_len, session.scoped_venom_bindings.items.len);
 }
 
+test "acheron_session: scoped venom aliases preserve template and host metadata" {
+    const allocator = std.testing.allocator;
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "default",
+        .{
+            .agents_dir = ".does-not-exist",
+            .projects_dir = ".does-not-exist",
+        },
+    );
+    defer session.deinit();
+
+    const nodes_root = session.lookupChild(session.root_id, "nodes") orelse return error.TestExpectedResponse;
+    const node_dir = try session.addDir(nodes_root, "edge-1", false);
+    const venoms_root = try session.addDir(node_dir, "venoms", false);
+    const tool_dir = try session.addDir(venoms_root, "tool-main", false);
+    _ = try session.addFile(tool_dir, "STATUS.json", "{\"endpoint\":\"/nodes/edge-1/venoms/tool-main\"}", false, .none);
+    _ = try session.addFile(tool_dir, "OPS.json", "{\"model\":\"namespace\",\"invoke\":\"control/invoke.json\"}", false, .none);
+    _ = try session.addFile(tool_dir, "RUNTIME.json", "{\"type\":\"native_proc\"}", false, .none);
+    _ = try session.addFile(tool_dir, "TEMPLATE.json", "{\"tool_name\":\"shell_exec\",\"arguments\":{\"command\":\"pwd\"}}", false, .none);
+    _ = try session.addFile(tool_dir, "HOST.json", "{\"runtime_kind\":\"native_proc\"}", false, .none);
+
+    const alias_root = try session.addDir(session.root_id, "alias-tests", false);
+    try std.testing.expect(try session.seedBoundNodeVenomNamespaceAt(
+        alias_root,
+        "/alias-tests",
+        "tool-main",
+        "global_binding",
+        "edge-1",
+    ));
+
+    const alias_dir = session.lookupChild(alias_root, "tool-main") orelse return error.TestExpectedResponse;
+    const template_id = session.lookupChild(alias_dir, "TEMPLATE.json") orelse return error.TestExpectedResponse;
+    const host_id = session.lookupChild(alias_dir, "HOST.json") orelse return error.TestExpectedResponse;
+    const template_node = session.nodes.get(template_id) orelse return error.TestExpectedResponse;
+    const host_node = session.nodes.get(host_id) orelse return error.TestExpectedResponse;
+
+    try std.testing.expect(std.mem.indexOf(u8, template_node.content, "\"shell_exec\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, host_node.content, "\"native_proc\"") != null);
+}
+
 test "acheron_session: scoped venom aliases shape proxy paths and job result paths" {
     const allocator = std.testing.allocator;
 
@@ -12120,7 +10116,7 @@ test "acheron_session: scoped venom aliases shape proxy paths and job result pat
     const global_chat_id = session.resolveAbsolutePathNoBinds("/global/chat") orelse return error.TestExpectedResponse;
     const global_result_path = try session.buildJobResultPathForNode(global_chat_id, "job-global");
     defer allocator.free(global_result_path);
-    try std.testing.expectEqualStrings("/global/jobs/job-global/result.txt", global_result_path);
+    try std.testing.expectEqualStrings("/nodes/local/venoms/jobs/job-global/result.txt", global_result_path);
 
     const agent_chat_id = session.resolveAbsolutePathNoBinds("/agents/default/venoms/chat") orelse return error.TestExpectedResponse;
     const agent_result_path = try session.buildJobResultPathForNode(agent_chat_id, "job-agent");
@@ -12180,6 +10176,18 @@ test "acheron_session: global library namespace exposes index and topic guides" 
     defer allocator.free(topic_payload);
     try std.testing.expect(std.mem.indexOf(u8, topic_payload, "/global/<venom_id>") != null);
     try std.testing.expect(std.mem.indexOf(u8, topic_payload, "VENOMS.json") != null);
+
+    const use_case_payload = try protocolReadFile(
+        &session,
+        allocator,
+        112,
+        113,
+        &.{ "global", "library", "use-cases", "pr-review", "README.md" },
+        785,
+    );
+    defer allocator.free(use_case_payload);
+    try std.testing.expect(std.mem.indexOf(u8, use_case_payload, "PR Review") != null);
+    try std.testing.expect(std.mem.indexOf(u8, use_case_payload, "save_draft") != null);
 }
 
 test "acheron_session: global library loads guides from assets_dir filesystem" {
@@ -12215,6 +10223,16 @@ test "acheron_session: global library loads guides from assets_dir filesystem" {
     try std.fs.cwd().writeFile(.{
         .sub_path = custom_topic_path,
         .data = "# Custom Topic\n\nThis guide is loaded from assets_dir.\n",
+    });
+
+    const custom_use_case_dir = try std.fmt.allocPrint(allocator, "{s}/library/use-cases/demo", .{assets_dir});
+    defer allocator.free(custom_use_case_dir);
+    try std.fs.cwd().makePath(custom_use_case_dir);
+    const custom_use_case_path = try std.fmt.allocPrint(allocator, "{s}/README.md", .{custom_use_case_dir});
+    defer allocator.free(custom_use_case_path);
+    try std.fs.cwd().writeFile(.{
+        .sub_path = custom_use_case_path,
+        .data = "# Demo Use Case\n\nLoaded from assets_dir use-cases.\n",
     });
 
     const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
@@ -12257,6 +10275,41 @@ test "acheron_session: global library loads guides from assets_dir filesystem" {
     );
     defer allocator.free(topic_payload);
     try std.testing.expect(std.mem.indexOf(u8, topic_payload, "loaded from assets_dir") != null);
+
+    const use_case_payload = try protocolReadFile(
+        &session,
+        allocator,
+        114,
+        115,
+        &.{ "global", "library", "use-cases", "demo", "README.md" },
+        786,
+    );
+    defer allocator.free(use_case_payload);
+    try std.testing.expect(std.mem.indexOf(u8, use_case_payload, "Loaded from assets_dir use-cases") != null);
+}
+
+test "acheron_session: local venom aliases mirror canonical and compatibility writes" {
+    const allocator = std.testing.allocator;
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.init(allocator, runtime_handle, &job_index, "default");
+    defer session.deinit();
+
+    const local_status_id = session.resolveAbsolutePathNoBinds("/nodes/local/venoms/memory/status.json") orelse return error.TestExpectedResponse;
+    const global_status_id = session.resolveAbsolutePathNoBinds("/global/memory/status.json") orelse return error.TestExpectedResponse;
+
+    try session.setFileContent(local_status_id, "{\"state\":\"canonical\"}");
+    const global_status_after_canonical = session.nodes.get(global_status_id) orelse return error.TestExpectedResponse;
+    try std.testing.expectEqualStrings("{\"state\":\"canonical\"}", global_status_after_canonical.content);
+
+    try session.setFileContent(global_status_id, "{\"state\":\"compat\"}");
+    const local_status_after_global = session.nodes.get(local_status_id) orelse return error.TestExpectedResponse;
+    try std.testing.expectEqualStrings("{\"state\":\"compat\"}", local_status_after_global.content);
 }
 
 test "acheron_session: agent services index includes first-class memory namespace entry" {
@@ -12282,8 +10335,8 @@ test "acheron_session: agent services index includes first-class memory namespac
     defer allocator.free(payload);
 
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"scope\":\"project_namespace\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_path\":\"/global/memory\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"invoke_path\":\"/global/memory/control/invoke.json\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_path\":\"/nodes/local/venoms/memory\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"invoke_path\":\"/nodes/local/venoms/memory/control/invoke.json\"") != null);
 }
 
 test "acheron_session: agent services index includes first-class web_search namespace entry" {
@@ -12309,8 +10362,8 @@ test "acheron_session: agent services index includes first-class web_search name
     defer allocator.free(payload);
 
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"scope\":\"project_namespace\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_path\":\"/global/web_search\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"invoke_path\":\"/global/web_search/control/invoke.json\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_path\":\"/nodes/local/venoms/web_search\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"invoke_path\":\"/nodes/local/venoms/web_search/control/invoke.json\"") != null);
 }
 
 test "acheron_session: agent services index includes first-class terminal namespace entry" {
@@ -12336,8 +10389,8 @@ test "acheron_session: agent services index includes first-class terminal namesp
     defer allocator.free(payload);
 
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"scope\":\"project_namespace\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_path\":\"/global/terminal\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"invoke_path\":\"/global/terminal/control/invoke.json\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_path\":\"/nodes/local/venoms/terminal\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"invoke_path\":\"/nodes/local/venoms/terminal/control/invoke.json\"") != null);
 }
 
 test "acheron_session: agent services index includes first-class sub_brains namespace entry" {
@@ -12363,8 +10416,8 @@ test "acheron_session: agent services index includes first-class sub_brains name
     defer allocator.free(payload);
 
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"scope\":\"project_namespace\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_path\":\"/global/sub_brains\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"invoke_path\":\"/global/sub_brains/control/invoke.json\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_path\":\"/nodes/local/venoms/sub_brains\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"invoke_path\":\"/nodes/local/venoms/sub_brains/control/invoke.json\"") != null);
 }
 
 test "acheron_session: agent services index includes first-class agents namespace entry" {
@@ -12390,8 +10443,8 @@ test "acheron_session: agent services index includes first-class agents namespac
     defer allocator.free(payload);
 
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"scope\":\"project_namespace\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_path\":\"/global/agents\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"invoke_path\":\"/global/agents/control/invoke.json\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_path\":\"/nodes/local/venoms/agents\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"invoke_path\":\"/nodes/local/venoms/agents/control/invoke.json\"") != null);
 }
 
 test "acheron_session: agent services index includes first-class projects namespace entry" {
@@ -12417,8 +10470,3241 @@ test "acheron_session: agent services index includes first-class projects namesp
     defer allocator.free(payload);
 
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"scope\":\"project_namespace\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_path\":\"/global/projects\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"invoke_path\":\"/global/projects/control/invoke.json\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_path\":\"/nodes/local/venoms/workspaces\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"invoke_path\":\"/nodes/local/venoms/workspaces/control/invoke.json\"") != null);
+}
+
+test "acheron_session: agent services index includes first-class missions namespace entry" {
+    const allocator = std.testing.allocator;
+
+    var mission_store = try mission_store_mod.MissionStore.initWithPath(allocator, null);
+    defer mission_store.deinit();
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "default",
+        .{
+            .mission_store = &mission_store,
+        },
+    );
+    defer session.deinit();
+
+    const payload = try protocolReadFile(
+        &session,
+        allocator,
+        294,
+        295,
+        &.{ "agents", "self", "venoms", "VENOMS.json" },
+        936,
+    );
+    defer allocator.free(payload);
+
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"scope\":\"project_namespace\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_path\":\"/nodes/local/venoms/missions\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"invoke_path\":\"/nodes/local/venoms/missions/control/invoke.json\"") != null);
+}
+
+test "acheron_session: missions namespace tracks lifecycle checkpoint and recovery state" {
+    const allocator = std.testing.allocator;
+
+    var mission_store = try mission_store_mod.MissionStore.initWithPath(allocator, null);
+    defer mission_store.deinit();
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "default",
+        .{
+            .mission_store = &mission_store,
+            .actor_type = "agent",
+            .actor_id = "worker-a",
+        },
+    );
+    defer session.deinit();
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        296,
+        297,
+        &.{ "agents", "self", "missions", "control", "create.json" },
+        "{\"use_case\":\"pr_review\",\"title\":\"Review PR 15\",\"stage\":\"planning\",\"contract\":{\"contract_id\":\"spider_monkey/pr_review@v1\",\"context_path\":\"/nodes/local/fs/pr-review/state/pr-15/context.json\"}}",
+        937,
+    );
+
+    const create_result = try protocolReadFile(
+        &session,
+        allocator,
+        298,
+        299,
+        &.{ "agents", "self", "missions", "result.json" },
+        938,
+    );
+    defer allocator.free(create_result);
+    try std.testing.expect(std.mem.indexOf(u8, create_result, "\"operation\":\"create\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, create_result, "\"ok\":true") != null);
+    const mission_id = try extractMissionIdFromResultPayload(allocator, create_result);
+    defer allocator.free(mission_id);
+
+    const resume_payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"mission_id\":\"{s}\",\"stage\":\"collecting_context\",\"contract\":{{\"state_path\":\"/nodes/local/fs/pr-review/state/pr-15/state.json\"}}}}",
+        .{mission_id},
+    );
+    defer allocator.free(resume_payload);
+    try protocolWriteFile(
+        &session,
+        allocator,
+        300,
+        301,
+        &.{ "agents", "self", "missions", "control", "resume.json" },
+        resume_payload,
+        939,
+    );
+
+    const checkpoint_payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"mission_id\":\"{s}\",\"stage\":\"reviewing\",\"summary\":\"Scanned changed files\",\"artifact\":{{\"kind\":\"notes\",\"path\":\"artifacts/review.md\",\"summary\":\"review notes\"}},\"contract\":{{\"artifact_root\":\"/nodes/local/fs/pr-review/runs/pr-15\"}}}}",
+        .{mission_id},
+    );
+    defer allocator.free(checkpoint_payload);
+    try protocolWriteFile(
+        &session,
+        allocator,
+        302,
+        303,
+        &.{ "agents", "self", "missions", "control", "checkpoint.json" },
+        checkpoint_payload,
+        940,
+    );
+
+    const recover_payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"mission_id\":\"{s}\",\"reason\":\"runtime_restart\",\"stage\":\"restoring_context\",\"summary\":\"Resuming review\"}}",
+        .{mission_id},
+    );
+    defer allocator.free(recover_payload);
+    try protocolWriteFile(
+        &session,
+        allocator,
+        304,
+        305,
+        &.{ "agents", "self", "missions", "control", "recover.json" },
+        recover_payload,
+        941,
+    );
+
+    const get_payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"mission_id\":\"{s}\"}}",
+        .{mission_id},
+    );
+    defer allocator.free(get_payload);
+    try protocolWriteFile(
+        &session,
+        allocator,
+        306,
+        307,
+        &.{ "agents", "self", "missions", "control", "get.json" },
+        get_payload,
+        942,
+    );
+
+    const get_result = try protocolReadFile(
+        &session,
+        allocator,
+        308,
+        309,
+        &.{ "agents", "self", "missions", "result.json" },
+        943,
+    );
+    defer allocator.free(get_result);
+    try std.testing.expect(std.mem.indexOf(u8, get_result, "\"operation\":\"get\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, get_result, mission_id) != null);
+    try std.testing.expect(std.mem.indexOf(u8, get_result, "\"state\":\"recovering\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, get_result, "\"checkpoint_seq\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, get_result, "\"recovery_count\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, get_result, "\"stage\":\"restoring_context\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, get_result, "\"kind\":\"notes\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, get_result, "\"contract_id\":\"spider_monkey/pr_review@v1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, get_result, "\"context_path\":\"/nodes/local/fs/pr-review/state/pr-15/context.json\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, get_result, "\"state_path\":\"/nodes/local/fs/pr-review/state/pr-15/state.json\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, get_result, "\"artifact_root\":\"/nodes/local/fs/pr-review/runs/pr-15\"") != null);
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        310,
+        311,
+        &.{ "agents", "self", "missions", "control", "list.json" },
+        "{\"state\":\"recovering\"}",
+        944,
+    );
+
+    const list_result = try protocolReadFile(
+        &session,
+        allocator,
+        312,
+        313,
+        &.{ "agents", "self", "missions", "result.json" },
+        945,
+    );
+    defer allocator.free(list_result);
+    try std.testing.expect(std.mem.indexOf(u8, list_result, "\"operation\":\"list\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, list_result, "\"count\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, list_result, mission_id) != null);
+}
+
+test "acheron_session: missions namespace requires admin approval for resolution" {
+    const allocator = std.testing.allocator;
+
+    var mission_store = try mission_store_mod.MissionStore.initWithPath(allocator, null);
+    defer mission_store.deinit();
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var user_session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "default",
+        .{
+            .mission_store = &mission_store,
+            .actor_type = "agent",
+            .actor_id = "worker-a",
+            .is_admin = false,
+        },
+    );
+    defer user_session.deinit();
+
+    try protocolWriteFile(
+        &user_session,
+        allocator,
+        314,
+        315,
+        &.{ "agents", "self", "missions", "control", "create.json" },
+        "{\"use_case\":\"pr_review\",\"title\":\"Review PR 22\"}",
+        946,
+    );
+    const create_result = try protocolReadFile(
+        &user_session,
+        allocator,
+        316,
+        317,
+        &.{ "agents", "self", "missions", "result.json" },
+        947,
+    );
+    defer allocator.free(create_result);
+    const mission_id = try extractMissionIdFromResultPayload(allocator, create_result);
+    defer allocator.free(mission_id);
+
+    const request_payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"mission_id\":\"{s}\",\"action_kind\":\"push_branch\",\"message\":\"Push review branch to origin\"}}",
+        .{mission_id},
+    );
+    defer allocator.free(request_payload);
+    try protocolWriteFile(
+        &user_session,
+        allocator,
+        318,
+        319,
+        &.{ "agents", "self", "missions", "control", "request_approval.json" },
+        request_payload,
+        948,
+    );
+
+    const approve_payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"mission_id\":\"{s}\",\"note\":\"ship it\"}}",
+        .{mission_id},
+    );
+    defer allocator.free(approve_payload);
+    const approve_error = try protocolWriteFileExpectError(
+        &user_session,
+        allocator,
+        320,
+        321,
+        &.{ "agents", "self", "missions", "control", "approve.json" },
+        approve_payload,
+        949,
+        "eperm",
+    );
+    defer allocator.free(approve_error);
+
+    const failed_result = try protocolReadFile(
+        &user_session,
+        allocator,
+        322,
+        323,
+        &.{ "agents", "self", "missions", "result.json" },
+        950,
+    );
+    defer allocator.free(failed_result);
+    try std.testing.expect(std.mem.indexOf(u8, failed_result, "\"code\":\"forbidden\"") != null);
+
+    const admin_runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const admin_runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, admin_runtime_server);
+    defer admin_runtime_handle.destroy();
+    var admin_job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer admin_job_index.deinit();
+
+    var admin_session = try Session.initWithOptions(
+        allocator,
+        admin_runtime_handle,
+        &admin_job_index,
+        "default",
+        .{
+            .mission_store = &mission_store,
+            .actor_type = "admin",
+            .actor_id = "operator-1",
+            .is_admin = true,
+        },
+    );
+    defer admin_session.deinit();
+
+    try protocolWriteFile(
+        &admin_session,
+        allocator,
+        324,
+        325,
+        &.{ "agents", "self", "missions", "control", "approve.json" },
+        approve_payload,
+        951,
+    );
+
+    const admin_result = try protocolReadFile(
+        &admin_session,
+        allocator,
+        326,
+        327,
+        &.{ "agents", "self", "missions", "result.json" },
+        952,
+    );
+    defer allocator.free(admin_result);
+    try std.testing.expect(std.mem.indexOf(u8, admin_result, "\"operation\":\"approve\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, admin_result, "\"state\":\"running\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, admin_result, "\"pending_approval\":null") != null);
+}
+
+test "acheron_session: missions invoke_service records successful venom step" {
+    const allocator = std.testing.allocator;
+
+    var mission_store = try mission_store_mod.MissionStore.initWithPath(allocator, null);
+    defer mission_store.deinit();
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "default",
+        .{
+            .mission_store = &mission_store,
+            .actor_type = "agent",
+            .actor_id = "worker-a",
+        },
+    );
+    defer session.deinit();
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        328,
+        329,
+        &.{ "agents", "self", "missions", "control", "create.json" },
+        "{\"use_case\":\"pr_review\",\"title\":\"Review PR 48\",\"contract\":{\"contract_id\":\"spider_monkey/pr_review@v1\",\"context_path\":\"/nodes/local/fs/pr-review/state/pr-48/context.json\"}}",
+        953,
+    );
+    const create_result = try protocolReadFile(
+        &session,
+        allocator,
+        330,
+        331,
+        &.{ "agents", "self", "missions", "result.json" },
+        954,
+    );
+    defer allocator.free(create_result);
+    const mission_id = try extractMissionIdFromResultPayload(allocator, create_result);
+    defer allocator.free(mission_id);
+
+    const resume_payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"mission_id\":\"{s}\",\"stage\":\"running_review\"}}",
+        .{mission_id},
+    );
+    defer allocator.free(resume_payload);
+    try protocolWriteFile(
+        &session,
+        allocator,
+        332,
+        333,
+        &.{ "agents", "self", "missions", "control", "resume.json" },
+        resume_payload,
+        955,
+    );
+
+    const invoke_payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"mission_id\":\"{s}\",\"service_path\":\"/global/memory\",\"stage\":\"collecting_context\",\"summary\":\"Created review memory\",\"op\":\"create\",\"arguments\":{{\"name\":\"mission-review-note\",\"kind\":\"note\",\"content\":{{\"text\":\"mission bridge ok\"}}}},\"contract\":{{\"artifact_root\":\"/nodes/local/fs/pr-review/runs/pr-48\"}}}}",
+        .{mission_id},
+    );
+    defer allocator.free(invoke_payload);
+    try protocolWriteFile(
+        &session,
+        allocator,
+        334,
+        335,
+        &.{ "agents", "self", "missions", "control", "invoke_service.json" },
+        invoke_payload,
+        956,
+    );
+
+    const mission_status = try protocolReadFile(
+        &session,
+        allocator,
+        336,
+        337,
+        &.{ "agents", "self", "missions", "status.json" },
+        957,
+    );
+    defer allocator.free(mission_status);
+    try std.testing.expect(std.mem.indexOf(u8, mission_status, "\"state\":\"done\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mission_status, "\"tool\":\"missions_invoke_service\"") != null);
+
+    const mission_result = try protocolReadFile(
+        &session,
+        allocator,
+        338,
+        339,
+        &.{ "agents", "self", "missions", "result.json" },
+        958,
+    );
+    defer allocator.free(mission_result);
+    try std.testing.expect(std.mem.indexOf(u8, mission_result, "\"operation\":\"invoke_service\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mission_result, "\"ok\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mission_result, "\"service_path\":\"/global/memory\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mission_result, "\"invoke_path\":\"/global/memory/control/invoke.json\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mission_result, "\"mission_id\":\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mission_result, "\"memory_path\":\"/nodes/local/venoms/memory/items/mission-review-note\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mission_result, "\"event_type\":\"mission.service_invoked\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mission_result, "\"kind\":\"service_result\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mission_result, "\"artifact_root\":\"/nodes/local/fs/pr-review/runs/pr-48\"") != null);
+}
+
+test "acheron_session: missions bootstrap_contract materializes contract files in local export root" {
+    const allocator = std.testing.allocator;
+
+    var mission_store = try mission_store_mod.MissionStore.initWithPath(allocator, null);
+    defer mission_store.deinit();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const local_export_root = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(local_export_root);
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "default",
+        .{
+            .mission_store = &mission_store,
+            .local_fs_export_root = local_export_root,
+            .actor_type = "agent",
+            .actor_id = "worker-a",
+        },
+    );
+    defer session.deinit();
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        352,
+        353,
+        &.{ "agents", "self", "missions", "control", "create.json" },
+        "{\"use_case\":\"pr_review\",\"title\":\"Review PR 77\",\"contract\":{\"contract_id\":\"spider_monkey/pr_review@v1\",\"context_path\":\"/nodes/local/fs/pr-review/state/pr-77/context.json\",\"state_path\":\"/nodes/local/fs/pr-review/state/pr-77/state.json\",\"artifact_root\":\"/nodes/local/fs/pr-review/runs/pr-77\"}}",
+        965,
+    );
+    const create_result = try protocolReadFile(
+        &session,
+        allocator,
+        354,
+        355,
+        &.{ "agents", "self", "missions", "result.json" },
+        966,
+    );
+    defer allocator.free(create_result);
+    const mission_id = try extractMissionIdFromResultPayload(allocator, create_result);
+    defer allocator.free(mission_id);
+
+    const bootstrap_payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"mission_id\":\"{s}\",\"stage\":\"bootstrap_context\",\"context\":{{\"repo\":\"DeanoC/Spiderweb\",\"pr_number\":77}},\"state\":{{\"stage\":\"intake\",\"artifacts\":[]}}}}",
+        .{mission_id},
+    );
+    defer allocator.free(bootstrap_payload);
+    try protocolWriteFile(
+        &session,
+        allocator,
+        356,
+        357,
+        &.{ "agents", "self", "missions", "control", "bootstrap_contract.json" },
+        bootstrap_payload,
+        967,
+    );
+
+    const mission_status = try protocolReadFile(
+        &session,
+        allocator,
+        358,
+        359,
+        &.{ "agents", "self", "missions", "status.json" },
+        968,
+    );
+    defer allocator.free(mission_status);
+    try std.testing.expect(std.mem.indexOf(u8, mission_status, "\"state\":\"done\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mission_status, "\"tool\":\"missions_bootstrap_contract\"") != null);
+
+    const mission_result = try protocolReadFile(
+        &session,
+        allocator,
+        360,
+        361,
+        &.{ "agents", "self", "missions", "result.json" },
+        969,
+    );
+    defer allocator.free(mission_result);
+    try std.testing.expect(std.mem.indexOf(u8, mission_result, "\"operation\":\"bootstrap_contract\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mission_result, "\"ok\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mission_result, "\"stage\":\"bootstrap_context\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mission_result, "\"contract_id\":\"spider_monkey/pr_review@v1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mission_result, "\"context_path\":\"/nodes/local/fs/pr-review/state/pr-77/context.json\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mission_result, "\"state_path\":\"/nodes/local/fs/pr-review/state/pr-77/state.json\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mission_result, "\"artifact_root\":\"/nodes/local/fs/pr-review/runs/pr-77\"") != null);
+
+    const context_host_path = try std.fs.path.join(allocator, &.{ local_export_root, "pr-review", "state", "pr-77", "context.json" });
+    defer allocator.free(context_host_path);
+    const context_content = try std.fs.cwd().readFileAlloc(allocator, context_host_path, 64 * 1024);
+    defer allocator.free(context_content);
+    try std.testing.expect(std.mem.indexOf(u8, context_content, "\"repo\":\"DeanoC/Spiderweb\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, context_content, "\"pr_number\":77") != null);
+
+    const state_host_path = try std.fs.path.join(allocator, &.{ local_export_root, "pr-review", "state", "pr-77", "state.json" });
+    defer allocator.free(state_host_path);
+    const state_content = try std.fs.cwd().readFileAlloc(allocator, state_host_path, 64 * 1024);
+    defer allocator.free(state_content);
+    try std.testing.expect(std.mem.indexOf(u8, state_content, "\"stage\":\"intake\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, state_content, "\"artifacts\":[]") != null);
+
+    const artifact_root_host_path = try std.fs.path.join(allocator, &.{ local_export_root, "pr-review", "runs", "pr-77" });
+    defer allocator.free(artifact_root_host_path);
+    var artifact_root_dir = try std.fs.openDirAbsolute(artifact_root_host_path, .{});
+    artifact_root_dir.close();
+}
+
+test "acheron_session: pr_review venom starts a mission and bootstraps contract files" {
+    const allocator = std.testing.allocator;
+
+    var mission_store = try mission_store_mod.MissionStore.initWithPath(allocator, null);
+    defer mission_store.deinit();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const local_export_root = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(local_export_root);
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "default",
+        .{
+            .mission_store = &mission_store,
+            .local_fs_export_root = local_export_root,
+            .actor_type = "agent",
+            .actor_id = "reviewer-a",
+        },
+    );
+    defer session.deinit();
+
+    const venoms_payload = try protocolReadFile(
+        &session,
+        allocator,
+        362,
+        363,
+        &.{ "agents", "self", "venoms", "VENOMS.json" },
+        970,
+    );
+    defer allocator.free(venoms_payload);
+    try std.testing.expect(std.mem.indexOf(u8, venoms_payload, "\"venom_path\":\"/nodes/local/venoms/pr_review\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, venoms_payload, "\"invoke_path\":\"/nodes/local/venoms/pr_review/control/invoke.json\"") != null);
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        364,
+        365,
+        &.{ "agents", "self", "pr_review", "control", "start.json" },
+        "{\"repo_key\":\"DeanoC/Spiderweb\",\"pr_number\":123,\"head_sha\":\"abc123\",\"default_review_commands\":[\"zig build\",\"zig build test\"]}",
+        971,
+    );
+
+    const pr_review_status = try protocolReadFile(
+        &session,
+        allocator,
+        366,
+        367,
+        &.{ "agents", "self", "pr_review", "status.json" },
+        972,
+    );
+    defer allocator.free(pr_review_status);
+    try std.testing.expect(std.mem.indexOf(u8, pr_review_status, "\"state\":\"done\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pr_review_status, "\"tool\":\"pr_review_start\"") != null);
+
+    const pr_review_result = try protocolReadFile(
+        &session,
+        allocator,
+        368,
+        369,
+        &.{ "agents", "self", "pr_review", "result.json" },
+        973,
+    );
+    defer allocator.free(pr_review_result);
+    try std.testing.expect(std.mem.indexOf(u8, pr_review_result, "\"operation\":\"start\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pr_review_result, "\"use_case\":\"pr_review\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pr_review_result, "\"repo_key\":\"DeanoC/Spiderweb\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pr_review_result, "\"checkout_path\":\"/nodes/local/fs/pr-review/repos/DeanoC__Spiderweb\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pr_review_result, "\"context_path\":\"/nodes/local/fs/pr-review/state/DeanoC__Spiderweb/pr-123/context.json\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pr_review_result, "\"state_path\":\"/nodes/local/fs/pr-review/state/DeanoC__Spiderweb/pr-123/state.json\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pr_review_result, "\"artifact_root\":\"/nodes/local/fs/pr-review/runs/DeanoC__Spiderweb/pr-123\"") != null);
+
+    const context_host_path = try std.fs.path.join(allocator, &.{ local_export_root, "pr-review", "state", "DeanoC__Spiderweb", "pr-123", "context.json" });
+    defer allocator.free(context_host_path);
+    const context_content = try std.fs.cwd().readFileAlloc(allocator, context_host_path, 64 * 1024);
+    defer allocator.free(context_content);
+    try std.testing.expect(std.mem.indexOf(u8, context_content, "\"repo_key\":\"DeanoC/Spiderweb\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, context_content, "\"pr_url\":\"https://github.com/DeanoC/Spiderweb/pull/123\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, context_content, "\"default_review_commands\":[\"zig build\",\"zig build test\"]") != null);
+
+    const state_host_path = try std.fs.path.join(allocator, &.{ local_export_root, "pr-review", "state", "DeanoC__Spiderweb", "pr-123", "state.json" });
+    defer allocator.free(state_host_path);
+    const state_content = try std.fs.cwd().readFileAlloc(allocator, state_host_path, 64 * 1024);
+    defer allocator.free(state_content);
+    try std.testing.expect(std.mem.indexOf(u8, state_content, "\"last_synced_head_sha\":\"abc123\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, state_content, "\"latest_recommendation\":{\"status\":\"pending\"") != null);
+
+    const artifact_root_host_path = try std.fs.path.join(allocator, &.{ local_export_root, "pr-review", "runs", "DeanoC__Spiderweb", "pr-123" });
+    defer allocator.free(artifact_root_host_path);
+    var artifact_root_dir = try std.fs.openDirAbsolute(artifact_root_host_path, .{});
+    artifact_root_dir.close();
+}
+
+test "acheron_session: pr_review repo onboarding persists config and start uses defaults" {
+    const allocator = std.testing.allocator;
+
+    var mission_store = try mission_store_mod.MissionStore.initWithPath(allocator, null);
+    defer mission_store.deinit();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const local_export_root = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(local_export_root);
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "default",
+        .{
+            .mission_store = &mission_store,
+            .local_fs_export_root = local_export_root,
+            .actor_type = "agent",
+            .actor_id = "reviewer-config",
+        },
+    );
+    defer session.deinit();
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        390,
+        391,
+        &.{ "agents", "self", "pr_review", "control", "configure_repo.json" },
+        "{\"repo_key\":\"DeanoC/Spiderweb\",\"provider\":\"github\",\"default_branch\":\"stable\",\"checkout_path\":\"/nodes/local/fs/pr-review/repos/spiderweb-configured\",\"review_policy_paths\":[\"/nodes/local/fs/policy/pr-review.md\"],\"default_review_commands\":[\"zig build test\"],\"approval_policy\":{\"push_fix_requires_approval\":true,\"merge_requires_approval\":false},\"auto_intake\":true,\"project_id\":\"proj-review\",\"agent_id\":\"reviewer-config\",\"workspace_root\":\"/nodes/local/fs/pr-review/workspaces/spiderweb-configured\",\"worktree_name\":\"review-pr\"}",
+        981,
+    );
+
+    const configure_status = try protocolReadFile(
+        &session,
+        allocator,
+        392,
+        393,
+        &.{ "agents", "self", "pr_review", "status.json" },
+        982,
+    );
+    defer allocator.free(configure_status);
+    try std.testing.expect(std.mem.indexOf(u8, configure_status, "\"state\":\"done\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, configure_status, "\"tool\":\"pr_review_configure_repo\"") != null);
+
+    const configure_result = try protocolReadFile(
+        &session,
+        allocator,
+        394,
+        395,
+        &.{ "agents", "self", "pr_review", "result.json" },
+        983,
+    );
+    defer allocator.free(configure_result);
+    try std.testing.expect(std.mem.indexOf(u8, configure_result, "\"operation\":\"configure_repo\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, configure_result, "\"repo_key\":\"DeanoC/Spiderweb\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, configure_result, "\"repositories_count\":1") != null);
+
+    const get_payload = "{\"repo_key\":\"DeanoC/Spiderweb\"}";
+    try protocolWriteFile(
+        &session,
+        allocator,
+        396,
+        397,
+        &.{ "agents", "self", "pr_review", "control", "get_repo.json" },
+        get_payload,
+        984,
+    );
+
+    const get_result = try protocolReadFile(
+        &session,
+        allocator,
+        398,
+        399,
+        &.{ "agents", "self", "pr_review", "result.json" },
+        985,
+    );
+    defer allocator.free(get_result);
+    try std.testing.expect(std.mem.indexOf(u8, get_result, "\"operation\":\"get_repo\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, get_result, "\"default_branch\":\"stable\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, get_result, "\"auto_intake\":true") != null);
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        400,
+        401,
+        &.{ "agents", "self", "pr_review", "control", "list_repos.json" },
+        "{}",
+        986,
+    );
+
+    const list_result = try protocolReadFile(
+        &session,
+        allocator,
+        402,
+        403,
+        &.{ "agents", "self", "pr_review", "result.json" },
+        987,
+    );
+    defer allocator.free(list_result);
+    try std.testing.expect(std.mem.indexOf(u8, list_result, "\"operation\":\"list_repos\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, list_result, "\"repositories\":[") != null);
+    try std.testing.expect(std.mem.indexOf(u8, list_result, "\"repo_key\":\"DeanoC/Spiderweb\"") != null);
+
+    const repo_catalog_host_path = try std.fs.path.join(allocator, &.{ local_export_root, "pr-review", "state", "repos.json" });
+    defer allocator.free(repo_catalog_host_path);
+    const repo_catalog_content = try std.fs.cwd().readFileAlloc(allocator, repo_catalog_host_path, 64 * 1024);
+    defer allocator.free(repo_catalog_content);
+    try std.testing.expect(std.mem.indexOf(u8, repo_catalog_content, "\"repo_key\":\"DeanoC/Spiderweb\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, repo_catalog_content, "\"auto_intake\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, repo_catalog_content, "\"checkout_path\":\"/nodes/local/fs/pr-review/repos/spiderweb-configured\"") != null);
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        404,
+        405,
+        &.{ "agents", "self", "pr_review", "control", "start.json" },
+        "{\"repo_key\":\"DeanoC/Spiderweb\",\"pr_number\":223,\"head_sha\":\"cfg223\"}",
+        988,
+    );
+
+    const start_result = try protocolReadFile(
+        &session,
+        allocator,
+        406,
+        407,
+        &.{ "agents", "self", "pr_review", "result.json" },
+        989,
+    );
+    defer allocator.free(start_result);
+    try std.testing.expect(std.mem.indexOf(u8, start_result, "\"operation\":\"start\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, start_result, "\"checkout_path\":\"/nodes/local/fs/pr-review/repos/spiderweb-configured\"") != null);
+
+    const context_host_path = try std.fs.path.join(allocator, &.{ local_export_root, "pr-review", "state", "DeanoC__Spiderweb", "pr-223", "context.json" });
+    defer allocator.free(context_host_path);
+    const context_content = try std.fs.cwd().readFileAlloc(allocator, context_host_path, 64 * 1024);
+    defer allocator.free(context_content);
+    try std.testing.expect(std.mem.indexOf(u8, context_content, "\"base_branch\":\"stable\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, context_content, "\"checkout_path\":\"/nodes/local/fs/pr-review/repos/spiderweb-configured\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, context_content, "\"default_review_commands\":[\"zig build test\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, context_content, "\"review_policy_paths\":[\"/nodes/local/fs/policy/pr-review.md\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, context_content, "\"push_fix_requires_approval\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, context_content, "\"merge_requires_approval\":false") != null);
+}
+
+test "acheron_session: pr_review repo onboarding accepts workspace root checkout path" {
+    const allocator = std.testing.allocator;
+
+    var mission_store = try mission_store_mod.MissionStore.initWithPath(allocator, null);
+    defer mission_store.deinit();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const local_export_root = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(local_export_root);
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "default",
+        .{
+            .mission_store = &mission_store,
+            .local_fs_export_root = local_export_root,
+            .actor_type = "agent",
+            .actor_id = "reviewer-root",
+        },
+    );
+    defer session.deinit();
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        408,
+        409,
+        &.{ "agents", "self", "pr_review", "control", "configure_repo.json" },
+        "{\"repo_key\":\"DeanoC/Spiderweb\",\"provider\":\"github\",\"checkout_path\":\"/nodes/local/fs\",\"default_review_commands\":[\"zig build test\"],\"workspace_root\":\"/nodes/local/fs\",\"worktree_name\":\"root-review\"}",
+        990,
+    );
+
+    const configure_result = try protocolReadFile(
+        &session,
+        allocator,
+        410,
+        411,
+        &.{ "agents", "self", "pr_review", "result.json" },
+        991,
+    );
+    defer allocator.free(configure_result);
+    try std.testing.expect(std.mem.indexOf(u8, configure_result, "\"operation\":\"configure_repo\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, configure_result, "\"checkout_path\":\"/nodes/local/fs\"") != null);
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        412,
+        413,
+        &.{ "agents", "self", "pr_review", "control", "start.json" },
+        "{\"repo_key\":\"DeanoC/Spiderweb\",\"pr_number\":224,\"head_sha\":\"cfg224\"}",
+        992,
+    );
+
+    const start_result = try protocolReadFile(
+        &session,
+        allocator,
+        414,
+        415,
+        &.{ "agents", "self", "pr_review", "result.json" },
+        993,
+    );
+    defer allocator.free(start_result);
+    try std.testing.expect(std.mem.indexOf(u8, start_result, "\"operation\":\"start\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, start_result, "\"checkout_path\":\"/nodes/local/fs\"") != null);
+
+    const context_host_path = try std.fs.path.join(allocator, &.{ local_export_root, "pr-review", "state", "DeanoC__Spiderweb", "pr-224", "context.json" });
+    defer allocator.free(context_host_path);
+    const context_content = try std.fs.cwd().readFileAlloc(allocator, context_host_path, 64 * 1024);
+    defer allocator.free(context_content);
+    try std.testing.expect(std.mem.indexOf(u8, context_content, "\"checkout_path\":\"/nodes/local/fs\"") != null);
+}
+
+test "acheron_session: pr_review venom intake bootstraps mission from provider sync" {
+    const allocator = std.testing.allocator;
+
+    var mission_store = try mission_store_mod.MissionStore.initWithPath(allocator, null);
+    defer mission_store.deinit();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const local_export_root = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(local_export_root);
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "default",
+        .{
+            .mission_store = &mission_store,
+            .local_fs_export_root = local_export_root,
+            .actor_type = "agent",
+            .actor_id = "reviewer-intake",
+        },
+    );
+    defer session.deinit();
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        369,
+        370,
+        &.{ "agents", "self", "pr_review", "control", "intake.json" },
+        "{\"repo_key\":\"DeanoC/Spiderweb\",\"pr_number\":125,\"provider_sync\":{\"dry_run\":true},\"default_review_commands\":[\"zig build test\"]}",
+        973,
+    );
+
+    const pr_review_status = try protocolReadFile(
+        &session,
+        allocator,
+        371,
+        372,
+        &.{ "agents", "self", "pr_review", "status.json" },
+        974,
+    );
+    defer allocator.free(pr_review_status);
+    try std.testing.expect(std.mem.indexOf(u8, pr_review_status, "\"state\":\"done\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pr_review_status, "\"tool\":\"pr_review_intake\"") != null);
+
+    const pr_review_result = try protocolReadFile(
+        &session,
+        allocator,
+        373,
+        374,
+        &.{ "agents", "self", "pr_review", "result.json" },
+        975,
+    );
+    defer allocator.free(pr_review_result);
+    try std.testing.expect(std.mem.indexOf(u8, pr_review_result, "\"operation\":\"intake\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pr_review_result, "\"use_case\":\"pr_review\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pr_review_result, "\"provider_sync_path\":\"/nodes/local/fs/pr-review/runs/DeanoC__Spiderweb/pr-125/services/provider-sync.json\"") != null);
+
+    const context_host_path = try std.fs.path.join(allocator, &.{ local_export_root, "pr-review", "state", "DeanoC__Spiderweb", "pr-125", "context.json" });
+    defer allocator.free(context_host_path);
+    const context_content = try std.fs.cwd().readFileAlloc(allocator, context_host_path, 64 * 1024);
+    defer allocator.free(context_content);
+    try std.testing.expect(std.mem.indexOf(u8, context_content, "\"repo_key\":\"DeanoC/Spiderweb\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, context_content, "\"default_review_commands\":[\"zig build test\"]") != null);
+
+    const provider_sync_path = try std.fs.path.join(allocator, &.{ local_export_root, "pr-review", "runs", "DeanoC__Spiderweb", "pr-125", "services", "provider-sync.json" });
+    defer allocator.free(provider_sync_path);
+    const provider_sync_content = try std.fs.cwd().readFileAlloc(allocator, provider_sync_path, 64 * 1024);
+    defer allocator.free(provider_sync_content);
+    try std.testing.expect(std.mem.indexOf(u8, provider_sync_content, "\"service_path\":\"/nodes/local/venoms/github_pr\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, provider_sync_content, "\"dry_run\":true") != null);
+}
+
+test "acheron_session: github_pr ingest_event uses configured repo onboarding defaults" {
+    const allocator = std.testing.allocator;
+
+    var mission_store = try mission_store_mod.MissionStore.initWithPath(allocator, null);
+    defer mission_store.deinit();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const local_export_root = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(local_export_root);
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "default",
+        .{
+            .mission_store = &mission_store,
+            .local_fs_export_root = local_export_root,
+            .actor_type = "agent",
+            .actor_id = "reviewer-ingest-config",
+        },
+    );
+    defer session.deinit();
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        408,
+        409,
+        &.{ "agents", "self", "pr_review", "control", "configure_repo.json" },
+        "{\"repo_key\":\"DeanoC/Spiderweb\",\"default_branch\":\"release\",\"checkout_path\":\"/nodes/local/fs/pr-review/repos/ingest-defaults\",\"default_review_commands\":[\"zig build\"],\"approval_policy\":{\"push_fix_requires_approval\":false,\"merge_requires_approval\":true},\"auto_intake\":true}",
+        990,
+    );
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        410,
+        411,
+        &.{ "agents", "self", "github_pr", "control", "ingest_event.json" },
+        "{\"repo_key\":\"DeanoC/Spiderweb\",\"pr_number\":129,\"action\":\"edited\",\"title\":\"Config-backed intake\",\"head_sha\":\"def129\"}",
+        991,
+    );
+
+    const github_pr_result = try protocolReadFile(
+        &session,
+        allocator,
+        412,
+        413,
+        &.{ "agents", "self", "github_pr", "result.json" },
+        992,
+    );
+    defer allocator.free(github_pr_result);
+    try std.testing.expect(std.mem.indexOf(u8, github_pr_result, "\"operation\":\"ingest_event\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, github_pr_result, "\"mission_action\":\"created\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, github_pr_result, "\"run_id\":\"pr_review:DeanoC__Spiderweb:129\"") != null);
+
+    const mission_id = try extractMissionIdFromResultPayload(allocator, github_pr_result);
+    defer allocator.free(mission_id);
+    try std.testing.expect(mission_id.len > 0);
+
+    const context_host_path = try std.fs.path.join(allocator, &.{ local_export_root, "pr-review", "state", "DeanoC__Spiderweb", "pr-129", "context.json" });
+    defer allocator.free(context_host_path);
+    const context_content = try std.fs.cwd().readFileAlloc(allocator, context_host_path, 64 * 1024);
+    defer allocator.free(context_content);
+    try std.testing.expect(std.mem.indexOf(u8, context_content, "\"base_branch\":\"release\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, context_content, "\"checkout_path\":\"/nodes/local/fs/pr-review/repos/ingest-defaults\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, context_content, "\"default_review_commands\":[\"zig build\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, context_content, "\"pr_url\":\"https://github.com/DeanoC/Spiderweb/pull/129\"") != null);
+}
+
+test "acheron_session: pr_review venom syncs state and records review artifacts" {
+    const allocator = std.testing.allocator;
+
+    var mission_store = try mission_store_mod.MissionStore.initWithPath(allocator, null);
+    defer mission_store.deinit();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const local_export_root = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(local_export_root);
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "default",
+        .{
+            .mission_store = &mission_store,
+            .local_fs_export_root = local_export_root,
+            .actor_type = "agent",
+            .actor_id = "reviewer-a",
+        },
+    );
+    defer session.deinit();
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        370,
+        371,
+        &.{ "agents", "self", "pr_review", "control", "start.json" },
+        "{\"repo_key\":\"DeanoC/Spiderweb\",\"pr_number\":124,\"head_sha\":\"abc124\"}",
+        974,
+    );
+
+    const start_result = try protocolReadFile(
+        &session,
+        allocator,
+        372,
+        373,
+        &.{ "agents", "self", "pr_review", "result.json" },
+        975,
+    );
+    defer allocator.free(start_result);
+    const mission_id = try extractMissionIdFromResultPayload(allocator, start_result);
+    defer allocator.free(mission_id);
+
+    const sync_payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"mission_id\":\"{s}\",\"phase\":\"ready_for_checkout\",\"current_focus\":\"Fetch PR branch\",\"open_threads\":[{{\"id\":\"thread-1\",\"status\":\"open\"}}],\"notes\":[\"queued for checkout\"],\"thread_actions\":[{{\"thread_id\":\"thread-1\",\"action\":\"observe\"}}]}}",
+        .{mission_id},
+    );
+    defer allocator.free(sync_payload);
+    try protocolWriteFile(
+        &session,
+        allocator,
+        374,
+        375,
+        &.{ "agents", "self", "pr_review", "control", "sync.json" },
+        sync_payload,
+        976,
+    );
+
+    const validation_payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"mission_id\":\"{s}\",\"head_sha\":\"def456\",\"validation\":{{\"status\":\"passed\",\"summary\":\"zig build test passed\",\"commands\":[\"zig build test\"]}}}}",
+        .{mission_id},
+    );
+    defer allocator.free(validation_payload);
+    try protocolWriteFile(
+        &session,
+        allocator,
+        376,
+        377,
+        &.{ "agents", "self", "pr_review", "control", "record_validation.json" },
+        validation_payload,
+        977,
+    );
+
+    const review_payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"mission_id\":\"{s}\",\"findings\":[{{\"severity\":\"high\",\"type\":\"correctness\",\"path\":\"src/example.zig\",\"line\":42,\"message\":\"Handle null response\"}}],\"recommendation\":{{\"decision\":\"request_changes\",\"summary\":\"One correctness issue remains\"}},\"review_comment\":\"Please handle the null response before merging.\",\"thread_actions\":[{{\"thread_id\":\"thread-1\",\"action\":\"comment\"}}]}}",
+        .{mission_id},
+    );
+    defer allocator.free(review_payload);
+    try protocolWriteFile(
+        &session,
+        allocator,
+        378,
+        379,
+        &.{ "agents", "self", "pr_review", "control", "record_review.json" },
+        review_payload,
+        978,
+    );
+
+    const pr_review_status = try protocolReadFile(
+        &session,
+        allocator,
+        380,
+        381,
+        &.{ "agents", "self", "pr_review", "status.json" },
+        979,
+    );
+    defer allocator.free(pr_review_status);
+    try std.testing.expect(std.mem.indexOf(u8, pr_review_status, "\"state\":\"done\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pr_review_status, "\"tool\":\"pr_review_record_review\"") != null);
+
+    const pr_review_result = try protocolReadFile(
+        &session,
+        allocator,
+        382,
+        383,
+        &.{ "agents", "self", "pr_review", "result.json" },
+        980,
+    );
+    defer allocator.free(pr_review_result);
+    try std.testing.expect(std.mem.indexOf(u8, pr_review_result, "\"operation\":\"record_review\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pr_review_result, "\"phase\":\"awaiting_author\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pr_review_result, "\"findings_path\":\"/nodes/local/fs/pr-review/runs/DeanoC__Spiderweb/pr-124/findings.json\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pr_review_result, "\"recommendation_path\":\"/nodes/local/fs/pr-review/runs/DeanoC__Spiderweb/pr-124/recommendation.json\"") != null);
+
+    const state_host_path = try std.fs.path.join(allocator, &.{ local_export_root, "pr-review", "state", "DeanoC__Spiderweb", "pr-124", "state.json" });
+    defer allocator.free(state_host_path);
+    const state_content = try std.fs.cwd().readFileAlloc(allocator, state_host_path, 64 * 1024);
+    defer allocator.free(state_content);
+    try std.testing.expect(std.mem.indexOf(u8, state_content, "\"phase\":\"awaiting_author\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, state_content, "\"last_synced_head_sha\":\"def456\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, state_content, "\"current_focus\":\"Fetch PR branch\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, state_content, "\"latest_validation\":{\"status\":\"passed\",\"summary\":\"zig build test passed\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, state_content, "\"latest_recommendation\":{\"status\":\"request_changes\",\"summary\":\"One correctness issue remains\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, state_content, "\"open_threads\":[{\"id\":\"thread-1\",\"status\":\"open\"}]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, state_content, "\"notes\":[\"queued for checkout\"]") != null);
+
+    const validation_host_path = try std.fs.path.join(allocator, &.{ local_export_root, "pr-review", "runs", "DeanoC__Spiderweb", "pr-124", "validation.json" });
+    defer allocator.free(validation_host_path);
+    const validation_content = try std.fs.cwd().readFileAlloc(allocator, validation_host_path, 64 * 1024);
+    defer allocator.free(validation_content);
+    try std.testing.expect(std.mem.indexOf(u8, validation_content, "\"status\":\"passed\"") != null);
+
+    const findings_host_path = try std.fs.path.join(allocator, &.{ local_export_root, "pr-review", "runs", "DeanoC__Spiderweb", "pr-124", "findings.json" });
+    defer allocator.free(findings_host_path);
+    const findings_content = try std.fs.cwd().readFileAlloc(allocator, findings_host_path, 64 * 1024);
+    defer allocator.free(findings_content);
+    try std.testing.expect(std.mem.indexOf(u8, findings_content, "\"severity\":\"high\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, findings_content, "\"message\":\"Handle null response\"") != null);
+
+    const recommendation_host_path = try std.fs.path.join(allocator, &.{ local_export_root, "pr-review", "runs", "DeanoC__Spiderweb", "pr-124", "recommendation.json" });
+    defer allocator.free(recommendation_host_path);
+    const recommendation_content = try std.fs.cwd().readFileAlloc(allocator, recommendation_host_path, 64 * 1024);
+    defer allocator.free(recommendation_content);
+    try std.testing.expect(std.mem.indexOf(u8, recommendation_content, "\"decision\":\"request_changes\"") != null);
+
+    const review_comment_host_path = try std.fs.path.join(allocator, &.{ local_export_root, "pr-review", "runs", "DeanoC__Spiderweb", "pr-124", "review-comment.md" });
+    defer allocator.free(review_comment_host_path);
+    const review_comment_content = try std.fs.cwd().readFileAlloc(allocator, review_comment_host_path, 64 * 1024);
+    defer allocator.free(review_comment_content);
+    try std.testing.expectEqualStrings("Please handle the null response before merging.", review_comment_content);
+
+    const thread_actions_host_path = try std.fs.path.join(allocator, &.{ local_export_root, "pr-review", "runs", "DeanoC__Spiderweb", "pr-124", "thread-actions.json" });
+    defer allocator.free(thread_actions_host_path);
+    const thread_actions_content = try std.fs.cwd().readFileAlloc(allocator, thread_actions_host_path, 64 * 1024);
+    defer allocator.free(thread_actions_content);
+    try std.testing.expect(std.mem.indexOf(u8, thread_actions_content, "\"action\":\"comment\"") != null);
+}
+
+test "acheron_session: pr_review venom orchestrates repo services and review publication" {
+    const allocator = std.testing.allocator;
+
+    var mission_store = try mission_store_mod.MissionStore.initWithPath(allocator, null);
+    defer mission_store.deinit();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const root = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+    const exports_dir = try std.fmt.allocPrint(allocator, "{s}/exports", .{root});
+    defer allocator.free(exports_dir);
+    const seed_dir = try std.fmt.allocPrint(allocator, "{s}/seed", .{root});
+    defer allocator.free(seed_dir);
+    const remote_dir = try std.fmt.allocPrint(allocator, "{s}/remote.git", .{root});
+    defer allocator.free(remote_dir);
+    try std.fs.cwd().makePath(exports_dir);
+
+    _ = try runTestCommandCapture(allocator, root, &.{ "git", "init", "seed" });
+    _ = try runTestCommandCapture(allocator, root, &.{ "git", "-C", seed_dir, "config", "user.email", "spider@example.com" });
+    _ = try runTestCommandCapture(allocator, root, &.{ "git", "-C", seed_dir, "config", "user.name", "Spider Monkey" });
+
+    const readme_path = try std.fmt.allocPrint(allocator, "{s}/README.md", .{seed_dir});
+    defer allocator.free(readme_path);
+    try std.fs.cwd().writeFile(.{ .sub_path = readme_path, .data = "hello\n" });
+    _ = try runTestCommandCapture(allocator, root, &.{ "git", "-C", seed_dir, "add", "README.md" });
+    _ = try runTestCommandCapture(allocator, root, &.{ "git", "-C", seed_dir, "commit", "-m", "initial" });
+    _ = try runTestCommandCapture(allocator, root, &.{ "git", "-C", seed_dir, "branch", "-M", "main" });
+
+    const first_sha_raw = try runTestCommandCapture(allocator, root, &.{ "git", "-C", seed_dir, "rev-parse", "HEAD" });
+    defer allocator.free(first_sha_raw);
+    const first_sha = std.mem.trim(u8, first_sha_raw, " \t\r\n");
+
+    const src_dir = try std.fmt.allocPrint(allocator, "{s}/src", .{seed_dir});
+    defer allocator.free(src_dir);
+    try std.fs.cwd().makePath(src_dir);
+    const app_path = try std.fmt.allocPrint(allocator, "{s}/src/app.txt", .{seed_dir});
+    defer allocator.free(app_path);
+    try std.fs.cwd().writeFile(.{ .sub_path = app_path, .data = "second\n" });
+    _ = try runTestCommandCapture(allocator, root, &.{ "git", "-C", seed_dir, "add", "src/app.txt" });
+    _ = try runTestCommandCapture(allocator, root, &.{ "git", "-C", seed_dir, "commit", "-m", "second" });
+
+    const second_sha_raw = try runTestCommandCapture(allocator, root, &.{ "git", "-C", seed_dir, "rev-parse", "HEAD" });
+    defer allocator.free(second_sha_raw);
+    const second_sha = std.mem.trim(u8, second_sha_raw, " \t\r\n");
+
+    _ = try runTestCommandCapture(allocator, root, &.{ "git", "init", "--bare", "remote.git" });
+    _ = try runTestCommandCapture(allocator, root, &.{ "git", "-C", seed_dir, "remote", "add", "origin", remote_dir });
+    _ = try runTestCommandCapture(allocator, root, &.{ "git", "-C", seed_dir, "push", "-u", "origin", "main" });
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "default",
+        .{
+            .mission_store = &mission_store,
+            .local_fs_export_root = exports_dir,
+            .actor_type = "agent",
+            .actor_id = "reviewer-b",
+        },
+    );
+    defer session.deinit();
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        700,
+        701,
+        &.{ "agents", "self", "pr_review", "control", "start.json" },
+        "{\"repo_key\":\"DeanoC/Spiderweb\",\"pr_number\":77,\"head_sha\":\"pending\"}",
+        1800,
+    );
+
+    const start_result = try protocolReadFile(
+        &session,
+        allocator,
+        702,
+        703,
+        &.{ "agents", "self", "pr_review", "result.json" },
+        1801,
+    );
+    defer allocator.free(start_result);
+    const mission_id = try extractMissionIdFromResultPayload(allocator, start_result);
+    defer allocator.free(mission_id);
+
+    const sync_payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"mission_id\":\"{s}\",\"phase\":\"ready_for_checkout\",\"current_focus\":\"Sync repo services\",\"provider_sync\":{{\"dry_run\":true}},\"sync_checkout\":{{\"repo_url\":\"{s}\",\"pr_number\":null,\"head_branch\":\"main\"}},\"repo_status\":{{\"base_ref\":\"{s}\"}},\"diff_range\":{{\"base_ref\":\"{s}\",\"head_ref\":\"HEAD\"}}}}",
+        .{ mission_id, remote_dir, first_sha, first_sha },
+    );
+    defer allocator.free(sync_payload);
+    try protocolWriteFile(
+        &session,
+        allocator,
+        704,
+        705,
+        &.{ "agents", "self", "pr_review", "control", "sync.json" },
+        sync_payload,
+        1802,
+    );
+
+    const sync_result = try protocolReadFile(
+        &session,
+        allocator,
+        706,
+        707,
+        &.{ "agents", "self", "pr_review", "result.json" },
+        1803,
+    );
+    defer allocator.free(sync_result);
+    try std.testing.expect(std.mem.indexOf(u8, sync_result, "\"operation\":\"sync\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sync_result, "\"provider_sync_path\":\"/nodes/local/fs/pr-review/runs/DeanoC__Spiderweb/pr-77/services/provider-sync.json\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sync_result, "\"checkout_sync_path\":\"/nodes/local/fs/pr-review/runs/DeanoC__Spiderweb/pr-77/services/checkout.json\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sync_result, "\"repo_status_path\":\"/nodes/local/fs/pr-review/runs/DeanoC__Spiderweb/pr-77/services/repo-status.json\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sync_result, "\"diff_range_path\":\"/nodes/local/fs/pr-review/runs/DeanoC__Spiderweb/pr-77/services/diff-range.json\"") != null);
+
+    const context_host_path = try std.fs.path.join(allocator, &.{ exports_dir, "pr-review", "state", "DeanoC__Spiderweb", "pr-77", "context.json" });
+    defer allocator.free(context_host_path);
+    const context_content = try std.fs.cwd().readFileAlloc(allocator, context_host_path, 64 * 1024);
+    defer allocator.free(context_content);
+    try std.testing.expect(std.mem.indexOf(u8, context_content, "\"head_branch\":\"main\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, context_content, second_sha) != null);
+
+    const state_host_path = try std.fs.path.join(allocator, &.{ exports_dir, "pr-review", "state", "DeanoC__Spiderweb", "pr-77", "state.json" });
+    defer allocator.free(state_host_path);
+    const state_content = try std.fs.cwd().readFileAlloc(allocator, state_host_path, 64 * 1024);
+    defer allocator.free(state_content);
+    try std.testing.expect(std.mem.indexOf(u8, state_content, second_sha) != null);
+    try std.testing.expect(std.mem.indexOf(u8, state_content, "\"provider_sync\":\"services/provider-sync.json\"") != null);
+
+    const provider_sync_path = try std.fs.path.join(allocator, &.{ exports_dir, "pr-review", "runs", "DeanoC__Spiderweb", "pr-77", "services", "provider-sync.json" });
+    defer allocator.free(provider_sync_path);
+    const provider_sync_content = try std.fs.cwd().readFileAlloc(allocator, provider_sync_path, 64 * 1024);
+    defer allocator.free(provider_sync_content);
+    try std.testing.expect(std.mem.indexOf(u8, provider_sync_content, "\"service_path\":\"/nodes/local/venoms/github_pr\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, provider_sync_content, "\"dry_run\":true") != null);
+
+    const checkout_capture_path = try std.fs.path.join(allocator, &.{ exports_dir, "pr-review", "runs", "DeanoC__Spiderweb", "pr-77", "services", "checkout.json" });
+    defer allocator.free(checkout_capture_path);
+    const checkout_capture_content = try std.fs.cwd().readFileAlloc(allocator, checkout_capture_path, 64 * 1024);
+    defer allocator.free(checkout_capture_content);
+    try std.testing.expect(std.mem.indexOf(u8, checkout_capture_content, "\"service_path\":\"/nodes/local/venoms/git\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, checkout_capture_content, second_sha) != null);
+
+    const repo_status_capture_path = try std.fs.path.join(allocator, &.{ exports_dir, "pr-review", "runs", "DeanoC__Spiderweb", "pr-77", "services", "repo-status.json" });
+    defer allocator.free(repo_status_capture_path);
+    const repo_status_capture_content = try std.fs.cwd().readFileAlloc(allocator, repo_status_capture_path, 64 * 1024);
+    defer allocator.free(repo_status_capture_content);
+    try std.testing.expect(std.mem.indexOf(u8, repo_status_capture_content, "\"changed_files\":[\"src/app.txt\"]") != null);
+
+    const diff_range_capture_path = try std.fs.path.join(allocator, &.{ exports_dir, "pr-review", "runs", "DeanoC__Spiderweb", "pr-77", "services", "diff-range.json" });
+    defer allocator.free(diff_range_capture_path);
+    const diff_range_capture_content = try std.fs.cwd().readFileAlloc(allocator, diff_range_capture_path, 64 * 1024);
+    defer allocator.free(diff_range_capture_content);
+    try std.testing.expect(std.mem.indexOf(u8, diff_range_capture_content, "\"changed_files\":[\"src/app.txt\"]") != null);
+
+    const review_payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"mission_id\":\"{s}\",\"findings\":[{{\"severity\":\"medium\",\"type\":\"maintainability\",\"path\":\"src/app.txt\",\"line\":1,\"message\":\"Add coverage for PR review orchestration\"}}],\"recommendation\":{{\"decision\":\"request_changes\",\"summary\":\"Capture the missing regression tests\"}},\"review_comment\":\"Please add regression coverage before merging.\",\"thread_actions\":[{{\"thread_id\":\"t-77\",\"action\":\"comment\"}}],\"publish_review\":{{\"dry_run\":true}}}}",
+        .{mission_id},
+    );
+    defer allocator.free(review_payload);
+    try protocolWriteFile(
+        &session,
+        allocator,
+        708,
+        709,
+        &.{ "agents", "self", "pr_review", "control", "record_review.json" },
+        review_payload,
+        1804,
+    );
+
+    const review_result = try protocolReadFile(
+        &session,
+        allocator,
+        710,
+        711,
+        &.{ "agents", "self", "pr_review", "result.json" },
+        1805,
+    );
+    defer allocator.free(review_result);
+    try std.testing.expect(std.mem.indexOf(u8, review_result, "\"operation\":\"record_review\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, review_result, "\"publish_review_path\":\"/nodes/local/fs/pr-review/runs/DeanoC__Spiderweb/pr-77/services/publish-review.json\"") != null);
+
+    const publish_review_capture_path = try std.fs.path.join(allocator, &.{ exports_dir, "pr-review", "runs", "DeanoC__Spiderweb", "pr-77", "services", "publish-review.json" });
+    defer allocator.free(publish_review_capture_path);
+    const publish_review_capture_content = try std.fs.cwd().readFileAlloc(allocator, publish_review_capture_path, 64 * 1024);
+    defer allocator.free(publish_review_capture_content);
+    try std.testing.expect(std.mem.indexOf(u8, publish_review_capture_content, "\"service_path\":\"/nodes/local/venoms/github_pr\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, publish_review_capture_content, "\"decision\":\"request_changes\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, publish_review_capture_content, "\"thread_actions_count\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, publish_review_capture_content, "\"dry_run\":true") != null);
+}
+
+test "acheron_session: pr_review run_validation executes configured review commands" {
+    const allocator = std.testing.allocator;
+
+    var mission_store = try mission_store_mod.MissionStore.initWithPath(allocator, null);
+    defer mission_store.deinit();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const local_export_root = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(local_export_root);
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "default",
+        .{
+            .mission_store = &mission_store,
+            .local_fs_export_root = local_export_root,
+            .actor_type = "agent",
+            .actor_id = "reviewer-validation",
+        },
+    );
+    defer session.deinit();
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        712,
+        713,
+        &.{ "agents", "self", "pr_review", "control", "start.json" },
+        "{\"repo_key\":\"DeanoC/Spiderweb\",\"pr_number\":126,\"default_review_commands\":[\"printf validation-ok\"]}",
+        1806,
+    );
+
+    const start_result = try protocolReadFile(
+        &session,
+        allocator,
+        714,
+        715,
+        &.{ "agents", "self", "pr_review", "result.json" },
+        1807,
+    );
+    defer allocator.free(start_result);
+    const mission_id = try extractMissionIdFromResultPayload(allocator, start_result);
+    defer allocator.free(mission_id);
+
+    const checkout_host_path = try std.fs.path.join(allocator, &.{ local_export_root, "pr-review", "repos", "DeanoC__Spiderweb" });
+    defer allocator.free(checkout_host_path);
+    try std.fs.cwd().makePath(checkout_host_path);
+
+    const validation_payload = try std.fmt.allocPrint(allocator, "{{\"mission_id\":\"{s}\"}}", .{mission_id});
+    defer allocator.free(validation_payload);
+    try protocolWriteFile(
+        &session,
+        allocator,
+        716,
+        717,
+        &.{ "agents", "self", "pr_review", "control", "run_validation.json" },
+        validation_payload,
+        1808,
+    );
+
+    const pr_review_status = try protocolReadFile(
+        &session,
+        allocator,
+        718,
+        719,
+        &.{ "agents", "self", "pr_review", "status.json" },
+        1809,
+    );
+    defer allocator.free(pr_review_status);
+    try std.testing.expect(std.mem.indexOf(u8, pr_review_status, "\"state\":\"done\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pr_review_status, "\"tool\":\"pr_review_run_validation\"") != null);
+
+    const pr_review_result = try protocolReadFile(
+        &session,
+        allocator,
+        720,
+        721,
+        &.{ "agents", "self", "pr_review", "result.json" },
+        1810,
+    );
+    defer allocator.free(pr_review_result);
+    try std.testing.expect(std.mem.indexOf(u8, pr_review_result, "\"operation\":\"run_validation\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pr_review_result, "\"validation_path\":\"/nodes/local/fs/pr-review/runs/DeanoC__Spiderweb/pr-126/validation.json\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pr_review_result, "\"validation_command_paths\":[\"/nodes/local/fs/pr-review/runs/DeanoC__Spiderweb/pr-126/services/validation-command-001.json\"]") != null);
+
+    const state_host_path = try std.fs.path.join(allocator, &.{ local_export_root, "pr-review", "state", "DeanoC__Spiderweb", "pr-126", "state.json" });
+    defer allocator.free(state_host_path);
+    const state_content = try std.fs.cwd().readFileAlloc(allocator, state_host_path, 64 * 1024);
+    defer allocator.free(state_content);
+    try std.testing.expect(std.mem.indexOf(u8, state_content, "\"latest_validation\":{\"status\":\"passed\",\"summary\":\"1 review command passed\"}") != null);
+
+    const validation_host_path = try std.fs.path.join(allocator, &.{ local_export_root, "pr-review", "runs", "DeanoC__Spiderweb", "pr-126", "validation.json" });
+    defer allocator.free(validation_host_path);
+    const validation_content = try std.fs.cwd().readFileAlloc(allocator, validation_host_path, 64 * 1024);
+    defer allocator.free(validation_content);
+    try std.testing.expect(std.mem.indexOf(u8, validation_content, "\"status\":\"passed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, validation_content, "\"exit_code\":0") != null);
+
+    const validation_command_path = try std.fs.path.join(allocator, &.{ local_export_root, "pr-review", "runs", "DeanoC__Spiderweb", "pr-126", "services", "validation-command-001.json" });
+    defer allocator.free(validation_command_path);
+    const validation_command_content = try std.fs.cwd().readFileAlloc(allocator, validation_command_path, 64 * 1024);
+    defer allocator.free(validation_command_content);
+    try std.testing.expect(std.mem.indexOf(u8, validation_command_content, "\"service_path\":\"/global/terminal\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, validation_command_content, "\"exit_code\":0") != null);
+}
+
+test "acheron_session: pr_review run_validation fails on non-zero command exits" {
+    const allocator = std.testing.allocator;
+
+    var mission_store = try mission_store_mod.MissionStore.initWithPath(allocator, null);
+    defer mission_store.deinit();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const local_export_root = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(local_export_root);
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "default",
+        .{
+            .mission_store = &mission_store,
+            .local_fs_export_root = local_export_root,
+            .actor_type = "agent",
+            .actor_id = "reviewer-validation-fail",
+        },
+    );
+    defer session.deinit();
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        722,
+        723,
+        &.{ "agents", "self", "pr_review", "control", "start.json" },
+        "{\"repo_key\":\"DeanoC/Spiderweb\",\"pr_number\":127,\"default_review_commands\":[\"false\"]}",
+        1811,
+    );
+
+    const start_result = try protocolReadFile(
+        &session,
+        allocator,
+        724,
+        725,
+        &.{ "agents", "self", "pr_review", "result.json" },
+        1812,
+    );
+    defer allocator.free(start_result);
+    const mission_id = try extractMissionIdFromResultPayload(allocator, start_result);
+    defer allocator.free(mission_id);
+
+    const checkout_host_path = try std.fs.path.join(allocator, &.{ local_export_root, "pr-review", "repos", "DeanoC__Spiderweb" });
+    defer allocator.free(checkout_host_path);
+    try std.fs.cwd().makePath(checkout_host_path);
+
+    const validation_payload = try std.fmt.allocPrint(allocator, "{{\"mission_id\":\"{s}\"}}", .{mission_id});
+    defer allocator.free(validation_payload);
+    try protocolWriteFile(
+        &session,
+        allocator,
+        726,
+        727,
+        &.{ "agents", "self", "pr_review", "control", "run_validation.json" },
+        validation_payload,
+        1813,
+    );
+
+    const pr_review_status = try protocolReadFile(
+        &session,
+        allocator,
+        728,
+        729,
+        &.{ "agents", "self", "pr_review", "status.json" },
+        1814,
+    );
+    defer allocator.free(pr_review_status);
+    try std.testing.expect(std.mem.indexOf(u8, pr_review_status, "\"state\":\"failed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pr_review_status, "\"tool\":\"pr_review_run_validation\"") != null);
+
+    const pr_review_result = try protocolReadFile(
+        &session,
+        allocator,
+        730,
+        731,
+        &.{ "agents", "self", "pr_review", "result.json" },
+        1815,
+    );
+    defer allocator.free(pr_review_result);
+    try std.testing.expect(std.mem.indexOf(u8, pr_review_result, "\"operation\":\"run_validation\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pr_review_result, "\"ok\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pr_review_result, "\"code\":\"execution_failed\"") != null);
+
+    const state_host_path = try std.fs.path.join(allocator, &.{ local_export_root, "pr-review", "state", "DeanoC__Spiderweb", "pr-127", "state.json" });
+    defer allocator.free(state_host_path);
+    const state_content = try std.fs.cwd().readFileAlloc(allocator, state_host_path, 64 * 1024);
+    defer allocator.free(state_content);
+    try std.testing.expect(std.mem.indexOf(u8, state_content, "\"latest_validation\":{\"status\":\"failed\",\"summary\":\"Validation command 1 exited with code 1\"}") != null);
+
+    const validation_host_path = try std.fs.path.join(allocator, &.{ local_export_root, "pr-review", "runs", "DeanoC__Spiderweb", "pr-127", "validation.json" });
+    defer allocator.free(validation_host_path);
+    const validation_content = try std.fs.cwd().readFileAlloc(allocator, validation_host_path, 64 * 1024);
+    defer allocator.free(validation_content);
+    try std.testing.expect(std.mem.indexOf(u8, validation_content, "\"status\":\"failed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, validation_content, "\"exit_code\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, validation_content, "\"code\":\"execution_failed\"") != null);
+}
+
+test "acheron_session: pr_review run_validation closes terminal after malformed command payload" {
+    const allocator = std.testing.allocator;
+
+    var mission_store = try mission_store_mod.MissionStore.initWithPath(allocator, null);
+    defer mission_store.deinit();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const local_export_root = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(local_export_root);
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "default",
+        .{
+            .mission_store = &mission_store,
+            .local_fs_export_root = local_export_root,
+            .actor_type = "agent",
+            .actor_id = "reviewer-validation-invalid",
+        },
+    );
+    defer session.deinit();
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        732,
+        733,
+        &.{ "agents", "self", "pr_review", "control", "start.json" },
+        "{\"repo_key\":\"DeanoC/Spiderweb\",\"pr_number\":128,\"default_review_commands\":[\"printf validation-ok\"]}",
+        1816,
+    );
+
+    const start_result = try protocolReadFile(
+        &session,
+        allocator,
+        734,
+        735,
+        &.{ "agents", "self", "pr_review", "result.json" },
+        1817,
+    );
+    defer allocator.free(start_result);
+    const mission_id = try extractMissionIdFromResultPayload(allocator, start_result);
+    defer allocator.free(mission_id);
+
+    const checkout_host_path = try std.fs.path.join(allocator, &.{ local_export_root, "pr-review", "repos", "DeanoC__Spiderweb" });
+    defer allocator.free(checkout_host_path);
+    try std.fs.cwd().makePath(checkout_host_path);
+
+    const validation_payload = try std.fmt.allocPrint(allocator, "{{\"mission_id\":\"{s}\",\"commands\":[123]}}", .{mission_id});
+    defer allocator.free(validation_payload);
+    const validation_error = try protocolWriteFileExpectError(
+        &session,
+        allocator,
+        736,
+        737,
+        &.{ "agents", "self", "pr_review", "control", "run_validation.json" },
+        validation_payload,
+        1818,
+        "",
+    );
+    defer allocator.free(validation_error);
+
+    const terminal_current = try protocolReadFile(
+        &session,
+        allocator,
+        738,
+        739,
+        &.{ "nodes", "local", "venoms", "terminal", "current.json" },
+        1819,
+    );
+    defer allocator.free(terminal_current);
+    try std.testing.expect(std.mem.indexOf(u8, terminal_current, "\"session\":null") != null);
+
+    const terminal_sessions = try protocolReadFile(
+        &session,
+        allocator,
+        740,
+        741,
+        &.{ "nodes", "local", "venoms", "terminal", "sessions.json" },
+        1820,
+    );
+    defer allocator.free(terminal_sessions);
+    try std.testing.expect(std.mem.indexOf(u8, terminal_sessions, "\"state\":\"closed\"") != null);
+}
+
+test "acheron_session: seeded pr_review eval propagates checkout failure" {
+    const allocator = std.testing.allocator;
+
+    var mission_store = try mission_store_mod.MissionStore.initWithPath(allocator, null);
+    defer mission_store.deinit();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const root = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+    const exports_dir = try std.fmt.allocPrint(allocator, "{s}/exports", .{root});
+    defer allocator.free(exports_dir);
+    try std.fs.cwd().makePath(exports_dir);
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "default",
+        .{
+            .mission_store = &mission_store,
+            .local_fs_export_root = exports_dir,
+            .actor_type = "agent",
+            .actor_id = "reviewer-c",
+        },
+    );
+    defer session.deinit();
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        720,
+        721,
+        &.{ "agents", "self", "pr_review", "control", "start.json" },
+        "{\"repo_key\":\"DeanoC/Spiderweb\",\"pr_number\":91}",
+        1810,
+    );
+
+    const start_result = try protocolReadFile(
+        &session,
+        allocator,
+        722,
+        723,
+        &.{ "agents", "self", "pr_review", "result.json" },
+        1811,
+    );
+    defer allocator.free(start_result);
+    const mission_id = try extractMissionIdFromResultPayload(allocator, start_result);
+    defer allocator.free(mission_id);
+
+    const missing_remote = try std.fmt.allocPrint(allocator, "{s}/missing-remote.git", .{root});
+    defer allocator.free(missing_remote);
+    const sync_payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"mission_id\":\"{s}\",\"phase\":\"ready_for_checkout\",\"sync_checkout\":{{\"repo_url\":\"{s}\",\"pr_number\":null,\"head_branch\":\"main\"}}}}",
+        .{ mission_id, missing_remote },
+    );
+    defer allocator.free(sync_payload);
+    try protocolWriteFile(
+        &session,
+        allocator,
+        724,
+        725,
+        &.{ "agents", "self", "pr_review", "control", "sync.json" },
+        sync_payload,
+        1812,
+    );
+
+    const pr_review_status = try protocolReadFile(
+        &session,
+        allocator,
+        726,
+        727,
+        &.{ "agents", "self", "pr_review", "status.json" },
+        1813,
+    );
+    defer allocator.free(pr_review_status);
+    try std.testing.expect(std.mem.indexOf(u8, pr_review_status, "\"state\":\"failed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pr_review_status, "\"tool\":\"pr_review_sync\"") != null);
+
+    const pr_review_result = try protocolReadFile(
+        &session,
+        allocator,
+        728,
+        729,
+        &.{ "agents", "self", "pr_review", "result.json" },
+        1814,
+    );
+    defer allocator.free(pr_review_result);
+    try std.testing.expect(std.mem.indexOf(u8, pr_review_result, "\"operation\":\"sync\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pr_review_result, "\"ok\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pr_review_result, "\"code\":\"execution_failed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pr_review_result, "\"checkout_sync_path\":\"/nodes/local/fs/pr-review/runs/DeanoC__Spiderweb/pr-91/services/checkout.json\"") != null);
+
+    const checkout_capture_path = try std.fs.path.join(allocator, &.{ exports_dir, "pr-review", "runs", "DeanoC__Spiderweb", "pr-91", "services", "checkout.json" });
+    defer allocator.free(checkout_capture_path);
+    const checkout_capture_content = try std.fs.cwd().readFileAlloc(allocator, checkout_capture_path, 64 * 1024);
+    defer allocator.free(checkout_capture_content);
+    try std.testing.expect(std.mem.indexOf(u8, checkout_capture_content, "\"service_path\":\"/nodes/local/venoms/git\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, checkout_capture_content, "\"code\":\"execution_failed\"") != null);
+
+    const state_host_path = try std.fs.path.join(allocator, &.{ exports_dir, "pr-review", "state", "DeanoC__Spiderweb", "pr-91", "state.json" });
+    defer allocator.free(state_host_path);
+    const state_content = try std.fs.cwd().readFileAlloc(allocator, state_host_path, 64 * 1024);
+    defer allocator.free(state_content);
+    try std.testing.expect(std.mem.indexOf(u8, state_content, "\"phase\":\"ready_for_checkout\"") != null);
+}
+
+test "acheron_session: pr_review advance primes checkout and validation for review" {
+    const allocator = std.testing.allocator;
+
+    var mission_store = try mission_store_mod.MissionStore.initWithPath(allocator, null);
+    defer mission_store.deinit();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const root = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+    const exports_dir = try std.fmt.allocPrint(allocator, "{s}/exports", .{root});
+    defer allocator.free(exports_dir);
+    try std.fs.cwd().makePath(exports_dir);
+
+    const seed_dir = try std.fmt.allocPrint(allocator, "{s}/seed", .{root});
+    defer allocator.free(seed_dir);
+    const remote_dir = try std.fmt.allocPrint(allocator, "{s}/remote.git", .{root});
+    defer allocator.free(remote_dir);
+    _ = try runTestCommandCapture(allocator, root, &.{ "git", "init", "seed" });
+    _ = try runTestCommandCapture(allocator, root, &.{ "git", "-C", seed_dir, "config", "user.email", "spider@example.com" });
+    _ = try runTestCommandCapture(allocator, root, &.{ "git", "-C", seed_dir, "config", "user.name", "Spider Monkey" });
+    const readme_path = try std.fmt.allocPrint(allocator, "{s}/README.md", .{seed_dir});
+    defer allocator.free(readme_path);
+    try std.fs.cwd().writeFile(.{ .sub_path = readme_path, .data = "first\n" });
+    _ = try runTestCommandCapture(allocator, root, &.{ "git", "-C", seed_dir, "add", "README.md" });
+    _ = try runTestCommandCapture(allocator, root, &.{ "git", "-C", seed_dir, "commit", "-m", "initial" });
+    _ = try runTestCommandCapture(allocator, root, &.{ "git", "-C", seed_dir, "branch", "-M", "main" });
+    const first_sha_raw = try runTestCommandCapture(allocator, root, &.{ "git", "-C", seed_dir, "rev-parse", "HEAD" });
+    defer allocator.free(first_sha_raw);
+    const first_sha = std.mem.trim(u8, first_sha_raw, " \t\r\n");
+
+    const src_dir = try std.fmt.allocPrint(allocator, "{s}/src", .{seed_dir});
+    defer allocator.free(src_dir);
+    try std.fs.cwd().makePath(src_dir);
+    const app_path = try std.fmt.allocPrint(allocator, "{s}/src/app.txt", .{seed_dir});
+    defer allocator.free(app_path);
+    try std.fs.cwd().writeFile(.{ .sub_path = app_path, .data = "second\n" });
+    _ = try runTestCommandCapture(allocator, root, &.{ "git", "-C", seed_dir, "add", "src/app.txt" });
+    _ = try runTestCommandCapture(allocator, root, &.{ "git", "-C", seed_dir, "commit", "-m", "second" });
+    const second_sha_raw = try runTestCommandCapture(allocator, root, &.{ "git", "-C", seed_dir, "rev-parse", "HEAD" });
+    defer allocator.free(second_sha_raw);
+    const second_sha = std.mem.trim(u8, second_sha_raw, " \t\r\n");
+
+    _ = try runTestCommandCapture(allocator, root, &.{ "git", "init", "--bare", "remote.git" });
+    _ = try runTestCommandCapture(allocator, root, &.{ "git", "-C", seed_dir, "remote", "add", "origin", remote_dir });
+    _ = try runTestCommandCapture(allocator, root, &.{ "git", "-C", seed_dir, "push", "-u", "origin", "main" });
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "default",
+        .{
+            .mission_store = &mission_store,
+            .local_fs_export_root = exports_dir,
+            .actor_type = "agent",
+            .actor_id = "reviewer-runner",
+        },
+    );
+    defer session.deinit();
+
+    const start_payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"repo_key\":\"DeanoC/Spiderweb\",\"pr_number\":130,\"head_sha\":\"{s}\",\"default_review_commands\":[\"git status --short\"]}}",
+        .{second_sha},
+    );
+    defer allocator.free(start_payload);
+    try protocolWriteFile(
+        &session,
+        allocator,
+        740,
+        741,
+        &.{ "agents", "self", "pr_review", "control", "start.json" },
+        start_payload,
+        1820,
+    );
+
+    const start_result = try protocolReadFile(
+        &session,
+        allocator,
+        742,
+        743,
+        &.{ "agents", "self", "pr_review", "result.json" },
+        1821,
+    );
+    defer allocator.free(start_result);
+    const mission_id = try extractMissionIdFromResultPayload(allocator, start_result);
+    defer allocator.free(mission_id);
+
+    const advance_payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"mission_id\":\"{s}\",\"provider_sync\":false,\"sync_checkout\":{{\"repo_url\":\"{s}\",\"base_branch\":\"main\"}},\"repo_status\":{{\"base_ref\":\"{s}\"}},\"diff_range\":{{\"base_ref\":\"{s}\",\"head_ref\":\"HEAD\"}},\"commands\":[\"git status --short\"]}}",
+        .{ mission_id, remote_dir, first_sha, first_sha },
+    );
+    defer allocator.free(advance_payload);
+    try protocolWriteFile(
+        &session,
+        allocator,
+        744,
+        745,
+        &.{ "agents", "self", "pr_review", "control", "advance.json" },
+        advance_payload,
+        1822,
+    );
+
+    const pr_review_status = try protocolReadFile(
+        &session,
+        allocator,
+        746,
+        747,
+        &.{ "agents", "self", "pr_review", "status.json" },
+        1823,
+    );
+    defer allocator.free(pr_review_status);
+    try std.testing.expect(std.mem.indexOf(u8, pr_review_status, "\"state\":\"done\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pr_review_status, "\"tool\":\"pr_review_advance\"") != null);
+
+    const pr_review_result = try protocolReadFile(
+        &session,
+        allocator,
+        748,
+        749,
+        &.{ "agents", "self", "pr_review", "result.json" },
+        1824,
+    );
+    defer allocator.free(pr_review_result);
+    try std.testing.expect(std.mem.indexOf(u8, pr_review_result, "\"operation\":\"advance\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pr_review_result, "\"status\":\"ready_for_review\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pr_review_result, "\"next_action\":\"draft_review\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pr_review_result, "\"operation\":\"sync\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pr_review_result, "\"operation\":\"run_validation\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pr_review_result, "\"context_path\":\"/nodes/local/fs/pr-review/state/DeanoC__Spiderweb/pr-130/context.json\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pr_review_result, "\"state_path\":\"/nodes/local/fs/pr-review/state/DeanoC__Spiderweb/pr-130/state.json\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pr_review_result, "\"artifact_root\":\"/nodes/local/fs/pr-review/runs/DeanoC__Spiderweb/pr-130\"") != null);
+
+    const state_host_path = try std.fs.path.join(allocator, &.{ exports_dir, "pr-review", "state", "DeanoC__Spiderweb", "pr-130", "state.json" });
+    defer allocator.free(state_host_path);
+    const state_content = try std.fs.cwd().readFileAlloc(allocator, state_host_path, 64 * 1024);
+    defer allocator.free(state_content);
+    try std.testing.expect(std.mem.indexOf(u8, state_content, "\"phase\":\"reviewing\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, state_content, "\"latest_validation\":{\"status\":\"passed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, state_content, second_sha) != null);
+
+    var mission = (try mission_store.getOwned(allocator, mission_id)) orelse return error.TestExpectedResponse;
+    defer mission.deinit(allocator);
+    try std.testing.expectEqual(mission_store_mod.MissionState.running, mission.state);
+}
+
+test "acheron_session: pr_review advance waits for github_pr events and resumes" {
+    const allocator = std.testing.allocator;
+
+    var mission_store = try mission_store_mod.MissionStore.initWithPath(allocator, null);
+    defer mission_store.deinit();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const exports_dir = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(exports_dir);
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "default",
+        .{
+            .mission_store = &mission_store,
+            .local_fs_export_root = exports_dir,
+            .actor_type = "agent",
+            .actor_id = "reviewer-wait",
+        },
+    );
+    defer session.deinit();
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        750,
+        751,
+        &.{ "agents", "self", "pr_review", "control", "start.json" },
+        "{\"repo_key\":\"DeanoC/Spiderweb\",\"pr_number\":131}",
+        1825,
+    );
+
+    const start_result = try protocolReadFile(
+        &session,
+        allocator,
+        752,
+        753,
+        &.{ "agents", "self", "pr_review", "result.json" },
+        1826,
+    );
+    defer allocator.free(start_result);
+    const mission_id = try extractMissionIdFromResultPayload(allocator, start_result);
+    defer allocator.free(mission_id);
+
+    const review_payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"mission_id\":\"{s}\",\"findings\":[],\"recommendation\":{{\"decision\":\"request_changes\",\"summary\":\"Needs follow-up\"}}}}",
+        .{mission_id},
+    );
+    defer allocator.free(review_payload);
+    try protocolWriteFile(
+        &session,
+        allocator,
+        754,
+        755,
+        &.{ "agents", "self", "pr_review", "control", "record_review.json" },
+        review_payload,
+        1827,
+    );
+
+    const wait_payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"mission_id\":\"{s}\",\"run_validation\":false,\"wait_timeout_ms\":0}}",
+        .{mission_id},
+    );
+    defer allocator.free(wait_payload);
+    try protocolWriteFile(
+        &session,
+        allocator,
+        756,
+        757,
+        &.{ "agents", "self", "pr_review", "control", "advance.json" },
+        wait_payload,
+        1828,
+    );
+
+    const waiting_result = try protocolReadFile(
+        &session,
+        allocator,
+        758,
+        759,
+        &.{ "agents", "self", "pr_review", "result.json" },
+        1829,
+    );
+    defer allocator.free(waiting_result);
+    try std.testing.expect(std.mem.indexOf(u8, waiting_result, "\"status\":\"waiting_for_event\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, waiting_result, "\"next_action\":\"wait_for_github_event\"") != null);
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        760,
+        761,
+        &.{ "agents", "self", "events", "control", "signal.json" },
+        "{\"event_type\":\"agent\",\"parameter\":\"github_pr\",\"payload\":{\"event_name\":\"pr.synchronized\",\"run_id\":\"pr_review:DeanoC__Spiderweb:999\"}}",
+        1830,
+    );
+
+    const unrelated_resume_payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"mission_id\":\"{s}\",\"run_validation\":false,\"provider_sync\":false,\"sync_checkout\":false,\"repo_status\":false,\"diff_range\":false,\"wait_timeout_ms\":0}}",
+        .{mission_id},
+    );
+    defer allocator.free(unrelated_resume_payload);
+    try protocolWriteFile(
+        &session,
+        allocator,
+        762,
+        763,
+        &.{ "agents", "self", "pr_review", "control", "advance.json" },
+        unrelated_resume_payload,
+        1831,
+    );
+
+    const unrelated_result = try protocolReadFile(
+        &session,
+        allocator,
+        764,
+        765,
+        &.{ "agents", "self", "pr_review", "result.json" },
+        1832,
+    );
+    defer allocator.free(unrelated_result);
+    try std.testing.expect(std.mem.indexOf(u8, unrelated_result, "\"status\":\"waiting_for_event\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unrelated_result, "\"next_action\":\"wait_for_github_event\"") != null);
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        766,
+        767,
+        &.{ "agents", "self", "events", "control", "signal.json" },
+        "{\"event_type\":\"agent\",\"parameter\":\"github_pr\",\"payload\":{\"event_name\":\"pr.synchronized\",\"run_id\":\"pr_review:DeanoC__Spiderweb:131\"}}",
+        1833,
+    );
+
+    const resume_payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"mission_id\":\"{s}\",\"run_validation\":false,\"provider_sync\":false,\"sync_checkout\":false,\"repo_status\":false,\"diff_range\":false,\"wait_timeout_ms\":0}}",
+        .{mission_id},
+    );
+    defer allocator.free(resume_payload);
+    try protocolWriteFile(
+        &session,
+        allocator,
+        768,
+        769,
+        &.{ "agents", "self", "pr_review", "control", "advance.json" },
+        resume_payload,
+        1834,
+    );
+
+    const resumed_result = try protocolReadFile(
+        &session,
+        allocator,
+        770,
+        771,
+        &.{ "agents", "self", "pr_review", "result.json" },
+        1835,
+    );
+    defer allocator.free(resumed_result);
+    try std.testing.expect(std.mem.indexOf(u8, resumed_result, "\"status\":\"ready_for_review\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resumed_result, "\"next_action\":\"draft_review\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resumed_result, "\"event_type\":\"agent\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resumed_result, "\"parameter\":\"github_pr\"") != null);
+
+    const state_host_path = try std.fs.path.join(allocator, &.{ exports_dir, "pr-review", "state", "DeanoC__Spiderweb", "pr-131", "state.json" });
+    defer allocator.free(state_host_path);
+    const state_content = try std.fs.cwd().readFileAlloc(allocator, state_host_path, 64 * 1024);
+    defer allocator.free(state_content);
+    try std.testing.expect(std.mem.indexOf(u8, state_content, "\"phase\":\"reviewing\"") != null);
+}
+
+test "acheron_session: pr_review advance keeps blocked mission blocked when resume_blocked is false" {
+    const allocator = std.testing.allocator;
+
+    var mission_store = try mission_store_mod.MissionStore.initWithPath(allocator, null);
+    defer mission_store.deinit();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const exports_dir = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(exports_dir);
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "default",
+        .{
+            .mission_store = &mission_store,
+            .local_fs_export_root = exports_dir,
+            .actor_type = "agent",
+            .actor_id = "reviewer-blocked",
+        },
+    );
+    defer session.deinit();
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        766,
+        767,
+        &.{ "agents", "self", "pr_review", "control", "start.json" },
+        "{\"repo_key\":\"DeanoC/Spiderweb\",\"pr_number\":133}",
+        1836,
+    );
+
+    const start_result = try protocolReadFile(
+        &session,
+        allocator,
+        768,
+        769,
+        &.{ "agents", "self", "pr_review", "result.json" },
+        1837,
+    );
+    defer allocator.free(start_result);
+    const mission_id = try extractMissionIdFromResultPayload(allocator, start_result);
+    defer allocator.free(mission_id);
+
+    const blocked = try mission_store.transition(allocator, mission_id, .{
+        .next_state = .blocked,
+        .stage = "runner.blocked",
+        .reason = "Waiting for operator input",
+        .summary = "Waiting for operator input",
+        .actor = .{ .actor_type = "agent", .actor_id = "reviewer-blocked" },
+    });
+    blocked.deinit(allocator);
+
+    const advance_payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"mission_id\":\"{s}\",\"resume_blocked\":false,\"run_validation\":false,\"wait_timeout_ms\":0}}",
+        .{mission_id},
+    );
+    defer allocator.free(advance_payload);
+    try protocolWriteFile(
+        &session,
+        allocator,
+        770,
+        771,
+        &.{ "agents", "self", "pr_review", "control", "advance.json" },
+        advance_payload,
+        1838,
+    );
+
+    const advance_result = try protocolReadFile(
+        &session,
+        allocator,
+        772,
+        773,
+        &.{ "agents", "self", "pr_review", "result.json" },
+        1839,
+    );
+    defer allocator.free(advance_result);
+    try std.testing.expect(std.mem.indexOf(u8, advance_result, "\"status\":\"blocked\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, advance_result, "\"next_action\":\"resume_blocked\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, advance_result, "Waiting for operator input") != null);
+
+    const mission = (try mission_store.getOwned(allocator, mission_id)) orelse return error.TestExpectedResponse;
+    defer mission.deinit(allocator);
+    try std.testing.expectEqual(mission_store_mod.MissionState.blocked, mission.state);
+}
+
+test "acheron_session: pr_review save_draft persists revision history and advance requests revision" {
+    const allocator = std.testing.allocator;
+
+    var mission_store = try mission_store_mod.MissionStore.initWithPath(allocator, null);
+    defer mission_store.deinit();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const exports_dir = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(exports_dir);
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "default",
+        .{
+            .mission_store = &mission_store,
+            .local_fs_export_root = exports_dir,
+            .actor_type = "agent",
+            .actor_id = "reviewer-draft",
+        },
+    );
+    defer session.deinit();
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        766,
+        767,
+        &.{ "agents", "self", "pr_review", "control", "start.json" },
+        "{\"repo_key\":\"DeanoC/Spiderweb\",\"pr_number\":132}",
+        1833,
+    );
+
+    const start_result = try protocolReadFile(
+        &session,
+        allocator,
+        768,
+        769,
+        &.{ "agents", "self", "pr_review", "result.json" },
+        1834,
+    );
+    defer allocator.free(start_result);
+    const mission_id = try extractMissionIdFromResultPayload(allocator, start_result);
+    defer allocator.free(mission_id);
+
+    const first_draft_payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"mission_id\":\"{s}\",\"phase\":\"reviewing\",\"summary\":\"First draft\",\"current_focus\":\"Inspect policy edge cases\",\"findings\":[{{\"path\":\"src/main.zig\",\"summary\":\"Check mount behavior\"}}],\"recommendation\":{{\"action\":\"request_changes\",\"summary\":\"Still gathering evidence\"}},\"review_comment\":\"Draft review note one.\"}}",
+        .{mission_id},
+    );
+    defer allocator.free(first_draft_payload);
+    try protocolWriteFile(
+        &session,
+        allocator,
+        770,
+        771,
+        &.{ "agents", "self", "pr_review", "control", "save_draft.json" },
+        first_draft_payload,
+        1835,
+    );
+
+    const second_draft_payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"mission_id\":\"{s}\",\"summary\":\"Second draft\",\"findings\":[{{\"path\":\"src/main.zig\",\"summary\":\"Check mount behavior\"}},{{\"path\":\"src/router.zig\",\"summary\":\"Need follow-up on proxy path\"}}],\"review_comment\":\"Draft review note two.\"}}",
+        .{mission_id},
+    );
+    defer allocator.free(second_draft_payload);
+    try protocolWriteFile(
+        &session,
+        allocator,
+        772,
+        773,
+        &.{ "agents", "self", "pr_review", "control", "save_draft.json" },
+        second_draft_payload,
+        1836,
+    );
+
+    const save_draft_result = try protocolReadFile(
+        &session,
+        allocator,
+        774,
+        775,
+        &.{ "agents", "self", "pr_review", "result.json" },
+        1837,
+    );
+    defer allocator.free(save_draft_result);
+    try std.testing.expect(std.mem.indexOf(u8, save_draft_result, "\"operation\":\"save_draft\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, save_draft_result, "\"draft_revision\":2") != null);
+
+    const draft_host_path = try std.fs.path.join(allocator, &.{ exports_dir, "pr-review", "runs", "DeanoC__Spiderweb", "pr-132", "draft-review.json" });
+    defer allocator.free(draft_host_path);
+    const draft_content = try std.fs.cwd().readFileAlloc(allocator, draft_host_path, 64 * 1024);
+    defer allocator.free(draft_content);
+    try std.testing.expect(std.mem.indexOf(u8, draft_content, "\"revision\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, draft_content, "Draft review note two.") != null);
+
+    const draft_history_path = try std.fs.path.join(allocator, &.{ exports_dir, "pr-review", "runs", "DeanoC__Spiderweb", "pr-132", "drafts", "review-draft-001.json" });
+    defer allocator.free(draft_history_path);
+    const draft_history_content = try std.fs.cwd().readFileAlloc(allocator, draft_history_path, 64 * 1024);
+    defer allocator.free(draft_history_content);
+    try std.testing.expect(std.mem.indexOf(u8, draft_history_content, "\"revision\":1") != null);
+
+    const state_host_path = try std.fs.path.join(allocator, &.{ exports_dir, "pr-review", "state", "DeanoC__Spiderweb", "pr-132", "state.json" });
+    defer allocator.free(state_host_path);
+    const state_content = try std.fs.cwd().readFileAlloc(allocator, state_host_path, 64 * 1024);
+    defer allocator.free(state_content);
+    try std.testing.expect(std.mem.indexOf(u8, state_content, "\"latest_draft\":{\"status\":\"revised\",\"summary\":\"Second draft\",\"revision\":2}") != null);
+
+    const advance_payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"mission_id\":\"{s}\",\"run_validation\":false,\"provider_sync\":false,\"sync_checkout\":false,\"repo_status\":false,\"diff_range\":false}}",
+        .{mission_id},
+    );
+    defer allocator.free(advance_payload);
+    try protocolWriteFile(
+        &session,
+        allocator,
+        776,
+        777,
+        &.{ "agents", "self", "pr_review", "control", "advance.json" },
+        advance_payload,
+        1838,
+    );
+
+    const advance_result = try protocolReadFile(
+        &session,
+        allocator,
+        778,
+        779,
+        &.{ "agents", "self", "pr_review", "result.json" },
+        1839,
+    );
+    defer allocator.free(advance_result);
+    try std.testing.expect(std.mem.indexOf(u8, advance_result, "\"next_action\":\"record_review\"") != null);
+
+    const record_review_payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"mission_id\":\"{s}\",\"publish_review\":{{\"dry_run\":true}}}}",
+        .{mission_id},
+    );
+    defer allocator.free(record_review_payload);
+    try protocolWriteFile(
+        &session,
+        allocator,
+        780,
+        781,
+        &.{ "agents", "self", "pr_review", "control", "record_review.json" },
+        record_review_payload,
+        1840,
+    );
+
+    const record_review_result = try protocolReadFile(
+        &session,
+        allocator,
+        782,
+        783,
+        &.{ "agents", "self", "pr_review", "result.json" },
+        1841,
+    );
+    defer allocator.free(record_review_result);
+    try std.testing.expect(std.mem.indexOf(u8, record_review_result, "\"operation\":\"record_review\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, record_review_result, "\"decision\":\"request_changes\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, record_review_result, "\"publish_review_path\":\"/nodes/local/fs/pr-review/runs/DeanoC__Spiderweb/pr-132/services/publish-review.json\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, record_review_result, "\"error\":null") != null);
+
+    const recommendation_host_path = try std.fs.path.join(allocator, &.{ exports_dir, "pr-review", "runs", "DeanoC__Spiderweb", "pr-132", "recommendation.json" });
+    defer allocator.free(recommendation_host_path);
+    const recommendation_content = try std.fs.cwd().readFileAlloc(allocator, recommendation_host_path, 64 * 1024);
+    defer allocator.free(recommendation_content);
+    try std.testing.expect(std.mem.indexOf(u8, recommendation_content, "\"action\":\"request_changes\"") != null);
+
+    const publish_review_host_path = try std.fs.path.join(allocator, &.{ exports_dir, "pr-review", "runs", "DeanoC__Spiderweb", "pr-132", "services", "publish-review.json" });
+    defer allocator.free(publish_review_host_path);
+    const publish_review_content = try std.fs.cwd().readFileAlloc(allocator, publish_review_host_path, 64 * 1024);
+    defer allocator.free(publish_review_content);
+    try std.testing.expect(std.mem.indexOf(u8, publish_review_content, "\"dry_run\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, publish_review_content, "\"decision\":\"request_changes\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, publish_review_content, "\"result\":{\"ok\":true") != null);
+
+    const final_review_comment_host_path = try std.fs.path.join(allocator, &.{ exports_dir, "pr-review", "runs", "DeanoC__Spiderweb", "pr-132", "review-comment.md" });
+    defer allocator.free(final_review_comment_host_path);
+    const final_review_comment_content = try std.fs.cwd().readFileAlloc(allocator, final_review_comment_host_path, 64 * 1024);
+    defer allocator.free(final_review_comment_content);
+    try std.testing.expect(std.mem.indexOf(u8, final_review_comment_content, "Draft review note two.") != null);
+
+    const finalized_state_content = try std.fs.cwd().readFileAlloc(allocator, state_host_path, 64 * 1024);
+    defer allocator.free(finalized_state_content);
+    try std.testing.expect(std.mem.indexOf(u8, finalized_state_content, "\"phase\":\"awaiting_author\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, finalized_state_content, "\"latest_recommendation\":{\"status\":\"request_changes\"") != null);
+}
+
+test "acheron_session: github_pr ingest_event emits agent event and auto-intakes pr_review mission" {
+    const allocator = std.testing.allocator;
+
+    var mission_store = try mission_store_mod.MissionStore.initWithPath(allocator, null);
+    defer mission_store.deinit();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const local_export_root = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(local_export_root);
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "default",
+        .{
+            .mission_store = &mission_store,
+            .local_fs_export_root = local_export_root,
+            .actor_type = "agent",
+            .actor_id = "reviewer-ingest",
+        },
+    );
+    defer session.deinit();
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        740,
+        741,
+        &.{ "agents", "self", "events", "control", "wait.json" },
+        "{\"paths\":[\"/nodes/local/venoms/events/sources/agent/github_pr.json\"],\"timeout_ms\":0}",
+        1816,
+    );
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        742,
+        743,
+        &.{ "agents", "self", "github_pr", "control", "ingest_event.json" },
+        "{\"repo_key\":\"DeanoC/Spiderweb\",\"pr_number\":128,\"action\":\"opened\",\"title\":\"Add agent loop\",\"pr_url\":\"https://github.com/DeanoC/Spiderweb/pull/128\",\"base_branch\":\"main\",\"base_sha\":\"abc\",\"head_branch\":\"feature/agent-loop\",\"head_sha\":\"def\",\"default_review_commands\":[\"zig build test\"]}",
+        1817,
+    );
+
+    const github_pr_status = try protocolReadFile(
+        &session,
+        allocator,
+        744,
+        745,
+        &.{ "agents", "self", "github_pr", "status.json" },
+        1818,
+    );
+    defer allocator.free(github_pr_status);
+    try std.testing.expect(std.mem.indexOf(u8, github_pr_status, "\"state\":\"done\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, github_pr_status, "\"tool\":\"github_pr_ingest_event\"") != null);
+
+    const github_pr_result = try protocolReadFile(
+        &session,
+        allocator,
+        746,
+        747,
+        &.{ "agents", "self", "github_pr", "result.json" },
+        1819,
+    );
+    defer allocator.free(github_pr_result);
+    try std.testing.expect(std.mem.indexOf(u8, github_pr_result, "\"operation\":\"ingest_event\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, github_pr_result, "\"mission_action\":\"created\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, github_pr_result, "\"signal_path\":\"/nodes/local/venoms/events/sources/agent/github_pr.json\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, github_pr_result, "\"run_id\":\"pr_review:DeanoC__Spiderweb:128\"") != null);
+
+    const mission_id = try extractMissionIdFromResultPayload(allocator, github_pr_result);
+    defer allocator.free(mission_id);
+
+    const next_payload = try protocolReadFile(
+        &session,
+        allocator,
+        748,
+        749,
+        &.{ "agents", "self", "events", "next.json" },
+        1820,
+    );
+    defer allocator.free(next_payload);
+    try std.testing.expect(std.mem.indexOf(u8, next_payload, "\"event_type\":\"agent\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, next_payload, "\"parameter\":\"github_pr\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, next_payload, "\"event_name\":\"pr.opened\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, next_payload, "\"mission_action\":\"created\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, next_payload, mission_id) != null);
+
+    const missions = try mission_store.listOwned(allocator, .{ .use_case = "pr_review" });
+    defer {
+        for (missions) |*item| item.deinit(allocator);
+        allocator.free(missions);
+    }
+    try std.testing.expectEqual(@as(usize, 1), missions.len);
+    try std.testing.expectEqualStrings("pr_review:DeanoC__Spiderweb:128", missions[0].run_id orelse return error.TestExpectedResponse);
+
+    const context_host_path = try std.fs.path.join(allocator, &.{ local_export_root, "pr-review", "state", "DeanoC__Spiderweb", "pr-128", "context.json" });
+    defer allocator.free(context_host_path);
+    const context_content = try std.fs.cwd().readFileAlloc(allocator, context_host_path, 64 * 1024);
+    defer allocator.free(context_content);
+    try std.testing.expect(std.mem.indexOf(u8, context_content, "\"repo_key\":\"DeanoC/Spiderweb\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, context_content, "\"default_review_commands\":[\"zig build test\"]") != null);
+}
+
+test "acheron_session: github_pr ingest_event reuses existing active pr_review mission" {
+    const allocator = std.testing.allocator;
+
+    var mission_store = try mission_store_mod.MissionStore.initWithPath(allocator, null);
+    defer mission_store.deinit();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const local_export_root = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(local_export_root);
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "default",
+        .{
+            .mission_store = &mission_store,
+            .local_fs_export_root = local_export_root,
+            .actor_type = "agent",
+            .actor_id = "reviewer-ingest-reuse",
+        },
+    );
+    defer session.deinit();
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        750,
+        751,
+        &.{ "agents", "self", "github_pr", "control", "ingest_event.json" },
+        "{\"repo_key\":\"DeanoC/Spiderweb\",\"pr_number\":129,\"action\":\"opened\",\"title\":\"Open PR review loop\",\"head_sha\":\"aaa\"}",
+        1821,
+    );
+
+    const first_result = try protocolReadFile(
+        &session,
+        allocator,
+        752,
+        753,
+        &.{ "agents", "self", "github_pr", "result.json" },
+        1822,
+    );
+    defer allocator.free(first_result);
+    const first_mission_id = try extractMissionIdFromResultPayload(allocator, first_result);
+    defer allocator.free(first_mission_id);
+    try std.testing.expect(std.mem.indexOf(u8, first_result, "\"mission_action\":\"created\"") != null);
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        754,
+        755,
+        &.{ "agents", "self", "github_pr", "control", "ingest_event.json" },
+        "{\"repo_key\":\"DeanoC/Spiderweb\",\"pr_number\":129,\"action\":\"synchronize\",\"title\":\"Open PR review loop\",\"head_sha\":\"bbb\"}",
+        1823,
+    );
+
+    const second_result = try protocolReadFile(
+        &session,
+        allocator,
+        756,
+        757,
+        &.{ "agents", "self", "github_pr", "result.json" },
+        1824,
+    );
+    defer allocator.free(second_result);
+    const second_mission_id = try extractMissionIdFromResultPayload(allocator, second_result);
+    defer allocator.free(second_mission_id);
+    try std.testing.expect(std.mem.indexOf(u8, second_result, "\"mission_action\":\"existing\"") != null);
+    try std.testing.expectEqualStrings(first_mission_id, second_mission_id);
+    try std.testing.expect(std.mem.indexOf(u8, second_result, "\"event_name\":\"pr.synchronized\"") != null);
+
+    const missions = try mission_store.listOwned(allocator, .{ .use_case = "pr_review" });
+    defer {
+        for (missions) |*item| item.deinit(allocator);
+        allocator.free(missions);
+    }
+
+    var matching_active: usize = 0;
+    for (missions) |mission| {
+        const mission_run_id = mission.run_id orelse continue;
+        if (!std.mem.eql(u8, mission_run_id, "pr_review:DeanoC__Spiderweb:129")) continue;
+        if (!isActiveMissionState(mission.state)) continue;
+        matching_active += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), matching_active);
+}
+
+test "acheron_session: github_pr ingest_event rejects unsupported provider" {
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const local_export_root = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(local_export_root);
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "default",
+        .{
+            .local_fs_export_root = local_export_root,
+            .actor_type = "agent",
+            .actor_id = "reviewer-ingest-provider",
+        },
+    );
+    defer session.deinit();
+
+    try std.testing.expectError(
+        error.InvalidPayload,
+        protocolWriteFile(
+            &session,
+            allocator,
+            758,
+            759,
+            &.{ "agents", "self", "github_pr", "control", "ingest_event.json" },
+            "{\"provider\":\"gitlab\",\"repo_key\":\"DeanoC/Spiderweb\",\"pr_number\":130,\"action\":\"opened\"}",
+            1825,
+        ),
+    );
+}
+
+test "acheron_session: github_pr ingest_event reuses configured project mission" {
+    const allocator = std.testing.allocator;
+
+    var mission_store = try mission_store_mod.MissionStore.initWithPath(allocator, null);
+    defer mission_store.deinit();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const local_export_root = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(local_export_root);
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "default",
+        .{
+            .mission_store = &mission_store,
+            .local_fs_export_root = local_export_root,
+            .actor_type = "agent",
+            .actor_id = "reviewer-ingest-config-project",
+        },
+    );
+    defer session.deinit();
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        760,
+        761,
+        &.{ "agents", "self", "pr_review", "control", "configure_repo.json" },
+        "{\"repo_key\":\"DeanoC/Spiderweb\",\"project_id\":\"proj-special\",\"default_branch\":\"main\",\"checkout_path\":\"/nodes/local/fs/pr-review/repos/project-special\",\"default_review_commands\":[\"zig build test\"],\"auto_intake\":true}",
+        1826,
+    );
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        762,
+        763,
+        &.{ "agents", "self", "github_pr", "control", "ingest_event.json" },
+        "{\"repo_key\":\"DeanoC/Spiderweb\",\"pr_number\":130,\"action\":\"opened\",\"title\":\"Configured project PR\",\"head_sha\":\"aaa130\"}",
+        1827,
+    );
+
+    const first_result = try protocolReadFile(
+        &session,
+        allocator,
+        764,
+        765,
+        &.{ "agents", "self", "github_pr", "result.json" },
+        1828,
+    );
+    defer allocator.free(first_result);
+    const first_mission_id = try extractMissionIdFromResultPayload(allocator, first_result);
+    defer allocator.free(first_mission_id);
+    try std.testing.expect(std.mem.indexOf(u8, first_result, "\"mission_action\":\"created\"") != null);
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        766,
+        767,
+        &.{ "agents", "self", "github_pr", "control", "ingest_event.json" },
+        "{\"repo_key\":\"DeanoC/Spiderweb\",\"pr_number\":130,\"action\":\"synchronize\",\"title\":\"Configured project PR\",\"head_sha\":\"bbb130\"}",
+        1829,
+    );
+
+    const second_result = try protocolReadFile(
+        &session,
+        allocator,
+        768,
+        769,
+        &.{ "agents", "self", "github_pr", "result.json" },
+        1830,
+    );
+    defer allocator.free(second_result);
+    const second_mission_id = try extractMissionIdFromResultPayload(allocator, second_result);
+    defer allocator.free(second_mission_id);
+    try std.testing.expect(std.mem.indexOf(u8, second_result, "\"mission_action\":\"existing\"") != null);
+    try std.testing.expectEqualStrings(first_mission_id, second_mission_id);
+
+    const missions = try mission_store.listOwned(allocator, .{ .use_case = "pr_review" });
+    defer {
+        for (missions) |*item| item.deinit(allocator);
+        allocator.free(missions);
+    }
+
+    var matching_active: usize = 0;
+    for (missions) |mission| {
+        const mission_run_id = mission.run_id orelse continue;
+        if (!std.mem.eql(u8, mission_run_id, "pr_review:DeanoC__Spiderweb:130")) continue;
+        if (!isActiveMissionState(mission.state)) continue;
+        if (!std.mem.eql(u8, mission.project_id orelse continue, "proj-special")) continue;
+        matching_active += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), matching_active);
+}
+
+test "acheron_session: missions invoke_service records downstream service failures" {
+    const allocator = std.testing.allocator;
+
+    var mission_store = try mission_store_mod.MissionStore.initWithPath(allocator, null);
+    defer mission_store.deinit();
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "default",
+        .{
+            .mission_store = &mission_store,
+            .actor_type = "agent",
+            .actor_id = "worker-a",
+        },
+    );
+    defer session.deinit();
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        340,
+        341,
+        &.{ "agents", "self", "missions", "control", "create.json" },
+        "{\"use_case\":\"pr_review\",\"title\":\"Review PR 49\"}",
+        959,
+    );
+    const create_result = try protocolReadFile(
+        &session,
+        allocator,
+        342,
+        343,
+        &.{ "agents", "self", "missions", "result.json" },
+        960,
+    );
+    defer allocator.free(create_result);
+    const mission_id = try extractMissionIdFromResultPayload(allocator, create_result);
+    defer allocator.free(mission_id);
+
+    const resume_payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"mission_id\":\"{s}\",\"stage\":\"running_review\"}}",
+        .{mission_id},
+    );
+    defer allocator.free(resume_payload);
+    try protocolWriteFile(
+        &session,
+        allocator,
+        344,
+        345,
+        &.{ "agents", "self", "missions", "control", "resume.json" },
+        resume_payload,
+        961,
+    );
+
+    const invoke_payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"mission_id\":\"{s}\",\"service_path\":\"/global/memory\",\"stage\":\"collecting_context\",\"summary\":\"Tried invalid memory request\",\"payload\":{{}}}}",
+        .{mission_id},
+    );
+    defer allocator.free(invoke_payload);
+    try protocolWriteFile(
+        &session,
+        allocator,
+        346,
+        347,
+        &.{ "agents", "self", "missions", "control", "invoke_service.json" },
+        invoke_payload,
+        962,
+    );
+
+    const mission_status = try protocolReadFile(
+        &session,
+        allocator,
+        348,
+        349,
+        &.{ "agents", "self", "missions", "status.json" },
+        963,
+    );
+    defer allocator.free(mission_status);
+    try std.testing.expect(std.mem.indexOf(u8, mission_status, "\"state\":\"failed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mission_status, "\"tool\":\"missions_invoke_service\"") != null);
+
+    const mission_result = try protocolReadFile(
+        &session,
+        allocator,
+        350,
+        351,
+        &.{ "agents", "self", "missions", "result.json" },
+        964,
+    );
+    defer allocator.free(mission_result);
+    try std.testing.expect(std.mem.indexOf(u8, mission_result, "\"operation\":\"invoke_service\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mission_result, "\"ok\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mission_result, "\"code\":\"invalid\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mission_result, "\"service_path\":\"/global/memory\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mission_result, "\"event_type\":\"mission.service_invoked\"") != null);
+}
+
+test "acheron_session: git venom syncs checkout and reports changed files" {
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const root = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+    const exports_dir = try std.fmt.allocPrint(allocator, "{s}/exports", .{root});
+    defer allocator.free(exports_dir);
+    const seed_dir = try std.fmt.allocPrint(allocator, "{s}/seed", .{root});
+    defer allocator.free(seed_dir);
+    const remote_dir = try std.fmt.allocPrint(allocator, "{s}/remote.git", .{root});
+    defer allocator.free(remote_dir);
+    try std.fs.cwd().makePath(exports_dir);
+
+    _ = try runTestCommandCapture(allocator, root, &.{ "git", "init", "seed" });
+    _ = try runTestCommandCapture(allocator, root, &.{ "git", "-C", seed_dir, "config", "user.email", "spider@example.com" });
+    _ = try runTestCommandCapture(allocator, root, &.{ "git", "-C", seed_dir, "config", "user.name", "Spider Monkey" });
+
+    const readme_path = try std.fmt.allocPrint(allocator, "{s}/README.md", .{seed_dir});
+    defer allocator.free(readme_path);
+    try std.fs.cwd().writeFile(.{ .sub_path = readme_path, .data = "hello\n" });
+    _ = try runTestCommandCapture(allocator, root, &.{ "git", "-C", seed_dir, "add", "README.md" });
+    _ = try runTestCommandCapture(allocator, root, &.{ "git", "-C", seed_dir, "commit", "-m", "initial" });
+    _ = try runTestCommandCapture(allocator, root, &.{ "git", "-C", seed_dir, "branch", "-M", "main" });
+
+    const first_sha_raw = try runTestCommandCapture(allocator, root, &.{ "git", "-C", seed_dir, "rev-parse", "HEAD" });
+    defer allocator.free(first_sha_raw);
+    const first_sha = std.mem.trim(u8, first_sha_raw, " \t\r\n");
+
+    const src_dir = try std.fmt.allocPrint(allocator, "{s}/src", .{seed_dir});
+    defer allocator.free(src_dir);
+    try std.fs.cwd().makePath(src_dir);
+    const app_path = try std.fmt.allocPrint(allocator, "{s}/src/app.txt", .{seed_dir});
+    defer allocator.free(app_path);
+    try std.fs.cwd().writeFile(.{ .sub_path = app_path, .data = "second\n" });
+    _ = try runTestCommandCapture(allocator, root, &.{ "git", "-C", seed_dir, "add", "src/app.txt" });
+    _ = try runTestCommandCapture(allocator, root, &.{ "git", "-C", seed_dir, "commit", "-m", "second" });
+
+    const second_sha_raw = try runTestCommandCapture(allocator, root, &.{ "git", "-C", seed_dir, "rev-parse", "HEAD" });
+    defer allocator.free(second_sha_raw);
+    const second_sha = std.mem.trim(u8, second_sha_raw, " \t\r\n");
+
+    _ = try runTestCommandCapture(allocator, root, &.{ "git", "init", "--bare", "remote.git" });
+    _ = try runTestCommandCapture(allocator, root, &.{ "git", "-C", seed_dir, "remote", "add", "origin", remote_dir });
+    _ = try runTestCommandCapture(allocator, root, &.{ "git", "-C", seed_dir, "push", "-u", "origin", "main" });
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "default",
+        .{
+            .local_fs_export_root = exports_dir,
+        },
+    );
+    defer session.deinit();
+
+    const checkout_world_path = "/nodes/local/fs/pr-review/repos/test-repo";
+    const sync_payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"repo_url\":\"{s}\",\"checkout_path\":\"{s}\",\"base_branch\":\"main\"}}",
+        .{ remote_dir, checkout_world_path },
+    );
+    defer allocator.free(sync_payload);
+    try protocolWriteFile(
+        &session,
+        allocator,
+        600,
+        601,
+        &.{ "agents", "self", "git", "control", "sync_checkout.json" },
+        sync_payload,
+        1600,
+    );
+
+    const git_status = try protocolReadFile(
+        &session,
+        allocator,
+        602,
+        603,
+        &.{ "agents", "self", "git", "status.json" },
+        1601,
+    );
+    defer allocator.free(git_status);
+    try std.testing.expect(std.mem.indexOf(u8, git_status, "\"state\":\"done\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, git_status, "\"tool\":\"git_sync_checkout\"") != null);
+
+    const sync_result = try protocolReadFile(
+        &session,
+        allocator,
+        604,
+        605,
+        &.{ "agents", "self", "git", "result.json" },
+        1602,
+    );
+    defer allocator.free(sync_result);
+    try std.testing.expect(std.mem.indexOf(u8, sync_result, "\"operation\":\"sync_checkout\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sync_result, second_sha) != null);
+    try std.testing.expect(std.mem.indexOf(u8, sync_result, "\"reused_checkout\":false") != null);
+
+    const host_checkout_file = try std.fs.path.join(allocator, &.{ exports_dir, "pr-review", "repos", "test-repo", "src", "app.txt" });
+    defer allocator.free(host_checkout_file);
+    const host_checkout_content = try std.fs.cwd().readFileAlloc(allocator, host_checkout_file, 64 * 1024);
+    defer allocator.free(host_checkout_content);
+    try std.testing.expectEqualStrings("second\n", host_checkout_content);
+
+    const status_payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"checkout_path\":\"{s}\",\"base_ref\":\"{s}\"}}",
+        .{ checkout_world_path, first_sha },
+    );
+    defer allocator.free(status_payload);
+    try protocolWriteFile(
+        &session,
+        allocator,
+        606,
+        607,
+        &.{ "agents", "self", "git", "control", "status.json" },
+        status_payload,
+        1603,
+    );
+
+    const status_result = try protocolReadFile(
+        &session,
+        allocator,
+        608,
+        609,
+        &.{ "agents", "self", "git", "result.json" },
+        1604,
+    );
+    defer allocator.free(status_result);
+    try std.testing.expect(std.mem.indexOf(u8, status_result, "\"operation\":\"status\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status_result, "\"changed_files\":[\"src/app.txt\"]") != null);
+
+    const diff_payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"checkout_path\":\"{s}\",\"base_ref\":\"{s}\",\"head_ref\":\"HEAD\"}}",
+        .{ checkout_world_path, first_sha },
+    );
+    defer allocator.free(diff_payload);
+    try protocolWriteFile(
+        &session,
+        allocator,
+        610,
+        611,
+        &.{ "agents", "self", "git", "control", "diff_range.json" },
+        diff_payload,
+        1605,
+    );
+
+    const diff_result = try protocolReadFile(
+        &session,
+        allocator,
+        612,
+        613,
+        &.{ "agents", "self", "git", "result.json" },
+        1606,
+    );
+    defer allocator.free(diff_result);
+    try std.testing.expect(std.mem.indexOf(u8, diff_result, "\"operation\":\"diff_range\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diff_result, "\"changed_files\":[\"src/app.txt\"]") != null);
+}
+
+test "acheron_session: github_pr venom dry run surfaces provider API requests" {
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const root = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+    const exports_dir = try std.fmt.allocPrint(allocator, "{s}/exports", .{root});
+    defer allocator.free(exports_dir);
+    try std.fs.cwd().makePath(exports_dir);
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "default",
+        .{
+            .local_fs_export_root = exports_dir,
+        },
+    );
+    defer session.deinit();
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        620,
+        621,
+        &.{ "agents", "self", "github_pr", "control", "sync.json" },
+        "{\"repo_key\":\"DeanoC/Spiderweb\",\"pr_number\":42,\"dry_run\":true}",
+        1610,
+    );
+
+    const github_status = try protocolReadFile(
+        &session,
+        allocator,
+        622,
+        623,
+        &.{ "agents", "self", "github_pr", "status.json" },
+        1611,
+    );
+    defer allocator.free(github_status);
+    try std.testing.expect(std.mem.indexOf(u8, github_status, "\"state\":\"done\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, github_status, "\"tool\":\"github_pr_sync\"") != null);
+
+    const sync_result = try protocolReadFile(
+        &session,
+        allocator,
+        624,
+        625,
+        &.{ "agents", "self", "github_pr", "result.json" },
+        1612,
+    );
+    defer allocator.free(sync_result);
+    try std.testing.expect(std.mem.indexOf(u8, sync_result, "\"operation\":\"sync\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sync_result, "\"dry_run\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sync_result, "https://api.github.com/repos/DeanoC/Spiderweb/pulls/42") != null);
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        626,
+        627,
+        &.{ "agents", "self", "github_pr", "control", "publish_review.json" },
+        "{\"repo_key\":\"DeanoC/Spiderweb\",\"pr_number\":42,\"decision\":\"request_changes\",\"review_comment\":\"Please fix the regression.\",\"dry_run\":true,\"thread_actions\":[{\"thread_id\":\"t1\",\"action\":\"comment\"}]}",
+        1613,
+    );
+
+    const publish_result = try protocolReadFile(
+        &session,
+        allocator,
+        628,
+        629,
+        &.{ "agents", "self", "github_pr", "result.json" },
+        1614,
+    );
+    defer allocator.free(publish_result);
+    try std.testing.expect(std.mem.indexOf(u8, publish_result, "\"operation\":\"publish_review\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, publish_result, "\"decision\":\"request_changes\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, publish_result, "\"thread_actions_count\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, publish_result, "\"thread_actions_supported\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, publish_result, "https://api.github.com/repos/DeanoC/Spiderweb/pulls/42/reviews") != null);
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        630,
+        631,
+        &.{ "agents", "self", "github_pr", "control", "publish_review.json" },
+        "{\"repo_key\":\"DeanoC/Spiderweb\",\"pr_number\":42,\"decision\":\"comment\",\"review_comment\":\"No line comments.\",\"dry_run\":true,\"thread_actions\":null}",
+        1615,
+    );
+
+    const publish_result_without_threads = try protocolReadFile(
+        &session,
+        allocator,
+        632,
+        633,
+        &.{ "agents", "self", "github_pr", "result.json" },
+        1616,
+    );
+    defer allocator.free(publish_result_without_threads);
+    try std.testing.expect(std.mem.indexOf(u8, publish_result_without_threads, "\"operation\":\"publish_review\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, publish_result_without_threads, "\"decision\":\"comment\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, publish_result_without_threads, "\"thread_actions_count\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, publish_result_without_threads, "\"error\":null") != null);
 }
 
 test "acheron_session: mother can upsert project from system context without project token" {
@@ -12451,7 +13737,7 @@ test "acheron_session: mother can upsert project from system context without pro
         allocator,
         332,
         333,
-        &.{ "agents", "self", "projects", "control", "up.json" },
+        &.{ "agents", "self", "workspaces", "control", "up.json" },
         "{\"name\":\"ZiggyPR\",\"vision\":\"Bootstrap project setup\",\"activate\":false}",
         954,
     );
@@ -12461,19 +13747,19 @@ test "acheron_session: mother can upsert project from system context without pro
         allocator,
         334,
         335,
-        &.{ "agents", "self", "projects", "status.json" },
+        &.{ "agents", "self", "workspaces", "status.json" },
         955,
     );
     defer allocator.free(status);
     try std.testing.expect(std.mem.indexOf(u8, status, "\"state\":\"done\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, status, "\"tool\":\"projects_up\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status, "\"tool\":\"workspaces_up\"") != null);
 
     const result = try protocolReadFile(
         &session,
         allocator,
         336,
         337,
-        &.{ "agents", "self", "projects", "result.json" },
+        &.{ "agents", "self", "workspaces", "result.json" },
         956,
     );
     defer allocator.free(result);
@@ -12560,16 +13846,17 @@ test "acheron_session: agents namespace create/list provisions new agent when ca
     try std.testing.expect(std.mem.indexOf(u8, create_result, "\"activated\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, create_result, "\"activation_error\":null") != null);
 
-    const hatch_path = try std.fs.path.join(allocator, &.{ agents_dir, "builder", "HATCH.md" });
-    defer allocator.free(hatch_path);
-    const hatch_content = try std.fs.cwd().readFileAlloc(allocator, hatch_path, 64 * 1024);
-    defer allocator.free(hatch_content);
-    try std.testing.expect(hatch_content.len > 0);
+    const soul_path = try std.fs.path.join(allocator, &.{ agents_dir, "builder", "SOUL.md" });
+    defer allocator.free(soul_path);
+    const soul_content = try std.fs.cwd().readFileAlloc(allocator, soul_path, 64 * 1024);
+    defer allocator.free(soul_content);
+    try std.testing.expect(soul_content.len > 0);
 
     const metadata_path = try std.fs.path.join(allocator, &.{ agents_dir, "builder", "agent.json" });
     defer allocator.free(metadata_path);
     const metadata_content = try std.fs.cwd().readFileAlloc(allocator, metadata_path, 64 * 1024);
     defer allocator.free(metadata_content);
+    try std.testing.expect(std.mem.indexOf(u8, metadata_content, "\"persona_pack\":\"default\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, metadata_content, "\"name\":\"Builder\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, metadata_content, "\"capabilities\"") != null);
 
@@ -12593,6 +13880,7 @@ test "acheron_session: agents namespace create/list provisions new agent when ca
     defer allocator.free(list_result);
     try std.testing.expect(std.mem.indexOf(u8, list_result, "\"operation\":\"list\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, list_result, "\"agent_id\":\"builder\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, list_result, "\"persona_pack\":\"default\"") != null);
 }
 
 test "acheron_session: agents namespace create can activate a new agent into a requested project" {
@@ -12736,11 +14024,11 @@ test "acheron_session: agents namespace create reports activation errors without
     try std.testing.expect(std.mem.indexOf(u8, create_result, "\"activated\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, create_result, "\"activation_error\":\"ProjectNotFound\"") != null);
 
-    const hatch_path = try std.fs.path.join(allocator, &.{ agents_dir, "builder-missing-project", "HATCH.md" });
-    defer allocator.free(hatch_path);
-    const hatch_content = try std.fs.cwd().readFileAlloc(allocator, hatch_path, 64 * 1024);
-    defer allocator.free(hatch_content);
-    try std.testing.expect(hatch_content.len > 0);
+    const soul_path = try std.fs.path.join(allocator, &.{ agents_dir, "builder-missing-project", "SOUL.md" });
+    defer allocator.free(soul_path);
+    const soul_content = try std.fs.cwd().readFileAlloc(allocator, soul_path, 64 * 1024);
+    defer allocator.free(soul_content);
+    try std.testing.expect(soul_content.len > 0);
 }
 
 test "acheron_session: agents namespace create denies invoke without capability" {
@@ -13013,6 +14301,7 @@ test "acheron_session: first-class memory namespace operation file maps to runti
     );
     defer allocator.free(result_payload);
     try std.testing.expect(std.mem.indexOf(u8, result_payload, "\"memory_path\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result_payload, "\"ownership\":\"working_memory\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, result_payload, "\"name\":\"ns-memory\"") != null);
 
     const status_payload = try protocolReadFile(
@@ -13095,6 +14384,7 @@ test "acheron_session: memory load accepts memory_path identity" {
     );
     defer allocator.free(loaded_payload);
     try std.testing.expect(std.mem.indexOf(u8, loaded_payload, "\"memory_path\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, loaded_payload, "\"ownership\":\"working_memory\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, loaded_payload, memory_path_value.string) != null);
 }
 
@@ -13324,13 +14614,37 @@ test "acheron_session: terminal-v2 session lifecycle updates current and session
     defer allocator.free(current_after_close);
     try std.testing.expect(std.mem.indexOf(u8, current_after_close, "\"session\":null") != null);
 
-    const sessions_payload = try protocolReadFile(
+    const close_status_payload = try protocolReadFile(
         &session,
         allocator,
         314,
         315,
-        &.{ "agents", "self", "terminal", "sessions.json" },
+        &.{ "agents", "self", "terminal", "status.json" },
         927,
+    );
+    defer allocator.free(close_status_payload);
+    try std.testing.expect(std.mem.indexOf(u8, close_status_payload, "\"tool\":\"terminal_session_close\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, close_status_payload, "\"session_id\":\"build\"") != null);
+
+    const close_result_payload = try protocolReadFile(
+        &session,
+        allocator,
+        316,
+        317,
+        &.{ "agents", "self", "terminal", "result.json" },
+        928,
+    );
+    defer allocator.free(close_result_payload);
+    try std.testing.expect(std.mem.indexOf(u8, close_result_payload, "\"operation\":\"close\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, close_result_payload, "\"session_id\":\"build\"") != null);
+
+    const sessions_payload = try protocolReadFile(
+        &session,
+        allocator,
+        318,
+        319,
+        &.{ "agents", "self", "terminal", "sessions.json" },
+        929,
     );
     defer allocator.free(sessions_payload);
     try std.testing.expect(std.mem.indexOf(u8, sessions_payload, "\"session_id\":\"build\"") != null);
@@ -13516,8 +14830,7 @@ test "acheron_session: terminal-v2 buffered output survives partial reads and mu
     );
 
     const terminal_session = session.terminal_sessions.getPtr("buf") orelse return error.TestExpectedResponse;
-    try session.appendTerminalBufferedResult(terminal_session, "abcdef");
-    try session.appendTerminalBufferedResult(terminal_session, "gh");
+    terminal_session.buffered_result = try allocator.dupe(u8, "abcdefgh");
 
     try protocolWriteFile(
         &session,
@@ -13936,6 +15249,29 @@ test "acheron_session: terminal-v2 write and exec surface shell_exec failures" {
     defer allocator.free(exec_result_payload);
     try std.testing.expect(std.mem.indexOf(u8, exec_result_payload, "\"ok\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, exec_result_payload, "\"operation\":\"exec\"") != null);
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        368,
+        369,
+        &.{ "agents", "self", "terminal", "control", "exec.json" },
+        "{\"command\":\"echo implicit-still-fails\"}",
+        953,
+    );
+
+    const implicit_exec_result_payload = try protocolReadFile(
+        &session,
+        allocator,
+        370,
+        371,
+        &.{ "agents", "self", "terminal", "result.json" },
+        954,
+    );
+    defer allocator.free(implicit_exec_result_payload);
+    try std.testing.expect(std.mem.indexOf(u8, implicit_exec_result_payload, "\"ok\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, implicit_exec_result_payload, "\"operation\":\"exec\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, implicit_exec_result_payload, "\"session_id\":\"fail\"") != null);
 }
 
 test "acheron_session: first-class memory namespace rejects unknown invoke op" {
@@ -14258,6 +15594,52 @@ test "acheron_session: mounts namespace mkdir creates local export folders" {
         "invalid",
     );
     defer allocator.free(invalid_response);
+}
+
+test "acheron_session: local fs export files appear in the combined /nodes/local/fs view" {
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const local_export_root = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(local_export_root);
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "default",
+        .{
+            .local_fs_export_root = local_export_root,
+        },
+    );
+    defer session.deinit();
+
+    const contract_dir = try std.fs.path.join(allocator, &.{ local_export_root, "pr-review", "state", "DeanoC__Spiderweb", "pr-115" });
+    defer allocator.free(contract_dir);
+    try std.fs.cwd().makePath(contract_dir);
+
+    const context_host_path = try std.fs.path.join(allocator, &.{ contract_dir, "context.json" });
+    defer allocator.free(context_host_path);
+    try std.fs.cwd().writeFile(.{
+        .sub_path = context_host_path,
+        .data = "{\"repo_key\":\"DeanoC/Spiderweb\",\"pr_number\":115}\n",
+    });
+
+    const dir_listing = (try session.tryReadInternalPath("/nodes/local/fs/pr-review/state/DeanoC__Spiderweb")) orelse return error.TestExpectedResponse;
+    defer allocator.free(dir_listing);
+    try std.testing.expect(std.mem.indexOf(u8, dir_listing, "pr-115") != null);
+
+    const context_content = (try session.tryReadInternalPath("/nodes/local/fs/pr-review/state/DeanoC__Spiderweb/pr-115/context.json")) orelse return error.TestExpectedResponse;
+    defer allocator.free(context_content);
+    try std.testing.expect(std.mem.indexOf(u8, context_content, "\"repo_key\":\"DeanoC/Spiderweb\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, context_content, "\"pr_number\":115") != null);
 }
 
 test "acheron_session: node services namespace prefers control-plane catalog" {
@@ -15393,7 +16775,7 @@ test "acheron_session: control-plane mounts expose custom node roots and metadat
     defer allocator.free(escaped_node_secret);
     const upsert_req = try std.fmt.allocPrint(
         allocator,
-        "{{\"node_id\":\"{s}\",\"node_secret\":\"{s}\",\"venoms\":[{{\"venom_id\":\"gdrive-main\",\"kind\":\"gdrive\",\"version\":\"1\",\"state\":\"online\",\"endpoints\":[\"/nodes/{s}/venoms/gdrive-main\"],\"capabilities\":{{\"provider\":\"google\"}},\"mounts\":[{{\"mount_id\":\"drive-main\",\"mount_path\":\"/nodes/{s}/drive/main\",\"state\":\"online\"}}],\"ops\":{{\"model\":\"namespace\"}},\"runtime\":{{\"type\":\"native_proc\"}},\"permissions\":{{\"default\":\"deny-by-default\",\"allow_roles\":[\"admin\",\"user\"]}},\"schema\":{{\"model\":\"namespace-mount\"}},\"help_md\":\"Google Drive namespace mount\"}}]}}",
+        "{{\"node_id\":\"{s}\",\"node_secret\":\"{s}\",\"venoms\":[{{\"venom_id\":\"gdrive-main\",\"kind\":\"gdrive\",\"version\":\"1\",\"state\":\"online\",\"endpoints\":[\"/nodes/{s}/venoms/gdrive-main\"],\"capabilities\":{{\"provider\":\"google\"}},\"mounts\":[{{\"mount_id\":\"drive-main\",\"mount_path\":\"/nodes/{s}/drive/main\",\"state\":\"online\"}}],\"ops\":{{\"model\":\"namespace\"}},\"runtime\":{{\"type\":\"native_proc\"}},\"permissions\":{{\"default\":\"deny-by-default\",\"allow_roles\":[\"admin\",\"user\"]}},\"schema\":{{\"model\":\"namespace-mount\"}},\"invoke_template\":{{\"tool_name\":\"gdrive_sync\",\"arguments\":{{\"drive\":\"main\"}}}},\"help_md\":\"Google Drive namespace mount\"}}]}}",
         .{ escaped_node_id, escaped_node_secret, escaped_node_id, escaped_node_id },
     );
     defer allocator.free(upsert_req);
@@ -15454,17 +16836,23 @@ test "acheron_session: control-plane mounts expose custom node roots and metadat
     const mounts_id = session.lookupChild(gdrive_service, "MOUNTS.json") orelse return error.TestExpectedResponse;
     const ops_id = session.lookupChild(gdrive_service, "OPS.json") orelse return error.TestExpectedResponse;
     const runtime_id = session.lookupChild(gdrive_service, "RUNTIME.json") orelse return error.TestExpectedResponse;
+    const template_id = session.lookupChild(gdrive_service, "TEMPLATE.json") orelse return error.TestExpectedResponse;
+    const host_id = session.lookupChild(gdrive_service, "HOST.json") orelse return error.TestExpectedResponse;
     const permissions_id = session.lookupChild(gdrive_service, "PERMISSIONS.json") orelse return error.TestExpectedResponse;
     const readme_id = session.lookupChild(gdrive_service, "README.md") orelse return error.TestExpectedResponse;
     const mounts_node = session.nodes.get(mounts_id) orelse return error.TestExpectedResponse;
     const ops_node = session.nodes.get(ops_id) orelse return error.TestExpectedResponse;
     const runtime_node = session.nodes.get(runtime_id) orelse return error.TestExpectedResponse;
+    const template_node = session.nodes.get(template_id) orelse return error.TestExpectedResponse;
+    const host_node = session.nodes.get(host_id) orelse return error.TestExpectedResponse;
     const permissions_node = session.nodes.get(permissions_id) orelse return error.TestExpectedResponse;
     const readme_node = session.nodes.get(readme_id) orelse return error.TestExpectedResponse;
 
     try std.testing.expect(std.mem.indexOf(u8, mounts_node.content, "\"mount_path\":\"/nodes/") != null);
     try std.testing.expect(std.mem.indexOf(u8, ops_node.content, "\"model\":\"namespace\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, runtime_node.content, "\"type\":\"native_proc\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, template_node.content, "\"tool_name\":\"gdrive_sync\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, host_node.content, "\"runtime_kind\":\"native_proc\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, permissions_node.content, "\"deny-by-default\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, readme_node.content, "Google Drive namespace mount") != null);
 }
@@ -16434,6 +17822,168 @@ test "acheron_session: runtime failure normalization redacts provider details" {
     const normalized = chat_runtime_job.normalizeRuntimeFailureForAgent("provider_request_invalid", "provider request invalid");
     try std.testing.expectEqualStrings("runtime_internal_limit", normalized.code);
     try std.testing.expectEqualStrings("Temporary internal runtime limit reached; retry this request.", normalized.message);
+}
+
+test "acheron_session: project metadata exposes workspace binds and mounted services" {
+    const allocator = std.testing.allocator;
+
+    var control_plane = control_plane_mod.ControlPlane.init(allocator);
+    defer control_plane.deinit();
+
+    const project_json = try control_plane.createProject(
+        "{\"name\":\"SessionTemplateGitHub\",\"vision\":\"SessionTemplateGitHub\",\"template_id\":\"github\"}",
+    );
+    defer allocator.free(project_json);
+    var parsed_project = try std.json.parseFromSlice(std.json.Value, allocator, project_json, .{});
+    defer parsed_project.deinit();
+    const project_id = parsed_project.value.object.get("project_id").?.string;
+    const project_token = parsed_project.value.object.get("project_token").?.string;
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "default",
+        .{
+            .project_id = project_id,
+            .project_token = project_token,
+            .agents_dir = ".does-not-exist",
+            .projects_dir = ".does-not-exist",
+            .control_plane = &control_plane,
+        },
+    );
+    defer session.deinit();
+
+    const projects_root = session.lookupChild(session.root_id, "projects") orelse return error.TestExpectedResponse;
+    const project_dir = session.lookupChild(projects_root, project_id) orelse return error.TestExpectedResponse;
+    const meta_dir = session.lookupChild(project_dir, "meta") orelse return error.TestExpectedResponse;
+    const binds_id = session.lookupChild(meta_dir, "binds.json") orelse return error.TestExpectedResponse;
+    const binds_node = session.nodes.get(binds_id) orelse return error.TestExpectedResponse;
+    try std.testing.expect(std.mem.indexOf(u8, binds_node.content, "\"bind_path\":\"/services/mounts\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, binds_node.content, "\"bind_path\":\"/services/github_pr\"") != null);
+
+    const mounted_services_id = session.lookupChild(meta_dir, "mounted_services.json") orelse return error.TestExpectedResponse;
+    const mounted_services_node = session.nodes.get(mounted_services_id) orelse return error.TestExpectedResponse;
+    try std.testing.expect(std.mem.indexOf(u8, mounted_services_node.content, "\"path\":\"/services/git\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mounted_services_node.content, "\"path\":\"/services/terminal\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mounted_services_node.content, "\"path\":\"/services/library\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mounted_services_node.content, "\"target_path\":\"/nodes/local/venoms/github_pr\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mounted_services_node.content, "\"venom_id\":\"pr_review\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mounted_services_node.content, "\"exposure\":\"project_bind\"") != null);
+
+    const root_meta_dir = session.lookupChild(session.root_id, "meta") orelse return error.TestExpectedResponse;
+    const workspace_services_id = session.lookupChild(root_meta_dir, "workspace_services.json") orelse return error.TestExpectedResponse;
+    const workspace_services_node = session.nodes.get(workspace_services_id) orelse return error.TestExpectedResponse;
+    try std.testing.expect(std.mem.indexOf(u8, workspace_services_node.content, "\"path\":\"/services/missions\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, workspace_services_node.content, "\"path\":\"/services/events\"") != null);
+}
+
+test "acheron_session: preferred service paths use workspace bindings when available" {
+    const allocator = std.testing.allocator;
+
+    var control_plane = control_plane_mod.ControlPlane.init(allocator);
+    defer control_plane.deinit();
+
+    const project_json = try control_plane.createProject(
+        "{\"name\":\"SessionServicePaths\",\"vision\":\"SessionServicePaths\",\"template_id\":\"github\"}",
+    );
+    defer allocator.free(project_json);
+    var parsed_project = try std.json.parseFromSlice(std.json.Value, allocator, project_json, .{});
+    defer parsed_project.deinit();
+    const project_id = parsed_project.value.object.get("project_id").?.string;
+    const project_token = parsed_project.value.object.get("project_token").?.string;
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var bound_session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "default",
+        .{
+            .project_id = project_id,
+            .project_token = project_token,
+            .agents_dir = ".does-not-exist",
+            .projects_dir = ".does-not-exist",
+            .control_plane = &control_plane,
+        },
+    );
+    defer bound_session.deinit();
+
+    const bound_github_path = try bound_session.resolvePreferredServicePath("github_pr", "/control/sync.json");
+    defer allocator.free(bound_github_path);
+    try std.testing.expectEqualStrings("/services/github_pr/control/sync.json", bound_github_path);
+
+    const bound_missions_path = try bound_session.resolvePreferredServicePath("missions", "/control/request_approval.json");
+    defer allocator.free(bound_missions_path);
+    try std.testing.expectEqualStrings("/services/missions/control/request_approval.json", bound_missions_path);
+
+    var unbound_session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "default",
+        .{
+            .agents_dir = ".does-not-exist",
+            .projects_dir = ".does-not-exist",
+        },
+    );
+    defer unbound_session.deinit();
+
+    const unbound_github_path = try unbound_session.resolvePreferredServicePath("github_pr", "/control/sync.json");
+    defer allocator.free(unbound_github_path);
+    try std.testing.expectEqualStrings("/nodes/local/venoms/github_pr/control/sync.json", unbound_github_path);
+}
+
+test "acheron_session: bound workspace service paths are readable through /services" {
+    const allocator = std.testing.allocator;
+
+    var control_plane = control_plane_mod.ControlPlane.init(allocator);
+    defer control_plane.deinit();
+
+    const project_json = try control_plane.createProject(
+        "{\"name\":\"SessionServiceWalk\",\"vision\":\"SessionServiceWalk\",\"template_id\":\"github\"}",
+    );
+    defer allocator.free(project_json);
+    var parsed_project = try std.json.parseFromSlice(std.json.Value, allocator, project_json, .{});
+    defer parsed_project.deinit();
+    const project_id = parsed_project.value.object.get("project_id").?.string;
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "default",
+        .{
+            .project_id = project_id,
+            .agents_dir = ".does-not-exist",
+            .projects_dir = ".does-not-exist",
+            .control_plane = &control_plane,
+        },
+    );
+    defer session.deinit();
+
+    const services_root = session.lookupChild(session.root_id, "services") orelse return error.TestExpectedResponse;
+    const pr_review_dir = session.lookupChild(services_root, "pr_review") orelse return error.TestExpectedResponse;
+    const schema_id = session.lookupChild(pr_review_dir, "SCHEMA.json") orelse return error.TestExpectedResponse;
+    const schema_node = session.nodes.get(schema_id) orelse return error.TestExpectedResponse;
+    try std.testing.expect(std.mem.indexOf(u8, schema_node.content, "\"venom_id\":\"pr_review\"") != null);
 }
 
 test "acheron_session: missing provider API key is surfaced directly" {

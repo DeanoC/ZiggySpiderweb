@@ -5,6 +5,7 @@ const HookData = hook_registry.HookData;
 const HookError = hook_registry.HookError;
 const Rom = hook_registry.Rom;
 const AgentRuntime = @import("agent_runtime.zig").AgentRuntime;
+const memory_ownership = @import("memory_ownership.zig");
 const memory = @import("ziggy-memory-store").memory;
 const memid = @import("ziggy-memory-store").memid;
 const protocol = @import("spider-protocol").protocol;
@@ -12,13 +13,13 @@ const Config = @import("../config.zig");
 const memory_schema = @import("memory_schema.zig");
 
 /// System paths for templates
-pub const SOUL_MEM_NAME = "system.soul";
-pub const AGENT_MEM_NAME = "system.agent";
-pub const IDENTITY_MEM_NAME = "system.identity";
-pub const BASE_CORE_MEM_NAME = "system.core";
+pub const SOUL_MEM_NAME = memory_ownership.SOUL_MEM_NAME;
+pub const AGENT_MEM_NAME = memory_ownership.AGENT_MEM_NAME;
+pub const IDENTITY_MEM_NAME = memory_ownership.IDENTITY_MEM_NAME;
+pub const BASE_CORE_MEM_NAME = memory_ownership.BASE_CORE_MEM_NAME;
 pub const BASE_CORE_ROM_KEY = "system:base_instructions";
 
-/// Load identity from LTM into core prompt memory map, or hatch from templates if first boot
+/// Load identity from LTM into core prompt memory map, or seed from persona files if first boot
 pub fn loadSharedRomHook(ctx: *HookContext, data: HookData) HookError!void {
     const rom = data.pre_observe;
     const allocator = ctx.runtime.allocator;
@@ -146,7 +147,7 @@ fn unwrapJsonString(allocator: std.mem.Allocator, json_str: []const u8) ![]u8 {
     return allocator.dupe(u8, json_str);
 }
 
-/// Ensure the identity memories exist for a brain, hatching from templates if needed.
+/// Ensure the identity memories exist for a brain, seeding from persona files if needed.
 pub fn ensureIdentityMemories(runtime: *AgentRuntime, brain_name: []const u8) !void {
     _ = try ensureMemoryFromTemplate(runtime, brain_name, "CORE.md", BASE_CORE_MEM_NAME);
     _ = try ensureMemoryFromTemplate(runtime, brain_name, "SOUL.md", SOUL_MEM_NAME);
@@ -179,7 +180,7 @@ fn logTemplateLoadFailure(template_name: []const u8, err: anyerror, has_fallback
             std.log.info("Template {s} not found; using persisted memory", .{template_name});
             return;
         }
-        std.log.info("Template {s} not found; skipping hatch", .{template_name});
+        std.log.info("Template {s} not found; skipping persona seeding", .{template_name});
         return;
     }
     std.log.warn("Failed to load template {s}: {s}", .{ template_name, @errorName(err) });
@@ -192,6 +193,7 @@ fn ensureMemoryFromTemplate(
     name: []const u8,
 ) !bool {
     const allocator = runtime.allocator;
+    const ownership_spec = memory_ownership.specForName(name);
     var existing = try loadMemoryByName(runtime, brain_name, name);
     if (existing) |*item| {
         defer item.deinit(allocator);
@@ -214,36 +216,61 @@ fn ensureMemoryFromTemplate(
 
                 if (!std.mem.eql(u8, item.content_json, template_content_json)) {
                     if (is_active) {
-                        var updated = runtime.active_memory.mutate(item.mem_id, template_content_json) catch |err| {
-                            if (err == memory.MemoryError.NotFound) {
-                                var recreated = runtime.active_memory.create(
-                                    brain_name,
-                                    name,
-                                    item.kind,
-                                    template_content_json,
-                                    false,
-                                    true,
-                                ) catch |create_err| {
-                                    std.log.warn("Failed to sync {s} from {s}: {s}", .{ name, template_name, @errorName(create_err) });
+                        if (item.mutable) {
+                            var updated = runtime.active_memory.mutate(item.mem_id, template_content_json) catch |err| {
+                                if (err == memory.MemoryError.NotFound) {
+                                    var recreated = runtime.active_memory.create(
+                                        brain_name,
+                                        name,
+                                        item.kind,
+                                        template_content_json,
+                                        ownership_spec.write_protected,
+                                        ownership_spec.unevictable,
+                                    ) catch |create_err| {
+                                        std.log.warn("Failed to sync {s} from {s}: {s}", .{ name, template_name, @errorName(create_err) });
+                                        return false;
+                                    };
+                                    recreated.deinit(allocator);
+                                    is_active = true;
+                                    std.log.info("Synced {s} from {s} for {s}/{s}", .{ name, template_name, runtime.agent_id, brain_name });
+                                    return true;
+                                }
+                                std.log.warn("Failed to sync {s} from {s}: {s}", .{ name, template_name, @errorName(err) });
+                                return false;
+                            };
+                            updated.deinit(allocator);
+                        } else {
+                            var removed = runtime.active_memory.removeActiveNoHistory(item.mem_id) catch |err| switch (err) {
+                                memory.MemoryError.NotFound => null,
+                                else => {
+                                    std.log.warn("Failed to remove protected {s} before sync from {s}: {s}", .{ name, template_name, @errorName(err) });
                                     return false;
-                                };
-                                recreated.deinit(allocator);
-                                is_active = true;
-                                std.log.info("Synced {s} from {s} for {s}/{s}", .{ name, template_name, runtime.agent_id, brain_name });
-                                return true;
-                            }
-                            std.log.warn("Failed to sync {s} from {s}: {s}", .{ name, template_name, @errorName(err) });
-                            return false;
-                        };
-                        updated.deinit(allocator);
+                                },
+                            };
+                            if (removed) |*removed_item| removed_item.deinit(allocator);
+
+                            var recreated = runtime.active_memory.create(
+                                brain_name,
+                                name,
+                                item.kind,
+                                template_content_json,
+                                ownership_spec.write_protected,
+                                ownership_spec.unevictable,
+                            ) catch |err| {
+                                std.log.warn("Failed to recreate protected {s} from {s}: {s}", .{ name, template_name, @errorName(err) });
+                                return false;
+                            };
+                            recreated.deinit(allocator);
+                            is_active = true;
+                        }
                     } else {
                         var synced = runtime.active_memory.create(
                             brain_name,
                             name,
                             item.kind,
                             template_content_json,
-                            false,
-                            true,
+                            ownership_spec.write_protected,
+                            ownership_spec.unevictable,
                         ) catch |err| {
                             std.log.warn("Failed to sync {s} from {s}: {s}", .{ name, template_name, @errorName(err) });
                             return false;
@@ -269,8 +296,8 @@ fn ensureMemoryFromTemplate(
             name,
             latest.kind,
             latest.content_json,
-            false,
-            true,
+            ownership_spec.write_protected,
+            ownership_spec.unevictable,
         ) catch |err| {
             std.log.warn("Failed to rehydrate memory {s} for {s}/{s}: {s}", .{ name, runtime.agent_id, brain_name, @errorName(err) });
             return false;
@@ -296,15 +323,15 @@ fn ensureMemoryFromTemplate(
         name,
         name,
         content_json,
-        false,
-        true,
+        ownership_spec.write_protected,
+        ownership_spec.unevictable,
     ) catch |err| {
         std.log.warn("Failed to create memory for {s}: {s}", .{ template_name, @errorName(err) });
         return false;
     };
     defer created.deinit(allocator);
 
-    std.log.info("Hatched {s} for {s}/{s}", .{ template_name, runtime.agent_id, brain_name });
+    std.log.info("Seeded {s} for {s}/{s}", .{ template_name, runtime.agent_id, brain_name });
     return true;
 }
 
@@ -579,6 +606,93 @@ test "system_hooks: ensureIdentityMemories rehydrates persisted identity into ac
     try std.testing.expect(containsNamedMemory(after, SOUL_MEM_NAME));
     try std.testing.expect(containsNamedMemory(after, AGENT_MEM_NAME));
     try std.testing.expect(containsNamedMemory(after, IDENTITY_MEM_NAME));
+}
+
+test "system_hooks: ensureIdentityMemories enforces kernel and identity ownership flags" {
+    const allocator = std.testing.allocator;
+    var runtime = try AgentRuntime.init(allocator, "agent-system-hooks-ownership", &.{}, .{});
+    defer runtime.deinit();
+
+    try ensureIdentityMemories(&runtime, "primary");
+
+    const core_opt = try loadMemoryByName(&runtime, "primary", BASE_CORE_MEM_NAME);
+    try std.testing.expect(core_opt != null);
+    var core = core_opt.?;
+    defer core.deinit(allocator);
+    try std.testing.expect(!core.mutable);
+    try std.testing.expect(core.unevictable);
+
+    inline for (.{ memory_schema.POLICY_MEM_NAME, memory_schema.LOOP_CONTRACT_MEM_NAME, memory_schema.TOOL_CONTRACT_MEM_NAME, memory_schema.COMPLETION_CONTRACT_MEM_NAME }) |name| {
+        const item_opt = try loadMemoryByName(&runtime, "primary", name);
+        try std.testing.expect(item_opt != null);
+        var item = item_opt.?;
+        defer item.deinit(allocator);
+        try std.testing.expect(!item.mutable);
+        try std.testing.expect(item.unevictable);
+    }
+
+    inline for (.{ SOUL_MEM_NAME, AGENT_MEM_NAME, IDENTITY_MEM_NAME }) |name| {
+        const item_opt = try loadMemoryByName(&runtime, "primary", name);
+        try std.testing.expect(item_opt != null);
+        var item = item_opt.?;
+        defer item.deinit(allocator);
+        try std.testing.expect(item.mutable);
+        try std.testing.expect(item.unevictable);
+    }
+}
+
+test "system_hooks: identity memories stay mutable while kernel core stays protected after restart" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const tmp_root = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_root);
+    const ltm_dir = try std.fs.path.join(allocator, &.{ tmp_root, "ltm" });
+    defer allocator.free(ltm_dir);
+    try std.fs.cwd().makePath(ltm_dir);
+
+    const assets_dir = try std.fs.path.join(allocator, &.{ tmp_root, "assets" });
+    defer allocator.free(assets_dir);
+    try std.fs.cwd().makePath(assets_dir);
+
+    inline for (.{ "CORE.md", "SOUL.md", "AGENT.md", "IDENTITY.md" }) |filename| {
+        const path = try std.fs.path.join(allocator, &.{ assets_dir, filename });
+        defer allocator.free(path);
+        try std.fs.cwd().writeFile(.{
+            .sub_path = path,
+            .data = "seed-v1",
+        });
+    }
+
+    var cfg = Config.RuntimeConfig{};
+    cfg.assets_dir = assets_dir;
+
+    {
+        var runtime = try AgentRuntime.initWithPersistence(allocator, "agent-system-hooks-ownership-restart", &.{}, ltm_dir, "runtime-memory.db", cfg);
+        defer runtime.deinit();
+        try ensureIdentityMemories(&runtime, "primary");
+    }
+
+    var restarted = try AgentRuntime.initWithPersistence(allocator, "agent-system-hooks-ownership-restart", &.{}, ltm_dir, "runtime-memory.db", cfg);
+    defer restarted.deinit();
+    try ensureIdentityMemories(&restarted, "primary");
+
+    const core_opt = try loadMemoryByName(&restarted, "primary", BASE_CORE_MEM_NAME);
+    try std.testing.expect(core_opt != null);
+    var core = core_opt.?;
+    defer core.deinit(allocator);
+    try std.testing.expect(!core.mutable);
+
+    const soul_opt = try loadMemoryByName(&restarted, "primary", SOUL_MEM_NAME);
+    try std.testing.expect(soul_opt != null);
+    var soul = soul_opt.?;
+    defer soul.deinit(allocator);
+    try std.testing.expect(soul.mutable);
+
+    var mutated = try restarted.active_memory.mutate(soul.mem_id, "\"mutated-soul\"");
+    defer mutated.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 3), mutated.version orelse 0);
 }
 
 test "system_hooks: ensureIdentityMemories rehydrates persisted CORE when template is unavailable" {

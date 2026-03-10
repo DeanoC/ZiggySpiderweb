@@ -54,7 +54,7 @@ Quick roots:
 - `/global/mounts`
 - `/global/sub_brains`
 - `/global/agents`
-- `/global/projects`
+- `/global/workspaces`
 - `/global/library`
 
 Node-scoped discovery root:

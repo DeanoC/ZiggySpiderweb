@@ -1,0 +1,34 @@
+{
+  "phase": "discovered",
+  "last_synced_head_sha": "",
+  "current_focus": "",
+  "open_threads": [],
+  "latest_validation": {
+    "status": "unknown",
+    "summary": null
+  },
+  "latest_draft": {
+    "status": "pending",
+    "summary": null,
+    "revision": 0
+  },
+  "latest_recommendation": {
+    "status": "pending",
+    "summary": null
+  },
+  "artifacts": {
+    "draft_review": "draft-review.json",
+    "draft_review_comment": "review-comment-draft.md",
+    "draft_history_dir": "drafts",
+    "findings": "findings.json",
+    "validation": "validation.json",
+    "recommendation": "recommendation.json",
+    "thread_actions": "thread-actions.json",
+    "provider_sync": "services/provider-sync.json",
+    "checkout": "services/checkout.json",
+    "repo_status": "services/repo-status.json",
+    "diff_range": "services/diff-range.json",
+    "publish_review": "services/publish-review.json"
+  },
+  "notes": []
+}

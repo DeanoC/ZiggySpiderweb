@@ -1,4 +1,5 @@
 {
+  "persona_pack": "default",
   "name": "Mother",
   "description": "System orchestration and bootstrap guardian",
   "is_default": true,
