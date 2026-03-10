@@ -154,6 +154,89 @@ pub fn statusToolName(op: Op) []const u8 {
     };
 }
 
+pub fn handleNamespaceWrite(self: anytype, special: anytype, node_id: u32, raw_input: []const u8) !usize {
+    const input = std.mem.trim(u8, raw_input, " \t\r\n");
+    const payload = if (input.len == 0) "{}" else input;
+    try self.setFileContent(node_id, payload);
+
+    var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, payload, .{}) catch return error.InvalidPayload;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidPayload;
+    const obj = parsed.value.object;
+
+    const op = switch (special) {
+        .pr_review_configure_repo => Op.configure_repo,
+        .pr_review_get_repo => Op.get_repo,
+        .pr_review_list_repos => Op.list_repos,
+        .pr_review_intake => Op.intake,
+        .pr_review_start => Op.start,
+        .pr_review_sync => Op.sync,
+        .pr_review_run_validation => Op.run_validation,
+        .pr_review_record_validation => Op.record_validation,
+        .pr_review_draft_review => Op.draft_review,
+        .pr_review_save_draft => Op.save_draft,
+        .pr_review_record_review => Op.record_review,
+        .pr_review_advance => Op.advance,
+        .pr_review_invoke => blk: {
+            const op_raw = blk2: {
+                if (obj.get("op")) |value| if (value == .string and value.string.len > 0) break :blk2 value.string;
+                if (obj.get("operation")) |value| if (value == .string and value.string.len > 0) break :blk2 value.string;
+                if (obj.get("tool")) |value| if (value == .string and value.string.len > 0) break :blk2 value.string;
+                if (obj.get("tool_name")) |value| if (value == .string and value.string.len > 0) break :blk2 value.string;
+                break :blk2 null;
+            } orelse return error.InvalidPayload;
+            break :blk parseOp(op_raw) orelse return error.InvalidPayload;
+        },
+        else => return error.InvalidPayload,
+    };
+
+    const args_obj = blk: {
+        if (obj.get("arguments")) |value| {
+            if (value != .object) return error.InvalidPayload;
+            break :blk value.object;
+        }
+        if (obj.get("args")) |value| {
+            if (value != .object) return error.InvalidPayload;
+            break :blk value.object;
+        }
+        break :blk obj;
+    };
+
+    return executeOp(self, op, args_obj, raw_input.len);
+}
+
+pub fn executeOp(self: anytype, op: Op, args_obj: std.json.ObjectMap, written: usize) !usize {
+    const tool_name = statusToolName(op);
+    const running_status = try self.buildServiceInvokeStatusJson("running", tool_name, null);
+    defer self.allocator.free(running_status);
+    try self.setMirroredFileContent(self.pr_review_status_id, self.pr_review_status_alias_id, running_status);
+
+    const result_payload = executeOpPayload(self, op, args_obj) catch |err| {
+        const error_message = @errorName(err);
+        const failed_status = try self.buildServiceInvokeStatusJson("failed", tool_name, error_message);
+        defer self.allocator.free(failed_status);
+        try self.setMirroredFileContent(self.pr_review_status_id, self.pr_review_status_alias_id, failed_status);
+        const failed_result = try buildPrReviewFailureResultJson(self, op, "invalid_payload", error_message);
+        defer self.allocator.free(failed_result);
+        try self.setMirroredFileContent(self.pr_review_result_id, self.pr_review_result_alias_id, failed_result);
+        return err;
+    };
+    defer self.allocator.free(result_payload);
+
+    if (try self.extractErrorMessageFromToolPayload(result_payload)) |message| {
+        defer self.allocator.free(message);
+        const failed_status = try self.buildServiceInvokeStatusJson("failed", tool_name, message);
+        defer self.allocator.free(failed_status);
+        try self.setMirroredFileContent(self.pr_review_status_id, self.pr_review_status_alias_id, failed_status);
+    } else {
+        const done_status = try self.buildServiceInvokeStatusJson("done", tool_name, null);
+        defer self.allocator.free(done_status);
+        try self.setMirroredFileContent(self.pr_review_status_id, self.pr_review_status_alias_id, done_status);
+    }
+    try self.setMirroredFileContent(self.pr_review_result_id, self.pr_review_result_alias_id, result_payload);
+    return written;
+}
+
 pub fn executeOpPayload(self: anytype, op: Op, args_obj: std.json.ObjectMap) ![]u8 {
     return switch (op) {
         .configure_repo => executeConfigureRepoOp(self, args_obj),

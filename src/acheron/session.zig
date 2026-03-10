@@ -6348,94 +6348,7 @@ pub const Session = struct {
     }
 
     fn handlePrReviewNamespaceWrite(self: *Session, special: SpecialKind, node_id: u32, raw_input: []const u8) !WriteOutcome {
-        const input = std.mem.trim(u8, raw_input, " \t\r\n");
-        const payload = if (input.len == 0) "{}" else input;
-        try self.setFileContent(node_id, payload);
-
-        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, payload, .{}) catch return error.InvalidPayload;
-        defer parsed.deinit();
-        if (parsed.value != .object) return error.InvalidPayload;
-        const obj = parsed.value.object;
-
-        const op = switch (special) {
-            .pr_review_configure_repo => PrReviewOp.configure_repo,
-            .pr_review_get_repo => PrReviewOp.get_repo,
-            .pr_review_list_repos => PrReviewOp.list_repos,
-            .pr_review_intake => PrReviewOp.intake,
-            .pr_review_start => PrReviewOp.start,
-            .pr_review_sync => PrReviewOp.sync,
-            .pr_review_run_validation => PrReviewOp.run_validation,
-            .pr_review_record_validation => PrReviewOp.record_validation,
-            .pr_review_draft_review => PrReviewOp.draft_review,
-            .pr_review_save_draft => PrReviewOp.save_draft,
-            .pr_review_record_review => PrReviewOp.record_review,
-            .pr_review_advance => PrReviewOp.advance,
-            .pr_review_invoke => blk: {
-                const op_raw = blk2: {
-                    if (obj.get("op")) |value| if (value == .string and value.string.len > 0) break :blk2 value.string;
-                    if (obj.get("operation")) |value| if (value == .string and value.string.len > 0) break :blk2 value.string;
-                    if (obj.get("tool")) |value| if (value == .string and value.string.len > 0) break :blk2 value.string;
-                    if (obj.get("tool_name")) |value| if (value == .string and value.string.len > 0) break :blk2 value.string;
-                    break :blk2 null;
-                } orelse return error.InvalidPayload;
-                break :blk parsePrReviewOp(op_raw) orelse return error.InvalidPayload;
-            },
-            else => return error.InvalidPayload,
-        };
-
-        const args_obj = blk: {
-            if (obj.get("arguments")) |value| {
-                if (value != .object) return error.InvalidPayload;
-                break :blk value.object;
-            }
-            if (obj.get("args")) |value| {
-                if (value != .object) return error.InvalidPayload;
-                break :blk value.object;
-            }
-            break :blk obj;
-        };
-
-        return self.executePrReviewOp(op, args_obj, raw_input.len);
-    }
-
-    fn parsePrReviewOp(raw: []const u8) ?PrReviewOp {
-        return pr_review_venom.parseOp(raw);
-    }
-
-    fn executePrReviewOp(self: *Session, op: PrReviewOp, args_obj: std.json.ObjectMap, written: usize) !WriteOutcome {
-        const tool_name = prReviewStatusToolName(op);
-        const running_status = try self.buildServiceInvokeStatusJson("running", tool_name, null);
-        defer self.allocator.free(running_status);
-        try self.setMirroredFileContent(self.pr_review_status_id, self.pr_review_status_alias_id, running_status);
-
-        const result_payload = self.executePrReviewOpPayload(op, args_obj) catch |err| {
-            const error_message = @errorName(err);
-            const failed_status = try self.buildServiceInvokeStatusJson("failed", tool_name, error_message);
-            defer self.allocator.free(failed_status);
-            try self.setMirroredFileContent(self.pr_review_status_id, self.pr_review_status_alias_id, failed_status);
-            const failed_result = try self.buildPrReviewFailureResultJson(op, "invalid_payload", error_message);
-            defer self.allocator.free(failed_result);
-            try self.setMirroredFileContent(self.pr_review_result_id, self.pr_review_result_alias_id, failed_result);
-            return err;
-        };
-        defer self.allocator.free(result_payload);
-
-        if (try self.extractErrorMessageFromToolPayload(result_payload)) |message| {
-            defer self.allocator.free(message);
-            const failed_status = try self.buildServiceInvokeStatusJson("failed", tool_name, message);
-            defer self.allocator.free(failed_status);
-            try self.setMirroredFileContent(self.pr_review_status_id, self.pr_review_status_alias_id, failed_status);
-        } else {
-            const done_status = try self.buildServiceInvokeStatusJson("done", tool_name, null);
-            defer self.allocator.free(done_status);
-            try self.setMirroredFileContent(self.pr_review_status_id, self.pr_review_status_alias_id, done_status);
-        }
-        try self.setMirroredFileContent(self.pr_review_result_id, self.pr_review_result_alias_id, result_payload);
-        return .{ .written = written };
-    }
-
-    fn executePrReviewOpPayload(self: *Session, op: PrReviewOp, args_obj: std.json.ObjectMap) ![]u8 {
-        return pr_review_venom.executeOpPayload(self, op, args_obj);
+        return .{ .written = try pr_review_venom.handleNamespaceWrite(self, special, node_id, raw_input) };
     }
 
     pub const PrReviewResolvedContract = pr_review_venom.ResolvedContract;
@@ -6947,14 +6860,6 @@ pub const Session = struct {
             error_code,
             error_message,
         );
-    }
-
-    fn prReviewOperationName(op: PrReviewOp) []const u8 {
-        return pr_review_venom.operationName(op);
-    }
-
-    fn prReviewStatusToolName(op: PrReviewOp) []const u8 {
-        return pr_review_venom.statusToolName(op);
     }
 
     fn seedAgentMissionsNamespace(self: *Session, missions_dir: u32) !void {
