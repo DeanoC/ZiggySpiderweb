@@ -178,6 +178,41 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(spiderweb);
 
+    const pr_review_dogfood_mod = b.createModule(.{
+        .root_source_file = b.path("src/pr_review_dogfood.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    pr_review_dogfood_mod.addIncludePath(b.path("src/c"));
+    pr_review_dogfood_mod.addImport("ziggy-piai", ziggy_piai_module);
+    pr_review_dogfood_mod.addImport("agent_config", agent_config_mod);
+    pr_review_dogfood_mod.addImport("spider-protocol", spider_protocol_module);
+    pr_review_dogfood_mod.addImport("spiderweb_node", spiderweb_node_module);
+    pr_review_dogfood_mod.addImport("spiderweb_fs", spiderweb_fs_protocol_module);
+    pr_review_dogfood_mod.addImport("spiderweb_fs_cache", spiderweb_fs_cache_mod);
+    pr_review_dogfood_mod.addImport("spiderweb_fs_source_policy", spiderweb_fs_source_policy_mod);
+    pr_review_dogfood_mod.addImport("ziggy-memory-store", ziggy_memory_store_module);
+    pr_review_dogfood_mod.addImport("ziggy-tool-runtime", ziggy_tool_runtime_module);
+    pr_review_dogfood_mod.addImport("ziggy-runtime-hooks", ziggy_runtime_hooks_module);
+    pr_review_dogfood_mod.addImport("ziggy-run-orchestrator", ziggy_run_orchestrator_module);
+
+    const pr_review_dogfood = b.addExecutable(.{
+        .name = "spiderweb-pr-review-dogfood",
+        .root_module = pr_review_dogfood_mod,
+    });
+    pr_review_dogfood.addCSourceFile(.{ .file = b.path("src/c/fuse_compat.c") });
+    pr_review_dogfood.linkLibC();
+    pr_review_dogfood.linkSystemLibrary("sqlite3");
+    b.installArtifact(pr_review_dogfood);
+
+    const run_pr_review_dogfood = b.addRunArtifact(pr_review_dogfood);
+    run_pr_review_dogfood.step.dependOn(b.getInstallStep());
+    if (b.args) |args| {
+        run_pr_review_dogfood.addArgs(args);
+    }
+    const pr_review_dogfood_step = b.step("pr-review-dogfood", "Run the PR review dogfood harness");
+    pr_review_dogfood_step.dependOn(&run_pr_review_dogfood.step);
+
     // Agent runtime child executable (sandbox target)
     const agent_runtime_child_mod = b.createModule(.{
         .root_source_file = b.path("src/agents/agent_runtime_child_main.zig"),

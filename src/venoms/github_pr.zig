@@ -286,9 +286,10 @@ fn executeSyncOp(self: anytype, args_obj: std.json.ObjectMap) ![]u8 {
 
     const access_token = resolveGitHubApiToken(self.allocator, args_obj) catch |err| switch (err) {
         error.InvalidPayload => return error.InvalidPayload,
-        else => return self.buildGitHubPrFailureResultJson(.sync, "missing_token", "GitHub token not configured"),
+        error.MissingGitHubToken => null,
+        else => return err,
     };
-    defer self.allocator.free(access_token);
+    defer if (access_token) |value| self.allocator.free(value);
 
     var pr_response = githubApiRequest(self.allocator, access_token, .GET, pr_url, null) catch |err|
         return self.buildGitHubPrFailureResultJson(.sync, "request_failed", @errorName(err));
@@ -967,17 +968,18 @@ fn buildPublishReviewPayloadJson(allocator: std.mem.Allocator, decision: []const
 
 fn githubApiRequest(
     allocator: std.mem.Allocator,
-    access_token: []const u8,
+    access_token: ?[]const u8,
     method: std.http.Method,
     url: []const u8,
     payload: ?[]const u8,
 ) !GitHubApiResponse {
-    const auth_header = try std.fmt.allocPrint(allocator, "Bearer {s}", .{access_token});
-    defer allocator.free(auth_header);
-
     var all_headers = std.ArrayListUnmanaged(std.http.Header){};
     defer all_headers.deinit(allocator);
-    try all_headers.append(allocator, .{ .name = "authorization", .value = auth_header });
+    if (access_token) |value| {
+        const auth_header = try std.fmt.allocPrint(allocator, "Bearer {s}", .{value});
+        defer allocator.free(auth_header);
+        try all_headers.append(allocator, .{ .name = "authorization", .value = auth_header });
+    }
     try all_headers.append(allocator, .{ .name = "accept", .value = "application/vnd.github+json" });
     try all_headers.append(allocator, .{ .name = "accept-encoding", .value = "identity" });
     try all_headers.append(allocator, .{ .name = "x-github-api-version", .value = "2022-11-28" });

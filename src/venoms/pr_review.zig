@@ -2983,6 +2983,8 @@ fn executeRecordValidationOp(self: anytype, args_obj: std.json.ObjectMap) ![]u8 
 }
 
 fn executeDraftReviewOp(self: anytype, args_obj: std.json.ObjectMap) ![]u8 {
+    const max_auto_resume_steps: usize = 6;
+    const max_rescue_auto_resume_steps: usize = 2;
     const store = self.mission_store orelse return error.InvalidPayload;
     const mission_id = extractOptionalStringByNames(args_obj, &[_][]const u8{ "mission_id", "id" }) orelse return error.InvalidPayload;
 
@@ -3008,11 +3010,88 @@ fn executeDraftReviewOp(self: anytype, args_obj: std.json.ObjectMap) ![]u8 {
     defer self.allocator.free(goal);
     if (goal.len == 0) return error.InvalidPayload;
 
-    const resume_run_id = extractOptionalStringByNames(args_obj, &[_][]const u8{
+    var resume_run_id = extractOptionalStringByNames(args_obj, &[_][]const u8{
         "resume_run_id",
         "agent_run_id",
     });
     var run = try self.executeAgentRun(goal, resume_run_id);
+    var auto_resume_steps: usize = 0;
+
+    const initial_mission = (try store.getOwned(self.allocator, mission_id)) orelse return error.NotFound;
+    mission.deinit(self.allocator);
+    mission = initial_mission;
+
+    const initial_state = try self.loadPrReviewStateSnapshot(contract.state_path);
+    state.deinit(self.allocator);
+    state = initial_state;
+
+    while (shouldAutoResumeDraftRun(run, prior_revision, state)) {
+        if (auto_resume_steps >= max_auto_resume_steps) break;
+        const current_run_id = switch (run) {
+            .success => |success| success.run_id,
+            .failure => break,
+        };
+        resume_run_id = current_run_id;
+
+        auto_resume_steps += 1;
+        const next_run = try self.executeAgentRun(goal, resume_run_id);
+        run.deinit(self.allocator);
+        run = next_run;
+
+        const latest_mission = (try store.getOwned(self.allocator, mission_id)) orelse return error.NotFound;
+        mission.deinit(self.allocator);
+        mission = latest_mission;
+
+        const latest_state = try self.loadPrReviewStateSnapshot(contract.state_path);
+        state.deinit(self.allocator);
+        state = latest_state;
+    }
+
+    if (state.latest_draft_revision <= prior_revision) {
+        const rescue_goal = try buildPrReviewAgenticRescueGoal(
+            self,
+            mission_id,
+            contract.context_path,
+            contract.state_path,
+            contract.artifact_root,
+            state,
+            action,
+        );
+        defer self.allocator.free(rescue_goal);
+
+        run.deinit(self.allocator);
+        run = try self.executeAgentRun(rescue_goal, null);
+
+        const rescued_mission = (try store.getOwned(self.allocator, mission_id)) orelse return error.NotFound;
+        mission.deinit(self.allocator);
+        mission = rescued_mission;
+
+        const rescued_state = try self.loadPrReviewStateSnapshot(contract.state_path);
+        state.deinit(self.allocator);
+        state = rescued_state;
+
+        var rescue_auto_resume_steps: usize = 0;
+        while (shouldAutoResumeDraftRun(run, prior_revision, state)) {
+            if (rescue_auto_resume_steps >= max_rescue_auto_resume_steps) break;
+            const current_run_id = switch (run) {
+                .success => |success| success.run_id,
+                .failure => break,
+            };
+
+            rescue_auto_resume_steps += 1;
+            const next_run = try self.executeAgentRun(rescue_goal, current_run_id);
+            run.deinit(self.allocator);
+            run = next_run;
+
+            const latest_mission = (try store.getOwned(self.allocator, mission_id)) orelse return error.NotFound;
+            mission.deinit(self.allocator);
+            mission = latest_mission;
+
+            const latest_state = try self.loadPrReviewStateSnapshot(contract.state_path);
+            state.deinit(self.allocator);
+            state = latest_state;
+        }
+    }
 
     const refreshed_mission = (try store.getOwned(self.allocator, mission_id)) orelse return error.NotFound;
     mission.deinit(self.allocator);
@@ -3066,6 +3145,10 @@ fn executeDraftReviewOp(self: anytype, args_obj: std.json.ObjectMap) ![]u8 {
     defer mission.deinit(self.allocator);
     defer run.deinit(self.allocator);
 
+    if (state.latest_draft_revision > prior_revision) {
+        return self.buildPrReviewSuccessResultJson(.draft_review, detail);
+    }
+
     switch (run) {
         .failure => |failure| {
             return self.buildPrReviewPartialFailureResultJson(.draft_review, detail, failure.code, failure.message);
@@ -3081,8 +3164,23 @@ fn executeDraftReviewOp(self: anytype, args_obj: std.json.ObjectMap) ![]u8 {
             "Spider Monkey did not persist a PR review draft via save_draft.json",
         );
     }
-
     return self.buildPrReviewSuccessResultJson(.draft_review, detail);
+}
+
+fn shouldAutoResumeDraftRun(
+    run: anytype,
+    prior_revision: u64,
+    state: StateSnapshot,
+) bool {
+    if (state.latest_draft_revision > prior_revision) return false;
+    return switch (run) {
+        .failure => false,
+        .success => |success| blk: {
+            if (!std.mem.eql(u8, success.state, "waiting_for_user")) break :blk false;
+            const assistant_output = success.assistant_output orelse break :blk false;
+            break :blk std.mem.indexOf(u8, assistant_output, "\"tool_calls\"") != null;
+        },
+    };
 }
 
 fn executeSaveDraftOp(self: anytype, args_obj: std.json.ObjectMap) ![]u8 {
@@ -3655,32 +3753,225 @@ fn buildPrReviewAgenticGoal(
     defer self.allocator.free(diff_range_path);
     const review_comment_path = try resolvePrReviewArtifactPath(self, artifact_root, state.draft_review_comment_artifact);
     defer self.allocator.free(review_comment_path);
+    const playbook_path = try self.resolvePreferredServicePath("library", "/use-cases/pr-review/README.md");
+    defer self.allocator.free(playbook_path);
+    const save_draft_path = try self.resolvePreferredServicePath("pr_review", "/control/save_draft.json");
+    defer self.allocator.free(save_draft_path);
+    const validation_summary = state.latest_validation_summary orelse "none";
+    const validation_preview = try loadPrReviewValidationPreview(self, validation_path);
+    defer if (validation_preview) |value| self.allocator.free(value);
+    const draft_artifact_instruction = if (state.latest_draft_revision > 0)
+        try std.fmt.allocPrint(
+            self.allocator,
+            "If you genuinely need the prior draft, you may read {s} and {s}, but still finish by saving the revised draft.",
+            .{ draft_path, review_comment_path },
+        )
+    else
+        try std.fmt.allocPrint(
+            self.allocator,
+            "Do not read or list {s} or {s}; save_draft will create those first-draft artifacts.",
+            .{ draft_path, review_comment_path },
+        );
+    defer self.allocator.free(draft_artifact_instruction);
+    const save_payload_instruction = try std.fmt.allocPrint(
+        self.allocator,
+        "Your save_draft payload only needs mission_id=\"{s}\", summary, findings (array), recommendation (object), and review_comment.",
+        .{mission_id},
+    );
+    defer self.allocator.free(save_payload_instruction);
+
+    if (validation_preview) |preview| {
+        return std.fmt.allocPrint(
+            self.allocator,
+            "Continue PR review mission {s}.\n" ++
+                "Start with {s} and {s}.\n" ++
+                "Latest validation status: {s}. Latest validation summary: {s}.\n" ++
+                "Validation preview:\n{s}\n" ++
+                "You already have enough evidence to draft a review from that validation failure unless another file is strictly necessary.\n" ++
+                "Inspect the latest review artifacts under {s}. Read {s} only if you need the full capture; only read {s} or {s} if you still need supporting evidence.\n" ++
+                "{s}\n" ++
+                "Read {s} only if you genuinely need a workflow reminder.\n" ++
+                "Current phase: {s}. Current focus: {s}.\n" ++
+                "You must finish this handoff by calling {s} to {s} the review draft and create or update the draft artifacts.\n" ++
+                "{s}\n" ++
+                "Once save_draft succeeds, stop issuing further tool calls.\n" ++
+                "Use the minimum number of reads needed to produce a concrete draft; do not stop after inspection alone.\n" ++
+                "Persist concrete findings, a recommendation object, and a review_comment draft.\n" ++
+                "Do not publish or finalize the review yet. If evidence is missing, capture the blocker in the saved draft summary.",
+            .{
+                mission_id,
+                context_path,
+                state_path,
+                state.latest_validation_status,
+                validation_summary,
+                preview,
+                artifact_root,
+                validation_path,
+                repo_status_path,
+                diff_range_path,
+                draft_artifact_instruction,
+                playbook_path,
+                state.phase,
+                state.current_focus,
+                save_draft_path,
+                action,
+                save_payload_instruction,
+            },
+        );
+    }
 
     return std.fmt.allocPrint(
         self.allocator,
         "Continue PR review mission {s}.\n" ++
-            "Read {s} and {s} first.\n" ++
-            "Then read /global/library/use-cases/pr-review/README.md.\n" ++
-            "Inspect the latest review artifacts under {s}, especially {s}, {s}, and {s}.\n" ++
+            "Start with {s} and {s}.\n" ++
+            "Latest validation status: {s}. Latest validation summary: {s}.\n" ++
+            "Inspect the latest review artifacts under {s}. Start with {s}; only read {s} or {s} if you still need supporting evidence.\n" ++
+            "{s}\n" ++
+            "Read {s} only if you genuinely need a workflow reminder.\n" ++
             "Current phase: {s}. Current focus: {s}.\n" ++
-            "Use /services/pr_review/control/save_draft.json to {s} the review draft and update {s} plus {s}.\n" ++
+            "You must finish this handoff by calling {s} to {s} the review draft and create or update the draft artifacts.\n" ++
+            "{s}\n" ++
+            "Once save_draft succeeds, stop issuing further tool calls.\n" ++
+            "Use the minimum number of reads needed to produce a concrete draft; do not stop after inspection alone.\n" ++
             "Persist concrete findings, a recommendation object, and a review_comment draft.\n" ++
             "Do not publish or finalize the review yet. If evidence is missing, capture the blocker in the saved draft summary.",
         .{
             mission_id,
             context_path,
             state_path,
+            state.latest_validation_status,
+            validation_summary,
             artifact_root,
             validation_path,
             repo_status_path,
             diff_range_path,
+            draft_artifact_instruction,
+            playbook_path,
             state.phase,
             state.current_focus,
+            save_draft_path,
             action,
-            draft_path,
-            review_comment_path,
+            save_payload_instruction,
         },
     );
+}
+
+fn buildPrReviewAgenticRescueGoal(
+    self: anytype,
+    mission_id: []const u8,
+    context_path: []const u8,
+    state_path: []const u8,
+    artifact_root: []const u8,
+    state: StateSnapshot,
+    action: []const u8,
+) ![]u8 {
+    const save_draft_path = try self.resolvePreferredServicePath("pr_review", "/control/save_draft.json");
+    defer self.allocator.free(save_draft_path);
+    const validation_path = try resolvePrReviewArtifactPath(self, artifact_root, state.validation_artifact);
+    defer self.allocator.free(validation_path);
+    const draft_path = try resolvePrReviewArtifactPath(self, artifact_root, state.draft_review_artifact);
+    defer self.allocator.free(draft_path);
+    const review_comment_path = try resolvePrReviewArtifactPath(self, artifact_root, state.draft_review_comment_artifact);
+    defer self.allocator.free(review_comment_path);
+
+    const validation_summary = state.latest_validation_summary orelse "Review evidence is already available in the validation artifact.";
+    const validation_preview = try loadPrReviewValidationPreview(self, validation_path);
+    defer if (validation_preview) |value| self.allocator.free(value);
+
+    if (validation_preview) |preview| {
+        return std.fmt.allocPrint(
+            self.allocator,
+            "Rescue PR review mission {s}.\n" ++
+                "The previous attempt did not persist a draft.\n" ++
+                "Treat {s} and {s} as outputs to create on the first save, not files to inspect.\n" ++
+                "Use exactly one file_write tool call to {s} now.\n" ++
+                "Do not call file_read again unless {s} or {s} is genuinely missing from active memory.\n" ++
+                "Write a valid save_draft payload with mission_id=\"{s}\", status=\"drafted\", summary, findings (array), recommendation (object), and review_comment.\n" ++
+                "This is a {s} step, so create a draft rather than publishing a final review.\n" ++
+                "Use this validation summary: {s}\n" ++
+                "Use this validation preview as evidence:\n{s}\n" ++
+                "A recommendation decision of \"comment\" is acceptable for this draft if you are blocked on validation.\n" ++
+                "This rescue round must end by saving the draft, then stopping with no additional inspection or extra tool calls.",
+            .{
+                mission_id,
+                draft_path,
+                review_comment_path,
+                save_draft_path,
+                context_path,
+                state_path,
+                mission_id,
+                action,
+                validation_summary,
+                preview,
+            },
+        );
+    }
+
+    return std.fmt.allocPrint(
+        self.allocator,
+        "Rescue PR review mission {s}.\n" ++
+            "The previous attempt did not persist a draft.\n" ++
+            "Treat {s} and {s} as outputs to create on the first save, not files to inspect.\n" ++
+            "Use exactly one file_write tool call to {s} now.\n" ++
+            "Do not call file_read again unless {s} or {s} is genuinely missing from active memory.\n" ++
+            "Write a valid save_draft payload with mission_id=\"{s}\", status=\"drafted\", summary, findings (array), recommendation (object), and review_comment.\n" ++
+            "This is a {s} step, so create a draft rather than publishing a final review.\n" ++
+            "Use this factual summary in the draft if helpful: {s}\n" ++
+            "A recommendation decision of \"comment\" is acceptable for this draft if you are blocked on validation.\n" ++
+            "This rescue round must end by saving the draft, then stopping with no additional inspection or extra tool calls.",
+        .{
+            mission_id,
+            draft_path,
+            review_comment_path,
+            save_draft_path,
+            context_path,
+            state_path,
+            mission_id,
+            action,
+            validation_summary,
+        },
+    );
+}
+
+fn loadPrReviewValidationPreview(self: anytype, validation_path: []const u8) !?[]u8 {
+    const validation_json = (self.tryReadInternalPath(validation_path) catch return null) orelse return null;
+    defer self.allocator.free(validation_json);
+
+    var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, validation_json, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const root = parsed.value.object;
+
+    if (root.get("commands")) |commands_value| {
+        if (commands_value == .array) {
+            for (commands_value.array.items) |command_value| {
+                if (command_value != .object) continue;
+                const result_value = command_value.object.get("result") orelse continue;
+                if (result_value != .object) continue;
+                const nested_result = result_value.object.get("result") orelse continue;
+                if (nested_result != .object) continue;
+                const data_b64 = nested_result.object.get("data_b64") orelse continue;
+                if (data_b64 != .string or data_b64.string.len == 0) continue;
+
+                const decoded_len = std.base64.standard.Decoder.calcSizeForSlice(data_b64.string) catch continue;
+                const decoded = try self.allocator.alloc(u8, decoded_len);
+                defer self.allocator.free(decoded);
+                _ = std.base64.standard.Decoder.decode(decoded, data_b64.string) catch continue;
+
+                const trimmed = std.mem.trim(u8, decoded, " \t\r\n");
+                if (trimmed.len == 0) continue;
+                const preview_len = @min(trimmed.len, 480);
+                return @as(?[]u8, try self.allocator.dupe(u8, trimmed[0..preview_len]));
+            }
+        }
+    }
+
+    if (root.get("summary")) |summary_value| {
+        if (summary_value == .string and summary_value.string.len > 0) {
+            return @as(?[]u8, try self.allocator.dupe(u8, summary_value.string));
+        }
+    }
+    return null;
 }
 
 fn resolvePreferredServiceTarget(self: anytype, service_id: []const u8, control_suffix: []const u8) !PreferredServiceTarget {
@@ -3739,6 +4030,8 @@ fn buildAdvanceSyncArgsJson(
             defer self.allocator.free(raw);
             try writer.print(",\"{s}\":", .{field});
             try writer.writeAll(raw);
+        } else {
+            try writer.print(",\"{s}\":true", .{field});
         }
     }
     try writer.writeByte('}');

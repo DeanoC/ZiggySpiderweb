@@ -309,6 +309,12 @@ const github_template_bind_specs = [_]ProjectTemplateBindSpec{
     .{ .bind_path = "/services/github_pr", .target_path = "/nodes/local/venoms/github_pr" },
     .{ .bind_path = "/services/missions", .target_path = "/nodes/local/venoms/missions" },
     .{ .bind_path = "/services/pr_review", .target_path = "/nodes/local/venoms/pr_review" },
+    .{ .bind_path = "/services/terminal", .target_path = "/nodes/local/venoms/terminal" },
+    .{ .bind_path = "/services/events", .target_path = "/nodes/local/venoms/events" },
+    .{ .bind_path = "/services/library", .target_path = "/nodes/local/venoms/library" },
+    .{ .bind_path = "/services/memory", .target_path = "/nodes/local/venoms/memory" },
+    .{ .bind_path = "/services/search_code", .target_path = "/nodes/local/venoms/search_code" },
+    .{ .bind_path = "/services/web_search", .target_path = "/nodes/local/venoms/web_search" },
 };
 
 const builtin_project_templates = [_]ProjectTemplateSpec{
@@ -7862,6 +7868,9 @@ test "acheron_control_plane: github template merges desired binds with template 
     try std.testing.expect(std.mem.indexOf(u8, get_json, "\"bind_path\":\"/services/github_pr\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, get_json, "\"bind_path\":\"/services/missions\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, get_json, "\"bind_path\":\"/services/pr_review\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, get_json, "\"bind_path\":\"/services/terminal\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, get_json, "\"bind_path\":\"/services/events\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, get_json, "\"bind_path\":\"/services/library\"") != null);
 
     const resolve_req = try std.fmt.allocPrint(
         allocator,

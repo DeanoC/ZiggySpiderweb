@@ -743,12 +743,14 @@ pub const Session = struct {
             try self.allocator.dupe(u8, "null");
         defer self.allocator.free(project_id_json);
         const debug_visible = self.lookupChild(self.root_id, "debug") != null;
+        const services_visible = self.lookupChild(self.root_id, "services") != null;
         const payload = try std.fmt.allocPrint(
             self.allocator,
-            "{{\"qid\":{{\"path\":{d},\"type\":\"dir\"}},\"layout\":\"unified-v2-fs\",\"project_id\":{s},\"roots\":[\"nodes\",\"agents\",\"global\"{s}],\"dynamic_bind_paths\":{s},\"bind_count\":{d}}}",
+            "{{\"qid\":{{\"path\":{d},\"type\":\"dir\"}},\"layout\":\"unified-v2-fs\",\"project_id\":{s},\"roots\":[\"nodes\",\"agents\",\"global\"{s}{s}],\"dynamic_bind_paths\":{s},\"bind_count\":{d}}}",
             .{
                 self.root_id,
                 project_id_json,
+                if (services_visible) ",\"services\"" else "",
                 if (debug_visible) ",\"debug\"" else "",
                 if (self.project_binds.items.len > 0) "true" else "false",
                 self.project_binds.items.len,
@@ -853,6 +855,7 @@ pub const Session = struct {
                     used_bound_proxy = true;
                 }
                 if (offset == 0 and !used_bound_proxy) {
+                    _ = try self.syncLocalFsFileNode(state.node_id);
                     if (state.node_id == self.debug_stream_log_id) {
                         try self.syncDebugStreamLogFromControlPlane();
                     }
@@ -914,7 +917,56 @@ pub const Session = struct {
         if (dir_id == self.nodes_root_id) {
             try self.addNodeDirectoriesFromControlPlane(self.nodes_root_id);
         }
+        try self.refreshLocalFsDirectory(dir_id);
         try self.refreshBoundVenomProxyDirectory(dir_id);
+    }
+
+    fn refreshLocalFsDirectory(self: *Session, dir_id: u32) !void {
+        const host_path = (try self.localFsNodeHostPath(dir_id)) orelse return;
+        defer self.allocator.free(host_path);
+
+        var host_dir = if (std.fs.path.isAbsolute(host_path))
+            std.fs.openDirAbsolute(host_path, .{ .iterate = true }) catch return
+        else
+            std.fs.cwd().openDir(host_path, .{ .iterate = true }) catch return;
+        defer host_dir.close();
+
+        var iterator = host_dir.iterate();
+        while (try iterator.next()) |entry| {
+            if (entry.name.len == 0) continue;
+            if (std.mem.eql(u8, entry.name, ".") or std.mem.eql(u8, entry.name, "..")) continue;
+            if (self.lookupChild(dir_id, entry.name) != null) continue;
+
+            switch (entry.kind) {
+                .directory => _ = try self.addDir(dir_id, entry.name, false),
+                .file, .sym_link, .unknown => _ = try self.addFile(dir_id, entry.name, "", true, .none),
+                else => {},
+            }
+        }
+    }
+
+    fn localFsNodeHostPath(self: *Session, node_id: u32) !?[]u8 {
+        if (self.local_fs_export_root == null) return null;
+        const absolute_path = try self.nodeAbsolutePath(node_id);
+        defer self.allocator.free(absolute_path);
+        if (!pathMatchesPrefixBoundary(absolute_path, local_fs_world_prefix)) return null;
+        return try self.resolveMissionContractHostPath(absolute_path);
+    }
+
+    fn syncLocalFsFileNode(self: *Session, node_id: u32) !bool {
+        const host_path = (try self.localFsNodeHostPath(node_id)) orelse return false;
+        defer self.allocator.free(host_path);
+
+        var file = if (std.fs.path.isAbsolute(host_path))
+            std.fs.openFileAbsolute(host_path, .{}) catch return false
+        else
+            std.fs.cwd().openFile(host_path, .{}) catch return false;
+        defer file.close();
+
+        const content = try file.readToEndAlloc(self.allocator, 1024 * 1024);
+        defer self.allocator.free(content);
+        try self.setFileContent(node_id, content);
+        return true;
     }
 
     fn handleWrite(self: *Session, msg: *const unified.ParsedMessage) ![]u8 {
@@ -2036,6 +2088,16 @@ pub const Session = struct {
         }
 
         try self.refreshProjectBindsFromControlPlane();
+        try self.materializeProjectBindPrefixDirectories();
+        if (self.lookupChild(self.root_id, "services")) |services_root| {
+            try self.addDirectoryDescriptors(
+                services_root,
+                "Services",
+                "{\"kind\":\"collection\",\"entries\":\"workspace service binds\",\"shape\":\"/services/<venom_id>/{README.md,SCHEMA.json,CAPS.json,OPS.json,STATUS.json,status.json,result.json,control/*}\"}",
+                "{\"read\":true,\"write\":false}",
+                "Workspace-bound service paths projected from the active workspace binds.",
+            );
+        }
 
         try self.registerExistingGlobalVenomBinding(global_root, "chat", "project_namespace");
         try self.registerExistingGlobalVenomBinding(global_root, "jobs", "project_namespace");
@@ -2407,6 +2469,36 @@ pub const Session = struct {
                 .bind_path = try self.allocator.dupe(u8, bind_path.string),
                 .target_path = try self.allocator.dupe(u8, target_path.string),
             });
+        }
+    }
+
+    fn materializeProjectBindPrefixDirectories(self: *Session) !void {
+        for (self.project_binds.items) |bind| {
+            try self.materializeBindPrefixDirectories(bind.bind_path);
+        }
+    }
+
+    fn materializeBindPrefixDirectories(self: *Session, bind_path: []const u8) !void {
+        var segments = std.ArrayListUnmanaged([]const u8){};
+        defer segments.deinit(self.allocator);
+
+        var iter = std.mem.splitScalar(u8, bind_path, '/');
+        while (iter.next()) |segment| {
+            if (segment.len == 0) continue;
+            try segments.append(self.allocator, segment);
+        }
+        if (segments.items.len <= 1) return;
+
+        var parent_id = self.root_id;
+        for (segments.items[0 .. segments.items.len - 1]) |segment| {
+            const existing = self.lookupChild(parent_id, segment);
+            if (existing) |child_id| {
+                const child = self.nodes.get(child_id) orelse return error.MissingNode;
+                if (child.kind != .dir) return error.InvalidPayload;
+                parent_id = child_id;
+                continue;
+            }
+            parent_id = try self.addDir(parent_id, segment, false);
         }
     }
 
@@ -3182,7 +3274,7 @@ pub const Session = struct {
         defer self.allocator.free(escaped_base_path);
         const shape_json = try std.fmt.allocPrint(
             self.allocator,
-            "{{\"kind\":\"venom\",\"venom_id\":\"library\",\"shape\":\"{s}/{{Index.md,README.md,SCHEMA.json,CAPS.json,OPS.json,PERMISSIONS.json,STATUS.json,topics/*}}\"}}",
+            "{{\"kind\":\"venom\",\"venom_id\":\"library\",\"shape\":\"{s}/{{Index.md,README.md,SCHEMA.json,CAPS.json,OPS.json,PERMISSIONS.json,STATUS.json,topics/*,use-cases/*}}\"}}",
             .{escaped_base_path},
         );
         defer self.allocator.free(shape_json);
@@ -3196,7 +3288,7 @@ pub const Session = struct {
         _ = try self.addFile(
             library_dir,
             "OPS.json",
-            "{\"model\":\"static_docs\",\"transport\":\"filesystem\",\"paths\":{\"index\":\"Index.md\",\"topics\":\"topics/*\"},\"operations\":{}}",
+            "{\"model\":\"static_docs\",\"transport\":\"filesystem\",\"paths\":{\"index\":\"Index.md\",\"topics\":\"topics/*\",\"use_cases\":\"use-cases/*\"},\"operations\":{}}",
             false,
             .none,
         );
@@ -3227,6 +3319,9 @@ pub const Session = struct {
 
         const loaded_topics = try self.seedGlobalLibraryTopicsFromAssets(topics_dir);
         if (!loaded_topics) try self.seedDefaultGlobalLibraryTopics(topics_dir);
+
+        const use_cases_dir = try self.addDir(library_dir, "use-cases", false);
+        _ = try self.seedGlobalLibrarySubtreeFromAssets(use_cases_dir, "use-cases");
     }
 
     fn loadGlobalLibraryIndexFromAssets(self: *Session) ![]u8 {
@@ -3252,6 +3347,41 @@ pub const Session = struct {
             defer self.allocator.free(content);
             _ = try self.addFile(topics_dir, entry.name, content, false, .none);
             loaded_any = true;
+        }
+        return loaded_any;
+    }
+
+    fn seedGlobalLibrarySubtreeFromAssets(
+        self: *Session,
+        parent_dir: u32,
+        relative_subtree: []const u8,
+    ) !bool {
+        const host_path = try std.fs.path.join(self.allocator, &.{ self.assets_dir, "library", relative_subtree });
+        defer self.allocator.free(host_path);
+
+        var host_dir = std.fs.cwd().openDir(host_path, .{ .iterate = true }) catch return false;
+        defer host_dir.close();
+
+        var iterator = host_dir.iterate();
+        var loaded_any = false;
+        while (try iterator.next()) |entry| {
+            switch (entry.kind) {
+                .file => {
+                    const content = host_dir.readFileAlloc(self.allocator, entry.name, 512 * 1024) catch continue;
+                    defer self.allocator.free(content);
+                    _ = try self.addFile(parent_dir, entry.name, content, false, .none);
+                    loaded_any = true;
+                },
+                .directory => {
+                    const child_dir = try self.addDir(parent_dir, entry.name, false);
+                    const child_relative = try std.fs.path.join(self.allocator, &.{ relative_subtree, entry.name });
+                    defer self.allocator.free(child_relative);
+                    if (try self.seedGlobalLibrarySubtreeFromAssets(child_dir, child_relative)) {
+                        loaded_any = true;
+                    }
+                },
+                else => {},
+            }
         }
         return loaded_any;
     }
@@ -10046,6 +10176,18 @@ test "acheron_session: global library namespace exposes index and topic guides" 
     defer allocator.free(topic_payload);
     try std.testing.expect(std.mem.indexOf(u8, topic_payload, "/global/<venom_id>") != null);
     try std.testing.expect(std.mem.indexOf(u8, topic_payload, "VENOMS.json") != null);
+
+    const use_case_payload = try protocolReadFile(
+        &session,
+        allocator,
+        112,
+        113,
+        &.{ "global", "library", "use-cases", "pr-review", "README.md" },
+        785,
+    );
+    defer allocator.free(use_case_payload);
+    try std.testing.expect(std.mem.indexOf(u8, use_case_payload, "PR Review") != null);
+    try std.testing.expect(std.mem.indexOf(u8, use_case_payload, "save_draft") != null);
 }
 
 test "acheron_session: global library loads guides from assets_dir filesystem" {
@@ -10081,6 +10223,16 @@ test "acheron_session: global library loads guides from assets_dir filesystem" {
     try std.fs.cwd().writeFile(.{
         .sub_path = custom_topic_path,
         .data = "# Custom Topic\n\nThis guide is loaded from assets_dir.\n",
+    });
+
+    const custom_use_case_dir = try std.fmt.allocPrint(allocator, "{s}/library/use-cases/demo", .{assets_dir});
+    defer allocator.free(custom_use_case_dir);
+    try std.fs.cwd().makePath(custom_use_case_dir);
+    const custom_use_case_path = try std.fmt.allocPrint(allocator, "{s}/README.md", .{custom_use_case_dir});
+    defer allocator.free(custom_use_case_path);
+    try std.fs.cwd().writeFile(.{
+        .sub_path = custom_use_case_path,
+        .data = "# Demo Use Case\n\nLoaded from assets_dir use-cases.\n",
     });
 
     const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
@@ -10123,6 +10275,17 @@ test "acheron_session: global library loads guides from assets_dir filesystem" {
     );
     defer allocator.free(topic_payload);
     try std.testing.expect(std.mem.indexOf(u8, topic_payload, "loaded from assets_dir") != null);
+
+    const use_case_payload = try protocolReadFile(
+        &session,
+        allocator,
+        114,
+        115,
+        &.{ "global", "library", "use-cases", "demo", "README.md" },
+        786,
+    );
+    defer allocator.free(use_case_payload);
+    try std.testing.expect(std.mem.indexOf(u8, use_case_payload, "Loaded from assets_dir use-cases") != null);
 }
 
 test "acheron_session: local venom aliases mirror canonical and compatibility writes" {
@@ -14980,6 +15143,52 @@ test "acheron_session: mounts namespace mkdir creates local export folders" {
     defer allocator.free(invalid_response);
 }
 
+test "acheron_session: local fs export files appear in the combined /nodes/local/fs view" {
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const local_export_root = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(local_export_root);
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "default",
+        .{
+            .local_fs_export_root = local_export_root,
+        },
+    );
+    defer session.deinit();
+
+    const contract_dir = try std.fs.path.join(allocator, &.{ local_export_root, "pr-review", "state", "DeanoC__Spiderweb", "pr-115" });
+    defer allocator.free(contract_dir);
+    try std.fs.cwd().makePath(contract_dir);
+
+    const context_host_path = try std.fs.path.join(allocator, &.{ contract_dir, "context.json" });
+    defer allocator.free(context_host_path);
+    try std.fs.cwd().writeFile(.{
+        .sub_path = context_host_path,
+        .data = "{\"repo_key\":\"DeanoC/Spiderweb\",\"pr_number\":115}\n",
+    });
+
+    const dir_listing = (try session.tryReadInternalPath("/nodes/local/fs/pr-review/state/DeanoC__Spiderweb")) orelse return error.TestExpectedResponse;
+    defer allocator.free(dir_listing);
+    try std.testing.expect(std.mem.indexOf(u8, dir_listing, "pr-115") != null);
+
+    const context_content = (try session.tryReadInternalPath("/nodes/local/fs/pr-review/state/DeanoC__Spiderweb/pr-115/context.json")) orelse return error.TestExpectedResponse;
+    defer allocator.free(context_content);
+    try std.testing.expect(std.mem.indexOf(u8, context_content, "\"repo_key\":\"DeanoC/Spiderweb\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, context_content, "\"pr_number\":115") != null);
+}
+
 test "acheron_session: node services namespace prefers control-plane catalog" {
     const allocator = std.testing.allocator;
 
@@ -17209,6 +17418,8 @@ test "acheron_session: project metadata exposes workspace binds and mounted serv
     const mounted_services_id = session.lookupChild(meta_dir, "mounted_services.json") orelse return error.TestExpectedResponse;
     const mounted_services_node = session.nodes.get(mounted_services_id) orelse return error.TestExpectedResponse;
     try std.testing.expect(std.mem.indexOf(u8, mounted_services_node.content, "\"path\":\"/services/git\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mounted_services_node.content, "\"path\":\"/services/terminal\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mounted_services_node.content, "\"path\":\"/services/library\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, mounted_services_node.content, "\"target_path\":\"/nodes/local/venoms/github_pr\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, mounted_services_node.content, "\"venom_id\":\"pr_review\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, mounted_services_node.content, "\"exposure\":\"project_bind\"") != null);
@@ -17217,6 +17428,7 @@ test "acheron_session: project metadata exposes workspace binds and mounted serv
     const workspace_services_id = session.lookupChild(root_meta_dir, "workspace_services.json") orelse return error.TestExpectedResponse;
     const workspace_services_node = session.nodes.get(workspace_services_id) orelse return error.TestExpectedResponse;
     try std.testing.expect(std.mem.indexOf(u8, workspace_services_node.content, "\"path\":\"/services/missions\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, workspace_services_node.content, "\"path\":\"/services/events\"") != null);
 }
 
 test "acheron_session: preferred service paths use workspace bindings when available" {
@@ -17278,6 +17490,47 @@ test "acheron_session: preferred service paths use workspace bindings when avail
     const unbound_github_path = try unbound_session.resolvePreferredServicePath("github_pr", "/control/sync.json");
     defer allocator.free(unbound_github_path);
     try std.testing.expectEqualStrings("/nodes/local/venoms/github_pr/control/sync.json", unbound_github_path);
+}
+
+test "acheron_session: bound workspace service paths are readable through /services" {
+    const allocator = std.testing.allocator;
+
+    var control_plane = control_plane_mod.ControlPlane.init(allocator);
+    defer control_plane.deinit();
+
+    const project_json = try control_plane.createProject(
+        "{\"name\":\"SessionServiceWalk\",\"vision\":\"SessionServiceWalk\",\"template_id\":\"github\"}",
+    );
+    defer allocator.free(project_json);
+    var parsed_project = try std.json.parseFromSlice(std.json.Value, allocator, project_json, .{});
+    defer parsed_project.deinit();
+    const project_id = parsed_project.value.object.get("project_id").?.string;
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "default",
+        .{
+            .project_id = project_id,
+            .agents_dir = ".does-not-exist",
+            .projects_dir = ".does-not-exist",
+            .control_plane = &control_plane,
+        },
+    );
+    defer session.deinit();
+
+    const services_root = session.lookupChild(session.root_id, "services") orelse return error.TestExpectedResponse;
+    const pr_review_dir = session.lookupChild(services_root, "pr_review") orelse return error.TestExpectedResponse;
+    const schema_id = session.lookupChild(pr_review_dir, "SCHEMA.json") orelse return error.TestExpectedResponse;
+    const schema_node = session.nodes.get(schema_id) orelse return error.TestExpectedResponse;
+    try std.testing.expect(std.mem.indexOf(u8, schema_node.content, "\"venom_id\":\"pr_review\"") != null);
 }
 
 test "acheron_session: missing provider API key is surfaced directly" {
