@@ -10,6 +10,8 @@ pub const Op = enum {
     publish_review,
 };
 
+const github_files_page_size: usize = 100;
+
 const MissionAction = enum {
     none,
     existing,
@@ -275,11 +277,13 @@ fn executeSyncOp(self: anytype, args_obj: std.json.ObjectMap) ![]u8 {
     const dry_run = (try jsonObjectOptionalBool(args_obj, "dry_run")) orelse false;
     const pr_url = try buildPullRequestApiUrl(self.allocator, repo_key, pr_number);
     defer self.allocator.free(pr_url);
-    const files_url = try buildPullRequestFilesApiUrl(self.allocator, repo_key, pr_number);
+    const files_url = try buildPullRequestFilesApiUrl(self.allocator, repo_key, pr_number, 1);
     defer self.allocator.free(files_url);
 
     if (dry_run) {
-        const detail = try buildSyncDryRunDetailJson(self, repo_key, pr_number, pr_url, files_url);
+        const requests_json = try buildGitHubSyncRequestsJson(self, repo_key, pr_number, 1);
+        defer self.allocator.free(requests_json);
+        const detail = try buildSyncDryRunDetailJson(self, repo_key, pr_number, requests_json);
         defer self.allocator.free(detail);
         return self.buildGitHubPrSuccessResultJson(.sync, detail);
     }
@@ -300,19 +304,47 @@ fn executeSyncOp(self: anytype, args_obj: std.json.ObjectMap) ![]u8 {
         return self.buildGitHubPrFailureResultJson(.sync, gitHubStatusCode(pr_response.status), message);
     }
 
-    var files_response = githubApiRequest(self.allocator, access_token, .GET, files_url, null) catch |err|
-        return self.buildGitHubPrFailureResultJson(.sync, "request_failed", @errorName(err));
-    defer files_response.deinit(self.allocator);
-    if (!isGitHubApiSuccessStatus(files_response.status)) {
-        const message = try extractGitHubApiErrorMessage(self.allocator, files_response.body, "GitHub pull request files request failed");
-        defer self.allocator.free(message);
-        return self.buildGitHubPrFailureResultJson(.sync, gitHubStatusCode(files_response.status), message);
-    }
+    var requests_json = std.ArrayListUnmanaged(u8){};
+    defer requests_json.deinit(self.allocator);
+    try requests_json.append(self.allocator, '[');
+    var first_request = true;
+    try appendGitHubRequestEntryJson(self, &requests_json, &first_request, pr_url);
 
-    const provider_json = buildGitHubProviderJson(self, pr_response.body, files_response.body) catch |err|
+    var files_json = std.ArrayListUnmanaged(u8){};
+    defer files_json.deinit(self.allocator);
+    try files_json.append(self.allocator, '[');
+    var first_file = true;
+    var page: usize = 1;
+    while (true) {
+        const page_url = try buildPullRequestFilesApiUrl(self.allocator, repo_key, pr_number, page);
+        defer self.allocator.free(page_url);
+        try appendGitHubRequestEntryJson(self, &requests_json, &first_request, page_url);
+
+        var files_response = githubApiRequest(self.allocator, access_token, .GET, page_url, null) catch |err|
+            return self.buildGitHubPrFailureResultJson(.sync, "request_failed", @errorName(err));
+        defer files_response.deinit(self.allocator);
+        if (!isGitHubApiSuccessStatus(files_response.status)) {
+            const message = try extractGitHubApiErrorMessage(self.allocator, files_response.body, "GitHub pull request files request failed");
+            defer self.allocator.free(message);
+            return self.buildGitHubPrFailureResultJson(.sync, gitHubStatusCode(files_response.status), message);
+        }
+
+        const page_count = try appendGitHubFilesJsonPage(self, &files_json, &first_file, files_response.body);
+        if (page_count < github_files_page_size) break;
+        page += 1;
+    }
+    try requests_json.append(self.allocator, ']');
+    try files_json.append(self.allocator, ']');
+
+    const provider_files_json = try files_json.toOwnedSlice(self.allocator);
+    defer self.allocator.free(provider_files_json);
+    const request_urls_json = try requests_json.toOwnedSlice(self.allocator);
+    defer self.allocator.free(request_urls_json);
+
+    const provider_json = buildGitHubProviderJson(self, pr_response.body, provider_files_json) catch |err|
         return self.buildGitHubPrFailureResultJson(.sync, "invalid_provider_payload", @errorName(err));
     defer self.allocator.free(provider_json);
-    const detail = try buildSyncDetailJson(self, repo_key, pr_number, pr_url, files_url, provider_json);
+    const detail = try buildSyncDetailJson(self, repo_key, pr_number, request_urls_json, provider_json);
     defer self.allocator.free(detail);
     return self.buildGitHubPrSuccessResultJson(.sync, detail);
 }
@@ -326,7 +358,12 @@ fn executeIngestEventOp(self: anytype, args_obj: std.json.ObjectMap) ![]u8 {
     const run_id = try self.buildPrReviewRunId(snapshot.repo_key, snapshot.pr_number);
     defer self.allocator.free(run_id);
 
-    const effective_project_id = extractOptionalStringByNames(args_obj, &[_][]const u8{"project_id"}) orelse self.project_id;
+    const effective_project_id = if (extractOptionalStringByNames(args_obj, &[_][]const u8{"project_id"})) |value|
+        value
+    else if (configured_repo) |value|
+        value.project_id orelse self.project_id
+    else
+        self.project_id;
     const auto_intake = if (try jsonObjectOptionalBool(args_obj, "auto_intake")) |value|
         value
     else if (configured_repo) |value|
@@ -551,7 +588,13 @@ fn parseEventSnapshot(self: anytype, args_obj: std.json.ObjectMap) !EventSnapsho
     const head_sha = std.mem.trim(u8, extractOptionalStringByNames(args_obj, &[_][]const u8{"head_sha"}) orelse if (head_obj) |value| (try jsonObjectOptionalString(value, "sha")) orelse "" else "", " \t\r\n");
     const pr_number = (try jsonObjectOptionalU64(args_obj, "pr_number")) orelse if (pull_request_obj) |value| (try jsonObjectOptionalU64(value, "number")) orelse 0 else 0;
 
-    if (provider.len == 0 or repo_key.len == 0 or action.len == 0 or event_name.len == 0 or pr_number == 0) {
+    if (provider.len == 0 or
+        !std.mem.eql(u8, provider, "github") or
+        repo_key.len == 0 or
+        action.len == 0 or
+        event_name.len == 0 or
+        pr_number == 0)
+    {
         return error.InvalidPayload;
     }
 
@@ -574,31 +617,23 @@ fn parseEventSnapshot(self: anytype, args_obj: std.json.ObjectMap) !EventSnapsho
     };
 }
 
-fn buildSyncDryRunDetailJson(self: anytype, repo_key: []const u8, pr_number: u64, pr_url: []const u8, files_url: []const u8) ![]u8 {
+fn buildSyncDryRunDetailJson(self: anytype, repo_key: []const u8, pr_number: u64, requests_json: []const u8) ![]u8 {
     const escaped_repo_key = try unified.jsonEscape(self.allocator, repo_key);
     defer self.allocator.free(escaped_repo_key);
-    const escaped_pr_url = try unified.jsonEscape(self.allocator, pr_url);
-    defer self.allocator.free(escaped_pr_url);
-    const escaped_files_url = try unified.jsonEscape(self.allocator, files_url);
-    defer self.allocator.free(escaped_files_url);
     return std.fmt.allocPrint(
         self.allocator,
-        "{{\"repo_key\":\"{s}\",\"pr_number\":{d},\"dry_run\":true,\"requests\":[{{\"method\":\"GET\",\"url\":\"{s}\"}},{{\"method\":\"GET\",\"url\":\"{s}\"}}]}}",
-        .{ escaped_repo_key, pr_number, escaped_pr_url, escaped_files_url },
+        "{{\"repo_key\":\"{s}\",\"pr_number\":{d},\"dry_run\":true,\"requests\":{s}}}",
+        .{ escaped_repo_key, pr_number, requests_json },
     );
 }
 
-fn buildSyncDetailJson(self: anytype, repo_key: []const u8, pr_number: u64, pr_url: []const u8, files_url: []const u8, provider_json: []const u8) ![]u8 {
+fn buildSyncDetailJson(self: anytype, repo_key: []const u8, pr_number: u64, requests_json: []const u8, provider_json: []const u8) ![]u8 {
     const escaped_repo_key = try unified.jsonEscape(self.allocator, repo_key);
     defer self.allocator.free(escaped_repo_key);
-    const escaped_pr_url = try unified.jsonEscape(self.allocator, pr_url);
-    defer self.allocator.free(escaped_pr_url);
-    const escaped_files_url = try unified.jsonEscape(self.allocator, files_url);
-    defer self.allocator.free(escaped_files_url);
     return std.fmt.allocPrint(
         self.allocator,
-        "{{\"repo_key\":\"{s}\",\"pr_number\":{d},\"dry_run\":false,\"requests\":[{{\"method\":\"GET\",\"url\":\"{s}\"}},{{\"method\":\"GET\",\"url\":\"{s}\"}}],\"provider\":{s}}}",
-        .{ escaped_repo_key, pr_number, escaped_pr_url, escaped_files_url, provider_json },
+        "{{\"repo_key\":\"{s}\",\"pr_number\":{d},\"dry_run\":false,\"requests\":{s},\"provider\":{s}}}",
+        .{ escaped_repo_key, pr_number, requests_json, provider_json },
     );
 }
 
@@ -935,8 +970,8 @@ fn buildPullRequestApiUrl(allocator: std.mem.Allocator, repo_key: []const u8, pr
     return std.fmt.allocPrint(allocator, "https://api.github.com/repos/{s}/pulls/{d}", .{ repo_key, pr_number });
 }
 
-fn buildPullRequestFilesApiUrl(allocator: std.mem.Allocator, repo_key: []const u8, pr_number: u64) ![]u8 {
-    return std.fmt.allocPrint(allocator, "https://api.github.com/repos/{s}/pulls/{d}/files?per_page=100", .{ repo_key, pr_number });
+fn buildPullRequestFilesApiUrl(allocator: std.mem.Allocator, repo_key: []const u8, pr_number: u64, page: usize) ![]u8 {
+    return std.fmt.allocPrint(allocator, "https://api.github.com/repos/{s}/pulls/{d}/files?per_page={d}&page={d}", .{ repo_key, pr_number, github_files_page_size, page });
 }
 
 fn buildPullRequestReviewsApiUrl(allocator: std.mem.Allocator, repo_key: []const u8, pr_number: u64) ![]u8 {
@@ -1069,7 +1104,7 @@ fn extractGitHubApiErrorMessage(allocator: std.mem.Allocator, body: []const u8, 
     return allocator.dupe(u8, trimmed);
 }
 
-fn buildGitHubProviderJson(self: anytype, pull_request_body: []const u8, files_body: []const u8) ![]u8 {
+fn buildGitHubProviderJson(self: anytype, pull_request_body: []const u8, files_json: []const u8) ![]u8 {
     var pr_parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, pull_request_body, .{});
     defer pr_parsed.deinit();
     if (pr_parsed.value != .object) return error.InvalidPayload;
@@ -1095,9 +1130,6 @@ fn buildGitHubProviderJson(self: anytype, pull_request_body: []const u8, files_b
     const base_ref_oid = (try jsonObjectOptionalString(base_obj, "sha")) orelse "";
     const head_ref_name = (try jsonObjectOptionalString(head_obj, "ref")) orelse "";
     const head_ref_oid = (try jsonObjectOptionalString(head_obj, "sha")) orelse "";
-    const files_json = try buildGitHubFilesJson(self, files_body);
-    defer self.allocator.free(files_json);
-
     const escaped_title = try unified.jsonEscape(self.allocator, title);
     defer self.allocator.free(escaped_title);
     const escaped_body = try unified.jsonEscape(self.allocator, body);
@@ -1137,16 +1169,49 @@ fn buildGitHubProviderJson(self: anytype, pull_request_body: []const u8, files_b
     );
 }
 
-fn buildGitHubFilesJson(self: anytype, files_body: []const u8) ![]u8 {
+fn appendGitHubRequestEntryJson(
+    self: anytype,
+    out: *std.ArrayListUnmanaged(u8),
+    first: *bool,
+    url: []const u8,
+) !void {
+    const writer = out.writer(self.allocator);
+    if (!first.*) try writer.writeByte(',');
+    first.* = false;
+    try writer.writeAll("{\"method\":\"GET\",\"url\":");
+    try writer.print("{f}", .{std.json.fmt(url, .{})});
+    try writer.writeByte('}');
+}
+
+fn buildGitHubSyncRequestsJson(self: anytype, repo_key: []const u8, pr_number: u64, file_pages: usize) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8){};
+    errdefer out.deinit(self.allocator);
+    try out.append(self.allocator, '[');
+    var first = true;
+    const pr_url = try buildPullRequestApiUrl(self.allocator, repo_key, pr_number);
+    defer self.allocator.free(pr_url);
+    try appendGitHubRequestEntryJson(self, &out, &first, pr_url);
+    var page: usize = 1;
+    while (page <= file_pages) : (page += 1) {
+        const files_url = try buildPullRequestFilesApiUrl(self.allocator, repo_key, pr_number, page);
+        defer self.allocator.free(files_url);
+        try appendGitHubRequestEntryJson(self, &out, &first, files_url);
+    }
+    try out.append(self.allocator, ']');
+    return out.toOwnedSlice(self.allocator);
+}
+
+fn appendGitHubFilesJsonPage(
+    self: anytype,
+    out: *std.ArrayListUnmanaged(u8),
+    first: *bool,
+    files_body: []const u8,
+) !usize {
     var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, files_body, .{});
     defer parsed.deinit();
     if (parsed.value != .array) return error.InvalidPayload;
 
-    var out = std.ArrayListUnmanaged(u8){};
-    errdefer out.deinit(self.allocator);
     const writer = out.writer(self.allocator);
-    try writer.writeByte('[');
-    var first = true;
     for (parsed.value.array.items) |item| {
         if (item != .object) continue;
         const file_obj = item.object;
@@ -1155,8 +1220,8 @@ fn buildGitHubFilesJson(self: anytype, files_body: []const u8) ![]u8 {
         const additions = (try jsonObjectOptionalU64(file_obj, "additions")) orelse 0;
         const deletions = (try jsonObjectOptionalU64(file_obj, "deletions")) orelse 0;
         const changes = (try jsonObjectOptionalU64(file_obj, "changes")) orelse 0;
-        if (!first) try writer.writeByte(',');
-        first = false;
+        if (!first.*) try writer.writeByte(',');
+        first.* = false;
         try writer.writeByte('{');
         try writer.writeAll("\"path\":");
         try writeJsonString(writer, filename);
@@ -1165,8 +1230,7 @@ fn buildGitHubFilesJson(self: anytype, files_body: []const u8) ![]u8 {
         try writer.print(",\"additions\":{d},\"deletions\":{d},\"changes\":{d}", .{ additions, deletions, changes });
         try writer.writeByte('}');
     }
-    try writer.writeByte(']');
-    return out.toOwnedSlice(self.allocator);
+    return parsed.value.array.items.len;
 }
 
 fn extractOptionalStringByNames(obj: std.json.ObjectMap, candidate_names: []const []const u8) ?[]const u8 {
@@ -1218,4 +1282,49 @@ fn jsonObjectOptionalU64(obj: std.json.ObjectMap, key: []const u8) !?u64 {
 
 fn writeJsonString(writer: anytype, value: []const u8) !void {
     try writer.print("{f}", .{std.json.fmt(value, .{})});
+}
+
+test "github_pr: ingest_event rejects unsupported providers" {
+    const allocator = std.testing.allocator;
+    const TestCtx = struct { allocator: std.mem.Allocator };
+    var ctx = TestCtx{ .allocator = allocator };
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, "{\"provider\":\"gitlab\",\"repo_key\":\"DeanoC/Spiderweb\",\"pr_number\":42,\"action\":\"opened\"}", .{});
+    defer parsed.deinit();
+
+    try std.testing.expectError(error.InvalidPayload, parseEventSnapshot(&ctx, parsed.value.object));
+}
+
+test "github_pr: sync file pagination appends all pages" {
+    const allocator = std.testing.allocator;
+    const TestCtx = struct { allocator: std.mem.Allocator };
+    var ctx = TestCtx{ .allocator = allocator };
+
+    var out = std.ArrayListUnmanaged(u8){};
+    defer out.deinit(allocator);
+    try out.append(allocator, '[');
+    var first = true;
+
+    const first_page_count = try appendGitHubFilesJsonPage(
+        &ctx,
+        &out,
+        &first,
+        "[{\"filename\":\"a.zig\",\"status\":\"modified\",\"additions\":1,\"deletions\":0,\"changes\":1},{\"filename\":\"b.zig\",\"status\":\"added\",\"additions\":2,\"deletions\":0,\"changes\":2}]",
+    );
+    const second_page_count = try appendGitHubFilesJsonPage(
+        &ctx,
+        &out,
+        &first,
+        "[{\"filename\":\"c.zig\",\"status\":\"removed\",\"additions\":0,\"deletions\":3,\"changes\":3}]",
+    );
+    try out.append(allocator, ']');
+
+    const files_json = try out.toOwnedSlice(allocator);
+    defer allocator.free(files_json);
+
+    try std.testing.expectEqual(@as(usize, 2), first_page_count);
+    try std.testing.expectEqual(@as(usize, 1), second_page_count);
+    try std.testing.expect(std.mem.indexOf(u8, files_json, "\"path\":\"a.zig\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, files_json, "\"path\":\"b.zig\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, files_json, "\"path\":\"c.zig\"") != null);
 }

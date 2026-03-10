@@ -12499,8 +12499,46 @@ test "acheron_session: pr_review advance waits for github_pr events and resumes"
         760,
         761,
         &.{ "agents", "self", "events", "control", "signal.json" },
-        "{\"event_type\":\"agent\",\"parameter\":\"github_pr\",\"payload\":{\"event_name\":\"pr.synchronized\"}}",
+        "{\"event_type\":\"agent\",\"parameter\":\"github_pr\",\"payload\":{\"event_name\":\"pr.synchronized\",\"run_id\":\"pr_review:DeanoC__Spiderweb:999\"}}",
         1830,
+    );
+
+    const unrelated_resume_payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"mission_id\":\"{s}\",\"run_validation\":false,\"provider_sync\":false,\"sync_checkout\":false,\"repo_status\":false,\"diff_range\":false,\"wait_timeout_ms\":0}}",
+        .{mission_id},
+    );
+    defer allocator.free(unrelated_resume_payload);
+    try protocolWriteFile(
+        &session,
+        allocator,
+        762,
+        763,
+        &.{ "agents", "self", "pr_review", "control", "advance.json" },
+        unrelated_resume_payload,
+        1831,
+    );
+
+    const unrelated_result = try protocolReadFile(
+        &session,
+        allocator,
+        764,
+        765,
+        &.{ "agents", "self", "pr_review", "result.json" },
+        1832,
+    );
+    defer allocator.free(unrelated_result);
+    try std.testing.expect(std.mem.indexOf(u8, unrelated_result, "\"status\":\"waiting_for_event\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unrelated_result, "\"next_action\":\"wait_for_github_event\"") != null);
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        766,
+        767,
+        &.{ "agents", "self", "events", "control", "signal.json" },
+        "{\"event_type\":\"agent\",\"parameter\":\"github_pr\",\"payload\":{\"event_name\":\"pr.synchronized\",\"run_id\":\"pr_review:DeanoC__Spiderweb:131\"}}",
+        1833,
     );
 
     const resume_payload = try std.fmt.allocPrint(
@@ -12512,20 +12550,20 @@ test "acheron_session: pr_review advance waits for github_pr events and resumes"
     try protocolWriteFile(
         &session,
         allocator,
-        762,
-        763,
+        768,
+        769,
         &.{ "agents", "self", "pr_review", "control", "advance.json" },
         resume_payload,
-        1831,
+        1834,
     );
 
     const resumed_result = try protocolReadFile(
         &session,
         allocator,
-        764,
-        765,
+        770,
+        771,
         &.{ "agents", "self", "pr_review", "result.json" },
-        1832,
+        1835,
     );
     defer allocator.free(resumed_result);
     try std.testing.expect(std.mem.indexOf(u8, resumed_result, "\"status\":\"ready_for_review\"") != null);
@@ -12538,6 +12576,102 @@ test "acheron_session: pr_review advance waits for github_pr events and resumes"
     const state_content = try std.fs.cwd().readFileAlloc(allocator, state_host_path, 64 * 1024);
     defer allocator.free(state_content);
     try std.testing.expect(std.mem.indexOf(u8, state_content, "\"phase\":\"reviewing\"") != null);
+}
+
+test "acheron_session: pr_review advance keeps blocked mission blocked when resume_blocked is false" {
+    const allocator = std.testing.allocator;
+
+    var mission_store = try mission_store_mod.MissionStore.initWithPath(allocator, null);
+    defer mission_store.deinit();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const exports_dir = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(exports_dir);
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "default",
+        .{
+            .mission_store = &mission_store,
+            .local_fs_export_root = exports_dir,
+            .actor_type = "agent",
+            .actor_id = "reviewer-blocked",
+        },
+    );
+    defer session.deinit();
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        766,
+        767,
+        &.{ "agents", "self", "pr_review", "control", "start.json" },
+        "{\"repo_key\":\"DeanoC/Spiderweb\",\"pr_number\":133}",
+        1836,
+    );
+
+    const start_result = try protocolReadFile(
+        &session,
+        allocator,
+        768,
+        769,
+        &.{ "agents", "self", "pr_review", "result.json" },
+        1837,
+    );
+    defer allocator.free(start_result);
+    const mission_id = try extractMissionIdFromResultPayload(allocator, start_result);
+    defer allocator.free(mission_id);
+
+    const blocked = try mission_store.transition(allocator, mission_id, .{
+        .next_state = .blocked,
+        .stage = "runner.blocked",
+        .reason = "Waiting for operator input",
+        .summary = "Waiting for operator input",
+        .actor = .{ .actor_type = "agent", .actor_id = "reviewer-blocked" },
+    });
+    blocked.deinit(allocator);
+
+    const advance_payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"mission_id\":\"{s}\",\"resume_blocked\":false,\"run_validation\":false,\"wait_timeout_ms\":0}}",
+        .{mission_id},
+    );
+    defer allocator.free(advance_payload);
+    try protocolWriteFile(
+        &session,
+        allocator,
+        770,
+        771,
+        &.{ "agents", "self", "pr_review", "control", "advance.json" },
+        advance_payload,
+        1838,
+    );
+
+    const advance_result = try protocolReadFile(
+        &session,
+        allocator,
+        772,
+        773,
+        &.{ "agents", "self", "pr_review", "result.json" },
+        1839,
+    );
+    defer allocator.free(advance_result);
+    try std.testing.expect(std.mem.indexOf(u8, advance_result, "\"status\":\"blocked\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, advance_result, "\"next_action\":\"resume_blocked\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, advance_result, "Waiting for operator input") != null);
+
+    const mission = (try mission_store.getOwned(allocator, mission_id)) orelse return error.TestExpectedResponse;
+    defer mission.deinit(allocator);
+    try std.testing.expectEqual(mission_store_mod.MissionState.blocked, mission.state);
 }
 
 test "acheron_session: pr_review save_draft persists revision history and advance requests revision" {
@@ -12940,6 +13074,152 @@ test "acheron_session: github_pr ingest_event reuses existing active pr_review m
         const mission_run_id = mission.run_id orelse continue;
         if (!std.mem.eql(u8, mission_run_id, "pr_review:DeanoC__Spiderweb:129")) continue;
         if (!isActiveMissionState(mission.state)) continue;
+        matching_active += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), matching_active);
+}
+
+test "acheron_session: github_pr ingest_event rejects unsupported provider" {
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const local_export_root = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(local_export_root);
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "default",
+        .{
+            .local_fs_export_root = local_export_root,
+            .actor_type = "agent",
+            .actor_id = "reviewer-ingest-provider",
+        },
+    );
+    defer session.deinit();
+
+    try std.testing.expectError(
+        error.InvalidPayload,
+        protocolWriteFile(
+            &session,
+            allocator,
+            758,
+            759,
+            &.{ "agents", "self", "github_pr", "control", "ingest_event.json" },
+            "{\"provider\":\"gitlab\",\"repo_key\":\"DeanoC/Spiderweb\",\"pr_number\":130,\"action\":\"opened\"}",
+            1825,
+        ),
+    );
+}
+
+test "acheron_session: github_pr ingest_event reuses configured project mission" {
+    const allocator = std.testing.allocator;
+
+    var mission_store = try mission_store_mod.MissionStore.initWithPath(allocator, null);
+    defer mission_store.deinit();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const local_export_root = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(local_export_root);
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "default",
+        .{
+            .mission_store = &mission_store,
+            .local_fs_export_root = local_export_root,
+            .actor_type = "agent",
+            .actor_id = "reviewer-ingest-config-project",
+        },
+    );
+    defer session.deinit();
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        760,
+        761,
+        &.{ "agents", "self", "pr_review", "control", "configure_repo.json" },
+        "{\"repo_key\":\"DeanoC/Spiderweb\",\"project_id\":\"proj-special\",\"default_branch\":\"main\",\"checkout_path\":\"/nodes/local/fs/pr-review/repos/project-special\",\"default_review_commands\":[\"zig build test\"],\"auto_intake\":true}",
+        1826,
+    );
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        762,
+        763,
+        &.{ "agents", "self", "github_pr", "control", "ingest_event.json" },
+        "{\"repo_key\":\"DeanoC/Spiderweb\",\"pr_number\":130,\"action\":\"opened\",\"title\":\"Configured project PR\",\"head_sha\":\"aaa130\"}",
+        1827,
+    );
+
+    const first_result = try protocolReadFile(
+        &session,
+        allocator,
+        764,
+        765,
+        &.{ "agents", "self", "github_pr", "result.json" },
+        1828,
+    );
+    defer allocator.free(first_result);
+    const first_mission_id = try extractMissionIdFromResultPayload(allocator, first_result);
+    defer allocator.free(first_mission_id);
+    try std.testing.expect(std.mem.indexOf(u8, first_result, "\"mission_action\":\"created\"") != null);
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        766,
+        767,
+        &.{ "agents", "self", "github_pr", "control", "ingest_event.json" },
+        "{\"repo_key\":\"DeanoC/Spiderweb\",\"pr_number\":130,\"action\":\"synchronize\",\"title\":\"Configured project PR\",\"head_sha\":\"bbb130\"}",
+        1829,
+    );
+
+    const second_result = try protocolReadFile(
+        &session,
+        allocator,
+        768,
+        769,
+        &.{ "agents", "self", "github_pr", "result.json" },
+        1830,
+    );
+    defer allocator.free(second_result);
+    const second_mission_id = try extractMissionIdFromResultPayload(allocator, second_result);
+    defer allocator.free(second_mission_id);
+    try std.testing.expect(std.mem.indexOf(u8, second_result, "\"mission_action\":\"existing\"") != null);
+    try std.testing.expectEqualStrings(first_mission_id, second_mission_id);
+
+    const missions = try mission_store.listOwned(allocator, .{ .use_case = "pr_review" });
+    defer {
+        for (missions) |*item| item.deinit(allocator);
+        allocator.free(missions);
+    }
+
+    var matching_active: usize = 0;
+    for (missions) |mission| {
+        const mission_run_id = mission.run_id orelse continue;
+        if (!std.mem.eql(u8, mission_run_id, "pr_review:DeanoC__Spiderweb:130")) continue;
+        if (!isActiveMissionState(mission.state)) continue;
+        if (!std.mem.eql(u8, mission.project_id orelse continue, "proj-special")) continue;
         matching_active += 1;
     }
     try std.testing.expectEqual(@as(usize, 1), matching_active);

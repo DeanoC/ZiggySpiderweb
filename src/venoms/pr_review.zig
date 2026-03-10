@@ -1097,6 +1097,7 @@ pub fn renderPrReviewU64Arg(
                 },
                 .float => |float_value| blk: {
                     if (float_value < 0 or std.math.floor(float_value) != float_value) return error.InvalidPayload;
+                    if (float_value > @as(f64, @floatFromInt(std.math.maxInt(u64)))) return error.InvalidPayload;
                     break :blk std.fmt.allocPrint(self.allocator, "{d}", .{@as(u64, @intFromFloat(float_value))});
                 },
                 else => error.InvalidPayload,
@@ -3001,8 +3002,11 @@ fn executeDraftReviewOp(self: anytype, args_obj: std.json.ObjectMap) ![]u8 {
     const mission_id = extractOptionalStringByNames(args_obj, &[_][]const u8{ "mission_id", "id" }) orelse return error.InvalidPayload;
 
     var mission = (try store.getOwned(self.allocator, mission_id)) orelse return error.NotFound;
+    defer mission.deinit(self.allocator);
     var contract = try self.resolvePrReviewMissionContract(mission);
+    defer contract.deinit(self.allocator);
     var state = try self.loadPrReviewStateSnapshot(contract.state_path);
+    defer state.deinit(self.allocator);
     const prior_revision = state.latest_draft_revision;
     const action = if (prior_revision > 0) "revise_review" else "draft_review";
 
@@ -3027,6 +3031,7 @@ fn executeDraftReviewOp(self: anytype, args_obj: std.json.ObjectMap) ![]u8 {
         "agent_run_id",
     });
     var run = try self.executeAgentRun(goal, resume_run_id);
+    defer run.deinit(self.allocator);
     var auto_resume_steps: usize = 0;
 
     const initial_mission = (try store.getOwned(self.allocator, mission_id)) orelse return error.NotFound;
@@ -3152,10 +3157,6 @@ fn executeDraftReviewOp(self: anytype, args_obj: std.json.ObjectMap) ![]u8 {
         ),
     };
     defer self.allocator.free(detail);
-    defer contract.deinit(self.allocator);
-    defer state.deinit(self.allocator);
-    defer mission.deinit(self.allocator);
-    defer run.deinit(self.allocator);
 
     if (state.latest_draft_revision > prior_revision) {
         return self.buildPrReviewSuccessResultJson(.draft_review, detail);
@@ -3591,6 +3592,32 @@ fn executeAdvanceOp(self: anytype, args_obj: std.json.ObjectMap) ![]u8 {
         return self.buildPrReviewSuccessResultJson(.advance, detail);
     }
 
+    if (mission.state == .blocked and !resume_blocked) {
+        var contract = try self.resolvePrReviewMissionContract(mission);
+        defer contract.deinit(self.allocator);
+        var state = try self.loadPrReviewStateSnapshot(contract.state_path);
+        defer state.deinit(self.allocator);
+        const mission_json = try self.buildMissionRecordJson(mission);
+        defer self.allocator.free(mission_json);
+        const note = mission.blocked_reason orelse "Mission is blocked; pass resume_blocked=true after clearing the blocker.";
+        const detail = try buildPrReviewAdvanceDetailJson(
+            self,
+            mission_json,
+            state.phase,
+            contract.context_path,
+            contract.state_path,
+            contract.artifact_root,
+            "blocked",
+            "resume_blocked",
+            null,
+            null,
+            null,
+            note,
+        );
+        defer self.allocator.free(detail);
+        return self.buildPrReviewSuccessResultJson(.advance, detail);
+    }
+
     if (mission.state == .planning or mission.state == .recovering or (mission.state == .blocked and resume_blocked)) {
         const resumed = store.transition(self.allocator, mission_id, .{
             .next_state = .running,
@@ -3656,7 +3683,7 @@ fn executeAdvanceOp(self: anytype, args_obj: std.json.ObjectMap) ![]u8 {
             defer self.allocator.free(detail);
             return self.buildPrReviewSuccessResultJson(.advance, detail);
         }
-        if (!try didAdvanceWaitFire(self, wait_result_json.?)) {
+        if (!try didAdvanceWaitFire(self, wait_result_json.?, mission.run_id)) {
             const heartbeat = store.recordHeartbeat(
                 self.allocator,
                 mission_id,
@@ -4110,6 +4137,7 @@ fn buildAdvanceSyncArgsJson(
         try writer.writeAll(",\"current_focus\":");
         try writer.writeAll(raw);
     }
+    // Advance refreshes the PR state by default unless the caller explicitly opts a step out.
     inline for ([_][]const u8{ "provider_sync", "sync_checkout", "repo_status", "diff_range" }) |field| {
         if (args_obj.get(field)) |value| {
             const raw = try self.renderJsonValue(value);
@@ -4208,13 +4236,22 @@ fn buildAdvanceWaitRequestJson(
     return out.toOwnedSlice(self.allocator);
 }
 
-fn didAdvanceWaitFire(self: anytype, payload_json: []const u8) !bool {
+fn didAdvanceWaitFire(self: anytype, payload_json: []const u8, expected_run_id: ?[]const u8) !bool {
     var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, payload_json, .{});
     defer parsed.deinit();
     if (parsed.value != .object) return false;
     const waiting = (try jsonObjectOptionalBool(parsed.value.object, "waiting")) orelse false;
     const configured = (try jsonObjectOptionalBool(parsed.value.object, "configured")) orelse false;
-    return configured and !waiting;
+    if (!configured or waiting) return false;
+    const run_id = expected_run_id orelse return true;
+    const signal_value = parsed.value.object.get("signal") orelse return true;
+    if (signal_value != .object) return false;
+    const parameter = (try jsonObjectOptionalString(signal_value.object, "parameter")) orelse return true;
+    if (!std.mem.eql(u8, parameter, "github_pr")) return true;
+    const payload_value = signal_value.object.get("payload") orelse return false;
+    if (payload_value != .object) return false;
+    const payload_run_id = (try jsonObjectOptionalString(payload_value.object, "run_id")) orelse return false;
+    return std.mem.eql(u8, payload_run_id, run_id);
 }
 
 fn advanceHasValidationCommands(
@@ -4322,7 +4359,16 @@ fn jsonObjectOptionalU64(obj: std.json.ObjectMap, key: []const u8) !?u64 {
     if (obj.get(key)) |value| {
         return switch (value) {
             .null => null,
-            .integer => @as(u64, @intCast(value.integer)),
+            .integer => |signed| blk: {
+                if (signed < 0) return error.InvalidPayload;
+                break :blk @as(u64, @intCast(signed));
+            },
+            .float => |float_value| blk: {
+                if (float_value < 0) return error.InvalidPayload;
+                if (std.math.floor(float_value) != float_value) return error.InvalidPayload;
+                if (float_value > @as(f64, @floatFromInt(std.math.maxInt(u64)))) return error.InvalidPayload;
+                break :blk @as(u64, @intFromFloat(float_value));
+            },
             else => error.InvalidPayload,
         };
     }
@@ -4525,6 +4571,49 @@ fn setServiceError(self: anytype, code: *?[]u8, message: *?[]u8, new_code: []con
     freeOptionalOwnedString(self, message);
     code.* = try self.allocator.dupe(u8, new_code);
     message.* = try self.allocator.dupe(u8, new_message);
+}
+
+test "pr_review: jsonObjectOptionalU64 rejects negative integers" {
+    const allocator = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, "{\"pr_number\":-1}", .{});
+    defer parsed.deinit();
+    try std.testing.expectError(error.InvalidPayload, jsonObjectOptionalU64(parsed.value.object, "pr_number"));
+}
+
+test "pr_review: renderPrReviewU64Arg rejects overflowing floats" {
+    const allocator = std.testing.allocator;
+    const TestCtx = struct {
+        allocator: std.mem.Allocator,
+
+        fn findJsonObjectFieldByNames(_: @This(), obj: std.json.ObjectMap, names: []const []const u8) ?std.json.Value {
+            for (names) |name| {
+                if (obj.get(name)) |value| return value;
+            }
+            return null;
+        }
+    };
+    var ctx = TestCtx{ .allocator = allocator };
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, "{\"timeout_ms\":1e40}", .{});
+    defer parsed.deinit();
+    try std.testing.expectError(error.InvalidPayload, renderPrReviewU64Arg(&ctx, parsed.value.object, &.{"timeout_ms"}, null));
+}
+
+test "pr_review: didAdvanceWaitFire requires matching github run_id" {
+    const allocator = std.testing.allocator;
+    const TestCtx = struct { allocator: std.mem.Allocator };
+    var ctx = TestCtx{ .allocator = allocator };
+
+    try std.testing.expect(!try didAdvanceWaitFire(
+        &ctx,
+        "{\"configured\":true,\"waiting\":false,\"signal\":{\"parameter\":\"github_pr\",\"payload\":{\"run_id\":\"pr_review:DeanoC__Spiderweb:999\"}}}",
+        "pr_review:DeanoC__Spiderweb:131",
+    ));
+    try std.testing.expect(try didAdvanceWaitFire(
+        &ctx,
+        "{\"configured\":true,\"waiting\":false,\"signal\":{\"parameter\":\"github_pr\",\"payload\":{\"run_id\":\"pr_review:DeanoC__Spiderweb:131\"}}}",
+        "pr_review:DeanoC__Spiderweb:131",
+    ));
 }
 
 fn captureServiceErrorFromPayload(
