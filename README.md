@@ -4,7 +4,7 @@
 [![Zig](https://img.shields.io/badge/Zig-0.15.0-orange.svg)](https://ziglang.org)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-An **AI agent gateway + Acheron-based distributed RPC filesystem** for multi-node, tool-capable agents. Built in Zig, Linux-only.
+An **AI agent gateway + Acheron-based distributed RPC filesystem** for multi-node, tool-capable agents. Built in Zig. The Spiderweb server remains Linux-oriented, and the standalone `spiderweb-fs-mount` client now builds for Linux and Windows.
 
 ## Vision
 
@@ -55,4 +55,39 @@ zig build
 
 # Or specify custom port
 ./zig-out/bin/spiderweb --port 9000
+```
+
+## Standalone Mount Client
+
+`spiderweb-fs-mount` can now run as a standalone client on machines that do not host Spiderweb locally.
+
+- `--workspace-url <ws-url>` keeps the existing routed `/v2/fs` mount mode.
+- `--namespace-url <ws-url>` connects to the main Spiderweb websocket, attaches an Acheron session root, and mounts the full namespace (`/agents`, `/nodes`, `/global`, optional `/debug`).
+- In namespace mode, node-backed filesystem subtrees discovered from workspace topology still route through `/v2/fs`, so regular file mutation keeps working under mounted workspace exports.
+- Session-only synthetic paths support `stat`, `readdir`, `read`, and writes to existing writable files. `create`, `unlink`, `mkdir`, `rmdir`, `rename`, and `truncate` return unsupported errors on those paths.
+
+Build only the standalone client:
+
+```bash
+zig build fs-mount
+zig build test-fs-mount
+```
+
+Installers:
+
+- Linux: `./install-fs-mount.sh`
+- Windows: `powershell -ExecutionPolicy Bypass -File .\install-fs-mount.ps1`
+- Smoke harnesses: `./scripts/acheron-namespace-smoke.sh` and `powershell -ExecutionPolicy Bypass -File .\scripts\acheron-namespace-smoke.ps1`
+
+Examples:
+
+```bash
+# Existing routed-FS mode
+./zig-out/bin/spiderweb-fs-mount --workspace-url ws://127.0.0.1:18790/ mount /mnt/spiderweb
+
+# Full namespace mode
+./zig-out/bin/spiderweb-fs-mount --namespace-url ws://127.0.0.1:18790/ --project-id proj-a mount /mnt/spiderweb
+
+# Namespace smoke harness (low-level commands, optional real mount when SMOKE_USE_OS_MOUNT=1)
+SPIDERWEB_PROJECT_ID=proj-a ./scripts/acheron-namespace-smoke.sh
 ```

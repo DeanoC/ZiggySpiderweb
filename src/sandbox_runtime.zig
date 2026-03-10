@@ -615,7 +615,9 @@ fn cleanupStaleAgentMounts(
 
 fn terminateMountAtPath(allocator: std.mem.Allocator, path: []const u8) void {
     terminateMountProcessesForPath(allocator, path);
-    runBestEffortCommand(allocator, &.{ "fuser", "-km", path });
+    // Avoid broad "kill all users of this mount" cleanup here. During runtime
+    // warmup the Spiderweb server itself can temporarily hold references under
+    // the project mount tree, and fuser -km would take the whole server down.
     detachMountAtPath(allocator, path);
 }
 
@@ -734,6 +736,21 @@ test "sandbox_runtime: filesystem unavailable failure triggers mount restart" {
     defer result.deinit(std.testing.allocator);
 
     try std.testing.expect(shouldRestartOnToolFailure(result));
+}
+
+test "sandbox_runtime: cmdline mount path matching only targets spiderweb-fs-mount mount commands" {
+    try std.testing.expect(cmdlineMatchesMountPath(
+        "spiderweb-fs-mount\x00--workspace-url\x00ws://127.0.0.1:28790/\x00mount\x00/tmp/project-mount\x00",
+        "/tmp/project-mount",
+    ));
+    try std.testing.expect(!cmdlineMatchesMountPath(
+        "spiderweb\x00--bind\x000.0.0.0\x00",
+        "/tmp/project-mount",
+    ));
+    try std.testing.expect(!cmdlineMatchesMountPath(
+        "spiderweb-fs-mount\x00status\x00--no-probe\x00",
+        "/tmp/project-mount",
+    ));
 }
 
 fn parseToolResponseLine(allocator: std.mem.Allocator, line: []const u8) !tool_registry.ToolExecutionResult {
