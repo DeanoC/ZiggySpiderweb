@@ -376,17 +376,17 @@ fn executeStatusOp(self: anytype, args_obj: std.json.ObjectMap) ![]u8 {
     const checkout_host_path = try self.resolveMissionContractHostPath(checkout_path);
     defer self.allocator.free(checkout_host_path);
 
-    const head_sha = try runGitCaptureStdout(self, checkout_host_path, &.{ "rev-parse", "HEAD" }, timeout_ms) catch |err| switch (err) {
+    const head_sha = runGitCaptureStdout(self, checkout_host_path, &.{ "rev-parse", "HEAD" }, timeout_ms) catch |err| switch (err) {
         error.InvalidPayload => return error.InvalidPayload,
         else => return self.buildGitFailureResultJson(.status, "execution_failed", @errorName(err)),
     };
     defer self.allocator.free(head_sha);
-    const branch_name = try runGitCaptureStdout(self, checkout_host_path, &.{ "rev-parse", "--abbrev-ref", "HEAD" }, timeout_ms) catch |err| switch (err) {
+    const branch_name = runGitCaptureStdout(self, checkout_host_path, &.{ "rev-parse", "--abbrev-ref", "HEAD" }, timeout_ms) catch |err| switch (err) {
         error.InvalidPayload => return error.InvalidPayload,
         else => return self.buildGitFailureResultJson(.status, "execution_failed", @errorName(err)),
     };
     defer self.allocator.free(branch_name);
-    const status_short = try runGitCaptureStdout(self, checkout_host_path, &.{ "status", "--short" }, timeout_ms) catch |err| switch (err) {
+    const status_short = runGitCaptureStdout(self, checkout_host_path, &.{ "status", "--short" }, timeout_ms) catch |err| switch (err) {
         error.InvalidPayload => return error.InvalidPayload,
         else => return self.buildGitFailureResultJson(.status, "execution_failed", @errorName(err)),
     };

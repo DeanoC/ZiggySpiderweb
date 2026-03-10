@@ -973,7 +973,7 @@ fn formatJsonStringOrNull(allocator: std.mem.Allocator, value: []const u8) ![]u8
 }
 
 fn writeJsonString(writer: anytype, value: []const u8) !void {
-    try std.json.stringify(value, .{}, writer);
+    try writer.print("{f}", .{std.json.fmt(value, .{})});
 }
 
 fn isWorldAbsolutePath(path: []const u8) bool {

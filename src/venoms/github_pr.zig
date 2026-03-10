@@ -932,7 +932,7 @@ fn gitHubStatusCode(status: std.http.Status) []const u8 {
         .forbidden => "forbidden",
         .not_found => "not_found",
         .too_many_requests => "rate_limited",
-        .unprocessable_content => "invalid_request",
+        .unprocessable_entity => "invalid_request",
         else => "api_error",
     };
 }

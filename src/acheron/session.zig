@@ -352,25 +352,23 @@ const FidState = struct {
     mode: []const u8 = "r",
 };
 
-const ToolPayloadErrorInfo = struct {
+pub const ToolPayloadErrorInfo = struct {
     code: []u8,
     message: []u8,
 
-    fn deinit(self: *ToolPayloadErrorInfo, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: ToolPayloadErrorInfo, allocator: std.mem.Allocator) void {
         allocator.free(self.code);
         allocator.free(self.message);
-        self.* = undefined;
     }
 };
 
-const InternalFsrpcErrorInfo = struct {
+pub const InternalFsrpcErrorInfo = struct {
     code: []u8,
     message: []u8,
 
-    fn deinit(self: *InternalFsrpcErrorInfo, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: InternalFsrpcErrorInfo, allocator: std.mem.Allocator) void {
         allocator.free(self.code);
         allocator.free(self.message);
-        self.* = undefined;
     }
 };
 
@@ -2843,7 +2841,7 @@ pub const Session = struct {
         );
     }
 
-    fn addDirectoryDescriptors(
+    pub fn addDirectoryDescriptors(
         self: *Session,
         dir_id: u32,
         title: []const u8,
@@ -4064,7 +4062,7 @@ pub const Session = struct {
         return error.InvalidPayload;
     }
 
-    fn appendShellSingleQuoted(self: *Session, out: *std.ArrayListUnmanaged(u8), value: []const u8) !void {
+    pub fn appendShellSingleQuoted(self: *Session, out: *std.ArrayListUnmanaged(u8), value: []const u8) !void {
         try out.append(self.allocator, '\'');
         var start: usize = 0;
         while (start < value.len) {
@@ -4188,7 +4186,7 @@ pub const Session = struct {
         return null;
     }
 
-    fn buildTerminalExecArgsJson(
+    pub fn buildTerminalExecArgsJson(
         self: *Session,
         obj: std.json.ObjectMap,
         session_cwd: ?[]const u8,
@@ -6104,11 +6102,11 @@ pub const Session = struct {
         return try self.allocator.dupe(u8, provider.node_id);
     }
 
-    fn addDir(self: *Session, parent: ?u32, name: []const u8, writable: bool) !u32 {
+    pub fn addDir(self: *Session, parent: ?u32, name: []const u8, writable: bool) !u32 {
         return self.addNode(parent, name, .dir, "", writable, .none);
     }
 
-    fn addFile(self: *Session, parent: u32, name: []const u8, content: []const u8, writable: bool, special: SpecialKind) !u32 {
+    pub fn addFile(self: *Session, parent: u32, name: []const u8, content: []const u8, writable: bool, special: SpecialKind) !u32 {
         return self.addNode(parent, name, .file, content, writable, special);
     }
 
@@ -6184,7 +6182,7 @@ pub const Session = struct {
         return null;
     }
 
-    fn resolveAbsolutePathNoBinds(self: *Session, path: []const u8) ?u32 {
+    pub fn resolveAbsolutePathNoBinds(self: *Session, path: []const u8) ?u32 {
         if (!std.mem.startsWith(u8, path, "/")) return null;
         if (std.mem.eql(u8, path, "/")) return self.root_id;
         var node_id = self.root_id;
@@ -6261,7 +6259,7 @@ pub const Session = struct {
         node_ptr.content = next;
     }
 
-    fn setFileContent(self: *Session, node_id: u32, data: []const u8) !void {
+    pub fn setFileContent(self: *Session, node_id: u32, data: []const u8) !void {
         const node_ptr = self.nodes.getPtr(node_id) orelse return error.MissingNode;
         if (node_ptr.kind != .file) return error.NotFile;
         self.allocator.free(node_ptr.content);
@@ -7665,7 +7663,7 @@ pub const Session = struct {
         };
     }
 
-    fn normalizeLocalFsRelativePath(self: *Session, raw_path: []const u8) ![]u8 {
+    pub fn normalizeLocalFsRelativePath(self: *Session, raw_path: []const u8) ![]u8 {
         var path = std.mem.trim(u8, raw_path, " \t\r\n");
         if (path.len == 0) return error.InvalidPayload;
 
@@ -9152,11 +9150,11 @@ pub const Session = struct {
         up,
     };
 
-    const GitOp = git_venom.Op;
+    pub const GitOp = git_venom.Op;
 
-    const GitHubPrOp = github_pr_venom.Op;
+    pub const GitHubPrOp = github_pr_venom.Op;
 
-    const PrReviewOp = pr_review_venom.Op;
+    pub const PrReviewOp = pr_review_venom.Op;
 
     fn handleProjectsNamespaceWrite(self: *Session, special: SpecialKind, node_id: u32, raw_input: []const u8) !WriteOutcome {
         const input = std.mem.trim(u8, raw_input, " \t\r\n");
@@ -9372,13 +9370,13 @@ pub const Session = struct {
         };
     }
 
-    const ParsedShellExecResult = git_venom.ParsedShellExecResult;
+    pub const ParsedShellExecResult = git_venom.ParsedShellExecResult;
 
-    const ShellExecOutcome = union(enum) {
+    pub const ShellExecOutcome = union(enum) {
         success: ParsedShellExecResult,
         failure: ToolPayloadErrorInfo,
 
-        fn deinit(self: *ShellExecOutcome, allocator: std.mem.Allocator) void {
+        pub fn deinit(self: *ShellExecOutcome, allocator: std.mem.Allocator) void {
             switch (self.*) {
                 .success => |*value| value.deinit(allocator),
                 .failure => |*value| value.deinit(allocator),
@@ -9567,11 +9565,11 @@ pub const Session = struct {
         return github_pr_venom.executeOpPayload(self, op, args_obj);
     }
 
-    fn buildCliCommand(self: *Session, program: []const u8, argv: []const []const u8) ![]u8 {
+    pub fn buildCliCommand(self: *Session, program: []const u8, argv: []const []const u8) ![]u8 {
         return git_venom.buildCliCommand(self, program, argv);
     }
 
-    fn runShellExecCommand(self: *Session, command: []const u8, cwd: ?[]const u8, timeout_ms: u64) !ShellExecOutcome {
+    pub fn runShellExecCommand(self: *Session, command: []const u8, cwd: ?[]const u8, timeout_ms: u64) !ShellExecOutcome {
         const args_json = try self.buildShellExecArgsJson(command, cwd, timeout_ms);
         defer self.allocator.free(args_json);
         const payload_json = try self.executeServiceToolCall("shell_exec", args_json);
@@ -9595,19 +9593,19 @@ pub const Session = struct {
         return git_venom.normalizeJsonText(self, raw);
     }
 
-    fn buildGitSuccessResultJson(self: *Session, op: GitOp, result_json: []const u8) ![]u8 {
+    pub fn buildGitSuccessResultJson(self: *Session, op: GitOp, result_json: []const u8) ![]u8 {
         return git_venom.buildGitSuccessResultJson(self, op, result_json);
     }
 
-    fn buildGitFailureResultJson(self: *Session, op: GitOp, code: []const u8, message: []const u8) ![]u8 {
+    pub fn buildGitFailureResultJson(self: *Session, op: GitOp, code: []const u8, message: []const u8) ![]u8 {
         return git_venom.buildGitFailureResultJson(self, op, code, message);
     }
 
-    fn buildGitHubPrSuccessResultJson(self: *Session, op: GitHubPrOp, result_json: []const u8) ![]u8 {
+    pub fn buildGitHubPrSuccessResultJson(self: *Session, op: GitHubPrOp, result_json: []const u8) ![]u8 {
         return github_pr_venom.buildGitHubPrSuccessResultJson(self, op, result_json);
     }
 
-    fn buildGitHubPrFailureResultJson(self: *Session, op: GitHubPrOp, code: []const u8, message: []const u8) ![]u8 {
+    pub fn buildGitHubPrFailureResultJson(self: *Session, op: GitHubPrOp, code: []const u8, message: []const u8) ![]u8 {
         return github_pr_venom.buildGitHubPrFailureResultJson(self, op, code, message);
     }
 
@@ -9701,28 +9699,28 @@ pub const Session = struct {
         return pr_review_venom.executeOpPayload(self, op, args_obj);
     }
 
-    const PrReviewResolvedContract = pr_review_venom.ResolvedContract;
-    const PrReviewContextSnapshot = pr_review_venom.ContextSnapshot;
-    const PrReviewStateSnapshot = pr_review_venom.StateSnapshot;
-    const PrReviewRepoConfigSnapshot = pr_review_venom.RepoConfigSnapshot;
+    pub const PrReviewResolvedContract = pr_review_venom.ResolvedContract;
+    pub const PrReviewContextSnapshot = pr_review_venom.ContextSnapshot;
+    pub const PrReviewStateSnapshot = pr_review_venom.StateSnapshot;
+    pub const PrReviewRepoConfigSnapshot = pr_review_venom.RepoConfigSnapshot;
 
-    fn bootstrapPrReviewMission(self: *Session, args_obj: std.json.ObjectMap) !mission_store_mod.MissionRecord {
+    pub fn bootstrapPrReviewMission(self: *Session, args_obj: std.json.ObjectMap) !mission_store_mod.MissionRecord {
         return pr_review_venom.bootstrapMission(self, args_obj);
     }
 
-    fn resolvePrReviewMissionContract(self: *Session, mission: mission_store_mod.MissionRecord) !PrReviewResolvedContract {
+    pub fn resolvePrReviewMissionContract(self: *Session, mission: mission_store_mod.MissionRecord) !PrReviewResolvedContract {
         return pr_review_venom.resolveMissionContract(self, mission);
     }
 
-    fn buildPrReviewRunId(self: *Session, repo_key: []const u8, pr_number: u64) ![]u8 {
+    pub fn buildPrReviewRunId(self: *Session, repo_key: []const u8, pr_number: u64) ![]u8 {
         return pr_review_venom.buildRunId(self, repo_key, pr_number);
     }
 
-    fn loadConfiguredPrReviewRepo(self: *Session, repo_key: []const u8) !?PrReviewRepoConfigSnapshot {
+    pub fn loadConfiguredPrReviewRepo(self: *Session, repo_key: []const u8) !?PrReviewRepoConfigSnapshot {
         return pr_review_venom.loadConfiguredRepo(self, repo_key);
     }
 
-    fn findActivePrReviewMissionByRunId(
+    pub fn findActivePrReviewMissionByRunId(
         self: *Session,
         store: *mission_store_mod.MissionStore,
         run_id: []const u8,
@@ -9731,7 +9729,7 @@ pub const Session = struct {
         return pr_review_venom.findActiveMissionByRunId(self, store, run_id, project_id);
     }
 
-    fn normalizeLocalWorkspaceAbsolutePath(self: *Session, raw_path: []const u8) ![]u8 {
+    pub fn normalizeLocalWorkspaceAbsolutePath(self: *Session, raw_path: []const u8) ![]u8 {
         const normalized = try self.normalizeMissionAbsolutePath(raw_path);
         errdefer self.allocator.free(normalized);
         const host_path = try self.resolveMissionContractHostPath(normalized);
@@ -9739,7 +9737,7 @@ pub const Session = struct {
         return normalized;
     }
 
-    fn readMissionContractFile(self: *Session, absolute_path: []const u8, max_bytes: usize) ![]u8 {
+    pub fn readMissionContractFile(self: *Session, absolute_path: []const u8, max_bytes: usize) ![]u8 {
         const host_path = try self.resolveMissionContractHostPath(absolute_path);
         defer self.allocator.free(host_path);
         if (std.fs.path.isAbsolute(host_path)) {
@@ -9750,26 +9748,26 @@ pub const Session = struct {
         return std.fs.cwd().readFileAlloc(self.allocator, host_path, max_bytes);
     }
 
-    fn loadPrReviewContextSnapshot(self: *Session, context_path: []const u8) !PrReviewContextSnapshot {
+    pub fn loadPrReviewContextSnapshot(self: *Session, context_path: []const u8) !PrReviewContextSnapshot {
         return pr_review_venom.loadContextSnapshot(self, context_path);
     }
 
-    fn loadPrReviewStateSnapshot(self: *Session, state_path: []const u8) !PrReviewStateSnapshot {
+    pub fn loadPrReviewStateSnapshot(self: *Session, state_path: []const u8) !PrReviewStateSnapshot {
         return pr_review_venom.loadStateSnapshot(self, state_path);
     }
 
-    fn replaceOwnedString(self: *Session, target: *[]u8, value: []const u8) !void {
+    pub fn replaceOwnedString(self: *Session, target: *[]u8, value: []const u8) !void {
         const copy = try self.allocator.dupe(u8, value);
         self.allocator.free(target.*);
         target.* = copy;
     }
 
-    fn replaceOptionalOwnedString(self: *Session, target: *?[]u8, value: ?[]const u8) !void {
+    pub fn replaceOptionalOwnedString(self: *Session, target: *?[]u8, value: ?[]const u8) !void {
         if (target.*) |existing| self.allocator.free(existing);
         target.* = if (value) |slice| try self.allocator.dupe(u8, slice) else null;
     }
 
-    fn replaceOwnedJsonValue(self: *Session, target: *[]u8, value: std.json.Value, default_json: []const u8) !void {
+    pub fn replaceOwnedJsonValue(self: *Session, target: *[]u8, value: std.json.Value, default_json: []const u8) !void {
         const rendered = if (value == .null)
             try self.allocator.dupe(u8, default_json)
         else
@@ -9778,14 +9776,14 @@ pub const Session = struct {
         target.* = rendered;
     }
 
-    fn findJsonObjectFieldByNames(obj: std.json.ObjectMap, names: []const []const u8) ?std.json.Value {
+    pub fn findJsonObjectFieldByNames(_: *Session, obj: std.json.ObjectMap, names: []const []const u8) ?std.json.Value {
         for (names) |name| {
             if (obj.get(name)) |value| return value;
         }
         return null;
     }
 
-    fn formatJsonString(self: *Session, value: []const u8) ![]u8 {
+    pub fn formatJsonString(self: *Session, value: []const u8) ![]u8 {
         const escaped = try unified.jsonEscape(self.allocator, value);
         defer self.allocator.free(escaped);
         return std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped});
@@ -9818,7 +9816,7 @@ pub const Session = struct {
         return pr_review_venom.renderPrReviewBoolArg(self, overrides, names, default);
     }
 
-    fn buildPrReviewGitHubSyncRequestJson(
+    pub fn buildPrReviewGitHubSyncRequestJson(
         self: *Session,
         context: PrReviewContextSnapshot,
         overrides: ?std.json.ObjectMap,
@@ -9826,7 +9824,7 @@ pub const Session = struct {
         return pr_review_venom.buildPrReviewGitHubSyncRequestJson(self, context, overrides);
     }
 
-    fn buildPrReviewGitSyncCheckoutRequestJson(
+    pub fn buildPrReviewGitSyncCheckoutRequestJson(
         self: *Session,
         context: PrReviewContextSnapshot,
         overrides: ?std.json.ObjectMap,
@@ -9834,7 +9832,7 @@ pub const Session = struct {
         return pr_review_venom.buildPrReviewGitSyncCheckoutRequestJson(self, context, overrides);
     }
 
-    fn buildPrReviewGitStatusRequestJson(
+    pub fn buildPrReviewGitStatusRequestJson(
         self: *Session,
         context: PrReviewContextSnapshot,
         overrides: ?std.json.ObjectMap,
@@ -9842,7 +9840,7 @@ pub const Session = struct {
         return pr_review_venom.buildPrReviewGitStatusRequestJson(self, context, overrides);
     }
 
-    fn buildPrReviewGitDiffRangeRequestJson(
+    pub fn buildPrReviewGitDiffRangeRequestJson(
         self: *Session,
         context: PrReviewContextSnapshot,
         overrides: ?std.json.ObjectMap,
@@ -9850,7 +9848,7 @@ pub const Session = struct {
         return pr_review_venom.buildPrReviewGitDiffRangeRequestJson(self, context, overrides);
     }
 
-    fn buildPrReviewGitHubPublishRequestJson(
+    pub fn buildPrReviewGitHubPublishRequestJson(
         self: *Session,
         context: PrReviewContextSnapshot,
         recommendation_value: std.json.Value,
@@ -9868,11 +9866,11 @@ pub const Session = struct {
         );
     }
 
-    fn buildPrReviewTerminalCreateRequestJson(self: *Session, checkout_path: []const u8) ![]u8 {
+    pub fn buildPrReviewTerminalCreateRequestJson(self: *Session, checkout_path: []const u8) ![]u8 {
         return pr_review_venom.buildPrReviewTerminalCreateRequestJson(self, checkout_path);
     }
 
-    fn buildPrReviewValidationExecRequestJson(
+    pub fn buildPrReviewValidationExecRequestJson(
         self: *Session,
         command_value: std.json.Value,
         checkout_path: []const u8,
@@ -9898,7 +9896,7 @@ pub const Session = struct {
         );
     }
 
-    fn invokePrReviewServiceCapture(
+    pub fn invokePrReviewServiceCapture(
         self: *Session,
         store: *mission_store_mod.MissionStore,
         mission_id: []const u8,
@@ -9926,7 +9924,7 @@ pub const Session = struct {
         );
     }
 
-    fn applyPrReviewContextFromGitHubSyncPayload(
+    pub fn applyPrReviewContextFromGitHubSyncPayload(
         self: *Session,
         context: *PrReviewContextSnapshot,
         state: *PrReviewStateSnapshot,
@@ -9935,7 +9933,7 @@ pub const Session = struct {
         return pr_review_venom.applyPrReviewContextFromGitHubSyncPayload(self, context, state, payload_json);
     }
 
-    fn extractTerminalExitCodeFromToolPayload(self: *Session, payload_json: []const u8) !?i32 {
+    pub fn extractTerminalExitCodeFromToolPayload(self: *Session, payload_json: []const u8) !?i32 {
         var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, payload_json, .{});
         defer parsed.deinit();
         if (parsed.value != .object) return null;
@@ -9952,7 +9950,7 @@ pub const Session = struct {
         };
     }
 
-    fn applyPrReviewContextFromGitSyncPayload(
+    pub fn applyPrReviewContextFromGitSyncPayload(
         self: *Session,
         context: *PrReviewContextSnapshot,
         state: *PrReviewStateSnapshot,
@@ -9961,7 +9959,7 @@ pub const Session = struct {
         return pr_review_venom.applyPrReviewContextFromGitSyncPayload(self, context, state, payload_json);
     }
 
-    fn applyPrReviewContextFromGitStatusPayload(
+    pub fn applyPrReviewContextFromGitStatusPayload(
         self: *Session,
         context: *PrReviewContextSnapshot,
         state: *PrReviewStateSnapshot,
@@ -9970,7 +9968,7 @@ pub const Session = struct {
         return pr_review_venom.applyPrReviewContextFromGitStatusPayload(self, context, state, payload_json);
     }
 
-    fn applyPrReviewCommonStateFields(self: *Session, args_obj: std.json.ObjectMap, state: *PrReviewStateSnapshot) !void {
+    pub fn applyPrReviewCommonStateFields(self: *Session, args_obj: std.json.ObjectMap, state: *PrReviewStateSnapshot) !void {
         return pr_review_venom.applyPrReviewCommonStateFields(self, args_obj, state);
     }
 
@@ -9978,19 +9976,19 @@ pub const Session = struct {
         return pr_review_venom.resolvePrReviewArtifactPath(self, artifact_root, artifact_relative_path);
     }
 
-    fn writePrReviewJsonArtifact(self: *Session, artifact_root: []const u8, artifact_relative_path: []const u8, value: std.json.Value) ![]u8 {
+    pub fn writePrReviewJsonArtifact(self: *Session, artifact_root: []const u8, artifact_relative_path: []const u8, value: std.json.Value) ![]u8 {
         return pr_review_venom.writePrReviewJsonArtifact(self, artifact_root, artifact_relative_path, value);
     }
 
-    fn writePrReviewArtifactPayload(self: *Session, artifact_root: []const u8, artifact_relative_path: []const u8, payload_json: []const u8) ![]u8 {
+    pub fn writePrReviewArtifactPayload(self: *Session, artifact_root: []const u8, artifact_relative_path: []const u8, payload_json: []const u8) ![]u8 {
         return pr_review_venom.writePrReviewArtifactPayload(self, artifact_root, artifact_relative_path, payload_json);
     }
 
-    fn writePrReviewTextArtifact(self: *Session, artifact_root: []const u8, artifact_relative_path: []const u8, content: []const u8) ![]u8 {
+    pub fn writePrReviewTextArtifact(self: *Session, artifact_root: []const u8, artifact_relative_path: []const u8, content: []const u8) ![]u8 {
         return pr_review_venom.writePrReviewTextArtifact(self, artifact_root, artifact_relative_path, content);
     }
 
-    fn buildPrReviewContextPayloadJson(
+    pub fn buildPrReviewContextPayloadJson(
         self: *Session,
         provider: []const u8,
         repo_key: []const u8,
@@ -10022,15 +10020,15 @@ pub const Session = struct {
         );
     }
 
-    fn buildDefaultPrReviewStatePayloadJson(self: *Session, head_sha: []const u8) ![]u8 {
+    pub fn buildDefaultPrReviewStatePayloadJson(self: *Session, head_sha: []const u8) ![]u8 {
         return pr_review_venom.buildDefaultPrReviewStatePayloadJson(self, head_sha);
     }
 
-    fn buildPrReviewStatePayloadJson(self: *Session, state: PrReviewStateSnapshot) ![]u8 {
+    pub fn buildPrReviewStatePayloadJson(self: *Session, state: PrReviewStateSnapshot) ![]u8 {
         return pr_review_venom.buildPrReviewStatePayloadJson(self, state);
     }
 
-    fn buildPrReviewStartDetailJson(
+    pub fn buildPrReviewStartDetailJson(
         self: *Session,
         mission_json: []const u8,
         provider: []const u8,
@@ -10056,7 +10054,7 @@ pub const Session = struct {
         );
     }
 
-    fn buildPrReviewIntakeDetailJson(
+    pub fn buildPrReviewIntakeDetailJson(
         self: *Session,
         mission_json: []const u8,
         provider: []const u8,
@@ -10084,7 +10082,7 @@ pub const Session = struct {
         );
     }
 
-    fn buildPrReviewSyncDetailJson(
+    pub fn buildPrReviewSyncDetailJson(
         self: *Session,
         mission_json: []const u8,
         phase: []const u8,
@@ -10108,7 +10106,7 @@ pub const Session = struct {
         );
     }
 
-    fn buildPrReviewValidationDetailJson(
+    pub fn buildPrReviewValidationDetailJson(
         self: *Session,
         mission_json: []const u8,
         phase: []const u8,
@@ -10130,7 +10128,7 @@ pub const Session = struct {
         );
     }
 
-    fn buildPrReviewReviewDetailJson(
+    pub fn buildPrReviewReviewDetailJson(
         self: *Session,
         mission_json: []const u8,
         phase: []const u8,
@@ -10154,11 +10152,11 @@ pub const Session = struct {
         );
     }
 
-    fn buildPrReviewSuccessResultJson(self: *Session, op: PrReviewOp, result_json: []const u8) ![]u8 {
+    pub fn buildPrReviewSuccessResultJson(self: *Session, op: PrReviewOp, result_json: []const u8) ![]u8 {
         return pr_review_venom.buildPrReviewSuccessResultJson(self, op, result_json);
     }
 
-    fn buildPrReviewPartialFailureResultJson(
+    pub fn buildPrReviewPartialFailureResultJson(
         self: *Session,
         op: PrReviewOp,
         result_json: []const u8,
@@ -10168,11 +10166,11 @@ pub const Session = struct {
         return pr_review_venom.buildPrReviewPartialFailureResultJson(self, op, result_json, code, message);
     }
 
-    fn buildPrReviewFailureResultJson(self: *Session, op: PrReviewOp, code: []const u8, message: []const u8) ![]u8 {
+    pub fn buildPrReviewFailureResultJson(self: *Session, op: PrReviewOp, code: []const u8, message: []const u8) ![]u8 {
         return pr_review_venom.buildPrReviewFailureResultJson(self, op, code, message);
     }
 
-    fn buildPrReviewValidationReportJson(
+    pub fn buildPrReviewValidationReportJson(
         self: *Session,
         status: []const u8,
         summary: []const u8,
@@ -10190,7 +10188,7 @@ pub const Session = struct {
         );
     }
 
-    fn buildPrReviewValidationCommandEntryJson(
+    pub fn buildPrReviewValidationCommandEntryJson(
         self: *Session,
         index: usize,
         request_payload_json: []const u8,
@@ -10224,7 +10222,7 @@ pub const Session = struct {
         return missions_venom.seedNamespace(self, missions_dir);
     }
 
-    const MissionOp = missions_venom.Op;
+    pub const MissionOp = missions_venom.Op;
 
     fn handleMissionsNamespaceWrite(self: *Session, special: SpecialKind, node_id: u32, raw_input: []const u8) !WriteOutcome {
         const input = std.mem.trim(u8, raw_input, " \t\r\n");
@@ -10294,15 +10292,15 @@ pub const Session = struct {
 
     const ResolvedMissionBootstrapContract = missions_venom.ResolvedBootstrapContract;
 
-    fn parseMissionContractInput(self: *Session, args_obj: std.json.ObjectMap) !?mission_store_mod.MissionContractInput {
+    pub fn parseMissionContractInput(self: *Session, args_obj: std.json.ObjectMap) !?mission_store_mod.MissionContractInput {
         return missions_venom.parseMissionContractInput(self, args_obj);
     }
 
-    fn parseMissionContractUpdateInput(self: *Session, args_obj: std.json.ObjectMap) !?mission_store_mod.MissionContractUpdateInput {
+    pub fn parseMissionContractUpdateInput(self: *Session, args_obj: std.json.ObjectMap) !?mission_store_mod.MissionContractUpdateInput {
         return missions_venom.parseMissionContractUpdateInput(self, args_obj);
     }
 
-    fn resolveMissionBootstrapContract(
+    pub fn resolveMissionBootstrapContract(
         self: *Session,
         mission: mission_store_mod.MissionRecord,
         args_obj: std.json.ObjectMap,
@@ -10310,14 +10308,14 @@ pub const Session = struct {
         return missions_venom.resolveMissionBootstrapContract(self, mission, args_obj);
     }
 
-    fn resolveMissionContractHostPath(self: *Session, absolute_path: []const u8) ![]u8 {
+    pub fn resolveMissionContractHostPath(self: *Session, absolute_path: []const u8) ![]u8 {
         const local_root = self.local_fs_export_root orelse return error.InvalidPayload;
         const relative_path = try self.normalizeLocalFsRelativePath(absolute_path);
         defer self.allocator.free(relative_path);
         return std.fs.path.join(self.allocator, &.{ local_root, relative_path });
     }
 
-    fn ensureMissionContractDirectory(self: *Session, absolute_path: []const u8) !void {
+    pub fn ensureMissionContractDirectory(self: *Session, absolute_path: []const u8) !void {
         const host_path = try self.resolveMissionContractHostPath(absolute_path);
         defer self.allocator.free(host_path);
         ensurePathExists(host_path) catch |err| switch (err) {
@@ -10329,7 +10327,7 @@ pub const Session = struct {
         };
     }
 
-    fn writeMissionContractFile(self: *Session, absolute_path: []const u8, content: []const u8) !void {
+    pub fn writeMissionContractFile(self: *Session, absolute_path: []const u8, content: []const u8) !void {
         const host_path = try self.resolveMissionContractHostPath(absolute_path);
         defer self.allocator.free(host_path);
 
@@ -10391,19 +10389,19 @@ pub const Session = struct {
         return missions_venom.executeOpPayload(self, op, args_obj);
     }
 
-    fn normalizeMissionAbsolutePath(self: *Session, raw: []const u8) ![]u8 {
+    pub fn normalizeMissionAbsolutePath(self: *Session, raw: []const u8) ![]u8 {
         return missions_venom.normalizeMissionAbsolutePath(self, raw);
     }
 
-    fn deriveMissionServiceInvokePath(self: *Session, service_path: []const u8) ![]u8 {
+    pub fn deriveMissionServiceInvokePath(self: *Session, service_path: []const u8) ![]u8 {
         return missions_venom.deriveMissionServiceInvokePath(self, service_path);
     }
 
-    fn buildMissionServiceInvokeRequestPayload(self: *Session, args_obj: std.json.ObjectMap) ![]u8 {
+    pub fn buildMissionServiceInvokeRequestPayload(self: *Session, args_obj: std.json.ObjectMap) ![]u8 {
         return missions_venom.buildMissionServiceInvokeRequestPayload(self, args_obj);
     }
 
-    fn buildMissionServiceInvocationDetailJson(
+    pub fn buildMissionServiceInvocationDetailJson(
         self: *Session,
         mission_json: []const u8,
         service_path: []const u8,
@@ -10423,7 +10421,7 @@ pub const Session = struct {
         );
     }
 
-    fn buildMissionBootstrapContractDetailJson(
+    pub fn buildMissionBootstrapContractDetailJson(
         self: *Session,
         mission_json: []const u8,
         context_path: []const u8,
@@ -10433,11 +10431,11 @@ pub const Session = struct {
         return missions_venom.buildMissionBootstrapContractDetailJson(self, mission_json, context_path, state_path, artifact_root);
     }
 
-    fn buildMissionSuccessResultJson(self: *Session, op: MissionOp, result_json: []const u8) ![]u8 {
+    pub fn buildMissionSuccessResultJson(self: *Session, op: MissionOp, result_json: []const u8) ![]u8 {
         return missions_venom.buildMissionSuccessResultJson(self, op, result_json);
     }
 
-    fn buildMissionPartialFailureResultJson(
+    pub fn buildMissionPartialFailureResultJson(
         self: *Session,
         op: MissionOp,
         result_json: []const u8,
@@ -10451,31 +10449,31 @@ pub const Session = struct {
         return missions_venom.buildMissionFailureResultJson(self, op, code, message);
     }
 
-    fn buildMissionListJson(self: *Session, missions: []const mission_store_mod.MissionRecord) ![]u8 {
+    pub fn buildMissionListJson(self: *Session, missions: []const mission_store_mod.MissionRecord) ![]u8 {
         return missions_venom.buildMissionListJson(self, missions);
     }
 
-    fn buildMissionRecordJson(self: *Session, mission: mission_store_mod.MissionRecord) ![]u8 {
+    pub fn buildMissionRecordJson(self: *Session, mission: mission_store_mod.MissionRecord) ![]u8 {
         return missions_venom.buildMissionRecordJson(self, mission);
     }
 
-    fn buildMissionContractJson(self: *Session, contract: mission_store_mod.MissionContract) ![]u8 {
+    pub fn buildMissionContractJson(self: *Session, contract: mission_store_mod.MissionContract) ![]u8 {
         return missions_venom.buildMissionContractJson(self, contract);
     }
 
-    fn buildMissionArtifactJson(self: *Session, artifact: mission_store_mod.MissionArtifact) ![]u8 {
+    pub fn buildMissionArtifactJson(self: *Session, artifact: mission_store_mod.MissionArtifact) ![]u8 {
         return missions_venom.buildMissionArtifactJson(self, artifact);
     }
 
-    fn buildMissionEventJson(self: *Session, event: mission_store_mod.MissionEvent) ![]u8 {
+    pub fn buildMissionEventJson(self: *Session, event: mission_store_mod.MissionEvent) ![]u8 {
         return missions_venom.buildMissionEventJson(self, event);
     }
 
-    fn buildMissionApprovalJson(self: *Session, approval: mission_store_mod.MissionApproval) ![]u8 {
+    pub fn buildMissionApprovalJson(self: *Session, approval: mission_store_mod.MissionApproval) ![]u8 {
         return missions_venom.buildMissionApprovalJson(self, approval);
     }
 
-    fn renderJsonValue(self: *Session, value: std.json.Value) ![]u8 {
+    pub fn renderJsonValue(self: *Session, value: std.json.Value) ![]u8 {
         return std.fmt.allocPrint(self.allocator, "{f}", .{std.json.fmt(value, .{})});
     }
 
@@ -10551,7 +10549,7 @@ pub const Session = struct {
         };
     }
 
-    fn writeInternalPath(self: *Session, absolute_path: []const u8, data: []const u8) anyerror!?InternalFsrpcErrorInfo {
+    pub fn writeInternalPath(self: *Session, absolute_path: []const u8, data: []const u8) anyerror!?InternalFsrpcErrorInfo {
         const ids = self.nextInternalFsrpcIds();
         const segments = try self.allocAbsolutePathSegments(absolute_path);
         defer freePathSegments(self.allocator, segments);
@@ -10605,7 +10603,7 @@ pub const Session = struct {
         return null;
     }
 
-    fn tryReadInternalPath(self: *Session, absolute_path: []const u8) anyerror!?[]u8 {
+    pub fn tryReadInternalPath(self: *Session, absolute_path: []const u8) anyerror!?[]u8 {
         const ids = self.nextInternalFsrpcIds();
         const segments = try self.allocAbsolutePathSegments(absolute_path);
         defer freePathSegments(self.allocator, segments);
@@ -10777,7 +10775,7 @@ pub const Session = struct {
         return self.buildServiceInvokeFailureResultJson("missing_result", "tool call produced no session.receive payload");
     }
 
-    fn buildServiceInvokeStatusJson(
+    pub fn buildServiceInvokeStatusJson(
         self: *Session,
         state: []const u8,
         tool_name: ?[]const u8,
@@ -10804,7 +10802,7 @@ pub const Session = struct {
         );
     }
 
-    fn buildServiceInvokeFailureResultJson(self: *Session, code: []const u8, message: []const u8) ![]u8 {
+    pub fn buildServiceInvokeFailureResultJson(self: *Session, code: []const u8, message: []const u8) ![]u8 {
         const escaped_code = try unified.jsonEscape(self.allocator, code);
         defer self.allocator.free(escaped_code);
         const escaped_message = try unified.jsonEscape(self.allocator, message);
@@ -10816,7 +10814,7 @@ pub const Session = struct {
         );
     }
 
-    fn extractErrorInfoFromToolPayload(self: *Session, payload_json: []const u8) !?ToolPayloadErrorInfo {
+    pub fn extractErrorInfoFromToolPayload(self: *Session, payload_json: []const u8) !?ToolPayloadErrorInfo {
         var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, payload_json, .{}) catch return null;
         defer parsed.deinit();
         if (parsed.value != .object) return null;
@@ -10843,7 +10841,7 @@ pub const Session = struct {
         };
     }
 
-    fn extractErrorMessageFromToolPayload(self: *Session, payload_json: []const u8) !?[]u8 {
+    pub fn extractErrorMessageFromToolPayload(self: *Session, payload_json: []const u8) !?[]u8 {
         if (try self.extractErrorInfoFromToolPayload(payload_json)) |info| {
             defer self.allocator.free(info.code);
             return info.message;
@@ -11718,7 +11716,7 @@ pub const Session = struct {
         );
     }
 
-    fn deriveVenomInvokePath(
+    pub fn deriveVenomInvokePath(
         self: *Session,
         node_id: []const u8,
         venom_id: []const u8,
@@ -11752,7 +11750,7 @@ pub const Session = struct {
         );
     }
 
-    fn pathWithInvokeSuffix(self: *Session, base_path: []const u8) ![]u8 {
+    pub fn pathWithInvokeSuffix(self: *Session, base_path: []const u8) ![]u8 {
         const trimmed = std.mem.trimRight(u8, base_path, "/");
         if (trimmed.len == 0) return self.allocator.dupe(u8, "/control/invoke.json");
         if (std.mem.endsWith(u8, trimmed, "/control/invoke.json")) {
@@ -11761,7 +11759,7 @@ pub const Session = struct {
         return std.fmt.allocPrint(self.allocator, "{s}/control/invoke.json", .{trimmed});
     }
 
-    fn pathWithInvokeTarget(self: *Session, base_path: []const u8, invoke_suffix: []const u8) ![]u8 {
+    pub fn pathWithInvokeTarget(self: *Session, base_path: []const u8, invoke_suffix: []const u8) ![]u8 {
         const base_trimmed = std.mem.trimRight(u8, base_path, "/");
         if (invoke_suffix.len == 0) return self.allocator.dupe(u8, base_trimmed);
         if (base_trimmed.len == 0) {
@@ -11770,7 +11768,7 @@ pub const Session = struct {
         return std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ base_trimmed, invoke_suffix });
     }
 
-    fn resolveNodeVenomInvokeTarget(self: *Session, venom_dir_id: u32) ![]u8 {
+    pub fn resolveNodeVenomInvokeTarget(self: *Session, venom_dir_id: u32) ![]u8 {
         const default_target = "/control/invoke.json";
         const ops_id = self.lookupChild(venom_dir_id, "OPS.json") orelse return self.allocator.dupe(u8, default_target);
         const ops_node = self.nodes.get(ops_id) orelse return self.allocator.dupe(u8, default_target);

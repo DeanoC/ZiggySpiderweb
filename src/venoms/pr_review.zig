@@ -340,7 +340,7 @@ pub fn loadConfiguredRepo(self: anytype, repo_key: []const u8) !?RepoConfigSnaps
 
     for (catalog.repositories) |repo| {
         if (std.mem.eql(u8, repo.repo_key, trimmed_repo_key)) {
-            return repo.cloneOwned(self.allocator);
+            return try repo.cloneOwned(self.allocator);
         }
     }
     return null;
@@ -827,7 +827,7 @@ pub fn findActiveMissionByRunId(
         if (!std.mem.eql(u8, mission_run_id, run_id)) continue;
         if (!sameOptionalString(project_id, mission.project_id)) continue;
         if (!isActiveMissionState(mission.state)) continue;
-        return mission.cloneOwned(self.allocator);
+        return try mission.cloneOwned(self.allocator);
     }
     return null;
 }
@@ -1698,43 +1698,36 @@ pub fn buildPrReviewIntakeDetailJson(
     artifact_root: []const u8,
     provider_sync_path: ?[]const u8,
 ) ![]u8 {
-    const escaped_provider = try unified.jsonEscape(self.allocator, provider);
-    defer self.allocator.free(escaped_provider);
-    const escaped_repo_key = try unified.jsonEscape(self.allocator, repo_key);
-    defer self.allocator.free(escaped_repo_key);
-    const escaped_pr_url = try unified.jsonEscape(self.allocator, pr_url);
-    defer self.allocator.free(escaped_pr_url);
-    const escaped_checkout_path = try unified.jsonEscape(self.allocator, checkout_path);
-    defer self.allocator.free(escaped_checkout_path);
-    const escaped_context_path = try unified.jsonEscape(self.allocator, context_path);
-    defer self.allocator.free(escaped_context_path);
-    const escaped_state_path = try unified.jsonEscape(self.allocator, state_path);
-    defer self.allocator.free(escaped_state_path);
-    const escaped_artifact_root = try unified.jsonEscape(self.allocator, artifact_root);
-    defer self.allocator.free(escaped_artifact_root);
     const provider_sync_json = if (provider_sync_path) |value| blk: {
         const escaped = try unified.jsonEscape(self.allocator, value);
         defer self.allocator.free(escaped);
         break :blk try std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped});
     } else try self.allocator.dupe(u8, "null");
     defer self.allocator.free(provider_sync_json);
-
-    return std.fmt.allocPrint(
-        self.allocator,
-        "{{\"mission\":{s},\"review\":{{\"provider\":\"{s}\",\"repo_key\":\"{s}\",\"pr_number\":{d},\"pr_url\":\"{s}\",\"checkout_path\":\"{s}\",\"context_path\":\"{s}\",\"state_path\":\"{s}\",\"artifact_root\":\"{s}\",\"services\":{{\"provider_sync_path\":{s}}}}}}",
-        .{
-            mission_json,
-            escaped_provider,
-            escaped_repo_key,
-            pr_number,
-            escaped_pr_url,
-            escaped_checkout_path,
-            escaped_context_path,
-            escaped_state_path,
-            escaped_artifact_root,
-            provider_sync_json,
-        },
-    );
+    var out = std.ArrayListUnmanaged(u8){};
+    errdefer out.deinit(self.allocator);
+    const writer = out.writer(self.allocator);
+    try writer.writeAll("{\"mission\":");
+    try writer.writeAll(mission_json);
+    try writer.writeAll(",\"review\":{\"provider\":");
+    try writeJsonString(writer, provider);
+    try writer.writeAll(",\"repo_key\":");
+    try writeJsonString(writer, repo_key);
+    try writer.print(",\"pr_number\":{d}", .{pr_number});
+    try writer.writeAll(",\"pr_url\":");
+    try writeJsonString(writer, pr_url);
+    try writer.writeAll(",\"checkout_path\":");
+    try writeJsonString(writer, checkout_path);
+    try writer.writeAll(",\"context_path\":");
+    try writeJsonString(writer, context_path);
+    try writer.writeAll(",\"state_path\":");
+    try writeJsonString(writer, state_path);
+    try writer.writeAll(",\"artifact_root\":");
+    try writeJsonString(writer, artifact_root);
+    try writer.writeAll(",\"services\":{\"provider_sync_path\":");
+    try writer.writeAll(provider_sync_json);
+    try writer.writeAll("}}}");
+    return out.toOwnedSlice(self.allocator);
 }
 
 pub fn buildPrReviewSyncDetailJson(
@@ -1748,10 +1741,6 @@ pub fn buildPrReviewSyncDetailJson(
     repo_status_path: ?[]const u8,
     diff_range_path: ?[]const u8,
 ) ![]u8 {
-    const escaped_phase = try unified.jsonEscape(self.allocator, phase);
-    defer self.allocator.free(escaped_phase);
-    const escaped_state_path = try unified.jsonEscape(self.allocator, state_path);
-    defer self.allocator.free(escaped_state_path);
     const thread_actions_json = if (thread_actions_path) |value| blk: {
         const escaped = try unified.jsonEscape(self.allocator, value);
         defer self.allocator.free(escaped);
@@ -1782,21 +1771,27 @@ pub fn buildPrReviewSyncDetailJson(
         break :blk try std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped});
     } else try self.allocator.dupe(u8, "null");
     defer self.allocator.free(diff_range_json);
-
-    return std.fmt.allocPrint(
-        self.allocator,
-        "{{\"mission\":{s},\"review\":{{\"phase\":\"{s}\",\"state_path\":\"{s}\",\"thread_actions_path\":{s},\"services\":{{\"provider_sync_path\":{s},\"checkout_sync_path\":{s},\"repo_status_path\":{s},\"diff_range_path\":{s}}}}}}}",
-        .{
-            mission_json,
-            escaped_phase,
-            escaped_state_path,
-            thread_actions_json,
-            provider_sync_json,
-            checkout_sync_json,
-            repo_status_json,
-            diff_range_json,
-        },
-    );
+    var out = std.ArrayListUnmanaged(u8){};
+    errdefer out.deinit(self.allocator);
+    const writer = out.writer(self.allocator);
+    try writer.writeAll("{\"mission\":");
+    try writer.writeAll(mission_json);
+    try writer.writeAll(",\"review\":{\"phase\":");
+    try writeJsonString(writer, phase);
+    try writer.writeAll(",\"state_path\":");
+    try writeJsonString(writer, state_path);
+    try writer.writeAll(",\"thread_actions_path\":");
+    try writer.writeAll(thread_actions_json);
+    try writer.writeAll(",\"services\":{\"provider_sync_path\":");
+    try writer.writeAll(provider_sync_json);
+    try writer.writeAll(",\"checkout_sync_path\":");
+    try writer.writeAll(checkout_sync_json);
+    try writer.writeAll(",\"repo_status_path\":");
+    try writer.writeAll(repo_status_json);
+    try writer.writeAll(",\"diff_range_path\":");
+    try writer.writeAll(diff_range_json);
+    try writer.writeAll("}}}");
+    return out.toOwnedSlice(self.allocator);
 }
 
 pub fn buildPrReviewValidationDetailJson(
@@ -1809,12 +1804,6 @@ pub fn buildPrReviewValidationDetailJson(
     command_paths_json: []const u8,
     session_close_path: ?[]const u8,
 ) ![]u8 {
-    const escaped_phase = try unified.jsonEscape(self.allocator, phase);
-    defer self.allocator.free(escaped_phase);
-    const escaped_state_path = try unified.jsonEscape(self.allocator, state_path);
-    defer self.allocator.free(escaped_state_path);
-    const escaped_validation_path = try unified.jsonEscape(self.allocator, validation_path);
-    defer self.allocator.free(escaped_validation_path);
     const session_create_json = if (session_create_path) |value| blk: {
         const escaped = try unified.jsonEscape(self.allocator, value);
         defer self.allocator.free(escaped);
@@ -1827,12 +1816,25 @@ pub fn buildPrReviewValidationDetailJson(
         break :blk try std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped});
     } else try self.allocator.dupe(u8, "null");
     defer self.allocator.free(session_close_json);
-
-    return std.fmt.allocPrint(
-        self.allocator,
-        "{{\"mission\":{s},\"review\":{{\"phase\":\"{s}\",\"state_path\":\"{s}\",\"validation_path\":\"{s}\",\"services\":{{\"validation_session_path\":{s},\"validation_command_paths\":{s},\"validation_close_path\":{s}}}}}}",
-        .{ mission_json, escaped_phase, escaped_state_path, escaped_validation_path, session_create_json, command_paths_json, session_close_json },
-    );
+    var out = std.ArrayListUnmanaged(u8){};
+    errdefer out.deinit(self.allocator);
+    const writer = out.writer(self.allocator);
+    try writer.writeAll("{\"mission\":");
+    try writer.writeAll(mission_json);
+    try writer.writeAll(",\"review\":{\"phase\":");
+    try writeJsonString(writer, phase);
+    try writer.writeAll(",\"state_path\":");
+    try writeJsonString(writer, state_path);
+    try writer.writeAll(",\"validation_path\":");
+    try writeJsonString(writer, validation_path);
+    try writer.writeAll(",\"services\":{\"validation_session_path\":");
+    try writer.writeAll(session_create_json);
+    try writer.writeAll(",\"validation_command_paths\":");
+    try writer.writeAll(command_paths_json);
+    try writer.writeAll(",\"validation_close_path\":");
+    try writer.writeAll(session_close_json);
+    try writer.writeAll("}}}");
+    return out.toOwnedSlice(self.allocator);
 }
 
 pub fn buildPrReviewDraftDetailJson(
@@ -1893,14 +1895,6 @@ pub fn buildPrReviewReviewDetailJson(
     thread_actions_path: ?[]const u8,
     publish_review_path: ?[]const u8,
 ) ![]u8 {
-    const escaped_phase = try unified.jsonEscape(self.allocator, phase);
-    defer self.allocator.free(escaped_phase);
-    const escaped_state_path = try unified.jsonEscape(self.allocator, state_path);
-    defer self.allocator.free(escaped_state_path);
-    const escaped_findings_path = try unified.jsonEscape(self.allocator, findings_path);
-    defer self.allocator.free(escaped_findings_path);
-    const escaped_recommendation_path = try unified.jsonEscape(self.allocator, recommendation_path);
-    defer self.allocator.free(escaped_recommendation_path);
     const review_comment_json = if (review_comment_path) |value| blk: {
         const escaped = try unified.jsonEscape(self.allocator, value);
         defer self.allocator.free(escaped);
@@ -1919,21 +1913,27 @@ pub fn buildPrReviewReviewDetailJson(
         break :blk try std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped});
     } else try self.allocator.dupe(u8, "null");
     defer self.allocator.free(publish_review_json);
-
-    return std.fmt.allocPrint(
-        self.allocator,
-        "{{\"mission\":{s},\"review\":{{\"phase\":\"{s}\",\"state_path\":\"{s}\",\"findings_path\":\"{s}\",\"recommendation_path\":\"{s}\",\"review_comment_path\":{s},\"thread_actions_path\":{s},\"services\":{{\"publish_review_path\":{s}}}}}}",
-        .{
-            mission_json,
-            escaped_phase,
-            escaped_state_path,
-            escaped_findings_path,
-            escaped_recommendation_path,
-            review_comment_json,
-            thread_actions_json,
-            publish_review_json,
-        },
-    );
+    var out = std.ArrayListUnmanaged(u8){};
+    errdefer out.deinit(self.allocator);
+    const writer = out.writer(self.allocator);
+    try writer.writeAll("{\"mission\":");
+    try writer.writeAll(mission_json);
+    try writer.writeAll(",\"review\":{\"phase\":");
+    try writeJsonString(writer, phase);
+    try writer.writeAll(",\"state_path\":");
+    try writeJsonString(writer, state_path);
+    try writer.writeAll(",\"findings_path\":");
+    try writeJsonString(writer, findings_path);
+    try writer.writeAll(",\"recommendation_path\":");
+    try writeJsonString(writer, recommendation_path);
+    try writer.writeAll(",\"review_comment_path\":");
+    try writer.writeAll(review_comment_json);
+    try writer.writeAll(",\"thread_actions_path\":");
+    try writer.writeAll(thread_actions_json);
+    try writer.writeAll(",\"services\":{\"publish_review_path\":");
+    try writer.writeAll(publish_review_json);
+    try writer.writeAll("}}}");
+    return out.toOwnedSlice(self.allocator);
 }
 
 pub fn buildPrReviewSuccessResultJson(self: anytype, op: Op, result_json: []const u8) ![]u8 {
@@ -2048,7 +2048,7 @@ pub fn buildPrReviewValidationCommandEntryJson(
 }
 
 fn writeJsonString(writer: anytype, value: []const u8) !void {
-    try std.json.stringify(value, .{}, writer);
+    try writer.print("{f}", .{std.json.fmt(value, .{})});
 }
 
 fn executeConfigureRepoOp(self: anytype, args_obj: std.json.ObjectMap) ![]u8 {
@@ -2436,7 +2436,7 @@ fn executeSyncOp(self: anytype, args_obj: std.json.ObjectMap) ![]u8 {
         value
     else
         extractOptionalStringByNames(args_obj, &[_][]const u8{"summary"}) orelse "Synced PR review state";
-    const checkpoint_artifact = blk: {
+    const checkpoint_artifact: struct { kind: []const u8, path: []const u8, summary: []const u8 } = blk: {
         if (service_error_code != null) {
             if (diff_range_capture) |value| break :blk .{ .kind = "diff_range", .path = value.artifact_path, .summary = "PR review diff-range capture" };
             if (repo_status_capture) |value| break :blk .{ .kind = "repo_status", .path = value.artifact_path, .summary = "PR review repo-status capture" };
@@ -3343,9 +3343,9 @@ fn buildAdvanceSyncArgsJson(
     const writer = out.writer(self.allocator);
     try writer.writeByte('{');
     try writer.writeAll("\"mission_id\":");
-    try std.json.stringify(mission_id, .{}, writer);
+    try writer.print("{f}", .{std.json.fmt(mission_id, .{})});
     try writer.writeAll(",\"phase\":");
-    try std.json.stringify(phase, .{}, writer);
+    try writer.print("{f}", .{std.json.fmt(phase, .{})});
     try writer.writeAll(",\"stage\":\"ready_for_checkout\"");
     if (args_obj.get("current_focus")) |value| {
         const raw = try self.renderJsonValue(value);
@@ -3375,7 +3375,7 @@ fn buildAdvanceValidationArgsJson(
     const writer = out.writer(self.allocator);
     try writer.writeByte('{');
     try writer.writeAll("\"mission_id\":");
-    try std.json.stringify(mission_id, .{}, writer);
+    try writer.print("{f}", .{std.json.fmt(mission_id, .{})});
     try writer.writeAll(",\"phase\":\"reviewing\"");
     try writer.writeAll(",\"stage\":\"validating\"");
     if (args_obj.get("current_focus")) |value| {
@@ -3430,14 +3430,14 @@ fn buildAdvanceWaitRequestJson(
         try writer.writeAll(raw);
     } else {
         try writer.writeByte('[');
-        try std.json.stringify("/global/events/sources/agent/github_pr.json", .{}, writer);
+        try writer.print("{f}", .{std.json.fmt("/global/events/sources/agent/github_pr.json", .{})});
         if (std.mem.eql(u8, phase, "awaiting_ci")) {
             try writer.writeByte(',');
-            try std.json.stringify("/global/events/sources/time/after/300000.json", .{}, writer);
+            try writer.print("{f}", .{std.json.fmt("/global/events/sources/time/after/300000.json", .{})});
         }
         try writer.writeByte(']');
     }
-    try writer.print(",\"timeout_ms\":{d}}", .{timeout_ms});
+    try writer.print(",\"timeout_ms\":{d}}}", .{timeout_ms});
     return out.toOwnedSlice(self.allocator);
 }
 
