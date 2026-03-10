@@ -1,6 +1,7 @@
 const std = @import("std");
 const unified = @import("spider-protocol").unified;
 const mission_store_mod = @import("../mission_store.zig");
+const mounts_venom = @import("./mounts.zig");
 
 const ParsedNodeVenomServicePath = struct {
     node_id: []const u8,
@@ -177,6 +178,98 @@ pub fn statusToolName(op: Op) []const u8 {
         .fail => "missions_fail",
         .cancel => "missions_cancel",
     };
+}
+
+pub fn handleNamespaceWrite(self: anytype, special: anytype, node_id: u32, raw_input: []const u8) !usize {
+    const input = std.mem.trim(u8, raw_input, " \t\r\n");
+    const payload = if (input.len == 0) "{}" else input;
+    try self.setFileContent(node_id, payload);
+
+    var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, payload, .{}) catch return error.InvalidPayload;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidPayload;
+    const obj = parsed.value.object;
+
+    const op = switch (special) {
+        .missions_create => Op.create,
+        .missions_list => Op.list,
+        .missions_get => Op.get,
+        .missions_heartbeat => Op.heartbeat,
+        .missions_checkpoint => Op.checkpoint,
+        .missions_bootstrap_contract => Op.bootstrap_contract,
+        .missions_invoke_service => Op.invoke_service,
+        .missions_recover => Op.recover,
+        .missions_request_approval => Op.request_approval,
+        .missions_approve => Op.approve,
+        .missions_reject => Op.reject,
+        .missions_resume => Op.@"resume",
+        .missions_block => Op.block,
+        .missions_complete => Op.complete,
+        .missions_fail => Op.fail,
+        .missions_cancel => Op.cancel,
+        .missions_invoke => blk: {
+            const op_raw = blk2: {
+                if (obj.get("op")) |value| if (value == .string and value.string.len > 0) break :blk2 value.string;
+                if (obj.get("operation")) |value| if (value == .string and value.string.len > 0) break :blk2 value.string;
+                if (obj.get("tool")) |value| if (value == .string and value.string.len > 0) break :blk2 value.string;
+                if (obj.get("tool_name")) |value| if (value == .string and value.string.len > 0) break :blk2 value.string;
+                break :blk2 null;
+            } orelse return error.InvalidPayload;
+            break :blk parseOp(op_raw) orelse return error.InvalidPayload;
+        },
+        else => return error.InvalidPayload,
+    };
+
+    const args_obj = blk: {
+        if (obj.get("arguments")) |value| {
+            if (value != .object) return error.InvalidPayload;
+            break :blk value.object;
+        }
+        if (obj.get("args")) |value| {
+            if (value != .object) return error.InvalidPayload;
+            break :blk value.object;
+        }
+        break :blk obj;
+    };
+
+    return executeOp(self, op, args_obj, raw_input.len);
+}
+
+pub fn executeOp(self: anytype, op: Op, args_obj: std.json.ObjectMap, written: usize) !usize {
+    const tool_name = statusToolName(op);
+    const running_status = try self.buildServiceInvokeStatusJson("running", tool_name, null);
+    defer self.allocator.free(running_status);
+    try self.setMirroredFileContent(self.missions_status_id, self.missions_status_alias_id, running_status);
+
+    const result_payload = executeOpPayload(self, op, args_obj) catch |err| {
+        const error_message = @errorName(err);
+        const error_code = switch (err) {
+            error.AccessDenied => "forbidden",
+            error.NotFound => "mission_not_found",
+            else => "invalid_payload",
+        };
+        const failed_status = try self.buildServiceInvokeStatusJson("failed", tool_name, error_message);
+        defer self.allocator.free(failed_status);
+        try self.setMirroredFileContent(self.missions_status_id, self.missions_status_alias_id, failed_status);
+        const failed_result = try buildMissionFailureResultJson(self, op, error_code, error_message);
+        defer self.allocator.free(failed_result);
+        try self.setMirroredFileContent(self.missions_result_id, self.missions_result_alias_id, failed_result);
+        return err;
+    };
+    defer self.allocator.free(result_payload);
+
+    if (try self.extractErrorMessageFromToolPayload(result_payload)) |message| {
+        defer self.allocator.free(message);
+        const failed_status = try self.buildServiceInvokeStatusJson("failed", tool_name, message);
+        defer self.allocator.free(failed_status);
+        try self.setMirroredFileContent(self.missions_status_id, self.missions_status_alias_id, failed_status);
+    } else {
+        const done_status = try self.buildServiceInvokeStatusJson("done", tool_name, null);
+        defer self.allocator.free(done_status);
+        try self.setMirroredFileContent(self.missions_status_id, self.missions_status_alias_id, done_status);
+    }
+    try self.setMirroredFileContent(self.missions_result_id, self.missions_result_alias_id, result_payload);
+    return written;
 }
 
 pub fn executeOpPayload(self: anytype, op: Op, args_obj: std.json.ObjectMap) ![]u8 {
@@ -516,9 +609,9 @@ fn executeBootstrapContractOp(self: anytype, args_obj: std.json.ObjectMap) ![]u8
         return error.InvalidPayload;
     defer self.allocator.free(state_payload);
 
-    try self.ensureMissionContractDirectory(contract.artifact_root);
-    try self.writeMissionContractFile(contract.context_path, context_payload);
-    try self.writeMissionContractFile(contract.state_path, state_payload);
+    try ensureContractDirectory(self, contract.artifact_root);
+    try writeContractFile(self, contract.context_path, context_payload);
+    try writeContractFile(self, contract.state_path, state_payload);
 
     var mission = store.recordCheckpoint(self.allocator, mission_id, .{
         .stage = extractOptionalStringByNames(args_obj, &[_][]const u8{"stage"}) orelse "bootstrap_contract",
@@ -558,6 +651,51 @@ pub const ResolvedBootstrapContract = struct {
     state_path: []const u8,
     artifact_root: []const u8,
 };
+
+pub fn resolveContractHostPath(self: anytype, absolute_path: []const u8) ![]u8 {
+    const local_root = self.local_fs_export_root orelse return error.InvalidPayload;
+    const local_fs_world_prefix = "/nodes/local/fs";
+    const trimmed = std.mem.trimRight(u8, absolute_path, "/");
+    if (std.mem.eql(u8, trimmed, local_fs_world_prefix)) {
+        return self.allocator.dupe(u8, local_root);
+    }
+    const relative_path = try self.normalizeLocalFsRelativePath(absolute_path);
+    defer self.allocator.free(relative_path);
+    return std.fs.path.join(self.allocator, &.{ local_root, relative_path });
+}
+
+pub fn ensureContractDirectory(self: anytype, absolute_path: []const u8) !void {
+    const host_path = try resolveContractHostPath(self, absolute_path);
+    defer self.allocator.free(host_path);
+    mounts_venom.ensurePathExists(host_path) catch |err| switch (err) {
+        error.PathAlreadyExists,
+        error.NotDir,
+        error.AccessDenied,
+        => return error.InvalidPayload,
+        else => return err,
+    };
+}
+
+pub fn writeContractFile(self: anytype, absolute_path: []const u8, content: []const u8) !void {
+    const host_path = try resolveContractHostPath(self, absolute_path);
+    defer self.allocator.free(host_path);
+
+    const parent = std.fs.path.dirname(host_path) orelse return error.InvalidPayload;
+    mounts_venom.ensurePathExists(parent) catch |err| switch (err) {
+        error.PathAlreadyExists,
+        error.NotDir,
+        error.AccessDenied,
+        => return error.InvalidPayload,
+        else => return err,
+    };
+
+    const file = if (std.fs.path.isAbsolute(host_path))
+        try std.fs.createFileAbsolute(host_path, .{ .truncate = true })
+    else
+        try std.fs.cwd().createFile(host_path, .{ .truncate = true });
+    defer file.close();
+    try file.writeAll(content);
+}
 
 pub fn parseMissionContractInput(self: anytype, args_obj: std.json.ObjectMap) !?mission_store_mod.MissionContractInput {
     _ = self;

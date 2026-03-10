@@ -5986,7 +5986,7 @@ pub const Session = struct {
         return mounts_venom.normalizeLocalFsRelativePath(self, raw_path);
     }
 
-    fn ensurePathExists(path: []const u8) !void {
+    pub fn ensurePathExists(path: []const u8) !void {
         return mounts_venom.ensurePathExists(path);
     }
 
@@ -6968,69 +6968,7 @@ pub const Session = struct {
     pub const MissionOp = missions_venom.Op;
 
     fn handleMissionsNamespaceWrite(self: *Session, special: SpecialKind, node_id: u32, raw_input: []const u8) !WriteOutcome {
-        const input = std.mem.trim(u8, raw_input, " \t\r\n");
-        const payload = if (input.len == 0) "{}" else input;
-        try self.setFileContent(node_id, payload);
-
-        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, payload, .{}) catch return error.InvalidPayload;
-        defer parsed.deinit();
-        if (parsed.value != .object) return error.InvalidPayload;
-        const obj = parsed.value.object;
-
-        const op = switch (special) {
-            .missions_create => MissionOp.create,
-            .missions_list => MissionOp.list,
-            .missions_get => MissionOp.get,
-            .missions_heartbeat => MissionOp.heartbeat,
-            .missions_checkpoint => MissionOp.checkpoint,
-            .missions_bootstrap_contract => MissionOp.bootstrap_contract,
-            .missions_invoke_service => MissionOp.invoke_service,
-            .missions_recover => MissionOp.recover,
-            .missions_request_approval => MissionOp.request_approval,
-            .missions_approve => MissionOp.approve,
-            .missions_reject => MissionOp.reject,
-            .missions_resume => MissionOp.@"resume",
-            .missions_block => MissionOp.block,
-            .missions_complete => MissionOp.complete,
-            .missions_fail => MissionOp.fail,
-            .missions_cancel => MissionOp.cancel,
-            .missions_invoke => blk: {
-                const op_raw = blk2: {
-                    if (obj.get("op")) |value| if (value == .string and value.string.len > 0) break :blk2 value.string;
-                    if (obj.get("operation")) |value| if (value == .string and value.string.len > 0) break :blk2 value.string;
-                    if (obj.get("tool")) |value| if (value == .string and value.string.len > 0) break :blk2 value.string;
-                    if (obj.get("tool_name")) |value| if (value == .string and value.string.len > 0) break :blk2 value.string;
-                    break :blk2 null;
-                } orelse return error.InvalidPayload;
-                break :blk parseMissionOp(op_raw) orelse return error.InvalidPayload;
-            },
-            else => return error.InvalidPayload,
-        };
-
-        const args_obj = blk: {
-            if (obj.get("arguments")) |value| {
-                if (value != .object) return error.InvalidPayload;
-                break :blk value.object;
-            }
-            if (obj.get("args")) |value| {
-                if (value != .object) return error.InvalidPayload;
-                break :blk value.object;
-            }
-            break :blk obj;
-        };
-        return self.executeMissionOp(op, args_obj, raw_input.len);
-    }
-
-    fn parseMissionOp(raw: []const u8) ?MissionOp {
-        return missions_venom.parseOp(raw);
-    }
-
-    fn missionToolName(op: MissionOp) []const u8 {
-        return missions_venom.statusToolName(op);
-    }
-
-    fn missionOperationName(op: MissionOp) []const u8 {
-        return missions_venom.operationName(op);
+        return .{ .written = try missions_venom.handleNamespaceWrite(self, special, node_id, raw_input) };
     }
 
     const ResolvedMissionBootstrapContract = missions_venom.ResolvedBootstrapContract;
@@ -7052,88 +6990,15 @@ pub const Session = struct {
     }
 
     pub fn resolveMissionContractHostPath(self: *Session, absolute_path: []const u8) ![]u8 {
-        const local_root = self.local_fs_export_root orelse return error.InvalidPayload;
-        const trimmed = std.mem.trimRight(u8, absolute_path, "/");
-        if (std.mem.eql(u8, trimmed, local_fs_world_prefix)) {
-            return self.allocator.dupe(u8, local_root);
-        }
-        const relative_path = try self.normalizeLocalFsRelativePath(absolute_path);
-        defer self.allocator.free(relative_path);
-        return std.fs.path.join(self.allocator, &.{ local_root, relative_path });
+        return missions_venom.resolveContractHostPath(self, absolute_path);
     }
 
     pub fn ensureMissionContractDirectory(self: *Session, absolute_path: []const u8) !void {
-        const host_path = try self.resolveMissionContractHostPath(absolute_path);
-        defer self.allocator.free(host_path);
-        ensurePathExists(host_path) catch |err| switch (err) {
-            error.PathAlreadyExists,
-            error.NotDir,
-            error.AccessDenied,
-            => return error.InvalidPayload,
-            else => return err,
-        };
+        return missions_venom.ensureContractDirectory(self, absolute_path);
     }
 
     pub fn writeMissionContractFile(self: *Session, absolute_path: []const u8, content: []const u8) !void {
-        const host_path = try self.resolveMissionContractHostPath(absolute_path);
-        defer self.allocator.free(host_path);
-
-        const parent = std.fs.path.dirname(host_path) orelse return error.InvalidPayload;
-        ensurePathExists(parent) catch |err| switch (err) {
-            error.PathAlreadyExists,
-            error.NotDir,
-            error.AccessDenied,
-            => return error.InvalidPayload,
-            else => return err,
-        };
-
-        const file = if (std.fs.path.isAbsolute(host_path))
-            try std.fs.createFileAbsolute(host_path, .{ .truncate = true })
-        else
-            try std.fs.cwd().createFile(host_path, .{ .truncate = true });
-        defer file.close();
-        try file.writeAll(content);
-    }
-
-    fn executeMissionOp(self: *Session, op: MissionOp, args_obj: std.json.ObjectMap, written: usize) !WriteOutcome {
-        const tool_name = missionToolName(op);
-        const running_status = try self.buildServiceInvokeStatusJson("running", tool_name, null);
-        defer self.allocator.free(running_status);
-        try self.setMirroredFileContent(self.missions_status_id, self.missions_status_alias_id, running_status);
-
-        const result_payload = self.executeMissionOpPayload(op, args_obj) catch |err| {
-            const error_message = @errorName(err);
-            const error_code = switch (err) {
-                error.AccessDenied => "forbidden",
-                error.NotFound => "mission_not_found",
-                else => "invalid_payload",
-            };
-            const failed_status = try self.buildServiceInvokeStatusJson("failed", tool_name, error_message);
-            defer self.allocator.free(failed_status);
-            try self.setMirroredFileContent(self.missions_status_id, self.missions_status_alias_id, failed_status);
-            const failed_result = try self.buildMissionFailureResultJson(op, error_code, error_message);
-            defer self.allocator.free(failed_result);
-            try self.setMirroredFileContent(self.missions_result_id, self.missions_result_alias_id, failed_result);
-            return err;
-        };
-        defer self.allocator.free(result_payload);
-
-        if (try self.extractErrorMessageFromToolPayload(result_payload)) |message| {
-            defer self.allocator.free(message);
-            const failed_status = try self.buildServiceInvokeStatusJson("failed", tool_name, message);
-            defer self.allocator.free(failed_status);
-            try self.setMirroredFileContent(self.missions_status_id, self.missions_status_alias_id, failed_status);
-        } else {
-            const done_status = try self.buildServiceInvokeStatusJson("done", tool_name, null);
-            defer self.allocator.free(done_status);
-            try self.setMirroredFileContent(self.missions_status_id, self.missions_status_alias_id, done_status);
-        }
-        try self.setMirroredFileContent(self.missions_result_id, self.missions_result_alias_id, result_payload);
-        return .{ .written = written };
-    }
-
-    fn executeMissionOpPayload(self: *Session, op: MissionOp, args_obj: std.json.ObjectMap) ![]u8 {
-        return missions_venom.executeOpPayload(self, op, args_obj);
+        return missions_venom.writeContractFile(self, absolute_path, content);
     }
 
     pub fn normalizeMissionAbsolutePath(self: *Session, raw: []const u8) ![]u8 {
@@ -7190,10 +7055,6 @@ pub const Session = struct {
         message: []const u8,
     ) ![]u8 {
         return missions_venom.buildMissionPartialFailureResultJson(self, op, result_json, code, message);
-    }
-
-    fn buildMissionFailureResultJson(self: *Session, op: MissionOp, code: []const u8, message: []const u8) ![]u8 {
-        return missions_venom.buildMissionFailureResultJson(self, op, code, message);
     }
 
     pub fn buildMissionListJson(self: *Session, missions: []const mission_store_mod.MissionRecord) ![]u8 {
