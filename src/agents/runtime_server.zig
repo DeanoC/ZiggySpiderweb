@@ -5619,22 +5619,26 @@ fn mockDispatchPrReviewAcheron(
             }
         else
             "";
-        const operation_result_json = if (std.mem.eql(u8, normalizeMockAcheronPath(path), "global/pr_review/control/configure_repo.json"))
+        const operation_result_json = if (std.mem.eql(u8, normalizeMockAcheronPath(path), "global/pr_review/control/configure_repo.json") or
+            std.mem.eql(u8, normalizeMockAcheronPath(path), "services/pr_review/control/configure_repo.json"))
             state.handleConfigureRepo(path, content) catch |err| {
                 const msg = allocator.dupe(u8, @errorName(err)) catch @panic("out of memory");
                 return .{ .failure = .{ .code = .execution_failed, .message = msg } };
             }
-        else if (std.mem.eql(u8, normalizeMockAcheronPath(path), "global/github_pr/control/ingest_event.json"))
+        else if (std.mem.eql(u8, normalizeMockAcheronPath(path), "global/github_pr/control/ingest_event.json") or
+            std.mem.eql(u8, normalizeMockAcheronPath(path), "services/github_pr/control/ingest_event.json"))
             state.handleIngestEvent(path, content) catch |err| {
                 const msg = allocator.dupe(u8, @errorName(err)) catch @panic("out of memory");
                 return .{ .failure = .{ .code = .execution_failed, .message = msg } };
             }
-        else if (std.mem.eql(u8, normalizeMockAcheronPath(path), "global/pr_review/control/advance.json"))
+        else if (std.mem.eql(u8, normalizeMockAcheronPath(path), "global/pr_review/control/advance.json") or
+            std.mem.eql(u8, normalizeMockAcheronPath(path), "services/pr_review/control/advance.json"))
             state.handleAdvance(path, content) catch |err| {
                 const msg = allocator.dupe(u8, @errorName(err)) catch @panic("out of memory");
                 return .{ .failure = .{ .code = .execution_failed, .message = msg } };
             }
-        else if (std.mem.eql(u8, normalizeMockAcheronPath(path), "global/pr_review/control/save_draft.json"))
+        else if (std.mem.eql(u8, normalizeMockAcheronPath(path), "global/pr_review/control/save_draft.json") or
+            std.mem.eql(u8, normalizeMockAcheronPath(path), "services/pr_review/control/save_draft.json"))
             state.handleSaveDraft(path, content) catch |err| {
                 const msg = allocator.dupe(u8, @errorName(err)) catch @panic("out of memory");
                 return .{ .failure = .{ .code = .execution_failed, .message = msg } };
@@ -5696,7 +5700,7 @@ fn mockProviderStreamByModelWithPrReviewAcheronLoop(
             .name = try allocator.dupe(u8, "file_write"),
             .arguments_json = try allocator.dupe(
                 u8,
-                "{\"path\":\"global/pr_review/control/configure_repo.json\",\"content\":\"{\\\"repo_key\\\":\\\"DeanoC/Spiderweb\\\",\\\"default_branch\\\":\\\"stable\\\",\\\"checkout_path\\\":\\\"/nodes/local/fs/pr-review/repos/spiderweb-configured\\\",\\\"default_review_commands\\\":[\\\"zig build test\\\"],\\\"auto_intake\\\":true}\"}",
+                "{\"path\":\"services/pr_review/control/configure_repo.json\",\"content\":\"{\\\"repo_key\\\":\\\"DeanoC/Spiderweb\\\",\\\"default_branch\\\":\\\"stable\\\",\\\"checkout_path\\\":\\\"/nodes/local/fs/pr-review/repos/spiderweb-configured\\\",\\\"default_review_commands\\\":[\\\"zig build test\\\"],\\\"auto_intake\\\":true}\"}",
             ),
         };
         try events.append(.{ .done = .{
@@ -5723,7 +5727,7 @@ fn mockProviderStreamByModelWithPrReviewAcheronLoop(
             .name = try allocator.dupe(u8, "file_write"),
             .arguments_json = try allocator.dupe(
                 u8,
-                "{\"path\":\"global/github_pr/control/ingest_event.json\",\"content\":\"{\\\"repo_key\\\":\\\"DeanoC/Spiderweb\\\",\\\"pr_number\\\":129,\\\"action\\\":\\\"edited\\\"}\"}",
+                "{\"path\":\"services/github_pr/control/ingest_event.json\",\"content\":\"{\\\"repo_key\\\":\\\"DeanoC/Spiderweb\\\",\\\"pr_number\\\":129,\\\"action\\\":\\\"edited\\\"}\"}",
             ),
         };
         try events.append(.{ .done = .{
@@ -5799,7 +5803,7 @@ fn mockProviderStreamByModelWithPrReviewRunnerAcheronLoop(
             .name = try allocator.dupe(u8, "file_write"),
             .arguments_json = try allocator.dupe(
                 u8,
-                "{\"path\":\"global/pr_review/control/configure_repo.json\",\"content\":\"{\\\"repo_key\\\":\\\"DeanoC/Spiderweb\\\",\\\"default_branch\\\":\\\"stable\\\",\\\"checkout_path\\\":\\\"/nodes/local/fs/pr-review/repos/spiderweb-configured\\\",\\\"default_review_commands\\\":[\\\"zig build test\\\"],\\\"auto_intake\\\":true}\"}",
+                "{\"path\":\"services/pr_review/control/configure_repo.json\",\"content\":\"{\\\"repo_key\\\":\\\"DeanoC/Spiderweb\\\",\\\"default_branch\\\":\\\"stable\\\",\\\"checkout_path\\\":\\\"/nodes/local/fs/pr-review/repos/spiderweb-configured\\\",\\\"default_review_commands\\\":[\\\"zig build test\\\"],\\\"auto_intake\\\":true}\"}",
             ),
         };
         try events.append(.{ .done = .{
@@ -5826,7 +5830,7 @@ fn mockProviderStreamByModelWithPrReviewRunnerAcheronLoop(
             .name = try allocator.dupe(u8, "file_write"),
             .arguments_json = try allocator.dupe(
                 u8,
-                "{\"path\":\"global/github_pr/control/ingest_event.json\",\"content\":\"{\\\"repo_key\\\":\\\"DeanoC/Spiderweb\\\",\\\"pr_number\\\":129,\\\"action\\\":\\\"opened\\\"}\"}",
+                "{\"path\":\"services/github_pr/control/ingest_event.json\",\"content\":\"{\\\"repo_key\\\":\\\"DeanoC/Spiderweb\\\",\\\"pr_number\\\":129,\\\"action\\\":\\\"opened\\\"}\"}",
             ),
         };
         try events.append(.{ .done = .{
@@ -5853,7 +5857,7 @@ fn mockProviderStreamByModelWithPrReviewRunnerAcheronLoop(
             .name = try allocator.dupe(u8, "file_write"),
             .arguments_json = try allocator.dupe(
                 u8,
-                "{\"path\":\"global/pr_review/control/advance.json\",\"content\":\"{\\\"mission_id\\\":\\\"mission-pr-129\\\",\\\"run_validation\\\":false,\\\"provider_sync\\\":false,\\\"sync_checkout\\\":false,\\\"repo_status\\\":false,\\\"diff_range\\\":false}\"}",
+                "{\"path\":\"services/pr_review/control/advance.json\",\"content\":\"{\\\"mission_id\\\":\\\"mission-pr-129\\\",\\\"run_validation\\\":false,\\\"provider_sync\\\":false,\\\"sync_checkout\\\":false,\\\"repo_status\\\":false,\\\"diff_range\\\":false}\"}",
             ),
         };
         try events.append(.{ .done = .{
@@ -5932,7 +5936,7 @@ fn mockProviderStreamByModelWithPrReviewDraftAcheronLoop(
             .name = try allocator.dupe(u8, "file_write"),
             .arguments_json = try allocator.dupe(
                 u8,
-                "{\"path\":\"global/pr_review/control/configure_repo.json\",\"content\":\"{\\\"repo_key\\\":\\\"DeanoC/Spiderweb\\\",\\\"default_branch\\\":\\\"stable\\\",\\\"checkout_path\\\":\\\"/nodes/local/fs/pr-review/repos/spiderweb-configured\\\",\\\"default_review_commands\\\":[\\\"zig build test\\\"],\\\"auto_intake\\\":true}\"}",
+                "{\"path\":\"services/pr_review/control/configure_repo.json\",\"content\":\"{\\\"repo_key\\\":\\\"DeanoC/Spiderweb\\\",\\\"default_branch\\\":\\\"stable\\\",\\\"checkout_path\\\":\\\"/nodes/local/fs/pr-review/repos/spiderweb-configured\\\",\\\"default_review_commands\\\":[\\\"zig build test\\\"],\\\"auto_intake\\\":true}\"}",
             ),
         };
         try events.append(.{ .done = .{
@@ -5959,7 +5963,7 @@ fn mockProviderStreamByModelWithPrReviewDraftAcheronLoop(
             .name = try allocator.dupe(u8, "file_write"),
             .arguments_json = try allocator.dupe(
                 u8,
-                "{\"path\":\"global/github_pr/control/ingest_event.json\",\"content\":\"{\\\"repo_key\\\":\\\"DeanoC/Spiderweb\\\",\\\"pr_number\\\":129,\\\"action\\\":\\\"opened\\\"}\"}",
+                "{\"path\":\"services/github_pr/control/ingest_event.json\",\"content\":\"{\\\"repo_key\\\":\\\"DeanoC/Spiderweb\\\",\\\"pr_number\\\":129,\\\"action\\\":\\\"opened\\\"}\"}",
             ),
         };
         try events.append(.{ .done = .{
@@ -5985,7 +5989,7 @@ fn mockProviderStreamByModelWithPrReviewDraftAcheronLoop(
             .name = try allocator.dupe(u8, "file_write"),
             .arguments_json = try allocator.dupe(
                 u8,
-                "{\"path\":\"global/pr_review/control/advance.json\",\"content\":\"{\\\"mission_id\\\":\\\"mission-pr-129\\\",\\\"run_validation\\\":false,\\\"provider_sync\\\":false,\\\"sync_checkout\\\":false,\\\"repo_status\\\":false,\\\"diff_range\\\":false}\"}",
+                "{\"path\":\"services/pr_review/control/advance.json\",\"content\":\"{\\\"mission_id\\\":\\\"mission-pr-129\\\",\\\"run_validation\\\":false,\\\"provider_sync\\\":false,\\\"sync_checkout\\\":false,\\\"repo_status\\\":false,\\\"diff_range\\\":false}\"}",
             ),
         };
         try events.append(.{ .done = .{
@@ -6038,7 +6042,7 @@ fn mockProviderStreamByModelWithPrReviewDraftAcheronLoop(
             .name = try allocator.dupe(u8, "file_write"),
             .arguments_json = try allocator.dupe(
                 u8,
-                "{\"path\":\"global/pr_review/control/save_draft.json\",\"content\":\"{\\\"mission_id\\\":\\\"mission-pr-129\\\",\\\"summary\\\":\\\"Flagged missing regression coverage\\\",\\\"findings\\\":[{\\\"path\\\":\\\"src/feature.zig\\\",\\\"severity\\\":\\\"medium\\\",\\\"summary\\\":\\\"Missing regression coverage for the new path\\\"}],\\\"recommendation\\\":{\\\"decision\\\":\\\"request_changes\\\",\\\"summary\\\":\\\"Add regression coverage before merge\\\"},\\\"review_comment\\\":\\\"Please add regression coverage for the new path.\\\",\\\"thread_actions\\\":[]}\"}",
+                "{\"path\":\"services/pr_review/control/save_draft.json\",\"content\":\"{\\\"mission_id\\\":\\\"mission-pr-129\\\",\\\"summary\\\":\\\"Flagged missing regression coverage\\\",\\\"findings\\\":[{\\\"path\\\":\\\"src/feature.zig\\\",\\\"severity\\\":\\\"medium\\\",\\\"summary\\\":\\\"Missing regression coverage for the new path\\\"}],\\\"recommendation\\\":{\\\"decision\\\":\\\"request_changes\\\",\\\"summary\\\":\\\"Add regression coverage before merge\\\"},\\\"review_comment\\\":\\\"Please add regression coverage for the new path.\\\",\\\"thread_actions\\\":[]}\"}",
             ),
         };
         try events.append(.{ .done = .{

@@ -11,8 +11,8 @@ Mission records may expose a generic `contract` bundle with:
 
 How to use it:
 
-1. Read the mission record from `/global/missions/result.json` or `/global/missions/control/get.json`.
-2. If `contract` is present, materialize its files under `/nodes/local/fs/...` with `/global/missions/control/bootstrap_contract.json` when they do not exist yet.
+1. Read the mission record from `/services/missions/result.json` or `/services/missions/control/get.json` when the workspace binds it. Fall back to `/global/missions/*` only when no workspace service bind is available yet.
+2. If `contract` is present, materialize its files under `/nodes/local/fs/...` with `/services/missions/control/bootstrap_contract.json` when they do not exist yet.
 3. Read `context_path` before acting.
 4. Read `state_path` to resume the current loop and avoid repeating work.
 5. Write findings, logs, reports, and patches under `artifact_root`.

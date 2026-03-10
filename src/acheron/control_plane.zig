@@ -299,6 +299,10 @@ const minimum_template_bind_specs = [_]ProjectTemplateBindSpec{
     .{ .bind_path = "/services/mounts", .target_path = "/global/mounts" },
 };
 
+const system_template_bind_specs = [_]ProjectTemplateBindSpec{
+    .{ .bind_path = "/services/mounts", .target_path = "/global/mounts" },
+};
+
 const github_template_bind_specs = [_]ProjectTemplateBindSpec{
     .{ .bind_path = "/services/mounts", .target_path = "/global/mounts" },
     .{ .bind_path = "/services/git", .target_path = "/global/git" },
@@ -613,6 +617,12 @@ pub const ControlPlane = struct {
             if (try ensureProjectTemplateBindsLocked(self, project)) project_changed = true;
             if (!project_changed) continue;
             project.updated_at_ms = now_ms;
+            changed = true;
+        }
+
+        const builtin_project = self.projects.getPtr(spider_web_project_id) orelse return;
+        if (try ensureProjectTemplateBindsLocked(self, builtin_project)) {
+            builtin_project.updated_at_ms = now_ms;
             changed = true;
         }
 
@@ -5098,7 +5108,7 @@ fn resolveProjectTemplateSpec(template_id: []const u8, kind: ProjectKind) ?Proje
             return .{
                 .id = system_project_template_id,
                 .description = "Built-in Spiderweb system project template.",
-                .bind_specs = &.{},
+                .bind_specs = system_template_bind_specs[0..],
             };
         }
         return null;
@@ -7792,6 +7802,21 @@ test "acheron_control_plane: createProject defaults to minimum template and seed
     defer allocator.free(resolved);
     try std.testing.expect(std.mem.indexOf(u8, resolved, "\"matched\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, resolved, "\"resolved_path\":\"/global/mounts/control/invoke.json\"") != null);
+}
+
+test "acheron_control_plane: builtin system project seeds mounts service bind" {
+    const allocator = std.testing.allocator;
+    var plane = ControlPlane.init(allocator);
+    defer plane.deinit();
+
+    try plane.ensureBuiltinSpiderWebProjectLocked(std.time.milliTimestamp());
+    const project = plane.projects.get(spider_web_project_id) orelse return error.TestExpectedResponse;
+    try std.testing.expectEqualStrings(system_project_template_id, project.template_id);
+
+    const payload = try renderProjectPayload(allocator, project, false);
+    defer allocator.free(payload);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"bind_path\":\"/services/mounts\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"target_path\":\"/global/mounts\"") != null);
 }
 
 test "acheron_control_plane: github template merges desired binds with template service binds" {

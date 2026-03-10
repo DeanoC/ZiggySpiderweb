@@ -172,6 +172,17 @@ pub const ServiceCapture = struct {
     }
 };
 
+const PreferredServiceTarget = struct {
+    service_path: []u8,
+    invoke_path: []u8,
+
+    fn deinit(self: *PreferredServiceTarget, allocator: std.mem.Allocator) void {
+        allocator.free(self.service_path);
+        allocator.free(self.invoke_path);
+        self.* = undefined;
+    }
+};
+
 pub const ResolvedContract = struct {
     contract_id: []u8,
     context_path: []u8,
@@ -2272,13 +2283,15 @@ fn executeIntakeOp(self: anytype, args_obj: std.json.ObjectMap) ![]u8 {
     if (provider_sync_input.enabled) {
         const request_payload = try self.buildPrReviewGitHubSyncRequestJson(context, provider_sync_input.overrides);
         defer self.allocator.free(request_payload);
+        var github_pr_target = try resolvePreferredServiceTarget(self, "github_pr", "/control/sync.json");
+        defer github_pr_target.deinit(self.allocator);
         provider_sync_capture = try self.invokePrReviewServiceCapture(
             store,
             mission.mission_id,
             checkpoint_stage,
             "Loaded provider metadata for PR review intake",
-            "/global/github_pr",
-            "/global/github_pr/control/sync.json",
+            github_pr_target.service_path,
+            github_pr_target.invoke_path,
             request_payload,
             contract.artifact_root,
             state.provider_sync_artifact,
@@ -2396,13 +2409,15 @@ fn executeSyncOp(self: anytype, args_obj: std.json.ObjectMap) ![]u8 {
     if (provider_sync_input.enabled) {
         const request_payload = try self.buildPrReviewGitHubSyncRequestJson(context, provider_sync_input.overrides);
         defer self.allocator.free(request_payload);
+        var github_pr_target = try resolvePreferredServiceTarget(self, "github_pr", "/control/sync.json");
+        defer github_pr_target.deinit(self.allocator);
         provider_sync_capture = try self.invokePrReviewServiceCapture(
             store,
             mission_id,
             checkpoint_stage,
             "Synced provider PR metadata",
-            "/global/github_pr",
-            "/global/github_pr/control/sync.json",
+            github_pr_target.service_path,
+            github_pr_target.invoke_path,
             request_payload,
             contract.artifact_root,
             state.provider_sync_artifact,
@@ -2423,13 +2438,15 @@ fn executeSyncOp(self: anytype, args_obj: std.json.ObjectMap) ![]u8 {
     if (service_error_code == null and sync_checkout_input.enabled) {
         const request_payload = try self.buildPrReviewGitSyncCheckoutRequestJson(context, sync_checkout_input.overrides);
         defer self.allocator.free(request_payload);
+        var git_sync_target = try resolvePreferredServiceTarget(self, "git", "/control/sync_checkout.json");
+        defer git_sync_target.deinit(self.allocator);
         checkout_sync_capture = try self.invokePrReviewServiceCapture(
             store,
             mission_id,
             checkpoint_stage,
             "Synced PR checkout",
-            "/global/git",
-            "/global/git/control/sync_checkout.json",
+            git_sync_target.service_path,
+            git_sync_target.invoke_path,
             request_payload,
             contract.artifact_root,
             state.checkout_sync_artifact,
@@ -2450,13 +2467,15 @@ fn executeSyncOp(self: anytype, args_obj: std.json.ObjectMap) ![]u8 {
     if (service_error_code == null and repo_status_input.enabled) {
         const request_payload = try self.buildPrReviewGitStatusRequestJson(context, repo_status_input.overrides);
         defer self.allocator.free(request_payload);
+        var git_status_target = try resolvePreferredServiceTarget(self, "git", "/control/status.json");
+        defer git_status_target.deinit(self.allocator);
         repo_status_capture = try self.invokePrReviewServiceCapture(
             store,
             mission_id,
             checkpoint_stage,
             "Captured repository status for PR review",
-            "/global/git",
-            "/global/git/control/status.json",
+            git_status_target.service_path,
+            git_status_target.invoke_path,
             request_payload,
             contract.artifact_root,
             state.repo_status_artifact,
@@ -2477,13 +2496,15 @@ fn executeSyncOp(self: anytype, args_obj: std.json.ObjectMap) ![]u8 {
     if (service_error_code == null and diff_range_input.enabled) {
         const request_payload = try self.buildPrReviewGitDiffRangeRequestJson(context, diff_range_input.overrides);
         defer self.allocator.free(request_payload);
+        var git_diff_target = try resolvePreferredServiceTarget(self, "git", "/control/diff_range.json");
+        defer git_diff_target.deinit(self.allocator);
         diff_range_capture = try self.invokePrReviewServiceCapture(
             store,
             mission_id,
             checkpoint_stage,
             "Captured changed files for PR review",
-            "/global/git",
-            "/global/git/control/diff_range.json",
+            git_diff_target.service_path,
+            git_diff_target.invoke_path,
             request_payload,
             contract.artifact_root,
             state.diff_range_artifact,
@@ -3159,13 +3180,15 @@ fn executeRecordReviewOp(self: anytype, args_obj: std.json.ObjectMap) ![]u8 {
             publish_review_input.overrides,
         );
         defer self.allocator.free(request_payload);
+        var github_pr_target = try resolvePreferredServiceTarget(self, "github_pr", "/control/publish_review.json");
+        defer github_pr_target.deinit(self.allocator);
         publish_review_capture = try self.invokePrReviewServiceCapture(
             store,
             mission_id,
             checkpoint_stage,
             "Published PR review through provider",
-            "/global/github_pr",
-            "/global/github_pr/control/publish_review.json",
+            github_pr_target.service_path,
+            github_pr_target.invoke_path,
             request_payload,
             contract.artifact_root,
             state.publish_review_artifact,
@@ -3537,7 +3560,7 @@ fn buildPrReviewAgenticGoal(
             "Then read /global/library/use-cases/pr-review/README.md.\n" ++
             "Inspect the latest review artifacts under {s}, especially {s}, {s}, and {s}.\n" ++
             "Current phase: {s}. Current focus: {s}.\n" ++
-            "Use /global/pr_review/control/save_draft.json to {s} the review draft and update {s} plus {s}.\n" ++
+            "Use /services/pr_review/control/save_draft.json to {s} the review draft and update {s} plus {s}.\n" ++
             "Persist concrete findings, a recommendation object, and a review_comment draft.\n" ++
             "Do not publish or finalize the review yet. If evidence is missing, capture the blocker in the saved draft summary.",
         .{
@@ -3555,6 +3578,17 @@ fn buildPrReviewAgenticGoal(
             review_comment_path,
         },
     );
+}
+
+fn resolvePreferredServiceTarget(self: anytype, service_id: []const u8, control_suffix: []const u8) !PreferredServiceTarget {
+    const service_path = try self.resolvePreferredServicePath(service_id, "");
+    errdefer self.allocator.free(service_path);
+    const invoke_path = try self.resolvePreferredServicePath(service_id, control_suffix);
+    errdefer self.allocator.free(invoke_path);
+    return .{
+        .service_path = service_path,
+        .invoke_path = invoke_path,
+    };
 }
 
 fn executeAdvanceSync(self: anytype, mission_id: []const u8, phase: []const u8, args_obj: std.json.ObjectMap) ![]u8 {

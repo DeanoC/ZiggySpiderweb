@@ -286,13 +286,18 @@ fn executeIngestEventOp(self: anytype, args_obj: std.json.ObjectMap) ![]u8 {
             const intake_payload = try buildIntakeRequestJson(self, snapshot, run_id, args_obj, configured_repo);
             defer self.allocator.free(intake_payload);
 
-            var write_error = try self.writeInternalPath("/global/pr_review/control/intake.json", intake_payload);
+            const intake_invoke_path = try self.resolvePreferredServicePath("pr_review", "/control/intake.json");
+            defer self.allocator.free(intake_invoke_path);
+            const intake_result_path = try self.resolvePreferredServicePath("pr_review", "/result.json");
+            defer self.allocator.free(intake_result_path);
+
+            var write_error = try self.writeInternalPath(intake_invoke_path, intake_payload);
             defer if (write_error) |*value| value.deinit(self.allocator);
             if (write_error) |value| {
                 return self.buildGitHubPrFailureResultJson(.ingest_event, value.code, value.message);
             }
 
-            const intake_result = (try self.tryReadInternalPath("/global/pr_review/result.json")) orelse
+            const intake_result = (try self.tryReadInternalPath(intake_result_path)) orelse
                 return self.buildGitHubPrFailureResultJson(.ingest_event, "missing_result", "pr_review intake produced no result payload");
             defer self.allocator.free(intake_result);
 

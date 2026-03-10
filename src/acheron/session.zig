@@ -6417,6 +6417,26 @@ pub const Session = struct {
         return null;
     }
 
+    pub fn resolvePreferredServicePath(self: *Session, service_id: []const u8, suffix: []const u8) ![]u8 {
+        const workspace_path = if (suffix.len == 0)
+            try std.fmt.allocPrint(self.allocator, "/services/{s}", .{service_id})
+        else
+            try std.fmt.allocPrint(self.allocator, "/services/{s}{s}", .{ service_id, suffix });
+        errdefer self.allocator.free(workspace_path);
+
+        const rebound = try self.resolveBoundPath(workspace_path);
+        if (rebound) |value| {
+            self.allocator.free(value);
+            return workspace_path;
+        }
+
+        self.allocator.free(workspace_path);
+        return if (suffix.len == 0)
+            try std.fmt.allocPrint(self.allocator, "/global/{s}", .{service_id})
+        else
+            try std.fmt.allocPrint(self.allocator, "/global/{s}{s}", .{ service_id, suffix });
+    }
+
     pub fn resolveAbsolutePathNoBinds(self: *Session, path: []const u8) ?u32 {
         if (!std.mem.startsWith(u8, path, "/")) return null;
         if (std.mem.eql(u8, path, "/")) return self.root_id;
@@ -21617,6 +21637,67 @@ test "acheron_session: project metadata exposes workspace binds and mounted serv
     const workspace_services_id = session.lookupChild(root_meta_dir, "workspace_services.json") orelse return error.TestExpectedResponse;
     const workspace_services_node = session.nodes.get(workspace_services_id) orelse return error.TestExpectedResponse;
     try std.testing.expect(std.mem.indexOf(u8, workspace_services_node.content, "\"path\":\"/services/missions\"") != null);
+}
+
+test "acheron_session: preferred service paths use workspace bindings when available" {
+    const allocator = std.testing.allocator;
+
+    var control_plane = control_plane_mod.ControlPlane.init(allocator);
+    defer control_plane.deinit();
+
+    const project_json = try control_plane.createProject(
+        "{\"name\":\"SessionServicePaths\",\"vision\":\"SessionServicePaths\",\"template_id\":\"github\"}",
+    );
+    defer allocator.free(project_json);
+    var parsed_project = try std.json.parseFromSlice(std.json.Value, allocator, project_json, .{});
+    defer parsed_project.deinit();
+    const project_id = parsed_project.value.object.get("project_id").?.string;
+    const project_token = parsed_project.value.object.get("project_token").?.string;
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var bound_session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "default",
+        .{
+            .project_id = project_id,
+            .project_token = project_token,
+            .agents_dir = ".does-not-exist",
+            .projects_dir = ".does-not-exist",
+            .control_plane = &control_plane,
+        },
+    );
+    defer bound_session.deinit();
+
+    const bound_github_path = try bound_session.resolvePreferredServicePath("github_pr", "/control/sync.json");
+    defer allocator.free(bound_github_path);
+    try std.testing.expectEqualStrings("/services/github_pr/control/sync.json", bound_github_path);
+
+    const bound_missions_path = try bound_session.resolvePreferredServicePath("missions", "/control/request_approval.json");
+    defer allocator.free(bound_missions_path);
+    try std.testing.expectEqualStrings("/services/missions/control/request_approval.json", bound_missions_path);
+
+    var unbound_session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "default",
+        .{
+            .agents_dir = ".does-not-exist",
+            .projects_dir = ".does-not-exist",
+        },
+    );
+    defer unbound_session.deinit();
+
+    const unbound_github_path = try unbound_session.resolvePreferredServicePath("github_pr", "/control/sync.json");
+    defer allocator.free(unbound_github_path);
+    try std.testing.expectEqualStrings("/global/github_pr/control/sync.json", unbound_github_path);
 }
 
 test "acheron_session: missing provider API key is surfaced directly" {
