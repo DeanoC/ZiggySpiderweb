@@ -6166,53 +6166,11 @@ pub const Session = struct {
     }
 
     fn handleGitHubPrNamespaceWrite(self: *Session, special: SpecialKind, node_id: u32, raw_input: []const u8) !WriteOutcome {
-        const input = std.mem.trim(u8, raw_input, " \t\r\n");
-        const payload = if (input.len == 0) "{}" else input;
-        try self.setFileContent(node_id, payload);
-
-        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, payload, .{}) catch return error.InvalidPayload;
-        defer parsed.deinit();
-        if (parsed.value != .object) return error.InvalidPayload;
-        const obj = parsed.value.object;
-
-        const op = switch (special) {
-            .github_pr_sync => GitHubPrOp.sync,
-            .github_pr_ingest_event => GitHubPrOp.ingest_event,
-            .github_pr_publish_review => GitHubPrOp.publish_review,
-            .github_pr_invoke => blk: {
-                const op_raw = blk2: {
-                    if (obj.get("op")) |value| if (value == .string and value.string.len > 0) break :blk2 value.string;
-                    if (obj.get("operation")) |value| if (value == .string and value.string.len > 0) break :blk2 value.string;
-                    if (obj.get("tool")) |value| if (value == .string and value.string.len > 0) break :blk2 value.string;
-                    if (obj.get("tool_name")) |value| if (value == .string and value.string.len > 0) break :blk2 value.string;
-                    break :blk2 null;
-                } orelse return error.InvalidPayload;
-                break :blk parseGitHubPrOp(op_raw) orelse return error.InvalidPayload;
-            },
-            else => return error.InvalidPayload,
-        };
-
-        const args_obj = blk: {
-            if (obj.get("arguments")) |value| {
-                if (value != .object) return error.InvalidPayload;
-                break :blk value.object;
-            }
-            if (obj.get("args")) |value| {
-                if (value != .object) return error.InvalidPayload;
-                break :blk value.object;
-            }
-            break :blk obj;
-        };
-
-        return self.executeGitHubPrOp(op, args_obj, raw_input.len);
+        return .{ .written = try github_pr_venom.handleNamespaceWrite(self, special, node_id, raw_input) };
     }
 
     fn parseGitOp(raw: []const u8) ?GitOp {
         return git_venom.parseOp(raw);
-    }
-
-    fn parseGitHubPrOp(raw: []const u8) ?GitHubPrOp {
-        return github_pr_venom.parseOp(raw);
     }
 
     fn gitOperationName(op: GitOp) []const u8 {
@@ -6221,14 +6179,6 @@ pub const Session = struct {
 
     fn gitStatusToolName(op: GitOp) []const u8 {
         return git_venom.statusToolName(op);
-    }
-
-    fn gitHubPrOperationName(op: GitHubPrOp) []const u8 {
-        return github_pr_venom.operationName(op);
-    }
-
-    fn gitHubPrStatusToolName(op: GitHubPrOp) []const u8 {
-        return github_pr_venom.statusToolName(op);
     }
 
     fn executeGitOp(self: *Session, op: GitOp, args_obj: std.json.ObjectMap, written: usize) !WriteOutcome {
@@ -6263,44 +6213,8 @@ pub const Session = struct {
         return .{ .written = written };
     }
 
-    fn executeGitHubPrOp(self: *Session, op: GitHubPrOp, args_obj: std.json.ObjectMap, written: usize) !WriteOutcome {
-        const tool_name = gitHubPrStatusToolName(op);
-        const running_status = try self.buildServiceInvokeStatusJson("running", tool_name, null);
-        defer self.allocator.free(running_status);
-        try self.setMirroredFileContent(self.github_pr_status_id, self.github_pr_status_alias_id, running_status);
-
-        const result_payload = self.executeGitHubPrOpPayload(op, args_obj) catch |err| {
-            const error_message = @errorName(err);
-            const failed_status = try self.buildServiceInvokeStatusJson("failed", tool_name, error_message);
-            defer self.allocator.free(failed_status);
-            try self.setMirroredFileContent(self.github_pr_status_id, self.github_pr_status_alias_id, failed_status);
-            const failed_result = try self.buildGitHubPrFailureResultJson(op, "invalid_payload", error_message);
-            defer self.allocator.free(failed_result);
-            try self.setMirroredFileContent(self.github_pr_result_id, self.github_pr_result_alias_id, failed_result);
-            return err;
-        };
-        defer self.allocator.free(result_payload);
-
-        if (try self.extractErrorMessageFromToolPayload(result_payload)) |message| {
-            defer self.allocator.free(message);
-            const failed_status = try self.buildServiceInvokeStatusJson("failed", tool_name, message);
-            defer self.allocator.free(failed_status);
-            try self.setMirroredFileContent(self.github_pr_status_id, self.github_pr_status_alias_id, failed_status);
-        } else {
-            const done_status = try self.buildServiceInvokeStatusJson("done", tool_name, null);
-            defer self.allocator.free(done_status);
-            try self.setMirroredFileContent(self.github_pr_status_id, self.github_pr_status_alias_id, done_status);
-        }
-        try self.setMirroredFileContent(self.github_pr_result_id, self.github_pr_result_alias_id, result_payload);
-        return .{ .written = written };
-    }
-
     fn executeGitOpPayload(self: *Session, op: GitOp, args_obj: std.json.ObjectMap) ![]u8 {
         return git_venom.executeOpPayload(self, op, args_obj);
-    }
-
-    fn executeGitHubPrOpPayload(self: *Session, op: GitHubPrOp, args_obj: std.json.ObjectMap) ![]u8 {
-        return github_pr_venom.executeOpPayload(self, op, args_obj);
     }
 
     pub fn buildCliCommand(self: *Session, program: []const u8, argv: []const []const u8) ![]u8 {
