@@ -27,10 +27,22 @@ pub const Op = enum {
 };
 
 pub fn seedNamespace(self: anytype, missions_dir: u32) !void {
+    return seedNamespaceAt(self, missions_dir, "/global/missions");
+}
+
+pub fn seedNamespaceAt(self: anytype, missions_dir: u32, base_path: []const u8) !void {
+    const escaped_base_path = try unified.jsonEscape(self.allocator, base_path);
+    defer self.allocator.free(escaped_base_path);
+    const shape_json = try std.fmt.allocPrint(
+        self.allocator,
+        "{{\"kind\":\"venom\",\"venom_id\":\"missions\",\"shape\":\"{s}/{{README.md,SCHEMA.json,CAPS.json,OPS.json,RUNTIME.json,PERMISSIONS.json,STATUS.json,status.json,result.json,control/*}}\"}}",
+        .{escaped_base_path},
+    );
+    defer self.allocator.free(shape_json);
     try self.addDirectoryDescriptors(
         missions_dir,
         "Missions",
-        "{\"kind\":\"venom\",\"venom_id\":\"missions\",\"shape\":\"/global/missions/{README.md,SCHEMA.json,CAPS.json,OPS.json,RUNTIME.json,PERMISSIONS.json,STATUS.json,status.json,result.json,control/*}\"}",
+        shape_json,
         "{\"invoke\":true,\"operations\":[\"missions_create\",\"missions_list\",\"missions_get\",\"missions_heartbeat\",\"missions_checkpoint\",\"missions_bootstrap_contract\",\"missions_invoke_service\",\"missions_recover\",\"missions_request_approval\",\"missions_approve\",\"missions_reject\",\"missions_resume\",\"missions_block\",\"missions_complete\",\"missions_fail\",\"missions_cancel\"],\"discoverable\":true,\"persistent\":true}",
         "Long-running mission records. Create/list/get missions, invoke workspace services through mission steps, request approvals, and track recovery/state transitions.",
     );

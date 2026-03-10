@@ -46,10 +46,22 @@ const EventSnapshot = struct {
 };
 
 pub fn seedNamespace(self: anytype, github_pr_dir: u32) !void {
+    return seedNamespaceAt(self, github_pr_dir, "/global/github_pr");
+}
+
+pub fn seedNamespaceAt(self: anytype, github_pr_dir: u32, base_path: []const u8) !void {
+    const escaped_base_path = try unified.jsonEscape(self.allocator, base_path);
+    defer self.allocator.free(escaped_base_path);
+    const shape_json = try std.fmt.allocPrint(
+        self.allocator,
+        "{{\"kind\":\"venom\",\"venom_id\":\"github_pr\",\"shape\":\"{s}/{{README.md,SCHEMA.json,TEMPLATE.json,CAPS.json,OPS.json,RUNTIME.json,HOST.json,PERMISSIONS.json,STATUS.json,status.json,result.json,control/*}}\"}}",
+        .{escaped_base_path},
+    );
+    defer self.allocator.free(shape_json);
     try self.addDirectoryDescriptors(
         github_pr_dir,
         "GitHub PR",
-        "{\"kind\":\"venom\",\"venom_id\":\"github_pr\",\"shape\":\"/global/github_pr/{README.md,SCHEMA.json,TEMPLATE.json,CAPS.json,OPS.json,RUNTIME.json,HOST.json,PERMISSIONS.json,STATUS.json,status.json,result.json,control/*}\"}",
+        shape_json,
         "{\"invoke\":true,\"operations\":[\"github_pr_sync\",\"github_pr_ingest_event\",\"github_pr_publish_review\"],\"discoverable\":true,\"network\":true}",
         "GitHub pull-request helpers backed by the GitHub REST API. Use sync to load provider PR metadata, ingest_event to normalize GitHub PR events into Acheron and auto-start review missions, and publish_review for top-level review submission.",
     );

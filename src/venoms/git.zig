@@ -20,10 +20,22 @@ pub const ParsedShellExecResult = struct {
 };
 
 pub fn seedNamespace(self: anytype, git_dir: u32) !void {
+    return seedNamespaceAt(self, git_dir, "/global/git");
+}
+
+pub fn seedNamespaceAt(self: anytype, git_dir: u32, base_path: []const u8) !void {
+    const escaped_base_path = try unified.jsonEscape(self.allocator, base_path);
+    defer self.allocator.free(escaped_base_path);
+    const shape_json = try std.fmt.allocPrint(
+        self.allocator,
+        "{{\"kind\":\"venom\",\"venom_id\":\"git\",\"shape\":\"{s}/{{README.md,SCHEMA.json,TEMPLATE.json,CAPS.json,OPS.json,RUNTIME.json,HOST.json,PERMISSIONS.json,STATUS.json,status.json,result.json,control/*}}\"}}",
+        .{escaped_base_path},
+    );
+    defer self.allocator.free(shape_json);
     try self.addDirectoryDescriptors(
         git_dir,
         "Git",
-        "{\"kind\":\"venom\",\"venom_id\":\"git\",\"shape\":\"/global/git/{README.md,SCHEMA.json,TEMPLATE.json,CAPS.json,OPS.json,RUNTIME.json,HOST.json,PERMISSIONS.json,STATUS.json,status.json,result.json,control/*}\"}",
+        shape_json,
         "{\"invoke\":true,\"operations\":[\"git_sync_checkout\",\"git_status\",\"git_diff_range\"],\"discoverable\":true,\"workspace_fs\":true}",
         "Repository checkout and diff helpers backed by the runtime shell_exec tool. Prefer these high-level operations over ad-hoc git shell commands.",
     );

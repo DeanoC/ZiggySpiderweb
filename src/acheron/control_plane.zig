@@ -296,19 +296,19 @@ const ProjectTemplateSpec = struct {
 };
 
 const minimum_template_bind_specs = [_]ProjectTemplateBindSpec{
-    .{ .bind_path = "/services/mounts", .target_path = "/global/mounts" },
+    .{ .bind_path = "/services/mounts", .target_path = "/nodes/local/venoms/mounts" },
 };
 
 const system_template_bind_specs = [_]ProjectTemplateBindSpec{
-    .{ .bind_path = "/services/mounts", .target_path = "/global/mounts" },
+    .{ .bind_path = "/services/mounts", .target_path = "/nodes/local/venoms/mounts" },
 };
 
 const github_template_bind_specs = [_]ProjectTemplateBindSpec{
-    .{ .bind_path = "/services/mounts", .target_path = "/global/mounts" },
-    .{ .bind_path = "/services/git", .target_path = "/global/git" },
-    .{ .bind_path = "/services/github_pr", .target_path = "/global/github_pr" },
-    .{ .bind_path = "/services/missions", .target_path = "/global/missions" },
-    .{ .bind_path = "/services/pr_review", .target_path = "/global/pr_review" },
+    .{ .bind_path = "/services/mounts", .target_path = "/nodes/local/venoms/mounts" },
+    .{ .bind_path = "/services/git", .target_path = "/nodes/local/venoms/git" },
+    .{ .bind_path = "/services/github_pr", .target_path = "/nodes/local/venoms/github_pr" },
+    .{ .bind_path = "/services/missions", .target_path = "/nodes/local/venoms/missions" },
+    .{ .bind_path = "/services/pr_review", .target_path = "/nodes/local/venoms/pr_review" },
 };
 
 const builtin_project_templates = [_]ProjectTemplateSpec{
@@ -5613,9 +5613,21 @@ fn projectPathWithinMountAuthority(project: *const Project, path: []const u8) bo
 
 fn projectPathWithinBindAuthority(project: *const Project, path: []const u8) bool {
     if (projectPathWithinMountAuthority(project, path)) return true;
+    if (isNodeVenomCatalogPath(path)) return true;
     if (std.mem.eql(u8, path, "/global")) return true;
     if (pathMatchesPrefix(path, "/global")) return true;
     return false;
+}
+
+fn isNodeVenomCatalogPath(path: []const u8) bool {
+    if (!pathMatchesPrefix(path, "/nodes")) return false;
+    var iter = std.mem.splitScalar(u8, path, '/');
+    _ = iter.next();
+    const first = iter.next() orelse return false;
+    if (!std.mem.eql(u8, first, "nodes")) return false;
+    _ = iter.next() orelse return false;
+    const third = iter.next() orelse return false;
+    return std.mem.eql(u8, third, "venoms");
 }
 
 fn pathMatchesPrefix(path: []const u8, prefix: []const u8) bool {
@@ -7785,7 +7797,7 @@ test "acheron_control_plane: createProject defaults to minimum template and seed
     defer allocator.free(project_json);
     try std.testing.expect(std.mem.indexOf(u8, project_json, "\"template_id\":\"minimum\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, project_json, "\"bind_path\":\"/services/mounts\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, project_json, "\"target_path\":\"/global/mounts\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, project_json, "\"target_path\":\"/nodes/local/venoms/mounts\"") != null);
 
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, project_json, .{});
     defer parsed.deinit();
@@ -7801,7 +7813,7 @@ test "acheron_control_plane: createProject defaults to minimum template and seed
     const resolved = try plane.resolveProjectPath(resolve_req);
     defer allocator.free(resolved);
     try std.testing.expect(std.mem.indexOf(u8, resolved, "\"matched\":true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, resolved, "\"resolved_path\":\"/global/mounts/control/invoke.json\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resolved, "\"resolved_path\":\"/nodes/local/venoms/mounts/control/invoke.json\"") != null);
 }
 
 test "acheron_control_plane: builtin system project seeds mounts service bind" {
@@ -7816,7 +7828,7 @@ test "acheron_control_plane: builtin system project seeds mounts service bind" {
     const payload = try renderProjectPayload(allocator, project, false);
     defer allocator.free(payload);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"bind_path\":\"/services/mounts\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"target_path\":\"/global/mounts\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"target_path\":\"/nodes/local/venoms/mounts\"") != null);
 }
 
 test "acheron_control_plane: github template merges desired binds with template service binds" {
@@ -7860,7 +7872,7 @@ test "acheron_control_plane: github template merges desired binds with template 
     const resolved = try plane.resolveProjectPath(resolve_req);
     defer allocator.free(resolved);
     try std.testing.expect(std.mem.indexOf(u8, resolved, "\"matched\":true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, resolved, "\"resolved_path\":\"/global/github_pr/control/invoke.json\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resolved, "\"resolved_path\":\"/nodes/local/venoms/github_pr/control/invoke.json\"") != null);
 }
 
 test "acheron_control_plane: snapshot encryption envelope roundtrip" {

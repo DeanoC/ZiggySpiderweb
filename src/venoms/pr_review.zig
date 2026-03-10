@@ -18,12 +18,24 @@ pub const Op = enum {
 };
 
 pub fn seedNamespace(self: anytype, pr_review_dir: u32) !void {
+    return seedNamespaceAt(self, pr_review_dir, "/global/pr_review");
+}
+
+pub fn seedNamespaceAt(self: anytype, pr_review_dir: u32, base_path: []const u8) !void {
+    const escaped_base_path = try unified.jsonEscape(self.allocator, base_path);
+    defer self.allocator.free(escaped_base_path);
+    const shape_json = try std.fmt.allocPrint(
+        self.allocator,
+        "{{\"kind\":\"venom\",\"venom_id\":\"pr_review\",\"shape\":\"{s}/{{README.md,SCHEMA.json,CAPS.json,OPS.json,PERMISSIONS.json,STATUS.json,status.json,result.json,control/*}}\"}}",
+        .{escaped_base_path},
+    );
+    defer self.allocator.free(shape_json);
     try self.addDirectoryDescriptors(
         pr_review_dir,
         "PR Review",
-        "{\"kind\":\"venom\",\"venom_id\":\"pr_review\",\"shape\":\"/global/pr_review/{README.md,SCHEMA.json,CAPS.json,OPS.json,PERMISSIONS.json,STATUS.json,status.json,result.json,control/*}\"}",
+        shape_json,
         "{\"invoke\":true,\"operations\":[\"pr_review_configure_repo\",\"pr_review_get_repo\",\"pr_review_list_repos\",\"pr_review_intake\",\"pr_review_start\",\"pr_review_sync\",\"pr_review_run_validation\",\"pr_review_record_validation\",\"pr_review_draft_review\",\"pr_review_save_draft\",\"pr_review_record_review\",\"pr_review_advance\"],\"discoverable\":true,\"persistent\":true}",
-        "Start PR review missions as a thin use-case venom layered over /global/missions.",
+        "Start PR review missions as a thin use-case venom layered over the missions service.",
     );
     _ = try self.addFile(
         pr_review_dir,

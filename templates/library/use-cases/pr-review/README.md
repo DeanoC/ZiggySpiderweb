@@ -24,7 +24,8 @@ Service entrypoint:
 
 Fallback origin:
 
-- `/global/*` remains the current local-service origin when no project-bound `/services/*` path is available yet.
+- `/nodes/local/venoms/*` is the canonical local-service origin when no project-bound `/services/*` path is available yet.
+- `/global/*` remains as a compatibility alias.
 
 Supporting service Venoms:
 
@@ -74,7 +75,7 @@ Suggested loop:
 11. Use `/services/pr_review/control/draft_review.json` when you want Spider Monkey to read the mission contract, inspect the saved artifacts, and persist the next review draft through Acheron.
 12. Use `/services/pr_review/control/save_draft.json` to persist an evolving review draft directly, keep the latest draft files current, and write immutable revision snapshots under `drafts/`.
 13. Use `/services/pr_review/control/record_review.json` to persist findings, recommendation, review-comment drafts, thread-action snapshots, and optionally `publish_review`.
-14. Discover available services through `/projects/<project_id>/meta/mounted_services.json` first, then fall back to `/global/venoms/VENOMS.json` if needed.
+14. Discover available services through `/projects/<project_id>/meta/mounted_services.json` first, then fall back to `/nodes/local/venoms/VENOMS.json` for the local catalog if needed. `/global/venoms/VENOMS.json` remains the compatibility discovery index.
 15. Use `/services/git/control/sync_checkout.json` to create or refresh the repo checkout under the mission workspace.
 16. Use `/services/github_pr/control/sync.json` to load provider PR metadata when GitHub context needs to be refreshed.
 17. Use `/services/git/control/status.json` and `/services/git/control/diff_range.json` for deterministic changed-file and branch-state inspection.

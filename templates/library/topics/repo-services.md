@@ -5,7 +5,7 @@ Spiderweb exposes first-class repository services through the Acheron namespace:
 - `/services/git`
 - `/services/github_pr`
 
-Use these before reaching for raw shell commands when the task is about repository checkout, diff inspection, or GitHub pull-request synchronization. `/global/*` remains the current local-service origin, but agents should prefer the workspace-bound `/services/*` paths whenever they are available.
+Use these before reaching for raw shell commands when the task is about repository checkout, diff inspection, or GitHub pull-request synchronization. `/nodes/local/venoms/*` is the canonical local catalog origin, `/global/*` is the compatibility alias, and agents should prefer the workspace-bound `/services/*` paths whenever they are available.
 
 ## Git service
 

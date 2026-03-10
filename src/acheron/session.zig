@@ -478,14 +478,24 @@ pub const Session = struct {
     projects_result_id: u32 = 0,
     git_status_id: u32 = 0,
     git_result_id: u32 = 0,
+    git_status_alias_id: u32 = 0,
+    git_result_alias_id: u32 = 0,
     github_pr_status_id: u32 = 0,
     github_pr_result_id: u32 = 0,
+    github_pr_status_alias_id: u32 = 0,
+    github_pr_result_alias_id: u32 = 0,
     pr_review_status_id: u32 = 0,
     pr_review_result_id: u32 = 0,
+    pr_review_status_alias_id: u32 = 0,
+    pr_review_result_alias_id: u32 = 0,
     missions_status_id: u32 = 0,
     missions_result_id: u32 = 0,
+    missions_status_alias_id: u32 = 0,
+    missions_result_alias_id: u32 = 0,
     mounts_status_id: u32 = 0,
     mounts_result_id: u32 = 0,
+    mounts_status_alias_id: u32 = 0,
+    mounts_result_alias_id: u32 = 0,
     wait_sources: std.ArrayListUnmanaged(WaitSource) = .{},
     wait_timeout_ms: i64 = default_wait_timeout_ms,
     wait_event_seq: u64 = 1,
@@ -1976,28 +1986,13 @@ pub const Session = struct {
         try self.seedAgentSearchCodeNamespace(search_code_dir);
         const terminal_dir = try self.addDir(global_root, "terminal", false);
         try self.seedAgentTerminalNamespace(terminal_dir);
-        if (self.local_fs_export_root != null) {
-            const git_dir = try self.addDir(global_root, "git", false);
-            try self.seedAgentGitNamespace(git_dir);
-            const github_pr_dir = try self.addDir(global_root, "github_pr", false);
-            try self.seedAgentGitHubPrNamespace(github_pr_dir);
-        }
-        const mounts_dir = try self.addDir(global_root, "mounts", false);
-        try self.seedAgentMountsNamespace(mounts_dir);
+        try self.seedLocalCatalogServiceNamespaces(global_root);
         const sub_brains_dir = try self.addDir(global_root, "sub_brains", false);
         try self.seedAgentSubBrainsNamespace(sub_brains_dir);
         const agents_control_dir = try self.addDir(global_root, "agents", false);
         try self.seedAgentAgentsNamespace(agents_control_dir);
         const projects_control_dir = try self.addDir(global_root, "projects", false);
         try self.seedAgentProjectsNamespace(projects_control_dir);
-        if (self.mission_store != null and self.local_fs_export_root != null) {
-            const pr_review_dir = try self.addDir(global_root, "pr_review", false);
-            try self.seedAgentPrReviewNamespace(pr_review_dir);
-        }
-        if (self.mission_store != null) {
-            const missions_dir = try self.addDir(global_root, "missions", false);
-            try self.seedAgentMissionsNamespace(missions_dir);
-        }
 
         self.jobs_root_id = try self.addDir(global_root, "jobs", false);
         try self.addDirectoryDescriptors(
@@ -2771,6 +2766,163 @@ pub const Session = struct {
         }
     }
 
+    fn lookupLocalNodeVenomsRoot(self: *Session) ?u32 {
+        const nodes_root = self.lookupChild(self.root_id, "nodes") orelse return null;
+        const local_node_dir = self.lookupChild(nodes_root, "local") orelse return null;
+        return self.lookupChild(local_node_dir, "venoms");
+    }
+
+    fn buildNodeVenomsIndexJson(self: *Session, venoms_root_id: u32) ![]u8 {
+        const venoms_root = self.nodes.get(venoms_root_id) orelse return error.MissingNode;
+        if (venoms_root.kind != .dir) return error.NotDir;
+
+        var out = std.ArrayListUnmanaged(u8){};
+        errdefer out.deinit(self.allocator);
+        try out.append(self.allocator, '[');
+        var first = true;
+
+        var it = venoms_root.children.iterator();
+        while (it.next()) |entry| {
+            if (std.mem.eql(u8, entry.key_ptr.*, "VENOMS.json")) continue;
+
+            const venom_dir_id = entry.value_ptr.*;
+            const venom_dir = self.nodes.get(venom_dir_id) orelse continue;
+            if (venom_dir.kind != .dir) continue;
+            if (!self.canInvokeVenomDirectory(venom_dir_id)) continue;
+
+            const status_id = self.lookupChild(venom_dir_id, "STATUS.json") orelse continue;
+            const status_node = self.nodes.get(status_id) orelse continue;
+            var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, status_node.content, .{}) catch continue;
+            defer parsed.deinit();
+            if (parsed.value != .object) continue;
+
+            const status_obj = parsed.value.object;
+            const venom_id = if (status_obj.get("venom_id")) |value|
+                if (value == .string and value.string.len > 0) value.string else entry.key_ptr.*
+            else
+                entry.key_ptr.*;
+            const kind = if (status_obj.get("kind")) |value|
+                if (value == .string and value.string.len > 0) value.string else "service"
+            else
+                "service";
+            const state = if (status_obj.get("state")) |value|
+                if (value == .string and value.string.len > 0) value.string else "namespace"
+            else
+                "namespace";
+            const endpoint = if (status_obj.get("endpoint")) |value|
+                if (value == .string and value.string.len > 0) value.string else ""
+            else
+                "";
+            try self.appendVenomIndexEntry(&out, &first, venom_id, kind, state, endpoint);
+        }
+
+        try out.append(self.allocator, ']');
+        return out.toOwnedSlice(self.allocator);
+    }
+
+    fn refreshNodeVenomsIndex(self: *Session, node_id: []const u8) !void {
+        const nodes_root = self.lookupChild(self.root_id, "nodes") orelse return;
+        const node_dir_id = self.lookupChild(nodes_root, node_id) orelse return;
+        const venoms_root_id = self.lookupChild(node_dir_id, "venoms") orelse return;
+        const index_id = self.lookupChild(venoms_root_id, "VENOMS.json") orelse return;
+        const content = try self.buildNodeVenomsIndexJson(venoms_root_id);
+        defer self.allocator.free(content);
+        try self.setFileContent(index_id, content);
+    }
+
+    fn cloneNodeSubtree(self: *Session, source_id: u32, target_parent_id: u32, alias_name: ?[]const u8) !u32 {
+        const source = self.nodes.get(source_id) orelse return error.MissingNode;
+        const name = alias_name orelse source.name;
+        const target_id = switch (source.kind) {
+            .dir => try self.addDir(target_parent_id, name, source.writable),
+            .file => try self.addFile(target_parent_id, name, source.content, source.writable, source.special),
+        };
+        if (source.kind == .dir) {
+            var it = source.children.iterator();
+            while (it.next()) |entry| {
+                _ = try self.cloneNodeSubtree(entry.value_ptr.*, target_id, null);
+            }
+        }
+        return target_id;
+    }
+
+    fn registerLocalCatalogVenomBinding(self: *Session, venom_id: []const u8, scope: []const u8) !void {
+        const local_venoms_root = self.lookupLocalNodeVenomsRoot() orelse return;
+        const venom_dir_id = self.lookupChild(local_venoms_root, venom_id) orelse return;
+        const venom_path = try std.fmt.allocPrint(self.allocator, "/nodes/local/venoms/{s}", .{venom_id});
+        defer self.allocator.free(venom_path);
+        const endpoint_path = blk: {
+            if (try self.firstVenomMountPath(venom_dir_id)) |value| break :blk value;
+            break :blk try self.venomEndpointPath(venom_dir_id);
+        };
+        defer if (endpoint_path) |value| self.allocator.free(value);
+        const invoke_path = try self.deriveVenomInvokePath("local", venom_id, venom_dir_id);
+        defer if (invoke_path) |value| self.allocator.free(value);
+
+        try self.registerScopedVenomBinding(
+            venom_id,
+            scope,
+            venom_path,
+            "local",
+            venom_path,
+            endpoint_path,
+            invoke_path,
+        );
+    }
+
+    fn seedLocalCatalogServiceNamespaces(self: *Session, global_root: u32) !void {
+        const local_venoms_root = self.lookupLocalNodeVenomsRoot() orelse return;
+
+        const mounts_dir = try self.addDir(local_venoms_root, "mounts", false);
+        try self.seedAgentMountsNamespaceAt(mounts_dir, "/nodes/local/venoms/mounts");
+        const mounts_alias_dir = try self.cloneNodeSubtree(mounts_dir, global_root, "mounts");
+        self.mounts_status_alias_id = self.lookupChild(mounts_alias_dir, "status.json") orelse 0;
+        self.mounts_result_alias_id = self.lookupChild(mounts_alias_dir, "result.json") orelse 0;
+
+        if (self.local_fs_export_root != null) {
+            const git_dir = try self.addDir(local_venoms_root, "git", false);
+            try self.seedAgentGitNamespaceAt(git_dir, "/nodes/local/venoms/git");
+            const git_alias_dir = try self.cloneNodeSubtree(git_dir, global_root, "git");
+            self.git_status_alias_id = self.lookupChild(git_alias_dir, "status.json") orelse 0;
+            self.git_result_alias_id = self.lookupChild(git_alias_dir, "result.json") orelse 0;
+
+            const github_pr_dir = try self.addDir(local_venoms_root, "github_pr", false);
+            try self.seedAgentGitHubPrNamespaceAt(github_pr_dir, "/nodes/local/venoms/github_pr");
+            const github_pr_alias_dir = try self.cloneNodeSubtree(github_pr_dir, global_root, "github_pr");
+            self.github_pr_status_alias_id = self.lookupChild(github_pr_alias_dir, "status.json") orelse 0;
+            self.github_pr_result_alias_id = self.lookupChild(github_pr_alias_dir, "result.json") orelse 0;
+        }
+
+        if (self.mission_store != null) {
+            const missions_dir = try self.addDir(local_venoms_root, "missions", false);
+            try self.seedAgentMissionsNamespaceAt(missions_dir, "/nodes/local/venoms/missions");
+            const missions_alias_dir = try self.cloneNodeSubtree(missions_dir, global_root, "missions");
+            self.missions_status_alias_id = self.lookupChild(missions_alias_dir, "status.json") orelse 0;
+            self.missions_result_alias_id = self.lookupChild(missions_alias_dir, "result.json") orelse 0;
+
+            if (self.local_fs_export_root != null) {
+                const pr_review_dir = try self.addDir(local_venoms_root, "pr_review", false);
+                try self.seedAgentPrReviewNamespaceAt(pr_review_dir, "/nodes/local/venoms/pr_review");
+                const pr_review_alias_dir = try self.cloneNodeSubtree(pr_review_dir, global_root, "pr_review");
+                self.pr_review_status_alias_id = self.lookupChild(pr_review_alias_dir, "status.json") orelse 0;
+                self.pr_review_result_alias_id = self.lookupChild(pr_review_alias_dir, "result.json") orelse 0;
+            }
+        }
+
+        try self.refreshNodeVenomsIndex("local");
+        try self.registerLocalCatalogVenomBinding("mounts", "node_catalog");
+        if (self.local_fs_export_root != null) {
+            try self.registerLocalCatalogVenomBinding("git", "node_catalog");
+            try self.registerLocalCatalogVenomBinding("github_pr", "node_catalog");
+        }
+        if (self.mission_store != null) {
+            try self.registerLocalCatalogVenomBinding("missions", "node_catalog");
+            if (self.local_fs_export_root != null) {
+                try self.registerLocalCatalogVenomBinding("pr_review", "node_catalog");
+            }
+        }
+    }
+
     fn addProjectFsLinksFromPolicy(
         self: *Session,
         project_fs_dir: u32,
@@ -3360,15 +3512,35 @@ pub const Session = struct {
         return git_venom.seedNamespace(self, git_dir);
     }
 
+    fn seedAgentGitNamespaceAt(self: *Session, git_dir: u32, base_path: []const u8) !void {
+        return git_venom.seedNamespaceAt(self, git_dir, base_path);
+    }
+
     fn seedAgentGitHubPrNamespace(self: *Session, github_pr_dir: u32) !void {
         return github_pr_venom.seedNamespace(self, github_pr_dir);
     }
 
+    fn seedAgentGitHubPrNamespaceAt(self: *Session, github_pr_dir: u32, base_path: []const u8) !void {
+        return github_pr_venom.seedNamespaceAt(self, github_pr_dir, base_path);
+    }
+
     fn seedAgentMountsNamespace(self: *Session, mounts_dir: u32) !void {
+        return self.seedAgentMountsNamespaceAt(mounts_dir, "/global/mounts");
+    }
+
+    fn seedAgentMountsNamespaceAt(self: *Session, mounts_dir: u32, base_path: []const u8) !void {
+        const escaped_base_path = try unified.jsonEscape(self.allocator, base_path);
+        defer self.allocator.free(escaped_base_path);
+        const shape_json = try std.fmt.allocPrint(
+            self.allocator,
+            "{{\"kind\":\"venom\",\"venom_id\":\"mounts\",\"shape\":\"{s}/{{README.md,SCHEMA.json,CAPS.json,OPS.json,RUNTIME.json,PERMISSIONS.json,STATUS.json,status.json,result.json,control/*}}\"}}",
+            .{escaped_base_path},
+        );
+        defer self.allocator.free(shape_json);
         try self.addDirectoryDescriptors(
             mounts_dir,
             "Mounts and Binds",
-            "{\"kind\":\"venom\",\"venom_id\":\"mounts\",\"shape\":\"/global/mounts/{README.md,SCHEMA.json,CAPS.json,OPS.json,RUNTIME.json,PERMISSIONS.json,STATUS.json,status.json,result.json,control/*}\"}",
+            shape_json,
             "{\"invoke\":true,\"operations\":[\"list\",\"mount\",\"mkdir\",\"unmount\",\"bind\",\"unbind\",\"resolve\"],\"discoverable\":true,\"project_scope\":true}",
             "Manage project mounts and path binds through Acheron control files.",
         );
@@ -3647,6 +3819,10 @@ pub const Session = struct {
 
     fn seedAgentPrReviewNamespace(self: *Session, pr_review_dir: u32) !void {
         return pr_review_venom.seedNamespace(self, pr_review_dir);
+    }
+
+    fn seedAgentPrReviewNamespaceAt(self: *Session, pr_review_dir: u32, base_path: []const u8) !void {
+        return pr_review_venom.seedNamespaceAt(self, pr_review_dir, base_path);
     }
 
     fn seedGlobalLibraryNamespace(self: *Session, library_dir: u32) !void {
@@ -6431,6 +6607,14 @@ pub const Session = struct {
         }
 
         self.allocator.free(workspace_path);
+        const catalog_path = if (suffix.len == 0)
+            try std.fmt.allocPrint(self.allocator, "/nodes/local/venoms/{s}", .{service_id})
+        else
+            try std.fmt.allocPrint(self.allocator, "/nodes/local/venoms/{s}{s}", .{ service_id, suffix });
+        errdefer self.allocator.free(catalog_path);
+        if (self.resolveAbsolutePathNoBinds(catalog_path) != null) return catalog_path;
+
+        self.allocator.free(catalog_path);
         return if (suffix.len == 0)
             try std.fmt.allocPrint(self.allocator, "/global/{s}", .{service_id})
         else
@@ -6519,6 +6703,11 @@ pub const Session = struct {
         if (node_ptr.kind != .file) return error.NotFile;
         self.allocator.free(node_ptr.content);
         node_ptr.content = try self.allocator.dupe(u8, data);
+    }
+
+    fn setMirroredFileContent(self: *Session, primary_id: u32, alias_id: u32, data: []const u8) !void {
+        if (primary_id != 0) try self.setFileContent(primary_id, data);
+        if (alias_id != 0 and alias_id != primary_id) try self.setFileContent(alias_id, data);
     }
 
     fn tryReadBoundVenomProxyFile(self: *Session, node_id: u32) !?[]u8 {
@@ -7988,7 +8177,7 @@ pub const Session = struct {
         const status_tool = mountsStatusToolName(op);
         const running_status = try self.buildServiceInvokeStatusJson("running", status_tool, null);
         defer self.allocator.free(running_status);
-        if (self.mounts_status_id != 0) try self.setFileContent(self.mounts_status_id, running_status);
+        try self.setMirroredFileContent(self.mounts_status_id, self.mounts_status_alias_id, running_status);
 
         const result_payload = self.executeMountsOpPayload(op, args_obj) catch |err| {
             const error_message = @errorName(err);
@@ -7998,18 +8187,18 @@ pub const Session = struct {
             };
             const failed_status = try self.buildServiceInvokeStatusJson("failed", status_tool, error_message);
             defer self.allocator.free(failed_status);
-            if (self.mounts_status_id != 0) try self.setFileContent(self.mounts_status_id, failed_status);
+            try self.setMirroredFileContent(self.mounts_status_id, self.mounts_status_alias_id, failed_status);
             const failed_result = try self.buildMountsFailureResultJson(op, code, error_message);
             defer self.allocator.free(failed_result);
-            if (self.mounts_result_id != 0) try self.setFileContent(self.mounts_result_id, failed_result);
+            try self.setMirroredFileContent(self.mounts_result_id, self.mounts_result_alias_id, failed_result);
             return err;
         };
         defer self.allocator.free(result_payload);
 
         const done_status = try self.buildServiceInvokeStatusJson("done", status_tool, null);
         defer self.allocator.free(done_status);
-        if (self.mounts_status_id != 0) try self.setFileContent(self.mounts_status_id, done_status);
-        if (self.mounts_result_id != 0) try self.setFileContent(self.mounts_result_id, result_payload);
+        try self.setMirroredFileContent(self.mounts_status_id, self.mounts_status_alias_id, done_status);
+        try self.setMirroredFileContent(self.mounts_result_id, self.mounts_result_alias_id, result_payload);
         return .{ .written = written };
     }
 
@@ -9752,16 +9941,16 @@ pub const Session = struct {
         const tool_name = gitStatusToolName(op);
         const running_status = try self.buildServiceInvokeStatusJson("running", tool_name, null);
         defer self.allocator.free(running_status);
-        if (self.git_status_id != 0) try self.setFileContent(self.git_status_id, running_status);
+        try self.setMirroredFileContent(self.git_status_id, self.git_status_alias_id, running_status);
 
         const result_payload = self.executeGitOpPayload(op, args_obj) catch |err| {
             const error_message = @errorName(err);
             const failed_status = try self.buildServiceInvokeStatusJson("failed", tool_name, error_message);
             defer self.allocator.free(failed_status);
-            if (self.git_status_id != 0) try self.setFileContent(self.git_status_id, failed_status);
+            try self.setMirroredFileContent(self.git_status_id, self.git_status_alias_id, failed_status);
             const failed_result = try self.buildGitFailureResultJson(op, "invalid_payload", error_message);
             defer self.allocator.free(failed_result);
-            if (self.git_result_id != 0) try self.setFileContent(self.git_result_id, failed_result);
+            try self.setMirroredFileContent(self.git_result_id, self.git_result_alias_id, failed_result);
             return err;
         };
         defer self.allocator.free(result_payload);
@@ -9770,13 +9959,13 @@ pub const Session = struct {
             defer self.allocator.free(message);
             const failed_status = try self.buildServiceInvokeStatusJson("failed", tool_name, message);
             defer self.allocator.free(failed_status);
-            if (self.git_status_id != 0) try self.setFileContent(self.git_status_id, failed_status);
+            try self.setMirroredFileContent(self.git_status_id, self.git_status_alias_id, failed_status);
         } else {
             const done_status = try self.buildServiceInvokeStatusJson("done", tool_name, null);
             defer self.allocator.free(done_status);
-            if (self.git_status_id != 0) try self.setFileContent(self.git_status_id, done_status);
+            try self.setMirroredFileContent(self.git_status_id, self.git_status_alias_id, done_status);
         }
-        if (self.git_result_id != 0) try self.setFileContent(self.git_result_id, result_payload);
+        try self.setMirroredFileContent(self.git_result_id, self.git_result_alias_id, result_payload);
         return .{ .written = written };
     }
 
@@ -9784,16 +9973,16 @@ pub const Session = struct {
         const tool_name = gitHubPrStatusToolName(op);
         const running_status = try self.buildServiceInvokeStatusJson("running", tool_name, null);
         defer self.allocator.free(running_status);
-        if (self.github_pr_status_id != 0) try self.setFileContent(self.github_pr_status_id, running_status);
+        try self.setMirroredFileContent(self.github_pr_status_id, self.github_pr_status_alias_id, running_status);
 
         const result_payload = self.executeGitHubPrOpPayload(op, args_obj) catch |err| {
             const error_message = @errorName(err);
             const failed_status = try self.buildServiceInvokeStatusJson("failed", tool_name, error_message);
             defer self.allocator.free(failed_status);
-            if (self.github_pr_status_id != 0) try self.setFileContent(self.github_pr_status_id, failed_status);
+            try self.setMirroredFileContent(self.github_pr_status_id, self.github_pr_status_alias_id, failed_status);
             const failed_result = try self.buildGitHubPrFailureResultJson(op, "invalid_payload", error_message);
             defer self.allocator.free(failed_result);
-            if (self.github_pr_result_id != 0) try self.setFileContent(self.github_pr_result_id, failed_result);
+            try self.setMirroredFileContent(self.github_pr_result_id, self.github_pr_result_alias_id, failed_result);
             return err;
         };
         defer self.allocator.free(result_payload);
@@ -9802,13 +9991,13 @@ pub const Session = struct {
             defer self.allocator.free(message);
             const failed_status = try self.buildServiceInvokeStatusJson("failed", tool_name, message);
             defer self.allocator.free(failed_status);
-            if (self.github_pr_status_id != 0) try self.setFileContent(self.github_pr_status_id, failed_status);
+            try self.setMirroredFileContent(self.github_pr_status_id, self.github_pr_status_alias_id, failed_status);
         } else {
             const done_status = try self.buildServiceInvokeStatusJson("done", tool_name, null);
             defer self.allocator.free(done_status);
-            if (self.github_pr_status_id != 0) try self.setFileContent(self.github_pr_status_id, done_status);
+            try self.setMirroredFileContent(self.github_pr_status_id, self.github_pr_status_alias_id, done_status);
         }
-        if (self.github_pr_result_id != 0) try self.setFileContent(self.github_pr_result_id, result_payload);
+        try self.setMirroredFileContent(self.github_pr_result_id, self.github_pr_result_alias_id, result_payload);
         return .{ .written = written };
     }
 
@@ -9923,16 +10112,16 @@ pub const Session = struct {
         const tool_name = prReviewStatusToolName(op);
         const running_status = try self.buildServiceInvokeStatusJson("running", tool_name, null);
         defer self.allocator.free(running_status);
-        if (self.pr_review_status_id != 0) try self.setFileContent(self.pr_review_status_id, running_status);
+        try self.setMirroredFileContent(self.pr_review_status_id, self.pr_review_status_alias_id, running_status);
 
         const result_payload = self.executePrReviewOpPayload(op, args_obj) catch |err| {
             const error_message = @errorName(err);
             const failed_status = try self.buildServiceInvokeStatusJson("failed", tool_name, error_message);
             defer self.allocator.free(failed_status);
-            if (self.pr_review_status_id != 0) try self.setFileContent(self.pr_review_status_id, failed_status);
+            try self.setMirroredFileContent(self.pr_review_status_id, self.pr_review_status_alias_id, failed_status);
             const failed_result = try self.buildPrReviewFailureResultJson(op, "invalid_payload", error_message);
             defer self.allocator.free(failed_result);
-            if (self.pr_review_result_id != 0) try self.setFileContent(self.pr_review_result_id, failed_result);
+            try self.setMirroredFileContent(self.pr_review_result_id, self.pr_review_result_alias_id, failed_result);
             return err;
         };
         defer self.allocator.free(result_payload);
@@ -9941,13 +10130,13 @@ pub const Session = struct {
             defer self.allocator.free(message);
             const failed_status = try self.buildServiceInvokeStatusJson("failed", tool_name, message);
             defer self.allocator.free(failed_status);
-            if (self.pr_review_status_id != 0) try self.setFileContent(self.pr_review_status_id, failed_status);
+            try self.setMirroredFileContent(self.pr_review_status_id, self.pr_review_status_alias_id, failed_status);
         } else {
             const done_status = try self.buildServiceInvokeStatusJson("done", tool_name, null);
             defer self.allocator.free(done_status);
-            if (self.pr_review_status_id != 0) try self.setFileContent(self.pr_review_status_id, done_status);
+            try self.setMirroredFileContent(self.pr_review_status_id, self.pr_review_status_alias_id, done_status);
         }
-        if (self.pr_review_result_id != 0) try self.setFileContent(self.pr_review_result_id, result_payload);
+        try self.setMirroredFileContent(self.pr_review_result_id, self.pr_review_result_alias_id, result_payload);
         return .{ .written = written };
     }
 
@@ -10478,6 +10667,10 @@ pub const Session = struct {
         return missions_venom.seedNamespace(self, missions_dir);
     }
 
+    fn seedAgentMissionsNamespaceAt(self: *Session, missions_dir: u32, base_path: []const u8) !void {
+        return missions_venom.seedNamespaceAt(self, missions_dir, base_path);
+    }
+
     pub const MissionOp = missions_venom.Op;
 
     fn handleMissionsNamespaceWrite(self: *Session, special: SpecialKind, node_id: u32, raw_input: []const u8) !WriteOutcome {
@@ -10612,7 +10805,7 @@ pub const Session = struct {
         const tool_name = missionToolName(op);
         const running_status = try self.buildServiceInvokeStatusJson("running", tool_name, null);
         defer self.allocator.free(running_status);
-        if (self.missions_status_id != 0) try self.setFileContent(self.missions_status_id, running_status);
+        try self.setMirroredFileContent(self.missions_status_id, self.missions_status_alias_id, running_status);
 
         const result_payload = self.executeMissionOpPayload(op, args_obj) catch |err| {
             const error_message = @errorName(err);
@@ -10623,10 +10816,10 @@ pub const Session = struct {
             };
             const failed_status = try self.buildServiceInvokeStatusJson("failed", tool_name, error_message);
             defer self.allocator.free(failed_status);
-            if (self.missions_status_id != 0) try self.setFileContent(self.missions_status_id, failed_status);
+            try self.setMirroredFileContent(self.missions_status_id, self.missions_status_alias_id, failed_status);
             const failed_result = try self.buildMissionFailureResultJson(op, error_code, error_message);
             defer self.allocator.free(failed_result);
-            if (self.missions_result_id != 0) try self.setFileContent(self.missions_result_id, failed_result);
+            try self.setMirroredFileContent(self.missions_result_id, self.missions_result_alias_id, failed_result);
             return err;
         };
         defer self.allocator.free(result_payload);
@@ -10635,13 +10828,13 @@ pub const Session = struct {
             defer self.allocator.free(message);
             const failed_status = try self.buildServiceInvokeStatusJson("failed", tool_name, message);
             defer self.allocator.free(failed_status);
-            if (self.missions_status_id != 0) try self.setFileContent(self.missions_status_id, failed_status);
+            try self.setMirroredFileContent(self.missions_status_id, self.missions_status_alias_id, failed_status);
         } else {
             const done_status = try self.buildServiceInvokeStatusJson("done", tool_name, null);
             defer self.allocator.free(done_status);
-            if (self.missions_status_id != 0) try self.setFileContent(self.missions_status_id, done_status);
+            try self.setMirroredFileContent(self.missions_status_id, self.missions_status_alias_id, done_status);
         }
-        if (self.missions_result_id != 0) try self.setFileContent(self.missions_result_id, result_payload);
+        try self.setMirroredFileContent(self.missions_result_id, self.missions_result_alias_id, result_payload);
         return .{ .written = written };
     }
 
@@ -12158,13 +12351,20 @@ pub const Session = struct {
         } else null;
         defer if (invoke_path) |value| self.allocator.free(value);
 
-        var explicit_provider = blk: {
+        const local_provider_dir_id = blk: {
+            const local_venoms_root = self.lookupLocalNodeVenomsRoot() orelse break :blk null;
+            break :blk self.lookupChild(local_venoms_root, venom_id);
+        };
+
+        var explicit_provider = if (local_provider_dir_id == null) blk: {
             const plane = self.control_plane orelse break :blk null;
             break :blk try plane.resolveExplicitPreferredVenomProvider(self.allocator, venom_id);
-        };
+        } else null;
         defer if (explicit_provider) |*value| value.deinit(self.allocator);
 
-        const provider_node_id = if (explicit_provider) |provider|
+        const provider_node_id = if (local_provider_dir_id != null)
+            try self.allocator.dupe(u8, "local")
+        else if (explicit_provider) |provider|
             try self.allocator.dupe(u8, provider.node_id)
         else
             null;
@@ -12174,7 +12374,9 @@ pub const Session = struct {
         else
             null;
         defer if (provider_venom_path) |value| self.allocator.free(value);
-        const provider_invoke_path = if (explicit_provider) |provider| blk: {
+        const provider_invoke_path = if (local_provider_dir_id) |provider_dir_id|
+            try self.deriveVenomInvokePath("local", venom_id, provider_dir_id)
+        else if (explicit_provider) |provider| blk: {
             const nodes_root = self.lookupChild(self.root_id, "nodes") orelse break :blk null;
             const node_dir_id = self.lookupChild(nodes_root, provider.node_id) orelse break :blk null;
             const venoms_root_id = self.lookupChild(node_dir_id, "venoms") orelse break :blk null;
@@ -12393,8 +12595,9 @@ fn defaultGlobalLibraryTopicMemoryWorkflows() []const u8 {
 
 fn defaultGlobalLibraryTopicProjectMountsAndBinds() []const u8 {
     return "# Project Mounts and Binds\n\n" ++
-        "Use `/global/mounts/control/mount.json`, `mkdir.json`, and `unmount.json` for project mounts.\n" ++
-        "Use `/global/mounts/control/bind.json` and `resolve.json` for stable project paths.\n";
+        "Use `/services/mounts/control/mount.json`, `mkdir.json`, and `unmount.json` for project mounts when the workspace binds the mounts service.\n" ++
+        "The canonical local origin is `/nodes/local/venoms/mounts/*`, with `/global/mounts/*` retained as a compatibility alias.\n" ++
+        "Use `/services/mounts/control/bind.json` and `resolve.json` for stable project paths.\n";
 }
 
 fn defaultGlobalLibraryTopicAgentManagementAndSubBrains() []const u8 {
@@ -15706,7 +15909,7 @@ test "acheron_session: pr_review venom intake bootstraps mission from provider s
     defer allocator.free(provider_sync_path);
     const provider_sync_content = try std.fs.cwd().readFileAlloc(allocator, provider_sync_path, 64 * 1024);
     defer allocator.free(provider_sync_content);
-    try std.testing.expect(std.mem.indexOf(u8, provider_sync_content, "\"service_path\":\"/global/github_pr\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, provider_sync_content, "\"service_path\":\"/nodes/local/venoms/github_pr\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, provider_sync_content, "\"dry_run\":true") != null);
 }
 
@@ -16100,14 +16303,14 @@ test "acheron_session: pr_review venom orchestrates repo services and review pub
     defer allocator.free(provider_sync_path);
     const provider_sync_content = try std.fs.cwd().readFileAlloc(allocator, provider_sync_path, 64 * 1024);
     defer allocator.free(provider_sync_content);
-    try std.testing.expect(std.mem.indexOf(u8, provider_sync_content, "\"service_path\":\"/global/github_pr\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, provider_sync_content, "\"service_path\":\"/nodes/local/venoms/github_pr\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, provider_sync_content, "\"dry_run\":true") != null);
 
     const checkout_capture_path = try std.fs.path.join(allocator, &.{ exports_dir, "pr-review", "runs", "DeanoC__Spiderweb", "pr-77", "services", "checkout.json" });
     defer allocator.free(checkout_capture_path);
     const checkout_capture_content = try std.fs.cwd().readFileAlloc(allocator, checkout_capture_path, 64 * 1024);
     defer allocator.free(checkout_capture_content);
-    try std.testing.expect(std.mem.indexOf(u8, checkout_capture_content, "\"service_path\":\"/global/git\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, checkout_capture_content, "\"service_path\":\"/nodes/local/venoms/git\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, checkout_capture_content, second_sha) != null);
 
     const repo_status_capture_path = try std.fs.path.join(allocator, &.{ exports_dir, "pr-review", "runs", "DeanoC__Spiderweb", "pr-77", "services", "repo-status.json" });
@@ -16154,7 +16357,7 @@ test "acheron_session: pr_review venom orchestrates repo services and review pub
     defer allocator.free(publish_review_capture_path);
     const publish_review_capture_content = try std.fs.cwd().readFileAlloc(allocator, publish_review_capture_path, 64 * 1024);
     defer allocator.free(publish_review_capture_content);
-    try std.testing.expect(std.mem.indexOf(u8, publish_review_capture_content, "\"service_path\":\"/global/github_pr\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, publish_review_capture_content, "\"service_path\":\"/nodes/local/venoms/github_pr\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, publish_review_capture_content, "\"decision\":\"request_changes\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, publish_review_capture_content, "\"thread_actions_count\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, publish_review_capture_content, "\"dry_run\":true") != null);
@@ -16488,7 +16691,7 @@ test "acheron_session: seeded pr_review eval propagates checkout failure" {
     defer allocator.free(checkout_capture_path);
     const checkout_capture_content = try std.fs.cwd().readFileAlloc(allocator, checkout_capture_path, 64 * 1024);
     defer allocator.free(checkout_capture_content);
-    try std.testing.expect(std.mem.indexOf(u8, checkout_capture_content, "\"service_path\":\"/global/git\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, checkout_capture_content, "\"service_path\":\"/nodes/local/venoms/git\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, checkout_capture_content, "\"code\":\"execution_failed\"") != null);
 
     const state_host_path = try std.fs.path.join(allocator, &.{ exports_dir, "pr-review", "state", "DeanoC__Spiderweb", "pr-91", "state.json" });
@@ -21629,7 +21832,7 @@ test "acheron_session: project metadata exposes workspace binds and mounted serv
     const mounted_services_id = session.lookupChild(meta_dir, "mounted_services.json") orelse return error.TestExpectedResponse;
     const mounted_services_node = session.nodes.get(mounted_services_id) orelse return error.TestExpectedResponse;
     try std.testing.expect(std.mem.indexOf(u8, mounted_services_node.content, "\"path\":\"/services/git\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, mounted_services_node.content, "\"target_path\":\"/global/github_pr\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mounted_services_node.content, "\"target_path\":\"/nodes/local/venoms/github_pr\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, mounted_services_node.content, "\"venom_id\":\"pr_review\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, mounted_services_node.content, "\"exposure\":\"project_bind\"") != null);
 
@@ -21697,7 +21900,7 @@ test "acheron_session: preferred service paths use workspace bindings when avail
 
     const unbound_github_path = try unbound_session.resolvePreferredServicePath("github_pr", "/control/sync.json");
     defer allocator.free(unbound_github_path);
-    try std.testing.expectEqualStrings("/global/github_pr/control/sync.json", unbound_github_path);
+    try std.testing.expectEqualStrings("/nodes/local/venoms/github_pr/control/sync.json", unbound_github_path);
 }
 
 test "acheron_session: missing provider API key is surfaced directly" {
