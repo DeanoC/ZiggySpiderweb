@@ -167,10 +167,18 @@ pub const ServiceCapture = struct {
 };
 
 pub const ResolvedContract = struct {
-    contract_id: []const u8,
-    context_path: []const u8,
-    state_path: []const u8,
-    artifact_root: []const u8,
+    contract_id: []u8,
+    context_path: []u8,
+    state_path: []u8,
+    artifact_root: []u8,
+
+    pub fn deinit(self: *ResolvedContract, allocator: std.mem.Allocator) void {
+        allocator.free(self.contract_id);
+        allocator.free(self.context_path);
+        allocator.free(self.state_path);
+        allocator.free(self.artifact_root);
+        self.* = undefined;
+    }
 };
 
 pub const ContextSnapshot = struct {
@@ -791,15 +799,14 @@ pub fn bootstrapMission(self: anytype, args_obj: std.json.ObjectMap) !mission_st
 }
 
 pub fn resolveMissionContract(self: anytype, mission: mission_store_mod.MissionRecord) !ResolvedContract {
-    _ = self;
     if (!std.mem.eql(u8, mission.use_case, "pr_review")) return error.InvalidPayload;
     const contract = mission.contract orelse return error.InvalidPayload;
     if (!std.mem.eql(u8, contract.contract_id, "spider_monkey/pr_review@v1")) return error.InvalidPayload;
     return .{
-        .contract_id = contract.contract_id,
-        .context_path = contract.context_path orelse return error.InvalidPayload,
-        .state_path = contract.state_path orelse return error.InvalidPayload,
-        .artifact_root = contract.artifact_root orelse return error.InvalidPayload,
+        .contract_id = try self.allocator.dupe(u8, contract.contract_id),
+        .context_path = try self.allocator.dupe(u8, contract.context_path orelse return error.InvalidPayload),
+        .state_path = try self.allocator.dupe(u8, contract.state_path orelse return error.InvalidPayload),
+        .artifact_root = try self.allocator.dupe(u8, contract.artifact_root orelse return error.InvalidPayload),
     };
 }
 
@@ -2138,7 +2145,8 @@ fn executeListReposOp(self: anytype) ![]u8 {
 fn executeStartOp(self: anytype, args_obj: std.json.ObjectMap) ![]u8 {
     var mission = try self.bootstrapPrReviewMission(args_obj);
     defer mission.deinit(self.allocator);
-    const contract = try self.resolvePrReviewMissionContract(mission);
+    var contract = try self.resolvePrReviewMissionContract(mission);
+    defer contract.deinit(self.allocator);
     var context = try self.loadPrReviewContextSnapshot(contract.context_path);
     defer context.deinit(self.allocator);
 
@@ -2164,7 +2172,8 @@ fn executeIntakeOp(self: anytype, args_obj: std.json.ObjectMap) ![]u8 {
 
     var mission = try self.bootstrapPrReviewMission(args_obj);
     defer mission.deinit(self.allocator);
-    const contract = try self.resolvePrReviewMissionContract(mission);
+    var contract = try self.resolvePrReviewMissionContract(mission);
+    defer contract.deinit(self.allocator);
 
     var context = try self.loadPrReviewContextSnapshot(contract.context_path);
     defer context.deinit(self.allocator);
@@ -2272,7 +2281,8 @@ fn executeSyncOp(self: anytype, args_obj: std.json.ObjectMap) ![]u8 {
     const mission_id = extractOptionalStringByNames(args_obj, &[_][]const u8{ "mission_id", "id" }) orelse return error.InvalidPayload;
     var mission = (try store.getOwned(self.allocator, mission_id)) orelse return error.NotFound;
     defer mission.deinit(self.allocator);
-    const contract = try self.resolvePrReviewMissionContract(mission);
+    var contract = try self.resolvePrReviewMissionContract(mission);
+    defer contract.deinit(self.allocator);
 
     var context = try self.loadPrReviewContextSnapshot(contract.context_path);
     defer context.deinit(self.allocator);
@@ -2486,7 +2496,8 @@ fn executeRunValidationOp(self: anytype, args_obj: std.json.ObjectMap) ![]u8 {
     const mission_id = extractOptionalStringByNames(args_obj, &[_][]const u8{ "mission_id", "id" }) orelse return error.InvalidPayload;
     var mission = (try store.getOwned(self.allocator, mission_id)) orelse return error.NotFound;
     defer mission.deinit(self.allocator);
-    const contract = try self.resolvePrReviewMissionContract(mission);
+    var contract = try self.resolvePrReviewMissionContract(mission);
+    defer contract.deinit(self.allocator);
 
     var context = try self.loadPrReviewContextSnapshot(contract.context_path);
     defer context.deinit(self.allocator);
@@ -2712,7 +2723,8 @@ fn executeRecordValidationOp(self: anytype, args_obj: std.json.ObjectMap) ![]u8 
 
     var mission = (try store.getOwned(self.allocator, mission_id)) orelse return error.NotFound;
     defer mission.deinit(self.allocator);
-    const contract = try self.resolvePrReviewMissionContract(mission);
+    var contract = try self.resolvePrReviewMissionContract(mission);
+    defer contract.deinit(self.allocator);
 
     var state = try self.loadPrReviewStateSnapshot(contract.state_path);
     defer state.deinit(self.allocator);
@@ -2775,7 +2787,8 @@ fn executeSaveDraftOp(self: anytype, args_obj: std.json.ObjectMap) ![]u8 {
 
     var mission = (try store.getOwned(self.allocator, mission_id)) orelse return error.NotFound;
     defer mission.deinit(self.allocator);
-    const contract = try self.resolvePrReviewMissionContract(mission);
+    var contract = try self.resolvePrReviewMissionContract(mission);
+    defer contract.deinit(self.allocator);
 
     var state = try self.loadPrReviewStateSnapshot(contract.state_path);
     defer state.deinit(self.allocator);
@@ -2897,7 +2910,8 @@ fn executeRecordReviewOp(self: anytype, args_obj: std.json.ObjectMap) ![]u8 {
 
     var mission = (try store.getOwned(self.allocator, mission_id)) orelse return error.NotFound;
     defer mission.deinit(self.allocator);
-    const contract = try self.resolvePrReviewMissionContract(mission);
+    var contract = try self.resolvePrReviewMissionContract(mission);
+    defer contract.deinit(self.allocator);
 
     var context = try self.loadPrReviewContextSnapshot(contract.context_path);
     defer context.deinit(self.allocator);
@@ -3042,7 +3056,8 @@ fn executeAdvanceOp(self: anytype, args_obj: std.json.ObjectMap) ![]u8 {
 
     switch (mission.state) {
         .completed, .failed, .cancelled => {
-            const contract = try self.resolvePrReviewMissionContract(mission);
+            var contract = try self.resolvePrReviewMissionContract(mission);
+            defer contract.deinit(self.allocator);
             var state = try self.loadPrReviewStateSnapshot(contract.state_path);
             defer state.deinit(self.allocator);
             const mission_json = try self.buildMissionRecordJson(mission);
@@ -3068,7 +3083,8 @@ fn executeAdvanceOp(self: anytype, args_obj: std.json.ObjectMap) ![]u8 {
     }
 
     if (mission.pending_approval != null or mission.state == .waiting_for_approval) {
-        const contract = try self.resolvePrReviewMissionContract(mission);
+        var contract = try self.resolvePrReviewMissionContract(mission);
+        defer contract.deinit(self.allocator);
         var state = try self.loadPrReviewStateSnapshot(contract.state_path);
         defer state.deinit(self.allocator);
         const mission_json = try self.buildMissionRecordJson(mission);
@@ -3106,7 +3122,8 @@ fn executeAdvanceOp(self: anytype, args_obj: std.json.ObjectMap) ![]u8 {
         mission = resumed;
     }
 
-    const contract = try self.resolvePrReviewMissionContract(mission);
+    var contract = try self.resolvePrReviewMissionContract(mission);
+    defer contract.deinit(self.allocator);
     var context = try self.loadPrReviewContextSnapshot(contract.context_path);
     defer context.deinit(self.allocator);
     var state = try self.loadPrReviewStateSnapshot(contract.state_path);

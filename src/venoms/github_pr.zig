@@ -222,7 +222,8 @@ fn executeSyncOp(self: anytype, args_obj: std.json.ObjectMap) ![]u8 {
         return self.buildGitHubPrFailureResultJson(.sync, gitHubStatusCode(files_response.status), message);
     }
 
-    const provider_json = try buildGitHubProviderJson(self, pr_response.body, files_response.body);
+    const provider_json = buildGitHubProviderJson(self, pr_response.body, files_response.body) catch |err|
+        return self.buildGitHubPrFailureResultJson(.sync, "invalid_provider_payload", @errorName(err));
     defer self.allocator.free(provider_json);
     const detail = try buildSyncDetailJson(self, repo_key, pr_number, pr_url, files_url, provider_json);
     defer self.allocator.free(detail);
@@ -882,6 +883,7 @@ fn githubApiRequest(
     defer all_headers.deinit(allocator);
     try all_headers.append(allocator, .{ .name = "authorization", .value = auth_header });
     try all_headers.append(allocator, .{ .name = "accept", .value = "application/vnd.github+json" });
+    try all_headers.append(allocator, .{ .name = "accept-encoding", .value = "identity" });
     try all_headers.append(allocator, .{ .name = "x-github-api-version", .value = "2022-11-28" });
     try all_headers.append(allocator, .{ .name = "user-agent", .value = "spiderweb" });
     if (payload != null) {
@@ -911,7 +913,22 @@ fn githubApiRequest(
     var response = req.receiveHead(&.{}) catch return error.ExecutionFailed;
     var body_writer: std.Io.Writer.Allocating = .init(allocator);
     defer body_writer.deinit();
-    _ = response.reader(&.{}).streamRemaining(&body_writer.writer) catch return error.ExecutionFailed;
+
+    const decompress_buffer: []u8 = switch (response.head.content_encoding) {
+        .identity => &.{},
+        .zstd => try allocator.alloc(u8, std.compress.zstd.default_window_len),
+        .deflate, .gzip => try allocator.alloc(u8, std.compress.flate.max_window_len),
+        .compress => return error.UnsupportedCompressionMethod,
+    };
+    defer if (decompress_buffer.len > 0) allocator.free(decompress_buffer);
+
+    var transfer_buffer: [64]u8 = undefined;
+    var decompress: std.http.Decompress = undefined;
+    const reader = response.readerDecompressing(&transfer_buffer, &decompress, decompress_buffer);
+    _ = reader.streamRemaining(&body_writer.writer) catch |err| switch (err) {
+        error.ReadFailed => return response.bodyErr() orelse error.ExecutionFailed,
+        else => return error.ExecutionFailed,
+    };
 
     return .{
         .status = response.head.status,

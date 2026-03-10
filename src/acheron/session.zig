@@ -6,6 +6,7 @@ const runtime_server_mod = @import("../agents/runtime_server.zig");
 const runtime_handle_mod = @import("../agents/runtime_handle.zig");
 const chat_job_index = @import("../agents/chat_job_index.zig");
 const chat_runtime_job = @import("../agents/chat_runtime_job.zig");
+const tool_executor_mod = @import("ziggy-tool-runtime").tool_executor;
 const job_projection = @import("job_projection.zig");
 const shared_node = @import("spiderweb_node");
 const workspace_policy = @import("../workspaces/policy.zig");
@@ -3707,6 +3708,8 @@ pub const Session = struct {
             if (self.current_terminal_session_id) |value| break :blk value;
             break :blk null;
         } orelse return error.InvalidPayload;
+        const stable_session_id = try self.allocator.dupe(u8, selected_id);
+        defer self.allocator.free(stable_session_id);
 
         var session = self.terminal_sessions.getPtr(selected_id) orelse return error.TerminalSessionNotFound;
         const now_ms = std.time.milliTimestamp();
@@ -3720,7 +3723,7 @@ pub const Session = struct {
             if (std.mem.eql(u8, current, selected_id)) try self.setCurrentTerminalSession(null);
         }
         try self.refreshTerminalV2StateFiles();
-        try self.updateTerminalV2StatusAndResult("done", "terminal_session_close", selected_id, null, "close", "{\"state\":\"closed\"}");
+        try self.updateTerminalV2StatusAndResult("done", "terminal_session_close", stable_session_id, null, "close", "{\"state\":\"closed\"}");
         return .{ .written = payload.len };
     }
 
@@ -3864,6 +3867,8 @@ pub const Session = struct {
         if (selected_session_id) |session_id| {
             var session = self.terminal_sessions.getPtr(session_id) orelse return error.TerminalSessionNotFound;
             if (session.isClosed()) return error.TerminalSessionClosed;
+            const stable_session_id = try self.allocator.dupe(u8, session_id);
+            defer self.allocator.free(stable_session_id);
 
             const command_bytes = try self.buildTerminalExecCommandBytes(obj);
             defer self.allocator.free(command_bytes);
@@ -3879,17 +3884,17 @@ pub const Session = struct {
                 session.cwd = try self.allocator.dupe(u8, next_cwd);
             }
             if (exec_outcome.error_message) |message| {
-                try self.setCurrentTerminalSession(session_id);
+                try self.setCurrentTerminalSession(stable_session_id);
                 try self.refreshTerminalV2StateFiles();
-                try self.updateTerminalV2StatusAndResult("failed", "shell_exec", session_id, message, "exec", "null");
+                try self.updateTerminalV2StatusAndResult("failed", "shell_exec", stable_session_id, message, "exec", "null");
                 return .{ .written = payload.len };
             }
-            try self.setCurrentTerminalSession(session_id);
+            try self.setCurrentTerminalSession(stable_session_id);
             try self.refreshTerminalV2StateFiles();
 
             const exec_result = try self.buildTerminalExecOutputResultJson(exec_outcome.output, false, exec_outcome.exit_code);
             defer self.allocator.free(exec_result);
-            try self.updateTerminalV2StatusAndResult("done", "shell_exec", session_id, null, "exec", exec_result);
+            try self.updateTerminalV2StatusAndResult("done", "shell_exec", stable_session_id, null, "exec", exec_result);
             return .{ .written = payload.len };
         }
 
@@ -4435,11 +4440,22 @@ pub const Session = struct {
     }
 
     fn setCurrentTerminalSession(self: *Session, session_id: ?[]const u8) !void {
-        if (self.current_terminal_session_id) |existing| self.allocator.free(existing);
-        self.current_terminal_session_id = if (session_id) |value|
+        if (self.current_terminal_session_id) |existing| {
+            if (session_id) |value| {
+                if (std.mem.eql(u8, existing, value)) return;
+            }
+        } else if (session_id == null) {
+            return;
+        }
+
+        const next_session_id = if (session_id) |value|
             try self.allocator.dupe(u8, value)
         else
             null;
+        errdefer if (next_session_id) |value| self.allocator.free(value);
+
+        if (self.current_terminal_session_id) |existing| self.allocator.free(existing);
+        self.current_terminal_session_id = next_session_id;
     }
 
     fn generateTerminalSessionId(self: *Session) ![]u8 {
@@ -10694,7 +10710,82 @@ pub const Session = struct {
         return decoded;
     }
 
+    fn executeDirectBuiltinToolCall(self: *Session, tool_name: []const u8, args_json: []const u8) !?[]u8 {
+        if (!std.mem.eql(u8, tool_name, "shell_exec")) return null;
+
+        var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, args_json, .{});
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidPayload;
+
+        const source_args = parsed.value.object;
+        const command = if (source_args.get("command")) |value|
+            if (value == .string) value.string else return error.InvalidPayload
+        else
+            return error.InvalidPayload;
+        const timeout_ms = if (source_args.get("timeout_ms")) |value| switch (value) {
+            .integer => |raw| blk: {
+                if (raw < 0) return error.InvalidPayload;
+                break :blk @as(u64, @intCast(raw));
+            },
+            .float => |raw| blk: {
+                if (raw < 0 or std.math.floor(raw) != raw) return error.InvalidPayload;
+                break :blk @as(u64, @intFromFloat(raw));
+            },
+            .null => null,
+            else => return error.InvalidPayload,
+        } else null;
+        const cwd = if (source_args.get("cwd")) |value|
+            if (value == .string) value.string else if (value == .null) null else return error.InvalidPayload
+        else
+            null;
+
+        const resolved_cwd = if (cwd) |value|
+            if (std.mem.startsWith(u8, value, local_fs_world_prefix))
+                try self.resolveMissionContractHostPath(value)
+            else
+                try self.allocator.dupe(u8, value)
+        else
+            null;
+        defer if (resolved_cwd) |value| self.allocator.free(value);
+
+        const escaped_command = try unified.jsonEscape(self.allocator, command);
+        defer self.allocator.free(escaped_command);
+        const cwd_fragment = if (resolved_cwd) |value| blk: {
+            const escaped_cwd = try unified.jsonEscape(self.allocator, value);
+            defer self.allocator.free(escaped_cwd);
+            break :blk try std.fmt.allocPrint(self.allocator, ",\"cwd\":\"{s}\"", .{escaped_cwd});
+        } else try self.allocator.dupe(u8, "");
+        defer self.allocator.free(cwd_fragment);
+        const timeout_fragment = if (timeout_ms) |value|
+            try std.fmt.allocPrint(self.allocator, ",\"timeout_ms\":{d}", .{value})
+        else
+            try self.allocator.dupe(u8, "");
+        defer self.allocator.free(timeout_fragment);
+
+        const direct_args_json = try std.fmt.allocPrint(
+            self.allocator,
+            "{{\"command\":\"{s}\"{s}{s}}}",
+            .{ escaped_command, timeout_fragment, cwd_fragment },
+        );
+        defer self.allocator.free(direct_args_json);
+
+        var direct_parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, direct_args_json, .{});
+        defer direct_parsed.deinit();
+        if (direct_parsed.value != .object) return error.InvalidPayload;
+
+        var result = tool_executor_mod.BuiltinTools.shellExec(self.allocator, direct_parsed.value.object);
+        defer result.deinit(self.allocator);
+        return switch (result) {
+            .success => |success| try self.allocator.dupe(u8, success.payload_json),
+            .failure => |failure| try self.buildServiceInvokeFailureResultJson(@tagName(failure.code), failure.message),
+        };
+    }
+
     fn executeServiceToolCall(self: *Session, tool_name: []const u8, args_json: []const u8) ![]u8 {
+        if (try self.executeDirectBuiltinToolCall(tool_name, args_json)) |payload| {
+            return payload;
+        }
+
         const escaped_tool_name = try unified.jsonEscape(self.allocator, tool_name);
         defer self.allocator.free(escaped_tool_name);
         const control_payload = try std.fmt.allocPrint(
@@ -16161,6 +16252,9 @@ test "acheron_session: pr_review advance primes checkout and validation for revi
     try std.testing.expect(std.mem.indexOf(u8, pr_review_result, "\"next_action\":\"draft_review\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, pr_review_result, "\"operation\":\"sync\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, pr_review_result, "\"operation\":\"run_validation\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pr_review_result, "\"context_path\":\"/nodes/local/fs/pr-review/state/DeanoC__Spiderweb/pr-130/context.json\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pr_review_result, "\"state_path\":\"/nodes/local/fs/pr-review/state/DeanoC__Spiderweb/pr-130/state.json\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pr_review_result, "\"artifact_root\":\"/nodes/local/fs/pr-review/runs/DeanoC__Spiderweb/pr-130\"") != null);
 
     const state_host_path = try std.fs.path.join(allocator, &.{ exports_dir, "pr-review", "state", "DeanoC__Spiderweb", "pr-130", "state.json" });
     defer allocator.free(state_host_path);
@@ -17940,13 +18034,37 @@ test "acheron_session: terminal-v2 session lifecycle updates current and session
     defer allocator.free(current_after_close);
     try std.testing.expect(std.mem.indexOf(u8, current_after_close, "\"session\":null") != null);
 
-    const sessions_payload = try protocolReadFile(
+    const close_status_payload = try protocolReadFile(
         &session,
         allocator,
         314,
         315,
-        &.{ "agents", "self", "terminal", "sessions.json" },
+        &.{ "agents", "self", "terminal", "status.json" },
         927,
+    );
+    defer allocator.free(close_status_payload);
+    try std.testing.expect(std.mem.indexOf(u8, close_status_payload, "\"tool\":\"terminal_session_close\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, close_status_payload, "\"session_id\":\"build\"") != null);
+
+    const close_result_payload = try protocolReadFile(
+        &session,
+        allocator,
+        316,
+        317,
+        &.{ "agents", "self", "terminal", "result.json" },
+        928,
+    );
+    defer allocator.free(close_result_payload);
+    try std.testing.expect(std.mem.indexOf(u8, close_result_payload, "\"operation\":\"close\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, close_result_payload, "\"session_id\":\"build\"") != null);
+
+    const sessions_payload = try protocolReadFile(
+        &session,
+        allocator,
+        318,
+        319,
+        &.{ "agents", "self", "terminal", "sessions.json" },
+        929,
     );
     defer allocator.free(sessions_payload);
     try std.testing.expect(std.mem.indexOf(u8, sessions_payload, "\"session_id\":\"build\"") != null);
@@ -18552,6 +18670,29 @@ test "acheron_session: terminal-v2 write and exec surface shell_exec failures" {
     defer allocator.free(exec_result_payload);
     try std.testing.expect(std.mem.indexOf(u8, exec_result_payload, "\"ok\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, exec_result_payload, "\"operation\":\"exec\"") != null);
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        368,
+        369,
+        &.{ "agents", "self", "terminal", "control", "exec.json" },
+        "{\"command\":\"echo implicit-still-fails\"}",
+        953,
+    );
+
+    const implicit_exec_result_payload = try protocolReadFile(
+        &session,
+        allocator,
+        370,
+        371,
+        &.{ "agents", "self", "terminal", "result.json" },
+        954,
+    );
+    defer allocator.free(implicit_exec_result_payload);
+    try std.testing.expect(std.mem.indexOf(u8, implicit_exec_result_payload, "\"ok\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, implicit_exec_result_payload, "\"operation\":\"exec\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, implicit_exec_result_payload, "\"session_id\":\"fail\"") != null);
 }
 
 test "acheron_session: first-class memory namespace rejects unknown invoke op" {
