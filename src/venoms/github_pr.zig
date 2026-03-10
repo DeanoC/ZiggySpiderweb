@@ -339,7 +339,12 @@ fn executeIngestEventOp(self: anytype, args_obj: std.json.ObjectMap) ![]u8 {
     const signal_request = try buildSignalRequestJson(self, "agent", "github_pr", signal_payload);
     defer self.allocator.free(signal_request);
 
-    var signal_error = try self.writeInternalPath("/global/events/control/signal.json", signal_request);
+    const events_signal_path = try self.resolvePreferredServicePath("events", "/control/signal.json");
+    defer self.allocator.free(events_signal_path);
+    const github_signal_source_path = try self.resolvePreferredServicePath("events", "/sources/agent/github_pr.json");
+    defer self.allocator.free(github_signal_source_path);
+
+    var signal_error = try self.writeInternalPath(events_signal_path, signal_request);
     defer if (signal_error) |*value| value.deinit(self.allocator);
     if (signal_error) |value| {
         return self.buildGitHubPrFailureResultJson(.ingest_event, value.code, value.message);
@@ -350,7 +355,7 @@ fn executeIngestEventOp(self: anytype, args_obj: std.json.ObjectMap) ![]u8 {
         snapshot,
         run_id,
         missionActionName(mission_action),
-        "/global/events/sources/agent/github_pr.json",
+        github_signal_source_path,
         mission_json,
     );
     defer self.allocator.free(detail);

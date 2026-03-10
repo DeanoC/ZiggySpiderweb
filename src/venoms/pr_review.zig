@@ -2647,6 +2647,14 @@ fn executeRunValidationOp(self: anytype, args_obj: std.json.ObjectMap) ![]u8 {
     try command_paths_json.append(self.allocator, '[');
     var first_command_entry = true;
     var first_command_path = true;
+    const terminal_service_path = try self.resolvePreferredServicePath("terminal", "");
+    defer self.allocator.free(terminal_service_path);
+    const terminal_create_path = try self.resolvePreferredServicePath("terminal", "/control/create.json");
+    defer self.allocator.free(terminal_create_path);
+    const terminal_exec_path = try self.resolvePreferredServicePath("terminal", "/control/exec.json");
+    defer self.allocator.free(terminal_exec_path);
+    const terminal_close_path = try self.resolvePreferredServicePath("terminal", "/control/close.json");
+    defer self.allocator.free(terminal_close_path);
 
     const create_payload = try self.buildPrReviewTerminalCreateRequestJson(context.checkout_path);
     defer self.allocator.free(create_payload);
@@ -2655,8 +2663,8 @@ fn executeRunValidationOp(self: anytype, args_obj: std.json.ObjectMap) ![]u8 {
         mission_id,
         checkpoint_stage,
         "Opened validation terminal session",
-        "/global/terminal",
-        "/global/terminal/control/create.json",
+        terminal_service_path,
+        terminal_create_path,
         create_payload,
         contract.artifact_root,
         "services/validation-create.json",
@@ -2681,8 +2689,8 @@ fn executeRunValidationOp(self: anytype, args_obj: std.json.ObjectMap) ![]u8 {
                 mission_id,
                 checkpoint_stage,
                 "Ran PR review validation command",
-                "/global/terminal",
-                "/global/terminal/control/exec.json",
+                terminal_service_path,
+                terminal_exec_path,
                 request_payload,
                 contract.artifact_root,
                 relative_path,
@@ -2760,8 +2768,8 @@ fn executeRunValidationOp(self: anytype, args_obj: std.json.ObjectMap) ![]u8 {
             mission_id,
             checkpoint_stage,
             "Closed validation terminal session",
-            "/global/terminal",
-            "/global/terminal/control/close.json",
+            terminal_service_path,
+            terminal_close_path,
             close_payload,
             contract.artifact_root,
             "services/validation-close.json",
@@ -3691,13 +3699,17 @@ fn executeAdvanceWait(
 ) ![]u8 {
     const wait_request = try buildAdvanceWaitRequestJson(self, args_obj, phase, timeout_ms);
     defer self.allocator.free(wait_request);
+    const events_wait_path = try self.resolvePreferredServicePath("events", "/control/wait.json");
+    defer self.allocator.free(events_wait_path);
+    const events_next_path = try self.resolvePreferredServicePath("events", "/next.json");
+    defer self.allocator.free(events_next_path);
 
-    var write_error = try self.writeInternalPath("/global/events/control/wait.json", wait_request);
+    var write_error = try self.writeInternalPath(events_wait_path, wait_request);
     defer if (write_error) |*value| value.deinit(self.allocator);
     if (write_error) |value| {
         return self.buildPrReviewFailureResultJson(.advance, value.code, value.message);
     }
-    const payload = (try self.tryReadInternalPath("/global/events/next.json")) orelse
+    const payload = (try self.tryReadInternalPath(events_next_path)) orelse
         try self.buildPrReviewFailureResultJson(.advance, "missing_wait_result", "events next.json produced no payload");
     return payload;
 }
@@ -3718,11 +3730,15 @@ fn buildAdvanceWaitRequestJson(
         defer self.allocator.free(raw);
         try writer.writeAll(raw);
     } else {
+        const github_event_path = try self.resolvePreferredServicePath("events", "/sources/agent/github_pr.json");
+        defer self.allocator.free(github_event_path);
+        const ci_timeout_path = try self.resolvePreferredServicePath("events", "/sources/time/after/300000.json");
+        defer self.allocator.free(ci_timeout_path);
         try writer.writeByte('[');
-        try writer.print("{f}", .{std.json.fmt("/global/events/sources/agent/github_pr.json", .{})});
+        try writer.print("{f}", .{std.json.fmt(github_event_path, .{})});
         if (std.mem.eql(u8, phase, "awaiting_ci")) {
             try writer.writeByte(',');
-            try writer.print("{f}", .{std.json.fmt("/global/events/sources/time/after/300000.json", .{})});
+            try writer.print("{f}", .{std.json.fmt(ci_timeout_path, .{})});
         }
         try writer.writeByte(']');
     }

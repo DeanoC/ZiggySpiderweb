@@ -508,6 +508,7 @@ pub const Session = struct {
     thought_job_sync_counts: std.StringHashMapUnmanaged(usize) = .{},
     project_binds: std.ArrayListUnmanaged(PathBind) = .{},
     scoped_venom_bindings: std.ArrayListUnmanaged(ScopedVenomBinding) = .{},
+    node_aliases: std.AutoHashMapUnmanaged(u32, u32) = .{},
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -591,6 +592,7 @@ pub const Session = struct {
         self.clearProjectBinds();
         self.clearScopedVenomBindings();
         self.clearThoughtJobSyncCounts();
+        self.node_aliases.deinit(self.allocator);
         var it = self.nodes.iterator();
         while (it.next()) |entry| {
             var node = entry.value_ptr.*;
@@ -1901,14 +1903,12 @@ pub const Session = struct {
             "{\"read\":true,\"write\":false}",
             "System-wide stable namespaces shared across agents/projects.",
         );
-        const global_library_dir = try self.addDir(global_root, "library", false);
-        try self.seedGlobalLibraryNamespace(global_library_dir);
-
         try self.addNodeDirectoriesFromControlPlane(nodes_root);
         for (policy.nodes.items) |node| {
             if (self.lookupChild(nodes_root, node.id) != null) continue;
             try self.addNodeDirectory(nodes_root, node, false);
         }
+        try self.seedLocalCatalogServiceNamespaces(global_root);
 
         const active_agent_dir = try self.addDir(agents_root, self.agent_id, false);
         _ = try self.addFile(active_agent_dir, "README.md", "Active agent identity in this project namespace.\n", false, .none);
@@ -1927,34 +1927,6 @@ pub const Session = struct {
             false,
             .agent_venoms_index,
         );
-        const chat = try self.addDir(global_root, "chat", false);
-        const control = try self.addDir(chat, "control", false);
-        const examples = try self.addDir(chat, "examples", false);
-        self.chat_input_id = try self.addFile(control, "input", "", true, .chat_input);
-        _ = try self.addFile(control, "reply", "", true, .chat_reply);
-        _ = try self.addFile(examples, "send.txt", shared_node.venom_contracts.chat.example_send_txt, false, .none);
-
-        const chat_schema_json = try shared_node.venom_contracts.chat.renderSchemaJson(self.allocator, "/global/jobs", "control/reply");
-        defer self.allocator.free(chat_schema_json);
-        const chat_ops_json = try shared_node.venom_contracts.chat.renderOpsJson(self.allocator, "control/input", "/global/jobs", "control/reply");
-        defer self.allocator.free(chat_ops_json);
-        const chat_status_json = try shared_node.venom_contracts.chat.renderStatusJson(self.allocator, "/global/chat", "/global/jobs");
-        defer self.allocator.free(chat_status_json);
-        _ = try self.addFile(chat, "README.md", shared_node.venom_contracts.chat.readme_md, false, .none);
-        _ = try self.addFile(chat, "SCHEMA.json", chat_schema_json, false, .none);
-        _ = try self.addFile(chat, "CAPS.json", shared_node.venom_contracts.chat.caps_json, false, .none);
-        _ = try self.addFile(chat, "OPS.json", chat_ops_json, false, .none);
-        _ = try self.addFile(chat, "STATUS.json", chat_status_json, false, .none);
-
-        const chat_meta_json = try shared_node.venom_contracts.chat.renderMetaJson(self.allocator, .{
-            .agent_id = self.agent_id,
-            .actor_type = self.actor_type,
-            .actor_id = self.actor_id,
-            .project_id = policy.project_id,
-        });
-        defer self.allocator.free(chat_meta_json);
-        _ = try self.addFile(chat, "meta.json", chat_meta_json, false, .none);
-
         const agent_venoms_dir = try self.addDir(global_root, "venoms", false);
         try self.addDirectoryDescriptors(
             agent_venoms_dir,
@@ -1976,141 +1948,6 @@ pub const Session = struct {
             "",
             false,
             .node_venom_events_log,
-        );
-
-        const memory_dir = try self.addDir(global_root, "memory", false);
-        try self.seedAgentMemoryNamespace(memory_dir);
-        const web_search_dir = try self.addDir(global_root, "web_search", false);
-        try self.seedAgentWebSearchNamespace(web_search_dir);
-        const search_code_dir = try self.addDir(global_root, "search_code", false);
-        try self.seedAgentSearchCodeNamespace(search_code_dir);
-        const terminal_dir = try self.addDir(global_root, "terminal", false);
-        try self.seedAgentTerminalNamespace(terminal_dir);
-        try self.seedLocalCatalogServiceNamespaces(global_root);
-        const sub_brains_dir = try self.addDir(global_root, "sub_brains", false);
-        try self.seedAgentSubBrainsNamespace(sub_brains_dir);
-        const agents_control_dir = try self.addDir(global_root, "agents", false);
-        try self.seedAgentAgentsNamespace(agents_control_dir);
-        const projects_control_dir = try self.addDir(global_root, "projects", false);
-        try self.seedAgentProjectsNamespace(projects_control_dir);
-
-        self.jobs_root_id = try self.addDir(global_root, "jobs", false);
-        try self.addDirectoryDescriptors(
-            self.jobs_root_id,
-            "Jobs",
-            "{\"kind\":\"collection\",\"entries\":\"job_id\",\"files\":[\"status.json\",\"result.txt\",\"log.txt\"]}",
-            "{\"read\":true,\"write\":false}",
-            "Chat job status and outputs.",
-        );
-        const jobs_schema_json = try shared_node.venom_contracts.jobs.renderSchemaJson(self.allocator, "/global/jobs");
-        defer self.allocator.free(jobs_schema_json);
-        const jobs_status_json = try shared_node.venom_contracts.jobs.renderStatusJson(self.allocator, "/global/jobs");
-        defer self.allocator.free(jobs_status_json);
-        _ = try self.addFile(self.jobs_root_id, "README.md", shared_node.venom_contracts.jobs.readme_md, false, .none);
-        _ = try self.addFile(self.jobs_root_id, "SCHEMA.json", jobs_schema_json, false, .none);
-        _ = try self.addFile(self.jobs_root_id, "CAPS.json", shared_node.venom_contracts.jobs.caps_json, false, .none);
-        _ = try self.addFile(self.jobs_root_id, "OPS.json", shared_node.venom_contracts.jobs.ops_json, false, .none);
-        _ = try self.addFile(self.jobs_root_id, "STATUS.json", jobs_status_json, false, .none);
-        try self.seedJobsFromIndex();
-
-        const thoughts_dir = try self.addDir(global_root, "thoughts", false);
-        try self.addDirectoryDescriptors(
-            thoughts_dir,
-            "Thoughts",
-            "{\"kind\":\"stream\",\"files\":[\"latest.txt\",\"history.ndjson\",\"status.json\"]}",
-            "{\"read\":true,\"write\":false}",
-            "Runtime internal thought stream (not chat output).",
-        );
-        _ = try self.addFile(
-            thoughts_dir,
-            "README.md",
-            shared_node.venom_contracts.thoughts.readme_md,
-            false,
-            .none,
-        );
-        _ = try self.addFile(
-            thoughts_dir,
-            "SCHEMA.json",
-            shared_node.venom_contracts.thoughts.schema_json,
-            false,
-            .none,
-        );
-        _ = try self.addFile(
-            thoughts_dir,
-            "CAPS.json",
-            shared_node.venom_contracts.thoughts.caps_json,
-            false,
-            .none,
-        );
-        _ = try self.addFile(thoughts_dir, "OPS.json", shared_node.venom_contracts.thoughts.ops_json, false, .none);
-        self.thoughts_latest_id = try self.addFile(thoughts_dir, "latest.txt", "", false, .none);
-        self.thoughts_history_id = try self.addFile(thoughts_dir, "history.ndjson", "", false, .none);
-        self.thoughts_status_id = try self.addFile(
-            thoughts_dir,
-            "status.json",
-            shared_node.venom_contracts.thoughts.initial_status_json,
-            false,
-            .none,
-        );
-
-        const events_dir = try self.addDir(global_root, "events", false);
-        const events_control_dir = try self.addDir(events_dir, "control", false);
-        const events_sources_dir = try self.addDir(events_dir, "sources", false);
-        _ = try self.addFile(events_dir, "README.md", shared_node.venom_contracts.events.readme_md, false, .none);
-        _ = try self.addFile(
-            events_dir,
-            "SCHEMA.json",
-            shared_node.venom_contracts.events.schema_json,
-            false,
-            .none,
-        );
-        _ = try self.addFile(
-            events_dir,
-            "CAPS.json",
-            shared_node.venom_contracts.events.caps_json,
-            false,
-            .none,
-        );
-        _ = try self.addFile(events_dir, "OPS.json", shared_node.venom_contracts.events.ops_json, false, .none);
-        _ = try self.addFile(events_dir, "STATUS.json", shared_node.venom_contracts.events.status_json, false, .none);
-        _ = try self.addFile(
-            events_control_dir,
-            "README.md",
-            shared_node.venom_contracts.events.control_readme_md,
-            false,
-            .none,
-        );
-        _ = try self.addFile(
-            events_control_dir,
-            "wait.json",
-            shared_node.venom_contracts.events.default_wait_json,
-            true,
-            .event_wait_config,
-        );
-        _ = try self.addFile(
-            events_control_dir,
-            "signal.json",
-            shared_node.venom_contracts.events.default_signal_json,
-            true,
-            .event_signal,
-        );
-        _ = try self.addFile(
-            events_sources_dir,
-            "README.md",
-            shared_node.venom_contracts.events.sources_readme_md,
-            false,
-            .none,
-        );
-        _ = try self.addFile(events_sources_dir, "agent.json", shared_node.venom_contracts.events.agent_source_help_md, false, .none);
-        _ = try self.addFile(events_sources_dir, "hook.json", shared_node.venom_contracts.events.hook_source_help_md, false, .none);
-        _ = try self.addFile(events_sources_dir, "user.json", shared_node.venom_contracts.events.user_source_help_md, false, .none);
-        _ = try self.addFile(events_sources_dir, "time.json", shared_node.venom_contracts.events.time_source_help_md, false, .none);
-        self.event_next_id = try self.addFile(
-            events_dir,
-            "next.json",
-            shared_node.venom_contracts.events.initial_next_json,
-            false,
-            .event_next,
         );
 
         for (policy.visible_agents.items) |agent_name| {
@@ -2837,6 +2674,7 @@ pub const Session = struct {
             .dir => try self.addDir(target_parent_id, name, source.writable),
             .file => try self.addFile(target_parent_id, name, source.content, source.writable, source.special),
         };
+        try self.registerNodeAliasPair(source_id, target_id);
         if (source.kind == .dir) {
             var it = source.children.iterator();
             while (it.next()) |entry| {
@@ -2844,6 +2682,47 @@ pub const Session = struct {
             }
         }
         return target_id;
+    }
+
+    fn registerNodeAliasPair(self: *Session, source_id: u32, alias_id: u32) !void {
+        if (source_id == 0 or alias_id == 0 or source_id == alias_id) return;
+        try self.node_aliases.put(self.allocator, source_id, alias_id);
+        try self.node_aliases.put(self.allocator, alias_id, source_id);
+    }
+
+    fn ensureAliasedSubtree(self: *Session, source_id: u32) !void {
+        const source = self.nodes.get(source_id) orelse return error.MissingNode;
+        if (self.node_aliases.get(source_id)) |alias_id| {
+            if (source.kind == .file) {
+                try self.setFileContentRaw(alias_id, source.content);
+                return;
+            }
+            var existing_it = source.children.iterator();
+            while (existing_it.next()) |entry| {
+                try self.ensureAliasedSubtree(entry.value_ptr.*);
+            }
+            return;
+        }
+
+        const parent_id = source.parent orelse return;
+        const alias_parent_id = self.node_aliases.get(parent_id) orelse return;
+        const alias_id = if (self.lookupChild(alias_parent_id, source.name)) |existing|
+            existing
+        else switch (source.kind) {
+            .dir => try self.addDir(alias_parent_id, source.name, source.writable),
+            .file => try self.addFile(alias_parent_id, source.name, source.content, source.writable, source.special),
+        };
+        try self.registerNodeAliasPair(source_id, alias_id);
+
+        if (source.kind == .file) {
+            try self.setFileContentRaw(alias_id, source.content);
+            return;
+        }
+
+        var child_it = source.children.iterator();
+        while (child_it.next()) |entry| {
+            try self.ensureAliasedSubtree(entry.value_ptr.*);
+        }
     }
 
     fn registerLocalCatalogVenomBinding(self: *Session, venom_id: []const u8, scope: []const u8) !void {
@@ -2870,25 +2749,78 @@ pub const Session = struct {
         );
     }
 
+    fn cloneLocalCatalogVenomAlias(self: *Session, source_dir: u32, global_root: u32, venom_id: []const u8) !u32 {
+        return self.cloneNodeSubtree(source_dir, global_root, venom_id);
+    }
+
     fn seedLocalCatalogServiceNamespaces(self: *Session, global_root: u32) !void {
         const local_venoms_root = self.lookupLocalNodeVenomsRoot() orelse return;
 
+        const library_dir = try self.addDir(local_venoms_root, "library", false);
+        try self.seedGlobalLibraryNamespaceAt(library_dir, "/nodes/local/venoms/library");
+        _ = try self.cloneLocalCatalogVenomAlias(library_dir, global_root, "library");
+
+        const chat_dir = try self.addDir(local_venoms_root, "chat", false);
+        try self.seedChatNamespaceAt(chat_dir, "/nodes/local/venoms/chat", "/nodes/local/venoms/jobs");
+        _ = try self.cloneLocalCatalogVenomAlias(chat_dir, global_root, "chat");
+
+        const jobs_dir = try self.addDir(local_venoms_root, "jobs", false);
+        try self.seedJobsNamespaceAt(jobs_dir, "/nodes/local/venoms/jobs");
+        try self.seedJobsFromIndex();
+        _ = try self.cloneLocalCatalogVenomAlias(jobs_dir, global_root, "jobs");
+
+        const thoughts_dir = try self.addDir(local_venoms_root, "thoughts", false);
+        try self.seedThoughtsNamespaceAt(thoughts_dir, "/nodes/local/venoms/thoughts");
+        _ = try self.cloneLocalCatalogVenomAlias(thoughts_dir, global_root, "thoughts");
+
+        const events_dir = try self.addDir(local_venoms_root, "events", false);
+        try self.seedEventsNamespaceAt(events_dir, "/nodes/local/venoms/events");
+        _ = try self.cloneLocalCatalogVenomAlias(events_dir, global_root, "events");
+
+        const memory_dir = try self.addDir(local_venoms_root, "memory", false);
+        try self.seedAgentMemoryNamespaceAt(memory_dir, "/nodes/local/venoms/memory");
+        _ = try self.cloneLocalCatalogVenomAlias(memory_dir, global_root, "memory");
+
+        const web_search_dir = try self.addDir(local_venoms_root, "web_search", false);
+        try self.seedAgentWebSearchNamespaceAt(web_search_dir, "/nodes/local/venoms/web_search");
+        _ = try self.cloneLocalCatalogVenomAlias(web_search_dir, global_root, "web_search");
+
+        const search_code_dir = try self.addDir(local_venoms_root, "search_code", false);
+        try self.seedAgentSearchCodeNamespaceAt(search_code_dir, "/nodes/local/venoms/search_code");
+        _ = try self.cloneLocalCatalogVenomAlias(search_code_dir, global_root, "search_code");
+
+        const terminal_dir = try self.addDir(local_venoms_root, "terminal", false);
+        try self.seedAgentTerminalNamespaceAt(terminal_dir, "/nodes/local/venoms/terminal");
+        _ = try self.cloneLocalCatalogVenomAlias(terminal_dir, global_root, "terminal");
+
         const mounts_dir = try self.addDir(local_venoms_root, "mounts", false);
         try self.seedAgentMountsNamespaceAt(mounts_dir, "/nodes/local/venoms/mounts");
-        const mounts_alias_dir = try self.cloneNodeSubtree(mounts_dir, global_root, "mounts");
+        const mounts_alias_dir = try self.cloneLocalCatalogVenomAlias(mounts_dir, global_root, "mounts");
         self.mounts_status_alias_id = self.lookupChild(mounts_alias_dir, "status.json") orelse 0;
         self.mounts_result_alias_id = self.lookupChild(mounts_alias_dir, "result.json") orelse 0;
+
+        const sub_brains_dir = try self.addDir(local_venoms_root, "sub_brains", false);
+        try self.seedAgentSubBrainsNamespaceAt(sub_brains_dir, "/nodes/local/venoms/sub_brains");
+        _ = try self.cloneLocalCatalogVenomAlias(sub_brains_dir, global_root, "sub_brains");
+
+        const agents_dir = try self.addDir(local_venoms_root, "agents", false);
+        try self.seedAgentAgentsNamespaceAt(agents_dir, "/nodes/local/venoms/agents");
+        _ = try self.cloneLocalCatalogVenomAlias(agents_dir, global_root, "agents");
+
+        const projects_dir = try self.addDir(local_venoms_root, "projects", false);
+        try self.seedAgentProjectsNamespaceAt(projects_dir, "/nodes/local/venoms/projects");
+        _ = try self.cloneLocalCatalogVenomAlias(projects_dir, global_root, "projects");
 
         if (self.local_fs_export_root != null) {
             const git_dir = try self.addDir(local_venoms_root, "git", false);
             try self.seedAgentGitNamespaceAt(git_dir, "/nodes/local/venoms/git");
-            const git_alias_dir = try self.cloneNodeSubtree(git_dir, global_root, "git");
+            const git_alias_dir = try self.cloneLocalCatalogVenomAlias(git_dir, global_root, "git");
             self.git_status_alias_id = self.lookupChild(git_alias_dir, "status.json") orelse 0;
             self.git_result_alias_id = self.lookupChild(git_alias_dir, "result.json") orelse 0;
 
             const github_pr_dir = try self.addDir(local_venoms_root, "github_pr", false);
             try self.seedAgentGitHubPrNamespaceAt(github_pr_dir, "/nodes/local/venoms/github_pr");
-            const github_pr_alias_dir = try self.cloneNodeSubtree(github_pr_dir, global_root, "github_pr");
+            const github_pr_alias_dir = try self.cloneLocalCatalogVenomAlias(github_pr_dir, global_root, "github_pr");
             self.github_pr_status_alias_id = self.lookupChild(github_pr_alias_dir, "status.json") orelse 0;
             self.github_pr_result_alias_id = self.lookupChild(github_pr_alias_dir, "result.json") orelse 0;
         }
@@ -2896,21 +2828,33 @@ pub const Session = struct {
         if (self.mission_store != null) {
             const missions_dir = try self.addDir(local_venoms_root, "missions", false);
             try self.seedAgentMissionsNamespaceAt(missions_dir, "/nodes/local/venoms/missions");
-            const missions_alias_dir = try self.cloneNodeSubtree(missions_dir, global_root, "missions");
+            const missions_alias_dir = try self.cloneLocalCatalogVenomAlias(missions_dir, global_root, "missions");
             self.missions_status_alias_id = self.lookupChild(missions_alias_dir, "status.json") orelse 0;
             self.missions_result_alias_id = self.lookupChild(missions_alias_dir, "result.json") orelse 0;
 
             if (self.local_fs_export_root != null) {
                 const pr_review_dir = try self.addDir(local_venoms_root, "pr_review", false);
                 try self.seedAgentPrReviewNamespaceAt(pr_review_dir, "/nodes/local/venoms/pr_review");
-                const pr_review_alias_dir = try self.cloneNodeSubtree(pr_review_dir, global_root, "pr_review");
+                const pr_review_alias_dir = try self.cloneLocalCatalogVenomAlias(pr_review_dir, global_root, "pr_review");
                 self.pr_review_status_alias_id = self.lookupChild(pr_review_alias_dir, "status.json") orelse 0;
                 self.pr_review_result_alias_id = self.lookupChild(pr_review_alias_dir, "result.json") orelse 0;
             }
         }
 
         try self.refreshNodeVenomsIndex("local");
+        try self.registerLocalCatalogVenomBinding("library", "node_catalog");
+        try self.registerLocalCatalogVenomBinding("chat", "node_catalog");
+        try self.registerLocalCatalogVenomBinding("jobs", "node_catalog");
+        try self.registerLocalCatalogVenomBinding("thoughts", "node_catalog");
+        try self.registerLocalCatalogVenomBinding("events", "node_catalog");
+        try self.registerLocalCatalogVenomBinding("memory", "node_catalog");
+        try self.registerLocalCatalogVenomBinding("web_search", "node_catalog");
+        try self.registerLocalCatalogVenomBinding("search_code", "node_catalog");
+        try self.registerLocalCatalogVenomBinding("terminal", "node_catalog");
         try self.registerLocalCatalogVenomBinding("mounts", "node_catalog");
+        try self.registerLocalCatalogVenomBinding("sub_brains", "node_catalog");
+        try self.registerLocalCatalogVenomBinding("agents", "node_catalog");
+        try self.registerLocalCatalogVenomBinding("projects", "node_catalog");
         if (self.local_fs_export_root != null) {
             try self.registerLocalCatalogVenomBinding("git", "node_catalog");
             try self.registerLocalCatalogVenomBinding("github_pr", "node_catalog");
@@ -3232,10 +3176,22 @@ pub const Session = struct {
     }
 
     fn seedAgentMemoryNamespace(self: *Session, memory_dir: u32) !void {
+        return self.seedAgentMemoryNamespaceAt(memory_dir, "/global/memory");
+    }
+
+    fn seedAgentMemoryNamespaceAt(self: *Session, memory_dir: u32, base_path: []const u8) !void {
+        const escaped_base_path = try unified.jsonEscape(self.allocator, base_path);
+        defer self.allocator.free(escaped_base_path);
+        const shape_json = try std.fmt.allocPrint(
+            self.allocator,
+            "{{\"kind\":\"venom\",\"venom_id\":\"memory\",\"shape\":\"{s}/{{README.md,SCHEMA.json,CAPS.json,OPS.json,PERMISSIONS.json,STATUS.json,status.json,result.json,control/*}}\"}}",
+            .{escaped_base_path},
+        );
+        defer self.allocator.free(shape_json);
         try self.addDirectoryDescriptors(
             memory_dir,
             "Memory",
-            "{\"kind\":\"venom\",\"venom_id\":\"memory\",\"shape\":\"/global/memory/{README.md,SCHEMA.json,CAPS.json,OPS.json,PERMISSIONS.json,STATUS.json,status.json,result.json,control/*}\"}",
+            shape_json,
             "{\"invoke\":true,\"operations\":[\"memory_create\",\"memory_load\",\"memory_versions\",\"memory_mutate\",\"memory_evict\",\"memory_search\"],\"discoverable\":true}",
             "First-class memory namespace. Write operation payloads to control/*.json, then read status.json/result.json.",
         );
@@ -3300,10 +3256,22 @@ pub const Session = struct {
     }
 
     fn seedAgentWebSearchNamespace(self: *Session, web_search_dir: u32) !void {
+        return self.seedAgentWebSearchNamespaceAt(web_search_dir, "/global/web_search");
+    }
+
+    fn seedAgentWebSearchNamespaceAt(self: *Session, web_search_dir: u32, base_path: []const u8) !void {
+        const escaped_base_path = try unified.jsonEscape(self.allocator, base_path);
+        defer self.allocator.free(escaped_base_path);
+        const shape_json = try std.fmt.allocPrint(
+            self.allocator,
+            "{{\"kind\":\"venom\",\"venom_id\":\"web_search\",\"shape\":\"{s}/{{README.md,SCHEMA.json,CAPS.json,OPS.json,RUNTIME.json,PERMISSIONS.json,STATUS.json,status.json,result.json,control/*}}\"}}",
+            .{escaped_base_path},
+        );
+        defer self.allocator.free(shape_json);
         try self.addDirectoryDescriptors(
             web_search_dir,
             "Web Search",
-            "{\"kind\":\"venom\",\"venom_id\":\"web_search\",\"shape\":\"/global/web_search/{README.md,SCHEMA.json,CAPS.json,OPS.json,RUNTIME.json,PERMISSIONS.json,STATUS.json,status.json,result.json,control/*}\"}",
+            shape_json,
             "{\"invoke\":true,\"operations\":[\"web_search\"],\"discoverable\":true,\"network\":true}",
             "First-class web search namespace. Write search payloads to control/search.json (or invoke.json), then read status.json/result.json.",
         );
@@ -3363,10 +3331,22 @@ pub const Session = struct {
     }
 
     fn seedAgentSearchCodeNamespace(self: *Session, search_code_dir: u32) !void {
+        return self.seedAgentSearchCodeNamespaceAt(search_code_dir, "/global/search_code");
+    }
+
+    fn seedAgentSearchCodeNamespaceAt(self: *Session, search_code_dir: u32, base_path: []const u8) !void {
+        const escaped_base_path = try unified.jsonEscape(self.allocator, base_path);
+        defer self.allocator.free(escaped_base_path);
+        const shape_json = try std.fmt.allocPrint(
+            self.allocator,
+            "{{\"kind\":\"venom\",\"venom_id\":\"search_code\",\"shape\":\"{s}/{{README.md,SCHEMA.json,CAPS.json,OPS.json,RUNTIME.json,PERMISSIONS.json,STATUS.json,status.json,result.json,control/*}}\"}}",
+            .{escaped_base_path},
+        );
+        defer self.allocator.free(shape_json);
         try self.addDirectoryDescriptors(
             search_code_dir,
             "Search Code",
-            "{\"kind\":\"venom\",\"venom_id\":\"search_code\",\"shape\":\"/global/search_code/{README.md,SCHEMA.json,CAPS.json,OPS.json,RUNTIME.json,PERMISSIONS.json,STATUS.json,status.json,result.json,control/*}\"}",
+            shape_json,
             "{\"invoke\":true,\"operations\":[\"search_code\"],\"discoverable\":true}",
             "First-class code search namespace. Write search payloads to control/search.json (or invoke.json), then read status.json/result.json.",
         );
@@ -3426,10 +3406,22 @@ pub const Session = struct {
     }
 
     fn seedAgentTerminalNamespace(self: *Session, terminal_dir: u32) !void {
+        return self.seedAgentTerminalNamespaceAt(terminal_dir, "/global/terminal");
+    }
+
+    fn seedAgentTerminalNamespaceAt(self: *Session, terminal_dir: u32, base_path: []const u8) !void {
+        const escaped_base_path = try unified.jsonEscape(self.allocator, base_path);
+        defer self.allocator.free(escaped_base_path);
+        const shape_json = try std.fmt.allocPrint(
+            self.allocator,
+            "{{\"kind\":\"venom\",\"venom_id\":\"terminal-v2\",\"shape\":\"{s}/{{README.md,SCHEMA.json,CAPS.json,OPS.json,RUNTIME.json,PERMISSIONS.json,STATUS.json,status.json,result.json,sessions.json,current.json,control/*}}\"}}",
+            .{escaped_base_path},
+        );
+        defer self.allocator.free(shape_json);
         try self.addDirectoryDescriptors(
             terminal_dir,
             "Terminal",
-            "{\"kind\":\"venom\",\"venom_id\":\"terminal-v2\",\"shape\":\"/global/terminal/{README.md,SCHEMA.json,CAPS.json,OPS.json,RUNTIME.json,PERMISSIONS.json,STATUS.json,status.json,result.json,sessions.json,current.json,control/*}\"}",
+            shape_json,
             "{\"invoke\":true,\"operations\":[\"terminal_session_create\",\"terminal_session_resume\",\"terminal_session_close\",\"terminal_session_write\",\"terminal_session_read\",\"terminal_session_resize\",\"shell_exec\"],\"discoverable\":true,\"interactive\":true,\"sessionized\":true,\"pty\":true}",
             "Sessionized terminal namespace. Create/resume/close PTY sessions and use write/read/resize for interactive workflows.",
         );
@@ -3608,15 +3600,27 @@ pub const Session = struct {
     }
 
     fn seedAgentSubBrainsNamespace(self: *Session, sub_brains_dir: u32) !void {
+        return self.seedAgentSubBrainsNamespaceAt(sub_brains_dir, "/global/sub_brains");
+    }
+
+    fn seedAgentSubBrainsNamespaceAt(self: *Session, sub_brains_dir: u32, base_path: []const u8) !void {
         const can_manage_sub_brains = self.canManageSubBrains();
         const caps_json = if (can_manage_sub_brains)
             "{\"invoke\":true,\"operations\":[\"sub_brains_list\",\"sub_brains_upsert\",\"sub_brains_delete\"],\"discoverable\":true,\"config_mutation\":true,\"manage_allowed\":true}"
         else
             "{\"invoke\":true,\"operations\":[\"sub_brains_list\"],\"discoverable\":true,\"config_mutation\":false,\"manage_allowed\":false}";
+        const escaped_base_path = try unified.jsonEscape(self.allocator, base_path);
+        defer self.allocator.free(escaped_base_path);
+        const shape_json = try std.fmt.allocPrint(
+            self.allocator,
+            "{{\"kind\":\"venom\",\"venom_id\":\"sub_brains\",\"shape\":\"{s}/{{README.md,SCHEMA.json,CAPS.json,OPS.json,PERMISSIONS.json,STATUS.json,status.json,result.json,control/*}}\"}}",
+            .{escaped_base_path},
+        );
+        defer self.allocator.free(shape_json);
         try self.addDirectoryDescriptors(
             sub_brains_dir,
             "Sub-Brains",
-            "{\"kind\":\"venom\",\"venom_id\":\"sub_brains\",\"shape\":\"/global/sub_brains/{README.md,SCHEMA.json,CAPS.json,OPS.json,PERMISSIONS.json,STATUS.json,status.json,result.json,control/*}\"}",
+            shape_json,
             caps_json,
             "Manage sub-brain configuration for this agent through Acheron control files.",
         );
@@ -3680,15 +3684,27 @@ pub const Session = struct {
     }
 
     fn seedAgentAgentsNamespace(self: *Session, agents_dir: u32) !void {
+        return self.seedAgentAgentsNamespaceAt(agents_dir, "/global/agents");
+    }
+
+    fn seedAgentAgentsNamespaceAt(self: *Session, agents_dir: u32, base_path: []const u8) !void {
         const can_create_agents = self.canCreateAgents();
         const caps_json = if (can_create_agents)
             "{\"invoke\":true,\"operations\":[\"agents_list\",\"agents_create\"],\"discoverable\":true,\"create_allowed\":true}"
         else
             "{\"invoke\":true,\"operations\":[\"agents_list\"],\"discoverable\":true,\"create_allowed\":false}";
+        const escaped_base_path = try unified.jsonEscape(self.allocator, base_path);
+        defer self.allocator.free(escaped_base_path);
+        const shape_json = try std.fmt.allocPrint(
+            self.allocator,
+            "{{\"kind\":\"venom\",\"venom_id\":\"agents\",\"shape\":\"{s}/{{README.md,SCHEMA.json,CAPS.json,OPS.json,PERMISSIONS.json,STATUS.json,status.json,result.json,control/*}}\"}}",
+            .{escaped_base_path},
+        );
+        defer self.allocator.free(shape_json);
         try self.addDirectoryDescriptors(
             agents_dir,
             "Agents Management",
-            "{\"kind\":\"venom\",\"venom_id\":\"agents\",\"shape\":\"/global/agents/{README.md,SCHEMA.json,CAPS.json,OPS.json,PERMISSIONS.json,STATUS.json,status.json,result.json,control/*}\"}",
+            shape_json,
             caps_json,
             "List and create agent workspaces through Acheron control files.",
         );
@@ -3751,10 +3767,22 @@ pub const Session = struct {
     }
 
     fn seedAgentProjectsNamespace(self: *Session, projects_dir: u32) !void {
+        return self.seedAgentProjectsNamespaceAt(projects_dir, "/global/projects");
+    }
+
+    fn seedAgentProjectsNamespaceAt(self: *Session, projects_dir: u32, base_path: []const u8) !void {
+        const escaped_base_path = try unified.jsonEscape(self.allocator, base_path);
+        defer self.allocator.free(escaped_base_path);
+        const shape_json = try std.fmt.allocPrint(
+            self.allocator,
+            "{{\"kind\":\"venom\",\"venom_id\":\"projects\",\"shape\":\"{s}/{{README.md,SCHEMA.json,CAPS.json,OPS.json,PERMISSIONS.json,STATUS.json,status.json,result.json,control/*}}\"}}",
+            .{escaped_base_path},
+        );
+        defer self.allocator.free(shape_json);
         try self.addDirectoryDescriptors(
             projects_dir,
             "Projects Management",
-            "{\"kind\":\"venom\",\"venom_id\":\"projects\",\"shape\":\"/global/projects/{README.md,SCHEMA.json,CAPS.json,OPS.json,PERMISSIONS.json,STATUS.json,status.json,result.json,control/*}\"}",
+            shape_json,
             "{\"invoke\":true,\"operations\":[\"projects_list\",\"projects_get\",\"projects_up\"],\"discoverable\":true}",
             "List, inspect, and create/update projects through Acheron control files.",
         );
@@ -3817,6 +3845,160 @@ pub const Session = struct {
         _ = try self.addFile(control_dir, "up.json", "", true, .projects_up);
     }
 
+    fn seedChatNamespaceAt(self: *Session, chat_dir: u32, base_path: []const u8, jobs_path: []const u8) !void {
+        const escaped_base_path = try unified.jsonEscape(self.allocator, base_path);
+        defer self.allocator.free(escaped_base_path);
+        const shape_json = try std.fmt.allocPrint(
+            self.allocator,
+            "{{\"kind\":\"venom\",\"venom_id\":\"chat\",\"shape\":\"{s}/{{README.md,SCHEMA.json,CAPS.json,OPS.json,STATUS.json,meta.json,control/*,examples/*}}\"}}",
+            .{escaped_base_path},
+        );
+        defer self.allocator.free(shape_json);
+        try self.addDirectoryDescriptors(
+            chat_dir,
+            "Chat",
+            shape_json,
+            "{\"invoke\":true,\"discoverable\":true,\"job_queue\":true}",
+            "Chat submit/reply namespace. Write prompts to control/input and read queued job outputs from the jobs venom.",
+        );
+
+        const control = try self.addDir(chat_dir, "control", false);
+        const examples = try self.addDir(chat_dir, "examples", false);
+        self.chat_input_id = try self.addFile(control, "input", "", true, .chat_input);
+        _ = try self.addFile(control, "reply", "", true, .chat_reply);
+        _ = try self.addFile(examples, "send.txt", shared_node.venom_contracts.chat.example_send_txt, false, .none);
+
+        const chat_schema_json = try shared_node.venom_contracts.chat.renderSchemaJson(self.allocator, jobs_path, "control/reply");
+        defer self.allocator.free(chat_schema_json);
+        const chat_ops_json = try shared_node.venom_contracts.chat.renderOpsJson(self.allocator, "control/input", jobs_path, "control/reply");
+        defer self.allocator.free(chat_ops_json);
+        const chat_status_json = try shared_node.venom_contracts.chat.renderStatusJson(self.allocator, base_path, jobs_path);
+        defer self.allocator.free(chat_status_json);
+        _ = try self.addFile(chat_dir, "README.md", shared_node.venom_contracts.chat.readme_md, false, .none);
+        _ = try self.addFile(chat_dir, "SCHEMA.json", chat_schema_json, false, .none);
+        _ = try self.addFile(chat_dir, "CAPS.json", shared_node.venom_contracts.chat.caps_json, false, .none);
+        _ = try self.addFile(chat_dir, "OPS.json", chat_ops_json, false, .none);
+        _ = try self.addFile(chat_dir, "STATUS.json", chat_status_json, false, .none);
+
+        const chat_meta_json = try shared_node.venom_contracts.chat.renderMetaJson(self.allocator, .{
+            .agent_id = self.agent_id,
+            .actor_type = self.actor_type,
+            .actor_id = self.actor_id,
+            .project_id = self.active_namespace_project_id orelse self.project_id orelse "",
+        });
+        defer self.allocator.free(chat_meta_json);
+        _ = try self.addFile(chat_dir, "meta.json", chat_meta_json, false, .none);
+    }
+
+    fn seedJobsNamespaceAt(self: *Session, jobs_dir: u32, base_path: []const u8) !void {
+        self.jobs_root_id = jobs_dir;
+        try self.addDirectoryDescriptors(
+            jobs_dir,
+            "Jobs",
+            "{\"kind\":\"collection\",\"entries\":\"job_id\",\"files\":[\"status.json\",\"result.txt\",\"log.txt\"]}",
+            "{\"read\":true,\"write\":false}",
+            "Chat job status and outputs.",
+        );
+        const jobs_schema_json = try shared_node.venom_contracts.jobs.renderSchemaJson(self.allocator, base_path);
+        defer self.allocator.free(jobs_schema_json);
+        const jobs_status_json = try shared_node.venom_contracts.jobs.renderStatusJson(self.allocator, base_path);
+        defer self.allocator.free(jobs_status_json);
+        _ = try self.addFile(jobs_dir, "README.md", shared_node.venom_contracts.jobs.readme_md, false, .none);
+        _ = try self.addFile(jobs_dir, "SCHEMA.json", jobs_schema_json, false, .none);
+        _ = try self.addFile(jobs_dir, "CAPS.json", shared_node.venom_contracts.jobs.caps_json, false, .none);
+        _ = try self.addFile(jobs_dir, "OPS.json", shared_node.venom_contracts.jobs.ops_json, false, .none);
+        _ = try self.addFile(jobs_dir, "STATUS.json", jobs_status_json, false, .none);
+    }
+
+    fn seedThoughtsNamespaceAt(self: *Session, thoughts_dir: u32, base_path: []const u8) !void {
+        const escaped_base_path = try unified.jsonEscape(self.allocator, base_path);
+        defer self.allocator.free(escaped_base_path);
+        const shape_json = try std.fmt.allocPrint(
+            self.allocator,
+            "{{\"kind\":\"venom\",\"venom_id\":\"thoughts\",\"shape\":\"{s}/{{README.md,SCHEMA.json,CAPS.json,OPS.json,latest.txt,history.ndjson,status.json}}\"}}",
+            .{escaped_base_path},
+        );
+        defer self.allocator.free(shape_json);
+        try self.addDirectoryDescriptors(
+            thoughts_dir,
+            "Thoughts",
+            shape_json,
+            "{\"read\":true,\"write\":false,\"discoverable\":true}",
+            "Runtime internal thought stream (not chat output).",
+        );
+        _ = try self.addFile(
+            thoughts_dir,
+            "README.md",
+            shared_node.venom_contracts.thoughts.readme_md,
+            false,
+            .none,
+        );
+        _ = try self.addFile(
+            thoughts_dir,
+            "SCHEMA.json",
+            shared_node.venom_contracts.thoughts.schema_json,
+            false,
+            .none,
+        );
+        _ = try self.addFile(
+            thoughts_dir,
+            "CAPS.json",
+            shared_node.venom_contracts.thoughts.caps_json,
+            false,
+            .none,
+        );
+        _ = try self.addFile(thoughts_dir, "OPS.json", shared_node.venom_contracts.thoughts.ops_json, false, .none);
+        self.thoughts_latest_id = try self.addFile(thoughts_dir, "latest.txt", "", false, .none);
+        self.thoughts_history_id = try self.addFile(thoughts_dir, "history.ndjson", "", false, .none);
+        self.thoughts_status_id = try self.addFile(
+            thoughts_dir,
+            "status.json",
+            shared_node.venom_contracts.thoughts.initial_status_json,
+            false,
+            .none,
+        );
+    }
+
+    fn seedEventsNamespaceAt(self: *Session, events_dir: u32, base_path: []const u8) !void {
+        const escaped_base_path = try unified.jsonEscape(self.allocator, base_path);
+        defer self.allocator.free(escaped_base_path);
+        const shape_json = try std.fmt.allocPrint(
+            self.allocator,
+            "{{\"kind\":\"venom\",\"venom_id\":\"events\",\"shape\":\"{s}/{{README.md,SCHEMA.json,CAPS.json,OPS.json,STATUS.json,next.json,control/*,sources/*}}\"}}",
+            .{escaped_base_path},
+        );
+        defer self.allocator.free(shape_json);
+        const events_control_dir = try self.addDir(events_dir, "control", false);
+        const events_sources_dir = try self.addDir(events_dir, "sources", false);
+        try self.addDirectoryDescriptors(
+            events_dir,
+            "Events",
+            shape_json,
+            shared_node.venom_contracts.events.caps_json,
+            "Event wait/signal namespace for agent runtime coordination.",
+        );
+        _ = try self.addFile(events_dir, "README.md", shared_node.venom_contracts.events.readme_md, false, .none);
+        _ = try self.addFile(events_dir, "SCHEMA.json", shared_node.venom_contracts.events.schema_json, false, .none);
+        _ = try self.addFile(events_dir, "CAPS.json", shared_node.venom_contracts.events.caps_json, false, .none);
+        _ = try self.addFile(events_dir, "OPS.json", shared_node.venom_contracts.events.ops_json, false, .none);
+        _ = try self.addFile(events_dir, "STATUS.json", shared_node.venom_contracts.events.status_json, false, .none);
+        _ = try self.addFile(events_control_dir, "README.md", shared_node.venom_contracts.events.control_readme_md, false, .none);
+        _ = try self.addFile(events_control_dir, "wait.json", shared_node.venom_contracts.events.default_wait_json, true, .event_wait_config);
+        _ = try self.addFile(events_control_dir, "signal.json", shared_node.venom_contracts.events.default_signal_json, true, .event_signal);
+        _ = try self.addFile(events_sources_dir, "README.md", shared_node.venom_contracts.events.sources_readme_md, false, .none);
+        _ = try self.addFile(events_sources_dir, "agent.json", shared_node.venom_contracts.events.agent_source_help_md, false, .none);
+        _ = try self.addFile(events_sources_dir, "hook.json", shared_node.venom_contracts.events.hook_source_help_md, false, .none);
+        _ = try self.addFile(events_sources_dir, "user.json", shared_node.venom_contracts.events.user_source_help_md, false, .none);
+        _ = try self.addFile(events_sources_dir, "time.json", shared_node.venom_contracts.events.time_source_help_md, false, .none);
+        self.event_next_id = try self.addFile(
+            events_dir,
+            "next.json",
+            shared_node.venom_contracts.events.initial_next_json,
+            false,
+            .event_next,
+        );
+    }
+
     fn seedAgentPrReviewNamespace(self: *Session, pr_review_dir: u32) !void {
         return pr_review_venom.seedNamespace(self, pr_review_dir);
     }
@@ -3826,10 +4008,22 @@ pub const Session = struct {
     }
 
     fn seedGlobalLibraryNamespace(self: *Session, library_dir: u32) !void {
+        return self.seedGlobalLibraryNamespaceAt(library_dir, "/global/library");
+    }
+
+    fn seedGlobalLibraryNamespaceAt(self: *Session, library_dir: u32, base_path: []const u8) !void {
+        const escaped_base_path = try unified.jsonEscape(self.allocator, base_path);
+        defer self.allocator.free(escaped_base_path);
+        const shape_json = try std.fmt.allocPrint(
+            self.allocator,
+            "{{\"kind\":\"venom\",\"venom_id\":\"library\",\"shape\":\"{s}/{{Index.md,README.md,SCHEMA.json,CAPS.json,OPS.json,PERMISSIONS.json,STATUS.json,topics/*}}\"}}",
+            .{escaped_base_path},
+        );
+        defer self.allocator.free(shape_json);
         try self.addDirectoryDescriptors(
             library_dir,
             "Global Library",
-            "{\"kind\":\"venom\",\"venom_id\":\"library\",\"shape\":\"/global/library/{Index.md,README.md,SCHEMA.json,CAPS.json,OPS.json,PERMISSIONS.json,STATUS.json,topics/*}\"}",
+            shape_json,
             "{\"invoke\":false,\"operations\":[],\"discoverable\":true,\"read_only\":true}",
             "Stable, system-wide documentation for common Spiderweb/Acheron operations.",
         );
@@ -6676,7 +6870,7 @@ pub const Session = struct {
         return out.toOwnedSlice(self.allocator);
     }
 
-    fn writeFileContent(self: *Session, node_id: u32, offset: u64, data: []const u8) !void {
+    fn writeFileContentRaw(self: *Session, node_id: u32, offset: u64, data: []const u8) !void {
         const node_ptr = self.nodes.getPtr(node_id) orelse return error.MissingNode;
         if (node_ptr.kind != .file) return error.NotFile;
 
@@ -6698,11 +6892,28 @@ pub const Session = struct {
         node_ptr.content = next;
     }
 
-    pub fn setFileContent(self: *Session, node_id: u32, data: []const u8) !void {
+    fn writeFileContent(self: *Session, node_id: u32, offset: u64, data: []const u8) !void {
+        try self.writeFileContentRaw(node_id, offset, data);
+        if (self.node_aliases.get(node_id)) |alias_id| {
+            if (alias_id != node_id) {
+                const node = self.nodes.get(node_id) orelse return error.MissingNode;
+                try self.setFileContentRaw(alias_id, node.content);
+            }
+        }
+    }
+
+    fn setFileContentRaw(self: *Session, node_id: u32, data: []const u8) !void {
         const node_ptr = self.nodes.getPtr(node_id) orelse return error.MissingNode;
         if (node_ptr.kind != .file) return error.NotFile;
         self.allocator.free(node_ptr.content);
         node_ptr.content = try self.allocator.dupe(u8, data);
+    }
+
+    pub fn setFileContent(self: *Session, node_id: u32, data: []const u8) !void {
+        try self.setFileContentRaw(node_id, data);
+        if (self.node_aliases.get(node_id)) |alias_id| {
+            if (alias_id != node_id) try self.setFileContentRaw(alias_id, data);
+        }
     }
 
     fn setMirroredFileContent(self: *Session, primary_id: u32, alias_id: u32, data: []const u8) !void {
@@ -6934,6 +7145,9 @@ pub const Session = struct {
         const absolute_path = try self.nodeAbsolutePath(node_id);
         defer self.allocator.free(absolute_path);
 
+        if (pathMatchesPrefixBoundary(absolute_path, "/nodes/local/venoms/chat")) {
+            return std.fmt.allocPrint(self.allocator, "/nodes/local/venoms/jobs/{s}/result.txt", .{job_id});
+        }
         if (parseEntityScopedVenomAliasPrefix(absolute_path, "/agents/", "/venoms/")) |parsed| {
             return std.fmt.allocPrint(
                 self.allocator,
@@ -7378,6 +7592,7 @@ pub const Session = struct {
             _ = try self.addFile(job_dir, "status.json", status_json, true, .job_status);
             _ = try self.addFile(job_dir, "result.txt", job.result_text orelse "", true, .job_result);
             _ = try self.addFile(job_dir, "log.txt", job.log_text orelse "", true, .job_log);
+            try self.ensureAliasedSubtree(job_dir);
         }
     }
 
@@ -7434,6 +7649,7 @@ pub const Session = struct {
         const status_id = try self.addFile(job_dir, "status.json", queued_status, true, .job_status);
         const result_id = try self.addFile(job_dir, "result.txt", "", true, .job_result);
         const log_id = try self.addFile(job_dir, "log.txt", "", true, .job_log);
+        try self.ensureAliasedSubtree(job_dir);
 
         try self.job_index.markRunning(job_name);
         const running_status = try self.buildJobStatusJson(.running, correlation_id, null);
@@ -14769,6 +14985,30 @@ test "acheron_session: global library loads guides from assets_dir filesystem" {
     );
     defer allocator.free(topic_payload);
     try std.testing.expect(std.mem.indexOf(u8, topic_payload, "loaded from assets_dir") != null);
+}
+
+test "acheron_session: local venom aliases mirror canonical and compatibility writes" {
+    const allocator = std.testing.allocator;
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.init(allocator, runtime_handle, &job_index, "default");
+    defer session.deinit();
+
+    const local_status_id = session.resolveAbsolutePathNoBinds("/nodes/local/venoms/memory/status.json") orelse return error.TestExpectedResponse;
+    const global_status_id = session.resolveAbsolutePathNoBinds("/global/memory/status.json") orelse return error.TestExpectedResponse;
+
+    try session.setFileContent(local_status_id, "{\"state\":\"canonical\"}");
+    const global_status_after_canonical = session.nodes.get(global_status_id) orelse return error.TestExpectedResponse;
+    try std.testing.expectEqualStrings("{\"state\":\"canonical\"}", global_status_after_canonical.content);
+
+    try session.setFileContent(global_status_id, "{\"state\":\"compat\"}");
+    const local_status_after_global = session.nodes.get(local_status_id) orelse return error.TestExpectedResponse;
+    try std.testing.expectEqualStrings("{\"state\":\"compat\"}", local_status_after_global.content);
 }
 
 test "acheron_session: agent services index includes first-class memory namespace entry" {
