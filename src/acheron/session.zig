@@ -20,6 +20,7 @@ const memory_venom = @import("../venoms/memory.zig");
 const search_services_venom = @import("../venoms/search_services.zig");
 const events_venom = @import("../venoms/events.zig");
 const pairing_venom = @import("../venoms/pairing.zig");
+const jobs_venom = @import("../venoms/jobs.zig");
 const terminal_venom = @import("../venoms/terminal.zig");
 const mounts_venom = @import("../venoms/mounts.zig");
 const sub_brains_venom = @import("../venoms/sub_brains.zig");
@@ -2537,7 +2538,7 @@ pub const Session = struct {
         try self.node_aliases.put(self.allocator, alias_id, source_id);
     }
 
-    fn ensureAliasedSubtree(self: *Session, source_id: u32) !void {
+    pub fn ensureAliasedSubtree(self: *Session, source_id: u32) !void {
         const source = self.nodes.get(source_id) orelse return error.MissingNode;
         if (self.node_aliases.get(source_id)) |alias_id| {
             if (source.kind == .file) {
@@ -3148,23 +3149,7 @@ pub const Session = struct {
     }
 
     fn seedJobsNamespaceAt(self: *Session, jobs_dir: u32, base_path: []const u8) !void {
-        self.jobs_root_id = jobs_dir;
-        try self.addDirectoryDescriptors(
-            jobs_dir,
-            "Jobs",
-            "{\"kind\":\"collection\",\"entries\":\"job_id\",\"files\":[\"status.json\",\"result.txt\",\"log.txt\"]}",
-            "{\"read\":true,\"write\":false}",
-            "Chat job status and outputs.",
-        );
-        const jobs_schema_json = try shared_node.venom_contracts.jobs.renderSchemaJson(self.allocator, base_path);
-        defer self.allocator.free(jobs_schema_json);
-        const jobs_status_json = try shared_node.venom_contracts.jobs.renderStatusJson(self.allocator, base_path);
-        defer self.allocator.free(jobs_status_json);
-        _ = try self.addFile(jobs_dir, "README.md", shared_node.venom_contracts.jobs.readme_md, false, .none);
-        _ = try self.addFile(jobs_dir, "SCHEMA.json", jobs_schema_json, false, .none);
-        _ = try self.addFile(jobs_dir, "CAPS.json", shared_node.venom_contracts.jobs.caps_json, false, .none);
-        _ = try self.addFile(jobs_dir, "OPS.json", shared_node.venom_contracts.jobs.ops_json, false, .none);
-        _ = try self.addFile(jobs_dir, "STATUS.json", jobs_status_json, false, .none);
+        return jobs_venom.seedNamespaceAt(self, jobs_dir, base_path);
     }
 
     fn seedThoughtsNamespaceAt(self: *Session, thoughts_dir: u32, base_path: []const u8) !void {
@@ -5788,22 +5773,10 @@ pub const Session = struct {
     }
 
     fn seedJobsFromIndex(self: *Session) !void {
-        const jobs = try self.job_index.listJobsForAgent(self.allocator, self.agent_id);
-        defer chat_job_index.deinitJobViews(self.allocator, jobs);
-
-        for (jobs) |job| {
-            if (self.lookupChild(self.jobs_root_id, job.job_id) != null) continue;
-            const job_dir = try self.addDir(self.jobs_root_id, job.job_id, false);
-            const status_json = try self.buildJobStatusJson(job.state, job.correlation_id, job.error_text);
-            defer self.allocator.free(status_json);
-            _ = try self.addFile(job_dir, "status.json", status_json, true, .job_status);
-            _ = try self.addFile(job_dir, "result.txt", job.result_text orelse "", true, .job_result);
-            _ = try self.addFile(job_dir, "log.txt", job.log_text orelse "", true, .job_log);
-            try self.ensureAliasedSubtree(job_dir);
-        }
+        return jobs_venom.seedFromIndex(self);
     }
 
-    fn buildJobStatusJson(
+    pub fn buildJobStatusJson(
         self: *Session,
         state: chat_job_index.JobState,
         correlation_id: ?[]const u8,
@@ -7977,32 +7950,7 @@ pub const Session = struct {
     }
 
     fn refreshJobNodeFromIndex(self: *Session, node_id: u32, special: SpecialKind) !void {
-        const node = self.nodes.get(node_id) orelse return error.MissingNode;
-        const job_dir_id = node.parent orelse return;
-        const job_dir = self.nodes.get(job_dir_id) orelse return error.MissingNode;
-        const job_id = job_dir.name;
-        const owned_view = try self.job_index.getJob(self.allocator, job_id);
-        if (owned_view == null) return;
-
-        var view = owned_view.?;
-        defer view.deinit(self.allocator);
-        if (!std.mem.eql(u8, view.agent_id, self.agent_id)) return;
-        try self.syncThoughtFramesFromJobTelemetry(job_id);
-
-        switch (special) {
-            .job_status => {
-                const status_json = try self.buildJobStatusJson(view.state, view.correlation_id, view.error_text);
-                defer self.allocator.free(status_json);
-                try self.setFileContent(node_id, status_json);
-            },
-            .job_result => {
-                try self.setFileContent(node_id, view.result_text orelse "");
-            },
-            .job_log => {
-                try self.setFileContent(node_id, view.log_text orelse "");
-            },
-            else => {},
-        }
+        return jobs_venom.refreshNodeFromIndex(self, node_id, special);
     }
 
     pub fn syncThoughtFramesFromJobTelemetry(self: *Session, job_id: []const u8) !void {
