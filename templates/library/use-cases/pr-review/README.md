@@ -8,11 +8,13 @@ This use case reviews a pull request using workspace-mounted services and record
 
 Service entrypoint:
 
+- `/global/pr_review/control/intake.json`
 - `/global/pr_review/control/start.json`
 - `/global/pr_review/control/sync.json`
+- `/global/pr_review/control/run_validation.json`
 - `/global/pr_review/control/record_validation.json`
 - `/global/pr_review/control/record_review.json`
-- `/global/pr_review/control/invoke.json` with `{"op":"start","arguments":{...}}`
+- `/global/pr_review/control/invoke.json` with `{"op":"intake","arguments":{...}}`
 
 Supporting service Venoms:
 
@@ -45,18 +47,19 @@ Recommended artifact layout under `artifact_root`:
 
 Suggested loop:
 
-1. Start a fresh review through `/global/pr_review/control/start.json` so the mission and contract files are created together.
+1. Load a PR through `/global/pr_review/control/intake.json` when you want provider metadata captured as part of mission bootstrap. Use `/global/pr_review/control/start.json` only when a lower-level caller already has the PR metadata locally.
 2. Read the mission `contract`, then load `context_path` and `state_path`.
 3. Use `/global/pr_review/control/sync.json` to advance the review phase, keep `state_path` current, and optionally orchestrate provider/repo sync through `provider_sync`, `sync_checkout`, `repo_status`, and `diff_range` blocks.
-4. Use `/global/pr_review/control/record_validation.json` to persist validation output and refresh the latest validation summary in state.
-5. Use `/global/pr_review/control/record_review.json` to persist findings, recommendation, review-comment drafts, thread-action snapshots, and optionally `publish_review`.
-6. Discover available services through `/global/venoms/VENOMS.json`.
-7. Use `/global/git/control/sync_checkout.json` to create or refresh the repo checkout under the mission workspace.
-8. Use `/global/github_pr/control/sync.json` to load provider PR metadata when GitHub context needs to be refreshed.
-9. Use `/global/git/control/status.json` and `/global/git/control/diff_range.json` for deterministic changed-file and branch-state inspection.
-10. Use mounted terminal, search, and memory services to validate findings and gather supporting evidence.
-11. Use `/global/github_pr/control/publish_review.json` for top-level review publication when policy allows it.
-12. Request approval through `/global/missions/control/request_approval.json` before push or merge when policy requires it.
+4. Use `/global/pr_review/control/run_validation.json` to execute the configured review commands through `/global/terminal`, persist per-command service captures, and refresh the latest validation summary in state.
+5. Use `/global/pr_review/control/record_validation.json` only when a higher-level agent wants to write a custom validation artifact instead of running commands through the built-in validation runner.
+6. Use `/global/pr_review/control/record_review.json` to persist findings, recommendation, review-comment drafts, thread-action snapshots, and optionally `publish_review`.
+7. Discover available services through `/global/venoms/VENOMS.json`.
+8. Use `/global/git/control/sync_checkout.json` to create or refresh the repo checkout under the mission workspace.
+9. Use `/global/github_pr/control/sync.json` to load provider PR metadata when GitHub context needs to be refreshed.
+10. Use `/global/git/control/status.json` and `/global/git/control/diff_range.json` for deterministic changed-file and branch-state inspection.
+11. Use mounted terminal, search, and memory services to validate findings and gather supporting evidence.
+12. Use `/global/github_pr/control/publish_review.json` for top-level review publication when policy allows it.
+13. Request approval through `/global/missions/control/request_approval.json` before push or merge when policy requires it.
 
 Example orchestration payloads:
 
@@ -68,6 +71,12 @@ Example orchestration payloads:
   "sync_checkout": { "head_branch": "feature/pr-123" },
   "repo_status": true,
   "diff_range": { "base_branch": "main", "head_ref": "HEAD" }
+}
+```
+
+```json
+{
+  "mission_id": "mission-123"
 }
 ```
 
