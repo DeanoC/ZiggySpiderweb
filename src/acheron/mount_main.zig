@@ -779,7 +779,36 @@ fn fetchWorkspaceEndpointSpecs(
     var connect_info = try client.controlConnect();
     defer connect_info.deinit(allocator);
 
-    const payload_json = try client.controlWorkspaceStatus(project_id, project_token);
+    if (!shouldFetchWorkspaceStatusFromControl(
+        project_id,
+        project_token,
+        connect_info.project_id,
+        connect_info.has_workspace_mounts,
+    )) {
+        if (connect_info.workspace_json) |workspace_json| {
+            var parsed_workspace = try std.json.parseFromSlice(std.json.Value, allocator, workspace_json, .{});
+            defer parsed_workspace.deinit();
+            if (parsed_workspace.value != .object) return error.InvalidWorkspacePayload;
+            try appendWorkspaceMountSpecsFromStatusObject(allocator, &specs, parsed_workspace.value.object);
+            return specs;
+        }
+    }
+
+    const effective_project_id = project_id orelse connect_info.project_id;
+    if (connect_info.requires_session_attach) {
+        const attach_session_key = connect_info.session_key orelse return error.InvalidWorkspacePayload;
+        const attach_agent_id = connect_info.agent_id orelse return error.InvalidWorkspacePayload;
+        const attach_project_id = effective_project_id orelse return error.ProjectRequired;
+        var attach_info = try client.controlSessionAttach(.{
+            .session_key = attach_session_key,
+            .agent_id = attach_agent_id,
+            .project_id = attach_project_id,
+            .project_token = project_token,
+        });
+        defer attach_info.deinit(allocator);
+    }
+
+    const payload_json = try client.controlWorkspaceStatus(effective_project_id, project_token);
     defer allocator.free(payload_json);
 
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload_json, .{});

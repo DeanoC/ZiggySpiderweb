@@ -29,11 +29,14 @@ pub const ConnectInfo = struct {
     project_id: ?[]u8 = null,
     session_key: ?[]u8 = null,
     requires_session_attach: bool = false,
+    workspace_json: ?[]u8 = null,
+    has_workspace_mounts: bool = false,
 
     pub fn deinit(self: *ConnectInfo, allocator: std.mem.Allocator) void {
         if (self.agent_id) |value| allocator.free(value);
         if (self.project_id) |value| allocator.free(value);
         if (self.session_key) |value| allocator.free(value);
+        if (self.workspace_json) |value| allocator.free(value);
         self.* = undefined;
     }
 };
@@ -140,17 +143,7 @@ pub const NamespaceClient = struct {
         const payload_json = try readControlPayloadFor(self, request_id, "control.connect_ack");
         defer self.allocator.free(payload_json);
 
-        var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, payload_json, .{});
-        defer parsed.deinit();
-        if (parsed.value != .object) return error.InvalidResponse;
-
-        var info = ConnectInfo{};
-        errdefer info.deinit(self.allocator);
-        info.agent_id = try optionalOwnedString(self.allocator, parsed.value.object, "agent_id");
-        info.project_id = try optionalOwnedString(self.allocator, parsed.value.object, "project_id");
-        info.session_key = try optionalOwnedString(self.allocator, parsed.value.object, "session");
-        info.requires_session_attach = optionalBool(parsed.value.object, "requires_session_attach") orelse false;
-        return info;
+        return parseConnectInfo(self.allocator, payload_json);
     }
 
     pub fn controlAgentEnsure(self: *NamespaceClient, agent_id: []const u8) !void {
@@ -645,22 +638,12 @@ pub const NamespaceClient = struct {
 
     fn recoverWarmupTransport(self: *NamespaceClient, request_type: unified.FsrpcType) anyerror!void {
         const session_key = self.active_session_key orelse return error.InvalidState;
+        const had_namespace_attached = self.namespace_attached;
         try self.reconnectControlSession(session_key);
 
+        if (!had_namespace_attached) return;
         if (request_type == .t_version or request_type == .t_attach) return;
-        if (!self.namespace_attached) return;
-
-        const version_payload = try self.callAcheron(
-            .t_version,
-            .r_version,
-            "\"msize\":1048576,\"version\":\"acheron-1\"",
-        );
-        self.allocator.free(version_payload);
-
-        const attach_payload = try self.callAcheron(.t_attach, .r_attach, "\"fid\":1");
-        self.allocator.free(attach_payload);
-        self.namespace_attached = true;
-        self.next_fid = 2;
+        try self.attachNamespaceRoot(session_key);
     }
 
     fn reconnectControlSession(self: *NamespaceClient, session_key: []const u8) anyerror!void {
@@ -1119,6 +1102,31 @@ fn flagsRequireWrite(flags: u32) bool {
     return (flags & 0x3) != 0;
 }
 
+fn parseConnectInfo(allocator: std.mem.Allocator, payload_json: []const u8) !ConnectInfo {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload_json, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidResponse;
+
+    var info = ConnectInfo{};
+    errdefer info.deinit(allocator);
+    info.agent_id = try optionalOwnedString(allocator, parsed.value.object, "agent_id");
+    info.project_id = try optionalOwnedString(allocator, parsed.value.object, "project_id");
+    info.session_key = try optionalOwnedString(allocator, parsed.value.object, "session");
+    info.requires_session_attach = optionalBool(parsed.value.object, "requires_session_attach") orelse false;
+    if (parsed.value.object.get("workspace")) |workspace_value| {
+        info.has_workspace_mounts = workspaceValueHasMounts(workspace_value);
+        info.workspace_json = try std.fmt.allocPrint(allocator, "{f}", .{std.json.fmt(workspace_value, .{})});
+    }
+    return info;
+}
+
+fn workspaceValueHasMounts(workspace_value: std.json.Value) bool {
+    if (workspace_value != .object) return false;
+    const mounts_value = workspace_value.object.get("mounts") orelse return false;
+    if (mounts_value != .array) return false;
+    return mounts_value.array.items.len > 0;
+}
+
 fn readControlPayloadFor(self: *NamespaceClient, expected_id: []const u8, expected_type: []const u8) ![]u8 {
     const deadline_ms = std.time.milliTimestamp() + @as(i64, control_reply_timeout_ms);
     while (true) {
@@ -1247,4 +1255,21 @@ test "namespace_client: parseReadPayload decodes data_b64" {
 test "namespace_client: parseWriteCount reads n field" {
     const allocator = std.testing.allocator;
     try std.testing.expectEqual(@as(u32, 7), try parseWriteCount(allocator, "{\"n\":7}"));
+}
+
+test "namespace_client: parseConnectInfo preserves workspace payload and mount presence" {
+    const allocator = std.testing.allocator;
+    var info = try parseConnectInfo(
+        allocator,
+        "{\"agent_id\":\"agent-a\",\"project_id\":\"proj-a\",\"session\":\"sess-a\",\"requires_session_attach\":true,\"workspace\":{\"mounts\":[{\"mount_path\":\"/nodes/local/fs\",\"fs_url\":\"ws://127.0.0.1:18891/v2/fs\"}]}}",
+    );
+    defer info.deinit(allocator);
+
+    try std.testing.expectEqualStrings("agent-a", info.agent_id.?);
+    try std.testing.expectEqualStrings("proj-a", info.project_id.?);
+    try std.testing.expectEqualStrings("sess-a", info.session_key.?);
+    try std.testing.expect(info.requires_session_attach);
+    try std.testing.expect(info.has_workspace_mounts);
+    try std.testing.expect(info.workspace_json != null);
+    try std.testing.expect(std.mem.indexOf(u8, info.workspace_json.?, "\"mounts\"") != null);
 }
