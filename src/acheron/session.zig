@@ -18108,6 +18108,120 @@ test "acheron_session: pr_review venom orchestrates repo services and review pub
     try std.testing.expect(std.mem.indexOf(u8, publish_review_capture_content, "\"dry_run\":true") != null);
 }
 
+test "acheron_session: seeded pr_review eval propagates checkout failure" {
+    const allocator = std.testing.allocator;
+
+    var mission_store = try mission_store_mod.MissionStore.initWithPath(allocator, null);
+    defer mission_store.deinit();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const root = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+    const exports_dir = try std.fmt.allocPrint(allocator, "{s}/exports", .{root});
+    defer allocator.free(exports_dir);
+    try std.fs.cwd().makePath(exports_dir);
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "default",
+        .{
+            .mission_store = &mission_store,
+            .local_fs_export_root = exports_dir,
+            .actor_type = "agent",
+            .actor_id = "reviewer-c",
+        },
+    );
+    defer session.deinit();
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        720,
+        721,
+        &.{ "agents", "self", "pr_review", "control", "start.json" },
+        "{\"repo_key\":\"DeanoC/Spiderweb\",\"pr_number\":91}",
+        1810,
+    );
+
+    const start_result = try protocolReadFile(
+        &session,
+        allocator,
+        722,
+        723,
+        &.{ "agents", "self", "pr_review", "result.json" },
+        1811,
+    );
+    defer allocator.free(start_result);
+    const mission_id = try extractMissionIdFromResultPayload(allocator, start_result);
+    defer allocator.free(mission_id);
+
+    const missing_remote = try std.fmt.allocPrint(allocator, "{s}/missing-remote.git", .{root});
+    defer allocator.free(missing_remote);
+    const sync_payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"mission_id\":\"{s}\",\"phase\":\"ready_for_checkout\",\"sync_checkout\":{{\"repo_url\":\"{s}\",\"pr_number\":null,\"head_branch\":\"main\"}}}}",
+        .{ mission_id, missing_remote },
+    );
+    defer allocator.free(sync_payload);
+    try protocolWriteFile(
+        &session,
+        allocator,
+        724,
+        725,
+        &.{ "agents", "self", "pr_review", "control", "sync.json" },
+        sync_payload,
+        1812,
+    );
+
+    const pr_review_status = try protocolReadFile(
+        &session,
+        allocator,
+        726,
+        727,
+        &.{ "agents", "self", "pr_review", "status.json" },
+        1813,
+    );
+    defer allocator.free(pr_review_status);
+    try std.testing.expect(std.mem.indexOf(u8, pr_review_status, "\"state\":\"failed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pr_review_status, "\"tool\":\"pr_review_sync\"") != null);
+
+    const pr_review_result = try protocolReadFile(
+        &session,
+        allocator,
+        728,
+        729,
+        &.{ "agents", "self", "pr_review", "result.json" },
+        1814,
+    );
+    defer allocator.free(pr_review_result);
+    try std.testing.expect(std.mem.indexOf(u8, pr_review_result, "\"operation\":\"sync\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pr_review_result, "\"ok\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pr_review_result, "\"code\":\"execution_failed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pr_review_result, "\"checkout_sync_path\":\"/nodes/local/fs/pr-review/runs/DeanoC__Spiderweb/pr-91/services/checkout.json\"") != null);
+
+    const checkout_capture_path = try std.fs.path.join(allocator, &.{ exports_dir, "pr-review", "runs", "DeanoC__Spiderweb", "pr-91", "services", "checkout.json" });
+    defer allocator.free(checkout_capture_path);
+    const checkout_capture_content = try std.fs.cwd().readFileAlloc(allocator, checkout_capture_path, 64 * 1024);
+    defer allocator.free(checkout_capture_content);
+    try std.testing.expect(std.mem.indexOf(u8, checkout_capture_content, "\"service_path\":\"/global/git\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, checkout_capture_content, "\"code\":\"execution_failed\"") != null);
+
+    const state_host_path = try std.fs.path.join(allocator, &.{ exports_dir, "pr-review", "state", "DeanoC__Spiderweb", "pr-91", "state.json" });
+    defer allocator.free(state_host_path);
+    const state_content = try std.fs.cwd().readFileAlloc(allocator, state_host_path, 64 * 1024);
+    defer allocator.free(state_content);
+    try std.testing.expect(std.mem.indexOf(u8, state_content, "\"phase\":\"ready_for_checkout\"") != null);
+}
+
 test "acheron_session: missions invoke_service records downstream service failures" {
     const allocator = std.testing.allocator;
 
