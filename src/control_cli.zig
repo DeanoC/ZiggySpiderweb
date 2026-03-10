@@ -1,3 +1,4 @@
+const builtin = @import("builtin");
 const std = @import("std");
 
 const default_ws_url = "ws://127.0.0.1:18790/";
@@ -354,7 +355,7 @@ fn performClientHandshake(
     );
     defer allocator.free(handshake);
 
-    try stream.writeAll(handshake);
+    try socketWriteAll(stream, handshake);
 
     const response = try readHttpHeadersAlloc(allocator, stream, 16 * 1024);
     defer allocator.free(response);
@@ -371,7 +372,7 @@ fn readHttpHeadersAlloc(allocator: std.mem.Allocator, stream: *std.net.Stream, m
 
     var buf: [1024]u8 = undefined;
     while (out.items.len < max_bytes) {
-        const read_n = try stream.read(&buf);
+        const read_n = try socketRead(stream, &buf);
         if (read_n == 0) return error.EndOfStream;
         try out.appendSlice(allocator, buf[0..read_n]);
         if (std.mem.indexOf(u8, out.items, "\r\n\r\n") != null) {
@@ -402,15 +403,15 @@ fn writeClientFrameMasked(stream: *std.net.Stream, opcode: u8, payload: []const 
     var mask_key: [4]u8 = undefined;
     std.crypto.random.bytes(&mask_key);
 
-    try stream.writeAll(header[0..header_len]);
-    try stream.writeAll(&mask_key);
+    try socketWriteAll(stream, header[0..header_len]);
+    try socketWriteAll(stream, &mask_key);
 
     const masked = try std.heap.page_allocator.alloc(u8, payload.len);
     defer std.heap.page_allocator.free(masked);
     for (payload, 0..) |byte, idx| {
         masked[idx] = byte ^ mask_key[idx % 4];
     }
-    try stream.writeAll(masked);
+    try socketWriteAll(stream, masked);
 }
 
 fn readServerFrame(allocator: std.mem.Allocator, stream: *std.net.Stream, max_payload_len: usize) !WsFrame {
@@ -450,9 +451,50 @@ fn readServerFrame(allocator: std.mem.Allocator, stream: *std.net.Stream, max_pa
 fn readExact(stream: *std.net.Stream, out: []u8) !void {
     var read_total: usize = 0;
     while (read_total < out.len) {
-        const read_n = try stream.read(out[read_total..]);
+        const read_n = try socketRead(stream, out[read_total..]);
         if (read_n == 0) return error.EndOfStream;
         read_total += read_n;
+    }
+}
+
+fn socketRead(stream: *std.net.Stream, buffer: []u8) !usize {
+    if (builtin.os.tag == .windows) {
+        const windows = std.os.windows;
+        const ws2_32 = windows.ws2_32;
+        const rc = ws2_32.recv(stream.handle, buffer.ptr, @intCast(@min(buffer.len, std.math.maxInt(i32))), 0);
+        if (rc == ws2_32.SOCKET_ERROR) {
+            return switch (ws2_32.WSAGetLastError()) {
+                .WSAEWOULDBLOCK => error.WouldBlock,
+                .WSAETIMEDOUT => error.TimedOut,
+                .WSAECONNRESET, .WSAECONNABORTED, .WSAENOTCONN => error.ConnectionResetByPeer,
+                else => |err| windows.unexpectedWSAError(err),
+            };
+        }
+        return @intCast(rc);
+    }
+    return std.posix.recv(stream.handle, buffer, 0);
+}
+
+fn socketWriteAll(stream: *std.net.Stream, data: []const u8) !void {
+    var offset: usize = 0;
+    while (offset < data.len) {
+        const written: usize = if (builtin.os.tag == .windows) blk: {
+            const windows = std.os.windows;
+            const ws2_32 = windows.ws2_32;
+            const chunk = data[offset..];
+            const rc = ws2_32.send(stream.handle, chunk.ptr, @intCast(@min(chunk.len, std.math.maxInt(i32))), 0);
+            if (rc == ws2_32.SOCKET_ERROR) {
+                return switch (ws2_32.WSAGetLastError()) {
+                    .WSAEWOULDBLOCK => error.WouldBlock,
+                    .WSAETIMEDOUT => error.TimedOut,
+                    .WSAECONNRESET, .WSAECONNABORTED, .WSAENOTCONN => error.ConnectionResetByPeer,
+                    else => |err| windows.unexpectedWSAError(err),
+                };
+            }
+            break :blk @as(usize, @intCast(rc));
+        } else try std.posix.send(stream.handle, data[offset..], 0);
+        if (written == 0) return error.ConnectionClosed;
+        offset += written;
     }
 }
 

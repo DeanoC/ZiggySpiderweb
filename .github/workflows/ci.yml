@@ -39,6 +39,13 @@ jobs:
           echo "[ci] RUN_SANDBOX_CI_TESTS!=1; skipping sandbox-dependent matrix + mother-e2e suite."
         fi
 
+  standalone-client-linux:
+    uses: ./.github/workflows/ziggy-shared-ci.yml
+    secrets: inherit
+    with:
+      build_command: zig build fs-mount
+      test_command: zig build test-fs-mount
+
   windows-fs-tests:
     name: windows-fs-tests
     runs-on: windows-latest
@@ -58,7 +65,12 @@ jobs:
       - name: Run Windows FS adapter tests
         run: zig test src/venoms/fs/shared/fs_windows_source_adapter.zig
 
-      - name: Run router and node ops tests
+      - name: Build standalone fs mount client
+        run: zig build fs-mount
+
+      - name: Run standalone fs mount client tests
+        run: zig build test-fs-mount
+
+      - name: Run Windows node ops tests
         run: |
-          zig build test
           zig test src/venoms/fs/shared/fs_node_ops.zig --test-filter "windows source"

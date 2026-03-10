@@ -1,3 +1,4 @@
+const builtin = @import("builtin");
 const std = @import("std");
 const acheron_protocol = @import("protocol.zig");
 const unified = @import("spider-protocol").unified;
@@ -188,7 +189,7 @@ fn performClientHandshake(
     );
     defer allocator.free(request);
 
-    try stream.writeAll(request);
+    try socketWriteAll(stream, request);
 
     const response = try readHttpResponse(allocator, stream, 8 * 1024);
     defer allocator.free(response);
@@ -209,7 +210,7 @@ fn readHttpResponse(allocator: std.mem.Allocator, stream: *std.net.Stream, max_b
         const remaining_i64 = deadline_ms - now_ms;
         const remaining_ms: i32 = @intCast(@min(remaining_i64, @as(i64, std.math.maxInt(i32))));
         if (!try waitForReadable(stream, remaining_ms)) return error.HandshakeTimeout;
-        const n = try stream.read(&chunk);
+        const n = try socketRead(stream, &chunk);
         if (n == 0) return error.ConnectionClosed;
         try buffer.appendSlice(allocator, chunk[0..n]);
         if (std.mem.indexOf(u8, buffer.items, "\r\n\r\n") != null) {
@@ -495,18 +496,59 @@ fn writeClientFrame(allocator: std.mem.Allocator, stream: *std.net.Stream, paylo
         masked_payload[idx] = byte ^ mask_key[idx % 4];
     }
 
-    try stream.writeAll(header[0..header_len]);
+    try socketWriteAll(stream, header[0..header_len]);
     if (masked_payload.len > 0) {
-        try stream.writeAll(masked_payload);
+        try socketWriteAll(stream, masked_payload);
     }
 }
 
 fn readExact(stream: *std.net.Stream, out: []u8) !void {
     var offset: usize = 0;
     while (offset < out.len) {
-        const n = try stream.read(out[offset..]);
+        const n = try socketRead(stream, out[offset..]);
         if (n == 0) return error.EndOfStream;
         offset += n;
+    }
+}
+
+fn socketRead(stream: *std.net.Stream, buffer: []u8) !usize {
+    if (builtin.os.tag == .windows) {
+        const windows = std.os.windows;
+        const ws2_32 = windows.ws2_32;
+        const rc = ws2_32.recv(stream.handle, buffer.ptr, @intCast(@min(buffer.len, std.math.maxInt(i32))), 0);
+        if (rc == ws2_32.SOCKET_ERROR) {
+            return switch (ws2_32.WSAGetLastError()) {
+                .WSAEWOULDBLOCK => error.WouldBlock,
+                .WSAETIMEDOUT => error.TimedOut,
+                .WSAECONNRESET, .WSAECONNABORTED, .WSAENOTCONN => error.ConnectionResetByPeer,
+                else => |err| windows.unexpectedWSAError(err),
+            };
+        }
+        return @intCast(rc);
+    }
+    return std.posix.recv(stream.handle, buffer, 0);
+}
+
+fn socketWriteAll(stream: *std.net.Stream, data: []const u8) !void {
+    var offset: usize = 0;
+    while (offset < data.len) {
+        const written: usize = if (builtin.os.tag == .windows) blk: {
+            const windows = std.os.windows;
+            const ws2_32 = windows.ws2_32;
+            const chunk = data[offset..];
+            const rc = ws2_32.send(stream.handle, chunk.ptr, @intCast(@min(chunk.len, std.math.maxInt(i32))), 0);
+            if (rc == ws2_32.SOCKET_ERROR) {
+                return switch (ws2_32.WSAGetLastError()) {
+                    .WSAEWOULDBLOCK => error.WouldBlock,
+                    .WSAETIMEDOUT => error.TimedOut,
+                    .WSAECONNRESET, .WSAECONNABORTED, .WSAENOTCONN => error.ConnectionResetByPeer,
+                    else => |err| windows.unexpectedWSAError(err),
+                };
+            }
+            break :blk @as(usize, @intCast(rc));
+        } else try std.posix.send(stream.handle, data[offset..], 0);
+        if (written == 0) return error.ConnectionClosed;
+        offset += written;
     }
 }
 

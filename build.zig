@@ -3,6 +3,7 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const sqlite_lib_dir = b.option([]const u8, "sqlite-lib-dir", "Directory containing sqlite3 import library and runtime DLL");
 
     // Get ziggy-piai dependency
     const ziggy_piai_dep = b.dependency("ziggy_piai", .{
@@ -66,6 +67,12 @@ pub fn build(b: *std.Build) void {
     acheron_fs_router_mod.addImport("spider-protocol", spider_protocol_module);
     acheron_fs_router_mod.addImport("spiderweb_fs_cache", spiderweb_fs_cache_mod);
     acheron_fs_router_mod.addImport("spiderweb_fs_source_policy", spiderweb_fs_source_policy_mod);
+    const spiderweb_mount_provider_mod = b.createModule(.{
+        .root_source_file = b.path("src/acheron/mount_provider.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    spiderweb_mount_provider_mod.addImport("acheron_fs_router", acheron_fs_router_mod);
     const spiderweb_fs_fuse_adapter_mod = b.createModule(.{
         .root_source_file = b.path("src/venoms/fs/fs_fuse_adapter.zig"),
         .target = target,
@@ -73,6 +80,20 @@ pub fn build(b: *std.Build) void {
     });
     spiderweb_fs_fuse_adapter_mod.addIncludePath(b.path("src/c"));
     spiderweb_fs_fuse_adapter_mod.addImport("acheron_fs_router", acheron_fs_router_mod);
+    spiderweb_fs_fuse_adapter_mod.addImport("spiderweb_mount_provider", spiderweb_mount_provider_mod);
+    const fuse_compat_stub_mod = b.createModule(.{
+        .root_source_file = b.path("src/c/fuse_compat_stub.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const fuse_compat_lib = b.addLibrary(.{
+        .name = "spiderweb-fuse-compat",
+        .root_module = fuse_compat_stub_mod,
+        .linkage = .static,
+    });
+    fuse_compat_lib.addIncludePath(b.path("src/c"));
+    fuse_compat_lib.addCSourceFile(.{ .file = b.path("src/c/fuse_compat.c") });
+    fuse_compat_lib.linkLibC();
 
     // Embeddable distributed filesystem module
     const spiderweb_fs_mod = b.addModule("spiderweb_fs", .{
@@ -130,7 +151,7 @@ pub fn build(b: *std.Build) void {
         .name = "embed-multi-service-node",
         .root_module = embed_multi_service_mod,
     });
-    embed_multi_service_example.addCSourceFile(.{ .file = b.path("src/c/fuse_compat.c") });
+    embed_multi_service_example.linkLibrary(fuse_compat_lib);
     embed_multi_service_example.linkLibC();
     b.installArtifact(embed_multi_service_example);
     const example_multi_step = b.step("example-embed-multi-service-node", "Build multi-service embedded node example");
@@ -172,11 +193,14 @@ pub fn build(b: *std.Build) void {
         .name = "spiderweb",
         .root_module = spiderweb_mod,
     });
-    spiderweb.addCSourceFile(.{ .file = b.path("src/c/fuse_compat.c") });
+    spiderweb.linkLibrary(fuse_compat_lib);
+    applySqliteLibraryPath(spiderweb, sqlite_lib_dir);
     spiderweb.linkLibC();
     spiderweb.linkSystemLibrary("sqlite3");
 
     b.installArtifact(spiderweb);
+    const spiderweb_build_step = b.step("spiderweb", "Build spiderweb server executable");
+    spiderweb_build_step.dependOn(&spiderweb.step);
 
     // Agent runtime child executable (sandbox target)
     const agent_runtime_child_mod = b.createModule(.{
@@ -197,7 +221,8 @@ pub fn build(b: *std.Build) void {
         .name = "spiderweb-agent-runtime",
         .root_module = agent_runtime_child_mod,
     });
-    spiderweb_agent_runtime.addCSourceFile(.{ .file = b.path("src/c/fuse_compat.c") });
+    spiderweb_agent_runtime.linkLibrary(fuse_compat_lib);
+    applySqliteLibraryPath(spiderweb_agent_runtime, sqlite_lib_dir);
     spiderweb_agent_runtime.linkLibC();
     spiderweb_agent_runtime.linkSystemLibrary("sqlite3");
     b.installArtifact(spiderweb_agent_runtime);
@@ -227,13 +252,16 @@ pub fn build(b: *std.Build) void {
     fs_mount_mod.addImport("spider-protocol", spider_protocol_module);
     fs_mount_mod.addImport("acheron_fs_router", acheron_fs_router_mod);
     fs_mount_mod.addImport("spiderweb_fs_fuse_adapter", spiderweb_fs_fuse_adapter_mod);
+    fs_mount_mod.addImport("spiderweb_mount_provider", spiderweb_mount_provider_mod);
     const spiderweb_fs_mount = b.addExecutable(.{
         .name = "spiderweb-fs-mount",
         .root_module = fs_mount_mod,
     });
-    spiderweb_fs_mount.addCSourceFile(.{ .file = b.path("src/c/fuse_compat.c") });
+    spiderweb_fs_mount.linkLibrary(fuse_compat_lib);
     spiderweb_fs_mount.linkLibC();
     b.installArtifact(spiderweb_fs_mount);
+    const fs_mount_step = b.step("fs-mount", "Build standalone spiderweb-fs-mount client");
+    fs_mount_step.dependOn(&spiderweb_fs_mount.step);
 
     // Config CLI executable
     const config_mod = b.createModule(.{
@@ -265,6 +293,8 @@ pub fn build(b: *std.Build) void {
     control_cli.linkLibC();
 
     b.installArtifact(control_cli);
+    const control_build_step = b.step("spiderweb-control", "Build spiderweb-control executable");
+    control_build_step.dependOn(&control_cli.step);
 
     // Run command
     const run_cmd = b.addRunArtifact(spiderweb);
@@ -299,11 +329,27 @@ pub fn build(b: *std.Build) void {
     const spiderweb_tests = b.addTest(.{
         .root_module = test_mod,
     });
-    spiderweb_tests.addCSourceFile(.{ .file = b.path("src/c/fuse_compat.c") });
+    spiderweb_tests.linkLibrary(fuse_compat_lib);
+    applySqliteLibraryPath(spiderweb_tests, sqlite_lib_dir);
     spiderweb_tests.linkLibC();
     spiderweb_tests.linkSystemLibrary("sqlite3");
 
     const run_tests = b.addRunArtifact(spiderweb_tests);
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_tests.step);
+
+    const fs_mount_tests = b.addTest(.{
+        .root_module = fs_mount_mod,
+    });
+    fs_mount_tests.linkLibrary(fuse_compat_lib);
+    fs_mount_tests.linkLibC();
+    const run_fs_mount_tests = b.addRunArtifact(fs_mount_tests);
+    const fs_mount_test_step = b.step("test-fs-mount", "Run spiderweb-fs-mount client tests");
+    fs_mount_test_step.dependOn(&run_fs_mount_tests.step);
+}
+
+fn applySqliteLibraryPath(compile: *std.Build.Step.Compile, sqlite_lib_dir: ?[]const u8) void {
+    if (sqlite_lib_dir) |dir| {
+        compile.addLibraryPath(.{ .cwd_relative = dir });
+    }
 }

@@ -109,6 +109,40 @@ What it checks:
 - every active mount path is readable through `spiderweb-fs-mount`
 - expected node IDs (if provided) are present in active mounts
 
+## Namespace Mount Smoke Check
+
+Run a standalone namespace-mode smoke check for `spiderweb-fs-mount`:
+
+Linux:
+```bash
+SPIDERWEB_PROJECT_ID=system ./scripts/acheron-namespace-smoke.sh
+```
+
+Windows:
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\acheron-namespace-smoke.ps1
+```
+
+Optional overrides:
+
+```bash
+SPIDERWEB_URL=ws://127.0.0.1:18790/ \
+SPIDERWEB_PROJECT_ID=system \
+SPIDERWEB_AUTH_TOKEN=sw-admin-... \
+SPIDERWEB_AGENT_ID=external-smoke \
+SMOKE_USE_OS_MOUNT=1 \
+SMOKE_MOUNTPOINT=/tmp/spiderweb-fs-smoke \
+./scripts/acheron-namespace-smoke.sh
+```
+
+What it checks:
+- namespace mode attaches successfully and `status --no-probe` reports `mode == "namespace"`
+- `/agents`, `/nodes`, and `/global` are readable
+- `/meta/protocol.json` is readable and valid JSON
+- a writable routed filesystem export can create and read back a smoke file
+- a synthetic namespace mutation (default: `mkdir /agents/__spiderweb_fs_mount_smoke__`) fails as expected
+- when `SMOKE_USE_OS_MOUNT=1`, the same namespace is also validated through a real local mountpoint
+
 ## Acheron Chaos Restart Check
 
 Run active read/list probes while restarting the user service mid-run:
