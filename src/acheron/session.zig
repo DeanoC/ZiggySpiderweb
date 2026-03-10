@@ -12595,7 +12595,7 @@ test "acheron_session: pr_review save_draft persists revision history and advanc
 
     const first_draft_payload = try std.fmt.allocPrint(
         allocator,
-        "{{\"mission_id\":\"{s}\",\"phase\":\"reviewing\",\"summary\":\"First draft\",\"current_focus\":\"Inspect policy edge cases\",\"findings\":[{{\"path\":\"src/main.zig\",\"summary\":\"Check mount behavior\"}}],\"recommendation\":{{\"decision\":\"comment\",\"summary\":\"Still gathering evidence\"}},\"review_comment\":\"Draft review note one.\"}}",
+        "{{\"mission_id\":\"{s}\",\"phase\":\"reviewing\",\"summary\":\"First draft\",\"current_focus\":\"Inspect policy edge cases\",\"findings\":[{{\"path\":\"src/main.zig\",\"summary\":\"Check mount behavior\"}}],\"recommendation\":{{\"action\":\"request_changes\",\"summary\":\"Still gathering evidence\"}},\"review_comment\":\"Draft review note one.\"}}",
         .{mission_id},
     );
     defer allocator.free(first_draft_payload);
@@ -12681,7 +12681,62 @@ test "acheron_session: pr_review save_draft persists revision history and advanc
         1839,
     );
     defer allocator.free(advance_result);
-    try std.testing.expect(std.mem.indexOf(u8, advance_result, "\"next_action\":\"revise_review\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, advance_result, "\"next_action\":\"record_review\"") != null);
+
+    const record_review_payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"mission_id\":\"{s}\",\"publish_review\":{{\"dry_run\":true}}}}",
+        .{mission_id},
+    );
+    defer allocator.free(record_review_payload);
+    try protocolWriteFile(
+        &session,
+        allocator,
+        780,
+        781,
+        &.{ "agents", "self", "pr_review", "control", "record_review.json" },
+        record_review_payload,
+        1840,
+    );
+
+    const record_review_result = try protocolReadFile(
+        &session,
+        allocator,
+        782,
+        783,
+        &.{ "agents", "self", "pr_review", "result.json" },
+        1841,
+    );
+    defer allocator.free(record_review_result);
+    try std.testing.expect(std.mem.indexOf(u8, record_review_result, "\"operation\":\"record_review\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, record_review_result, "\"decision\":\"request_changes\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, record_review_result, "\"publish_review_path\":\"/nodes/local/fs/pr-review/runs/DeanoC__Spiderweb/pr-132/services/publish-review.json\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, record_review_result, "\"error\":null") != null);
+
+    const recommendation_host_path = try std.fs.path.join(allocator, &.{ exports_dir, "pr-review", "runs", "DeanoC__Spiderweb", "pr-132", "recommendation.json" });
+    defer allocator.free(recommendation_host_path);
+    const recommendation_content = try std.fs.cwd().readFileAlloc(allocator, recommendation_host_path, 64 * 1024);
+    defer allocator.free(recommendation_content);
+    try std.testing.expect(std.mem.indexOf(u8, recommendation_content, "\"action\":\"request_changes\"") != null);
+
+    const publish_review_host_path = try std.fs.path.join(allocator, &.{ exports_dir, "pr-review", "runs", "DeanoC__Spiderweb", "pr-132", "services", "publish-review.json" });
+    defer allocator.free(publish_review_host_path);
+    const publish_review_content = try std.fs.cwd().readFileAlloc(allocator, publish_review_host_path, 64 * 1024);
+    defer allocator.free(publish_review_content);
+    try std.testing.expect(std.mem.indexOf(u8, publish_review_content, "\"dry_run\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, publish_review_content, "\"decision\":\"request_changes\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, publish_review_content, "\"result\":{\"ok\":true") != null);
+
+    const final_review_comment_host_path = try std.fs.path.join(allocator, &.{ exports_dir, "pr-review", "runs", "DeanoC__Spiderweb", "pr-132", "review-comment.md" });
+    defer allocator.free(final_review_comment_host_path);
+    const final_review_comment_content = try std.fs.cwd().readFileAlloc(allocator, final_review_comment_host_path, 64 * 1024);
+    defer allocator.free(final_review_comment_content);
+    try std.testing.expect(std.mem.indexOf(u8, final_review_comment_content, "Draft review note two.") != null);
+
+    const finalized_state_content = try std.fs.cwd().readFileAlloc(allocator, state_host_path, 64 * 1024);
+    defer allocator.free(finalized_state_content);
+    try std.testing.expect(std.mem.indexOf(u8, finalized_state_content, "\"phase\":\"awaiting_author\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, finalized_state_content, "\"latest_recommendation\":{\"status\":\"request_changes\"") != null);
 }
 
 test "acheron_session: github_pr ingest_event emits agent event and auto-intakes pr_review mission" {
@@ -13252,6 +13307,30 @@ test "acheron_session: github_pr venom dry run surfaces provider API requests" {
     try std.testing.expect(std.mem.indexOf(u8, publish_result, "\"thread_actions_count\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, publish_result, "\"thread_actions_supported\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, publish_result, "https://api.github.com/repos/DeanoC/Spiderweb/pulls/42/reviews") != null);
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        630,
+        631,
+        &.{ "agents", "self", "github_pr", "control", "publish_review.json" },
+        "{\"repo_key\":\"DeanoC/Spiderweb\",\"pr_number\":42,\"decision\":\"comment\",\"review_comment\":\"No line comments.\",\"dry_run\":true,\"thread_actions\":null}",
+        1615,
+    );
+
+    const publish_result_without_threads = try protocolReadFile(
+        &session,
+        allocator,
+        632,
+        633,
+        &.{ "agents", "self", "github_pr", "result.json" },
+        1616,
+    );
+    defer allocator.free(publish_result_without_threads);
+    try std.testing.expect(std.mem.indexOf(u8, publish_result_without_threads, "\"operation\":\"publish_review\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, publish_result_without_threads, "\"decision\":\"comment\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, publish_result_without_threads, "\"thread_actions_count\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, publish_result_without_threads, "\"error\":null") != null);
 }
 
 test "acheron_session: mother can upsert project from system context without project token" {

@@ -377,6 +377,21 @@ pub const StateSnapshot = struct {
     }
 };
 
+const LoadedDraftSnapshot = struct {
+    parsed: std.json.Parsed(std.json.Value),
+    findings: std.json.Value,
+    recommendation: std.json.Value,
+    review_comment: ?[]const u8 = null,
+    thread_actions: ?std.json.Value = null,
+    summary: ?[]const u8 = null,
+    status: ?[]const u8 = null,
+
+    fn deinit(self: *LoadedDraftSnapshot) void {
+        self.parsed.deinit();
+        self.* = undefined;
+    }
+};
+
 const OptionalServiceArgs = struct {
     enabled: bool = false,
     overrides: ?std.json.ObjectMap = null,
@@ -1225,10 +1240,7 @@ pub fn buildPrReviewGitHubPublishRequestJson(
     defer self.allocator.free(repo_key_json);
     const pr_number_json = try renderPrReviewU64Arg(self, overrides, &.{"pr_number"}, context.pr_number);
     defer self.allocator.free(pr_number_json);
-    const default_decision = if (recommendation_value == .object)
-        (try jsonObjectOptionalString(recommendation_value.object, "decision")) orelse "comment"
-    else
-        "comment";
+    const default_decision = try recommendationDecisionFromValue(recommendation_value);
     const decision_json = try renderPrReviewStringArg(self, overrides, &.{"decision"}, default_decision);
     defer self.allocator.free(decision_json);
     const body_json = try renderPrReviewStringArg(self, overrides, &.{ "body", "review_comment" }, review_comment);
@@ -3199,13 +3211,43 @@ fn executeSaveDraftOp(self: anytype, args_obj: std.json.ObjectMap) ![]u8 {
         try self.replaceOwnedString(&state.phase, "reviewing");
     }
 
-    const findings_value = args_obj.get("findings");
-    if (findings_value != null and findings_value.? != .array and findings_value.? != .null) return error.InvalidPayload;
-    const recommendation_value = args_obj.get("recommendation");
-    if (recommendation_value != null and recommendation_value.? != .object and recommendation_value.? != .null) return error.InvalidPayload;
-    const thread_actions_value = args_obj.get("thread_actions");
-    if (thread_actions_value != null and thread_actions_value.? != .array and thread_actions_value.? != .null) return error.InvalidPayload;
-    const review_comment = try jsonObjectOptionalString(args_obj, "review_comment");
+    const explicit_review_comment = try jsonObjectOptionalString(args_obj, "review_comment");
+    var prior_draft: ?LoadedDraftSnapshot = null;
+    defer if (prior_draft) |*value| value.deinit();
+    if (state.latest_draft_revision > 0 and
+        (args_obj.get("findings") == null or
+            args_obj.get("recommendation") == null or
+            args_obj.get("thread_actions") == null or
+            explicit_review_comment == null))
+    {
+        prior_draft = try loadLatestPrReviewDraftSnapshot(self, contract, state);
+    }
+
+    const findings_value = blk: {
+        if (args_obj.get("findings")) |value| {
+            if (value != .array and value != .null) return error.InvalidPayload;
+            break :blk value;
+        }
+        if (prior_draft) |value| break :blk value.findings;
+        break :blk null;
+    };
+    const recommendation_value = blk: {
+        if (args_obj.get("recommendation")) |value| {
+            if (value != .object and value != .null) return error.InvalidPayload;
+            break :blk value;
+        }
+        if (prior_draft) |value| break :blk value.recommendation;
+        break :blk null;
+    };
+    const thread_actions_value = blk: {
+        if (args_obj.get("thread_actions")) |value| {
+            if (value != .array and value != .null) return error.InvalidPayload;
+            break :blk value;
+        }
+        if (prior_draft) |value| if (value.thread_actions) |draft_value| break :blk draft_value;
+        break :blk null;
+    };
+    const review_comment = explicit_review_comment orelse if (prior_draft) |value| value.review_comment else null;
 
     const has_payload = findings_value != null or
         recommendation_value != null or
@@ -3305,10 +3347,6 @@ fn executeSaveDraftOp(self: anytype, args_obj: std.json.ObjectMap) ![]u8 {
 fn executeRecordReviewOp(self: anytype, args_obj: std.json.ObjectMap) ![]u8 {
     const store = self.mission_store orelse return error.InvalidPayload;
     const mission_id = extractOptionalStringByNames(args_obj, &[_][]const u8{ "mission_id", "id" }) orelse return error.InvalidPayload;
-    const findings_value = args_obj.get("findings") orelse return error.InvalidPayload;
-    if (findings_value != .array) return error.InvalidPayload;
-    const recommendation_value = args_obj.get("recommendation") orelse return error.InvalidPayload;
-    if (recommendation_value != .object) return error.InvalidPayload;
 
     var mission = (try store.getOwned(self.allocator, mission_id)) orelse return error.NotFound;
     defer mission.deinit(self.allocator);
@@ -3321,18 +3359,61 @@ fn executeRecordReviewOp(self: anytype, args_obj: std.json.ObjectMap) ![]u8 {
     defer state.deinit(self.allocator);
     try self.applyPrReviewCommonStateFields(args_obj, &state);
 
-    const recommendation_decision = (try jsonObjectOptionalString(recommendation_value.object, "decision")) orelse "comment";
+    const explicit_review_comment = try jsonObjectOptionalString(args_obj, "review_comment");
+    const explicit_summary = try jsonObjectOptionalString(args_obj, "summary");
+    const explicit_status = try jsonObjectOptionalString(args_obj, "status");
+    var loaded_draft: ?LoadedDraftSnapshot = null;
+    defer if (loaded_draft) |*value| value.deinit();
+    if (args_obj.get("findings") == null or
+        args_obj.get("recommendation") == null or
+        explicit_review_comment == null or
+        args_obj.get("thread_actions") == null or
+        explicit_summary == null or
+        explicit_status == null)
+    {
+        loaded_draft = try loadLatestPrReviewDraftSnapshot(self, contract, state);
+    }
+
+    const findings_value = blk: {
+        if (args_obj.get("findings")) |value| {
+            if (value != .array) return error.InvalidPayload;
+            break :blk value;
+        }
+        if (loaded_draft) |value| break :blk value.findings;
+        return error.InvalidPayload;
+    };
+    const recommendation_value = blk: {
+        if (args_obj.get("recommendation")) |value| {
+            if (value != .object) return error.InvalidPayload;
+            break :blk value;
+        }
+        if (loaded_draft) |value| break :blk value.recommendation;
+        return error.InvalidPayload;
+    };
+    const review_comment = explicit_review_comment orelse if (loaded_draft) |value| value.review_comment else null;
+    const thread_actions_value = blk: {
+        if (args_obj.get("thread_actions")) |value| {
+            if (value != .array and value != .null) return error.InvalidPayload;
+            break :blk value;
+        }
+        if (loaded_draft) |value| if (value.thread_actions) |draft_value| break :blk draft_value;
+        break :blk null;
+    };
+    const effective_summary = explicit_summary orelse if (loaded_draft) |value| value.summary else null;
+    const effective_status = explicit_status orelse if (loaded_draft) |value| value.status else null;
+
+    const recommendation_decision = try recommendationDecisionFromValue(recommendation_value);
     if (args_obj.get("phase") == null) {
         try self.replaceOwnedString(&state.phase, phaseForDecision(recommendation_decision));
     }
 
-    const recommendation_status = if (try jsonObjectOptionalString(args_obj, "status")) |value|
+    const recommendation_status = if (effective_status) |value|
         value
     else
         (try jsonObjectOptionalString(recommendation_value.object, "status")) orelse recommendation_decision;
     try self.replaceOwnedString(&state.latest_recommendation_status, recommendation_status);
 
-    const recommendation_summary = if (try jsonObjectOptionalString(args_obj, "summary")) |value|
+    const recommendation_summary = if (effective_summary) |value|
         value
     else
         try jsonObjectOptionalString(recommendation_value.object, "summary");
@@ -3351,13 +3432,13 @@ fn executeRecordReviewOp(self: anytype, args_obj: std.json.ObjectMap) ![]u8 {
 
     var review_comment_path: ?[]u8 = null;
     defer if (review_comment_path) |value| self.allocator.free(value);
-    if (try jsonObjectOptionalString(args_obj, "review_comment")) |value| {
+    if (review_comment) |value| {
         review_comment_path = try self.writePrReviewTextArtifact(contract.artifact_root, "review-comment.md", value);
     }
 
     var thread_actions_path: ?[]u8 = null;
     defer if (thread_actions_path) |value| self.allocator.free(value);
-    if (args_obj.get("thread_actions")) |value| {
+    if (thread_actions_value) |value| {
         thread_actions_path = try self.writePrReviewJsonArtifact(contract.artifact_root, state.thread_actions_artifact, value);
     }
 
@@ -3372,12 +3453,11 @@ fn executeRecordReviewOp(self: anytype, args_obj: std.json.ObjectMap) ![]u8 {
     defer freeOptionalOwnedString(self, &service_error_message);
 
     if (publish_review_input.enabled) {
-        const review_comment_text = try jsonObjectOptionalString(args_obj, "review_comment");
         const request_payload = try self.buildPrReviewGitHubPublishRequestJson(
             context,
             recommendation_value,
-            review_comment_text,
-            args_obj.get("thread_actions"),
+            review_comment,
+            thread_actions_value,
             publish_review_input.overrides,
         );
         defer self.allocator.free(request_payload);
@@ -3712,10 +3792,16 @@ fn executeAdvanceOp(self: anytype, args_obj: std.json.ObjectMap) ![]u8 {
     defer self.allocator.free(mission_json);
 
     const runner_status: []const u8 = "ready_for_review";
-    const next_action: []const u8 = if (state.latest_draft_revision > 0)
+    const next_action: []const u8 = if (state.latest_draft_revision > 0 and std.mem.eql(u8, state.latest_recommendation_status, "pending"))
+        "record_review"
+    else if (state.latest_draft_revision > 0)
         "revise_review"
     else
         "draft_review";
+    const runner_note: []const u8 = if (std.mem.eql(u8, next_action, "record_review"))
+        "Deterministic PR review runner steps are complete; Spider Monkey should promote the saved draft into a final review and optionally publish it."
+    else
+        "Deterministic PR review runner steps are complete; Spider Monkey should inspect the workspace artifacts and continue the review draft.";
     const detail = try buildPrReviewAdvanceDetailJson(
         self,
         mission_json,
@@ -3728,7 +3814,7 @@ fn executeAdvanceOp(self: anytype, args_obj: std.json.ObjectMap) ![]u8 {
         sync_result_json,
         validation_result_json,
         wait_result_json,
-        "Deterministic PR review runner steps are complete; Spider Monkey should inspect the workspace artifacts and continue the review draft.",
+        runner_note,
     );
     defer self.allocator.free(detail);
     return self.buildPrReviewSuccessResultJson(.advance, detail);
@@ -4283,6 +4369,99 @@ fn phaseForDecision(decision: []const u8) []const u8 {
     if (std.mem.eql(u8, decision, "approve")) return "awaiting_ci";
     if (std.mem.eql(u8, decision, "request_changes")) return "awaiting_author";
     return "reviewing";
+}
+
+fn normalizeRecommendationDecision(raw: []const u8) []const u8 {
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0) return "comment";
+    if (std.ascii.eqlIgnoreCase(trimmed, "approve") or
+        std.ascii.eqlIgnoreCase(trimmed, "approved") or
+        std.ascii.eqlIgnoreCase(trimmed, "approval"))
+    {
+        return "approve";
+    }
+    if (std.ascii.eqlIgnoreCase(trimmed, "request_changes") or
+        std.ascii.eqlIgnoreCase(trimmed, "request-changes") or
+        std.ascii.eqlIgnoreCase(trimmed, "request changes") or
+        std.ascii.eqlIgnoreCase(trimmed, "changes_requested") or
+        std.ascii.eqlIgnoreCase(trimmed, "changes-requested") or
+        std.ascii.eqlIgnoreCase(trimmed, "block") or
+        std.ascii.eqlIgnoreCase(trimmed, "blocked") or
+        std.ascii.eqlIgnoreCase(trimmed, "reject"))
+    {
+        return "request_changes";
+    }
+    return "comment";
+}
+
+fn recommendationDecisionFromValue(value: std.json.Value) ![]const u8 {
+    if (value != .object) return "comment";
+    return recommendationDecisionFromObject(value.object);
+}
+
+fn recommendationDecisionFromObject(obj: std.json.ObjectMap) ![]const u8 {
+    inline for ([_][]const u8{ "decision", "verdict", "action", "status" }) |field| {
+        if (try jsonObjectOptionalString(obj, field)) |value| {
+            return normalizeRecommendationDecision(value);
+        }
+    }
+    if ((try jsonObjectOptionalBool(obj, "blocking")) orelse false) {
+        return "request_changes";
+    }
+    return "comment";
+}
+
+fn loadLatestPrReviewDraftSnapshot(
+    self: anytype,
+    contract: ResolvedContract,
+    state: StateSnapshot,
+) !LoadedDraftSnapshot {
+    if (state.latest_draft_revision == 0) return error.NotFound;
+    const draft_path = try resolvePrReviewArtifactPath(self, contract.artifact_root, state.draft_review_artifact);
+    defer self.allocator.free(draft_path);
+    const draft_json = try self.readMissionContractFile(draft_path, 256 * 1024);
+    defer self.allocator.free(draft_json);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, draft_json, .{});
+    errdefer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidPayload;
+    const obj = parsed.value.object;
+
+    const findings = obj.get("findings") orelse return error.InvalidPayload;
+    if (findings != .array) return error.InvalidPayload;
+    const recommendation = obj.get("recommendation") orelse return error.InvalidPayload;
+    if (recommendation != .object) return error.InvalidPayload;
+
+    const review_comment = if (obj.get("review_comment")) |value| blk: {
+        if (value == .null) break :blk null;
+        if (value != .string) return error.InvalidPayload;
+        break :blk value.string;
+    } else null;
+    const thread_actions = if (obj.get("thread_actions")) |value| blk: {
+        if (value == .null) break :blk null;
+        if (value != .array) return error.InvalidPayload;
+        break :blk value;
+    } else null;
+    const summary = if (obj.get("summary")) |value| blk: {
+        if (value == .null) break :blk null;
+        if (value != .string) return error.InvalidPayload;
+        break :blk value.string;
+    } else null;
+    const status = if (obj.get("status")) |value| blk: {
+        if (value == .null) break :blk null;
+        if (value != .string) return error.InvalidPayload;
+        break :blk value.string;
+    } else null;
+
+    return .{
+        .parsed = parsed,
+        .findings = findings,
+        .recommendation = recommendation,
+        .review_comment = review_comment,
+        .thread_actions = thread_actions,
+        .summary = summary,
+        .status = status,
+    };
 }
 
 fn phaseWaitsForGitHubEvents(phase: []const u8) bool {

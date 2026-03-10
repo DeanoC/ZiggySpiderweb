@@ -451,6 +451,7 @@ fn executePublishReviewOp(self: anytype, args_obj: std.json.ObjectMap) ![]u8 {
     const dry_run = (try jsonObjectOptionalBool(args_obj, "dry_run")) orelse false;
     const thread_actions_count = blk: {
         if (args_obj.get("thread_actions")) |value| {
+            if (value == .null) break :blk @as(usize, 0);
             if (value != .array) return error.InvalidPayload;
             break :blk value.array.items.len;
         }

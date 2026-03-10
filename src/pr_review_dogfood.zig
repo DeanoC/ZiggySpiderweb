@@ -302,6 +302,16 @@ pub fn main() !void {
     defer allocator.free(draft_result);
     try stdoutPrint("Draft result:\n{s}\n\n", .{draft_result});
 
+    const record_review_payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"mission_id\":\"{s}\",\"publish_review\":{{\"dry_run\":true}}}}",
+        .{mission_id},
+    );
+    defer allocator.free(record_review_payload);
+    const record_review_result = try invokeControl(&session, "/services/pr_review/control/record_review.json", record_review_payload);
+    defer allocator.free(record_review_result);
+    try stdoutPrint("Record review result:\n{s}\n\n", .{record_review_result});
+
     const slug = try buildRepoSlug(allocator, args.repo_key);
     defer allocator.free(slug);
     const pr_dir_name = try std.fmt.allocPrint(allocator, "pr-{d}", .{args.pr_number});
@@ -326,6 +336,34 @@ pub fn main() !void {
         "review-comment-draft.md",
     });
     defer allocator.free(review_comment_host_path);
+    const recommendation_host_path = try std.fs.path.join(allocator, &.{
+        exports_dir,
+        "pr-review",
+        "runs",
+        slug,
+        pr_dir_name,
+        "recommendation.json",
+    });
+    defer allocator.free(recommendation_host_path);
+    const final_review_comment_host_path = try std.fs.path.join(allocator, &.{
+        exports_dir,
+        "pr-review",
+        "runs",
+        slug,
+        pr_dir_name,
+        "review-comment.md",
+    });
+    defer allocator.free(final_review_comment_host_path);
+    const publish_review_host_path = try std.fs.path.join(allocator, &.{
+        exports_dir,
+        "pr-review",
+        "runs",
+        slug,
+        pr_dir_name,
+        "services",
+        "publish-review.json",
+    });
+    defer allocator.free(publish_review_host_path);
 
     if (std.fs.cwd().access(draft_host_path, .{})) |_| {
         const draft_content = try std.fs.cwd().readFileAlloc(allocator, draft_host_path, 256 * 1024);
@@ -341,6 +379,30 @@ pub fn main() !void {
         try stdoutPrint("Review comment draft ({s}):\n{s}\n", .{ review_comment_host_path, review_comment });
     } else |_| {
         try stdoutPrint("Review comment draft not found at {s}\n", .{review_comment_host_path});
+    }
+
+    if (std.fs.cwd().access(recommendation_host_path, .{})) |_| {
+        const recommendation = try std.fs.cwd().readFileAlloc(allocator, recommendation_host_path, 64 * 1024);
+        defer allocator.free(recommendation);
+        try stdoutPrint("\nRecommendation artifact ({s}):\n{s}\n", .{ recommendation_host_path, recommendation });
+    } else |_| {
+        try stdoutPrint("\nRecommendation artifact not found at {s}\n", .{recommendation_host_path});
+    }
+
+    if (std.fs.cwd().access(final_review_comment_host_path, .{})) |_| {
+        const final_review_comment = try std.fs.cwd().readFileAlloc(allocator, final_review_comment_host_path, 64 * 1024);
+        defer allocator.free(final_review_comment);
+        try stdoutPrint("\nFinal review comment ({s}):\n{s}\n", .{ final_review_comment_host_path, final_review_comment });
+    } else |_| {
+        try stdoutPrint("\nFinal review comment not found at {s}\n", .{final_review_comment_host_path});
+    }
+
+    if (std.fs.cwd().access(publish_review_host_path, .{})) |_| {
+        const publish_review = try std.fs.cwd().readFileAlloc(allocator, publish_review_host_path, 64 * 1024);
+        defer allocator.free(publish_review);
+        try stdoutPrint("\nPublish review artifact ({s}):\n{s}\n", .{ publish_review_host_path, publish_review });
+    } else |_| {
+        try stdoutPrint("\nPublish review artifact not found at {s}\n", .{publish_review_host_path});
     }
 }
 
