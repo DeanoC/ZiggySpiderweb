@@ -16,6 +16,8 @@ const spider_web_project_mount_prefix = "/nodes/local/projects/" ++ spider_web_p
 const default_project_up_export_name = "work";
 const spider_web_project_kind_name = "system_builtin";
 const normal_project_kind_name = "normal";
+const system_project_template_id = "system";
+const default_project_template_id = "minimum";
 const default_primary_agent_id = "mother";
 const default_spider_web_root = "";
 const default_platform_os = "unknown";
@@ -282,11 +284,48 @@ const ProjectBind = struct {
     }
 };
 
+const ProjectTemplateBindSpec = struct {
+    bind_path: []const u8,
+    target_path: []const u8,
+};
+
+const ProjectTemplateSpec = struct {
+    id: []const u8,
+    description: []const u8,
+    bind_specs: []const ProjectTemplateBindSpec,
+};
+
+const minimum_template_bind_specs = [_]ProjectTemplateBindSpec{
+    .{ .bind_path = "/services/mounts", .target_path = "/global/mounts" },
+};
+
+const github_template_bind_specs = [_]ProjectTemplateBindSpec{
+    .{ .bind_path = "/services/mounts", .target_path = "/global/mounts" },
+    .{ .bind_path = "/services/git", .target_path = "/global/git" },
+    .{ .bind_path = "/services/github_pr", .target_path = "/global/github_pr" },
+    .{ .bind_path = "/services/missions", .target_path = "/global/missions" },
+    .{ .bind_path = "/services/pr_review", .target_path = "/global/pr_review" },
+};
+
+const builtin_project_templates = [_]ProjectTemplateSpec{
+    .{
+        .id = default_project_template_id,
+        .description = "Minimal bootstrap workspace with only the core mounts-management service bound into /services.",
+        .bind_specs = minimum_template_bind_specs[0..],
+    },
+    .{
+        .id = "github",
+        .description = "GitHub-oriented workspace with git, GitHub PR, missions, and PR review services bound into /services.",
+        .bind_specs = github_template_bind_specs[0..],
+    },
+};
+
 const Project = struct {
     id: []u8,
     name: []u8,
     vision: []u8,
     status: []u8,
+    template_id: []u8,
     kind: ProjectKind = .normal,
     is_delete_protected: bool = false,
     token_locked: bool = false,
@@ -302,6 +341,7 @@ const Project = struct {
         allocator.free(self.name);
         allocator.free(self.vision);
         allocator.free(self.status);
+        allocator.free(self.template_id);
         allocator.free(self.mutation_token);
         self.access_policy.deinit(allocator);
         for (self.mounts.items) |*mount| mount.deinit(allocator);
@@ -490,6 +530,11 @@ pub const ControlPlane = struct {
                 project.kind = .spider_web_builtin;
                 changed = true;
             }
+            if (!std.mem.eql(u8, project.template_id, system_project_template_id)) {
+                self.allocator.free(project.template_id);
+                project.template_id = try self.allocator.dupe(u8, system_project_template_id);
+                changed = true;
+            }
             if (!project.token_locked) {
                 project.token_locked = true;
                 changed = true;
@@ -516,6 +561,7 @@ pub const ControlPlane = struct {
                 .name = try self.allocator.dupe(u8, spider_web_project_name),
                 .vision = try self.allocator.dupe(u8, spider_web_project_vision),
                 .status = try self.allocator.dupe(u8, spider_web_project_status),
+                .template_id = try self.allocator.dupe(u8, system_project_template_id),
                 .kind = .spider_web_builtin,
                 .is_delete_protected = true,
                 .token_locked = true,
@@ -528,6 +574,7 @@ pub const ControlPlane = struct {
                 self.allocator.free(project.name);
                 self.allocator.free(project.vision);
                 self.allocator.free(project.status);
+                self.allocator.free(project.template_id);
                 self.allocator.free(project.mutation_token);
             }
             try self.projects.put(self.allocator, project.id, project);
@@ -561,7 +608,10 @@ pub const ControlPlane = struct {
         var project_it = self.projects.valueIterator();
         while (project_it.next()) |project| {
             if (project.kind == .spider_web_builtin) continue;
-            if (!try ensureDefaultProjectMountsLocked(self, project)) continue;
+            var project_changed = false;
+            if (try ensureDefaultProjectMountsLocked(self, project)) project_changed = true;
+            if (try ensureProjectTemplateBindsLocked(self, project)) project_changed = true;
+            if (!project_changed) continue;
             project.updated_at_ms = now_ms;
             changed = true;
         }
@@ -1651,11 +1701,13 @@ pub const ControlPlane = struct {
         const name_raw = getRequiredString(obj, "name") catch return ControlPlaneError.MissingField;
         const vision_raw = getRequiredString(obj, "vision") catch return ControlPlaneError.MissingField;
         const status_raw = getOptionalString(obj, "status") orelse "active";
+        const template_id_raw = getOptionalString(obj, "template_id") orelse default_project_template_id;
         const now = std.time.milliTimestamp();
         try self.ensureBuiltinSpiderWebProjectLocked(now);
         try validateDisplayString(name_raw, 128);
         try validateIdentifier(status_raw, 64);
         try validateDisplayString(vision_raw, 1024);
+        _ = resolveProjectTemplateSpec(template_id_raw, .normal) orelse return ControlPlaneError.InvalidPayload;
 
         var access_policy: ProjectAccessPolicy = .{};
         errdefer access_policy.deinit(self.allocator);
@@ -1673,6 +1725,7 @@ pub const ControlPlane = struct {
             .name = try self.allocator.dupe(u8, name_raw),
             .vision = try self.allocator.dupe(u8, vision_raw),
             .status = try self.allocator.dupe(u8, status_raw),
+            .template_id = try self.allocator.dupe(u8, template_id_raw),
             .token_locked = false,
             .mutation_token = mutation_token,
             .access_policy = access_policy,
@@ -1683,11 +1736,19 @@ pub const ControlPlane = struct {
             self.allocator.free(project.name);
             self.allocator.free(project.vision);
             self.allocator.free(project.status);
+            self.allocator.free(project.template_id);
             self.allocator.free(project.mutation_token);
         }
         try self.projects.put(self.allocator, project.id, project);
         const stored_project = self.projects.getPtr(project_id) orelse return error.ProjectNotFound;
+        var project_changed = false;
         if (try ensureDefaultProjectMountsLocked(self, stored_project)) {
+            project_changed = true;
+        }
+        if (try ensureProjectTemplateBindsLocked(self, stored_project)) {
+            project_changed = true;
+        }
+        if (project_changed) {
             stored_project.updated_at_ms = now;
             self.mount_sets_total +%= 1;
             self.requestReconcileLocked(now);
@@ -2079,7 +2140,7 @@ pub const ControlPlane = struct {
         if (std.mem.eql(u8, bind_path, "/")) return ControlPlaneError.InvalidPayload;
         const target_path = try normalizeMountPath(self.allocator, target_path_raw);
         errdefer self.allocator.free(target_path);
-        if (!projectPathWithinMountAuthority(project, target_path)) return ControlPlaneError.BindConflict;
+        if (!projectPathWithinBindAuthority(project, target_path)) return ControlPlaneError.BindConflict;
 
         for (project.mounts.items) |mount| {
             if (pathsConflict(mount.mount_path, bind_path)) return ControlPlaneError.BindConflict;
@@ -2361,6 +2422,8 @@ pub const ControlPlane = struct {
         defer self.allocator.free(escaped_agent);
         const escaped_project = try jsonEscape(self.allocator, project_id);
         defer self.allocator.free(escaped_project);
+        const escaped_template_id = try jsonEscape(self.allocator, project.template_id);
+        defer self.allocator.free(escaped_template_id);
         const escaped_root = try jsonEscape(self.allocator, workspace_root);
         defer self.allocator.free(escaped_root);
 
@@ -2419,6 +2482,7 @@ pub const ControlPlane = struct {
         const requested_name = getOptionalString(obj, "name") orelse getOptionalString(obj, "project_name");
         const requested_vision = getOptionalString(obj, "vision");
         const requested_status = getOptionalString(obj, "status");
+        const requested_template_id = getOptionalString(obj, "template_id");
         const requested_project_token = getOptionalString(obj, "project_token");
         const requested_access_policy_value = obj.get("access_policy");
         const activate = getOptionalBool(obj, "activate", true) catch return ControlPlaneError.InvalidPayload;
@@ -2427,6 +2491,7 @@ pub const ControlPlane = struct {
         var project_ptr: ?*Project = null;
         var created = false;
         var mounts_replaced = false;
+        var binds_replaced = false;
 
         if (requested_project_id) |project_id| {
             try validateIdentifier(project_id, 128);
@@ -2447,9 +2512,11 @@ pub const ControlPlane = struct {
             const name_raw = requested_name orelse return ControlPlaneError.MissingField;
             const vision_raw = requested_vision orelse return ControlPlaneError.MissingField;
             const status_raw = requested_status orelse "active";
+            const template_id_raw = requested_template_id orelse default_project_template_id;
             try validateDisplayString(name_raw, 128);
             try validateDisplayString(vision_raw, 1024);
             try validateIdentifier(status_raw, 64);
+            _ = resolveProjectTemplateSpec(template_id_raw, .normal) orelse return ControlPlaneError.InvalidPayload;
 
             const project_id = try makeSequentialId(self.allocator, "proj", &self.next_project_id);
             errdefer self.allocator.free(project_id);
@@ -2466,6 +2533,7 @@ pub const ControlPlane = struct {
                 .name = try self.allocator.dupe(u8, name_raw),
                 .vision = try self.allocator.dupe(u8, vision_raw),
                 .status = try self.allocator.dupe(u8, status_raw),
+                .template_id = try self.allocator.dupe(u8, template_id_raw),
                 .token_locked = false,
                 .mutation_token = mutation_token,
                 .access_policy = access_policy,
@@ -2476,6 +2544,7 @@ pub const ControlPlane = struct {
                 self.allocator.free(project.name);
                 self.allocator.free(project.vision);
                 self.allocator.free(project.status);
+                self.allocator.free(project.template_id);
                 self.allocator.free(project.mutation_token);
             }
 
@@ -2493,18 +2562,23 @@ pub const ControlPlane = struct {
         if (!created) {
             if (project.kind != .spider_web_builtin) {
                 const wants_mount_update = obj.get("desired_mounts") != null;
+                const wants_bind_update = obj.get("desired_binds") != null;
                 const wants_admin_update = requested_name != null or
                     requested_vision != null or
                     requested_status != null or
+                    requested_template_id != null or
                     requested_access_policy_value != null;
                 if (!is_primary_agent) {
                     if (wants_mount_update) {
                         try requireProjectActionAccess(project, .mount, agent_id, requested_project_token, is_admin);
                     }
+                    if (wants_bind_update) {
+                        try requireProjectActionAccess(project, .bind, agent_id, requested_project_token, is_admin);
+                    }
                     if (wants_admin_update) {
                         try requireProjectActionAccess(project, .admin, agent_id, requested_project_token, is_admin);
                     }
-                    if (!wants_mount_update and !wants_admin_update) {
+                    if (!wants_mount_update and !wants_bind_update and !wants_admin_update) {
                         try requireProjectActionAccess(project, .read, agent_id, requested_project_token, is_admin);
                     }
                 } else if (requested_project_token) |project_token| {
@@ -2527,7 +2601,9 @@ pub const ControlPlane = struct {
                 (requested_name != null or
                     requested_vision != null or
                     requested_status != null or
+                    requested_template_id != null or
                     obj.get("desired_mounts") != null or
+                    obj.get("desired_binds") != null or
                     requested_access_policy_value != null))
             {
                 return ControlPlaneError.ProjectProtected;
@@ -2546,6 +2622,13 @@ pub const ControlPlane = struct {
                 try validateIdentifier(next_status, 64);
                 self.allocator.free(project.status);
                 project.status = try self.allocator.dupe(u8, next_status);
+            }
+            if (requested_template_id) |template_id| {
+                _ = resolveProjectTemplateSpec(template_id, project.kind) orelse return ControlPlaneError.InvalidPayload;
+                if (!std.mem.eql(u8, project.template_id, template_id)) {
+                    self.allocator.free(project.template_id);
+                    project.template_id = try self.allocator.dupe(u8, template_id);
+                }
             }
             if (requested_access_policy_value) |value| {
                 var parsed_policy = try parseProjectAccessPolicyValue(self.allocator, value);
@@ -2608,6 +2691,64 @@ pub const ControlPlane = struct {
             mounts_replaced = true;
         } else if (created and project.kind != .spider_web_builtin) {
             if (try ensureDefaultProjectMountsLocked(self, project)) mounts_replaced = true;
+        }
+
+        if (obj.get("desired_binds")) |desired_val| {
+            if (project.kind == .spider_web_builtin) return ControlPlaneError.ProjectProtected;
+            if (desired_val != .array) return ControlPlaneError.InvalidPayload;
+            var next_binds = std.ArrayListUnmanaged(ProjectBind){};
+            errdefer {
+                for (next_binds.items) |*bind| bind.deinit(self.allocator);
+                next_binds.deinit(self.allocator);
+            }
+
+            for (desired_val.array.items) |item| {
+                if (item != .object) return ControlPlaneError.InvalidPayload;
+                const bind_obj = item.object;
+                const bind_path_raw = getRequiredString(bind_obj, "bind_path") catch return ControlPlaneError.MissingField;
+                const target_path_raw = getRequiredString(bind_obj, "target_path") catch return ControlPlaneError.MissingField;
+                const bind_path = try normalizeMountPath(self.allocator, bind_path_raw);
+                errdefer self.allocator.free(bind_path);
+                if (std.mem.eql(u8, bind_path, "/")) return ControlPlaneError.InvalidPayload;
+                const target_path = try normalizeMountPath(self.allocator, target_path_raw);
+                errdefer self.allocator.free(target_path);
+                if (!projectPathWithinBindAuthority(project, target_path)) return ControlPlaneError.BindConflict;
+
+                for (project.mounts.items) |mount| {
+                    if (pathsConflict(mount.mount_path, bind_path)) return ControlPlaneError.BindConflict;
+                }
+
+                var duplicate_exact = false;
+                for (next_binds.items) |existing| {
+                    if (std.mem.eql(u8, existing.bind_path, bind_path)) {
+                        if (std.mem.eql(u8, existing.target_path, target_path)) {
+                            duplicate_exact = true;
+                            break;
+                        }
+                        return ControlPlaneError.BindConflict;
+                    }
+                    if (pathsConflict(existing.bind_path, bind_path)) return ControlPlaneError.BindConflict;
+                }
+                if (duplicate_exact) {
+                    self.allocator.free(bind_path);
+                    self.allocator.free(target_path);
+                    continue;
+                }
+
+                try next_binds.append(self.allocator, .{
+                    .bind_path = bind_path,
+                    .target_path = target_path,
+                });
+            }
+
+            for (project.binds.items) |*bind| bind.deinit(self.allocator);
+            project.binds.deinit(self.allocator);
+            project.binds = next_binds;
+            binds_replaced = true;
+        }
+
+        if (project.kind != .spider_web_builtin) {
+            if (try ensureProjectTemplateBindsLocked(self, project)) binds_replaced = true;
         }
 
         project.updated_at_ms = now_ms;
@@ -2773,7 +2914,7 @@ pub const ControlPlane = struct {
 
         return std.fmt.allocPrint(
             self.allocator,
-            "{{\"agent_id\":\"{s}\",\"project_id\":null,\"workspace_root\":null,\"mounts\":[],\"desired_mounts\":[],\"actual_mounts\":[],\"drift\":{{\"count\":0,\"items\":[]}},\"availability\":{{\"mounts_total\":0,\"online\":0,\"degraded\":0,\"missing\":0}},\"reconcile_state\":\"{s}\",\"last_reconcile_ms\":{d},\"last_success_ms\":{d},\"last_error\":{s},\"queue_depth\":{d}}}",
+            "{{\"agent_id\":\"{s}\",\"project_id\":null,\"template_id\":null,\"workspace_root\":null,\"mounts\":[],\"desired_mounts\":[],\"actual_mounts\":[],\"drift\":{{\"count\":0,\"items\":[]}},\"availability\":{{\"mounts_total\":0,\"online\":0,\"degraded\":0,\"missing\":0}},\"reconcile_state\":\"{s}\",\"last_reconcile_ms\":{d},\"last_success_ms\":{d},\"last_error\":{s},\"queue_depth\":{d}}}",
             .{
                 escaped_agent,
                 reconcileStateName(self.reconcile_state),
@@ -2960,6 +3101,8 @@ pub const ControlPlane = struct {
         defer self.allocator.free(escaped_agent);
         const escaped_project = try jsonEscape(self.allocator, project_id);
         defer self.allocator.free(escaped_project);
+        const escaped_template_id = try jsonEscape(self.allocator, project.template_id);
+        defer self.allocator.free(escaped_template_id);
         const escaped_root = try jsonEscape(self.allocator, workspace_root);
         defer self.allocator.free(escaped_root);
         const last_error_json = if (self.reconcile_last_error) |value| blk: {
@@ -2972,8 +3115,8 @@ pub const ControlPlane = struct {
         var out = std.ArrayListUnmanaged(u8){};
         errdefer out.deinit(self.allocator);
         try out.writer(self.allocator).print(
-            "{{\"agent_id\":\"{s}\",\"project_id\":\"{s}\",\"workspace_root\":\"{s}\"",
-            .{ escaped_agent, escaped_project, escaped_root },
+            "{{\"agent_id\":\"{s}\",\"project_id\":\"{s}\",\"template_id\":\"{s}\",\"workspace_root\":\"{s}\"",
+            .{ escaped_agent, escaped_project, escaped_template_id, escaped_root },
         );
         const topology = try self.appendWorkspaceTopologyJsonLocked(
             &out,
@@ -4080,16 +4223,19 @@ pub const ControlPlane = struct {
             defer self.allocator.free(escaped_status);
             const escaped_kind = try jsonEscape(self.allocator, projectKindName(project.kind));
             defer self.allocator.free(escaped_kind);
+            const escaped_template_id = try jsonEscape(self.allocator, project.template_id);
+            defer self.allocator.free(escaped_template_id);
             const escaped_token = try jsonEscape(self.allocator, project.mutation_token);
             defer self.allocator.free(escaped_token);
 
             try out.writer(self.allocator).print(
-                "{{\"id\":\"{s}\",\"name\":\"{s}\",\"vision\":\"{s}\",\"status\":\"{s}\",\"kind\":\"{s}\",\"is_delete_protected\":{s},\"token_locked\":{s},\"mutation_token\":\"{s}\",\"created_at_ms\":{d},\"updated_at_ms\":{d},\"access_policy\":",
+                "{{\"id\":\"{s}\",\"name\":\"{s}\",\"vision\":\"{s}\",\"status\":\"{s}\",\"template_id\":\"{s}\",\"kind\":\"{s}\",\"is_delete_protected\":{s},\"token_locked\":{s},\"mutation_token\":\"{s}\",\"created_at_ms\":{d},\"updated_at_ms\":{d},\"access_policy\":",
                 .{
                     escaped_id,
                     escaped_name,
                     escaped_vision,
                     escaped_status,
+                    escaped_template_id,
                     escaped_kind,
                     if (project.is_delete_protected) "true" else "false",
                     if (project.token_locked) "true" else "false",
@@ -4332,6 +4478,10 @@ pub const ControlPlane = struct {
                     .name = try dupeRequiredString(self.allocator, item.object, "name"),
                     .vision = try dupeRequiredString(self.allocator, item.object, "vision"),
                     .status = try dupeRequiredString(self.allocator, item.object, "status"),
+                    .template_id = if (item.object.get("template_id")) |template_val| blk: {
+                        if (template_val != .string or template_val.string.len == 0) return error.InvalidSnapshot;
+                        break :blk try self.allocator.dupe(u8, template_val.string);
+                    } else try self.allocator.dupe(u8, defaultTemplateIdForProjectKind(kind)),
                     .kind = kind,
                     .is_delete_protected = is_delete_protected,
                     .token_locked = token_locked,
@@ -4935,6 +5085,31 @@ fn parseProjectKind(value: []const u8) ProjectKind {
     return .normal;
 }
 
+fn defaultTemplateIdForProjectKind(kind: ProjectKind) []const u8 {
+    return switch (kind) {
+        .normal => default_project_template_id,
+        .spider_web_builtin => system_project_template_id,
+    };
+}
+
+fn resolveProjectTemplateSpec(template_id: []const u8, kind: ProjectKind) ?ProjectTemplateSpec {
+    if (kind == .spider_web_builtin) {
+        if (std.mem.eql(u8, template_id, system_project_template_id)) {
+            return .{
+                .id = system_project_template_id,
+                .description = "Built-in Spiderweb system project template.",
+                .bind_specs = &.{},
+            };
+        }
+        return null;
+    }
+
+    for (builtin_project_templates) |template| {
+        if (std.mem.eql(u8, template.id, template_id)) return template;
+    }
+    return null;
+}
+
 fn projectTokenEnabled(project: *const Project) bool {
     return project.token_locked and project.mutation_token.len > 0;
 }
@@ -5179,6 +5354,8 @@ fn renderProjectPayload(allocator: std.mem.Allocator, project: Project, include_
     defer allocator.free(escaped_vision);
     const escaped_status = try jsonEscape(allocator, project.status);
     defer allocator.free(escaped_status);
+    const escaped_template_id = try jsonEscape(allocator, project.template_id);
+    defer allocator.free(escaped_template_id);
     const escaped_kind = try jsonEscape(allocator, projectKindName(project.kind));
     defer allocator.free(escaped_kind);
     const escaped_token = if (include_project_token and projectTokenEnabled(&project)) blk: {
@@ -5189,12 +5366,13 @@ fn renderProjectPayload(allocator: std.mem.Allocator, project: Project, include_
     var out = std.ArrayListUnmanaged(u8){};
     errdefer out.deinit(allocator);
     try out.writer(allocator).print(
-        "{{\"project_id\":\"{s}\",\"name\":\"{s}\",\"vision\":\"{s}\",\"status\":\"{s}\",\"kind\":\"{s}\",\"is_delete_protected\":{s},\"token_locked\":{s},\"created_at_ms\":{d},\"updated_at_ms\":{d}",
+        "{{\"project_id\":\"{s}\",\"name\":\"{s}\",\"vision\":\"{s}\",\"status\":\"{s}\",\"template_id\":\"{s}\",\"kind\":\"{s}\",\"is_delete_protected\":{s},\"token_locked\":{s},\"created_at_ms\":{d},\"updated_at_ms\":{d}",
         .{
             escaped_id,
             escaped_name,
             escaped_vision,
             escaped_status,
+            escaped_template_id,
             escaped_kind,
             if (project.is_delete_protected) "true" else "false",
             if (project.token_locked) "true" else "false",
@@ -5308,9 +5486,50 @@ fn ensureDefaultProjectMountsLocked(self: *ControlPlane, project: *Project) !boo
     return changed;
 }
 
+fn ensureProjectTemplateBindsLocked(self: *ControlPlane, project: *Project) !bool {
+    const template = resolveProjectTemplateSpec(project.template_id, project.kind) orelse return false;
+    var changed = false;
+    for (template.bind_specs) |spec| {
+        const normalized_bind = try normalizeMountPath(self.allocator, spec.bind_path);
+        defer self.allocator.free(normalized_bind);
+        const normalized_target = try normalizeMountPath(self.allocator, spec.target_path);
+        defer self.allocator.free(normalized_target);
+
+        if (!projectPathWithinBindAuthority(project, normalized_target)) continue;
+
+        var skip = false;
+        for (project.mounts.items) |mount| {
+            if (pathsConflict(mount.mount_path, normalized_bind)) {
+                skip = true;
+                break;
+            }
+        }
+        if (skip) continue;
+
+        for (project.binds.items) |existing| {
+            if (std.mem.eql(u8, existing.bind_path, normalized_bind)) {
+                skip = true;
+                break;
+            }
+            if (pathsConflict(existing.bind_path, normalized_bind)) {
+                skip = true;
+                break;
+            }
+        }
+        if (skip) continue;
+
+        try project.binds.append(self.allocator, .{
+            .bind_path = try self.allocator.dupe(u8, normalized_bind),
+            .target_path = try self.allocator.dupe(u8, normalized_target),
+        });
+        changed = true;
+    }
+    return changed;
+}
+
 fn projectHasCanonicalWorkspaceMount(project: *const Project) bool {
     for (project.mounts.items) |mount| {
-        if (!std.mem.eql(u8, mount.mount_path, "/workspace")) return true;
+        if (std.mem.eql(u8, mount.mount_path, spider_web_workspace_mount_path)) return true;
     }
     return false;
 }
@@ -5379,6 +5598,13 @@ fn projectPathWithinMountAuthority(project: *const Project, path: []const u8) bo
     for (project.mounts.items) |mount| {
         if (pathIsAncestorOrEqual(mount.mount_path, path)) return true;
     }
+    return false;
+}
+
+fn projectPathWithinBindAuthority(project: *const Project, path: []const u8) bool {
+    if (projectPathWithinMountAuthority(project, path)) return true;
+    if (std.mem.eql(u8, path, "/global")) return true;
+    if (pathMatchesPrefix(path, "/global")) return true;
     return false;
 }
 
@@ -5989,7 +6215,8 @@ test "acheron_control_plane: project bind lifecycle resolves bound paths" {
     defer allocator.free(unbind_req);
     const unbound = try plane.removeProjectBind(unbind_req);
     defer allocator.free(unbound);
-    try std.testing.expect(std.mem.indexOf(u8, unbound, "\"binds\":[]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unbound, "\"bind_path\":\"/repo\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, unbound, "\"bind_path\":\"/services/mounts\"") != null);
 }
 
 test "acheron_control_plane: bind conflicts with existing mount path" {
@@ -7537,6 +7764,78 @@ test "acheron_control_plane: builtin ensure prunes legacy workspace alias when c
     try std.testing.expectEqual(@as(usize, 1), project.mounts.items.len);
     try std.testing.expectEqualStrings("/nodes/local/fs", project.mounts.items[0].mount_path);
     try std.testing.expectEqualStrings("node-canonical", project.mounts.items[0].node_id);
+}
+
+test "acheron_control_plane: createProject defaults to minimum template and seeds service binds" {
+    const allocator = std.testing.allocator;
+    var plane = ControlPlane.init(allocator);
+    defer plane.deinit();
+
+    const project_json = try plane.createProject("{\"name\":\"TemplateMinimum\",\"vision\":\"TemplateMinimum\"}");
+    defer allocator.free(project_json);
+    try std.testing.expect(std.mem.indexOf(u8, project_json, "\"template_id\":\"minimum\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, project_json, "\"bind_path\":\"/services/mounts\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, project_json, "\"target_path\":\"/global/mounts\"") != null);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, project_json, .{});
+    defer parsed.deinit();
+    const project_id = parsed.value.object.get("project_id").?.string;
+    const project_token = parsed.value.object.get("project_token").?.string;
+
+    const resolve_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"project_id\":\"{s}\",\"project_token\":\"{s}\",\"path\":\"/services/mounts/control/invoke.json\"}}",
+        .{ project_id, project_token },
+    );
+    defer allocator.free(resolve_req);
+    const resolved = try plane.resolveProjectPath(resolve_req);
+    defer allocator.free(resolved);
+    try std.testing.expect(std.mem.indexOf(u8, resolved, "\"matched\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resolved, "\"resolved_path\":\"/global/mounts/control/invoke.json\"") != null);
+}
+
+test "acheron_control_plane: github template merges desired binds with template service binds" {
+    const allocator = std.testing.allocator;
+    var plane = ControlPlane.init(allocator);
+    defer plane.deinit();
+
+    const joined = try plane.ensureNode("template-github-node", "", 60_000);
+    defer allocator.free(joined);
+
+    const up_json = try plane.projectUp(
+        "agent-template",
+        "{\"name\":\"TemplateGitHub\",\"vision\":\"TemplateGitHub\",\"template_id\":\"github\",\"desired_binds\":[{\"bind_path\":\"/repo\",\"target_path\":\"/nodes/local/fs\"}],\"activate\":false}",
+    );
+    defer allocator.free(up_json);
+    try std.testing.expect(std.mem.indexOf(u8, up_json, "\"created\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, up_json, "\"activated\":false") != null);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, up_json, .{});
+    defer parsed.deinit();
+    const project_id = parsed.value.object.get("project_id").?.string;
+    const project_token = parsed.value.object.get("project_token").?.string;
+
+    const get_req = try std.fmt.allocPrint(allocator, "{{\"project_id\":\"{s}\"}}", .{project_id});
+    defer allocator.free(get_req);
+    const get_json = try plane.getProject(get_req);
+    defer allocator.free(get_json);
+    try std.testing.expect(std.mem.indexOf(u8, get_json, "\"template_id\":\"github\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, get_json, "\"bind_path\":\"/repo\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, get_json, "\"bind_path\":\"/services/git\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, get_json, "\"bind_path\":\"/services/github_pr\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, get_json, "\"bind_path\":\"/services/missions\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, get_json, "\"bind_path\":\"/services/pr_review\"") != null);
+
+    const resolve_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"project_id\":\"{s}\",\"project_token\":\"{s}\",\"path\":\"/services/github_pr/control/invoke.json\"}}",
+        .{ project_id, project_token },
+    );
+    defer allocator.free(resolve_req);
+    const resolved = try plane.resolveProjectPath(resolve_req);
+    defer allocator.free(resolved);
+    try std.testing.expect(std.mem.indexOf(u8, resolved, "\"matched\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resolved, "\"resolved_path\":\"/global/github_pr/control/invoke.json\"") != null);
 }
 
 test "acheron_control_plane: snapshot encryption envelope roundtrip" {

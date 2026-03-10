@@ -74,6 +74,7 @@ const SpecialKind = enum {
     pr_review_sync,
     pr_review_run_validation,
     pr_review_record_validation,
+    pr_review_draft_review,
     pr_review_save_draft,
     pr_review_record_review,
     pr_review_advance,
@@ -360,6 +361,34 @@ pub const ToolPayloadErrorInfo = struct {
     pub fn deinit(self: ToolPayloadErrorInfo, allocator: std.mem.Allocator) void {
         allocator.free(self.code);
         allocator.free(self.message);
+    }
+};
+
+pub const AgentRunSuccessInfo = struct {
+    run_id: []u8,
+    state: []u8,
+    assistant_output: ?[]u8 = null,
+    step_count: u64 = 0,
+    checkpoint_seq: u64 = 0,
+
+    pub fn deinit(self: *AgentRunSuccessInfo, allocator: std.mem.Allocator) void {
+        allocator.free(self.run_id);
+        allocator.free(self.state);
+        if (self.assistant_output) |value| allocator.free(value);
+        self.* = undefined;
+    }
+};
+
+pub const AgentRunOutcome = union(enum) {
+    success: AgentRunSuccessInfo,
+    failure: ToolPayloadErrorInfo,
+
+    pub fn deinit(self: *AgentRunOutcome, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .success => |*value| value.deinit(allocator),
+            .failure => |value| value.deinit(allocator),
+        }
+        self.* = undefined;
     }
 };
 
@@ -1330,6 +1359,7 @@ pub const Session = struct {
             .pr_review_sync,
             .pr_review_run_validation,
             .pr_review_record_validation,
+            .pr_review_draft_review,
             .pr_review_save_draft,
             .pr_review_record_review,
             .pr_review_advance,
@@ -2149,7 +2179,7 @@ pub const Session = struct {
         try self.addDirectoryDescriptors(
             project_meta_dir,
             "Project Metadata",
-            "{\"kind\":\"metadata\",\"files\":[\"topology.json\",\"nodes.json\",\"agents.json\",\"sources.json\",\"contracts.json\",\"paths.json\",\"summary.json\",\"alerts.json\",\"workspace_status.json\",\"mounts.json\",\"desired_mounts.json\",\"actual_mounts.json\",\"drift.json\",\"reconcile.json\",\"availability.json\",\"health.json\"]}",
+            "{\"kind\":\"metadata\",\"files\":[\"topology.json\",\"nodes.json\",\"agents.json\",\"sources.json\",\"contracts.json\",\"paths.json\",\"summary.json\",\"alerts.json\",\"workspace_status.json\",\"mounts.json\",\"desired_mounts.json\",\"actual_mounts.json\",\"binds.json\",\"mounted_services.json\",\"drift.json\",\"reconcile.json\",\"availability.json\",\"health.json\"]}",
             "{\"read\":true,\"write\":false}",
             "Project topology and availability metadata.",
         );
@@ -2209,7 +2239,7 @@ pub const Session = struct {
         try self.addDirectoryDescriptors(
             meta_root,
             "Meta",
-            "{\"kind\":\"meta\",\"entries\":[\"protocol.json\",\"view.json\",\"workspace_status.json\",\"workspace_availability.json\",\"workspace_health.json\",\"workspace_alerts.json\"]}",
+            "{\"kind\":\"meta\",\"entries\":[\"protocol.json\",\"view.json\",\"workspace_status.json\",\"workspace_availability.json\",\"workspace_health.json\",\"workspace_alerts.json\",\"workspace_binds.json\",\"workspace_services.json\"]}",
             "{\"read\":true,\"write\":false}",
             "Attached-session compatibility metadata.",
         );
@@ -2277,12 +2307,17 @@ pub const Session = struct {
         try self.registerExistingGlobalVenomBinding(global_root, "agents", "project_namespace");
         try self.registerExistingGlobalVenomBinding(global_root, "projects", "project_namespace");
         try self.registerExistingGlobalVenomBinding(global_root, "thoughts", "project_namespace");
+        try self.registerExistingGlobalVenomBinding(global_root, "git", "project_namespace");
+        try self.registerExistingGlobalVenomBinding(global_root, "github_pr", "project_namespace");
+        try self.registerExistingGlobalVenomBinding(global_root, "missions", "project_namespace");
+        try self.registerExistingGlobalVenomBinding(global_root, "pr_review", "project_namespace");
         try self.registerExistingGlobalVenomBinding(global_root, "library", "global_namespace");
         const preferred_fs_node_id = try self.resolvePreferredBoundVenomNodeId("fs");
         defer if (preferred_fs_node_id) |value| self.allocator.free(value);
         _ = try self.seedBoundGlobalFsNamespace(global_root, preferred_fs_node_id orelse "local");
         try self.seedActiveScopedVenomBindings(active_agent_venoms_dir, project_venoms_dir, policy.project_id);
         try self.refreshScopedVenomIndexes();
+        try self.addWorkspaceServiceDiscoveryFiles(meta_root, project_meta_dir);
     }
 
     fn addProjectMetaFiles(
@@ -2407,6 +2442,189 @@ pub const Session = struct {
         _ = try self.addFile(project_meta_dir, "reconcile.json", "{\"reconcile_state\":\"unknown\",\"last_reconcile_ms\":0,\"last_success_ms\":0,\"last_error\":null,\"queue_depth\":0}", false, .none);
         _ = try self.addFile(project_meta_dir, "availability.json", "{\"mounts_total\":0,\"online\":0,\"degraded\":0,\"missing\":0}", false, .none);
         _ = try self.addFile(project_meta_dir, "health.json", "{\"state\":\"unknown\",\"availability\":{\"mounts_total\":0,\"online\":0,\"degraded\":0,\"missing\":0},\"drift_count\":0,\"reconcile_state\":\"unknown\",\"queue_depth\":0}", false, .none);
+    }
+
+    fn addWorkspaceServiceDiscoveryFiles(self: *Session, meta_root: u32, project_meta_dir: u32) !void {
+        const binds_json = try self.buildProjectBindsArrayJson();
+        defer self.allocator.free(binds_json);
+        _ = try self.addFile(project_meta_dir, "binds.json", binds_json, false, .none);
+        _ = try self.addFile(meta_root, "workspace_binds.json", binds_json, false, .none);
+
+        const services_json = try self.buildMountedServicesJson();
+        defer self.allocator.free(services_json);
+        _ = try self.addFile(project_meta_dir, "mounted_services.json", services_json, false, .none);
+        _ = try self.addFile(meta_root, "workspace_services.json", services_json, false, .none);
+    }
+
+    fn buildProjectBindsArrayJson(self: *Session) ![]u8 {
+        var out = std.ArrayListUnmanaged(u8){};
+        errdefer out.deinit(self.allocator);
+        try out.append(self.allocator, '[');
+        for (self.project_binds.items, 0..) |bind, idx| {
+            if (idx != 0) try out.append(self.allocator, ',');
+            const escaped_bind = try unified.jsonEscape(self.allocator, bind.bind_path);
+            defer self.allocator.free(escaped_bind);
+            const escaped_target = try unified.jsonEscape(self.allocator, bind.target_path);
+            defer self.allocator.free(escaped_target);
+            try out.writer(self.allocator).print(
+                "{{\"bind_path\":\"{s}\",\"target_path\":\"{s}\"}}",
+                .{ escaped_bind, escaped_target },
+            );
+        }
+        try out.append(self.allocator, ']');
+        return out.toOwnedSlice(self.allocator);
+    }
+
+    fn buildMountedServicesJson(self: *Session) ![]u8 {
+        var out = std.ArrayListUnmanaged(u8){};
+        errdefer out.deinit(self.allocator);
+        try out.append(self.allocator, '[');
+        var first = true;
+
+        for (self.project_binds.items) |bind| {
+            if (!first) try out.append(self.allocator, ',');
+            first = false;
+            try self.appendMountedServiceBindJson(&out, bind);
+        }
+
+        for (self.scoped_venom_bindings.items) |binding| {
+            if (!first) try out.append(self.allocator, ',');
+            first = false;
+            try self.appendDirectMountedServiceJson(&out, binding);
+        }
+
+        try out.append(self.allocator, ']');
+        return out.toOwnedSlice(self.allocator);
+    }
+
+    fn appendMountedServiceBindJson(self: *Session, out: *std.ArrayListUnmanaged(u8), bind: PathBind) !void {
+        var selected: ?*const ScopedVenomBinding = null;
+        for (self.scoped_venom_bindings.items) |*binding| {
+            if (!pathMatchesPrefixBoundary(bind.target_path, binding.venom_path)) continue;
+            if (selected == null or binding.venom_path.len > selected.?.venom_path.len) selected = binding;
+        }
+
+        const escaped_bind = try unified.jsonEscape(self.allocator, bind.bind_path);
+        defer self.allocator.free(escaped_bind);
+        const escaped_target = try unified.jsonEscape(self.allocator, bind.target_path);
+        defer self.allocator.free(escaped_target);
+
+        if (selected) |binding| {
+            const escaped_venom_id = try unified.jsonEscape(self.allocator, binding.venom_id);
+            defer self.allocator.free(escaped_venom_id);
+            const escaped_scope = try unified.jsonEscape(self.allocator, binding.scope);
+            defer self.allocator.free(escaped_scope);
+            const escaped_source = try unified.jsonEscape(self.allocator, binding.venom_path);
+            defer self.allocator.free(escaped_source);
+            const invoke_json = if (binding.invoke_path) |invoke_path| blk: {
+                if (try self.rebaseBoundServicePath(bind.bind_path, bind.target_path, invoke_path)) |rebased| {
+                    defer self.allocator.free(rebased);
+                    const escaped = try unified.jsonEscape(self.allocator, rebased);
+                    defer self.allocator.free(escaped);
+                    break :blk try std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped});
+                }
+                break :blk try self.allocator.dupe(u8, "null");
+            } else try self.allocator.dupe(u8, "null");
+            defer self.allocator.free(invoke_json);
+            const provider_node_json = if (binding.provider_node_id) |value| blk: {
+                const escaped = try unified.jsonEscape(self.allocator, value);
+                defer self.allocator.free(escaped);
+                break :blk try std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped});
+            } else try self.allocator.dupe(u8, "null");
+            defer self.allocator.free(provider_node_json);
+            const provider_path_json = if (binding.provider_venom_path) |value| blk: {
+                const escaped = try unified.jsonEscape(self.allocator, value);
+                defer self.allocator.free(escaped);
+                break :blk try std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped});
+            } else try self.allocator.dupe(u8, "null");
+            defer self.allocator.free(provider_path_json);
+            const endpoint_json = if (binding.endpoint_path) |value| blk: {
+                const escaped = try unified.jsonEscape(self.allocator, value);
+                defer self.allocator.free(escaped);
+                break :blk try std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped});
+            } else try self.allocator.dupe(u8, "null");
+            defer self.allocator.free(endpoint_json);
+
+            try out.writer(self.allocator).print(
+                "{{\"kind\":\"venom\",\"exposure\":\"project_bind\",\"venom_id\":\"{s}\",\"scope\":\"{s}\",\"path\":\"{s}\",\"target_path\":\"{s}\",\"source_path\":\"{s}\",\"provider_node_id\":{s},\"provider_venom_path\":{s},\"endpoint_path\":{s},\"invoke_path\":{s}}}",
+                .{
+                    escaped_venom_id,
+                    escaped_scope,
+                    escaped_bind,
+                    escaped_target,
+                    escaped_source,
+                    provider_node_json,
+                    provider_path_json,
+                    endpoint_json,
+                    invoke_json,
+                },
+            );
+            return;
+        }
+
+        try out.writer(self.allocator).print(
+            "{{\"kind\":\"path_bind\",\"exposure\":\"project_bind\",\"path\":\"{s}\",\"target_path\":\"{s}\"}}",
+            .{ escaped_bind, escaped_target },
+        );
+    }
+
+    fn appendDirectMountedServiceJson(self: *Session, out: *std.ArrayListUnmanaged(u8), binding: ScopedVenomBinding) !void {
+        const escaped_venom_id = try unified.jsonEscape(self.allocator, binding.venom_id);
+        defer self.allocator.free(escaped_venom_id);
+        const escaped_scope = try unified.jsonEscape(self.allocator, binding.scope);
+        defer self.allocator.free(escaped_scope);
+        const escaped_path = try unified.jsonEscape(self.allocator, binding.venom_path);
+        defer self.allocator.free(escaped_path);
+        const provider_node_json = if (binding.provider_node_id) |value| blk: {
+            const escaped = try unified.jsonEscape(self.allocator, value);
+            defer self.allocator.free(escaped);
+            break :blk try std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped});
+        } else try self.allocator.dupe(u8, "null");
+        defer self.allocator.free(provider_node_json);
+        const provider_path_json = if (binding.provider_venom_path) |value| blk: {
+            const escaped = try unified.jsonEscape(self.allocator, value);
+            defer self.allocator.free(escaped);
+            break :blk try std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped});
+        } else try self.allocator.dupe(u8, "null");
+        defer self.allocator.free(provider_path_json);
+        const endpoint_json = if (binding.endpoint_path) |value| blk: {
+            const escaped = try unified.jsonEscape(self.allocator, value);
+            defer self.allocator.free(escaped);
+            break :blk try std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped});
+        } else try self.allocator.dupe(u8, "null");
+        defer self.allocator.free(endpoint_json);
+        const invoke_json = if (binding.invoke_path) |value| blk: {
+            const escaped = try unified.jsonEscape(self.allocator, value);
+            defer self.allocator.free(escaped);
+            break :blk try std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped});
+        } else try self.allocator.dupe(u8, "null");
+        defer self.allocator.free(invoke_json);
+
+        try out.writer(self.allocator).print(
+            "{{\"kind\":\"venom\",\"exposure\":\"direct\",\"venom_id\":\"{s}\",\"scope\":\"{s}\",\"path\":\"{s}\",\"provider_node_id\":{s},\"provider_venom_path\":{s},\"endpoint_path\":{s},\"invoke_path\":{s}}}",
+            .{
+                escaped_venom_id,
+                escaped_scope,
+                escaped_path,
+                provider_node_json,
+                provider_path_json,
+                endpoint_json,
+                invoke_json,
+            },
+        );
+    }
+
+    fn rebaseBoundServicePath(
+        self: *Session,
+        bind_path: []const u8,
+        target_path: []const u8,
+        absolute_path: []const u8,
+    ) !?[]u8 {
+        if (!pathMatchesPrefixBoundary(absolute_path, target_path)) return null;
+        const suffix = absolute_path[target_path.len..];
+        if (suffix.len == 0) return try self.allocator.dupe(u8, bind_path);
+        if (std.mem.eql(u8, bind_path, "/")) return try std.fmt.allocPrint(self.allocator, "{s}", .{suffix});
+        return try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ bind_path, suffix });
     }
 
     fn addDebugPairingSurface(self: *Session, debug_root: u32) !void {
@@ -4575,8 +4793,8 @@ pub const Session = struct {
         defer self.allocator.free(escaped_project_id);
         return std.fmt.allocPrint(
             self.allocator,
-            "{{\"version\":\"acheron-namespace-project-contract-v2\",\"project_id\":\"{s}\",\"top_level_roots\":[\"/nodes\",\"/agents\",\"/global\"],\"project_metadata_files\":[\"topology.json\",\"nodes.json\",\"agents.json\",\"sources.json\",\"contracts.json\",\"paths.json\",\"summary.json\",\"alerts.json\",\"workspace_status.json\",\"mounts.json\",\"desired_mounts.json\",\"actual_mounts.json\",\"drift.json\",\"reconcile.json\",\"availability.json\",\"health.json\"],\"links\":{{\"nodes_root\":\"/nodes\",\"agents_root\":\"/agents\",\"global_root\":\"/global\",\"project_control\":\"/global/projects\",\"workspace_status\":\"/global/projects/control/invoke.json\"}}}}",
-            .{escaped_project_id},
+            "{{\"version\":\"acheron-namespace-project-contract-v2\",\"project_id\":\"{s}\",\"top_level_roots\":[\"/nodes\",\"/agents\",\"/global\",\"/services\"],\"project_metadata_files\":[\"topology.json\",\"nodes.json\",\"agents.json\",\"sources.json\",\"contracts.json\",\"paths.json\",\"summary.json\",\"alerts.json\",\"workspace_status.json\",\"mounts.json\",\"desired_mounts.json\",\"actual_mounts.json\",\"binds.json\",\"mounted_services.json\",\"drift.json\",\"reconcile.json\",\"availability.json\",\"health.json\"],\"links\":{{\"nodes_root\":\"/nodes\",\"agents_root\":\"/agents\",\"global_root\":\"/global\",\"services_root\":\"/services\",\"project_control\":\"/global/projects\",\"workspace_status\":\"/global/projects/control/invoke.json\",\"workspace_binds\":\"/projects/{s}/meta/binds.json\",\"workspace_services\":\"/projects/{s}/meta/mounted_services.json\"}}}}",
+            .{ escaped_project_id, escaped_project_id, escaped_project_id },
         );
     }
 
@@ -4585,8 +4803,9 @@ pub const Session = struct {
         defer self.allocator.free(escaped_project_id);
         return std.fmt.allocPrint(
             self.allocator,
-            "{{\"project_id\":\"{s}\",\"nodes_root\":\"/nodes\",\"agents_root\":\"/agents\",\"global\":{{\"root\":\"/global\",\"library\":\"/global/library\",\"projects\":\"/global/projects\",\"chat\":\"/global/chat\",\"jobs\":\"/global/jobs\",\"mounts\":\"/global/mounts\",\"debug\":{s}}}}}",
+            "{{\"project_id\":\"{s}\",\"nodes_root\":\"/nodes\",\"agents_root\":\"/agents\",\"services\":{{\"root\":\"/services\",\"mounted_services_meta\":\"/projects/{s}/meta/mounted_services.json\"}},\"global\":{{\"root\":\"/global\",\"library\":\"/global/library\",\"projects\":\"/global/projects\",\"chat\":\"/global/chat\",\"jobs\":\"/global/jobs\",\"mounts\":\"/global/mounts\",\"debug\":{s}}}}}",
             .{
+                escaped_project_id,
                 escaped_project_id,
                 if (policy.show_debug or self.is_admin) "\"/debug\"" else "null",
             },
@@ -4605,7 +4824,7 @@ pub const Session = struct {
         defer self.allocator.free(escaped_project_id);
         return std.fmt.allocPrint(
             self.allocator,
-            "{{\"project_id\":\"{s}\",\"workspace_status\":\"{s}\",\"project_fs\":\"{s}\",\"project_nodes\":\"{s}\",\"nodes_meta\":\"{s}\"}}",
+            "{{\"project_id\":\"{s}\",\"workspace_status\":\"{s}\",\"project_fs\":\"{s}\",\"project_nodes\":\"{s}\",\"nodes_meta\":\"{s}\",\"project_binds\":\"control_plane\",\"mounted_services\":\"namespace_projection\"}}",
             .{
                 escaped_project_id,
                 if (has_workspace_status) "control_plane" else "policy",
@@ -5120,7 +5339,7 @@ pub const Session = struct {
 
         return std.fmt.allocPrint(
             self.allocator,
-            "{{\"agent_id\":\"{s}\",\"project_id\":\"{s}\",\"source\":\"policy\",\"workspace_root\":null,\"mounts\":[],\"desired_mounts\":[],\"actual_mounts\":[],\"drift\":{{\"count\":0,\"items\":[]}},\"availability\":{{\"mounts_total\":0,\"online\":0,\"degraded\":0,\"missing\":0}},\"reconcile_state\":\"unknown\",\"last_reconcile_ms\":0,\"last_success_ms\":0,\"last_error\":null,\"queue_depth\":0}}",
+            "{{\"agent_id\":\"{s}\",\"project_id\":\"{s}\",\"template_id\":null,\"source\":\"policy\",\"workspace_root\":null,\"mounts\":[],\"desired_mounts\":[],\"actual_mounts\":[],\"drift\":{{\"count\":0,\"items\":[]}},\"availability\":{{\"mounts_total\":0,\"online\":0,\"degraded\":0,\"missing\":0}},\"reconcile_state\":\"unknown\",\"last_reconcile_ms\":0,\"last_success_ms\":0,\"last_error\":null,\"queue_depth\":0}}",
             .{ escaped_agent, escaped_project },
         );
     }
@@ -9644,6 +9863,7 @@ pub const Session = struct {
             .pr_review_sync => PrReviewOp.sync,
             .pr_review_run_validation => PrReviewOp.run_validation,
             .pr_review_record_validation => PrReviewOp.record_validation,
+            .pr_review_draft_review => PrReviewOp.draft_review,
             .pr_review_save_draft => PrReviewOp.save_draft,
             .pr_review_record_review => PrReviewOp.record_review,
             .pr_review_advance => PrReviewOp.advance,
@@ -10868,6 +11088,149 @@ pub const Session = struct {
             return self.allocator.dupe(u8, payload);
         }
         return self.buildServiceInvokeFailureResultJson("missing_result", "tool call produced no session.receive payload");
+    }
+
+    pub fn executeAgentRun(self: *Session, goal: []const u8, resume_run_id: ?[]const u8) !AgentRunOutcome {
+        const trimmed_goal = std.mem.trim(u8, goal, " \t\r\n");
+        if (trimmed_goal.len == 0) {
+            return .{ .failure = .{
+                .code = try self.allocator.dupe(u8, "invalid_goal"),
+                .message = try self.allocator.dupe(u8, "agent run goal must not be empty"),
+            } };
+        }
+
+        const request_id = try std.fmt.allocPrint(self.allocator, "agent-run-{d}", .{std.time.milliTimestamp()});
+        defer self.allocator.free(request_id);
+        const escaped_request_id = try unified.jsonEscape(self.allocator, request_id);
+        defer self.allocator.free(escaped_request_id);
+        const escaped_goal = try unified.jsonEscape(self.allocator, trimmed_goal);
+        defer self.allocator.free(escaped_goal);
+
+        const runtime_req = if (resume_run_id) |run_id| blk: {
+            const escaped_run_id = try unified.jsonEscape(self.allocator, run_id);
+            defer self.allocator.free(escaped_run_id);
+            break :blk try std.fmt.allocPrint(
+                self.allocator,
+                "{{\"id\":\"{s}\",\"type\":\"agent.run.resume\",\"action\":\"{s}\",\"content\":\"{s}\"}}",
+                .{ escaped_request_id, escaped_run_id, escaped_goal },
+            );
+        } else try std.fmt.allocPrint(
+            self.allocator,
+            "{{\"id\":\"{s}\",\"type\":\"agent.run.start\",\"content\":\"{s}\"}}",
+            .{ escaped_request_id, escaped_goal },
+        );
+        defer self.allocator.free(runtime_req);
+
+        const frames = self.runtime_handle.handleMessageFramesWithDebug(runtime_req, self.shouldEmitRuntimeDebugFrames()) catch |err| {
+            const normalized = chat_runtime_job.normalizeRuntimeFailureForAgent("runtime_error", @errorName(err));
+            return .{ .failure = .{
+                .code = try self.allocator.dupe(u8, normalized.code),
+                .message = try self.allocator.dupe(u8, normalized.message),
+            } };
+        };
+        defer runtime_server_mod.deinitResponseFrames(self.allocator, frames);
+
+        var run_id: ?[]u8 = null;
+        defer if (run_id) |value| self.allocator.free(value);
+        var state: ?[]u8 = null;
+        defer if (state) |value| self.allocator.free(value);
+        var assistant_output: ?[]u8 = null;
+        defer if (assistant_output) |value| self.allocator.free(value);
+        var step_count: u64 = 0;
+        var checkpoint_seq: u64 = 0;
+
+        for (frames) |frame| {
+            try self.recordRuntimeFrameForDebug(request_id, frame);
+
+            var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, frame, .{}) catch continue;
+            defer parsed.deinit();
+            if (parsed.value != .object) continue;
+            const obj = parsed.value.object;
+            const type_value = obj.get("type") orelse continue;
+            if (type_value != .string) continue;
+
+            if (std.mem.eql(u8, type_value.string, "error")) {
+                const code = if (obj.get("code")) |value|
+                    if (value == .string and value.string.len > 0) value.string else "runtime_error"
+                else
+                    "runtime_error";
+                const message = if (obj.get("message")) |value|
+                    if (value == .string and value.string.len > 0) value.string else "runtime agent run failed"
+                else
+                    "runtime agent run failed";
+                const normalized = chat_runtime_job.normalizeRuntimeFailureForAgent(code, message);
+                return .{ .failure = .{
+                    .code = try self.allocator.dupe(u8, normalized.code),
+                    .message = try self.allocator.dupe(u8, normalized.message),
+                } };
+            }
+
+            if (std.mem.eql(u8, type_value.string, "agent.run.ack") or std.mem.eql(u8, type_value.string, "agent.run.state")) {
+                if (obj.get("run_id")) |value| {
+                    if (value == .string and value.string.len > 0) {
+                        if (run_id) |old| self.allocator.free(old);
+                        run_id = try self.allocator.dupe(u8, value.string);
+                    }
+                }
+                if (obj.get("state")) |value| {
+                    if (value == .string and value.string.len > 0) {
+                        if (state) |old| self.allocator.free(old);
+                        state = try self.allocator.dupe(u8, value.string);
+                    }
+                }
+                if (obj.get("step_count")) |value| {
+                    if (value == .integer and value.integer >= 0) step_count = @intCast(value.integer);
+                }
+                if (obj.get("checkpoint_seq")) |value| {
+                    if (value == .integer and value.integer >= 0) checkpoint_seq = @intCast(value.integer);
+                }
+                continue;
+            }
+
+            if (std.mem.eql(u8, type_value.string, "agent.run.event")) {
+                const event_type = if (obj.get("event_type")) |value|
+                    if (value == .string) value.string else ""
+                else
+                    "";
+                if (!std.mem.eql(u8, event_type, "assistant.output")) continue;
+                const payload = obj.get("payload") orelse continue;
+                if (payload != .object) continue;
+                const assistant = payload.object.get("assistant") orelse continue;
+                if (assistant != .string) continue;
+                if (assistant_output) |old| self.allocator.free(old);
+                assistant_output = try self.allocator.dupe(u8, assistant.string);
+            }
+        }
+
+        const owned_run_id = if (run_id) |value|
+            try self.allocator.dupe(u8, value)
+        else
+            return .{ .failure = .{
+                .code = try self.allocator.dupe(u8, "missing_run_id"),
+                .message = try self.allocator.dupe(u8, "runtime agent run produced no run_id"),
+            } };
+        errdefer self.allocator.free(owned_run_id);
+        const owned_state = if (state) |value|
+            try self.allocator.dupe(u8, value)
+        else
+            return .{ .failure = .{
+                .code = try self.allocator.dupe(u8, "missing_run_state"),
+                .message = try self.allocator.dupe(u8, "runtime agent run produced no state"),
+            } };
+        errdefer self.allocator.free(owned_state);
+        const owned_assistant_output = if (assistant_output) |value|
+            try self.allocator.dupe(u8, value)
+        else
+            null;
+        errdefer if (owned_assistant_output) |value| self.allocator.free(value);
+
+        return .{ .success = .{
+            .run_id = owned_run_id,
+            .state = owned_state,
+            .assistant_output = owned_assistant_output,
+            .step_count = step_count,
+            .checkpoint_seq = checkpoint_seq,
+        } };
     }
 
     pub fn buildServiceInvokeStatusJson(
@@ -21197,6 +21560,63 @@ test "acheron_session: runtime failure normalization redacts provider details" {
     const normalized = chat_runtime_job.normalizeRuntimeFailureForAgent("provider_request_invalid", "provider request invalid");
     try std.testing.expectEqualStrings("runtime_internal_limit", normalized.code);
     try std.testing.expectEqualStrings("Temporary internal runtime limit reached; retry this request.", normalized.message);
+}
+
+test "acheron_session: project metadata exposes workspace binds and mounted services" {
+    const allocator = std.testing.allocator;
+
+    var control_plane = control_plane_mod.ControlPlane.init(allocator);
+    defer control_plane.deinit();
+
+    const project_json = try control_plane.createProject(
+        "{\"name\":\"SessionTemplateGitHub\",\"vision\":\"SessionTemplateGitHub\",\"template_id\":\"github\"}",
+    );
+    defer allocator.free(project_json);
+    var parsed_project = try std.json.parseFromSlice(std.json.Value, allocator, project_json, .{});
+    defer parsed_project.deinit();
+    const project_id = parsed_project.value.object.get("project_id").?.string;
+    const project_token = parsed_project.value.object.get("project_token").?.string;
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "default",
+        .{
+            .project_id = project_id,
+            .project_token = project_token,
+            .agents_dir = ".does-not-exist",
+            .projects_dir = ".does-not-exist",
+            .control_plane = &control_plane,
+        },
+    );
+    defer session.deinit();
+
+    const projects_root = session.lookupChild(session.root_id, "projects") orelse return error.TestExpectedResponse;
+    const project_dir = session.lookupChild(projects_root, project_id) orelse return error.TestExpectedResponse;
+    const meta_dir = session.lookupChild(project_dir, "meta") orelse return error.TestExpectedResponse;
+    const binds_id = session.lookupChild(meta_dir, "binds.json") orelse return error.TestExpectedResponse;
+    const binds_node = session.nodes.get(binds_id) orelse return error.TestExpectedResponse;
+    try std.testing.expect(std.mem.indexOf(u8, binds_node.content, "\"bind_path\":\"/services/mounts\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, binds_node.content, "\"bind_path\":\"/services/github_pr\"") != null);
+
+    const mounted_services_id = session.lookupChild(meta_dir, "mounted_services.json") orelse return error.TestExpectedResponse;
+    const mounted_services_node = session.nodes.get(mounted_services_id) orelse return error.TestExpectedResponse;
+    try std.testing.expect(std.mem.indexOf(u8, mounted_services_node.content, "\"path\":\"/services/git\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mounted_services_node.content, "\"target_path\":\"/global/github_pr\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mounted_services_node.content, "\"venom_id\":\"pr_review\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mounted_services_node.content, "\"exposure\":\"project_bind\"") != null);
+
+    const root_meta_dir = session.lookupChild(session.root_id, "meta") orelse return error.TestExpectedResponse;
+    const workspace_services_id = session.lookupChild(root_meta_dir, "workspace_services.json") orelse return error.TestExpectedResponse;
+    const workspace_services_node = session.nodes.get(workspace_services_id) orelse return error.TestExpectedResponse;
+    try std.testing.expect(std.mem.indexOf(u8, workspace_services_node.content, "\"path\":\"/services/missions\"") != null);
 }
 
 test "acheron_session: missing provider API key is surfaced directly" {
