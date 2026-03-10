@@ -16,6 +16,8 @@ const agent_config = @import("../agents/agent_config.zig");
 const agent_registry = @import("../agents/agent_registry.zig");
 const memory_ownership = @import("../agents/memory_ownership.zig");
 const mission_store_mod = @import("../mission_store.zig");
+const memory_venom = @import("../venoms/memory.zig");
+const search_services_venom = @import("../venoms/search_services.zig");
 const git_venom = @import("../venoms/git.zig");
 const github_pr_venom = @import("../venoms/github_pr.zig");
 const missions_venom = @import("../venoms/missions.zig");
@@ -3176,233 +3178,27 @@ pub const Session = struct {
     }
 
     fn seedAgentMemoryNamespace(self: *Session, memory_dir: u32) !void {
-        return self.seedAgentMemoryNamespaceAt(memory_dir, "/global/memory");
+        return memory_venom.seedNamespace(self, memory_dir);
     }
 
     fn seedAgentMemoryNamespaceAt(self: *Session, memory_dir: u32, base_path: []const u8) !void {
-        const escaped_base_path = try unified.jsonEscape(self.allocator, base_path);
-        defer self.allocator.free(escaped_base_path);
-        const shape_json = try std.fmt.allocPrint(
-            self.allocator,
-            "{{\"kind\":\"venom\",\"venom_id\":\"memory\",\"shape\":\"{s}/{{README.md,SCHEMA.json,CAPS.json,OPS.json,PERMISSIONS.json,STATUS.json,status.json,result.json,control/*}}\"}}",
-            .{escaped_base_path},
-        );
-        defer self.allocator.free(shape_json);
-        try self.addDirectoryDescriptors(
-            memory_dir,
-            "Memory",
-            shape_json,
-            "{\"invoke\":true,\"operations\":[\"memory_create\",\"memory_load\",\"memory_versions\",\"memory_mutate\",\"memory_evict\",\"memory_search\"],\"discoverable\":true}",
-            "First-class memory namespace. Write operation payloads to control/*.json, then read status.json/result.json.",
-        );
-        _ = try self.addFile(
-            memory_dir,
-            "OPS.json",
-            "{\"model\":\"local_bridge\",\"invoke\":\"control/invoke.json\",\"transport\":\"acheron-local\",\"paths\":{\"create\":\"control/create.json\",\"load\":\"control/load.json\",\"versions\":\"control/versions.json\",\"mutate\":\"control/mutate.json\",\"evict\":\"control/evict.json\",\"search\":\"control/search.json\"},\"operations\":{\"create\":\"create\",\"load\":\"load\",\"versions\":\"versions\",\"mutate\":\"mutate\",\"evict\":\"evict\",\"search\":\"search\"}}",
-            false,
-            .none,
-        );
-        _ = try self.addFile(
-            memory_dir,
-            "RUNTIME.json",
-            "{\"type\":\"acheron_local\",\"component\":\"acheron_session\",\"subject\":\"agent_memory\"}",
-            false,
-            .none,
-        );
-        _ = try self.addFile(
-            memory_dir,
-            "PERMISSIONS.json",
-            "{\"default\":\"allow-by-default\",\"allow_roles\":[\"admin\",\"user\"],\"scope\":\"agent\"}",
-            false,
-            .none,
-        );
-        _ = try self.addFile(
-            memory_dir,
-            "STATUS.json",
-            "{\"venom_id\":\"memory\",\"state\":\"namespace\",\"has_invoke\":true}",
-            false,
-            .none,
-        );
-        _ = try self.addFile(
-            memory_dir,
-            "status.json",
-            "{\"state\":\"idle\",\"tool\":null,\"updated_at_ms\":0,\"error\":null}",
-            false,
-            .none,
-        );
-        _ = try self.addFile(
-            memory_dir,
-            "result.json",
-            "{\"ok\":false,\"result\":null,\"error\":null}",
-            false,
-            .none,
-        );
-
-        const control_dir = try self.addDir(memory_dir, "control", false);
-        _ = try self.addFile(
-            control_dir,
-            "README.md",
-            "Write JSON payloads to operation files. Generic invoke is available at invoke.json.\n",
-            false,
-            .none,
-        );
-        _ = try self.addFile(control_dir, "invoke.json", "", true, .memory_invoke);
-        _ = try self.addFile(control_dir, "create.json", "", true, .memory_create);
-        _ = try self.addFile(control_dir, "load.json", "", true, .memory_load);
-        _ = try self.addFile(control_dir, "versions.json", "", true, .memory_versions);
-        _ = try self.addFile(control_dir, "mutate.json", "", true, .memory_mutate);
-        _ = try self.addFile(control_dir, "evict.json", "", true, .memory_evict);
-        _ = try self.addFile(control_dir, "search.json", "", true, .memory_search);
+        return memory_venom.seedNamespaceAt(self, memory_dir, base_path);
     }
 
     fn seedAgentWebSearchNamespace(self: *Session, web_search_dir: u32) !void {
-        return self.seedAgentWebSearchNamespaceAt(web_search_dir, "/global/web_search");
+        return search_services_venom.seedWebSearchNamespace(self, web_search_dir);
     }
 
     fn seedAgentWebSearchNamespaceAt(self: *Session, web_search_dir: u32, base_path: []const u8) !void {
-        const escaped_base_path = try unified.jsonEscape(self.allocator, base_path);
-        defer self.allocator.free(escaped_base_path);
-        const shape_json = try std.fmt.allocPrint(
-            self.allocator,
-            "{{\"kind\":\"venom\",\"venom_id\":\"web_search\",\"shape\":\"{s}/{{README.md,SCHEMA.json,CAPS.json,OPS.json,RUNTIME.json,PERMISSIONS.json,STATUS.json,status.json,result.json,control/*}}\"}}",
-            .{escaped_base_path},
-        );
-        defer self.allocator.free(shape_json);
-        try self.addDirectoryDescriptors(
-            web_search_dir,
-            "Web Search",
-            shape_json,
-            "{\"invoke\":true,\"operations\":[\"web_search\"],\"discoverable\":true,\"network\":true}",
-            "First-class web search namespace. Write search payloads to control/search.json (or invoke.json), then read status.json/result.json.",
-        );
-        _ = try self.addFile(
-            web_search_dir,
-            "OPS.json",
-            "{\"model\":\"local_bridge\",\"invoke\":\"control/invoke.json\",\"transport\":\"acheron-local\",\"paths\":{\"search\":\"control/search.json\"},\"operations\":{\"search\":\"search\"}}",
-            false,
-            .none,
-        );
-        _ = try self.addFile(
-            web_search_dir,
-            "RUNTIME.json",
-            "{\"type\":\"acheron_local\",\"component\":\"acheron_session\",\"subject\":\"web_search\"}",
-            false,
-            .none,
-        );
-        _ = try self.addFile(
-            web_search_dir,
-            "PERMISSIONS.json",
-            "{\"default\":\"allow-by-default\",\"allow_roles\":[\"admin\",\"user\"],\"scope\":\"agent\"}",
-            false,
-            .none,
-        );
-        _ = try self.addFile(
-            web_search_dir,
-            "STATUS.json",
-            "{\"venom_id\":\"web_search\",\"state\":\"namespace\",\"has_invoke\":true}",
-            false,
-            .none,
-        );
-        _ = try self.addFile(
-            web_search_dir,
-            "status.json",
-            "{\"state\":\"idle\",\"tool\":null,\"updated_at_ms\":0,\"error\":null}",
-            false,
-            .none,
-        );
-        _ = try self.addFile(
-            web_search_dir,
-            "result.json",
-            "{\"ok\":false,\"result\":null,\"error\":null}",
-            false,
-            .none,
-        );
-
-        const control_dir = try self.addDir(web_search_dir, "control", false);
-        _ = try self.addFile(
-            control_dir,
-            "README.md",
-            "Write search payloads to search.json (or explicit envelopes to invoke.json). Read result.json and status.json.\n",
-            false,
-            .none,
-        );
-        _ = try self.addFile(control_dir, "invoke.json", "", true, .web_search_invoke);
-        _ = try self.addFile(control_dir, "search.json", "", true, .web_search_search);
+        return search_services_venom.seedWebSearchNamespaceAt(self, web_search_dir, base_path);
     }
 
     fn seedAgentSearchCodeNamespace(self: *Session, search_code_dir: u32) !void {
-        return self.seedAgentSearchCodeNamespaceAt(search_code_dir, "/global/search_code");
+        return search_services_venom.seedSearchCodeNamespace(self, search_code_dir);
     }
 
     fn seedAgentSearchCodeNamespaceAt(self: *Session, search_code_dir: u32, base_path: []const u8) !void {
-        const escaped_base_path = try unified.jsonEscape(self.allocator, base_path);
-        defer self.allocator.free(escaped_base_path);
-        const shape_json = try std.fmt.allocPrint(
-            self.allocator,
-            "{{\"kind\":\"venom\",\"venom_id\":\"search_code\",\"shape\":\"{s}/{{README.md,SCHEMA.json,CAPS.json,OPS.json,RUNTIME.json,PERMISSIONS.json,STATUS.json,status.json,result.json,control/*}}\"}}",
-            .{escaped_base_path},
-        );
-        defer self.allocator.free(shape_json);
-        try self.addDirectoryDescriptors(
-            search_code_dir,
-            "Search Code",
-            shape_json,
-            "{\"invoke\":true,\"operations\":[\"search_code\"],\"discoverable\":true}",
-            "First-class code search namespace. Write search payloads to control/search.json (or invoke.json), then read status.json/result.json.",
-        );
-        _ = try self.addFile(
-            search_code_dir,
-            "OPS.json",
-            "{\"model\":\"local_bridge\",\"invoke\":\"control/invoke.json\",\"transport\":\"acheron-local\",\"paths\":{\"search\":\"control/search.json\"},\"operations\":{\"search\":\"search\"}}",
-            false,
-            .none,
-        );
-        _ = try self.addFile(
-            search_code_dir,
-            "RUNTIME.json",
-            "{\"type\":\"acheron_local\",\"component\":\"acheron_session\",\"subject\":\"search_code\"}",
-            false,
-            .none,
-        );
-        _ = try self.addFile(
-            search_code_dir,
-            "PERMISSIONS.json",
-            "{\"default\":\"allow-by-default\",\"allow_roles\":[\"admin\",\"user\"],\"scope\":\"agent\"}",
-            false,
-            .none,
-        );
-        _ = try self.addFile(
-            search_code_dir,
-            "STATUS.json",
-            "{\"venom_id\":\"search_code\",\"state\":\"namespace\",\"has_invoke\":true}",
-            false,
-            .none,
-        );
-        _ = try self.addFile(
-            search_code_dir,
-            "status.json",
-            "{\"state\":\"idle\",\"tool\":null,\"updated_at_ms\":0,\"error\":null}",
-            false,
-            .none,
-        );
-        _ = try self.addFile(
-            search_code_dir,
-            "result.json",
-            "{\"ok\":false,\"result\":null,\"error\":null}",
-            false,
-            .none,
-        );
-
-        const control_dir = try self.addDir(search_code_dir, "control", false);
-        _ = try self.addFile(
-            control_dir,
-            "README.md",
-            "Write search payloads to search.json (or explicit envelopes to invoke.json). Read result.json and status.json.\n",
-            false,
-            .none,
-        );
-        _ = try self.addFile(control_dir, "invoke.json", "", true, .search_code_invoke);
-        _ = try self.addFile(control_dir, "search.json", "", true, .search_code_search);
+        return search_services_venom.seedSearchCodeNamespaceAt(self, search_code_dir, base_path);
     }
 
     fn seedAgentTerminalNamespace(self: *Session, terminal_dir: u32) !void {
@@ -7162,7 +6958,7 @@ pub const Session = struct {
                 .{ parsed.entity_id, job_id },
             );
         }
-        return std.fmt.allocPrint(self.allocator, "/global/jobs/{s}/result.txt", .{job_id});
+        return std.fmt.allocPrint(self.allocator, "/nodes/local/venoms/jobs/{s}/result.txt", .{job_id});
     }
 
     fn boundVenomProxyPathForAbsolutePath(self: *Session, absolute_path: []const u8) !?BoundVenomProxyPath {
@@ -7847,320 +7643,19 @@ pub const Session = struct {
         try self.setFileContent(self.thoughts_status_id, status_json);
     }
 
-    const SearchNamespace = enum {
-        web_search,
-        search_code,
-    };
-
-    const SearchRequest = struct {
-        tool_name: []const u8,
-        args_json: []u8,
-
-        fn deinit(self: *SearchRequest, allocator: std.mem.Allocator) void {
-            allocator.free(self.args_json);
-            self.* = undefined;
-        }
-    };
-
     fn handleSearchNamespaceWrite(
         self: *Session,
         special: SpecialKind,
         node_id: u32,
         raw_input: []const u8,
     ) !WriteOutcome {
-        const invoke_node = self.nodes.get(node_id) orelse return error.MissingNode;
-        const control_dir_id = invoke_node.parent orelse return error.MissingNode;
-        const venom_dir_id = (self.nodes.get(control_dir_id) orelse return error.MissingNode).parent orelse return error.MissingNode;
-        if (!self.canInvokeVenomDirectory(venom_dir_id)) return error.AccessDenied;
-        const status_runtime_id = self.lookupChild(venom_dir_id, "status.json") orelse return error.MissingNode;
-        const result_id = self.lookupChild(venom_dir_id, "result.json") orelse return error.MissingNode;
-
-        var request = self.parseSearchRequest(special, invoke_node.name, raw_input) catch return error.InvalidPayload;
-        defer request.deinit(self.allocator);
-
-        const input = std.mem.trim(u8, raw_input, " \t\r\n");
-        try self.setFileContent(node_id, input);
-
-        const running_status = try self.buildServiceInvokeStatusJson("running", request.tool_name, null);
-        defer self.allocator.free(running_status);
-        try self.setFileContent(status_runtime_id, running_status);
-
-        const result_payload = try self.executeServiceToolCall(request.tool_name, request.args_json);
-        defer self.allocator.free(result_payload);
-        if (try self.extractErrorMessageFromToolPayload(result_payload)) |message| {
-            defer self.allocator.free(message);
-            const status = try self.buildServiceInvokeStatusJson("failed", request.tool_name, message);
-            defer self.allocator.free(status);
-            try self.setFileContent(status_runtime_id, status);
-        } else {
-            const status = try self.buildServiceInvokeStatusJson("done", request.tool_name, null);
-            defer self.allocator.free(status);
-            try self.setFileContent(status_runtime_id, status);
-        }
-        try self.setFileContent(result_id, result_payload);
-        return .{ .written = raw_input.len };
+        const written = try search_services_venom.handleNamespaceWrite(self, special, node_id, raw_input);
+        return .{ .written = written };
     }
-
-    fn parseSearchRequest(
-        self: *Session,
-        special: SpecialKind,
-        invoke_file_name: []const u8,
-        raw_input: []const u8,
-    ) !SearchRequest {
-        const input = std.mem.trim(u8, raw_input, " \t\r\n");
-        if (input.len == 0) return error.InvalidPayload;
-
-        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, input, .{}) catch return error.InvalidPayload;
-        defer parsed.deinit();
-        if (parsed.value != .object) return error.InvalidPayload;
-        const obj = parsed.value.object;
-
-        const service = searchNamespaceFromSpecial(special) orelse return error.InvalidPayload;
-        if (!searchNamespaceMatchesInvokeFile(special, invoke_file_name)) return error.InvalidPayload;
-
-        if (extractOptionalStringByNames(obj, &.{ "op", "operation", "tool", "tool_name" })) |raw_op| {
-            if (!isValidSearchNamespaceOperation(service, raw_op)) return error.InvalidPayload;
-        }
-
-        const args_json = if (obj.get("arguments")) |value| blk: {
-            if (value != .object) return error.InvalidPayload;
-            break :blk try self.renderJsonValue(value);
-        } else if (obj.get("args")) |value| blk: {
-            if (value != .object) return error.InvalidPayload;
-            break :blk try self.renderJsonValue(value);
-        } else try self.renderJsonValue(parsed.value);
-
-        return .{
-            .tool_name = searchNamespaceRuntimeTool(service),
-            .args_json = args_json,
-        };
-    }
-
-    fn searchNamespaceFromSpecial(special: SpecialKind) ?SearchNamespace {
-        return switch (special) {
-            .web_search_invoke, .web_search_search => .web_search,
-            .search_code_invoke, .search_code_search => .search_code,
-            else => null,
-        };
-    }
-
-    fn searchNamespaceMatchesInvokeFile(special: SpecialKind, invoke_file_name: []const u8) bool {
-        return switch (special) {
-            .web_search_invoke, .search_code_invoke => std.mem.eql(u8, invoke_file_name, "invoke.json"),
-            .web_search_search, .search_code_search => std.mem.eql(u8, invoke_file_name, "search.json"),
-            else => false,
-        };
-    }
-
-    fn searchNamespaceRuntimeTool(namespace: SearchNamespace) []const u8 {
-        return switch (namespace) {
-            .web_search => "web_search",
-            .search_code => "search_code",
-        };
-    }
-
-    fn isValidSearchNamespaceOperation(namespace: SearchNamespace, raw_operation: []const u8) bool {
-        const op = std.mem.trim(u8, raw_operation, " \t\r\n");
-        return switch (namespace) {
-            .web_search => std.mem.eql(u8, op, "search") or std.mem.eql(u8, op, "web_search"),
-            .search_code => std.mem.eql(u8, op, "search") or std.mem.eql(u8, op, "search_code"),
-        };
-    }
-
-    const MemoryOp = enum {
-        create,
-        load,
-        versions,
-        mutate,
-        evict,
-        search,
-    };
 
     fn handleMemoryNamespaceWrite(self: *Session, special: SpecialKind, node_id: u32, raw_input: []const u8) !WriteOutcome {
-        const invoke_node = self.nodes.get(node_id) orelse return error.MissingNode;
-        const control_dir_id = invoke_node.parent orelse return error.MissingNode;
-        const venom_dir_id = (self.nodes.get(control_dir_id) orelse return error.MissingNode).parent orelse return error.MissingNode;
-        if (!self.canInvokeVenomDirectory(venom_dir_id)) return error.AccessDenied;
-        const status_runtime_id = self.lookupChild(venom_dir_id, "status.json") orelse return error.MissingNode;
-        const result_id = self.lookupChild(venom_dir_id, "result.json") orelse return error.MissingNode;
-
-        const parsed = self.parseMemoryRequest(special, invoke_node.name, raw_input) catch return error.InvalidPayload;
-        defer {
-            self.allocator.free(parsed.args_json);
-        }
-
-        const input = std.mem.trim(u8, raw_input, " \t\r\n");
-        try self.setFileContent(node_id, if (input.len == 0) "{}" else input);
-
-        const tool_name = memoryRuntimeTool(parsed.op);
-        const running_status = try self.buildServiceInvokeStatusJson("running", tool_name, null);
-        defer self.allocator.free(running_status);
-        try self.setFileContent(status_runtime_id, running_status);
-
-        const runtime_args = try self.normalizeMemoryArgsForRuntime(parsed.op, parsed.args_json);
-        defer self.allocator.free(runtime_args);
-        const runtime_payload = try self.executeServiceToolCall(tool_name, runtime_args);
-        defer self.allocator.free(runtime_payload);
-        const transformed_payload = try self.transformMemoryResultPayload(runtime_payload);
-        defer self.allocator.free(transformed_payload);
-
-        if (try self.extractErrorMessageFromToolPayload(transformed_payload)) |message| {
-            defer self.allocator.free(message);
-            const status = try self.buildServiceInvokeStatusJson("failed", tool_name, message);
-            defer self.allocator.free(status);
-            try self.setFileContent(status_runtime_id, status);
-        } else {
-            const status = try self.buildServiceInvokeStatusJson("done", tool_name, null);
-            defer self.allocator.free(status);
-            try self.setFileContent(status_runtime_id, status);
-        }
-        try self.setFileContent(result_id, transformed_payload);
-        return .{ .written = raw_input.len };
-    }
-
-    const MemoryRequest = struct {
-        op: MemoryOp,
-        args_json: []u8,
-    };
-
-    fn parseMemoryRequest(
-        self: *Session,
-        special: SpecialKind,
-        invoke_file_name: []const u8,
-        raw_input: []const u8,
-    ) !MemoryRequest {
-        const input = std.mem.trim(u8, raw_input, " \t\r\n");
-        const payload = if (input.len == 0) "{}" else input;
-        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, payload, .{}) catch return error.InvalidPayload;
-        defer parsed.deinit();
-        if (parsed.value != .object) return error.InvalidPayload;
-        const obj = parsed.value.object;
-
-        const op = switch (special) {
-            .memory_create => MemoryOp.create,
-            .memory_load => MemoryOp.load,
-            .memory_versions => MemoryOp.versions,
-            .memory_mutate => MemoryOp.mutate,
-            .memory_evict => MemoryOp.evict,
-            .memory_search => MemoryOp.search,
-            .memory_invoke => blk: {
-                const op_raw = blk2: {
-                    if (obj.get("op")) |value| if (value == .string and value.string.len > 0) break :blk2 value.string;
-                    if (obj.get("operation")) |value| if (value == .string and value.string.len > 0) break :blk2 value.string;
-                    if (obj.get("tool")) |value| if (value == .string and value.string.len > 0) break :blk2 value.string;
-                    if (obj.get("tool_name")) |value| if (value == .string and value.string.len > 0) break :blk2 value.string;
-                    break :blk2 null;
-                } orelse return error.InvalidPayload;
-                break :blk parseMemoryOp(op_raw) orelse return error.InvalidPayload;
-            },
-            else => return error.InvalidPayload,
-        };
-
-        const args_json = if (obj.get("arguments")) |value|
-            try self.renderJsonValue(value)
-        else if (obj.get("args")) |value|
-            try self.renderJsonValue(value)
-        else if (special == .memory_invoke)
-            try self.renderJsonValue(parsed.value)
-        else
-            try self.renderJsonValue(parsed.value);
-
-        _ = invoke_file_name;
-        return .{ .op = op, .args_json = args_json };
-    }
-
-    fn parseMemoryOp(raw: []const u8) ?MemoryOp {
-        const value = std.mem.trim(u8, raw, " \t\r\n");
-        if (std.mem.eql(u8, value, "create") or std.mem.eql(u8, value, "memory_create")) return .create;
-        if (std.mem.eql(u8, value, "load") or std.mem.eql(u8, value, "memory_load")) return .load;
-        if (std.mem.eql(u8, value, "versions") or std.mem.eql(u8, value, "memory_versions")) return .versions;
-        if (std.mem.eql(u8, value, "mutate") or std.mem.eql(u8, value, "memory_mutate")) return .mutate;
-        if (std.mem.eql(u8, value, "evict") or std.mem.eql(u8, value, "memory_evict")) return .evict;
-        if (std.mem.eql(u8, value, "search") or std.mem.eql(u8, value, "memory_search")) return .search;
-        return null;
-    }
-
-    fn memoryRuntimeTool(op: MemoryOp) []const u8 {
-        return switch (op) {
-            .create => "memory_create",
-            .load => "memory_load",
-            .versions => "memory_versions",
-            .mutate => "memory_mutate",
-            .evict => "memory_evict",
-            .search => "memory_search",
-        };
-    }
-
-    fn memoryOpNeedsMemId(op: MemoryOp) bool {
-        return switch (op) {
-            .load, .versions, .mutate, .evict => true,
-            else => false,
-        };
-    }
-
-    fn normalizeMemoryArgsForRuntime(self: *Session, op: MemoryOp, args_json: []const u8) ![]u8 {
-        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, args_json, .{}) catch return error.InvalidPayload;
-        defer parsed.deinit();
-        if (parsed.value != .object) return error.InvalidPayload;
-        const obj = parsed.value.object;
-        if (!memoryOpNeedsMemId(op)) return self.allocator.dupe(u8, args_json);
-
-        var mem_id: ?[]const u8 = null;
-        var mem_id_owned = false;
-        if (obj.get("mem_id")) |value| {
-            if (value == .string and value.string.len > 0) mem_id = value.string;
-        }
-        if (mem_id == null) {
-            if (obj.get("memory_path")) |value| {
-                if (value != .string or value.string.len == 0) return error.InvalidPayload;
-                mem_id = try decodeMemIdFromPath(self.allocator, value.string);
-                mem_id_owned = true;
-            }
-        }
-        const resolved_mem_id = mem_id orelse return error.InvalidPayload;
-        defer if (mem_id_owned) self.allocator.free(resolved_mem_id);
-
-        var out = std.ArrayListUnmanaged(u8){};
-        errdefer out.deinit(self.allocator);
-        const writer = out.writer(self.allocator);
-        try writer.writeByte('{');
-        var first = true;
-        var has_mem_id = false;
-        var it = obj.iterator();
-        while (it.next()) |entry| {
-            if (std.mem.eql(u8, entry.key_ptr.*, "memory_path")) continue;
-            if (std.mem.eql(u8, entry.key_ptr.*, "mem_id")) {
-                has_mem_id = true;
-            }
-            if (!first) try writer.writeByte(',');
-            first = false;
-            try writeJsonString(writer, entry.key_ptr.*);
-            try writer.writeByte(':');
-            if (std.mem.eql(u8, entry.key_ptr.*, "mem_id")) {
-                try writeJsonString(writer, resolved_mem_id);
-            } else {
-                try self.renderJsonValueToWriter(writer, entry.value_ptr.*);
-            }
-        }
-        if (!has_mem_id) {
-            if (!first) try writer.writeByte(',');
-            try writer.writeAll("\"mem_id\":");
-            try writeJsonString(writer, resolved_mem_id);
-        }
-        try writer.writeByte('}');
-        return out.toOwnedSlice(self.allocator);
-    }
-
-    fn transformMemoryResultPayload(self: *Session, runtime_payload: []const u8) ![]u8 {
-        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, runtime_payload, .{}) catch {
-            return self.allocator.dupe(u8, runtime_payload);
-        };
-        defer parsed.deinit();
-        var out = std.ArrayListUnmanaged(u8){};
-        errdefer out.deinit(self.allocator);
-        const writer = out.writer(self.allocator);
-        try self.renderJsonValueWithMemoryPaths(writer, parsed.value);
-        return out.toOwnedSlice(self.allocator);
+        const written = try memory_venom.handleNamespaceWrite(self, special, node_id, raw_input);
+        return .{ .written = written };
     }
 
     fn renderJsonValueToWriter(self: *Session, writer: anytype, value: std.json.Value) !void {
@@ -8189,50 +7684,6 @@ pub const Session = struct {
                     try writeJsonString(writer, entry.key_ptr.*);
                     try writer.writeByte(':');
                     try self.renderJsonValueToWriter(writer, entry.value_ptr.*);
-                }
-                try writer.writeByte('}');
-            },
-        }
-    }
-
-    fn renderJsonValueWithMemoryPaths(self: *Session, writer: anytype, value: std.json.Value) !void {
-        switch (value) {
-            .null, .bool, .integer, .float, .number_string, .string => try self.renderJsonValueToWriter(writer, value),
-            .array => |arr| {
-                try writer.writeByte('[');
-                for (arr.items, 0..) |item, idx| {
-                    if (idx != 0) try writer.writeByte(',');
-                    try self.renderJsonValueWithMemoryPaths(writer, item);
-                }
-                try writer.writeByte(']');
-            },
-            .object => |obj| {
-                try writer.writeByte('{');
-                var first = true;
-                var it = obj.iterator();
-                while (it.next()) |entry| {
-                    if (std.mem.eql(u8, entry.key_ptr.*, "mem_id")) {
-                        if (entry.value_ptr.* == .string and entry.value_ptr.*.string.len > 0) {
-                            const memory_path = try buildMemoryPathFromMemId(self.allocator, entry.value_ptr.*.string);
-                            defer self.allocator.free(memory_path);
-                            if (!first) try writer.writeByte(',');
-                            first = false;
-                            try writer.writeAll("\"memory_path\":");
-                            try writeJsonString(writer, memory_path);
-
-                            if (memory_ownership.ownershipLabelFromMemId(entry.value_ptr.*.string)) |ownership| {
-                                try writer.writeByte(',');
-                                try writer.writeAll("\"ownership\":");
-                                try writeJsonString(writer, ownership);
-                            }
-                            continue;
-                        }
-                    }
-                    if (!first) try writer.writeByte(',');
-                    first = false;
-                    try writeJsonString(writer, entry.key_ptr.*);
-                    try writer.writeByte(':');
-                    try self.renderJsonValueWithMemoryPaths(writer, entry.value_ptr.*);
                 }
                 try writer.writeByte('}');
             },
@@ -11886,114 +11337,160 @@ pub const Session = struct {
     }
 
     fn parseWaitSourcePath(self: *Session, path: []const u8) !WaitSource {
-        if (std.mem.eql(u8, path, "/global/chat/control/input") or
-            std.mem.endsWith(u8, path, "/global/chat/control/input"))
-        {
-            return .{
-                .raw_path = try self.allocator.dupe(u8, path),
-                .kind = .chat_input,
-            };
+        inline for ([_][]const u8{
+            "/global/chat/control/input",
+            "/nodes/local/venoms/chat/control/input",
+            "/services/chat/control/input",
+        }) |candidate| {
+            if (std.mem.eql(u8, path, candidate) or std.mem.endsWith(u8, path, candidate)) {
+                return .{
+                    .raw_path = try self.allocator.dupe(u8, path),
+                    .kind = .chat_input,
+                };
+            }
         }
 
-        if (std.mem.eql(u8, path, "/global/events/sources/agent.json") or
-            std.mem.endsWith(u8, path, "/global/events/sources/agent.json"))
-        {
-            return .{
-                .raw_path = try self.allocator.dupe(u8, path),
-                .kind = .agent_signal,
-            };
+        inline for ([_][]const u8{
+            "/global/events/sources/agent.json",
+            "/nodes/local/venoms/events/sources/agent.json",
+            "/services/events/sources/agent.json",
+        }) |candidate| {
+            if (std.mem.eql(u8, path, candidate) or std.mem.endsWith(u8, path, candidate)) {
+                return .{
+                    .raw_path = try self.allocator.dupe(u8, path),
+                    .kind = .agent_signal,
+                };
+            }
         }
-        if (std.mem.eql(u8, path, "/global/events/sources/hook.json") or
-            std.mem.endsWith(u8, path, "/global/events/sources/hook.json"))
-        {
-            return .{
-                .raw_path = try self.allocator.dupe(u8, path),
-                .kind = .hook_signal,
-            };
+        inline for ([_][]const u8{
+            "/global/events/sources/hook.json",
+            "/nodes/local/venoms/events/sources/hook.json",
+            "/services/events/sources/hook.json",
+        }) |candidate| {
+            if (std.mem.eql(u8, path, candidate) or std.mem.endsWith(u8, path, candidate)) {
+                return .{
+                    .raw_path = try self.allocator.dupe(u8, path),
+                    .kind = .hook_signal,
+                };
+            }
         }
-        if (std.mem.eql(u8, path, "/global/events/sources/user.json") or
-            std.mem.endsWith(u8, path, "/global/events/sources/user.json"))
-        {
-            return .{
-                .raw_path = try self.allocator.dupe(u8, path),
-                .kind = .user_signal,
-            };
+        inline for ([_][]const u8{
+            "/global/events/sources/user.json",
+            "/nodes/local/venoms/events/sources/user.json",
+            "/services/events/sources/user.json",
+        }) |candidate| {
+            if (std.mem.eql(u8, path, candidate) or std.mem.endsWith(u8, path, candidate)) {
+                return .{
+                    .raw_path = try self.allocator.dupe(u8, path),
+                    .kind = .user_signal,
+                };
+            }
         }
-        if (std.mem.indexOf(u8, path, "/global/events/sources/agent/")) |prefix_index| {
-            const marker = "/global/events/sources/agent/";
-            const token = path[prefix_index + marker.len ..];
-            const parameter = try self.parseWaitSelectorToken(token);
-            errdefer self.allocator.free(parameter);
-            return .{
-                .raw_path = try self.allocator.dupe(u8, path),
-                .kind = .agent_signal,
-                .parameter = parameter,
-            };
+        inline for ([_][]const u8{
+            "/global/events/sources/agent/",
+            "/nodes/local/venoms/events/sources/agent/",
+            "/services/events/sources/agent/",
+        }) |marker| {
+            if (std.mem.indexOf(u8, path, marker)) |prefix_index| {
+                const token = path[prefix_index + marker.len ..];
+                const parameter = try self.parseWaitSelectorToken(token);
+                errdefer self.allocator.free(parameter);
+                return .{
+                    .raw_path = try self.allocator.dupe(u8, path),
+                    .kind = .agent_signal,
+                    .parameter = parameter,
+                };
+            }
         }
-        if (std.mem.indexOf(u8, path, "/global/events/sources/hook/")) |prefix_index| {
-            const marker = "/global/events/sources/hook/";
-            const token = path[prefix_index + marker.len ..];
-            const parameter = try self.parseWaitSelectorToken(token);
-            errdefer self.allocator.free(parameter);
-            return .{
-                .raw_path = try self.allocator.dupe(u8, path),
-                .kind = .hook_signal,
-                .parameter = parameter,
-            };
+        inline for ([_][]const u8{
+            "/global/events/sources/hook/",
+            "/nodes/local/venoms/events/sources/hook/",
+            "/services/events/sources/hook/",
+        }) |marker| {
+            if (std.mem.indexOf(u8, path, marker)) |prefix_index| {
+                const token = path[prefix_index + marker.len ..];
+                const parameter = try self.parseWaitSelectorToken(token);
+                errdefer self.allocator.free(parameter);
+                return .{
+                    .raw_path = try self.allocator.dupe(u8, path),
+                    .kind = .hook_signal,
+                    .parameter = parameter,
+                };
+            }
         }
-        if (std.mem.indexOf(u8, path, "/global/events/sources/user/")) |prefix_index| {
-            const marker = "/global/events/sources/user/";
-            const token = path[prefix_index + marker.len ..];
-            const parameter = try self.parseWaitSelectorToken(token);
-            errdefer self.allocator.free(parameter);
-            return .{
-                .raw_path = try self.allocator.dupe(u8, path),
-                .kind = .user_signal,
-                .parameter = parameter,
-            };
+        inline for ([_][]const u8{
+            "/global/events/sources/user/",
+            "/nodes/local/venoms/events/sources/user/",
+            "/services/events/sources/user/",
+        }) |marker| {
+            if (std.mem.indexOf(u8, path, marker)) |prefix_index| {
+                const token = path[prefix_index + marker.len ..];
+                const parameter = try self.parseWaitSelectorToken(token);
+                errdefer self.allocator.free(parameter);
+                return .{
+                    .raw_path = try self.allocator.dupe(u8, path),
+                    .kind = .user_signal,
+                    .parameter = parameter,
+                };
+            }
         }
-        if (std.mem.indexOf(u8, path, "/global/events/sources/time/after/")) |prefix_index| {
-            const marker = "/global/events/sources/time/after/";
-            const token = path[prefix_index + marker.len ..];
-            const delay_ms = try self.parseWaitSelectorMillis(token);
-            const target_time_ms = std.math.add(i64, std.time.milliTimestamp(), delay_ms) catch return error.InvalidPayload;
-            return .{
-                .raw_path = try self.allocator.dupe(u8, path),
-                .kind = .time_after,
-                .target_time_ms = target_time_ms,
-            };
+        inline for ([_][]const u8{
+            "/global/events/sources/time/after/",
+            "/nodes/local/venoms/events/sources/time/after/",
+            "/services/events/sources/time/after/",
+        }) |marker| {
+            if (std.mem.indexOf(u8, path, marker)) |prefix_index| {
+                const token = path[prefix_index + marker.len ..];
+                const delay_ms = try self.parseWaitSelectorMillis(token);
+                const target_time_ms = std.math.add(i64, std.time.milliTimestamp(), delay_ms) catch return error.InvalidPayload;
+                return .{
+                    .raw_path = try self.allocator.dupe(u8, path),
+                    .kind = .time_after,
+                    .target_time_ms = target_time_ms,
+                };
+            }
         }
-        if (std.mem.indexOf(u8, path, "/global/events/sources/time/at/")) |prefix_index| {
-            const marker = "/global/events/sources/time/at/";
-            const token = path[prefix_index + marker.len ..];
-            const target_ms = try self.parseWaitSelectorMillis(token);
-            return .{
-                .raw_path = try self.allocator.dupe(u8, path),
-                .kind = .time_at,
-                .target_time_ms = target_ms,
-            };
+        inline for ([_][]const u8{
+            "/global/events/sources/time/at/",
+            "/nodes/local/venoms/events/sources/time/at/",
+            "/services/events/sources/time/at/",
+        }) |marker| {
+            if (std.mem.indexOf(u8, path, marker)) |prefix_index| {
+                const token = path[prefix_index + marker.len ..];
+                const target_ms = try self.parseWaitSelectorMillis(token);
+                return .{
+                    .raw_path = try self.allocator.dupe(u8, path),
+                    .kind = .time_at,
+                    .target_time_ms = target_ms,
+                };
+            }
         }
 
-        if (std.mem.indexOf(u8, path, "/global/jobs/")) |prefix_index| {
-            const prefix = "/global/jobs/";
-            const tail = path[prefix_index + prefix.len ..];
-            var tokens = std.mem.tokenizeScalar(u8, tail, '/');
-            const job_id = tokens.next() orelse return error.InvalidPayload;
-            const leaf = tokens.next() orelse return error.InvalidPayload;
-            if (tokens.next() != null) return error.InvalidPayload;
+        inline for ([_][]const u8{
+            "/global/jobs/",
+            "/nodes/local/venoms/jobs/",
+            "/services/jobs/",
+        }) |prefix| {
+            if (std.mem.indexOf(u8, path, prefix)) |prefix_index| {
+                const tail = path[prefix_index + prefix.len ..];
+                var tokens = std.mem.tokenizeScalar(u8, tail, '/');
+                const job_id = tokens.next() orelse return error.InvalidPayload;
+                const leaf = tokens.next() orelse return error.InvalidPayload;
+                if (tokens.next() != null) return error.InvalidPayload;
 
-            const kind: WaitSourceKind = if (std.mem.eql(u8, leaf, "status.json"))
-                .job_status
-            else if (std.mem.eql(u8, leaf, "result.txt"))
-                .job_result
-            else
-                return error.InvalidPayload;
+                const kind: WaitSourceKind = if (std.mem.eql(u8, leaf, "status.json"))
+                    .job_status
+                else if (std.mem.eql(u8, leaf, "result.txt"))
+                    .job_result
+                else
+                    return error.InvalidPayload;
 
-            return .{
-                .raw_path = try self.allocator.dupe(u8, path),
-                .kind = kind,
-                .job_id = try self.allocator.dupe(u8, job_id),
-            };
+                return .{
+                    .raw_path = try self.allocator.dupe(u8, path),
+                    .kind = kind,
+                    .job_id = try self.allocator.dupe(u8, job_id),
+                };
+            }
         }
 
         return error.InvalidPayload;
@@ -12122,8 +11619,8 @@ pub const Session = struct {
         try self.syncThoughtFramesFromJobTelemetry(job_id);
 
         const event_path = switch (source.kind) {
-            .job_status => try std.fmt.allocPrint(self.allocator, "/global/jobs/{s}/status.json", .{view.job_id}),
-            .job_result => try std.fmt.allocPrint(self.allocator, "/global/jobs/{s}/result.txt", .{view.job_id}),
+            .job_status => try std.fmt.allocPrint(self.allocator, "/nodes/local/venoms/jobs/{s}/status.json", .{view.job_id}),
+            .job_result => try std.fmt.allocPrint(self.allocator, "/nodes/local/venoms/jobs/{s}/result.txt", .{view.job_id}),
             else => unreachable,
         };
         defer self.allocator.free(event_path);
@@ -12156,7 +11653,7 @@ pub const Session = struct {
         defer event.deinit(self.allocator);
         try self.syncThoughtFramesFromJobTelemetry(event.job_id);
 
-        const event_path = try std.fmt.allocPrint(self.allocator, "/global/jobs/{s}/status.json", .{event.job_id});
+        const event_path = try std.fmt.allocPrint(self.allocator, "/nodes/local/venoms/jobs/{s}/status.json", .{event.job_id});
         defer self.allocator.free(event_path);
         const payload = try job_projection.buildTerminalJobWaitEventPayload(
             self.allocator,
@@ -12210,17 +11707,17 @@ pub const Session = struct {
         const event = selected.?;
         const event_path = switch (source.kind) {
             .agent_signal => if (event.parameter) |value|
-                try std.fmt.allocPrint(self.allocator, "/global/events/sources/agent/{s}.json", .{value})
+                try std.fmt.allocPrint(self.allocator, "/nodes/local/venoms/events/sources/agent/{s}.json", .{value})
             else
-                try self.allocator.dupe(u8, "/global/events/sources/agent.json"),
+                try self.allocator.dupe(u8, "/nodes/local/venoms/events/sources/agent.json"),
             .hook_signal => if (event.parameter) |value|
-                try std.fmt.allocPrint(self.allocator, "/global/events/sources/hook/{s}.json", .{value})
+                try std.fmt.allocPrint(self.allocator, "/nodes/local/venoms/events/sources/hook/{s}.json", .{value})
             else
-                try self.allocator.dupe(u8, "/global/events/sources/hook.json"),
+                try self.allocator.dupe(u8, "/nodes/local/venoms/events/sources/hook.json"),
             .user_signal => if (event.parameter) |value|
-                try std.fmt.allocPrint(self.allocator, "/global/events/sources/user/{s}.json", .{value})
+                try std.fmt.allocPrint(self.allocator, "/nodes/local/venoms/events/sources/user/{s}.json", .{value})
             else
-                try self.allocator.dupe(u8, "/global/events/sources/user.json"),
+                try self.allocator.dupe(u8, "/nodes/local/venoms/events/sources/user.json"),
             else => unreachable,
         };
         defer self.allocator.free(event_path);
@@ -12251,7 +11748,7 @@ pub const Session = struct {
         const event_id = self.nextWaitEventId();
         return std.fmt.allocPrint(
             self.allocator,
-            "{{\"configured\":true,\"waiting\":false,\"event_id\":{d},\"source_path\":\"{s}\",\"event_path\":\"/global/events/sources/time\",\"updated_at_ms\":{d},\"time\":{{\"target_ms\":{d},\"now_ms\":{d},\"fired\":true}}}}",
+            "{{\"configured\":true,\"waiting\":false,\"event_id\":{d},\"source_path\":\"{s}\",\"event_path\":\"/nodes/local/venoms/events/sources/time\",\"updated_at_ms\":{d},\"time\":{{\"target_ms\":{d},\"now_ms\":{d},\"fired\":true}}}}",
             .{ event_id, source_path_escaped, now_ms, target_ms, now_ms },
         );
     }
@@ -12752,35 +12249,39 @@ pub const Session = struct {
 fn isWorldAbsolutePath(path: []const u8) bool {
     return std.mem.startsWith(u8, path, "/nodes/") or
         std.mem.startsWith(u8, path, "/agents/") or
+        std.mem.startsWith(u8, path, "/services/") or
         std.mem.startsWith(u8, path, "/global/") or
         std.mem.startsWith(u8, path, "/debug/");
 }
 
 fn defaultGlobalLibraryIndexMd() []const u8 {
     return "# Spiderweb Global Library\n\n" ++
-        "- [Getting Started](/global/library/topics/getting-started.md)\n" ++
-        "- [Service Discovery](/global/library/topics/service-discovery.md)\n" ++
-        "- [Events and Waits](/global/library/topics/events-and-waits.md)\n" ++
-        "- [Search Services](/global/library/topics/search-services.md)\n" ++
-        "- [Terminal Workflows](/global/library/topics/terminal-workflows.md)\n" ++
-        "- [Memory Workflows](/global/library/topics/memory-workflows.md)\n" ++
-        "- [Project Mounts and Binds](/global/library/topics/project-mounts-and-binds.md)\n" ++
-        "- [Agent Management and Sub-Brains](/global/library/topics/agent-management-and-sub-brains.md)\n";
+        "- [Getting Started](/nodes/local/venoms/library/topics/getting-started.md)\n" ++
+        "- [Service Discovery](/nodes/local/venoms/library/topics/service-discovery.md)\n" ++
+        "- [Events and Waits](/nodes/local/venoms/library/topics/events-and-waits.md)\n" ++
+        "- [Search Services](/nodes/local/venoms/library/topics/search-services.md)\n" ++
+        "- [Terminal Workflows](/nodes/local/venoms/library/topics/terminal-workflows.md)\n" ++
+        "- [Memory Workflows](/nodes/local/venoms/library/topics/memory-workflows.md)\n" ++
+        "- [Project Mounts and Binds](/nodes/local/venoms/library/topics/project-mounts-and-binds.md)\n" ++
+        "- [Agent Management and Sub-Brains](/nodes/local/venoms/library/topics/agent-management-and-sub-brains.md)\n";
 }
 
 fn defaultGlobalLibraryTopicGettingStarted() []const u8 {
     return "# Getting Started\n\n" ++
-        "1. Discover Venoms in `/global/venoms/VENOMS.json`.\n" ++
-        "2. Read each Venom `README.md`, `SCHEMA.json`, `TEMPLATE.json`, `HOST.json`, and `CAPS.json` before using it.\n" ++
-        "3. Use `/global/library` for system guides.\n";
+        "1. Discover mounted workspace services in `/meta/workspace_services.json` or `/projects/<project_id>/meta/mounted_services.json`.\n" ++
+        "2. Use `/services/<venom_id>` when the workspace binds a service, then fall back to `/nodes/local/venoms/<venom_id>` for local catalog access.\n" ++
+        "3. Treat `/global/*` as a compatibility alias when older workflows still reference it.\n" ++
+        "4. Read each Venom `README.md`, `SCHEMA.json`, `TEMPLATE.json`, `HOST.json`, and `CAPS.json` before using it.\n" ++
+        "5. Use `/services/library` when bound, otherwise `/nodes/local/venoms/library`, for system guides.\n";
 }
 
 fn defaultGlobalLibraryTopicServiceDiscovery() []const u8 {
     return "# Venom Discovery\n\n" ++
         "- Node Venoms: `/nodes/<node_id>/venoms/<venom_id>`\n" ++
-        "- Project namespaces: `/global/<venom_id>`\n" ++
-        "- Global namespaces: `/global/<venom_id>`\n" ++
-        "- Start with `/global/venoms/VENOMS.json`.\n" ++
+        "- Local built-in Venoms: `/nodes/local/venoms/<venom_id>`\n" ++
+        "- Workspace service namespaces: `/services/<venom_id>`\n" ++
+        "- Compatibility aliases: `/global/<venom_id>`\n" ++
+        "- Start with `/meta/workspace_services.json`, `/projects/<project_id>/meta/mounted_services.json`, or `/nodes/local/venoms/VENOMS.json`.\n" ++
         "- Service Venoms should expose `TEMPLATE.json` and `HOST.json` alongside `SCHEMA.json`, `OPS.json`, and `STATUS.json`.\n" ++
         "- Common project Venoms include: memory, web_search, search_code, terminal, mounts, sub_brains, agents, projects.\n";
 }
@@ -12788,24 +12289,24 @@ fn defaultGlobalLibraryTopicServiceDiscovery() []const u8 {
 fn defaultGlobalLibraryTopicEventsAndWaits() []const u8 {
     return "# Events and Waits\n\n" ++
         "Use single-source blocking reads first for deterministic waits.\n" ++
-        "Use `/global/events/control/wait.json` + `/global/events/next.json` for one-of-many waits.\n";
+        "Use `/services/events/control/wait.json` + `/services/events/next.json` when the workspace binds events, otherwise use `/nodes/local/venoms/events/control/wait.json` + `/nodes/local/venoms/events/next.json`.\n";
 }
 
 fn defaultGlobalLibraryTopicSearchServices() []const u8 {
     return "# Search Services\n\n" ++
-        "Use `/global/search_code` for repository-local search and `/global/web_search` for external lookup.\n" ++
+        "Use `/services/search_code` for repository-local search and `/services/web_search` for external lookup when bound, otherwise use `/nodes/local/venoms/search_code` and `/nodes/local/venoms/web_search`.\n" ++
         "Drive both through `control/search.json` or `control/invoke.json`, then check `status.json` and `result.json`.\n";
 }
 
 fn defaultGlobalLibraryTopicTerminalWorkflows() []const u8 {
     return "# Terminal Workflows\n\n" ++
-        "Use `/global/terminal/control/*.json` for sessionized shell execution.\n" ++
+        "Use `/services/terminal/control/*.json` for sessionized shell execution when bound, otherwise use `/nodes/local/venoms/terminal/control/*.json`.\n" ++
         "Prefer `create` + `write/read` for interactive loops and `exec` for single command tasks.\n";
 }
 
 fn defaultGlobalLibraryTopicMemoryWorkflows() []const u8 {
     return "# Memory Workflows\n\n" ++
-        "Use `/global/memory/control/*.json` and pass `memory_path` for targeted operations.\n" ++
+        "Use `/services/memory/control/*.json` when the workspace binds memory, otherwise use `/nodes/local/venoms/memory/control/*.json`, and pass `memory_path` for targeted operations.\n" ++
         "Use `search` before creating duplicate memories.\n";
 }
 
@@ -12957,70 +12458,6 @@ fn writeJsonString(writer: anytype, value: []const u8) !void {
         }
     }
     try writer.writeByte('"');
-}
-
-fn hexDigitUpper(value: u8) u8 {
-    return if (value < 10) ('0' + value) else ('A' + (value - 10));
-}
-
-fn parseHexNibble(value: u8) ?u8 {
-    if (value >= '0' and value <= '9') return value - '0';
-    if (value >= 'A' and value <= 'F') return value - 'A' + 10;
-    if (value >= 'a' and value <= 'f') return value - 'a' + 10;
-    return null;
-}
-
-fn urlPathEncode(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
-    var out = std.ArrayListUnmanaged(u8){};
-    errdefer out.deinit(allocator);
-    for (value) |char| {
-        if (std.ascii.isAlphanumeric(char) or char == '-' or char == '_' or char == '.' or char == '~') {
-            try out.append(allocator, char);
-            continue;
-        }
-        try out.append(allocator, '%');
-        try out.append(allocator, hexDigitUpper((char >> 4) & 0x0F));
-        try out.append(allocator, hexDigitUpper(char & 0x0F));
-    }
-    return out.toOwnedSlice(allocator);
-}
-
-fn urlPathDecode(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
-    var out = std.ArrayListUnmanaged(u8){};
-    errdefer out.deinit(allocator);
-    var i: usize = 0;
-    while (i < value.len) {
-        const char = value[i];
-        if (char == '%') {
-            if (i + 2 >= value.len) return error.InvalidPayload;
-            const hi = parseHexNibble(value[i + 1]) orelse return error.InvalidPayload;
-            const lo = parseHexNibble(value[i + 2]) orelse return error.InvalidPayload;
-            try out.append(allocator, (hi << 4) | lo);
-            i += 3;
-            continue;
-        }
-        try out.append(allocator, char);
-        i += 1;
-    }
-    return out.toOwnedSlice(allocator);
-}
-
-fn buildMemoryPathFromMemId(allocator: std.mem.Allocator, mem_id: []const u8) ![]u8 {
-    const encoded = try urlPathEncode(allocator, mem_id);
-    defer allocator.free(encoded);
-    return std.fmt.allocPrint(allocator, "/global/memory/items/{s}", .{encoded});
-}
-
-fn decodeMemIdFromPath(allocator: std.mem.Allocator, path_or_mem_id: []const u8) ![]u8 {
-    const prefix = "/global/memory/items/";
-    if (!std.mem.startsWith(u8, path_or_mem_id, prefix)) {
-        return allocator.dupe(u8, path_or_mem_id);
-    }
-    const tail = path_or_mem_id[prefix.len..];
-    if (tail.len == 0) return error.InvalidPayload;
-    const slash = std.mem.indexOfScalar(u8, tail, '/') orelse tail.len;
-    if (slash == 0) return error.InvalidPayload;
-    return urlPathDecode(allocator, tail[0..slash]);
 }
 
 fn parseTerminalInvokeOp(raw: []const u8) ?TerminalInvokeOp {
@@ -13670,7 +13107,7 @@ test "acheron_session: events wait returns next completed chat job" {
 
     try std.testing.expect(std.mem.indexOf(u8, next_payload, "\"configured\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, next_payload, "\"source_path\":\"/global/chat/control/input\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, next_payload, "\"event_path\":\"/global/jobs/job-") != null);
+    try std.testing.expect(std.mem.indexOf(u8, next_payload, "\"event_path\":\"/nodes/local/venoms/jobs/job-") != null);
     try std.testing.expect(std.mem.indexOf(u8, next_payload, "\"job_id\":\"job-") != null);
 }
 
@@ -13692,7 +13129,7 @@ test "acheron_session: events wait reports timeout when no source event is avail
         90,
         91,
         &.{ "agents", "self", "events", "control", "wait.json" },
-        "{\"paths\":[\"/global/jobs/job-missing/status.json\"],\"timeout_ms\":0}",
+        "{\"paths\":[\"/nodes/local/venoms/jobs/job-missing/status.json\"],\"timeout_ms\":0}",
         730,
     );
 
@@ -13727,7 +13164,7 @@ test "acheron_session: events wait supports time source selectors" {
         94,
         95,
         &.{ "agents", "self", "events", "control", "wait.json" },
-        "{\"paths\":[\"/global/events/sources/time/after/0.json\"],\"timeout_ms\":0}",
+        "{\"paths\":[\"/nodes/local/venoms/events/sources/time/after/0.json\"],\"timeout_ms\":0}",
         745,
     );
 
@@ -13742,7 +13179,7 @@ test "acheron_session: events wait supports time source selectors" {
     defer allocator.free(next_payload);
 
     try std.testing.expect(std.mem.indexOf(u8, next_payload, "\"configured\":true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, next_payload, "\"event_path\":\"/global/events/sources/time\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, next_payload, "\"event_path\":\"/nodes/local/venoms/events/sources/time\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, next_payload, "\"time\":{") != null);
 }
 
@@ -14392,12 +13829,11 @@ test "acheron_session: agent services index includes first-class namespaces only
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_id\":\"mounts\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_id\":\"projects\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_id\":\"library\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_path\":\"/global/search_code\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_path\":\"/global/search_code\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_path\":\"/global/mounts\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_path\":\"/global/projects\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_path\":\"/global/library\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"scope\":\"global_namespace\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_path\":\"/nodes/local/venoms/search_code\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_path\":\"/nodes/local/venoms/mounts\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_path\":\"/nodes/local/venoms/projects\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_path\":\"/nodes/local/venoms/library\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"scope\":\"node_catalog\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"has_invoke\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_path\":\"/global/venoms/contracts/") == null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"scope\":\"agent_contract\"") == null);
@@ -14848,7 +14284,7 @@ test "acheron_session: scoped venom aliases shape proxy paths and job result pat
     const global_chat_id = session.resolveAbsolutePathNoBinds("/global/chat") orelse return error.TestExpectedResponse;
     const global_result_path = try session.buildJobResultPathForNode(global_chat_id, "job-global");
     defer allocator.free(global_result_path);
-    try std.testing.expectEqualStrings("/global/jobs/job-global/result.txt", global_result_path);
+    try std.testing.expectEqualStrings("/nodes/local/venoms/jobs/job-global/result.txt", global_result_path);
 
     const agent_chat_id = session.resolveAbsolutePathNoBinds("/agents/default/venoms/chat") orelse return error.TestExpectedResponse;
     const agent_result_path = try session.buildJobResultPathForNode(agent_chat_id, "job-agent");
@@ -15034,8 +14470,8 @@ test "acheron_session: agent services index includes first-class memory namespac
     defer allocator.free(payload);
 
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"scope\":\"project_namespace\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_path\":\"/global/memory\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"invoke_path\":\"/global/memory/control/invoke.json\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_path\":\"/nodes/local/venoms/memory\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"invoke_path\":\"/nodes/local/venoms/memory/control/invoke.json\"") != null);
 }
 
 test "acheron_session: agent services index includes first-class web_search namespace entry" {
@@ -15061,8 +14497,8 @@ test "acheron_session: agent services index includes first-class web_search name
     defer allocator.free(payload);
 
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"scope\":\"project_namespace\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_path\":\"/global/web_search\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"invoke_path\":\"/global/web_search/control/invoke.json\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_path\":\"/nodes/local/venoms/web_search\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"invoke_path\":\"/nodes/local/venoms/web_search/control/invoke.json\"") != null);
 }
 
 test "acheron_session: agent services index includes first-class terminal namespace entry" {
@@ -15088,8 +14524,8 @@ test "acheron_session: agent services index includes first-class terminal namesp
     defer allocator.free(payload);
 
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"scope\":\"project_namespace\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_path\":\"/global/terminal\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"invoke_path\":\"/global/terminal/control/invoke.json\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_path\":\"/nodes/local/venoms/terminal\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"invoke_path\":\"/nodes/local/venoms/terminal/control/invoke.json\"") != null);
 }
 
 test "acheron_session: agent services index includes first-class sub_brains namespace entry" {
@@ -15115,8 +14551,8 @@ test "acheron_session: agent services index includes first-class sub_brains name
     defer allocator.free(payload);
 
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"scope\":\"project_namespace\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_path\":\"/global/sub_brains\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"invoke_path\":\"/global/sub_brains/control/invoke.json\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_path\":\"/nodes/local/venoms/sub_brains\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"invoke_path\":\"/nodes/local/venoms/sub_brains/control/invoke.json\"") != null);
 }
 
 test "acheron_session: agent services index includes first-class agents namespace entry" {
@@ -15142,8 +14578,8 @@ test "acheron_session: agent services index includes first-class agents namespac
     defer allocator.free(payload);
 
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"scope\":\"project_namespace\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_path\":\"/global/agents\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"invoke_path\":\"/global/agents/control/invoke.json\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_path\":\"/nodes/local/venoms/agents\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"invoke_path\":\"/nodes/local/venoms/agents/control/invoke.json\"") != null);
 }
 
 test "acheron_session: agent services index includes first-class projects namespace entry" {
@@ -15169,8 +14605,8 @@ test "acheron_session: agent services index includes first-class projects namesp
     defer allocator.free(payload);
 
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"scope\":\"project_namespace\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_path\":\"/global/projects\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"invoke_path\":\"/global/projects/control/invoke.json\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_path\":\"/nodes/local/venoms/projects\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"invoke_path\":\"/nodes/local/venoms/projects/control/invoke.json\"") != null);
 }
 
 test "acheron_session: agent services index includes first-class missions namespace entry" {
@@ -15207,8 +14643,8 @@ test "acheron_session: agent services index includes first-class missions namesp
     defer allocator.free(payload);
 
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"scope\":\"project_namespace\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_path\":\"/global/missions\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"invoke_path\":\"/global/missions/control/invoke.json\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_path\":\"/nodes/local/venoms/missions\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"invoke_path\":\"/nodes/local/venoms/missions/control/invoke.json\"") != null);
 }
 
 test "acheron_session: missions namespace tracks lifecycle checkpoint and recovery state" {
@@ -15609,7 +15045,7 @@ test "acheron_session: missions invoke_service records successful venom step" {
     try std.testing.expect(std.mem.indexOf(u8, mission_result, "\"service_path\":\"/global/memory\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, mission_result, "\"invoke_path\":\"/global/memory/control/invoke.json\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, mission_result, "\"mission_id\":\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, mission_result, "\"memory_path\":\"/global/memory/items/mission-review-note\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mission_result, "\"memory_path\":\"/nodes/local/venoms/memory/items/mission-review-note\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, mission_result, "\"event_type\":\"mission.service_invoked\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, mission_result, "\"kind\":\"service_result\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, mission_result, "\"artifact_root\":\"/nodes/local/fs/pr-review/runs/pr-48\"") != null);
@@ -15772,8 +15208,8 @@ test "acheron_session: pr_review venom starts a mission and bootstraps contract 
         970,
     );
     defer allocator.free(venoms_payload);
-    try std.testing.expect(std.mem.indexOf(u8, venoms_payload, "\"venom_path\":\"/global/pr_review\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, venoms_payload, "\"invoke_path\":\"/global/pr_review/control/invoke.json\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, venoms_payload, "\"venom_path\":\"/nodes/local/venoms/pr_review\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, venoms_payload, "\"invoke_path\":\"/nodes/local/venoms/pr_review/control/invoke.json\"") != null);
 
     try protocolWriteFile(
         &session,
@@ -17420,7 +16856,7 @@ test "acheron_session: github_pr ingest_event emits agent event and auto-intakes
         740,
         741,
         &.{ "agents", "self", "events", "control", "wait.json" },
-        "{\"paths\":[\"/global/events/sources/agent/github_pr.json\"],\"timeout_ms\":0}",
+        "{\"paths\":[\"/nodes/local/venoms/events/sources/agent/github_pr.json\"],\"timeout_ms\":0}",
         1816,
     );
 
@@ -17457,7 +16893,7 @@ test "acheron_session: github_pr ingest_event emits agent event and auto-intakes
     defer allocator.free(github_pr_result);
     try std.testing.expect(std.mem.indexOf(u8, github_pr_result, "\"operation\":\"ingest_event\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, github_pr_result, "\"mission_action\":\"created\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, github_pr_result, "\"signal_path\":\"/global/events/sources/agent/github_pr.json\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, github_pr_result, "\"signal_path\":\"/nodes/local/venoms/events/sources/agent/github_pr.json\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, github_pr_result, "\"run_id\":\"pr_review:DeanoC__Spiderweb:128\"") != null);
 
     const mission_id = try extractMissionIdFromResultPayload(allocator, github_pr_result);

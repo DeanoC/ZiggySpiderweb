@@ -2942,7 +2942,7 @@ pub const RuntimeServer = struct {
             if (include_protocol_repair_hint) {
                 const next_prompt = try std.fmt.allocPrint(
                     self.allocator,
-                    "{s}\n\n<protocol_repair>\nThe previous provider response violated the single-tool-call contract after at least one tool result.\nThe latest tool result is already in active memory.\nYour next response must do exactly one of these:\n1) emit exactly one file_write tool call to `/global/chat/control/reply` that tells the user what you learned from the last result, or\n2) emit exactly one different tool call only if the last result is still genuinely insufficient.\nDo not repeat the same failing tool call unchanged.\nDo not emit plain text without tool_calls in this repair round.\n</protocol_repair>",
+                    "{s}\n\n<protocol_repair>\nThe previous provider response violated the single-tool-call contract after at least one tool result.\nThe latest tool result is already in active memory.\nYour next response must do exactly one of these:\n1) emit exactly one file_write tool call to `/nodes/local/venoms/chat/control/reply` that tells the user what you learned from the last result, or\n2) emit exactly one different tool call only if the last result is still genuinely insufficient.\nDo not repeat the same failing tool call unchanged.\nDo not emit plain text without tool_calls in this repair round.\n</protocol_repair>",
                     .{active_memory_prompt},
                 );
                 self.allocator.free(active_memory_prompt);
@@ -3687,7 +3687,7 @@ pub const RuntimeServer = struct {
             \\
         ;
         const memory_guidance_line =
-            "- context_guidance: Context usage is above 50%. Read /global/library/topics/memory-management.md\n";
+            "- context_guidance: Context usage is above 50%. Read /nodes/local/venoms/library/topics/memory-management.md\n";
 
         // Two-pass estimate so the board includes itself in the approximation.
         const base_estimate = estimateTokenCount(core_prompt) + estimateTokenCount(active_memory_prompt) + tool_context_token_estimate;
@@ -5418,7 +5418,7 @@ const MockPrReviewAcheronState = struct {
 
         try self.setFile(path, content);
         try self.setFile("global/github_pr/status.json", "{\"state\":\"done\",\"tool\":\"github_pr_ingest_event\"}");
-        try self.setFile("global/events/sources/agent/github_pr.json", "{\"event_type\":\"agent\",\"parameter\":\"github_pr\"}");
+        try self.setFile("nodes/local/venoms/events/sources/agent/github_pr.json", "{\"event_type\":\"agent\",\"parameter\":\"github_pr\"}");
         try self.setFile("nodes/local/fs/pr-review/state/repos.json", "{\"use_case\":\"pr_review\",\"repositories\":[{\"repo_key\":\"DeanoC/Spiderweb\",\"provider\":\"github\",\"default_branch\":\"stable\",\"checkout_path\":\"/nodes/local/fs/pr-review/repos/spiderweb-configured\",\"default_review_commands\":[\"zig build test\"],\"approval_policy\":{\"push_fix_requires_approval\":false,\"merge_requires_approval\":true},\"auto_intake\":true}]}");
         const context_path = try std.fmt.allocPrint(self.allocator, "nodes/local/fs/pr-review/state/{s}/pr-{d}/context.json", .{ repo_slug, pr_number });
         defer self.allocator.free(context_path);
@@ -5429,7 +5429,7 @@ const MockPrReviewAcheronState = struct {
 
         return std.fmt.allocPrint(
             self.allocator,
-            "{{\"ok\":true,\"operation\":\"ingest_event\",\"result\":{{\"run_id\":\"{s}\",\"mission_action\":\"created\",\"signal_path\":\"/global/events/sources/agent/github_pr.json\",\"mission\":{{\"mission_id\":\"{s}\",\"use_case\":\"pr_review\"}}}},\"error\":null}}",
+            "{{\"ok\":true,\"operation\":\"ingest_event\",\"result\":{{\"run_id\":\"{s}\",\"mission_action\":\"created\",\"signal_path\":\"/nodes/local/venoms/events/sources/agent/github_pr.json\",\"mission\":{{\"mission_id\":\"{s}\",\"use_case\":\"pr_review\"}}}},\"error\":null}}",
             .{ run_id, mission_id },
         );
     }
@@ -7810,7 +7810,7 @@ test "runtime_server: dynamic info board links memory management above 50 percen
     const board = try server.buildDynamicCoreInfoBoard("primary", "core", "active", 32, 0);
     defer allocator.free(board);
 
-    try std.testing.expect(std.mem.indexOf(u8, board, "/global/library/topics/memory-management.md") != null);
+    try std.testing.expect(std.mem.indexOf(u8, board, "/nodes/local/venoms/library/topics/memory-management.md") != null);
 }
 
 test "runtime_server: dynamic info board omits memory management link at low context usage" {
@@ -7821,7 +7821,7 @@ test "runtime_server: dynamic info board omits memory management link at low con
     const board = try server.buildDynamicCoreInfoBoard("primary", "core", "active", 128_000, 0);
     defer allocator.free(board);
 
-    try std.testing.expect(std.mem.indexOf(u8, board, "/global/library/topics/memory-management.md") == null);
+    try std.testing.expect(std.mem.indexOf(u8, board, "/nodes/local/venoms/library/topics/memory-management.md") == null);
 }
 
 test "runtime_server: compactRuntimeStateForProviderRequest preserves state when budget allows" {
