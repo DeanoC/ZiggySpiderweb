@@ -8,12 +8,17 @@ This use case reviews a pull request using workspace-mounted services and record
 
 Service entrypoint:
 
+- `/global/pr_review/control/configure_repo.json`
+- `/global/pr_review/control/get_repo.json`
+- `/global/pr_review/control/list_repos.json`
 - `/global/pr_review/control/intake.json`
 - `/global/pr_review/control/start.json`
 - `/global/pr_review/control/sync.json`
 - `/global/pr_review/control/run_validation.json`
 - `/global/pr_review/control/record_validation.json`
+- `/global/pr_review/control/save_draft.json`
 - `/global/pr_review/control/record_review.json`
+- `/global/pr_review/control/advance.json`
 - `/global/pr_review/control/invoke.json` with `{"op":"intake","arguments":{...}}`
 
 Supporting service Venoms:
@@ -33,6 +38,9 @@ Recommended contract file roles:
 
 Recommended artifact layout under `artifact_root`:
 
+- `draft-review.json`
+- `review-comment-draft.md`
+- `drafts/`
 - `findings.json`
 - `validation.json`
 - `recommendation.json`
@@ -48,20 +56,25 @@ Recommended artifact layout under `artifact_root`:
 
 Suggested loop:
 
-1. Prefer `/global/github_pr/control/ingest_event.json` for provider-driven PR intake. It normalizes the GitHub event, emits `/global/events/sources/agent/github_pr.json`, and auto-creates or reuses the matching `pr_review` mission.
-2. Load a PR through `/global/pr_review/control/intake.json` when you want provider metadata captured as part of mission bootstrap from a manual/operator flow. Use `/global/pr_review/control/start.json` only when a lower-level caller already has the PR metadata locally.
-3. Read the mission `contract`, then load `context_path` and `state_path`.
-4. Use `/global/pr_review/control/sync.json` to advance the review phase, keep `state_path` current, and optionally orchestrate provider/repo sync through `provider_sync`, `sync_checkout`, `repo_status`, and `diff_range` blocks.
-5. Use `/global/pr_review/control/run_validation.json` to execute the configured review commands through `/global/terminal`, persist per-command service captures, and refresh the latest validation summary in state.
-6. Use `/global/pr_review/control/record_validation.json` only when a higher-level agent wants to write a custom validation artifact instead of running commands through the built-in validation runner.
-7. Use `/global/pr_review/control/record_review.json` to persist findings, recommendation, review-comment drafts, thread-action snapshots, and optionally `publish_review`.
-8. Discover available services through `/global/venoms/VENOMS.json`.
-9. Use `/global/git/control/sync_checkout.json` to create or refresh the repo checkout under the mission workspace.
-10. Use `/global/github_pr/control/sync.json` to load provider PR metadata when GitHub context needs to be refreshed.
-11. Use `/global/git/control/status.json` and `/global/git/control/diff_range.json` for deterministic changed-file and branch-state inspection.
-12. Use mounted terminal, search, and memory services to validate findings and gather supporting evidence.
-13. Use `/global/github_pr/control/publish_review.json` for top-level review publication when policy allows it.
-14. Request approval through `/global/missions/control/request_approval.json` before push or merge when policy requires it.
+1. Onboard or update each monitored repository through `/global/pr_review/control/configure_repo.json`. The canonical repo catalog lives at `/nodes/local/fs/pr-review/state/repos.json`.
+2. Use `/global/pr_review/control/get_repo.json` and `/global/pr_review/control/list_repos.json` to inspect the current onboarding state before taking action.
+3. Prefer `/global/github_pr/control/ingest_event.json` for provider-driven PR intake. It normalizes the GitHub event, emits `/global/events/sources/agent/github_pr.json`, and auto-creates or reuses the matching `pr_review` mission.
+4. If the event payload omits repo-specific defaults, `github_pr ingest_event` will fill them from the configured repo record. Explicit event fields still win.
+5. Load a PR through `/global/pr_review/control/intake.json` when you want provider metadata captured as part of mission bootstrap from a manual/operator flow. Use `/global/pr_review/control/start.json` only when a lower-level caller already has the PR metadata locally.
+6. Read the mission `contract`, then load `context_path` and `state_path`.
+7. Use `/global/pr_review/control/advance.json` for the deterministic runner step. It can resume a blocked/planning mission, wait on `/global/events/...`, perform the next sync/validation pass, and return `runner.status` plus `runner.next_action` like `draft_review` or `revise_review` without hard-coding review judgment into Zig.
+8. Use `/global/pr_review/control/sync.json` when you need lower-level control over provider/repo sync, or when a higher-level agent wants to override the deterministic runner step.
+9. Use `/global/pr_review/control/run_validation.json` to execute the configured review commands through `/global/terminal`, persist per-command service captures, and refresh the latest validation summary in state.
+10. Use `/global/pr_review/control/record_validation.json` only when a higher-level agent wants to write a custom validation artifact instead of running commands through the built-in validation runner.
+11. Use `/global/pr_review/control/save_draft.json` to persist an evolving review draft, keep the latest draft files current, and write immutable revision snapshots under `drafts/`.
+12. Use `/global/pr_review/control/record_review.json` to persist findings, recommendation, review-comment drafts, thread-action snapshots, and optionally `publish_review`.
+13. Discover available services through `/global/venoms/VENOMS.json`.
+14. Use `/global/git/control/sync_checkout.json` to create or refresh the repo checkout under the mission workspace.
+15. Use `/global/github_pr/control/sync.json` to load provider PR metadata when GitHub context needs to be refreshed.
+16. Use `/global/git/control/status.json` and `/global/git/control/diff_range.json` for deterministic changed-file and branch-state inspection.
+17. Use mounted terminal, search, and memory services to validate findings and gather supporting evidence.
+18. Use `/global/github_pr/control/publish_review.json` for top-level review publication when policy allows it.
+19. Request approval through `/global/missions/control/request_approval.json` before push or merge when policy requires it.
 
 Example orchestration payloads:
 

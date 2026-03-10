@@ -5208,6 +5208,8 @@ var mockCapturedModelName: ?[]const u8 = null;
 var mockCapturedReasoning: ?[]const u8 = null;
 var mockCapturedApiKey: ?[]u8 = null;
 var mockDispatchContextByte: u8 = 0;
+var mockPrReviewAgenticEvalCallCount: usize = 0;
+var mockPrReviewRunnerAgenticEvalCallCount: usize = 0;
 
 fn mockProviderStreamCaptureConfig(
     allocator: std.mem.Allocator,
@@ -5297,6 +5299,555 @@ fn mockDispatchCapabilityOk(
         return .{ .failure = .{ .code = .execution_failed, .message = msg } };
     };
     return .{ .success = .{ .payload_json = payload } };
+}
+
+const MockPrReviewAcheronState = struct {
+    allocator: std.mem.Allocator,
+    files: std.StringHashMapUnmanaged([]u8) = .{},
+
+    fn init(allocator: std.mem.Allocator) MockPrReviewAcheronState {
+        return .{ .allocator = allocator };
+    }
+
+    fn deinit(self: *MockPrReviewAcheronState) void {
+        var it = self.files.iterator();
+        while (it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            self.allocator.free(entry.value_ptr.*);
+        }
+        self.files.deinit(self.allocator);
+    }
+
+    fn setFile(self: *MockPrReviewAcheronState, path: []const u8, content: []const u8) !void {
+        const normalized = normalizeMockAcheronPath(path);
+        const key = try self.allocator.dupe(u8, normalized);
+        errdefer self.allocator.free(key);
+        const value = try self.allocator.dupe(u8, content);
+        errdefer self.allocator.free(value);
+
+        const gop = try self.files.getOrPut(self.allocator, key);
+        if (gop.found_existing) {
+            self.allocator.free(key);
+            self.allocator.free(gop.value_ptr.*);
+            gop.value_ptr.* = value;
+            return;
+        }
+        gop.value_ptr.* = value;
+    }
+
+    fn getFile(self: *MockPrReviewAcheronState, path: []const u8) ?[]const u8 {
+        return self.files.get(normalizeMockAcheronPath(path));
+    }
+
+    fn handleConfigureRepo(self: *MockPrReviewAcheronState, path: []const u8, content: []const u8) ![]u8 {
+        var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, content, .{});
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidPayload;
+        const obj = parsed.value.object;
+
+        const repo_key = if (obj.get("repo_key")) |value|
+            if (value == .string) value.string else return error.InvalidPayload
+        else
+            return error.InvalidPayload;
+        const default_branch = if (obj.get("default_branch")) |value|
+            if (value == .string) value.string else return error.InvalidPayload
+        else
+            "main";
+        const checkout_path = if (obj.get("checkout_path")) |value|
+            if (value == .string) value.string else return error.InvalidPayload
+        else
+            "/nodes/local/fs/pr-review/repos/DeanoC__Spiderweb";
+        const auto_intake = if (obj.get("auto_intake")) |value|
+            if (value == .bool) value.bool else return error.InvalidPayload
+        else
+            true;
+        const repo_json = try std.fmt.allocPrint(
+            self.allocator,
+            "{{\"repo_key\":\"{s}\",\"provider\":\"github\",\"default_branch\":\"{s}\",\"checkout_path\":\"{s}\",\"default_review_commands\":[\"zig build test\"],\"approval_policy\":{{\"push_fix_requires_approval\":false,\"merge_requires_approval\":true}},\"auto_intake\":{s}}}",
+            .{ repo_key, default_branch, checkout_path, if (auto_intake) "true" else "false" },
+        );
+        defer self.allocator.free(repo_json);
+        const repos_json = try std.fmt.allocPrint(
+            self.allocator,
+            "{{\"use_case\":\"pr_review\",\"repositories\":[{s}]}}",
+            .{repo_json},
+        );
+        defer self.allocator.free(repos_json);
+
+        try self.setFile(path, content);
+        try self.setFile("nodes/local/fs/pr-review/state/repos.json", repos_json);
+        try self.setFile("global/pr_review/status.json", "{\"state\":\"done\",\"tool\":\"pr_review_configure_repo\"}");
+
+        return std.fmt.allocPrint(
+            self.allocator,
+            "{{\"ok\":true,\"operation\":\"configure_repo\",\"result\":{{\"config_path\":\"/nodes/local/fs/pr-review/state/repos.json\",\"repo_key\":\"{s}\",\"repositories_count\":1,\"repository\":{s}}},\"error\":null}}",
+            .{ repo_key, repo_json },
+        );
+    }
+
+    fn handleIngestEvent(self: *MockPrReviewAcheronState, path: []const u8, content: []const u8) ![]u8 {
+        var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, content, .{});
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidPayload;
+        const obj = parsed.value.object;
+
+        const repo_key = if (obj.get("repo_key")) |value|
+            if (value == .string) value.string else return error.InvalidPayload
+        else
+            return error.InvalidPayload;
+        const pr_number = if (obj.get("pr_number")) |value|
+            if (value == .integer) @as(u64, @intCast(value.integer)) else return error.InvalidPayload
+        else
+            return error.InvalidPayload;
+
+        const repo_slug = try buildMockRepoSlug(self.allocator, repo_key);
+        defer self.allocator.free(repo_slug);
+        const run_id = try std.fmt.allocPrint(self.allocator, "pr_review:{s}:{d}", .{ repo_slug, pr_number });
+        defer self.allocator.free(run_id);
+        const mission_id = try std.fmt.allocPrint(self.allocator, "mission-pr-{d}", .{pr_number});
+        defer self.allocator.free(mission_id);
+        const context_json = try std.fmt.allocPrint(
+            self.allocator,
+            "{{\"provider\":\"github\",\"repo_key\":\"{s}\",\"pr_number\":{d},\"pr_url\":\"https://github.com/{s}/pull/{d}\",\"base_branch\":\"stable\",\"head_sha\":\"def129\",\"checkout_path\":\"/nodes/local/fs/pr-review/repos/spiderweb-configured\",\"default_review_commands\":[\"zig build test\"],\"approval_policy\":{{\"push_fix_requires_approval\":false,\"merge_requires_approval\":true}}}}",
+            .{ repo_key, pr_number, repo_key, pr_number },
+        );
+        defer self.allocator.free(context_json);
+        const state_json =
+            "{\"phase\":\"planning\",\"last_synced_head_sha\":\"def129\",\"current_focus\":\"\",\"open_threads\":[],\"latest_validation\":{\"status\":\"unknown\",\"summary\":null},\"latest_recommendation\":{\"status\":\"pending\",\"summary\":null},\"artifacts\":{\"findings\":\"findings.json\",\"validation\":\"validation.json\",\"recommendation\":\"recommendation.json\",\"thread_actions\":\"thread-actions.json\",\"provider_sync\":\"services/provider-sync.json\",\"checkout\":\"services/checkout.json\",\"repo_status\":\"services/repo-status.json\",\"diff_range\":\"services/diff-range.json\",\"publish_review\":\"services/publish-review.json\"},\"notes\":[]}";
+
+        try self.setFile(path, content);
+        try self.setFile("global/github_pr/status.json", "{\"state\":\"done\",\"tool\":\"github_pr_ingest_event\"}");
+        try self.setFile("global/events/sources/agent/github_pr.json", "{\"event_type\":\"agent\",\"parameter\":\"github_pr\"}");
+        try self.setFile("nodes/local/fs/pr-review/state/repos.json", "{\"use_case\":\"pr_review\",\"repositories\":[{\"repo_key\":\"DeanoC/Spiderweb\",\"provider\":\"github\",\"default_branch\":\"stable\",\"checkout_path\":\"/nodes/local/fs/pr-review/repos/spiderweb-configured\",\"default_review_commands\":[\"zig build test\"],\"approval_policy\":{\"push_fix_requires_approval\":false,\"merge_requires_approval\":true},\"auto_intake\":true}]}");
+        const context_path = try std.fmt.allocPrint(self.allocator, "nodes/local/fs/pr-review/state/{s}/pr-{d}/context.json", .{ repo_slug, pr_number });
+        defer self.allocator.free(context_path);
+        const state_path = try std.fmt.allocPrint(self.allocator, "nodes/local/fs/pr-review/state/{s}/pr-{d}/state.json", .{ repo_slug, pr_number });
+        defer self.allocator.free(state_path);
+        try self.setFile(context_path, context_json);
+        try self.setFile(state_path, state_json);
+
+        return std.fmt.allocPrint(
+            self.allocator,
+            "{{\"ok\":true,\"operation\":\"ingest_event\",\"result\":{{\"run_id\":\"{s}\",\"mission_action\":\"created\",\"signal_path\":\"/global/events/sources/agent/github_pr.json\",\"mission\":{{\"mission_id\":\"{s}\",\"use_case\":\"pr_review\"}}}},\"error\":null}}",
+            .{ run_id, mission_id },
+        );
+    }
+
+    fn handleAdvance(self: *MockPrReviewAcheronState, path: []const u8, content: []const u8) ![]u8 {
+        var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, content, .{});
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidPayload;
+        const obj = parsed.value.object;
+
+        const mission_id = if (obj.get("mission_id")) |value|
+            if (value == .string and value.string.len > 0) value.string else return error.InvalidPayload
+        else
+            return error.InvalidPayload;
+        if (!std.mem.startsWith(u8, mission_id, "mission-pr-")) return error.InvalidPayload;
+        const pr_number = std.fmt.parseInt(u64, mission_id["mission-pr-".len..], 10) catch return error.InvalidPayload;
+
+        const state_path = try std.fmt.allocPrint(
+            self.allocator,
+            "nodes/local/fs/pr-review/state/DeanoC__Spiderweb/pr-{d}/state.json",
+            .{pr_number},
+        );
+        defer self.allocator.free(state_path);
+        if (self.getFile(state_path) == null) return error.InvalidPayload;
+
+        const next_state =
+            "{\"phase\":\"reviewing\",\"last_synced_head_sha\":\"def129\",\"current_focus\":\"Inspect the validation output and diff artifacts.\",\"open_threads\":[],\"latest_validation\":{\"status\":\"passed\",\"summary\":\"1 review command passed\"},\"latest_recommendation\":{\"status\":\"pending\",\"summary\":null},\"artifacts\":{\"findings\":\"findings.json\",\"validation\":\"validation.json\",\"recommendation\":\"recommendation.json\",\"thread_actions\":\"thread-actions.json\",\"provider_sync\":\"services/provider-sync.json\",\"checkout\":\"services/checkout.json\",\"repo_status\":\"services/repo-status.json\",\"diff_range\":\"services/diff-range.json\",\"publish_review\":\"services/publish-review.json\"},\"notes\":[]}";
+
+        try self.setFile(path, content);
+        try self.setFile(state_path, next_state);
+        try self.setFile("global/pr_review/status.json", "{\"state\":\"done\",\"tool\":\"pr_review_advance\"}");
+
+        return std.fmt.allocPrint(
+            self.allocator,
+            "{{\"ok\":true,\"operation\":\"advance\",\"result\":{{\"mission\":{{\"mission_id\":\"{s}\",\"use_case\":\"pr_review\",\"state\":\"running\"}},\"review\":{{\"phase\":\"reviewing\",\"context_path\":\"/nodes/local/fs/pr-review/state/DeanoC__Spiderweb/pr-{d}/context.json\",\"state_path\":\"/nodes/local/fs/pr-review/state/DeanoC__Spiderweb/pr-{d}/state.json\",\"artifact_root\":\"/nodes/local/fs/pr-review/runs/DeanoC__Spiderweb/pr-{d}\"}},\"runner\":{{\"status\":\"ready_for_review\",\"next_action\":\"draft_review\",\"sync\":null,\"validation\":null,\"wait\":null,\"note\":\"Deterministic PR review runner steps are complete; Spider Monkey should inspect the workspace artifacts and continue the review draft.\"}}}},\"error\":null}}",
+            .{ mission_id, pr_number, pr_number, pr_number },
+        );
+    }
+};
+
+fn normalizeMockAcheronPath(path: []const u8) []const u8 {
+    return std.mem.trimLeft(u8, path, "/");
+}
+
+fn buildMockRepoSlug(allocator: std.mem.Allocator, repo_key: []const u8) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8){};
+    errdefer out.deinit(allocator);
+    for (repo_key) |char| {
+        if (char == '/') {
+            try out.appendSlice(allocator, "__");
+        } else {
+            try out.append(allocator, char);
+        }
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn buildMockFileWritePayload(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    bytes_written: usize,
+    operation_result_json: ?[]const u8,
+) ![]u8 {
+    const escaped_path = try protocol.jsonEscape(allocator, normalizeMockAcheronPath(path));
+    defer allocator.free(escaped_path);
+    if (operation_result_json) |value| {
+        return std.fmt.allocPrint(
+            allocator,
+            "{{\"path\":\"{s}\",\"bytes_written\":{d},\"append\":false,\"ready\":true,\"wait_until_ready\":true,\"operation_result\":{s}}}",
+            .{ escaped_path, bytes_written, value },
+        );
+    }
+    return std.fmt.allocPrint(
+        allocator,
+        "{{\"path\":\"{s}\",\"bytes_written\":{d},\"append\":false,\"ready\":true,\"wait_until_ready\":true}}",
+        .{ escaped_path, bytes_written },
+    );
+}
+
+fn buildMockFileReadPayload(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    content: []const u8,
+) ![]u8 {
+    const escaped_path = try protocol.jsonEscape(allocator, normalizeMockAcheronPath(path));
+    defer allocator.free(escaped_path);
+    const escaped_content = try protocol.jsonEscape(allocator, content);
+    defer allocator.free(escaped_content);
+    return std.fmt.allocPrint(
+        allocator,
+        "{{\"path\":\"{s}\",\"bytes\":{d},\"truncated\":false,\"content\":\"{s}\",\"ready\":true,\"wait_until_ready\":true}}",
+        .{ escaped_path, content.len, escaped_content },
+    );
+}
+
+fn mockDispatchPrReviewAcheron(
+    ctx: *anyopaque,
+    allocator: std.mem.Allocator,
+    tool_name: []const u8,
+    args_json: []const u8,
+) tool_registry.ToolExecutionResult {
+    const state: *MockPrReviewAcheronState = @ptrCast(@alignCast(ctx));
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, args_json, .{}) catch {
+        const msg = allocator.dupe(u8, "invalid tool args") catch @panic("out of memory");
+        return .{ .failure = .{ .code = .invalid_params, .message = msg } };
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) {
+        const msg = allocator.dupe(u8, "tool args must be an object") catch @panic("out of memory");
+        return .{ .failure = .{ .code = .invalid_params, .message = msg } };
+    }
+    const obj = parsed.value.object;
+    const path = if (obj.get("path")) |value|
+        if (value == .string) value.string else {
+            const msg = allocator.dupe(u8, "path must be string") catch @panic("out of memory");
+            return .{ .failure = .{ .code = .invalid_params, .message = msg } };
+        }
+    else {
+        const msg = allocator.dupe(u8, "missing path") catch @panic("out of memory");
+        return .{ .failure = .{ .code = .invalid_params, .message = msg } };
+    };
+
+    if (std.mem.eql(u8, tool_name, "file_write")) {
+        const content = if (obj.get("content")) |value|
+            if (value == .string) value.string else {
+                const msg = allocator.dupe(u8, "content must be string") catch @panic("out of memory");
+                return .{ .failure = .{ .code = .invalid_params, .message = msg } };
+            }
+        else
+            "";
+        const operation_result_json = if (std.mem.eql(u8, normalizeMockAcheronPath(path), "global/pr_review/control/configure_repo.json"))
+            state.handleConfigureRepo(path, content) catch |err| {
+                const msg = allocator.dupe(u8, @errorName(err)) catch @panic("out of memory");
+                return .{ .failure = .{ .code = .execution_failed, .message = msg } };
+            }
+        else if (std.mem.eql(u8, normalizeMockAcheronPath(path), "global/github_pr/control/ingest_event.json"))
+            state.handleIngestEvent(path, content) catch |err| {
+                const msg = allocator.dupe(u8, @errorName(err)) catch @panic("out of memory");
+                return .{ .failure = .{ .code = .execution_failed, .message = msg } };
+            }
+        else if (std.mem.eql(u8, normalizeMockAcheronPath(path), "global/pr_review/control/advance.json"))
+            state.handleAdvance(path, content) catch |err| {
+                const msg = allocator.dupe(u8, @errorName(err)) catch @panic("out of memory");
+                return .{ .failure = .{ .code = .execution_failed, .message = msg } };
+            }
+        else blk: {
+            state.setFile(path, content) catch |err| {
+                const msg = allocator.dupe(u8, @errorName(err)) catch @panic("out of memory");
+                return .{ .failure = .{ .code = .execution_failed, .message = msg } };
+            };
+            break :blk null;
+        };
+        defer if (operation_result_json) |value| allocator.free(value);
+
+        const payload = buildMockFileWritePayload(allocator, path, content.len, operation_result_json) catch {
+            const msg = allocator.dupe(u8, "out of memory") catch @panic("out of memory");
+            return .{ .failure = .{ .code = .execution_failed, .message = msg } };
+        };
+        return .{ .success = .{ .payload_json = payload } };
+    }
+
+    if (std.mem.eql(u8, tool_name, "file_read")) {
+        const content = state.getFile(path) orelse {
+            const msg = allocator.dupe(u8, "file not found") catch @panic("out of memory");
+            return .{ .failure = .{ .code = .execution_failed, .message = msg } };
+        };
+        const payload = buildMockFileReadPayload(allocator, path, content) catch {
+            const msg = allocator.dupe(u8, "out of memory") catch @panic("out of memory");
+            return .{ .failure = .{ .code = .execution_failed, .message = msg } };
+        };
+        return .{ .success = .{ .payload_json = payload } };
+    }
+
+    if (std.mem.eql(u8, tool_name, "file_list")) {
+        const payload = allocator.dupe(u8, "{\"path\":\".\",\"entries\":[],\"truncated\":false}") catch {
+            const msg = allocator.dupe(u8, "out of memory") catch @panic("out of memory");
+            return .{ .failure = .{ .code = .execution_failed, .message = msg } };
+        };
+        return .{ .success = .{ .payload_json = payload } };
+    }
+
+    const msg = allocator.dupe(u8, "unexpected tool name in dispatch") catch @panic("out of memory");
+    return .{ .failure = .{ .code = .invalid_params, .message = msg } };
+}
+
+fn mockProviderStreamByModelWithPrReviewAcheronLoop(
+    allocator: std.mem.Allocator,
+    _: *std.http.Client,
+    _: *ziggy_piai.api_registry.ApiRegistry,
+    model: ziggy_piai.types.Model,
+    context: ziggy_piai.types.Context,
+    _: ziggy_piai.types.StreamOptions,
+    events: *std.array_list.Managed(ziggy_piai.types.AssistantMessageEvent),
+) anyerror!void {
+    if (mockPrReviewAgenticEvalCallCount == 0) {
+        mockPrReviewAgenticEvalCallCount += 1;
+        const tool_calls = try allocator.alloc(ziggy_piai.types.ToolCall, 1);
+        tool_calls[0] = .{
+            .id = try allocator.dupe(u8, "call-pr-review-configure"),
+            .name = try allocator.dupe(u8, "file_write"),
+            .arguments_json = try allocator.dupe(
+                u8,
+                "{\"path\":\"global/pr_review/control/configure_repo.json\",\"content\":\"{\\\"repo_key\\\":\\\"DeanoC/Spiderweb\\\",\\\"default_branch\\\":\\\"stable\\\",\\\"checkout_path\\\":\\\"/nodes/local/fs/pr-review/repos/spiderweb-configured\\\",\\\"default_review_commands\\\":[\\\"zig build test\\\"],\\\"auto_intake\\\":true}\"}",
+            ),
+        };
+        try events.append(.{ .done = .{
+            .text = try allocator.dupe(u8, ""),
+            .thinking = try allocator.dupe(u8, ""),
+            .tool_calls = tool_calls,
+            .api = model.api,
+            .provider = model.provider,
+            .model = model.id,
+            .usage = .{},
+            .stop_reason = .tool_use,
+            .error_message = null,
+        } });
+        return;
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), context.messages.len);
+    if (mockPrReviewAgenticEvalCallCount == 1) {
+        try std.testing.expect(std.mem.indexOf(u8, context.messages[0].content, "\"operation\":\"configure_repo\"") != null);
+        mockPrReviewAgenticEvalCallCount += 1;
+        const tool_calls = try allocator.alloc(ziggy_piai.types.ToolCall, 1);
+        tool_calls[0] = .{
+            .id = try allocator.dupe(u8, "call-pr-review-ingest"),
+            .name = try allocator.dupe(u8, "file_write"),
+            .arguments_json = try allocator.dupe(
+                u8,
+                "{\"path\":\"global/github_pr/control/ingest_event.json\",\"content\":\"{\\\"repo_key\\\":\\\"DeanoC/Spiderweb\\\",\\\"pr_number\\\":129,\\\"action\\\":\\\"edited\\\"}\"}",
+            ),
+        };
+        try events.append(.{ .done = .{
+            .text = try allocator.dupe(u8, ""),
+            .thinking = try allocator.dupe(u8, ""),
+            .tool_calls = tool_calls,
+            .api = model.api,
+            .provider = model.provider,
+            .model = model.id,
+            .usage = .{},
+            .stop_reason = .tool_use,
+            .error_message = null,
+        } });
+        return;
+    }
+
+    if (mockPrReviewAgenticEvalCallCount == 2) {
+        try std.testing.expect(std.mem.indexOf(u8, context.messages[0].content, "\"mission_action\":\"created\"") != null);
+        mockPrReviewAgenticEvalCallCount += 1;
+        const tool_calls = try allocator.alloc(ziggy_piai.types.ToolCall, 1);
+        tool_calls[0] = .{
+            .id = try allocator.dupe(u8, "call-pr-review-read-config"),
+            .name = try allocator.dupe(u8, "file_read"),
+            .arguments_json = try allocator.dupe(
+                u8,
+                "{\"path\":\"nodes/local/fs/pr-review/state/repos.json\",\"max_bytes\":2048}",
+            ),
+        };
+        try events.append(.{ .done = .{
+            .text = try allocator.dupe(u8, ""),
+            .thinking = try allocator.dupe(u8, ""),
+            .tool_calls = tool_calls,
+            .api = model.api,
+            .provider = model.provider,
+            .model = model.id,
+            .usage = .{},
+            .stop_reason = .tool_use,
+            .error_message = null,
+        } });
+        return;
+    }
+
+    try std.testing.expect(std.mem.indexOf(u8, context.messages[0].content, "\"auto_intake\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, context.messages[0].content, "\"default_review_commands\":[\"zig build test\"]") != null);
+    const output = try buildMessageOnlyOutput(allocator, "configured repo and created pr_review mission");
+    try events.append(.{ .done = .{
+        .text = output,
+        .thinking = try allocator.dupe(u8, ""),
+        .tool_calls = &.{},
+        .api = model.api,
+        .provider = model.provider,
+        .model = model.id,
+        .usage = .{},
+        .stop_reason = .stop,
+        .error_message = null,
+    } });
+}
+
+fn mockProviderStreamByModelWithPrReviewRunnerAcheronLoop(
+    allocator: std.mem.Allocator,
+    _: *std.http.Client,
+    _: *ziggy_piai.api_registry.ApiRegistry,
+    model: ziggy_piai.types.Model,
+    context: ziggy_piai.types.Context,
+    _: ziggy_piai.types.StreamOptions,
+    events: *std.array_list.Managed(ziggy_piai.types.AssistantMessageEvent),
+) anyerror!void {
+    if (mockPrReviewRunnerAgenticEvalCallCount == 0) {
+        mockPrReviewRunnerAgenticEvalCallCount += 1;
+        const tool_calls = try allocator.alloc(ziggy_piai.types.ToolCall, 1);
+        tool_calls[0] = .{
+            .id = try allocator.dupe(u8, "call-pr-review-runner-configure"),
+            .name = try allocator.dupe(u8, "file_write"),
+            .arguments_json = try allocator.dupe(
+                u8,
+                "{\"path\":\"global/pr_review/control/configure_repo.json\",\"content\":\"{\\\"repo_key\\\":\\\"DeanoC/Spiderweb\\\",\\\"default_branch\\\":\\\"stable\\\",\\\"checkout_path\\\":\\\"/nodes/local/fs/pr-review/repos/spiderweb-configured\\\",\\\"default_review_commands\\\":[\\\"zig build test\\\"],\\\"auto_intake\\\":true}\"}",
+            ),
+        };
+        try events.append(.{ .done = .{
+            .text = try allocator.dupe(u8, ""),
+            .thinking = try allocator.dupe(u8, ""),
+            .tool_calls = tool_calls,
+            .api = model.api,
+            .provider = model.provider,
+            .model = model.id,
+            .usage = .{},
+            .stop_reason = .tool_use,
+            .error_message = null,
+        } });
+        return;
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), context.messages.len);
+    if (mockPrReviewRunnerAgenticEvalCallCount == 1) {
+        try std.testing.expect(std.mem.indexOf(u8, context.messages[0].content, "\"operation\":\"configure_repo\"") != null);
+        mockPrReviewRunnerAgenticEvalCallCount += 1;
+        const tool_calls = try allocator.alloc(ziggy_piai.types.ToolCall, 1);
+        tool_calls[0] = .{
+            .id = try allocator.dupe(u8, "call-pr-review-runner-ingest"),
+            .name = try allocator.dupe(u8, "file_write"),
+            .arguments_json = try allocator.dupe(
+                u8,
+                "{\"path\":\"global/github_pr/control/ingest_event.json\",\"content\":\"{\\\"repo_key\\\":\\\"DeanoC/Spiderweb\\\",\\\"pr_number\\\":129,\\\"action\\\":\\\"opened\\\"}\"}",
+            ),
+        };
+        try events.append(.{ .done = .{
+            .text = try allocator.dupe(u8, ""),
+            .thinking = try allocator.dupe(u8, ""),
+            .tool_calls = tool_calls,
+            .api = model.api,
+            .provider = model.provider,
+            .model = model.id,
+            .usage = .{},
+            .stop_reason = .tool_use,
+            .error_message = null,
+        } });
+        return;
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), context.messages.len);
+    if (mockPrReviewRunnerAgenticEvalCallCount == 2) {
+        try std.testing.expect(std.mem.indexOf(u8, context.messages[0].content, "\"mission_action\":\"created\"") != null);
+        mockPrReviewRunnerAgenticEvalCallCount += 1;
+        const tool_calls = try allocator.alloc(ziggy_piai.types.ToolCall, 1);
+        tool_calls[0] = .{
+            .id = try allocator.dupe(u8, "call-pr-review-runner-advance"),
+            .name = try allocator.dupe(u8, "file_write"),
+            .arguments_json = try allocator.dupe(
+                u8,
+                "{\"path\":\"global/pr_review/control/advance.json\",\"content\":\"{\\\"mission_id\\\":\\\"mission-pr-129\\\",\\\"run_validation\\\":false,\\\"provider_sync\\\":false,\\\"sync_checkout\\\":false,\\\"repo_status\\\":false,\\\"diff_range\\\":false}\"}",
+            ),
+        };
+        try events.append(.{ .done = .{
+            .text = try allocator.dupe(u8, ""),
+            .thinking = try allocator.dupe(u8, ""),
+            .tool_calls = tool_calls,
+            .api = model.api,
+            .provider = model.provider,
+            .model = model.id,
+            .usage = .{},
+            .stop_reason = .tool_use,
+            .error_message = null,
+        } });
+        return;
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), context.messages.len);
+    if (mockPrReviewRunnerAgenticEvalCallCount == 3) {
+        try std.testing.expect(std.mem.indexOf(u8, context.messages[0].content, "\"operation\":\"advance\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, context.messages[0].content, "\"status\":\"ready_for_review\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, context.messages[0].content, "\"next_action\":\"draft_review\"") != null);
+        mockPrReviewRunnerAgenticEvalCallCount += 1;
+        const tool_calls = try allocator.alloc(ziggy_piai.types.ToolCall, 1);
+        tool_calls[0] = .{
+            .id = try allocator.dupe(u8, "call-pr-review-runner-read-state"),
+            .name = try allocator.dupe(u8, "file_read"),
+            .arguments_json = try allocator.dupe(
+                u8,
+                "{\"path\":\"nodes/local/fs/pr-review/state/DeanoC__Spiderweb/pr-129/state.json\",\"max_bytes\":2048}",
+            ),
+        };
+        try events.append(.{ .done = .{
+            .text = try allocator.dupe(u8, ""),
+            .thinking = try allocator.dupe(u8, ""),
+            .tool_calls = tool_calls,
+            .api = model.api,
+            .provider = model.provider,
+            .model = model.id,
+            .usage = .{},
+            .stop_reason = .tool_use,
+            .error_message = null,
+        } });
+        return;
+    }
+
+    try std.testing.expect(std.mem.indexOf(u8, context.messages[0].content, "\"phase\":\"reviewing\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, context.messages[0].content, "\"status\":\"passed\"") != null);
+    const output = try buildMessageOnlyOutput(allocator, "advanced pr_review mission to ready_for_review");
+    try events.append(.{ .done = .{
+        .text = output,
+        .thinking = try allocator.dupe(u8, ""),
+        .tool_calls = &.{},
+        .api = model.api,
+        .provider = model.provider,
+        .model = model.id,
+        .usage = .{},
+        .stop_reason = .stop,
+        .error_message = null,
+    } });
 }
 
 fn mockProviderStreamByModelWithChatReplyTool(
@@ -7686,6 +8237,119 @@ test "runtime_server: provider tool loop executes capability and returns final r
     try std.testing.expect(std.mem.indexOf(u8, snapshot_json, "\"tool_calls\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot_json, "\"id\":\"call-1\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot_json, "\"name\":\"file_list\"") != null);
+}
+
+test "runtime_server: agentic pr_review eval drives onboarding and intake over acheron files" {
+    const allocator = std.testing.allocator;
+    const original_stream_fn = streamByModelFn;
+    defer streamByModelFn = original_stream_fn;
+    streamByModelFn = mockProviderStreamByModelWithPrReviewAcheronLoop;
+    mockPrReviewAgenticEvalCallCount = 0;
+
+    var acheron_state = MockPrReviewAcheronState.init(allocator);
+    defer acheron_state.deinit();
+
+    const server = try RuntimeServer.createWithProviderAndToolDispatch(
+        allocator,
+        "agent-pr-review-eval",
+        .{
+            .ltm_directory = "",
+            .ltm_filename = "",
+        },
+        .{
+            .name = "openai",
+            .model = "gpt-4o-mini",
+            .api_key = "test-key",
+        },
+        &acheron_state,
+        mockDispatchPrReviewAcheron,
+    );
+    defer server.destroy();
+
+    const frames = try server.handleMessageFrames(
+        "{\"id\":\"req-agentic-pr-review\",\"type\":\"agent.run.start\",\"content\":\"Onboard the repository for PR review and react to the GitHub pull request event.\"}",
+    );
+    defer deinitResponseFrames(allocator, frames);
+
+    var saw_completed_state = false;
+    var saw_final_message = false;
+    for (frames) |payload| {
+        if (std.mem.indexOf(u8, payload, "\"type\":\"agent.run.state\"") != null and
+            std.mem.indexOf(u8, payload, "\"state\":\"completed\"") != null)
+        {
+            saw_completed_state = true;
+        }
+        if (std.mem.indexOf(u8, payload, "configured repo and created pr_review mission") != null) {
+            saw_final_message = true;
+        }
+    }
+
+    try std.testing.expect(saw_completed_state);
+    try std.testing.expect(saw_final_message);
+
+    const repos_json = acheron_state.getFile("nodes/local/fs/pr-review/state/repos.json") orelse return error.TestExpectedResponse;
+    try std.testing.expect(std.mem.indexOf(u8, repos_json, "\"repo_key\":\"DeanoC/Spiderweb\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, repos_json, "\"auto_intake\":true") != null);
+
+    const event_json = acheron_state.getFile("global/events/sources/agent/github_pr.json") orelse return error.TestExpectedResponse;
+    try std.testing.expect(std.mem.indexOf(u8, event_json, "\"event_type\":\"agent\"") != null);
+
+    const context_json = acheron_state.getFile("nodes/local/fs/pr-review/state/DeanoC__Spiderweb/pr-129/context.json") orelse return error.TestExpectedResponse;
+    try std.testing.expect(std.mem.indexOf(u8, context_json, "\"base_branch\":\"stable\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, context_json, "\"default_review_commands\":[\"zig build test\"]") != null);
+}
+
+test "runtime_server: agentic pr_review eval advances mission to ready_for_review" {
+    const allocator = std.testing.allocator;
+    const original_stream_fn = streamByModelFn;
+    defer streamByModelFn = original_stream_fn;
+    streamByModelFn = mockProviderStreamByModelWithPrReviewRunnerAcheronLoop;
+    mockPrReviewRunnerAgenticEvalCallCount = 0;
+
+    var acheron_state = MockPrReviewAcheronState.init(allocator);
+    defer acheron_state.deinit();
+
+    const server = try RuntimeServer.createWithProviderAndToolDispatch(
+        allocator,
+        "agent-pr-review-runner-eval",
+        .{
+            .ltm_directory = "",
+            .ltm_filename = "",
+        },
+        .{
+            .name = "openai",
+            .model = "gpt-4o-mini",
+            .api_key = "test-key",
+        },
+        &acheron_state,
+        mockDispatchPrReviewAcheron,
+    );
+    defer server.destroy();
+
+    const frames = try server.handleMessageFrames(
+        "{\"id\":\"req-agentic-pr-review-runner\",\"type\":\"agent.run.start\",\"content\":\"Onboard the repository, ingest the PR event, then advance the mission until it is ready for review.\"}",
+    );
+    defer deinitResponseFrames(allocator, frames);
+
+    var saw_completed_state = false;
+    var saw_final_message = false;
+    for (frames) |payload| {
+        if (std.mem.indexOf(u8, payload, "\"type\":\"agent.run.state\"") != null and
+            std.mem.indexOf(u8, payload, "\"state\":\"completed\"") != null)
+        {
+            saw_completed_state = true;
+        }
+        if (std.mem.indexOf(u8, payload, "advanced pr_review mission to ready_for_review") != null) {
+            saw_final_message = true;
+        }
+    }
+
+    try std.testing.expect(saw_completed_state);
+    try std.testing.expect(saw_final_message);
+
+    const state_json = acheron_state.getFile("nodes/local/fs/pr-review/state/DeanoC__Spiderweb/pr-129/state.json") orelse return error.TestExpectedResponse;
+    try std.testing.expect(std.mem.indexOf(u8, state_json, "\"phase\":\"reviewing\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, state_json, "\"status\":\"passed\"") != null);
 }
 
 test "runtime_server: file_write chat reply payload short-circuits provider loop to session.receive" {

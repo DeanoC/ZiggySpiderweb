@@ -7,11 +7,19 @@
     "status": "unknown",
     "summary": null
   },
+  "latest_draft": {
+    "status": "pending",
+    "summary": null,
+    "revision": 0
+  },
   "latest_recommendation": {
     "status": "pending",
     "summary": null
   },
   "artifacts": {
+    "draft_review": "draft-review.json",
+    "draft_review_comment": "review-comment-draft.md",
+    "draft_history_dir": "drafts",
     "findings": "findings.json",
     "validation": "validation.json",
     "recommendation": "recommendation.json",
