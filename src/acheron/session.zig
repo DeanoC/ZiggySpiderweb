@@ -10310,6 +10310,10 @@ pub const Session = struct {
 
     pub fn resolveMissionContractHostPath(self: *Session, absolute_path: []const u8) ![]u8 {
         const local_root = self.local_fs_export_root orelse return error.InvalidPayload;
+        const trimmed = std.mem.trimRight(u8, absolute_path, "/");
+        if (std.mem.eql(u8, trimmed, local_fs_world_prefix)) {
+            return self.allocator.dupe(u8, local_root);
+        }
         const relative_path = try self.normalizeLocalFsRelativePath(absolute_path);
         defer self.allocator.free(relative_path);
         return std.fs.path.join(self.allocator, &.{ local_root, relative_path });
@@ -15067,6 +15071,88 @@ test "acheron_session: pr_review repo onboarding persists config and start uses 
     try std.testing.expect(std.mem.indexOf(u8, context_content, "\"review_policy_paths\":[\"/nodes/local/fs/policy/pr-review.md\"]") != null);
     try std.testing.expect(std.mem.indexOf(u8, context_content, "\"push_fix_requires_approval\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, context_content, "\"merge_requires_approval\":false") != null);
+}
+
+test "acheron_session: pr_review repo onboarding accepts workspace root checkout path" {
+    const allocator = std.testing.allocator;
+
+    var mission_store = try mission_store_mod.MissionStore.initWithPath(allocator, null);
+    defer mission_store.deinit();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const local_export_root = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(local_export_root);
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "default",
+        .{
+            .mission_store = &mission_store,
+            .local_fs_export_root = local_export_root,
+            .actor_type = "agent",
+            .actor_id = "reviewer-root",
+        },
+    );
+    defer session.deinit();
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        408,
+        409,
+        &.{ "agents", "self", "pr_review", "control", "configure_repo.json" },
+        "{\"repo_key\":\"DeanoC/Spiderweb\",\"provider\":\"github\",\"checkout_path\":\"/nodes/local/fs\",\"default_review_commands\":[\"zig build test\"],\"workspace_root\":\"/nodes/local/fs\",\"worktree_name\":\"root-review\"}",
+        990,
+    );
+
+    const configure_result = try protocolReadFile(
+        &session,
+        allocator,
+        410,
+        411,
+        &.{ "agents", "self", "pr_review", "result.json" },
+        991,
+    );
+    defer allocator.free(configure_result);
+    try std.testing.expect(std.mem.indexOf(u8, configure_result, "\"operation\":\"configure_repo\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, configure_result, "\"checkout_path\":\"/nodes/local/fs\"") != null);
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        412,
+        413,
+        &.{ "agents", "self", "pr_review", "control", "start.json" },
+        "{\"repo_key\":\"DeanoC/Spiderweb\",\"pr_number\":224,\"head_sha\":\"cfg224\"}",
+        992,
+    );
+
+    const start_result = try protocolReadFile(
+        &session,
+        allocator,
+        414,
+        415,
+        &.{ "agents", "self", "pr_review", "result.json" },
+        993,
+    );
+    defer allocator.free(start_result);
+    try std.testing.expect(std.mem.indexOf(u8, start_result, "\"operation\":\"start\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, start_result, "\"checkout_path\":\"/nodes/local/fs\"") != null);
+
+    const context_host_path = try std.fs.path.join(allocator, &.{ local_export_root, "pr-review", "state", "DeanoC__Spiderweb", "pr-224", "context.json" });
+    defer allocator.free(context_host_path);
+    const context_content = try std.fs.cwd().readFileAlloc(allocator, context_host_path, 64 * 1024);
+    defer allocator.free(context_content);
+    try std.testing.expect(std.mem.indexOf(u8, context_content, "\"checkout_path\":\"/nodes/local/fs\"") != null);
 }
 
 test "acheron_session: pr_review venom intake bootstraps mission from provider sync" {

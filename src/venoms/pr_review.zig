@@ -771,7 +771,7 @@ pub fn bootstrapMission(self: anytype, args_obj: std.json.ObjectMap) !mission_st
     try self.writeMissionContractFile(context_path, context_payload);
     try self.writeMissionContractFile(state_path, state_payload);
 
-    var bootstrapped = try store.recordCheckpoint(self.allocator, mission.mission_id, .{
+    const bootstrapped = try store.recordCheckpoint(self.allocator, mission.mission_id, .{
         .stage = "bootstrap_context",
         .summary = "Bootstrapped PR review contract",
         .artifact = .{
@@ -786,7 +786,6 @@ pub fn bootstrapMission(self: anytype, args_obj: std.json.ObjectMap) !mission_st
             .artifact_root = artifact_root,
         },
     });
-    defer bootstrapped.deinit(self.allocator);
 
     return bootstrapped;
 }
