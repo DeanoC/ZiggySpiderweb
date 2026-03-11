@@ -796,19 +796,6 @@ fn fetchWorkspaceEndpointSpecs(
     }
 
     const effective_project_id = workspace_id orelse connect_info.project_id;
-    if (connect_info.requires_session_attach) {
-        const attach_session_key = connect_info.session_key orelse return error.InvalidWorkspacePayload;
-        const attach_agent_id = connect_info.agent_id orelse return error.InvalidWorkspacePayload;
-        const attach_project_id = effective_project_id orelse return error.ProjectRequired;
-        var attach_info = try client.controlSessionAttach(.{
-            .session_key = attach_session_key,
-            .agent_id = attach_agent_id,
-            .project_id = attach_project_id,
-            .project_token = workspace_token,
-        });
-        defer attach_info.deinit(allocator);
-    }
-
     const payload_json = try client.controlWorkspaceStatus(effective_project_id, workspace_token);
     defer allocator.free(payload_json);
 
