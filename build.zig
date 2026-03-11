@@ -163,7 +163,7 @@ pub fn build(b: *std.Build) void {
     const run_example_multi_step = b.step("run-example-embed-multi-service-node", "Run multi-service embedded node example");
     run_example_multi_step.dependOn(&run_multi_example.step);
 
-    // Spiderweb executable
+    // Spiderweb workspace host executable
     const spiderweb_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
@@ -201,67 +201,6 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(spiderweb);
     const spiderweb_build_step = b.step("spiderweb", "Build spiderweb server executable");
     spiderweb_build_step.dependOn(&spiderweb.step);
-
-    const pr_review_dogfood_mod = b.createModule(.{
-        .root_source_file = b.path("src/pr_review_dogfood.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    pr_review_dogfood_mod.addIncludePath(b.path("src/c"));
-    pr_review_dogfood_mod.addImport("ziggy-piai", ziggy_piai_module);
-    pr_review_dogfood_mod.addImport("agent_config", agent_config_mod);
-    pr_review_dogfood_mod.addImport("spider-protocol", spider_protocol_module);
-    pr_review_dogfood_mod.addImport("spiderweb_node", spiderweb_node_module);
-    pr_review_dogfood_mod.addImport("spiderweb_fs", spiderweb_fs_protocol_module);
-    pr_review_dogfood_mod.addImport("spiderweb_fs_cache", spiderweb_fs_cache_mod);
-    pr_review_dogfood_mod.addImport("spiderweb_fs_source_policy", spiderweb_fs_source_policy_mod);
-    pr_review_dogfood_mod.addImport("ziggy-memory-store", ziggy_memory_store_module);
-    pr_review_dogfood_mod.addImport("ziggy-tool-runtime", ziggy_tool_runtime_module);
-    pr_review_dogfood_mod.addImport("ziggy-runtime-hooks", ziggy_runtime_hooks_module);
-    pr_review_dogfood_mod.addImport("ziggy-run-orchestrator", ziggy_run_orchestrator_module);
-
-    const pr_review_dogfood = b.addExecutable(.{
-        .name = "spiderweb-pr-review-dogfood",
-        .root_module = pr_review_dogfood_mod,
-    });
-    pr_review_dogfood.addCSourceFile(.{ .file = b.path("src/c/fuse_compat.c") });
-    pr_review_dogfood.linkLibC();
-    pr_review_dogfood.linkSystemLibrary("sqlite3");
-    b.installArtifact(pr_review_dogfood);
-
-    const run_pr_review_dogfood = b.addRunArtifact(pr_review_dogfood);
-    run_pr_review_dogfood.step.dependOn(b.getInstallStep());
-    if (b.args) |args| {
-        run_pr_review_dogfood.addArgs(args);
-    }
-    const pr_review_dogfood_step = b.step("pr-review-dogfood", "Run the PR review dogfood harness");
-    pr_review_dogfood_step.dependOn(&run_pr_review_dogfood.step);
-
-    // Agent runtime child executable (sandbox target)
-    const agent_runtime_child_mod = b.createModule(.{
-        .root_source_file = b.path("src/agents/agent_runtime_child_main.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    agent_runtime_child_mod.addIncludePath(b.path("src/c"));
-    agent_runtime_child_mod.addImport("ziggy-piai", ziggy_piai_module);
-    agent_runtime_child_mod.addImport("spider-protocol", spider_protocol_module);
-    agent_runtime_child_mod.addImport("ziggy-memory-store", ziggy_memory_store_module);
-    agent_runtime_child_mod.addImport("ziggy-tool-runtime", ziggy_tool_runtime_module);
-    agent_runtime_child_mod.addImport("ziggy-runtime-hooks", ziggy_runtime_hooks_module);
-    agent_runtime_child_mod.addImport("ziggy-run-orchestrator", ziggy_run_orchestrator_module);
-    agent_runtime_child_mod.addImport("agent_config", agent_config_mod);
-
-    const spiderweb_agent_runtime = b.addExecutable(.{
-        .name = "spiderweb-agent-runtime",
-        .root_module = agent_runtime_child_mod,
-    });
-    spiderweb_agent_runtime.linkLibrary(fuse_compat_lib);
-    applySqliteLibraryPath(spiderweb_agent_runtime, sqlite_lib_dir);
-    spiderweb_agent_runtime.linkLibC();
-    spiderweb_agent_runtime.linkSystemLibrary("sqlite3");
-    b.installArtifact(spiderweb_agent_runtime);
-
     // Distributed filesystem node executable
     const fs_node_mod = b.createModule(.{
         .root_source_file = b.path("src/venoms/fs/shared/fs_node_main.zig"),
@@ -339,7 +278,7 @@ pub fn build(b: *std.Build) void {
         run_cmd.addArgs(args);
     }
 
-    const run_step = b.step("run", "Run spiderweb");
+    const run_step = b.step("run", "Run spiderweb workspace host");
     run_step.dependOn(&run_cmd.step);
 
     // Tests

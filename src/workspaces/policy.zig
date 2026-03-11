@@ -83,9 +83,9 @@ pub fn loadWorkspacePolicy(allocator: std.mem.Allocator, options: LoadOptions) !
 }
 
 fn initDefaults(allocator: std.mem.Allocator, options: LoadOptions) !WorkspacePolicy {
-    const project_seed = options.project_id orelse "system";
+    const project_seed = options.project_id orelse "workspace";
     var policy = WorkspacePolicy{
-        .show_debug = std.mem.eql(u8, options.agent_id, "mother"),
+        .show_debug = false,
         .project_id = try allocator.dupe(u8, project_seed),
     };
     errdefer policy.deinit(allocator);
@@ -342,16 +342,16 @@ test "workspace_policy: defaults provide a usable workspace view" {
     var policy = try loadWorkspacePolicy(
         allocator,
         .{
-            .agent_id = "mother",
-            .project_id = "system",
+            .agent_id = "spider-monkey",
+            .project_id = "workspace-demo",
             .agents_dir = ".does-not-exist",
             .projects_dir = ".does-not-exist",
         },
     );
     defer policy.deinit(allocator);
 
-    try std.testing.expect(policy.show_debug);
-    try std.testing.expectEqualStrings("system", policy.project_id);
+    try std.testing.expect(!policy.show_debug);
+    try std.testing.expectEqualStrings("workspace-demo", policy.project_id);
     try std.testing.expect(policy.nodes.items.len > 0);
     try std.testing.expect(policy.project_links.items.len > 0);
     try std.testing.expect(policy.visible_agents.items.len > 0);

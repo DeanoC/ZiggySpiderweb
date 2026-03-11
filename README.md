@@ -4,57 +4,57 @@
 [![Zig](https://img.shields.io/badge/Zig-0.15.0-orange.svg)](https://ziglang.org)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-An **AI agent gateway + Acheron-based distributed RPC filesystem** for multi-node, tool-capable agents. Built in Zig. The Spiderweb server remains Linux-oriented, and the standalone `spiderweb-fs-mount` client now builds for Linux and Windows.
+Spiderweb is a **workspace host + Acheron-based distributed RPC filesystem** for external agents. It provides the workspace, virtual filesystem, nodes, venoms, and control plane. The agent process itself lives outside Spiderweb and uses the mounted workspace as its contract.
+
+Built in Zig. The Spiderweb server remains Linux-oriented, and the standalone `spiderweb-fs-mount` client builds for Linux and Windows.
 
 ## Vision
 
-Spiderweb’s goal is to make agents work across machines and services **as if they were navigating a filesystem**. Instead of bespoke APIs, agents get a unified WorldFS where chat, tools, files, and remote services are just paths. This makes multi-node workspaces, device services, and project context feel native and composable.
+Spiderweb’s goal is to make agent systems feel like they are navigating a filesystem instead of stitching together bespoke APIs. Chat, jobs, memory surfaces, worker registration, files, and remote services are projected into one namespace so agents can discover and use them by path.
 
-In short: **a gateway + distributed RPC filesystem that turns the world into paths**.
+In short: **Spiderweb hosts the namespace; workers operate through it**.
 
 If that resonates, start with:
 - `docs/overview.md`
 - `docs/README.md`
 
-The docs tree is intentionally minimal and code-grounded. Older RFC/migration notes were removed once the single-websocket worldfs transport became the shipped behavior.
-
 ## Quick Start
 
-### Automated Install (Recommended for Debian/Ubuntu)
+### Workspace-First External Worker Flow
+
+This is the current product path.
 
 ```bash
-# One-line install - downloads, builds, configures, and runs
-curl -fsSL https://raw.githubusercontent.com/DeanoC/Spiderweb/main/install.sh -o /tmp/install.sh
-chmod +x /tmp/install.sh
-/tmp/instaill.sh
-```
-
-This script will:
-1. Check and install dependencies (Zig, secret-tool, jq, etc.)
-2. Clone and build Spiderweb
-3. Prompt for AI provider and API key
-4. Configure secure credential storage
-5. Provision Mother system agent scaffold
-6. Start the server
-
-### Manual Install
-
-```bash
-# Clone and build
+# Build Spiderweb
 git clone --recurse-submodules https://github.com/DeanoC/Spiderweb.git
 cd Spiderweb
-# If you already cloned without submodules:
-git submodule update --init --recursive
 zig build
 
-# Store provider key in secure credential backend (Linux: secret-tool)
-./zig-out/bin/spiderweb-config config set-key sk-... openai
+# Check the local control auth tokens used by spiderweb-control/spiderweb-fs-mount
+./zig-out/bin/spiderweb-config auth status --reveal
 
-# Run on default port 18790
+# Start Spiderweb
 ./zig-out/bin/spiderweb
 
-# Or specify custom port
-./zig-out/bin/spiderweb --port 9000
+# Create a workspace
+./zig-out/bin/spiderweb-control \
+  --auth-token <admin-token> \
+  workspace_create \
+  '{"name":"Demo","vision":"Mounted workspace demo"}'
+
+# Mount that workspace into the local filesystem
+./zig-out/bin/spiderweb-fs-mount \
+  --workspace-url ws://127.0.0.1:18790/ \
+  --workspace-id <workspace-id> \
+  --auth-token <admin-or-user-token> \
+  mount /mnt/spiderweb-demo
+
+# Start an external worker against the mounted folder
+../SpiderMonkey/zig-out/bin/spider-monkey \
+  run \
+  --agent-id spider-monkey \
+  --worker-id spider-monkey-a \
+  --workspace-root /mnt/spiderweb-demo
 ```
 
 ## Standalone Mount Client
@@ -91,3 +91,31 @@ Examples:
 # Namespace smoke harness (low-level commands, optional real mount when SMOKE_USE_OS_MOUNT=1)
 SPIDERWEB_PROJECT_ID=proj-a ./scripts/acheron-namespace-smoke.sh
 ```
+
+This flow has been smoke-tested with:
+- `spiderweb`
+- `spiderweb-control workspace_create`
+- `spiderweb-control workspace_list`
+- `spiderweb-fs-mount ... readdir /`
+
+### What Spiderweb Owns
+
+- Workspace creation, topology, control-plane metadata, and workspace tokens.
+- Mounted namespace projection through Acheron / WorldFS.
+- Shared workspace services such as `/services/home`, `/services/workers`, chat/job queue surfaces, and control venoms.
+- Durable per-agent home allocation inside a workspace.
+- Ephemeral worker-node projection and liveness tracking for attached workers.
+
+### What External Workers Own
+
+- Model/provider configuration and credentials.
+- Private loopback services such as worker-owned `memory` and `sub_brains`.
+- Job consumption and reply writing through the mounted workspace.
+- Their own process lifecycle outside Spiderweb.
+
+## Notes
+
+- If `runtime.spider_web_root` is empty, Spiderweb uses its current working directory as the default local workspace root.
+- `spiderweb-config auth path` and `auth status` now resolve auth tokens from the local runtime context instead of assuming an embedded AI setup.
+- The happy path no longer uses Mother/system bootstrap or provider setup inside Spiderweb.
+- Spider Monkey is the first external worker for this model, but the intent is broader: any agent that can work against a filesystem can use a mounted Spiderweb workspace.

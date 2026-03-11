@@ -14,9 +14,7 @@ const control_plane_mod = @import("control_plane.zig");
 const acheron_router = @import("router.zig");
 const agent_config = @import("../agents/agent_config.zig");
 const agent_registry = @import("../agents/agent_registry.zig");
-const memory_ownership = @import("../agents/memory_ownership.zig");
 const mission_store_mod = @import("../mission_store.zig");
-const memory_venom = @import("../venoms/memory.zig");
 const search_services_venom = @import("../venoms/search_services.zig");
 const chat_venom = @import("../venoms/chat.zig");
 const events_venom = @import("../venoms/events.zig");
@@ -24,7 +22,8 @@ const pairing_venom = @import("../venoms/pairing.zig");
 const jobs_venom = @import("../venoms/jobs.zig");
 const terminal_venom = @import("../venoms/terminal.zig");
 const mounts_venom = @import("../venoms/mounts.zig");
-const sub_brains_venom = @import("../venoms/sub_brains.zig");
+const home_venom = @import("../venoms/home.zig");
+const workers_venom = @import("../venoms/workers.zig");
 const agents_venom = @import("../venoms/agents.zig");
 const workspaces_venom = @import("../venoms/workspaces.zig");
 const git_venom = @import("../venoms/git.zig");
@@ -50,20 +49,15 @@ const SpecialKind = enum {
     web_search_search,
     search_code_invoke,
     search_code_search,
-    memory_invoke,
-    memory_create,
-    memory_load,
-    memory_versions,
-    memory_mutate,
-    memory_evict,
-    memory_search,
-    sub_brains_invoke,
-    sub_brains_list,
-    sub_brains_upsert,
-    sub_brains_delete,
     agents_invoke,
     agents_list,
     agents_create,
+    home_invoke,
+    home_ensure,
+    workers_invoke,
+    workers_register,
+    workers_heartbeat,
+    workers_detach,
     projects_invoke,
     projects_list,
     projects_get,
@@ -137,16 +131,7 @@ const wait_poll_interval_ms: u64 = events_venom.wait_poll_interval_ms;
 const debug_stream_log_max_bytes: usize = 2 * 1024 * 1024;
 const max_signal_events: usize = events_venom.max_signal_events;
 const local_fs_world_prefix = "/nodes/local/fs";
-
-const sub_brains_manage_capabilities = [_][]const u8{
-    "sub_brains.manage",
-    "subbrains.manage",
-    "sub_brains",
-    "subbrains",
-    "can_spawn_subbrains",
-    "agent_admin",
-    "agent_manage",
-};
+const worker_reap_grace_ms: i64 = 60_000;
 
 const agent_create_capabilities = [_][]const u8{
     "agents.create",
@@ -318,6 +303,17 @@ const InternalFsrpcIds = struct {
     tag_base: u32,
 };
 
+const WorkerPresence = struct {
+    agent_id: []u8,
+    last_seen_ms: i64,
+    expires_at_ms: i64,
+
+    fn deinit(self: *WorkerPresence, allocator: std.mem.Allocator) void {
+        allocator.free(self.agent_id);
+        self.* = undefined;
+    }
+};
+
 pub const Session = struct {
     pub const NamespaceOptions = struct {
         project_id: ?[]const u8 = null,
@@ -406,6 +402,14 @@ pub const Session = struct {
     mounts_result_id: u32 = 0,
     mounts_status_alias_id: u32 = 0,
     mounts_result_alias_id: u32 = 0,
+    home_status_id: u32 = 0,
+    home_result_id: u32 = 0,
+    home_status_alias_id: u32 = 0,
+    home_result_alias_id: u32 = 0,
+    workers_status_id: u32 = 0,
+    workers_result_id: u32 = 0,
+    workers_status_alias_id: u32 = 0,
+    workers_result_alias_id: u32 = 0,
     wait_sources: std.ArrayListUnmanaged(WaitSource) = .{},
     wait_timeout_ms: i64 = default_wait_timeout_ms,
     wait_event_seq: u64 = 1,
@@ -416,6 +420,7 @@ pub const Session = struct {
     next_terminal_session_seq: u64 = 1,
     next_thought_seq: u64 = 1,
     thought_job_sync_counts: std.StringHashMapUnmanaged(usize) = .{},
+    worker_presence: std.StringHashMapUnmanaged(WorkerPresence) = .{},
     project_binds: std.ArrayListUnmanaged(PathBind) = .{},
     scoped_venom_bindings: std.ArrayListUnmanaged(ScopedVenomBinding) = .{},
     node_aliases: std.AutoHashMapUnmanaged(u32, u32) = .{},
@@ -502,6 +507,7 @@ pub const Session = struct {
         self.clearProjectBinds();
         self.clearScopedVenomBindings();
         self.clearThoughtJobSyncCounts();
+        self.clearWorkerPresence();
         self.node_aliases.deinit(self.allocator);
         var it = self.nodes.iterator();
         while (it.next()) |entry| {
@@ -523,6 +529,17 @@ pub const Session = struct {
         if (self.control_operator_token) |value| self.allocator.free(value);
         self.runtime_handle.release();
         self.* = undefined;
+    }
+
+    fn clearWorkerPresence(self: *Session) void {
+        var it = self.worker_presence.iterator();
+        while (it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            var presence = entry.value_ptr.*;
+            presence.deinit(self.allocator);
+        }
+        self.worker_presence.deinit(self.allocator);
+        self.worker_presence = .{};
     }
 
     pub fn setRuntimeBinding(
@@ -914,6 +931,8 @@ pub const Session = struct {
     }
 
     fn refreshDynamicDirectory(self: *Session, dir_id: u32) !void {
+        try self.reapExpiredWorkerNodes();
+        try self.refreshWorkerPresenceStatuses();
         if (dir_id == self.nodes_root_id) {
             try self.addNodeDirectoriesFromControlPlane(self.nodes_root_id);
         }
@@ -1011,6 +1030,28 @@ pub const Session = struct {
                 written = outcome.written;
                 chat_reply_content = outcome.chat_reply_content;
             },
+            .job_status => {
+                const outcome = self.handleJobStatusWrite(state.node_id, offset, data) catch |err| switch (err) {
+                    error.InvalidPayload => {
+                        return unified.buildFsrpcError(
+                            self.allocator,
+                            msg.tag,
+                            "invalid",
+                            "job status payload must be a JSON object with state=queued|running|done|failed and optional error",
+                        );
+                    },
+                    else => return err,
+                };
+                written = outcome.written;
+            },
+            .job_result => {
+                const outcome = try self.handleJobResultWrite(state.node_id, offset, data);
+                written = outcome.written;
+            },
+            .job_log => {
+                const outcome = try self.handleJobLogWrite(state.node_id, offset, data);
+                written = outcome.written;
+            },
             .event_wait_config => {
                 const outcome = self.handleEventWaitConfigWrite(state.node_id, data) catch |err| switch (err) {
                     error.InvalidPayload => {
@@ -1033,35 +1074,6 @@ pub const Session = struct {
                             msg.tag,
                             "invalid",
                             "signal.json payload must be an object with event_type=user|agent|hook and optional parameter/payload",
-                        );
-                    },
-                    else => return err,
-                };
-                written = outcome.written;
-            },
-            .memory_invoke,
-            .memory_create,
-            .memory_load,
-            .memory_versions,
-            .memory_mutate,
-            .memory_evict,
-            .memory_search,
-            => {
-                const outcome = self.handleMemoryNamespaceWrite(node.special, state.node_id, data) catch |err| switch (err) {
-                    error.InvalidPayload => {
-                        return unified.buildFsrpcError(
-                            self.allocator,
-                            msg.tag,
-                            "invalid",
-                            "memory payload is invalid for requested operation",
-                        );
-                    },
-                    error.AccessDenied => {
-                        return unified.buildFsrpcError(
-                            self.allocator,
-                            msg.tag,
-                            "eperm",
-                            "memory invoke access denied by permissions",
                         );
                     },
                     else => return err,
@@ -1124,14 +1136,16 @@ pub const Session = struct {
                 };
                 written = outcome.written;
             },
-            .sub_brains_invoke => {
-                const outcome = self.handleSubBrainsInvokeWrite(state.node_id, data) catch |err| switch (err) {
+            .home_invoke,
+            .home_ensure,
+            => {
+                const outcome = self.handleHomeNamespaceWrite(node.special, state.node_id, data) catch |err| switch (err) {
                     error.InvalidPayload => {
                         return unified.buildFsrpcError(
                             self.allocator,
                             msg.tag,
                             "invalid",
-                            "sub_brains invoke payload must include op=list|upsert|delete and optional arguments/args",
+                            "home payload is invalid for requested operation",
                         );
                     },
                     error.AccessDenied => {
@@ -1139,65 +1153,25 @@ pub const Session = struct {
                             self.allocator,
                             msg.tag,
                             "eperm",
-                            "sub_brains mutation requires capability",
+                            "home operation denied by project policy",
                         );
                     },
                     else => return err,
                 };
                 written = outcome.written;
             },
-            .sub_brains_list => {
-                const outcome = self.handleSubBrainsListWrite(state.node_id, data) catch |err| switch (err) {
+            .workers_invoke,
+            .workers_register,
+            .workers_heartbeat,
+            .workers_detach,
+            => {
+                const outcome = self.handleWorkersNamespaceWrite(node.special, state.node_id, data) catch |err| switch (err) {
                     error.InvalidPayload => {
                         return unified.buildFsrpcError(
                             self.allocator,
                             msg.tag,
                             "invalid",
-                            "sub_brains list payload must be empty or a JSON object",
-                        );
-                    },
-                    else => return err,
-                };
-                written = outcome.written;
-            },
-            .sub_brains_upsert => {
-                const outcome = self.handleSubBrainsUpsertWrite(state.node_id, data) catch |err| switch (err) {
-                    error.InvalidPayload => {
-                        return unified.buildFsrpcError(
-                            self.allocator,
-                            msg.tag,
-                            "invalid",
-                            "sub_brains upsert payload requires brain_name (or name/id) and optional template/provider/tool fields",
-                        );
-                    },
-                    error.AccessDenied => {
-                        return unified.buildFsrpcError(
-                            self.allocator,
-                            msg.tag,
-                            "eperm",
-                            "sub_brains mutation requires capability",
-                        );
-                    },
-                    else => return err,
-                };
-                written = outcome.written;
-            },
-            .sub_brains_delete => {
-                const outcome = self.handleSubBrainsDeleteWrite(state.node_id, data) catch |err| switch (err) {
-                    error.InvalidPayload => {
-                        return unified.buildFsrpcError(
-                            self.allocator,
-                            msg.tag,
-                            "invalid",
-                            "sub_brains delete payload requires brain_name (or name/id)",
-                        );
-                    },
-                    error.AccessDenied => {
-                        return unified.buildFsrpcError(
-                            self.allocator,
-                            msg.tag,
-                            "eperm",
-                            "sub_brains mutation requires capability",
+                            "workers payload is invalid for requested operation",
                         );
                     },
                     else => return err,
@@ -2102,12 +2076,11 @@ pub const Session = struct {
         try self.registerExistingGlobalVenomBinding(global_root, "chat", "project_namespace");
         try self.registerExistingGlobalVenomBinding(global_root, "jobs", "project_namespace");
         try self.registerExistingGlobalVenomBinding(global_root, "events", "project_namespace");
-        try self.registerExistingGlobalVenomBinding(global_root, "memory", "project_namespace");
         try self.registerExistingGlobalVenomBinding(global_root, "web_search", "project_namespace");
         try self.registerExistingGlobalVenomBinding(global_root, "search_code", "project_namespace");
         try self.registerExistingGlobalVenomBinding(global_root, "terminal", "project_namespace");
         try self.registerExistingGlobalVenomBinding(global_root, "mounts", "project_namespace");
-        try self.registerExistingGlobalVenomBinding(global_root, "sub_brains", "project_namespace");
+        try self.registerExistingGlobalVenomBinding(global_root, "workers", "project_namespace");
         try self.registerExistingGlobalVenomBinding(global_root, "agents", "project_namespace");
         try self.registerExistingGlobalVenomBinding(global_root, "workspaces", "project_namespace");
         try self.registerExistingGlobalVenomBinding(global_root, "thoughts", "project_namespace");
@@ -2718,9 +2691,17 @@ pub const Session = struct {
         try self.seedEventsNamespaceAt(events_dir, "/nodes/local/venoms/events");
         _ = try self.cloneLocalCatalogVenomAlias(events_dir, global_root, "events");
 
-        const memory_dir = try self.addDir(local_venoms_root, "memory", false);
-        try self.seedAgentMemoryNamespaceAt(memory_dir, "/nodes/local/venoms/memory");
-        _ = try self.cloneLocalCatalogVenomAlias(memory_dir, global_root, "memory");
+        const home_dir = try self.addDir(local_venoms_root, "home", false);
+        try self.seedAgentHomeNamespaceAt(home_dir, "/nodes/local/venoms/home");
+        const home_alias_dir = try self.cloneLocalCatalogVenomAlias(home_dir, global_root, "home");
+        self.home_status_alias_id = self.lookupChild(home_alias_dir, "status.json") orelse 0;
+        self.home_result_alias_id = self.lookupChild(home_alias_dir, "result.json") orelse 0;
+
+        const workers_dir = try self.addDir(local_venoms_root, "workers", false);
+        try workers_venom.seedNamespaceAt(self, workers_dir, "/nodes/local/venoms/workers");
+        const workers_alias_dir = try self.cloneLocalCatalogVenomAlias(workers_dir, global_root, "workers");
+        self.workers_status_alias_id = self.lookupChild(workers_alias_dir, "status.json") orelse 0;
+        self.workers_result_alias_id = self.lookupChild(workers_alias_dir, "result.json") orelse 0;
 
         const web_search_dir = try self.addDir(local_venoms_root, "web_search", false);
         try self.seedAgentWebSearchNamespaceAt(web_search_dir, "/nodes/local/venoms/web_search");
@@ -2739,10 +2720,6 @@ pub const Session = struct {
         const mounts_alias_dir = try self.cloneLocalCatalogVenomAlias(mounts_dir, global_root, "mounts");
         self.mounts_status_alias_id = self.lookupChild(mounts_alias_dir, "status.json") orelse 0;
         self.mounts_result_alias_id = self.lookupChild(mounts_alias_dir, "result.json") orelse 0;
-
-        const sub_brains_dir = try self.addDir(local_venoms_root, "sub_brains", false);
-        try self.seedAgentSubBrainsNamespaceAt(sub_brains_dir, "/nodes/local/venoms/sub_brains");
-        _ = try self.cloneLocalCatalogVenomAlias(sub_brains_dir, global_root, "sub_brains");
 
         const agents_dir = try self.addDir(local_venoms_root, "agents", false);
         try self.seedAgentAgentsNamespaceAt(agents_dir, "/nodes/local/venoms/agents");
@@ -2788,12 +2765,11 @@ pub const Session = struct {
         try self.registerLocalCatalogVenomBinding("jobs", "node_catalog");
         try self.registerLocalCatalogVenomBinding("thoughts", "node_catalog");
         try self.registerLocalCatalogVenomBinding("events", "node_catalog");
-        try self.registerLocalCatalogVenomBinding("memory", "node_catalog");
+        try self.registerLocalCatalogVenomBinding("workers", "node_catalog");
         try self.registerLocalCatalogVenomBinding("web_search", "node_catalog");
         try self.registerLocalCatalogVenomBinding("search_code", "node_catalog");
         try self.registerLocalCatalogVenomBinding("terminal", "node_catalog");
         try self.registerLocalCatalogVenomBinding("mounts", "node_catalog");
-        try self.registerLocalCatalogVenomBinding("sub_brains", "node_catalog");
         try self.registerLocalCatalogVenomBinding("agents", "node_catalog");
         try self.registerLocalCatalogVenomBinding("workspaces", "node_catalog");
         if (self.local_fs_export_root != null) {
@@ -3116,12 +3092,215 @@ pub const Session = struct {
         _ = try self.addFile(dir_id, "CAPS.json", caps_json, false, .none);
     }
 
-    fn seedAgentMemoryNamespace(self: *Session, memory_dir: u32) !void {
-        return memory_venom.seedNamespace(self, memory_dir);
+    pub fn ensureWorkerLoopbackNode(self: *Session, worker_id: []const u8, agent_id: []const u8, venoms: []const []const u8) !void {
+        const nodes_root = self.lookupChild(self.root_id, "nodes") orelse return error.InvalidPayload;
+        const node_dir_id = if (self.lookupChild(nodes_root, worker_id)) |existing|
+            existing
+        else
+            try self.addDir(nodes_root, worker_id, false);
+
+        try self.ensureWorkerFile(node_dir_id, "README.md", "External worker node projected into this mounted workspace session.\n", false, .none);
+        try self.ensureWorkerFile(node_dir_id, "SCHEMA.json", "{\"kind\":\"node\",\"children\":\"venoms + worker metadata\"}", false, .none);
+        try self.ensureWorkerFile(node_dir_id, "CAPS.json", "{\"worker_owned\":true,\"venoms\":true}", false, .none);
+        const status_json = try self.renderWorkerNodeStatusJson(worker_id, agent_id);
+        defer self.allocator.free(status_json);
+        try self.ensureWorkerFile(node_dir_id, "STATUS.json", status_json, false, .none);
+        try self.ensureWorkerFile(node_dir_id, "NODE.json", status_json, false, .none);
+
+        const venoms_root_id = if (self.lookupChild(node_dir_id, "venoms")) |existing|
+            existing
+        else
+            try self.addDir(node_dir_id, "venoms", false);
+        try self.ensureWorkerFile(
+            venoms_root_id,
+            "README.md",
+            "Worker-owned loopback venoms. External agents may read and write these files directly within the mounted workspace.\n",
+            false,
+            .none,
+        );
+        try self.ensureWorkerFile(
+            venoms_root_id,
+            "SCHEMA.json",
+            "{\"kind\":\"collection\",\"entries\":\"worker venoms\",\"shape\":\"/nodes/<worker_id>/venoms/<venom_id>/{README.md,SCHEMA.json,CAPS.json,OPS.json,STATUS.json,status.json,result.json,control/*}\"}",
+            false,
+            .none,
+        );
+        try self.ensureWorkerFile(venoms_root_id, "CAPS.json", "{\"discover\":true,\"invoke_via_paths\":true,\"worker_owned\":true}", false, .none);
+        try self.ensureWorkerFile(venoms_root_id, "VENOMS.json", "[]", false, .none);
+
+        for (venoms) |venom_id| {
+            if (std.mem.eql(u8, venom_id, "memory")) {
+                const memory_dir_id = if (self.lookupChild(venoms_root_id, "memory")) |existing|
+                    existing
+                else
+                    try self.addDir(venoms_root_id, "memory", false);
+                const base_path = try std.fmt.allocPrint(self.allocator, "/nodes/{s}/venoms/memory", .{worker_id});
+                defer self.allocator.free(base_path);
+                try workers_venom.seedPassiveWorkerMemoryNamespaceAt(self, memory_dir_id, base_path, worker_id, agent_id);
+            } else if (std.mem.eql(u8, venom_id, "sub_brains")) {
+                const sub_brains_dir_id = if (self.lookupChild(venoms_root_id, "sub_brains")) |existing|
+                    existing
+                else
+                    try self.addDir(venoms_root_id, "sub_brains", false);
+                const base_path = try std.fmt.allocPrint(self.allocator, "/nodes/{s}/venoms/sub_brains", .{worker_id});
+                defer self.allocator.free(base_path);
+                try workers_venom.seedPassiveWorkerSubBrainsNamespaceAt(self, sub_brains_dir_id, base_path, worker_id, agent_id);
+            }
+        }
+
+        try self.refreshNodeVenomsIndex(worker_id);
+        try self.refreshScopedVenomIndexes();
     }
 
-    fn seedAgentMemoryNamespaceAt(self: *Session, memory_dir: u32, base_path: []const u8) !void {
-        return memory_venom.seedNamespaceAt(self, memory_dir, base_path);
+    pub fn recordWorkerHeartbeat(self: *Session, worker_id: []const u8, agent_id: []const u8, ttl_ms: u64) !void {
+        const now_ms = std.time.milliTimestamp();
+        const expires_at_ms = now_ms + @as(i64, @intCast(ttl_ms));
+        const entry = try self.worker_presence.getOrPut(self.allocator, worker_id);
+        if (entry.found_existing) {
+            if (!std.mem.eql(u8, entry.value_ptr.agent_id, agent_id)) {
+                self.allocator.free(entry.value_ptr.agent_id);
+                entry.value_ptr.agent_id = try self.allocator.dupe(u8, agent_id);
+            }
+            entry.value_ptr.last_seen_ms = now_ms;
+            entry.value_ptr.expires_at_ms = expires_at_ms;
+            return;
+        }
+
+        entry.key_ptr.* = try self.allocator.dupe(u8, worker_id);
+        entry.value_ptr.* = .{
+            .agent_id = try self.allocator.dupe(u8, agent_id),
+            .last_seen_ms = now_ms,
+            .expires_at_ms = expires_at_ms,
+        };
+    }
+
+    pub fn detachWorkerLoopbackNode(self: *Session, worker_id: []const u8) !void {
+        if (self.worker_presence.fetchRemove(worker_id)) |removed| {
+            self.allocator.free(removed.key);
+            removed.value.deinit(self.allocator);
+        }
+
+        const nodes_root = self.lookupChild(self.root_id, "nodes") orelse return;
+        const worker_node_dir_id = self.lookupChild(nodes_root, worker_id) orelse return;
+
+        try self.deleteNodeRecursive(worker_node_dir_id);
+        try self.refreshScopedVenomIndexes();
+    }
+
+    fn refreshWorkerPresenceStatuses(self: *Session) !void {
+        var it = self.worker_presence.iterator();
+        while (it.next()) |entry| {
+            const worker_id = entry.key_ptr.*;
+            const presence = entry.value_ptr.*;
+            const nodes_root = self.lookupChild(self.root_id, "nodes") orelse continue;
+            const node_dir_id = self.lookupChild(nodes_root, worker_id) orelse continue;
+            const status_json = try self.renderWorkerNodeStatusJson(worker_id, presence.agent_id);
+            defer self.allocator.free(status_json);
+            if (self.lookupChild(node_dir_id, "STATUS.json")) |status_id| {
+                try self.setFileContent(status_id, status_json);
+            }
+            if (self.lookupChild(node_dir_id, "NODE.json")) |node_json_id| {
+                try self.setFileContent(node_json_id, status_json);
+            }
+        }
+    }
+
+    fn reapExpiredWorkerNodes(self: *Session) !void {
+        var expired = std.ArrayListUnmanaged([]const u8){};
+        defer expired.deinit(self.allocator);
+
+        const now_ms = std.time.milliTimestamp();
+        var it = self.worker_presence.iterator();
+        while (it.next()) |entry| {
+            const presence = entry.value_ptr.*;
+            if (presence.expires_at_ms <= 0) continue;
+            if (now_ms <= presence.expires_at_ms + worker_reap_grace_ms) continue;
+            try expired.append(self.allocator, try self.allocator.dupe(u8, entry.key_ptr.*));
+        }
+        defer for (expired.items) |worker_id| self.allocator.free(worker_id);
+
+        for (expired.items) |worker_id| {
+            try self.detachWorkerLoopbackNode(worker_id);
+        }
+    }
+
+    fn renderWorkerNodeStatusJson(self: *Session, worker_id: []const u8, default_agent_id: []const u8) ![]u8 {
+        const now_ms = std.time.milliTimestamp();
+        var agent_id = default_agent_id;
+        var last_seen_ms: i64 = 0;
+        var expires_at_ms: i64 = 0;
+        if (self.worker_presence.get(worker_id)) |presence| {
+            agent_id = presence.agent_id;
+            last_seen_ms = presence.last_seen_ms;
+            expires_at_ms = presence.expires_at_ms;
+        }
+        const online = expires_at_ms > now_ms;
+        return std.fmt.allocPrint(
+            self.allocator,
+            "{{\"node_id\":\"{s}\",\"node_name\":\"{s}\",\"state\":\"{s}\",\"online\":{s},\"agent_id\":\"{s}\",\"last_seen_ms\":{d},\"expires_at_ms\":{d},\"source\":\"worker_registration\"}}",
+            .{
+                worker_id,
+                worker_id,
+                if (online) "worker_attached" else "worker_stale",
+                if (online) "true" else "false",
+                agent_id,
+                last_seen_ms,
+                expires_at_ms,
+            },
+        );
+    }
+
+    fn deleteNodeRecursive(self: *Session, node_id: u32) !void {
+        if (node_id == self.root_id) return;
+        const node = self.nodes.get(node_id) orelse return;
+
+        var child_ids = std.ArrayListUnmanaged(u32){};
+        defer child_ids.deinit(self.allocator);
+        if (node.kind == .dir) {
+            var it = node.children.iterator();
+            while (it.next()) |entry| {
+                try child_ids.append(self.allocator, entry.value_ptr.*);
+            }
+        }
+        for (child_ids.items) |child_id| {
+            try self.deleteNodeRecursive(child_id);
+        }
+
+        if (self.node_aliases.fetchRemove(node_id)) |removed_alias| {
+            _ = self.node_aliases.remove(removed_alias.value);
+        }
+
+        if (node.parent) |parent_id| {
+            var parent = self.nodes.getPtr(parent_id) orelse return error.MissingNode;
+            _ = parent.children.fetchRemove(node.name);
+        }
+
+        const removed = self.nodes.fetchRemove(node_id) orelse return;
+        var doomed = removed.value;
+        doomed.deinit(self.allocator);
+    }
+
+    fn ensureWorkerFile(
+        self: *Session,
+        parent_id: u32,
+        name: []const u8,
+        content: []const u8,
+        writable: bool,
+        special: SpecialKind,
+    ) !void {
+        if (self.lookupChild(parent_id, name)) |existing| {
+            try self.setFileContent(existing, content);
+            return;
+        }
+        _ = try self.addFile(parent_id, name, content, writable, special);
+    }
+
+    fn seedAgentHomeNamespace(self: *Session, home_dir: u32) !void {
+        return home_venom.seedNamespace(self, home_dir);
+    }
+
+    fn seedAgentHomeNamespaceAt(self: *Session, home_dir: u32, base_path: []const u8) !void {
+        return home_venom.seedNamespaceAt(self, home_dir, base_path);
     }
 
     fn seedAgentWebSearchNamespace(self: *Session, web_search_dir: u32) !void {
@@ -3170,14 +3349,6 @@ pub const Session = struct {
 
     fn seedAgentMountsNamespaceAt(self: *Session, mounts_dir: u32, base_path: []const u8) !void {
         return mounts_venom.seedNamespaceAt(self, mounts_dir, base_path);
-    }
-
-    fn seedAgentSubBrainsNamespace(self: *Session, sub_brains_dir: u32) !void {
-        return self.seedAgentSubBrainsNamespaceAt(sub_brains_dir, "/global/sub_brains");
-    }
-
-    fn seedAgentSubBrainsNamespaceAt(self: *Session, sub_brains_dir: u32, base_path: []const u8) !void {
-        return sub_brains_venom.seedNamespaceAt(self, sub_brains_dir, base_path);
     }
 
     fn seedAgentAgentsNamespace(self: *Session, agents_dir: u32) !void {
@@ -5548,6 +5719,7 @@ pub const Session = struct {
     fn ensureProxyJobDirectory(self: *Session, jobs_root_id: u32, job_id: []const u8) !void {
         if (self.lookupChild(jobs_root_id, job_id) != null) return;
         const job_dir = try self.addDir(jobs_root_id, job_id, false);
+        _ = try self.addFile(job_dir, "request.json", "", false, .none);
         _ = try self.addFile(job_dir, "status.json", "", false, .none);
         _ = try self.addFile(job_dir, "result.txt", "", false, .none);
         _ = try self.addFile(job_dir, "log.txt", "", false, .none);
@@ -5903,6 +6075,16 @@ pub const Session = struct {
         );
     }
 
+    const JobStatusWritePayload = struct {
+        state: chat_job_index.JobState,
+        error_text: ?[]u8 = null,
+
+        fn deinit(self: *JobStatusWritePayload, allocator: std.mem.Allocator) void {
+            if (self.error_text) |value| allocator.free(value);
+            self.* = undefined;
+        }
+    };
+
     fn handleChatInputWrite(self: *Session, msg: *const unified.ParsedMessage, raw_input: []const u8) !WriteOutcome {
         const outcome = try chat_venom.handleInputWrite(self, msg, raw_input);
         return .{
@@ -5911,6 +6093,110 @@ pub const Session = struct {
             .correlation_id = outcome.correlation_id,
             .chat_reply_content = outcome.chat_reply_content,
         };
+    }
+
+    fn handleJobStatusWrite(self: *Session, node_id: u32, offset: u64, raw_input: []const u8) !WriteOutcome {
+        try self.writeFileContent(node_id, offset, raw_input);
+        const node = self.nodes.get(node_id) orelse return error.MissingNode;
+        var parsed = try self.parseJobStatusWritePayload(node.content);
+        defer parsed.deinit(self.allocator);
+
+        const job_id = try self.jobIdForJobFileNode(node_id);
+        defer self.allocator.free(job_id);
+
+        switch (parsed.state) {
+            .queued => {
+                if (parsed.error_text) |value| {
+                    try self.job_index.updateArtifacts(job_id, null, value, null);
+                }
+            },
+            .running => {
+                try self.job_index.markRunning(job_id);
+                if (parsed.error_text) |value| {
+                    try self.job_index.updateArtifacts(job_id, null, value, null);
+                }
+            },
+            .done, .failed => {
+                const result_text = try self.jobSiblingContent(node_id, "result.txt");
+                defer self.allocator.free(result_text);
+                const log_text = try self.jobSiblingContent(node_id, "log.txt");
+                defer self.allocator.free(log_text);
+                try self.job_index.markCompleted(
+                    job_id,
+                    parsed.state == .done,
+                    result_text,
+                    parsed.error_text,
+                    log_text,
+                );
+            },
+        }
+
+        return .{ .written = raw_input.len };
+    }
+
+    fn handleJobResultWrite(self: *Session, node_id: u32, offset: u64, raw_input: []const u8) !WriteOutcome {
+        try self.writeFileContent(node_id, offset, raw_input);
+        const node = self.nodes.get(node_id) orelse return error.MissingNode;
+        const job_id = try self.jobIdForJobFileNode(node_id);
+        defer self.allocator.free(job_id);
+        try self.job_index.updateArtifacts(job_id, node.content, null, null);
+        return .{ .written = raw_input.len };
+    }
+
+    fn handleJobLogWrite(self: *Session, node_id: u32, offset: u64, raw_input: []const u8) !WriteOutcome {
+        try self.writeFileContent(node_id, offset, raw_input);
+        const node = self.nodes.get(node_id) orelse return error.MissingNode;
+        const job_id = try self.jobIdForJobFileNode(node_id);
+        defer self.allocator.free(job_id);
+        try self.job_index.updateArtifacts(job_id, null, null, node.content);
+        return .{ .written = raw_input.len };
+    }
+
+    fn parseJobStatusWritePayload(self: *Session, raw_input: []const u8) !JobStatusWritePayload {
+        var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, raw_input, .{});
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidPayload;
+        const obj = parsed.value.object;
+
+        const state_value = obj.get("state") orelse return error.InvalidPayload;
+        if (state_value != .string) return error.InvalidPayload;
+        const state = if (std.mem.eql(u8, state_value.string, "queued"))
+            chat_job_index.JobState.queued
+        else if (std.mem.eql(u8, state_value.string, "running"))
+            chat_job_index.JobState.running
+        else if (std.mem.eql(u8, state_value.string, "done"))
+            chat_job_index.JobState.done
+        else if (std.mem.eql(u8, state_value.string, "failed"))
+            chat_job_index.JobState.failed
+        else
+            return error.InvalidPayload;
+
+        return .{
+            .state = state,
+            .error_text = if (obj.get("error")) |value|
+                switch (value) {
+                    .null => null,
+                    .string => try self.allocator.dupe(u8, value.string),
+                    else => return error.InvalidPayload,
+                }
+            else
+                null,
+        };
+    }
+
+    fn jobIdForJobFileNode(self: *Session, node_id: u32) ![]u8 {
+        const node = self.nodes.get(node_id) orelse return error.MissingNode;
+        const job_dir_id = node.parent orelse return error.MissingNode;
+        const job_dir = self.nodes.get(job_dir_id) orelse return error.MissingNode;
+        return self.allocator.dupe(u8, job_dir.name);
+    }
+
+    fn jobSiblingContent(self: *Session, node_id: u32, sibling_name: []const u8) ![]u8 {
+        const node = self.nodes.get(node_id) orelse return error.MissingNode;
+        const job_dir_id = node.parent orelse return error.MissingNode;
+        const sibling_id = self.lookupChild(job_dir_id, sibling_name) orelse return self.allocator.dupe(u8, "");
+        const sibling = self.nodes.get(sibling_id) orelse return self.allocator.dupe(u8, "");
+        return self.allocator.dupe(u8, sibling.content);
     }
 
     pub fn spawnAsyncChatRuntimeJob(
@@ -6071,11 +6357,6 @@ pub const Session = struct {
         return .{ .written = written };
     }
 
-    fn handleMemoryNamespaceWrite(self: *Session, special: SpecialKind, node_id: u32, raw_input: []const u8) !WriteOutcome {
-        const written = try memory_venom.handleNamespaceWrite(self, special, node_id, raw_input);
-        return .{ .written = written };
-    }
-
     pub fn renderJsonValueToWriter(self: *Session, writer: anytype, value: std.json.Value) !void {
         switch (value) {
             .null => try writer.writeAll("null"),
@@ -6112,28 +6393,20 @@ pub const Session = struct {
         return .{ .written = try mounts_venom.handleNamespaceWrite(self, special, node_id, raw_input) };
     }
 
+    fn handleHomeNamespaceWrite(self: *Session, special: SpecialKind, node_id: u32, raw_input: []const u8) !WriteOutcome {
+        return .{ .written = try home_venom.handleNamespaceWrite(self, special, node_id, raw_input) };
+    }
+
+    fn handleWorkersNamespaceWrite(self: *Session, special: SpecialKind, node_id: u32, raw_input: []const u8) !WriteOutcome {
+        return .{ .written = try workers_venom.handleNamespaceWrite(self, special, node_id, raw_input) };
+    }
+
     pub fn normalizeLocalFsRelativePath(self: *Session, raw_path: []const u8) ![]u8 {
         return mounts_venom.normalizeLocalFsRelativePath(self, raw_path);
     }
 
     pub fn ensurePathExists(path: []const u8) !void {
         return mounts_venom.ensurePathExists(path);
-    }
-
-    fn handleSubBrainsInvokeWrite(self: *Session, invoke_node_id: u32, raw_input: []const u8) !WriteOutcome {
-        return .{ .written = try sub_brains_venom.handleInvokeWrite(self, invoke_node_id, raw_input) };
-    }
-
-    fn handleSubBrainsListWrite(self: *Session, list_node_id: u32, raw_input: []const u8) !WriteOutcome {
-        return .{ .written = try sub_brains_venom.handleListWrite(self, list_node_id, raw_input) };
-    }
-
-    fn handleSubBrainsUpsertWrite(self: *Session, upsert_node_id: u32, raw_input: []const u8) !WriteOutcome {
-        return .{ .written = try sub_brains_venom.handleUpsertWrite(self, upsert_node_id, raw_input) };
-    }
-
-    fn handleSubBrainsDeleteWrite(self: *Session, delete_node_id: u32, raw_input: []const u8) !WriteOutcome {
-        return .{ .written = try sub_brains_venom.handleDeleteWrite(self, delete_node_id, raw_input) };
     }
 
     fn handleAgentsInvokeWrite(self: *Session, invoke_node_id: u32, raw_input: []const u8) !WriteOutcome {
@@ -6149,14 +6422,8 @@ pub const Session = struct {
     }
 
     const AgentAbilities = struct {
-        can_manage_sub_brains: bool,
         can_create_agents: bool,
     };
-
-    pub fn canManageSubBrains(self: *Session) bool {
-        const abilities = self.resolveAgentAbilities() catch return false;
-        return abilities.can_manage_sub_brains;
-    }
 
     pub fn canCreateAgents(self: *Session) bool {
         const abilities = self.resolveAgentAbilities() catch return false;
@@ -6165,7 +6432,6 @@ pub const Session = struct {
 
     fn resolveAgentAbilities(self: *Session) !AgentAbilities {
         var abilities = AgentAbilities{
-            .can_manage_sub_brains = std.mem.eql(u8, self.agent_id, "mother"),
             .can_create_agents = std.mem.eql(u8, self.agent_id, "mother"),
         };
 
@@ -6174,12 +6440,8 @@ pub const Session = struct {
                 var owned = config;
                 owned.deinit();
             }
-            if (config.primary.can_spawn_subbrains) abilities.can_manage_sub_brains = true;
             if (config.primary.capabilities) |caps| {
                 for (caps.items) |capability| {
-                    if (capabilityMatchesAny(capability, &sub_brains_manage_capabilities)) {
-                        abilities.can_manage_sub_brains = true;
-                    }
                     if (capabilityMatchesAny(capability, &agent_create_capabilities)) {
                         abilities.can_create_agents = true;
                     }
@@ -8114,7 +8376,7 @@ fn defaultGlobalLibraryTopicGettingStarted() []const u8 {
     return "# Getting Started\n\n" ++
         "1. Discover mounted workspace services in `/meta/workspace_services.json` or `/projects/<project_id>/meta/mounted_services.json`.\n" ++
         "2. Use `/services/<venom_id>` when the workspace binds a service, then fall back to `/nodes/local/venoms/<venom_id>` for local catalog access.\n" ++
-        "3. Treat `/global/*` as a compatibility alias when older workflows still reference it.\n" ++
+        "3. Register external workers through `/services/workers/control/register.json` before expecting worker-owned venoms like memory or sub_brains to appear.\n" ++
         "4. Read each Venom `README.md`, `SCHEMA.json`, `TEMPLATE.json`, `HOST.json`, and `CAPS.json` before using it.\n" ++
         "5. Use `/services/library` when bound, otherwise `/nodes/local/venoms/library`, for system guides.\n";
 }
@@ -8124,10 +8386,10 @@ fn defaultGlobalLibraryTopicServiceDiscovery() []const u8 {
         "- Node Venoms: `/nodes/<node_id>/venoms/<venom_id>`\n" ++
         "- Local built-in Venoms: `/nodes/local/venoms/<venom_id>`\n" ++
         "- Workspace service namespaces: `/services/<venom_id>`\n" ++
-        "- Compatibility aliases: `/global/<venom_id>`\n" ++
+        "- Global shared namespaces: `/global/<venom_id>`\n" ++
         "- Start with `/meta/workspace_services.json`, `/projects/<project_id>/meta/mounted_services.json`, or `/nodes/local/venoms/VENOMS.json`.\n" ++
         "- Service Venoms should expose `TEMPLATE.json` and `HOST.json` alongside `SCHEMA.json`, `OPS.json`, and `STATUS.json`.\n" ++
-        "- Common workspace Venoms include: memory, web_search, search_code, terminal, mounts, sub_brains, agents, workspaces.\n";
+        "- Common workspace Venoms include: workers, web_search, search_code, terminal, mounts, agents, workspaces.\n";
 }
 
 fn defaultGlobalLibraryTopicEventsAndWaits() []const u8 {
@@ -8150,7 +8412,7 @@ fn defaultGlobalLibraryTopicTerminalWorkflows() []const u8 {
 
 fn defaultGlobalLibraryTopicMemoryWorkflows() []const u8 {
     return "# Memory Workflows\n\n" ++
-        "Use `/services/memory/control/*.json` when the workspace binds memory, otherwise use `/nodes/local/venoms/memory/control/*.json`, and pass `memory_path` for targeted operations.\n" ++
+        "Use worker-owned memory venom paths after registering a worker node (for example `/nodes/<worker-node>/venoms/memory/control/*.json`). Spiderweb does not provide a canonical shared memory venom for Spider Monkey.\n" ++
         "Use `search` before creating duplicate memories.\n";
 }
 
@@ -8163,7 +8425,7 @@ fn defaultGlobalLibraryTopicProjectMountsAndBinds() []const u8 {
 
 fn defaultGlobalLibraryTopicAgentManagementAndSubBrains() []const u8 {
     return "# Agent Management and Sub-Brains\n\n" ++
-        "Use `/global/agents` for list/create, `/global/sub_brains` for list/upsert/delete, and `/global/workspaces` for list/get/up.\n" ++
+        "Use `/global/agents` for list/create, `/global/workspaces` for list/get/up, and worker-owned `/nodes/<worker-node>/venoms/sub_brains/*` for private sub-brain control.\n" ++
         "Mutation operations depend on capability flags and service permissions.\n";
 }
 
@@ -8943,6 +9205,156 @@ test "acheron_session: events wait returns next completed chat job" {
     try std.testing.expect(std.mem.indexOf(u8, next_payload, "\"job_id\":\"job-") != null);
 }
 
+test "acheron_session: chat input queues request artifacts for external worker" {
+    const allocator = std.testing.allocator;
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.init(allocator, runtime_handle, &job_index, "default");
+    defer session.deinit();
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        120,
+        121,
+        &.{ "agents", "self", "chat", "control", "input" },
+        "queue this for spider monkey",
+        800,
+    );
+
+    const jobs = try job_index.listJobsForAgent(allocator, "default");
+    defer chat_job_index.deinitJobViews(allocator, jobs);
+    try std.testing.expectEqual(@as(usize, 1), jobs.len);
+    try std.testing.expectEqual(chat_job_index.JobState.queued, jobs[0].state);
+    try std.testing.expectEqualStrings("queue this for spider monkey", jobs[0].request_text.?);
+    try std.testing.expectEqualStrings("", jobs[0].result_text.?);
+    try std.testing.expect(std.mem.indexOf(u8, jobs[0].log_text.?, "queued for external worker") != null);
+
+    const request_payload = try protocolReadFile(
+        &session,
+        allocator,
+        122,
+        123,
+        &.{ "agents", "self", "jobs", jobs[0].job_id, "request.json" },
+        804,
+    );
+    defer allocator.free(request_payload);
+    try std.testing.expect(std.mem.indexOf(u8, request_payload, "\"job_id\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, request_payload, "\"input\":\"queue this for spider monkey\"") != null);
+
+    const status_payload = try protocolReadFile(
+        &session,
+        allocator,
+        124,
+        125,
+        &.{ "agents", "self", "jobs", jobs[0].job_id, "status.json" },
+        808,
+    );
+    defer allocator.free(status_payload);
+    try std.testing.expect(std.mem.indexOf(u8, status_payload, "\"state\":\"queued\"") != null);
+
+    const log_payload = try protocolReadFile(
+        &session,
+        allocator,
+        126,
+        127,
+        &.{ "agents", "self", "jobs", jobs[0].job_id, "log.txt" },
+        812,
+    );
+    defer allocator.free(log_payload);
+    try std.testing.expect(std.mem.indexOf(u8, log_payload, "queued for external worker") != null);
+}
+
+test "acheron_session: external worker file writes complete queued chat job" {
+    const allocator = std.testing.allocator;
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.init(allocator, runtime_handle, &job_index, "default");
+    defer session.deinit();
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        130,
+        131,
+        &.{ "agents", "self", "chat", "control", "input" },
+        "complete this externally",
+        820,
+    );
+
+    const jobs_before = try job_index.listJobsForAgent(allocator, "default");
+    defer chat_job_index.deinitJobViews(allocator, jobs_before);
+    try std.testing.expectEqual(@as(usize, 1), jobs_before.len);
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        132,
+        133,
+        &.{ "agents", "self", "jobs", jobs_before[0].job_id, "result.txt" },
+        "external worker result",
+        824,
+    );
+    try protocolWriteFile(
+        &session,
+        allocator,
+        134,
+        135,
+        &.{ "agents", "self", "jobs", jobs_before[0].job_id, "log.txt" },
+        "external worker log",
+        828,
+    );
+    try protocolWriteFile(
+        &session,
+        allocator,
+        136,
+        137,
+        &.{ "agents", "self", "jobs", jobs_before[0].job_id, "status.json" },
+        "{\"state\":\"done\",\"error\":null}",
+        832,
+    );
+
+    const job = try job_index.getJob(allocator, jobs_before[0].job_id);
+    try std.testing.expect(job != null);
+    var view = job.?;
+    defer view.deinit(allocator);
+    try std.testing.expectEqual(chat_job_index.JobState.done, view.state);
+    try std.testing.expectEqualStrings("external worker result", view.result_text.?);
+    try std.testing.expectEqualStrings("external worker log", view.log_text.?);
+
+    const status_payload = try protocolReadFile(
+        &session,
+        allocator,
+        138,
+        139,
+        &.{ "agents", "self", "jobs", jobs_before[0].job_id, "status.json" },
+        836,
+    );
+    defer allocator.free(status_payload);
+    try std.testing.expect(std.mem.indexOf(u8, status_payload, "\"state\":\"done\"") != null);
+
+    const result_payload = try protocolReadFile(
+        &session,
+        allocator,
+        140,
+        141,
+        &.{ "agents", "self", "jobs", jobs_before[0].job_id, "result.txt" },
+        840,
+    );
+    defer allocator.free(result_payload);
+    try std.testing.expectEqualStrings("external worker result", result_payload);
+}
+
 test "acheron_session: events wait reports timeout when no source event is available" {
     const allocator = std.testing.allocator;
 
@@ -9694,8 +10106,8 @@ test "acheron_session: global venoms index mirrors Venom discovery entries" {
     );
     defer allocator.free(payload);
 
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_id\":\"memory\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_path\":\"/global/memory\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_id\":\"workers\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_path\":\"/global/workers\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_id\":\"chat\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"invoke_path\":\"/global/chat/control/input\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_id\":\"events\"") != null);
@@ -10288,57 +10700,6 @@ test "acheron_session: global library loads guides from assets_dir filesystem" {
     try std.testing.expect(std.mem.indexOf(u8, use_case_payload, "Loaded from assets_dir use-cases") != null);
 }
 
-test "acheron_session: local venom aliases mirror canonical and compatibility writes" {
-    const allocator = std.testing.allocator;
-
-    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
-    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
-    defer runtime_handle.destroy();
-    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
-    defer job_index.deinit();
-
-    var session = try Session.init(allocator, runtime_handle, &job_index, "default");
-    defer session.deinit();
-
-    const local_status_id = session.resolveAbsolutePathNoBinds("/nodes/local/venoms/memory/status.json") orelse return error.TestExpectedResponse;
-    const global_status_id = session.resolveAbsolutePathNoBinds("/global/memory/status.json") orelse return error.TestExpectedResponse;
-
-    try session.setFileContent(local_status_id, "{\"state\":\"canonical\"}");
-    const global_status_after_canonical = session.nodes.get(global_status_id) orelse return error.TestExpectedResponse;
-    try std.testing.expectEqualStrings("{\"state\":\"canonical\"}", global_status_after_canonical.content);
-
-    try session.setFileContent(global_status_id, "{\"state\":\"compat\"}");
-    const local_status_after_global = session.nodes.get(local_status_id) orelse return error.TestExpectedResponse;
-    try std.testing.expectEqualStrings("{\"state\":\"compat\"}", local_status_after_global.content);
-}
-
-test "acheron_session: agent services index includes first-class memory namespace entry" {
-    const allocator = std.testing.allocator;
-
-    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
-    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
-    defer runtime_handle.destroy();
-    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
-    defer job_index.deinit();
-
-    var session = try Session.init(allocator, runtime_handle, &job_index, "default");
-    defer session.deinit();
-
-    const payload = try protocolReadFile(
-        &session,
-        allocator,
-        110,
-        111,
-        &.{ "agents", "self", "venoms", "VENOMS.json" },
-        820,
-    );
-    defer allocator.free(payload);
-
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"scope\":\"project_namespace\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_path\":\"/nodes/local/venoms/memory\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"invoke_path\":\"/nodes/local/venoms/memory/control/invoke.json\"") != null);
-}
-
 test "acheron_session: agent services index includes first-class web_search namespace entry" {
     const allocator = std.testing.allocator;
 
@@ -10391,33 +10752,6 @@ test "acheron_session: agent services index includes first-class terminal namesp
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"scope\":\"project_namespace\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_path\":\"/nodes/local/venoms/terminal\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"invoke_path\":\"/nodes/local/venoms/terminal/control/invoke.json\"") != null);
-}
-
-test "acheron_session: agent services index includes first-class sub_brains namespace entry" {
-    const allocator = std.testing.allocator;
-
-    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
-    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
-    defer runtime_handle.destroy();
-    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
-    defer job_index.deinit();
-
-    var session = try Session.init(allocator, runtime_handle, &job_index, "default");
-    defer session.deinit();
-
-    const payload = try protocolReadFile(
-        &session,
-        allocator,
-        248,
-        249,
-        &.{ "agents", "self", "venoms", "VENOMS.json" },
-        916,
-    );
-    defer allocator.free(payload);
-
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"scope\":\"project_namespace\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_path\":\"/nodes/local/venoms/sub_brains\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, payload, "\"invoke_path\":\"/nodes/local/venoms/sub_brains/control/invoke.json\"") != null);
 }
 
 test "acheron_session: agent services index includes first-class agents namespace entry" {
@@ -10804,116 +11138,6 @@ test "acheron_session: missions namespace requires admin approval for resolution
     try std.testing.expect(std.mem.indexOf(u8, admin_result, "\"operation\":\"approve\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, admin_result, "\"state\":\"running\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, admin_result, "\"pending_approval\":null") != null);
-}
-
-test "acheron_session: missions invoke_service records successful venom step" {
-    const allocator = std.testing.allocator;
-
-    var mission_store = try mission_store_mod.MissionStore.initWithPath(allocator, null);
-    defer mission_store.deinit();
-
-    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
-    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
-    defer runtime_handle.destroy();
-    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
-    defer job_index.deinit();
-
-    var session = try Session.initWithOptions(
-        allocator,
-        runtime_handle,
-        &job_index,
-        "default",
-        .{
-            .mission_store = &mission_store,
-            .actor_type = "agent",
-            .actor_id = "worker-a",
-        },
-    );
-    defer session.deinit();
-
-    try protocolWriteFile(
-        &session,
-        allocator,
-        328,
-        329,
-        &.{ "agents", "self", "missions", "control", "create.json" },
-        "{\"use_case\":\"pr_review\",\"title\":\"Review PR 48\",\"contract\":{\"contract_id\":\"spider_monkey/pr_review@v1\",\"context_path\":\"/nodes/local/fs/pr-review/state/pr-48/context.json\"}}",
-        953,
-    );
-    const create_result = try protocolReadFile(
-        &session,
-        allocator,
-        330,
-        331,
-        &.{ "agents", "self", "missions", "result.json" },
-        954,
-    );
-    defer allocator.free(create_result);
-    const mission_id = try extractMissionIdFromResultPayload(allocator, create_result);
-    defer allocator.free(mission_id);
-
-    const resume_payload = try std.fmt.allocPrint(
-        allocator,
-        "{{\"mission_id\":\"{s}\",\"stage\":\"running_review\"}}",
-        .{mission_id},
-    );
-    defer allocator.free(resume_payload);
-    try protocolWriteFile(
-        &session,
-        allocator,
-        332,
-        333,
-        &.{ "agents", "self", "missions", "control", "resume.json" },
-        resume_payload,
-        955,
-    );
-
-    const invoke_payload = try std.fmt.allocPrint(
-        allocator,
-        "{{\"mission_id\":\"{s}\",\"service_path\":\"/global/memory\",\"stage\":\"collecting_context\",\"summary\":\"Created review memory\",\"op\":\"create\",\"arguments\":{{\"name\":\"mission-review-note\",\"kind\":\"note\",\"content\":{{\"text\":\"mission bridge ok\"}}}},\"contract\":{{\"artifact_root\":\"/nodes/local/fs/pr-review/runs/pr-48\"}}}}",
-        .{mission_id},
-    );
-    defer allocator.free(invoke_payload);
-    try protocolWriteFile(
-        &session,
-        allocator,
-        334,
-        335,
-        &.{ "agents", "self", "missions", "control", "invoke_service.json" },
-        invoke_payload,
-        956,
-    );
-
-    const mission_status = try protocolReadFile(
-        &session,
-        allocator,
-        336,
-        337,
-        &.{ "agents", "self", "missions", "status.json" },
-        957,
-    );
-    defer allocator.free(mission_status);
-    try std.testing.expect(std.mem.indexOf(u8, mission_status, "\"state\":\"done\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, mission_status, "\"tool\":\"missions_invoke_service\"") != null);
-
-    const mission_result = try protocolReadFile(
-        &session,
-        allocator,
-        338,
-        339,
-        &.{ "agents", "self", "missions", "result.json" },
-        958,
-    );
-    defer allocator.free(mission_result);
-    try std.testing.expect(std.mem.indexOf(u8, mission_result, "\"operation\":\"invoke_service\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, mission_result, "\"ok\":true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, mission_result, "\"service_path\":\"/global/memory\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, mission_result, "\"invoke_path\":\"/global/memory/control/invoke.json\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, mission_result, "\"mission_id\":\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, mission_result, "\"memory_path\":\"/nodes/local/venoms/memory/items/mission-review-note\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, mission_result, "\"event_type\":\"mission.service_invoked\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, mission_result, "\"kind\":\"service_result\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, mission_result, "\"artifact_root\":\"/nodes/local/fs/pr-review/runs/pr-48\"") != null);
 }
 
 test "acheron_session: missions bootstrap_contract materializes contract files in local export root" {
@@ -13319,112 +13543,6 @@ test "acheron_session: github_pr ingest_event reuses configured project mission"
     try std.testing.expectEqual(@as(usize, 1), matching_active);
 }
 
-test "acheron_session: missions invoke_service records downstream service failures" {
-    const allocator = std.testing.allocator;
-
-    var mission_store = try mission_store_mod.MissionStore.initWithPath(allocator, null);
-    defer mission_store.deinit();
-
-    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
-    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
-    defer runtime_handle.destroy();
-    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
-    defer job_index.deinit();
-
-    var session = try Session.initWithOptions(
-        allocator,
-        runtime_handle,
-        &job_index,
-        "default",
-        .{
-            .mission_store = &mission_store,
-            .actor_type = "agent",
-            .actor_id = "worker-a",
-        },
-    );
-    defer session.deinit();
-
-    try protocolWriteFile(
-        &session,
-        allocator,
-        340,
-        341,
-        &.{ "agents", "self", "missions", "control", "create.json" },
-        "{\"use_case\":\"pr_review\",\"title\":\"Review PR 49\"}",
-        959,
-    );
-    const create_result = try protocolReadFile(
-        &session,
-        allocator,
-        342,
-        343,
-        &.{ "agents", "self", "missions", "result.json" },
-        960,
-    );
-    defer allocator.free(create_result);
-    const mission_id = try extractMissionIdFromResultPayload(allocator, create_result);
-    defer allocator.free(mission_id);
-
-    const resume_payload = try std.fmt.allocPrint(
-        allocator,
-        "{{\"mission_id\":\"{s}\",\"stage\":\"running_review\"}}",
-        .{mission_id},
-    );
-    defer allocator.free(resume_payload);
-    try protocolWriteFile(
-        &session,
-        allocator,
-        344,
-        345,
-        &.{ "agents", "self", "missions", "control", "resume.json" },
-        resume_payload,
-        961,
-    );
-
-    const invoke_payload = try std.fmt.allocPrint(
-        allocator,
-        "{{\"mission_id\":\"{s}\",\"service_path\":\"/global/memory\",\"stage\":\"collecting_context\",\"summary\":\"Tried invalid memory request\",\"payload\":{{}}}}",
-        .{mission_id},
-    );
-    defer allocator.free(invoke_payload);
-    try protocolWriteFile(
-        &session,
-        allocator,
-        346,
-        347,
-        &.{ "agents", "self", "missions", "control", "invoke_service.json" },
-        invoke_payload,
-        962,
-    );
-
-    const mission_status = try protocolReadFile(
-        &session,
-        allocator,
-        348,
-        349,
-        &.{ "agents", "self", "missions", "status.json" },
-        963,
-    );
-    defer allocator.free(mission_status);
-    try std.testing.expect(std.mem.indexOf(u8, mission_status, "\"state\":\"failed\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, mission_status, "\"tool\":\"missions_invoke_service\"") != null);
-
-    const mission_result = try protocolReadFile(
-        &session,
-        allocator,
-        350,
-        351,
-        &.{ "agents", "self", "missions", "result.json" },
-        964,
-    );
-    defer allocator.free(mission_result);
-    try std.testing.expect(std.mem.indexOf(u8, mission_result, "\"operation\":\"invoke_service\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, mission_result, "\"ok\":false") != null);
-    try std.testing.expect(std.mem.indexOf(u8, mission_result, "\"code\":\"invalid\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, mission_result, "\"service_path\":\"/global/memory\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, mission_result, "\"event_type\":\"mission.service_invoked\"") != null);
-}
-
 test "acheron_session: git venom syncs checkout and reports changed files" {
     const allocator = std.testing.allocator;
 
@@ -14085,307 +14203,6 @@ test "acheron_session: agents namespace create denies invoke without capability"
     );
     defer allocator.free(result);
     try std.testing.expect(std.mem.indexOf(u8, result, "\"code\":\"forbidden\"") != null);
-}
-
-test "acheron_session: sub_brains namespace upsert/list/delete persists config and updates state" {
-    const allocator = std.testing.allocator;
-
-    var tmp_dir = std.testing.tmpDir(.{});
-    defer tmp_dir.cleanup();
-    const root = try tmp_dir.dir.realpathAlloc(allocator, ".");
-    defer allocator.free(root);
-    const agents_dir = try std.fmt.allocPrint(allocator, "{s}/agents", .{root});
-    defer allocator.free(agents_dir);
-    const projects_dir = try std.fmt.allocPrint(allocator, "{s}/projects", .{root});
-    defer allocator.free(projects_dir);
-    try std.fs.cwd().makePath(agents_dir);
-    try std.fs.cwd().makePath(projects_dir);
-    const allow_sub_brains_config = try std.fmt.allocPrint(
-        allocator,
-        "{s}/default_config.json",
-        .{agents_dir},
-    );
-    defer allocator.free(allow_sub_brains_config);
-    try std.fs.cwd().writeFile(.{
-        .sub_path = allow_sub_brains_config,
-        .data = "{\"agent_id\":\"default\",\"primary\":{\"can_spawn_subbrains\":true}}",
-    });
-
-    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
-    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
-    defer runtime_handle.destroy();
-    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
-    defer job_index.deinit();
-
-    var session = try Session.initWithOptions(
-        allocator,
-        runtime_handle,
-        &job_index,
-        "default",
-        .{
-            .agents_dir = agents_dir,
-            .projects_dir = projects_dir,
-        },
-    );
-    defer session.deinit();
-
-    try protocolWriteFile(
-        &session,
-        allocator,
-        250,
-        251,
-        &.{ "agents", "self", "sub_brains", "control", "upsert.json" },
-        "{\"brain_name\":\"research\",\"template\":\"researcher\",\"provider\":{\"name\":\"openai-codex\",\"model\":\"gpt-5.3-codex\",\"think_level\":\"high\"},\"personality\":{\"creature\":\"Knowledge seeker\",\"vibe\":\"Thorough, analytical\",\"emoji\":\"🔍\"}}",
-        917,
-    );
-
-    const upsert_status = try protocolReadFile(
-        &session,
-        allocator,
-        252,
-        253,
-        &.{ "agents", "self", "sub_brains", "status.json" },
-        918,
-    );
-    defer allocator.free(upsert_status);
-    try std.testing.expect(std.mem.indexOf(u8, upsert_status, "\"state\":\"done\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, upsert_status, "\"tool\":\"sub_brains_upsert\"") != null);
-
-    const upsert_result = try protocolReadFile(
-        &session,
-        allocator,
-        254,
-        255,
-        &.{ "agents", "self", "sub_brains", "result.json" },
-        919,
-    );
-    defer allocator.free(upsert_result);
-    try std.testing.expect(std.mem.indexOf(u8, upsert_result, "\"operation\":\"upsert\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, upsert_result, "\"brain_name\":\"research\"") != null);
-
-    const config_path = try std.fs.path.join(allocator, &.{ agents_dir, "default_config.json" });
-    defer allocator.free(config_path);
-    const saved_config = try std.fs.cwd().readFileAlloc(allocator, config_path, 1024 * 1024);
-    defer allocator.free(saved_config);
-    try std.testing.expect(std.mem.indexOf(u8, saved_config, "\"sub_brains\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, saved_config, "\"research\"") != null);
-
-    try protocolWriteFile(
-        &session,
-        allocator,
-        256,
-        257,
-        &.{ "agents", "self", "sub_brains", "control", "list.json" },
-        "{}",
-        920,
-    );
-    const list_result = try protocolReadFile(
-        &session,
-        allocator,
-        258,
-        259,
-        &.{ "agents", "self", "sub_brains", "result.json" },
-        921,
-    );
-    defer allocator.free(list_result);
-    try std.testing.expect(std.mem.indexOf(u8, list_result, "\"operation\":\"list\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, list_result, "\"brain_name\":\"research\"") != null);
-
-    try protocolWriteFile(
-        &session,
-        allocator,
-        260,
-        261,
-        &.{ "agents", "self", "sub_brains", "control", "delete.json" },
-        "{\"brain_name\":\"research\"}",
-        922,
-    );
-    const delete_result = try protocolReadFile(
-        &session,
-        allocator,
-        262,
-        263,
-        &.{ "agents", "self", "sub_brains", "result.json" },
-        923,
-    );
-    defer allocator.free(delete_result);
-    try std.testing.expect(std.mem.indexOf(u8, delete_result, "\"operation\":\"delete\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, delete_result, "\"removed\":true") != null);
-}
-
-test "acheron_session: sub_brains namespace mutation denies invoke without capability" {
-    const allocator = std.testing.allocator;
-
-    var tmp_dir = std.testing.tmpDir(.{});
-    defer tmp_dir.cleanup();
-    const root = try tmp_dir.dir.realpathAlloc(allocator, ".");
-    defer allocator.free(root);
-    const agents_dir = try std.fmt.allocPrint(allocator, "{s}/agents", .{root});
-    defer allocator.free(agents_dir);
-    const projects_dir = try std.fmt.allocPrint(allocator, "{s}/projects", .{root});
-    defer allocator.free(projects_dir);
-    try std.fs.cwd().makePath(agents_dir);
-    try std.fs.cwd().makePath(projects_dir);
-
-    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
-    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
-    defer runtime_handle.destroy();
-    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
-    defer job_index.deinit();
-
-    var session = try Session.initWithOptions(
-        allocator,
-        runtime_handle,
-        &job_index,
-        "default",
-        .{
-            .agents_dir = agents_dir,
-            .projects_dir = projects_dir,
-        },
-    );
-    defer session.deinit();
-
-    const write_error = try protocolWriteFileExpectError(
-        &session,
-        allocator,
-        288,
-        289,
-        &.{ "agents", "self", "sub_brains", "control", "invoke.json" },
-        "{\"op\":\"upsert\",\"arguments\":{\"brain_name\":\"research\"}}",
-        934,
-        "eperm",
-    );
-    defer allocator.free(write_error);
-
-    const result = try protocolReadFile(
-        &session,
-        allocator,
-        290,
-        291,
-        &.{ "agents", "self", "sub_brains", "result.json" },
-        935,
-    );
-    defer allocator.free(result);
-    try std.testing.expect(std.mem.indexOf(u8, result, "\"code\":\"forbidden\"") != null);
-}
-
-test "acheron_session: first-class memory namespace operation file maps to runtime tool" {
-    const allocator = std.testing.allocator;
-
-    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
-    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
-    defer runtime_handle.destroy();
-    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
-    defer job_index.deinit();
-
-    var session = try Session.init(allocator, runtime_handle, &job_index, "default");
-    defer session.deinit();
-
-    try protocolWriteFile(
-        &session,
-        allocator,
-        112,
-        113,
-        &.{ "agents", "self", "memory", "control", "create.json" },
-        "{\"name\":\"ns-memory\",\"kind\":\"note\",\"content\":{\"text\":\"ns bridge ok\"}}",
-        830,
-    );
-
-    const result_payload = try protocolReadFile(
-        &session,
-        allocator,
-        114,
-        115,
-        &.{ "agents", "self", "memory", "result.json" },
-        840,
-    );
-    defer allocator.free(result_payload);
-    try std.testing.expect(std.mem.indexOf(u8, result_payload, "\"memory_path\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result_payload, "\"ownership\":\"working_memory\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result_payload, "\"name\":\"ns-memory\"") != null);
-
-    const status_payload = try protocolReadFile(
-        &session,
-        allocator,
-        116,
-        117,
-        &.{ "agents", "self", "memory", "status.json" },
-        850,
-    );
-    defer allocator.free(status_payload);
-    try std.testing.expect(std.mem.indexOf(u8, status_payload, "\"state\":\"done\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, status_payload, "\"tool\":\"memory_create\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, status_payload, "\"error\":null") != null);
-}
-
-test "acheron_session: memory load accepts memory_path identity" {
-    const allocator = std.testing.allocator;
-
-    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
-    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
-    defer runtime_handle.destroy();
-    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
-    defer job_index.deinit();
-
-    var session = try Session.init(allocator, runtime_handle, &job_index, "default");
-    defer session.deinit();
-
-    try protocolWriteFile(
-        &session,
-        allocator,
-        118,
-        119,
-        &.{ "agents", "self", "memory", "control", "create.json" },
-        "{\"name\":\"mem-path\",\"kind\":\"note\",\"content\":{\"text\":\"path identity\"}}",
-        862,
-    );
-
-    const created_payload = try protocolReadFile(
-        &session,
-        allocator,
-        120,
-        121,
-        &.{ "agents", "self", "memory", "result.json" },
-        863,
-    );
-    defer allocator.free(created_payload);
-    var created = try std.json.parseFromSlice(std.json.Value, allocator, created_payload, .{});
-    defer created.deinit();
-    const result_obj = created.value.object.get("result") orelse return error.TestExpectedResponse;
-    if (result_obj != .object) return error.TestExpectedResponse;
-    const memory_path_value = result_obj.object.get("memory_path") orelse return error.TestExpectedResponse;
-    if (memory_path_value != .string or memory_path_value.string.len == 0) return error.TestExpectedResponse;
-
-    const escaped_memory_path = try unified.jsonEscape(allocator, memory_path_value.string);
-    defer allocator.free(escaped_memory_path);
-    const load_payload = try std.fmt.allocPrint(
-        allocator,
-        "{{\"memory_path\":\"{s}\"}}",
-        .{escaped_memory_path},
-    );
-    defer allocator.free(load_payload);
-    try protocolWriteFile(
-        &session,
-        allocator,
-        122,
-        123,
-        &.{ "agents", "self", "memory", "control", "load.json" },
-        load_payload,
-        864,
-    );
-
-    const loaded_payload = try protocolReadFile(
-        &session,
-        allocator,
-        124,
-        125,
-        &.{ "agents", "self", "memory", "result.json" },
-        865,
-    );
-    defer allocator.free(loaded_payload);
-    try std.testing.expect(std.mem.indexOf(u8, loaded_payload, "\"memory_path\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, loaded_payload, "\"ownership\":\"working_memory\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, loaded_payload, memory_path_value.string) != null);
 }
 
 test "acheron_session: first-class web_search namespace operation file maps to runtime tool" {
@@ -15274,90 +15091,6 @@ test "acheron_session: terminal-v2 write and exec surface shell_exec failures" {
     try std.testing.expect(std.mem.indexOf(u8, implicit_exec_result_payload, "\"session_id\":\"fail\"") != null);
 }
 
-test "acheron_session: first-class memory namespace rejects unknown invoke op" {
-    const allocator = std.testing.allocator;
-
-    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
-    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
-    defer runtime_handle.destroy();
-    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
-    defer job_index.deinit();
-
-    var session = try Session.init(allocator, runtime_handle, &job_index, "default");
-    defer session.deinit();
-
-    const response = try protocolWriteFileExpectError(
-        &session,
-        allocator,
-        140,
-        141,
-        &.{ "agents", "self", "memory", "control", "invoke.json" },
-        "{\"op\":\"nope\",\"arguments\":{}}",
-        859,
-        "invalid",
-    );
-    defer allocator.free(response);
-    try std.testing.expect(std.mem.indexOf(u8, response, "memory payload is invalid") != null);
-}
-
-test "acheron_session: first-class memory namespace invoke does not accept non-memory tool aliases" {
-    const allocator = std.testing.allocator;
-
-    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
-    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
-    defer runtime_handle.destroy();
-    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
-    defer job_index.deinit();
-
-    var session = try Session.init(allocator, runtime_handle, &job_index, "default");
-    defer session.deinit();
-
-    const response = try protocolWriteFileExpectError(
-        &session,
-        allocator,
-        142,
-        143,
-        &.{ "agents", "self", "memory", "control", "invoke.json" },
-        "{\"tool_name\":\"web_search\",\"arguments\":{\"query\":\"zig\"}}",
-        860,
-        "invalid",
-    );
-    defer allocator.free(response);
-    try std.testing.expect(std.mem.indexOf(u8, response, "memory payload is invalid") != null);
-}
-
-test "acheron_session: first-class namespace invoke honors PERMISSIONS policy" {
-    const allocator = std.testing.allocator;
-
-    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
-    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
-    defer runtime_handle.destroy();
-    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
-    defer job_index.deinit();
-
-    var session = try Session.init(allocator, runtime_handle, &job_index, "default");
-    defer session.deinit();
-
-    const agents_root = session.lookupChild(session.root_id, "agents") orelse return error.TestExpectedResponse;
-    const self_agent = session.lookupChild(agents_root, "self") orelse return error.TestExpectedResponse;
-    const memory_dir = session.lookupChild(self_agent, "memory") orelse return error.TestExpectedResponse;
-    const permissions_id = session.lookupChild(memory_dir, "PERMISSIONS.json") orelse return error.TestExpectedResponse;
-    try session.setFileContent(permissions_id, "{\"default\":\"deny-by-default\",\"allow_roles\":[]}");
-
-    const response = try protocolWriteFileExpectError(
-        &session,
-        allocator,
-        144,
-        145,
-        &.{ "agents", "self", "memory", "control", "create.json" },
-        "{\"name\":\"blocked-memory\",\"kind\":\"note\",\"content\":{\"text\":\"blocked\"}}",
-        861,
-        "eperm",
-    );
-    defer allocator.free(response);
-    try std.testing.expect(std.mem.indexOf(u8, response, "memory invoke access denied by permissions") != null);
-}
-
 test "acheron_session: mounts namespace manages mount bind and resolve operations" {
     const allocator = std.testing.allocator;
 
@@ -15594,6 +15327,268 @@ test "acheron_session: mounts namespace mkdir creates local export folders" {
         "invalid",
     );
     defer allocator.free(invalid_response);
+}
+
+test "acheron_session: home namespace ensures durable agent home bind" {
+    const allocator = std.testing.allocator;
+
+    var control_plane = control_plane_mod.ControlPlane.init(allocator);
+    defer control_plane.deinit();
+
+    const joined = try control_plane.ensureNode("home-node", "ws://127.0.0.1:18891/v2/fs", 60_000);
+    defer allocator.free(joined);
+    var joined_parsed = try std.json.parseFromSlice(std.json.Value, allocator, joined, .{});
+    defer joined_parsed.deinit();
+    const node_id = joined_parsed.value.object.get("node_id").?.string;
+
+    const project_json = try control_plane.createProject("{\"name\":\"HomeEnsure\",\"vision\":\"HomeEnsure\"}");
+    defer allocator.free(project_json);
+    var project_parsed = try std.json.parseFromSlice(std.json.Value, allocator, project_json, .{});
+    defer project_parsed.deinit();
+    const project_id = project_parsed.value.object.get("project_id").?.string;
+    const project_token = project_parsed.value.object.get("project_token").?.string;
+
+    const mount_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"project_id\":\"{s}\",\"project_token\":\"{s}\",\"node_id\":\"{s}\",\"export_name\":\"work\",\"mount_path\":\"/nodes/local/fs\"}}",
+        .{ project_id, project_token, node_id },
+    );
+    defer allocator.free(mount_req);
+    const mounted = try control_plane.setProjectMount(mount_req);
+    defer allocator.free(mounted);
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const local_export_root = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(local_export_root);
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "default",
+        .{
+            .project_id = project_id,
+            .project_token = project_token,
+            .control_plane = &control_plane,
+            .local_fs_export_root = local_export_root,
+        },
+    );
+    defer session.deinit();
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        190,
+        191,
+        &.{ "services", "home", "control", "ensure.json" },
+        "{\"agent_id\":\"spider-monkey\"}",
+        920,
+    );
+
+    const result_payload = try protocolReadFile(
+        &session,
+        allocator,
+        192,
+        193,
+        &.{ "services", "home", "result.json" },
+        924,
+    );
+    defer allocator.free(result_payload);
+    try std.testing.expect(std.mem.indexOf(u8, result_payload, "\"operation\":\"ensure\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result_payload, "\"home_path\":\"/agents/spider-monkey/home\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result_payload, "\"target_path\":\"/nodes/local/fs/.spiderweb/agents/spider-monkey/home\"") != null);
+
+    const ensured_home = session.resolveAbsolutePathNoBinds("/agents/spider-monkey/home") orelse return error.TestExpectedResponse;
+    const ensured_home_node = session.nodes.get(ensured_home) orelse return error.TestExpectedResponse;
+    try std.testing.expectEqual(NodeKind.dir, ensured_home_node.kind);
+
+    const binds_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"project_id\":\"{s}\",\"project_token\":\"{s}\"}}",
+        .{ project_id, project_token },
+    );
+    defer allocator.free(binds_req);
+    const binds_payload = try control_plane.listProjectBinds(binds_req);
+    defer allocator.free(binds_payload);
+    try std.testing.expect(std.mem.indexOf(u8, binds_payload, "\"bind_path\":\"/agents/spider-monkey/home\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, binds_payload, "\"target_path\":\"/nodes/local/fs/.spiderweb/agents/spider-monkey/home\"") != null);
+}
+
+test "acheron_session: workers register worker-owned memory and sub_brains nodes" {
+    const allocator = std.testing.allocator;
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.init(allocator, runtime_handle, &job_index, "default");
+    defer session.deinit();
+
+    try std.testing.expect(session.resolveAbsolutePathNoBinds("/nodes/local/venoms/memory") == null);
+    try std.testing.expect(session.resolveAbsolutePathNoBinds("/global/memory") == null);
+    try std.testing.expect(session.resolveAbsolutePathNoBinds("/nodes/local/venoms/sub_brains") == null);
+    try std.testing.expect(session.resolveAbsolutePathNoBinds("/global/sub_brains") == null);
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        194,
+        195,
+        &.{ "global", "workers", "control", "register.json" },
+        "{\"agent_id\":\"spider-monkey\",\"worker_id\":\"spider-monkey-a\",\"venoms\":[\"memory\",\"sub_brains\"]}",
+        925,
+    );
+
+    const register_result = try protocolReadFile(
+        &session,
+        allocator,
+        196,
+        197,
+        &.{ "global", "workers", "result.json" },
+        926,
+    );
+    defer allocator.free(register_result);
+    try std.testing.expect(std.mem.indexOf(u8, register_result, "\"node_path\":\"/nodes/spider-monkey-a\"") != null);
+    try std.testing.expect(session.resolveAbsolutePathNoBinds("/agents/self/memory") == null);
+    try std.testing.expect(session.resolveAbsolutePathNoBinds("/agents/spider-monkey/memory") == null);
+
+    const worker_memory_status_id = session.resolveAbsolutePathNoBinds("/nodes/spider-monkey-a/venoms/memory/status.json") orelse return error.TestExpectedResponse;
+    try session.setFileContent(worker_memory_status_id, "{\"state\":\"worker-owned\"}");
+    const worker_memory_status_node = session.nodes.get(worker_memory_status_id) orelse return error.TestExpectedResponse;
+    try std.testing.expectEqualStrings("{\"state\":\"worker-owned\"}", worker_memory_status_node.content);
+
+    const payload = try protocolReadFile(
+        &session,
+        allocator,
+        198,
+        199,
+        &.{ "agents", "self", "venoms", "VENOMS.json" },
+        927,
+    );
+    defer allocator.free(payload);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_path\":\"/nodes/spider-monkey-a/venoms/memory\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"venom_path\":\"/nodes/spider-monkey-a/venoms/sub_brains\"") != null);
+}
+
+test "acheron_session: worker heartbeat lease marks node stale after expiry" {
+    const allocator = std.testing.allocator;
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.init(allocator, runtime_handle, &job_index, "default");
+    defer session.deinit();
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        200,
+        201,
+        &.{ "services", "workers", "control", "register.json" },
+        "{\"agent_id\":\"spider-monkey\",\"worker_id\":\"spider-monkey-b\",\"venoms\":[\"memory\"],\"ttl_ms\":10}",
+        928,
+    );
+
+    const worker_status_id = session.resolveAbsolutePathNoBinds("/nodes/spider-monkey-b/STATUS.json") orelse return error.TestExpectedResponse;
+    const initial_status = session.nodes.get(worker_status_id) orelse return error.TestExpectedResponse;
+    try std.testing.expect(std.mem.indexOf(u8, initial_status.content, "\"online\":true") != null);
+
+    if (session.worker_presence.getPtr("spider-monkey-b")) |presence| {
+        presence.expires_at_ms = std.time.milliTimestamp() - 1;
+    } else return error.TestExpectedResponse;
+
+    try session.refreshDynamicDirectory(session.nodes_root_id);
+
+    const refreshed_status = session.nodes.get(worker_status_id) orelse return error.TestExpectedResponse;
+    try std.testing.expect(std.mem.indexOf(u8, refreshed_status.content, "\"state\":\"worker_stale\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, refreshed_status.content, "\"online\":false") != null);
+}
+
+test "acheron_session: workers detach removes worker node and aliases" {
+    const allocator = std.testing.allocator;
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.init(allocator, runtime_handle, &job_index, "default");
+    defer session.deinit();
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        202,
+        203,
+        &.{ "services", "workers", "control", "register.json" },
+        "{\"agent_id\":\"spider-monkey\",\"worker_id\":\"spider-monkey-c\",\"venoms\":[\"memory\",\"sub_brains\"]}",
+        929,
+    );
+    try std.testing.expect(session.resolveAbsolutePathNoBinds("/nodes/spider-monkey-c") != null);
+    try std.testing.expect(session.resolveAbsolutePathNoBinds("/agents/self/memory") == null);
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        204,
+        205,
+        &.{ "services", "workers", "control", "detach.json" },
+        "{\"agent_id\":\"spider-monkey\",\"worker_id\":\"spider-monkey-c\"}",
+        930,
+    );
+
+    try std.testing.expect(session.resolveAbsolutePathNoBinds("/nodes/spider-monkey-c") == null);
+    try std.testing.expect(session.resolveAbsolutePathNoBinds("/agents/self/memory") == null);
+    try std.testing.expect(session.resolveAbsolutePathNoBinds("/agents/self/sub_brains") == null);
+    try std.testing.expect(session.resolveAbsolutePathNoBinds("/agents/spider-monkey/memory") == null);
+    try std.testing.expect(session.resolveAbsolutePathNoBinds("/agents/spider-monkey/sub_brains") == null);
+}
+
+test "acheron_session: expired workers are reaped after grace window" {
+    const allocator = std.testing.allocator;
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.init(allocator, runtime_handle, &job_index, "default");
+    defer session.deinit();
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        206,
+        207,
+        &.{ "services", "workers", "control", "register.json" },
+        "{\"agent_id\":\"spider-monkey\",\"worker_id\":\"spider-monkey-d\",\"venoms\":[\"memory\"]}",
+        931,
+    );
+    try std.testing.expect(session.resolveAbsolutePathNoBinds("/nodes/spider-monkey-d") != null);
+
+    if (session.worker_presence.getPtr("spider-monkey-d")) |presence| {
+        presence.expires_at_ms = std.time.milliTimestamp() - worker_reap_grace_ms - 1;
+    } else return error.TestExpectedResponse;
+
+    try session.refreshDynamicDirectory(session.nodes_root_id);
+
+    try std.testing.expect(session.resolveAbsolutePathNoBinds("/nodes/spider-monkey-d") == null);
+    try std.testing.expect(session.resolveAbsolutePathNoBinds("/agents/self/memory") == null);
+    try std.testing.expect(session.resolveAbsolutePathNoBinds("/agents/spider-monkey/memory") == null);
 }
 
 test "acheron_session: local fs export files appear in the combined /nodes/local/fs view" {

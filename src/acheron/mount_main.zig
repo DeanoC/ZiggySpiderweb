@@ -30,8 +30,8 @@ pub fn main() !void {
     defer remaining.deinit(allocator);
     var workspace_url: ?[]const u8 = null;
     var namespace_url: ?[]const u8 = null;
-    var workspace_project_id: ?[]const u8 = null;
-    var workspace_project_token: ?[]const u8 = null;
+    var workspace_id: ?[]const u8 = null;
+    var workspace_token: ?[]const u8 = null;
     var workspace_auth_token: ?[]const u8 = null;
     var workspace_sync_interval_ms: u64 = 5_000;
     var namespace_agent_id: ?[]const u8 = null;
@@ -56,14 +56,14 @@ pub fn main() !void {
             i += 1;
             if (i >= args.len) return error.InvalidArguments;
             workspace_sync_interval_ms = try std.fmt.parseInt(u64, args[i], 10);
-        } else if (std.mem.eql(u8, args[i], "--project-id")) {
+        } else if (std.mem.eql(u8, args[i], "--workspace-id") or std.mem.eql(u8, args[i], "--project-id")) {
             i += 1;
             if (i >= args.len) return error.InvalidArguments;
-            workspace_project_id = args[i];
-        } else if (std.mem.eql(u8, args[i], "--project-token")) {
+            workspace_id = args[i];
+        } else if (std.mem.eql(u8, args[i], "--workspace-token") or std.mem.eql(u8, args[i], "--project-token")) {
             i += 1;
             if (i >= args.len) return error.InvalidArguments;
-            workspace_project_token = args[i];
+            workspace_token = args[i];
         } else if (std.mem.eql(u8, args[i], "--auth-token")) {
             i += 1;
             if (i >= args.len) return error.InvalidArguments;
@@ -87,7 +87,7 @@ pub fn main() !void {
             try remaining.append(allocator, args[i]);
         }
     }
-    if (workspace_project_token != null and workspace_project_id == null) return error.InvalidArguments;
+    if (workspace_token != null and workspace_id == null) return error.InvalidArguments;
     if (workspace_url != null and namespace_url != null) return error.InvalidArguments;
     const resolved_workspace_auth_token = workspace_auth_token orelse std.process.getEnvVarOwned(allocator, "SPIDERWEB_AUTH_TOKEN") catch null;
     defer if (workspace_auth_token == null) {
@@ -103,8 +103,8 @@ pub fn main() !void {
         var hydrated = try fetchWorkspaceEndpointSpecs(
             allocator,
             url,
-            workspace_project_id,
-            workspace_project_token,
+            workspace_id,
+            workspace_token,
             resolved_workspace_auth_token,
         );
         defer hydrated.deinit(allocator);
@@ -116,7 +116,7 @@ pub fn main() !void {
         var connect_info = try client.controlConnect();
         defer connect_info.deinit(allocator);
 
-        const resolved_project_id = if (workspace_project_id) |project_id|
+        const resolved_project_id = if (workspace_id) |project_id|
             try allocator.dupe(u8, project_id)
         else if (connect_info.project_id) |project_id|
             try allocator.dupe(u8, project_id)
@@ -144,7 +144,7 @@ pub fn main() !void {
             .session_key = resolved_session_key,
             .agent_id = resolved_agent_id,
             .project_id = resolved_project_id,
-            .project_token = workspace_project_token,
+            .project_token = workspace_token,
         });
         defer attach_info.deinit(allocator);
 
@@ -154,7 +154,7 @@ pub fn main() !void {
             allocator,
             url,
             resolved_project_id,
-            workspace_project_token,
+            workspace_token,
             resolved_workspace_auth_token,
         );
         defer hydrated.deinit(allocator);
@@ -351,14 +351,14 @@ pub fn main() !void {
                     .allocator = allocator,
                     .adapter = &adapter,
                     .workspace_url = try allocator.dupe(u8, url),
-                    .project_id = if (workspace_project_id) |project_id| try allocator.dupe(u8, project_id) else null,
-                    .project_token = if (workspace_project_token) |project_token| try allocator.dupe(u8, project_token) else null,
+                    .workspace_id = if (workspace_id) |selected_workspace_id| try allocator.dupe(u8, selected_workspace_id) else null,
+                    .workspace_token = if (workspace_token) |selected_workspace_token| try allocator.dupe(u8, selected_workspace_token) else null,
                     .auth_token = if (resolved_workspace_auth_token) |token| try allocator.dupe(u8, token) else null,
                     .interval_ms = workspace_sync_interval_ms,
                 };
                 errdefer allocator.free(ctx.workspace_url);
-                errdefer if (ctx.project_id) |project_id| allocator.free(project_id);
-                errdefer if (ctx.project_token) |project_token| allocator.free(project_token);
+                errdefer if (ctx.workspace_id) |selected_workspace_id| allocator.free(selected_workspace_id);
+                errdefer if (ctx.workspace_token) |selected_workspace_token| allocator.free(selected_workspace_token);
                 errdefer if (ctx.auth_token) |token| allocator.free(token);
                 sync_thread = try std.Thread.spawn(.{}, workspaceSyncThreadMain, .{ctx});
                 sync_ctx = ctx;
@@ -414,7 +414,7 @@ fn printHelp() !void {
         \\spiderweb-fs-mount - Distributed filesystem router client
         \\
         \\Usage:
-        \\  spiderweb-fs-mount [--workspace-url <ws-url> | --namespace-url <ws-url>] [--project-id <id>] [--project-token <token>] [--auth-token <token>] [--agent-id <id>] [--session-key <key>] [--mount-backend auto|fuse|winfsp] [--workspace-sync-interval-ms <ms>] [--endpoint <name>=<ws-url>[#export][@/mount]] <command> [args]
+        \\  spiderweb-fs-mount [--workspace-url <ws-url> | --namespace-url <ws-url>] [--workspace-id <id>] [--workspace-token <token>] [--project-id <id>] [--project-token <token>] [--auth-token <token>] [--agent-id <id>] [--session-key <key>] [--mount-backend auto|fuse|winfsp] [--workspace-sync-interval-ms <ms>] [--endpoint <name>=<ws-url>[#export][@/mount]] <command> [args]
         \\
         \\Commands:
         \\  getattr <path>
@@ -435,7 +435,8 @@ fn printHelp() !void {
         \\  spiderweb-fs-mount --endpoint a=ws://127.0.0.1:18891/v2/fs cat /a/README.md
         \\  spiderweb-fs-mount --endpoint a=ws://127.0.0.1:18891/v2/fs status
         \\  spiderweb-fs-mount --workspace-url ws://127.0.0.1:18790/ readdir /
-        \\  spiderweb-fs-mount --workspace-url ws://127.0.0.1:18790/ --workspace-sync-interval-ms 5000 mount /mnt/spiderweb
+        \\  spiderweb-fs-mount --workspace-url ws://127.0.0.1:18790/ --workspace-id proj-1 --workspace-sync-interval-ms 5000 mount /mnt/spiderweb
+        \\  spiderweb-fs-mount --workspace-url ws://127.0.0.1:18790/ --workspace-id proj-1 --workspace-token proj-... readdir /
         \\  spiderweb-fs-mount --workspace-url ws://127.0.0.1:18790/ --auth-token sw-admin-... readdir /
         \\  spiderweb-fs-mount --namespace-url ws://127.0.0.1:18790/ --project-id proj-a mount /mnt/spiderweb
         \\  spiderweb-fs-mount --namespace-url ws://127.0.0.1:18790/ --project-id proj-a --mount-backend winfsp mount X:
@@ -635,8 +636,8 @@ const WorkspaceSyncContext = struct {
     allocator: std.mem.Allocator,
     adapter: *fs_fuse_adapter.FuseAdapter,
     workspace_url: []u8,
-    project_id: ?[]u8 = null,
-    project_token: ?[]u8 = null,
+    workspace_id: ?[]u8 = null,
+    workspace_token: ?[]u8 = null,
     auth_token: ?[]u8 = null,
     interval_ms: u64,
     stop: bool = false,
@@ -658,8 +659,8 @@ const WorkspaceSyncContext = struct {
 
     fn deinit(self: *WorkspaceSyncContext) void {
         self.allocator.free(self.workspace_url);
-        if (self.project_id) |project_id| self.allocator.free(project_id);
-        if (self.project_token) |project_token| self.allocator.free(project_token);
+        if (self.workspace_id) |selected_workspace_id| self.allocator.free(selected_workspace_id);
+        if (self.workspace_token) |selected_workspace_token| self.allocator.free(selected_workspace_token);
         if (self.auth_token) |token| self.allocator.free(token);
         self.* = undefined;
     }
@@ -704,8 +705,8 @@ fn tryRefreshWorkspaceTopology(allocator: std.mem.Allocator, ctx: *WorkspaceSync
     var specs = fetchWorkspaceEndpointSpecs(
         allocator,
         ctx.workspace_url,
-        if (ctx.project_id) |project_id| project_id else null,
-        if (ctx.project_token) |project_token| project_token else null,
+        if (ctx.workspace_id) |selected_workspace_id| selected_workspace_id else null,
+        if (ctx.workspace_token) |selected_workspace_token| selected_workspace_token else null,
         if (ctx.auth_token) |token| token else null,
     ) catch |err| {
         std.log.warn("workspace sync: fetch workspace endpoint specs failed: {s}", .{@errorName(err)});
@@ -766,8 +767,8 @@ fn sleepWithStop(ctx: *WorkspaceSyncContext, total_ms: u64) bool {
 fn fetchWorkspaceEndpointSpecs(
     allocator: std.mem.Allocator,
     workspace_url: []const u8,
-    project_id: ?[]const u8,
-    project_token: ?[]const u8,
+    workspace_id: ?[]const u8,
+    workspace_token: ?[]const u8,
     auth_token: ?[]const u8,
 ) !WorkspaceEndpointSpecs {
     var specs = WorkspaceEndpointSpecs{ .allocator = allocator };
@@ -780,8 +781,8 @@ fn fetchWorkspaceEndpointSpecs(
     defer connect_info.deinit(allocator);
 
     if (!shouldFetchWorkspaceStatusFromControl(
-        project_id,
-        project_token,
+        workspace_id,
+        workspace_token,
         connect_info.project_id,
         connect_info.has_workspace_mounts,
     )) {
@@ -794,7 +795,7 @@ fn fetchWorkspaceEndpointSpecs(
         }
     }
 
-    const effective_project_id = project_id orelse connect_info.project_id;
+    const effective_project_id = workspace_id orelse connect_info.project_id;
     if (connect_info.requires_session_attach) {
         const attach_session_key = connect_info.session_key orelse return error.InvalidWorkspacePayload;
         const attach_agent_id = connect_info.agent_id orelse return error.InvalidWorkspacePayload;
@@ -803,12 +804,12 @@ fn fetchWorkspaceEndpointSpecs(
             .session_key = attach_session_key,
             .agent_id = attach_agent_id,
             .project_id = attach_project_id,
-            .project_token = project_token,
+            .project_token = workspace_token,
         });
         defer attach_info.deinit(allocator);
     }
 
-    const payload_json = try client.controlWorkspaceStatus(effective_project_id, project_token);
+    const payload_json = try client.controlWorkspaceStatus(effective_project_id, workspace_token);
     defer allocator.free(payload_json);
 
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload_json, .{});

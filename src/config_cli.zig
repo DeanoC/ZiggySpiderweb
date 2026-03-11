@@ -1,11 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const Config = @import("config.zig");
-const credential_store = @import("credential_store.zig");
-const ziggy_piai = @import("ziggy-piai");
 const first_run = @import("first_run.zig");
-const oauth_cli = @import("oauth_cli.zig");
-const provider_models = @import("provider_models.zig");
 
 const auth_tokens_filename = "auth_tokens.json";
 
@@ -41,8 +37,6 @@ pub fn main() !void {
         try handleAuthCommand(allocator, args[2..]);
     } else if (std.mem.eql(u8, command, "first-run")) {
         try first_run.runFirstRun(allocator, args[2..]);
-    } else if (std.mem.eql(u8, command, "oauth")) {
-        try oauth_cli.run(allocator, args[2..]);
     } else {
         std.log.err("Unknown command: {s}", .{command});
         try printUsage();
@@ -56,7 +50,7 @@ fn handleAuthCommand(allocator: std.mem.Allocator, args: []const []const u8) !vo
     if (std.mem.eql(u8, subcommand, "path")) {
         var config = try Config.init(allocator, null);
         defer config.deinit();
-        const path = try resolveAuthTokensPath(allocator, config.runtime.ltm_directory, config.config_path);
+        const path = try resolveAuthTokensPath(allocator, config.runtime.ltm_directory, config.runtime.spider_web_root, config.config_path);
         defer allocator.free(path);
         const out = try std.fmt.allocPrint(allocator, "{s}\n", .{path});
         defer allocator.free(out);
@@ -77,7 +71,7 @@ fn handleAuthCommand(allocator: std.mem.Allocator, args: []const []const u8) !vo
 
         var config = try Config.init(allocator, null);
         defer config.deinit();
-        const path = try resolveAuthTokensPath(allocator, config.runtime.ltm_directory, config.config_path);
+        const path = try resolveAuthTokensPath(allocator, config.runtime.ltm_directory, config.runtime.spider_web_root, config.config_path);
         defer allocator.free(path);
 
         var snapshot = try loadAuthStatusSnapshot(allocator, path);
@@ -129,7 +123,7 @@ fn handleAuthCommand(allocator: std.mem.Allocator, args: []const []const u8) !vo
 
         var config = try Config.init(allocator, null);
         defer config.deinit();
-        const path = try resolveAuthTokensPath(allocator, config.runtime.ltm_directory, config.config_path);
+        const path = try resolveAuthTokensPath(allocator, config.runtime.ltm_directory, config.runtime.spider_web_root, config.config_path);
         defer allocator.free(path);
         const admin_token = try makeOpaqueToken(allocator, "sw-admin");
         defer allocator.free(admin_token);
@@ -153,56 +147,26 @@ fn handleConfigCommand(allocator: std.mem.Allocator, args: []const []const u8) !
         // Show current config
         var config = try Config.init(allocator, null);
         defer config.deinit();
-        const store = credential_store.CredentialStore.init(allocator);
-
-        var key_source: []const u8 = "missing";
-        if (store.getProviderApiKey(config.provider.name)) |key| {
-            allocator.free(key);
-            key_source = "secure-store";
-        } else if (ziggy_piai.env_api_keys.getEnvApiKey(allocator, config.provider.name)) |key| {
-            allocator.free(key);
-            key_source = "environment";
-        }
 
         const stdout_file = std.fs.File.stdout();
         var buf: [1024]u8 = undefined;
-        const msg = try std.fmt.bufPrint(&buf, "Config: {s}\n  Bind: {s}:{d}\n  Provider: {s}/{s}\n  Default Agent: {s}\n  Spider Web Root: {s}\n  API Key Source: {s}\n  Secure Backend: {s}\n  Log: {s}\n", .{
+        const msg = try std.fmt.bufPrint(&buf, "Config: {s}\n  Bind: {s}:{d}\n  Spider Web Root: {s}\n  Runtime Storage: {s}/{s}\n  Log: {s}\n", .{
             config.config_path,
             config.server.bind,
             config.server.port,
-            config.provider.name,
-            config.provider.model orelse "(default)",
-            config.runtime.default_agent_id,
             config.runtime.spider_web_root,
-            key_source,
-            store.backendName(),
+            config.runtime.ltm_directory,
+            config.runtime.ltm_filename,
             config.log.level,
         });
         try stdout_file.writeAll(msg);
+        try stdout_file.writeAll("  Note: AI provider and worker configuration now lives with the external worker (for example Spider Monkey).\n");
         return;
     }
 
     const subcommand = args[0];
 
-    if (std.mem.eql(u8, subcommand, "set-provider")) {
-        if (args.len < 2) {
-            std.log.err("Usage: config set-provider <name> [model]", .{});
-            return error.InvalidArguments;
-        }
-
-        var config = try Config.init(allocator, null);
-        defer config.deinit();
-
-        const provider = args[1];
-        const requested_model = if (args.len >= 3) args[2] else provider_models.preferredDefaultModel(provider);
-        const model = if (requested_model) |value|
-            provider_models.remapLegacyModel(provider, value) orelse value
-        else
-            null;
-
-        try config.setProvider(provider, model);
-        std.log.info("Set provider to {s} (model: {s})", .{ provider, model orelse "default" });
-    } else if (std.mem.eql(u8, subcommand, "set-server")) {
+    if (std.mem.eql(u8, subcommand, "set-server")) {
         if (args.len < 3) {
             std.log.err("Usage: config set-server --bind <addr> --port <port>", .{});
             return error.InvalidArguments;
@@ -227,42 +191,6 @@ fn handleConfigCommand(allocator: std.mem.Allocator, args: []const []const u8) !
 
         try config.setServer(bind, port);
         std.log.info("Updated server config", .{});
-    } else if (std.mem.eql(u8, subcommand, "set-key")) {
-        if (args.len < 2) {
-            std.log.err("Usage: config set-key <api-key> [provider]", .{});
-            return error.InvalidArguments;
-        }
-
-        var config = try Config.init(allocator, null);
-        defer config.deinit();
-        const provider_name = if (args.len >= 3) args[2] else config.provider.name;
-
-        const store = credential_store.CredentialStore.init(allocator);
-        if (!store.supportsSecureStorage()) {
-            std.log.err("No secure credential backend available (expected `secret-tool` on Linux)", .{});
-            return error.SecureStoreUnavailable;
-        }
-
-        try store.setProviderApiKey(provider_name, args[1]);
-        // Re-save config to scrub any legacy plaintext provider.api_key fields.
-        try config.save();
-
-        std.log.info("API key stored in secure backend '{s}' for provider '{s}' and rewrote config", .{ store.backendName(), provider_name });
-    } else if (std.mem.eql(u8, subcommand, "clear-key")) {
-        var config = try Config.init(allocator, null);
-        defer config.deinit();
-        const provider_name = if (args.len >= 2) args[1] else config.provider.name;
-
-        const store = credential_store.CredentialStore.init(allocator);
-        if (!store.supportsSecureStorage()) {
-            std.log.err("No secure credential backend available (expected `secret-tool` on Linux)", .{});
-            return error.SecureStoreUnavailable;
-        }
-
-        try store.clearProviderApiKey(provider_name);
-        // Re-save config to scrub any legacy plaintext provider.api_key fields.
-        try config.save();
-        std.log.info("Cleared secure API key for provider '{s}' and rewrote config", .{provider_name});
     } else if (std.mem.eql(u8, subcommand, "set-log")) {
         if (args.len < 2) {
             std.log.err("Usage: config set-log <level>", .{});
@@ -286,7 +214,7 @@ fn handleConfigCommand(allocator: std.mem.Allocator, args: []const []const u8) !
         try installSystemdService(allocator);
     } else {
         std.log.err("Unknown config command: {s}", .{subcommand});
-        std.log.info("Available: set-provider, set-server, set-key, clear-key, set-log, path, install-service", .{});
+        std.log.info("Available: set-server, set-log, path, install-service", .{});
         return error.UnknownCommand;
     }
 }
@@ -316,7 +244,7 @@ fn installSystemdService(allocator: std.mem.Allocator) !void {
 
     const service_content =
         \\[Unit]
-        \\Description=Spiderweb AI Agent Gateway
+        \\Description=Spiderweb Workspace Host
         \\After=network.target
         \\
         \\[Service]
@@ -345,9 +273,10 @@ fn installSystemdService(allocator: std.mem.Allocator) !void {
 fn resolveAuthTokensPath(
     allocator: std.mem.Allocator,
     ltm_directory: []const u8,
+    spider_web_root: []const u8,
     config_path: []const u8,
 ) ![]u8 {
-    const storage_dir = try resolveRuntimeStorageDirectory(allocator, ltm_directory, config_path);
+    const storage_dir = try resolveRuntimeStorageDirectory(allocator, ltm_directory, spider_web_root, config_path);
     defer allocator.free(storage_dir);
     try std.fs.cwd().makePath(storage_dir);
     return std.fs.path.join(allocator, &.{ storage_dir, auth_tokens_filename });
@@ -356,9 +285,10 @@ fn resolveAuthTokensPath(
 fn resolveRuntimeStorageDirectory(
     allocator: std.mem.Allocator,
     ltm_directory: []const u8,
+    spider_web_root: []const u8,
     config_path: []const u8,
 ) ![]u8 {
-    const runtime_base = try resolveRuntimeBaseDirectory(allocator, config_path);
+    const runtime_base = try resolveRuntimeBaseDirectory(allocator, ltm_directory, spider_web_root, config_path);
     defer allocator.free(runtime_base);
     return resolveRuntimeStorageDirectoryWithBase(allocator, ltm_directory, runtime_base);
 }
@@ -374,10 +304,34 @@ fn resolveRuntimeStorageDirectoryWithBase(
     return std.fs.path.join(allocator, &.{ runtime_base, base_dir });
 }
 
-fn resolveRuntimeBaseDirectory(allocator: std.mem.Allocator, config_path: []const u8) ![]u8 {
+fn resolveRuntimeBaseDirectory(
+    allocator: std.mem.Allocator,
+    ltm_directory: []const u8,
+    spider_web_root: []const u8,
+    config_path: []const u8,
+) ![]u8 {
+    _ = ltm_directory;
     _ = config_path;
-    if (try detectRunningSpiderwebWorkingDirectory(allocator)) |runtime_dir| return runtime_dir;
+    const configured_root = std.mem.trim(u8, spider_web_root, " \t\r\n");
+    if (configured_root.len > 0 and !std.mem.eql(u8, configured_root, "/")) {
+        if (std.fs.path.isAbsolute(configured_root)) return allocator.dupe(u8, configured_root);
+        const cwd = try currentShellWorkingDirectory(allocator);
+        defer allocator.free(cwd);
+        return std.fs.path.join(allocator, &.{ cwd, configured_root });
+    }
+    const cwd = try currentShellWorkingDirectory(allocator);
+    if (cwd.len > 0 and !std.mem.eql(u8, cwd, "/")) return cwd;
+    allocator.free(cwd);
     if (try detectServiceWorkingDirectory(allocator)) |service_dir| return service_dir;
+    return currentShellWorkingDirectory(allocator);
+}
+
+fn currentShellWorkingDirectory(allocator: std.mem.Allocator) ![]u8 {
+    const env_pwd = std.process.getEnvVarOwned(allocator, "PWD") catch null;
+    if (env_pwd) |pwd| {
+        if (pwd.len > 0 and std.fs.path.isAbsolute(pwd)) return pwd;
+        allocator.free(pwd);
+    }
     return std.process.getCwdAlloc(allocator);
 }
 
@@ -391,41 +345,6 @@ fn detectServiceWorkingDirectory(allocator: std.mem.Allocator) !?[]u8 {
     }
 
     if (try parseServiceWorkingDirectory(allocator, "/etc/systemd/system/spiderweb.service")) |dir| return dir;
-    return null;
-}
-
-fn detectRunningSpiderwebWorkingDirectory(allocator: std.mem.Allocator) !?[]u8 {
-    if (builtin.os.tag != .linux) return null;
-
-    var proc_dir = std.fs.openDirAbsolute("/proc", .{ .iterate = true }) catch |err| switch (err) {
-        error.FileNotFound,
-        error.NotDir,
-        error.AccessDenied,
-        => return null,
-        else => return err,
-    };
-    defer proc_dir.close();
-
-    var iter = proc_dir.iterate();
-    while (try iter.next()) |entry| {
-        if (entry.kind != .directory) continue;
-        _ = std.fmt.parseInt(u32, entry.name, 10) catch continue;
-
-        const comm_path = try std.fmt.allocPrint(allocator, "/proc/{s}/comm", .{entry.name});
-        defer allocator.free(comm_path);
-        const comm_contents = readFileAllocAny(allocator, comm_path, 512) catch continue;
-        defer allocator.free(comm_contents);
-        const process_name = std.mem.trim(u8, comm_contents, " \t\r\n");
-        if (!std.mem.eql(u8, process_name, "spiderweb")) continue;
-
-        const cwd_path = try std.fmt.allocPrint(allocator, "/proc/{s}/cwd", .{entry.name});
-        defer allocator.free(cwd_path);
-        var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const cwd = std.posix.readlink(cwd_path, &cwd_buf) catch continue;
-        if (cwd.len == 0) continue;
-        return try allocator.dupe(u8, cwd);
-    }
-
     return null;
 }
 
@@ -559,31 +478,25 @@ fn printUsage() !void {
         \\  spiderweb-config auth path
         \\  spiderweb-config auth status [--reveal]
         \\  spiderweb-config auth reset --yes
-        \\  spiderweb-config first-run [--non-interactive] [--provider <name>] [--model <model>] [--agent <name>]
-        \\  spiderweb-config oauth login <provider> [--enterprise-domain <domain>] [--no-set-provider]
-        \\  spiderweb-config oauth clear <provider>
+        \\  spiderweb-config first-run [--non-interactive]
         \\  spiderweb-config config              Show current config
         \\  spiderweb-config config path         Show config file path
-        \\  spiderweb-config config set-provider <name> [model]
         \\  spiderweb-config config set-server --bind <addr> --port <port>
-        \\  spiderweb-config config set-key <api-key> [provider]
-        \\  spiderweb-config config clear-key [provider]
         \\  spiderweb-config config set-log <debug|info|warn|error>
         \\  spiderweb-config config install-service     Install systemd service
         \\
         \\Examples:
         \\  spiderweb-config first-run
-        \\  spiderweb-config first-run --non-interactive --provider openai-codex --agent ziggy
-        \\  spiderweb-config oauth login openai-codex
-        \\  spiderweb-config oauth login github-copilot --enterprise-domain github.example.com
+        \\  spiderweb-config first-run --non-interactive
         \\  spiderweb-config auth path
         \\  spiderweb-config auth status --reveal
         \\  spiderweb-config auth reset --yes
-        \\  spiderweb-config config set-provider openai gpt-4o
-        \\  spiderweb-config config set-provider kimi-coding kimi-k2.5
         \\  spiderweb-config config set-server --bind 0.0.0.0 --port 9000
-        \\  spiderweb-config config set-key sk-... openai
-        \\  spiderweb-config config clear-key openai
+        \\
+        \\Workspace-first flow:
+        \\  spiderweb-control workspace_create '{"name":"Demo","vision":"Deliver the demo workspace"}'
+        \\  spiderweb-fs-mount --workspace-id <workspace-id> ./workspace
+        \\  spider-monkey run --workspace-root ./workspace
         \\
     ;
     const stdout_file = std.fs.File.stdout();

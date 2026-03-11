@@ -229,7 +229,6 @@ fn executeOpPayload(self: anytype, op: Op, args_obj: std.json.ObjectMap) ![]u8 {
 
 fn renderWorkspaceUpPayload(self: anytype, args_obj: std.json.ObjectMap) ![]u8 {
     const has_explicit_project_id = args_obj.get("project_id") != null;
-    const should_inject_activate = std.mem.eql(u8, self.agent_id, "mother") and args_obj.get("activate") == null;
 
     var out = std.ArrayListUnmanaged(u8){};
     errdefer out.deinit(self.allocator);
@@ -247,11 +246,6 @@ fn renderWorkspaceUpPayload(self: anytype, args_obj: std.json.ObjectMap) ![]u8 {
         try writeJsonString(writer, key);
         try writer.writeByte(':');
         try writer.print("{f}", .{std.json.fmt(entry.value_ptr.*, .{})});
-    }
-
-    if (should_inject_activate) {
-        if (!first) try writer.writeByte(',');
-        try writer.writeAll("\"activate\":false");
     }
 
     try writer.writeByte('}');

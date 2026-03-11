@@ -2,14 +2,11 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Config = @import("config.zig");
 const connection_dispatcher = @import("connection_dispatcher.zig");
-const memory = @import("ziggy-memory-store").memory;
 const protocol = @import("spider-protocol").protocol;
 const runtime_server_mod = @import("agents/runtime_server.zig");
 const runtime_handle_mod = @import("agents/runtime_handle.zig");
-const chat_runtime_job = @import("agents/chat_runtime_job.zig");
 const sandbox_runtime_mod = @import("sandbox_runtime.zig");
 const websocket_transport = @import("websocket_transport.zig");
-const acheron_session_mod = @import("acheron/session.zig");
 const control_plane_mod = @import("acheron/control_plane.zig");
 const chat_job_index = @import("agents/chat_job_index.zig");
 const fs_protocol = @import("spiderweb_fs").fs_protocol;
@@ -1444,15 +1441,15 @@ const LocalFsNode = struct {
     ) !fs_node_service.NodeService.ChatInputSubmission {
         const job_id = try self.runtime_registry.job_index.createJob(system_agent_id, correlation_id);
         errdefer self.allocator.free(job_id);
-        self.runtime_registry.job_index.markRunning(job_id) catch |err| {
-            const message = try std.fmt.allocPrint(self.allocator, "chat job markRunning failed: {s}", .{@errorName(err)});
+        self.runtime_registry.job_index.setRequestText(job_id, input) catch |err| {
+            const message = try std.fmt.allocPrint(self.allocator, "chat job request persistence failed: {s}", .{@errorName(err)});
             defer self.allocator.free(message);
             try self.runtime_registry.job_index.markCompleted(
                 job_id,
                 false,
                 message,
                 message,
-                "[local fs chat submit failure]\n",
+                "[local fs chat queue failure]\n",
             );
             return .{
                 .job_id = job_id,
@@ -1460,67 +1457,14 @@ const LocalFsNode = struct {
                 .state = .failed,
                 .error_text = try self.allocator.dupe(u8, message),
                 .result_text = try self.allocator.dupe(u8, message),
-                .log_text = try self.allocator.dupe(u8, "[local fs chat submit failure]\n"),
+                .log_text = try self.allocator.dupe(u8, "[local fs chat queue failure]\n"),
             };
         };
-
-        self.beginChatJobWorker() catch |begin_err| {
-            const message = try std.fmt.allocPrint(self.allocator, "chat job worker start blocked: {s}", .{@errorName(begin_err)});
-            defer self.allocator.free(message);
-            try self.runtime_registry.job_index.markCompleted(
-                job_id,
-                false,
-                message,
-                message,
-                "[local fs chat worker start blocked]\n",
-            );
-            return .{
-                .job_id = job_id,
-                .correlation_id = if (correlation_id) |value| try self.allocator.dupe(u8, value) else null,
-                .state = .failed,
-                .error_text = try self.allocator.dupe(u8, message),
-                .result_text = try self.allocator.dupe(u8, message),
-                .log_text = try self.allocator.dupe(u8, "[local fs chat worker start blocked]\n"),
-            };
-        };
-        var worker_handed_off = false;
-        defer if (!worker_handed_off) self.finishChatJobWorker();
-
-        const worker_ctx = try self.allocator.create(LocalFsChatJobContext);
-        worker_ctx.* = .{
-            .allocator = self.allocator,
-            .node = self,
-            .job_id = try self.allocator.dupe(u8, job_id),
-            .input = try self.allocator.dupe(u8, input),
-            .correlation_id = if (correlation_id) |value| try self.allocator.dupe(u8, value) else null,
-        };
-        const worker = std.Thread.spawn(.{}, localFsChatJobThreadMain, .{worker_ctx}) catch |spawn_err| {
-            worker_ctx.deinit();
-            const message = try std.fmt.allocPrint(self.allocator, "chat job worker spawn failed: {s}", .{@errorName(spawn_err)});
-            defer self.allocator.free(message);
-            try self.runtime_registry.job_index.markCompleted(
-                job_id,
-                false,
-                message,
-                message,
-                "[local fs chat worker spawn failure]\n",
-            );
-            return .{
-                .job_id = job_id,
-                .correlation_id = if (correlation_id) |value| try self.allocator.dupe(u8, value) else null,
-                .state = .failed,
-                .error_text = try self.allocator.dupe(u8, message),
-                .result_text = try self.allocator.dupe(u8, message),
-                .log_text = try self.allocator.dupe(u8, "[local fs chat worker spawn failure]\n"),
-            };
-        };
-        worker_handed_off = true;
-        worker.detach();
 
         return .{
             .job_id = job_id,
             .correlation_id = if (correlation_id) |value| try self.allocator.dupe(u8, value) else null,
-            .state = .running,
+            .state = .queued,
         };
     }
 
@@ -1552,21 +1496,6 @@ fn countLocalFsRwExports(specs: []const fs_node_ops.ExportSpec) usize {
     return count;
 }
 
-const LocalFsChatJobContext = struct {
-    allocator: std.mem.Allocator,
-    node: *LocalFsNode,
-    job_id: []u8,
-    input: []u8,
-    correlation_id: ?[]u8 = null,
-
-    fn deinit(self: *LocalFsChatJobContext) void {
-        self.allocator.free(self.job_id);
-        self.allocator.free(self.input);
-        if (self.correlation_id) |value| self.allocator.free(value);
-        self.allocator.destroy(self);
-    }
-};
-
 fn localFsNodeChatInputSubmitHook(
     raw_ctx: ?*anyopaque,
     allocator: std.mem.Allocator,
@@ -1577,76 +1506,6 @@ fn localFsNodeChatInputSubmitHook(
     const ctx = raw_ctx orelse return error.InvalidContext;
     const node: *LocalFsNode = @ptrCast(@alignCast(ctx));
     return node.submitChatInput(input, correlation_id);
-}
-
-fn localFsChatJobThreadMain(ctx: *LocalFsChatJobContext) void {
-    defer ctx.deinit();
-    defer ctx.node.finishChatJobWorker();
-    executeLocalFsChatJob(ctx.node, ctx.job_id, ctx.input, ctx.correlation_id) catch |err| {
-        const message = std.fmt.allocPrint(
-            ctx.allocator,
-            "runtime execution failed: {s}",
-            .{@errorName(err)},
-        ) catch return;
-        defer ctx.allocator.free(message);
-        const log_owned = std.fmt.allocPrint(
-            ctx.allocator,
-            "[local fs chat runtime failure] {s}\n",
-            .{@errorName(err)},
-        ) catch null;
-        defer if (log_owned) |value| ctx.allocator.free(value);
-        const log = if (log_owned) |value|
-            value
-        else
-            "[local fs chat runtime failure]\n";
-        ctx.node.runtime_registry.job_index.markCompleted(
-            ctx.job_id,
-            false,
-            message,
-            message,
-            log,
-        ) catch |mark_err| {
-            std.log.warn("local fs chat job completion update failed after runtime error: {s}", .{@errorName(mark_err)});
-        };
-        ctx.node.publishChatJobUpdate(.{
-            .job_id = ctx.job_id,
-            .state = .failed,
-            .correlation_id = ctx.correlation_id,
-            .error_text = message,
-            .result_text = message,
-            .log_text = log,
-        });
-    };
-}
-
-fn executeLocalFsChatJob(
-    node: *LocalFsNode,
-    job_id: []const u8,
-    input: []const u8,
-    correlation_id: ?[]const u8,
-) !void {
-    const runtime = try node.runtime_registry.getOrCreate(system_agent_id, system_project_id, null);
-    defer runtime.release();
-
-    var outcome = try chat_runtime_job.execute(.{
-        .allocator = node.allocator,
-        .runtime_handle = runtime,
-        .job_index = &node.runtime_registry.job_index,
-        .job_id = job_id,
-        .input = input,
-        .correlation_id = correlation_id,
-        .emit_debug = false,
-        .max_retries = chat_runtime_job.max_internal_retries,
-    });
-    defer outcome.deinit(node.allocator);
-    node.publishChatJobUpdate(.{
-        .job_id = job_id,
-        .state = if (outcome.succeeded) .done else .failed,
-        .correlation_id = correlation_id,
-        .error_text = outcome.error_text,
-        .result_text = outcome.result_text,
-        .log_text = outcome.log_text,
-    });
 }
 
 const NodeRegistration = struct {
@@ -3716,18 +3575,31 @@ const AgentRuntimeRegistry = struct {
         max_runtimes: usize,
     ) AgentRuntimeRegistry {
         const configured_default = std.mem.trim(u8, runtime_config.default_agent_id, " \t\r\n");
+        var effective_default = allocator.dupe(u8, system_agent_id) catch @panic("OOM");
         if (configured_default.len > 0 and !isValidAgentId(configured_default)) {
             std.log.warn(
                 "Invalid default_agent_id '{s}', falling back to '{s}'",
                 .{ configured_default, system_agent_id },
             );
-        } else if (configured_default.len > 0 and !std.mem.eql(u8, configured_default, system_agent_id)) {
-            std.log.warn(
-                "Ignoring configured default_agent_id '{s}'; system agent '{s}' is reserved as the only default route",
-                .{ configured_default, system_agent_id },
+        } else if (configured_default.len > 0) {
+            allocator.free(effective_default);
+            effective_default = allocator.dupe(u8, configured_default) catch @panic("OOM");
+        } else {
+            var registry = agent_registry_mod.AgentRegistry.init(
+                allocator,
+                ".",
+                runtime_config.agents_dir,
+                runtime_config.assets_dir,
             );
+            defer registry.deinit();
+            registry.scan() catch |err| {
+                std.log.warn("failed to scan agents while resolving default route: {s}", .{@errorName(err)});
+            };
+            if (registry.getDefaultAgent()) |agent| {
+                allocator.free(effective_default);
+                effective_default = allocator.dupe(u8, agent.id) catch @panic("OOM");
+            }
         }
-        const effective_default = system_agent_id;
         const debug_stream_sink = DebugStreamFileSink.init(allocator, runtime_config);
         const operator_token = parseOptionalEnvOwned(allocator, control_operator_token_env);
         const project_scope_token = parseOptionalEnvOwned(allocator, control_project_scope_token_env);
@@ -3767,32 +3639,29 @@ const AgentRuntimeRegistry = struct {
         else
             false;
 
-        var effective_runtime_config = runtime_config;
-        effective_runtime_config.default_agent_id = effective_default;
-
         var registry: AgentRuntimeRegistry = .{
             .allocator = allocator,
-            .runtime_config = effective_runtime_config,
+            .runtime_config = runtime_config,
             .provider_config = provider_config,
             .default_agent_id = effective_default,
             .max_runtimes = if (max_runtimes == 0) 1 else max_runtimes,
             .debug_stream_sink = debug_stream_sink,
             .control_plane = control_plane_mod.ControlPlane.initWithPersistenceOptions(
                 allocator,
-                effective_runtime_config.ltm_directory,
-                effective_runtime_config.ltm_filename,
+                runtime_config.ltm_directory,
+                runtime_config.ltm_filename,
                 .{
                     .primary_agent_id = system_agent_id,
-                    .spider_web_root = effective_runtime_config.spider_web_root,
+                    .spider_web_root = runtime_config.spider_web_root,
                     .node_venom_event_history_max = history_max,
                 },
             ),
             .job_index = chat_job_index.ChatJobIndex.init(
                 allocator,
-                effective_runtime_config.ltm_directory,
+                runtime_config.ltm_directory,
             ),
-            .auth_tokens = AuthTokenStore.init(allocator, effective_runtime_config),
-            .missions = mission_store_mod.MissionStore.init(allocator, effective_runtime_config),
+            .auth_tokens = AuthTokenStore.init(allocator, runtime_config),
+            .missions = mission_store_mod.MissionStore.init(allocator, runtime_config),
             .control_operator_token = operator_token,
             .control_project_scope_token = project_scope_token,
             .control_node_scope_token = node_scope_token,
@@ -3910,6 +3779,7 @@ const AgentRuntimeRegistry = struct {
         self.debug_stream_sink.deinit();
         self.auth_tokens.deinit();
         self.missions.deinit();
+        self.allocator.free(self.default_agent_id);
     }
 
     fn authenticateConnection(self: *AgentRuntimeRegistry, authorization_header: ?[]const u8) ?ConnectionPrincipal {
@@ -4123,7 +3993,7 @@ const AgentRuntimeRegistry = struct {
             hint.required = true;
             hint.message = try self.allocator.dupe(
                 u8,
-                "Project setup required: ask Mother for the first project name, vision, and first non-system agent.",
+                "Workspace setup required: use spiderweb-control workspace_create, mount the workspace locally, then start Spider Monkey against that mounted folder.",
             );
             return hint;
         }
@@ -4153,7 +4023,7 @@ const AgentRuntimeRegistry = struct {
             hint.message = if (agent_missing)
                 try std.fmt.allocPrint(
                     self.allocator,
-                    "Project setup required for {s}: attach a non-system agent, then ask Mother to confirm setup details.",
+                    "Workspace setup required for {s}: attach an external worker to the mounted workspace.",
                     .{project_id},
                 )
             else if (mounts_missing)
@@ -4352,9 +4222,11 @@ const AgentRuntimeRegistry = struct {
         venom_id: []const u8,
         attached: bool,
     ) void {
+        if (binding.project_id == null) return;
+
         var setup_hint = ProjectSetupHint{};
         defer setup_hint.deinit(self.allocator);
-        if (attached and binding.project_id != null) {
+        if (attached) {
             const bootstrap_only = self.isBootstrapMotherOnlyState();
             setup_hint = self.projectSetupHint(role, binding, bootstrap_only) catch |err| blk: {
                 std.log.warn("project setup hint presence sync failed for {s}: {s}", .{ binding.agent_id, @errorName(err) });
@@ -4469,23 +4341,8 @@ const AgentRuntimeRegistry = struct {
         return false;
     }
 
-    fn hasNonSystemAgent(self: *AgentRuntimeRegistry) bool {
-        var registry = agent_registry_mod.AgentRegistry.init(
-            self.allocator,
-            ".",
-            self.runtime_config.agents_dir,
-            self.runtime_config.assets_dir,
-        );
-        defer registry.deinit();
-        registry.scan() catch return false;
-        for (registry.listAgents()) |agent| {
-            if (!std.mem.eql(u8, agent.id, system_agent_id)) return true;
-        }
-        return false;
-    }
-
     fn isBootstrapMotherOnlyState(self: *AgentRuntimeRegistry) bool {
-        return !self.hasNonSystemProject() or !self.hasNonSystemAgent();
+        return !self.hasNonSystemProject();
     }
 
     fn agentExists(self: *AgentRuntimeRegistry, agent_id: []const u8) bool {
@@ -4544,19 +4401,6 @@ const AgentRuntimeRegistry = struct {
 
     fn buildInitialSessionBinding(self: *AgentRuntimeRegistry, role: ConnectionRole) !InitialSessionBinding {
         const bootstrap_only = self.isBootstrapMotherOnlyState();
-        if (role == .admin) {
-            return .{
-                .binding = .{
-                    .agent_id = try self.allocator.dupe(u8, system_agent_id),
-                    .actor_type = try self.allocator.dupe(u8, defaultActorTypeForRole(role)),
-                    .actor_id = try self.allocator.dupe(u8, connectionRoleName(role)),
-                    .project_id = try self.allocator.dupe(u8, system_project_id),
-                    .project_token = null,
-                },
-                .bootstrap_only = bootstrap_only,
-            };
-        }
-
         if (try self.resolvePreferredBindingForRole(role)) |binding| {
             return .{
                 .binding = binding,
@@ -4566,18 +4410,18 @@ const AgentRuntimeRegistry = struct {
 
         return .{
             .binding = .{
-                .agent_id = try self.allocator.dupe(u8, system_agent_id),
+                .agent_id = try self.allocator.dupe(u8, self.default_agent_id),
                 .actor_type = try self.allocator.dupe(u8, defaultActorTypeForRole(role)),
                 .actor_id = try self.allocator.dupe(u8, connectionRoleName(role)),
-                .project_id = try self.allocator.dupe(u8, system_project_id),
+                .project_id = null,
                 .project_token = null,
             },
             .connect_gate_error = .{
                 .code = if (bootstrap_only) "provisioning_required" else "project_context_required",
                 .message = if (bootstrap_only)
-                    "no non-system project/agent is available; an admin should use Mother to provision one"
+                    "no workspace is available; create one with spiderweb-control workspace_create, mount it, and start Spider Monkey"
                 else
-                    "project selection is required; call control.session_attach with project_id",
+                    "workspace selection is required; call control.session_attach with workspace_id",
             },
             .bootstrap_only = bootstrap_only,
         };
@@ -4629,14 +4473,7 @@ const AgentRuntimeRegistry = struct {
     }
 
     fn startRuntimeResidencyWorker(self: *AgentRuntimeRegistry) !void {
-        self.runtime_residency_worker_mutex.lock();
-        self.runtime_residency_worker_stop = false;
-        self.runtime_residency_worker_mutex.unlock();
-        self.runtime_residency_worker_thread = try std.Thread.spawn(
-            .{},
-            runtimeResidencyWorkerMain,
-            .{self},
-        );
+        _ = self;
     }
 
     fn requestReconcileWorkerStop(self: *AgentRuntimeRegistry) void {
@@ -4677,10 +4514,9 @@ const AgentRuntimeRegistry = struct {
             self.allocator.free(bindings);
         }
 
-        // Admin/control connections default to mother@system even when Mother's
-        // active project has moved to a non-system workspace. Keep the system
-        // runtime resident independently of active project assignment so the
-        // default control route remains available.
+        // Keep the reserved system runtime resident independently of active
+        // workspace assignment so internal control-plane provisioning paths
+        // remain available even when user-facing routes prefer mounted workspaces.
         if (self.control_plane.projectHasMounts(system_project_id)) {
             var system_attach_state = self.ensureRuntimeWarmup(
                 system_agent_id,
@@ -5086,6 +4922,7 @@ const AgentRuntimeRegistry = struct {
     }
 
     fn runtimeAttachSnapshot(self: *AgentRuntimeRegistry, agent_id: []const u8, project_id: ?[]const u8) SessionAttachStateSnapshot {
+        _ = agent_id;
         if (!self.runtime_config.sandbox_enabled) {
             return .{
                 .state = .ready,
@@ -5094,55 +4931,32 @@ const AgentRuntimeRegistry = struct {
                 .updated_at_ms = std.time.milliTimestamp(),
             };
         }
-        const binding_key = self.runtimeBindingKey(agent_id, project_id) catch {
-            return .{
-                .state = .warming,
+        if (project_id) |value| {
+            if (self.control_plane.projectHasMounts(value)) {
+                return .{
+                    .state = .ready,
+                    .runtime_ready = true,
+                    .mount_ready = true,
+                    .updated_at_ms = std.time.milliTimestamp(),
+                };
+            }
+            var snapshot = SessionAttachStateSnapshot{
+                .state = .err,
                 .runtime_ready = false,
                 .mount_ready = false,
                 .updated_at_ms = std.time.milliTimestamp(),
             };
-        };
-        defer self.allocator.free(binding_key);
-
-        // Read warmup state first so callers don't block on runtime mutex while
-        // a background warmup is in-flight.
-        var warmup_snapshot: ?SessionAttachStateSnapshot = null;
-        self.runtime_warmups_mutex.lock();
-        if (self.runtime_warmups.getPtr(binding_key)) |state| {
-            warmup_snapshot = state.snapshotOwned(self.allocator) catch .{
-                .state = state.state,
-                .runtime_ready = state.runtime_ready,
-                .mount_ready = state.mount_ready,
-                .updated_at_ms = state.updated_at_ms,
-            };
+            snapshot.error_code = self.allocator.dupe(u8, "project_mounts_missing") catch null;
+            snapshot.error_message = self.allocator.dupe(u8, "project has no workspace mounts configured") catch null;
+            return snapshot;
         }
-        self.runtime_warmups_mutex.unlock();
-
-        if (warmup_snapshot) |snapshot| {
-            if (snapshot.state != .ready) {
-                return snapshot;
-            }
-            var ready_snapshot = snapshot;
-            ready_snapshot.deinit(self.allocator);
-            warmup_snapshot = null;
-        }
-
-        const has_runtime = self.hasRuntimeForBinding(agent_id, project_id);
-        if (has_runtime) {
-            return .{
-                .state = .ready,
-                .runtime_ready = true,
-                .mount_ready = true,
-                .updated_at_ms = std.time.milliTimestamp(),
-            };
-        }
-
-        if (warmup_snapshot) |snapshot| return snapshot;
         return .{
-            .state = .warming,
+            .state = .err,
             .runtime_ready = false,
             .mount_ready = false,
             .updated_at_ms = std.time.milliTimestamp(),
+            .error_code = self.allocator.dupe(u8, "sandbox_mount_missing") catch null,
+            .error_message = self.allocator.dupe(u8, "sandbox requires a project binding") catch null,
         };
     }
 
@@ -5151,60 +4965,23 @@ const AgentRuntimeRegistry = struct {
 
         const binding_key = self.runtimeBindingKey(agent_id, project_id) catch return;
         defer self.allocator.free(binding_key);
-
-        const has_runtime = self.hasRuntimeForBinding(agent_id, project_id);
-        const now_ms = std.time.milliTimestamp();
-        var snapshot = SessionAttachStateSnapshot{
-            .state = if (has_runtime) .ready else .warming,
-            .runtime_ready = has_runtime,
-            .mount_ready = has_runtime,
-            .updated_at_ms = now_ms,
-        };
-        defer snapshot.deinit(self.allocator);
-
-        self.runtime_warmups_mutex.lock();
-        if (self.runtime_warmups.getPtr(binding_key)) |state| {
-            if (has_runtime) {
-                state.state = .ready;
-                state.runtime_ready = true;
-                state.mount_ready = true;
-                state.updated_at_ms = now_ms;
-                state.in_flight = false;
-                if (state.error_code) |value| {
-                    self.allocator.free(value);
-                    state.error_code = null;
-                }
-                if (state.error_message) |value| {
-                    self.allocator.free(value);
-                    state.error_message = null;
-                }
+        if (project_id) |value| {
+            if (self.control_plane.projectHasMounts(value)) {
+                self.markRuntimeWarmupReady(binding_key);
+            } else {
+                self.markRuntimeWarmupError(
+                    binding_key,
+                    "project_mounts_missing",
+                    "project has no workspace mounts configured",
+                );
             }
-            snapshot.deinit(self.allocator);
-            snapshot = state.snapshotOwned(self.allocator) catch .{
-                .state = if (has_runtime) .ready else state.state,
-                .runtime_ready = if (has_runtime) true else state.runtime_ready,
-                .mount_ready = if (has_runtime) true else state.mount_ready,
-                .updated_at_ms = if (has_runtime) now_ms else state.updated_at_ms,
-            };
-        } else if (has_runtime) {
-            const owned_key = self.allocator.dupe(u8, binding_key) catch {
-                self.runtime_warmups_mutex.unlock();
-                return;
-            };
-            const state = RuntimeWarmupState{
-                .state = .ready,
-                .runtime_ready = true,
-                .mount_ready = true,
-                .updated_at_ms = now_ms,
-                .in_flight = false,
-            };
-            self.runtime_warmups.put(self.allocator, owned_key, state) catch {
-                self.allocator.free(owned_key);
-            };
+            return;
         }
-        self.runtime_warmups_mutex.unlock();
-
-        if (has_runtime) self.emitSessionAttachStateDebugEvent(binding_key, snapshot);
+        self.markRuntimeWarmupError(
+            binding_key,
+            "sandbox_mount_missing",
+            "sandbox requires a project binding",
+        );
     }
 
     const RuntimeWarmupErrorInfo = struct {
@@ -5434,6 +5211,8 @@ const AgentRuntimeRegistry = struct {
         project_token: ?[]const u8,
         retry_on_error: bool,
     ) !SessionAttachStateSnapshot {
+        _ = project_token;
+        _ = retry_on_error;
         if (!self.runtime_config.sandbox_enabled) {
             return .{
                 .state = .ready,
@@ -5453,82 +5232,18 @@ const AgentRuntimeRegistry = struct {
                 );
                 return self.runtimeAttachSnapshotByKey(binding_key);
             }
+            const binding_key = try self.runtimeBindingKey(agent_id, project_id);
+            defer self.allocator.free(binding_key);
+            self.markRuntimeWarmupReady(binding_key);
+            return self.runtimeAttachSnapshotByKey(binding_key);
         }
-        _ = self.dropUnhealthyRuntimeForBinding(
-            agent_id,
-            project_id,
-            "runtime_unhealthy",
-            "project runtime became unhealthy",
-        );
-        if (self.hasRuntimeForBinding(agent_id, project_id)) {
-            return .{
-                .state = .ready,
-                .runtime_ready = true,
-                .mount_ready = true,
-                .updated_at_ms = std.time.milliTimestamp(),
-            };
-        }
-
         const binding_key = try self.runtimeBindingKey(agent_id, project_id);
         defer self.allocator.free(binding_key);
-
-        var should_spawn = false;
-        const now_ms = std.time.milliTimestamp();
-        {
-            self.runtime_warmups_mutex.lock();
-            defer self.runtime_warmups_mutex.unlock();
-            if (self.runtime_warmups.getPtr(binding_key)) |state| {
-                if (state.in_flight and state.state == .warming and state.updated_at_ms > 0 and
-                    (now_ms - state.updated_at_ms) >= runtime_warmup_stale_timeout_ms)
-                {
-                    state.in_flight = false;
-                    state.setError(self.allocator, "runtime_warmup_timeout", "sandbox runtime warmup timed out") catch {
-                        if (state.error_code) |value| self.allocator.free(value);
-                        if (state.error_message) |value| self.allocator.free(value);
-                        state.error_code = null;
-                        state.error_message = null;
-                        state.state = .err;
-                        state.runtime_ready = false;
-                        state.mount_ready = false;
-                        state.updated_at_ms = std.time.milliTimestamp();
-                    };
-                }
-                if (!state.in_flight) {
-                    if (state.state == .err and !retry_on_error) {
-                        // Preserve sticky error state for read-only status probes so callers can
-                        // surface the real failure instead of oscillating forever in "warming".
-                    } else if (state.state == .err and state.retry_after_ms > now_ms) {
-                        // Back off after a terminal warmup failure so attach/status/presence
-                        // probes do not immediately recreate the same broken runtime.
-                    } else {
-                        // Runtime is currently absent/unhealthy, so move the warmup state back
-                        // to warming even if a stale "ready" snapshot is present.
-                        state.setWarming(self.allocator);
-                        state.in_flight = true;
-                        should_spawn = true;
-                    }
-                }
-            } else {
-                const owned_key = try self.allocator.dupe(u8, binding_key);
-                errdefer self.allocator.free(owned_key);
-                var state = RuntimeWarmupState{};
-                state.setWarming(self.allocator);
-                state.in_flight = true;
-                try self.runtime_warmups.put(self.allocator, owned_key, state);
-                should_spawn = true;
-            }
-        }
-
-        if (should_spawn) {
-            self.spawnRuntimeWarmupThread(binding_key, agent_id, project_id, project_token) catch |spawn_err| {
-                self.markRuntimeWarmupError(
-                    binding_key,
-                    "execution_failed",
-                    @errorName(spawn_err),
-                );
-            };
-        }
-
+        self.markRuntimeWarmupError(
+            binding_key,
+            "sandbox_mount_missing",
+            "sandbox requires a project binding",
+        );
         return self.runtimeAttachSnapshotByKey(binding_key);
     }
 
@@ -6323,54 +6038,6 @@ fn localFsBootstrapThreadMain(ctx: *LocalFsBootstrapContext) void {
         std.log.warn("local fs node setup skipped: {s}", .{@errorName(err)});
         return;
     };
-
-    // Startup can race the initial residency warmup before the local fs node
-    // has finished registering and writing the system project mounts. Retry
-    // residency after bootstrap so mother@system recovers once mounts exist.
-    ctx.runtime_registry.ensureActiveRuntimeResidency(true) catch |err| {
-        std.log.warn("local fs bootstrap runtime residency retry failed: {s}", .{@errorName(err)});
-    };
-}
-
-fn ensureMotherAgentScaffoldBestEffort(allocator: std.mem.Allocator, runtime_config: Config.RuntimeConfig) void {
-    ensureMotherAgentScaffold(allocator, runtime_config) catch |err| {
-        std.log.warn("mother scaffold ensure failed: {s}", .{@errorName(err)});
-    };
-}
-
-fn ensureMotherAgentScaffold(allocator: std.mem.Allocator, runtime_config: Config.RuntimeConfig) !void {
-    const agents_dir_trimmed = std.mem.trim(u8, runtime_config.agents_dir, " \t\r\n");
-    if (agents_dir_trimmed.len == 0) return error.InvalidPath;
-
-    try std.fs.cwd().makePath(agents_dir_trimmed);
-
-    const mother_dir = try std.fs.path.join(allocator, &.{ agents_dir_trimmed, system_agent_id });
-    defer allocator.free(mother_dir);
-    try std.fs.cwd().makePath(mother_dir);
-
-    const mother_json_path = try std.fs.path.join(allocator, &.{ mother_dir, "agent.json" });
-    defer allocator.free(mother_json_path);
-
-    if (std.fs.cwd().openFile(mother_json_path, .{ .mode = .read_only })) |file| {
-        file.close();
-        return;
-    } else |err| switch (err) {
-        error.FileNotFound => {},
-        else => return err,
-    }
-
-    try std.fs.cwd().writeFile(.{
-        .sub_path = mother_json_path,
-        .data =
-        \\{
-        \\  "persona_pack": "default",
-        \\  "name": "Mother",
-        \\  "description": "System orchestration and bootstrap guardian",
-        \\  "is_default": true,
-        \\  "capabilities": ["chat","plan","code","research"]
-        \\}
-        ,
-    });
 }
 
 fn reconcileWorkerMain(runtime_registry: *AgentRuntimeRegistry) void {
@@ -6424,20 +6091,6 @@ fn servicePresenceWorkerMain(runtime_registry: *AgentRuntimeRegistry) void {
     }
 }
 
-fn runtimeResidencyWorkerMain(runtime_registry: *AgentRuntimeRegistry) void {
-    while (true) {
-        if (runtime_registry.shouldStopRuntimeResidencyWorker()) return;
-
-        // Keep mount/runtime failures sticky until an explicit attach retry.
-        // Aggressive background retries can flood the control socket pool.
-        runtime_registry.ensureActiveRuntimeResidency(false) catch |err| {
-            std.log.warn("runtime residency worker error: {s}", .{@errorName(err)});
-        };
-
-        std.Thread.sleep(runtime_registry.runtime_residency_worker_interval_ms * std.time.ns_per_ms);
-    }
-}
-
 pub fn run(
     allocator: std.mem.Allocator,
     bind_addr: []const u8,
@@ -6447,8 +6100,6 @@ pub fn run(
 ) !void {
     var runtime_registry = AgentRuntimeRegistry.init(allocator, runtime_config, provider_config);
     defer runtime_registry.deinit();
-
-    ensureMotherAgentScaffoldBestEffort(allocator, runtime_registry.runtime_config);
 
     runtime_registry.workspace_url = try formatInternalWsUrl(allocator, bind_addr, port, "/");
     try runtime_registry.startVenomPresenceWorker();
@@ -6507,10 +6158,6 @@ pub fn run(
         .{ bind_addr, port },
     );
     startLocalFsBootstrapThread(allocator, &runtime_registry, bind_addr, port);
-    runtime_registry.ensureActiveRuntimeResidency(true) catch |err| {
-        std.log.warn("initial runtime residency warmup failed: {s}", .{@errorName(err)});
-    };
-    try runtime_registry.startRuntimeResidencyWorker();
 
     while (true) {
         var connection = tcp_server.accept() catch |err| {
@@ -6605,12 +6252,7 @@ fn handleWebSocketConnection(
     );
     var active_session_key = try allocator.dupe(u8, "main");
     defer allocator.free(active_session_key);
-    var acheron_session: ?acheron_session_mod.Session = null;
-    defer if (acheron_session) |*session| session.deinit();
-    var acheron_bound_session_key = try allocator.dupe(u8, "main");
-    defer allocator.free(acheron_bound_session_key);
     var control_protocol_negotiated = false;
-    var runtime_acheron_version_negotiated = false;
     var connection_write_mutex: std.Thread.Mutex = .{};
     const connection_venom_id = try std.fmt.allocPrint(
         allocator,
@@ -6685,17 +6327,7 @@ fn handleWebSocketConnection(
                             try writeFrameLocked(stream, &connection_write_mutex, "", .close);
                             return;
                         }
-                        if (connect_gate_error != null and
-                            control_type != .version and
-                            control_type != .connect and
-                            control_type != .session_attach and
-                            control_type != .session_restore and
-                            control_type != .session_history and
-                            control_type != .agent_ensure and
-                            control_type != .agent_list and
-                            control_type != .agent_get and
-                            control_type != .project_list and
-                            control_type != .project_get)
+                        if (connect_gate_error != null and !isConnectGateExemptControlType(control_type))
                         {
                             const gate = connect_gate_error.?;
                             const response = try unified.buildControlError(
@@ -6770,7 +6402,7 @@ fn handleWebSocketConnection(
                                 const bootstrap_message_json = if (bootstrap_only_mode and principal.role == .admin) blk: {
                                     const escaped_bootstrap = try unified.jsonEscape(
                                         allocator,
-                                        "Bootstrap required: chat with Mother to define the first project vision and first non-system agent.",
+                                        "Workspace setup required: create a workspace, mount it locally, and start Spider Monkey against that mounted folder.",
                                     );
                                     defer allocator.free(escaped_bootstrap);
                                     break :blk try std.fmt.allocPrint(allocator, "\"{s}\"", .{escaped_bootstrap});
@@ -7200,13 +6832,13 @@ fn handleWebSocketConnection(
                                         "session_attach_forbidden_system_agent",
                                         false,
                                         "forbidden",
-                                        "user role cannot attach to mother agent",
+                                        "user role cannot attach to reserved system agent",
                                     );
                                     const response = try unified.buildControlError(
                                         allocator,
                                         parsed.id,
                                         "forbidden",
-                                        "user role cannot attach to mother agent",
+                                        "user role cannot attach to reserved system agent",
                                     );
                                     defer allocator.free(response);
                                     try writeFrameLocked(stream, &connection_write_mutex, response, .text);
@@ -7221,13 +6853,13 @@ fn handleWebSocketConnection(
                                         "session_attach_forbidden_system_project",
                                         false,
                                         "forbidden",
-                                        "user role cannot attach to system project",
+                                        "user role cannot attach to reserved system workspace",
                                     );
                                     const response = try unified.buildControlError(
                                         allocator,
                                         parsed.id,
                                         "forbidden",
-                                        "user role cannot attach to system project",
+                                        "user role cannot attach to reserved system workspace",
                                     );
                                     defer allocator.free(response);
                                     try writeFrameLocked(stream, &connection_write_mutex, response, .text);
@@ -7244,13 +6876,13 @@ fn handleWebSocketConnection(
                                         "session_attach_forbidden_primary_project",
                                         false,
                                         "forbidden",
-                                        "mother can only attach to system project",
+                                        "reserved system agent can only attach to the reserved system workspace",
                                     );
                                     const response = try unified.buildControlError(
                                         allocator,
                                         parsed.id,
                                         "forbidden",
-                                        "mother can only attach to system project",
+                                        "reserved system agent can only attach to the reserved system workspace",
                                     );
                                     defer allocator.free(response);
                                     try writeFrameLocked(stream, &connection_write_mutex, response, .text);
@@ -7793,122 +7425,6 @@ fn handleWebSocketConnection(
                                 if (std.mem.eql(u8, active_session_key, session_key)) {
                                     allocator.free(active_session_key);
                                     active_session_key = try allocator.dupe(u8, "main");
-                                    if (acheron_session) |*session| {
-                                        const main_binding = session_bindings.get("main") orelse return error.InvalidState;
-                                        const main_runtime = runtime_registry.getOrCreate(
-                                            main_binding.agent_id,
-                                            main_binding.project_id,
-                                            main_binding.project_token,
-                                        ) catch |err| switch (err) {
-                                            error.InvalidAgentId => {
-                                                const response = try unified.buildControlError(
-                                                    allocator,
-                                                    parsed.id,
-                                                    "invalid_payload",
-                                                    "invalid agent_id",
-                                                );
-                                                defer allocator.free(response);
-                                                try writeFrameLocked(stream, &connection_write_mutex, response, .text);
-                                                continue;
-                                            },
-                                            error.InvalidProjectId => {
-                                                const response = try unified.buildControlError(
-                                                    allocator,
-                                                    parsed.id,
-                                                    "invalid_payload",
-                                                    "invalid project_id",
-                                                );
-                                                defer allocator.free(response);
-                                                try writeFrameLocked(stream, &connection_write_mutex, response, .text);
-                                                continue;
-                                            },
-                                            error.RuntimeLimitReached => {
-                                                const response = try unified.buildControlError(
-                                                    allocator,
-                                                    parsed.id,
-                                                    "queue_saturated",
-                                                    "agent runtime limit reached",
-                                                );
-                                                defer allocator.free(response);
-                                                try writeFrameLocked(stream, &connection_write_mutex, response, .text);
-                                                continue;
-                                            },
-                                            error.ProjectRequired => {
-                                                const response = try unified.buildControlError(
-                                                    allocator,
-                                                    parsed.id,
-                                                    "sandbox_mount_missing",
-                                                    "sandbox requires a project binding",
-                                                );
-                                                defer allocator.free(response);
-                                                try writeFrameLocked(stream, &connection_write_mutex, response, .text);
-                                                continue;
-                                            },
-                                            error.ProjectMountsMissing => {
-                                                const response = try unified.buildControlError(
-                                                    allocator,
-                                                    parsed.id,
-                                                    "project_mounts_missing",
-                                                    "project has no workspace mounts configured",
-                                                );
-                                                defer allocator.free(response);
-                                                try writeFrameLocked(stream, &connection_write_mutex, response, .text);
-                                                continue;
-                                            },
-                                            error.SandboxMountUnavailable => {
-                                                const response = try unified.buildControlError(
-                                                    allocator,
-                                                    parsed.id,
-                                                    "sandbox_mount_unavailable",
-                                                    "sandbox mount is unavailable",
-                                                );
-                                                defer allocator.free(response);
-                                                try writeFrameLocked(stream, &connection_write_mutex, response, .text);
-                                                continue;
-                                            },
-                                            error.ProcessFdQuotaExceeded => {
-                                                const response = try unified.buildControlError(
-                                                    allocator,
-                                                    parsed.id,
-                                                    "runtime_resource_exhausted",
-                                                    "sandbox runtime hit process fd quota",
-                                                );
-                                                defer allocator.free(response);
-                                                try writeFrameLocked(stream, &connection_write_mutex, response, .text);
-                                                continue;
-                                            },
-                                            error.InvalidSandboxConfig => {
-                                                const response = try unified.buildControlError(
-                                                    allocator,
-                                                    parsed.id,
-                                                    "sandbox_invalid_config",
-                                                    "sandbox config is invalid",
-                                                );
-                                                defer allocator.free(response);
-                                                try writeFrameLocked(stream, &connection_write_mutex, response, .text);
-                                                continue;
-                                            },
-                                            else => return err,
-                                        };
-                                        defer main_runtime.release();
-                                        try session.setRuntimeBindingWithOptions(
-                                            main_runtime,
-                                            main_binding.agent_id,
-                                            .{
-                                                .project_id = main_binding.project_id,
-                                                .project_token = main_binding.project_token,
-                                                .agents_dir = runtime_registry.runtime_config.agents_dir,
-                                                .assets_dir = runtime_registry.runtime_config.assets_dir,
-                                                .projects_dir = "projects",
-                                                .control_plane = &runtime_registry.control_plane,
-                                                .mission_store = &runtime_registry.missions,
-                                                .control_operator_token = runtime_registry.control_operator_token,
-                                                .actor_type = main_binding.actor_type,
-                                                .actor_id = main_binding.actor_id,
-                                                .is_admin = principal.role == .admin,
-                                            },
-                                        );
-                                    }
                                 }
                                 if (control_service_attached and previous_active_binding != null and previous_active_session_key != null) {
                                     const main_binding = session_bindings.get(active_session_key) orelse return error.InvalidState;
@@ -7966,6 +7482,17 @@ fn handleWebSocketConnection(
                             .node_list,
                             .node_get,
                             .node_delete,
+                            .workspace_create,
+                            .workspace_update,
+                            .workspace_delete,
+                            .workspace_list,
+                            .workspace_get,
+                            .workspace_mount_set,
+                            .workspace_mount_remove,
+                            .workspace_mount_list,
+                            .workspace_token_rotate,
+                            .workspace_token_revoke,
+                            .workspace_activate,
                             .project_create,
                             .project_update,
                             .project_delete,
@@ -7979,6 +7506,7 @@ fn handleWebSocketConnection(
                             .project_activate,
                             .workspace_status,
                             .reconcile_status,
+                            .workspace_up,
                             .project_up,
                             .audit_tail,
                             => {
@@ -8115,11 +7643,6 @@ fn handleWebSocketConnection(
                                 if (topology_mutation or availability_changed) {
                                     runtime_registry.control_plane.requestReconcile();
                                 }
-                                if (topology_mutation) {
-                                    runtime_registry.ensureActiveRuntimeResidency(true) catch |err| {
-                                        std.log.warn("runtime residency refresh failed after topology mutation: {s}", .{@errorName(err)});
-                                    };
-                                }
                                 continue;
                             },
                             else => {
@@ -8136,321 +7659,16 @@ fn handleWebSocketConnection(
                         }
                     },
                     .acheron => {
-                        if (connect_gate_error) |gate| {
-                            const response = try unified.buildFsrpcError(
-                                allocator,
-                                parsed.tag,
-                                gate.code,
-                                gate.message,
-                            );
-                            defer allocator.free(response);
-                            try writeFrameLocked(stream, &connection_write_mutex, response, .text);
-                            continue;
-                        }
-                        const acheron_type = parsed.acheron_type orelse {
-                            const response = try unified.buildFsrpcError(
-                                allocator,
-                                parsed.tag,
-                                "invalid_type",
-                                "missing fsrpc message type",
-                            );
-                            defer allocator.free(response);
-                            try writeFrameLocked(stream, &connection_write_mutex, response, .text);
-                            try writeFrameLocked(stream, &connection_write_mutex, "", .close);
-                            return;
-                        };
-                        if (!runtime_acheron_version_negotiated) {
-                            if (acheron_type != .t_version) {
-                                const response = try unified.buildFsrpcError(
-                                    allocator,
-                                    parsed.tag,
-                                    "protocol_mismatch",
-                                    "acheron.t_version must be negotiated first",
-                                );
-                                defer allocator.free(response);
-                                try writeFrameLocked(stream, &connection_write_mutex, response, .text);
-                                try writeFrameLocked(stream, &connection_write_mutex, "", .close);
-                                return;
-                            }
-                            if (parsed.version == null or !std.mem.eql(u8, parsed.version.?, acheron_runtime_protocol_version)) {
-                                const response = try unified.buildFsrpcError(
-                                    allocator,
-                                    parsed.tag,
-                                    "protocol_mismatch",
-                                    "unsupported fsrpc runtime version",
-                                );
-                                defer allocator.free(response);
-                                try writeFrameLocked(stream, &connection_write_mutex, response, .text);
-                                try writeFrameLocked(stream, &connection_write_mutex, "", .close);
-                                return;
-                            }
-                            runtime_acheron_version_negotiated = true;
-                        } else if (acheron_type == .t_version) {
-                            if (parsed.version == null or !std.mem.eql(u8, parsed.version.?, acheron_runtime_protocol_version)) {
-                                const response = try unified.buildFsrpcError(
-                                    allocator,
-                                    parsed.tag,
-                                    "protocol_mismatch",
-                                    "unsupported fsrpc runtime version",
-                                );
-                                defer allocator.free(response);
-                                try writeFrameLocked(stream, &connection_write_mutex, response, .text);
-                                try writeFrameLocked(stream, &connection_write_mutex, "", .close);
-                                return;
-                            }
-                        }
-                        if (acheron_type == .t_version) {
-                            const negotiated_msize = parsed.msize orelse 1_048_576;
-                            const payload = try std.fmt.allocPrint(
-                                allocator,
-                                "{{\"msize\":{d},\"version\":\"{s}\"}}",
-                                .{ negotiated_msize, acheron_runtime_protocol_version },
-                            );
-                            defer allocator.free(payload);
-                            const response = try unified.buildFsrpcResponse(
-                                allocator,
-                                .r_version,
-                                parsed.tag,
-                                payload,
-                            );
-                            defer allocator.free(response);
-                            try writeFrameLocked(stream, &connection_write_mutex, response, .text);
-                            continue;
-                        }
-
-                        const target_session_key = parsed.session_key orelse active_session_key;
-                        const target_binding = session_bindings.get(target_session_key) orelse {
-                            const response = try unified.buildFsrpcError(
-                                allocator,
-                                parsed.tag,
-                                "session_not_found",
-                                "unknown session_key",
-                            );
-                            defer allocator.free(response);
-                            try writeFrameLocked(stream, &connection_write_mutex, response, .text);
-                            continue;
-                        };
-                        if (acheron_type == .t_write and target_binding.project_id != null) {
-                            runtime_registry.auth_tokens.recordSessionActivity(
-                                principal.role,
-                                target_session_key,
-                                target_binding.agent_id,
-                                target_binding.project_id.?,
-                                1,
-                            ) catch |history_err| {
-                                std.log.warn("session activity update failed: {s}", .{@errorName(history_err)});
-                            };
-                        }
-                        var attach_state = runtime_registry.runtimeAttachSnapshot(
-                            target_binding.agent_id,
-                            target_binding.project_id,
+                        const response = try unified.buildFsrpcError(
+                            allocator,
+                            parsed.tag,
+                            "external_worker_required",
+                            "embedded runtime websocket access is removed; mount the workspace with spiderweb-fs-mount and run Spider Monkey against that mount",
                         );
-                        defer attach_state.deinit(allocator);
-                        if (attach_state.state != .ready) {
-                            const warmed_attach_state = runtime_registry.ensureRuntimeWarmup(
-                                target_binding.agent_id,
-                                target_binding.project_id,
-                                target_binding.project_token,
-                                true,
-                            ) catch |warm_err| {
-                                const response = try unified.buildFsrpcError(
-                                    allocator,
-                                    parsed.tag,
-                                    "execution_failed",
-                                    @errorName(warm_err),
-                                );
-                                defer allocator.free(response);
-                                try writeFrameLocked(stream, &connection_write_mutex, response, .text);
-                                continue;
-                            };
-                            attach_state.deinit(allocator);
-                            attach_state = warmed_attach_state;
-
-                            if (attach_state.state == .warming) {
-                                const response = try unified.buildFsrpcError(
-                                    allocator,
-                                    parsed.tag,
-                                    "runtime_warming",
-                                    "sandbox attach is still preparing for this project",
-                                );
-                                defer allocator.free(response);
-                                try writeFrameLocked(stream, &connection_write_mutex, response, .text);
-                                continue;
-                            }
-                            if (attach_state.state == .err) {
-                                const response = try unified.buildFsrpcError(
-                                    allocator,
-                                    parsed.tag,
-                                    attach_state.error_code orelse "runtime_unavailable",
-                                    attach_state.error_message orelse "runtime is unavailable",
-                                );
-                                defer allocator.free(response);
-                                try writeFrameLocked(stream, &connection_write_mutex, response, .text);
-                                continue;
-                            }
-                        }
-                        const target_runtime = runtime_registry.getOrCreate(
-                            target_binding.agent_id,
-                            target_binding.project_id,
-                            target_binding.project_token,
-                        ) catch |err| switch (err) {
-                            error.InvalidAgentId => {
-                                const response = try unified.buildFsrpcError(
-                                    allocator,
-                                    parsed.tag,
-                                    "invalid_agent",
-                                    "invalid session agent",
-                                );
-                                defer allocator.free(response);
-                                try writeFrameLocked(stream, &connection_write_mutex, response, .text);
-                                continue;
-                            },
-                            error.InvalidProjectId => {
-                                const response = try unified.buildFsrpcError(
-                                    allocator,
-                                    parsed.tag,
-                                    "invalid_project",
-                                    "invalid session project",
-                                );
-                                defer allocator.free(response);
-                                try writeFrameLocked(stream, &connection_write_mutex, response, .text);
-                                continue;
-                            },
-                            error.RuntimeLimitReached => {
-                                const response = try unified.buildFsrpcError(
-                                    allocator,
-                                    parsed.tag,
-                                    "queue_saturated",
-                                    "agent runtime limit reached",
-                                );
-                                defer allocator.free(response);
-                                try writeFrameLocked(stream, &connection_write_mutex, response, .text);
-                                continue;
-                            },
-                            error.ProjectRequired => {
-                                const response = try unified.buildFsrpcError(
-                                    allocator,
-                                    parsed.tag,
-                                    "sandbox_mount_missing",
-                                    "sandbox requires a project binding",
-                                );
-                                defer allocator.free(response);
-                                try writeFrameLocked(stream, &connection_write_mutex, response, .text);
-                                continue;
-                            },
-                            error.ProjectMountsMissing => {
-                                const response = try unified.buildFsrpcError(
-                                    allocator,
-                                    parsed.tag,
-                                    "project_mounts_missing",
-                                    "project has no workspace mounts configured",
-                                );
-                                defer allocator.free(response);
-                                try writeFrameLocked(stream, &connection_write_mutex, response, .text);
-                                continue;
-                            },
-                            error.SandboxMountUnavailable => {
-                                const response = try unified.buildFsrpcError(
-                                    allocator,
-                                    parsed.tag,
-                                    "sandbox_mount_unavailable",
-                                    "sandbox mount is unavailable",
-                                );
-                                defer allocator.free(response);
-                                try writeFrameLocked(stream, &connection_write_mutex, response, .text);
-                                continue;
-                            },
-                            error.InvalidSandboxConfig => {
-                                const response = try unified.buildFsrpcError(
-                                    allocator,
-                                    parsed.tag,
-                                    "sandbox_invalid_config",
-                                    "sandbox config is invalid",
-                                );
-                                defer allocator.free(response);
-                                try writeFrameLocked(stream, &connection_write_mutex, response, .text);
-                                continue;
-                            },
-                            error.ProcessFdQuotaExceeded => {
-                                const response = try unified.buildFsrpcError(
-                                    allocator,
-                                    parsed.tag,
-                                    "runtime_resource_exhausted",
-                                    "sandbox runtime hit process fd quota",
-                                );
-                                defer allocator.free(response);
-                                try writeFrameLocked(stream, &connection_write_mutex, response, .text);
-                                continue;
-                            },
-                            else => return err,
-                        };
-                        defer target_runtime.release();
-                        if (acheron_type == .t_write and control_service_attached) {
-                            runtime_registry.publishVenomPresenceForBinding(
-                                principal.role,
-                                target_binding,
-                                target_session_key,
-                                connection_venom_id,
-                                true,
-                            );
-                        }
-                        const local_fs_workspace_root = try runtime_registry.copyLocalFsWorkspaceRoot(allocator);
-                        defer if (local_fs_workspace_root) |value| allocator.free(value);
-                        if (acheron_session == null) {
-                            acheron_session = try acheron_session_mod.Session.initWithOptions(
-                                allocator,
-                                target_runtime,
-                                &runtime_registry.job_index,
-                                target_binding.agent_id,
-                                .{
-                                    .project_id = target_binding.project_id,
-                                    .project_token = target_binding.project_token,
-                                    .agents_dir = runtime_registry.runtime_config.agents_dir,
-                                    .assets_dir = runtime_registry.runtime_config.assets_dir,
-                                    .projects_dir = "projects",
-                                    .local_fs_export_root = local_fs_workspace_root,
-                                    .control_plane = &runtime_registry.control_plane,
-                                    .mission_store = &runtime_registry.missions,
-                                    .control_operator_token = runtime_registry.control_operator_token,
-                                    .actor_type = target_binding.actor_type,
-                                    .actor_id = target_binding.actor_id,
-                                    .is_admin = principal.role == .admin,
-                                },
-                            );
-                            const next_bound_session_key = try allocator.dupe(u8, target_session_key);
-                            allocator.free(acheron_bound_session_key);
-                            acheron_bound_session_key = next_bound_session_key;
-                        } else {
-                            const needs_rebind = !std.mem.eql(u8, acheron_bound_session_key, target_session_key) or
-                                !std.mem.eql(u8, acheron_session.?.agent_id, target_binding.agent_id);
-                            if (needs_rebind) {
-                                try acheron_session.?.setRuntimeBindingWithOptions(
-                                    target_runtime,
-                                    target_binding.agent_id,
-                                    .{
-                                        .project_id = target_binding.project_id,
-                                        .project_token = target_binding.project_token,
-                                        .agents_dir = runtime_registry.runtime_config.agents_dir,
-                                        .assets_dir = runtime_registry.runtime_config.assets_dir,
-                                        .projects_dir = "projects",
-                                        .local_fs_export_root = local_fs_workspace_root,
-                                        .control_plane = &runtime_registry.control_plane,
-                                        .mission_store = &runtime_registry.missions,
-                                        .control_operator_token = runtime_registry.control_operator_token,
-                                        .actor_type = target_binding.actor_type,
-                                        .actor_id = target_binding.actor_id,
-                                        .is_admin = principal.role == .admin,
-                                    },
-                                );
-                                const next_bound_session_key = try allocator.dupe(u8, target_session_key);
-                                allocator.free(acheron_bound_session_key);
-                                acheron_bound_session_key = next_bound_session_key;
-                            }
-                        }
-                        const response = try acheron_session.?.handle(&parsed);
                         defer allocator.free(response);
                         try writeFrameLocked(stream, &connection_write_mutex, response, .text);
-                        continue;
+                        try writeFrameLocked(stream, &connection_write_mutex, "", .close);
+                        return;
                     },
                 }
             },
@@ -8876,6 +8094,62 @@ fn isControlAdminOnly(control_type: unified.ControlType) bool {
     };
 }
 
+fn isConnectGateExemptControlType(control_type: unified.ControlType) bool {
+    return switch (control_type) {
+        .version,
+        .connect,
+        .session_attach,
+        .session_restore,
+        .session_history,
+        .agent_ensure,
+        .agent_list,
+        .agent_get,
+        .node_invite_create,
+        .node_join_request,
+        .node_join_pending_list,
+        .node_join_approve,
+        .node_join_deny,
+        .node_join,
+        .node_ensure,
+        .node_lease_refresh,
+        .venom_bind,
+        .venom_upsert,
+        .venom_get,
+        .node_list,
+        .node_get,
+        .node_delete,
+        .workspace_create,
+        .workspace_update,
+        .workspace_delete,
+        .workspace_list,
+        .workspace_get,
+        .workspace_mount_set,
+        .workspace_mount_remove,
+        .workspace_mount_list,
+        .workspace_token_rotate,
+        .workspace_token_revoke,
+        .workspace_activate,
+        .workspace_status,
+        .workspace_up,
+        .project_create,
+        .project_update,
+        .project_delete,
+        .project_list,
+        .project_get,
+        .project_mount_set,
+        .project_mount_remove,
+        .project_mount_list,
+        .project_token_rotate,
+        .project_token_revoke,
+        .project_activate,
+        .project_up,
+        .reconcile_status,
+        .audit_tail,
+        => true,
+        else => false,
+    };
+}
+
 fn sendWebSocketErrorAndClose(
     allocator: std.mem.Allocator,
     stream: *std.net.Stream,
@@ -8953,6 +8227,13 @@ fn isWorkspaceTopologyMutation(control_type: unified.ControlType) bool {
         .node_join,
         .node_ensure,
         .node_delete,
+        .workspace_create,
+        .workspace_update,
+        .workspace_delete,
+        .workspace_mount_set,
+        .workspace_mount_remove,
+        .workspace_activate,
+        .workspace_up,
         .project_create,
         .project_update,
         .project_delete,
@@ -9028,6 +8309,15 @@ fn controlMutationScope(control_type: unified.ControlType) ControlMutationScope 
         .node_join_approve,
         .node_join_deny,
         => .operator,
+        .workspace_create,
+        .workspace_update,
+        .workspace_delete,
+        .workspace_mount_set,
+        .workspace_mount_remove,
+        .workspace_token_rotate,
+        .workspace_token_revoke,
+        .workspace_activate,
+        .workspace_up,
         .project_create,
         .project_update,
         .project_delete,
@@ -9183,6 +8473,134 @@ fn buildControlErrorWithCorrelation(
     );
 }
 
+const JsonFieldAlias = struct {
+    from: []const u8,
+    to: []const u8,
+};
+
+const workspace_to_project_aliases = [_]JsonFieldAlias{
+    .{ .from = "workspace_id", .to = "project_id" },
+    .{ .from = "workspace_token", .to = "project_token" },
+    .{ .from = "workspace_name", .to = "name" },
+    .{ .from = "workspaces", .to = "projects" },
+    .{ .from = "active_workspace", .to = "active_project" },
+    .{ .from = "selected_workspace", .to = "selected_project" },
+    .{ .from = "workspace_mount_digest", .to = "project_mount_digest" },
+};
+
+const project_to_workspace_aliases = [_]JsonFieldAlias{
+    .{ .from = "project_id", .to = "workspace_id" },
+    .{ .from = "project_token", .to = "workspace_token" },
+    .{ .from = "project_name", .to = "workspace_name" },
+    .{ .from = "projects", .to = "workspaces" },
+    .{ .from = "active_project", .to = "active_workspace" },
+    .{ .from = "selected_project", .to = "selected_workspace" },
+    .{ .from = "project_mount_digest", .to = "workspace_mount_digest" },
+};
+
+fn isWorkspaceAliasControlType(control_type: unified.ControlType) bool {
+    return switch (control_type) {
+        .workspace_create,
+        .workspace_update,
+        .workspace_delete,
+        .workspace_list,
+        .workspace_get,
+        .workspace_mount_set,
+        .workspace_mount_remove,
+        .workspace_mount_list,
+        .workspace_token_rotate,
+        .workspace_token_revoke,
+        .workspace_activate,
+        .workspace_status,
+        .workspace_up,
+        => true,
+        else => false,
+    };
+}
+
+fn canonicalProjectControlType(control_type: unified.ControlType) unified.ControlType {
+    return switch (control_type) {
+        .workspace_create => .project_create,
+        .workspace_update => .project_update,
+        .workspace_delete => .project_delete,
+        .workspace_list => .project_list,
+        .workspace_get => .project_get,
+        .workspace_mount_set => .project_mount_set,
+        .workspace_mount_remove => .project_mount_remove,
+        .workspace_mount_list => .project_mount_list,
+        .workspace_token_rotate => .project_token_rotate,
+        .workspace_token_revoke => .project_token_revoke,
+        .workspace_activate => .project_activate,
+        .workspace_up => .project_up,
+        else => control_type,
+    };
+}
+
+fn aliasFieldName(name: []const u8, aliases: []const JsonFieldAlias) []const u8 {
+    for (aliases) |alias| {
+        if (std.mem.eql(u8, name, alias.from)) return alias.to;
+    }
+    return name;
+}
+
+fn appendAliasedJsonValue(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    value: std.json.Value,
+    aliases: []const JsonFieldAlias,
+) !void {
+    switch (value) {
+        .null => try out.appendSlice(allocator, "null"),
+        .bool => |boolean| try out.appendSlice(allocator, if (boolean) "true" else "false"),
+        .integer => |integer| try out.writer(allocator).print("{d}", .{integer}),
+        .float => |float| try out.writer(allocator).print("{d}", .{float}),
+        .number_string => |number| try out.appendSlice(allocator, number),
+        .string => |string| {
+            const escaped = try unified.jsonEscape(allocator, string);
+            defer allocator.free(escaped);
+            try out.writer(allocator).print("\"{s}\"", .{escaped});
+        },
+        .array => |array| {
+            try out.append(allocator, '[');
+            for (array.items, 0..) |item, idx| {
+                if (idx != 0) try out.append(allocator, ',');
+                try appendAliasedJsonValue(allocator, out, item, aliases);
+            }
+            try out.append(allocator, ']');
+        },
+        .object => |object| {
+            try out.append(allocator, '{');
+            var it = object.iterator();
+            var idx: usize = 0;
+            while (it.next()) |entry| : (idx += 1) {
+                if (idx != 0) try out.append(allocator, ',');
+                const aliased_name = aliasFieldName(entry.key_ptr.*, aliases);
+                const escaped_name = try unified.jsonEscape(allocator, aliased_name);
+                defer allocator.free(escaped_name);
+                try out.writer(allocator).print("\"{s}\":", .{escaped_name});
+                try appendAliasedJsonValue(allocator, out, entry.value_ptr.*, aliases);
+            }
+            try out.append(allocator, '}');
+        },
+    }
+}
+
+fn rewriteJsonFieldAliases(
+    allocator: std.mem.Allocator,
+    payload_json: ?[]const u8,
+    aliases: []const JsonFieldAlias,
+) !?[]u8 {
+    const raw = payload_json orelse return null;
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
+    defer parsed.deinit();
+
+    var out = std.ArrayListUnmanaged(u8){};
+    errdefer out.deinit(allocator);
+    try appendAliasedJsonValue(allocator, &out, parsed.value, aliases);
+    const owned = try out.toOwnedSlice(allocator);
+    return @as(?[]u8, owned);
+}
+
 fn handleControlPlaneCommand(
     runtime_registry: *AgentRuntimeRegistry,
     control_type: unified.ControlType,
@@ -9190,41 +8608,59 @@ fn handleControlPlaneCommand(
     is_admin: bool,
     payload_json: ?[]const u8,
 ) ![]u8 {
-    return switch (control_type) {
-        .node_invite_create => runtime_registry.control_plane.createNodeInvite(payload_json),
-        .node_join_request => runtime_registry.control_plane.nodeJoinRequest(payload_json),
-        .node_join_pending_list => runtime_registry.control_plane.listPendingNodeJoins(payload_json),
-        .node_join_approve => runtime_registry.control_plane.approvePendingNodeJoin(payload_json),
-        .node_join_deny => runtime_registry.control_plane.denyPendingNodeJoin(payload_json),
-        .node_join => runtime_registry.control_plane.nodeJoin(payload_json),
-        .node_ensure => runtime_registry.control_plane.nodeEnsure(payload_json),
-        .node_lease_refresh => runtime_registry.control_plane.refreshNodeLease(payload_json),
-        .venom_bind => runtime_registry.control_plane.bindPreferredVenomProvider(payload_json),
-        .venom_upsert => runtime_registry.control_plane.nodeVenomUpsert(payload_json),
-        .venom_get => runtime_registry.control_plane.nodeVenomGet(payload_json),
-        .agent_ensure => runtime_registry.ensureAgentPayloadWithRole(payload_json, agent_id, is_admin),
-        .agent_list => runtime_registry.listAgentsPayloadWithRole(is_admin),
-        .agent_get => runtime_registry.getAgentPayloadWithRole(payload_json, is_admin),
-        .node_list => runtime_registry.control_plane.listNodes(),
-        .node_get => runtime_registry.control_plane.getNode(payload_json),
-        .node_delete => runtime_registry.control_plane.deleteNode(payload_json),
-        .project_create => runtime_registry.control_plane.createProject(payload_json),
-        .project_update => runtime_registry.control_plane.updateProjectWithRole(payload_json, is_admin),
-        .project_delete => runtime_registry.control_plane.deleteProjectWithRole(payload_json, is_admin),
-        .project_list => runtime_registry.control_plane.listProjects(),
-        .project_get => runtime_registry.control_plane.getProjectWithRole(payload_json, is_admin),
-        .project_mount_set => runtime_registry.control_plane.setProjectMountWithRole(payload_json, is_admin),
-        .project_mount_remove => runtime_registry.control_plane.removeProjectMountWithRole(payload_json, is_admin),
-        .project_mount_list => runtime_registry.control_plane.listProjectMountsWithRole(payload_json, is_admin),
-        .project_token_rotate => runtime_registry.control_plane.rotateProjectTokenWithRole(payload_json, is_admin),
-        .project_token_revoke => runtime_registry.control_plane.revokeProjectTokenWithRole(payload_json, is_admin),
-        .project_activate => runtime_registry.control_plane.activateProjectWithRole(agent_id, payload_json, is_admin),
-        .workspace_status => runtime_registry.control_plane.workspaceStatusWithRole(agent_id, payload_json, is_admin),
-        .reconcile_status => runtime_registry.control_plane.reconcileStatus(payload_json),
-        .project_up => runtime_registry.control_plane.projectUpWithRole(agent_id, payload_json, is_admin),
-        .audit_tail => runtime_registry.buildAuditTailPayload(payload_json),
-        else => error.UnsupportedControlPlaneOperation,
+    const control_type_canonical = canonicalProjectControlType(control_type);
+    const request_json = if (isWorkspaceAliasControlType(control_type) or control_type == .workspace_status)
+        try rewriteJsonFieldAliases(runtime_registry.allocator, payload_json, &workspace_to_project_aliases)
+    else
+        null;
+    defer if (request_json) |value| runtime_registry.allocator.free(value);
+
+    const effective_payload = if (request_json) |value| @as(?[]const u8, value) else payload_json;
+    const response_json = switch (control_type_canonical) {
+        .node_invite_create => try runtime_registry.control_plane.createNodeInvite(effective_payload),
+        .node_join_request => try runtime_registry.control_plane.nodeJoinRequest(effective_payload),
+        .node_join_pending_list => try runtime_registry.control_plane.listPendingNodeJoins(effective_payload),
+        .node_join_approve => try runtime_registry.control_plane.approvePendingNodeJoin(effective_payload),
+        .node_join_deny => try runtime_registry.control_plane.denyPendingNodeJoin(effective_payload),
+        .node_join => try runtime_registry.control_plane.nodeJoin(effective_payload),
+        .node_ensure => try runtime_registry.control_plane.nodeEnsure(effective_payload),
+        .node_lease_refresh => try runtime_registry.control_plane.refreshNodeLease(effective_payload),
+        .venom_bind => try runtime_registry.control_plane.bindPreferredVenomProvider(effective_payload),
+        .venom_upsert => try runtime_registry.control_plane.nodeVenomUpsert(effective_payload),
+        .venom_get => try runtime_registry.control_plane.nodeVenomGet(effective_payload),
+        .agent_ensure => try runtime_registry.ensureAgentPayloadWithRole(effective_payload, agent_id, is_admin),
+        .agent_list => try runtime_registry.listAgentsPayloadWithRole(is_admin),
+        .agent_get => try runtime_registry.getAgentPayloadWithRole(effective_payload, is_admin),
+        .node_list => try runtime_registry.control_plane.listNodes(),
+        .node_get => try runtime_registry.control_plane.getNode(effective_payload),
+        .node_delete => try runtime_registry.control_plane.deleteNode(effective_payload),
+        .project_create => try runtime_registry.control_plane.createProject(effective_payload),
+        .project_update => try runtime_registry.control_plane.updateProjectWithRole(effective_payload, is_admin),
+        .project_delete => try runtime_registry.control_plane.deleteProjectWithRole(effective_payload, is_admin),
+        .project_list => try runtime_registry.control_plane.listProjects(),
+        .project_get => try runtime_registry.control_plane.getProjectWithRole(effective_payload, is_admin),
+        .project_mount_set => try runtime_registry.control_plane.setProjectMountWithRole(effective_payload, is_admin),
+        .project_mount_remove => try runtime_registry.control_plane.removeProjectMountWithRole(effective_payload, is_admin),
+        .project_mount_list => try runtime_registry.control_plane.listProjectMountsWithRole(effective_payload, is_admin),
+        .project_token_rotate => try runtime_registry.control_plane.rotateProjectTokenWithRole(effective_payload, is_admin),
+        .project_token_revoke => try runtime_registry.control_plane.revokeProjectTokenWithRole(effective_payload, is_admin),
+        .project_activate => try runtime_registry.control_plane.activateProjectWithRole(agent_id, effective_payload, is_admin),
+        .workspace_status => try runtime_registry.control_plane.workspaceStatusWithRole(agent_id, effective_payload, is_admin),
+        .reconcile_status => try runtime_registry.control_plane.reconcileStatus(effective_payload),
+        .project_up => try runtime_registry.control_plane.projectUpWithRole(agent_id, effective_payload, is_admin),
+        .audit_tail => try runtime_registry.buildAuditTailPayload(effective_payload),
+        else => return error.UnsupportedControlPlaneOperation,
     };
+    errdefer runtime_registry.allocator.free(response_json);
+
+    if (isWorkspaceAliasControlType(control_type) or control_type == .workspace_status) {
+        const rewritten = try rewriteJsonFieldAliases(runtime_registry.allocator, response_json, &project_to_workspace_aliases);
+        const rewritten_value = rewritten orelse return response_json;
+        runtime_registry.allocator.free(response_json);
+        return rewritten_value;
+    }
+
+    return response_json;
 }
 
 fn controlPlaneErrorCode(err: anyerror) []const u8 {
@@ -9510,7 +8946,7 @@ fn seedUserRememberedTargetForTests(
     try runtime_registry.auth_tokens.setRememberedTarget(.user, agent_id, project_id_value.string);
 }
 
-test "server_piai: admin initial binding stays on mother/system even with remembered target" {
+test "server_piai: admin initial binding prefers remembered workspace target" {
     const allocator = std.testing.allocator;
     var runtime_registry = AgentRuntimeRegistry.init(allocator, .{
         .ltm_directory = "",
@@ -9550,9 +8986,9 @@ test "server_piai: admin initial binding stays on mother/system even with rememb
         owned.deinit(allocator);
     }
     try std.testing.expect(initial.connect_gate_error == null);
-    try std.testing.expectEqualStrings(system_agent_id, initial.binding.agent_id);
+    try std.testing.expectEqualStrings("roger", initial.binding.agent_id);
     try std.testing.expect(initial.binding.project_id != null);
-    try std.testing.expectEqualStrings(system_project_id, initial.binding.project_id.?);
+    try std.testing.expectEqualStrings(project_id_value.string, initial.binding.project_id.?);
 }
 
 fn readHttpHeadersAlloc(allocator: std.mem.Allocator, stream: *std.net.Stream, max_bytes: usize) ![]u8 {
@@ -9641,13 +9077,6 @@ fn readServerFrame(allocator: std.mem.Allocator, stream: *std.net.Stream) !TestS
     return .{ .opcode = opcode, .payload = payload };
 }
 
-fn readServerFrameForProtocolTest(
-    allocator: std.mem.Allocator,
-    stream: *std.net.Stream,
-) !TestServerFrame {
-    return readServerFrame(allocator, stream);
-}
-
 fn readExactFromStream(stream: *std.net.Stream, out: []u8) !void {
     var read_total: usize = 0;
     while (read_total < out.len) {
@@ -9728,109 +9157,18 @@ fn fsrpcConnectAndAttach(allocator: std.mem.Allocator, client: *std.net.Stream, 
     try std.testing.expectEqual(@as(u8, 0x1), connect_ack.opcode);
     try std.testing.expect(std.mem.indexOf(u8, connect_ack.payload, "\"type\":\"control.connect_ack\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, connect_ack.payload, "\"ok\":true") != null);
+}
 
+fn expectLegacyAcheronRejected(allocator: std.mem.Allocator, client: *std.net.Stream) !void {
     try writeClientTextFrameMasked(client, "{\"channel\":\"acheron\",\"type\":\"acheron.t_version\",\"tag\":1,\"msize\":1048576,\"version\":\"acheron-1\"}");
-    var version = try readServerFrame(allocator, client);
-    defer version.deinit(allocator);
-    try std.testing.expect(std.mem.indexOf(u8, version.payload, "\"type\":\"acheron.r_version\"") != null);
+    var rejection = try readServerFrame(allocator, client);
+    defer rejection.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, rejection.payload, "\"type\":\"acheron.r_error\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rejection.payload, "\"code\":\"external_worker_required\"") != null);
 
-    try writeClientTextFrameMasked(client, "{\"channel\":\"acheron\",\"type\":\"acheron.t_attach\",\"tag\":2,\"fid\":1}");
-    var attach = try readServerFrame(allocator, client);
-    defer attach.deinit(allocator);
-    try std.testing.expect(std.mem.indexOf(u8, attach.payload, "\"type\":\"acheron.r_attach\"") != null);
-}
-
-fn fsrpcWriteChatInput(
-    allocator: std.mem.Allocator,
-    client: *std.net.Stream,
-    content: []const u8,
-) ![]u8 {
-    const encoded = try unified.encodeDataB64(allocator, content);
-    defer allocator.free(encoded);
-
-    try writeClientTextFrameMasked(client, "{\"channel\":\"acheron\",\"type\":\"acheron.t_walk\",\"tag\":10,\"fid\":1,\"newfid\":2,\"path\":[\"capabilities\",\"chat\",\"control\",\"input\"]}");
-    var walk = try readServerFrameForProtocolTest(allocator, client);
-    defer walk.deinit(allocator);
-    try std.testing.expect(std.mem.indexOf(u8, walk.payload, "\"type\":\"acheron.r_walk\"") != null);
-
-    try writeClientTextFrameMasked(client, "{\"channel\":\"acheron\",\"type\":\"acheron.t_open\",\"tag\":11,\"fid\":2,\"mode\":\"rw\"}");
-    var open = try readServerFrameForProtocolTest(allocator, client);
-    defer open.deinit(allocator);
-    try std.testing.expect(std.mem.indexOf(u8, open.payload, "\"type\":\"acheron.r_open\"") != null);
-
-    const write_req = try std.fmt.allocPrint(
-        allocator,
-        "{{\"channel\":\"acheron\",\"type\":\"acheron.t_write\",\"tag\":12,\"fid\":2,\"offset\":0,\"data_b64\":\"{s}\"}}",
-        .{encoded},
-    );
-    defer allocator.free(write_req);
-    try writeClientTextFrameMasked(client, write_req);
-    var write = try readServerFrameForProtocolTest(allocator, client);
-    defer write.deinit(allocator);
-    try std.testing.expect(std.mem.indexOf(u8, write.payload, "\"type\":\"acheron.r_write\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, write.payload, "\"job\":\"job-") != null);
-
-    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, write.payload, .{});
-    defer parsed.deinit();
-    if (parsed.value != .object) return error.TestExpectedResponse;
-    const payload = parsed.value.object.get("payload") orelse return error.TestExpectedResponse;
-    if (payload != .object) return error.TestExpectedResponse;
-    const job = payload.object.get("job") orelse return error.TestExpectedResponse;
-    if (job != .string) return error.TestExpectedResponse;
-    const job_name = try allocator.dupe(u8, job.string);
-
-    try writeClientTextFrameMasked(client, "{\"channel\":\"acheron\",\"type\":\"acheron.t_clunk\",\"tag\":13,\"fid\":2}");
-    var clunk = try readServerFrameForProtocolTest(allocator, client);
-    defer clunk.deinit(allocator);
-    try std.testing.expect(std.mem.indexOf(u8, clunk.payload, "\"type\":\"acheron.r_clunk\"") != null);
-
-    return job_name;
-}
-
-fn fsrpcReadJobResult(allocator: std.mem.Allocator, client: *std.net.Stream, job_name: []const u8) ![]u8 {
-    const escaped_job = try unified.jsonEscape(allocator, job_name);
-    defer allocator.free(escaped_job);
-
-    const walk_req = try std.fmt.allocPrint(
-        allocator,
-        "{{\"channel\":\"acheron\",\"type\":\"acheron.t_walk\",\"tag\":20,\"fid\":1,\"newfid\":3,\"path\":[\"jobs\",\"{s}\",\"result.txt\"]}}",
-        .{escaped_job},
-    );
-    defer allocator.free(walk_req);
-    try writeClientTextFrameMasked(client, walk_req);
-    var walk = try readServerFrameForProtocolTest(allocator, client);
-    defer walk.deinit(allocator);
-    try std.testing.expect(std.mem.indexOf(u8, walk.payload, "\"type\":\"acheron.r_walk\"") != null);
-
-    try writeClientTextFrameMasked(client, "{\"channel\":\"acheron\",\"type\":\"acheron.t_open\",\"tag\":21,\"fid\":3,\"mode\":\"r\"}");
-    var open = try readServerFrameForProtocolTest(allocator, client);
-    defer open.deinit(allocator);
-    try std.testing.expect(std.mem.indexOf(u8, open.payload, "\"type\":\"acheron.r_open\"") != null);
-
-    try writeClientTextFrameMasked(client, "{\"channel\":\"acheron\",\"type\":\"acheron.t_read\",\"tag\":22,\"fid\":3,\"offset\":0,\"count\":1048576}");
-    var read = try readServerFrameForProtocolTest(allocator, client);
-    defer read.deinit(allocator);
-    try std.testing.expect(std.mem.indexOf(u8, read.payload, "\"type\":\"acheron.r_read\"") != null);
-
-    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, read.payload, .{});
-    defer parsed.deinit();
-    if (parsed.value != .object) return error.TestExpectedResponse;
-    const payload = parsed.value.object.get("payload") orelse return error.TestExpectedResponse;
-    if (payload != .object) return error.TestExpectedResponse;
-    const data_b64 = payload.object.get("data_b64") orelse return error.TestExpectedResponse;
-    if (data_b64 != .string) return error.TestExpectedResponse;
-
-    const decoded_len = std.base64.standard.Decoder.calcSizeForSlice(data_b64.string) catch return error.TestExpectedResponse;
-    const decoded = try allocator.alloc(u8, decoded_len);
-    errdefer allocator.free(decoded);
-    _ = std.base64.standard.Decoder.decode(decoded, data_b64.string) catch return error.TestExpectedResponse;
-
-    try writeClientTextFrameMasked(client, "{\"channel\":\"acheron\",\"type\":\"acheron.t_clunk\",\"tag\":23,\"fid\":3}");
-    var clunk = try readServerFrameForProtocolTest(allocator, client);
-    defer clunk.deinit(allocator);
-    try std.testing.expect(std.mem.indexOf(u8, clunk.payload, "\"type\":\"acheron.r_clunk\"") != null);
-
-    return decoded;
+    var close_reply = try readServerFrame(allocator, client);
+    defer close_reply.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0x8), close_reply.opcode);
 }
 
 const WorkspaceScopeSnapshot = struct {
@@ -9902,7 +9240,7 @@ fn expectWorkspaceScopeSnapshotsEqual(
     }
 }
 
-test "server_piai: base websocket path handles unified control/acheron chat flow and rejects legacy session.send" {
+test "server_piai: base websocket path handles unified control and rejects legacy runtime channels" {
     const allocator = std.testing.allocator;
     var runtime_registry = AgentRuntimeRegistry.init(allocator, .{
         .ltm_directory = "",
@@ -9952,18 +9290,11 @@ test "server_piai: base websocket path handles unified control/acheron chat flow
     try std.testing.expect(std.mem.indexOf(u8, debug_sub.payload, "\"type\":\"control.error\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, debug_sub.payload, "\"code\":\"unsupported_legacy_api\"") != null);
 
-    const job_name = try fsrpcWriteChatInput(allocator, &client, "hello");
-    defer allocator.free(job_name);
-
     try writeClientTextFrameMasked(&client, "{\"channel\":\"control\",\"type\":\"control.debug_unsubscribe\",\"id\":\"req-debug-unsub\"}");
     var debug_unsub = try readServerFrame(allocator, &client);
     defer debug_unsub.deinit(allocator);
     try std.testing.expect(std.mem.indexOf(u8, debug_unsub.payload, "\"type\":\"control.error\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, debug_unsub.payload, "\"code\":\"unsupported_legacy_api\"") != null);
-
-    const result = try fsrpcReadJobResult(allocator, &client, job_name);
-    defer allocator.free(result);
-    try std.testing.expect(result.len > 0);
 
     try writeClientTextFrameMasked(&client, "{\"id\":\"req-chat\",\"type\":\"session.send\",\"content\":\"legacy\"}");
     var legacy_reply = try readServerFrame(allocator, &client);
@@ -9972,10 +9303,7 @@ test "server_piai: base websocket path handles unified control/acheron chat flow
     try std.testing.expect(std.mem.indexOf(u8, legacy_reply.payload, "\"type\":\"control.error\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, legacy_reply.payload, "\"code\":\"unsupported_legacy_api\"") != null);
 
-    try websocket_transport.writeFrame(&client, "", .close);
-    var close_reply = try readServerFrame(allocator, &client);
-    defer close_reply.deinit(allocator);
-    try std.testing.expectEqual(@as(u8, 0x8), close_reply.opcode);
+    try expectLegacyAcheronRejected(allocator, &client);
 
     try std.testing.expect(server_ctx.err_name == null);
 }
@@ -10335,11 +9663,12 @@ test "server_piai: operator token gate protects control mutations" {
     try std.testing.expect(std.mem.indexOf(u8, bad_token.payload, "\"type\":\"control.error\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, bad_token.payload, "\"code\":\"operator_auth_failed\"") != null);
 
-    try writeClientTextFrameMasked(&client, "{\"channel\":\"control\",\"type\":\"control.project_create\",\"id\":\"p-good\",\"payload\":{\"name\":\"GoodToken\",\"vision\":\"GoodToken\",\"operator_token\":\"operator-secret\"}}");
+    try writeClientTextFrameMasked(&client, "{\"channel\":\"control\",\"type\":\"control.workspace_create\",\"id\":\"p-good\",\"payload\":{\"name\":\"GoodToken\",\"vision\":\"GoodToken\",\"operator_token\":\"operator-secret\"}}");
     var good = try readServerFrame(allocator, &client);
     defer good.deinit(allocator);
-    try std.testing.expect(std.mem.indexOf(u8, good.payload, "\"type\":\"control.project_create\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, good.payload, "\"project_id\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, good.payload, "\"type\":\"control.workspace_create\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, good.payload, "\"workspace_id\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, good.payload, "\"workspace_token\"") != null);
 
     try websocket_transport.writeFrame(&client, "", .close);
     var close_reply = try readServerFrame(allocator, &client);
@@ -10349,7 +9678,7 @@ test "server_piai: operator token gate protects control mutations" {
     try std.testing.expect(server_ctx.err_name == null);
 }
 
-test "server_piai: fsrpc fid state survives across frames for unchanged binding" {
+test "server_piai: base websocket rejects legacy acheron runtime session" {
     const allocator = std.testing.allocator;
     var runtime_registry = AgentRuntimeRegistry.init(allocator, .{
         .ltm_directory = "",
@@ -10376,16 +9705,7 @@ test "server_piai: fsrpc fid state survives across frames for unchanged binding"
 
     try performClientHandshakeWithBearerToken(allocator, &client, "/", "admin-secret");
     try fsrpcConnectAndAttach(allocator, &client, "fid-survive");
-
-    try writeClientTextFrameMasked(&client, "{\"channel\":\"acheron\",\"type\":\"acheron.t_walk\",\"tag\":30,\"fid\":1,\"newfid\":2,\"path\":[\"capabilities\",\"chat\"]}");
-    var walk = try readServerFrame(allocator, &client);
-    defer walk.deinit(allocator);
-    try std.testing.expect(std.mem.indexOf(u8, walk.payload, "\"type\":\"acheron.r_walk\"") != null);
-
-    try websocket_transport.writeFrame(&client, "", .close);
-    var close_reply = try readServerFrame(allocator, &client);
-    defer close_reply.deinit(allocator);
-    try std.testing.expectEqual(@as(u8, 0x8), close_reply.opcode);
+    try expectLegacyAcheronRejected(allocator, &client);
 
     try std.testing.expect(server_ctx.err_name == null);
 }
@@ -10605,6 +9925,57 @@ test "server_piai: user connect advertises provisioning gate when no remembered 
 
     try websocket_transport.writeFrame(&user_client, "", .close);
     var close_reply = try readServerFrame(allocator, &user_client);
+    defer close_reply.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0x8), close_reply.opcode);
+
+    try std.testing.expect(server_ctx.err_name == null);
+}
+
+test "server_piai: provisioning gate still allows workspace bootstrap control operations" {
+    const allocator = std.testing.allocator;
+    var runtime_registry = AgentRuntimeRegistry.init(allocator, .{
+        .ltm_directory = "",
+        .ltm_filename = "",
+    }, null);
+    defer runtime_registry.deinit();
+    try setAuthTokensForTests(&runtime_registry, "admin-secret", "user-secret");
+
+    var listener = try (try std.net.Address.parseIp("127.0.0.1", 0)).listen(.{ .reuse_address = true });
+    defer listener.deinit();
+
+    var server_ctx = WsTestServerCtx{
+        .allocator = allocator,
+        .runtime_registry = &runtime_registry,
+        .listener = &listener,
+    };
+    defer server_ctx.deinit();
+
+    const server_thread = try std.Thread.spawn(.{}, runSingleWsConnection, .{&server_ctx});
+    defer server_thread.join();
+
+    var admin_client = try std.net.tcpConnectToAddress(listener.listen_address);
+    defer admin_client.close();
+    try performClientHandshakeWithBearerToken(allocator, &admin_client, "/", "admin-secret");
+
+    try writeClientTextFrameMasked(&admin_client, "{\"channel\":\"control\",\"type\":\"control.version\",\"id\":\"bootstrap-version\",\"payload\":{\"protocol\":\"unified-v2\"}}");
+    var version_ack = try readServerFrame(allocator, &admin_client);
+    defer version_ack.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, version_ack.payload, "\"type\":\"control.version_ack\"") != null);
+
+    try writeClientTextFrameMasked(&admin_client, "{\"channel\":\"control\",\"type\":\"control.connect\",\"id\":\"bootstrap-connect\"}");
+    var connect_ack = try readServerFrame(allocator, &admin_client);
+    defer connect_ack.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, connect_ack.payload, "\"type\":\"control.connect_ack\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, connect_ack.payload, "\"connect_gate\":{\"code\":\"provisioning_required\"") != null);
+
+    try writeClientTextFrameMasked(&admin_client, "{\"channel\":\"control\",\"type\":\"control.workspace_create\",\"id\":\"bootstrap-create\",\"payload\":{\"name\":\"Bootstrap\",\"vision\":\"Bootstrap workspace\"}}");
+    var create_ack = try readServerFrame(allocator, &admin_client);
+    defer create_ack.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, create_ack.payload, "\"type\":\"control.workspace_create\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, create_ack.payload, "\"workspace_id\"") != null);
+
+    try websocket_transport.writeFrame(&admin_client, "", .close);
+    var close_reply = try readServerFrame(allocator, &admin_client);
     defer close_reply.deinit(allocator);
     try std.testing.expectEqual(@as(u8, 0x8), close_reply.opcode);
 
@@ -11056,7 +10427,7 @@ test "server_piai: session_attach rejects project changes while jobs are in-flig
     try std.testing.expect(server_ctx.err_name == null);
 }
 
-test "server_piai: session_attach forbids mother on non-system project" {
+test "server_piai: session_attach forbids reserved system agent on non-system workspace" {
     const allocator = std.testing.allocator;
     var runtime_registry = AgentRuntimeRegistry.init(allocator, .{
         .ltm_directory = "",
@@ -11093,19 +10464,19 @@ test "server_piai: session_attach forbids mother on non-system project" {
     defer client.close();
     try performClientHandshakeWithBearerToken(allocator, &client, "/", "admin-secret");
 
-    try writeClientTextFrameMasked(&client, "{\"channel\":\"control\",\"type\":\"control.version\",\"id\":\"mother-guard-version\",\"payload\":{\"protocol\":\"unified-v2\"}}");
+    try writeClientTextFrameMasked(&client, "{\"channel\":\"control\",\"type\":\"control.version\",\"id\":\"system-agent-guard-version\",\"payload\":{\"protocol\":\"unified-v2\"}}");
     var version_ack = try readServerFrame(allocator, &client);
     defer version_ack.deinit(allocator);
     try std.testing.expect(std.mem.indexOf(u8, version_ack.payload, "\"type\":\"control.version_ack\"") != null);
 
-    try writeClientTextFrameMasked(&client, "{\"channel\":\"control\",\"type\":\"control.connect\",\"id\":\"mother-guard-connect\"}");
+    try writeClientTextFrameMasked(&client, "{\"channel\":\"control\",\"type\":\"control.connect\",\"id\":\"system-agent-guard-connect\"}");
     var connect_ack = try readServerFrame(allocator, &client);
     defer connect_ack.deinit(allocator);
     try std.testing.expect(std.mem.indexOf(u8, connect_ack.payload, "\"type\":\"control.connect_ack\"") != null);
 
     const attach_request = try std.fmt.allocPrint(
         allocator,
-        "{{\"channel\":\"control\",\"type\":\"control.session_attach\",\"id\":\"mother-guard-attach\",\"payload\":{{\"session_key\":\"main\",\"agent_id\":\"{s}\",\"project_id\":\"{s}\"}}}}",
+        "{{\"channel\":\"control\",\"type\":\"control.session_attach\",\"id\":\"system-agent-guard-attach\",\"payload\":{{\"session_key\":\"main\",\"agent_id\":\"{s}\",\"project_id\":\"{s}\"}}}}",
         .{ system_agent_id, non_system_project_id },
     );
     defer allocator.free(attach_request);
@@ -11115,7 +10486,7 @@ test "server_piai: session_attach forbids mother on non-system project" {
     defer attach_error.deinit(allocator);
     try std.testing.expect(std.mem.indexOf(u8, attach_error.payload, "\"type\":\"control.error\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, attach_error.payload, "\"code\":\"forbidden\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, attach_error.payload, "mother can only attach to system project") != null);
+    try std.testing.expect(std.mem.indexOf(u8, attach_error.payload, "reserved system agent can only attach to the reserved system workspace") != null);
 
     try websocket_transport.writeFrame(&client, "", .close);
     var close_reply = try readServerFrame(allocator, &client);
@@ -11178,7 +10549,7 @@ test "server_piai: debug subscription control operations are unsupported in ache
     try std.testing.expect(server_ctx.err_name == null);
 }
 
-test "server_piai: base path routes all connections to default runtime" {
+test "server_piai: base path rejects legacy runtime connections cleanly across reconnects" {
     const allocator = std.testing.allocator;
     var runtime_registry = AgentRuntimeRegistry.init(allocator, .{
         .ltm_directory = "",
@@ -11206,13 +10577,7 @@ test "server_piai: base path routes all connections to default runtime" {
         try performClientHandshakeWithBearerToken(allocator, &client, "/", "admin-secret");
 
         try fsrpcConnectAndAttach(allocator, &client, "a-connect");
-        const alpha_job = try fsrpcWriteChatInput(allocator, &client, "alpha hello");
-        defer allocator.free(alpha_job);
-
-        try websocket_transport.writeFrame(&client, "", .close);
-        var close_reply = try readServerFrame(allocator, &client);
-        defer close_reply.deinit(allocator);
-        try std.testing.expectEqual(@as(u8, 0x8), close_reply.opcode);
+        try expectLegacyAcheronRejected(allocator, &client);
     }
 
     {
@@ -11224,26 +10589,10 @@ test "server_piai: base path routes all connections to default runtime" {
         try performClientHandshakeWithBearerToken(allocator, &client, "/", "admin-secret");
 
         try fsrpcConnectAndAttach(allocator, &client, "b-connect");
-        const beta_job = try fsrpcWriteChatInput(allocator, &client, "beta hello");
-        defer allocator.free(beta_job);
-
-        try websocket_transport.writeFrame(&client, "", .close);
-        var close_reply = try readServerFrame(allocator, &client);
-        defer close_reply.deinit(allocator);
-        try std.testing.expectEqual(@as(u8, 0x8), close_reply.opcode);
+        try expectLegacyAcheronRejected(allocator, &client);
     }
 
-    const runtime = try runtime_registry.getOrCreate(runtime_registry.default_agent_id, null, null);
-    defer runtime.release();
-    try std.testing.expect(runtime.kind == .local);
-    const snapshot = try runtime.local.?.runtime.active_memory.snapshotActive(allocator, "primary");
-    defer memory.deinitItems(allocator, snapshot);
-    const snapshot_json = try memory.toActiveMemoryJson(allocator, "primary", snapshot);
-    defer allocator.free(snapshot_json);
-
-    try std.testing.expect(std.mem.indexOf(u8, snapshot_json, "alpha hello") != null);
-    try std.testing.expect(std.mem.indexOf(u8, snapshot_json, "beta hello") != null);
-    try std.testing.expectEqual(@as(usize, 1), runtime_registry.by_agent.count());
+    try std.testing.expectEqual(@as(usize, 0), runtime_registry.by_agent.count());
 
     try std.testing.expect(server_ctx.err_name == null);
 }

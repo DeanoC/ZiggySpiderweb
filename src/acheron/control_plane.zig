@@ -297,14 +297,20 @@ const ProjectTemplateSpec = struct {
 
 const minimum_template_bind_specs = [_]ProjectTemplateBindSpec{
     .{ .bind_path = "/services/mounts", .target_path = "/nodes/local/venoms/mounts" },
+    .{ .bind_path = "/services/home", .target_path = "/nodes/local/venoms/home" },
+    .{ .bind_path = "/services/workers", .target_path = "/nodes/local/venoms/workers" },
 };
 
 const system_template_bind_specs = [_]ProjectTemplateBindSpec{
     .{ .bind_path = "/services/mounts", .target_path = "/nodes/local/venoms/mounts" },
+    .{ .bind_path = "/services/home", .target_path = "/nodes/local/venoms/home" },
+    .{ .bind_path = "/services/workers", .target_path = "/nodes/local/venoms/workers" },
 };
 
 const github_template_bind_specs = [_]ProjectTemplateBindSpec{
     .{ .bind_path = "/services/mounts", .target_path = "/nodes/local/venoms/mounts" },
+    .{ .bind_path = "/services/home", .target_path = "/nodes/local/venoms/home" },
+    .{ .bind_path = "/services/workers", .target_path = "/nodes/local/venoms/workers" },
     .{ .bind_path = "/services/git", .target_path = "/nodes/local/venoms/git" },
     .{ .bind_path = "/services/github_pr", .target_path = "/nodes/local/venoms/github_pr" },
     .{ .bind_path = "/services/missions", .target_path = "/nodes/local/venoms/missions" },
@@ -312,7 +318,6 @@ const github_template_bind_specs = [_]ProjectTemplateBindSpec{
     .{ .bind_path = "/services/terminal", .target_path = "/nodes/local/venoms/terminal" },
     .{ .bind_path = "/services/events", .target_path = "/nodes/local/venoms/events" },
     .{ .bind_path = "/services/library", .target_path = "/nodes/local/venoms/library" },
-    .{ .bind_path = "/services/memory", .target_path = "/nodes/local/venoms/memory" },
     .{ .bind_path = "/services/search_code", .target_path = "/nodes/local/venoms/search_code" },
     .{ .bind_path = "/services/web_search", .target_path = "/nodes/local/venoms/web_search" },
 };

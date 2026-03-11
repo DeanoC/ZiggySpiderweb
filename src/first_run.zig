@@ -1,15 +1,5 @@
 const std = @import("std");
 const Config = @import("config.zig");
-const credential_store = @import("credential_store.zig");
-const provider_models = @import("provider_models.zig");
-const ziggy_piai = @import("ziggy-piai");
-const max_agent_id_len: usize = 64;
-
-fn print(comptime fmt: []const u8, args: anytype) !void {
-    var buf: [4096]u8 = undefined;
-    const msg = try std.fmt.bufPrint(&buf, fmt, args);
-    try std.fs.File.stdout().writeAll(msg);
-}
 
 fn println(comptime fmt: []const u8, args: anytype) !void {
     var buf: [4096]u8 = undefined;
@@ -18,341 +8,70 @@ fn println(comptime fmt: []const u8, args: anytype) !void {
 }
 
 pub fn runFirstRun(allocator: std.mem.Allocator, args: []const []const u8) !void {
-    // Check for non-interactive mode
     var non_interactive = false;
-    var provider_param: ?[]const u8 = null;
-    var model_param: ?[]const u8 = null;
-    var agent_name_param: ?[]const u8 = null;
+    var saw_legacy_provider_flag = false;
+    var saw_legacy_model_flag = false;
+    var saw_legacy_agent_flag = false;
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--non-interactive")) {
             non_interactive = true;
         } else if (std.mem.eql(u8, args[i], "--provider")) {
-            i += 1;
-            if (i < args.len) provider_param = args[i];
+            saw_legacy_provider_flag = true;
+            if (i + 1 < args.len) i += 1;
         } else if (std.mem.eql(u8, args[i], "--model")) {
-            i += 1;
-            if (i < args.len) model_param = args[i];
+            saw_legacy_model_flag = true;
+            if (i + 1 < args.len) i += 1;
         } else if (std.mem.eql(u8, args[i], "--agent")) {
-            i += 1;
-            if (i < args.len) agent_name_param = args[i];
+            saw_legacy_agent_flag = true;
+            if (i + 1 < args.len) i += 1;
+        } else {
+            std.log.err("Unknown first-run option: {s}", .{args[i]});
+            return error.InvalidArguments;
         }
     }
 
-    // Print banner
     try std.fs.File.stdout().writeAll("\n");
     try std.fs.File.stdout().writeAll("╔═══════════════════════════════════════════════════════════════╗\n");
     try std.fs.File.stdout().writeAll("║                                                               ║\n");
-    try std.fs.File.stdout().writeAll("║   Spiderweb - First Time Setup                           ║\n");
+    try std.fs.File.stdout().writeAll("║   Spiderweb - Workspace Setup                                 ║\n");
     try std.fs.File.stdout().writeAll("║                                                               ║\n");
     try std.fs.File.stdout().writeAll("╚═══════════════════════════════════════════════════════════════╝\n");
     try std.fs.File.stdout().writeAll("\n");
 
-    // Step 1: Provider selection
-    const provider_name, const selected_model_name = if (non_interactive) blk: {
-        const p = provider_param orelse {
-            std.log.err("--provider required in non-interactive mode", .{});
-            return error.InvalidArguments;
-        };
-        break :blk .{ p, model_param };
-    } else blk: {
-        break :blk try selectProviderInteractive(allocator);
-    };
+    var config = try Config.init(allocator, null);
+    defer config.deinit();
 
-    var model_name = selected_model_name;
-    if (model_name) |value| {
-        if (provider_models.remapLegacyModel(provider_name, value)) |mapped| {
-            std.log.warn("Model {s}/{s} is deprecated; using {s}", .{ provider_name, value, mapped });
-            model_name = mapped;
-        }
-    } else {
-        model_name = provider_models.preferredDefaultModel(provider_name);
+    if (saw_legacy_provider_flag or saw_legacy_model_flag or saw_legacy_agent_flag) {
+        try std.fs.File.stdout().writeAll(
+            "Legacy provider/agent setup flags were ignored. Spiderweb now expects external workers such as Spider Monkey to own model and credential configuration.\n\n",
+        );
     }
 
-    // Step 2: Configure credentials
-    try configureCredentials(allocator, provider_name, non_interactive);
+    try std.fs.File.stdout().writeAll("Spiderweb is configured as a workspace host and mounted-filesystem control plane.\n");
+    try std.fs.File.stdout().writeAll("Provider selection, OAuth, and API-key setup belong in the external worker repo.\n");
+    try std.fs.File.stdout().writeAll("If runtime.spider_web_root is empty, Spiderweb uses its current working directory as the default local workspace root.\n");
 
-    // Step 3: Save configuration
-    {
-        var config = try Config.init(allocator, null);
-        defer config.deinit();
-        try config.setProvider(provider_name, model_name);
-        std.log.info("Configuration saved", .{});
+    if (!non_interactive) {
+        try std.fs.File.stdout().writeAll("\n");
     }
 
-    // Step 4: Summary
-    try std.fs.File.stdout().writeAll("\n");
     try std.fs.File.stdout().writeAll("╔═══════════════════════════════════════════════════════════════╗\n");
     try std.fs.File.stdout().writeAll("║  Setup Complete!                                              ║\n");
     try std.fs.File.stdout().writeAll("╚═══════════════════════════════════════════════════════════════╝\n");
-    try println("\n  Provider: {s}/{s}", .{ provider_name, model_name orelse "default" });
-    if (agent_name_param) |hint| {
-        if (normalizeAgentId(allocator, hint)) |normalized| {
-            defer allocator.free(normalized);
-            try println("  First agent hint: {s}", .{normalized});
-        } else |_| {
-            try println("  First agent hint: {s}", .{hint});
-        }
-    }
-    try std.fs.File.stdout().writeAll("  System agent: mother (auto-managed)\n");
-    try std.fs.File.stdout().writeAll("  Config: ~/.config/spiderweb/config.json\n");
-    try std.fs.File.stdout().writeAll("\nNext steps:\n");
-    try std.fs.File.stdout().writeAll("  Start server:    spiderweb\n");
-    try std.fs.File.stdout().writeAll("  Connect client:  zss connect --url ws://127.0.0.1:18790\n");
-    try std.fs.File.stdout().writeAll("  Bootstrap:       admin chats with Mother to create first project + agent\n");
+    try println("\n  Config: {s}", .{config.config_path});
+    try println("  Server: ws://{s}:{d}", .{ config.server.bind, config.server.port });
+    try std.fs.File.stdout().writeAll("  Worker model: external filesystem agents\n");
+    try std.fs.File.stdout().writeAll("\nManual v1 flow:\n");
+    try std.fs.File.stdout().writeAll("  1. Start Spiderweb: spiderweb\n");
+    try std.fs.File.stdout().writeAll("  2. Create a workspace: spiderweb-control workspace_create '{\"name\":\"Demo\",\"vision\":\"Mounted workspace\"}'\n");
+    try std.fs.File.stdout().writeAll("  3. Mount it locally: spiderweb-fs-mount --url ws://127.0.0.1:18790/ --workspace-id <workspace-id> <mountpoint>\n");
+    try std.fs.File.stdout().writeAll("  4. Start Spider Monkey: spider-monkey run --workspace-root <mountpoint>\n");
+    try std.fs.File.stdout().writeAll("\nUseful commands:\n");
+    try std.fs.File.stdout().writeAll("  spiderweb-config auth status\n");
+    try std.fs.File.stdout().writeAll("  spiderweb-config config set-server --bind 0.0.0.0 --port 18790\n");
+    try std.fs.File.stdout().writeAll("  spiderweb-control workspace_list\n");
     try std.fs.File.stdout().writeAll("\nInstall systemd service:\n");
     try std.fs.File.stdout().writeAll("  spiderweb-config config install-service\n");
-
-    if (!non_interactive) {
-        // Check if spiderweb is already running (via systemd or manual)
-        const is_running = blk: {
-            // Try to check if process exists (exact match)
-            const result = std.process.Child.run(.{
-                .allocator = allocator,
-                .argv = &.{ "pgrep", "-x", "spiderweb" },
-            }) catch break :blk false;
-            defer allocator.free(result.stdout);
-            defer allocator.free(result.stderr);
-            break :blk result.term == .Exited and result.term.Exited == 0;
-        };
-
-        if (!is_running) {
-            try std.fs.File.stdout().writeAll("\nStart the server now? [Y/n]: ");
-            const line = try readLineTrimmedAlloc(allocator, 8);
-            defer if (line) |value| allocator.free(value);
-
-            if (line == null or line.?.len == 0 or (line.?[0] != 'n' and line.?[0] != 'N')) {
-                try std.fs.File.stdout().writeAll("\nStarting Spiderweb...\n");
-
-                // Check if systemd user service exists
-                const systemd_user_exists = blk: {
-                    const home = std.process.getEnvVarOwned(allocator, "HOME") catch break :blk false;
-                    defer allocator.free(home);
-                    const path = std.fs.path.join(allocator, &.{ home, ".config/systemd/user/spiderweb.service" }) catch break :blk false;
-                    defer allocator.free(path);
-                    std.fs.accessAbsolute(path, .{}) catch break :blk false;
-                    break :blk true;
-                };
-
-                // Check if systemd system service exists
-                const systemd_system_exists = blk: {
-                    std.fs.accessAbsolute("/etc/systemd/system/spiderweb.service", .{}) catch break :blk false;
-                    break :blk true;
-                };
-
-                if (systemd_user_exists) {
-                    // Use systemd user service
-                    var child = std.process.Child.init(&.{ "systemctl", "--user", "start", "spiderweb" }, allocator);
-                    _ = child.spawn() catch {};
-                } else if (systemd_system_exists) {
-                    // Use systemd system service
-                    var child = std.process.Child.init(&.{ "sudo", "systemctl", "start", "spiderweb" }, allocator);
-                    _ = child.spawn() catch {};
-                } else {
-                    // Start directly
-                    var child = std.process.Child.init(&.{"spiderweb"}, allocator);
-                    child.stdin_behavior = .Ignore;
-                    child.stdout_behavior = .Ignore;
-                    child.stderr_behavior = .Ignore;
-                    _ = child.spawn() catch {};
-                }
-                std.Thread.sleep(1 * std.time.ns_per_s);
-            }
-        } else {
-            try std.fs.File.stdout().writeAll("\nSpiderweb is already running.\n");
-        }
-    }
-}
-
-fn selectProviderInteractive(allocator: std.mem.Allocator) !struct { []const u8, ?[]const u8 } {
-    try std.fs.File.stdout().writeAll("\nSelect your AI provider:\n\n");
-    try std.fs.File.stdout().writeAll("Quick setup:\n");
-    try std.fs.File.stdout().writeAll("  1) OpenAI        - GPT-4o, GPT-4.1\n");
-    try std.fs.File.stdout().writeAll("  2) OpenAI Codex  - GPT-5.3 Codex (with OAuth support)\n");
-    try std.fs.File.stdout().writeAll("  3) Kimi Coding   - Kimi K2, K2.5 (Moonshot AI)\n");
-    try std.fs.File.stdout().writeAll("\n  4) Manual setup  - Other providers\n");
-
-    while (true) {
-        try std.fs.File.stdout().writeAll("\nSelect [1-4]: ");
-        const choice_line = try readLineTrimmedAlloc(allocator, 16);
-        defer if (choice_line) |value| allocator.free(value);
-
-        if (choice_line == null) {
-            // EOF - probably piped without input, use default
-            return .{ "openai", "gpt-4o-mini" };
-        }
-
-        const choice = choice_line.?;
-
-        if (std.mem.eql(u8, choice, "1")) {
-            return .{ "openai", try selectModel(allocator, &.{ "gpt-4o-mini", "gpt-4.1-mini" }) };
-        } else if (std.mem.eql(u8, choice, "2")) {
-            return .{ "openai-codex", try selectModel(allocator, &.{ "gpt-5.3-codex", "gpt-5.3-codex-spark", "gpt-5.2-codex", "gpt-5.1-codex-mini" }) };
-        } else if (std.mem.eql(u8, choice, "3")) {
-            return .{ "kimi-coding", try selectModel(allocator, &.{ "k2p5", "kimi-k2.5" }) };
-        } else if (std.mem.eql(u8, choice, "4")) {
-            try std.fs.File.stdout().writeAll("\nAvailable providers: openai, openai-codex, openai-codex-spark, kimi-coding\n");
-            try std.fs.File.stdout().writeAll("Enter provider name: ");
-            const provider_name = try readLineTrimmedAlloc(allocator, 64);
-            defer if (provider_name) |value| allocator.free(value);
-            if (provider_name == null or provider_name.?.len == 0) continue;
-
-            try std.fs.File.stdout().writeAll("Enter model name: ");
-            const model_name = try readLineTrimmedAlloc(allocator, 64);
-            defer if (model_name) |value| allocator.free(value);
-
-            return .{
-                try allocator.dupe(u8, provider_name.?),
-                if (model_name != null and model_name.?.len > 0) try allocator.dupe(u8, model_name.?) else null,
-            };
-        }
-    }
-}
-
-fn selectModel(allocator: std.mem.Allocator, models: []const []const u8) !?[]const u8 {
-    try std.fs.File.stdout().writeAll("\nAvailable models:\n");
-    for (models, 1..) |model, idx| {
-        try print("  {d}) {s}\n", .{ idx, model });
-    }
-    try print("\nSelect [1-{d}]: ", .{models.len});
-
-    const choice_line = try readLineTrimmedAlloc(allocator, 16);
-    defer if (choice_line) |value| allocator.free(value);
-    if (choice_line == null or choice_line.?.len == 0) return models[0];
-
-    const choice = std.fmt.parseInt(usize, choice_line.?, 10) catch return models[0];
-    if (choice < 1 or choice > models.len) return models[0];
-
-    return models[choice - 1];
-}
-
-fn configureCredentials(allocator: std.mem.Allocator, provider_name: []const u8, non_interactive: bool) !void {
-    _ = non_interactive;
-
-    // Check for Codex OAuth
-    if (std.mem.startsWith(u8, provider_name, "openai-codex")) {
-        const home = std.process.getEnvVarOwned(allocator, "HOME") catch return;
-        defer allocator.free(home);
-
-        const codex_auth_path = try std.fs.path.join(allocator, &.{ home, ".codex", "auth.json" });
-        defer allocator.free(codex_auth_path);
-
-        if (std.fs.accessAbsolute(codex_auth_path, .{})) {
-            try std.fs.File.stdout().writeAll("\nFound ~/.codex/auth.json - OAuth available\n");
-            try std.fs.File.stdout().writeAll("Use Codex OAuth authentication? [Y/n]: ");
-
-            const line = try readLineTrimmedAlloc(allocator, 8);
-            defer if (line) |value| allocator.free(value);
-            if (line == null or line.?.len == 0 or (line.?[0] != 'n' and line.?[0] != 'N')) {
-                try std.fs.File.stdout().writeAll("Using Codex OAuth\n");
-                return;
-            }
-        } else |_| {
-            // No auth.json found
-        }
-    }
-
-    // Check for environment variable
-    if (ziggy_piai.env_api_keys.getEnvApiKey(allocator, provider_name)) |key| {
-        defer allocator.free(key);
-        try print("\nFound API key in environment for {s}\n", .{provider_name});
-        return;
-    }
-
-    // Check secure store
-    const store = credential_store.CredentialStore.init(allocator);
-    if (store.getProviderApiKey(provider_name)) |key| {
-        defer allocator.free(key);
-        try print("\nFound API key in secure storage for {s}\n", .{provider_name});
-        return;
-    }
-
-    // Prompt for API key
-    try std.fs.File.stdout().writeAll("\nAPI Key Setup\n");
-    try std.fs.File.stdout().writeAll("Your API key will be stored securely using secret-tool.\n\n");
-    try std.fs.File.stdout().writeAll("Enter API key: ");
-
-    const key = try readLineTrimmedAlloc(allocator, 256);
-    defer if (key) |value| allocator.free(value);
-    if (key == null or key.?.len == 0) return;
-
-    if (!store.supportsSecureStorage()) {
-        try std.fs.File.stdout().writeAll("\nWarning: No secure credential backend available.\n");
-        try std.fs.File.stdout().writeAll("Set the API key via environment variable instead.\n");
-        return;
-    }
-
-    try store.setProviderApiKey(provider_name, key.?);
-    try std.fs.File.stdout().writeAll("API key stored securely\n");
-}
-
-fn readLineTrimmedAlloc(allocator: std.mem.Allocator, max_len: usize) !?[]u8 {
-    var out = std.ArrayListUnmanaged(u8){};
-    errdefer out.deinit(allocator);
-
-    var saw_any = false;
-    var stdin = std.fs.File.stdin();
-    var byte: [1]u8 = undefined;
-    while (true) {
-        const n = try stdin.read(byte[0..]);
-        if (n == 0) break;
-        saw_any = true;
-
-        const ch = byte[0];
-        if (ch == '\n') break;
-        if (ch == '\r') continue;
-
-        if (out.items.len >= max_len) return error.InputTooLong;
-        try out.append(allocator, ch);
-    }
-
-    if (!saw_any and out.items.len == 0) return null;
-
-    const trimmed = std.mem.trim(u8, out.items, " \t");
-    if (trimmed.len == 0) {
-        out.deinit(allocator);
-        return try allocator.dupe(u8, "");
-    }
-    const dup = try allocator.dupe(u8, trimmed);
-    out.deinit(allocator);
-    return dup;
-}
-
-fn normalizeAgentId(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
-    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
-    if (trimmed.len == 0) return allocator.dupe(u8, "ziggy");
-
-    var out = std.ArrayListUnmanaged(u8){};
-    errdefer out.deinit(allocator);
-
-    var last_dash = false;
-    for (trimmed) |ch| {
-        const lower = std.ascii.toLower(ch);
-        if (std.ascii.isAlphanumeric(lower) or lower == '_' or lower == '-') {
-            try out.append(allocator, lower);
-            last_dash = false;
-            continue;
-        }
-
-        if (!last_dash) {
-            try out.append(allocator, '-');
-            last_dash = true;
-        }
-    }
-
-    while (out.items.len > 0 and out.items[0] == '-') {
-        _ = out.orderedRemove(0);
-    }
-    while (out.items.len > 0 and out.items[out.items.len - 1] == '-') {
-        _ = out.pop();
-    }
-
-    if (out.items.len == 0) {
-        out.deinit(allocator);
-        return allocator.dupe(u8, "ziggy");
-    }
-    if (out.items.len > max_agent_id_len) return error.AgentIdTooLong;
-
-    return out.toOwnedSlice(allocator);
 }

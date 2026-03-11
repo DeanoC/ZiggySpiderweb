@@ -7,9 +7,9 @@ pub fn seedNamespaceAt(self: anytype, jobs_dir: u32, base_path: []const u8) !voi
     try self.addDirectoryDescriptors(
         jobs_dir,
         "Jobs",
-        "{\"kind\":\"collection\",\"entries\":\"job_id\",\"files\":[\"status.json\",\"result.txt\",\"log.txt\"]}",
+        "{\"kind\":\"collection\",\"entries\":\"job_id\",\"files\":[\"request.json\",\"status.json\",\"result.txt\",\"log.txt\"]}",
         "{\"read\":true,\"write\":false}",
-        "Chat job status and outputs.",
+        "Chat job requests, status, and outputs.",
     );
     const jobs_schema_json = try shared_node.venom_contracts.jobs.renderSchemaJson(self.allocator, base_path);
     defer self.allocator.free(jobs_schema_json);
@@ -29,6 +29,7 @@ pub fn seedFromIndex(self: anytype) !void {
     for (jobs) |job| {
         if (self.lookupChild(self.jobs_root_id, job.job_id) != null) continue;
         const job_dir = try self.addDir(self.jobs_root_id, job.job_id, false);
+        _ = try self.addFile(job_dir, "request.json", job.request_text orelse "", false, .none);
         const status_json = try self.buildJobStatusJson(job.state, job.correlation_id, job.error_text);
         defer self.allocator.free(status_json);
         _ = try self.addFile(job_dir, "status.json", status_json, true, .job_status);

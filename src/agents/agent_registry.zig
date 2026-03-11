@@ -77,28 +77,20 @@ pub const AgentRegistry = struct {
         defer agents_dir.close();
 
         var has_default = false;
-        var mother_index: ?usize = null;
         var it = agents_dir.iterate();
         while (try it.next()) |entry| {
             if (entry.kind != .directory) continue;
 
             const agent = try self.loadAgent(entry.name, agents_dir_path);
-            if (std.mem.eql(u8, agent.id, "mother")) {
-                mother_index = self.agents.items.len;
-            }
             if (agent.is_default) {
                 has_default = true;
             }
             try self.agents.append(self.allocator, agent);
         }
 
-        // If no agent is marked as default, prefer Mother and otherwise the first agent.
+        // If no agent is marked as default, use the first discovered agent.
         if (!has_default and self.agents.items.len > 0) {
-            if (mother_index) |idx| {
-                self.agents.items[idx].is_default = true;
-            } else {
-                self.agents.items[0].is_default = true;
-            }
+            self.agents.items[0].is_default = true;
         }
     }
 
