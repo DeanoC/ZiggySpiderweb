@@ -277,7 +277,7 @@ pub fn executeOpPayload(self: anytype, op: Op, args_obj: std.json.ObjectMap) ![]
     return switch (op) {
         .create => blk: {
             const use_case = extractOptionalStringByNames(args_obj, &[_][]const u8{ "use_case", "kind" }) orelse return error.InvalidPayload;
-            const allow_override = self.is_admin or std.mem.eql(u8, self.agent_id, "mother");
+            const allow_override = self.is_admin;
             const agent_id = if (allow_override)
                 extractOptionalStringByNames(args_obj, &[_][]const u8{"agent_id"})
             else

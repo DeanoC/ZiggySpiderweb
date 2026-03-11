@@ -536,21 +536,6 @@ fi
 # Ensure remaining install steps run from the spiderweb repo.
 cd "$REPO_DIR"
 
-# Ensure Mother system agent scaffold exists.
-log_info "Ensuring Mother system agent scaffold..."
-mkdir -p "$REPO_DIR/agents/mother"
-if [[ ! -f "$REPO_DIR/agents/mother/agent.json" ]]; then
-cat > "$REPO_DIR/agents/mother/agent.json" <<'EOF'
-{
-  "persona_pack": "default",
-  "name": "Mother",
-  "description": "System orchestration and bootstrap guardian",
-  "is_default": true,
-  "capabilities": ["chat","plan","code","research"]
-}
-EOF
-fi
-
 # Ask about systemd service
 INSTALL_SYSTEMD=false
 SYSTEMD_SCOPE="user"

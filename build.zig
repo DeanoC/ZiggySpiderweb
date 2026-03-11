@@ -273,35 +273,69 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run spiderweb workspace host");
     run_step.dependOn(&run_cmd.step);
 
-    // Tests
-    const test_mod = b.createModule(.{
-        .root_source_file = b.path("src/test_root.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    test_mod.addIncludePath(b.path("src/c"));
-    test_mod.addImport("agent_config", agent_config_mod);
-    test_mod.addImport("spider-protocol", spider_protocol_module);
-    test_mod.addImport("spiderweb_node", spiderweb_node_module);
-    test_mod.addImport("spiderweb_fs", spiderweb_fs_protocol_module);
-    test_mod.addImport("spiderweb_fs_cache", spiderweb_fs_cache_mod);
-    test_mod.addImport("spiderweb_fs_source_policy", spiderweb_fs_source_policy_mod);
-    test_mod.addImport("ziggy-memory-store", ziggy_memory_store_module);
-    test_mod.addImport("ziggy-tool-runtime", ziggy_tool_runtime_module);
-    test_mod.addImport("ziggy-runtime-hooks", ziggy_runtime_hooks_module);
-    test_mod.addImport("ziggy-run-orchestrator", ziggy_run_orchestrator_module);
+    const test_step = b.step("test", "Run tests");
 
     const spiderweb_tests = b.addTest(.{
-        .root_module = test_mod,
+        .root_module = spiderweb_mod,
     });
     spiderweb_tests.linkLibrary(fuse_compat_lib);
     applySqliteLibraryPath(spiderweb_tests, sqlite_lib_dir);
     spiderweb_tests.linkLibC();
     spiderweb_tests.linkSystemLibrary("sqlite3");
+    const run_spiderweb_tests = b.addRunArtifact(spiderweb_tests);
+    test_step.dependOn(&run_spiderweb_tests.step);
 
-    const run_tests = b.addRunArtifact(spiderweb_tests);
-    const test_step = b.step("test", "Run tests");
-    test_step.dependOn(&run_tests.step);
+    const config_tests = b.addTest(.{
+        .root_module = config_mod,
+    });
+    config_tests.linkLibC();
+    const run_config_tests = b.addRunArtifact(config_tests);
+    test_step.dependOn(&run_config_tests.step);
+
+    const control_tests = b.addTest(.{
+        .root_module = control_mod,
+    });
+    control_tests.linkLibC();
+    const run_control_tests = b.addRunArtifact(control_tests);
+    test_step.dependOn(&run_control_tests.step);
+
+    const client_tests = b.addTest(.{
+        .root_module = acheron_fs_client_mod,
+    });
+    const run_client_tests = b.addRunArtifact(client_tests);
+    test_step.dependOn(&run_client_tests.step);
+
+    const router_tests = b.addTest(.{
+        .root_module = acheron_fs_router_mod,
+    });
+    const run_router_tests = b.addRunArtifact(router_tests);
+    test_step.dependOn(&run_router_tests.step);
+
+    const fs_cache_tests = b.addTest(.{
+        .root_module = spiderweb_fs_cache_mod,
+    });
+    const run_fs_cache_tests = b.addRunArtifact(fs_cache_tests);
+    test_step.dependOn(&run_fs_cache_tests.step);
+
+    const fs_source_policy_tests = b.addTest(.{
+        .root_module = spiderweb_fs_source_policy_mod,
+    });
+    const run_fs_source_policy_tests = b.addRunArtifact(fs_source_policy_tests);
+    test_step.dependOn(&run_fs_source_policy_tests.step);
+
+    const fs_fuse_adapter_tests = b.addTest(.{
+        .root_module = spiderweb_fs_fuse_adapter_mod,
+    });
+    fs_fuse_adapter_tests.linkLibrary(fuse_compat_lib);
+    fs_fuse_adapter_tests.linkLibC();
+    const run_fs_fuse_adapter_tests = b.addRunArtifact(fs_fuse_adapter_tests);
+    test_step.dependOn(&run_fs_fuse_adapter_tests.step);
+
+    const websocket_transport_tests = b.addTest(.{
+        .root_module = websocket_transport_mod,
+    });
+    const run_websocket_transport_tests = b.addRunArtifact(websocket_transport_tests);
+    test_step.dependOn(&run_websocket_transport_tests.step);
 
     const fs_mount_tests = b.addTest(.{
         .root_module = fs_mount_mod,
@@ -309,6 +343,7 @@ pub fn build(b: *std.Build) void {
     fs_mount_tests.linkLibrary(fuse_compat_lib);
     fs_mount_tests.linkLibC();
     const run_fs_mount_tests = b.addRunArtifact(fs_mount_tests);
+    test_step.dependOn(&run_fs_mount_tests.step);
     const fs_mount_test_step = b.step("test-fs-mount", "Run spiderweb-fs-mount client tests");
     fs_mount_test_step.dependOn(&run_fs_mount_tests.step);
 }

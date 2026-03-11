@@ -39,7 +39,7 @@ const local_node_name_env = "SPIDERWEB_LOCAL_NODE_NAME";
 const local_node_lease_ttl_env = "SPIDERWEB_LOCAL_NODE_LEASE_TTL_MS";
 const local_node_heartbeat_ms_env = "SPIDERWEB_LOCAL_NODE_HEARTBEAT_MS";
 const local_node_watcher_enabled_env = "SPIDERWEB_LOCAL_NODE_WATCHER_ENABLED";
-const system_agent_id = "mother";
+const system_agent_id = "spiderweb";
 const system_project_id = control_plane_mod.spider_web_project_id;
 const local_node_default_workspace_export_name = "system-workspace";
 const local_node_agents_export_name = "system-agents";
@@ -8978,17 +8978,17 @@ test "server_piai: control.agent_list and control.agent_get expose registry meta
     defer allocator.free(agents_dir);
     try std.fs.cwd().makePath(agents_dir);
 
-    const mother_dir = try std.fs.path.join(allocator, &.{ agents_dir, "mother" });
-    defer allocator.free(mother_dir);
-    try std.fs.cwd().makePath(mother_dir);
-    const mother_json_path = try std.fs.path.join(allocator, &.{ mother_dir, "agent.json" });
-    defer allocator.free(mother_json_path);
+    const system_agent_dir = try std.fs.path.join(allocator, &.{ agents_dir, system_agent_id });
+    defer allocator.free(system_agent_dir);
+    try std.fs.cwd().makePath(system_agent_dir);
+    const system_agent_json_path = try std.fs.path.join(allocator, &.{ system_agent_dir, "agent.json" });
+    defer allocator.free(system_agent_json_path);
     try std.fs.cwd().writeFile(.{
-        .sub_path = mother_json_path,
+        .sub_path = system_agent_json_path,
         .data =
         \\{
-        \\  "name": "Mother",
-        \\  "description": "Primary orchestrator",
+        \\  "name": "Spiderweb",
+        \\  "description": "Workspace host control identity",
         \\  "is_default": true,
         \\  "capabilities": ["chat","plan"]
         \\}
@@ -9016,7 +9016,7 @@ test "server_piai: control.agent_list and control.agent_get expose registry meta
         .ltm_filename = "",
         .agents_dir = agents_dir,
         .assets_dir = root,
-        .default_agent_id = "mother",
+        .default_agent_id = system_agent_id,
     }, null);
     defer runtime_registry.deinit();
     try setAuthTokensForTests(&runtime_registry, "admin-secret", "user-secret");
@@ -9053,7 +9053,7 @@ test "server_piai: control.agent_list and control.agent_get expose registry meta
     var list_reply = try readServerFrame(allocator, &client);
     defer list_reply.deinit(allocator);
     try std.testing.expect(std.mem.indexOf(u8, list_reply.payload, "\"type\":\"control.agent_list\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, list_reply.payload, "\"id\":\"mother\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, list_reply.payload, "\"id\":\"spiderweb\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, list_reply.payload, "\"id\":\"bob\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, list_reply.payload, "\"capabilities\":[\"chat\",\"plan\"]") != null);
 
@@ -9080,17 +9080,17 @@ test "server_piai: control.agent_ensure creates missing agents and is idempotent
     defer allocator.free(agents_dir);
     try std.fs.cwd().makePath(agents_dir);
 
-    const mother_dir = try std.fs.path.join(allocator, &.{ agents_dir, "mother" });
-    defer allocator.free(mother_dir);
-    try std.fs.cwd().makePath(mother_dir);
-    const mother_json_path = try std.fs.path.join(allocator, &.{ mother_dir, "agent.json" });
-    defer allocator.free(mother_json_path);
+    const system_agent_dir = try std.fs.path.join(allocator, &.{ agents_dir, system_agent_id });
+    defer allocator.free(system_agent_dir);
+    try std.fs.cwd().makePath(system_agent_dir);
+    const system_agent_json_path = try std.fs.path.join(allocator, &.{ system_agent_dir, "agent.json" });
+    defer allocator.free(system_agent_json_path);
     try std.fs.cwd().writeFile(.{
-        .sub_path = mother_json_path,
+        .sub_path = system_agent_json_path,
         .data =
         \\{
-        \\  "name": "Mother",
-        \\  "description": "Primary orchestrator",
+        \\  "name": "Spiderweb",
+        \\  "description": "Workspace host control identity",
         \\  "is_default": true,
         \\  "capabilities": ["chat","plan"]
         \\}
@@ -9102,7 +9102,7 @@ test "server_piai: control.agent_ensure creates missing agents and is idempotent
         .ltm_filename = "",
         .agents_dir = agents_dir,
         .assets_dir = root,
-        .default_agent_id = "mother",
+        .default_agent_id = system_agent_id,
     }, null);
     defer runtime_registry.deinit();
     try setAuthTokensForTests(&runtime_registry, "admin-secret", "user-secret");
