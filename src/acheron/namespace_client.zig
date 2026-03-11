@@ -269,11 +269,10 @@ pub const NamespaceClient = struct {
 
     pub fn keepActiveSessionAlive(self: *NamespaceClient) !void {
         const session_key = self.active_session_key orelse return;
-        const had_namespace_attached = self.namespace_attached;
         var status = blk: {
             break :blk self.controlSessionStatus(session_key, true) catch |err| {
                 if (!isTransportError(err)) return err;
-                try self.recoverActiveSessionTransport(session_key, had_namespace_attached);
+                try self.recoverActiveSessionTransport(session_key);
                 break :blk try self.controlSessionStatus(session_key, true);
             };
         };
@@ -284,7 +283,7 @@ pub const NamespaceClient = struct {
         return self.getattrOnce(path) catch |err| {
             if (!isTransportError(err)) return err;
             const session_key = self.active_session_key orelse return err;
-            try self.recoverActiveSessionTransport(session_key, self.namespace_attached);
+            try self.recoverActiveSessionTransport(session_key);
             return self.getattrOnce(path);
         };
     }
@@ -298,7 +297,7 @@ pub const NamespaceClient = struct {
         return self.readdirOnce(path, cookie, max_entries) catch |err| {
             if (!isTransportError(err)) return err;
             const session_key = self.active_session_key orelse return err;
-            try self.recoverActiveSessionTransport(session_key, self.namespace_attached);
+            try self.recoverActiveSessionTransport(session_key);
             return self.readdirOnce(path, cookie, max_entries);
         };
     }
@@ -359,7 +358,7 @@ pub const NamespaceClient = struct {
         return self.openOnce(path, flags) catch |err| {
             if (!isTransportError(err)) return err;
             const session_key = self.active_session_key orelse return err;
-            try self.recoverActiveSessionTransport(session_key, self.namespace_attached);
+            try self.recoverActiveSessionTransport(session_key);
             return self.openOnce(path, flags);
         };
     }
@@ -392,7 +391,7 @@ pub const NamespaceClient = struct {
         return self.readFid(state.fid, off, len) catch |err| {
             if (!isTransportError(err)) return err;
             const session_key = self.active_session_key orelse return err;
-            try self.recoverActiveSessionTransport(session_key, self.namespace_attached);
+            try self.recoverActiveSessionTransport(session_key);
             const recovered = try self.resolveOpenHandleForIo(handle.handle_id);
             return self.readFid(recovered.fid, off, len);
         };
@@ -415,7 +414,7 @@ pub const NamespaceClient = struct {
         return self.writeFid(state.fid, off, data) catch |err| {
             if (!isTransportError(err)) return err;
             const session_key = self.active_session_key orelse return err;
-            try self.recoverActiveSessionTransport(session_key, self.namespace_attached);
+            try self.recoverActiveSessionTransport(session_key);
             const recovered = try self.resolveOpenHandleForIo(handle.handle_id);
             return self.writeFid(recovered.fid, off, data);
         };
@@ -440,6 +439,7 @@ pub const NamespaceClient = struct {
         if (self.open_handles.fetchRemove(handle.handle_id)) |removed| {
             var state = removed.value;
             defer state.deinit(self.allocator);
+            if (state.fid == 0) return;
             self.clunk(state.fid) catch |err| {
                 if (!isTransportError(err)) return err;
             };
@@ -748,13 +748,8 @@ pub const NamespaceClient = struct {
         try self.attachNamespaceRoot(session_key);
     }
 
-    fn recoverActiveSessionTransport(
-        self: *NamespaceClient,
-        session_key: []const u8,
-        had_namespace_attached: bool,
-    ) !void {
+    fn recoverActiveSessionTransport(self: *NamespaceClient, session_key: []const u8) !void {
         try self.reconnectControlSession(session_key);
-        if (!had_namespace_attached) return;
         try self.attachNamespaceRoot(session_key);
         try self.reopenAllTrackedHandles();
     }
