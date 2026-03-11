@@ -9,9 +9,27 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    const spider_protocol_module = spider_protocol_dep.module("spider-protocol");
+    const spider_protocol_protocol_module = b.createModule(.{
+        .root_source_file = b.path("deps/spider-protocol/src/protocol.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const spider_protocol_unified_module = b.createModule(.{
+        .root_source_file = b.path("deps/spider-protocol/src/unified.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const spider_protocol_module = b.createModule(.{
+        .root_source_file = b.path("src/build_support/spider_protocol_host.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    spider_protocol_module.addImport("spider-protocol-protocol", spider_protocol_protocol_module);
+    spider_protocol_module.addImport("spider-protocol-unified", spider_protocol_unified_module);
     const spiderweb_node_module = spider_protocol_dep.module("spiderweb_node");
     const spiderweb_fs_protocol_module = spider_protocol_dep.module("spiderweb_fs");
+    spiderweb_node_module.addImport("spider-protocol", spider_protocol_module);
+    spiderweb_fs_protocol_module.addImport("spider-protocol", spider_protocol_module);
     const ziggy_memory_store_dep = b.dependency("ziggy_memory_store", .{
         .target = target,
         .optimize = optimize,
