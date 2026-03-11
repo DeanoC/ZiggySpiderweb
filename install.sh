@@ -464,7 +464,6 @@ git -C "$REPO_DIR" submodule sync --recursive
 git -C "$REPO_DIR" submodule update --init --recursive
 REPO_BASE_DIR="$(dirname "$REPO_DIR")"
 log_info "Ensuring local Ziggy module dependencies..."
-ensure_git_repo "${REPO_BASE_DIR}/ZiggyPiAi" "https://github.com/DeanoC/ZiggyPiAi.git"
 ensure_git_repo "${REPO_BASE_DIR}/ZiggyMemoryStore" "https://github.com/DeanoC/ZiggyMemoryStore.git"
 ensure_git_repo "${REPO_BASE_DIR}/ZiggyToolRuntime" "https://github.com/DeanoC/ZiggyToolRuntime.git"
 ensure_git_repo "${REPO_BASE_DIR}/ZiggyRuntimeHooks" "https://github.com/DeanoC/ZiggyRuntimeHooks.git"
@@ -478,7 +477,7 @@ zig build -Doptimize=ReleaseSafe
 log_info "Installing binaries..."
 mkdir -p "$INSTALL_DIR"
 
-SPIDERWEB_BINARIES=(spiderweb spiderweb-config spiderweb-control spiderweb-fs-mount spiderweb-agent-runtime)
+SPIDERWEB_BINARIES=(spiderweb spiderweb-config spiderweb-control spiderweb-fs-mount)
 for bin in "${SPIDERWEB_BINARIES[@]}"; do
     if [[ ! -x "zig-out/bin/${bin}" ]]; then
         echo "Error: expected build artifact missing: zig-out/bin/${bin}"
@@ -647,19 +646,14 @@ if [[ -t 0 ]]; then
     fi
 fi
 
-# Run first-run wizard
 echo ""
-log_info "Starting first-time setup..."
+log_info "Preparing local workspace-host config..."
 echo ""
 
 if [[ -n "${SPIDERWEB_NON_INTERACTIVE:-}" ]]; then
-    # Non-interactive mode - skip first-run, user should run manually
-    log_info "Skipping interactive first-time setup (non-interactive mode)"
-    log_info "Run 'spiderweb-config first-run' manually to configure provider/auth"
+    log_info "Skipping interactive setup notes (non-interactive mode)"
 else
-    # Clear any leftover input before running first-run
-    while IFS= read -r -t 0.1 dummy 2>/dev/null; do : ; done
-    "${INSTALL_DIR}/spiderweb-config" first-run
+    "${INSTALL_DIR}/spiderweb-config" first-run --non-interactive
 fi
 
 # Only configure bind address in interactive mode (when we asked the user)
@@ -691,7 +685,7 @@ if [[ -t 0 ]]; then
             log_info "Restarting spiderweb with new bind address..."
             pkill -x spiderweb 2>/dev/null || true
             sleep 1
-            # spiderweb-config first-run will have started it, or user can start manually
+            # User can start Spiderweb manually after install when not using systemd.
             "${INSTALL_DIR}/spiderweb" &
         fi
     fi
@@ -742,14 +736,13 @@ fi
 print_auth_tokens_summary
 
 echo ""
+echo "Next steps:"
+echo "  1. Reveal auth tokens: spiderweb-config auth status --reveal"
+echo "  2. Create a workspace: spiderweb-control workspace_create '{\"name\":\"Demo\",\"vision\":\"Mounted workspace\"}'"
+echo "  3. Mount it: spiderweb-fs-mount --workspace-url ws://127.0.0.1:${CURRENT_PORT}/ --auth-token <admin-token> --workspace-id <workspace-id> mount ./workspace"
+echo "  4. Start Spider Monkey: spider-monkey run --workspace-root ./workspace"
 if [[ "$INSTALL_ZSS" == "true" ]]; then
-    echo "Connect to your agent:"
-    echo "  Local:  zss connect"
-    # Only show remote URL if remote access is enabled
-    if [[ -t 0 ]] && [[ "$BIND_ADDRESS" == "0.0.0.0" ]]; then
-        echo "  Remote: zss connect --url ws://<host-ip>:${CURRENT_PORT}"
-    fi
-else
-    echo "To connect to your agent, install ZiggyStarSpider:"
-    echo "  https://github.com/DeanoC/ZiggyStarSpider"
+    echo ""
+    echo "Optional GUI/tooling:"
+    echo "  zss connect"
 fi

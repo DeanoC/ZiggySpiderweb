@@ -5,12 +5,6 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     const sqlite_lib_dir = b.option([]const u8, "sqlite-lib-dir", "Directory containing sqlite3 import library and runtime DLL");
 
-    // Get ziggy-piai dependency
-    const ziggy_piai_dep = b.dependency("ziggy_piai", .{
-        .target = target,
-        .optimize = optimize,
-    });
-    const ziggy_piai_module = ziggy_piai_dep.module("ziggypiai");
     const spider_protocol_dep = b.dependency("spider_protocol", .{
         .target = target,
         .optimize = optimize,
@@ -170,7 +164,6 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     spiderweb_mod.addIncludePath(b.path("src/c"));
-    spiderweb_mod.addImport("ziggy-piai", ziggy_piai_module);
     spiderweb_mod.addImport("spider-protocol", spider_protocol_module);
     spiderweb_mod.addImport("spiderweb_node", spiderweb_node_module);
     spiderweb_mod.addImport("spiderweb_fs", spiderweb_fs_protocol_module);
@@ -243,7 +236,6 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    config_mod.addImport("ziggy-piai", ziggy_piai_module);
 
     const config_cli = b.addExecutable(.{
         .name = "spiderweb-config",
@@ -283,12 +275,11 @@ pub fn build(b: *std.Build) void {
 
     // Tests
     const test_mod = b.createModule(.{
-        .root_source_file = b.path("src/main.zig"),
+        .root_source_file = b.path("src/test_root.zig"),
         .target = target,
         .optimize = optimize,
     });
     test_mod.addIncludePath(b.path("src/c"));
-    test_mod.addImport("ziggy-piai", ziggy_piai_module);
     test_mod.addImport("agent_config", agent_config_mod);
     test_mod.addImport("spider-protocol", spider_protocol_module);
     test_mod.addImport("spiderweb_node", spiderweb_node_module);

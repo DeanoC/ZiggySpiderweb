@@ -3,25 +3,6 @@ const std = @import("std");
 const server = @import("server_piai.zig");
 const Config = @import("config.zig");
 
-comptime {
-    _ = @import("agents/agent_runtime.zig");
-    _ = @import("agents/brain_context.zig");
-    _ = @import("agents/capability_engine.zig");
-    _ = @import("agents/brain_specialization.zig");
-    _ = @import("ziggy-runtime-hooks").event_bus;
-    _ = @import("ziggy-run-orchestrator").run_engine;
-    _ = @import("agents/hook_registry.zig");
-    _ = @import("agents/system_hooks.zig");
-    _ = @import("ziggy-memory-store").ltm_store;
-    _ = @import("ziggy-memory-store").memory;
-    _ = @import("agents/memory_schema.zig");
-    _ = @import("ziggy-memory-store").memid;
-    _ = @import("prompt_compiler.zig");
-    _ = @import("spider-protocol").protocol;
-    _ = @import("ziggy-memory-store").run_store;
-    _ = @import("ziggy-tool-runtime").tool_registry;
-}
-
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -106,5 +87,5 @@ pub fn main() !void {
     }
 
     // Start server
-    try server.run(allocator, bind_addr, port, config.provider, config.runtime);
+    try server.run(allocator, bind_addr, port, config.runtime);
 }
