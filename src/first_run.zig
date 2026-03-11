@@ -66,7 +66,7 @@ pub fn runFirstRun(allocator: std.mem.Allocator, args: []const []const u8) !void
     try std.fs.File.stdout().writeAll("\nManual v1 flow:\n");
     try std.fs.File.stdout().writeAll("  1. Start Spiderweb: spiderweb\n");
     try std.fs.File.stdout().writeAll("  2. Create a workspace: spiderweb-control workspace_create '{\"name\":\"Demo\",\"vision\":\"Mounted workspace\"}'\n");
-    try std.fs.File.stdout().writeAll("  3. Mount it locally: spiderweb-fs-mount --url ws://127.0.0.1:18790/ --workspace-id <workspace-id> <mountpoint>\n");
+    try std.fs.File.stdout().writeAll("  3. Mount it locally: spiderweb-fs-mount --workspace-url ws://127.0.0.1:18790/ --workspace-id <workspace-id> mount <mountpoint>\n");
     try std.fs.File.stdout().writeAll("  4. Start Spider Monkey: spider-monkey run --workspace-root <mountpoint>\n");
     try std.fs.File.stdout().writeAll("\nUseful commands:\n");
     try std.fs.File.stdout().writeAll("  spiderweb-config auth status\n");

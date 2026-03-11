@@ -310,7 +310,6 @@ fn resolveRuntimeBaseDirectory(
     spider_web_root: []const u8,
     config_path: []const u8,
 ) ![]u8 {
-    _ = ltm_directory;
     _ = config_path;
     const configured_root = std.mem.trim(u8, spider_web_root, " \t\r\n");
     if (configured_root.len > 0 and !std.mem.eql(u8, configured_root, "/")) {
@@ -319,11 +318,35 @@ fn resolveRuntimeBaseDirectory(
         defer allocator.free(cwd);
         return std.fs.path.join(allocator, &.{ cwd, configured_root });
     }
+
+    if (try detectServiceWorkingDirectory(allocator)) |service_dir| {
+        errdefer allocator.free(service_dir);
+        if (try currentDirectoryOwnsRuntimeStorage(allocator, ltm_directory)) return currentShellWorkingDirectory(allocator);
+        return service_dir;
+    }
+
     const cwd = try currentShellWorkingDirectory(allocator);
     if (cwd.len > 0 and !std.mem.eql(u8, cwd, "/")) return cwd;
     allocator.free(cwd);
-    if (try detectServiceWorkingDirectory(allocator)) |service_dir| return service_dir;
     return currentShellWorkingDirectory(allocator);
+}
+
+fn currentDirectoryOwnsRuntimeStorage(allocator: std.mem.Allocator, ltm_directory: []const u8) !bool {
+    const cwd = try currentShellWorkingDirectory(allocator);
+    defer allocator.free(cwd);
+    if (cwd.len == 0 or std.mem.eql(u8, cwd, "/")) return false;
+
+    const storage_dir = try resolveRuntimeStorageDirectoryWithBase(allocator, ltm_directory, cwd);
+    defer allocator.free(storage_dir);
+
+    const auth_tokens_path = try std.fs.path.join(allocator, &.{ storage_dir, auth_tokens_filename });
+    defer allocator.free(auth_tokens_path);
+    return pathExists(auth_tokens_path);
+}
+
+fn pathExists(path: []const u8) bool {
+    std.fs.accessAbsolute(path, .{}) catch return false;
+    return true;
 }
 
 fn currentShellWorkingDirectory(allocator: std.mem.Allocator) ![]u8 {
