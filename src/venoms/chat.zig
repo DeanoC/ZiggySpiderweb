@@ -65,9 +65,10 @@ pub fn handleInputWrite(self: anytype, msg: *const unified.ParsedMessage, raw_in
     defer self.allocator.free(job_name);
 
     const job_dir = try self.addDir(self.jobs_root_id, job_name, false);
-    try self.job_index.setRequestText(job_name, input);
     const request_json = try buildChatJobRequestJson(self, job_name, input, correlation_id);
     defer self.allocator.free(request_json);
+    try self.job_index.setRequestText(job_name, input);
+    try self.job_index.setRequestEnvelopeJson(job_name, request_json);
     _ = try self.addFile(job_dir, "request.json", request_json, false, .none);
     const queued_status = try self.buildJobStatusJson(.queued, correlation_id, null);
     defer self.allocator.free(queued_status);

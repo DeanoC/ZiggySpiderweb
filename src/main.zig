@@ -54,7 +54,7 @@ pub fn main() !void {
             "Workspace-first flow:\n" ++
             "  spiderweb-config first-run\n" ++
             "  spiderweb-control workspace_create '{\"name\":\"Demo\",\"vision\":\"Deliver the demo workspace\"}'\n" ++
-            "  spiderweb-fs-mount --workspace-id <workspace-id> ./workspace\n" ++
+            "  spiderweb-fs-mount --workspace-url ws://127.0.0.1:18790/ --workspace-id <workspace-id> mount ./workspace\n" ++
             "  spider-monkey run --workspace-root ./workspace\n" ++
             "\n";
         std.debug.print("{s}", .{help});
