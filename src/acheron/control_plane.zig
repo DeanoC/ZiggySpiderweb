@@ -8486,6 +8486,30 @@ test "acheron_control_plane: node venom upsert rejects runtime mismatch with ins
     try std.testing.expectError(ControlPlaneError.VenomPackageRuntimeMismatch, plane.nodeVenomUpsert(upsert_req));
 }
 
+test "acheron_control_plane: builtin jobs package accepts local node export upsert" {
+    const allocator = std.testing.allocator;
+    var plane = ControlPlane.init(allocator);
+    defer plane.deinit();
+
+    const joined = try plane.ensureNode("spiderweb-local", "", 60_000);
+    defer allocator.free(joined);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, joined, .{});
+    defer parsed.deinit();
+    const node_id = parsed.value.object.get("node_id").?.string;
+    const node_secret = parsed.value.object.get("node_secret").?.string;
+
+    const upsert_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"node_id\":\"{s}\",\"node_secret\":\"{s}\",\"platform\":{{\"os\":\"linux\",\"arch\":\"amd64\",\"runtime_kind\":\"spiderweb\"}},\"venoms\":[{{\"venom_id\":\"jobs\",\"kind\":\"jobs\",\"version\":\"1\",\"state\":\"online\",\"package_id\":\"jobs\",\"provider_scope\":\"node_export\",\"hosts\":[\"spiderweb\",\"node\"],\"projection_modes\":[\"session_dynamic\",\"host_local\",\"node_export\"],\"requirements\":{{}},\"endpoints\":[\"/nodes/{s}/jobs\"],\"capabilities\":{{\"invoke\":true}},\"ops\":{{\"model\":\"namespace\",\"invoke\":\"control/invoke.json\"}},\"runtime\":{{\"type\":\"builtin\",\"abi\":\"venom-driver-v1\"}},\"permissions\":{{\"default\":\"allow-by-default\"}},\"schema\":{{\"model\":\"namespace-jobs-v1\"}}}}]}}",
+        .{ node_id, node_secret, node_id },
+    );
+    defer allocator.free(upsert_req);
+
+    const upserted = try plane.nodeVenomUpsert(upsert_req);
+    defer allocator.free(upserted);
+    try std.testing.expect(std.mem.indexOf(u8, upserted, "\"venom_id\":\"jobs\"") != null);
+}
+
 test "acheron_control_plane: worker venom instantiation requires package dependencies" {
     const allocator = std.testing.allocator;
     var plane = ControlPlane.init(allocator);
