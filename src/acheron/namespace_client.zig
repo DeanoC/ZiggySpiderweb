@@ -662,7 +662,10 @@ pub const NamespaceClient = struct {
     }
 
     fn setActiveSessionKey(self: *NamespaceClient, session_key: []const u8) !void {
-        if (self.active_session_key) |value| self.allocator.free(value);
+        if (self.active_session_key) |value| {
+            if (std.mem.eql(u8, value, session_key)) return;
+            self.allocator.free(value);
+        }
         self.active_session_key = try self.allocator.dupe(u8, session_key);
     }
 
@@ -751,15 +754,37 @@ pub const NamespaceClient = struct {
         had_namespace_attached: bool,
     ) !void {
         try self.reconnectControlSession(session_key);
-        if (had_namespace_attached) try self.attachNamespaceRoot(session_key);
+        if (!had_namespace_attached) return;
+        try self.attachNamespaceRoot(session_key);
+        try self.reopenAllTrackedHandles();
     }
 
     fn resolveOpenHandleForIo(self: *NamespaceClient, handle_id: u64) !*OpenHandleState {
+        const state = self.open_handles.getPtr(handle_id) orelse return error.InvalidState;
+        if (state.fid == 0) return self.reopenTrackedHandle(handle_id);
+        return state;
+    }
+
+    fn reopenAllTrackedHandles(self: *NamespaceClient) !void {
+        var handle_ids = std.ArrayListUnmanaged(u64){};
+        defer handle_ids.deinit(self.allocator);
+
+        var it = self.open_handles.iterator();
+        while (it.next()) |entry| {
+            entry.value_ptr.fid = 0;
+            try handle_ids.append(self.allocator, entry.key_ptr.*);
+        }
+        for (handle_ids.items) |handle_id| {
+            _ = try self.reopenTrackedHandle(handle_id);
+        }
+    }
+
+    fn resolveOpenHandle(self: *NamespaceClient, handle_id: u64) !*OpenHandleState {
         return self.open_handles.getPtr(handle_id) orelse error.InvalidState;
     }
 
     fn reopenTrackedHandle(self: *NamespaceClient, handle_id: u64) !*OpenHandleState {
-        const state = self.open_handles.getPtr(handle_id) orelse return error.InvalidState;
+        const state = try self.resolveOpenHandle(handle_id);
         const new_fid = try self.walkPathToNewFid(state.path);
         errdefer self.clunk(new_fid) catch {};
         try self.openFid(new_fid, if (flagsRequireWrite(state.flags)) "rw" else "r");
@@ -1433,6 +1458,18 @@ test "namespace_client: parseConnectInfo preserves workspace payload and mount p
     try std.testing.expect(info.has_workspace_mounts);
     try std.testing.expect(info.workspace_json != null);
     try std.testing.expect(std.mem.indexOf(u8, info.workspace_json.?, "\"mounts\"") != null);
+}
+
+test "namespace_client: setActiveSessionKey reuses identical session ids safely" {
+    var client: NamespaceClient = undefined;
+    client.allocator = std.testing.allocator;
+    client.active_session_key = try std.testing.allocator.dupe(u8, "sess-a");
+    defer if (client.active_session_key) |value| std.testing.allocator.free(value);
+
+    const before = client.active_session_key.?;
+    try client.setActiveSessionKey(before);
+    try std.testing.expect(client.active_session_key != null);
+    try std.testing.expect(client.active_session_key.?.ptr == before.ptr);
 }
 
 test "namespace_client: isTransportError recognizes reconnect-worthy failures" {
