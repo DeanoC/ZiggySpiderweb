@@ -393,7 +393,7 @@ pub const NamespaceClient = struct {
             if (!isTransportError(err)) return err;
             const session_key = self.active_session_key orelse return err;
             try self.recoverActiveSessionTransport(session_key, self.namespace_attached);
-            const recovered = try self.reopenTrackedHandle(handle.handle_id);
+            const recovered = try self.resolveOpenHandleForIo(handle.handle_id);
             return self.readFid(recovered.fid, off, len);
         };
     }
@@ -416,7 +416,7 @@ pub const NamespaceClient = struct {
             if (!isTransportError(err)) return err;
             const session_key = self.active_session_key orelse return err;
             try self.recoverActiveSessionTransport(session_key, self.namespace_attached);
-            const recovered = try self.reopenTrackedHandle(handle.handle_id);
+            const recovered = try self.resolveOpenHandleForIo(handle.handle_id);
             return self.writeFid(recovered.fid, off, data);
         };
     }
@@ -775,7 +775,13 @@ pub const NamespaceClient = struct {
             try handle_ids.append(self.allocator, entry.key_ptr.*);
         }
         for (handle_ids.items) |handle_id| {
-            _ = try self.reopenTrackedHandle(handle_id);
+            _ = self.reopenTrackedHandle(handle_id) catch |err| {
+                std.log.warn("namespace reconnect: failed to reopen tracked handle {d}: {s}", .{
+                    handle_id,
+                    @errorName(err),
+                });
+                continue;
+            };
         }
     }
 
