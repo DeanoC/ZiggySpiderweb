@@ -77,6 +77,18 @@ const SessionStatusInfo = struct {
     }
 };
 
+const OpenHandleState = struct {
+    path: []u8,
+    flags: u32,
+    fid: u32,
+    writable: bool,
+
+    fn deinit(self: *OpenHandleState, allocator: std.mem.Allocator) void {
+        allocator.free(self.path);
+        self.* = undefined;
+    }
+};
+
 pub const NamespaceClient = struct {
     allocator: std.mem.Allocator,
     namespace_url: []u8,
@@ -91,6 +103,8 @@ pub const NamespaceClient = struct {
     active_agent_id: ?[]u8 = null,
     active_project_id: ?[]u8 = null,
     active_project_token: ?[]u8 = null,
+    next_handle_id: u64 = 1,
+    open_handles: std.AutoHashMapUnmanaged(u64, OpenHandleState) = .{},
 
     pub fn connect(
         allocator: std.mem.Allocator,
@@ -125,6 +139,12 @@ pub const NamespaceClient = struct {
     }
 
     pub fn deinit(self: *NamespaceClient) void {
+        var open_it = self.open_handles.iterator();
+        while (open_it.next()) |entry| {
+            var state = entry.value_ptr.*;
+            state.deinit(self.allocator);
+        }
+        self.open_handles.deinit(self.allocator);
         if (self.active_session_key) |value| self.allocator.free(value);
         if (self.active_agent_id) |value| self.allocator.free(value);
         if (self.active_project_id) |value| self.allocator.free(value);
@@ -247,12 +267,43 @@ pub const NamespaceClient = struct {
         self.next_fid = 2;
     }
 
+    pub fn keepActiveSessionAlive(self: *NamespaceClient) !void {
+        const session_key = self.active_session_key orelse return;
+        const had_namespace_attached = self.namespace_attached;
+        var status = blk: {
+            break :blk self.controlSessionStatus(session_key, true) catch |err| {
+                if (!isTransportError(err)) return err;
+                try self.recoverActiveSessionTransport(session_key, had_namespace_attached);
+                break :blk try self.controlSessionStatus(session_key, true);
+            };
+        };
+        status.deinit(self.allocator);
+    }
+
     pub fn getattr(self: *NamespaceClient, path: []const u8) ![]u8 {
+        return self.getattrOnce(path) catch |err| {
+            if (!isTransportError(err)) return err;
+            const session_key = self.active_session_key orelse return err;
+            try self.recoverActiveSessionTransport(session_key, self.namespace_attached);
+            return self.getattrOnce(path);
+        };
+    }
+
+    fn getattrOnce(self: *NamespaceClient, path: []const u8) ![]u8 {
         const stat = try self.statPath(path);
         return self.statToAttrJson(stat);
     }
 
     pub fn readdir(self: *NamespaceClient, path: []const u8, cookie: u64, max_entries: u32) ![]u8 {
+        return self.readdirOnce(path, cookie, max_entries) catch |err| {
+            if (!isTransportError(err)) return err;
+            const session_key = self.active_session_key orelse return err;
+            try self.recoverActiveSessionTransport(session_key, self.namespace_attached);
+            return self.readdirOnce(path, cookie, max_entries);
+        };
+    }
+
+    fn readdirOnce(self: *NamespaceClient, path: []const u8, cookie: u64, max_entries: u32) ![]u8 {
         const stat = try self.statPath(path);
         if (stat.kind != .dir) return error.NotDirectory;
 
@@ -305,22 +356,53 @@ pub const NamespaceClient = struct {
     }
 
     pub fn open(self: *NamespaceClient, path: []const u8, flags: u32) !NamespaceHandle {
+        return self.openOnce(path, flags) catch |err| {
+            if (!isTransportError(err)) return err;
+            const session_key = self.active_session_key orelse return err;
+            try self.recoverActiveSessionTransport(session_key, self.namespace_attached);
+            return self.openOnce(path, flags);
+        };
+    }
+
+    fn openOnce(self: *NamespaceClient, path: []const u8, flags: u32) !NamespaceHandle {
         const stat = try self.statPath(path);
         const fid = try self.walkPathToNewFid(path);
         errdefer self.clunk(fid) catch {};
         try self.openFid(fid, if (flagsRequireWrite(flags)) "rw" else "r");
-        return .{
+        const owned_path = try self.allocator.dupe(u8, path);
+        errdefer self.allocator.free(owned_path);
+        const handle_id = self.next_handle_id;
+        self.next_handle_id +%= 1;
+        if (self.next_handle_id == 0) self.next_handle_id = 1;
+        try self.open_handles.put(self.allocator, handle_id, .{
+            .path = owned_path,
+            .flags = flags,
             .fid = fid,
+            .writable = stat.writable,
+        });
+        return .{
+            .handle_id = handle_id,
             .writable = stat.writable,
         };
     }
 
     pub fn read(self: *NamespaceClient, handle: NamespaceHandle, off: u64, len: u32) ![]u8 {
         if (len == 0) return self.allocator.dupe(u8, "");
+        const state = try self.resolveOpenHandleForIo(handle.handle_id);
+        return self.readFid(state.fid, off, len) catch |err| {
+            if (!isTransportError(err)) return err;
+            const session_key = self.active_session_key orelse return err;
+            try self.recoverActiveSessionTransport(session_key, self.namespace_attached);
+            const recovered = try self.reopenTrackedHandle(handle.handle_id);
+            return self.readFid(recovered.fid, off, len);
+        };
+    }
+
+    fn readFid(self: *NamespaceClient, fid: u32, off: u64, len: u32) ![]u8 {
         const fields = try std.fmt.allocPrint(
             self.allocator,
             "\"fid\":{d},\"offset\":{d},\"count\":{d}",
-            .{ handle.fid, off, len },
+            .{ fid, off, len },
         );
         defer self.allocator.free(fields);
         const payload_json = try self.callAcheron(.t_read, .r_read, fields);
@@ -329,12 +411,23 @@ pub const NamespaceClient = struct {
     }
 
     pub fn write(self: *NamespaceClient, handle: NamespaceHandle, off: u64, data: []const u8) !u32 {
+        const state = try self.resolveOpenHandleForIo(handle.handle_id);
+        return self.writeFid(state.fid, off, data) catch |err| {
+            if (!isTransportError(err)) return err;
+            const session_key = self.active_session_key orelse return err;
+            try self.recoverActiveSessionTransport(session_key, self.namespace_attached);
+            const recovered = try self.reopenTrackedHandle(handle.handle_id);
+            return self.writeFid(recovered.fid, off, data);
+        };
+    }
+
+    fn writeFid(self: *NamespaceClient, fid: u32, off: u64, data: []const u8) !u32 {
         const encoded = try encodeBase64(self.allocator, data);
         defer self.allocator.free(encoded);
         const fields = try std.fmt.allocPrint(
             self.allocator,
             "\"fid\":{d},\"offset\":{d},\"data_b64\":\"{s}\"",
-            .{ handle.fid, off, encoded },
+            .{ fid, off, encoded },
         );
         defer self.allocator.free(fields);
         const payload_json = try self.callAcheron(.t_write, .r_write, fields);
@@ -344,7 +437,13 @@ pub const NamespaceClient = struct {
 
     pub fn release(self: *NamespaceClient, handle: NamespaceHandle) !void {
         self.flush() catch {};
-        try self.clunk(handle.fid);
+        if (self.open_handles.fetchRemove(handle.handle_id)) |removed| {
+            var state = removed.value;
+            defer state.deinit(self.allocator);
+            self.clunk(state.fid) catch |err| {
+                if (!isTransportError(err)) return err;
+            };
+        }
     }
 
     pub fn create(self: *NamespaceClient, path: []const u8, mode: u32, flags: u32) !NamespaceHandle {
@@ -448,7 +547,7 @@ pub const NamespaceClient = struct {
         while (out.items.len < max_bytes) {
             const remaining = max_bytes - out.items.len;
             const request_len: u32 = @intCast(@min(remaining, @as(usize, 64 * 1024)));
-            const chunk = try self.read(.{ .fid = fid, .writable = false }, offset, request_len);
+            const chunk = try self.readFid(fid, offset, request_len);
             defer self.allocator.free(chunk);
             if (chunk.len == 0) break;
             try out.appendSlice(self.allocator, chunk);
@@ -641,10 +740,31 @@ pub const NamespaceClient = struct {
         const session_key = self.active_session_key orelse return error.InvalidState;
         const had_namespace_attached = self.namespace_attached;
         try self.reconnectControlSession(session_key);
-
         if (!had_namespace_attached) return;
         if (request_type == .t_version or request_type == .t_attach) return;
         try self.attachNamespaceRoot(session_key);
+    }
+
+    fn recoverActiveSessionTransport(
+        self: *NamespaceClient,
+        session_key: []const u8,
+        had_namespace_attached: bool,
+    ) !void {
+        try self.reconnectControlSession(session_key);
+        if (had_namespace_attached) try self.attachNamespaceRoot(session_key);
+    }
+
+    fn resolveOpenHandleForIo(self: *NamespaceClient, handle_id: u64) !*OpenHandleState {
+        return self.open_handles.getPtr(handle_id) orelse error.InvalidState;
+    }
+
+    fn reopenTrackedHandle(self: *NamespaceClient, handle_id: u64) !*OpenHandleState {
+        const state = self.open_handles.getPtr(handle_id) orelse return error.InvalidState;
+        const new_fid = try self.walkPathToNewFid(state.path);
+        errdefer self.clunk(new_fid) catch {};
+        try self.openFid(new_fid, if (flagsRequireWrite(state.flags)) "rw" else "r");
+        state.fid = new_fid;
+        return state;
     }
 
     fn reconnectControlSession(self: *NamespaceClient, session_key: []const u8) anyerror!void {
@@ -1236,6 +1356,18 @@ fn mapRemoteErrorCode(code: []const u8) anyerror {
     return error.ProtocolError;
 }
 
+fn isTransportError(err: anyerror) bool {
+    return switch (err) {
+        error.ConnectionClosed,
+        error.ConnectionResetByPeer,
+        error.BrokenPipe,
+        error.EndOfStream,
+        error.TimedOut,
+        => true,
+        else => false,
+    };
+}
+
 test "namespace_client: normalizeAbsolutePath trims trailing separators" {
     try std.testing.expectEqualStrings("/", normalizeAbsolutePath("/"));
     try std.testing.expectEqualStrings("/agents", normalizeAbsolutePath("/agents/"));
@@ -1301,4 +1433,13 @@ test "namespace_client: parseConnectInfo preserves workspace payload and mount p
     try std.testing.expect(info.has_workspace_mounts);
     try std.testing.expect(info.workspace_json != null);
     try std.testing.expect(std.mem.indexOf(u8, info.workspace_json.?, "\"mounts\"") != null);
+}
+
+test "namespace_client: isTransportError recognizes reconnect-worthy failures" {
+    try std.testing.expect(isTransportError(error.ConnectionClosed));
+    try std.testing.expect(isTransportError(error.ConnectionResetByPeer));
+    try std.testing.expect(isTransportError(error.BrokenPipe));
+    try std.testing.expect(isTransportError(error.EndOfStream));
+    try std.testing.expect(isTransportError(error.TimedOut));
+    try std.testing.expect(!isTransportError(error.InvalidResponse));
 }

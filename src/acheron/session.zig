@@ -6326,16 +6326,27 @@ pub const Session = struct {
         var router = (try self.boundVenomRouter(proxy.venom_id, proxy.project_id, proxy.agent_id)) orelse return;
         defer router.deinit();
 
+        var seen_names = std.ArrayListUnmanaged([]u8){};
+        defer {
+            for (seen_names.items) |name| self.allocator.free(name);
+            seen_names.deinit(self.allocator);
+        }
         var cookie: u64 = 0;
         while (true) {
             const listing_json = router.readdir(proxy.remote_path, cookie, 4096) catch return;
             defer self.allocator.free(listing_json);
-            cookie = try self.applyBoundVenomProxyListing(dir_id, listing_json);
+            cookie = try self.applyBoundVenomProxyListing(dir_id, listing_json, &seen_names);
             if (cookie == 0) break;
         }
+        try self.pruneBoundVenomProxyChildren(dir_id, seen_names.items);
     }
 
-    fn applyBoundVenomProxyListing(self: *Session, parent_id: u32, listing_json: []const u8) !u64 {
+    fn applyBoundVenomProxyListing(
+        self: *Session,
+        parent_id: u32,
+        listing_json: []const u8,
+        seen_names: *std.ArrayListUnmanaged([]u8),
+    ) !u64 {
         var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, listing_json, .{});
         defer parsed.deinit();
         if (parsed.value != .object) return 0;
@@ -6348,6 +6359,7 @@ pub const Session = struct {
             const name_val = entry.object.get("name") orelse continue;
             const attr_val = entry.object.get("attr") orelse continue;
             if (name_val != .string or name_val.string.len == 0) continue;
+            try self.noteBoundVenomProxyChildSeen(seen_names, name_val.string);
             try self.upsertBoundVenomProxyChild(parent_id, name_val.string, attr_val);
         }
         return next_cookie;
@@ -6375,6 +6387,39 @@ pub const Session = struct {
             .dir => _ = try self.addDir(parent_id, name, false),
             .file => _ = try self.addFile(parent_id, name, "", summary.writable, .none),
         }
+    }
+
+    fn noteBoundVenomProxyChildSeen(
+        self: *Session,
+        seen_names: *std.ArrayListUnmanaged([]u8),
+        name: []const u8,
+    ) !void {
+        for (seen_names.items) |existing| {
+            if (std.mem.eql(u8, existing, name)) return;
+        }
+        try seen_names.append(self.allocator, try self.allocator.dupe(u8, name));
+    }
+
+    fn pruneBoundVenomProxyChildren(self: *Session, parent_id: u32, seen_names: []const []const u8) !void {
+        const parent = self.nodes.get(parent_id) orelse return;
+        var doomed = std.ArrayListUnmanaged(u32){};
+        defer doomed.deinit(self.allocator);
+
+        var it = parent.children.iterator();
+        while (it.next()) |entry| {
+            if (containsBoundVenomProxyChildName(seen_names, entry.key_ptr.*)) continue;
+            try doomed.append(self.allocator, entry.value_ptr.*);
+        }
+        for (doomed.items) |child_id| {
+            try self.deleteNodeRecursive(child_id);
+        }
+    }
+
+    fn containsBoundVenomProxyChildName(seen_names: []const []const u8, name: []const u8) bool {
+        for (seen_names) |seen| {
+            if (std.mem.eql(u8, seen, name)) return true;
+        }
+        return false;
     }
 
     fn boundVenomRouter(
