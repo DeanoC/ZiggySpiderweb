@@ -5967,15 +5967,27 @@ pub const Session = struct {
         const node = self.nodes.get(node_id) orelse return error.MissingNode;
         if (node.kind != .dir) return error.NotDir;
 
+        var names = std.ArrayListUnmanaged([]const u8){};
+        defer names.deinit(self.allocator);
+
+        var collect_it = node.children.iterator();
+        while (collect_it.next()) |entry| {
+            try names.append(self.allocator, entry.key_ptr.*);
+        }
+        std.mem.sort([]const u8, names.items, {}, struct {
+            fn lessThan(_: void, lhs: []const u8, rhs: []const u8) bool {
+                return std.mem.lessThan(u8, lhs, rhs);
+            }
+        }.lessThan);
+
         var out = std.ArrayListUnmanaged(u8){};
         defer out.deinit(self.allocator);
 
-        var it = node.children.iterator();
         var first = true;
-        while (it.next()) |entry| {
+        for (names.items) |name| {
             if (!first) try out.append(self.allocator, '\n');
             first = false;
-            try out.appendSlice(self.allocator, entry.key_ptr.*);
+            try out.appendSlice(self.allocator, name);
         }
 
         return out.toOwnedSlice(self.allocator);
