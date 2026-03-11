@@ -18,7 +18,7 @@ const spider_web_project_kind_name = "system_builtin";
 const normal_project_kind_name = "normal";
 const system_project_template_id = "system";
 const default_project_template_id = "minimum";
-const default_primary_agent_id = "mother";
+const default_primary_agent_id = "spiderweb";
 const default_spider_web_root = "";
 const default_platform_os = "unknown";
 const default_platform_arch = "unknown";
@@ -5920,7 +5920,7 @@ test "acheron_control_plane: builtin system project is protected and primary-onl
     defer allocator.free(activate_missing_token);
     try std.testing.expectError(
         ControlPlaneError.MissingField,
-        plane.activateProject("mother", activate_missing_token),
+        plane.activateProject(default_primary_agent_id, activate_missing_token),
     );
 
     const activated_req = try std.fmt.allocPrint(
@@ -5929,11 +5929,11 @@ test "acheron_control_plane: builtin system project is protected and primary-onl
         .{ spider_web_project_id, spider_token.? },
     );
     defer allocator.free(activated_req);
-    const activated = try plane.activateProject("mother", activated_req);
+    const activated = try plane.activateProject(default_primary_agent_id, activated_req);
     defer allocator.free(activated);
     try std.testing.expect(std.mem.indexOf(u8, activated, "\"project_id\":\"system\"") != null);
 
-    const status = try plane.workspaceStatus("mother", activated_req);
+    const status = try plane.workspaceStatus(default_primary_agent_id, activated_req);
     defer allocator.free(status);
     try std.testing.expect(std.mem.indexOf(u8, status, "\"project_id\":\"system\"") != null);
 
@@ -5946,14 +5946,14 @@ test "acheron_control_plane: builtin system project is protected and primary-onl
     defer allocator.free(activate_non_system);
     try std.testing.expectError(
         ControlPlaneError.ProjectAssignmentForbidden,
-        plane.activateProject("mother", activate_non_system),
+        plane.activateProject(default_primary_agent_id, activate_non_system),
     );
 
     try std.testing.expectError(
         ControlPlaneError.ProjectAssignmentForbidden,
-        plane.activateProjectWithRole("mother", activate_non_system, true),
+        plane.activateProjectWithRole(default_primary_agent_id, activate_non_system, true),
     );
-    const admin_status = try plane.workspaceStatusWithRole("mother", activate_non_system, true);
+    const admin_status = try plane.workspaceStatusWithRole(default_primary_agent_id, activate_non_system, true);
     defer allocator.free(admin_status);
     const expected_project_id = try std.fmt.allocPrint(allocator, "\"project_id\":\"{s}\"", .{non_system_project_id});
     defer allocator.free(expected_project_id);
@@ -5973,7 +5973,7 @@ test "acheron_control_plane: builtin system mount can be bound from local node" 
 
     try plane.ensureSpiderWebMount(node_id, "system-root");
 
-    const status = try plane.workspaceStatus("mother", "{\"project_id\":\"system\"}");
+    const status = try plane.workspaceStatus(default_primary_agent_id, "{\"project_id\":\"system\"}");
     defer allocator.free(status);
     try std.testing.expect(std.mem.indexOf(u8, status, "\"project_id\":\"system\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, status, "\"mount_path\":\"/nodes/local/fs\"") != null);
@@ -6006,7 +6006,7 @@ test "acheron_control_plane: builtin system mounts support namespace topology" {
     };
     try plane.ensureSpiderWebMounts(node_id, &mounts);
 
-    const status = try plane.workspaceStatus("mother", "{\"project_id\":\"system\"}");
+    const status = try plane.workspaceStatus(default_primary_agent_id, "{\"project_id\":\"system\"}");
     defer allocator.free(status);
     try std.testing.expect(std.mem.indexOf(u8, status, "\"mount_path\":\"/agents\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, status, "\"mount_path\":\"/meta\"") != null);
@@ -6091,7 +6091,7 @@ test "acheron_control_plane: ensureSpiderWebMounts preserves extra builtin mount
     // Re-ensuring local mount specs should not wipe additional admin-managed mounts.
     try plane.ensureSpiderWebMount(local_node_id, "system-root");
 
-    const status = try plane.workspaceStatus("mother", "{\"project_id\":\"system\"}");
+    const status = try plane.workspaceStatus(default_primary_agent_id, "{\"project_id\":\"system\"}");
     defer allocator.free(status);
     try std.testing.expect(std.mem.indexOf(u8, status, "\"mount_path\":\"/nodes/local/fs\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, status, "\"mount_path\":\"/nodes/clawz/fs\"") != null);
@@ -6552,13 +6552,13 @@ test "acheron_control_plane: workspace status filters invoke service mounts when
     const selected_req = try std.fmt.allocPrint(allocator, "{{\"project_id\":\"{s}\"}}", .{project_id});
     defer allocator.free(selected_req);
 
-    const user_status = try plane.workspaceStatus("mother", selected_req);
+    const user_status = try plane.workspaceStatus(default_primary_agent_id, selected_req);
     defer allocator.free(user_status);
     try std.testing.expect(std.mem.indexOf(u8, user_status, "\"mount_path\":\"/nodes/") != null);
     try std.testing.expect(std.mem.indexOf(u8, user_status, "/fs\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, user_status, "/tool/main\"") == null);
 
-    const admin_status = try plane.workspaceStatusWithRole("mother", selected_req, true);
+    const admin_status = try plane.workspaceStatusWithRole(default_primary_agent_id, selected_req, true);
     defer allocator.free(admin_status);
     try std.testing.expect(std.mem.indexOf(u8, admin_status, "/tool/main\"") != null);
 }
@@ -7019,7 +7019,7 @@ test "acheron_control_plane: workspaceStatus supports explicit project selection
     try std.testing.expect(std.mem.indexOf(u8, selected, "\"mount_path\":\"/src\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, selected, "\"fs_auth_token\":null") != null);
 
-    const selected_primary = try plane.workspaceStatus("mother", selected_req);
+    const selected_primary = try plane.workspaceStatus(default_primary_agent_id, selected_req);
     defer allocator.free(selected_primary);
     try std.testing.expect(std.mem.indexOf(u8, selected_primary, "\"fs_auth_token\":\"") != null);
 
@@ -7594,7 +7594,7 @@ test "acheron_control_plane: projectUp requires project_token for builtin system
         .{spider_web_project_id},
     );
     defer allocator.free(missing_token_req);
-    try std.testing.expectError(ControlPlaneError.MissingField, plane.projectUp("mother", missing_token_req));
+    try std.testing.expectError(ControlPlaneError.MissingField, plane.projectUp(default_primary_agent_id, missing_token_req));
 
     const bad_token_req = try std.fmt.allocPrint(
         allocator,
@@ -7602,7 +7602,7 @@ test "acheron_control_plane: projectUp requires project_token for builtin system
         .{spider_web_project_id},
     );
     defer allocator.free(bad_token_req);
-    try std.testing.expectError(ControlPlaneError.ProjectAuthFailed, plane.projectUp("mother", bad_token_req));
+    try std.testing.expectError(ControlPlaneError.ProjectAuthFailed, plane.projectUp(default_primary_agent_id, bad_token_req));
 
     const ok_req = try std.fmt.allocPrint(
         allocator,
@@ -7610,7 +7610,7 @@ test "acheron_control_plane: projectUp requires project_token for builtin system
         .{ spider_web_project_id, spider_token.? },
     );
     defer allocator.free(ok_req);
-    const ok_json = try plane.projectUp("mother", ok_req);
+    const ok_json = try plane.projectUp(default_primary_agent_id, ok_req);
     defer allocator.free(ok_json);
     try std.testing.expect(std.mem.indexOf(u8, ok_json, "\"created\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, ok_json, "\"activated\":true") != null);
@@ -7625,7 +7625,7 @@ test "acheron_control_plane: primary agent can upsert existing non-system projec
     defer allocator.free(project_json);
 
     const upsert_json = try plane.projectUp(
-        "mother",
+        default_primary_agent_id,
         "{\"name\":\"ZiggyPR\",\"vision\":\"Help review PRs\",\"activate\":false}",
     );
     defer allocator.free(upsert_json);
@@ -7648,7 +7648,7 @@ test "acheron_control_plane: primary agent bypasses project invoke token gates" 
     defer plane.deinit();
 
     try std.testing.expect(!plane.projectAllowsAction(spider_web_project_id, "worker", .invoke, null, false));
-    try std.testing.expect(plane.projectAllowsAction(spider_web_project_id, "mother", .invoke, null, false));
+    try std.testing.expect(plane.projectAllowsAction(spider_web_project_id, default_primary_agent_id, .invoke, null, false));
 
     const created = try plane.createProject("{\"name\":\"InvokeGate\",\"vision\":\"InvokeGate\"}");
     defer allocator.free(created);
@@ -7659,7 +7659,7 @@ test "acheron_control_plane: primary agent bypasses project invoke token gates" 
 
     try std.testing.expect(!plane.projectAllowsAction(project_id, "worker", .invoke, null, false));
     try std.testing.expect(plane.projectAllowsAction(project_id, "worker", .invoke, project_token, false));
-    try std.testing.expect(plane.projectAllowsAction(project_id, "mother", .invoke, null, false));
+    try std.testing.expect(plane.projectAllowsAction(project_id, default_primary_agent_id, .invoke, null, false));
 }
 
 test "acheron_control_plane: project create/up require non-empty vision" {
@@ -7719,7 +7719,7 @@ test "acheron_control_plane: projectUp auto-provisions default /nodes/local/fs m
     try plane.ensureSpiderWebMount(node_id, "bootstrap-workspace");
 
     const up_json = try plane.projectUp(
-        "mother",
+        default_primary_agent_id,
         "{\"name\":\"BootstrapProject\",\"vision\":\"BootstrapProject\",\"activate\":false}",
     );
     defer allocator.free(up_json);
@@ -7749,7 +7749,7 @@ test "acheron_control_plane: default mount migration replaces legacy /workspace-
     const node_id = parsed_node.value.object.get("node_id").?.string;
 
     const up_json = try plane.projectUp(
-        "mother",
+        default_primary_agent_id,
         "{\"name\":\"LegacyMountProject\",\"vision\":\"LegacyMountProject\",\"activate\":false}",
     );
     defer allocator.free(up_json);
@@ -8093,7 +8093,7 @@ test "acheron_control_plane: persistence keeps primary active project override" 
             .{ project_id, project_token },
         );
         defer allocator.free(activate_req);
-        const activated = try plane.activateProjectWithRole("mother", activate_req, true);
+        const activated = try plane.activateProjectWithRole(default_primary_agent_id, activate_req, true);
         defer allocator.free(activated);
         try std.testing.expect(std.mem.indexOf(u8, activated, expected_project_id.?) != null);
     }
@@ -8102,7 +8102,7 @@ test "acheron_control_plane: persistence keeps primary active project override" 
         var plane = ControlPlane.initWithPersistence(allocator, dir, "control-plane.db");
         defer plane.deinit();
 
-        const status = try plane.workspaceStatusWithRole("mother", null, true);
+        const status = try plane.workspaceStatusWithRole(default_primary_agent_id, null, true);
         defer allocator.free(status);
         try std.testing.expect(std.mem.indexOf(u8, status, expected_project_id.?) != null);
     }

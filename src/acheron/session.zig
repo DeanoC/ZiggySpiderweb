@@ -6463,7 +6463,7 @@ pub const Session = struct {
 
     fn resolveAgentAbilities(self: *Session) !AgentAbilities {
         var abilities = AgentAbilities{
-            .can_create_agents = std.mem.eql(u8, self.agent_id, "mother"),
+            .can_create_agents = std.mem.eql(u8, self.agent_id, "spiderweb"),
         };
 
         if (try agent_config.loadAgentConfigFromDir(self.allocator, self.agents_dir, self.agent_id)) |config| {

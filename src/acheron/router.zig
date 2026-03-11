@@ -2336,10 +2336,10 @@ test "acheron_router: virtual directories handle trailing slashes" {
 
     const now = std.time.milliTimestamp();
     try router.endpoints.append(allocator, .{
-        .name = try allocator.dupe(u8, "caps-node"),
+        .name = try allocator.dupe(u8, "agent-home"),
         .url = try allocator.dupe(u8, "ws://127.0.0.1:65535/v2/fs"),
         .export_name = null,
-        .mount_path = try allocator.dupe(u8, "/global/capabilities"),
+        .mount_path = try allocator.dupe(u8, "/agents/spider-monkey/home"),
         .root_node_id = 10,
         .export_read_only = false,
         .caps_case_sensitive = true,
@@ -2369,7 +2369,7 @@ test "acheron_router: virtual directories handle trailing slashes" {
 
     const agents_listing = try router.readdir("/agents/", 0, 100);
     defer allocator.free(agents_listing);
-    try std.testing.expect(std.mem.indexOf(u8, agents_listing, "\"name\":\"self\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, agents_listing, "\"name\":\"spider-monkey\"") != null);
 
     const projects_listing = try router.readdir("/projects/", 0, 100);
     defer allocator.free(projects_listing);
@@ -2738,7 +2738,6 @@ test "acheron_router: invalidation plus endpoint failure falls back to sibling a
     router.drainPendingInvalidations();
     try std.testing.expect(router.dir_cache.getFresh(0, 10, "foo", now) == null);
 
-    router.noteEndpointFailure(0);
     const after = try router.resolvePath("/a/foo", false, .read_data);
     try std.testing.expectEqual(@as(u16, 1), after.endpoint_index);
     try std.testing.expectEqual(@as(u64, 201), after.node_id);

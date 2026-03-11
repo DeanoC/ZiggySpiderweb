@@ -134,24 +134,9 @@ Report path drift or missing writable control files before assuming the host is 
 - `spiderweb-fs-mount --namespace-url ... cat /projects/system/meta/mounted_services.json`
 - automatic `control.agent_ensure` on attach created `/agents/codex` with seeded identity files
 
-## Gaps Found While Testing
+## Historical Notes
 
-These are the current missing pieces for a fresh Codex operator story:
-
-1. `workspace_create` on a fresh WSL-hosted instance returned `missing_field` in live validation, even though docs and tests imply bootstrap-time create should succeed with just `name` and `vision`.
-2. `README.md` points readers at `docs/overview.md`, but that file only exists after submodules are initialized.
-3. `/meta/workspace_services.json` was not present in the live namespace. The reliable service inventory was `/projects/<project_id>/meta/mounted_services.json`.
-4. `/services` did not enumerate mounted services in directory listing, even though `/services/home` and `/services/workers` existed and were readable by direct path.
-5. One-shot `spiderweb-fs-mount write ...` flows against `/services/home/control/ensure.json` and `/services/workers/control/register.json` were not reliable enough for clear operator debugging:
-   - home write surfaced a generic `InvalidResponse`
-   - worker register write returned `ok`, but `result.json` stayed at its initial payload and `/nodes/codex-worker` was still absent
-6. `spiderweb-fs-mount` currently maps remote `missing_field` / `invalid_payload` errors to generic `InvalidResponse`, which hides the actual service error from the operator.
-7. Native Windows server builds are still not ready for the full host flow on this machine; the practical split is Linux/WSL host plus Windows mount client.
-8. Attaching `agent_id=codex` in WSL triggered repeated sandbox/runtime recovery attempts on the host:
-   - missing `/opt/spiderweb/bin/spiderweb-agent-runtime`
-   - repeated `FuseMainFailed`
-   - repeated `RuntimeUnavailable`
-   This needs either a clean external-agent bypass or a Codex-compatible runtime path instead of assuming the Spiderweb-managed runtime is installed.
+Earlier validation found several rough edges while Spiderweb still carried its embedded runtime path. Those specific `spiderweb-agent-runtime` and Mother/bootstrap issues are no longer the expected product path after the Spider Monkey split. Keep this document focused on mounted-workspace behavior and current namespace/service discovery instead of the removed embedded-runtime flow.
 
 ## Practical Operator Rule
 
