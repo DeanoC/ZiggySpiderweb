@@ -33,7 +33,7 @@ const UnavailableRuntime = struct {
         const response = try protocol.buildErrorWithCode(
             allocator,
             request_id orelse "unknown",
-            .execution_failed,
+            parseUnavailableErrorCode(ctx.code),
             ctx.message,
         );
         var frames = try allocator.alloc([]u8, 1);
@@ -57,7 +57,7 @@ const UnavailableRuntime = struct {
         _: anyerror,
     ) ![]u8 {
         const ctx: *UnavailableRuntime = @ptrCast(@alignCast(raw_ctx orelse return error.InvalidContext));
-        return protocol.buildErrorWithCode(allocator, request_id, .execution_failed, ctx.message);
+        return protocol.buildErrorWithCode(allocator, request_id, parseUnavailableErrorCode(ctx.code), ctx.message);
     }
 };
 
@@ -155,4 +155,36 @@ fn parseRequestId(allocator: std.mem.Allocator, raw_json: []const u8) !?[]u8 {
     const value = parsed.value.object.get("id") orelse return null;
     if (value != .string or value.string.len == 0) return null;
     return @as(?[]u8, try allocator.dupe(u8, value.string));
+}
+
+fn parseUnavailableErrorCode(raw: []const u8) protocol.ErrorCode {
+    inline for (std.meta.fields(protocol.ErrorCode)) |field| {
+        if (std.mem.eql(u8, raw, field.name)) {
+            return @field(protocol.ErrorCode, field.name);
+        }
+    }
+    return .execution_failed;
+}
+
+test "RuntimeHandle unavailable runtime preserves explicit error code" {
+    const allocator = std.testing.allocator;
+
+    const handle = try RuntimeHandle.createUnavailable(
+        allocator,
+        "provider_timeout",
+        "external worker did not respond",
+    );
+    defer handle.destroy();
+
+    const frames = try handle.handleMessageFramesWithDebug(
+        "{\"id\":\"req-1\"}",
+        false,
+    );
+    defer {
+        for (frames) |frame| allocator.free(frame);
+        allocator.free(frames);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), frames.len);
+    try std.testing.expect(std.mem.indexOf(u8, frames[0], "\"code\":\"provider_timeout\"") != null);
 }
