@@ -355,10 +355,10 @@ def run_control_runtime_order(host: str, port: int, auth_token=None) -> None:
             err_msg = conn.read_json()
             expect_type(err_msg, "acheron", "acheron.error")
             err = err_msg.get("error") or {}
-            require(err.get("code") == "protocol_mismatch", f"unexpected acheron error code: {err}")
-            require("acheron.t_version" in str(err.get("message", "")), f"unexpected acheron error message: {err}")
+            require(err.get("code") == "external_worker_required", f"unexpected acheron error code: {err}")
+            require("spiderweb-fs-mount" in str(err.get("message", "")), f"unexpected acheron error message: {err}")
             opcode, _ = conn.read_frame()
-            require(opcode == 0x8, "expected close frame after acheron protocol mismatch")
+            require(opcode == 0x8, "expected close frame after external-worker rejection")
         finally:
             conn.close()
 
@@ -390,48 +390,19 @@ def run_control_runtime_order(host: str, port: int, auth_token=None) -> None:
                 "msize": 1048576,
                 "version": "acheron-1",
             })
-            tversion_ack = conn.read_json()
-            expect_type(tversion_ack, "acheron", "acheron.r_version")
-
-            allowed_attach_runtime_codes = (
-                "runtime_warming",
-                "runtime_unhealthy",
-                "sandbox_mount_unavailable",
-                "runtime_warmup_timeout",
-            )
-            next_tag = 2
-            saw_allowed_attach_error = False
-            for _ in range(ATTACH_POLL_ATTEMPTS):
-                conn.send_json({
-                    "channel": "acheron",
-                    "type": "acheron.t_attach",
-                    "tag": next_tag,
-                    "fid": 1,
-                })
-                next_tag += 1
-                try:
-                    attach_msg = conn.read_json()
-                except TimeoutError:
-                    time.sleep(ATTACH_POLL_DELAY_SEC)
-                    continue
-                if attach_msg.get("channel") == "acheron" and attach_msg.get("type") == "acheron.r_attach":
-                    return
-
-                expect_type(attach_msg, "acheron", "acheron.error")
-                err = attach_msg.get("error") or {}
-                code = str(err.get("code") or "")
-                require(code in allowed_attach_runtime_codes, f"unexpected acheron attach error: {err}")
-                saw_allowed_attach_error = True
-                time.sleep(ATTACH_POLL_DELAY_SEC)
-            if saw_allowed_attach_error:
-                return
-            raise WsError("attach did not become ready before timeout")
+            err_msg = conn.read_json()
+            expect_type(err_msg, "acheron", "acheron.error")
+            err = err_msg.get("error") or {}
+            require(err.get("code") == "external_worker_required", f"unexpected acheron version error: {err}")
+            require("Spider Monkey" in str(err.get("message", "")), f"unexpected acheron version message: {err}")
+            opcode, _ = conn.read_frame()
+            require(opcode == 0x8, "expected close frame after external-worker rejection")
         finally:
             conn.close()
 
     run_with_retries("control-before-version", scenario_control_before_version)
     run_with_retries("attach-before-version", scenario_attach_before_version)
-    run_with_retries("runtime-happy-path", scenario_happy_path)
+    run_with_retries("external-worker-rejection", scenario_happy_path)
 
 
 def fs_ready(host: str, port: int, auth_token: str) -> None:
@@ -558,7 +529,7 @@ def run_source_guard(root_dir: str) -> None:
         ("src/acheron/namespace_client.zig", 'try self.writeControlRequest("control.workspace_status", request_id, payload);'),
         ("src/acheron/mount_main.zig", "var connect_info = try client.controlConnect();"),
         ("src/acheron/mount_main.zig", "var attach_info = try client.controlSessionAttach(.{"),
-        ("src/acheron/mount_main.zig", "const payload_json = try client.controlWorkspaceStatus(effective_project_id, project_token);"),
+        ("src/acheron/mount_main.zig", "const payload_json = try client.controlWorkspaceStatus(effective_project_id, workspace_token);"),
         ("src/venoms/fs/shared/fs_node_main.zig", 'const node = @import("spiderweb_node").fs_node_main;'),
         ("deps/spider-protocol/src/spiderweb_node/fs_node_main.zig", '\\"channel\\":\\"control\\",\\"type\\":\\"control.version\\"'),
         ("deps/spider-protocol/src/spiderweb_node/fs_node_main.zig", '\\"channel\\":\\"control\\",\\"type\\":\\"control.connect\\"'),
