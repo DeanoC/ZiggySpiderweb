@@ -190,6 +190,13 @@ fn executeOpPayload(self: anytype, op: Op, args_obj: std.json.ObjectMap) ![]u8 {
     defer venoms.deinit(self.allocator);
     try appendRequestedVenoms(self.allocator, &venoms, args_obj);
     if (venoms.items.len == 0) return error.InvalidPayload;
+    if (self.control_plane) |control_plane| {
+        try control_plane.validateWorkerVenomInstantiation(venoms.items);
+    } else {
+        for (venoms.items) |venom_id| {
+            if (!isSupportedWorkerVenom(venom_id)) return error.InvalidPayload;
+        }
+    }
 
     try self.recordWorkerHeartbeat(worker_id, agent_id, ttl_ms);
     try self.ensureWorkerLoopbackNode(worker_id, agent_id, venoms.items);
@@ -209,7 +216,6 @@ fn appendRequestedVenoms(
         if (value != .array) return error.InvalidPayload;
         for (value.array.items) |item| {
             if (item != .string or item.string.len == 0) return error.InvalidPayload;
-            if (!isSupportedWorkerVenom(item.string)) return error.InvalidPayload;
             try venoms.append(allocator, item.string);
         }
         return;
