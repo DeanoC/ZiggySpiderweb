@@ -5982,12 +5982,29 @@ pub const Session = struct {
 
         var out = std.ArrayListUnmanaged(u8){};
         defer out.deinit(self.allocator);
+        var seen = std.StringHashMapUnmanaged(void){};
+        defer seen.deinit(self.allocator);
 
         var first = true;
         for (names.items) |name| {
             if (!first) try out.append(self.allocator, '\n');
             first = false;
             try out.appendSlice(self.allocator, name);
+            try seen.put(self.allocator, name, {});
+        }
+
+        if (self.project_binds.items.len > 0) {
+            const dir_path = try self.nodeAbsolutePath(node_id);
+            defer self.allocator.free(dir_path);
+
+            for (self.project_binds.items) |bind| {
+                const child_name = immediateBoundChildName(dir_path, bind.bind_path) orelse continue;
+                if (seen.contains(child_name)) continue;
+                if (!first) try out.append(self.allocator, '\n');
+                first = false;
+                try out.appendSlice(self.allocator, child_name);
+                try seen.put(self.allocator, child_name, {});
+            }
         }
 
         return out.toOwnedSlice(self.allocator);
@@ -9002,6 +9019,30 @@ fn pathMatchesPrefixBoundary(path: []const u8, prefix: []const u8) bool {
     if (prefix.len == 0) return false;
     if (!std.mem.startsWith(u8, path, prefix)) return false;
     return path.len > prefix.len and path[prefix.len] == '/';
+}
+
+fn immediateBoundChildName(dir_path: []const u8, bind_path: []const u8) ?[]const u8 {
+    const suffix = if (std.mem.eql(u8, dir_path, "/")) blk: {
+        if (!std.mem.startsWith(u8, bind_path, "/")) return null;
+        if (bind_path.len <= 1) return null;
+        break :blk bind_path[1..];
+    } else blk: {
+        if (!pathMatchesPrefixBoundary(bind_path, dir_path)) return null;
+        if (bind_path.len <= dir_path.len + 1) return null;
+        break :blk bind_path[dir_path.len + 1 ..];
+    };
+
+    const slash_idx = std.mem.indexOfScalar(u8, suffix, '/') orelse suffix.len;
+    if (slash_idx == 0) return null;
+    return suffix[0..slash_idx];
+}
+
+test "immediateBoundChildName returns direct bind child for directory" {
+    try std.testing.expectEqualStrings("home", immediateBoundChildName("/services", "/services/home").?);
+    try std.testing.expectEqualStrings("services", immediateBoundChildName("/", "/services/home").?);
+    try std.testing.expectEqualStrings("codex", immediateBoundChildName("/agents", "/agents/codex/home").?);
+    try std.testing.expect(immediateBoundChildName("/services", "/nodes/local/venoms/home") == null);
+    try std.testing.expect(immediateBoundChildName("/services/home", "/services/home") == null);
 }
 
 const ParsedScopedVenomAlias = struct {

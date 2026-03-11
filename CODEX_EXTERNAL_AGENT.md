@@ -10,6 +10,8 @@ Validated on March 11, 2026 against current `Spiderweb` `main`, plus the Windows
   - `git submodule update --init --recursive` is required before builds or docs are trustworthy.
   - `zig build fs-mount`
   - `zig build test-fs-mount`
+  - `spiderweb-fs-mount.exe --mount-backend winfsp` works from Windows against a WSL-hosted Spiderweb server.
+  - Windows namespace validation passed for `dir X:\services`, `Get-Content X:\meta\protocol.json`, `Get-Content X:\projects\<project_id>\meta\mounted_services.json`, and routed writes under `X:\nodes\local\fs\...`.
   - Full `zig build` does not currently pass on Windows on this machine. The failures were in `zwasm`/POSIX-dependent targets plus missing `sqlite3` linkage for the server binary.
 - WSL / Linux:
   - `zig build` passes in a clean Linux checkout.
@@ -20,7 +22,7 @@ Validated on March 11, 2026 against current `Spiderweb` `main`, plus the Windows
 
 Run the Spiderweb server in Linux or WSL.
 
-Use Windows only for the standalone `spiderweb-fs-mount` client and the final mounted workspace if you want Codex Desktop on Windows to work against it.
+Use Windows for the standalone `spiderweb-fs-mount` client and the final mounted workspace if you want Codex Desktop on Windows to work against it. That client path is now validated with WinFsp; the unsupported part is the full native Windows host build.
 
 ## Setup
 
@@ -136,6 +138,10 @@ Report path drift or missing writable control files before assuming the host is 
 - `spiderweb-fs-mount --namespace-url ... readdir /services`
 - `spiderweb-fs-mount --namespace-url ... cat /meta/protocol.json`
 - `spiderweb-fs-mount --namespace-url ... cat /projects/<project_id>/meta/mounted_services.json`
+- `spiderweb-fs-mount.exe --mount-backend winfsp ... mount X:` against a WSL-hosted Spiderweb server
+- Windows `dir X:\services` and `Get-ChildItem X:\services`
+- Windows reads from `X:\services\home\README.md` and `X:\services\workers\OPS.json`
+- Windows routed writes under `X:\nodes\local\fs\...`
 - project-scoped `workspace_status` now returns `fs_auth_token` for authorized callers, so routed namespace endpoints come up healthy
 - automatic `control.agent_ensure` on attach created `/agents/codex` with seeded identity files
 - the Linux / WSL host no longer depends on launch cwd for `agents`, `templates`, or the local agents export when `runtime.spider_web_root` is configured
@@ -145,7 +151,7 @@ Report path drift or missing writable control files before assuming the host is 
 These issues from the earlier Codex validation are no longer reproducing on the current branch:
 
 1. `workspace_create` now succeeds with just `name` and `vision`.
-2. `/services` now enumerates cleanly in namespace directory listing.
+2. `/services` now enumerates cleanly in namespace directory listing, including through the Windows WinFsp mount.
 3. namespace-routed `/v2/fs` endpoints now hydrate correctly from project-scoped `workspace_status`, instead of staying unhealthy because `fs_auth_token` was omitted.
 4. launching the WSL host from the wrong cwd no longer breaks agent/template discovery or the local agents export when `runtime.spider_web_root` is set.
 5. remote `missing_field` and `invalid_payload` errors are now surfaced by `spiderweb-fs-mount` as `MissingField` and `InvalidPayload` instead of generic `InvalidResponse`.
@@ -155,9 +161,10 @@ These issues from the earlier Codex validation are no longer reproducing on the 
 These are the current missing pieces for a fresh Codex operator story:
 
 1. `/meta/workspace_services.json` was still absent in live namespace validation. The reliable service inventory is still `/projects/<project_id>/meta/mounted_services.json`.
-2. One-shot `spiderweb-fs-mount write ...` flows against `/services/home/control/ensure.json` and `/services/workers/control/register.json` are still not reliable enough for a clear operator story:
-   - home write now fails with `InvalidPayload` for a minimal `{"agent_id":"codex"}` payload, and `result.json` stays at `ok:false`
-   - worker register write returns `ok`, but `result.json` stays at its initial payload and `/nodes/codex-worker` is still absent
+2. Service-control writes are still not reliable enough for a clear operator story, including from a real Windows mounted drive:
+   - `/services/home/control/ensure.json` still leaves `result.json` at `{"ok":false,...}` for a minimal `{"agent_id":"codex"}` payload
+   - `/services/workers/control/register.json` still leaves `result.json` at `{"ok":false,...}` and `/nodes/codex-worker` is still absent
+   - the Windows-mounted path is therefore good for discovery and routed filesystem work, but not yet for durable service provisioning
 3. Native Windows server builds are still not ready for the full host flow on this machine; the practical split is Linux/WSL host plus Windows mount client.
 4. `docs/overview.md` still depends on submodules being initialized, so `git submodule update --init --recursive` remains mandatory before trusting the docs.
 
