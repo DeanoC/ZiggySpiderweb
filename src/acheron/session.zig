@@ -23,12 +23,14 @@ const terminal_venom = @import("../venoms/terminal.zig");
 const mounts_venom = @import("../venoms/mounts.zig");
 const home_venom = @import("../venoms/home.zig");
 const workers_venom = @import("../venoms/workers.zig");
+const venom_packages_service_venom = @import("../venoms/venom_packages_service.zig");
 const agents_venom = @import("../venoms/agents.zig");
 const workspaces_venom = @import("../venoms/workspaces.zig");
 const git_venom = @import("../venoms/git.zig");
 const github_pr_venom = @import("../venoms/github_pr.zig");
 const missions_venom = @import("../venoms/missions.zig");
 const pr_review_venom = @import("../venoms/pr_review.zig");
+const venom_packages = @import("../venom_packages.zig");
 
 const NodeKind = enum {
     dir,
@@ -57,6 +59,11 @@ const SpecialKind = enum {
     workers_register,
     workers_heartbeat,
     workers_detach,
+    venom_packages_invoke,
+    venom_packages_list,
+    venom_packages_get,
+    venom_packages_install,
+    venom_packages_remove,
     projects_invoke,
     projects_list,
     projects_get,
@@ -429,6 +436,10 @@ pub const Session = struct {
     workers_result_id: u32 = 0,
     workers_status_alias_id: u32 = 0,
     workers_result_alias_id: u32 = 0,
+    venom_packages_status_id: u32 = 0,
+    venom_packages_result_id: u32 = 0,
+    venom_packages_status_alias_id: u32 = 0,
+    venom_packages_result_alias_id: u32 = 0,
     wait_sources: std.ArrayListUnmanaged(WaitSource) = .{},
     wait_timeout_ms: i64 = default_wait_timeout_ms,
     wait_event_seq: u64 = 1,
@@ -1191,6 +1202,41 @@ pub const Session = struct {
                             msg.tag,
                             "invalid",
                             "workers payload is invalid for requested operation",
+                        );
+                    },
+                    else => return err,
+                };
+                written = outcome.written;
+            },
+            .venom_packages_invoke,
+            .venom_packages_list,
+            .venom_packages_get,
+            .venom_packages_install,
+            .venom_packages_remove,
+            => {
+                const outcome = self.handleVenomPackagesNamespaceWrite(node.special, state.node_id, data) catch |err| switch (err) {
+                    error.InvalidPayload => {
+                        return unified.buildFsrpcError(
+                            self.allocator,
+                            msg.tag,
+                            "invalid",
+                            "venom_packages payload is invalid for requested operation",
+                        );
+                    },
+                    error.AccessDenied => {
+                        return unified.buildFsrpcError(
+                            self.allocator,
+                            msg.tag,
+                            "eperm",
+                            "venom package operation denied by policy",
+                        );
+                    },
+                    error.AlreadyExists => {
+                        return unified.buildFsrpcError(
+                            self.allocator,
+                            msg.tag,
+                            "eexist",
+                            "venom package already installed",
                         );
                     },
                     else => return err,
@@ -1966,7 +2012,7 @@ pub const Session = struct {
         try self.addDirectoryDescriptors(
             project_meta_dir,
             "Project Metadata",
-            "{\"kind\":\"metadata\",\"files\":[\"topology.json\",\"nodes.json\",\"agents.json\",\"sources.json\",\"contracts.json\",\"paths.json\",\"summary.json\",\"alerts.json\",\"workspace_status.json\",\"mounts.json\",\"desired_mounts.json\",\"actual_mounts.json\",\"binds.json\",\"mounted_services.json\",\"drift.json\",\"reconcile.json\",\"availability.json\",\"health.json\"]}",
+            "{\"kind\":\"metadata\",\"files\":[\"topology.json\",\"nodes.json\",\"agents.json\",\"sources.json\",\"contracts.json\",\"paths.json\",\"summary.json\",\"alerts.json\",\"workspace_status.json\",\"mounts.json\",\"desired_mounts.json\",\"actual_mounts.json\",\"binds.json\",\"mounted_services.json\",\"venom_packages.json\",\"drift.json\",\"reconcile.json\",\"availability.json\",\"health.json\"]}",
             "{\"read\":true,\"write\":false}",
             "Project topology and availability metadata.",
         );
@@ -2026,7 +2072,7 @@ pub const Session = struct {
         try self.addDirectoryDescriptors(
             meta_root,
             "Meta",
-            "{\"kind\":\"meta\",\"entries\":[\"protocol.json\",\"view.json\",\"workspace_status.json\",\"workspace_availability.json\",\"workspace_health.json\",\"workspace_alerts.json\",\"workspace_binds.json\",\"workspace_services.json\"]}",
+            "{\"kind\":\"meta\",\"entries\":[\"protocol.json\",\"view.json\",\"workspace_status.json\",\"workspace_availability.json\",\"workspace_health.json\",\"workspace_alerts.json\",\"workspace_binds.json\",\"workspace_services.json\",\"venom_packages.json\"]}",
             "{\"read\":true,\"write\":false}",
             "Attached-session compatibility metadata.",
         );
@@ -2250,6 +2296,27 @@ pub const Session = struct {
         defer self.allocator.free(services_json);
         _ = try self.addFile(project_meta_dir, "mounted_services.json", services_json, false, .none);
         _ = try self.addFile(meta_root, "workspace_services.json", services_json, false, .none);
+
+        const packages_json = try self.buildVenomPackagesJson();
+        defer self.allocator.free(packages_json);
+        _ = try self.addFile(project_meta_dir, "venom_packages.json", packages_json, false, .none);
+        _ = try self.addFile(meta_root, "venom_packages.json", packages_json, false, .none);
+    }
+
+    pub fn refreshWorkspaceServiceDiscoveryFiles(self: *Session) !void {
+        const meta_root = self.lookupChild(self.root_id, "meta") orelse return;
+        const projects_root = self.lookupChild(self.root_id, "projects") orelse return;
+        const active_project_id = self.active_namespace_project_id orelse self.project_id orelse return;
+        const project_dir = self.lookupChild(projects_root, active_project_id) orelse return;
+        const project_meta_dir = self.lookupChild(project_dir, "meta") orelse return;
+        return self.addWorkspaceServiceDiscoveryFiles(meta_root, project_meta_dir);
+    }
+
+    fn buildVenomPackagesJson(self: *Session) ![]u8 {
+        if (self.control_plane) |plane| {
+            return plane.listVenomPackages();
+        }
+        return venom_packages.buildPackagesJson(self.allocator);
     }
 
     fn buildProjectBindsArrayJson(self: *Session) ![]u8 {
@@ -2691,72 +2758,94 @@ pub const Session = struct {
 
         const library_dir = try self.addDir(local_venoms_root, "library", false);
         try self.seedGlobalLibraryNamespaceAt(library_dir, "/nodes/local/venoms/library");
+        try self.seedBuiltinPackageMetadata(library_dir, "library");
         _ = try self.cloneLocalCatalogVenomAlias(library_dir, global_root, "library");
+
+        const venom_packages_dir = try self.addDir(local_venoms_root, "venom_packages", false);
+        try self.seedVenomPackagesNamespaceAt(venom_packages_dir, "/nodes/local/venoms/venom_packages");
+        try self.seedBuiltinPackageMetadata(venom_packages_dir, "venom_packages");
+        const venom_packages_alias_dir = try self.cloneLocalCatalogVenomAlias(venom_packages_dir, global_root, "venom_packages");
+        self.venom_packages_status_alias_id = self.lookupChild(venom_packages_alias_dir, "status.json") orelse 0;
+        self.venom_packages_result_alias_id = self.lookupChild(venom_packages_alias_dir, "result.json") orelse 0;
 
         const chat_dir = try self.addDir(local_venoms_root, "chat", false);
         try self.seedChatNamespaceAt(chat_dir, "/nodes/local/venoms/chat", "/nodes/local/venoms/jobs");
+        try self.seedBuiltinPackageMetadata(chat_dir, "chat");
         _ = try self.cloneLocalCatalogVenomAlias(chat_dir, global_root, "chat");
 
         const jobs_dir = try self.addDir(local_venoms_root, "jobs", false);
         try self.seedJobsNamespaceAt(jobs_dir, "/nodes/local/venoms/jobs");
         try self.seedJobsFromIndex();
+        try self.seedBuiltinPackageMetadata(jobs_dir, "jobs");
         _ = try self.cloneLocalCatalogVenomAlias(jobs_dir, global_root, "jobs");
 
         const thoughts_dir = try self.addDir(local_venoms_root, "thoughts", false);
         try self.seedThoughtsNamespaceAt(thoughts_dir, "/nodes/local/venoms/thoughts");
+        try self.seedBuiltinPackageMetadata(thoughts_dir, "thoughts");
         _ = try self.cloneLocalCatalogVenomAlias(thoughts_dir, global_root, "thoughts");
 
         const events_dir = try self.addDir(local_venoms_root, "events", false);
         try self.seedEventsNamespaceAt(events_dir, "/nodes/local/venoms/events");
+        try self.seedBuiltinPackageMetadata(events_dir, "events");
         _ = try self.cloneLocalCatalogVenomAlias(events_dir, global_root, "events");
 
         const home_dir = try self.addDir(local_venoms_root, "home", false);
         try self.seedAgentHomeNamespaceAt(home_dir, "/nodes/local/venoms/home");
+        try self.seedBuiltinPackageMetadata(home_dir, "home");
         const home_alias_dir = try self.cloneLocalCatalogVenomAlias(home_dir, global_root, "home");
         self.home_status_alias_id = self.lookupChild(home_alias_dir, "status.json") orelse 0;
         self.home_result_alias_id = self.lookupChild(home_alias_dir, "result.json") orelse 0;
 
         const workers_dir = try self.addDir(local_venoms_root, "workers", false);
         try workers_venom.seedNamespaceAt(self, workers_dir, "/nodes/local/venoms/workers");
+        try self.seedBuiltinPackageMetadata(workers_dir, "workers");
         const workers_alias_dir = try self.cloneLocalCatalogVenomAlias(workers_dir, global_root, "workers");
         self.workers_status_alias_id = self.lookupChild(workers_alias_dir, "status.json") orelse 0;
         self.workers_result_alias_id = self.lookupChild(workers_alias_dir, "result.json") orelse 0;
 
         const web_search_dir = try self.addDir(local_venoms_root, "web_search", false);
         try self.seedAgentWebSearchNamespaceAt(web_search_dir, "/nodes/local/venoms/web_search");
+        try self.seedBuiltinPackageMetadata(web_search_dir, "web_search");
         _ = try self.cloneLocalCatalogVenomAlias(web_search_dir, global_root, "web_search");
 
         const search_code_dir = try self.addDir(local_venoms_root, "search_code", false);
         try self.seedAgentSearchCodeNamespaceAt(search_code_dir, "/nodes/local/venoms/search_code");
+        try self.seedBuiltinPackageMetadata(search_code_dir, "search_code");
         _ = try self.cloneLocalCatalogVenomAlias(search_code_dir, global_root, "search_code");
 
         const terminal_dir = try self.addDir(local_venoms_root, "terminal", false);
         try self.seedAgentTerminalNamespaceAt(terminal_dir, "/nodes/local/venoms/terminal");
+        try self.seedBuiltinPackageMetadata(terminal_dir, "terminal");
         _ = try self.cloneLocalCatalogVenomAlias(terminal_dir, global_root, "terminal");
 
         const mounts_dir = try self.addDir(local_venoms_root, "mounts", false);
         try self.seedAgentMountsNamespaceAt(mounts_dir, "/nodes/local/venoms/mounts");
+        try self.seedBuiltinPackageMetadata(mounts_dir, "mounts");
         const mounts_alias_dir = try self.cloneLocalCatalogVenomAlias(mounts_dir, global_root, "mounts");
         self.mounts_status_alias_id = self.lookupChild(mounts_alias_dir, "status.json") orelse 0;
         self.mounts_result_alias_id = self.lookupChild(mounts_alias_dir, "result.json") orelse 0;
 
         const agents_dir = try self.addDir(local_venoms_root, "agents", false);
         try self.seedAgentAgentsNamespaceAt(agents_dir, "/nodes/local/venoms/agents");
+        try self.seedBuiltinPackageMetadata(agents_dir, "agents");
         _ = try self.cloneLocalCatalogVenomAlias(agents_dir, global_root, "agents");
 
         const workspaces_dir = try self.addDir(local_venoms_root, "workspaces", false);
         try self.seedAgentWorkspacesNamespaceAt(workspaces_dir, "/nodes/local/venoms/workspaces");
+        try self.seedBuiltinPackageMetadata(workspaces_dir, "workspaces");
         _ = try self.cloneLocalCatalogVenomAlias(workspaces_dir, global_root, "workspaces");
 
         if (self.local_fs_export_root != null) {
             const git_dir = try self.addDir(local_venoms_root, "git", false);
             try self.seedAgentGitNamespaceAt(git_dir, "/nodes/local/venoms/git");
+            try self.seedBuiltinPackageMetadata(git_dir, "git");
             const git_alias_dir = try self.cloneLocalCatalogVenomAlias(git_dir, global_root, "git");
             self.git_status_alias_id = self.lookupChild(git_alias_dir, "status.json") orelse 0;
             self.git_result_alias_id = self.lookupChild(git_alias_dir, "result.json") orelse 0;
 
             const github_pr_dir = try self.addDir(local_venoms_root, "github_pr", false);
             try self.seedAgentGitHubPrNamespaceAt(github_pr_dir, "/nodes/local/venoms/github_pr");
+            try self.seedBuiltinPackageMetadata(github_pr_dir, "github_pr");
             const github_pr_alias_dir = try self.cloneLocalCatalogVenomAlias(github_pr_dir, global_root, "github_pr");
             self.github_pr_status_alias_id = self.lookupChild(github_pr_alias_dir, "status.json") orelse 0;
             self.github_pr_result_alias_id = self.lookupChild(github_pr_alias_dir, "result.json") orelse 0;
@@ -2765,6 +2854,7 @@ pub const Session = struct {
         if (self.mission_store != null) {
             const missions_dir = try self.addDir(local_venoms_root, "missions", false);
             try self.seedAgentMissionsNamespaceAt(missions_dir, "/nodes/local/venoms/missions");
+            try self.seedBuiltinPackageMetadata(missions_dir, "missions");
             const missions_alias_dir = try self.cloneLocalCatalogVenomAlias(missions_dir, global_root, "missions");
             self.missions_status_alias_id = self.lookupChild(missions_alias_dir, "status.json") orelse 0;
             self.missions_result_alias_id = self.lookupChild(missions_alias_dir, "result.json") orelse 0;
@@ -2772,6 +2862,7 @@ pub const Session = struct {
             if (self.local_fs_export_root != null) {
                 const pr_review_dir = try self.addDir(local_venoms_root, "pr_review", false);
                 try self.seedAgentPrReviewNamespaceAt(pr_review_dir, "/nodes/local/venoms/pr_review");
+                try self.seedBuiltinPackageMetadata(pr_review_dir, "pr_review");
                 const pr_review_alias_dir = try self.cloneLocalCatalogVenomAlias(pr_review_dir, global_root, "pr_review");
                 self.pr_review_status_alias_id = self.lookupChild(pr_review_alias_dir, "status.json") orelse 0;
                 self.pr_review_result_alias_id = self.lookupChild(pr_review_alias_dir, "result.json") orelse 0;
@@ -2780,6 +2871,7 @@ pub const Session = struct {
 
         try self.refreshNodeVenomsIndex("local");
         try self.registerLocalCatalogVenomBinding("library", "node_catalog");
+        try self.registerLocalCatalogVenomBinding("venom_packages", "node_catalog");
         try self.registerLocalCatalogVenomBinding("chat", "node_catalog");
         try self.registerLocalCatalogVenomBinding("jobs", "node_catalog");
         try self.registerLocalCatalogVenomBinding("thoughts", "node_catalog");
@@ -3156,6 +3248,7 @@ pub const Session = struct {
                 const base_path = try std.fmt.allocPrint(self.allocator, "/nodes/{s}/venoms/memory", .{worker_id});
                 defer self.allocator.free(base_path);
                 try workers_venom.seedPassiveWorkerMemoryNamespaceAt(self, memory_dir_id, base_path, worker_id, agent_id);
+                try self.seedBuiltinPackageMetadata(memory_dir_id, "memory");
             } else if (std.mem.eql(u8, venom_id, "sub_brains")) {
                 const sub_brains_dir_id = if (self.lookupChild(venoms_root_id, "sub_brains")) |existing|
                     existing
@@ -3164,6 +3257,7 @@ pub const Session = struct {
                 const base_path = try std.fmt.allocPrint(self.allocator, "/nodes/{s}/venoms/sub_brains", .{worker_id});
                 defer self.allocator.free(base_path);
                 try workers_venom.seedPassiveWorkerSubBrainsNamespaceAt(self, sub_brains_dir_id, base_path, worker_id, agent_id);
+                try self.seedBuiltinPackageMetadata(sub_brains_dir_id, "sub_brains");
             }
         }
 
@@ -3321,6 +3415,10 @@ pub const Session = struct {
 
     fn seedAgentHomeNamespaceAt(self: *Session, home_dir: u32, base_path: []const u8) !void {
         return home_venom.seedNamespaceAt(self, home_dir, base_path);
+    }
+
+    fn seedVenomPackagesNamespaceAt(self: *Session, packages_dir: u32, base_path: []const u8) !void {
+        return venom_packages_service_venom.seedNamespaceAt(self, packages_dir, base_path);
     }
 
     fn seedAgentWebSearchNamespace(self: *Session, web_search_dir: u32) !void {
@@ -3805,8 +3903,8 @@ pub const Session = struct {
         defer self.allocator.free(escaped_project_id);
         return std.fmt.allocPrint(
             self.allocator,
-            "{{\"version\":\"acheron-namespace-project-contract-v2\",\"project_id\":\"{s}\",\"top_level_roots\":[\"/nodes\",\"/agents\",\"/global\",\"/services\"],\"project_metadata_files\":[\"topology.json\",\"nodes.json\",\"agents.json\",\"sources.json\",\"contracts.json\",\"paths.json\",\"summary.json\",\"alerts.json\",\"workspace_status.json\",\"mounts.json\",\"desired_mounts.json\",\"actual_mounts.json\",\"binds.json\",\"mounted_services.json\",\"drift.json\",\"reconcile.json\",\"availability.json\",\"health.json\"],\"links\":{{\"nodes_root\":\"/nodes\",\"agents_root\":\"/agents\",\"global_root\":\"/global\",\"services_root\":\"/services\",\"workspace_control\":\"/global/workspaces\",\"workspace_status\":\"/global/workspaces/control/invoke.json\",\"workspace_binds\":\"/projects/{s}/meta/binds.json\",\"workspace_services\":\"/projects/{s}/meta/mounted_services.json\"}}}}",
-            .{ escaped_project_id, escaped_project_id, escaped_project_id },
+            "{{\"version\":\"acheron-namespace-project-contract-v2\",\"project_id\":\"{s}\",\"top_level_roots\":[\"/nodes\",\"/agents\",\"/global\",\"/services\"],\"project_metadata_files\":[\"topology.json\",\"nodes.json\",\"agents.json\",\"sources.json\",\"contracts.json\",\"paths.json\",\"summary.json\",\"alerts.json\",\"workspace_status.json\",\"mounts.json\",\"desired_mounts.json\",\"actual_mounts.json\",\"binds.json\",\"mounted_services.json\",\"venom_packages.json\",\"drift.json\",\"reconcile.json\",\"availability.json\",\"health.json\"],\"links\":{{\"nodes_root\":\"/nodes\",\"agents_root\":\"/agents\",\"global_root\":\"/global\",\"services_root\":\"/services\",\"workspace_control\":\"/global/workspaces\",\"workspace_status\":\"/global/workspaces/control/invoke.json\",\"workspace_binds\":\"/projects/{s}/meta/binds.json\",\"workspace_services\":\"/projects/{s}/meta/mounted_services.json\",\"venom_packages\":\"/projects/{s}/meta/venom_packages.json\"}}}}",
+            .{ escaped_project_id, escaped_project_id, escaped_project_id, escaped_project_id },
         );
     }
 
@@ -3815,8 +3913,9 @@ pub const Session = struct {
         defer self.allocator.free(escaped_project_id);
         return std.fmt.allocPrint(
             self.allocator,
-            "{{\"project_id\":\"{s}\",\"nodes_root\":\"/nodes\",\"agents_root\":\"/agents\",\"services\":{{\"root\":\"/services\",\"mounted_services_meta\":\"/projects/{s}/meta/mounted_services.json\"}},\"global\":{{\"root\":\"/global\",\"library\":\"/global/library\",\"workspaces\":\"/global/workspaces\",\"chat\":\"/global/chat\",\"jobs\":\"/global/jobs\",\"mounts\":\"/global/mounts\",\"debug\":{s}}}}}",
+            "{{\"project_id\":\"{s}\",\"nodes_root\":\"/nodes\",\"agents_root\":\"/agents\",\"services\":{{\"root\":\"/services\",\"mounted_services_meta\":\"/projects/{s}/meta/mounted_services.json\"}},\"packages\":{{\"meta\":\"/projects/{s}/meta/venom_packages.json\"}},\"global\":{{\"root\":\"/global\",\"library\":\"/global/library\",\"workspaces\":\"/global/workspaces\",\"chat\":\"/global/chat\",\"jobs\":\"/global/jobs\",\"mounts\":\"/global/mounts\",\"debug\":{s}}}}}",
             .{
+                escaped_project_id,
                 escaped_project_id,
                 escaped_project_id,
                 if (policy.show_debug or self.is_admin) "\"/debug\"" else "null",
@@ -4625,8 +4724,16 @@ pub const Session = struct {
                     try self.addNodeVenomEntry(
                         venoms_root,
                         venom.venom_id,
+                        venom.package_id,
+                        venom.instance_id,
                         venom.kind,
+                        venom.version,
                         venom.state,
+                        venom.provider_scope,
+                        venom.categories_json,
+                        venom.hosts_json,
+                        venom.projection_modes_json,
+                        venom.requirements_json,
                         venom.endpoint,
                         venom.caps_json,
                         venom.mounts_json,
@@ -4686,7 +4793,15 @@ pub const Session = struct {
                     venoms_root,
                     "fs",
                     "fs",
+                    "local:fs",
+                    "fs",
+                    "1",
                     "online",
+                    "node_export",
+                    "[\"filesystem\"]",
+                    "[\"node\"]",
+                    "[\"node_export\"]",
+                    "{}",
                     endpoint,
                     caps,
                     mounts,
@@ -4701,7 +4816,15 @@ pub const Session = struct {
                     venoms_root,
                     "fs",
                     "fs",
+                    "local:fs",
+                    "fs",
+                    "1",
                     "online",
+                    "node_export",
+                    "[\"filesystem\"]",
+                    "[\"node\"]",
+                    "[\"node_export\"]",
+                    "{}",
                     endpoint,
                     caps,
                     mounts,
@@ -4732,7 +4855,15 @@ pub const Session = struct {
                     venoms_root,
                     "camera",
                     "camera",
+                    "local:camera",
+                    "camera",
+                    "1",
                     "online",
+                    "node_export",
+                    "[\"camera\"]",
+                    "[\"node\"]",
+                    "[\"node_export\"]",
+                    "{}",
                     endpoint,
                     caps,
                     mounts,
@@ -4747,7 +4878,15 @@ pub const Session = struct {
                     venoms_root,
                     "camera",
                     "camera",
+                    "local:camera",
+                    "camera",
+                    "1",
                     "online",
+                    "node_export",
+                    "[\"camera\"]",
+                    "[\"node\"]",
+                    "[\"node_export\"]",
+                    "{}",
                     endpoint,
                     caps,
                     mounts,
@@ -4778,7 +4917,15 @@ pub const Session = struct {
                     venoms_root,
                     "screen",
                     "screen",
+                    "local:screen",
+                    "screen",
+                    "1",
                     "online",
+                    "node_export",
+                    "[\"screen\"]",
+                    "[\"node\"]",
+                    "[\"node_export\"]",
+                    "{}",
                     endpoint,
                     caps,
                     mounts,
@@ -4793,7 +4940,15 @@ pub const Session = struct {
                     venoms_root,
                     "screen",
                     "screen",
+                    "local:screen",
+                    "screen",
+                    "1",
                     "online",
+                    "node_export",
+                    "[\"screen\"]",
+                    "[\"node\"]",
+                    "[\"node_export\"]",
+                    "{}",
                     endpoint,
                     caps,
                     mounts,
@@ -4824,7 +4979,15 @@ pub const Session = struct {
                     venoms_root,
                     "user",
                     "user",
+                    "local:user",
+                    "user",
+                    "1",
                     "online",
+                    "node_export",
+                    "[\"user_interaction\"]",
+                    "[\"node\"]",
+                    "[\"node_export\"]",
+                    "{}",
                     endpoint,
                     caps,
                     mounts,
@@ -4839,7 +5002,15 @@ pub const Session = struct {
                     venoms_root,
                     "user",
                     "user",
+                    "local:user",
+                    "user",
+                    "1",
                     "online",
+                    "node_export",
+                    "[\"user_interaction\"]",
+                    "[\"node\"]",
+                    "[\"node_export\"]",
+                    "{}",
                     endpoint,
                     caps,
                     mounts,
@@ -4880,7 +5051,15 @@ pub const Session = struct {
                     venoms_root,
                     venom_id,
                     "terminal",
+                    venom_id,
+                    "terminal",
+                    "1",
                     "online",
+                    "node_export",
+                    "[\"terminal\",\"exec\"]",
+                    "[\"node\"]",
+                    "[\"node_export\"]",
+                    "{}",
                     endpoint,
                     caps,
                     mounts,
@@ -4895,7 +5074,15 @@ pub const Session = struct {
                     venoms_root,
                     venom_id,
                     "terminal",
+                    venom_id,
+                    "terminal",
+                    "1",
                     "online",
+                    "node_export",
+                    "[\"terminal\",\"exec\"]",
+                    "[\"node\"]",
+                    "[\"node_export\"]",
+                    "{}",
                     endpoint,
                     caps,
                     mounts,
@@ -4921,8 +5108,16 @@ pub const Session = struct {
     const NodeVenomCatalog = struct {
         const Entry = struct {
             venom_id: []u8,
+            package_id: []u8,
+            instance_id: ?[]u8 = null,
             kind: []u8,
+            version: []u8,
             state: []u8,
+            provider_scope: []u8,
+            categories_json: []u8,
+            hosts_json: []u8,
+            projection_modes_json: []u8,
+            requirements_json: []u8,
             endpoint: []u8,
             caps_json: []u8,
             mounts_json: []u8,
@@ -4935,8 +5130,16 @@ pub const Session = struct {
 
             fn deinit(self: *Entry, allocator: std.mem.Allocator) void {
                 allocator.free(self.venom_id);
+                allocator.free(self.package_id);
+                if (self.instance_id) |value| allocator.free(value);
                 allocator.free(self.kind);
+                allocator.free(self.version);
                 allocator.free(self.state);
+                allocator.free(self.provider_scope);
+                allocator.free(self.categories_json);
+                allocator.free(self.hosts_json);
+                allocator.free(self.projection_modes_json);
+                allocator.free(self.requirements_json);
                 allocator.free(self.endpoint);
                 allocator.free(self.caps_json);
                 allocator.free(self.mounts_json);
@@ -5018,6 +5221,78 @@ pub const Session = struct {
                 try std.fmt.allocPrint(self.allocator, "/nodes/{s}/venoms/{s}", .{ node_id, venom_id_val.string });
             errdefer self.allocator.free(resolved_endpoint);
 
+            const package_id = if (item.object.get("package_id")) |value|
+                if (value == .string and value.string.len > 0)
+                    try self.allocator.dupe(u8, value.string)
+                else
+                    try self.allocator.dupe(u8, venom_id_val.string)
+            else
+                try self.allocator.dupe(u8, venom_id_val.string);
+            errdefer self.allocator.free(package_id);
+
+            const instance_id = if (item.object.get("instance_id")) |value|
+                if (value == .string and value.string.len > 0)
+                    try self.allocator.dupe(u8, value.string)
+                else
+                    null
+            else
+                null;
+            errdefer if (instance_id) |value| self.allocator.free(value);
+
+            const provider_scope = if (item.object.get("provider_scope")) |value|
+                if (value == .string and value.string.len > 0)
+                    try self.allocator.dupe(u8, value.string)
+                else
+                    try self.allocator.dupe(u8, "node_export")
+            else
+                try self.allocator.dupe(u8, "node_export");
+            errdefer self.allocator.free(provider_scope);
+
+            const categories_json = if (item.object.get("categories")) |value|
+                if (value == .array)
+                    try std.fmt.allocPrint(self.allocator, "{f}", .{std.json.fmt(value, .{})})
+                else
+                    try self.allocator.dupe(u8, "[]")
+            else
+                try self.allocator.dupe(u8, "[]");
+            errdefer self.allocator.free(categories_json);
+
+            const hosts_json = if (item.object.get("hosts")) |value|
+                if (value == .array)
+                    try std.fmt.allocPrint(self.allocator, "{f}", .{std.json.fmt(value, .{})})
+                else
+                    try self.allocator.dupe(u8, "[]")
+            else
+                try self.allocator.dupe(u8, "[]");
+            errdefer self.allocator.free(hosts_json);
+
+            const projection_modes_json = if (item.object.get("projection_modes")) |value|
+                if (value == .array)
+                    try std.fmt.allocPrint(self.allocator, "{f}", .{std.json.fmt(value, .{})})
+                else
+                    try self.allocator.dupe(u8, "[]")
+            else
+                try self.allocator.dupe(u8, "[]");
+            errdefer self.allocator.free(projection_modes_json);
+
+            const requirements_json = if (item.object.get("requirements")) |value|
+                if (value == .object)
+                    try std.fmt.allocPrint(self.allocator, "{f}", .{std.json.fmt(value, .{})})
+                else
+                    try self.allocator.dupe(u8, "{}")
+            else
+                try self.allocator.dupe(u8, "{}");
+            errdefer self.allocator.free(requirements_json);
+
+            const version = if (item.object.get("version")) |value|
+                if (value == .string and value.string.len > 0)
+                    try self.allocator.dupe(u8, value.string)
+                else
+                    try self.allocator.dupe(u8, "1")
+            else
+                try self.allocator.dupe(u8, "1");
+            errdefer self.allocator.free(version);
+
             const caps_json = if (item.object.get("capabilities")) |caps|
                 if (caps == .object)
                     try std.fmt.allocPrint(self.allocator, "{f}", .{std.json.fmt(caps, .{})})
@@ -5092,8 +5367,16 @@ pub const Session = struct {
 
             try catalog.items.append(self.allocator, .{
                 .venom_id = try self.allocator.dupe(u8, venom_id_val.string),
+                .package_id = package_id,
+                .instance_id = instance_id,
                 .kind = try self.allocator.dupe(u8, kind_val.string),
+                .version = version,
                 .state = try self.allocator.dupe(u8, state),
+                .provider_scope = provider_scope,
+                .categories_json = categories_json,
+                .hosts_json = hosts_json,
+                .projection_modes_json = projection_modes_json,
+                .requirements_json = requirements_json,
                 .endpoint = resolved_endpoint,
                 .caps_json = caps_json,
                 .mounts_json = mounts_json,
@@ -5117,8 +5400,16 @@ pub const Session = struct {
         self: *Session,
         services_root: u32,
         venom_id: []const u8,
+        package_id: []const u8,
+        instance_id: ?[]const u8,
         kind: []const u8,
+        version: []const u8,
         state: []const u8,
+        provider_scope: []const u8,
+        categories_json: []const u8,
+        hosts_json: []const u8,
+        projection_modes_json: []const u8,
+        requirements_json: []const u8,
         endpoint: []const u8,
         caps_json: []const u8,
         mounts_json: []const u8,
@@ -5145,6 +5436,24 @@ pub const Session = struct {
         else
             "# Venom metadata for this node capability.\n";
         _ = try self.addFile(venom_dir, "README.md", readme, false, .none);
+        const package_json = try self.renderNodeVenomPackageJson(
+            package_id,
+            kind,
+            version,
+            provider_scope,
+            categories_json,
+            hosts_json,
+            projection_modes_json,
+            requirements_json,
+            caps_json,
+            ops_json,
+            runtime_json,
+            permissions_json,
+            schema_json,
+            help_md,
+        );
+        defer self.allocator.free(package_json);
+        _ = try self.addFile(venom_dir, "PACKAGE.json", package_json, false, .none);
         _ = try self.addFile(venom_dir, "SCHEMA.json", schema_json, false, .none);
         _ = try self.addFile(venom_dir, "CAPS.json", caps_json, false, .none);
         _ = try self.addFile(venom_dir, "MOUNTS.json", mounts_json, false, .none);
@@ -5158,13 +5467,67 @@ pub const Session = struct {
         _ = try self.addFile(venom_dir, "HOST.json", host_json, false, .none);
         _ = try self.addFile(venom_dir, "PERMISSIONS.json", permissions_json, false, .none);
 
+        const escaped_package_id = try unified.jsonEscape(self.allocator, package_id);
+        defer self.allocator.free(escaped_package_id);
+        const escaped_provider_scope = try unified.jsonEscape(self.allocator, provider_scope);
+        defer self.allocator.free(escaped_provider_scope);
+        const instance_id_json = if (instance_id) |value| blk: {
+            const escaped_instance_id = try unified.jsonEscape(self.allocator, value);
+            defer self.allocator.free(escaped_instance_id);
+            break :blk try std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped_instance_id});
+        } else try self.allocator.dupe(u8, "null");
+        defer self.allocator.free(instance_id_json);
+
         const status = try std.fmt.allocPrint(
             self.allocator,
-            "{{\"venom_id\":\"{s}\",\"kind\":\"{s}\",\"state\":\"{s}\",\"endpoint\":\"{s}\"}}",
-            .{ escaped_venom_id, escaped_kind, escaped_state, escaped_endpoint },
+            "{{\"venom_id\":\"{s}\",\"package_id\":\"{s}\",\"instance_id\":{s},\"kind\":\"{s}\",\"state\":\"{s}\",\"provider_scope\":\"{s}\",\"endpoint\":\"{s}\"}}",
+            .{ escaped_venom_id, escaped_package_id, instance_id_json, escaped_kind, escaped_state, escaped_provider_scope, escaped_endpoint },
         );
         defer self.allocator.free(status);
         _ = try self.addFile(venom_dir, "STATUS.json", status, false, .none);
+    }
+
+    fn renderNodeVenomPackageJson(
+        self: *Session,
+        venom_id: []const u8,
+        kind: []const u8,
+        version: []const u8,
+        provider_scope: []const u8,
+        categories_json: []const u8,
+        hosts_json: []const u8,
+        projection_modes_json: []const u8,
+        requirements_json: []const u8,
+        capabilities_json: []const u8,
+        ops_json: []const u8,
+        runtime_json: []const u8,
+        permissions_json: []const u8,
+        schema_json: []const u8,
+        help_md: ?[]const u8,
+    ) ![]u8 {
+        const escaped_venom_id = try unified.jsonEscape(self.allocator, venom_id);
+        defer self.allocator.free(escaped_venom_id);
+        const escaped_kind = try unified.jsonEscape(self.allocator, kind);
+        defer self.allocator.free(escaped_kind);
+        const escaped_version = try unified.jsonEscape(self.allocator, version);
+        defer self.allocator.free(escaped_version);
+        const escaped_provider_scope = try unified.jsonEscape(self.allocator, provider_scope);
+        defer self.allocator.free(escaped_provider_scope);
+
+        if (help_md) |help| {
+            const escaped_help = try unified.jsonEscape(self.allocator, help);
+            defer self.allocator.free(escaped_help);
+            return std.fmt.allocPrint(
+                self.allocator,
+                "{{\"venom_id\":\"{s}\",\"kind\":\"{s}\",\"version\":\"{s}\",\"categories\":{s},\"hosts\":{s},\"projection_modes\":{s},\"requirements\":{s},\"capabilities\":{s},\"ops\":{s},\"runtime\":{s},\"permissions\":{s},\"schema\":{s},\"provider_scope\":\"{s}\",\"help_md\":\"{s}\"}}",
+                .{ escaped_venom_id, escaped_kind, escaped_version, categories_json, hosts_json, projection_modes_json, requirements_json, capabilities_json, ops_json, runtime_json, permissions_json, schema_json, escaped_provider_scope, escaped_help },
+            );
+        }
+
+        return std.fmt.allocPrint(
+            self.allocator,
+            "{{\"venom_id\":\"{s}\",\"kind\":\"{s}\",\"version\":\"{s}\",\"categories\":{s},\"hosts\":{s},\"projection_modes\":{s},\"requirements\":{s},\"capabilities\":{s},\"ops\":{s},\"runtime\":{s},\"permissions\":{s},\"schema\":{s},\"provider_scope\":\"{s}\"}}",
+            .{ escaped_venom_id, escaped_kind, escaped_version, categories_json, hosts_json, projection_modes_json, requirements_json, capabilities_json, ops_json, runtime_json, permissions_json, schema_json, escaped_provider_scope },
+        );
     }
 
     fn renderNodeVenomHostJson(self: *Session, runtime_json: []const u8) ![]u8 {
@@ -5188,6 +5551,13 @@ pub const Session = struct {
         const source_node = self.nodes.get(source_id) orelse return;
         if (source_node.kind != .file) return;
         _ = try self.addFile(target_dir_id, name, source_node.content, false, .none);
+    }
+
+    fn seedBuiltinPackageMetadata(self: *Session, venom_dir_id: u32, venom_id: []const u8) !void {
+        const spec = venom_packages.findBuiltinPackage(venom_id) orelse return;
+        const package_json = try venom_packages.renderPackageMetadataJson(self.allocator, spec);
+        defer self.allocator.free(package_json);
+        _ = try self.addFile(venom_dir_id, "PACKAGE.json", package_json, false, .none);
     }
 
     fn seedActiveScopedVenomBindings(
@@ -6430,6 +6800,10 @@ pub const Session = struct {
 
     fn handleWorkersNamespaceWrite(self: *Session, special: SpecialKind, node_id: u32, raw_input: []const u8) !WriteOutcome {
         return .{ .written = try workers_venom.handleNamespaceWrite(self, special, node_id, raw_input) };
+    }
+
+    fn handleVenomPackagesNamespaceWrite(self: *Session, special: SpecialKind, node_id: u32, raw_input: []const u8) !WriteOutcome {
+        return .{ .written = try venom_packages_service_venom.handleNamespaceWrite(self, special, node_id, raw_input) };
     }
 
     pub fn normalizeLocalFsRelativePath(self: *Session, raw_path: []const u8) ![]u8 {

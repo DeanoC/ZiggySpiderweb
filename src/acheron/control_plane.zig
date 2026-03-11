@@ -1,6 +1,8 @@
 const std = @import("std");
 const ltm_store = @import("ziggy-memory-store").ltm_store;
 const venom_catalog = @import("spiderweb_node").venom_catalog;
+const venom_package_model = @import("spiderweb_node").venom_package;
+const venom_packages = @import("../venom_packages.zig");
 
 const persistence_base_id = "spiderweb:control-plane:state";
 const persistence_kind = "control_plane_state_v1";
@@ -49,6 +51,9 @@ pub const ControlPlaneError = error{
     MountNotFound,
     BindConflict,
     BindNotFound,
+    VenomPackageNotFound,
+    VenomPackageBuiltinProtected,
+    AlreadyExists,
 };
 
 pub const ProjectAction = enum {
@@ -286,7 +291,8 @@ const ProjectBind = struct {
 
 const ProjectTemplateBindSpec = struct {
     bind_path: []const u8,
-    target_path: []const u8,
+    venom_id: []const u8,
+    provider_scope: []const u8 = "host_local",
 };
 
 const ProjectTemplateSpec = struct {
@@ -296,30 +302,33 @@ const ProjectTemplateSpec = struct {
 };
 
 const minimum_template_bind_specs = [_]ProjectTemplateBindSpec{
-    .{ .bind_path = "/services/mounts", .target_path = "/nodes/local/venoms/mounts" },
-    .{ .bind_path = "/services/home", .target_path = "/nodes/local/venoms/home" },
-    .{ .bind_path = "/services/workers", .target_path = "/nodes/local/venoms/workers" },
+    .{ .bind_path = "/services/venom_packages", .venom_id = "venom_packages" },
+    .{ .bind_path = "/services/mounts", .venom_id = "mounts" },
+    .{ .bind_path = "/services/home", .venom_id = "home" },
+    .{ .bind_path = "/services/workers", .venom_id = "workers" },
 };
 
 const system_template_bind_specs = [_]ProjectTemplateBindSpec{
-    .{ .bind_path = "/services/mounts", .target_path = "/nodes/local/venoms/mounts" },
-    .{ .bind_path = "/services/home", .target_path = "/nodes/local/venoms/home" },
-    .{ .bind_path = "/services/workers", .target_path = "/nodes/local/venoms/workers" },
+    .{ .bind_path = "/services/venom_packages", .venom_id = "venom_packages" },
+    .{ .bind_path = "/services/mounts", .venom_id = "mounts" },
+    .{ .bind_path = "/services/home", .venom_id = "home" },
+    .{ .bind_path = "/services/workers", .venom_id = "workers" },
 };
 
 const github_template_bind_specs = [_]ProjectTemplateBindSpec{
-    .{ .bind_path = "/services/mounts", .target_path = "/nodes/local/venoms/mounts" },
-    .{ .bind_path = "/services/home", .target_path = "/nodes/local/venoms/home" },
-    .{ .bind_path = "/services/workers", .target_path = "/nodes/local/venoms/workers" },
-    .{ .bind_path = "/services/git", .target_path = "/nodes/local/venoms/git" },
-    .{ .bind_path = "/services/github_pr", .target_path = "/nodes/local/venoms/github_pr" },
-    .{ .bind_path = "/services/missions", .target_path = "/nodes/local/venoms/missions" },
-    .{ .bind_path = "/services/pr_review", .target_path = "/nodes/local/venoms/pr_review" },
-    .{ .bind_path = "/services/terminal", .target_path = "/nodes/local/venoms/terminal" },
-    .{ .bind_path = "/services/events", .target_path = "/nodes/local/venoms/events" },
-    .{ .bind_path = "/services/library", .target_path = "/nodes/local/venoms/library" },
-    .{ .bind_path = "/services/search_code", .target_path = "/nodes/local/venoms/search_code" },
-    .{ .bind_path = "/services/web_search", .target_path = "/nodes/local/venoms/web_search" },
+    .{ .bind_path = "/services/venom_packages", .venom_id = "venom_packages" },
+    .{ .bind_path = "/services/mounts", .venom_id = "mounts" },
+    .{ .bind_path = "/services/home", .venom_id = "home" },
+    .{ .bind_path = "/services/workers", .venom_id = "workers" },
+    .{ .bind_path = "/services/git", .venom_id = "git" },
+    .{ .bind_path = "/services/github_pr", .venom_id = "github_pr" },
+    .{ .bind_path = "/services/missions", .venom_id = "missions" },
+    .{ .bind_path = "/services/pr_review", .venom_id = "pr_review" },
+    .{ .bind_path = "/services/terminal", .venom_id = "terminal" },
+    .{ .bind_path = "/services/events", .venom_id = "events" },
+    .{ .bind_path = "/services/library", .venom_id = "library" },
+    .{ .bind_path = "/services/search_code", .venom_id = "search_code" },
+    .{ .bind_path = "/services/web_search", .venom_id = "web_search" },
 };
 
 const builtin_project_templates = [_]ProjectTemplateSpec{
@@ -402,6 +411,7 @@ pub const ControlPlane = struct {
     nodes: std.StringHashMapUnmanaged(Node) = .{},
     pending_joins: std.StringHashMapUnmanaged(PendingJoin) = .{},
     projects: std.StringHashMapUnmanaged(Project) = .{},
+    installed_venom_packages: std.ArrayListUnmanaged(venom_package_model.VenomPackage) = .{},
     active_project_by_agent: std.StringHashMapUnmanaged([]u8) = .{},
     preferred_venom_provider_by_scope_venom: std.StringHashMapUnmanaged([]u8) = .{},
     debug_stream_by_agent: std.StringHashMapUnmanaged([]u8) = .{},
@@ -948,6 +958,8 @@ pub const ControlPlane = struct {
         self.projects.deinit(self.allocator);
         self.projects = .{};
 
+        venom_package_model.deinitPackages(self.allocator, &self.installed_venom_packages);
+
         var active_it = self.active_project_by_agent.iterator();
         while (active_it.next()) |entry| {
             self.allocator.free(entry.key_ptr.*);
@@ -1292,6 +1304,79 @@ pub const ControlPlane = struct {
         try validateIdentifier(node_id, 128);
         _ = self.nodes.get(node_id) orelse return ControlPlaneError.NodeNotFound;
         return self.renderNodeVenomPayload(node_id, null);
+    }
+
+    pub fn listVenomPackages(self: *ControlPlane) ![]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return venom_packages.buildCombinedPackagesJson(self.allocator, self.installed_venom_packages.items);
+    }
+
+    pub fn getVenomPackage(self: *ControlPlane, payload_json: ?[]const u8) ![]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        var payload = try parsePayload(self.allocator, payload_json);
+        defer payload.deinit();
+        const obj = payload.value.object;
+
+        const venom_id = getRequiredString(obj, "venom_id") catch return ControlPlaneError.MissingField;
+        try validateIdentifier(venom_id, 128);
+        return self.renderSingleVenomPackageJsonLocked(venom_id);
+    }
+
+    pub fn installVenomPackage(self: *ControlPlane, payload_json: ?[]const u8) ![]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        var payload = try parsePayload(self.allocator, payload_json);
+        defer payload.deinit();
+        const obj = payload.value.object;
+
+        const package_value = obj.get("package") orelse payload.value;
+        var package = try parseVenomPackageValue(self.allocator, package_value);
+        errdefer package.deinit(self.allocator);
+
+        if (venom_packages.findBuiltinPackage(package.venom_id) != null) {
+            return ControlPlaneError.VenomPackageBuiltinProtected;
+        }
+        for (self.installed_venom_packages.items) |installed| {
+            if (std.mem.eql(u8, installed.venom_id, package.venom_id)) return ControlPlaneError.AlreadyExists;
+        }
+
+        try self.installed_venom_packages.append(self.allocator, package);
+        self.persistSnapshotBestEffortLocked();
+        return self.renderSingleInstalledVenomPackageJsonLocked(package.venom_id);
+    }
+
+    pub fn removeVenomPackage(self: *ControlPlane, payload_json: ?[]const u8) ![]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        var payload = try parsePayload(self.allocator, payload_json);
+        defer payload.deinit();
+        const obj = payload.value.object;
+
+        const venom_id = getRequiredString(obj, "venom_id") catch return ControlPlaneError.MissingField;
+        try validateIdentifier(venom_id, 128);
+        if (venom_packages.findBuiltinPackage(venom_id) != null) {
+            return ControlPlaneError.VenomPackageBuiltinProtected;
+        }
+
+        for (self.installed_venom_packages.items, 0..) |installed, idx| {
+            if (!std.mem.eql(u8, installed.venom_id, venom_id)) continue;
+            var removed = self.installed_venom_packages.orderedRemove(idx);
+            removed.deinit(self.allocator);
+            self.persistSnapshotBestEffortLocked();
+            const escaped_id = try jsonEscape(self.allocator, venom_id);
+            defer self.allocator.free(escaped_id);
+            return std.fmt.allocPrint(
+                self.allocator,
+                "{{\"removed\":true,\"venom_id\":\"{s}\"}}",
+                .{escaped_id},
+            );
+        }
+        return ControlPlaneError.VenomPackageNotFound;
     }
 
     pub fn resolvePreferredVenomProvider(
@@ -3821,6 +3906,24 @@ pub const ControlPlane = struct {
         return out.toOwnedSlice(self.allocator);
     }
 
+    fn renderSingleInstalledVenomPackageJsonLocked(self: *ControlPlane, venom_id: []const u8) ![]u8 {
+        for (self.installed_venom_packages.items) |package| {
+            if (!std.mem.eql(u8, package.venom_id, venom_id)) continue;
+            var out = std.ArrayListUnmanaged(u8){};
+            defer out.deinit(self.allocator);
+            try venom_package_model.appendPackageJson(self.allocator, &out, package);
+            return out.toOwnedSlice(self.allocator);
+        }
+        return ControlPlaneError.VenomPackageNotFound;
+    }
+
+    fn renderSingleVenomPackageJsonLocked(self: *ControlPlane, venom_id: []const u8) ![]u8 {
+        if (venom_packages.findBuiltinPackage(venom_id)) |spec| {
+            return venom_packages.renderPackageMetadataJson(self.allocator, spec);
+        }
+        return self.renderSingleInstalledVenomPackageJsonLocked(venom_id);
+    }
+
     fn clonePreferredVenomProviderLocked(
         self: *ControlPlane,
         allocator: std.mem.Allocator,
@@ -4295,6 +4398,12 @@ pub const ControlPlane = struct {
             try out.appendSlice(self.allocator, "]}");
         }
 
+        try out.appendSlice(self.allocator, "],\"installed_venom_packages\":[");
+        for (self.installed_venom_packages.items, 0..) |package, idx| {
+            if (idx != 0) try out.append(self.allocator, ',');
+            try venom_package_model.appendPackageJson(self.allocator, &out, package);
+        }
+
         try out.appendSlice(self.allocator, "],\"active_project_by_agent\":[");
         first = true;
         var active_it = self.active_project_by_agent.iterator();
@@ -4546,6 +4655,10 @@ pub const ControlPlane = struct {
             }
         }
 
+        if (root.get("installed_venom_packages")) |packages_val| {
+            venom_package_model.replacePackagesFromJsonValue(self.allocator, &self.installed_venom_packages, packages_val) catch return error.InvalidSnapshot;
+        }
+
         if (root.get("active_project_by_agent")) |active_val| {
             if (active_val != .array) return error.InvalidSnapshot;
             for (active_val.array.items) |item| {
@@ -4579,6 +4692,24 @@ fn parsePayload(allocator: std.mem.Allocator, payload_json: ?[]const u8) !Parsed
     errdefer parsed.deinit();
     if (parsed.value != .object) return ControlPlaneError.InvalidPayload;
     return parsed;
+}
+
+fn parseVenomPackageValue(allocator: std.mem.Allocator, value: std.json.Value) !venom_package_model.VenomPackage {
+    if (value != .object) return ControlPlaneError.InvalidPayload;
+    const wrapped = try std.fmt.allocPrint(allocator, "[{f}]", .{std.json.fmt(value, .{})});
+    defer allocator.free(wrapped);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, wrapped, .{});
+    defer parsed.deinit();
+
+    var packages = std.ArrayListUnmanaged(venom_package_model.VenomPackage){};
+    errdefer venom_package_model.deinitPackages(allocator, &packages);
+    venom_package_model.replacePackagesFromJsonValue(allocator, &packages, parsed.value) catch return ControlPlaneError.InvalidPayload;
+    if (packages.items.len != 1) return ControlPlaneError.InvalidPayload;
+    const package = packages.items[0];
+    packages.items.len = 0;
+    venom_package_model.deinitPackages(allocator, &packages);
+    return package;
 }
 
 fn getRequiredString(obj: std.json.ObjectMap, name: []const u8) ![]const u8 {
@@ -5511,9 +5642,10 @@ fn ensureProjectTemplateBindsLocked(self: *ControlPlane, project: *Project) !boo
     const template = resolveProjectTemplateSpec(project.template_id, project.kind) orelse return false;
     var changed = false;
     for (template.bind_specs) |spec| {
+        const target_path = resolveTemplateBindTargetPath(spec) orelse continue;
         const normalized_bind = try normalizeMountPath(self.allocator, spec.bind_path);
         defer self.allocator.free(normalized_bind);
-        const normalized_target = try normalizeMountPath(self.allocator, spec.target_path);
+        const normalized_target = try normalizeMountPath(self.allocator, target_path);
         defer self.allocator.free(normalized_target);
 
         if (!projectPathWithinBindAuthority(project, normalized_target)) continue;
@@ -5546,6 +5678,10 @@ fn ensureProjectTemplateBindsLocked(self: *ControlPlane, project: *Project) !boo
         changed = true;
     }
     return changed;
+}
+
+fn resolveTemplateBindTargetPath(spec: ProjectTemplateBindSpec) ?[]const u8 {
+    return venom_packages.resolveBuiltinTargetPath(spec.venom_id, spec.provider_scope);
 }
 
 fn projectHasCanonicalWorkspaceMount(project: *const Project) bool {
@@ -8061,6 +8197,67 @@ test "acheron_control_plane: persistence restores node venom catalogs" {
         defer allocator.free(fetched);
         try std.testing.expect(std.mem.indexOf(u8, fetched, "\"venom_id\":\"camera\"") != null);
         try std.testing.expect(std.mem.indexOf(u8, fetched, "\"/nodes/") != null);
+    }
+}
+
+test "acheron_control_plane: venom package install list get remove" {
+    const allocator = std.testing.allocator;
+    var plane = ControlPlane.init(allocator);
+    defer plane.deinit();
+
+    const install_req =
+        \\{"package":{"venom_id":"camera_pkg","kind":"camera","version":"1","categories":["camera","edge"],"hosts":["node"],"projection_modes":["node_export"],"requirements":{},"capabilities":{"still":true},"ops":{"model":"namespace"},"runtime":{"type":"native_proc"},"permissions":{"default":"deny-by-default"},"schema":{"model":"namespace-mount"},"help_md":"Camera package"}}
+    ;
+    const installed = try plane.installVenomPackage(install_req);
+    defer allocator.free(installed);
+    try std.testing.expect(std.mem.indexOf(u8, installed, "\"venom_id\":\"camera_pkg\"") != null);
+
+    const listed = try plane.listVenomPackages();
+    defer allocator.free(listed);
+    try std.testing.expect(std.mem.indexOf(u8, listed, "\"venom_id\":\"venom_packages\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, listed, "\"venom_id\":\"camera_pkg\"") != null);
+
+    const fetched = try plane.getVenomPackage("{\"venom_id\":\"camera_pkg\"}");
+    defer allocator.free(fetched);
+    try std.testing.expect(std.mem.indexOf(u8, fetched, "\"kind\":\"camera\"") != null);
+
+    const removed = try plane.removeVenomPackage("{\"venom_id\":\"camera_pkg\"}");
+    defer allocator.free(removed);
+    try std.testing.expect(std.mem.indexOf(u8, removed, "\"removed\":true") != null);
+
+    const listed_after = try plane.listVenomPackages();
+    defer allocator.free(listed_after);
+    try std.testing.expect(std.mem.indexOf(u8, listed_after, "\"venom_id\":\"camera_pkg\"") == null);
+}
+
+test "acheron_control_plane: venom package persistence restores installed registry" {
+    const allocator = std.testing.allocator;
+    const dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/fs-control-plane-packages-{d}", .{std.time.nanoTimestamp()});
+    defer allocator.free(dir);
+    defer std.fs.cwd().deleteTree(dir) catch {};
+
+    try std.fs.cwd().makePath(dir);
+
+    {
+        var plane = ControlPlane.initWithPersistence(allocator, dir, "control-plane.db");
+        defer plane.deinit();
+        const installed = try plane.installVenomPackage(
+            \\{"package":{"venom_id":"package_persist","kind":"registry_test","version":"3","categories":["test"],"hosts":["spiderweb"],"projection_modes":["host_local"],"requirements":{},"capabilities":{},"ops":{},"runtime":{},"permissions":{},"schema":{}}}
+        );
+        defer allocator.free(installed);
+        try std.testing.expect(std.mem.indexOf(u8, installed, "\"venom_id\":\"package_persist\"") != null);
+    }
+
+    {
+        var plane = ControlPlane.initWithPersistence(allocator, dir, "control-plane.db");
+        defer plane.deinit();
+        const listed = try plane.listVenomPackages();
+        defer allocator.free(listed);
+        try std.testing.expect(std.mem.indexOf(u8, listed, "\"venom_id\":\"package_persist\"") != null);
+
+        const fetched = try plane.getVenomPackage("{\"venom_id\":\"package_persist\"}");
+        defer allocator.free(fetched);
+        try std.testing.expect(std.mem.indexOf(u8, fetched, "\"version\":\"3\"") != null);
     }
 }
 
