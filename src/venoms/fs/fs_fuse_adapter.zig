@@ -297,7 +297,7 @@ pub const FuseAdapter = struct {
         } else |_| {}
         const mount_options = switch (@import("builtin").os.tag) {
             .windows => "uid=-1,gid=-1,FileInfoTimeout=-1",
-            else => "default_permissions,attr_timeout=120,entry_timeout=120,negative_timeout=10",
+            else => "default_permissions,attr_timeout=1,entry_timeout=1,negative_timeout=0",
         };
         try appendArgZ(self.allocator, &argv, "-o");
         try appendArgZ(self.allocator, &argv, mount_options);
@@ -601,6 +601,7 @@ fn cOpen(path_c: [*c]const u8, fi: ?*c.struct_fuse_file_info) callconv(.c) c_int
     if (path_c == null) return -fs_protocol.Errno.EINVAL;
     const path = std.mem.span(path_c);
     const flags = if (fi) |info| @as(u32, @intCast(c.spiderweb_fi_get_flags(info))) else @as(u32, 0);
+    fuseTrace("open path={s} flags={d}", .{ path, flags });
     if (fi) |info| {
         const local_id = adapter.openAndStoreHandle(path, flags) catch |err| return toFuseError(err);
         c.spiderweb_fi_set_fh(info, local_id);
@@ -616,6 +617,7 @@ fn cRead(path_c: [*c]const u8, buf: [*c]u8, size: usize, off: c.off_t, fi: ?*c.s
     if (path_c == null) return -fs_protocol.Errno.EINVAL;
     if (off < 0) return -fs_protocol.Errno.EINVAL;
     const path = std.mem.span(path_c);
+    fuseTrace("read path={s} size={d} off={d}", .{ path, size, off });
 
     var open_file: mount_provider.OpenFile = undefined;
     var owns_close = false;
@@ -758,8 +760,9 @@ fn cWriteWin(path_c: [*c]const u8, buf: [*c]const u8, size: usize, off: c.fuse_o
 }
 
 fn cRelease(path_c: [*c]const u8, fi: ?*c.struct_fuse_file_info) callconv(.c) c_int {
-    _ = path_c;
+    const path = if (path_c) |value| std.mem.span(value) else "";
     const adapter = active_adapter orelse return -fs_protocol.Errno.EIO;
+    fuseTrace("release path={s}", .{path});
     if (fi) |info| {
         const local_id = c.spiderweb_fi_get_fh(info);
         if (local_id != 0) {

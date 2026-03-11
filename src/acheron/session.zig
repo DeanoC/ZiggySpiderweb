@@ -6328,10 +6328,7 @@ pub const Session = struct {
         defer parsed.deinit();
         if (parsed.value != .object) return 0;
 
-        const next_cookie: u64 = if (parsed.value.object.get("next_cookie")) |value|
-            if (value == .integer and value.integer >= 0) @intCast(value.integer) else 0
-        else
-            0;
+        const next_cookie = parseReaddirNextCookie(parsed.value.object);
         const ents = parsed.value.object.get("ents") orelse return next_cookie;
         if (ents != .array) return next_cookie;
         for (ents.array.items) |entry| {
@@ -6342,6 +6339,16 @@ pub const Session = struct {
             try self.upsertBoundVenomProxyChild(parent_id, name_val.string, attr_val);
         }
         return next_cookie;
+    }
+
+    fn parseReaddirNextCookie(obj: std.json.ObjectMap) u64 {
+        if (obj.get("next_cookie")) |value| {
+            if (value == .integer and value.integer >= 0) return @intCast(value.integer);
+        }
+        if (obj.get("next")) |value| {
+            if (value == .integer and value.integer >= 0) return @intCast(value.integer);
+        }
+        return 0;
     }
 
     fn upsertBoundVenomProxyChild(self: *Session, parent_id: u32, name: []const u8, attr_val: std.json.Value) !void {
@@ -9412,4 +9419,10 @@ fn decodeReadResponseData(allocator: std.mem.Allocator, frame: []const u8) ![]u8
     errdefer allocator.free(decoded);
     try std.base64.standard.Decoder.decode(decoded, data_b64.string);
     return decoded;
+}
+
+test "session: parseReaddirNextCookie accepts next" {
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"ents\":[],\"next\":18}", .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(u64, 18), Session.parseReaddirNextCookie(parsed.value.object));
 }

@@ -81,7 +81,7 @@ pub fn seedNamespaceAt(self: anytype, home_dir: u32, base_path: []const u8) !voi
     _ = try self.addFile(
         control_dir,
         "README.md",
-        "Write {\"agent_id\":\"...\"} to ensure.json to provision /agents/<agent_id>/home as a durable bind into the mounted workspace.\n",
+        "Write {\"agent_id\":\"...\"} to ensure.json to provision /home/<agent_id> as a durable bind into the mounted workspace.\n",
         false,
         .none,
     );
@@ -174,7 +174,7 @@ fn executeOpPayload(self: anytype, op: Op, args_obj: std.json.ObjectMap) ![]u8 {
         const trimmed = std.mem.trim(u8, value, " \t\r\n");
         if (trimmed.len == 0) return error.InvalidPayload;
         break :blk try self.allocator.dupe(u8, trimmed);
-    } else try std.fmt.allocPrint(self.allocator, "/agents/{s}/home", .{agent_id});
+    } else try std.fmt.allocPrint(self.allocator, "/home/{s}", .{agent_id});
     defer self.allocator.free(bind_path);
 
     const target_path = if (extractOptionalStringByNames(args_obj, &[_][]const u8{"target_path"})) |value| blk: {

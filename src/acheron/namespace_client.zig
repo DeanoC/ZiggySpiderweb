@@ -415,10 +415,11 @@ pub const NamespaceClient = struct {
             .file => 1,
             .dir => 2,
         };
+        const owner = currentProcessAttrOwner();
         return std.fmt.allocPrint(
             self.allocator,
-            "{{\"id\":{d},\"k\":{d},\"m\":{d},\"n\":{d},\"u\":0,\"g\":0,\"sz\":{d},\"at\":0,\"mt\":0,\"ct\":0,\"gen\":0}}",
-            .{ stat.id, kind_code, normalizeMode(stat.mode, stat.kind), nlink, stat.size },
+            "{{\"id\":{d},\"k\":{d},\"m\":{d},\"n\":{d},\"u\":{d},\"g\":{d},\"sz\":{d},\"at\":0,\"mt\":0,\"ct\":0,\"gen\":0}}",
+            .{ stat.id, kind_code, normalizeMode(stat.mode, stat.kind), nlink, owner.uid, owner.gid, stat.size },
         );
     }
 
@@ -1098,6 +1099,13 @@ fn normalizeMode(mode: u32, kind: NamespaceStat.Kind) u32 {
     };
 }
 
+fn currentProcessAttrOwner() struct { uid: u32, gid: u32 } {
+    return switch (builtin.os.tag) {
+        .linux => .{ .uid = @intCast(std.os.linux.getuid()), .gid = @intCast(std.os.linux.getgid()) },
+        else => .{ .uid = 0, .gid = 0 },
+    };
+}
+
 fn flagsRequireWrite(flags: u32) bool {
     return (flags & 0x3) != 0;
 }
@@ -1243,6 +1251,27 @@ test "namespace_client: stat attrs synthesize mode from kind when remote mode is
     try std.testing.expectEqual(@as(u64, 4), stat.id);
     try std.testing.expectEqual(NamespaceStat.Kind.dir, stat.kind);
     try std.testing.expectEqual(@as(u32, 0o040755), normalizeMode(stat.mode, stat.kind));
+}
+
+test "namespace_client: stat attrs use current process owner on posix" {
+    if (builtin.os.tag != .linux) return;
+
+    var client: NamespaceClient = undefined;
+    client.allocator = std.testing.allocator;
+    const attr_json = try client.statToAttrJson(.{
+        .id = 7,
+        .kind = .file,
+        .size = 11,
+        .mode = 0o100644,
+        .writable = true,
+    });
+    defer std.testing.allocator.free(attr_json);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, attr_json, .{});
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(i64, std.os.linux.getuid()), parsed.value.object.get("u").?.integer);
+    try std.testing.expectEqual(@as(i64, std.os.linux.getgid()), parsed.value.object.get("g").?.integer);
 }
 
 test "namespace_client: parseReadPayload decodes data_b64" {
