@@ -17,6 +17,7 @@ In short: **Spiderweb hosts the namespace; workers operate through it**.
 If that resonates, start with:
 - `docs/overview.md`
 - `docs/README.md`
+- `CODEX_EXTERNAL_AGENT.md` for the current non-Spider-Monkey external-worker path
 
 ## Quick Start
 
