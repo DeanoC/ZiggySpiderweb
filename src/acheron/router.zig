@@ -1549,11 +1549,7 @@ pub const Router = struct {
         var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, payload_json, .{});
         defer parsed.deinit();
         if (parsed.value != .object) return .{ .complete = false, .next_cookie = 0 };
-        const next_cookie = parsed.value.object.get("next_cookie");
-        const parsed_next_cookie: u64 = if (next_cookie) |value|
-            (if (value == .integer and value.integer >= 0) @as(u64, @intCast(value.integer)) else 0)
-        else
-            0;
+        const parsed_next_cookie = parseReaddirNextCookie(parsed.value.object);
         const complete = parsed_next_cookie == 0;
         const ents = parsed.value.object.get("ents") orelse return .{ .complete = complete, .next_cookie = parsed_next_cookie };
         if (ents != .array) return .{ .complete = complete, .next_cookie = parsed_next_cookie };
@@ -1578,6 +1574,16 @@ pub const Router = struct {
             try self.dir_cache.put(endpoint_index, dir_id, normalized_name, node_id, attr_json, now);
         }
         return .{ .complete = complete, .next_cookie = parsed_next_cookie };
+    }
+
+    fn parseReaddirNextCookie(obj: std.json.ObjectMap) u64 {
+        if (obj.get("next_cookie")) |value| {
+            if (value == .integer and value.integer >= 0) return @intCast(value.integer);
+        }
+        if (obj.get("next")) |value| {
+            if (value == .integer and value.integer >= 0) return @intCast(value.integer);
+        }
+        return 0;
     }
 
     fn isVirtualDirectoryPath(self: *const Router, path: []const u8) bool {
@@ -2781,4 +2787,10 @@ test "acheron_router: replaceEndpoints swaps mount topology and clears caches" {
     try std.testing.expect(router.dir_listing_cache.getFresh(.{ .endpoint_index = 0, .node_id = 10 }, now) == null);
     try std.testing.expect(!router.dir_complete_cache.isFresh(.{ .endpoint_index = 0, .node_id = 10 }, now));
     try std.testing.expect(!router.dir_prime_cache.isFresh(.{ .endpoint_index = 0, .node_id = 10 }, now));
+}
+
+test "acheron_router: parseReaddirNextCookie accepts next" {
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"ents\":[],\"next\":18}", .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(u64, 18), Router.parseReaddirNextCookie(parsed.value.object));
 }

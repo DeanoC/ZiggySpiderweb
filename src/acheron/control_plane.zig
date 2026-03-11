@@ -15,7 +15,7 @@ const spider_web_project_status = "active";
 const spider_web_project_vision = "System project for Spiderweb control and host integrations";
 const spider_web_workspace_mount_path = "/nodes/local/fs";
 const spider_web_project_mount_prefix = "/nodes/local/projects/" ++ spider_web_project_id ++ "/";
-const default_project_up_export_name = "work";
+const default_project_up_export_name = "system-workspace";
 const spider_web_project_kind_name = "system_builtin";
 const normal_project_kind_name = "normal";
 const system_project_template_id = "system";
@@ -310,6 +310,9 @@ const minimum_template_bind_specs = [_]ProjectTemplateBindSpec{
     .{ .bind_path = "/services/mounts", .venom_id = "mounts" },
     .{ .bind_path = "/services/home", .venom_id = "home" },
     .{ .bind_path = "/services/workers", .venom_id = "workers" },
+    .{ .bind_path = "/services/chat", .venom_id = "chat", .provider_scope = "session_dynamic" },
+    .{ .bind_path = "/services/jobs", .venom_id = "jobs", .provider_scope = "session_dynamic" },
+    .{ .bind_path = "/services/events", .venom_id = "events" },
 };
 
 const system_template_bind_specs = [_]ProjectTemplateBindSpec{
@@ -317,6 +320,9 @@ const system_template_bind_specs = [_]ProjectTemplateBindSpec{
     .{ .bind_path = "/services/mounts", .venom_id = "mounts" },
     .{ .bind_path = "/services/home", .venom_id = "home" },
     .{ .bind_path = "/services/workers", .venom_id = "workers" },
+    .{ .bind_path = "/services/chat", .venom_id = "chat", .provider_scope = "session_dynamic" },
+    .{ .bind_path = "/services/jobs", .venom_id = "jobs", .provider_scope = "session_dynamic" },
+    .{ .bind_path = "/services/events", .venom_id = "events" },
 };
 
 const github_template_bind_specs = [_]ProjectTemplateBindSpec{
@@ -324,6 +330,8 @@ const github_template_bind_specs = [_]ProjectTemplateBindSpec{
     .{ .bind_path = "/services/mounts", .venom_id = "mounts" },
     .{ .bind_path = "/services/home", .venom_id = "home" },
     .{ .bind_path = "/services/workers", .venom_id = "workers" },
+    .{ .bind_path = "/services/chat", .venom_id = "chat", .provider_scope = "session_dynamic" },
+    .{ .bind_path = "/services/jobs", .venom_id = "jobs", .provider_scope = "session_dynamic" },
     .{ .bind_path = "/services/git", .venom_id = "git" },
     .{ .bind_path = "/services/github_pr", .venom_id = "github_pr" },
     .{ .bind_path = "/services/missions", .venom_id = "missions" },
@@ -3282,7 +3290,7 @@ pub const ControlPlane = struct {
             project,
             now_ms,
             null,
-            self.isPrimaryAgent(agent_id),
+            self.isPrimaryAgent(agent_id) or is_admin,
             agent_id,
             project_token,
             is_admin,
@@ -7411,6 +7419,10 @@ test "acheron_control_plane: workspaceStatus supports explicit project selection
     const selected_primary = try plane.workspaceStatus(default_primary_agent_id, selected_req);
     defer allocator.free(selected_primary);
     try std.testing.expect(std.mem.indexOf(u8, selected_primary, "\"fs_auth_token\":\"") != null);
+
+    const selected_admin = try plane.workspaceStatusWithRole("agent-selector", selected_req, true);
+    defer allocator.free(selected_admin);
+    try std.testing.expect(std.mem.indexOf(u8, selected_admin, "\"fs_auth_token\":\"") != null);
 
     const selected_without_token = try std.fmt.allocPrint(
         allocator,
