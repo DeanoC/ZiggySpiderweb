@@ -318,10 +318,7 @@ fn ensureFile(
     writable: bool,
     special: anytype,
 ) !void {
-    if (self.lookupChild(parent_id, name)) |existing| {
-        try self.setFileContent(existing, content);
-        return;
-    }
+    if (self.lookupChild(parent_id, name) != null) return;
     _ = try self.addFile(parent_id, name, content, writable, special);
 }
 

@@ -8,6 +8,7 @@ const runtime_handle_mod = @import("agents/runtime_handle.zig");
 const sandbox_runtime_mod = @import("sandbox_runtime.zig");
 const websocket_transport = @import("websocket_transport.zig");
 const control_plane_mod = @import("acheron/control_plane.zig");
+const acheron_session_mod = @import("acheron/session.zig");
 const chat_job_index = @import("agents/chat_job_index.zig");
 const fs_protocol = @import("spiderweb_fs").fs_protocol;
 const spiderweb_node = @import("spiderweb_node");
@@ -6253,6 +6254,8 @@ fn handleWebSocketConnection(
     var active_session_key = try allocator.dupe(u8, "main");
     defer allocator.free(active_session_key);
     var control_protocol_negotiated = false;
+    var namespace_session: ?acheron_session_mod.Session = null;
+    defer resetNamespaceSession(&namespace_session);
     var connection_write_mutex: std.Thread.Mutex = .{};
     const connection_venom_id = try std.fmt.allocPrint(
         allocator,
@@ -7030,6 +7033,7 @@ fn handleWebSocketConnection(
                                 );
                                 defer allocator.free(response);
                                 try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                resetNamespaceSession(&namespace_session);
                                 connect_gate_error = null;
                                 bootstrap_only_mode = runtime_registry.isBootstrapMotherOnlyState();
                                 runtime_registry.rememberPrincipalSession(
@@ -7237,6 +7241,7 @@ fn handleWebSocketConnection(
                                 );
                                 defer allocator.free(response);
                                 try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                resetNamespaceSession(&namespace_session);
                                 runtime_registry.rememberPrincipalSession(
                                     principal,
                                     session_key,
@@ -7463,6 +7468,7 @@ fn handleWebSocketConnection(
                                 );
                                 defer allocator.free(response);
                                 try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                resetNamespaceSession(&namespace_session);
                                 continue;
                             },
                             .node_invite_create,
@@ -7659,16 +7665,56 @@ fn handleWebSocketConnection(
                         }
                     },
                     .acheron => {
-                        const response = try unified.buildFsrpcError(
-                            allocator,
-                            parsed.tag,
-                            "external_worker_required",
-                            "embedded runtime websocket access is removed; mount the workspace with spiderweb-fs-mount and run Spider Monkey against that mount",
-                        );
+                        if (!control_protocol_negotiated) {
+                            const response = try unified.buildFsrpcError(
+                                allocator,
+                                parsed.tag,
+                                "protocol_mismatch",
+                                "control.version must be negotiated first",
+                            );
+                            defer allocator.free(response);
+                            try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                            try writeFrameLocked(stream, &connection_write_mutex, "", .close);
+                            return;
+                        }
+
+                        const active_binding = session_bindings.get(active_session_key) orelse return error.InvalidState;
+                        if (active_binding.project_id == null) {
+                            const response = try unified.buildFsrpcError(
+                                allocator,
+                                parsed.tag,
+                                "external_worker_required",
+                                "embedded runtime websocket access is removed; call control.session_attach with a workspace_id before using namespace fsrpc",
+                            );
+                            defer allocator.free(response);
+                            try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                            try writeFrameLocked(stream, &connection_write_mutex, "", .close);
+                            return;
+                        }
+
+                        if (namespace_session == null) {
+                            namespace_session = initNamespaceSessionForBinding(
+                                allocator,
+                                runtime_registry,
+                                active_binding,
+                                principal.role == .admin,
+                            ) catch |err| {
+                                const response = try unified.buildFsrpcError(
+                                    allocator,
+                                    parsed.tag,
+                                    "execution_failed",
+                                    @errorName(err),
+                                );
+                                defer allocator.free(response);
+                                try writeFrameLocked(stream, &connection_write_mutex, response, .text);
+                                continue;
+                            };
+                        }
+
+                        const response = try namespace_session.?.handle(&parsed);
                         defer allocator.free(response);
                         try writeFrameLocked(stream, &connection_write_mutex, response, .text);
-                        try writeFrameLocked(stream, &connection_write_mutex, "", .close);
-                        return;
+                        continue;
                     },
                 }
             },
@@ -7694,6 +7740,52 @@ fn deinitSessionBindings(allocator: std.mem.Allocator, map: *std.StringHashMapUn
     }
     map.deinit(allocator);
     map.* = .{};
+}
+
+fn resetNamespaceSession(namespace_session: *?acheron_session_mod.Session) void {
+    if (namespace_session.*) |*session| {
+        session.deinit();
+        namespace_session.* = null;
+    }
+}
+
+fn localFsExportRootForNamespace(runtime_registry: *AgentRuntimeRegistry) ?[]const u8 {
+    const trimmed = std.mem.trim(u8, runtime_registry.runtime_config.spider_web_root, " \t\r\n");
+    if (trimmed.len == 0 or std.mem.eql(u8, trimmed, "/")) return null;
+    return trimmed;
+}
+
+fn initNamespaceSessionForBinding(
+    allocator: std.mem.Allocator,
+    runtime_registry: *AgentRuntimeRegistry,
+    binding: SessionBinding,
+    is_admin: bool,
+) !acheron_session_mod.Session {
+    const project_id = binding.project_id orelse return error.InvalidState;
+    const runtime = runtime_registry.getRuntimeForBindingIfReady(binding.agent_id, binding.project_id) orelse
+        try runtime_registry.getOrCreate(binding.agent_id, binding.project_id, binding.project_token);
+    defer runtime.release();
+
+    return acheron_session_mod.Session.initWithOptions(
+        allocator,
+        runtime,
+        &runtime_registry.job_index,
+        binding.agent_id,
+        .{
+            .project_id = project_id,
+            .project_token = binding.project_token,
+            .agents_dir = runtime_registry.runtime_config.agents_dir,
+            .assets_dir = runtime_registry.runtime_config.assets_dir,
+            .projects_dir = "projects",
+            .local_fs_export_root = localFsExportRootForNamespace(runtime_registry),
+            .control_plane = &runtime_registry.control_plane,
+            .mission_store = &runtime_registry.missions,
+            .control_operator_token = runtime_registry.control_operator_token,
+            .actor_type = binding.actor_type,
+            .actor_id = binding.actor_id,
+            .is_admin = is_admin,
+        },
+    );
 }
 
 fn cloneSessionBinding(allocator: std.mem.Allocator, binding: SessionBinding) !SessionBinding {
@@ -9706,6 +9798,100 @@ test "server_piai: base websocket rejects legacy acheron runtime session" {
     try performClientHandshakeWithBearerToken(allocator, &client, "/", "admin-secret");
     try fsrpcConnectAndAttach(allocator, &client, "fid-survive");
     try expectLegacyAcheronRejected(allocator, &client);
+
+    try std.testing.expect(server_ctx.err_name == null);
+}
+
+test "server_piai: base websocket supports namespace attach after session_attach" {
+    const allocator = std.testing.allocator;
+    var runtime_registry = AgentRuntimeRegistry.init(allocator, .{
+        .ltm_directory = "",
+        .ltm_filename = "",
+    }, null);
+    defer runtime_registry.deinit();
+    try setAuthTokensForTests(&runtime_registry, "admin-secret", "user-secret");
+
+    const join_payload = try runtime_registry.control_plane.ensureNode("node-a", "ws://127.0.0.1:18891/v2/fs", 60_000);
+    defer allocator.free(join_payload);
+    const node_registration = try parseNodeRegistrationFromJoinPayload(allocator, join_payload);
+    defer {
+        allocator.free(node_registration.node_id);
+        allocator.free(node_registration.node_secret);
+    }
+
+    const project_created = try runtime_registry.control_plane.createProject(
+        "{\"name\":\"NamespaceAttach\",\"vision\":\"NamespaceAttach\"}",
+    );
+    defer allocator.free(project_created);
+    const project_id = (try extractProjectIdFromControlPayload(allocator, project_created)) orelse return error.TestExpectedResponse;
+    defer allocator.free(project_id);
+
+    const mount_payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"project_id\":\"{s}\",\"mount_path\":\"/nodes/{s}/fs\",\"node_id\":\"{s}\",\"export_name\":\"fs\"}}",
+        .{ project_id, node_registration.node_id, node_registration.node_id },
+    );
+    defer allocator.free(mount_payload);
+    const mount_result = try runtime_registry.control_plane.setProjectMountWithRole(mount_payload, true);
+    defer allocator.free(mount_result);
+
+    var listener = try (try std.net.Address.parseIp("127.0.0.1", 0)).listen(.{ .reuse_address = true });
+    defer listener.deinit();
+
+    var server_ctx = WsTestServerCtx{
+        .allocator = allocator,
+        .runtime_registry = &runtime_registry,
+        .listener = &listener,
+    };
+    defer server_ctx.deinit();
+
+    const server_thread = try std.Thread.spawn(.{}, runSingleWsConnection, .{&server_ctx});
+    defer server_thread.join();
+
+    var client = try std.net.tcpConnectToAddress(listener.listen_address);
+    defer client.close();
+
+    try performClientHandshakeWithBearerToken(allocator, &client, "/", "admin-secret");
+    try writeClientTextFrameMasked(&client, "{\"channel\":\"control\",\"type\":\"control.version\",\"id\":\"version\",\"payload\":{\"protocol\":\"unified-v2\"}}");
+    var version_ack = try readServerFrame(allocator, &client);
+    defer version_ack.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, version_ack.payload, "\"type\":\"control.version_ack\"") != null);
+
+    try writeClientTextFrameMasked(&client, "{\"channel\":\"control\",\"type\":\"control.connect\",\"id\":\"connect\"}");
+    var connect_ack = try readServerFrame(allocator, &client);
+    defer connect_ack.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, connect_ack.payload, "\"type\":\"control.connect_ack\"") != null);
+
+    const attach_payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"channel\":\"control\",\"type\":\"control.session_attach\",\"id\":\"attach\",\"payload\":{{\"session_key\":\"main\",\"agent_id\":\"test-agent\",\"project_id\":\"{s}\"}}}}",
+        .{project_id},
+    );
+    defer allocator.free(attach_payload);
+    try writeClientTextFrameMasked(&client, attach_payload);
+    var attach_ack = try readServerFrame(allocator, &client);
+    defer attach_ack.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, attach_ack.payload, "\"type\":\"control.session_attach\"") != null);
+
+    try writeClientTextFrameMasked(&client, "{\"channel\":\"acheron\",\"type\":\"acheron.t_version\",\"tag\":1,\"msize\":1048576,\"version\":\"acheron-1\"}");
+    var acheron_version = try readServerFrame(allocator, &client);
+    defer acheron_version.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, acheron_version.payload, "\"type\":\"acheron.r_version\"") != null);
+
+    try writeClientTextFrameMasked(&client, "{\"channel\":\"acheron\",\"type\":\"acheron.t_attach\",\"tag\":2,\"fid\":1}");
+    var acheron_attach = try readServerFrame(allocator, &client);
+    defer acheron_attach.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, acheron_attach.payload, "\"type\":\"acheron.r_attach\"") != null);
+
+    try writeClientTextFrameMasked(&client, "{\"channel\":\"acheron\",\"type\":\"acheron.t_walk\",\"tag\":3,\"fid\":1,\"newfid\":2,\"path\":[\"services\"]}");
+    var acheron_walk = try readServerFrame(allocator, &client);
+    defer acheron_walk.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, acheron_walk.payload, "\"type\":\"acheron.r_walk\"") != null);
+
+    try websocket_transport.writeFrame(&client, "", .close);
+    var close_reply = try readServerFrame(allocator, &client);
+    defer close_reply.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0x8), close_reply.opcode);
 
     try std.testing.expect(server_ctx.err_name == null);
 }

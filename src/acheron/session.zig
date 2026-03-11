@@ -3174,10 +3174,11 @@ pub const Session = struct {
         };
     }
 
-    pub fn detachWorkerLoopbackNode(self: *Session, worker_id: []const u8) !void {
+    pub fn detachWorkerLoopbackNode(self: *Session, worker_id: []const u8) anyerror!void {
         if (self.worker_presence.fetchRemove(worker_id)) |removed| {
             self.allocator.free(removed.key);
-            removed.value.deinit(self.allocator);
+            var presence = removed.value;
+            presence.deinit(self.allocator);
         }
 
         const nodes_root = self.lookupChild(self.root_id, "nodes") orelse return;
@@ -15514,6 +15515,50 @@ test "acheron_session: worker heartbeat lease marks node stale after expiry" {
     const refreshed_status = session.nodes.get(worker_status_id) orelse return error.TestExpectedResponse;
     try std.testing.expect(std.mem.indexOf(u8, refreshed_status.content, "\"state\":\"worker_stale\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, refreshed_status.content, "\"online\":false") != null);
+}
+
+test "acheron_session: worker heartbeat preserves worker-owned loopback files" {
+    const allocator = std.testing.allocator;
+
+    const runtime_server = try runtime_server_mod.RuntimeServer.create(allocator, "default", .{});
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createLocal(allocator, runtime_server);
+    defer runtime_handle.destroy();
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.init(allocator, runtime_handle, &job_index, "default");
+    defer session.deinit();
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        211,
+        212,
+        &.{ "services", "workers", "control", "register.json" },
+        "{\"agent_id\":\"spider-monkey\",\"worker_id\":\"spider-monkey-hb\",\"venoms\":[\"memory\"],\"ttl_ms\":30000}",
+        932,
+    );
+
+    const worker_memory_status_id = session.resolveAbsolutePathNoBinds("/nodes/spider-monkey-hb/venoms/memory/status.json") orelse return error.TestExpectedResponse;
+    try session.setFileContent(worker_memory_status_id, "{\"state\":\"worker-owned\"}");
+
+    const worker_memory_load_id = session.resolveAbsolutePathNoBinds("/nodes/spider-monkey-hb/venoms/memory/control/load.json") orelse return error.TestExpectedResponse;
+    try session.setFileContent(worker_memory_load_id, "{\"op\":\"load\",\"id\":\"mem-1\"}");
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        213,
+        214,
+        &.{ "services", "workers", "control", "heartbeat.json" },
+        "{\"agent_id\":\"spider-monkey\",\"worker_id\":\"spider-monkey-hb\",\"venoms\":[\"memory\"],\"ttl_ms\":30000}",
+        933,
+    );
+
+    const refreshed_status = session.nodes.get(worker_memory_status_id) orelse return error.TestExpectedResponse;
+    try std.testing.expectEqualStrings("{\"state\":\"worker-owned\"}", refreshed_status.content);
+    const refreshed_load = session.nodes.get(worker_memory_load_id) orelse return error.TestExpectedResponse;
+    try std.testing.expectEqualStrings("{\"op\":\"load\",\"id\":\"mem-1\"}", refreshed_load.content);
 }
 
 test "acheron_session: workers detach removes worker node and aliases" {
