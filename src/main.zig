@@ -27,6 +27,40 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
+    const args = try std.process.argsAlloc(allocator);
+    defer std.process.argsFree(allocator, args);
+
+    var requested_help = false;
+    for (args[1..]) |arg| {
+        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
+            requested_help = true;
+            break;
+        }
+    }
+
+    if (requested_help) {
+        const help =
+            "Spiderweb v0.3.0 - Workspace Host for OpenClaw Protocol\n" ++
+            "\n" ++
+            "A WebSocket host that exposes Spiderweb workspaces, nodes, venoms, and the virtual filesystem.\n" ++
+            "\n" ++
+            "Usage: spiderweb [options]\n" ++
+            "\n" ++
+            "Options:\n" ++
+            "  --bind <addr>    Bind address (default: from config or 127.0.0.1)\n" ++
+            "  --port <port>    Port number (default: from config or 18790)\n" ++
+            "  --help, -h       Show this help\n" ++
+            "\n" ++
+            "Workspace-first flow:\n" ++
+            "  spiderweb-config first-run\n" ++
+            "  spiderweb-control workspace_create '{\"name\":\"Demo\",\"vision\":\"Deliver the demo workspace\"}'\n" ++
+            "  spiderweb-fs-mount --workspace-url ws://127.0.0.1:18790/ --workspace-id <workspace-id> mount ./workspace\n" ++
+            "  spider-monkey run --workspace-root ./workspace\n" ++
+            "\n";
+        std.debug.print("{s}", .{help});
+        return;
+    }
+
     // Load config
     var config = Config.init(allocator, null) catch |err| {
         std.log.err("Failed to load config: {s}", .{@errorName(err)});
@@ -34,17 +68,19 @@ pub fn main() !void {
     };
     defer config.deinit();
 
-    std.log.info("Starting Spiderweb v0.3.0 (Pi AI)", .{});
+    if (std.mem.trim(u8, config.runtime.spider_web_root, " \t\r\n").len == 0) {
+        const cwd = try std.process.getCwdAlloc(allocator);
+        config.allocator.free(config.runtime.spider_web_root);
+        config.runtime.spider_web_root = cwd;
+    }
+
+    std.log.info("Starting Spiderweb v0.3.0 (Workspace Host)", .{});
     std.log.info("Config: {s}", .{config.config_path});
-    std.log.info("Provider: {s}/{s}", .{ config.provider.name, config.provider.model orelse "default" });
-    std.log.info("Default agent route: {s}", .{config.runtime.default_agent_id});
+    std.log.info("Workspace mount binary: {s}", .{config.runtime.sandbox_fs_mount_bin});
 
     // Override with CLI args if provided
     var port = config.server.port;
     var bind_addr = config.server.bind;
-
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
 
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -59,30 +95,6 @@ pub fn main() !void {
             if (i < args.len) {
                 bind_addr = args[i];
             }
-        } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
-            const help =
-                "Spiderweb v0.3.0 - Pi AI Gateway for OpenClaw Protocol\n" ++
-                "\n" ++
-                "A WebSocket gateway that proxies OpenClaw protocol messages to Pi AI providers.\n" ++
-                "\n" ++
-                "Usage: spiderweb [options]\n" ++
-                "\n" ++
-                "Options:\n" ++
-                "  --bind <addr>    Bind address (default: from config or 127.0.0.1)\n" ++
-                "  --port <port>    Port number (default: from config or 18790)\n" ++
-                "  --help, -h       Show this help\n" ++
-                "\n" ++
-                "Configuration:\n" ++
-                "  spiderweb-config oauth login <provider> [--enterprise-domain <domain>] [--no-set-provider]\n" ++
-                "  spiderweb-config oauth clear <provider>\n" ++
-                "  spiderweb-config config              Show current config\n" ++
-                "  spiderweb-config config set-provider <name> [model]\n" ++
-                "  spiderweb-config config set-key <api-key> [provider]\n" ++
-                "  spiderweb-config config clear-key [provider]\n" ++
-                "\n" ++
-                "API key resolution order: secure credential backend (Linux: secret-tool), then provider OAuth/env keys.\n";
-            std.debug.print("{s}", .{help});
-            return;
         }
     }
 

@@ -195,6 +195,15 @@ fn isOperatorTokenProtectedMutation(op_type: []const u8) bool {
         std.mem.eql(u8, op_type, "control.node_join_approve") or
         std.mem.eql(u8, op_type, "control.node_join_deny") or
         std.mem.eql(u8, op_type, "control.node_delete") or
+        std.mem.eql(u8, op_type, "control.workspace_create") or
+        std.mem.eql(u8, op_type, "control.workspace_update") or
+        std.mem.eql(u8, op_type, "control.workspace_delete") or
+        std.mem.eql(u8, op_type, "control.workspace_activate") or
+        std.mem.eql(u8, op_type, "control.workspace_up") or
+        std.mem.eql(u8, op_type, "control.workspace_mount_set") or
+        std.mem.eql(u8, op_type, "control.workspace_mount_remove") or
+        std.mem.eql(u8, op_type, "control.workspace_token_rotate") or
+        std.mem.eql(u8, op_type, "control.workspace_token_revoke") or
         std.mem.eql(u8, op_type, "control.project_create") or
         std.mem.eql(u8, op_type, "control.project_update") or
         std.mem.eql(u8, op_type, "control.project_delete") or
@@ -207,6 +216,8 @@ fn isOperatorTokenProtectedMutation(op_type: []const u8) bool {
 }
 
 test "control_cli: operator token mutation whitelist includes project activate and up" {
+    try std.testing.expect(isOperatorTokenProtectedMutation("control.workspace_create"));
+    try std.testing.expect(isOperatorTokenProtectedMutation("control.workspace_up"));
     try std.testing.expect(isOperatorTokenProtectedMutation("control.project_activate"));
     try std.testing.expect(isOperatorTokenProtectedMutation("control.project_up"));
     try std.testing.expect(isOperatorTokenProtectedMutation("control.node_join_approve"));
@@ -538,10 +549,10 @@ fn printHelp() !void {
         \\Examples:
         \\  spiderweb-control workspace_status
         \\  spiderweb-control --auth-token sw-admin-... auth_status
-        \\  spiderweb-control project_list
-        \\  spiderweb-control project_create '{"name":"Demo","vision":"Track and deliver demo milestones"}'
-        \\  spiderweb-control --operator-token mytoken project_create '{"name":"Secure","vision":"Harden service auth and policy"}'
-        \\  spiderweb-control --url ws://127.0.0.1:28790/ project_get '{"project_id":"proj-1"}'
+        \\  spiderweb-control workspace_list
+        \\  spiderweb-control workspace_create '{"name":"Demo","vision":"Track and deliver demo milestones"}'
+        \\  spiderweb-control --operator-token mytoken workspace_create '{"name":"Secure","vision":"Harden service auth and policy"}'
+        \\  spiderweb-control --url ws://127.0.0.1:28790/ workspace_get '{"workspace_id":"proj-1"}'
         \\
     ;
     try std.fs.File.stdout().writeAll(help);

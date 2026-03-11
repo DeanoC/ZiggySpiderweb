@@ -1,15 +1,16 @@
 const std = @import("std");
 const chat_job_index = @import("../agents/chat_job_index.zig");
 const shared_node = @import("spiderweb_node");
+const unified = @import("spider-protocol").unified;
 
 pub fn seedNamespaceAt(self: anytype, jobs_dir: u32, base_path: []const u8) !void {
     self.jobs_root_id = jobs_dir;
     try self.addDirectoryDescriptors(
         jobs_dir,
         "Jobs",
-        "{\"kind\":\"collection\",\"entries\":\"job_id\",\"files\":[\"status.json\",\"result.txt\",\"log.txt\"]}",
+        "{\"kind\":\"collection\",\"entries\":\"job_id\",\"files\":[\"request.json\",\"status.json\",\"result.txt\",\"log.txt\"]}",
         "{\"read\":true,\"write\":false}",
-        "Chat job status and outputs.",
+        "Chat job requests, status, and outputs.",
     );
     const jobs_schema_json = try shared_node.venom_contracts.jobs.renderSchemaJson(self.allocator, base_path);
     defer self.allocator.free(jobs_schema_json);
@@ -29,6 +30,9 @@ pub fn seedFromIndex(self: anytype) !void {
     for (jobs) |job| {
         if (self.lookupChild(self.jobs_root_id, job.job_id) != null) continue;
         const job_dir = try self.addDir(self.jobs_root_id, job.job_id, false);
+        const request_json = try buildRequestJsonForJobView(self.allocator, job);
+        defer self.allocator.free(request_json);
+        _ = try self.addFile(job_dir, "request.json", request_json, false, .none);
         const status_json = try self.buildJobStatusJson(job.state, job.correlation_id, job.error_text);
         defer self.allocator.free(status_json);
         _ = try self.addFile(job_dir, "status.json", status_json, true, .job_status);
@@ -36,6 +40,36 @@ pub fn seedFromIndex(self: anytype) !void {
         _ = try self.addFile(job_dir, "log.txt", job.log_text orelse "", true, .job_log);
         try self.ensureAliasedSubtree(job_dir);
     }
+}
+
+fn buildRequestJsonForJobView(allocator: std.mem.Allocator, job: chat_job_index.JobView) ![]u8 {
+    if (job.request_json) |value| return allocator.dupe(u8, value);
+
+    const escaped_job = try unified.jsonEscape(allocator, job.job_id);
+    defer allocator.free(escaped_job);
+    const escaped_agent = try unified.jsonEscape(allocator, job.agent_id);
+    defer allocator.free(escaped_agent);
+    const escaped_input = try unified.jsonEscape(allocator, job.request_text orelse "");
+    defer allocator.free(escaped_input);
+
+    const correlation_json = if (job.correlation_id) |value| blk: {
+        const escaped = try unified.jsonEscape(allocator, value);
+        defer allocator.free(escaped);
+        break :blk try std.fmt.allocPrint(allocator, "\"{s}\"", .{escaped});
+    } else try allocator.dupe(u8, "null");
+    defer allocator.free(correlation_json);
+
+    return std.fmt.allocPrint(
+        allocator,
+        "{{\"job_id\":\"{s}\",\"agent_id\":\"{s}\",\"actor_type\":null,\"actor_id\":null,\"project_id\":null,\"correlation_id\":{s},\"input\":\"{s}\",\"created_at_ms\":{d}}}",
+        .{
+            escaped_job,
+            escaped_agent,
+            correlation_json,
+            escaped_input,
+            job.created_at_ms,
+        },
+    );
 }
 
 pub fn refreshNodeFromIndex(self: anytype, node_id: u32, special: anytype) !void {

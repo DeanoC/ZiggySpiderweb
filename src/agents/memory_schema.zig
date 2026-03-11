@@ -43,20 +43,17 @@ pub const LOOP_CONTRACT_TEXT =
 pub const TOOL_CONTRACT_TEXT =
     \\Use only these runtime tools: file_read, file_write, file_list.
     \\Use JSON object args that match the tool schema; file_read/file_write support wait_until_ready (default true).
-    \\For file_* tool args, use canonical absolute paths. Project sandboxes expose a full rootfs at `/`; prefer `/services/*` for bound workspace venoms and `/nodes/local/venoms/*` for local catalog origins. `/global/*` is compatibility-only.
+    \\For file_* tool args, use canonical absolute paths. Project sandboxes expose a full rootfs at `/`; prefer `/services/*` for bound workspace venoms and `/nodes/local/venoms/*` for local catalog origins.
     \\Do not use talk_* tools.
-    \\Do not call memory_* directly; use Acheron paths under `/services/memory/control/*.json` when bound, otherwise `/nodes/local/venoms/memory/control/*.json`.
-    \\Access web search, code search, terminal, sub-brains, and agent management through `/services/*` when bound, otherwise `/nodes/local/venoms/*`.
+    \\Do not call memory_* directly; register or discover a worker-owned memory venom path and use that path instead (for example `/nodes/<worker-node>/venoms/memory/control/*.json`).
+    \\Access web search, code search, terminal, agent management, and worker registration through `/services/*` when bound, otherwise `/nodes/local/venoms/*`. Access sub-brains through worker-owned node venoms.
     \\Before claiming a capability is unavailable, check `/meta/workspace_services.json`, `/projects/<project_id>/meta/mounted_services.json`, `/nodes/local/venoms/VENOMS.json`, and `/global/venoms/VENOMS.json`.
     \\Use project_namespace for project-shared capabilities and node scope for node-specific capabilities.
     \\If `/services/web_search` or `/nodes/local/venoms/web_search` exists, do not claim you cannot do web search; invoke the web search service.
     \\For "what workspaces/agents exist" requests, use `/services/workspaces/control/list.json` or `/nodes/local/venoms/workspaces/control/list.json`, and `/services/agents/control/list.json` or `/nodes/local/venoms/agents/control/list.json`, not directory-entry inference.
     \\When presenting workspaces/agents to users, prefer human labels first (`name`) and include stable ids (`project_id`/`id`) only as secondary identifiers.
-    \\If you are Mother (`agent_id=mother`), your role is system orchestration and provisioning, not project delivery execution.
-    \\After creating the first non-system project/agent, give handoff instructions and stop: confirm the created `{project_id,agent_id}` and tell the admin to switch to that new project/agent for project work.
-    \\Do not include protocol-level or API instructions in that handoff message.
-    \\Do not volunteer to start repo setup, PR preparation, coding, or project implementation work from Mother after provisioning.
-    \\Mother may still run project setup primitives when requested (project/agent create, mount/bind/resolve) to complete bootstrap.
+    \\Treat the workspace as the source of truth. Do not assume special bootstrap agents, hidden system workspaces, or provider-owned control channels exist unless the mounted filesystem exposes them.
+    \\When asked to create or select a workspace, prefer the explicit workspace services and mounted filesystem contract over any legacy Mother/system bootstrap flow.
     \\To reply to user/admin, write text to `/nodes/local/venoms/chat/control/reply`.
     \\Treat `/nodes/local/venoms/chat/control/input` as inbound user/admin input channel (do not use it for outbound replies).
     \\Internal thought telemetry is exposed at `/nodes/local/venoms/thoughts/*` and is observational (not chat).
@@ -226,8 +223,7 @@ test "memory_schema: ensures runtime instruction memories" {
     try std.testing.expect(saw_goal);
 }
 
-test "memory_schema: tool contract includes mother provisioning handoff guardrails" {
-    try std.testing.expect(std.mem.indexOf(u8, TOOL_CONTRACT_TEXT, "If you are Mother (`agent_id=mother`)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, TOOL_CONTRACT_TEXT, "tell the admin to switch to that new project/agent for project work") != null);
-    try std.testing.expect(std.mem.indexOf(u8, TOOL_CONTRACT_TEXT, "Do not volunteer to start repo setup, PR preparation, coding, or project implementation work from Mother after provisioning.") != null);
+test "memory_schema: tool contract prefers the mounted workspace over legacy bootstrap flows" {
+    try std.testing.expect(std.mem.indexOf(u8, TOOL_CONTRACT_TEXT, "Treat the workspace as the source of truth.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, TOOL_CONTRACT_TEXT, "legacy Mother/system bootstrap flow") != null);
 }

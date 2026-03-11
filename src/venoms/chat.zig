@@ -1,7 +1,6 @@
 const std = @import("std");
 const unified = @import("spider-protocol").unified;
 const shared_node = @import("spiderweb_node");
-const chat_runtime_job = @import("../agents/chat_runtime_job.zig");
 
 pub const WriteResult = struct {
     written: usize,
@@ -66,54 +65,20 @@ pub fn handleInputWrite(self: anytype, msg: *const unified.ParsedMessage, raw_in
     defer self.allocator.free(job_name);
 
     const job_dir = try self.addDir(self.jobs_root_id, job_name, false);
+    const request_json = try buildChatJobRequestJson(self, job_name, input, correlation_id);
+    defer self.allocator.free(request_json);
+    try self.job_index.setRequestText(job_name, input);
+    try self.job_index.setRequestEnvelopeJson(job_name, request_json);
+    _ = try self.addFile(job_dir, "request.json", request_json, false, .none);
     const queued_status = try self.buildJobStatusJson(.queued, correlation_id, null);
     defer self.allocator.free(queued_status);
     const status_id = try self.addFile(job_dir, "status.json", queued_status, true, .job_status);
     const result_id = try self.addFile(job_dir, "result.txt", "", true, .job_result);
-    const log_id = try self.addFile(job_dir, "log.txt", "", true, .job_log);
+    _ = try self.addFile(job_dir, "log.txt", "queued for external worker\n", true, .job_log);
     try self.ensureAliasedSubtree(job_dir);
-
-    try self.job_index.markRunning(job_name);
-    const running_status = try self.buildJobStatusJson(.running, correlation_id, null);
-    defer self.allocator.free(running_status);
-    try self.setFileContent(status_id, running_status);
-
-    self.spawnAsyncChatRuntimeJob(job_name, input, correlation_id) catch |spawn_err| {
-        const normalized = chat_runtime_job.normalizeRuntimeFailureForAgent("runtime_error", @errorName(spawn_err));
-        const failed_status = try self.buildJobStatusJson(.failed, correlation_id, normalized.message);
-        defer self.allocator.free(failed_status);
-
-        self.setFileContent(status_id, failed_status) catch |err| {
-            std.log.warn("failed to update chat status after spawn failure: {s}", .{@errorName(err)});
-        };
-        self.setFileContent(result_id, normalized.message) catch |err| {
-            std.log.warn("failed to update chat result after spawn failure: {s}", .{@errorName(err)});
-        };
-
-        const spawn_log_owned = std.fmt.allocPrint(
-            self.allocator,
-            "[runtime worker spawn failure] {s}\n",
-            .{@errorName(spawn_err)},
-        ) catch null;
-        defer if (spawn_log_owned) |value| self.allocator.free(value);
-        const spawn_log = if (spawn_log_owned) |value|
-            value
-        else
-            "[runtime worker spawn failure]\n";
-
-        self.setFileContent(log_id, spawn_log) catch |err| {
-            std.log.warn("failed to update chat log after spawn failure: {s}", .{@errorName(err)});
-        };
-        self.job_index.markCompleted(
-            job_name,
-            false,
-            normalized.message,
-            normalized.message,
-            spawn_log,
-        ) catch |err| {
-            std.log.warn("chat job index completion update failed after spawn failure: {s}", .{@errorName(err)});
-        };
-    };
+    _ = status_id;
+    _ = result_id;
+    try self.job_index.updateArtifacts(job_name, "", null, "queued for external worker\n");
 
     return .{
         .written = raw_input.len,
@@ -129,4 +94,46 @@ pub fn handleReplyWrite(self: anytype, node_id: u32, raw_input: []const u8) !Wri
         .written = raw_input.len,
         .chat_reply_content = try self.allocator.dupe(u8, reply),
     };
+}
+
+fn buildChatJobRequestJson(self: anytype, job_name: []const u8, input: []const u8, correlation_id: ?[]const u8) ![]u8 {
+    const escaped_job = try unified.jsonEscape(self.allocator, job_name);
+    defer self.allocator.free(escaped_job);
+    const escaped_agent = try unified.jsonEscape(self.allocator, self.agent_id);
+    defer self.allocator.free(escaped_agent);
+    const escaped_actor_type = try unified.jsonEscape(self.allocator, self.actor_type);
+    defer self.allocator.free(escaped_actor_type);
+    const escaped_actor_id = try unified.jsonEscape(self.allocator, self.actor_id);
+    defer self.allocator.free(escaped_actor_id);
+    const escaped_input = try unified.jsonEscape(self.allocator, input);
+    defer self.allocator.free(escaped_input);
+
+    const correlation_json = if (correlation_id) |value| blk: {
+        const escaped = try unified.jsonEscape(self.allocator, value);
+        defer self.allocator.free(escaped);
+        break :blk try std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped});
+    } else try self.allocator.dupe(u8, "null");
+    defer self.allocator.free(correlation_json);
+
+    const project_json = if (self.active_namespace_project_id orelse self.project_id) |value| blk: {
+        const escaped = try unified.jsonEscape(self.allocator, value);
+        defer self.allocator.free(escaped);
+        break :blk try std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped});
+    } else try self.allocator.dupe(u8, "null");
+    defer self.allocator.free(project_json);
+
+    return std.fmt.allocPrint(
+        self.allocator,
+        "{{\"job_id\":\"{s}\",\"agent_id\":\"{s}\",\"actor_type\":\"{s}\",\"actor_id\":\"{s}\",\"project_id\":{s},\"correlation_id\":{s},\"input\":\"{s}\",\"created_at_ms\":{d}}}",
+        .{
+            escaped_job,
+            escaped_agent,
+            escaped_actor_type,
+            escaped_actor_id,
+            project_json,
+            correlation_json,
+            escaped_input,
+            std.time.milliTimestamp(),
+        },
+    );
 }

@@ -1478,14 +1478,14 @@ test "mission_store: service invocation records artifact and event" {
     var invoked = try store.recordServiceInvocation(allocator, created.mission_id, .{
         .stage = "reviewing",
         .summary = "Created memory note",
-        .service_path = "/global/memory",
-        .invoke_path = "/global/memory/control/invoke.json",
+        .service_path = "/nodes/spider-monkey-a/venoms/memory",
+        .invoke_path = "/nodes/spider-monkey-a/venoms/memory/control/invoke.json",
         .request_payload_json = "{\"op\":\"create\",\"arguments\":{\"name\":\"review-note\"}}",
-        .result_payload_json = "{\"ok\":true,\"result\":{\"memory_path\":\"/global/memory/items/review-note\"},\"error\":null}",
+        .result_payload_json = "{\"ok\":true,\"result\":{\"memory_path\":\"/nodes/spider-monkey-a/venoms/memory/items/review-note\"},\"error\":null}",
         .status_payload_json = "{\"state\":\"done\",\"tool\":\"memory_create\",\"updated_at_ms\":1,\"error\":null}",
         .artifact = .{
             .kind = "service_result",
-            .path = "/global/memory/result.json",
+            .path = "/nodes/spider-monkey-a/venoms/memory/result.json",
             .summary = "Created review note",
         },
         .contract = .{
@@ -1499,13 +1499,13 @@ test "mission_store: service invocation records artifact and event" {
     try std.testing.expect(std.mem.eql(u8, invoked.stage, "reviewing"));
     try std.testing.expect(std.mem.eql(u8, invoked.summary.?, "Created memory note"));
     try std.testing.expectEqualStrings("service_result", invoked.artifacts.items[0].kind);
-    try std.testing.expectEqualStrings("/global/memory/result.json", invoked.artifacts.items[0].path.?);
+    try std.testing.expectEqualStrings("/nodes/spider-monkey-a/venoms/memory/result.json", invoked.artifacts.items[0].path.?);
     try std.testing.expect(invoked.contract != null);
     try std.testing.expectEqualStrings("/nodes/local/fs/pr-review/runs/pr-456", invoked.contract.?.artifact_root.?);
     try std.testing.expect(invoked.events.items.len >= 3);
     const latest_event = invoked.events.items[invoked.events.items.len - 1];
     try std.testing.expectEqualStrings("mission.service_invoked", latest_event.event_type);
-    try std.testing.expect(std.mem.indexOf(u8, latest_event.payload_json, "\"service_path\":\"/global/memory\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, latest_event.payload_json, "\"service_path\":\"/nodes/spider-monkey-a/venoms/memory\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, latest_event.payload_json, "\"actor_type\":\"agent\"") != null);
 }
 
