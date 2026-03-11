@@ -1364,7 +1364,8 @@ fn mapRemoteErrorCode(code: []const u8) anyerror {
     if (std.mem.eql(u8, code, "forbidden") or std.mem.eql(u8, code, "access_denied")) return error.PermissionDenied;
     if (std.mem.eql(u8, code, "agent_not_found") or std.mem.eql(u8, code, "project_not_found")) return error.FileNotFound;
     if (std.mem.eql(u8, code, "project_context_required")) return error.ProjectRequired;
-    if (std.mem.eql(u8, code, "missing_field") or std.mem.eql(u8, code, "invalid_payload") or std.mem.eql(u8, code, "invalid")) return error.InvalidResponse;
+    if (std.mem.eql(u8, code, "missing_field")) return error.MissingField;
+    if (std.mem.eql(u8, code, "invalid_payload") or std.mem.eql(u8, code, "invalid")) return error.InvalidPayload;
     if (std.mem.eql(u8, code, "enoent")) return error.FileNotFound;
     if (std.mem.eql(u8, code, "eperm")) return error.PermissionDenied;
     if (std.mem.eql(u8, code, "enotdir")) return error.NotDirectory;
@@ -1398,6 +1399,12 @@ test "namespace_client: normalizeAbsolutePath trims trailing separators" {
     try std.testing.expectEqualStrings("/", normalizeAbsolutePath("/"));
     try std.testing.expectEqualStrings("/agents", normalizeAbsolutePath("/agents/"));
     try std.testing.expectEqualStrings("/agents/self", normalizeAbsolutePath("/agents/self"));
+}
+
+test "namespace_client: remote payload validation errors stay specific" {
+    try std.testing.expect(mapRemoteErrorCode("missing_field") == error.MissingField);
+    try std.testing.expect(mapRemoteErrorCode("invalid_payload") == error.InvalidPayload);
+    try std.testing.expect(mapRemoteErrorCode("invalid") == error.InvalidPayload);
 }
 
 test "namespace_client: stat attrs synthesize mode from kind when remote mode is zero" {

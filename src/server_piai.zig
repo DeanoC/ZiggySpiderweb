@@ -5304,6 +5304,8 @@ const AgentRuntimeRegistry = struct {
         var heartbeat_ms = parseUnsignedEnv(self.allocator, local_node_heartbeat_ms_env, lease_ttl_ms / 2);
         if (heartbeat_ms == 0) heartbeat_ms = 1_000;
         if (heartbeat_ms > lease_ttl_ms) heartbeat_ms = lease_ttl_ms;
+        const configured_agents_path = std.mem.trim(u8, self.runtime_config.agents_dir, " \t\r\n");
+        const agents_export_path = if (configured_agents_path.len > 0) configured_agents_path else "agents";
 
         const export_specs = [_]fs_node_ops.ExportSpec{
             .{
@@ -5314,7 +5316,7 @@ const AgentRuntimeRegistry = struct {
             },
             .{
                 .name = local_node_agents_export_name,
-                .path = "agents",
+                .path = agents_export_path,
                 .ro = false,
                 .desc = "spiderweb-agents-export",
             },

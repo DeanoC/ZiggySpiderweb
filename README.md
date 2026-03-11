@@ -117,6 +117,7 @@ This flow has been smoke-tested with:
 ## Notes
 
 - If `runtime.spider_web_root` is empty, Spiderweb uses its current working directory as the default local workspace root.
+- If `runtime.spider_web_root` is set, relative runtime paths such as `agents`, `templates`, and `sandbox_fs_mount_bin` are resolved from that root instead of the process launch cwd.
 - `spiderweb-config auth path` and `auth status` now resolve auth tokens from the local runtime context instead of assuming an embedded AI setup.
 - The happy path no longer uses Mother/system bootstrap or provider setup inside Spiderweb.
 - Spider Monkey is the first external worker for this model, but the intent is broader: any agent that can work against a filesystem can use a mounted Spiderweb workspace.

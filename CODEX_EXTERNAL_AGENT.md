@@ -4,7 +4,7 @@ This guide is for running a non-Spider-Monkey agent inside Spiderweb, using Code
 
 ## Tested Status
 
-Validated on March 11, 2026 against `Spiderweb` `main`.
+Validated on March 11, 2026 against current `Spiderweb` `main`, plus the Windows/WSL follow-up fixes in this branch.
 
 - Windows native:
   - `git submodule update --init --recursive` is required before builds or docs are trustworthy.
@@ -14,6 +14,7 @@ Validated on March 11, 2026 against `Spiderweb` `main`.
 - WSL / Linux:
   - `zig build` passes in a clean Linux checkout.
   - Namespace attach with `spiderweb-fs-mount --namespace-url ...` works.
+  - Starting `spiderweb` from a different WSL working directory still works when `runtime.spider_web_root` is set.
 
 ## Current Recommendation
 
@@ -128,15 +129,37 @@ Report path drift or missing writable control files before assuming the host is 
 
 ## What Worked In Validation
 
+- `spiderweb-control workspace_create '{"name":"...","vision":"..."}'`
 - `spiderweb-fs-mount --namespace-url ... status --no-probe`
+- `spiderweb-fs-mount --namespace-url ... status`
 - `spiderweb-fs-mount --namespace-url ... readdir /`
+- `spiderweb-fs-mount --namespace-url ... readdir /services`
 - `spiderweb-fs-mount --namespace-url ... cat /meta/protocol.json`
-- `spiderweb-fs-mount --namespace-url ... cat /projects/system/meta/mounted_services.json`
+- `spiderweb-fs-mount --namespace-url ... cat /projects/<project_id>/meta/mounted_services.json`
+- project-scoped `workspace_status` now returns `fs_auth_token` for authorized callers, so routed namespace endpoints come up healthy
 - automatic `control.agent_ensure` on attach created `/agents/codex` with seeded identity files
+- the Linux / WSL host no longer depends on launch cwd for `agents`, `templates`, or the local agents export when `runtime.spider_web_root` is configured
 
-## Historical Notes
+## Fixed Since First Pass
 
-Earlier validation found several rough edges while Spiderweb still carried its embedded runtime path. Those specific `spiderweb-agent-runtime` and Mother/bootstrap issues are no longer the expected product path after the Spider Monkey split. Keep this document focused on mounted-workspace behavior and current namespace/service discovery instead of the removed embedded-runtime flow.
+These issues from the earlier Codex validation are no longer reproducing on the current branch:
+
+1. `workspace_create` now succeeds with just `name` and `vision`.
+2. `/services` now enumerates cleanly in namespace directory listing.
+3. namespace-routed `/v2/fs` endpoints now hydrate correctly from project-scoped `workspace_status`, instead of staying unhealthy because `fs_auth_token` was omitted.
+4. launching the WSL host from the wrong cwd no longer breaks agent/template discovery or the local agents export when `runtime.spider_web_root` is set.
+5. remote `missing_field` and `invalid_payload` errors are now surfaced by `spiderweb-fs-mount` as `MissingField` and `InvalidPayload` instead of generic `InvalidResponse`.
+
+## Gaps Found While Testing
+
+These are the current missing pieces for a fresh Codex operator story:
+
+1. `/meta/workspace_services.json` was still absent in live namespace validation. The reliable service inventory is still `/projects/<project_id>/meta/mounted_services.json`.
+2. One-shot `spiderweb-fs-mount write ...` flows against `/services/home/control/ensure.json` and `/services/workers/control/register.json` are still not reliable enough for a clear operator story:
+   - home write now fails with `InvalidPayload` for a minimal `{"agent_id":"codex"}` payload, and `result.json` stays at `ok:false`
+   - worker register write returns `ok`, but `result.json` stays at its initial payload and `/nodes/codex-worker` is still absent
+3. Native Windows server builds are still not ready for the full host flow on this machine; the practical split is Linux/WSL host plus Windows mount client.
+4. `docs/overview.md` still depends on submodules being initialized, so `git submodule update --init --recursive` remains mandatory before trusting the docs.
 
 ## Practical Operator Rule
 
@@ -146,4 +169,4 @@ Right now, the safest external-agent story is:
 - mount the namespace with `spiderweb-fs-mount`
 - let Codex work against the mounted filesystem
 - treat project metadata discovery as stable
-- treat service-control writes as an area still needing hardening and better error reporting
+- treat service-control writes as an area still needing hardening, payload clarification, and better result propagation

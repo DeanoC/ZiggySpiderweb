@@ -3318,6 +3318,7 @@ pub const ControlPlane = struct {
     ) ![]u8 {
         const project = self.projects.get(project_id) orelse return ControlPlaneError.ProjectNotFound;
         const workspace_root = "/";
+        const include_node_secrets = is_admin or project_token != null or self.isPrimaryAgent(agent_id);
         const escaped_agent = try jsonEscape(self.allocator, agent_id);
         defer self.allocator.free(escaped_agent);
         const escaped_project = try jsonEscape(self.allocator, project_id);
@@ -3344,7 +3345,7 @@ pub const ControlPlane = struct {
             project,
             now_ms,
             null,
-            self.isPrimaryAgent(agent_id) or is_admin,
+            include_node_secrets,
             agent_id,
             project_token,
             is_admin,
@@ -7513,7 +7514,7 @@ test "acheron_control_plane: workspaceStatus supports explicit project selection
     defer allocator.free(selected);
     try std.testing.expect(std.mem.indexOf(u8, selected, project_id) != null);
     try std.testing.expect(std.mem.indexOf(u8, selected, "\"mount_path\":\"/src\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, selected, "\"fs_auth_token\":null") != null);
+    try std.testing.expect(std.mem.indexOf(u8, selected, "\"fs_auth_token\":\"") != null);
 
     const selected_primary = try plane.workspaceStatus(default_primary_agent_id, selected_req);
     defer allocator.free(selected_primary);
