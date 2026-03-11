@@ -5,7 +5,6 @@ const protocol = @import("spider-protocol").protocol;
 const shared_exec = @import("spiderweb_node").chat_runtime_exec;
 const runtime_handle_mod = @import("../agents/runtime_handle.zig");
 const chat_job_index = @import("../agents/chat_job_index.zig");
-const tool_executor_mod = @import("ziggy-tool-runtime").tool_executor;
 const job_projection = @import("job_projection.zig");
 const shared_node = @import("spiderweb_node");
 const workspace_policy = @import("../workspaces/policy.zig");
@@ -8077,82 +8076,7 @@ pub const Session = struct {
         return decoded;
     }
 
-    fn executeDirectBuiltinToolCall(self: *Session, tool_name: []const u8, args_json: []const u8) !?[]u8 {
-        if (!std.mem.eql(u8, tool_name, "shell_exec")) return null;
-
-        var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, args_json, .{});
-        defer parsed.deinit();
-        if (parsed.value != .object) return error.InvalidPayload;
-
-        const source_args = parsed.value.object;
-        const command = if (source_args.get("command")) |value|
-            if (value == .string) value.string else return error.InvalidPayload
-        else
-            return error.InvalidPayload;
-        const timeout_ms = if (source_args.get("timeout_ms")) |value| switch (value) {
-            .integer => |raw| blk: {
-                if (raw < 0) return error.InvalidPayload;
-                break :blk @as(u64, @intCast(raw));
-            },
-            .float => |raw| blk: {
-                if (raw < 0 or std.math.floor(raw) != raw) return error.InvalidPayload;
-                break :blk @as(u64, @intFromFloat(raw));
-            },
-            .null => null,
-            else => return error.InvalidPayload,
-        } else null;
-        const cwd = if (source_args.get("cwd")) |value|
-            if (value == .string) value.string else if (value == .null) null else return error.InvalidPayload
-        else
-            null;
-
-        const resolved_cwd = if (cwd) |value|
-            if (std.mem.startsWith(u8, value, local_fs_world_prefix))
-                try self.resolveMissionContractHostPath(value)
-            else
-                try self.allocator.dupe(u8, value)
-        else
-            null;
-        defer if (resolved_cwd) |value| self.allocator.free(value);
-
-        const escaped_command = try unified.jsonEscape(self.allocator, command);
-        defer self.allocator.free(escaped_command);
-        const cwd_fragment = if (resolved_cwd) |value| blk: {
-            const escaped_cwd = try unified.jsonEscape(self.allocator, value);
-            defer self.allocator.free(escaped_cwd);
-            break :blk try std.fmt.allocPrint(self.allocator, ",\"cwd\":\"{s}\"", .{escaped_cwd});
-        } else try self.allocator.dupe(u8, "");
-        defer self.allocator.free(cwd_fragment);
-        const timeout_fragment = if (timeout_ms) |value|
-            try std.fmt.allocPrint(self.allocator, ",\"timeout_ms\":{d}", .{value})
-        else
-            try self.allocator.dupe(u8, "");
-        defer self.allocator.free(timeout_fragment);
-
-        const direct_args_json = try std.fmt.allocPrint(
-            self.allocator,
-            "{{\"command\":\"{s}\"{s}{s}}}",
-            .{ escaped_command, timeout_fragment, cwd_fragment },
-        );
-        defer self.allocator.free(direct_args_json);
-
-        var direct_parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, direct_args_json, .{});
-        defer direct_parsed.deinit();
-        if (direct_parsed.value != .object) return error.InvalidPayload;
-
-        var result = tool_executor_mod.BuiltinTools.shellExec(self.allocator, direct_parsed.value.object);
-        defer result.deinit(self.allocator);
-        return switch (result) {
-            .success => |success| try self.allocator.dupe(u8, success.payload_json),
-            .failure => |failure| try self.buildServiceInvokeFailureResultJson(@tagName(failure.code), failure.message),
-        };
-    }
-
     pub fn executeServiceToolCall(self: *Session, tool_name: []const u8, args_json: []const u8) ![]u8 {
-        if (try self.executeDirectBuiltinToolCall(tool_name, args_json)) |payload| {
-            return payload;
-        }
-
         const escaped_tool_name = try unified.jsonEscape(self.allocator, tool_name);
         defer self.allocator.free(escaped_tool_name);
         const control_payload = try std.fmt.allocPrint(
