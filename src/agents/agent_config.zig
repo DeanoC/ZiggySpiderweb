@@ -1,5 +1,4 @@
 const std = @import("std");
-const BrainSpecialization = @import("brain_specialization.zig").BrainSpecialization;
 
 /// Flat agent configuration structure
 pub const AgentConfig = struct {

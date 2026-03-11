@@ -1,81 +1,105 @@
 const std = @import("std");
 const protocol = @import("spider-protocol").protocol;
-const runtime_server_mod = @import("runtime_server.zig");
-const sandbox_runtime = @import("../sandbox_runtime.zig");
 
-pub const Kind = enum {
-    local,
-    local_sandbox,
-    sandbox,
+pub const RuntimeVTable = struct {
+    destroy: *const fn (?*anyopaque, std.mem.Allocator) void,
+    handle_message_frames_with_debug: *const fn (?*anyopaque, std.mem.Allocator, []const u8, bool) anyerror![][]u8,
+    is_healthy: *const fn (?*anyopaque) bool,
+    health_summary: *const fn (?*anyopaque, std.mem.Allocator) anyerror![]u8,
+    build_runtime_error_response: ?*const fn (?*anyopaque, std.mem.Allocator, []const u8, anyerror) anyerror![]u8 = null,
+};
+
+const UnavailableRuntime = struct {
+    code: []u8,
+    message: []u8,
+
+    fn destroy(raw_ctx: ?*anyopaque, allocator: std.mem.Allocator) void {
+        const ctx: *UnavailableRuntime = @ptrCast(@alignCast(raw_ctx orelse return));
+        allocator.free(ctx.code);
+        allocator.free(ctx.message);
+        allocator.destroy(ctx);
+    }
+
+    fn handleMessageFramesWithDebug(
+        raw_ctx: ?*anyopaque,
+        allocator: std.mem.Allocator,
+        raw_json: []const u8,
+        emit_debug: bool,
+    ) ![][]u8 {
+        _ = emit_debug;
+        const ctx: *UnavailableRuntime = @ptrCast(@alignCast(raw_ctx orelse return error.InvalidContext));
+        const request_id = parseRequestId(allocator, raw_json) catch null;
+        defer if (request_id) |value| allocator.free(value);
+        const response = try protocol.buildErrorWithCode(
+            allocator,
+            request_id orelse "unknown",
+            parseUnavailableErrorCode(ctx.code),
+            ctx.message,
+        );
+        var frames = try allocator.alloc([]u8, 1);
+        frames[0] = response;
+        return frames;
+    }
+
+    fn isHealthy(_: ?*anyopaque) bool {
+        return true;
+    }
+
+    fn healthSummary(raw_ctx: ?*anyopaque, allocator: std.mem.Allocator) ![]u8 {
+        const ctx: *UnavailableRuntime = @ptrCast(@alignCast(raw_ctx orelse return error.InvalidContext));
+        return allocator.dupe(u8, ctx.message);
+    }
+
+    fn buildRuntimeErrorResponse(
+        raw_ctx: ?*anyopaque,
+        allocator: std.mem.Allocator,
+        request_id: []const u8,
+        _: anyerror,
+    ) ![]u8 {
+        const ctx: *UnavailableRuntime = @ptrCast(@alignCast(raw_ctx orelse return error.InvalidContext));
+        return protocol.buildErrorWithCode(allocator, request_id, parseUnavailableErrorCode(ctx.code), ctx.message);
+    }
 };
 
 pub const RuntimeHandle = struct {
     allocator: std.mem.Allocator,
-    kind: Kind,
-    local: ?*runtime_server_mod.RuntimeServer = null,
-    sandbox: ?*sandbox_runtime.SandboxRuntime = null,
+    ctx: ?*anyopaque,
+    vtable: RuntimeVTable,
     ref_count: std.atomic.Value(u32) = std.atomic.Value(u32).init(1),
 
-    pub fn createLocal(
+    pub fn init(
         allocator: std.mem.Allocator,
-        runtime: *runtime_server_mod.RuntimeServer,
+        ctx: ?*anyopaque,
+        vtable: RuntimeVTable,
     ) !*RuntimeHandle {
         const handle = try allocator.create(RuntimeHandle);
         handle.* = .{
             .allocator = allocator,
-            .kind = .local,
-            .local = runtime,
-            .sandbox = null,
+            .ctx = ctx,
+            .vtable = vtable,
             .ref_count = std.atomic.Value(u32).init(1),
         };
         return handle;
     }
 
-    pub fn createSandbox(
-        allocator: std.mem.Allocator,
-        runtime: *sandbox_runtime.SandboxRuntime,
-    ) !*RuntimeHandle {
-        const handle = try allocator.create(RuntimeHandle);
-        handle.* = .{
-            .allocator = allocator,
-            .kind = .sandbox,
-            .local = null,
-            .sandbox = runtime,
-            .ref_count = std.atomic.Value(u32).init(1),
+    pub fn createUnavailable(allocator: std.mem.Allocator, code: []const u8, message: []const u8) !*RuntimeHandle {
+        const ctx = try allocator.create(UnavailableRuntime);
+        errdefer allocator.destroy(ctx);
+        ctx.* = .{
+            .code = try allocator.dupe(u8, code),
+            .message = try allocator.dupe(u8, message),
         };
-        return handle;
-    }
-
-    pub fn createLocalWithSandbox(
-        allocator: std.mem.Allocator,
-        runtime: *runtime_server_mod.RuntimeServer,
-        sandbox: *sandbox_runtime.SandboxRuntime,
-    ) !*RuntimeHandle {
-        const handle = try allocator.create(RuntimeHandle);
-        handle.* = .{
-            .allocator = allocator,
-            .kind = .local_sandbox,
-            .local = runtime,
-            .sandbox = sandbox,
-            .ref_count = std.atomic.Value(u32).init(1),
-        };
-        return handle;
-    }
-
-    fn destroyOwned(self: *RuntimeHandle) void {
-        switch (self.kind) {
-            .local => {
-                if (self.local) |runtime| runtime.destroy();
-            },
-            .local_sandbox => {
-                if (self.local) |runtime| runtime.destroy();
-                if (self.sandbox) |runtime| runtime.destroy();
-            },
-            .sandbox => {
-                if (self.sandbox) |runtime| runtime.destroy();
-            },
+        errdefer {
+            allocator.free(ctx.code);
+            allocator.free(ctx.message);
         }
-        self.allocator.destroy(self);
+        return init(allocator, ctx, .{
+            .destroy = UnavailableRuntime.destroy,
+            .handle_message_frames_with_debug = UnavailableRuntime.handleMessageFramesWithDebug,
+            .is_healthy = UnavailableRuntime.isHealthy,
+            .health_summary = UnavailableRuntime.healthSummary,
+            .build_runtime_error_response = UnavailableRuntime.buildRuntimeErrorResponse,
+        });
     }
 
     pub fn retain(self: *RuntimeHandle) void {
@@ -93,49 +117,74 @@ pub const RuntimeHandle = struct {
         self.release();
     }
 
+    fn destroyOwned(self: *RuntimeHandle) void {
+        self.vtable.destroy(self.ctx, self.allocator);
+        self.allocator.destroy(self);
+    }
+
     pub fn handleMessageFramesWithDebug(
         self: *RuntimeHandle,
         raw_json: []const u8,
         emit_debug: bool,
     ) ![][]u8 {
-        return switch (self.kind) {
-            .local => self.local.?.handleMessageFramesWithDebug(raw_json, emit_debug),
-            .local_sandbox => self.local.?.handleMessageFramesWithDebug(raw_json, emit_debug),
-            .sandbox => self.sandbox.?.handleMessageFramesWithDebug(raw_json, emit_debug),
-        };
+        return self.vtable.handle_message_frames_with_debug(self.ctx, self.allocator, raw_json, emit_debug);
     }
 
     pub fn buildRuntimeErrorResponse(self: *RuntimeHandle, request_id: []const u8, err: anyerror) ![]u8 {
-        return switch (self.kind) {
-            .local => self.local.?.buildRuntimeErrorResponse(request_id, err),
-            .local_sandbox => self.local.?.buildRuntimeErrorResponse(request_id, err),
-            .sandbox => blk: {
-                const message = try std.fmt.allocPrint(self.allocator, "sandbox runtime error: {s}", .{@errorName(err)});
-                defer self.allocator.free(message);
-                break :blk protocol.buildErrorWithCode(self.allocator, request_id, .execution_failed, message);
-            },
-        };
+        if (self.vtable.build_runtime_error_response) |func| {
+            return func(self.ctx, self.allocator, request_id, err);
+        }
+        const message = try std.fmt.allocPrint(self.allocator, "runtime error: {s}", .{@errorName(err)});
+        defer self.allocator.free(message);
+        return protocol.buildErrorWithCode(self.allocator, request_id, .execution_failed, message);
     }
 
     pub fn isHealthy(self: *RuntimeHandle) bool {
-        return switch (self.kind) {
-            .local => true,
-            .local_sandbox => if (self.sandbox) |runtime| runtime.isHealthy() else false,
-            .sandbox => if (self.sandbox) |runtime| runtime.isHealthy() else false,
-        };
+        return self.vtable.is_healthy(self.ctx);
     }
 
     pub fn healthSummary(self: *RuntimeHandle, allocator: std.mem.Allocator) ![]u8 {
-        return switch (self.kind) {
-            .local => allocator.dupe(u8, "local runtime is always treated as healthy"),
-            .local_sandbox => if (self.sandbox) |runtime|
-                runtime.healthSummary(allocator)
-            else
-                allocator.dupe(u8, "local_sandbox runtime missing sandbox handle"),
-            .sandbox => if (self.sandbox) |runtime|
-                runtime.healthSummary(allocator)
-            else
-                allocator.dupe(u8, "sandbox runtime missing sandbox handle"),
-        };
+        return self.vtable.health_summary(self.ctx, allocator);
     }
 };
+
+fn parseRequestId(allocator: std.mem.Allocator, raw_json: []const u8) !?[]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw_json, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const value = parsed.value.object.get("id") orelse return null;
+    if (value != .string or value.string.len == 0) return null;
+    return @as(?[]u8, try allocator.dupe(u8, value.string));
+}
+
+fn parseUnavailableErrorCode(raw: []const u8) protocol.ErrorCode {
+    inline for (std.meta.fields(protocol.ErrorCode)) |field| {
+        if (std.mem.eql(u8, raw, field.name)) {
+            return @field(protocol.ErrorCode, field.name);
+        }
+    }
+    return .execution_failed;
+}
+
+test "RuntimeHandle unavailable runtime preserves explicit error code" {
+    const allocator = std.testing.allocator;
+
+    const handle = try RuntimeHandle.createUnavailable(
+        allocator,
+        "provider_timeout",
+        "external worker did not respond",
+    );
+    defer handle.destroy();
+
+    const frames = try handle.handleMessageFramesWithDebug(
+        "{\"id\":\"req-1\"}",
+        false,
+    );
+    defer {
+        for (frames) |frame| allocator.free(frame);
+        allocator.free(frames);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), frames.len);
+    try std.testing.expect(std.mem.indexOf(u8, frames[0], "\"code\":\"provider_timeout\"") != null);
+}
