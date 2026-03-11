@@ -8,7 +8,7 @@ pub const LockMode = enum {
 };
 
 pub const NamespaceHandle = struct {
-    fid: u32,
+    handle_id: u64,
     writable: bool,
 };
 
@@ -44,6 +44,7 @@ pub const Provider = struct {
         removexattr: *const fn (ctx: *anyopaque, path: []const u8, name: []const u8) anyerror!void,
         lock: *const fn (ctx: *anyopaque, file: OpenFile, mode: LockMode, wait: bool) anyerror!void,
         try_reconcile_endpoints_if_idle: ?*const fn (ctx: *anyopaque, endpoint_configs: []const fs_router.EndpointConfig) anyerror!bool = null,
+        try_keepalive_if_idle: ?*const fn (ctx: *anyopaque) anyerror!bool = null,
     };
 
     pub fn deinit(self: *Provider) void {
@@ -130,6 +131,11 @@ pub const Provider = struct {
     pub fn tryReconcileEndpointsIfIdle(self: *Provider, endpoint_configs: []const fs_router.EndpointConfig) !bool {
         const reconcile = self.vtable.try_reconcile_endpoints_if_idle orelse return false;
         return reconcile(self.ctx, endpoint_configs);
+    }
+
+    pub fn tryKeepAliveIfIdle(self: *Provider) !bool {
+        const keepalive = self.vtable.try_keepalive_if_idle orelse return false;
+        return keepalive(self.ctx);
     }
 };
 

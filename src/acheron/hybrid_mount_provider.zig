@@ -68,6 +68,7 @@ const hybrid_vtable: mount_provider.Provider.VTable = .{
     .listxattr = hybridListxattr,
     .removexattr = hybridRemovexattr,
     .lock = hybridLock,
+    .try_keepalive_if_idle = hybridTryKeepAliveIfIdle,
 };
 
 fn asCtx(ctx: *anyopaque) *HybridContext {
@@ -228,6 +229,12 @@ fn hybridLock(ctx: *anyopaque, file: mount_provider.OpenFile, mode: mount_provid
         }, wait),
         .namespace => |namespace_file| self.namespace.lock(namespace_file, @tagName(mode), wait),
     };
+}
+
+fn hybridTryKeepAliveIfIdle(ctx: *anyopaque) !bool {
+    const self = asCtx(ctx);
+    try self.namespace.keepActiveSessionAlive();
+    return true;
 }
 
 test "hybrid_mount_provider: pathMatchesMount routes exact and descendant matches" {

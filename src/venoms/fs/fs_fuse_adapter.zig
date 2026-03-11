@@ -229,6 +229,16 @@ pub const FuseAdapter = struct {
         return self.provider.tryReconcileEndpointsIfIdle(endpoint_configs);
     }
 
+    pub fn tryKeepAliveIfIdle(self: *FuseAdapter) !bool {
+        if (!self.provider_mutex.tryLock()) return false;
+        defer self.provider_mutex.unlock();
+        self.handles_mutex.lock();
+        const has_handles = self.handles.count() != 0;
+        self.handles_mutex.unlock();
+        if (has_handles) return false;
+        return self.provider.tryKeepAliveIfIdle();
+    }
+
     pub fn mount(self: *FuseAdapter, mountpoint: []const u8) !void {
         return self.mountWithBackend(mountpoint, .auto);
     }

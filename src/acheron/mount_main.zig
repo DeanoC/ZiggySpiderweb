@@ -34,6 +34,7 @@ pub fn main() !void {
     var workspace_token: ?[]const u8 = null;
     var workspace_auth_token: ?[]const u8 = null;
     var workspace_sync_interval_ms: u64 = 5_000;
+    var namespace_keepalive_interval_ms: u64 = 60_000;
     var namespace_agent_id: ?[]const u8 = null;
     var namespace_session_key: ?[]const u8 = null;
     var mount_backend: fs_fuse_adapter.FuseAdapter.MountBackend = .auto;
@@ -56,6 +57,10 @@ pub fn main() !void {
             i += 1;
             if (i >= args.len) return error.InvalidArguments;
             workspace_sync_interval_ms = try std.fmt.parseInt(u64, args[i], 10);
+        } else if (std.mem.eql(u8, args[i], "--namespace-keepalive-interval-ms")) {
+            i += 1;
+            if (i >= args.len) return error.InvalidArguments;
+            namespace_keepalive_interval_ms = try std.fmt.parseInt(u64, args[i], 10);
         } else if (std.mem.eql(u8, args[i], "--workspace-id") or std.mem.eql(u8, args[i], "--project-id")) {
             i += 1;
             if (i >= args.len) return error.InvalidArguments;
@@ -333,7 +338,17 @@ pub fn main() !void {
         }
         var sync_ctx: ?*WorkspaceSyncContext = null;
         var sync_thread: ?std.Thread = null;
+        var keepalive_ctx: ?*NamespaceKeepaliveContext = null;
+        var keepalive_thread: ?std.Thread = null;
         defer {
+            if (keepalive_ctx) |ctx| {
+                ctx.requestStop();
+                if (keepalive_thread) |thread| {
+                    thread.join();
+                }
+                ctx.deinit();
+                allocator.destroy(ctx);
+            }
             if (sync_ctx) |ctx| {
                 ctx.requestStop();
                 if (sync_thread) |thread| {
@@ -363,6 +378,16 @@ pub fn main() !void {
                 sync_thread = try std.Thread.spawn(.{}, workspaceSyncThreadMain, .{ctx});
                 sync_ctx = ctx;
             }
+        }
+        if (namespace_client_instance != null and namespace_keepalive_interval_ms > 0) {
+            const ctx = try allocator.create(NamespaceKeepaliveContext);
+            errdefer allocator.destroy(ctx);
+            ctx.* = .{
+                .adapter = &adapter,
+                .interval_ms = namespace_keepalive_interval_ms,
+            };
+            keepalive_thread = try std.Thread.spawn(.{}, namespaceKeepaliveThreadMain, .{ctx});
+            keepalive_ctx = ctx;
         }
         try adapter.mountWithBackend(remaining.items[1], mount_backend);
         return;
@@ -414,7 +439,7 @@ fn printHelp() !void {
         \\spiderweb-fs-mount - Distributed filesystem router client
         \\
         \\Usage:
-        \\  spiderweb-fs-mount [--workspace-url <ws-url> | --namespace-url <ws-url>] [--workspace-id <id>] [--workspace-token <token>] [--project-id <id>] [--project-token <token>] [--auth-token <token>] [--agent-id <id>] [--session-key <key>] [--mount-backend auto|fuse|winfsp] [--workspace-sync-interval-ms <ms>] [--endpoint <name>=<ws-url>[#export][@/mount]] <command> [args]
+        \\  spiderweb-fs-mount [--workspace-url <ws-url> | --namespace-url <ws-url>] [--workspace-id <id>] [--workspace-token <token>] [--project-id <id>] [--project-token <token>] [--auth-token <token>] [--agent-id <id>] [--session-key <key>] [--mount-backend auto|fuse|winfsp] [--workspace-sync-interval-ms <ms>] [--namespace-keepalive-interval-ms <ms>] [--endpoint <name>=<ws-url>[#export][@/mount]] <command> [args]
         \\
         \\Commands:
         \\  getattr <path>
@@ -680,6 +705,29 @@ const WorkspaceSyncContext = struct {
     }
 };
 
+const NamespaceKeepaliveContext = struct {
+    adapter: *fs_fuse_adapter.FuseAdapter,
+    interval_ms: u64,
+    stop: bool = false,
+    stop_mutex: std.Thread.Mutex = .{},
+
+    fn requestStop(self: *NamespaceKeepaliveContext) void {
+        self.stop_mutex.lock();
+        self.stop = true;
+        self.stop_mutex.unlock();
+    }
+
+    fn shouldStop(self: *NamespaceKeepaliveContext) bool {
+        self.stop_mutex.lock();
+        defer self.stop_mutex.unlock();
+        return self.stop;
+    }
+
+    fn deinit(self: *NamespaceKeepaliveContext) void {
+        self.* = undefined;
+    }
+};
+
 fn workspaceSyncThreadMain(ctx: *WorkspaceSyncContext) void {
     const allocator = std.heap.page_allocator;
     ctx.requestRefresh();
@@ -698,6 +746,15 @@ fn workspaceSyncThreadMain(ctx: *WorkspaceSyncContext) void {
         }
 
         if (!sleepWithStop(ctx, 250)) return;
+    }
+}
+
+fn namespaceKeepaliveThreadMain(ctx: *NamespaceKeepaliveContext) void {
+    while (true) {
+        if (!sleepNamespaceKeepalive(ctx, ctx.interval_ms)) return;
+        _ = ctx.adapter.tryKeepAliveIfIdle() catch |err| {
+            std.log.warn("namespace keepalive failed: {s}", .{@errorName(err)});
+        };
     }
 }
 
@@ -753,6 +810,18 @@ fn waitReadable(stream: *std.net.Stream, timeout_ms: i32) !bool {
 }
 
 fn sleepWithStop(ctx: *WorkspaceSyncContext, total_ms: u64) bool {
+    if (total_ms == 0) return !ctx.shouldStop();
+    var elapsed: u64 = 0;
+    while (elapsed < total_ms) {
+        if (ctx.shouldStop()) return false;
+        const chunk_ms: u64 = @min(@as(u64, 250), total_ms - elapsed);
+        std.Thread.sleep(chunk_ms * std.time.ns_per_ms);
+        elapsed += chunk_ms;
+    }
+    return !ctx.shouldStop();
+}
+
+fn sleepNamespaceKeepalive(ctx: *NamespaceKeepaliveContext, total_ms: u64) bool {
     if (total_ms == 0) return !ctx.shouldStop();
     var elapsed: u64 = 0;
     while (elapsed < total_ms) {
