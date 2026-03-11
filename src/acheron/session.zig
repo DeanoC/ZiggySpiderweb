@@ -5252,14 +5252,6 @@ pub const Session = struct {
         }
 
         self.allocator.free(workspace_path);
-        const catalog_path = if (suffix.len == 0)
-            try std.fmt.allocPrint(self.allocator, "/nodes/local/venoms/{s}", .{service_id})
-        else
-            try std.fmt.allocPrint(self.allocator, "/nodes/local/venoms/{s}{s}", .{ service_id, suffix });
-        errdefer self.allocator.free(catalog_path);
-        if (self.resolveAbsolutePathNoBinds(catalog_path) != null) return catalog_path;
-
-        self.allocator.free(catalog_path);
         return if (suffix.len == 0)
             try std.fmt.allocPrint(self.allocator, "/global/{s}", .{service_id})
         else
@@ -17942,7 +17934,7 @@ test "acheron_session: preferred service paths use workspace bindings when avail
 
     const unbound_github_path = try unbound_session.resolvePreferredServicePath("github_pr", "/control/sync.json");
     defer allocator.free(unbound_github_path);
-    try std.testing.expectEqualStrings("/nodes/local/venoms/github_pr/control/sync.json", unbound_github_path);
+    try std.testing.expectEqualStrings("/global/github_pr/control/sync.json", unbound_github_path);
 }
 
 test "acheron_session: bound workspace service paths are readable through /services" {
