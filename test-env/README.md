@@ -53,6 +53,16 @@ SPIDERWEB_INSTALL_ZSS=0 \
 SPIDERWEB_INSTALL_SYSTEMD=0 \
 SPIDERWEB_START_AFTER_INSTALL=0 \
 bash ./install.sh
+
+# Future release-binary path once GitHub release assets exist
+SPIDERWEB_NON_INTERACTIVE=1 \
+SPIDERWEB_INSTALL_SOURCE=release \
+SPIDERWEB_RELEASE_ARCHIVE_URL=https://github.com/DeanoC/Spiderweb/releases/download/vX.Y.Z/spiderweb-linux-x86_64.tar.gz \
+SPIDERWEB_RELEASE_ARCHIVE_SHA256=<sha256> \
+SPIDERWEB_INSTALL_ZSS=0 \
+SPIDERWEB_INSTALL_SYSTEMD=0 \
+SPIDERWEB_START_AFTER_INSTALL=0 \
+bash ./install.sh
 ```
 
 ## External Codex Workspace E2E Harness
@@ -123,6 +133,14 @@ Codex launch controls:
 - `CODEX_DISABLE_APPS=1`: inject `--disable apps` by default because the current live Spiderweb path is more reliable without the apps surface in non-interactive `exec`
 - `CODEX_DISABLE_SHELL_SNAPSHOT=1`: inject `--disable shell_snapshot` by default because the current live Spiderweb path is more reliable without shell snapshotting in non-interactive `exec`
 - `CODEX_ALLOW_HOST_CODEX_HOME=1`: temporarily allow writes under host `~/.codex` for reliability while still reporting them as a `codex_home` machine-independence gap
+- `SPIDERWEB_INSTALL_SOURCE=auto|source|release`: choose whether the harness compiles Spiderweb locally or installs from a prebuilt archive. Default: `auto`
+- `SPIDERWEB_RELEASE_ARCHIVE_URL`: release asset URL to use when `SPIDERWEB_INSTALL_SOURCE=release`
+- `SPIDERWEB_RELEASE_ARCHIVE_SHA256`: optional checksum for the release archive
+- `SPIDERWEB_RELEASE_VERSION`: optional label recorded in installer output for the chosen release build
+
+Current note:
+
+- `DeanoC/Spiderweb` does not publish GitHub Releases yet, so the release installer path is preparatory plumbing for future binary assets. Today, `auto` falls back to the existing source-build path unless you provide an explicit archive URL.
 
 Expected output artifacts:
 
