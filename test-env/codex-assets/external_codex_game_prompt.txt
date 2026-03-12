@@ -54,6 +54,10 @@ Workspace contract:
 - Do not spend extra turns trying to normalize every metadata schema. You only need enough information to confirm the mounted service paths and the shared-data inputs.
 - If `__SERVICE_ROOT__/home`, `__SERVICE_ROOT__/mounts`, `__SERVICE_ROOT__/workers`, `__SERVICE_ROOT__/terminal`, `__SERVICE_ROOT__/git`, `__SERVICE_ROOT__/search_code`, `__SERVICE_ROOT__/library`, and `__SERVICE_ROOT__/events` are already present, proceed directly from bootstrap into implementation.
 - Prefer creating all four deliverables in one decisive shell or Python write step, then iterate only if validation fails.
+- When writing or replacing `game.py`, `game_manifest.json`, `walkthrough.txt`, or `README.md`, write the full intended contents in one pass. Do not append fragments to an existing file.
+- If you need to replace `game.py` after a failed attempt, remove the old file first and then recreate it from scratch so stale trailing content cannot survive a shorter rewrite.
+- Do not run `chmod` on project files. This mount may not support chmod, and the game only needs to run via `python3 ./game.py`.
+- Before running the official validator, run `python3 -m py_compile ./game.py` and `python3 ./game.py < ./walkthrough.txt`. Only move on to the validator once both succeed.
 
 Deliverable:
 - Build a Python terminal adventure game in the current working directory.
@@ -92,6 +96,10 @@ The shared_data_inputs array must list:
 
 Before you finish:
 1. Run:
+   python3 -m py_compile ./game.py
+2. Run:
+   python3 ./game.py < ./walkthrough.txt
+3. Run:
    python3 ./validate_game.py --workspace . --shared-data __SHARED_DATA_DIR__ --output ./game_validation.json
-2. If validation fails, fix the game and rerun validation.
-3. In your final note, summarize which mounted paths you used and which bootstrap actions you performed inside the workspace.
+4. If any step fails, fix the game and rerun the failing step(s) before finishing.
+5. In your final note, summarize which mounted paths you used and which bootstrap actions you performed inside the workspace.

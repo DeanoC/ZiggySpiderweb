@@ -724,6 +724,10 @@ Rules:
 - After the required discovery reads and bootstrap actions, start implementing immediately instead of doing extra exploratory reads unless validation fails.
 - Keep discovery simple. Do not build a large custom metadata-inspection script; adapt only the single file you are currently reading if its schema is unexpected.
 - Prefer writing all deliverables in one shell or Python file-generation step, then iterate only if validation fails.
+- When writing or replacing game.py, game_manifest.json, walkthrough.txt, or README.md, write the full intended contents in one pass. Do not append fragments to an existing file.
+- If you need to replace game.py after a failed attempt, remove the old file first and then recreate it from scratch so stale trailing content cannot survive a shorter rewrite.
+- Do not run chmod on project files. This mount may not support chmod, and python3 game.py is sufficient for validation.
+- Before running validate_game.py, first run python3 -m py_compile ./game.py and then python3 ./game.py < ./walkthrough.txt. Only move on to the validator once both succeed.
 - The victory line must be:
   VICTORY: Lantern of Nine Paths recovered
 EOF
