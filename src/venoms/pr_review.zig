@@ -2724,6 +2724,14 @@ fn executeRunValidationOp(self: anytype, args_obj: std.json.ObjectMap) ![]u8 {
     };
     if (command_items.len == 0) return error.InvalidPayload;
 
+    if (!(try self.isToolAllowedForCurrentAgent("shell_exec"))) {
+        return self.buildPrReviewFailureResultJson(
+            .run_validation,
+            "tool_not_allowed",
+            "shell_exec is denied for this agent",
+        );
+    }
+
     const checkpoint_stage = extractOptionalStringByNames(args_obj, &[_][]const u8{"stage"}) orelse state.phase;
 
     var create_capture: ?ServiceCapture = null;

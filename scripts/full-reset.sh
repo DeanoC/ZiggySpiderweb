@@ -34,6 +34,8 @@ USER_PATHS=(
     "$TARGET_HOME/.local/share/ziggy"
     "$TARGET_HOME/.local/bin/spiderweb"
     "$TARGET_HOME/.local/bin/spiderweb-config"
+    "$TARGET_HOME/.local/bin/spiderweb-control"
+    "$TARGET_HOME/.local/bin/spiderweb-fs-mount"
     "/tmp/spiderweb.log"
 )
 
@@ -46,6 +48,8 @@ SYSTEM_PATHS=(
     "/opt/spiderweb"
     "/usr/local/bin/spiderweb"
     "/usr/local/bin/spiderweb-config"
+    "/usr/local/bin/spiderweb-control"
+    "/usr/local/bin/spiderweb-fs-mount"
 )
 
 if [ -n "$BASE_DIR" ]; then

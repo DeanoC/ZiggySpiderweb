@@ -5,7 +5,8 @@ SPIDERWEB_URL="${SPIDERWEB_URL:-ws://127.0.0.1:18790/}"
 SPIDERWEB_WORKSPACE_ID="${SPIDERWEB_WORKSPACE_ID:-}"
 SPIDERWEB_WORKSPACE_TOKEN="${SPIDERWEB_WORKSPACE_TOKEN:-}"
 SPIDERWEB_AUTH_TOKEN="${SPIDERWEB_AUTH_TOKEN:-}"
-SPIDERWEB_AUTH_TOKEN_FILE="${SPIDERWEB_AUTH_TOKEN_FILE:-$HOME/.local/share/ziggy-spiderweb/.spiderweb-ltm/auth_tokens.json}"
+SPIDERWEB_AUTH_TOKEN_FILE="${SPIDERWEB_AUTH_TOKEN_FILE:-}"
+SPIDERWEB_CONFIG_BIN="${SPIDERWEB_CONFIG_BIN:-spiderweb-config}"
 EXPECTED_NODES="${EXPECTED_NODES:-}"
 EXPECTED_SERVICES="${EXPECTED_SERVICES:-}"
 HARNESS_TIMEOUT_SEC="${HARNESS_TIMEOUT_SEC:-90}"
@@ -26,6 +27,22 @@ require_bin spiderweb-control
 require_bin spiderweb-fs-mount
 require_bin jq
 require_bin timeout
+
+resolve_auth_token_file() {
+    if command -v "$SPIDERWEB_CONFIG_BIN" >/dev/null 2>&1; then
+        local resolved
+        resolved="$("$SPIDERWEB_CONFIG_BIN" auth path 2>/dev/null | tr -d '\r' | tail -n 1 || true)"
+        if [[ -n "$resolved" ]]; then
+            printf '%s\n' "$resolved"
+            return
+        fi
+    fi
+    printf '%s\n' "$HOME/.local/share/ziggy-spiderweb/.spiderweb-ltm/auth_tokens.json"
+}
+
+if [[ -z "$SPIDERWEB_AUTH_TOKEN_FILE" ]]; then
+    SPIDERWEB_AUTH_TOKEN_FILE="$(resolve_auth_token_file)"
+fi
 
 if [[ -z "$SPIDERWEB_AUTH_TOKEN" && -f "$SPIDERWEB_AUTH_TOKEN_FILE" ]]; then
     SPIDERWEB_AUTH_TOKEN="$(jq -r '.admin_token // .user_token // empty' "$SPIDERWEB_AUTH_TOKEN_FILE" 2>/dev/null || true)"

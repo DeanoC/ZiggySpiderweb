@@ -314,11 +314,12 @@ pub fn executeOpPayload(self: anytype, op: Op, args_obj: std.json.ObjectMap) ![]
                 const raw = extractOptionalStringByNames(args_obj, &[_][]const u8{"state"}) orelse break :blk2 null;
                 break :blk2 mission_store_mod.parseMissionState(raw) orelse return error.InvalidPayload;
             };
+            const scoped_filter = try scopedMissionListFilter(self, args_obj, state_filter);
             const missions = try store.listOwned(self.allocator, .{
-                .state = state_filter,
-                .use_case = extractOptionalStringByNames(args_obj, &[_][]const u8{"use_case"}),
-                .agent_id = extractOptionalStringByNames(args_obj, &[_][]const u8{"agent_id"}),
-                .project_id = extractOptionalStringByNames(args_obj, &[_][]const u8{"project_id"}),
+                .state = scoped_filter.state,
+                .use_case = scoped_filter.use_case,
+                .agent_id = scoped_filter.agent_id,
+                .project_id = scoped_filter.project_id,
             });
             defer mission_store_mod.deinitMissionList(self.allocator, missions);
             const inventory = try self.buildMissionListJson(missions);
@@ -329,6 +330,7 @@ pub fn executeOpPayload(self: anytype, op: Op, args_obj: std.json.ObjectMap) ![]
             const mission_id = extractOptionalStringByNames(args_obj, &[_][]const u8{ "mission_id", "id" }) orelse return error.InvalidPayload;
             var mission = (try store.getOwned(self.allocator, mission_id)) orelse return error.NotFound;
             defer mission.deinit(self.allocator);
+            try ensureMissionAccess(self, mission);
             const mission_json = try self.buildMissionRecordJson(mission);
             defer self.allocator.free(mission_json);
             const detail = try std.fmt.allocPrint(self.allocator, "{{\"mission\":{s}}}", .{mission_json});
@@ -337,6 +339,7 @@ pub fn executeOpPayload(self: anytype, op: Op, args_obj: std.json.ObjectMap) ![]
         },
         .heartbeat => blk: {
             const mission_id = extractOptionalStringByNames(args_obj, &[_][]const u8{ "mission_id", "id" }) orelse return error.InvalidPayload;
+            try ensureMissionAccessById(self, store, mission_id);
             var mission = store.recordHeartbeat(
                 self.allocator,
                 mission_id,
@@ -354,6 +357,7 @@ pub fn executeOpPayload(self: anytype, op: Op, args_obj: std.json.ObjectMap) ![]
         },
         .checkpoint => blk: {
             const mission_id = extractOptionalStringByNames(args_obj, &[_][]const u8{ "mission_id", "id" }) orelse return error.InvalidPayload;
+            try ensureMissionAccessById(self, store, mission_id);
             const artifact_input = if (args_obj.get("artifact")) |value| blk2: {
                 if (value != .object) return error.InvalidPayload;
                 const kind = extractOptionalStringByNames(value.object, &[_][]const u8{"kind"}) orelse return error.InvalidPayload;
@@ -383,6 +387,7 @@ pub fn executeOpPayload(self: anytype, op: Op, args_obj: std.json.ObjectMap) ![]
         .invoke_service => executeInvokeServiceOp(self, args_obj),
         .recover => blk: {
             const mission_id = extractOptionalStringByNames(args_obj, &[_][]const u8{ "mission_id", "id" }) orelse return error.InvalidPayload;
+            try ensureMissionAccessById(self, store, mission_id);
             const reason = extractOptionalStringByNames(args_obj, &[_][]const u8{ "reason", "message" }) orelse return error.InvalidPayload;
             var mission = store.recordRecovery(self.allocator, mission_id, .{
                 .reason = reason,
@@ -401,6 +406,7 @@ pub fn executeOpPayload(self: anytype, op: Op, args_obj: std.json.ObjectMap) ![]
         },
         .request_approval => blk: {
             const mission_id = extractOptionalStringByNames(args_obj, &[_][]const u8{ "mission_id", "id" }) orelse return error.InvalidPayload;
+            try ensureMissionAccessById(self, store, mission_id);
             const action_kind = extractOptionalStringByNames(args_obj, &[_][]const u8{ "action_kind", "action" }) orelse return error.InvalidPayload;
             const message = extractOptionalStringByNames(args_obj, &[_][]const u8{ "message", "reason" }) orelse return error.InvalidPayload;
             const payload_json = if (args_obj.get("payload")) |value|
@@ -446,6 +452,7 @@ pub fn executeOpPayload(self: anytype, op: Op, args_obj: std.json.ObjectMap) ![]
         },
         .@"resume", .block, .complete, .fail, .cancel => blk: {
             const mission_id = extractOptionalStringByNames(args_obj, &[_][]const u8{ "mission_id", "id" }) orelse return error.InvalidPayload;
+            try ensureMissionAccessById(self, store, mission_id);
             const next_state: mission_store_mod.MissionState = switch (op) {
                 .@"resume" => .running,
                 .block => .blocked,
@@ -480,6 +487,7 @@ fn executeInvokeServiceOp(self: anytype, args_obj: std.json.ObjectMap) ![]u8 {
     const mission_id = extractOptionalStringByNames(args_obj, &[_][]const u8{ "mission_id", "id" }) orelse return error.InvalidPayload;
     var existing = (try store.getOwned(self.allocator, mission_id)) orelse return error.NotFound;
     defer existing.deinit(self.allocator);
+    try ensureMissionAccess(self, existing);
 
     const service_path = try self.normalizeMissionAbsolutePath(
         extractOptionalStringByNames(args_obj, &[_][]const u8{ "service_path", "venom_path" }) orelse return error.InvalidPayload,
@@ -594,6 +602,7 @@ fn executeBootstrapContractOp(self: anytype, args_obj: std.json.ObjectMap) ![]u8
     const mission_id = extractOptionalStringByNames(args_obj, &[_][]const u8{ "mission_id", "id" }) orelse return error.InvalidPayload;
     var existing = (try store.getOwned(self.allocator, mission_id)) orelse return error.NotFound;
     defer existing.deinit(self.allocator);
+    try ensureMissionAccess(self, existing);
 
     const contract = try self.resolveMissionBootstrapContract(existing, args_obj);
 
@@ -1093,6 +1102,49 @@ pub fn buildMissionApprovalJson(self: anytype, approval: mission_store_mod.Missi
     try writer.writeAll(resolution_json);
     try writer.writeByte('}');
     return out.toOwnedSlice(self.allocator);
+}
+
+const ScopedMissionListFilter = struct {
+    state: ?mission_store_mod.MissionState,
+    use_case: ?[]const u8,
+    agent_id: ?[]const u8,
+    project_id: ?[]const u8,
+};
+
+fn scopedMissionListFilter(self: anytype, args_obj: std.json.ObjectMap, state_filter: ?mission_store_mod.MissionState) !ScopedMissionListFilter {
+    if (self.is_admin) {
+        return .{
+            .state = state_filter,
+            .use_case = extractOptionalStringByNames(args_obj, &[_][]const u8{"use_case"}),
+            .agent_id = extractOptionalStringByNames(args_obj, &[_][]const u8{"agent_id"}),
+            .project_id = extractOptionalStringByNames(args_obj, &[_][]const u8{"project_id"}),
+        };
+    }
+    return .{
+        .state = state_filter,
+        .use_case = extractOptionalStringByNames(args_obj, &[_][]const u8{"use_case"}),
+        .agent_id = self.agent_id,
+        .project_id = self.project_id,
+    };
+}
+
+fn ensureMissionAccessById(self: anytype, store: *mission_store_mod.MissionStore, mission_id: []const u8) !void {
+    var mission = (try store.getOwned(self.allocator, mission_id)) orelse return error.NotFound;
+    defer mission.deinit(self.allocator);
+    try ensureMissionAccess(self, mission);
+}
+
+fn ensureMissionAccess(self: anytype, mission: mission_store_mod.MissionRecord) !void {
+    if (self.is_admin) return;
+    const mission_agent_id = mission.agent_id orelse return error.AccessDenied;
+    if (!std.mem.eql(u8, mission_agent_id, self.agent_id)) return error.AccessDenied;
+    if (!optionalStringEql(mission.project_id, self.project_id)) return error.AccessDenied;
+}
+
+fn optionalStringEql(left: ?[]const u8, right: ?[]const u8) bool {
+    if (left == null and right == null) return true;
+    if (left == null or right == null) return false;
+    return std.mem.eql(u8, left.?, right.?);
 }
 
 fn extractOptionalStringByNames(obj: std.json.ObjectMap, candidate_names: []const []const u8) ?[]const u8 {

@@ -5,13 +5,15 @@ SPIDERWEB_URL="${SPIDERWEB_URL:-ws://127.0.0.1:18790/}"
 SPIDERWEB_WORKSPACE_ID="${SPIDERWEB_WORKSPACE_ID:-}"
 SPIDERWEB_WORKSPACE_TOKEN="${SPIDERWEB_WORKSPACE_TOKEN:-}"
 SPIDERWEB_AUTH_TOKEN="${SPIDERWEB_AUTH_TOKEN:-}"
-SPIDERWEB_AUTH_TOKEN_FILE="${SPIDERWEB_AUTH_TOKEN_FILE:-$HOME/.local/share/ziggy-spiderweb/.spiderweb-ltm/auth_tokens.json}"
+SPIDERWEB_AUTH_TOKEN_FILE="${SPIDERWEB_AUTH_TOKEN_FILE:-}"
+SPIDERWEB_CONFIG_BIN="${SPIDERWEB_CONFIG_BIN:-spiderweb-config}"
 EXPECTED_NODES="${EXPECTED_NODES:-}"
 SMOKE_TIMEOUT_SEC="${SMOKE_TIMEOUT_SEC:-15}"
 SMOKE_FAIL_ON_DEGRADED="${SMOKE_FAIL_ON_DEGRADED:-1}"
 SMOKE_CONNECT_RETRIES="${SMOKE_CONNECT_RETRIES:-8}"
 SMOKE_RETRY_DELAY_MS="${SMOKE_RETRY_DELAY_MS:-500}"
 SPIDERWEB_SERVICE="${SPIDERWEB_SERVICE:-spiderweb.service}"
+SPIDERWEB_SERVICE_SCOPE="${SPIDERWEB_SERVICE_SCOPE:-auto}"
 
 require_bin() {
     if ! command -v "$1" >/dev/null 2>&1; then
@@ -25,8 +27,52 @@ require_bin spiderweb-fs-mount
 require_bin jq
 require_bin timeout
 
-if command -v systemctl >/dev/null 2>&1 && systemctl show "$SPIDERWEB_SERVICE" >/dev/null 2>&1; then
+resolve_auth_token_file() {
+    if command -v "$SPIDERWEB_CONFIG_BIN" >/dev/null 2>&1; then
+        local resolved
+        resolved="$("$SPIDERWEB_CONFIG_BIN" auth path 2>/dev/null | tr -d '\r' | tail -n 1 || true)"
+        if [[ -n "$resolved" ]]; then
+            printf '%s\n' "$resolved"
+            return
+        fi
+    fi
+    printf '%s\n' "$HOME/.local/share/ziggy-spiderweb/.spiderweb-ltm/auth_tokens.json"
+}
+
+resolve_service_scope() {
+    case "$SPIDERWEB_SERVICE_SCOPE" in
+        user|system)
+            printf '%s\n' "$SPIDERWEB_SERVICE_SCOPE"
+            ;;
+        auto)
+            if command -v systemctl >/dev/null 2>&1 && systemctl --user show "$SPIDERWEB_SERVICE" >/dev/null 2>&1; then
+                printf 'user\n'
+            elif command -v systemctl >/dev/null 2>&1 && systemctl show "$SPIDERWEB_SERVICE" >/dev/null 2>&1; then
+                printf 'system\n'
+            else
+                printf 'unknown\n'
+            fi
+            ;;
+        *)
+            echo "error: invalid SPIDERWEB_SERVICE_SCOPE: $SPIDERWEB_SERVICE_SCOPE" >&2
+            exit 2
+            ;;
+    esac
+}
+
+if [[ -z "$SPIDERWEB_AUTH_TOKEN_FILE" ]]; then
+    SPIDERWEB_AUTH_TOKEN_FILE="$(resolve_auth_token_file)"
+fi
+
+service_scope="$(resolve_service_scope)"
+if [[ "$service_scope" == "user" ]]; then
+    restrict_namespaces="$(systemctl --user show "$SPIDERWEB_SERVICE" -p RestrictNamespaces --value 2>/dev/null || true)"
+elif [[ "$service_scope" == "system" ]]; then
     restrict_namespaces="$(systemctl show "$SPIDERWEB_SERVICE" -p RestrictNamespaces --value 2>/dev/null || true)"
+else
+    restrict_namespaces=""
+fi
+if [[ -n "$restrict_namespaces" ]]; then
     if [[ "$restrict_namespaces" == "yes" ]]; then
         echo "error: $SPIDERWEB_SERVICE has RestrictNamespaces=yes; sandbox runtime/bwrap will fail" >&2
         echo "hint: reinstall with scripts/install-systemd.sh or set RestrictNamespaces=false in the unit" >&2
@@ -87,9 +133,9 @@ availability_total="$(jq -r '.payload.availability.mounts_total // 0' <<<"$reply
 availability_online="$(jq -r '.payload.availability.online // 0' <<<"$reply")"
 availability_degraded="$(jq -r '.payload.availability.degraded // 0' <<<"$reply")"
 availability_missing="$(jq -r '.payload.availability.missing // 0' <<<"$reply")"
-project_id_resolved="$(jq -r '.payload.project_id // "(none)"' <<<"$reply")"
+workspace_id_resolved="$(jq -r '.payload.workspace_id // .payload.project_id // "(none)"' <<<"$reply")"
 
-echo "workspace id: ${project_id_resolved}"
+echo "workspace id: ${workspace_id_resolved}"
 echo "availability: online=${availability_online}/${availability_total} degraded=${availability_degraded} missing=${availability_missing}"
 
 if [[ "$availability_total" -eq 0 ]]; then

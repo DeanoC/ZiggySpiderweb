@@ -5,8 +5,10 @@ SPIDERWEB_URL="${SPIDERWEB_URL:-ws://127.0.0.1:18790/}"
 SPIDERWEB_WORKSPACE_ID="${SPIDERWEB_WORKSPACE_ID:-system}"
 SPIDERWEB_WORKSPACE_TOKEN="${SPIDERWEB_WORKSPACE_TOKEN:-}"
 SPIDERWEB_AUTH_TOKEN="${SPIDERWEB_AUTH_TOKEN:-}"
-SPIDERWEB_AUTH_TOKEN_FILE="${SPIDERWEB_AUTH_TOKEN_FILE:-$HOME/.local/share/ziggy-spiderweb/.spiderweb-ltm/auth_tokens.json}"
+SPIDERWEB_AUTH_TOKEN_FILE="${SPIDERWEB_AUTH_TOKEN_FILE:-}"
+SPIDERWEB_CONFIG_BIN="${SPIDERWEB_CONFIG_BIN:-spiderweb-config}"
 SPIDERWEB_SERVICE="${SPIDERWEB_SERVICE:-spiderweb.service}"
+SPIDERWEB_SERVICE_SCOPE="${SPIDERWEB_SERVICE_SCOPE:-auto}"
 
 CHAOS_ITERATIONS="${CHAOS_ITERATIONS:-30}"
 CHAOS_RESTART_AT="${CHAOS_RESTART_AT:-10}"
@@ -24,7 +26,6 @@ require_bin() {
 }
 
 require_bin systemctl
-require_bin systemd-run
 require_bin spiderweb-control
 require_bin spiderweb-fs-mount
 require_bin jq
@@ -33,6 +34,56 @@ require_bin timeout
 spiderweb_control_bin="$(command -v spiderweb-control)"
 spiderweb_fs_mount_bin="$(command -v spiderweb-fs-mount)"
 timeout_bin="$(command -v timeout)"
+
+resolve_auth_token_file() {
+    if command -v "$SPIDERWEB_CONFIG_BIN" >/dev/null 2>&1; then
+        local resolved
+        resolved="$("$SPIDERWEB_CONFIG_BIN" auth path 2>/dev/null | tr -d '\r' | tail -n 1 || true)"
+        if [[ -n "$resolved" ]]; then
+            printf '%s\n' "$resolved"
+            return
+        fi
+    fi
+    printf '%s\n' "$HOME/.local/share/ziggy-spiderweb/.spiderweb-ltm/auth_tokens.json"
+}
+
+resolve_service_scope() {
+    case "$SPIDERWEB_SERVICE_SCOPE" in
+        user|system)
+            printf '%s\n' "$SPIDERWEB_SERVICE_SCOPE"
+            ;;
+        auto)
+            if systemctl --user show "$SPIDERWEB_SERVICE" >/dev/null 2>&1; then
+                printf 'user\n'
+            elif systemctl show "$SPIDERWEB_SERVICE" >/dev/null 2>&1; then
+                printf 'system\n'
+            else
+                printf 'system\n'
+            fi
+            ;;
+        *)
+            echo "error: invalid SPIDERWEB_SERVICE_SCOPE: $SPIDERWEB_SERVICE_SCOPE" >&2
+            exit 2
+            ;;
+    esac
+}
+
+run_service_ctl() {
+    local action="$1"
+    shift || true
+    if [[ "$service_scope" == "user" ]]; then
+        systemctl --user "$action" "$SPIDERWEB_SERVICE" "$@"
+    elif [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
+        systemctl "$action" "$SPIDERWEB_SERVICE" "$@"
+    else
+        sudo systemctl "$action" "$SPIDERWEB_SERVICE" "$@"
+    fi
+}
+
+if [[ -z "$SPIDERWEB_AUTH_TOKEN_FILE" ]]; then
+    SPIDERWEB_AUTH_TOKEN_FILE="$(resolve_auth_token_file)"
+fi
+service_scope="$(resolve_service_scope)"
 
 if [[ -z "$SPIDERWEB_AUTH_TOKEN" && -f "$SPIDERWEB_AUTH_TOKEN_FILE" ]]; then
     SPIDERWEB_AUTH_TOKEN="$(jq -r '.admin_token // .user_token // empty' "$SPIDERWEB_AUTH_TOKEN_FILE" 2>/dev/null || true)"
@@ -48,7 +99,7 @@ if [[ "$CHAOS_RESTART_AT" -lt 2 || "$CHAOS_RESTART_AT" -gt $((CHAOS_ITERATIONS -
 fi
 
 run_unit_cmd() {
-    systemd-run --user --wait --collect --pipe --quiet "$timeout_bin" "${CHAOS_TIMEOUT_SEC}s" "$@"
+    "$timeout_bin" "${CHAOS_TIMEOUT_SEC}s" "$@"
 }
 
 control_args=(--url "$SPIDERWEB_URL")
@@ -78,6 +129,7 @@ fi
 
 echo "chaos log: $CHAOS_LOG_PATH"
 echo "service: $SPIDERWEB_SERVICE"
+echo "service scope: $service_scope"
 echo "url: $SPIDERWEB_URL"
 echo "workspace: $SPIDERWEB_WORKSPACE_ID"
 echo "iterations: $CHAOS_ITERATIONS restart_at: $CHAOS_RESTART_AT interval_ms: $CHAOS_INTERVAL_MS"
@@ -103,7 +155,7 @@ restart_done=0
 for i in $(seq 1 "$CHAOS_ITERATIONS"); do
     if [[ "$i" -eq "$CHAOS_RESTART_AT" ]]; then
         echo "$(date --iso-8601=seconds) event=restart-start service=$SPIDERWEB_SERVICE" | tee -a "$CHAOS_LOG_PATH"
-        systemctl --user restart "$SPIDERWEB_SERVICE"
+        run_service_ctl restart
         echo "$(date --iso-8601=seconds) event=restart-done service=$SPIDERWEB_SERVICE" | tee -a "$CHAOS_LOG_PATH"
         restart_done=1
     fi

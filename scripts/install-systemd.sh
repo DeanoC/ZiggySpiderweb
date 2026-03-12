@@ -134,6 +134,7 @@ install_files() {
     ln -sf "$INSTALL_DIR/bin/spiderweb" /usr/local/bin/spiderweb
     ln -sf "$INSTALL_DIR/bin/spiderweb-config" /usr/local/bin/spiderweb-config
     ln -sf "$INSTALL_DIR/bin/spiderweb-control" /usr/local/bin/spiderweb-control
+    ln -sf "$INSTALL_DIR/bin/spiderweb-fs-mount" /usr/local/bin/spiderweb-fs-mount
 
     log_info "Binaries installed ✓"
 }
@@ -277,11 +278,13 @@ print_summary() {
     echo "  Stop:      sudo systemctl stop $SERVICE_NAME"
     echo "  Status:    sudo systemctl status $SERVICE_NAME"
     echo "  Logs:      sudo journalctl -u $SERVICE_NAME -f"
-    echo "  Config:    sudo spiderweb-config config"
+    echo "  Config:    sudo env SPIDERWEB_CONFIG=$CONFIG_DIR/config.json spiderweb-config config"
+    echo "  Auth:      sudo env SPIDERWEB_CONFIG=$CONFIG_DIR/config.json spiderweb-config auth status --reveal"
     echo ""
     echo "Notes:"
     echo "  - Spiderweb now runs as a workspace host only."
     echo "  - Create and mount workspaces with spiderweb-control and spiderweb-fs-mount."
+    echo "  - Export SPIDERWEB_CONFIG=$CONFIG_DIR/config.json when using spiderweb-config outside the service."
     echo "  - External workers such as Spider Monkey own model/provider credentials."
     echo ""
 }

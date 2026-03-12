@@ -1002,14 +1002,35 @@ pub const Session = struct {
         return try self.resolveMissionContractHostPath(absolute_path);
     }
 
+    fn resolveLocalFsSafeHostPath(self: *Session, host_path: []const u8) !?[]u8 {
+        const export_root = self.local_fs_export_root orelse return null;
+        const resolved_root = if (std.fs.path.isAbsolute(export_root))
+            std.fs.realpathAlloc(self.allocator, export_root) catch return null
+        else
+            std.fs.cwd().realpathAlloc(self.allocator, export_root) catch return null;
+        defer self.allocator.free(resolved_root);
+
+        const resolved_host = if (std.fs.path.isAbsolute(host_path))
+            std.fs.realpathAlloc(self.allocator, host_path) catch return null
+        else
+            std.fs.cwd().realpathAlloc(self.allocator, host_path) catch return null;
+        errdefer self.allocator.free(resolved_host);
+
+        if (!hostPathMatchesPrefixBoundary(resolved_host, resolved_root)) return null;
+        return resolved_host;
+    }
+
     fn syncLocalFsFileNode(self: *Session, node_id: u32) !bool {
         const host_path = (try self.localFsNodeHostPath(node_id)) orelse return false;
         defer self.allocator.free(host_path);
 
-        var file = if (std.fs.path.isAbsolute(host_path))
-            std.fs.openFileAbsolute(host_path, .{}) catch return false
+        const safe_host_path = (try self.resolveLocalFsSafeHostPath(host_path)) orelse return false;
+        defer self.allocator.free(safe_host_path);
+
+        var file = if (std.fs.path.isAbsolute(safe_host_path))
+            std.fs.openFileAbsolute(safe_host_path, .{}) catch return false
         else
-            std.fs.cwd().openFile(host_path, .{}) catch return false;
+            std.fs.cwd().openFile(safe_host_path, .{}) catch return false;
         defer file.close();
 
         const content = try file.readToEndAlloc(self.allocator, 1024 * 1024);
@@ -5912,14 +5933,6 @@ pub const Session = struct {
         }
 
         self.allocator.free(workspace_path);
-        const catalog_path = if (suffix.len == 0)
-            try std.fmt.allocPrint(self.allocator, "/nodes/local/venoms/{s}", .{service_id})
-        else
-            try std.fmt.allocPrint(self.allocator, "/nodes/local/venoms/{s}{s}", .{ service_id, suffix });
-        errdefer self.allocator.free(catalog_path);
-        if (self.resolveAbsolutePathNoBinds(catalog_path) != null) return catalog_path;
-
-        self.allocator.free(catalog_path);
         return if (suffix.len == 0)
             try std.fmt.allocPrint(self.allocator, "/global/{s}", .{service_id})
         else
@@ -7015,6 +7028,34 @@ pub const Session = struct {
         return abilities.can_create_agents;
     }
 
+    pub fn isToolAllowedForCurrentAgent(self: *Session, tool_name: []const u8) !bool {
+        const policy_agent_id = if (std.mem.eql(u8, self.actor_type, "agent") and self.actor_id.len > 0)
+            self.actor_id
+        else
+            self.agent_id;
+
+        var config = try agent_config.loadAgentConfigFromDir(self.allocator, self.agents_dir, policy_agent_id);
+        if (config == null and !std.mem.eql(u8, policy_agent_id, self.agent_id)) {
+            config = try agent_config.loadAgentConfigFromDir(self.allocator, self.agents_dir, self.agent_id);
+        }
+        if (config == null) return true;
+
+        var owned_config = config.?;
+        defer owned_config.deinit();
+
+        const primary = owned_config.primary.view();
+
+        if (primary.denied_tools) |denied_tools| {
+            if (toolListContains(denied_tools, tool_name)) return false;
+        }
+
+        if (primary.allowed_tools) |allowed_tools| {
+            return toolListContains(allowed_tools, tool_name);
+        }
+
+        return true;
+    }
+
     fn resolveAgentAbilities(self: *Session) !AgentAbilities {
         var abilities = AgentAbilities{
             .can_create_agents = std.mem.eql(u8, self.agent_id, "spiderweb"),
@@ -7057,6 +7098,13 @@ pub const Session = struct {
     fn capabilityMatchesAny(capability: []const u8, accepted: []const []const u8) bool {
         for (accepted) |candidate| {
             if (std.ascii.eqlIgnoreCase(capability, candidate)) return true;
+        }
+        return false;
+    }
+
+    fn toolListContains(list: std.ArrayListUnmanaged([]u8), tool_name: []const u8) bool {
+        for (list.items) |item| {
+            if (std.mem.eql(u8, item, tool_name)) return true;
         }
         return false;
     }
@@ -9045,6 +9093,23 @@ test "immediateBoundChildName returns direct bind child for directory" {
     try std.testing.expect(immediateBoundChildName("/services/home", "/services/home") == null);
 }
 
+fn hostPathMatchesPrefixBoundary(path: []const u8, prefix: []const u8) bool {
+    if (builtin.os.tag != .windows) return pathMatchesPrefixBoundary(path, prefix);
+    if (std.mem.eql(u8, path, prefix)) return true;
+    if (prefix.len == 0 or path.len < prefix.len) return false;
+
+    for (prefix, 0..) |prefix_ch, idx| {
+        const path_ch = path[idx];
+        const normalized_path = if (path_ch == '\\') '/' else std.ascii.toLower(path_ch);
+        const normalized_prefix = if (prefix_ch == '\\') '/' else std.ascii.toLower(prefix_ch);
+        if (normalized_path != normalized_prefix) return false;
+    }
+
+    if (prefix[prefix.len - 1] == '/' or prefix[prefix.len - 1] == '\\') return true;
+    const boundary = path[prefix.len];
+    return boundary == '/' or boundary == '\\';
+}
+
 const ParsedScopedVenomAlias = struct {
     venom_id: []const u8,
     remote_path: []const u8,
@@ -9517,6 +9582,362 @@ fn decodeReadResponseData(allocator: std.mem.Allocator, frame: []const u8) ![]u8
     errdefer allocator.free(decoded);
     try std.base64.standard.Decoder.decode(decoded, data_b64.string);
     return decoded;
+}
+
+test "acheron_session: preferred service paths use workspace bindings when available" {
+    const allocator = std.testing.allocator;
+
+    var control_plane = control_plane_mod.ControlPlane.init(allocator);
+    defer control_plane.deinit();
+
+    const project_json = try control_plane.createProject(
+        "{\"name\":\"SessionServicePaths\",\"vision\":\"SessionServicePaths\",\"template_id\":\"github\"}",
+    );
+    defer allocator.free(project_json);
+
+    var parsed_project = try std.json.parseFromSlice(std.json.Value, allocator, project_json, .{});
+    defer parsed_project.deinit();
+    const project_id = parsed_project.value.object.get("project_id").?.string;
+    const project_token = parsed_project.value.object.get("project_token").?.string;
+
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createUnavailable(
+        allocator,
+        "execution_failed",
+        "runtime unavailable",
+    );
+    defer runtime_handle.destroy();
+
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var bound_session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "default",
+        .{
+            .project_id = project_id,
+            .project_token = project_token,
+            .agents_dir = ".does-not-exist",
+            .projects_dir = ".does-not-exist",
+            .control_plane = &control_plane,
+        },
+    );
+    defer bound_session.deinit();
+
+    const bound_github_path = try bound_session.resolvePreferredServicePath("github_pr", "/control/sync.json");
+    defer allocator.free(bound_github_path);
+    try std.testing.expectEqualStrings("/services/github_pr/control/sync.json", bound_github_path);
+
+    const bound_missions_path = try bound_session.resolvePreferredServicePath("missions", "/control/request_approval.json");
+    defer allocator.free(bound_missions_path);
+    try std.testing.expectEqualStrings("/services/missions/control/request_approval.json", bound_missions_path);
+
+    var unbound_session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "default",
+        .{
+            .agents_dir = ".does-not-exist",
+            .projects_dir = ".does-not-exist",
+        },
+    );
+    defer unbound_session.deinit();
+
+    const unbound_github_path = try unbound_session.resolvePreferredServicePath("github_pr", "/control/sync.json");
+    defer allocator.free(unbound_github_path);
+    try std.testing.expectEqualStrings("/global/github_pr/control/sync.json", unbound_github_path);
+}
+
+test "acheron_session: missions namespace enforces mission ownership across agents" {
+    const allocator = std.testing.allocator;
+
+    var mission_store = try mission_store_mod.MissionStore.initWithPath(allocator, null);
+    defer mission_store.deinit();
+
+    const runtime_handle_a = try runtime_handle_mod.RuntimeHandle.createUnavailable(
+        allocator,
+        "execution_failed",
+        "runtime unavailable",
+    );
+    defer runtime_handle_a.destroy();
+
+    const runtime_handle_b = try runtime_handle_mod.RuntimeHandle.createUnavailable(
+        allocator,
+        "execution_failed",
+        "runtime unavailable",
+    );
+    defer runtime_handle_b.destroy();
+
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session_a = try Session.initWithOptions(
+        allocator,
+        runtime_handle_a,
+        &job_index,
+        "agent-a",
+        .{
+            .mission_store = &mission_store,
+            .actor_type = "agent",
+            .actor_id = "worker-a",
+        },
+    );
+    defer session_a.deinit();
+
+    var session_b = try Session.initWithOptions(
+        allocator,
+        runtime_handle_b,
+        &job_index,
+        "agent-b",
+        .{
+            .mission_store = &mission_store,
+            .actor_type = "agent",
+            .actor_id = "worker-b",
+        },
+    );
+    defer session_b.deinit();
+
+    try protocolWriteFile(
+        &session_a,
+        allocator,
+        380,
+        381,
+        &.{ "agents", "self", "missions", "control", "create.json" },
+        "{\"use_case\":\"pr_review\",\"title\":\"Review PR 91\"}",
+        980,
+    );
+
+    const create_result = try protocolReadFile(
+        &session_a,
+        allocator,
+        382,
+        383,
+        &.{ "agents", "self", "missions", "result.json" },
+        981,
+    );
+    defer allocator.free(create_result);
+    const mission_id = try extractMissionIdFromResultPayload(allocator, create_result);
+    defer allocator.free(mission_id);
+
+    try protocolWriteFile(
+        &session_b,
+        allocator,
+        384,
+        385,
+        &.{ "agents", "self", "missions", "control", "list.json" },
+        "{}",
+        982,
+    );
+
+    const list_result = try protocolReadFile(
+        &session_b,
+        allocator,
+        386,
+        387,
+        &.{ "agents", "self", "missions", "result.json" },
+        983,
+    );
+    defer allocator.free(list_result);
+    try std.testing.expect(std.mem.indexOf(u8, list_result, "\"operation\":\"list\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, list_result, "\"count\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, list_result, mission_id) == null);
+
+    const get_payload = try std.fmt.allocPrint(allocator, "{{\"mission_id\":\"{s}\"}}", .{mission_id});
+    defer allocator.free(get_payload);
+    const get_error = try protocolWriteFileExpectError(
+        &session_b,
+        allocator,
+        388,
+        389,
+        &.{ "agents", "self", "missions", "control", "get.json" },
+        get_payload,
+        984,
+        "forbidden",
+    );
+    defer allocator.free(get_error);
+
+    const resume_payload = try std.fmt.allocPrint(allocator, "{{\"mission_id\":\"{s}\",\"stage\":\"reviewing\"}}", .{mission_id});
+    defer allocator.free(resume_payload);
+    const resume_error = try protocolWriteFileExpectError(
+        &session_b,
+        allocator,
+        390,
+        391,
+        &.{ "agents", "self", "missions", "control", "resume.json" },
+        resume_payload,
+        985,
+        "forbidden",
+    );
+    defer allocator.free(resume_error);
+}
+
+test "acheron_session: pr_review run_validation denied when shell_exec is blocked" {
+    const allocator = std.testing.allocator;
+
+    var mission_store = try mission_store_mod.MissionStore.initWithPath(allocator, null);
+    defer mission_store.deinit();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    try tmp_dir.dir.makePath("exports");
+    try tmp_dir.dir.makePath("agents");
+    try tmp_dir.dir.writeFile(.{
+        .sub_path = "agents/reviewer-denied_config.json",
+        .data = "{\"agent_id\":\"reviewer-denied\",\"primary\":{\"denied_tools\":[\"shell_exec\"]}}",
+    });
+
+    const root = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+    const exports_dir = try std.fs.path.join(allocator, &.{ root, "exports" });
+    defer allocator.free(exports_dir);
+    const agents_dir = try std.fs.path.join(allocator, &.{ root, "agents" });
+    defer allocator.free(agents_dir);
+
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createUnavailable(
+        allocator,
+        "execution_failed",
+        "runtime unavailable",
+    );
+    defer runtime_handle.destroy();
+
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "reviewer-host",
+        .{
+            .mission_store = &mission_store,
+            .local_fs_export_root = exports_dir,
+            .agents_dir = agents_dir,
+            .actor_type = "agent",
+            .actor_id = "reviewer-denied",
+        },
+    );
+    defer session.deinit();
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        732,
+        733,
+        &.{ "agents", "self", "pr_review", "control", "start.json" },
+        "{\"repo_key\":\"DeanoC/Spiderweb\",\"pr_number\":129,\"default_review_commands\":[\"printf validation-ok\"]}",
+        1816,
+    );
+
+    const start_result = try protocolReadFile(
+        &session,
+        allocator,
+        734,
+        735,
+        &.{ "agents", "self", "pr_review", "result.json" },
+        1817,
+    );
+    defer allocator.free(start_result);
+    const mission_id = try extractMissionIdFromResultPayload(allocator, start_result);
+    defer allocator.free(mission_id);
+
+    const validation_payload = try std.fmt.allocPrint(allocator, "{{\"mission_id\":\"{s}\"}}", .{mission_id});
+    defer allocator.free(validation_payload);
+    try protocolWriteFile(
+        &session,
+        allocator,
+        736,
+        737,
+        &.{ "agents", "self", "pr_review", "control", "run_validation.json" },
+        validation_payload,
+        1818,
+    );
+
+    const pr_review_result = try protocolReadFile(
+        &session,
+        allocator,
+        738,
+        739,
+        &.{ "agents", "self", "pr_review", "result.json" },
+        1819,
+    );
+    defer allocator.free(pr_review_result);
+    try std.testing.expect(std.mem.indexOf(u8, pr_review_result, "\"operation\":\"run_validation\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pr_review_result, "\"ok\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pr_review_result, "\"code\":\"tool_not_allowed\"") != null);
+
+    const terminal_current = try protocolReadFile(
+        &session,
+        allocator,
+        740,
+        741,
+        &.{ "nodes", "local", "venoms", "terminal", "current.json" },
+        1820,
+    );
+    defer allocator.free(terminal_current);
+    try std.testing.expect(std.mem.indexOf(u8, terminal_current, "\"session\":null") != null);
+}
+
+test "acheron_session: local fs export rejects symlink targets outside export root" {
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    try tmp_dir.dir.makePath("exports");
+    try tmp_dir.dir.makePath("outside");
+    try tmp_dir.dir.writeFile(.{
+        .sub_path = "outside/secret.txt",
+        .data = "super-secret",
+    });
+    tmp_dir.dir.symLink("../outside/secret.txt", "exports/leak.txt", .{}) catch |err| switch (err) {
+        error.AccessDenied, error.PermissionDenied, error.Unsupported => return error.SkipZigTest,
+        else => return err,
+    };
+
+    const root = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+    const exports_dir = try std.fs.path.join(allocator, &.{ root, "exports" });
+    defer allocator.free(exports_dir);
+
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createUnavailable(
+        allocator,
+        "execution_failed",
+        "runtime unavailable",
+    );
+    defer runtime_handle.destroy();
+
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "default",
+        .{
+            .local_fs_export_root = exports_dir,
+            .agents_dir = ".does-not-exist",
+            .projects_dir = ".does-not-exist",
+        },
+    );
+    defer session.deinit();
+
+    const leak = try session.tryReadInternalPath("/nodes/local/fs/leak.txt");
+    defer if (leak) |value| allocator.free(value);
+    try std.testing.expect(leak == null);
+}
+
+test "session: hostPathMatchesPrefixBoundary handles native separators" {
+    if (builtin.os.tag == .windows) {
+        try std.testing.expect(hostPathMatchesPrefixBoundary("C:\\root\\file.txt", "C:\\root"));
+        try std.testing.expect(hostPathMatchesPrefixBoundary("C:\\root\\file.txt", "C:\\root\\"));
+        try std.testing.expect(!hostPathMatchesPrefixBoundary("C:\\rooted\\file.txt", "C:\\root"));
+    } else {
+        try std.testing.expect(hostPathMatchesPrefixBoundary("/root/file.txt", "/root"));
+        try std.testing.expect(hostPathMatchesPrefixBoundary("/root/file.txt", "/"));
+        try std.testing.expect(!hostPathMatchesPrefixBoundary("/rooted/file.txt", "/root"));
+    }
 }
 
 test "session: parseReaddirNextCookie accepts next" {
