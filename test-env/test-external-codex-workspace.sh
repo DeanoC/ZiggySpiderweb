@@ -240,6 +240,7 @@ build_usage_report() {
     local -a cmd=(
         python3 "$PARSER_SRC"
         --strace-prefix "$STRACE_PREFIX"
+        --workspace-root "$MOUNT_WORKSPACE_PATH"
         --mount-root "$MOUNT_POINT"
         --artifact-root "$OUTPUT_DIR"
         --project-id "${PROJECT_ID:-unknown}"

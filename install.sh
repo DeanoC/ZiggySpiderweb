@@ -104,9 +104,16 @@ stop_spiderweb_processes() {
     elif sudo systemctl is-active spiderweb >/dev/null 2>&1; then
         sudo systemctl stop spiderweb || true
     fi
-    pkill spiderweb 2>/dev/null || sudo pkill spiderweb 2>/dev/null || true
+    local pid
+    for pid in "${MATCHING_SPIDERWEB_PIDS[@]:-}"; do
+        [[ -n "$pid" ]] || continue
+        kill "$pid" 2>/dev/null || sudo kill "$pid" 2>/dev/null || true
+    done
     sleep 2
-    pkill -9 spiderweb 2>/dev/null || sudo pkill -9 spiderweb 2>/dev/null || true
+    for pid in "${MATCHING_SPIDERWEB_PIDS[@]:-}"; do
+        [[ -n "$pid" ]] || continue
+        kill -9 "$pid" 2>/dev/null || sudo kill -9 "$pid" 2>/dev/null || true
+    done
     sleep 1
 }
 

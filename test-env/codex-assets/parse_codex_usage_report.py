@@ -84,10 +84,10 @@ def path_within_any_root(path: str, roots: list[Path]) -> bool:
     return any(path_within_root(path, str(root)) for root in roots)
 
 
-def classify_path(raw_path: str, mount_root: Path, artifact_root: Path, allowed_runtime_roots: list[Path]):
+def classify_path(raw_path: str, workspace_root: Path, mount_root: Path, artifact_root: Path, allowed_runtime_roots: list[Path]):
     path = raw_path
     if not path.startswith("/"):
-        path = str((mount_root / path).resolve())
+        path = str((workspace_root / path).resolve())
 
     mount_root_str = str(mount_root)
     artifact_root_str = str(artifact_root)
@@ -200,6 +200,7 @@ def markdown_report(payload: dict) -> str:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--strace-prefix", required=True)
+    parser.add_argument("--workspace-root", required=True)
     parser.add_argument("--mount-root", required=True)
     parser.add_argument("--artifact-root", required=True)
     parser.add_argument("--project-id", required=True)
@@ -217,6 +218,7 @@ def main() -> int:
     json_output = Path(args.json_output)
     markdown_output = Path(args.markdown_output)
 
+    workspace_root = Path(args.workspace_root).resolve()
     mount_root = Path(args.mount_root).resolve()
     artifact_root = Path(args.artifact_root).resolve()
     repo_root = Path(args.repo_root).resolve()
@@ -252,7 +254,7 @@ def main() -> int:
                 continue
 
             raw_path = bytes(raw_path, "utf-8").decode("unicode_escape")
-            category, normalized_path = classify_path(raw_path, mount_root, artifact_root, allowed_runtime_roots)
+            category, normalized_path = classify_path(raw_path, workspace_root, mount_root, artifact_root, allowed_runtime_roots)
             if category == "artifact_runtime":
                 continue
 
