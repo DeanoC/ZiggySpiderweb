@@ -7016,7 +7016,15 @@ pub const Session = struct {
     }
 
     pub fn isToolAllowedForCurrentAgent(self: *Session, tool_name: []const u8) !bool {
-        const config = try agent_config.loadAgentConfigFromDir(self.allocator, self.agents_dir, self.agent_id);
+        const policy_agent_id = if (std.mem.eql(u8, self.actor_type, "agent") and self.actor_id.len > 0)
+            self.actor_id
+        else
+            self.agent_id;
+
+        var config = try agent_config.loadAgentConfigFromDir(self.allocator, self.agents_dir, policy_agent_id);
+        if (config == null and !std.mem.eql(u8, policy_agent_id, self.agent_id)) {
+            config = try agent_config.loadAgentConfigFromDir(self.allocator, self.agents_dir, self.agent_id);
+        }
         if (config == null) return true;
 
         var owned_config = config.?;
@@ -9582,11 +9590,13 @@ test "acheron_session: pr_review run_validation denied when shell_exec is blocke
         allocator,
         runtime_handle,
         &job_index,
-        "reviewer-denied",
+        "reviewer-host",
         .{
             .mission_store = &mission_store,
             .local_fs_export_root = exports_dir,
             .agents_dir = agents_dir,
+            .actor_type = "agent",
+            .actor_id = "reviewer-denied",
         },
     );
     defer session.deinit();
