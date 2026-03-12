@@ -89,6 +89,7 @@ validation = load_json(run_dir / "game_validation.json")
 bootstrap = load_json(run_dir / "bootstrap_provenance.json")
 exec_summary = load_json(run_dir / "codex_exec_summary.json")
 runtime = load_json(run_dir / "snapshots" / "codex_runtime.json")
+timeline = load_json(run_dir / "codex_progress_timeline.json")
 
 handoff_reason = None
 handoff_path = run_dir / "codex_handoff" / "README.md"
@@ -108,12 +109,17 @@ payload["required_reads_complete"] = (bootstrap or {}).get("required_reads_compl
 payload["bootstrap_actions"] = [item.get("action") for item in (bootstrap or {}).get("agent_bootstrap_actions_after_mount", [])]
 payload["turn_completed"] = (exec_summary or {}).get("turn_completed")
 payload["stall_stage"] = (exec_summary or {}).get("stall_stage")
+payload["bootstrap_complete_at_utc"] = (timeline or {}).get("bootstrap_complete_at_utc")
+payload["first_workspace_write_at_utc"] = (timeline or {}).get("first_workspace_write_at_utc")
+payload["first_workspace_write_path"] = (timeline or {}).get("first_workspace_write_path")
+payload["validation_started_at_utc"] = (timeline or {}).get("validation_started_at_utc")
 payload["handoff_reason"] = handoff_reason
 payload["run_log"] = str(run_dir / "harness.log")
 payload["has_usage_report"] = usage is not None
 payload["has_validation_report"] = validation is not None
 payload["has_exec_summary"] = exec_summary is not None
 payload["has_bootstrap_provenance"] = bootstrap is not None
+payload["has_progress_timeline"] = timeline is not None
 
 (run_dir / "repeatability_summary.json").write_text(
     json.dumps(payload, indent=2, sort_keys=True) + "\n",
@@ -196,6 +202,14 @@ for run in runs:
             stall_stage=run.get("stall_stage") or "",
         )
     )
+    if run.get("bootstrap_complete_at_utc") or run.get("first_workspace_write_at_utc") or run.get("validation_started_at_utc"):
+        lines.append(
+            "  milestones: bootstrap={bootstrap} first_write={first_write} validation={validation}".format(
+                bootstrap=run.get("bootstrap_complete_at_utc") or "-",
+                first_write=run.get("first_workspace_write_at_utc") or "-",
+                validation=run.get("validation_started_at_utc") or "-",
+            )
+        )
 
 (root / "repeatability_summary.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 PY

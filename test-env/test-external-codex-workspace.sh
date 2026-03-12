@@ -1040,17 +1040,23 @@ run_live_codex() {
     quoted_cmd="$(shell_quote "$cmd")"
 
     if [[ "$CODEX_USE_PTY" == "1" ]]; then
-        "${CODEX_ENV_BASE[@]}" \
-            PATH="$INSTALL_DIR:$PATH" \
-            setsid \
-            strace -ff -s 4096 -e trace=%file,%process -o "$STRACE_PREFIX" \
-            script -qefc "bash -lc $quoted_cmd" "$CODEX_PTY_LOG" >"$CODEX_STDOUT_LOG" 2>"$CODEX_STDERR_LOG" &
+        (
+            cd "$MOUNT_WORKSPACE_PATH"
+            "${CODEX_ENV_BASE[@]}" \
+                PATH="$INSTALL_DIR:$PATH" \
+                setsid \
+                strace -ff -s 4096 -e trace=%file,%process -o "$STRACE_PREFIX" \
+                script -qefc "bash -lc $quoted_cmd" "$CODEX_PTY_LOG" >"$CODEX_STDOUT_LOG" 2>"$CODEX_STDERR_LOG"
+        ) &
     else
-        "${CODEX_ENV_BASE[@]}" \
-            PATH="$INSTALL_DIR:$PATH" \
-            setsid \
-            strace -ff -s 4096 -e trace=%file,%process -o "$STRACE_PREFIX" \
-            bash -lc "$cmd" >"$CODEX_STDOUT_LOG" 2>"$CODEX_STDERR_LOG" &
+        (
+            cd "$MOUNT_WORKSPACE_PATH"
+            "${CODEX_ENV_BASE[@]}" \
+                PATH="$INSTALL_DIR:$PATH" \
+                setsid \
+                strace -ff -s 4096 -e trace=%file,%process -o "$STRACE_PREFIX" \
+                bash -lc "$cmd" >"$CODEX_STDOUT_LOG" 2>"$CODEX_STDERR_LOG"
+        ) &
     fi
     local runner_pid="$!"
 
