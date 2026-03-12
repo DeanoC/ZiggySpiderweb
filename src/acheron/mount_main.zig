@@ -61,11 +61,11 @@ pub fn main() !void {
             i += 1;
             if (i >= args.len) return error.InvalidArguments;
             namespace_keepalive_interval_ms = try std.fmt.parseInt(u64, args[i], 10);
-        } else if (std.mem.eql(u8, args[i], "--workspace-id") or std.mem.eql(u8, args[i], "--project-id")) {
+        } else if (std.mem.eql(u8, args[i], "--workspace-id")) {
             i += 1;
             if (i >= args.len) return error.InvalidArguments;
             workspace_id = args[i];
-        } else if (std.mem.eql(u8, args[i], "--workspace-token") or std.mem.eql(u8, args[i], "--project-token")) {
+        } else if (std.mem.eql(u8, args[i], "--workspace-token")) {
             i += 1;
             if (i >= args.len) return error.InvalidArguments;
             workspace_token = args[i];
@@ -439,7 +439,7 @@ fn printHelp() !void {
         \\spiderweb-fs-mount - Distributed filesystem router client
         \\
         \\Usage:
-        \\  spiderweb-fs-mount [--workspace-url <ws-url> | --namespace-url <ws-url>] [--workspace-id <id>] [--workspace-token <token>] [--project-id <id>] [--project-token <token>] [--auth-token <token>] [--agent-id <id>] [--session-key <key>] [--mount-backend auto|fuse|winfsp] [--workspace-sync-interval-ms <ms>] [--namespace-keepalive-interval-ms <ms>] [--endpoint <name>=<ws-url>[#export][@/mount]] <command> [args]
+        \\  spiderweb-fs-mount [--workspace-url <ws-url> | --namespace-url <ws-url>] [--workspace-id <id>] [--workspace-token <token>] [--auth-token <token>] [--agent-id <id>] [--session-key <key>] [--mount-backend auto|fuse|winfsp] [--workspace-sync-interval-ms <ms>] [--namespace-keepalive-interval-ms <ms>] [--endpoint <name>=<ws-url>[#export][@/mount]] <command> [args]
         \\
         \\Commands:
         \\  getattr <path>
@@ -460,11 +460,11 @@ fn printHelp() !void {
         \\  spiderweb-fs-mount --endpoint a=ws://127.0.0.1:18891/v2/fs cat /a/README.md
         \\  spiderweb-fs-mount --endpoint a=ws://127.0.0.1:18891/v2/fs status
         \\  spiderweb-fs-mount --workspace-url ws://127.0.0.1:18790/ readdir /
-        \\  spiderweb-fs-mount --workspace-url ws://127.0.0.1:18790/ --workspace-id proj-1 --workspace-sync-interval-ms 5000 mount /mnt/spiderweb
-        \\  spiderweb-fs-mount --workspace-url ws://127.0.0.1:18790/ --workspace-id proj-1 --workspace-token proj-... readdir /
+        \\  spiderweb-fs-mount --workspace-url ws://127.0.0.1:18790/ --workspace-id ws-demo --workspace-sync-interval-ms 5000 mount /mnt/spiderweb
+        \\  spiderweb-fs-mount --workspace-url ws://127.0.0.1:18790/ --workspace-id ws-demo --workspace-token ws-token-... readdir /
         \\  spiderweb-fs-mount --workspace-url ws://127.0.0.1:18790/ --auth-token sw-admin-... readdir /
-        \\  spiderweb-fs-mount --namespace-url ws://127.0.0.1:18790/ --project-id proj-a mount /mnt/spiderweb
-        \\  spiderweb-fs-mount --namespace-url ws://127.0.0.1:18790/ --project-id proj-a --mount-backend winfsp mount X:
+        \\  spiderweb-fs-mount --namespace-url ws://127.0.0.1:18790/ --workspace-id ws-demo mount /mnt/spiderweb
+        \\  spiderweb-fs-mount --namespace-url ws://127.0.0.1:18790/ --workspace-id ws-demo --mount-backend winfsp mount X:
         \\  spiderweb-fs-mount --endpoint a=ws://127.0.0.1:18891/v2/fs#work@/a --endpoint b=ws://127.0.0.1:18892/v2/fs#work@/a readdir /a
         \\    (repeat the same mount path to enable failover)
         \\  Auth token for workspace control can also come from SPIDERWEB_AUTH_TOKEN.

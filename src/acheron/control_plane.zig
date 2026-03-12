@@ -36,6 +36,7 @@ const ProjectKind = enum {
 pub const ControlPlaneError = error{
     InvalidPayload,
     MissingField,
+    TemplateNotFound,
     InviteNotFound,
     InviteExpired,
     InviteRedeemed,
@@ -343,11 +344,29 @@ const github_template_bind_specs = [_]ProjectTemplateBindSpec{
     .{ .bind_path = "/services/web_search", .venom_id = "web_search" },
 };
 
+const dev_template_bind_specs = [_]ProjectTemplateBindSpec{
+    .{ .bind_path = "/services/venom_packages", .venom_id = "venom_packages" },
+    .{ .bind_path = "/services/mounts", .venom_id = "mounts" },
+    .{ .bind_path = "/services/home", .venom_id = "home" },
+    .{ .bind_path = "/services/workers", .venom_id = "workers" },
+    .{ .bind_path = "/services/git", .venom_id = "git" },
+    .{ .bind_path = "/services/terminal", .venom_id = "terminal" },
+    .{ .bind_path = "/services/events", .venom_id = "events" },
+    .{ .bind_path = "/services/library", .venom_id = "library" },
+    .{ .bind_path = "/services/search_code", .venom_id = "search_code" },
+    .{ .bind_path = "/services/web_search", .venom_id = "web_search" },
+};
+
 const builtin_project_templates = [_]ProjectTemplateSpec{
     .{
         .id = default_project_template_id,
         .description = "Minimal bootstrap workspace with only the core mounts-management service bound into /services.",
         .bind_specs = minimum_template_bind_specs[0..],
+    },
+    .{
+        .id = "dev",
+        .description = "Development workspace with core filesystem, git, terminal, events, library, and search services bound into /services.",
+        .bind_specs = dev_template_bind_specs[0..],
     },
     .{
         .id = "github",
@@ -2038,6 +2057,41 @@ pub const ControlPlane = struct {
             try appendProjectSummaryJson(self.allocator, &out, project.*);
         }
         try out.appendSlice(self.allocator, "]}");
+        return out.toOwnedSlice(self.allocator);
+    }
+
+    pub fn listWorkspaceTemplates(self: *ControlPlane) ![]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        _ = self.reapExpiredLeasesLocked(std.time.milliTimestamp());
+
+        var out = std.ArrayListUnmanaged(u8){};
+        defer out.deinit(self.allocator);
+        try out.appendSlice(self.allocator, "{\"templates\":[");
+        for (builtin_project_templates, 0..) |template, idx| {
+            if (idx != 0) try out.append(self.allocator, ',');
+            try appendWorkspaceTemplateJson(self.allocator, &out, template);
+        }
+        try out.appendSlice(self.allocator, "]}");
+        return out.toOwnedSlice(self.allocator);
+    }
+
+    pub fn getWorkspaceTemplate(self: *ControlPlane, payload_json: ?[]const u8) ![]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        _ = self.reapExpiredLeasesLocked(std.time.milliTimestamp());
+
+        var payload = try parsePayload(self.allocator, payload_json);
+        defer payload.deinit();
+        const obj = payload.value.object;
+        const template_id = getRequiredString(obj, "template_id") catch return ControlPlaneError.MissingField;
+        const template = resolveProjectTemplateSpec(template_id, .normal) orelse return ControlPlaneError.TemplateNotFound;
+
+        var out = std.ArrayListUnmanaged(u8){};
+        defer out.deinit(self.allocator);
+        try out.appendSlice(self.allocator, "{\"template\":");
+        try appendWorkspaceTemplateJson(self.allocator, &out, template);
+        try out.appendSlice(self.allocator, "}");
         return out.toOwnedSlice(self.allocator);
     }
 
@@ -5255,6 +5309,51 @@ fn appendBindJson(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8)
     );
 }
 
+fn appendWorkspaceTemplateBindJson(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    bind_spec: ProjectTemplateBindSpec,
+) !void {
+    const escaped_bind = try jsonEscape(allocator, bind_spec.bind_path);
+    defer allocator.free(escaped_bind);
+    const escaped_venom = try jsonEscape(allocator, bind_spec.venom_id);
+    defer allocator.free(escaped_venom);
+    const escaped_scope = try jsonEscape(allocator, bind_spec.provider_scope);
+    defer allocator.free(escaped_scope);
+    const target_path_json = if (resolveTemplateBindTargetPath(bind_spec)) |target_path| blk: {
+        const escaped_target = try jsonEscape(allocator, target_path);
+        defer allocator.free(escaped_target);
+        break :blk try std.fmt.allocPrint(allocator, "\"{s}\"", .{escaped_target});
+    } else try allocator.dupe(u8, "null");
+    defer allocator.free(target_path_json);
+
+    try out.writer(allocator).print(
+        "{{\"bind_path\":\"{s}\",\"venom_id\":\"{s}\",\"provider_scope\":\"{s}\",\"target_path\":{s}}}",
+        .{ escaped_bind, escaped_venom, escaped_scope, target_path_json },
+    );
+}
+
+fn appendWorkspaceTemplateJson(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    template: ProjectTemplateSpec,
+) !void {
+    const escaped_id = try jsonEscape(allocator, template.id);
+    defer allocator.free(escaped_id);
+    const escaped_description = try jsonEscape(allocator, template.description);
+    defer allocator.free(escaped_description);
+
+    try out.writer(allocator).print(
+        "{{\"template_id\":\"{s}\",\"description\":\"{s}\",\"binds\":[",
+        .{ escaped_id, escaped_description },
+    );
+    for (template.bind_specs, 0..) |bind_spec, idx| {
+        if (idx != 0) try out.append(allocator, ',');
+        try appendWorkspaceTemplateBindJson(allocator, out, bind_spec);
+    }
+    try out.appendSlice(allocator, "]}");
+}
+
 fn appendWorkspaceAvailabilityJson(
     allocator: std.mem.Allocator,
     out: *std.ArrayListUnmanaged(u8),
@@ -8228,6 +8327,29 @@ test "acheron_control_plane: createProject defaults to minimum template and seed
     try std.testing.expect(std.mem.indexOf(u8, resolved, "\"resolved_path\":\"/nodes/local/venoms/mounts/control/invoke.json\"") != null);
 }
 
+test "acheron_control_plane: workspace template catalog lists dev template and returns bind metadata" {
+    const allocator = std.testing.allocator;
+    var plane = ControlPlane.init(allocator);
+    defer plane.deinit();
+
+    const listed = try plane.listWorkspaceTemplates();
+    defer allocator.free(listed);
+    try std.testing.expect(std.mem.indexOf(u8, listed, "\"template_id\":\"minimum\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, listed, "\"template_id\":\"dev\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, listed, "\"template_id\":\"github\"") != null);
+
+    const fetched = try plane.getWorkspaceTemplate("{\"template_id\":\"dev\"}");
+    defer allocator.free(fetched);
+    try std.testing.expect(std.mem.indexOf(u8, fetched, "\"template_id\":\"dev\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fetched, "\"bind_path\":\"/services/git\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fetched, "\"bind_path\":\"/services/terminal\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fetched, "\"bind_path\":\"/services/search_code\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fetched, "\"target_path\":\"/nodes/local/venoms/git\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fetched, "\"provider_scope\":\"host_local\"") != null);
+
+    try std.testing.expectError(ControlPlaneError.TemplateNotFound, plane.getWorkspaceTemplate("{\"template_id\":\"unknown\"}"));
+}
+
 test "acheron_control_plane: builtin system project seeds mounts service bind" {
     const allocator = std.testing.allocator;
     var plane = ControlPlane.init(allocator);
@@ -8241,6 +8363,25 @@ test "acheron_control_plane: builtin system project seeds mounts service bind" {
     defer allocator.free(payload);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"bind_path\":\"/services/mounts\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, payload, "\"target_path\":\"/nodes/local/venoms/mounts\"") != null);
+}
+
+test "acheron_control_plane: dev template seeds development service binds" {
+    const allocator = std.testing.allocator;
+    var plane = ControlPlane.init(allocator);
+    defer plane.deinit();
+
+    const project_json = try plane.createProject("{\"name\":\"TemplateDev\",\"vision\":\"TemplateDev\",\"template_id\":\"dev\"}");
+    defer allocator.free(project_json);
+    try std.testing.expect(std.mem.indexOf(u8, project_json, "\"template_id\":\"dev\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, project_json, "\"bind_path\":\"/services/mounts\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, project_json, "\"bind_path\":\"/services/home\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, project_json, "\"bind_path\":\"/services/workers\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, project_json, "\"bind_path\":\"/services/git\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, project_json, "\"bind_path\":\"/services/terminal\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, project_json, "\"bind_path\":\"/services/events\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, project_json, "\"bind_path\":\"/services/library\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, project_json, "\"bind_path\":\"/services/search_code\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, project_json, "\"bind_path\":\"/services/web_search\"") != null);
 }
 
 test "acheron_control_plane: github template merges desired binds with template service binds" {

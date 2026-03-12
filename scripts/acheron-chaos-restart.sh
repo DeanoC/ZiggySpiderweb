@@ -2,8 +2,8 @@
 set -euo pipefail
 
 SPIDERWEB_URL="${SPIDERWEB_URL:-ws://127.0.0.1:18790/}"
-SPIDERWEB_PROJECT_ID="${SPIDERWEB_PROJECT_ID:-system}"
-SPIDERWEB_PROJECT_TOKEN="${SPIDERWEB_PROJECT_TOKEN:-}"
+SPIDERWEB_WORKSPACE_ID="${SPIDERWEB_WORKSPACE_ID:-system}"
+SPIDERWEB_WORKSPACE_TOKEN="${SPIDERWEB_WORKSPACE_TOKEN:-}"
 SPIDERWEB_AUTH_TOKEN="${SPIDERWEB_AUTH_TOKEN:-}"
 SPIDERWEB_AUTH_TOKEN_FILE="${SPIDERWEB_AUTH_TOKEN_FILE:-$HOME/.local/share/ziggy-spiderweb/.spiderweb-ltm/auth_tokens.json}"
 SPIDERWEB_SERVICE="${SPIDERWEB_SERVICE:-spiderweb.service}"
@@ -60,26 +60,26 @@ mount_args=(--workspace-url "$SPIDERWEB_URL")
 if [[ -n "$SPIDERWEB_AUTH_TOKEN" ]]; then
     mount_args+=(--auth-token "$SPIDERWEB_AUTH_TOKEN")
 fi
-if [[ -n "$SPIDERWEB_PROJECT_ID" ]]; then
-    mount_args+=(--project-id "$SPIDERWEB_PROJECT_ID")
+if [[ -n "$SPIDERWEB_WORKSPACE_ID" ]]; then
+    mount_args+=(--workspace-id "$SPIDERWEB_WORKSPACE_ID")
 fi
-if [[ -n "$SPIDERWEB_PROJECT_TOKEN" ]]; then
-    mount_args+=(--project-token "$SPIDERWEB_PROJECT_TOKEN")
+if [[ -n "$SPIDERWEB_WORKSPACE_TOKEN" ]]; then
+    mount_args+=(--workspace-token "$SPIDERWEB_WORKSPACE_TOKEN")
 fi
 
 payload='{}'
-if [[ -n "$SPIDERWEB_PROJECT_ID" ]]; then
-    if [[ -n "$SPIDERWEB_PROJECT_TOKEN" ]]; then
-        payload="$(jq -cn --arg project_id "$SPIDERWEB_PROJECT_ID" --arg project_token "$SPIDERWEB_PROJECT_TOKEN" '{project_id: $project_id, project_token: $project_token}')"
+if [[ -n "$SPIDERWEB_WORKSPACE_ID" ]]; then
+    if [[ -n "$SPIDERWEB_WORKSPACE_TOKEN" ]]; then
+        payload="$(jq -cn --arg workspace_id "$SPIDERWEB_WORKSPACE_ID" --arg workspace_token "$SPIDERWEB_WORKSPACE_TOKEN" '{workspace_id: $workspace_id, workspace_token: $workspace_token}')"
     else
-        payload="$(jq -cn --arg project_id "$SPIDERWEB_PROJECT_ID" '{project_id: $project_id}')"
+        payload="$(jq -cn --arg workspace_id "$SPIDERWEB_WORKSPACE_ID" '{workspace_id: $workspace_id}')"
     fi
 fi
 
 echo "chaos log: $CHAOS_LOG_PATH"
 echo "service: $SPIDERWEB_SERVICE"
 echo "url: $SPIDERWEB_URL"
-echo "project: $SPIDERWEB_PROJECT_ID"
+echo "workspace: $SPIDERWEB_WORKSPACE_ID"
 echo "iterations: $CHAOS_ITERATIONS restart_at: $CHAOS_RESTART_AT interval_ms: $CHAOS_INTERVAL_MS"
 
 if ! status_json="$(run_unit_cmd "$spiderweb_control_bin" "${control_args[@]}" workspace_status "$payload" 2>&1)"; then

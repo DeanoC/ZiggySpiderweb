@@ -63,12 +63,12 @@ Linux / WSL:
 
 ## Attach Flow For Codex
 
-If you already have a project/workspace id:
+If you already have a workspace id:
 
 ```bash
 ./zig-out/bin/spiderweb-fs-mount \
   --namespace-url ws://127.0.0.1:18790/ \
-  --project-id <workspace-id> \
+  --workspace-id <workspace-id> \
   --auth-token <admin-or-user-token> \
   --agent-id codex \
   --session-key main \
@@ -80,7 +80,7 @@ For Windows with WinFsp:
 ```powershell
 spiderweb-fs-mount.exe `
   --namespace-url ws://127.0.0.1:18790/ `
-  --project-id <workspace-id> `
+  --workspace-id <workspace-id> `
   --auth-token <admin-or-user-token> `
   --agent-id codex `
   --session-key main `
