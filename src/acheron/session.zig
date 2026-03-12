@@ -5912,14 +5912,6 @@ pub const Session = struct {
         }
 
         self.allocator.free(workspace_path);
-        const catalog_path = if (suffix.len == 0)
-            try std.fmt.allocPrint(self.allocator, "/nodes/local/venoms/{s}", .{service_id})
-        else
-            try std.fmt.allocPrint(self.allocator, "/nodes/local/venoms/{s}{s}", .{ service_id, suffix });
-        errdefer self.allocator.free(catalog_path);
-        if (self.resolveAbsolutePathNoBinds(catalog_path) != null) return catalog_path;
-
-        self.allocator.free(catalog_path);
         return if (suffix.len == 0)
             try std.fmt.allocPrint(self.allocator, "/global/{s}", .{service_id})
         else
@@ -9552,6 +9544,72 @@ fn decodeReadResponseData(allocator: std.mem.Allocator, frame: []const u8) ![]u8
     errdefer allocator.free(decoded);
     try std.base64.standard.Decoder.decode(decoded, data_b64.string);
     return decoded;
+}
+
+test "acheron_session: preferred service paths use workspace bindings when available" {
+    const allocator = std.testing.allocator;
+
+    var control_plane = control_plane_mod.ControlPlane.init(allocator);
+    defer control_plane.deinit();
+
+    const project_json = try control_plane.createProject(
+        "{\"name\":\"SessionServicePaths\",\"vision\":\"SessionServicePaths\",\"template_id\":\"github\"}",
+    );
+    defer allocator.free(project_json);
+
+    var parsed_project = try std.json.parseFromSlice(std.json.Value, allocator, project_json, .{});
+    defer parsed_project.deinit();
+    const project_id = parsed_project.value.object.get("project_id").?.string;
+    const project_token = parsed_project.value.object.get("project_token").?.string;
+
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createUnavailable(
+        allocator,
+        "execution_failed",
+        "runtime unavailable",
+    );
+    defer runtime_handle.destroy();
+
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var bound_session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "default",
+        .{
+            .project_id = project_id,
+            .project_token = project_token,
+            .agents_dir = ".does-not-exist",
+            .projects_dir = ".does-not-exist",
+            .control_plane = &control_plane,
+        },
+    );
+    defer bound_session.deinit();
+
+    const bound_github_path = try bound_session.resolvePreferredServicePath("github_pr", "/control/sync.json");
+    defer allocator.free(bound_github_path);
+    try std.testing.expectEqualStrings("/services/github_pr/control/sync.json", bound_github_path);
+
+    const bound_missions_path = try bound_session.resolvePreferredServicePath("missions", "/control/request_approval.json");
+    defer allocator.free(bound_missions_path);
+    try std.testing.expectEqualStrings("/services/missions/control/request_approval.json", bound_missions_path);
+
+    var unbound_session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "default",
+        .{
+            .agents_dir = ".does-not-exist",
+            .projects_dir = ".does-not-exist",
+        },
+    );
+    defer unbound_session.deinit();
+
+    const unbound_github_path = try unbound_session.resolvePreferredServicePath("github_pr", "/control/sync.json");
+    defer allocator.free(unbound_github_path);
+    try std.testing.expectEqualStrings("/global/github_pr/control/sync.json", unbound_github_path);
 }
 
 test "acheron_session: pr_review run_validation denied when shell_exec is blocked" {
