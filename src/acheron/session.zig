@@ -1016,7 +1016,7 @@ pub const Session = struct {
             std.fs.cwd().realpathAlloc(self.allocator, host_path) catch return null;
         errdefer self.allocator.free(resolved_host);
 
-        if (!pathMatchesPrefixBoundary(resolved_host, resolved_root)) return null;
+        if (!hostPathMatchesPrefixBoundary(resolved_host, resolved_root)) return null;
         return resolved_host;
     }
 
@@ -9093,6 +9093,23 @@ test "immediateBoundChildName returns direct bind child for directory" {
     try std.testing.expect(immediateBoundChildName("/services/home", "/services/home") == null);
 }
 
+fn hostPathMatchesPrefixBoundary(path: []const u8, prefix: []const u8) bool {
+    if (builtin.os.tag != .windows) return pathMatchesPrefixBoundary(path, prefix);
+    if (std.mem.eql(u8, path, prefix)) return true;
+    if (prefix.len == 0 or path.len < prefix.len) return false;
+
+    for (prefix, 0..) |prefix_ch, idx| {
+        const path_ch = path[idx];
+        const normalized_path = if (path_ch == '\\') '/' else std.ascii.toLower(path_ch);
+        const normalized_prefix = if (prefix_ch == '\\') '/' else std.ascii.toLower(prefix_ch);
+        if (normalized_path != normalized_prefix) return false;
+    }
+
+    if (prefix[prefix.len - 1] == '/' or prefix[prefix.len - 1] == '\\') return true;
+    const boundary = path[prefix.len];
+    return boundary == '/' or boundary == '\\';
+}
+
 const ParsedScopedVenomAlias = struct {
     venom_id: []const u8,
     remote_path: []const u8,
@@ -9786,6 +9803,18 @@ test "acheron_session: local fs export rejects symlink targets outside export ro
     const leak = try session.tryReadInternalPath("/nodes/local/fs/leak.txt");
     defer if (leak) |value| allocator.free(value);
     try std.testing.expect(leak == null);
+}
+
+test "session: hostPathMatchesPrefixBoundary handles native separators" {
+    if (builtin.os.tag == .windows) {
+        try std.testing.expect(hostPathMatchesPrefixBoundary("C:\\root\\file.txt", "C:\\root"));
+        try std.testing.expect(hostPathMatchesPrefixBoundary("C:\\root\\file.txt", "C:\\root\\"));
+        try std.testing.expect(!hostPathMatchesPrefixBoundary("C:\\rooted\\file.txt", "C:\\root"));
+    } else {
+        try std.testing.expect(hostPathMatchesPrefixBoundary("/root/file.txt", "/root"));
+        try std.testing.expect(hostPathMatchesPrefixBoundary("/root/file.txt", "/"));
+        try std.testing.expect(!hostPathMatchesPrefixBoundary("/rooted/file.txt", "/root"));
+    }
 }
 
 test "session: parseReaddirNextCookie accepts next" {
