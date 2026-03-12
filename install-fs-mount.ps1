@@ -61,4 +61,4 @@ Copy-Item -Force "$DestDir\zig-out\bin\spiderweb-fs-mount.exe" "$InstallDir\spid
 
 Write-Host "Installed spiderweb-fs-mount.exe to $InstallDir"
 Write-Host "Example:"
-Write-Host "  spiderweb-fs-mount.exe --namespace-url ws://host:18790/ --project-id proj-a --mount-backend winfsp mount X:"
+Write-Host "  spiderweb-fs-mount.exe --namespace-url ws://host:18790/ --workspace-id ws-demo --mount-backend winfsp mount X:"

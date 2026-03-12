@@ -89,10 +89,10 @@ read_mount_text() {
     local mount_path="$1"
     local args=(--workspace-url "$WORKSPACE_URL")
     if [[ -n "${PROJECT_ID:-}" ]]; then
-        args+=(--project-id "$PROJECT_ID")
+        args+=(--workspace-id "$PROJECT_ID")
     fi
     if [[ -n "${PROJECT_TOKEN:-}" ]]; then
-        args+=(--project-token "$PROJECT_TOKEN")
+        args+=(--workspace-token "$PROJECT_TOKEN")
     fi
     if [[ -n "${SPIDERWEB_AUTH_TOKEN:-}" ]]; then
         args+=(--auth-token "$SPIDERWEB_AUTH_TOKEN")

@@ -5,8 +5,8 @@ SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 
 SPIDERWEB_URL="${SPIDERWEB_URL:-ws://127.0.0.1:18790/}"
-SPIDERWEB_PROJECT_ID="${SPIDERWEB_PROJECT_ID:-}"
-SPIDERWEB_PROJECT_TOKEN="${SPIDERWEB_PROJECT_TOKEN:-}"
+SPIDERWEB_WORKSPACE_ID="${SPIDERWEB_WORKSPACE_ID:-}"
+SPIDERWEB_WORKSPACE_TOKEN="${SPIDERWEB_WORKSPACE_TOKEN:-}"
 SPIDERWEB_AUTH_TOKEN="${SPIDERWEB_AUTH_TOKEN:-}"
 SPIDERWEB_AUTH_TOKEN_FILE="${SPIDERWEB_AUTH_TOKEN_FILE:-$HOME/.local/share/ziggy-spiderweb/.spiderweb-ltm/auth_tokens.json}"
 SPIDERWEB_AGENT_ID="${SPIDERWEB_AGENT_ID:-}"
@@ -69,11 +69,11 @@ if [[ -z "$SPIDERWEB_AUTH_TOKEN" && -f "$SPIDERWEB_AUTH_TOKEN_FILE" ]]; then
 fi
 
 mount_args=(--namespace-url "$SPIDERWEB_URL" --mount-backend "$SPIDERWEB_MOUNT_BACKEND")
-if [[ -n "$SPIDERWEB_PROJECT_ID" ]]; then
-    mount_args+=(--project-id "$SPIDERWEB_PROJECT_ID")
+if [[ -n "$SPIDERWEB_WORKSPACE_ID" ]]; then
+    mount_args+=(--workspace-id "$SPIDERWEB_WORKSPACE_ID")
 fi
-if [[ -n "$SPIDERWEB_PROJECT_TOKEN" ]]; then
-    mount_args+=(--project-token "$SPIDERWEB_PROJECT_TOKEN")
+if [[ -n "$SPIDERWEB_WORKSPACE_TOKEN" ]]; then
+    mount_args+=(--workspace-token "$SPIDERWEB_WORKSPACE_TOKEN")
 fi
 if [[ -n "$SPIDERWEB_AUTH_TOKEN" ]]; then
     mount_args+=(--auth-token "$SPIDERWEB_AUTH_TOKEN")
@@ -108,7 +108,7 @@ done
 
 resolved_project_id="$(jq -r '.project_id // empty' <<<"$status_json")"
 resolved_agent_id="$(jq -r '.agent_id // empty' <<<"$status_json")"
-echo "namespace project: ${resolved_project_id:-"(none)"}"
+echo "namespace workspace: ${resolved_project_id:-"(none)"}"
 echo "namespace agent: ${resolved_agent_id:-"(none)"}"
 
 for path in /agents /nodes /global; do

@@ -8,8 +8,8 @@ $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $RepoRoot = Split-Path -Parent $ScriptDir
 
 $SpiderwebUrl = if ($env:SPIDERWEB_URL) { $env:SPIDERWEB_URL } else { "ws://127.0.0.1:18790/" }
-$SpiderwebProjectId = $env:SPIDERWEB_PROJECT_ID
-$SpiderwebProjectToken = $env:SPIDERWEB_PROJECT_TOKEN
+$SpiderwebWorkspaceId = $env:SPIDERWEB_WORKSPACE_ID
+$SpiderwebWorkspaceToken = $env:SPIDERWEB_WORKSPACE_TOKEN
 $SpiderwebAuthToken = $env:SPIDERWEB_AUTH_TOKEN
 $SpiderwebAuthTokenFile = if ($env:SPIDERWEB_AUTH_TOKEN_FILE) { $env:SPIDERWEB_AUTH_TOKEN_FILE } else { Join-Path $HOME ".local\share\ziggy-spiderweb\.spiderweb-ltm\auth_tokens.json" }
 $SpiderwebAgentId = $env:SPIDERWEB_AGENT_ID
@@ -166,8 +166,8 @@ if (-not $SpiderwebAuthToken -and (Test-Path $SpiderwebAuthTokenFile)) {
 }
 
 $CommonArgs = @("--namespace-url", $SpiderwebUrl, "--mount-backend", $SpiderwebMountBackend)
-if ($SpiderwebProjectId) { $CommonArgs += @("--project-id", $SpiderwebProjectId) }
-if ($SpiderwebProjectToken) { $CommonArgs += @("--project-token", $SpiderwebProjectToken) }
+if ($SpiderwebWorkspaceId) { $CommonArgs += @("--workspace-id", $SpiderwebWorkspaceId) }
+if ($SpiderwebWorkspaceToken) { $CommonArgs += @("--workspace-token", $SpiderwebWorkspaceToken) }
 if ($SpiderwebAuthToken) { $CommonArgs += @("--auth-token", $SpiderwebAuthToken) }
 if ($SpiderwebAgentId) { $CommonArgs += @("--agent-id", $SpiderwebAgentId) }
 if ($SpiderwebSessionKey) { $CommonArgs += @("--session-key", $SpiderwebSessionKey) }
@@ -192,7 +192,7 @@ for ($attempt = 1; $attempt -le $SmokeConnectRetries; $attempt += 1) {
 }
 
 $status = $statusText | ConvertFrom-Json
-Write-Host "namespace project: $($status.project_id)"
+Write-Host "namespace workspace: $($status.project_id)"
 Write-Host "namespace agent: $($status.agent_id)"
 
 foreach ($path in @("/agents", "/nodes", "/global")) {

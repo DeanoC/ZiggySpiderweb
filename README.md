@@ -87,10 +87,10 @@ Examples:
 ./zig-out/bin/spiderweb-fs-mount --workspace-url ws://127.0.0.1:18790/ mount /mnt/spiderweb
 
 # Full namespace mode
-./zig-out/bin/spiderweb-fs-mount --namespace-url ws://127.0.0.1:18790/ --project-id proj-a mount /mnt/spiderweb
+./zig-out/bin/spiderweb-fs-mount --namespace-url ws://127.0.0.1:18790/ --workspace-id ws-demo mount /mnt/spiderweb
 
 # Namespace smoke harness (low-level commands, optional real mount when SMOKE_USE_OS_MOUNT=1)
-SPIDERWEB_PROJECT_ID=proj-a ./scripts/acheron-namespace-smoke.sh
+SPIDERWEB_WORKSPACE_ID=ws-demo ./scripts/acheron-namespace-smoke.sh
 ```
 
 This flow has been smoke-tested with:

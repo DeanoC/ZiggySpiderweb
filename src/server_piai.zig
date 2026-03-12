@@ -5787,8 +5787,7 @@ fn handleWebSocketConnection(
                             try writeFrameLocked(stream, &connection_write_mutex, "", .close);
                             return;
                         }
-                        if (connect_gate_error != null and !isConnectGateExemptControlType(control_type))
-                        {
+                        if (connect_gate_error != null and !isConnectGateExemptControlType(control_type)) {
                             const gate = connect_gate_error.?;
                             const response = try unified.buildControlError(
                                 allocator,
@@ -6950,9 +6949,14 @@ fn handleWebSocketConnection(
                             .workspace_delete,
                             .workspace_list,
                             .workspace_get,
+                            .workspace_template_list,
+                            .workspace_template_get,
                             .workspace_mount_set,
                             .workspace_mount_remove,
                             .workspace_mount_list,
+                            .workspace_bind_set,
+                            .workspace_bind_remove,
+                            .workspace_bind_list,
                             .workspace_token_rotate,
                             .workspace_token_revoke,
                             .workspace_activate,
@@ -7672,9 +7676,14 @@ fn isConnectGateExemptControlType(control_type: unified.ControlType) bool {
         .workspace_delete,
         .workspace_list,
         .workspace_get,
+        .workspace_template_list,
+        .workspace_template_get,
         .workspace_mount_set,
         .workspace_mount_remove,
         .workspace_mount_list,
+        .workspace_bind_set,
+        .workspace_bind_remove,
+        .workspace_bind_list,
         .workspace_token_rotate,
         .workspace_token_revoke,
         .workspace_activate,
@@ -7779,6 +7788,8 @@ fn isWorkspaceTopologyMutation(control_type: unified.ControlType) bool {
         .workspace_create,
         .workspace_update,
         .workspace_delete,
+        .workspace_bind_set,
+        .workspace_bind_remove,
         .workspace_mount_set,
         .workspace_mount_remove,
         .workspace_activate,
@@ -7861,6 +7872,8 @@ fn controlMutationScope(control_type: unified.ControlType) ControlMutationScope 
         .workspace_create,
         .workspace_update,
         .workspace_delete,
+        .workspace_bind_set,
+        .workspace_bind_remove,
         .workspace_mount_set,
         .workspace_mount_remove,
         .workspace_token_rotate,
@@ -8054,9 +8067,14 @@ fn isWorkspaceAliasControlType(control_type: unified.ControlType) bool {
         .workspace_delete,
         .workspace_list,
         .workspace_get,
+        .workspace_template_list,
+        .workspace_template_get,
         .workspace_mount_set,
         .workspace_mount_remove,
         .workspace_mount_list,
+        .workspace_bind_set,
+        .workspace_bind_remove,
+        .workspace_bind_list,
         .workspace_token_rotate,
         .workspace_token_revoke,
         .workspace_activate,
@@ -8188,9 +8206,14 @@ fn handleControlPlaneCommand(
         .project_delete => try runtime_registry.control_plane.deleteProjectWithRole(effective_payload, is_admin),
         .project_list => try runtime_registry.control_plane.listProjects(),
         .project_get => try runtime_registry.control_plane.getProjectWithRole(effective_payload, is_admin),
+        .workspace_template_list => try runtime_registry.control_plane.listWorkspaceTemplates(),
+        .workspace_template_get => try runtime_registry.control_plane.getWorkspaceTemplate(effective_payload),
         .project_mount_set => try runtime_registry.control_plane.setProjectMountWithRole(effective_payload, is_admin),
         .project_mount_remove => try runtime_registry.control_plane.removeProjectMountWithRole(effective_payload, is_admin),
         .project_mount_list => try runtime_registry.control_plane.listProjectMountsWithRole(effective_payload, is_admin),
+        .workspace_bind_set => try runtime_registry.control_plane.setProjectBindWithRole(effective_payload, is_admin),
+        .workspace_bind_remove => try runtime_registry.control_plane.removeProjectBindWithRole(effective_payload, is_admin),
+        .workspace_bind_list => try runtime_registry.control_plane.listProjectBindsWithRole(effective_payload, is_admin),
         .project_token_rotate => try runtime_registry.control_plane.rotateProjectTokenWithRole(effective_payload, is_admin),
         .project_token_revoke => try runtime_registry.control_plane.revokeProjectTokenWithRole(effective_payload, is_admin),
         .project_activate => try runtime_registry.control_plane.activateProjectWithRole(agent_id, effective_payload, is_admin),
@@ -8218,6 +8241,7 @@ fn controlPlaneErrorCode(err: anyerror) []const u8 {
         error.InvalidAgentId => "invalid_payload",
         control_plane_mod.ControlPlaneError.InvalidPayload => "invalid_payload",
         control_plane_mod.ControlPlaneError.MissingField => "missing_field",
+        control_plane_mod.ControlPlaneError.TemplateNotFound => "template_not_found",
         control_plane_mod.ControlPlaneError.InviteNotFound => "invite_not_found",
         control_plane_mod.ControlPlaneError.InviteExpired => "invite_expired",
         control_plane_mod.ControlPlaneError.InviteRedeemed => "invite_redeemed",
@@ -8232,6 +8256,8 @@ fn controlPlaneErrorCode(err: anyerror) []const u8 {
         control_plane_mod.ControlPlaneError.ProjectPolicyForbidden => "project_policy_forbidden",
         control_plane_mod.ControlPlaneError.MountConflict => "mount_conflict",
         control_plane_mod.ControlPlaneError.MountNotFound => "mount_not_found",
+        control_plane_mod.ControlPlaneError.BindConflict => "bind_conflict",
+        control_plane_mod.ControlPlaneError.BindNotFound => "bind_not_found",
         else => "control_plane_error",
     };
 }
@@ -8493,6 +8519,113 @@ fn seedUserRememberedTargetForTests(
     if (project_id_value != .string) return error.TestExpectedResult;
 
     try runtime_registry.auth_tokens.setRememberedTarget(.user, agent_id, project_id_value.string);
+}
+
+test "server_piai: workspace template control ops expose dev catalog entries" {
+    const allocator = std.testing.allocator;
+    var runtime_registry = AgentRuntimeRegistry.init(allocator, .{
+        .ltm_directory = "",
+        .ltm_filename = "",
+    }, null);
+    defer runtime_registry.deinit();
+
+    const listed = try handleControlPlaneCommand(
+        &runtime_registry,
+        .workspace_template_list,
+        system_agent_id,
+        true,
+        null,
+    );
+    defer allocator.free(listed);
+    try std.testing.expect(std.mem.indexOf(u8, listed, "\"template_id\":\"minimum\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, listed, "\"template_id\":\"dev\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, listed, "\"template_id\":\"github\"") != null);
+
+    const fetched = try handleControlPlaneCommand(
+        &runtime_registry,
+        .workspace_template_get,
+        system_agent_id,
+        true,
+        "{\"template_id\":\"dev\"}",
+    );
+    defer allocator.free(fetched);
+    try std.testing.expect(std.mem.indexOf(u8, fetched, "\"template_id\":\"dev\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fetched, "\"bind_path\":\"/services/git\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fetched, "\"bind_path\":\"/services/search_code\"") != null);
+}
+
+test "server_piai: workspace bind control ops rewrite workspace payload and response fields" {
+    const allocator = std.testing.allocator;
+    var runtime_registry = AgentRuntimeRegistry.init(allocator, .{
+        .ltm_directory = "",
+        .ltm_filename = "",
+    }, null);
+    defer runtime_registry.deinit();
+
+    const project_json = try runtime_registry.control_plane.createProject(
+        "{\"name\":\"WorkspaceBind\",\"vision\":\"WorkspaceBind\"}",
+    );
+    defer allocator.free(project_json);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, project_json, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.TestExpectedResult;
+    const project_id_value = parsed.value.object.get("project_id") orelse return error.TestExpectedResult;
+    const project_token_value = parsed.value.object.get("project_token") orelse return error.TestExpectedResult;
+    if (project_id_value != .string or project_token_value != .string) return error.TestExpectedResult;
+
+    const bind_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"workspace_id\":\"{s}\",\"workspace_token\":\"{s}\",\"bind_path\":\"/repo\",\"target_path\":\"/nodes/local/fs\"}}",
+        .{ project_id_value.string, project_token_value.string },
+    );
+    defer allocator.free(bind_req);
+    const bound = try handleControlPlaneCommand(
+        &runtime_registry,
+        .workspace_bind_set,
+        system_agent_id,
+        false,
+        bind_req,
+    );
+    defer allocator.free(bound);
+    try std.testing.expect(std.mem.indexOf(u8, bound, "\"workspace_id\":\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bound, "\"project_id\":\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, bound, "\"bind_path\":\"/repo\"") != null);
+
+    const list_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"workspace_id\":\"{s}\",\"workspace_token\":\"{s}\"}}",
+        .{ project_id_value.string, project_token_value.string },
+    );
+    defer allocator.free(list_req);
+    const listed = try handleControlPlaneCommand(
+        &runtime_registry,
+        .workspace_bind_list,
+        system_agent_id,
+        false,
+        list_req,
+    );
+    defer allocator.free(listed);
+    try std.testing.expect(std.mem.indexOf(u8, listed, "\"workspace_id\":\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, listed, "\"project_id\":\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, listed, "\"target_path\":\"/nodes/local/fs\"") != null);
+
+    const remove_req = try std.fmt.allocPrint(
+        allocator,
+        "{{\"workspace_id\":\"{s}\",\"workspace_token\":\"{s}\",\"bind_path\":\"/repo\"}}",
+        .{ project_id_value.string, project_token_value.string },
+    );
+    defer allocator.free(remove_req);
+    const removed = try handleControlPlaneCommand(
+        &runtime_registry,
+        .workspace_bind_remove,
+        system_agent_id,
+        false,
+        remove_req,
+    );
+    defer allocator.free(removed);
+    try std.testing.expect(std.mem.indexOf(u8, removed, "\"workspace_id\":\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, removed, "\"project_id\":\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, removed, "\"bind_path\":\"/repo\"") == null);
 }
 
 test "server_piai: admin initial binding prefers remembered workspace target" {

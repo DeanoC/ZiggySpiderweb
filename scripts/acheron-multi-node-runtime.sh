@@ -2,8 +2,8 @@
 set -euo pipefail
 
 SPIDERWEB_URL="${SPIDERWEB_URL:-ws://127.0.0.1:18790/}"
-SPIDERWEB_PROJECT_ID="${SPIDERWEB_PROJECT_ID:-}"
-SPIDERWEB_PROJECT_TOKEN="${SPIDERWEB_PROJECT_TOKEN:-}"
+SPIDERWEB_WORKSPACE_ID="${SPIDERWEB_WORKSPACE_ID:-}"
+SPIDERWEB_WORKSPACE_TOKEN="${SPIDERWEB_WORKSPACE_TOKEN:-}"
 SPIDERWEB_AUTH_TOKEN="${SPIDERWEB_AUTH_TOKEN:-}"
 SPIDERWEB_AUTH_TOKEN_FILE="${SPIDERWEB_AUTH_TOKEN_FILE:-$HOME/.local/share/ziggy-spiderweb/.spiderweb-ltm/auth_tokens.json}"
 EXPECTED_NODES="${EXPECTED_NODES:-}"
@@ -40,19 +40,19 @@ mount_args=(--workspace-url "$SPIDERWEB_URL")
 if [[ -n "$SPIDERWEB_AUTH_TOKEN" ]]; then
     mount_args+=(--auth-token "$SPIDERWEB_AUTH_TOKEN")
 fi
-if [[ -n "$SPIDERWEB_PROJECT_ID" ]]; then
-    mount_args+=(--project-id "$SPIDERWEB_PROJECT_ID")
+if [[ -n "$SPIDERWEB_WORKSPACE_ID" ]]; then
+    mount_args+=(--workspace-id "$SPIDERWEB_WORKSPACE_ID")
 fi
-if [[ -n "$SPIDERWEB_PROJECT_TOKEN" ]]; then
-    mount_args+=(--project-token "$SPIDERWEB_PROJECT_TOKEN")
+if [[ -n "$SPIDERWEB_WORKSPACE_TOKEN" ]]; then
+    mount_args+=(--workspace-token "$SPIDERWEB_WORKSPACE_TOKEN")
 fi
 
 workspace_payload='{}'
-if [[ -n "$SPIDERWEB_PROJECT_ID" ]]; then
-    if [[ -n "$SPIDERWEB_PROJECT_TOKEN" ]]; then
-        workspace_payload="$(jq -cn --arg project_id "$SPIDERWEB_PROJECT_ID" --arg project_token "$SPIDERWEB_PROJECT_TOKEN" '{project_id: $project_id, project_token: $project_token}')"
+if [[ -n "$SPIDERWEB_WORKSPACE_ID" ]]; then
+    if [[ -n "$SPIDERWEB_WORKSPACE_TOKEN" ]]; then
+        workspace_payload="$(jq -cn --arg workspace_id "$SPIDERWEB_WORKSPACE_ID" --arg workspace_token "$SPIDERWEB_WORKSPACE_TOKEN" '{workspace_id: $workspace_id, workspace_token: $workspace_token}')"
     else
-        workspace_payload="$(jq -cn --arg project_id "$SPIDERWEB_PROJECT_ID" '{project_id: $project_id}')"
+        workspace_payload="$(jq -cn --arg workspace_id "$SPIDERWEB_WORKSPACE_ID" '{workspace_id: $workspace_id}')"
     fi
 fi
 
@@ -185,4 +185,3 @@ if [[ -n "$marker_mount_path" && -n "$marker_value" ]]; then
 fi
 
 echo "multi-node runtime harness passed"
-

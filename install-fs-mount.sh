@@ -49,5 +49,5 @@ Linux notes:
   - Non-root mounts require a working fuse3 setup on this machine.
   - Your user may need fuse access, depending on distro policy.
   - Example:
-      spiderweb-fs-mount --namespace-url ws://host:18790/ --project-id proj-a mount /mnt/spiderweb
+      spiderweb-fs-mount --namespace-url ws://host:18790/ --workspace-id ws-demo mount /mnt/spiderweb
 EOF
