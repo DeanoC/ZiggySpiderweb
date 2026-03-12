@@ -11,7 +11,7 @@ $SpiderwebUrl = if ($env:SPIDERWEB_URL) { $env:SPIDERWEB_URL } else { "ws://127.
 $SpiderwebWorkspaceId = $env:SPIDERWEB_WORKSPACE_ID
 $SpiderwebWorkspaceToken = $env:SPIDERWEB_WORKSPACE_TOKEN
 $SpiderwebAuthToken = $env:SPIDERWEB_AUTH_TOKEN
-$SpiderwebAuthTokenFile = if ($env:SPIDERWEB_AUTH_TOKEN_FILE) { $env:SPIDERWEB_AUTH_TOKEN_FILE } else { Join-Path $HOME ".local\share\ziggy-spiderweb\.spiderweb-ltm\auth_tokens.json" }
+$SpiderwebAuthTokenFile = $env:SPIDERWEB_AUTH_TOKEN_FILE
 $SpiderwebAgentId = $env:SPIDERWEB_AGENT_ID
 $SpiderwebSessionKey = $env:SPIDERWEB_SESSION_KEY
 $SpiderwebMountBackend = if ($env:SPIDERWEB_MOUNT_BACKEND) { $env:SPIDERWEB_MOUNT_BACKEND } else { "auto" }
@@ -62,6 +62,30 @@ function Require-Command {
     if (-not (Get-Command $Name -ErrorAction SilentlyContinue)) {
         throw "required binary not found: $Name"
     }
+}
+
+function Resolve-AuthTokenFile {
+    param([string]$ExplicitPath)
+
+    if ($ExplicitPath) {
+        return $ExplicitPath
+    }
+
+    $configCmd = Get-Command "spiderweb-config" -ErrorAction SilentlyContinue
+    if ($configCmd) {
+        try {
+            $resolved = (& $configCmd.Source auth path 2>$null | Select-Object -Last 1)
+            if ($resolved) {
+                $trimmed = [string]$resolved
+                if ($trimmed.Trim().Length -gt 0) {
+                    return $trimmed.Trim()
+                }
+            }
+        } catch {
+        }
+    }
+
+    return (Join-Path $HOME ".local\share\ziggy-spiderweb\.spiderweb-ltm\auth_tokens.json")
 }
 
 function Invoke-FsMountRaw {
@@ -155,6 +179,7 @@ function Test-PathSafe {
 
 $FsMountBin = if ($SpiderwebFsMountBin) { $SpiderwebFsMountBin } else { Resolve-Binary "spiderweb-fs-mount" }
 Require-Command "ConvertFrom-Json"
+$SpiderwebAuthTokenFile = Resolve-AuthTokenFile -ExplicitPath $SpiderwebAuthTokenFile
 
 if (-not $SpiderwebAuthToken -and (Test-Path $SpiderwebAuthTokenFile)) {
     $tokenJson = Get-Content -LiteralPath $SpiderwebAuthTokenFile -Raw | ConvertFrom-Json
@@ -192,7 +217,13 @@ for ($attempt = 1; $attempt -le $SmokeConnectRetries; $attempt += 1) {
 }
 
 $status = $statusText | ConvertFrom-Json
-Write-Host "namespace workspace: $($status.project_id)"
+if ($status.PSObject.Properties.Name -contains "workspace_id" -and $status.workspace_id) {
+    Write-Host "namespace workspace: $($status.workspace_id)"
+} elseif ($status.PSObject.Properties.Name -contains "project_id" -and $status.project_id) {
+    Write-Host "namespace workspace: $($status.project_id)"
+} else {
+    Write-Host "namespace workspace: (none)"
+}
 Write-Host "namespace agent: $($status.agent_id)"
 
 foreach ($path in @("/agents", "/nodes", "/global")) {

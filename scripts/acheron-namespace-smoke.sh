@@ -8,7 +8,8 @@ SPIDERWEB_URL="${SPIDERWEB_URL:-ws://127.0.0.1:18790/}"
 SPIDERWEB_WORKSPACE_ID="${SPIDERWEB_WORKSPACE_ID:-}"
 SPIDERWEB_WORKSPACE_TOKEN="${SPIDERWEB_WORKSPACE_TOKEN:-}"
 SPIDERWEB_AUTH_TOKEN="${SPIDERWEB_AUTH_TOKEN:-}"
-SPIDERWEB_AUTH_TOKEN_FILE="${SPIDERWEB_AUTH_TOKEN_FILE:-$HOME/.local/share/ziggy-spiderweb/.spiderweb-ltm/auth_tokens.json}"
+SPIDERWEB_AUTH_TOKEN_FILE="${SPIDERWEB_AUTH_TOKEN_FILE:-}"
+SPIDERWEB_CONFIG_BIN="${SPIDERWEB_CONFIG_BIN:-spiderweb-config}"
 SPIDERWEB_AGENT_ID="${SPIDERWEB_AGENT_ID:-}"
 SPIDERWEB_SESSION_KEY="${SPIDERWEB_SESSION_KEY:-}"
 SPIDERWEB_MOUNT_BACKEND="${SPIDERWEB_MOUNT_BACKEND:-auto}"
@@ -64,6 +65,22 @@ fi
 require_bin jq
 require_bin timeout
 
+resolve_auth_token_file() {
+    if command -v "$SPIDERWEB_CONFIG_BIN" >/dev/null 2>&1; then
+        local resolved
+        resolved="$("$SPIDERWEB_CONFIG_BIN" auth path 2>/dev/null | tr -d '\r' | tail -n 1 || true)"
+        if [[ -n "$resolved" ]]; then
+            printf '%s\n' "$resolved"
+            return
+        fi
+    fi
+    printf '%s\n' "$HOME/.local/share/ziggy-spiderweb/.spiderweb-ltm/auth_tokens.json"
+}
+
+if [[ -z "$SPIDERWEB_AUTH_TOKEN_FILE" ]]; then
+    SPIDERWEB_AUTH_TOKEN_FILE="$(resolve_auth_token_file)"
+fi
+
 if [[ -z "$SPIDERWEB_AUTH_TOKEN" && -f "$SPIDERWEB_AUTH_TOKEN_FILE" ]]; then
     SPIDERWEB_AUTH_TOKEN="$(jq -r '.admin_token // .user_token // empty' "$SPIDERWEB_AUTH_TOKEN_FILE" 2>/dev/null || true)"
 fi
@@ -106,9 +123,9 @@ while true; do
     attempt=$((attempt + 1))
 done
 
-resolved_project_id="$(jq -r '.project_id // empty' <<<"$status_json")"
+resolved_workspace_id="$(jq -r '.workspace_id // .project_id // empty' <<<"$status_json")"
 resolved_agent_id="$(jq -r '.agent_id // empty' <<<"$status_json")"
-echo "namespace workspace: ${resolved_project_id:-"(none)"}"
+echo "namespace workspace: ${resolved_workspace_id:-"(none)"}"
 echo "namespace agent: ${resolved_agent_id:-"(none)"}"
 
 for path in /agents /nodes /global; do

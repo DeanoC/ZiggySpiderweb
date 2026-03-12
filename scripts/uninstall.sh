@@ -4,12 +4,26 @@
 # Run as root or with sudo
 #
 
-set -e
+set -euo pipefail
 
 INSTALL_USER="${INSTALL_USER:-spiderweb}"
-INSTALL_DIR="${INSTALL_DIR:-/opt/spiderweb}"
-CONFIG_DIR="${CONFIG_DIR:-/etc/spiderweb}"
 SERVICE_NAME="${SERVICE_NAME:-spiderweb}"
+BASE_DIR="${SPIDERWEB_BASE_DIR:-${BASE_DIR:-}}"
+if [ -n "$BASE_DIR" ]; then
+    INSTALL_DIR_DEFAULT="$BASE_DIR/opt/spiderweb"
+    CONFIG_DIR_DEFAULT="$BASE_DIR/etc/spiderweb"
+    DATA_DIR_DEFAULT="$BASE_DIR/var/lib/spiderweb"
+    LOG_DIR_DEFAULT="$BASE_DIR/var/log/spiderweb"
+else
+    INSTALL_DIR_DEFAULT="/opt/spiderweb"
+    CONFIG_DIR_DEFAULT="/etc/spiderweb"
+    DATA_DIR_DEFAULT="/var/lib/spiderweb"
+    LOG_DIR_DEFAULT="/var/log/spiderweb"
+fi
+INSTALL_DIR="${INSTALL_DIR:-$INSTALL_DIR_DEFAULT}"
+CONFIG_DIR="${CONFIG_DIR:-$CONFIG_DIR_DEFAULT}"
+DATA_DIR="${DATA_DIR:-$DATA_DIR_DEFAULT}"
+LOG_DIR="${LOG_DIR:-$LOG_DIR_DEFAULT}"
 
 # Colors
 RED='\033[0;31m'
@@ -44,8 +58,8 @@ read_confirm() {
     echo "  - User: $INSTALL_USER"
     echo "  - Directory: $INSTALL_DIR"
     echo "  - Config: $CONFIG_DIR"
-    echo "  - Logs: /var/log/spiderweb"
-    echo "  - Data: /var/lib/spiderweb"
+    echo "  - Logs: $LOG_DIR"
+    echo "  - Data: $DATA_DIR"
     echo ""
     read -p "Are you sure? [y/N] " -n 1 -r
     echo ""
@@ -74,6 +88,8 @@ remove_files() {
     rm -rf "$INSTALL_DIR"
     rm -f /usr/local/bin/spiderweb
     rm -f /usr/local/bin/spiderweb-config
+    rm -f /usr/local/bin/spiderweb-control
+    rm -f /usr/local/bin/spiderweb-fs-mount
     
     # Config (backup first if exists)
     if [ -d "$CONFIG_DIR" ]; then
@@ -84,8 +100,8 @@ remove_files() {
     fi
     
     # Logs and data
-    rm -rf /var/log/spiderweb
-    rm -rf /var/lib/spiderweb
+    rm -rf "$LOG_DIR"
+    rm -rf "$DATA_DIR"
 }
 
 remove_user() {

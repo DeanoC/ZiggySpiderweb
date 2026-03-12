@@ -4,9 +4,17 @@
 # Run as root or with sudo
 #
 
-set -e
+set -euo pipefail
 
 SERVICE_NAME="${SERVICE_NAME:-spiderweb}"
+BASE_DIR="${SPIDERWEB_BASE_DIR:-${BASE_DIR:-}}"
+if [ -n "$BASE_DIR" ]; then
+    INSTALL_DIR_DEFAULT="$BASE_DIR/opt/spiderweb"
+else
+    INSTALL_DIR_DEFAULT="/opt/spiderweb"
+fi
+INSTALL_DIR="${INSTALL_DIR:-$INSTALL_DIR_DEFAULT}"
+BINARIES=(spiderweb spiderweb-config spiderweb-control spiderweb-fs-mount)
 
 log_info() {
     echo -e "\033[0;32m[INFO]\033[0m $1"
@@ -34,8 +42,19 @@ rm -rf zig-out .zig-cache
 zig build -Doptimize=ReleaseSafe
 
 log_info "Installing binaries..."
-cp zig-out/bin/spiderweb /opt/spiderweb/bin/
-cp zig-out/bin/spiderweb-config /opt/spiderweb/bin/
+if [ ! -d "$INSTALL_DIR/bin" ]; then
+    log_error "Install directory not found: $INSTALL_DIR/bin"
+    exit 1
+fi
+
+for bin in "${BINARIES[@]}"; do
+    if [ ! -x "zig-out/bin/$bin" ]; then
+        log_error "Missing build artifact: zig-out/bin/$bin"
+        exit 1
+    fi
+    cp "zig-out/bin/$bin" "$INSTALL_DIR/bin/"
+    ln -sf "$INSTALL_DIR/bin/$bin" "/usr/local/bin/$bin"
+done
 
 log_info "Restarting service..."
 systemctl start "$SERVICE_NAME"

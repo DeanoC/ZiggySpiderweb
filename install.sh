@@ -8,8 +8,9 @@
 # PIPED (non-interactive, uses defaults):
 #   curl -fsSL https://raw.githubusercontent.com/DeanoC/Spiderweb/main/install.sh | bash
 #
-# NON-INTERACTIVE with options:
-#   curl ... | SPIDERWEB_PROVIDER=openai-codex SPIDERWEB_AGENT=ziggy bash
+# NON-INTERACTIVE with defaults:
+#   curl ... | SPIDERWEB_NON_INTERACTIVE=1 bash
+#
 # Pin installer repo refs (for testing non-main branches):
 #   curl .../install.sh | SPIDERWEB_GIT_REF=feat/foo ZSS_GIT_REF=feat/bar bash
 
@@ -576,7 +577,7 @@ if [[ "$INSTALL_SYSTEMD" == "true" ]]; then
     # Create service file content
     if [[ "$SYSTEMD_SCOPE" == "system" ]]; then
         SERVICE_FILE="[Unit]
-Description=Spiderweb AI Agent Gateway
+Description=Spiderweb Workspace Host
 After=network.target
 
 [Service]
@@ -596,7 +597,7 @@ WantedBy=multi-user.target"
         log_success "System service installed and started"
     else
         SERVICE_FILE="[Unit]
-Description=Spiderweb AI Agent Gateway
+Description=Spiderweb Workspace Host
 After=network.target
 
 [Service]
@@ -723,9 +724,9 @@ print_auth_tokens_summary
 echo ""
 echo "Next steps:"
 echo "  1. Reveal auth tokens: spiderweb-config auth status --reveal"
-echo "  2. Create a workspace: spiderweb-control workspace_create '{\"name\":\"Demo\",\"vision\":\"Mounted workspace\"}'"
-echo "  3. Mount it: spiderweb-fs-mount --workspace-url ws://127.0.0.1:${CURRENT_PORT}/ --auth-token <admin-token> --workspace-id <workspace-id> mount ./workspace"
-echo "  4. Start Spider Monkey: spider-monkey run --workspace-root ./workspace"
+echo "  2. Create a dev workspace: spiderweb-control --url ws://127.0.0.1:${CURRENT_PORT}/ --auth-token <admin-token> workspace_create '{\"name\":\"Demo\",\"vision\":\"Mounted workspace\",\"template_id\":\"dev\"}'"
+echo "  3. Mount it: spiderweb-fs-mount --workspace-url ws://127.0.0.1:${CURRENT_PORT}/ --auth-token <admin-or-user-token> --workspace-id <workspace-id> mount ./workspace"
+echo "  4. Start Spider Monkey: spider-monkey run --agent-id spider-monkey --worker-id spider-monkey-a --workspace-root ./workspace"
 if [[ "$INSTALL_ZSS" == "true" ]]; then
     echo ""
     echo "Optional GUI/tooling:"

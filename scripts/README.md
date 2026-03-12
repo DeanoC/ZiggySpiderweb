@@ -33,9 +33,10 @@ sudo journalctl -u spiderweb -f
 After the service is running:
 
 ```bash
+export SPIDERWEB_CONFIG=/etc/spiderweb/config.json
 spiderweb-config auth status --reveal
-spiderweb-control --url ws://127.0.0.1:18790/ --auth-token <admin-token> workspace_create '{"name":"Demo","vision":"Mounted workspace"}'
-spiderweb-fs-mount --workspace-url ws://127.0.0.1:18790/ --auth-token <admin-token> --workspace-id <workspace-id> mount ./workspace
+spiderweb-control --url ws://127.0.0.1:18790/ --auth-token <admin-token> workspace_create '{"name":"Demo","vision":"Mounted workspace","template_id":"dev"}'
+spiderweb-fs-mount --workspace-url ws://127.0.0.1:18790/ --auth-token <admin-or-user-token> --workspace-id <workspace-id> mount ./workspace
 ```
 
 Then start an external worker, for example Spider Monkey, against the mounted directory.
