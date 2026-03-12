@@ -11,6 +11,8 @@
 # NON-INTERACTIVE with defaults:
 #   curl ... | SPIDERWEB_NON_INTERACTIVE=1 bash
 #
+# NON-INTERACTIVE with options:
+#   curl ... | SPIDERWEB_INSTALL_ZSS=0 SPIDERWEB_INSTALL_SYSTEMD=0 bash
 # Pin installer repo refs (for testing non-main branches):
 #   curl .../install.sh | SPIDERWEB_GIT_REF=feat/foo ZSS_GIT_REF=feat/bar bash
 
@@ -47,6 +49,65 @@ log_warn() {
 
 log_success() {
     echo -e "${GREEN}[OK]${NC} $1"
+}
+
+normalize_bool() {
+    local raw="${1:-}"
+    local default="${2:-0}"
+    case "${raw,,}" in
+        1|true|yes|y|on)
+            echo "1"
+            ;;
+        0|false|no|n|off)
+            echo "0"
+            ;;
+        *)
+            echo "$default"
+            ;;
+    esac
+}
+
+path_within_dir() {
+    local path="$1"
+    local dir="$2"
+    local norm_path norm_dir
+    norm_path="$(readlink -f "$path" 2>/dev/null || printf '%s' "$path")"
+    norm_dir="$(readlink -f "$dir" 2>/dev/null || printf '%s' "$dir")"
+    [[ "$norm_path" == "$norm_dir" || "$norm_path" == "$norm_dir/"* ]]
+}
+
+collect_spiderweb_pids_by_install_dir() {
+    local install_dir="$1"
+    local -n matching_ref="$2"
+    local -n foreign_ref="$3"
+    matching_ref=()
+    foreign_ref=()
+
+    local pid exe
+    while read -r pid; do
+        [[ -n "$pid" ]] || continue
+        exe="$(readlink -f "/proc/$pid/exe" 2>/dev/null || true)"
+        if [[ -z "$exe" ]]; then
+            foreign_ref+=("$pid")
+        elif path_within_dir "$exe" "$install_dir"; then
+            matching_ref+=("$pid")
+        else
+            foreign_ref+=("$pid")
+        fi
+    done < <(pgrep -x spiderweb 2>/dev/null || true)
+}
+
+stop_spiderweb_processes() {
+    log_info "Stopping spiderweb..."
+    if systemctl --user is-active spiderweb >/dev/null 2>&1; then
+        systemctl --user stop spiderweb || true
+    elif sudo systemctl is-active spiderweb >/dev/null 2>&1; then
+        sudo systemctl stop spiderweb || true
+    fi
+    pkill spiderweb 2>/dev/null || sudo pkill spiderweb 2>/dev/null || true
+    sleep 2
+    pkill -9 spiderweb 2>/dev/null || sudo pkill -9 spiderweb 2>/dev/null || true
+    sleep 1
 }
 
 ensure_git_repo() {
@@ -269,7 +330,7 @@ sync_zss_auth_tokens() {
 }
 
 # Detect if we're being piped
-if [[ ! -t 0 ]]; then
+if [[ ! -t 0 && -z "${SPIDERWEB_NON_INTERACTIVE:-}" ]]; then
     echo ""
     log_warn "Running via pipe (curl | bash)"
     echo ""
@@ -281,6 +342,8 @@ if [[ ! -t 0 ]]; then
     echo ""
     export SPIDERWEB_NON_INTERACTIVE=1
 fi
+
+NON_INTERACTIVE="$(normalize_bool "${SPIDERWEB_NON_INTERACTIVE:-}" "0")"
 
 # Check OS
 if [[ "$OSTYPE" != "linux-gnu"* ]]; then
@@ -412,40 +475,59 @@ if [[ ${#POST_MISSING[@]} -gt 0 ]]; then
 fi
 
 # Clone and build
-REPO_DIR="${HOME}/.local/share/ziggy-spiderweb"
-INSTALL_DIR="${HOME}/.local/bin"
+REPO_DIR="${SPIDERWEB_REPO_DIR:-$HOME/.local/share/ziggy-spiderweb}"
+INSTALL_DIR="${SPIDERWEB_INSTALL_DIR:-$HOME/.local/bin}"
 export PATH="${INSTALL_DIR}:${PATH}"
 SPIDERWEB_REPO_URL="${SPIDERWEB_REPO_URL:-https://github.com/DeanoC/Spiderweb.git}"
 SPIDERWEB_GIT_REF="${SPIDERWEB_GIT_REF:-main}"
 ZSS_REPO_URL="${ZSS_REPO_URL:-https://github.com/DeanoC/ZiggyStarSpider.git}"
 ZSS_GIT_REF="${ZSS_GIT_REF:-main}"
+DEFAULT_START_AFTER_INSTALL="0"
+DEFAULT_INSTALL_ZSS="0"
+DEFAULT_INSTALL_SYSTEMD="0"
+if [[ "$NON_INTERACTIVE" != "1" ]]; then
+    DEFAULT_START_AFTER_INSTALL="1"
+    DEFAULT_INSTALL_ZSS="1"
+fi
+START_AFTER_INSTALL="$(normalize_bool "${SPIDERWEB_START_AFTER_INSTALL:-}" "$DEFAULT_START_AFTER_INSTALL")"
+INSTALL_ZSS="${SPIDERWEB_INSTALL_ZSS:-}"
+INSTALL_SYSTEMD="${SPIDERWEB_INSTALL_SYSTEMD:-}"
+SPIDERWEB_REPO_DIR_SET=0
+if [[ -n "${SPIDERWEB_REPO_DIR+x}" ]]; then
+    SPIDERWEB_REPO_DIR_SET=1
+fi
+MANAGED_REPO=1
 
 # Check if spiderweb is running and offer to stop it first
 SPIDERWEB_RUNNING=false
-if pgrep spiderweb > /dev/null 2>&1; then
+MATCHING_SPIDERWEB_PIDS=()
+FOREIGN_SPIDERWEB_PIDS=()
+collect_spiderweb_pids_by_install_dir "$INSTALL_DIR" MATCHING_SPIDERWEB_PIDS FOREIGN_SPIDERWEB_PIDS
+if (( ${#MATCHING_SPIDERWEB_PIDS[@]} > 0 || ${#FOREIGN_SPIDERWEB_PIDS[@]} > 0 )); then
     SPIDERWEB_RUNNING=true
-    if [[ -t 0 ]]; then
-        echo ""
-        read -rp "Spiderweb is currently running. Stop it to allow update? [Y/n]: " stop_confirm
-        if [[ ! "$stop_confirm" =~ ^[Nn]$ ]] || [[ -z "$stop_confirm" ]]; then
-            log_info "Stopping spiderweb..."
-            # Try graceful stop first
-            if systemctl --user is-active spiderweb >/dev/null 2>&1; then
-                systemctl --user stop spiderweb || true
-            elif sudo systemctl is-active spiderweb >/dev/null 2>&1; then
-                sudo systemctl stop spiderweb || true
+    if (( ${#MATCHING_SPIDERWEB_PIDS[@]} > 0 )); then
+        if [[ "$NON_INTERACTIVE" == "1" ]]; then
+            stop_spiderweb_processes
+        elif [[ -t 0 ]]; then
+            echo ""
+            read -rp "Spiderweb is currently running from ${INSTALL_DIR}. Stop it to allow update? [Y/n]: " stop_confirm
+            if [[ ! "$stop_confirm" =~ ^[Nn]$ ]] || [[ -z "$stop_confirm" ]]; then
+                stop_spiderweb_processes
             fi
-            # Kill any remaining processes
-            pkill spiderweb 2>/dev/null || sudo pkill spiderweb 2>/dev/null || true
-            sleep 2
-            pkill -9 spiderweb 2>/dev/null || sudo pkill -9 spiderweb 2>/dev/null || true
-            sleep 1
         fi
+    elif [[ "$NON_INTERACTIVE" == "1" ]]; then
+        log_info "Detected an existing spiderweb process outside ${INSTALL_DIR}; continuing without stopping it"
+    elif [[ -t 0 ]]; then
+        echo ""
+        log_warn "Another spiderweb process is running outside ${INSTALL_DIR}; leaving it untouched"
     fi
 fi
 
 if [[ -d "$REPO_DIR" ]]; then
-    if [[ -t 0 ]]; then
+    if [[ "$SPIDERWEB_REPO_DIR_SET" == "1" ]]; then
+        log_info "Using provided Spiderweb checkout at ${REPO_DIR}"
+        MANAGED_REPO=0
+    elif [[ -t 0 ]]; then
         # Interactive - ask user
         echo ""
         read -rp "Remove existing install and re-clone? [y/N]: " confirm
@@ -459,16 +541,17 @@ if [[ -d "$REPO_DIR" ]]; then
 fi
 
 mkdir -p "$(dirname "$REPO_DIR")"
-ensure_git_repo "$REPO_DIR" "$SPIDERWEB_REPO_URL" "$SPIDERWEB_GIT_REF"
-log_info "Syncing Spiderweb submodules..."
-git -C "$REPO_DIR" submodule sync --recursive
-git -C "$REPO_DIR" submodule update --init --recursive
-REPO_BASE_DIR="$(dirname "$REPO_DIR")"
-log_info "Ensuring local Ziggy module dependencies..."
-ensure_git_repo "${REPO_BASE_DIR}/ZiggyMemoryStore" "https://github.com/DeanoC/ZiggyMemoryStore.git"
-ensure_git_repo "${REPO_BASE_DIR}/ZiggyToolRuntime" "https://github.com/DeanoC/ZiggyToolRuntime.git"
-ensure_git_repo "${REPO_BASE_DIR}/ZiggyRuntimeHooks" "https://github.com/DeanoC/ZiggyRuntimeHooks.git"
-ensure_git_repo "${REPO_BASE_DIR}/ZiggyRunOrchestrator" "https://github.com/DeanoC/ZiggyRunOrchestrator.git"
+if [[ "$MANAGED_REPO" == "1" ]]; then
+    ensure_git_repo "$REPO_DIR" "$SPIDERWEB_REPO_URL" "$SPIDERWEB_GIT_REF"
+    log_info "Syncing Spiderweb submodules..."
+    git -C "$REPO_DIR" submodule sync --recursive
+    git -C "$REPO_DIR" submodule update --init --recursive
+else
+    if [[ ! -d "$REPO_DIR" ]] || [[ ! -f "$REPO_DIR/build.zig" ]]; then
+        echo "Error: SPIDERWEB_REPO_DIR does not look like a Spiderweb checkout: $REPO_DIR"
+        exit 1
+    fi
+fi
 
 cd "$REPO_DIR"
 
@@ -478,7 +561,7 @@ zig build -Doptimize=ReleaseSafe
 log_info "Installing binaries..."
 mkdir -p "$INSTALL_DIR"
 
-SPIDERWEB_BINARIES=(spiderweb spiderweb-config spiderweb-control spiderweb-fs-mount)
+SPIDERWEB_BINARIES=(spiderweb spiderweb-config spiderweb-control spiderweb-fs-mount spiderweb-fs-node)
 for bin in "${SPIDERWEB_BINARIES[@]}"; do
     if [[ ! -x "zig-out/bin/${bin}" ]]; then
         echo "Error: expected build artifact missing: zig-out/bin/${bin}"
@@ -504,16 +587,20 @@ fi
 log_success "Build complete!"
 
 # Ask about installing ZiggyStarSpider client
-INSTALL_ZSS=false
-if [[ -t 0 ]]; then
+INSTALL_ZSS_BOOL="$DEFAULT_INSTALL_ZSS"
+if [[ -n "$INSTALL_ZSS" ]]; then
+    INSTALL_ZSS_BOOL="$(normalize_bool "$INSTALL_ZSS" "$DEFAULT_INSTALL_ZSS")"
+elif [[ -t 0 ]]; then
     echo ""
     read -rp "Also install ZiggyStarSpider client (zss)? [Y/n]: " zss_confirm
     if [[ ! "$zss_confirm" =~ ^[Nn]$ ]] || [[ -z "$zss_confirm" ]]; then
-        INSTALL_ZSS=true
+        INSTALL_ZSS_BOOL="1"
+    else
+        INSTALL_ZSS_BOOL="0"
     fi
 fi
 
-if [[ "$INSTALL_ZSS" == "true" ]]; then
+if [[ "$INSTALL_ZSS_BOOL" == "1" ]]; then
     ZSS_REPO="${HOME}/.local/share/ziggy-starspider"
 
     mkdir -p "$(dirname "$ZSS_REPO")"
@@ -538,7 +625,7 @@ fi
 cd "$REPO_DIR"
 
 # Ask about systemd service
-INSTALL_SYSTEMD=false
+INSTALL_SYSTEMD_BOOL="$DEFAULT_INSTALL_SYSTEMD"
 SYSTEMD_SCOPE="user"
 
 # Check for existing systemd services
@@ -554,21 +641,25 @@ fi
 
 if [[ "$SYSTEMD_EXISTS" == "true" ]]; then
     log_info "Systemd service already exists ($EXISTING_SCOPE scope)"
-    INSTALL_SYSTEMD=false
+    INSTALL_SYSTEMD_BOOL="0"
+elif [[ -n "$INSTALL_SYSTEMD" ]]; then
+    INSTALL_SYSTEMD_BOOL="$(normalize_bool "$INSTALL_SYSTEMD" "$DEFAULT_INSTALL_SYSTEMD")"
 elif [[ -t 0 ]]; then
     echo ""
     read -rp "Install systemd service? [Y/n]: " systemd_confirm
     if [[ ! "$systemd_confirm" =~ ^[Nn]$ ]] || [[ -z "$systemd_confirm" ]]; then
-        INSTALL_SYSTEMD=true
+        INSTALL_SYSTEMD_BOOL="1"
         echo ""
         read -rp "User or system service? [user/system]: " scope_choice
         if [[ "$scope_choice" =~ ^[Ss]ystem$ ]]; then
             SYSTEMD_SCOPE="system"
         fi
+    else
+        INSTALL_SYSTEMD_BOOL="0"
     fi
 fi
 
-if [[ "$INSTALL_SYSTEMD" == "true" ]]; then
+if [[ "$INSTALL_SYSTEMD_BOOL" == "1" ]]; then
     log_info "Installing systemd service..."
     
     # Get current user for system service
@@ -593,8 +684,13 @@ WantedBy=multi-user.target"
         
         echo "$SERVICE_FILE" | sudo tee /etc/systemd/system/spiderweb.service > /dev/null
         sudo systemctl daemon-reload
-        sudo systemctl enable --now spiderweb
-        log_success "System service installed and started"
+        if [[ "$START_AFTER_INSTALL" == "1" ]]; then
+            sudo systemctl enable --now spiderweb
+            log_success "System service installed and started"
+        else
+            sudo systemctl enable spiderweb
+            log_success "System service installed"
+        fi
     else
         SERVICE_FILE="[Unit]
 Description=Spiderweb Workspace Host
@@ -613,15 +709,21 @@ WantedBy=default.target"
         mkdir -p "$HOME/.config/systemd/user"
         echo "$SERVICE_FILE" > "$HOME/.config/systemd/user/spiderweb.service"
         systemctl --user daemon-reload
-        systemctl --user enable --now spiderweb
-        log_success "User service installed and started"
+        if [[ "$START_AFTER_INSTALL" == "1" ]]; then
+            systemctl --user enable --now spiderweb
+            log_success "User service installed and started"
+        else
+            systemctl --user enable spiderweb
+            log_success "User service installed"
+        fi
     fi
 fi
 
 # Ask about remote access
-BIND_ADDRESS="127.0.0.1"
+BIND_ADDRESS="${SPIDERWEB_BIND_ADDRESS:-127.0.0.1}"
 CURRENT_PORT="18790"
-if [[ -t 0 ]]; then
+CONFIGURE_BIND_ADDRESS="0"
+if [[ "$NON_INTERACTIVE" != "1" && -t 0 ]]; then
     echo ""
     read -rp "Allow remote connections (Tailscale/VPN)? [y/N]: " remote_confirm
     if [[ "$remote_confirm" =~ ^[Yy]$ ]]; then
@@ -630,20 +732,24 @@ if [[ -t 0 ]]; then
     else
         log_info "Server will bind to localhost only (127.0.0.1)"
     fi
+    CONFIGURE_BIND_ADDRESS="1"
+elif [[ -n "${SPIDERWEB_BIND_ADDRESS:-}" ]]; then
+    log_info "Using requested bind address (${BIND_ADDRESS}) from SPIDERWEB_BIND_ADDRESS"
+    CONFIGURE_BIND_ADDRESS="1"
 fi
 
 echo ""
 log_info "Preparing local workspace-host config..."
 echo ""
 
-if [[ -n "${SPIDERWEB_NON_INTERACTIVE:-}" ]]; then
+if [[ "$NON_INTERACTIVE" == "1" ]]; then
     log_info "Skipping interactive setup notes (non-interactive mode)"
 else
     "${INSTALL_DIR}/spiderweb-config" first-run --non-interactive
 fi
 
-# Only configure bind address in interactive mode (when we asked the user)
-if [[ -t 0 ]]; then
+# Only configure bind address when it was chosen interactively or explicitly requested.
+if [[ "$CONFIGURE_BIND_ADDRESS" == "1" ]]; then
     log_info "Configuring bind address (${BIND_ADDRESS})..."
     
     # Get current port from config - spiderweb-config outputs "Bind: <host>:<port>"
@@ -656,7 +762,7 @@ if [[ -t 0 ]]; then
     "${INSTALL_DIR}/spiderweb-config" config set-server --bind "$BIND_ADDRESS" --port "$CURRENT_PORT"
     
     # Restart service if running to apply new bind address
-    if [[ "$INSTALL_SYSTEMD" == "true" ]] || [[ "$SYSTEMD_EXISTS" == "true" ]]; then
+    if [[ "$START_AFTER_INSTALL" == "1" ]] && ([[ "$INSTALL_SYSTEMD_BOOL" == "1" ]] || [[ "$SYSTEMD_EXISTS" == "true" ]]); then
         if systemctl --user is-active spiderweb >/dev/null 2>&1 || sudo systemctl is-active spiderweb >/dev/null 2>&1; then
             log_info "Restarting service with new bind address..."
             if [[ "$SYSTEMD_SCOPE" == "system" ]] || [[ "$EXISTING_SCOPE" == "system" ]]; then
@@ -665,7 +771,7 @@ if [[ -t 0 ]]; then
                 systemctl --user restart spiderweb 2>/dev/null || true
             fi
         fi
-    else
+    elif [[ "$START_AFTER_INSTALL" == "1" ]]; then
         # No systemd - check if spiderweb is running directly and restart it
         if pgrep -x spiderweb > /dev/null 2>&1; then
             log_info "Restarting spiderweb with new bind address..."
@@ -685,7 +791,7 @@ echo "Binaries installed to:"
 for bin in "${SPIDERWEB_BINARIES[@]}"; do
     echo "  $INSTALL_DIR/${bin}"
 done
-if [[ "$INSTALL_ZSS" == "true" ]]; then
+if [[ "$INSTALL_ZSS_BOOL" == "1" ]]; then
     echo "  $INSTALL_DIR/zss"
     echo "  $INSTALL_DIR/zss-tui"
 fi
@@ -700,8 +806,12 @@ if [[ -n "$ACTIVE_CONFIG_CMD" ]] && [[ "$ACTIVE_CONFIG_CMD" != "${INSTALL_DIR}/s
     echo "Then update PATH to prefer ${INSTALL_DIR} and run: hash -r"
 fi
 
-if [[ "$INSTALL_SYSTEMD" == "true" ]]; then
-    echo "Systemd service installed and started ($SYSTEMD_SCOPE scope)"
+if [[ "$INSTALL_SYSTEMD_BOOL" == "1" ]]; then
+    if [[ "$START_AFTER_INSTALL" == "1" ]]; then
+        echo "Systemd service installed and started ($SYSTEMD_SCOPE scope)"
+    else
+        echo "Systemd service installed ($SYSTEMD_SCOPE scope)"
+    fi
 elif [[ "$SYSTEMD_EXISTS" == "true" ]]; then
     echo "Systemd service already exists ($EXISTING_SCOPE scope)"
 else
@@ -710,7 +820,7 @@ else
 fi
 
 SYNC_ZSS_AUTH=false
-if [[ "$INSTALL_ZSS" == "true" ]]; then
+if [[ "$INSTALL_ZSS_BOOL" == "1" ]]; then
     SYNC_ZSS_AUTH=true
 elif [[ -x "${INSTALL_DIR}/zss" ]] || command -v zss >/dev/null 2>&1 || [[ -f "${HOME}/.config/zss/config.json" ]]; then
     SYNC_ZSS_AUTH=true
@@ -724,10 +834,11 @@ print_auth_tokens_summary
 echo ""
 echo "Next steps:"
 echo "  1. Reveal auth tokens: spiderweb-config auth status --reveal"
-echo "  2. Create a dev workspace: spiderweb-control --url ws://127.0.0.1:${CURRENT_PORT}/ --auth-token <admin-token> workspace_create '{\"name\":\"Demo\",\"vision\":\"Mounted workspace\",\"template_id\":\"dev\"}'"
-echo "  3. Mount it: spiderweb-fs-mount --workspace-url ws://127.0.0.1:${CURRENT_PORT}/ --auth-token <admin-or-user-token> --workspace-id <workspace-id> mount ./workspace"
-echo "  4. Start Spider Monkey: spider-monkey run --agent-id spider-monkey --worker-id spider-monkey-a --workspace-root ./workspace"
-if [[ "$INSTALL_ZSS" == "true" ]]; then
+echo "  2. Create a workspace: spiderweb-control workspace_create '{\"name\":\"Demo\",\"vision\":\"Mounted workspace\"}'"
+echo "  3. Namespace-mount it: spiderweb-fs-mount --namespace-url ws://127.0.0.1:${CURRENT_PORT}/ --auth-token <admin-token> --workspace-id <workspace-id> --agent-id codex --session-key main mount ./workspace"
+echo "  4. Start your external worker inside the mount; for Codex, read /meta/protocol.json and /projects/<workspace-id>/meta/* first."
+echo "  5. Add remote filesystems with spiderweb-fs-node --control-url ws://127.0.0.1:${CURRENT_PORT}/ --pair-mode invite ..."
+if [[ "$INSTALL_ZSS_BOOL" == "1" ]]; then
     echo ""
     echo "Optional GUI/tooling:"
     echo "  zss connect"

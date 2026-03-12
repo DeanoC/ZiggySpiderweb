@@ -1,0 +1,22 @@
+{
+  "puzzles": [
+    {
+      "id": "rune_gate",
+      "name": "Rune Gate",
+      "answer": "EMBER",
+      "hint": "The harbor inscription names the fire that opens old paths."
+    },
+    {
+      "id": "bell_sequence",
+      "name": "Bell Sequence",
+      "answer": "2431",
+      "hint": "The Moss Clock and Whisper Market together reveal the four-note order."
+    },
+    {
+      "id": "star_dial",
+      "name": "Star Dial",
+      "answer": "NORTH",
+      "hint": "The observatory chart points toward the last unshadowed route."
+    }
+  ]
+}

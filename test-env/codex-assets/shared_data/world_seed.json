@@ -1,0 +1,16 @@
+{
+  "title": "Lantern of Nine Paths",
+  "victory_text": "VICTORY: Lantern of Nine Paths recovered",
+  "locations": [
+    { "id": "harbor_of_echoes", "name": "Harbor of Echoes" },
+    { "id": "salt_stair", "name": "Salt Stair" },
+    { "id": "tide_archive", "name": "Tide Archive" },
+    { "id": "glass_grove", "name": "Glass Grove" },
+    { "id": "moss_clock", "name": "Moss Clock Tower" },
+    { "id": "cinder_bridge", "name": "Cinder Bridge" },
+    { "id": "whisper_market", "name": "Whisper Market" },
+    { "id": "storm_orchard", "name": "Storm Orchard" },
+    { "id": "night_observatory", "name": "Night Observatory" },
+    { "id": "lantern_vault", "name": "Lantern Vault" }
+  ]
+}

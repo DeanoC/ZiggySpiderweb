@@ -1,0 +1,69 @@
+You are operating inside a Spiderweb-mounted workspace.
+
+Your current working directory is the writable project tree:
+- __WORKSPACE_ROOT__
+
+Before making assumptions, inspect these exact files in order:
+- __NAMESPACE_META_DIR__/protocol.json
+- __PROJECT_META_DIR__/mounted_services.json
+- __PROJECT_META_DIR__/workspace_status.json
+- __PROJECT_META_DIR__/venom_packages.json
+- ./TASK.md
+- __SHARED_DATA_DIR__/world_seed.json
+- __SHARED_DATA_DIR__/items_seed.json
+- __SHARED_DATA_DIR__/puzzle_seed.json
+
+Discovery rules:
+- Read only what you need to confirm the path contract, mounted services, and exact seed content.
+- Do not dump entire JSON files back into the terminal.
+- Do not re-read the same metadata files once you have the needed fields.
+
+Contract:
+- Keep all project files in the current working directory.
+- Read shared seed data only from __SHARED_DATA_DIR__.
+- Do not depend on repo files, home files, or host-local paths outside the working directory and the listed metadata/shared-data directories.
+- Preserve ./validate_game.py.
+- This external Codex CLI run does not expose apply_patch. Use shell commands or small local scripts to create and edit files in the working directory.
+- After the required discovery reads, start implementing immediately instead of spending extra turns on exploratory reads.
+- Prefer creating all four deliverables in one decisive shell or Python write step, then iterate only if validation fails.
+
+Deliverable:
+- Build a Python terminal adventure game in the current working directory.
+- The game must run with stdin/stdout only.
+- The winning state must print this exact line:
+  VICTORY: Lantern of Nine Paths recovered
+
+Required output files:
+- ./game.py
+- ./game_manifest.json
+- ./walkthrough.txt
+- ./README.md
+
+Gameplay requirements:
+- Use exactly the 10 locations from __SHARED_DATA_DIR__/world_seed.json.
+- Use exactly the 10 items from __SHARED_DATA_DIR__/items_seed.json.
+- Include at least the 3 puzzles from __SHARED_DATA_DIR__/puzzle_seed.json.
+- The walkthrough must complete the game from a fresh start.
+
+Manifest requirements:
+- game_manifest.json must be valid JSON.
+- It must contain:
+  - title: string
+  - locations: array of 10 objects with id and name
+  - items: array of 10 objects with id and name
+  - puzzles: array with at least 3 objects with id and name
+  - shared_data_inputs: array of absolute namespace paths
+  - victory_text: exact victory line
+  - entrypoint: "game.py"
+  - walkthrough: "walkthrough.txt"
+
+The shared_data_inputs array must list:
+- /shared_data/world_seed.json
+- /shared_data/items_seed.json
+- /shared_data/puzzle_seed.json
+
+Before you finish:
+1. Run:
+   python3 ./validate_game.py --workspace . --shared-data __SHARED_DATA_DIR__ --output ./game_validation.json
+2. If validation fails, fix the game and rerun validation.
+3. In your final note, summarize which mounted paths you used.

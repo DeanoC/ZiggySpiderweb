@@ -4526,6 +4526,23 @@ const AgentRuntimeRegistry = struct {
                 .mount_ready = true,
                 .updated_at_ms = std.time.milliTimestamp(),
             };
+        } else {
+            const owned_key = self.allocator.dupe(u8, binding_key) catch {
+                self.runtime_warmups_mutex.unlock();
+                self.emitSessionAttachStateDebugEvent(binding_key, snapshot);
+                return;
+            };
+            var state = RuntimeWarmupState{};
+            state.setReady(self.allocator);
+            state.in_flight = false;
+            self.runtime_warmups.put(self.allocator, owned_key, state) catch {
+                var cleanup = state;
+                cleanup.deinit(self.allocator);
+                self.allocator.free(owned_key);
+                self.runtime_warmups_mutex.unlock();
+                self.emitSessionAttachStateDebugEvent(binding_key, snapshot);
+                return;
+            };
         }
         self.runtime_warmups_mutex.unlock();
         self.emitSessionAttachStateDebugEvent(binding_key, snapshot);
@@ -9464,6 +9481,9 @@ test "server_piai: base websocket supports namespace attach after session_attach
     var attach_ack = try readServerFrame(allocator, &client);
     defer attach_ack.deinit(allocator);
     try std.testing.expect(std.mem.indexOf(u8, attach_ack.payload, "\"type\":\"control.session_attach\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, attach_ack.payload, "\"state\":\"ready\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, attach_ack.payload, "\"runtime_ready\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, attach_ack.payload, "\"mount_ready\":true") != null);
 
     try writeClientTextFrameMasked(&client, "{\"channel\":\"acheron\",\"type\":\"acheron.t_version\",\"tag\":1,\"msize\":1048576,\"version\":\"acheron-1\"}");
     var acheron_version = try readServerFrame(allocator, &client);
