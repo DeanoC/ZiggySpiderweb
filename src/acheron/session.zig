@@ -1002,14 +1002,35 @@ pub const Session = struct {
         return try self.resolveMissionContractHostPath(absolute_path);
     }
 
+    fn resolveLocalFsSafeHostPath(self: *Session, host_path: []const u8) !?[]u8 {
+        const export_root = self.local_fs_export_root orelse return null;
+        const resolved_root = if (std.fs.path.isAbsolute(export_root))
+            std.fs.realpathAlloc(self.allocator, export_root) catch return null
+        else
+            std.fs.cwd().realpathAlloc(self.allocator, export_root) catch return null;
+        defer self.allocator.free(resolved_root);
+
+        const resolved_host = if (std.fs.path.isAbsolute(host_path))
+            std.fs.realpathAlloc(self.allocator, host_path) catch return null
+        else
+            std.fs.cwd().realpathAlloc(self.allocator, host_path) catch return null;
+        errdefer self.allocator.free(resolved_host);
+
+        if (!pathMatchesPrefixBoundary(resolved_host, resolved_root)) return null;
+        return resolved_host;
+    }
+
     fn syncLocalFsFileNode(self: *Session, node_id: u32) !bool {
         const host_path = (try self.localFsNodeHostPath(node_id)) orelse return false;
         defer self.allocator.free(host_path);
 
-        var file = if (std.fs.path.isAbsolute(host_path))
-            std.fs.openFileAbsolute(host_path, .{}) catch return false
+        const safe_host_path = (try self.resolveLocalFsSafeHostPath(host_path)) orelse return false;
+        defer self.allocator.free(safe_host_path);
+
+        var file = if (std.fs.path.isAbsolute(safe_host_path))
+            std.fs.openFileAbsolute(safe_host_path, .{}) catch return false
         else
-            std.fs.cwd().openFile(host_path, .{}) catch return false;
+            std.fs.cwd().openFile(safe_host_path, .{}) catch return false;
         defer file.close();
 
         const content = try file.readToEndAlloc(self.allocator, 1024 * 1024);
@@ -9716,6 +9737,55 @@ test "acheron_session: pr_review run_validation denied when shell_exec is blocke
     );
     defer allocator.free(terminal_current);
     try std.testing.expect(std.mem.indexOf(u8, terminal_current, "\"session\":null") != null);
+}
+
+test "acheron_session: local fs export rejects symlink targets outside export root" {
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    try tmp_dir.dir.makePath("exports");
+    try tmp_dir.dir.makePath("outside");
+    try tmp_dir.dir.writeFile(.{
+        .sub_path = "outside/secret.txt",
+        .data = "super-secret",
+    });
+    tmp_dir.dir.symLink("../outside/secret.txt", "exports/leak.txt", .{}) catch |err| switch (err) {
+        error.AccessDenied, error.PermissionDenied, error.Unsupported => return error.SkipZigTest,
+        else => return err,
+    };
+
+    const root = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+    const exports_dir = try std.fs.path.join(allocator, &.{ root, "exports" });
+    defer allocator.free(exports_dir);
+
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createUnavailable(
+        allocator,
+        "execution_failed",
+        "runtime unavailable",
+    );
+    defer runtime_handle.destroy();
+
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "default",
+        .{
+            .local_fs_export_root = exports_dir,
+            .agents_dir = ".does-not-exist",
+            .projects_dir = ".does-not-exist",
+        },
+    );
+    defer session.deinit();
+
+    const leak = try session.tryReadInternalPath("/nodes/local/fs/leak.txt");
+    defer if (leak) |value| allocator.free(value);
+    try std.testing.expect(leak == null);
 }
 
 test "session: parseReaddirNextCookie accepts next" {
