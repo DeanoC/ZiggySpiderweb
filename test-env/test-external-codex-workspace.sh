@@ -718,6 +718,8 @@ Rules:
 - On this client, Spiderweb namespace paths are mounted under the namespace root, so `/services/*` from metadata is available at `../../../services/*` relative to this workspace and at the absolute mount path shown in the rendered prompt.
 - Ensure your own durable agent home first, then verify or repair required generic service binds from inside the mounted workspace if needed.
 - Use `agent_bootstrap_quickref.json` plus the mounted service directory itself as the verification source. Read `mounted_services.json` only if the quick reference is missing a detail you genuinely need. Do not read service README/SCHEMA/OPS files unless a required binding is missing and you genuinely need the repair shape.
+- If `agent_bootstrap_quickref.json` says `all_required_services_present=true` and your write to `/services/home/control/ensure.json` succeeds, treat bootstrap as complete immediately.
+- After that point, do not spend more turns probing `/services/*`, looping over service directories, or re-checking the same service paths. Move straight into file generation.
 - Read the shared seed files exactly as instructed by the rendered prompt.
 - Keep all project writes in this directory.
 - In this external Codex CLI run, apply_patch is not available. Use shell commands or small local scripts to create and edit files here.

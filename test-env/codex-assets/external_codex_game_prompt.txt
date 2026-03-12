@@ -40,6 +40,8 @@ Bootstrap contract:
 - Ensure your durable agent home first by writing the requested control payload to `__SERVICE_ROOT__/home/control/ensure.json`.
 - Verify the required generic service entries under `__SERVICE_ROOT__`. If any required service is missing there, repair it yourself through `__SERVICE_ROOT__/mounts/control/bind.json` using the generic fallback roots described in agent_bootstrap.json.
 - Treat `agent_bootstrap_quickref.json` plus path existence under `__SERVICE_ROOT__/*` as sufficient verification. Read `mounted_services.json` only if the quick reference lacks a detail you genuinely need.
+- If `agent_bootstrap_quickref.json` says `all_required_services_present=true` and your write to `__SERVICE_ROOT__/home/control/ensure.json` succeeds, treat bootstrap as complete immediately.
+- After that point, do not spend more turns probing `/services/*`, looping over service directories, or re-checking the same service paths. Move straight into file generation.
 - Treat any worker registration as optional and ephemeral. Do not assume worker-private state persists after detach.
 - Make bootstrap actions idempotent so the same workspace can be rejoined later by this or another agent.
 
