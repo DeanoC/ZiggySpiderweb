@@ -4,6 +4,8 @@ This is the operator guide for the external Codex end-to-end harness. Spiderweb 
 
 The harness entrypoint for this flow is `test-env/test-external-codex-workspace.sh`.
 
+The current milestone is agent-driven workspace bootstrap, not Codex-specific harness shaping. The harness creates a generic shared workspace baseline. The mounted external agent must then discover the environment and bootstrap itself from inside the namespace.
+
 ## Current Recommendation
 
 Use a Linux host for the documented Codex E2E path.
@@ -38,6 +40,15 @@ Use the installer-first path instead of treating the harness as a source-build-o
 ```bash
 ./install.sh
 spiderweb-config auth status --reveal
+```
+
+The same installer can skip local compilation by using the published release asset:
+
+```bash
+SPIDERWEB_INSTALL_SOURCE=release \
+SPIDERWEB_RELEASE_ARCHIVE_URL=https://github.com/DeanoC/Spiderweb/releases/download/v0.3.0/spiderweb-linux-x86_64.tar.gz \
+SPIDERWEB_RELEASE_ARCHIVE_SHA256=<sha256> \
+./install.sh
 ```
 
 That installs the Linux host surface used by the harness:
@@ -120,6 +131,7 @@ Or through `make`:
 ```bash
 cd test-env
 make test-external-codex-workspace
+make test-external-codex-repeatability
 make test-external-codex-cli-matrix
 make package-external-codex-repro
 ```
@@ -127,9 +139,10 @@ make package-external-codex-repro
 What this harness is expected to cover:
 
 - installer-first Linux host flow
-- isolated Spiderweb runtime root plus standalone workspace/remote node lifecycle
+- generic `dev`-template workspace baseline plus standalone workspace/remote node lifecycle
 - namespace mount with `spiderweb-fs-mount --namespace-url ...`
 - pinned plain Codex bootstrap, auth, launch, or manual handoff preparation
+- agent-driven in-workspace bootstrap through generic `/services/*`
 - validation and report artifact capture
 
 When you need to compare Codex CLI versions or launch modes, use:
@@ -143,6 +156,18 @@ The matrix runner reuses the main external-Codex harness and writes:
 - `matrix_summary.json`
 - `matrix_summary.md`
 - one subdirectory per case, each with the usual handoff/report artifacts
+
+When you need to prove the new agent-bootstrap milestone is stable across repeated live runs, use:
+
+```bash
+bash test-env/test-external-codex-repeatability.sh
+```
+
+That repeatability runner writes:
+
+- `repeatability_summary.json`
+- `repeatability_summary.md`
+- one subdirectory per run, each with the usual live harness artifacts
 
 When you need a ready-to-file upstream repro bundle, use:
 
@@ -179,6 +204,14 @@ The harness should expose these launch controls:
 - `CODEX_DISABLE_APPS=1`: inject `--disable apps` by default because the current live Spiderweb path is more reliable without the apps surface in non-interactive `exec`.
 - `CODEX_DISABLE_SHELL_SNAPSHOT=1`: inject `--disable shell_snapshot` by default because the current live Spiderweb path is more reliable without shell snapshotting in non-interactive `exec`.
 - `CODEX_ALLOW_HOST_CODEX_HOME=1`: temporarily allow writes under host `~/.codex` for reliability while still reporting them as a `codex_home` machine-independence gap.
+- `SPIDERWEB_INSTALL_SOURCE=auto|source|release`: choose whether the harness compiles Spiderweb locally or installs from a prebuilt archive. Default: `auto`, which currently resolves to the published `v0.3.0` release asset in the external Codex harness.
+- `SPIDERWEB_RELEASE_ARCHIVE_URL`: release asset URL to use when `SPIDERWEB_INSTALL_SOURCE=release`. Default in the external Codex harness: `https://github.com/DeanoC/Spiderweb/releases/download/v0.3.0/spiderweb-linux-x86_64.tar.gz`.
+- `SPIDERWEB_RELEASE_ARCHIVE_SHA256`: optional checksum for the release archive.
+- `SPIDERWEB_RELEASE_VERSION`: label recorded in installer output for the chosen release build. Default in the external Codex harness: `v0.3.0`.
+
+Current note:
+
+- The external Codex harness now defaults to the published `v0.3.0` release asset to avoid rebuilding Spiderweb on every run. Set `SPIDERWEB_INSTALL_SOURCE=source` when you explicitly want a local source build instead.
 
 Practical rule:
 
@@ -212,6 +245,7 @@ Each run should preserve the same high-signal artifacts:
 - `codex_exec_summary.json`
 - `codex_usage_report.json`
 - `codex_usage_report.md`
+- `bootstrap_provenance.json`
 - `game_validation.json`
 - `codex_handoff/`
 
@@ -228,8 +262,12 @@ Each run should preserve the same high-signal artifacts:
 The usage report distinguishes:
 
 - `reliability_ok`: no disallowed writes outside the mounted workspace plus harness-owned runtime roots
+- `workspace_bootstrap_ok`: the mounted agent read the bootstrap metadata and completed the required in-workspace bootstrap actions
 - `machine_independence_ok`: no host-runtime gaps observed
-- `candidate_venom_gaps`: inferred gaps such as `codex_runtime`, `codex_home`, `terminal_runtime`, `git_runtime`, and `search_code_bridge`
+- `project_bound_services`: services actually bound under `/services/*`
+- `namespace_visible_services`: services visible somewhere in the namespace, even if not project-bound under `/services/*`
+- `external_prereqs_observed`: declared external prerequisites, such as the operator-installed Codex runtime
+- `candidate_venom_gaps`: inferred gaps such as `codex_home`, `terminal_runtime`, `git_runtime`, and `search_code_bridge`
 
 ## Dedicated Fallback Behavior
 
@@ -252,11 +290,32 @@ Once Codex is dropped into the mounted workspace, the minimum discovery order sh
 1. `/meta/protocol.json`
 2. `/projects/<project_id>/meta/mounted_services.json`
 3. `/projects/<project_id>/meta/workspace_status.json`
-4. `/services/<service>/README.md`
-5. `/services/<service>/OPS.json`
-6. `/services/<service>/SCHEMA.json`
-7. `/services/<service>/CAPS.json`
-8. `/agents/<agent_id>/`
+4. `/projects/<project_id>/meta/venom_packages.json`
+5. `/projects/<project_id>/meta/agent_bootstrap.json`
+6. `/services/<service>/README.md`
+7. `/services/<service>/OPS.json`
+8. `/services/<service>/SCHEMA.json`
+9. `/services/<service>/CAPS.json`
+10. `/agents/<agent_id>/`
+
+## Agent-Driven Bootstrap Contract
+
+The attached agent, not the harness, should perform these steps after mount:
+
+1. Read `agent_bootstrap.json`.
+2. Ensure its durable home through `/services/home/control/ensure.json`.
+3. Verify the required generic `/services/*` entries.
+4. If a required service is missing, repair it through `/services/mounts/control/bind.json` using the fallback namespace roots described in `agent_bootstrap.json`.
+5. Optionally register worker-private venoms through `/services/workers/control/register.json` when the task needs them.
+6. Perform the workspace task and validation.
+
+Persistence model for this milestone:
+
+- shared workspace/project binds are persistent
+- `/home/<agent>` is durable per agent
+- worker loopback state is ephemeral and should be recreated after detach if needed
+
+Plain Codex is the current test agent, but this contract is intended to work for other external agents too. Because launch-time hooks are intentionally out of scope, plain Codex may still observe `codex_home`, `terminal_runtime`, or `git_runtime` gaps even after `workspace_bootstrap_ok` passes. Those are follow-on machine-independence items, not reasons to let the harness bootstrap on the agent’s behalf.
 
 What this gives Codex:
 

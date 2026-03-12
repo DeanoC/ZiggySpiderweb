@@ -49,8 +49,12 @@ CODEX_DISABLE_APPS="${CODEX_DISABLE_APPS:-1}"
 CODEX_DISABLE_SHELL_SNAPSHOT="${CODEX_DISABLE_SHELL_SNAPSHOT:-1}"
 CODEX_ALLOW_HOST_CODEX_HOME="${CODEX_ALLOW_HOST_CODEX_HOME:-1}"
 CODEX_INSTALL_IF_MISSING="${CODEX_INSTALL_IF_MISSING:-1}"
+SPIDERWEB_INSTALL_SOURCE="${SPIDERWEB_INSTALL_SOURCE:-auto}"
+SPIDERWEB_RELEASE_VERSION="${SPIDERWEB_RELEASE_VERSION:-v0.3.0}"
+SPIDERWEB_RELEASE_ARCHIVE_URL="${SPIDERWEB_RELEASE_ARCHIVE_URL:-https://github.com/DeanoC/Spiderweb/releases/download/${SPIDERWEB_RELEASE_VERSION}/spiderweb-linux-x86_64.tar.gz}"
+SPIDERWEB_RELEASE_ARCHIVE_SHA256="${SPIDERWEB_RELEASE_ARCHIVE_SHA256:-}"
 MANUAL_EXIT_CODE=20
-OUTPUT_DIR="${OUTPUT_DIR:-$ROOT_DIR/test-env/out/external-codex-workspace-$(date +%Y%m%d-%H%M%S)}"
+OUTPUT_DIR="${OUTPUT_DIR:-/tmp/spiderweb-external-codex-workspace-$(date +%Y%m%d-%H%M%S)-$$}"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -211,6 +215,7 @@ HANDOFF_DIR="$OUTPUT_DIR/codex_handoff"
 VALIDATION_OUTPUT="$OUTPUT_DIR/game_validation.json"
 USAGE_JSON="$OUTPUT_DIR/codex_usage_report.json"
 USAGE_MD="$OUTPUT_DIR/codex_usage_report.md"
+BOOTSTRAP_JSON="$OUTPUT_DIR/bootstrap_provenance.json"
 STRACE_PREFIX="$OUTPUT_DIR/logs/codex.strace"
 TASK_FILE="$WORKSPACE_EXPORT_ROOT/TASK.md"
 VALIDATOR_SRC="$ASSET_DIR/validate_text_adventure.py"
@@ -261,6 +266,7 @@ build_usage_report() {
         cmd+=(--skipped-reason "$skipped_reason")
     fi
     "${cmd[@]}"
+    jq '.bootstrap_provenance' "$USAGE_JSON" > "$BOOTSTRAP_JSON"
 }
 
 write_skip_outputs() {
@@ -346,11 +352,16 @@ write_handoff_bundle() {
     cp "$PROMPT_FILE" "$HANDOFF_DIR/PROMPT.txt"
     cp "$TASK_FILE" "$HANDOFF_DIR/TASK.md"
     cp "$OUTPUT_DIR/snapshots/protocol.json" "$HANDOFF_DIR/protocol.json"
+    cp "$OUTPUT_DIR/snapshots/agent_bootstrap_quickref.json" "$HANDOFF_DIR/agent_bootstrap_quickref.json"
     cp "$OUTPUT_DIR/snapshots/mounted_services.json" "$HANDOFF_DIR/mounted_services.json"
     cp "$OUTPUT_DIR/snapshots/workspace_status.json" "$HANDOFF_DIR/workspace_status.json"
     cp "$OUTPUT_DIR/snapshots/venom_packages.json" "$HANDOFF_DIR/venom_packages.json"
+    cp "$OUTPUT_DIR/snapshots/agent_bootstrap.json" "$HANDOFF_DIR/agent_bootstrap.json"
     if [[ -f "$OUTPUT_DIR/snapshots/codex_runtime.json" ]]; then
         cp "$OUTPUT_DIR/snapshots/codex_runtime.json" "$HANDOFF_DIR/codex_runtime.json"
+    fi
+    if [[ -f "$BOOTSTRAP_JSON" ]]; then
+        cp "$BOOTSTRAP_JSON" "$HANDOFF_DIR/bootstrap_provenance.json"
     fi
     if [[ -f "$CODEX_EVENT_SUMMARY" ]]; then
         cp "$CODEX_EVENT_SUMMARY" "$HANDOFF_DIR/codex_exec_summary.json"
@@ -382,6 +393,8 @@ $(handoff_intro)
 - Namespace metadata directory: $MOUNT_POINT/meta
 - Project metadata directory: $MOUNT_POINT/projects/${PROJECT_ID:-unknown}/meta
 - Remote shared-data directory: $MOUNT_POINT/shared_data
+- Bootstrap contract metadata: $MOUNT_POINT/projects/${PROJECT_ID:-unknown}/meta/agent_bootstrap.json
+- Bootstrap quick reference: $MOUNT_POINT/projects/${PROJECT_ID:-unknown}/meta/agent_bootstrap_quickref.json
 - Codex auth mode selected: ${CODEX_SELECTED_AUTH_MODE:-unresolved}
 - Codex binary: ${CODEX_RESOLVED_BIN:-unresolved}
 - Codex stdout log: $CODEX_STDOUT_LOG
@@ -492,9 +505,11 @@ wait_for_workspace_mounts() {
 wait_for_namespace_mount() {
     for _ in $(seq 1 180); do
         if [[ -f "$MOUNT_POINT/meta/protocol.json" &&
+              -f "$MOUNT_POINT/projects/$PROJECT_ID/meta/agent_bootstrap_quickref.json" &&
               -f "$MOUNT_POINT/projects/$PROJECT_ID/meta/mounted_services.json" &&
               -f "$MOUNT_POINT/projects/$PROJECT_ID/meta/workspace_status.json" &&
               -f "$MOUNT_POINT/projects/$PROJECT_ID/meta/venom_packages.json" &&
+              -f "$MOUNT_POINT/projects/$PROJECT_ID/meta/agent_bootstrap.json" &&
               -d "$MOUNT_WORKSPACE_PATH" &&
               -d "$MOUNT_POINT/shared_data" ]]; then
             return 0
@@ -541,6 +556,7 @@ render_prompt() {
     python3 - "$ASSET_DIR/external_codex_game_prompt.txt" "$PROMPT_FILE" \
         "$PROJECT_ID" \
         "$MOUNT_POINT" \
+        "$MOUNT_POINT/services" \
         "$MOUNT_POINT/meta" \
         "$MOUNT_POINT/projects/$PROJECT_ID/meta" \
         "$MOUNT_WORKSPACE_PATH" \
@@ -553,10 +569,11 @@ output_path = Path(sys.argv[2])
 replacements = {
     "__PROJECT_ID__": sys.argv[3],
     "__MOUNT_ROOT__": sys.argv[4],
-    "__NAMESPACE_META_DIR__": sys.argv[5],
-    "__PROJECT_META_DIR__": sys.argv[6],
-    "__WORKSPACE_ROOT__": sys.argv[7],
-    "__SHARED_DATA_DIR__": sys.argv[8],
+    "__SERVICE_ROOT__": sys.argv[5],
+    "__NAMESPACE_META_DIR__": sys.argv[6],
+    "__PROJECT_META_DIR__": sys.argv[7],
+    "__WORKSPACE_ROOT__": sys.argv[8],
+    "__SHARED_DATA_DIR__": sys.argv[9],
 }
 
 text = template_path.read_text(encoding="utf-8")
@@ -583,10 +600,15 @@ Required outputs:
 Rules:
 - Treat this directory as the only writable project root.
 - Preserve validate_game.py.
+- Read `/projects/<project_id>/meta/agent_bootstrap_quickref.json` first, then `/projects/<project_id>/meta/agent_bootstrap.json`, and perform the bootstrap steps from inside the mounted workspace before you start building the game.
+- On this client, Spiderweb namespace paths are mounted under the namespace root, so `/services/*` from metadata is available at `../../../services/*` relative to this workspace and at the absolute mount path shown in the rendered prompt.
+- Ensure your own durable agent home first, then verify or repair required generic service binds from inside the mounted workspace if needed.
+- Use `agent_bootstrap_quickref.json` plus the mounted service directory itself as the verification source. Read `mounted_services.json` only if the quick reference is missing a detail you genuinely need. Do not read service README/SCHEMA/OPS files unless a required binding is missing and you genuinely need the repair shape.
 - Read the shared seed files exactly as instructed by the rendered prompt.
 - Keep all project writes in this directory.
 - In this external Codex CLI run, apply_patch is not available. Use shell commands or small local scripts to create and edit files here.
-- After the required discovery reads, start implementing immediately instead of doing extra exploratory reads unless validation fails.
+- After the required discovery reads and bootstrap actions, start implementing immediately instead of doing extra exploratory reads unless validation fails.
+- Keep discovery simple. Do not build a large custom metadata-inspection script; adapt only the single file you are currently reading if its schema is unexpected.
 - Prefer writing all deliverables in one shell or Python file-generation step, then iterate only if validation fails.
 - The victory line must be:
   VICTORY: Lantern of Nine Paths recovered
@@ -943,6 +965,10 @@ SPIDERWEB_INSTALL_DIR="$INSTALL_DIR" \
 SPIDERWEB_REPO_DIR="$ROOT_DIR" \
 SPIDERWEB_INSTALL_ZSS=0 \
 SPIDERWEB_INSTALL_SYSTEMD=0 \
+SPIDERWEB_INSTALL_SOURCE="$SPIDERWEB_INSTALL_SOURCE" \
+SPIDERWEB_RELEASE_ARCHIVE_URL="$SPIDERWEB_RELEASE_ARCHIVE_URL" \
+SPIDERWEB_RELEASE_ARCHIVE_SHA256="$SPIDERWEB_RELEASE_ARCHIVE_SHA256" \
+SPIDERWEB_RELEASE_VERSION="$SPIDERWEB_RELEASE_VERSION" \
 SPIDERWEB_START_AFTER_INSTALL=0 \
 bash "$ROOT_DIR/install.sh" >"$INSTALL_LOG" 2>&1
 
@@ -1044,11 +1070,13 @@ log_pass "remote shared-data node joined as $REMOTE_NODE_ID"
 PROJECT_UP_PAYLOAD="$(jq -cn \
     --arg name "External Codex Text Adventure" \
     --arg vision "Installer-first external Codex workspace validation" \
+    --arg template_id "dev" \
     --arg local_node "$LOCAL_WORKSPACE_NODE_ID" \
     --arg remote_node "$REMOTE_NODE_ID" \
     '{
         name: $name,
         vision: $vision,
+        template_id: $template_id,
         activate: true,
         desired_mounts: [
             {mount_path: "/nodes/local/fs", node_id: $local_node, export_name: "workspace"},
@@ -1086,9 +1114,11 @@ fi
 log_pass "namespace mount is ready"
 
 cp "$MOUNT_POINT/meta/protocol.json" "$OUTPUT_DIR/snapshots/protocol.json"
+cp "$MOUNT_POINT/projects/$PROJECT_ID/meta/agent_bootstrap_quickref.json" "$OUTPUT_DIR/snapshots/agent_bootstrap_quickref.json"
 cp "$MOUNT_POINT/projects/$PROJECT_ID/meta/mounted_services.json" "$OUTPUT_DIR/snapshots/mounted_services.json"
 cp "$MOUNT_POINT/projects/$PROJECT_ID/meta/workspace_status.json" "$OUTPUT_DIR/snapshots/workspace_status.json"
 cp "$MOUNT_POINT/projects/$PROJECT_ID/meta/venom_packages.json" "$OUTPUT_DIR/snapshots/venom_packages.json"
+cp "$MOUNT_POINT/projects/$PROJECT_ID/meta/agent_bootstrap.json" "$OUTPUT_DIR/snapshots/agent_bootstrap.json"
 
 if [[ ! -d "$MOUNT_WORKSPACE_PATH" || ! -d "$MOUNT_POINT/shared_data" ]]; then
     log_fail "mounted namespace is missing /nodes/local/fs or /shared_data"
@@ -1151,8 +1181,15 @@ if ! jq -e '.reliability_ok == true' "$USAGE_JSON" >/dev/null 2>&1; then
     exit 1
 fi
 
+if ! jq -e '.workspace_bootstrap_ok == true' "$USAGE_JSON" >/dev/null 2>&1; then
+    write_handoff_bundle "workspace_bootstrap_failed"
+    log_fail "external agent did not complete the required in-workspace bootstrap contract"
+    cat "$USAGE_JSON"
+    exit 1
+fi
+
 if ! jq -e '.machine_independence_ok == true' "$USAGE_JSON" >/dev/null 2>&1; then
-    log_info "run passed reliability, but machine-independence gaps are still present"
+    log_info "run passed reliability and workspace bootstrap, but machine-independence gaps are still present"
 fi
 
 log_pass "external Codex workspace scenario completed successfully"

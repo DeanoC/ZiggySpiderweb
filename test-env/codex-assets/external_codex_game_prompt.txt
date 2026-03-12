@@ -3,28 +3,56 @@ You are operating inside a Spiderweb-mounted workspace.
 Your current working directory is the writable project tree:
 - __WORKSPACE_ROOT__
 
+On this client, the mounted namespace root is:
+- __MOUNT_ROOT__
+
+Namespace paths from Spiderweb metadata are mounted under that root on this machine:
+- namespace `/services/...` is client path `__SERVICE_ROOT__/...`
+- namespace `/shared_data/...` is client path `__SHARED_DATA_DIR__/...`
+- namespace `/projects/__PROJECT_ID__/meta/...` is client path `__PROJECT_META_DIR__/...`
+- namespace `/meta/...` is client path `__NAMESPACE_META_DIR__/...`
+
 Before making assumptions, inspect these exact files in order:
 - __NAMESPACE_META_DIR__/protocol.json
-- __PROJECT_META_DIR__/mounted_services.json
+- __PROJECT_META_DIR__/agent_bootstrap_quickref.json
+- __PROJECT_META_DIR__/agent_bootstrap.json
 - __PROJECT_META_DIR__/workspace_status.json
-- __PROJECT_META_DIR__/venom_packages.json
 - ./TASK.md
 - __SHARED_DATA_DIR__/world_seed.json
 - __SHARED_DATA_DIR__/items_seed.json
 - __SHARED_DATA_DIR__/puzzle_seed.json
 
+Only if the quick reference is missing something you need:
+- __PROJECT_META_DIR__/mounted_services.json
+- __PROJECT_META_DIR__/venom_packages.json
+
 Discovery rules:
 - Read only what you need to confirm the path contract, mounted services, and exact seed content.
 - Do not dump entire JSON files back into the terminal.
 - Do not re-read the same metadata files once you have the needed fields.
+- Use simple direct reads for discovery. Do not write a large custom metadata-inspection script or discovery harness.
+- If one metadata file has an unexpected shape, adapt that single read and continue. Do not restart the whole discovery sequence.
 
-Contract:
+Bootstrap contract:
+- Read __PROJECT_META_DIR__/agent_bootstrap.json and follow it from inside the mounted workspace.
+- Use __PROJECT_META_DIR__/agent_bootstrap_quickref.json as the primary source of truth for service presence, control write paths, and discovery order.
+- For this external agent run, use the mounted client paths, not host-root `/services`.
+- Ensure your durable agent home first by writing the requested control payload to `__SERVICE_ROOT__/home/control/ensure.json`.
+- Verify the required generic service entries under `__SERVICE_ROOT__`. If any required service is missing there, repair it yourself through `__SERVICE_ROOT__/mounts/control/bind.json` using the generic fallback roots described in agent_bootstrap.json.
+- Treat `agent_bootstrap_quickref.json` plus path existence under `__SERVICE_ROOT__/*` as sufficient verification. Read `mounted_services.json` only if the quick reference lacks a detail you genuinely need.
+- Treat any worker registration as optional and ephemeral. Do not assume worker-private state persists after detach.
+- Make bootstrap actions idempotent so the same workspace can be rejoined later by this or another agent.
+
+Workspace contract:
 - Keep all project files in the current working directory.
 - Read shared seed data only from __SHARED_DATA_DIR__.
+- Prefer the canonical shared workspace interface mounted at `__SERVICE_ROOT__/*`. Use fallback namespace paths only when the bootstrap metadata says they are available and needed.
 - Do not depend on repo files, home files, or host-local paths outside the working directory and the listed metadata/shared-data directories.
 - Preserve ./validate_game.py.
 - This external Codex CLI run does not expose apply_patch. Use shell commands or small local scripts to create and edit files in the working directory.
-- After the required discovery reads, start implementing immediately instead of spending extra turns on exploratory reads.
+- After the required discovery reads and bootstrap actions, start implementing immediately instead of spending extra turns on exploratory reads.
+- Do not spend extra turns trying to normalize every metadata schema. You only need enough information to confirm the mounted service paths and the shared-data inputs.
+- If `__SERVICE_ROOT__/home`, `__SERVICE_ROOT__/mounts`, `__SERVICE_ROOT__/workers`, `__SERVICE_ROOT__/terminal`, `__SERVICE_ROOT__/git`, `__SERVICE_ROOT__/search_code`, `__SERVICE_ROOT__/library`, and `__SERVICE_ROOT__/events` are already present, proceed directly from bootstrap into implementation.
 - Prefer creating all four deliverables in one decisive shell or Python write step, then iterate only if validation fails.
 
 Deliverable:
@@ -66,4 +94,4 @@ Before you finish:
 1. Run:
    python3 ./validate_game.py --workspace . --shared-data __SHARED_DATA_DIR__ --output ./game_validation.json
 2. If validation fails, fix the game and rerun validation.
-3. In your final note, summarize which mounted paths you used.
+3. In your final note, summarize which mounted paths you used and which bootstrap actions you performed inside the workspace.
