@@ -54,6 +54,7 @@ pub fn main() !void {
         config.allocator.free(config.runtime.spider_web_root);
         config.runtime.spider_web_root = cwd;
     }
+    try config.normalizeRuntimePathsFromSpiderWebRoot();
 
     std.log.info("Starting Spiderweb v0.3.0 (Workspace Host)", .{});
     std.log.info("Config: {s}", .{config.config_path});

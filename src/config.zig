@@ -271,6 +271,15 @@ pub fn init(allocator: std.mem.Allocator, config_path: ?[]const u8) !Config {
     return self;
 }
 
+pub fn normalizeRuntimePathsFromSpiderWebRoot(self: *Config) !void {
+    const root = std.mem.trim(u8, self.runtime.spider_web_root, " \t\r\n");
+    if (root.len == 0) return;
+
+    try self.normalizeRuntimeDirPath(&self.runtime.assets_dir, root);
+    try self.normalizeRuntimeDirPath(&self.runtime.agents_dir, root);
+    try self.normalizeRuntimeExecutablePath(&self.runtime.sandbox_fs_mount_bin, root);
+}
+
 pub fn deinit(self: *Config) void {
     self.allocator.free(self.config_path);
     self.allocator.free(self.server.bind);
@@ -762,6 +771,27 @@ pub fn setDefaultAgentId(self: *Config, agent_id: []const u8) !void {
     try self.save();
 }
 
+fn normalizeRuntimeDirPath(self: *Config, field: *[]const u8, root: []const u8) !void {
+    if (std.fs.path.isAbsolute(field.*)) return;
+    const joined = try std.fs.path.join(self.allocator, &.{ root, field.* });
+    self.allocator.free(field.*);
+    field.* = joined;
+}
+
+fn normalizeRuntimeExecutablePath(self: *Config, field: *[]const u8, root: []const u8) !void {
+    if (!runtimePathLooksRelativeFilesystemPath(field.*)) return;
+    const joined = try std.fs.path.join(self.allocator, &.{ root, field.* });
+    self.allocator.free(field.*);
+    field.* = joined;
+}
+
+fn runtimePathLooksRelativeFilesystemPath(path: []const u8) bool {
+    if (path.len == 0) return false;
+    if (std.fs.path.isAbsolute(path)) return false;
+    if (path[0] == '.') return true;
+    return std.mem.indexOfAny(u8, path, "/\\") != null;
+}
+
 test "Config defaults" {
     const allocator = std.testing.allocator;
     var tmp_dir = std.testing.tmpDir(.{});
@@ -864,4 +894,55 @@ test "Config validation rejects empty rootfs base ref" {
     config.runtime.sandbox_rootfs_base_ref = try allocator.dupe(u8, "   ");
 
     try std.testing.expectError(error.InvalidConfig, config.validateRuntimeConfig());
+}
+
+test "Config normalizes runtime paths from spider_web_root" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const tmp_root = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_root);
+    const cfg_path = try std.fs.path.join(allocator, &.{ tmp_root, "config.json" });
+
+    var config = try Config.init(allocator, cfg_path);
+    defer config.deinit();
+
+    config.allocator.free(config.runtime.spider_web_root);
+    config.runtime.spider_web_root = try allocator.dupe(u8, tmp_root);
+
+    try config.normalizeRuntimePathsFromSpiderWebRoot();
+
+    const expected_assets = try std.fs.path.join(allocator, &.{ tmp_root, "templates" });
+    defer allocator.free(expected_assets);
+    const expected_agents = try std.fs.path.join(allocator, &.{ tmp_root, "agents" });
+    defer allocator.free(expected_agents);
+
+    try std.testing.expectEqualStrings(expected_assets, config.runtime.assets_dir);
+    try std.testing.expectEqualStrings(expected_agents, config.runtime.agents_dir);
+    try std.testing.expectEqualStrings("spiderweb-fs-mount", config.runtime.sandbox_fs_mount_bin);
+}
+
+test "Config normalizes relative sandbox_fs_mount_bin from spider_web_root" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const tmp_root = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_root);
+    const cfg_path = try std.fs.path.join(allocator, &.{ tmp_root, "config.json" });
+
+    var config = try Config.init(allocator, cfg_path);
+    defer config.deinit();
+
+    config.allocator.free(config.runtime.spider_web_root);
+    config.runtime.spider_web_root = try allocator.dupe(u8, tmp_root);
+    config.allocator.free(config.runtime.sandbox_fs_mount_bin);
+    config.runtime.sandbox_fs_mount_bin = try allocator.dupe(u8, "zig-out/bin/spiderweb-fs-mount");
+
+    try config.normalizeRuntimePathsFromSpiderWebRoot();
+
+    const expected_bin = try std.fs.path.join(allocator, &.{ tmp_root, "zig-out", "bin", "spiderweb-fs-mount" });
+    defer allocator.free(expected_bin);
+    try std.testing.expectEqualStrings(expected_bin, config.runtime.sandbox_fs_mount_bin);
 }
