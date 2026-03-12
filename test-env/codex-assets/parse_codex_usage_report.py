@@ -286,15 +286,19 @@ def main() -> int:
     terminal_runtime_commands = []
     git_runtime_commands = []
     bootstrap_reads = []
+    fallback_bootstrap_reads = []
     bootstrap_actions = []
     persistent_changes = []
     ephemeral_changes = []
     required_bootstrap_paths = [
         str((mount_root / "meta" / "protocol.json").resolve()),
-        str((mount_root / "projects" / args.project_id / "meta" / "mounted_services.json").resolve()),
-        str((mount_root / "projects" / args.project_id / "meta" / "workspace_status.json").resolve()),
-        str((mount_root / "projects" / args.project_id / "meta" / "venom_packages.json").resolve()),
+        str((mount_root / "projects" / args.project_id / "meta" / "agent_bootstrap_quickref.json").resolve()),
         str((mount_root / "projects" / args.project_id / "meta" / "agent_bootstrap.json").resolve()),
+        str((mount_root / "projects" / args.project_id / "meta" / "workspace_status.json").resolve()),
+    ]
+    fallback_bootstrap_paths = [
+        str((mount_root / "projects" / args.project_id / "meta" / "mounted_services.json").resolve()),
+        str((mount_root / "projects" / args.project_id / "meta" / "venom_packages.json").resolve()),
     ]
 
     for trace_path in sorted(glob.glob(args.strace_prefix + "*")):
@@ -320,6 +324,8 @@ def main() -> int:
 
             if normalized_path in required_bootstrap_paths:
                 append_unique(bootstrap_reads, normalized_path)
+            if normalized_path in fallback_bootstrap_paths:
+                append_unique(fallback_bootstrap_reads, normalized_path)
 
             if syscall == "execve":
                 append_unique(executed_commands, normalized_path)
@@ -474,6 +480,8 @@ def main() -> int:
             "required_reads": required_bootstrap_paths,
             "required_reads_seen": bootstrap_reads,
             "required_reads_complete": required_reads_complete,
+            "fallback_reads": fallback_bootstrap_paths,
+            "fallback_reads_seen": fallback_bootstrap_reads,
             "agent_bootstrap_actions_after_mount": bootstrap_actions,
             "persistent_workspace_changes": persistent_changes,
             "ephemeral_agent_changes": ephemeral_changes,
