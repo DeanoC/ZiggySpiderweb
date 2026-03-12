@@ -549,6 +549,7 @@ render_prompt() {
     python3 - "$ASSET_DIR/external_codex_game_prompt.txt" "$PROMPT_FILE" \
         "$PROJECT_ID" \
         "$MOUNT_POINT" \
+        "$MOUNT_POINT/services" \
         "$MOUNT_POINT/meta" \
         "$MOUNT_POINT/projects/$PROJECT_ID/meta" \
         "$MOUNT_WORKSPACE_PATH" \
@@ -561,10 +562,11 @@ output_path = Path(sys.argv[2])
 replacements = {
     "__PROJECT_ID__": sys.argv[3],
     "__MOUNT_ROOT__": sys.argv[4],
-    "__NAMESPACE_META_DIR__": sys.argv[5],
-    "__PROJECT_META_DIR__": sys.argv[6],
-    "__WORKSPACE_ROOT__": sys.argv[7],
-    "__SHARED_DATA_DIR__": sys.argv[8],
+    "__SERVICE_ROOT__": sys.argv[5],
+    "__NAMESPACE_META_DIR__": sys.argv[6],
+    "__PROJECT_META_DIR__": sys.argv[7],
+    "__WORKSPACE_ROOT__": sys.argv[8],
+    "__SHARED_DATA_DIR__": sys.argv[9],
 }
 
 text = template_path.read_text(encoding="utf-8")
@@ -592,12 +594,14 @@ Rules:
 - Treat this directory as the only writable project root.
 - Preserve validate_game.py.
 - Read `/projects/<project_id>/meta/agent_bootstrap.json` and perform the bootstrap steps from inside the mounted workspace before you start building the game.
-- Ensure your own durable agent home first, then verify or repair required generic `/services/*` binds from inside the workspace if needed.
-- Use `mounted_services.json` plus the `/services/*` directory itself as the verification source. Do not read service README/SCHEMA/OPS files unless a required binding is missing and you genuinely need the repair shape.
+- On this client, Spiderweb namespace paths are mounted under the namespace root, so `/services/*` from metadata is available at `../../../services/*` relative to this workspace and at the absolute mount path shown in the rendered prompt.
+- Ensure your own durable agent home first, then verify or repair required generic service binds from inside the mounted workspace if needed.
+- Use `mounted_services.json` plus the mounted service directory itself as the verification source. Do not read service README/SCHEMA/OPS files unless a required binding is missing and you genuinely need the repair shape.
 - Read the shared seed files exactly as instructed by the rendered prompt.
 - Keep all project writes in this directory.
 - In this external Codex CLI run, apply_patch is not available. Use shell commands or small local scripts to create and edit files here.
 - After the required discovery reads and bootstrap actions, start implementing immediately instead of doing extra exploratory reads unless validation fails.
+- Keep discovery simple. Do not build a large custom metadata-inspection script; adapt only the single file you are currently reading if its schema is unexpected.
 - Prefer writing all deliverables in one shell or Python file-generation step, then iterate only if validation fails.
 - The victory line must be:
   VICTORY: Lantern of Nine Paths recovered
