@@ -52,17 +52,30 @@ def parse_json_file(path: Path):
         return json.load(handle)
 
 
-def extract_service_names(entries):
-    names = []
+def service_name_from_entry(item: dict) -> str | None:
+    venom_id = item.get("venom_id")
+    if venom_id:
+        return str(venom_id)
+    path = item.get("path")
+    if path and isinstance(path, str) and path.startswith("/services/"):
+        return path.removeprefix("/services/").split("/", 1)[0]
+    return None
+
+
+def extract_service_views(entries):
+    project_bound = []
+    namespace_visible = []
     for item in entries or []:
-        if isinstance(item, dict):
-            venom_id = item.get("venom_id")
-            path = item.get("path")
-            if venom_id:
-                names.append(str(venom_id))
-            elif path and isinstance(path, str) and path.startswith("/services/"):
-                names.append(path.removeprefix("/services/").split("/", 1)[0])
-    return sorted(dict.fromkeys(names))
+        if not isinstance(item, dict):
+            continue
+        service_name = service_name_from_entry(item)
+        path = item.get("path")
+        if service_name is None:
+            continue
+        append_unique(namespace_visible, service_name)
+        if path and isinstance(path, str) and path.startswith("/services/"):
+            append_unique(project_bound, service_name)
+    return sorted(project_bound), sorted(namespace_visible)
 
 
 def extract_package_names(entries):
@@ -130,13 +143,30 @@ def append_unique(items: list[str], value: str):
         items.append(value)
 
 
-def service_reason(service: str, mounted_services: list[str], present_reason: str, missing_reason: str):
-    if service in mounted_services:
-        return present_reason, True
-    return missing_reason, False
+def service_reason(
+    service: str,
+    project_bound_services: list[str],
+    namespace_visible_services: list[str],
+    bound_reason: str,
+    namespace_reason: str,
+    missing_reason: str,
+):
+    if service in project_bound_services:
+        return bound_reason, "project_bound"
+    if service in namespace_visible_services:
+        return namespace_reason, "namespace_visible_only"
+    return missing_reason, "missing"
 
 
-def add_gap(candidate_gaps: list[dict], seen_gap_ids: set[str], venom_id: str, reason: str, observed_paths: list[str], service_available: bool | None):
+def add_gap(
+    candidate_gaps: list[dict],
+    seen_gap_ids: set[str],
+    venom_id: str,
+    reason: str,
+    observed_paths: list[str],
+    service_state: str | None,
+    resolution_hint: str,
+):
     if venom_id in seen_gap_ids:
         return
     seen_gap_ids.add(venom_id)
@@ -145,7 +175,8 @@ def add_gap(candidate_gaps: list[dict], seen_gap_ids: set[str], venom_id: str, r
             "venom_id": venom_id,
             "reason": reason,
             "observed_paths": observed_paths[:5],
-            "service_available": service_available,
+            "service_state": service_state,
+            "resolution_hint": resolution_hint,
         }
     )
 
@@ -155,6 +186,7 @@ def markdown_report(payload: dict) -> str:
         "# Codex Usage Report",
         "",
         f"- Reliability: {'ok' if payload.get('reliability_ok') else 'issue'}",
+        f"- Workspace Bootstrap: {'ok' if payload.get('workspace_bootstrap_ok') else 'issue'}",
         f"- Machine Independence: {'ok' if payload.get('machine_independence_ok') else 'issue'}",
         f"- Project ID: {payload.get('project_id')}",
         f"- Mode: {payload.get('mode')}",
@@ -183,6 +215,19 @@ def markdown_report(payload: dict) -> str:
             lines.append(f"- {gap['venom_id']}: {gap['reason']}")
     else:
         lines.append("- none inferred")
+
+    if payload.get("external_prereqs_observed"):
+        lines.extend(["", "## External Prereqs"])
+        for key, values in payload["external_prereqs_observed"].items():
+            lines.append(f"- {key}: {', '.join(values[:5])}")
+
+    if payload.get("bootstrap_provenance"):
+        provenance = payload["bootstrap_provenance"]
+        lines.extend(["", "## Bootstrap Provenance"])
+        lines.append(f"- required reads complete: {provenance.get('required_reads_complete')}")
+        lines.append(f"- agent bootstrap actions: {len(provenance.get('agent_bootstrap_actions_after_mount', []))}")
+        for item in provenance.get("agent_bootstrap_actions_after_mount", [])[:8]:
+            lines.append(f"- {item['action']}: {item['path']}")
 
     if payload.get("allowed_host_writes"):
         lines.extend(["", "## Temporarily Allowed Host Writes"])
@@ -224,7 +269,8 @@ def main() -> int:
     repo_root = Path(args.repo_root).resolve()
     allowed_runtime_roots = [Path(value).resolve() for value in args.allowed_runtime_root]
     allowed_host_write_prefixes = [Path(value).resolve() for value in args.allowed_host_write_prefix]
-    mounted_services = extract_service_names(parse_json_file(Path(args.mounted_services)))
+    mounted_service_entries = parse_json_file(Path(args.mounted_services))
+    project_bound_services, namespace_visible_services = extract_service_views(mounted_service_entries)
     venom_packages = extract_package_names(parse_json_file(Path(args.venom_packages)))
 
     counts = Counter()
@@ -239,6 +285,17 @@ def main() -> int:
     codex_runtime_paths = []
     terminal_runtime_commands = []
     git_runtime_commands = []
+    bootstrap_reads = []
+    bootstrap_actions = []
+    persistent_changes = []
+    ephemeral_changes = []
+    required_bootstrap_paths = [
+        str((mount_root / "meta" / "protocol.json").resolve()),
+        str((mount_root / "projects" / args.project_id / "meta" / "mounted_services.json").resolve()),
+        str((mount_root / "projects" / args.project_id / "meta" / "workspace_status.json").resolve()),
+        str((mount_root / "projects" / args.project_id / "meta" / "venom_packages.json").resolve()),
+        str((mount_root / "projects" / args.project_id / "meta" / "agent_bootstrap.json").resolve()),
+    ]
 
     for trace_path in sorted(glob.glob(args.strace_prefix + "*")):
         for raw_line in Path(trace_path).read_text(encoding="utf-8", errors="replace").splitlines():
@@ -260,6 +317,9 @@ def main() -> int:
 
             counts[category] += 1
             append_unique(samples[category], normalized_path)
+
+            if normalized_path in required_bootstrap_paths:
+                append_unique(bootstrap_reads, normalized_path)
 
             if syscall == "execve":
                 append_unique(executed_commands, normalized_path)
@@ -285,6 +345,42 @@ def main() -> int:
                 if any(token in normalized_path for token in CODEX_RUNTIME_TOKENS):
                     append_unique(codex_runtime_paths, normalized_path)
 
+            if category == "mounted_workspace" and is_write(syscall, line):
+                action = None
+                change_scope = None
+                if normalized_path.endswith("/services/home/control/ensure.json"):
+                    action = "home_ensure"
+                    change_scope = "persistent"
+                elif normalized_path.endswith("/services/mounts/control/bind.json"):
+                    action = "mounts_bind"
+                    change_scope = "persistent"
+                elif normalized_path.endswith("/services/mounts/control/unbind.json"):
+                    action = "mounts_unbind"
+                    change_scope = "persistent"
+                elif normalized_path.endswith("/services/mounts/control/mount.json"):
+                    action = "mounts_mount"
+                    change_scope = "persistent"
+                elif normalized_path.endswith("/services/mounts/control/unmount.json"):
+                    action = "mounts_unmount"
+                    change_scope = "persistent"
+                elif normalized_path.endswith("/services/workers/control/register.json"):
+                    action = "workers_register"
+                    change_scope = "ephemeral"
+                elif normalized_path.endswith("/services/workers/control/heartbeat.json"):
+                    action = "workers_heartbeat"
+                    change_scope = "ephemeral"
+                elif normalized_path.endswith("/services/workers/control/detach.json"):
+                    action = "workers_detach"
+                    change_scope = "ephemeral"
+                if action:
+                    event = {"action": action, "path": normalized_path}
+                    if event not in bootstrap_actions:
+                        bootstrap_actions.append(event)
+                    if change_scope == "persistent":
+                        append_unique(persistent_changes, action)
+                    elif change_scope == "ephemeral":
+                        append_unique(ephemeral_changes, action)
+
             if is_write(syscall, line) and normalized_path not in ALLOWED_SPECIAL_WRITES and category not in {"mounted_workspace", "mounted_remote_node", "artifact_runtime", "allowed_local_runtime"}:
                 if category == "host_local" and path_within_any_root(normalized_path, allowed_host_write_prefixes):
                     append_unique(allowed_host_writes, normalized_path)
@@ -294,64 +390,71 @@ def main() -> int:
     candidate_gaps = []
     seen_gap_ids = set()
 
+    external_prereqs_observed = {}
     if codex_runtime_paths:
-        add_gap(
-            candidate_gaps,
-            seen_gap_ids,
-            "codex_runtime",
-            "Plain Codex CLI and/or Node runtime executed locally instead of coming from the mounted Spiderweb environment.",
-            codex_runtime_paths,
-            None,
-        )
+        external_prereqs_observed["codex_runtime"] = codex_runtime_paths[:10]
 
     if home_state_paths:
-        reason, service_available = service_reason(
+        reason, service_state = service_reason(
             "home",
-            mounted_services,
-            "Codex touched host home/config paths even though a home surface was mounted.",
-            "Codex touched host home/config paths and no mounted home surface was available.",
+            project_bound_services,
+            namespace_visible_services,
+            "Codex touched host home/config paths even though /services/home was bound.",
+            "Codex touched host home/config paths and home was only namespace-visible, not project-bound under /services.",
+            "Codex touched host home/config paths and no home surface was visible in the namespace.",
         )
-        add_gap(candidate_gaps, seen_gap_ids, "codex_home", reason, home_state_paths, service_available)
+        add_gap(candidate_gaps, seen_gap_ids, "codex_home", reason, home_state_paths, service_state, "blocked_until_agent_runtime_support")
 
     if terminal_runtime_commands:
-        reason, service_available = service_reason(
+        reason, service_state = service_reason(
             "terminal",
-            mounted_services,
-            "Codex executed host shell/coreutils commands even though a terminal surface was mounted.",
-            "Codex executed host shell/coreutils commands and no mounted terminal surface was available.",
+            project_bound_services,
+            namespace_visible_services,
+            "Codex executed host shell/coreutils commands even though /services/terminal was bound.",
+            "Codex executed host shell/coreutils commands and terminal was only namespace-visible, not project-bound under /services.",
+            "Codex executed host shell/coreutils commands and no terminal surface was visible in the namespace.",
         )
-        add_gap(candidate_gaps, seen_gap_ids, "terminal_runtime", reason, terminal_runtime_commands, service_available)
+        add_gap(candidate_gaps, seen_gap_ids, "terminal_runtime", reason, terminal_runtime_commands, service_state, "blocked_until_agent_runtime_support")
 
     git_observations = git_runtime_commands + [path for path in git_like_paths if path not in git_runtime_commands]
     if git_observations:
-        reason, service_available = service_reason(
+        reason, service_state = service_reason(
             "git",
-            mounted_services,
-            "Codex used host-local git commands or metadata even though a git surface was mounted.",
-            "Codex used host-local git commands or metadata and no mounted git surface was available.",
+            project_bound_services,
+            namespace_visible_services,
+            "Codex used host-local git commands or metadata even though /services/git was bound.",
+            "Codex used host-local git commands or metadata and git was only namespace-visible, not project-bound under /services.",
+            "Codex used host-local git commands or metadata and no git surface was visible in the namespace.",
         )
-        add_gap(candidate_gaps, seen_gap_ids, "git_runtime", reason, git_observations, service_available)
+        add_gap(candidate_gaps, seen_gap_ids, "git_runtime", reason, git_observations, service_state, "blocked_until_agent_runtime_support")
 
     if search_code_paths:
-        reason, service_available = service_reason(
+        reason, service_state = service_reason(
             "search_code",
-            mounted_services,
-            "Codex read repo content from the host checkout even though a search_code surface was mounted.",
-            "Codex read repo content from the host checkout and no mounted search_code surface was available.",
+            project_bound_services,
+            namespace_visible_services,
+            "Codex read repo content from the host checkout even though /services/search_code was bound.",
+            "Codex read repo content from the host checkout and search_code was only namespace-visible, not project-bound under /services.",
+            "Codex read repo content from the host checkout and no search_code surface was visible in the namespace.",
         )
-        add_gap(candidate_gaps, seen_gap_ids, "search_code_bridge", reason, search_code_paths, service_available)
+        add_gap(candidate_gaps, seen_gap_ids, "search_code_bridge", reason, search_code_paths, service_state, "workspace_or_launch_isolation_fixable")
 
     reliability_ok = len(disallowed_writes) == 0 and not args.skipped_reason
+    required_reads_complete = all(path in bootstrap_reads for path in required_bootstrap_paths)
+    home_bootstrap_done = any(item["action"] == "home_ensure" for item in bootstrap_actions)
+    workspace_bootstrap_ok = not args.skipped_reason and required_reads_complete and home_bootstrap_done
     machine_independence_ok = not args.skipped_reason and len(candidate_gaps) == 0
 
     payload = {
         "ok": reliability_ok,
         "reliability_ok": reliability_ok,
+        "workspace_bootstrap_ok": workspace_bootstrap_ok,
         "machine_independence_ok": machine_independence_ok,
         "mode": args.mode,
         "project_id": args.project_id,
         "skipped_reason": args.skipped_reason,
-        "mounted_services": mounted_services,
+        "project_bound_services": project_bound_services,
+        "namespace_visible_services": namespace_visible_services,
         "venom_packages": venom_packages,
         "access_summary": {
             key: {
@@ -365,7 +468,16 @@ def main() -> int:
         "allowed_host_writes": allowed_host_writes[:50],
         "disallowed_writes": disallowed_writes[:50],
         "writes_outside_mount": disallowed_writes[:50],
+        "external_prereqs_observed": external_prereqs_observed,
         "candidate_venom_gaps": candidate_gaps,
+        "bootstrap_provenance": {
+            "required_reads": required_bootstrap_paths,
+            "required_reads_seen": bootstrap_reads,
+            "required_reads_complete": required_reads_complete,
+            "agent_bootstrap_actions_after_mount": bootstrap_actions,
+            "persistent_workspace_changes": persistent_changes,
+            "ephemeral_agent_changes": ephemeral_changes,
+        },
     }
 
     json_output.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")

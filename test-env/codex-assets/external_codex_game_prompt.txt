@@ -8,6 +8,7 @@ Before making assumptions, inspect these exact files in order:
 - __PROJECT_META_DIR__/mounted_services.json
 - __PROJECT_META_DIR__/workspace_status.json
 - __PROJECT_META_DIR__/venom_packages.json
+- __PROJECT_META_DIR__/agent_bootstrap.json
 - ./TASK.md
 - __SHARED_DATA_DIR__/world_seed.json
 - __SHARED_DATA_DIR__/items_seed.json
@@ -18,13 +19,23 @@ Discovery rules:
 - Do not dump entire JSON files back into the terminal.
 - Do not re-read the same metadata files once you have the needed fields.
 
-Contract:
+Bootstrap contract:
+- Read __PROJECT_META_DIR__/agent_bootstrap.json and follow it from inside the mounted workspace.
+- Ensure your durable agent home first by writing the requested control payload to `/services/home/control/ensure.json`.
+- Verify the required generic `/services/*` entries. If any required service is missing, repair it yourself through `/services/mounts/control/bind.json` using the generic fallback roots described in agent_bootstrap.json.
+- Treat `mounted_services.json` plus path existence under `/services/*` as sufficient verification. Do not browse `/services/*` README, SCHEMA, OPS, or CAPS files unless a required binding is actually missing and you need the exact repair surface.
+- Treat any worker registration as optional and ephemeral. Do not assume worker-private state persists after detach.
+- Make bootstrap actions idempotent so the same workspace can be rejoined later by this or another agent.
+
+Workspace contract:
 - Keep all project files in the current working directory.
 - Read shared seed data only from __SHARED_DATA_DIR__.
+- Prefer `/services/*` as the canonical shared workspace interface. Use fallback namespace paths only when the bootstrap metadata says they are available and needed.
 - Do not depend on repo files, home files, or host-local paths outside the working directory and the listed metadata/shared-data directories.
 - Preserve ./validate_game.py.
 - This external Codex CLI run does not expose apply_patch. Use shell commands or small local scripts to create and edit files in the working directory.
-- After the required discovery reads, start implementing immediately instead of spending extra turns on exploratory reads.
+- After the required discovery reads and bootstrap actions, start implementing immediately instead of spending extra turns on exploratory reads.
+- If `/services/home`, `/services/mounts`, `/services/workers`, `/services/terminal`, `/services/git`, `/services/search_code`, `/services/library`, and `/services/events` are already present, proceed directly from bootstrap into implementation.
 - Prefer creating all four deliverables in one decisive shell or Python write step, then iterate only if validation fails.
 
 Deliverable:
@@ -66,4 +77,4 @@ Before you finish:
 1. Run:
    python3 ./validate_game.py --workspace . --shared-data __SHARED_DATA_DIR__ --output ./game_validation.json
 2. If validation fails, fix the game and rerun validation.
-3. In your final note, summarize which mounted paths you used.
+3. In your final note, summarize which mounted paths you used and which bootstrap actions you performed inside the workspace.

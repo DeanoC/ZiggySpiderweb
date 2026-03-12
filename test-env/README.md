@@ -60,11 +60,12 @@ bash ./install.sh
 This harness documents and exercises the Linux-first external Codex operator path:
 
 - installer-first host flow (`./install.sh` on the Spiderweb host)
+- generic `dev`-template workspace baseline that can outlive any one agent session
 - isolated Spiderweb runtime root plus a clean standalone local workspace node
 - standalone `spiderweb-fs-node` as the remote filesystem node under test
 - namespace mount via `spiderweb-fs-mount --namespace-url ...`
 - plain Codex launch in live or manual-handoff mode
-- validation and report artifact capture
+- agent-driven in-workspace bootstrap, validation, and report artifact capture
 
 Mounted namespace paths used by the harness:
 
@@ -72,6 +73,7 @@ Mounted namespace paths used by the harness:
 - remote shared seed data: `/shared_data`
 - project metadata: `/projects/<project_id>/meta/*`
 - namespace metadata: `/meta/*`
+- generic project services: `/services/*`
 
 Run it directly from the repo root:
 
@@ -83,6 +85,12 @@ Or through `make`:
 
 ```bash
 cd test-env && make test-external-codex-workspace
+```
+
+Repeatability runner:
+
+```bash
+cd test-env && make test-external-codex-repeatability
 ```
 
 Compatibility matrix runner:
@@ -121,8 +129,15 @@ Expected output artifacts:
 - `codex_exec_summary.json`
 - `codex_usage_report.json`
 - `codex_usage_report.md`
+- `bootstrap_provenance.json`
 - `game_validation.json`
 - `codex_handoff/`
+
+Repeatability artifacts:
+
+- `repeatability_summary.json`
+- `repeatability_summary.md`
+- one subdirectory per run, each containing the normal live harness artifacts
 
 Matrix runner artifacts:
 
@@ -142,8 +157,12 @@ Repro bundle artifacts:
 Usage report result semantics:
 
 - `reliability_ok`: true only when the run stayed inside the mounted workspace plus harness-owned runtime roots, plus any explicit temporary host-write allowlists
+- `workspace_bootstrap_ok`: true only when the attached agent read the bootstrap metadata and performed the required in-workspace bootstrap actions
 - `machine_independence_ok`: true only when no host-runtime gaps were observed
-- `candidate_venom_gaps`: inferred local-runtime gaps such as `codex_runtime`, `codex_home`, `terminal_runtime`, `git_runtime`, and `search_code_bridge`
+- `project_bound_services`: services bound under `/services/*` for the mounted workspace
+- `namespace_visible_services`: services visible somewhere in the namespace, even if not project-bound under `/services/*`
+- `external_prereqs_observed`: declared external prerequisites observed during the run, such as the operator-installed Codex runtime
+- `candidate_venom_gaps`: inferred local-runtime gaps such as `codex_home`, `terminal_runtime`, `git_runtime`, and `search_code_bridge`
 
 Fallback behavior:
 
@@ -158,12 +177,18 @@ Operator notes:
 - prefer the installer-first Linux path for this harness; use `./install-fs-mount.sh` only when the namespace mount happens on a separate Linux machine
 - the harness is about the standalone node + namespace story, not the older routed `--workspace-url` only flow
 - the clean writable project tree is `/nodes/local/fs`; Spiderweb’s own runtime root is kept separate from that workspace on purpose
+- the harness creates only a generic `dev`-template workspace baseline; after attach, the external agent is responsible for reading `/projects/<project_id>/meta/agent_bootstrap.json` and bootstrapping itself from inside the workspace
+- `agent_bootstrap.json` is the generic contract for discovery order, preferred `/services/*` usage, self-home provisioning, service verification/repair, and persistence semantics
+- shared project binds persist across agent detach/reattach, while worker-private loopback state is expected to be ephemeral
 - `CODEX_AUTH_MODE=api_key` is still the strict fresh-install path, but `existing_login` is temporarily acceptable for reliability because host `~/.codex` writes are allowlisted by default while still reported as a `codex_home` machine-independence gap
 - `CODEX_LAUNCH_CMD` is optional; the harness can build a default launcher around the pinned `codex exec` flow
 - the default live launcher now preserves both `logs/codex.stdout.log` and `logs/codex.pty.log`, which makes it much easier to distinguish “still progressing” from “stopped after a tool result”
 - `test-env/test-external-codex-cli-matrix.sh` is the fast way to compare pinned Codex CLI versions and PTY/JSON launch modes against the same Spiderweb scenario
+- `test-env/test-external-codex-repeatability.sh` is the fast way to prove the new `workspace_bootstrap_ok` milestone stays green across multiple live runs on the same machine
 - `test-env/package-external-codex-repro.sh` collects the matrix outputs into a single upstream-ready repro pack with a generated bug report
 - custom launch templates may use `{codex_bin}`, `{workspace_root}`, `{namespace_root}`, `{namespace_meta_dir}`, `{project_meta_dir}`, `{shared_data_dir}`, `{prompt_file}`, and `{artifact_dir}`
+- the default artifact directory is now outside the repo checkout so the harness does not create false host-repo leakage by itself
+- the current milestone is `workspace_bootstrap_ok`; plain Codex still cannot fully clear `codex_home`, `terminal_runtime`, and `git_runtime` under the no-launch-hook rule, so `machine_independence_ok` remains the follow-on milestone
 - if you still want to override the launcher, a working template is:
 
 ```bash

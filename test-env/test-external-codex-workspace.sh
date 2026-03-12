@@ -50,7 +50,7 @@ CODEX_DISABLE_SHELL_SNAPSHOT="${CODEX_DISABLE_SHELL_SNAPSHOT:-1}"
 CODEX_ALLOW_HOST_CODEX_HOME="${CODEX_ALLOW_HOST_CODEX_HOME:-1}"
 CODEX_INSTALL_IF_MISSING="${CODEX_INSTALL_IF_MISSING:-1}"
 MANUAL_EXIT_CODE=20
-OUTPUT_DIR="${OUTPUT_DIR:-$ROOT_DIR/test-env/out/external-codex-workspace-$(date +%Y%m%d-%H%M%S)}"
+OUTPUT_DIR="${OUTPUT_DIR:-/tmp/spiderweb-external-codex-workspace-$(date +%Y%m%d-%H%M%S)-$$}"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -211,6 +211,7 @@ HANDOFF_DIR="$OUTPUT_DIR/codex_handoff"
 VALIDATION_OUTPUT="$OUTPUT_DIR/game_validation.json"
 USAGE_JSON="$OUTPUT_DIR/codex_usage_report.json"
 USAGE_MD="$OUTPUT_DIR/codex_usage_report.md"
+BOOTSTRAP_JSON="$OUTPUT_DIR/bootstrap_provenance.json"
 STRACE_PREFIX="$OUTPUT_DIR/logs/codex.strace"
 TASK_FILE="$WORKSPACE_EXPORT_ROOT/TASK.md"
 VALIDATOR_SRC="$ASSET_DIR/validate_text_adventure.py"
@@ -261,6 +262,7 @@ build_usage_report() {
         cmd+=(--skipped-reason "$skipped_reason")
     fi
     "${cmd[@]}"
+    jq '.bootstrap_provenance' "$USAGE_JSON" > "$BOOTSTRAP_JSON"
 }
 
 write_skip_outputs() {
@@ -349,8 +351,12 @@ write_handoff_bundle() {
     cp "$OUTPUT_DIR/snapshots/mounted_services.json" "$HANDOFF_DIR/mounted_services.json"
     cp "$OUTPUT_DIR/snapshots/workspace_status.json" "$HANDOFF_DIR/workspace_status.json"
     cp "$OUTPUT_DIR/snapshots/venom_packages.json" "$HANDOFF_DIR/venom_packages.json"
+    cp "$OUTPUT_DIR/snapshots/agent_bootstrap.json" "$HANDOFF_DIR/agent_bootstrap.json"
     if [[ -f "$OUTPUT_DIR/snapshots/codex_runtime.json" ]]; then
         cp "$OUTPUT_DIR/snapshots/codex_runtime.json" "$HANDOFF_DIR/codex_runtime.json"
+    fi
+    if [[ -f "$BOOTSTRAP_JSON" ]]; then
+        cp "$BOOTSTRAP_JSON" "$HANDOFF_DIR/bootstrap_provenance.json"
     fi
     if [[ -f "$CODEX_EVENT_SUMMARY" ]]; then
         cp "$CODEX_EVENT_SUMMARY" "$HANDOFF_DIR/codex_exec_summary.json"
@@ -382,6 +388,7 @@ $(handoff_intro)
 - Namespace metadata directory: $MOUNT_POINT/meta
 - Project metadata directory: $MOUNT_POINT/projects/${PROJECT_ID:-unknown}/meta
 - Remote shared-data directory: $MOUNT_POINT/shared_data
+- Bootstrap contract metadata: $MOUNT_POINT/projects/${PROJECT_ID:-unknown}/meta/agent_bootstrap.json
 - Codex auth mode selected: ${CODEX_SELECTED_AUTH_MODE:-unresolved}
 - Codex binary: ${CODEX_RESOLVED_BIN:-unresolved}
 - Codex stdout log: $CODEX_STDOUT_LOG
@@ -495,6 +502,7 @@ wait_for_namespace_mount() {
               -f "$MOUNT_POINT/projects/$PROJECT_ID/meta/mounted_services.json" &&
               -f "$MOUNT_POINT/projects/$PROJECT_ID/meta/workspace_status.json" &&
               -f "$MOUNT_POINT/projects/$PROJECT_ID/meta/venom_packages.json" &&
+              -f "$MOUNT_POINT/projects/$PROJECT_ID/meta/agent_bootstrap.json" &&
               -d "$MOUNT_WORKSPACE_PATH" &&
               -d "$MOUNT_POINT/shared_data" ]]; then
             return 0
@@ -583,10 +591,13 @@ Required outputs:
 Rules:
 - Treat this directory as the only writable project root.
 - Preserve validate_game.py.
+- Read `/projects/<project_id>/meta/agent_bootstrap.json` and perform the bootstrap steps from inside the mounted workspace before you start building the game.
+- Ensure your own durable agent home first, then verify or repair required generic `/services/*` binds from inside the workspace if needed.
+- Use `mounted_services.json` plus the `/services/*` directory itself as the verification source. Do not read service README/SCHEMA/OPS files unless a required binding is missing and you genuinely need the repair shape.
 - Read the shared seed files exactly as instructed by the rendered prompt.
 - Keep all project writes in this directory.
 - In this external Codex CLI run, apply_patch is not available. Use shell commands or small local scripts to create and edit files here.
-- After the required discovery reads, start implementing immediately instead of doing extra exploratory reads unless validation fails.
+- After the required discovery reads and bootstrap actions, start implementing immediately instead of doing extra exploratory reads unless validation fails.
 - Prefer writing all deliverables in one shell or Python file-generation step, then iterate only if validation fails.
 - The victory line must be:
   VICTORY: Lantern of Nine Paths recovered
@@ -1044,11 +1055,13 @@ log_pass "remote shared-data node joined as $REMOTE_NODE_ID"
 PROJECT_UP_PAYLOAD="$(jq -cn \
     --arg name "External Codex Text Adventure" \
     --arg vision "Installer-first external Codex workspace validation" \
+    --arg template_id "dev" \
     --arg local_node "$LOCAL_WORKSPACE_NODE_ID" \
     --arg remote_node "$REMOTE_NODE_ID" \
     '{
         name: $name,
         vision: $vision,
+        template_id: $template_id,
         activate: true,
         desired_mounts: [
             {mount_path: "/nodes/local/fs", node_id: $local_node, export_name: "workspace"},
@@ -1089,6 +1102,7 @@ cp "$MOUNT_POINT/meta/protocol.json" "$OUTPUT_DIR/snapshots/protocol.json"
 cp "$MOUNT_POINT/projects/$PROJECT_ID/meta/mounted_services.json" "$OUTPUT_DIR/snapshots/mounted_services.json"
 cp "$MOUNT_POINT/projects/$PROJECT_ID/meta/workspace_status.json" "$OUTPUT_DIR/snapshots/workspace_status.json"
 cp "$MOUNT_POINT/projects/$PROJECT_ID/meta/venom_packages.json" "$OUTPUT_DIR/snapshots/venom_packages.json"
+cp "$MOUNT_POINT/projects/$PROJECT_ID/meta/agent_bootstrap.json" "$OUTPUT_DIR/snapshots/agent_bootstrap.json"
 
 if [[ ! -d "$MOUNT_WORKSPACE_PATH" || ! -d "$MOUNT_POINT/shared_data" ]]; then
     log_fail "mounted namespace is missing /nodes/local/fs or /shared_data"
@@ -1151,8 +1165,15 @@ if ! jq -e '.reliability_ok == true' "$USAGE_JSON" >/dev/null 2>&1; then
     exit 1
 fi
 
+if ! jq -e '.workspace_bootstrap_ok == true' "$USAGE_JSON" >/dev/null 2>&1; then
+    write_handoff_bundle "workspace_bootstrap_failed"
+    log_fail "external agent did not complete the required in-workspace bootstrap contract"
+    cat "$USAGE_JSON"
+    exit 1
+fi
+
 if ! jq -e '.machine_independence_ok == true' "$USAGE_JSON" >/dev/null 2>&1; then
-    log_info "run passed reliability, but machine-independence gaps are still present"
+    log_info "run passed reliability and workspace bootstrap, but machine-independence gaps are still present"
 fi
 
 log_pass "external Codex workspace scenario completed successfully"

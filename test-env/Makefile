@@ -1,6 +1,6 @@
 # Spiderweb Test Environment Makefile
 
-.PHONY: help build up down shell test wipe logs status test-embed-multi-service test-external-codex-workspace test-external-codex-cli-matrix package-external-codex-repro test-distributed-workspace test-distributed-workspace-bootstrap test-distributed-workspace-drift test-distributed-workspace-matrix test-distributed-workspace-encrypted test-distributed-workspace-operator-token test-distributed-soak-chaos test-unified-v2-protocol
+.PHONY: help build up down shell test wipe logs status test-embed-multi-service test-external-codex-workspace test-external-codex-repeatability test-external-codex-cli-matrix package-external-codex-repro test-distributed-workspace test-distributed-workspace-bootstrap test-distributed-workspace-drift test-distributed-workspace-matrix test-distributed-workspace-encrypted test-distributed-workspace-operator-token test-distributed-soak-chaos test-unified-v2-protocol
 
 help: ## Show this help message
 	@echo "Spiderweb Test Environment"
@@ -55,6 +55,13 @@ test-external-codex-workspace: ## Run external Codex workspace end-to-end harnes
 		exit 1; \
 	fi
 	@bash ./test-external-codex-workspace.sh
+
+test-external-codex-repeatability: ## Run the external Codex harness multiple times and summarize reliability/bootstrap stability
+	@if [ ! -f ./test-external-codex-repeatability.sh ]; then \
+		echo "Missing ./test-external-codex-repeatability.sh. Add the repeatability runner to test-env/ first."; \
+		exit 1; \
+	fi
+	@bash ./test-external-codex-repeatability.sh
 
 test-external-codex-cli-matrix: ## Run external Codex CLI compatibility matrix against the E2E harness
 	@if [ ! -f ./test-external-codex-cli-matrix.sh ]; then \
