@@ -129,6 +129,13 @@ CODEX_FAILURE_REASON=""
 CODEX_RUN_STATE="not_started"
 CODEX_LAUNCH_SOURCE=""
 declare -a CODEX_ENV_BASE=()
+RUN_STARTED_AT_UTC=""
+CODEX_LAUNCH_STARTED_AT_UTC=""
+CODEX_BOOTSTRAP_COMPLETE_AT_UTC=""
+CODEX_BOOTSTRAP_COMPLETE_SOURCE=""
+CODEX_FIRST_WORKSPACE_WRITE_AT_UTC=""
+CODEX_FIRST_WORKSPACE_WRITE_PATH=""
+VALIDATION_STARTED_AT_UTC=""
 
 cleanup() {
     local exit_code=$?
@@ -183,6 +190,7 @@ if [[ -z "$REMOTE_NODE_PORT" ]]; then
 fi
 
 mkdir -p "$OUTPUT_DIR" "$OUTPUT_DIR/logs" "$OUTPUT_DIR/snapshots"
+RUN_STARTED_AT_UTC="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 
 TEST_TMP_DIR="$(mktemp -d)"
 TEMP_HOME="$TEST_TMP_DIR/home"
@@ -202,6 +210,7 @@ CODEX_PTY_LOG="$OUTPUT_DIR/logs/codex.pty.log"
 CODEX_INSTALL_LOG="$OUTPUT_DIR/logs/codex-install.log"
 CODEX_AUTH_LOG="$OUTPUT_DIR/logs/codex-auth.log"
 CODEX_EVENT_SUMMARY="$OUTPUT_DIR/codex_exec_summary.json"
+CODEX_PROGRESS_TIMELINE="$OUTPUT_DIR/codex_progress_timeline.json"
 
 SPIDERWEB_CONFIG_FILE="$TEST_TMP_DIR/spiderweb.json"
 LTM_DIR="$TEST_TMP_DIR/ltm"
@@ -329,6 +338,108 @@ write_codex_runtime_snapshot() {
         }' > "$OUTPUT_DIR/snapshots/codex_runtime.json"
 }
 
+file_mtime_utc() {
+    python3 - "$1" <<'PY'
+from datetime import datetime, timezone
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+if not path.exists():
+    raise SystemExit(1)
+timestamp = path.stat().st_mtime
+if timestamp <= 1:
+    raise SystemExit(2)
+dt = datetime.fromtimestamp(timestamp, tz=timezone.utc)
+print(dt.strftime("%Y-%m-%dT%H:%M:%SZ"))
+PY
+}
+
+workspace_first_write_info() {
+    python3 - "$MOUNT_WORKSPACE_PATH" <<'PY'
+from datetime import datetime, timezone
+from pathlib import Path
+import sys
+
+workspace = Path(sys.argv[1])
+skip = {"TASK.md", "validate_game.py"}
+best = None
+
+if workspace.exists():
+    for entry in workspace.rglob("*"):
+        if entry.name in skip:
+            continue
+        try:
+            stat = entry.stat()
+        except FileNotFoundError:
+            continue
+        rel = entry.relative_to(workspace)
+        candidate = (stat.st_mtime, str(rel))
+        if best is None or candidate < best:
+            best = candidate
+
+if best is None:
+    raise SystemExit(1)
+
+dt = datetime.fromtimestamp(best[0], tz=timezone.utc)
+print(dt.strftime("%Y-%m-%dT%H:%M:%SZ"))
+print(best[1])
+PY
+}
+
+write_codex_progress_timeline() {
+    jq -cn \
+        --arg run_started "${RUN_STARTED_AT_UTC:-}" \
+        --arg codex_launch_started "${CODEX_LAUNCH_STARTED_AT_UTC:-}" \
+        --arg bootstrap_complete "${CODEX_BOOTSTRAP_COMPLETE_AT_UTC:-}" \
+        --arg bootstrap_source "${CODEX_BOOTSTRAP_COMPLETE_SOURCE:-}" \
+        --arg first_workspace_write "${CODEX_FIRST_WORKSPACE_WRITE_AT_UTC:-}" \
+        --arg first_workspace_write_path "${CODEX_FIRST_WORKSPACE_WRITE_PATH:-}" \
+        --arg validation_started "${VALIDATION_STARTED_AT_UTC:-}" \
+        --arg updated_at "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
+        '{
+            run_started_at_utc: ($run_started | if . == "" then null else . end),
+            codex_launch_started_at_utc: ($codex_launch_started | if . == "" then null else . end),
+            bootstrap_complete_at_utc: ($bootstrap_complete | if . == "" then null else . end),
+            bootstrap_complete_source: ($bootstrap_source | if . == "" then null else . end),
+            first_workspace_write_at_utc: ($first_workspace_write | if . == "" then null else . end),
+            first_workspace_write_path: ($first_workspace_write_path | if . == "" then null else . end),
+            validation_started_at_utc: ($validation_started | if . == "" then null else . end),
+            updated_at_utc: $updated_at
+        }' > "$CODEX_PROGRESS_TIMELINE"
+}
+
+observe_codex_progress() {
+    local changed=0
+    local first_write_info
+
+    if [[ -z "$CODEX_BOOTSTRAP_COMPLETE_AT_UTC" && -s "$MOUNT_POINT/services/home/control/ensure.json" ]]; then
+        CODEX_BOOTSTRAP_COMPLETE_AT_UTC="$(file_mtime_utc "$MOUNT_POINT/services/home/control/ensure.json" || true)"
+        if [[ -n "$CODEX_BOOTSTRAP_COMPLETE_AT_UTC" ]]; then
+            CODEX_BOOTSTRAP_COMPLETE_SOURCE="/services/home/control/ensure.json"
+        else
+            CODEX_BOOTSTRAP_COMPLETE_AT_UTC="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+            CODEX_BOOTSTRAP_COMPLETE_SOURCE="/services/home/control/ensure.json (observed)"
+        fi
+        changed=1
+    fi
+
+    if [[ -z "$CODEX_FIRST_WORKSPACE_WRITE_AT_UTC" ]]; then
+        first_write_info="$(workspace_first_write_info 2>/dev/null || true)"
+        if [[ -n "$first_write_info" ]]; then
+            CODEX_FIRST_WORKSPACE_WRITE_AT_UTC="$(sed -n '1p' <<<"$first_write_info")"
+            CODEX_FIRST_WORKSPACE_WRITE_PATH="$(sed -n '2p' <<<"$first_write_info")"
+            changed=1
+        fi
+    fi
+
+    if [[ "$changed" == "1" ]]; then
+        write_codex_progress_timeline
+    fi
+}
+
+write_codex_progress_timeline
+
 handoff_intro() {
     case "$CODEX_RUN_STATE" in
         not_started)
@@ -365,6 +476,9 @@ write_handoff_bundle() {
     fi
     if [[ -f "$CODEX_EVENT_SUMMARY" ]]; then
         cp "$CODEX_EVENT_SUMMARY" "$HANDOFF_DIR/codex_exec_summary.json"
+    fi
+    if [[ -f "$CODEX_PROGRESS_TIMELINE" ]]; then
+        cp "$CODEX_PROGRESS_TIMELINE" "$HANDOFF_DIR/codex_progress_timeline.json"
     fi
 
     local codex_summary_lines=""
@@ -876,6 +990,7 @@ monitor_codex_process() {
             last_fingerprint="$current_fingerprint"
             last_progress_ts="$now_ts"
         fi
+        observe_codex_progress
 
         if (( CODEX_TIMEOUT_SECONDS > 0 && now_ts - start_ts >= CODEX_TIMEOUT_SECONDS )); then
             CODEX_FAILURE_REASON="codex_timeout_after_${CODEX_TIMEOUT_SECONDS}s"
@@ -914,6 +1029,8 @@ run_live_codex() {
     cmd="$(render_codex_launch_command)"
     CODEX_RUN_STATE="running"
     CODEX_FAILURE_REASON=""
+    CODEX_LAUNCH_STARTED_AT_UTC="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+    write_codex_progress_timeline
 
     : >"$CODEX_STDOUT_LOG"
     : >"$CODEX_STDERR_LOG"
@@ -943,6 +1060,7 @@ run_live_codex() {
     wait "$runner_pid"
     CODEX_EXIT_CODE=$?
     set -e
+    observe_codex_progress
     summarize_codex_events
 
     if [[ "$CODEX_EXIT_CODE" -ne 0 ]]; then
@@ -1160,6 +1278,8 @@ log_pass "Codex auth prepared using $CODEX_SELECTED_AUTH_MODE"
 
 run_live_codex
 
+VALIDATION_STARTED_AT_UTC="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+write_codex_progress_timeline
 python3 "$MOUNT_WORKSPACE_PATH/validate_game.py" \
     --workspace "$MOUNT_WORKSPACE_PATH" \
     --shared-data "$MOUNT_POINT/shared_data" \
