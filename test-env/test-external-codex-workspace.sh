@@ -348,6 +348,7 @@ write_handoff_bundle() {
     cp "$PROMPT_FILE" "$HANDOFF_DIR/PROMPT.txt"
     cp "$TASK_FILE" "$HANDOFF_DIR/TASK.md"
     cp "$OUTPUT_DIR/snapshots/protocol.json" "$HANDOFF_DIR/protocol.json"
+    cp "$OUTPUT_DIR/snapshots/agent_bootstrap_quickref.json" "$HANDOFF_DIR/agent_bootstrap_quickref.json"
     cp "$OUTPUT_DIR/snapshots/mounted_services.json" "$HANDOFF_DIR/mounted_services.json"
     cp "$OUTPUT_DIR/snapshots/workspace_status.json" "$HANDOFF_DIR/workspace_status.json"
     cp "$OUTPUT_DIR/snapshots/venom_packages.json" "$HANDOFF_DIR/venom_packages.json"
@@ -389,6 +390,7 @@ $(handoff_intro)
 - Project metadata directory: $MOUNT_POINT/projects/${PROJECT_ID:-unknown}/meta
 - Remote shared-data directory: $MOUNT_POINT/shared_data
 - Bootstrap contract metadata: $MOUNT_POINT/projects/${PROJECT_ID:-unknown}/meta/agent_bootstrap.json
+- Bootstrap quick reference: $MOUNT_POINT/projects/${PROJECT_ID:-unknown}/meta/agent_bootstrap_quickref.json
 - Codex auth mode selected: ${CODEX_SELECTED_AUTH_MODE:-unresolved}
 - Codex binary: ${CODEX_RESOLVED_BIN:-unresolved}
 - Codex stdout log: $CODEX_STDOUT_LOG
@@ -499,6 +501,7 @@ wait_for_workspace_mounts() {
 wait_for_namespace_mount() {
     for _ in $(seq 1 180); do
         if [[ -f "$MOUNT_POINT/meta/protocol.json" &&
+              -f "$MOUNT_POINT/projects/$PROJECT_ID/meta/agent_bootstrap_quickref.json" &&
               -f "$MOUNT_POINT/projects/$PROJECT_ID/meta/mounted_services.json" &&
               -f "$MOUNT_POINT/projects/$PROJECT_ID/meta/workspace_status.json" &&
               -f "$MOUNT_POINT/projects/$PROJECT_ID/meta/venom_packages.json" &&
@@ -593,10 +596,10 @@ Required outputs:
 Rules:
 - Treat this directory as the only writable project root.
 - Preserve validate_game.py.
-- Read `/projects/<project_id>/meta/agent_bootstrap.json` and perform the bootstrap steps from inside the mounted workspace before you start building the game.
+- Read `/projects/<project_id>/meta/agent_bootstrap_quickref.json` first, then `/projects/<project_id>/meta/agent_bootstrap.json`, and perform the bootstrap steps from inside the mounted workspace before you start building the game.
 - On this client, Spiderweb namespace paths are mounted under the namespace root, so `/services/*` from metadata is available at `../../../services/*` relative to this workspace and at the absolute mount path shown in the rendered prompt.
 - Ensure your own durable agent home first, then verify or repair required generic service binds from inside the mounted workspace if needed.
-- Use `mounted_services.json` plus the mounted service directory itself as the verification source. Do not read service README/SCHEMA/OPS files unless a required binding is missing and you genuinely need the repair shape.
+- Use `agent_bootstrap_quickref.json` plus the mounted service directory itself as the verification source. Read `mounted_services.json` only if the quick reference is missing a detail you genuinely need. Do not read service README/SCHEMA/OPS files unless a required binding is missing and you genuinely need the repair shape.
 - Read the shared seed files exactly as instructed by the rendered prompt.
 - Keep all project writes in this directory.
 - In this external Codex CLI run, apply_patch is not available. Use shell commands or small local scripts to create and edit files here.
@@ -1103,6 +1106,7 @@ fi
 log_pass "namespace mount is ready"
 
 cp "$MOUNT_POINT/meta/protocol.json" "$OUTPUT_DIR/snapshots/protocol.json"
+cp "$MOUNT_POINT/projects/$PROJECT_ID/meta/agent_bootstrap_quickref.json" "$OUTPUT_DIR/snapshots/agent_bootstrap_quickref.json"
 cp "$MOUNT_POINT/projects/$PROJECT_ID/meta/mounted_services.json" "$OUTPUT_DIR/snapshots/mounted_services.json"
 cp "$MOUNT_POINT/projects/$PROJECT_ID/meta/workspace_status.json" "$OUTPUT_DIR/snapshots/workspace_status.json"
 cp "$MOUNT_POINT/projects/$PROJECT_ID/meta/venom_packages.json" "$OUTPUT_DIR/snapshots/venom_packages.json"

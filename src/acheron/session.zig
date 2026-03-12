@@ -2033,7 +2033,7 @@ pub const Session = struct {
         try self.addDirectoryDescriptors(
             project_meta_dir,
             "Project Metadata",
-            "{\"kind\":\"metadata\",\"files\":[\"topology.json\",\"nodes.json\",\"agents.json\",\"sources.json\",\"contracts.json\",\"paths.json\",\"summary.json\",\"agent_bootstrap.json\",\"alerts.json\",\"workspace_status.json\",\"mounts.json\",\"desired_mounts.json\",\"actual_mounts.json\",\"binds.json\",\"mounted_services.json\",\"venom_packages.json\",\"drift.json\",\"reconcile.json\",\"availability.json\",\"health.json\"]}",
+            "{\"kind\":\"metadata\",\"files\":[\"topology.json\",\"nodes.json\",\"agents.json\",\"sources.json\",\"contracts.json\",\"paths.json\",\"summary.json\",\"agent_bootstrap.json\",\"agent_bootstrap_quickref.json\",\"alerts.json\",\"workspace_status.json\",\"mounts.json\",\"desired_mounts.json\",\"actual_mounts.json\",\"binds.json\",\"mounted_services.json\",\"venom_packages.json\",\"drift.json\",\"reconcile.json\",\"availability.json\",\"health.json\"]}",
             "{\"read\":true,\"write\":false}",
             "Project topology, bootstrap guidance, and availability metadata.",
         );
@@ -2093,7 +2093,7 @@ pub const Session = struct {
         try self.addDirectoryDescriptors(
             meta_root,
             "Meta",
-            "{\"kind\":\"meta\",\"entries\":[\"protocol.json\",\"view.json\",\"agent_bootstrap.json\",\"workspace_status.json\",\"workspace_availability.json\",\"workspace_health.json\",\"workspace_alerts.json\",\"workspace_binds.json\",\"workspace_services.json\",\"venom_packages.json\"]}",
+            "{\"kind\":\"meta\",\"entries\":[\"protocol.json\",\"view.json\",\"agent_bootstrap.json\",\"agent_bootstrap_quickref.json\",\"workspace_status.json\",\"workspace_availability.json\",\"workspace_health.json\",\"workspace_alerts.json\",\"workspace_binds.json\",\"workspace_services.json\",\"venom_packages.json\"]}",
             "{\"read\":true,\"write\":false}",
             "Attached-session compatibility metadata.",
         );
@@ -2183,7 +2183,7 @@ pub const Session = struct {
         _ = try self.seedBoundGlobalFsNamespace(global_root, preferred_fs_node_id orelse "local");
         try self.seedActiveScopedVenomBindings(active_agent_venoms_dir, project_venoms_dir, policy.project_id);
         try self.refreshScopedVenomIndexes();
-        try self.addWorkspaceServiceDiscoveryFiles(meta_root, project_meta_dir);
+        try self.addWorkspaceServiceDiscoveryFiles(meta_root, project_meta_dir, policy.project_id);
     }
 
     fn addProjectMetaFiles(
@@ -2313,7 +2313,12 @@ pub const Session = struct {
         _ = try self.addFile(project_meta_dir, "health.json", "{\"state\":\"unknown\",\"availability\":{\"mounts_total\":0,\"online\":0,\"degraded\":0,\"missing\":0},\"drift_count\":0,\"reconcile_state\":\"unknown\",\"queue_depth\":0}", false, .none);
     }
 
-    fn addWorkspaceServiceDiscoveryFiles(self: *Session, meta_root: u32, project_meta_dir: u32) !void {
+    fn addWorkspaceServiceDiscoveryFiles(self: *Session, meta_root: u32, project_meta_dir: u32, project_id: []const u8) !void {
+        const quickref_json = try self.buildAgentBootstrapQuickrefJson(project_id, self.agent_id);
+        defer self.allocator.free(quickref_json);
+        _ = try self.addFile(project_meta_dir, "agent_bootstrap_quickref.json", quickref_json, false, .none);
+        _ = try self.addFile(meta_root, "agent_bootstrap_quickref.json", quickref_json, false, .none);
+
         const binds_json = try self.buildProjectBindsArrayJson();
         defer self.allocator.free(binds_json);
         _ = try self.addFile(project_meta_dir, "binds.json", binds_json, false, .none);
@@ -2336,7 +2341,7 @@ pub const Session = struct {
         const active_project_id = self.active_namespace_project_id orelse self.project_id orelse return;
         const project_dir = self.lookupChild(projects_root, active_project_id) orelse return;
         const project_meta_dir = self.lookupChild(project_dir, "meta") orelse return;
-        return self.addWorkspaceServiceDiscoveryFiles(meta_root, project_meta_dir);
+        return self.addWorkspaceServiceDiscoveryFiles(meta_root, project_meta_dir, active_project_id);
     }
 
     fn buildVenomPackagesJson(self: *Session) ![]u8 {
@@ -2363,6 +2368,13 @@ pub const Session = struct {
         }
         try out.append(self.allocator, ']');
         return out.toOwnedSlice(self.allocator);
+    }
+
+    fn hasProjectBindPath(self: *Session, bind_path: []const u8) bool {
+        for (self.project_binds.items) |bind| {
+            if (std.mem.eql(u8, bind.bind_path, bind_path)) return true;
+        }
+        return false;
     }
 
     fn buildMountedServicesJson(self: *Session) ![]u8 {
@@ -3941,8 +3953,8 @@ pub const Session = struct {
         defer self.allocator.free(escaped_project_id);
         return std.fmt.allocPrint(
             self.allocator,
-            "{{\"version\":\"acheron-namespace-project-contract-v2\",\"project_id\":\"{s}\",\"top_level_roots\":[\"/nodes\",\"/agents\",\"/global\",\"/services\"],\"project_metadata_files\":[\"topology.json\",\"nodes.json\",\"agents.json\",\"sources.json\",\"contracts.json\",\"paths.json\",\"summary.json\",\"agent_bootstrap.json\",\"alerts.json\",\"workspace_status.json\",\"mounts.json\",\"desired_mounts.json\",\"actual_mounts.json\",\"binds.json\",\"mounted_services.json\",\"venom_packages.json\",\"drift.json\",\"reconcile.json\",\"availability.json\",\"health.json\"],\"links\":{{\"nodes_root\":\"/nodes\",\"agents_root\":\"/agents\",\"global_root\":\"/global\",\"services_root\":\"/services\",\"workspace_control\":\"/global/workspaces\",\"workspace_status\":\"/global/workspaces/control/invoke.json\",\"workspace_binds\":\"/projects/{s}/meta/binds.json\",\"workspace_services\":\"/projects/{s}/meta/mounted_services.json\",\"venom_packages\":\"/projects/{s}/meta/venom_packages.json\",\"agent_bootstrap\":\"/projects/{s}/meta/agent_bootstrap.json\"}}}}",
-            .{ escaped_project_id, escaped_project_id, escaped_project_id, escaped_project_id, escaped_project_id },
+            "{{\"version\":\"acheron-namespace-project-contract-v2\",\"project_id\":\"{s}\",\"top_level_roots\":[\"/nodes\",\"/agents\",\"/global\",\"/services\"],\"project_metadata_files\":[\"topology.json\",\"nodes.json\",\"agents.json\",\"sources.json\",\"contracts.json\",\"paths.json\",\"summary.json\",\"agent_bootstrap.json\",\"agent_bootstrap_quickref.json\",\"alerts.json\",\"workspace_status.json\",\"mounts.json\",\"desired_mounts.json\",\"actual_mounts.json\",\"binds.json\",\"mounted_services.json\",\"venom_packages.json\",\"drift.json\",\"reconcile.json\",\"availability.json\",\"health.json\"],\"links\":{{\"nodes_root\":\"/nodes\",\"agents_root\":\"/agents\",\"global_root\":\"/global\",\"services_root\":\"/services\",\"workspace_control\":\"/global/workspaces\",\"workspace_status\":\"/global/workspaces/control/invoke.json\",\"workspace_binds\":\"/projects/{s}/meta/binds.json\",\"workspace_services\":\"/projects/{s}/meta/mounted_services.json\",\"venom_packages\":\"/projects/{s}/meta/venom_packages.json\",\"agent_bootstrap\":\"/projects/{s}/meta/agent_bootstrap.json\",\"agent_bootstrap_quickref\":\"/projects/{s}/meta/agent_bootstrap_quickref.json\"}}}}",
+            .{ escaped_project_id, escaped_project_id, escaped_project_id, escaped_project_id, escaped_project_id, escaped_project_id },
         );
     }
 
@@ -3951,8 +3963,9 @@ pub const Session = struct {
         defer self.allocator.free(escaped_project_id);
         return std.fmt.allocPrint(
             self.allocator,
-            "{{\"project_id\":\"{s}\",\"nodes_root\":\"/nodes\",\"agents_root\":\"/agents\",\"services\":{{\"root\":\"/services\",\"mounted_services_meta\":\"/projects/{s}/meta/mounted_services.json\"}},\"packages\":{{\"meta\":\"/projects/{s}/meta/venom_packages.json\"}},\"bootstrap\":{{\"meta\":\"/projects/{s}/meta/agent_bootstrap.json\"}},\"global\":{{\"root\":\"/global\",\"library\":\"/global/library\",\"workspaces\":\"/global/workspaces\",\"chat\":\"/global/chat\",\"jobs\":\"/global/jobs\",\"mounts\":\"/global/mounts\",\"debug\":{s}}}}}",
+            "{{\"project_id\":\"{s}\",\"nodes_root\":\"/nodes\",\"agents_root\":\"/agents\",\"services\":{{\"root\":\"/services\",\"mounted_services_meta\":\"/projects/{s}/meta/mounted_services.json\"}},\"packages\":{{\"meta\":\"/projects/{s}/meta/venom_packages.json\"}},\"bootstrap\":{{\"meta\":\"/projects/{s}/meta/agent_bootstrap.json\",\"quickref\":\"/projects/{s}/meta/agent_bootstrap_quickref.json\"}},\"global\":{{\"root\":\"/global\",\"library\":\"/global/library\",\"workspaces\":\"/global/workspaces\",\"chat\":\"/global/chat\",\"jobs\":\"/global/jobs\",\"mounts\":\"/global/mounts\",\"debug\":{s}}}}}",
             .{
+                escaped_project_id,
                 escaped_project_id,
                 escaped_project_id,
                 escaped_project_id,
@@ -3960,6 +3973,95 @@ pub const Session = struct {
                 if (policy.show_debug or self.is_admin) "\"/debug\"" else "null",
             },
         );
+    }
+
+    fn buildAgentBootstrapQuickrefJson(self: *Session, project_id: []const u8, agent_id: []const u8) ![]u8 {
+        const required_services = [_]struct {
+            id: []const u8,
+            ensure_path: ?[]const u8 = null,
+            invoke_path: ?[]const u8 = null,
+        }{
+            .{ .id = "home", .ensure_path = "/services/home/control/ensure.json", .invoke_path = "/services/home/control/invoke.json" },
+            .{ .id = "mounts", .invoke_path = "/services/mounts/control/bind.json" },
+            .{ .id = "workers", .invoke_path = "/services/workers/control/register.json" },
+            .{ .id = "terminal", .invoke_path = "/services/terminal/control/invoke.json" },
+            .{ .id = "git", .invoke_path = "/services/git/control/invoke.json" },
+            .{ .id = "search_code", .invoke_path = "/services/search_code/control/invoke.json" },
+            .{ .id = "library" },
+            .{ .id = "events" },
+        };
+
+        const escaped_project_id = try unified.jsonEscape(self.allocator, project_id);
+        defer self.allocator.free(escaped_project_id);
+        const escaped_agent_id = try unified.jsonEscape(self.allocator, agent_id);
+        defer self.allocator.free(escaped_agent_id);
+
+        var out = std.ArrayListUnmanaged(u8){};
+        errdefer out.deinit(self.allocator);
+
+        try out.writer(self.allocator).print(
+            "{{\"version\":\"spiderweb-agent-bootstrap-quickref-v1\",\"project_id\":\"{s}\",\"agent_id\":\"{s}\",\"workspace_root\":\"/nodes/local/fs\",\"shared_data_root\":\"/shared_data\",\"service_root\":\"/services\",\"discovery_order\":[\"/meta/protocol.json\",\"/projects/{s}/meta/agent_bootstrap_quickref.json\",\"/projects/{s}/meta/agent_bootstrap.json\",\"/projects/{s}/meta/workspace_status.json\",\"./TASK.md\",\"/shared_data/world_seed.json\",\"/shared_data/items_seed.json\",\"/shared_data/puzzle_seed.json\"],\"fallback_meta\":{{\"mounted_services\":\"/projects/{s}/meta/mounted_services.json\",\"venom_packages\":\"/projects/{s}/meta/venom_packages.json\"}},\"required_services\":[",
+            .{
+                escaped_project_id,
+                escaped_agent_id,
+                escaped_project_id,
+                escaped_project_id,
+                escaped_project_id,
+                escaped_project_id,
+                escaped_project_id,
+            },
+        );
+
+        var present_count: usize = 0;
+        for (required_services, 0..) |service, idx| {
+            if (idx != 0) try out.append(self.allocator, ',');
+
+            const bind_path = try std.fmt.allocPrint(self.allocator, "/services/{s}", .{service.id});
+            defer self.allocator.free(bind_path);
+            const present = self.hasProjectBindPath(bind_path);
+            if (present) present_count += 1;
+
+            const escaped_service_id = try unified.jsonEscape(self.allocator, service.id);
+            defer self.allocator.free(escaped_service_id);
+            const escaped_bind_path = try unified.jsonEscape(self.allocator, bind_path);
+            defer self.allocator.free(escaped_bind_path);
+
+            const ensure_json = if (service.ensure_path) |value| blk: {
+                const escaped = try unified.jsonEscape(self.allocator, value);
+                defer self.allocator.free(escaped);
+                break :blk try std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped});
+            } else try self.allocator.dupe(u8, "null");
+            defer self.allocator.free(ensure_json);
+
+            const invoke_json = if (service.invoke_path) |value| blk: {
+                const escaped = try unified.jsonEscape(self.allocator, value);
+                defer self.allocator.free(escaped);
+                break :blk try std.fmt.allocPrint(self.allocator, "\"{s}\"", .{escaped});
+            } else try self.allocator.dupe(u8, "null");
+            defer self.allocator.free(invoke_json);
+
+            try out.writer(self.allocator).print(
+                "{{\"service_id\":\"{s}\",\"path\":\"{s}\",\"present\":{s},\"ensure_path\":{s},\"invoke_path\":{s}}}",
+                .{
+                    escaped_service_id,
+                    escaped_bind_path,
+                    if (present) "true" else "false",
+                    ensure_json,
+                    invoke_json,
+                },
+            );
+        }
+
+        try out.writer(self.allocator).print(
+            "],\"all_required_services_present\":{s},\"required_service_count\":{d},\"required_services_present_count\":{d},\"control_writes\":{{\"ensure_home\":\"/services/home/control/ensure.json\",\"repair_bind\":\"/services/mounts/control/bind.json\"}},\"implementation_hint\":{{\"prefer_quickref_over_raw_service_enumeration\":true,\"proceed_directly_when_ready\":true}}}}",
+            .{
+                if (present_count == required_services.len) "true" else "false",
+                required_services.len,
+                present_count,
+            },
+        );
+
+        return out.toOwnedSlice(self.allocator);
     }
 
     fn buildAgentBootstrapJson(self: *Session, project_id: []const u8, agent_id: []const u8) ![]u8 {
@@ -3971,10 +4073,11 @@ pub const Session = struct {
         defer self.allocator.free(escaped_target_template);
         return std.fmt.allocPrint(
             self.allocator,
-            "{{\"version\":\"spiderweb-agent-bootstrap-v1\",\"project_id\":\"{s}\",\"agent_id\":\"{s}\",\"workspace_root\":\"/nodes/local/fs\",\"shared_data_root\":\"/shared_data\",\"service_preference\":{{\"preferred_root\":\"/services\",\"fallback_roots\":[\"/global\",\"/nodes/local/venoms\"]}},\"required_reads\":[\"/meta/protocol.json\",\"/projects/{s}/meta/mounted_services.json\",\"/projects/{s}/meta/workspace_status.json\",\"/projects/{s}/meta/venom_packages.json\",\"/projects/{s}/meta/agent_bootstrap.json\"],\"bootstrap_sequence\":[{{\"step\":\"ensure_home\",\"service\":\"/services/home\",\"invoke_path\":\"/services/home/control/ensure.json\",\"payload\":{{\"agent_id\":\"{s}\",\"project_id\":\"{s}\"}},\"required\":true}},{{\"step\":\"verify_generic_services\",\"service\":\"/services/mounts\",\"required_services\":[\"home\",\"mounts\",\"workers\",\"terminal\",\"git\",\"search_code\",\"library\",\"events\"],\"repair_invoke_path\":\"/services/mounts/control/bind.json\",\"target_template\":\"{s}\",\"required\":true}},{{\"step\":\"optional_worker_register\",\"service\":\"/services/workers\",\"invoke_path\":\"/services/workers/control/register.json\",\"default_venoms\":[\"memory\",\"sub_brains\"],\"required\":false}}],\"persistence\":{{\"shared_project_binds\":\"persistent\",\"shared_project_mounts\":\"persistent\",\"agent_home\":\"durable_per_agent\",\"worker_loopback\":\"ephemeral\"}},\"detach\":{{\"shared_changes\":\"keep\",\"worker_state\":\"detach_or_ttl_cleanup\"}}}}",
+            "{{\"version\":\"spiderweb-agent-bootstrap-v1\",\"project_id\":\"{s}\",\"agent_id\":\"{s}\",\"workspace_root\":\"/nodes/local/fs\",\"shared_data_root\":\"/shared_data\",\"service_preference\":{{\"preferred_root\":\"/services\",\"fallback_roots\":[\"/global\",\"/nodes/local/venoms\"]}},\"required_reads\":[\"/meta/protocol.json\",\"/projects/{s}/meta/agent_bootstrap_quickref.json\",\"/projects/{s}/meta/agent_bootstrap.json\",\"/projects/{s}/meta/workspace_status.json\",\"/projects/{s}/meta/venom_packages.json\"],\"fallback_reads\":[\"/projects/{s}/meta/mounted_services.json\"],\"bootstrap_sequence\":[{{\"step\":\"ensure_home\",\"service\":\"/services/home\",\"invoke_path\":\"/services/home/control/ensure.json\",\"payload\":{{\"agent_id\":\"{s}\",\"project_id\":\"{s}\"}},\"required\":true}},{{\"step\":\"verify_generic_services\",\"service\":\"/services/mounts\",\"required_services\":[\"home\",\"mounts\",\"workers\",\"terminal\",\"git\",\"search_code\",\"library\",\"events\"],\"repair_invoke_path\":\"/services/mounts/control/bind.json\",\"target_template\":\"{s}\",\"required\":true}},{{\"step\":\"optional_worker_register\",\"service\":\"/services/workers\",\"invoke_path\":\"/services/workers/control/register.json\",\"default_venoms\":[\"memory\",\"sub_brains\"],\"required\":false}}],\"persistence\":{{\"shared_project_binds\":\"persistent\",\"shared_project_mounts\":\"persistent\",\"agent_home\":\"durable_per_agent\",\"worker_loopback\":\"ephemeral\"}},\"detach\":{{\"shared_changes\":\"keep\",\"worker_state\":\"detach_or_ttl_cleanup\"}}}}",
             .{
                 escaped_project_id,
                 escaped_agent_id,
+                escaped_project_id,
                 escaped_project_id,
                 escaped_project_id,
                 escaped_project_id,

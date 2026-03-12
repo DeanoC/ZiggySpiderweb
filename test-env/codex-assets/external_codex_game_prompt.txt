@@ -14,14 +14,17 @@ Namespace paths from Spiderweb metadata are mounted under that root on this mach
 
 Before making assumptions, inspect these exact files in order:
 - __NAMESPACE_META_DIR__/protocol.json
-- __PROJECT_META_DIR__/mounted_services.json
-- __PROJECT_META_DIR__/workspace_status.json
-- __PROJECT_META_DIR__/venom_packages.json
+- __PROJECT_META_DIR__/agent_bootstrap_quickref.json
 - __PROJECT_META_DIR__/agent_bootstrap.json
+- __PROJECT_META_DIR__/workspace_status.json
 - ./TASK.md
 - __SHARED_DATA_DIR__/world_seed.json
 - __SHARED_DATA_DIR__/items_seed.json
 - __SHARED_DATA_DIR__/puzzle_seed.json
+
+Only if the quick reference is missing something you need:
+- __PROJECT_META_DIR__/mounted_services.json
+- __PROJECT_META_DIR__/venom_packages.json
 
 Discovery rules:
 - Read only what you need to confirm the path contract, mounted services, and exact seed content.
@@ -32,10 +35,11 @@ Discovery rules:
 
 Bootstrap contract:
 - Read __PROJECT_META_DIR__/agent_bootstrap.json and follow it from inside the mounted workspace.
+- Use __PROJECT_META_DIR__/agent_bootstrap_quickref.json as the primary source of truth for service presence, control write paths, and discovery order.
 - For this external agent run, use the mounted client paths, not host-root `/services`.
 - Ensure your durable agent home first by writing the requested control payload to `__SERVICE_ROOT__/home/control/ensure.json`.
 - Verify the required generic service entries under `__SERVICE_ROOT__`. If any required service is missing there, repair it yourself through `__SERVICE_ROOT__/mounts/control/bind.json` using the generic fallback roots described in agent_bootstrap.json.
-- Treat `mounted_services.json` plus path existence under `__SERVICE_ROOT__/*` as sufficient verification. Do not browse service README, SCHEMA, OPS, or CAPS files unless a required binding is actually missing and you need the exact repair surface.
+- Treat `agent_bootstrap_quickref.json` plus path existence under `__SERVICE_ROOT__/*` as sufficient verification. Read `mounted_services.json` only if the quick reference lacks a detail you genuinely need.
 - Treat any worker registration as optional and ephemeral. Do not assume worker-private state persists after detach.
 - Make bootstrap actions idempotent so the same workspace can be rejoined later by this or another agent.
 
