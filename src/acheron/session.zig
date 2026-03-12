@@ -9650,6 +9650,129 @@ test "acheron_session: preferred service paths use workspace bindings when avail
     try std.testing.expectEqualStrings("/global/github_pr/control/sync.json", unbound_github_path);
 }
 
+test "acheron_session: missions namespace enforces mission ownership across agents" {
+    const allocator = std.testing.allocator;
+
+    var mission_store = try mission_store_mod.MissionStore.initWithPath(allocator, null);
+    defer mission_store.deinit();
+
+    const runtime_handle_a = try runtime_handle_mod.RuntimeHandle.createUnavailable(
+        allocator,
+        "execution_failed",
+        "runtime unavailable",
+    );
+    defer runtime_handle_a.destroy();
+
+    const runtime_handle_b = try runtime_handle_mod.RuntimeHandle.createUnavailable(
+        allocator,
+        "execution_failed",
+        "runtime unavailable",
+    );
+    defer runtime_handle_b.destroy();
+
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session_a = try Session.initWithOptions(
+        allocator,
+        runtime_handle_a,
+        &job_index,
+        "agent-a",
+        .{
+            .mission_store = &mission_store,
+            .actor_type = "agent",
+            .actor_id = "worker-a",
+        },
+    );
+    defer session_a.deinit();
+
+    var session_b = try Session.initWithOptions(
+        allocator,
+        runtime_handle_b,
+        &job_index,
+        "agent-b",
+        .{
+            .mission_store = &mission_store,
+            .actor_type = "agent",
+            .actor_id = "worker-b",
+        },
+    );
+    defer session_b.deinit();
+
+    try protocolWriteFile(
+        &session_a,
+        allocator,
+        380,
+        381,
+        &.{ "agents", "self", "missions", "control", "create.json" },
+        "{\"use_case\":\"pr_review\",\"title\":\"Review PR 91\"}",
+        980,
+    );
+
+    const create_result = try protocolReadFile(
+        &session_a,
+        allocator,
+        382,
+        383,
+        &.{ "agents", "self", "missions", "result.json" },
+        981,
+    );
+    defer allocator.free(create_result);
+    const mission_id = try extractMissionIdFromResultPayload(allocator, create_result);
+    defer allocator.free(mission_id);
+
+    try protocolWriteFile(
+        &session_b,
+        allocator,
+        384,
+        385,
+        &.{ "agents", "self", "missions", "control", "list.json" },
+        "{}",
+        982,
+    );
+
+    const list_result = try protocolReadFile(
+        &session_b,
+        allocator,
+        386,
+        387,
+        &.{ "agents", "self", "missions", "result.json" },
+        983,
+    );
+    defer allocator.free(list_result);
+    try std.testing.expect(std.mem.indexOf(u8, list_result, "\"operation\":\"list\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, list_result, "\"count\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, list_result, mission_id) == null);
+
+    const get_payload = try std.fmt.allocPrint(allocator, "{{\"mission_id\":\"{s}\"}}", .{mission_id});
+    defer allocator.free(get_payload);
+    const get_error = try protocolWriteFileExpectError(
+        &session_b,
+        allocator,
+        388,
+        389,
+        &.{ "agents", "self", "missions", "control", "get.json" },
+        get_payload,
+        984,
+        "forbidden",
+    );
+    defer allocator.free(get_error);
+
+    const resume_payload = try std.fmt.allocPrint(allocator, "{{\"mission_id\":\"{s}\",\"stage\":\"reviewing\"}}", .{mission_id});
+    defer allocator.free(resume_payload);
+    const resume_error = try protocolWriteFileExpectError(
+        &session_b,
+        allocator,
+        390,
+        391,
+        &.{ "agents", "self", "missions", "control", "resume.json" },
+        resume_payload,
+        985,
+        "forbidden",
+    );
+    defer allocator.free(resume_error);
+}
+
 test "acheron_session: pr_review run_validation denied when shell_exec is blocked" {
     const allocator = std.testing.allocator;
 
