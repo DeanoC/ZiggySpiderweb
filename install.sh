@@ -110,6 +110,30 @@ stop_spiderweb_processes() {
     sleep 1
 }
 
+systemd_spiderweb_scope() {
+    if [[ "${INSTALL_SYSTEMD_BOOL:-0}" == "1" ]]; then
+        printf '%s' "${SYSTEMD_SCOPE:-user}"
+    elif [[ "${SYSTEMD_EXISTS:-false}" == "true" ]]; then
+        printf '%s' "${EXISTING_SCOPE:-user}"
+    fi
+}
+
+restore_previously_running_spiderweb() {
+    local scope
+    scope="$(systemd_spiderweb_scope)"
+    if [[ -n "$scope" ]]; then
+        log_info "Restoring previously-running spiderweb service after upgrade..."
+        if [[ "$scope" == "system" ]]; then
+            sudo systemctl start spiderweb 2>/dev/null || true
+        else
+            systemctl --user start spiderweb 2>/dev/null || true
+        fi
+    else
+        log_info "Restoring previously-running spiderweb after upgrade..."
+        "${INSTALL_DIR}/spiderweb" &
+    fi
+}
+
 ensure_git_repo() {
     local dir="$1"
     local url="$2"
@@ -500,6 +524,7 @@ MANAGED_REPO=1
 
 # Check if spiderweb is running and offer to stop it first
 SPIDERWEB_RUNNING=false
+RESTORE_STOPPED_MATCHING_SPIDERWEB=0
 MATCHING_SPIDERWEB_PIDS=()
 FOREIGN_SPIDERWEB_PIDS=()
 collect_spiderweb_pids_by_install_dir "$INSTALL_DIR" MATCHING_SPIDERWEB_PIDS FOREIGN_SPIDERWEB_PIDS
@@ -508,11 +533,13 @@ if (( ${#MATCHING_SPIDERWEB_PIDS[@]} > 0 || ${#FOREIGN_SPIDERWEB_PIDS[@]} > 0 ))
     if (( ${#MATCHING_SPIDERWEB_PIDS[@]} > 0 )); then
         if [[ "$NON_INTERACTIVE" == "1" ]]; then
             stop_spiderweb_processes
+            RESTORE_STOPPED_MATCHING_SPIDERWEB=1
         elif [[ -t 0 ]]; then
             echo ""
             read -rp "Spiderweb is currently running from ${INSTALL_DIR}. Stop it to allow update? [Y/n]: " stop_confirm
             if [[ ! "$stop_confirm" =~ ^[Nn]$ ]] || [[ -z "$stop_confirm" ]]; then
                 stop_spiderweb_processes
+                RESTORE_STOPPED_MATCHING_SPIDERWEB=1
             fi
         fi
     elif [[ "$NON_INTERACTIVE" == "1" ]]; then
@@ -783,6 +810,10 @@ if [[ "$CONFIGURE_BIND_ADDRESS" == "1" ]]; then
     fi
 fi
 
+if [[ "$RESTORE_STOPPED_MATCHING_SPIDERWEB" == "1" && "$START_AFTER_INSTALL" != "1" ]]; then
+    restore_previously_running_spiderweb
+fi
+
 # Post-install summary
 echo ""
 log_success "Installation complete!"
@@ -817,6 +848,10 @@ elif [[ "$SYSTEMD_EXISTS" == "true" ]]; then
 else
     echo "To install systemd service later:"
     echo "  spiderweb-config config install-service"
+fi
+
+if [[ "$RESTORE_STOPPED_MATCHING_SPIDERWEB" == "1" ]]; then
+    echo "Previously-running spiderweb was restored after upgrade"
 fi
 
 SYNC_ZSS_AUTH=false
