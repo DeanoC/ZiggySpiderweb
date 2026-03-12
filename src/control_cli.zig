@@ -198,6 +198,8 @@ fn isOperatorTokenProtectedMutation(op_type: []const u8) bool {
         std.mem.eql(u8, op_type, "control.workspace_create") or
         std.mem.eql(u8, op_type, "control.workspace_update") or
         std.mem.eql(u8, op_type, "control.workspace_delete") or
+        std.mem.eql(u8, op_type, "control.workspace_bind_set") or
+        std.mem.eql(u8, op_type, "control.workspace_bind_remove") or
         std.mem.eql(u8, op_type, "control.workspace_activate") or
         std.mem.eql(u8, op_type, "control.workspace_up") or
         std.mem.eql(u8, op_type, "control.workspace_mount_set") or
@@ -215,13 +217,31 @@ fn isOperatorTokenProtectedMutation(op_type: []const u8) bool {
         std.mem.eql(u8, op_type, "control.project_token_revoke");
 }
 
-test "control_cli: operator token mutation whitelist includes project activate and up" {
+test "control_cli: operator token mutation whitelist includes workspace bind mutations" {
     try std.testing.expect(isOperatorTokenProtectedMutation("control.workspace_create"));
+    try std.testing.expect(isOperatorTokenProtectedMutation("control.workspace_bind_set"));
+    try std.testing.expect(isOperatorTokenProtectedMutation("control.workspace_bind_remove"));
     try std.testing.expect(isOperatorTokenProtectedMutation("control.workspace_up"));
     try std.testing.expect(isOperatorTokenProtectedMutation("control.project_activate"));
     try std.testing.expect(isOperatorTokenProtectedMutation("control.project_up"));
     try std.testing.expect(isOperatorTokenProtectedMutation("control.node_join_approve"));
     try std.testing.expect(!isOperatorTokenProtectedMutation("control.workspace_status"));
+}
+
+test "control_cli: buildPayloadJson injects operator token for workspace bind set" {
+    const allocator = std.testing.allocator;
+    const payload = try buildPayloadJson(
+        allocator,
+        "control.workspace_bind_set",
+        "{\"workspace_id\":\"ws-123\",\"bind_path\":\"/services/git\",\"target\":\"/workspace/.services/git\"}",
+        "operator-secret",
+    );
+    defer allocator.free(payload);
+
+    try std.testing.expectEqualStrings(
+        "{\"workspace_id\":\"ws-123\",\"bind_path\":\"/services/git\",\"target\":\"/workspace/.services/git\",\"operator_token\":\"operator-secret\"}",
+        payload,
+    );
 }
 
 const ControlSend = struct {
