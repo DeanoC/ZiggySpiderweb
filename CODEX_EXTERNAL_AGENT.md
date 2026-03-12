@@ -169,6 +169,8 @@ That repeatability runner writes:
 - `repeatability_summary.md`
 - one subdirectory per run, each with the usual live harness artifacts
 
+If you stop the repeatability batch intentionally, it still writes partial repeatability summaries from the artifacts that already exist. Interrupted runs are marked with `interrupted=true` and an `interrupt_reason`.
+
 When you need a ready-to-file upstream repro bundle, use:
 
 ```bash
