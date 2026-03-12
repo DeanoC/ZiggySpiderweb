@@ -7015,6 +7015,34 @@ pub const Session = struct {
         return abilities.can_create_agents;
     }
 
+    pub fn isToolAllowedForCurrentAgent(self: *Session, tool_name: []const u8) !bool {
+        const policy_agent_id = if (std.mem.eql(u8, self.actor_type, "agent") and self.actor_id.len > 0)
+            self.actor_id
+        else
+            self.agent_id;
+
+        var config = try agent_config.loadAgentConfigFromDir(self.allocator, self.agents_dir, policy_agent_id);
+        if (config == null and !std.mem.eql(u8, policy_agent_id, self.agent_id)) {
+            config = try agent_config.loadAgentConfigFromDir(self.allocator, self.agents_dir, self.agent_id);
+        }
+        if (config == null) return true;
+
+        var owned_config = config.?;
+        defer owned_config.deinit();
+
+        const primary = owned_config.primary.view();
+
+        if (primary.denied_tools) |denied_tools| {
+            if (toolListContains(denied_tools, tool_name)) return false;
+        }
+
+        if (primary.allowed_tools) |allowed_tools| {
+            return toolListContains(allowed_tools, tool_name);
+        }
+
+        return true;
+    }
+
     fn resolveAgentAbilities(self: *Session) !AgentAbilities {
         var abilities = AgentAbilities{
             .can_create_agents = std.mem.eql(u8, self.agent_id, "spiderweb"),
@@ -7057,6 +7085,13 @@ pub const Session = struct {
     fn capabilityMatchesAny(capability: []const u8, accepted: []const []const u8) bool {
         for (accepted) |candidate| {
             if (std.ascii.eqlIgnoreCase(capability, candidate)) return true;
+        }
+        return false;
+    }
+
+    fn toolListContains(list: std.ArrayListUnmanaged([]u8), tool_name: []const u8) bool {
+        for (list.items) |item| {
+            if (std.mem.eql(u8, item, tool_name)) return true;
         }
         return false;
     }
@@ -9517,6 +9552,112 @@ fn decodeReadResponseData(allocator: std.mem.Allocator, frame: []const u8) ![]u8
     errdefer allocator.free(decoded);
     try std.base64.standard.Decoder.decode(decoded, data_b64.string);
     return decoded;
+}
+
+test "acheron_session: pr_review run_validation denied when shell_exec is blocked" {
+    const allocator = std.testing.allocator;
+
+    var mission_store = try mission_store_mod.MissionStore.initWithPath(allocator, null);
+    defer mission_store.deinit();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    try tmp_dir.dir.makePath("exports");
+    try tmp_dir.dir.makePath("agents");
+    try tmp_dir.dir.writeFile(.{
+        .sub_path = "agents/reviewer-denied_config.json",
+        .data = "{\"agent_id\":\"reviewer-denied\",\"primary\":{\"denied_tools\":[\"shell_exec\"]}}",
+    });
+
+    const root = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+    const exports_dir = try std.fs.path.join(allocator, &.{ root, "exports" });
+    defer allocator.free(exports_dir);
+    const agents_dir = try std.fs.path.join(allocator, &.{ root, "agents" });
+    defer allocator.free(agents_dir);
+
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createUnavailable(
+        allocator,
+        "execution_failed",
+        "runtime unavailable",
+    );
+    defer runtime_handle.destroy();
+
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "reviewer-host",
+        .{
+            .mission_store = &mission_store,
+            .local_fs_export_root = exports_dir,
+            .agents_dir = agents_dir,
+            .actor_type = "agent",
+            .actor_id = "reviewer-denied",
+        },
+    );
+    defer session.deinit();
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        732,
+        733,
+        &.{ "agents", "self", "pr_review", "control", "start.json" },
+        "{\"repo_key\":\"DeanoC/Spiderweb\",\"pr_number\":129,\"default_review_commands\":[\"printf validation-ok\"]}",
+        1816,
+    );
+
+    const start_result = try protocolReadFile(
+        &session,
+        allocator,
+        734,
+        735,
+        &.{ "agents", "self", "pr_review", "result.json" },
+        1817,
+    );
+    defer allocator.free(start_result);
+    const mission_id = try extractMissionIdFromResultPayload(allocator, start_result);
+    defer allocator.free(mission_id);
+
+    const validation_payload = try std.fmt.allocPrint(allocator, "{{\"mission_id\":\"{s}\"}}", .{mission_id});
+    defer allocator.free(validation_payload);
+    try protocolWriteFile(
+        &session,
+        allocator,
+        736,
+        737,
+        &.{ "agents", "self", "pr_review", "control", "run_validation.json" },
+        validation_payload,
+        1818,
+    );
+
+    const pr_review_result = try protocolReadFile(
+        &session,
+        allocator,
+        738,
+        739,
+        &.{ "agents", "self", "pr_review", "result.json" },
+        1819,
+    );
+    defer allocator.free(pr_review_result);
+    try std.testing.expect(std.mem.indexOf(u8, pr_review_result, "\"operation\":\"run_validation\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pr_review_result, "\"ok\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pr_review_result, "\"code\":\"tool_not_allowed\"") != null);
+
+    const terminal_current = try protocolReadFile(
+        &session,
+        allocator,
+        740,
+        741,
+        &.{ "nodes", "local", "venoms", "terminal", "current.json" },
+        1820,
+    );
+    defer allocator.free(terminal_current);
+    try std.testing.expect(std.mem.indexOf(u8, terminal_current, "\"session\":null") != null);
 }
 
 test "session: parseReaddirNextCookie accepts next" {
