@@ -47,7 +47,131 @@ docker run -it --rm \
 # Test the full interactive install
 curl -fsSL https://raw.githubusercontent.com/DeanoC/Spiderweb/main/install.sh | bash
 
-# Or run with pre-configured values (non-interactive mode coming soon)
+# Or drive a non-interactive install explicitly
+SPIDERWEB_NON_INTERACTIVE=1 \
+SPIDERWEB_INSTALL_ZSS=0 \
+SPIDERWEB_INSTALL_SYSTEMD=0 \
+SPIDERWEB_START_AFTER_INSTALL=0 \
+bash ./install.sh
+```
+
+## External Codex Workspace E2E Harness
+
+This harness documents and exercises the Linux-first external Codex operator path:
+
+- installer-first host flow (`./install.sh` on the Spiderweb host)
+- isolated Spiderweb runtime root plus a clean standalone local workspace node
+- standalone `spiderweb-fs-node` as the remote filesystem node under test
+- namespace mount via `spiderweb-fs-mount --namespace-url ...`
+- plain Codex launch in live or manual-handoff mode
+- validation and report artifact capture
+
+Mounted namespace paths used by the harness:
+
+- local writable project tree: `/nodes/local/fs`
+- remote shared seed data: `/shared_data`
+- project metadata: `/projects/<project_id>/meta/*`
+- namespace metadata: `/meta/*`
+
+Run it directly from the repo root:
+
+```bash
+bash test-env/test-external-codex-workspace.sh
+```
+
+Or through `make`:
+
+```bash
+cd test-env && make test-external-codex-workspace
+```
+
+Compatibility matrix runner:
+
+```bash
+cd test-env && make test-external-codex-cli-matrix
+```
+
+Repro bundle packager:
+
+```bash
+cd test-env && make package-external-codex-repro
+```
+
+Codex launch controls:
+
+- `CODEX_MODE=auto`: try a live Codex launch, then fall back to the dedicated handoff package if the launcher is unavailable or the live step cannot proceed
+- `CODEX_MODE=live`: require a real Codex launch; launch failure fails the harness
+- `CODEX_MODE=manual`: skip live launch and prepare the manual handoff package only
+- `CODEX_BIN`: override the detected Codex binary
+- `CODEX_CLI_VERSION`: pinned plain Codex CLI version the harness expects. Default: `0.111.0`
+- `CODEX_AUTH_MODE=auto|api_key|existing_login`: choose isolated API-key auth or an existing login. `auto` prefers API-key auth when `OPENAI_API_KEY` is set
+- `CODEX_API_KEY_ENV`: environment variable name to read for `api_key` mode. Default: `OPENAI_API_KEY`
+- `CODEX_LAUNCH_CMD`: override the detected launcher when the default `codex exec` template is not correct for the machine
+- `CODEX_TIMEOUT_SECONDS`: maximum seconds to allow the live Codex phase before the harness fails with a diagnostic handoff/report. Default: `900`
+- `CODEX_IDLE_TIMEOUT_SECONDS`: optional idle cutoff for the live Codex phase. Default: `0` (disabled), because `codex exec --json` can spend long periods silently reasoning before the next visible tool or file event.
+- `CODEX_JSON_EVENTS=1`: inject `--json` into common `codex exec` launch templates and preserve the raw Codex event stream in `logs/codex.stdout.log`
+- `CODEX_USE_PTY=1`: wrap the live Codex launch in `script(1)` so the run behaves like a real terminal session and preserves `logs/codex.pty.log`
+- `CODEX_DISABLE_COLLABORATION_MODES=1`: inject `--disable collaboration_modes` into common `codex exec` templates unless disabled
+- `CODEX_DISABLE_APPS=1`: inject `--disable apps` by default because the current live Spiderweb path is more reliable without the apps surface in non-interactive `exec`
+- `CODEX_DISABLE_SHELL_SNAPSHOT=1`: inject `--disable shell_snapshot` by default because the current live Spiderweb path is more reliable without shell snapshotting in non-interactive `exec`
+- `CODEX_ALLOW_HOST_CODEX_HOME=1`: temporarily allow writes under host `~/.codex` for reliability while still reporting them as a `codex_home` machine-independence gap
+
+Expected output artifacts:
+
+- `codex_exec_summary.json`
+- `codex_usage_report.json`
+- `codex_usage_report.md`
+- `game_validation.json`
+- `codex_handoff/`
+
+Matrix runner artifacts:
+
+- `matrix_summary.json`
+- `matrix_summary.md`
+- one subdirectory per case, each containing the normal live harness artifacts
+
+Repro bundle artifacts:
+
+- `README.md`
+- `BUG_REPORT.md`
+- `repro_manifest.json`
+- `source_summaries/`
+- `cases/`
+- optional `*.tar.gz` bundle
+
+Usage report result semantics:
+
+- `reliability_ok`: true only when the run stayed inside the mounted workspace plus harness-owned runtime roots, plus any explicit temporary host-write allowlists
+- `machine_independence_ok`: true only when no host-runtime gaps were observed
+- `candidate_venom_gaps`: inferred local-runtime gaps such as `codex_runtime`, `codex_home`, `terminal_runtime`, `git_runtime`, and `search_code_bridge`
+
+Fallback behavior:
+
+- `auto` does not silently skip the Codex step
+- the harness should still preserve the namespace-mounted workspace context
+- `codex_handoff/` is the dedicated resume package for manual continuation
+- `codex_exec_summary.json` captures the last observed Codex event, last completed item, and inferred stall stage from the live `--json` event stream
+- validation and usage reports should still be written in fallback/manual mode
+
+Operator notes:
+
+- prefer the installer-first Linux path for this harness; use `./install-fs-mount.sh` only when the namespace mount happens on a separate Linux machine
+- the harness is about the standalone node + namespace story, not the older routed `--workspace-url` only flow
+- the clean writable project tree is `/nodes/local/fs`; Spiderweb’s own runtime root is kept separate from that workspace on purpose
+- `CODEX_AUTH_MODE=api_key` is still the strict fresh-install path, but `existing_login` is temporarily acceptable for reliability because host `~/.codex` writes are allowlisted by default while still reported as a `codex_home` machine-independence gap
+- `CODEX_LAUNCH_CMD` is optional; the harness can build a default launcher around the pinned `codex exec` flow
+- the default live launcher now preserves both `logs/codex.stdout.log` and `logs/codex.pty.log`, which makes it much easier to distinguish “still progressing” from “stopped after a tool result”
+- `test-env/test-external-codex-cli-matrix.sh` is the fast way to compare pinned Codex CLI versions and PTY/JSON launch modes against the same Spiderweb scenario
+- `test-env/package-external-codex-repro.sh` collects the matrix outputs into a single upstream-ready repro pack with a generated bug report
+- custom launch templates may use `{codex_bin}`, `{workspace_root}`, `{namespace_root}`, `{namespace_meta_dir}`, `{project_meta_dir}`, `{shared_data_dir}`, `{prompt_file}`, and `{artifact_dir}`
+- if you still want to override the launcher, a working template is:
+
+```bash
+CODEX_MODE=live \
+CODEX_AUTH_MODE=api_key \
+OPENAI_API_KEY=... \
+CODEX_LAUNCH_CMD='cat {prompt_file} | {codex_bin} exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox --ephemeral --add-dir {namespace_meta_dir} --add-dir {project_meta_dir} --add-dir {shared_data_dir} --add-dir {artifact_dir} -C {workspace_root} -o {artifact_dir}/codex_last_message.txt -' \
+bash test-env/test-external-codex-workspace.sh
 ```
 
 ## Embedded Multi-Service Integration Test

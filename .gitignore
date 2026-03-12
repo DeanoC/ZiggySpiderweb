@@ -30,3 +30,7 @@ Thumbs.db
 # Test artifacts
 *.log
 /tmp/
+
+# Python cache
+__pycache__/
+*.pyc

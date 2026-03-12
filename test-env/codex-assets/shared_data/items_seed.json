@@ -1,0 +1,14 @@
+{
+  "items": [
+    { "id": "glass_key", "name": "Glass Key" },
+    { "id": "moss_compass", "name": "Moss Compass" },
+    { "id": "rope_of_bells", "name": "Rope of Bells" },
+    { "id": "ember_chalk", "name": "Ember Chalk" },
+    { "id": "salt_coin", "name": "Salt Coin" },
+    { "id": "storm_apple", "name": "Storm Apple" },
+    { "id": "brass_lens", "name": "Brass Lens" },
+    { "id": "rune_ribbon", "name": "Rune Ribbon" },
+    { "id": "dawn_fuse", "name": "Dawn Fuse" },
+    { "id": "lantern_of_nine_paths", "name": "Lantern of Nine Paths" }
+  ]
+}

@@ -1,30 +1,22 @@
 # Codex External Agent Guide
 
-This guide is for running a non-Spider-Monkey agent inside Spiderweb, using Codex as the reference worker.
+This is the operator guide for the external Codex end-to-end harness. Spiderweb owns the hosted workspace, namespace, control plane, and remote-node topology. Codex stays outside Spiderweb and works through the mounted filesystem contract.
 
-## Tested Status
-
-Validated on March 11, 2026 against current `Spiderweb` `main`, plus the Windows/WSL follow-up fixes in this branch.
-
-- Windows native:
-  - `git submodule update --init --recursive` is required before builds or docs are trustworthy.
-  - `zig build fs-mount`
-  - `zig build test-fs-mount`
-  - `spiderweb-fs-mount.exe --mount-backend winfsp` works from Windows against a WSL-hosted Spiderweb server.
-  - Windows namespace validation passed for `dir X:\services`, `Get-Content X:\meta\protocol.json`, `Get-Content X:\projects\<project_id>\meta\mounted_services.json`, and routed writes under `X:\nodes\local\fs\...`.
-  - Full `zig build` does not currently pass on Windows on this machine. The failures were in `zwasm`/POSIX-dependent targets plus missing `sqlite3` linkage for the server binary.
-- WSL / Linux:
-  - `zig build` passes in a clean Linux checkout.
-  - Namespace attach with `spiderweb-fs-mount --namespace-url ...` works.
-  - Starting `spiderweb` from a different WSL working directory still works when `runtime.spider_web_root` is set.
+The harness entrypoint for this flow is `test-env/test-external-codex-workspace.sh`.
 
 ## Current Recommendation
 
-Run the Spiderweb server in Linux or WSL.
+Use a Linux host for the documented Codex E2E path.
 
-Use Windows for the standalone `spiderweb-fs-mount` client and the final mounted workspace if you want Codex Desktop on Windows to work against it. That client path is now validated with WinFsp; the unsupported part is the full native Windows host build.
+- install the host tools first with `./install.sh`
+- keep Spiderweb’s runtime root separate from the Codex project tree
+- use one clean standalone `spiderweb-fs-node` for `/nodes/local/fs` and one standalone node for `/shared_data`
+- mount the workspace with `spiderweb-fs-mount --namespace-url ...`
+- launch plain Codex from `/nodes/local/fs`, or deliberately fall back to a prepared handoff
 
-## Setup
+Windows `spiderweb-fs-mount` remains useful for separate client validation, but the new external Codex harness is Linux-first.
+
+## Installer-First Linux Flow
 
 ### 1. Clone with submodules
 
@@ -39,59 +31,219 @@ If you already cloned without submodules:
 git submodule update --init --recursive
 ```
 
-### 2. Build
+### 2. Install the host toolchain
 
-Linux / WSL:
-
-```bash
-zig build
-```
-
-Windows-only mount client:
-
-```powershell
-zig build fs-mount
-zig build test-fs-mount
-```
-
-### 3. Start Spiderweb and reveal auth
-
-Linux / WSL:
+Use the installer-first path instead of treating the harness as a source-build-only workflow:
 
 ```bash
-./zig-out/bin/spiderweb-config auth reset --yes
-./zig-out/bin/spiderweb-config auth status --reveal
-./zig-out/bin/spiderweb
+./install.sh
+spiderweb-config auth status --reveal
 ```
 
-## Attach Flow For Codex
+That installs the Linux host surface used by the harness:
 
-If you already have a workspace id:
+- `spiderweb`
+- `spiderweb-config`
+- `spiderweb-control`
+- `spiderweb-fs-mount`
+- `spiderweb-fs-node`
+
+If the namespace mount runs on a different Linux machine, install the standalone mount client there:
 
 ```bash
-./zig-out/bin/spiderweb-fs-mount \
+./install-fs-mount.sh
+```
+
+### 3. Start Spiderweb
+
+```bash
+spiderweb
+```
+
+Create a workspace once the host is up:
+
+```bash
+spiderweb-control \
+  --auth-token <admin-token> \
+  workspace_create \
+  '{"name":"Codex Demo","vision":"External Codex workspace"}'
+```
+
+## Standalone Remote Node
+
+The new harness uses a standalone `spiderweb-fs-node` remote node instead of assuming everything lives on the Spiderweb host filesystem.
+
+Typical invite-flow start:
+
+```bash
+spiderweb-fs-node \
+  --export "work=/srv/codex-fixture:rw" \
+  --control-url "ws://127.0.0.1:18790/" \
+  --control-auth-token "<admin-token>" \
+  --pair-mode invite \
+  --invite-token "<invite-token>" \
+  --node-name "codex-e2e-node"
+```
+
+Notes:
+
+- `SPIDERWEB_AUTH_TOKEN` can supply control auth when `--control-url` is used.
+- The node can run on a different machine than the Spiderweb host.
+- The namespace should expose that node through project metadata, not through hard-coded path assumptions.
+
+## Namespace Mount For Codex
+
+Use namespace mode for the harness. That is the path which exposes `/meta`, `/projects`, `/services`, `/nodes`, and `/agents` together:
+
+```bash
+spiderweb-fs-mount \
   --namespace-url ws://127.0.0.1:18790/ \
   --workspace-id <workspace-id> \
   --auth-token <admin-or-user-token> \
   --agent-id codex \
   --session-key main \
-  mount /mnt/spiderweb
+  mount /mnt/spiderweb-codex
 ```
 
-For Windows with WinFsp:
+Codex itself does not need a Spiderweb-specific runtime binary. It only needs filesystem access to the mounted namespace.
 
-```powershell
-spiderweb-fs-mount.exe `
-  --namespace-url ws://127.0.0.1:18790/ `
-  --workspace-id <workspace-id> `
-  --auth-token <admin-or-user-token> `
-  --agent-id codex `
-  --session-key main `
-  --mount-backend winfsp `
-  mount X:
+## External Codex E2E Harness
+
+The new end-to-end entrypoint is:
+
+```bash
+bash test-env/test-external-codex-workspace.sh
 ```
 
-Codex itself does not need a Spiderweb-specific runtime binary. It only needs filesystem access to the mounted workspace.
+Or through `make`:
+
+```bash
+cd test-env
+make test-external-codex-workspace
+make test-external-codex-cli-matrix
+make package-external-codex-repro
+```
+
+What this harness is expected to cover:
+
+- installer-first Linux host flow
+- isolated Spiderweb runtime root plus standalone workspace/remote node lifecycle
+- namespace mount with `spiderweb-fs-mount --namespace-url ...`
+- pinned plain Codex bootstrap, auth, launch, or manual handoff preparation
+- validation and report artifact capture
+
+When you need to compare Codex CLI versions or launch modes, use:
+
+```bash
+bash test-env/test-external-codex-cli-matrix.sh
+```
+
+The matrix runner reuses the main external-Codex harness and writes:
+
+- `matrix_summary.json`
+- `matrix_summary.md`
+- one subdirectory per case, each with the usual handoff/report artifacts
+
+When you need a ready-to-file upstream repro bundle, use:
+
+```bash
+bash test-env/package-external-codex-repro.sh
+```
+
+That packager collects selected matrix cases and writes:
+
+- `README.md`
+- `BUG_REPORT.md`
+- `repro_manifest.json`
+- `source_summaries/`
+- `cases/`
+- an optional `.tar.gz` archive
+
+## Codex Launch Modes
+
+The harness should expose these launch controls:
+
+- `CODEX_MODE=auto`: try to launch a live Codex session. If no usable launcher is available, or the live launch cannot proceed, switch to the dedicated fallback handoff behavior and still preserve the run artifacts.
+- `CODEX_MODE=live`: require a live Codex launch. Launch failure is a harness failure; do not auto-downgrade.
+- `CODEX_MODE=manual`: skip live Codex launch and go straight to the dedicated handoff package.
+- `CODEX_BIN`: override the detected Codex binary.
+- `CODEX_CLI_VERSION`: pinned plain Codex CLI version to verify or install. Default: `0.111.0`.
+- `CODEX_AUTH_MODE=auto|api_key|existing_login`: choose isolated API-key auth or an existing login. `auto` prefers API-key auth when `OPENAI_API_KEY` is present.
+- `CODEX_API_KEY_ENV`: environment variable name for API-key auth. Default: `OPENAI_API_KEY`.
+- `CODEX_LAUNCH_CMD`: override the detected Codex launcher when the default command is not correct for the machine running the harness.
+- `CODEX_TIMEOUT_SECONDS`: bound the live Codex phase so the harness cannot hang forever on an upstream CLI regression. Default: `900`.
+- `CODEX_IDLE_TIMEOUT_SECONDS`: optional idle cutoff for the live Codex phase. Default: `0` (disabled), because `codex exec --json` can spend long periods silently reasoning before the next visible tool or file event.
+- `CODEX_JSON_EVENTS=1`: inject `--json` into common `codex exec` launch templates and preserve the raw event stream in `logs/codex.stdout.log`.
+- `CODEX_USE_PTY=1`: wrap the live launch in `script(1)` so Codex runs in a terminal-like session and preserves `logs/codex.pty.log`.
+- `CODEX_DISABLE_COLLABORATION_MODES=1`: inject `--disable collaboration_modes` into common `codex exec` templates unless you opt out.
+- `CODEX_DISABLE_APPS=1`: inject `--disable apps` by default because the current live Spiderweb path is more reliable without the apps surface in non-interactive `exec`.
+- `CODEX_DISABLE_SHELL_SNAPSHOT=1`: inject `--disable shell_snapshot` by default because the current live Spiderweb path is more reliable without shell snapshotting in non-interactive `exec`.
+- `CODEX_ALLOW_HOST_CODEX_HOME=1`: temporarily allow writes under host `~/.codex` for reliability while still reporting them as a `codex_home` machine-independence gap.
+
+Practical rule:
+
+- use `auto` for operator convenience
+- use `live` for strict E2E validation
+- use `manual` when you want the environment prepared but will attach Codex yourself
+
+For current Linux live runs, prefer the default launcher and isolated API-key auth. Existing-login auth is also acceptable for now when you need to reuse an already prepared host `~/.codex` state:
+
+```bash
+CODEX_MODE=live \
+CODEX_AUTH_MODE=api_key \
+OPENAI_API_KEY=... \
+bash test-env/test-external-codex-workspace.sh
+```
+
+If you do need to override the launcher, use a template that keeps Codex rooted in `/nodes/local/fs` and adds only the metadata/data directories it needs:
+
+```bash
+CODEX_MODE=live \
+CODEX_AUTH_MODE=api_key \
+OPENAI_API_KEY=... \
+CODEX_LAUNCH_CMD='cat {prompt_file} | {codex_bin} exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox --ephemeral --add-dir {namespace_meta_dir} --add-dir {project_meta_dir} --add-dir {shared_data_dir} --add-dir {artifact_dir} -C {workspace_root} -o {artifact_dir}/codex_last_message.txt -' \
+bash test-env/test-external-codex-workspace.sh
+```
+
+## Output Artifacts
+
+Each run should preserve the same high-signal artifacts:
+
+- `codex_exec_summary.json`
+- `codex_usage_report.json`
+- `codex_usage_report.md`
+- `game_validation.json`
+- `codex_handoff/`
+
+`codex_handoff/` is the dedicated resume package for manual continuation. It should contain the workspace and mount context Codex needs when the live launch is skipped or unavailable.
+
+`codex_exec_summary.json` is the quick diagnosis artifact for live stalls. It records:
+
+- whether Codex JSON events were detected
+- the last observed event type
+- the last completed item type
+- the last agent message, if one was emitted
+- an inferred stall stage such as `after_tool_result` or `after_agent_message`
+
+The usage report distinguishes:
+
+- `reliability_ok`: no disallowed writes outside the mounted workspace plus harness-owned runtime roots
+- `machine_independence_ok`: no host-runtime gaps observed
+- `candidate_venom_gaps`: inferred gaps such as `codex_runtime`, `codex_home`, `terminal_runtime`, `git_runtime`, and `search_code_bridge`
+
+## Dedicated Fallback Behavior
+
+The fallback path is deliberate. It should not silently replace the live run with an opaque no-op.
+
+When fallback is used:
+
+- the namespace mount and remote-node setup are still treated as the source of truth
+- the harness writes the dedicated `codex_handoff/` package for a later/manual Codex run
+- usage and validation artifacts are still emitted so the operator can inspect what happened
+- the reason for fallback should be visible in the handoff/report output
+- the handoff README should include the last observed Codex event summary when live JSON events were captured
+
+This is the main difference between `CODEX_MODE=auto` and `CODEX_MODE=live`.
 
 ## What A Fresh Codex Should Read First
 
@@ -114,6 +266,13 @@ What this gives Codex:
 - the live control-file contract for each service
 - the agent identity files Spiderweb seeded for the current `agent_id`
 
+For the current external Codex harness, the important writable/data paths inside the namespace are:
+
+- local writable project tree: `/nodes/local/fs`
+- remote shared seed data: `/shared_data`
+
+In the current harness, Spiderweb’s own runtime root is intentionally not the Codex project tree. That separation keeps `agents/` and `templates/` out of Codex’s cwd and makes the workspace topology match what a fresh user should see.
+
 ## Minimal Codex Prompt
 
 Use something close to this when placing a fresh Codex into a Spiderweb mount:
@@ -121,59 +280,19 @@ Use something close to this when placing a fresh Codex into a Spiderweb mount:
 ```text
 You are operating inside a Spiderweb-mounted workspace.
 Treat the filesystem as the contract.
-Do not assume service availability from docs alone.
-Start by reading /meta/protocol.json, /projects/<project_id>/meta/mounted_services.json, and /projects/<project_id>/meta/workspace_status.json.
-Before using any service, read its README.md, OPS.json, SCHEMA.json, and CAPS.json.
-Prefer /services/<venom_id> when present.
-If a service is not bound there, fall back to the path reported in mounted_services.json.
-Report path drift or missing writable control files before assuming the host is misconfigured.
+Treat /nodes/local/fs as the writable project tree and /shared_data as the required remote input mount.
+Inspect /meta/protocol.json, /projects/<project_id>/meta/mounted_services.json, and /projects/<project_id>/meta/workspace_status.json first.
+Read only the fields you need; do not dump whole metadata files back into the terminal.
+After the discovery reads, create the deliverable files immediately and iterate only if validation fails.
 ```
-
-## What Worked In Validation
-
-- `spiderweb-control workspace_create '{"name":"...","vision":"..."}'`
-- `spiderweb-fs-mount --namespace-url ... status --no-probe`
-- `spiderweb-fs-mount --namespace-url ... status`
-- `spiderweb-fs-mount --namespace-url ... readdir /`
-- `spiderweb-fs-mount --namespace-url ... readdir /services`
-- `spiderweb-fs-mount --namespace-url ... cat /meta/protocol.json`
-- `spiderweb-fs-mount --namespace-url ... cat /projects/<project_id>/meta/mounted_services.json`
-- `spiderweb-fs-mount.exe --mount-backend winfsp ... mount X:` against a WSL-hosted Spiderweb server
-- Windows `dir X:\services` and `Get-ChildItem X:\services`
-- Windows reads from `X:\services\home\README.md` and `X:\services\workers\OPS.json`
-- Windows routed writes under `X:\nodes\local\fs\...`
-- project-scoped `workspace_status` now returns `fs_auth_token` for authorized callers, so routed namespace endpoints come up healthy
-- automatic `control.agent_ensure` on attach created `/agents/codex` with seeded identity files
-- the Linux / WSL host no longer depends on launch cwd for `agents`, `templates`, or the local agents export when `runtime.spider_web_root` is configured
-
-## Fixed Since First Pass
-
-These issues from the earlier Codex validation are no longer reproducing on the current branch:
-
-1. `workspace_create` now succeeds with just `name` and `vision`.
-2. `/services` now enumerates cleanly in namespace directory listing, including through the Windows WinFsp mount.
-3. namespace-routed `/v2/fs` endpoints now hydrate correctly from project-scoped `workspace_status`, instead of staying unhealthy because `fs_auth_token` was omitted.
-4. launching the WSL host from the wrong cwd no longer breaks agent/template discovery or the local agents export when `runtime.spider_web_root` is set.
-5. remote `missing_field` and `invalid_payload` errors are now surfaced by `spiderweb-fs-mount` as `MissingField` and `InvalidPayload` instead of generic `InvalidResponse`.
-
-## Gaps Found While Testing
-
-These are the current missing pieces for a fresh Codex operator story:
-
-1. `/meta/workspace_services.json` was still absent in live namespace validation. The reliable service inventory is still `/projects/<project_id>/meta/mounted_services.json`.
-2. Service-control writes are still not reliable enough for a clear operator story, including from a real Windows mounted drive:
-   - `/services/home/control/ensure.json` still leaves `result.json` at `{"ok":false,...}` for a minimal `{"agent_id":"codex"}` payload
-   - `/services/workers/control/register.json` still leaves `result.json` at `{"ok":false,...}` and `/nodes/codex-worker` is still absent
-   - the Windows-mounted path is therefore good for discovery and routed filesystem work, but not yet for durable service provisioning
-3. Native Windows server builds are still not ready for the full host flow on this machine; the practical split is Linux/WSL host plus Windows mount client.
-4. `docs/overview.md` still depends on submodules being initialized, so `git submodule update --init --recursive` remains mandatory before trusting the docs.
 
 ## Practical Operator Rule
 
-Right now, the safest external-agent story is:
+Right now, the safest external Codex story is:
 
-- host Spiderweb on Linux or WSL
+- host Spiderweb on Linux
+- use installer-first binaries for the host flow
+- attach remote content with standalone `spiderweb-fs-node`
 - mount the namespace with `spiderweb-fs-mount`
-- let Codex work against the mounted filesystem
 - treat project metadata discovery as stable
-- treat service-control writes as an area still needing hardening, payload clarification, and better result propagation
+- use the dedicated fallback handoff when live Codex launch is unavailable
