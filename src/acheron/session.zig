@@ -32,6 +32,8 @@ const missions_venom = @import("../venoms/missions.zig");
 const pr_review_venom = @import("../venoms/pr_review.zig");
 const venom_packages = @import("../venom_packages.zig");
 
+var direct_builtin_shell_exec_mutex: std.Thread.Mutex = .{};
+
 const NodeKind = enum {
     dir,
     file,
@@ -346,16 +348,72 @@ fn deinitResponseFramesWithContext(_: ?*anyopaque, allocator: std.mem.Allocator,
     deinitResponseFrames(allocator, frames);
 }
 
+fn pathExistsAbsolute(path: []const u8) bool {
+    std.fs.accessAbsolute(path, .{}) catch return false;
+    return true;
+}
+
+fn ensureAbsoluteDirectoryExists(dir_path: []const u8) !void {
+    if (!std.fs.path.isAbsolute(dir_path)) return error.InvalidPath;
+    var root_dir = try std.fs.openDirAbsolute("/", .{});
+    defer root_dir.close();
+    const rel_dir = std.mem.trimLeft(u8, dir_path, "/");
+    if (rel_dir.len == 0) return;
+    root_dir.makePath(rel_dir) catch |err| {
+        if (err != error.PathAlreadyExists) return err;
+    };
+}
+
+fn deleteAbsoluteTreeIfPresent(dir_path: []const u8) !void {
+    if (!std.fs.path.isAbsolute(dir_path)) return error.InvalidPath;
+    var root_dir = try std.fs.openDirAbsolute("/", .{});
+    defer root_dir.close();
+    const rel_dir = std.mem.trimLeft(u8, dir_path, "/");
+    if (rel_dir.len == 0) return;
+    root_dir.deleteTree(rel_dir) catch return;
+}
+
+fn sanitizePathComponent(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
+    if (raw.len == 0) return allocator.dupe(u8, "unknown");
+    var out = try allocator.alloc(u8, raw.len);
+    for (raw, 0..) |char, idx| {
+        out[idx] = if (std.ascii.isAlphanumeric(char) or char == '-' or char == '_' or char == '.')
+            char
+        else
+            '_';
+    }
+    return out;
+}
+
+fn appendExistingBindArg(
+    allocator: std.mem.Allocator,
+    argv: *std.ArrayListUnmanaged([]const u8),
+    flag: []const u8,
+    source: []const u8,
+    target: []const u8,
+) !void {
+    if (!pathExistsAbsolute(source)) return;
+    try argv.append(allocator, flag);
+    try argv.append(allocator, source);
+    try argv.append(allocator, target);
+}
+
 pub const Session = struct {
     pub const NamespaceOptions = struct {
         project_id: ?[]const u8 = null,
         project_token: ?[]const u8 = null,
+        namespace_mount_url: ?[]const u8 = null,
+        namespace_session_key: ?[]const u8 = null,
         agents_dir: []const u8 = "agents",
         assets_dir: []const u8 = "templates",
         projects_dir: []const u8 = "projects",
         local_fs_export_root: ?[]const u8 = null,
+        sandbox_mounts_root: ?[]const u8 = null,
+        sandbox_launcher: ?[]const u8 = null,
+        sandbox_fs_mount_bin: ?[]const u8 = null,
         control_plane: ?*control_plane_mod.ControlPlane = null,
         mission_store: ?*mission_store_mod.MissionStore = null,
+        namespace_auth_token: ?[]const u8 = null,
         control_operator_token: ?[]const u8 = null,
         actor_type: ?[]const u8 = null,
         actor_id: ?[]const u8 = null,
@@ -371,12 +429,18 @@ pub const Session = struct {
     project_id: ?[]u8 = null,
     active_namespace_project_id: ?[]u8 = null,
     project_token: ?[]u8 = null,
+    namespace_mount_url: ?[]u8 = null,
+    namespace_session_key: ?[]u8 = null,
     agents_dir: []u8,
     assets_dir: []u8,
     projects_dir: []u8,
     local_fs_export_root: ?[]u8 = null,
+    sandbox_mounts_root: ?[]u8 = null,
+    sandbox_launcher: ?[]u8 = null,
+    sandbox_fs_mount_bin: ?[]u8 = null,
     control_plane: ?*control_plane_mod.ControlPlane = null,
     mission_store: ?*mission_store_mod.MissionStore = null,
+    namespace_auth_token: ?[]u8 = null,
     control_operator_token: ?[]u8 = null,
     is_admin: bool = false,
 
@@ -460,6 +524,10 @@ pub const Session = struct {
     project_binds: std.ArrayListUnmanaged(PathBind) = .{},
     scoped_venom_bindings: std.ArrayListUnmanaged(ScopedVenomBinding) = .{},
     node_aliases: std.AutoHashMapUnmanaged(u32, u32) = .{},
+    namespace_mount_dir: ?[]u8 = null,
+    namespace_mount_point: ?[]u8 = null,
+    namespace_mount_child: ?std.process.Child = null,
+    namespace_mount_ready: bool = false,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -489,6 +557,16 @@ pub const Session = struct {
         else
             null;
         errdefer if (owned_project_token) |value| allocator.free(value);
+        const owned_namespace_mount_url = if (options.namespace_mount_url) |value|
+            try allocator.dupe(u8, value)
+        else
+            null;
+        errdefer if (owned_namespace_mount_url) |value| allocator.free(value);
+        const owned_namespace_session_key = if (options.namespace_session_key) |value|
+            try allocator.dupe(u8, value)
+        else
+            null;
+        errdefer if (owned_namespace_session_key) |value| allocator.free(value);
         const actor_type_value = options.actor_type orelse "agent";
         const owned_actor_type = try allocator.dupe(u8, actor_type_value);
         errdefer allocator.free(owned_actor_type);
@@ -506,11 +584,31 @@ pub const Session = struct {
         else
             null;
         errdefer if (owned_local_fs_export_root) |value| allocator.free(value);
+        const owned_sandbox_mounts_root = if (options.sandbox_mounts_root) |value|
+            try allocator.dupe(u8, value)
+        else
+            null;
+        errdefer if (owned_sandbox_mounts_root) |value| allocator.free(value);
+        const owned_sandbox_launcher = if (options.sandbox_launcher) |value|
+            try allocator.dupe(u8, value)
+        else
+            null;
+        errdefer if (owned_sandbox_launcher) |value| allocator.free(value);
+        const owned_sandbox_fs_mount_bin = if (options.sandbox_fs_mount_bin) |value|
+            try allocator.dupe(u8, value)
+        else
+            null;
+        errdefer if (owned_sandbox_fs_mount_bin) |value| allocator.free(value);
         const owned_control_operator_token = if (options.control_operator_token) |value|
             try allocator.dupe(u8, value)
         else
             null;
         errdefer if (owned_control_operator_token) |value| allocator.free(value);
+        const owned_namespace_auth_token = if (options.namespace_auth_token) |value|
+            try allocator.dupe(u8, value)
+        else
+            null;
+        errdefer if (owned_namespace_auth_token) |value| allocator.free(value);
         runtime_handle.retain();
         errdefer runtime_handle.release();
 
@@ -523,12 +621,18 @@ pub const Session = struct {
             .actor_id = owned_actor_id,
             .project_id = owned_project,
             .project_token = owned_project_token,
+            .namespace_mount_url = owned_namespace_mount_url,
+            .namespace_session_key = owned_namespace_session_key,
             .agents_dir = owned_agents_dir,
             .assets_dir = owned_assets_dir,
             .projects_dir = owned_projects_dir,
             .local_fs_export_root = owned_local_fs_export_root,
+            .sandbox_mounts_root = owned_sandbox_mounts_root,
+            .sandbox_launcher = owned_sandbox_launcher,
+            .sandbox_fs_mount_bin = owned_sandbox_fs_mount_bin,
             .control_plane = options.control_plane,
             .mission_store = options.mission_store,
+            .namespace_auth_token = owned_namespace_auth_token,
             .control_operator_token = owned_control_operator_token,
             .is_admin = options.is_admin,
         };
@@ -563,13 +667,57 @@ pub const Session = struct {
         if (self.project_id) |value| self.allocator.free(value);
         if (self.active_namespace_project_id) |value| self.allocator.free(value);
         if (self.project_token) |value| self.allocator.free(value);
+        if (self.namespace_mount_url) |value| self.allocator.free(value);
+        if (self.namespace_session_key) |value| self.allocator.free(value);
         self.allocator.free(self.agents_dir);
         self.allocator.free(self.assets_dir);
         self.allocator.free(self.projects_dir);
         if (self.local_fs_export_root) |value| self.allocator.free(value);
+        self.cleanupNamespaceMount();
+        if (self.sandbox_mounts_root) |value| self.allocator.free(value);
+        if (self.sandbox_launcher) |value| self.allocator.free(value);
+        if (self.sandbox_fs_mount_bin) |value| self.allocator.free(value);
+        if (self.namespace_auth_token) |value| self.allocator.free(value);
         if (self.control_operator_token) |value| self.allocator.free(value);
         self.runtime_handle.release();
         self.* = undefined;
+    }
+
+    pub fn terminalNamespaceMode(self: *const Session) []const u8 {
+        return if (self.canUseNamespaceShellExec()) "attached-live" else "runtime-local";
+    }
+
+    pub fn terminalPathModel(self: *const Session) []const u8 {
+        return if (self.canUseNamespaceShellExec()) "shared-absolute" else "localfs-only";
+    }
+
+    fn canUseNamespaceShellExec(self: *const Session) bool {
+        return builtin.os.tag == .linux and
+            self.project_id != null and
+            self.namespace_mount_url != null and
+            self.namespace_session_key != null and
+            self.sandbox_mounts_root != null and
+            self.sandbox_launcher != null and
+            self.sandbox_fs_mount_bin != null;
+    }
+
+    fn cleanupNamespaceMount(self: *Session) void {
+        if (self.namespace_mount_child) |*child| {
+            _ = child.kill() catch {};
+            _ = child.wait() catch {};
+        }
+        self.namespace_mount_child = null;
+
+        if (self.namespace_mount_dir) |dir_path| {
+            deleteAbsoluteTreeIfPresent(dir_path) catch {};
+            self.allocator.free(dir_path);
+            self.namespace_mount_dir = null;
+        }
+        if (self.namespace_mount_point) |mount_point| {
+            self.allocator.free(mount_point);
+            self.namespace_mount_point = null;
+        }
+        self.namespace_mount_ready = false;
     }
 
     fn clearWorkerPresence(self: *Session) void {
@@ -594,12 +742,18 @@ pub const Session = struct {
             .{
                 .project_id = self.project_id,
                 .project_token = self.project_token,
+                .namespace_mount_url = self.namespace_mount_url,
+                .namespace_session_key = self.namespace_session_key,
                 .agents_dir = self.agents_dir,
                 .assets_dir = self.assets_dir,
                 .projects_dir = self.projects_dir,
                 .local_fs_export_root = self.local_fs_export_root,
+                .sandbox_mounts_root = self.sandbox_mounts_root,
+                .sandbox_launcher = self.sandbox_launcher,
+                .sandbox_fs_mount_bin = self.sandbox_fs_mount_bin,
                 .control_plane = self.control_plane,
                 .mission_store = self.mission_store,
+                .namespace_auth_token = self.namespace_auth_token,
                 .control_operator_token = self.control_operator_token,
                 .actor_type = self.actor_type,
                 .actor_id = self.actor_id,
@@ -5461,6 +5615,12 @@ pub const Session = struct {
         return self.addNode(parent, name, .file, content, writable, special);
     }
 
+    fn copyNodeBytes(self: *Session, value: []const u8) ![]u8 {
+        const copy = try self.allocator.alloc(u8, value.len);
+        std.mem.copyForwards(u8, copy, value);
+        return copy;
+    }
+
     fn addNode(
         self: *Session,
         parent: ?u32,
@@ -5477,9 +5637,9 @@ pub const Session = struct {
             .id = node_id,
             .parent = parent,
             .kind = kind,
-            .name = try self.allocator.dupe(u8, name),
+            .name = try self.copyNodeBytes(name),
             .writable = writable,
-            .content = try self.allocator.dupe(u8, content),
+            .content = try self.copyNodeBytes(content),
             .special = special,
         };
 
@@ -5874,6 +6034,15 @@ pub const Session = struct {
         const absolute_path = try self.nodeAbsolutePath(source_node_id);
         defer self.allocator.free(absolute_path);
 
+        if (pathMatchesPrefixBoundary(absolute_path, "/services/")) {
+            if (self.active_namespace_project_id != null or self.project_id != null) {
+                const jobs_root = try self.jobsAliasRootForAbsolutePath(absolute_path, "services");
+                if (jobs_root) |value| {
+                    try self.ensureProxyJobDirectory(value, job_id);
+                    return;
+                }
+            }
+        }
         if (pathMatchesPrefixBoundary(absolute_path, "/agents/")) {
             const jobs_root = try self.jobsAliasRootForAbsolutePath(absolute_path, "agents");
             if (jobs_root) |value| {
@@ -5892,6 +6061,14 @@ pub const Session = struct {
     }
 
     fn jobsAliasRootForAbsolutePath(self: *Session, absolute_path: []const u8, scope_root: []const u8) !?u32 {
+        if (std.mem.eql(u8, scope_root, "services")) {
+            _ = parseServiceScopedVenomAliasPrefix(self, absolute_path) orelse return null;
+            const active_project_id = self.active_namespace_project_id orelse self.project_id orelse return null;
+            const projects_root = self.lookupChild(self.root_id, "projects") orelse return null;
+            const project_dir = self.lookupChild(projects_root, active_project_id) orelse return null;
+            const venoms_dir = self.lookupChild(project_dir, "venoms") orelse return null;
+            return self.lookupChild(venoms_dir, "jobs");
+        }
         if (std.mem.eql(u8, scope_root, "agents")) {
             const parsed = parseEntityScopedVenomAliasPrefix(absolute_path, "/agents/", "/venoms/") orelse return null;
             const agents_root = self.lookupChild(self.root_id, "agents") orelse return null;
@@ -5916,6 +6093,13 @@ pub const Session = struct {
         if (pathMatchesPrefixBoundary(absolute_path, "/nodes/local/venoms/chat")) {
             return std.fmt.allocPrint(self.allocator, "/nodes/local/venoms/jobs/{s}/result.txt", .{job_id});
         }
+        if (parseServiceScopedVenomAliasPrefix(self, absolute_path)) |parsed| {
+            return std.fmt.allocPrint(
+                self.allocator,
+                "/projects/{s}/venoms/jobs/{s}/result.txt",
+                .{ parsed.project_id, job_id },
+            );
+        }
         if (parseEntityScopedVenomAliasPrefix(absolute_path, "/agents/", "/venoms/")) |parsed| {
             return std.fmt.allocPrint(
                 self.allocator,
@@ -5934,6 +6118,14 @@ pub const Session = struct {
     }
 
     fn boundVenomProxyPathForAbsolutePath(self: *Session, absolute_path: []const u8) !?BoundVenomProxyPath {
+        const service_match = parseServiceScopedVenomAliasPrefix(self, absolute_path);
+        if (service_match) |value| {
+            return .{
+                .venom_id = value.venom_id,
+                .remote_path = try self.allocator.dupe(u8, value.remote_path),
+                .project_id = value.project_id,
+            };
+        }
         const global_match = parseScopedVenomAliasPrefix(absolute_path, "/global/");
         if (global_match) |value| {
             return .{
@@ -7554,6 +7746,274 @@ pub const Session = struct {
         };
     }
 
+    fn ensureNamespaceMount(self: *Session) ![]const u8 {
+        if (!self.canUseNamespaceShellExec()) return error.UnsupportedPlatform;
+        if (self.namespace_mount_point) |mount_point| {
+            if (self.namespace_mount_ready) return mount_point;
+        }
+
+        self.cleanupNamespaceMount();
+
+        const sandbox_mounts_root = self.sandbox_mounts_root orelse return error.InvalidState;
+        const project_id = self.project_id orelse return error.InvalidState;
+        const namespace_mount_url = self.namespace_mount_url orelse return error.InvalidState;
+        const namespace_session_key = self.namespace_session_key orelse return error.InvalidState;
+        const sandbox_fs_mount_bin = self.sandbox_fs_mount_bin orelse return error.InvalidState;
+        const helper_session_key = try self.buildTerminalHelperSessionKey(namespace_session_key);
+        defer self.allocator.free(helper_session_key);
+        const probe_session_key = try self.buildTerminalProbeSessionKey(namespace_session_key);
+        defer self.allocator.free(probe_session_key);
+
+        const project_component = try sanitizePathComponent(self.allocator, project_id);
+        defer self.allocator.free(project_component);
+        const agent_component = try sanitizePathComponent(self.allocator, self.agent_id);
+        defer self.allocator.free(agent_component);
+        const session_component = try sanitizePathComponent(self.allocator, helper_session_key);
+        defer self.allocator.free(session_component);
+
+        var mount_dir = try std.fs.path.join(
+            self.allocator,
+            &.{ sandbox_mounts_root, "terminal-ns", project_component, agent_component, session_component },
+        );
+        errdefer if (mount_dir.len > 0) self.allocator.free(mount_dir);
+        var mount_point = try std.fs.path.join(self.allocator, &.{ mount_dir, "mount" });
+        errdefer if (mount_point.len > 0) self.allocator.free(mount_point);
+        try ensureAbsoluteDirectoryExists(mount_point);
+
+        var argv = std.ArrayListUnmanaged([]const u8){};
+        defer argv.deinit(self.allocator);
+        try argv.append(self.allocator, sandbox_fs_mount_bin);
+        try argv.append(self.allocator, "--namespace-url");
+        try argv.append(self.allocator, namespace_mount_url);
+        try argv.append(self.allocator, "--workspace-id");
+        try argv.append(self.allocator, project_id);
+        if (self.namespace_auth_token orelse self.control_operator_token orelse self.project_token) |token| {
+            try argv.append(self.allocator, "--auth-token");
+            try argv.append(self.allocator, token);
+        }
+        try argv.append(self.allocator, "--agent-id");
+        try argv.append(self.allocator, self.agent_id);
+        try argv.append(self.allocator, "--session-key");
+        try argv.append(self.allocator, helper_session_key);
+        try argv.append(self.allocator, "--namespace-keepalive-interval-ms");
+        try argv.append(self.allocator, "15000");
+        try argv.append(self.allocator, "mount");
+        try argv.append(self.allocator, mount_point);
+
+        var child = std.process.Child.init(argv.items, self.allocator);
+        child.stdin_behavior = .Ignore;
+        child.stdout_behavior = .Ignore;
+        child.stderr_behavior = .Inherit;
+        try child.spawn();
+
+        self.namespace_mount_dir = mount_dir;
+        self.namespace_mount_point = mount_point;
+        self.namespace_mount_child = child;
+        mount_dir = mount_dir[0..0];
+        mount_point = mount_point[0..0];
+        errdefer self.cleanupNamespaceMount();
+
+        try self.waitForNamespaceMountReady(probe_session_key);
+        self.namespace_mount_ready = true;
+        return self.namespace_mount_point.?;
+    }
+
+    fn buildTerminalHelperSessionKey(self: *Session, base_session_key: []const u8) ![]u8 {
+        return std.fmt.allocPrint(self.allocator, "termns-{s}", .{base_session_key});
+    }
+
+    fn buildTerminalProbeSessionKey(self: *Session, base_session_key: []const u8) ![]u8 {
+        return std.fmt.allocPrint(self.allocator, "termprobe-{s}", .{base_session_key});
+    }
+
+    fn waitForNamespaceMountReady(self: *Session, probe_session_key: []const u8) !void {
+        var attempt: usize = 0;
+        while (attempt < 200) : (attempt += 1) {
+            if (try self.probeNamespaceMountReady(probe_session_key)) return;
+            std.Thread.sleep(25 * std.time.ns_per_ms);
+        }
+        self.cleanupNamespaceMount();
+        return error.Timeout;
+    }
+
+    fn probeNamespaceMountReady(self: *Session, probe_session_key: []const u8) !bool {
+        const sandbox_fs_mount_bin = self.sandbox_fs_mount_bin orelse return error.InvalidState;
+        const namespace_mount_url = self.namespace_mount_url orelse return error.InvalidState;
+        const project_id = self.project_id orelse return error.InvalidState;
+
+        var argv = std.ArrayListUnmanaged([]const u8){};
+        defer argv.deinit(self.allocator);
+        try argv.append(self.allocator, sandbox_fs_mount_bin);
+        try argv.append(self.allocator, "--namespace-url");
+        try argv.append(self.allocator, namespace_mount_url);
+        try argv.append(self.allocator, "--workspace-id");
+        try argv.append(self.allocator, project_id);
+        if (self.namespace_auth_token orelse self.control_operator_token orelse self.project_token) |token| {
+            try argv.append(self.allocator, "--auth-token");
+            try argv.append(self.allocator, token);
+        }
+        try argv.append(self.allocator, "--agent-id");
+        try argv.append(self.allocator, self.agent_id);
+        try argv.append(self.allocator, "--session-key");
+        try argv.append(self.allocator, probe_session_key);
+        try argv.append(self.allocator, "readdir");
+        try argv.append(self.allocator, "/");
+
+        const result = std.process.Child.run(.{
+            .allocator = self.allocator,
+            .argv = argv.items,
+            .max_output_bytes = 64 * 1024,
+        }) catch return false;
+        defer self.allocator.free(result.stdout);
+        defer self.allocator.free(result.stderr);
+        return switch (result.term) {
+            .Exited => |code| code == 0 and std.mem.indexOf(u8, result.stdout, "\"meta\"") != null,
+            else => false,
+        };
+    }
+
+    fn executeNamespaceShellExecPayload(self: *Session, args_obj: std.json.ObjectMap) ![]u8 {
+        const mount_point = try self.ensureNamespaceMount();
+        const command = if (args_obj.get("command")) |value|
+            if (value == .string) value.string else return error.InvalidPayload
+        else
+            return error.InvalidPayload;
+        const timeout_ms = if (args_obj.get("timeout_ms")) |value| switch (value) {
+            .integer => |raw| blk: {
+                if (raw < 0) return error.InvalidPayload;
+                break :blk @as(u64, @intCast(raw));
+            },
+            .float => |raw| blk: {
+                if (raw < 0 or std.math.floor(raw) != raw) return error.InvalidPayload;
+                break :blk @as(u64, @intFromFloat(raw));
+            },
+            .null => null,
+            else => return error.InvalidPayload,
+        } else null;
+        const cwd_value = if (args_obj.get("cwd")) |value|
+            if (value == .string) value.string else if (value == .null) null else return error.InvalidPayload
+        else
+            null;
+        const namespace_cwd = try self.resolveNamespaceShellCwd(cwd_value);
+        defer self.allocator.free(namespace_cwd);
+
+        var argv = std.ArrayListUnmanaged([]const u8){};
+        defer argv.deinit(self.allocator);
+        var owned_bind_sources = std.ArrayListUnmanaged([]u8){};
+        defer {
+            for (owned_bind_sources.items) |source| self.allocator.free(source);
+            owned_bind_sources.deinit(self.allocator);
+        }
+        const sandbox_launcher = self.sandbox_launcher orelse return error.InvalidState;
+        try argv.append(self.allocator, sandbox_launcher);
+        try argv.append(self.allocator, "--die-with-parent");
+        try argv.append(self.allocator, "--proc");
+        try argv.append(self.allocator, "/proc");
+        try argv.append(self.allocator, "--dev");
+        try argv.append(self.allocator, "/dev");
+        try argv.append(self.allocator, "--tmpfs");
+        try argv.append(self.allocator, "/tmp");
+        try argv.append(self.allocator, "--setenv");
+        try argv.append(self.allocator, "HOME");
+        try argv.append(self.allocator, "/tmp");
+        try argv.append(self.allocator, "--setenv");
+        try argv.append(self.allocator, "TMPDIR");
+        try argv.append(self.allocator, "/tmp");
+        try argv.append(self.allocator, "--setenv");
+        try argv.append(self.allocator, "PATH");
+        try argv.append(self.allocator, "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
+
+        try appendExistingBindArg(self.allocator, &argv, "--ro-bind", "/bin", "/bin");
+        try appendExistingBindArg(self.allocator, &argv, "--ro-bind", "/usr", "/usr");
+        try appendExistingBindArg(self.allocator, &argv, "--ro-bind", "/lib", "/lib");
+        try appendExistingBindArg(self.allocator, &argv, "--ro-bind", "/lib64", "/lib64");
+        try appendExistingBindArg(self.allocator, &argv, "--ro-bind", "/sbin", "/sbin");
+        try appendExistingBindArg(self.allocator, &argv, "--ro-bind", "/etc", "/etc");
+        try appendExistingBindArg(self.allocator, &argv, "--ro-bind", "/opt", "/opt");
+        try appendExistingBindArg(self.allocator, &argv, "--ro-bind", "/run", "/run");
+
+        try self.appendNamespaceBindArg(&argv, &owned_bind_sources, mount_point, "meta", "/meta");
+        try self.appendNamespaceBindArg(&argv, &owned_bind_sources, mount_point, "projects", "/projects");
+        try self.appendNamespaceBindArg(&argv, &owned_bind_sources, mount_point, "services", "/services");
+        try self.appendNamespaceBindArg(&argv, &owned_bind_sources, mount_point, "shared_data", "/shared_data");
+        try self.appendNamespaceBindArg(&argv, &owned_bind_sources, mount_point, "nodes", "/nodes");
+        try self.appendNamespaceBindArg(&argv, &owned_bind_sources, mount_point, "global", "/global");
+        try self.appendNamespaceBindArg(&argv, &owned_bind_sources, mount_point, "agents", "/agents");
+
+        try argv.append(self.allocator, "--chdir");
+        try argv.append(self.allocator, namespace_cwd);
+
+        const shell_path = if (pathExistsAbsolute("/bin/bash")) "/bin/bash" else "/bin/sh";
+        const timeout_path = "/usr/bin/timeout";
+        var timeout_arg: ?[]u8 = null;
+        defer if (timeout_arg) |value| self.allocator.free(value);
+        if (timeout_ms) |value| {
+            if (value > 0 and pathExistsAbsolute(timeout_path)) {
+                const timeout_secs = @max(@as(u64, 1), (value + 999) / 1000);
+                timeout_arg = try std.fmt.allocPrint(self.allocator, "{d}s", .{timeout_secs});
+                try argv.append(self.allocator, timeout_path);
+                try argv.append(self.allocator, "--signal=TERM");
+                try argv.append(self.allocator, "--kill-after=2s");
+                try argv.append(self.allocator, timeout_arg.?);
+            }
+        }
+        try argv.append(self.allocator, shell_path);
+        try argv.append(self.allocator, "-lc");
+        try argv.append(self.allocator, command);
+
+        const result = try std.process.Child.run(.{
+            .allocator = self.allocator,
+            .argv = argv.items,
+            .max_output_bytes = 8 * 1024 * 1024,
+        });
+        defer self.allocator.free(result.stdout);
+        defer self.allocator.free(result.stderr);
+
+        const exit_code: i32 = switch (result.term) {
+            .Exited => |code| @intCast(code),
+            .Signal => |sig| 128 + @as(i32, @intCast(sig)),
+            else => 1,
+        };
+        return self.buildShellExecPayloadJson(exit_code, result.stdout, result.stderr);
+    }
+
+    fn resolveNamespaceShellCwd(self: *Session, cwd_value: ?[]const u8) ![]u8 {
+        if (cwd_value) |value| {
+            if (value.len > 0 and value[0] == '/') return self.allocator.dupe(u8, value);
+            if (value.len == 0 or std.mem.eql(u8, value, ".")) return self.allocator.dupe(u8, local_fs_world_prefix);
+            return std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ local_fs_world_prefix, std.mem.trimLeft(u8, value, "./") });
+        }
+        return self.allocator.dupe(u8, local_fs_world_prefix);
+    }
+
+    fn appendNamespaceBindArg(
+        self: *Session,
+        argv: *std.ArrayListUnmanaged([]const u8),
+        owned_bind_sources: *std.ArrayListUnmanaged([]u8),
+        mount_point: []const u8,
+        relative: []const u8,
+        target: []const u8,
+    ) !void {
+        const source = try std.fs.path.join(self.allocator, &.{ mount_point, relative });
+        if (!pathExistsAbsolute(source)) return;
+        try owned_bind_sources.append(self.allocator, source);
+        try argv.append(self.allocator, "--bind");
+        try argv.append(self.allocator, source);
+        try argv.append(self.allocator, target);
+    }
+
+    fn buildShellExecPayloadJson(self: *Session, exit_code: i32, stdout: []const u8, stderr: []const u8) ![]u8 {
+        const escaped_stdout = try unified.jsonEscape(self.allocator, stdout);
+        defer self.allocator.free(escaped_stdout);
+        const escaped_stderr = try unified.jsonEscape(self.allocator, stderr);
+        defer self.allocator.free(escaped_stderr);
+        return std.fmt.allocPrint(
+            self.allocator,
+            "{{\"exit_code\":{d},\"stdout\":\"{s}\",\"stderr\":\"{s}\"}}",
+            .{ exit_code, escaped_stdout, escaped_stderr },
+        );
+    }
+
     fn allocAbsolutePathSegments(self: *Session, absolute_path: []const u8) anyerror![][]u8 {
         if (absolute_path.len == 0 or absolute_path[0] != '/') return error.InvalidPayload;
         var count: usize = 0;
@@ -7764,6 +8224,17 @@ pub const Session = struct {
         if (parsed.value != .object) return error.InvalidPayload;
 
         const source_args = parsed.value.object;
+        if (self.canUseNamespaceShellExec()) {
+            return self.executeNamespaceShellExecPayload(source_args) catch |err| blk: {
+                const message = try std.fmt.allocPrint(
+                    self.allocator,
+                    "namespace-backed shell_exec failed: {s}",
+                    .{@errorName(err)},
+                );
+                defer self.allocator.free(message);
+                break :blk try self.buildServiceInvokeFailureResultJson(@errorName(err), message);
+            };
+        }
         const command = if (source_args.get("command")) |value|
             if (value == .string) value.string else return error.InvalidPayload
         else
@@ -7785,13 +8256,25 @@ pub const Session = struct {
         else
             null;
 
-        const resolved_cwd = if (cwd) |value|
-            if (std.mem.startsWith(u8, value, local_fs_world_prefix))
-                try self.resolveMissionContractHostPath(value)
-            else
-                try self.allocator.dupe(u8, value)
-        else
-            null;
+        const direct_workspace_root = if (cwd) |value| blk: {
+            if (!pathMatchesPrefixBoundary(value, local_fs_world_prefix)) break :blk null;
+            break :blk try self.resolveMissionContractHostPath(local_fs_world_prefix);
+        } else null;
+        defer if (direct_workspace_root) |value| self.allocator.free(value);
+
+        const resolved_cwd = if (cwd) |value| blk: {
+            if (!pathMatchesPrefixBoundary(value, local_fs_world_prefix)) {
+                break :blk try self.allocator.dupe(u8, value);
+            }
+            if (std.mem.eql(u8, value, local_fs_world_prefix)) {
+                break :blk try self.allocator.dupe(u8, ".");
+            }
+            const relative = std.mem.trimLeft(u8, value[local_fs_world_prefix.len..], "/");
+            if (relative.len == 0) {
+                break :blk try self.allocator.dupe(u8, ".");
+            }
+            break :blk try self.allocator.dupe(u8, relative);
+        } else null;
         defer if (resolved_cwd) |value| self.allocator.free(value);
 
         const escaped_command = try unified.jsonEscape(self.allocator, command);
@@ -7818,6 +8301,25 @@ pub const Session = struct {
         var direct_parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, direct_args_json, .{});
         defer direct_parsed.deinit();
         if (direct_parsed.value != .object) return error.InvalidPayload;
+
+        var original_cwd: ?[]u8 = null;
+        if (direct_workspace_root) |workspace_root| {
+            direct_builtin_shell_exec_mutex.lock();
+            errdefer direct_builtin_shell_exec_mutex.unlock();
+
+            original_cwd = try std.process.getCwdAlloc(self.allocator);
+            errdefer if (original_cwd) |value| self.allocator.free(value);
+            try std.process.changeCurDir(workspace_root);
+        }
+        defer {
+            if (direct_workspace_root != null) {
+                if (original_cwd) |value| {
+                    std.process.changeCurDir(value) catch {};
+                    self.allocator.free(value);
+                }
+                direct_builtin_shell_exec_mutex.unlock();
+            }
+        }
 
         var result = tool_executor_mod.BuiltinTools.shellExec(self.allocator, direct_parsed.value.object);
         defer result.deinit(self.allocator);
@@ -8735,6 +9237,12 @@ const ParsedEntityScopedVenomAlias = struct {
     remote_path: []const u8,
 };
 
+const ParsedServiceScopedVenomAlias = struct {
+    project_id: []const u8,
+    venom_id: []const u8,
+    remote_path: []const u8,
+};
+
 const ParsedNodeVenomServicePath = struct {
     node_id: []const u8,
     venom_id: []const u8,
@@ -8776,6 +9284,16 @@ fn parseEntityScopedVenomAliasPrefix(
         .entity_id = entity_id,
         .venom_id = venom_id,
         .remote_path = remote_path,
+    };
+}
+
+fn parseServiceScopedVenomAliasPrefix(self: *Session, path: []const u8) ?ParsedServiceScopedVenomAlias {
+    const project_id = self.active_namespace_project_id orelse self.project_id orelse return null;
+    const parsed = parseScopedVenomAliasPrefix(path, "/services/") orelse return null;
+    return .{
+        .project_id = project_id,
+        .venom_id = parsed.venom_id,
+        .remote_path = parsed.remote_path,
     };
 }
 
@@ -9404,6 +9922,83 @@ test "acheron_session: preferred service paths use workspace bindings when avail
     const unbound_github_path = try unbound_session.resolvePreferredServicePath("github_pr", "/control/sync.json");
     defer allocator.free(unbound_github_path);
     try std.testing.expectEqualStrings("/global/github_pr/control/sync.json", unbound_github_path);
+}
+
+test "acheron_session: services terminal exec updates live service status and result" {
+    const allocator = std.testing.allocator;
+
+    var control_plane = control_plane_mod.ControlPlane.init(allocator);
+    defer control_plane.deinit();
+
+    const project_json = try control_plane.createProject(
+        "{\"name\":\"ServiceTerminalExec\",\"vision\":\"ServiceTerminalExec\",\"template_id\":\"dev\"}",
+    );
+    defer allocator.free(project_json);
+
+    var parsed_project = try std.json.parseFromSlice(std.json.Value, allocator, project_json, .{});
+    defer parsed_project.deinit();
+    const project_id = parsed_project.value.object.get("project_id").?.string;
+    const project_token = parsed_project.value.object.get("project_token").?.string;
+
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createUnavailable(
+        allocator,
+        "execution_failed",
+        "runtime unavailable",
+    );
+    defer runtime_handle.destroy();
+
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "default",
+        .{
+            .project_id = project_id,
+            .project_token = project_token,
+            .agents_dir = ".does-not-exist",
+            .projects_dir = ".does-not-exist",
+            .control_plane = &control_plane,
+        },
+    );
+    defer session.deinit();
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        510,
+        511,
+        &.{ "services", "terminal", "control", "exec.json" },
+        "{\"command\":\"printf terminal-ok\"}",
+        1200,
+    );
+
+    const terminal_status = try protocolReadFile(
+        &session,
+        allocator,
+        512,
+        513,
+        &.{ "services", "terminal", "status.json" },
+        1205,
+    );
+    defer allocator.free(terminal_status);
+    try std.testing.expect(std.mem.indexOf(u8, terminal_status, "\"state\":\"done\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, terminal_status, "\"tool\":\"shell_exec\"") != null);
+
+    const terminal_result = try protocolReadFile(
+        &session,
+        allocator,
+        514,
+        515,
+        &.{ "services", "terminal", "result.json" },
+        1210,
+    );
+    defer allocator.free(terminal_result);
+    try std.testing.expect(std.mem.indexOf(u8, terminal_result, "\"operation\":\"exec\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, terminal_result, "\"ok\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, terminal_result, "dGVybWluYWwtb2s=") != null);
 }
 
 test "acheron_session: missions namespace enforces mission ownership across agents" {

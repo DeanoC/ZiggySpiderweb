@@ -1,7 +1,10 @@
 const std = @import("std");
 
 pub const default_max_http_request_bytes: usize = 16 * 1024;
-pub const default_max_ws_frame_payload_bytes: usize = 256 * 1024;
+// Routed fs/node-tunnel traffic can legitimately carry large write/read frames
+// during mounted workspace use, so keep the general websocket payload cap aligned
+// with the local /v2/fs handler's effective 4 MiB allowance.
+pub const default_max_ws_frame_payload_bytes: usize = 4 * 1024 * 1024;
 
 const WEBSOCKET_MAGIC = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 

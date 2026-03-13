@@ -3040,6 +3040,12 @@ const AuthTokenStore = struct {
         defer self.mutex.unlock();
         return self.allocator.dupe(u8, self.admin_token);
     }
+
+    fn copyUserToken(self: *AuthTokenStore) ![]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.allocator.dupe(u8, self.user_token);
+    }
 };
 
 const AgentRuntimeEntry = struct {
@@ -7177,6 +7183,7 @@ fn handleWebSocketConnection(
                                 allocator,
                                 runtime_registry,
                                 active_binding,
+                                active_session_key,
                                 principal.role == .admin,
                             ) catch |err| {
                                 const response = try unified.buildFsrpcError(
@@ -7239,12 +7246,19 @@ fn initNamespaceSessionForBinding(
     allocator: std.mem.Allocator,
     runtime_registry: *AgentRuntimeRegistry,
     binding: SessionBinding,
+    session_key: []const u8,
     is_admin: bool,
 ) !acheron_session_mod.Session {
     const project_id = binding.project_id orelse return error.InvalidState;
     const runtime = runtime_registry.getRuntimeForBindingIfReady(binding.agent_id, binding.project_id) orelse
         try runtime_registry.getOrCreate(binding.agent_id, binding.project_id, binding.project_token);
     defer runtime.release();
+
+    const namespace_auth_token = if (is_admin)
+        try runtime_registry.auth_tokens.copyAdminToken()
+    else
+        try runtime_registry.auth_tokens.copyUserToken();
+    defer allocator.free(namespace_auth_token);
 
     return acheron_session_mod.Session.initWithOptions(
         allocator,
@@ -7254,12 +7268,18 @@ fn initNamespaceSessionForBinding(
         .{
             .project_id = project_id,
             .project_token = binding.project_token,
+            .namespace_mount_url = runtime_registry.workspace_url,
+            .namespace_session_key = session_key,
             .agents_dir = runtime_registry.runtime_config.agents_dir,
             .assets_dir = runtime_registry.runtime_config.assets_dir,
             .projects_dir = "projects",
             .local_fs_export_root = localFsExportRootForNamespace(runtime_registry),
+            .sandbox_mounts_root = runtime_registry.runtime_config.sandbox_mounts_root,
+            .sandbox_launcher = runtime_registry.runtime_config.sandbox_launcher,
+            .sandbox_fs_mount_bin = runtime_registry.runtime_config.sandbox_fs_mount_bin,
             .control_plane = &runtime_registry.control_plane,
             .mission_store = &runtime_registry.missions,
+            .namespace_auth_token = namespace_auth_token,
             .control_operator_token = runtime_registry.control_operator_token,
             .actor_type = binding.actor_type,
             .actor_id = binding.actor_id,
