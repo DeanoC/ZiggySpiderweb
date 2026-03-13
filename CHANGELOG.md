@@ -2,7 +2,16 @@
 
 All notable changes to this project are documented in this file.
 
-## Unreleased - 2026-03-08
+## 0.3.1 - 2026-03-13
+
+### External Agent Machine Independence
+- Closed the strict external-agent machine-independence path for the Spiderweb + external Codex E2E harness.
+- Added namespace-backed terminal execution so bridged shell commands see the same `/meta`, `/projects`, `/services`, `/shared_data`, and `/nodes` surfaces as the attached agent.
+- Fixed mounted venom control-file behavior to commit buffered writes on close, which makes normal append/close writer behavior reliable for service control files.
+- Added bridge-runtime helper shims and stricter usage-report parsing so release-backed runs can distinguish real host leakage from local bridge-runtime execution.
+- Release-backed strict live runs now report `reliability_ok=true`, `workspace_bootstrap_ok=true`, and `machine_independence_ok=true`.
+
+### Runtime Convergence
 
 ### Runtime Convergence
 - Converged Spiderweb’s built-in namespace surfaces onto the shared `spiderweb_node` runtime path, including the in-process FS host and embeddable `spiderweb_fs` facade.
