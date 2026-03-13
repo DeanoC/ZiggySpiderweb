@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-import shlex
 import sys
 
 
@@ -14,10 +13,11 @@ def main() -> int:
 
     prompt_file = sys.argv[1]
     command = sys.argv[2]
-    argv = shlex.split(command)
-    if not argv:
+    if not command.strip():
         sys.stderr.write("codex stdin launcher: empty command\n")
         return 2
+    shell = os.environ.get("SHELL", "").strip() or "/bin/sh"
+    argv = [shell, "-lc", command]
 
     with open(prompt_file, "rb", buffering=0) as handle:
         os.dup2(handle.fileno(), 0)

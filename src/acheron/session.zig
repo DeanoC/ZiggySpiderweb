@@ -4434,27 +4434,33 @@ pub const Session = struct {
         offset: u64,
         data: []const u8,
     ) !void {
-        if (state.pending_special_write == null) {
-            state.pending_special_write = try self.allocator.dupe(u8, "");
-        }
-        errdefer if (state.pending_special_write) |value| self.allocator.free(value);
-
         const base_offset = std.math.cast(usize, offset) orelse return error.InvalidOffset;
-        const current = state.pending_special_write.?;
+        const current_opt = state.pending_special_write;
+        const current_len: usize = if (current_opt) |current| current.len else 0;
         const required_len = std.math.add(usize, base_offset, data.len) catch return error.InvalidOffset;
 
-        if (required_len > current.len) {
-            var next = try self.allocator.alloc(u8, required_len);
+        var next_owned: ?[]u8 = null;
+        errdefer if (next_owned) |value| self.allocator.free(value);
+
+        var target: []u8 = if (current_opt) |current| current else &.{};
+        if (required_len > current_len) {
+            const next = try self.allocator.alloc(u8, required_len);
             @memset(next, 0);
-            if (current.len > 0) @memcpy(next[0..current.len], current);
-            self.allocator.free(current);
-            state.pending_special_write = next;
+            if (current_opt) |current| {
+                if (current.len > 0) @memcpy(next[0..current.len], current);
+            }
+            next_owned = next;
+            target = next;
         }
 
         if (data.len > 0) {
-            @memcpy(state.pending_special_write.?[base_offset .. base_offset + data.len], data);
+            @memcpy(target[base_offset .. base_offset + data.len], data);
         }
-        try self.setFileContent(state.node_id, state.pending_special_write.?);
+        try self.setFileContent(state.node_id, target);
+        if (next_owned) |next| {
+            if (current_opt) |current| self.allocator.free(current);
+            state.pending_special_write = next;
+        }
         _ = node_id;
     }
 
