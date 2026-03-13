@@ -751,7 +751,8 @@ Rules:
 - Treat this directory as the only writable project root.
 - Preserve validate_game.py.
 - Read `/projects/<project_id>/meta/agent_bootstrap_quickref.json` first, then `/projects/<project_id>/meta/agent_bootstrap.json`, and perform the bootstrap steps from inside the mounted workspace before you start building the game.
-- On this client, Spiderweb namespace paths are mounted under the namespace root, but when you use shell commands through the bridged terminal you must use namespace-visible paths like `/meta/*`, `/projects/<project_id>/meta/*`, `/services/*`, `/shared_data/*`, and `./TASK.md` instead of client-only absolute mount paths.
+- On this client, first try namespace-visible shell paths like `/meta/*`, `/projects/<project_id>/meta/*`, `/services/*`, `/shared_data/*`, and `./TASK.md`.
+- If those literal namespace-visible paths are not present in your shell, determine `namespace_root` once by walking upward from the current working directory until you find a directory containing `meta`, `projects`, `services`, and `nodes`, then use `{namespace_root}/meta/*`, `{namespace_root}/projects/*`, `{namespace_root}/services/*`, and `{namespace_root}/shared_data/*` consistently for the rest of the run.
 - Ensure your own durable agent home first, then verify or repair required generic service binds from inside the mounted workspace if needed.
 - Use `agent_bootstrap_quickref.json` plus the mounted service directory itself as the verification source. Read `mounted_services.json` only if the quick reference is missing a detail you genuinely need. Do not read service README/SCHEMA/OPS files unless a required binding is missing and you genuinely need the repair shape.
 - Use the current metadata field names exactly as they exist today:
@@ -775,7 +776,7 @@ Rules:
   4. Generate `game.py`, `game_manifest.json`, `walkthrough.txt`, and `README.md` in one Python file-generation step.
   5. Run `python3 -m py_compile ./game.py`.
   6. Run `python3 ./game.py < ./walkthrough.txt`.
-  7. Run `python3 ./validate_game.py --workspace . --shared-data /shared_data --output ./game_validation.json`.
+  7. Run `python3 ./validate_game.py --workspace . --shared-data <shared-data-path> --output ./game_validation.json`.
   8. If a validation step fails, fix only the project files and rerun only the failed step(s).
 - After the required discovery reads and bootstrap actions, start implementing immediately instead of doing extra exploratory reads unless validation fails.
 - Keep discovery simple. Do not build a large custom metadata-inspection script; adapt only the single file you are currently reading if its schema is unexpected.
@@ -792,7 +793,8 @@ Rules:
 - If you need to replace game.py after a failed attempt, remove the old file first and then recreate it from scratch so stale trailing content cannot survive a shorter rewrite.
 - Do not run chmod on project files. This mount may not support chmod, and python3 game.py is sufficient for validation.
 - Before running validate_game.py, first run python3 -m py_compile ./game.py and then python3 ./game.py < ./walkthrough.txt. Only move on to the validator once both succeed.
-- When you run validate_game.py through the bridged terminal, use namespace paths, not client-only mount paths: `python3 ./validate_game.py --workspace . --shared-data /shared_data --output ./game_validation.json`.
+- When you run validate_game.py, set `<shared-data-path>` to `/shared_data` if that literal path exists in the shell; otherwise use `{namespace_root}/shared_data`.
+- Do not create root-level symlinks, mounts, or other host filesystem hacks to force `/shared_data` into existence.
 - The victory line must be:
   VICTORY: Lantern of Nine Paths recovered
 EOF
@@ -1296,6 +1298,7 @@ run_live_codex() {
         (
             cd "$MOUNT_WORKSPACE_PATH"
             "${CODEX_ENV_BASE[@]}" \
+                SHELL=/bin/bash \
                 GIT_DIR= \
                 GIT_WORK_TREE= \
                 setsid \
