@@ -731,6 +731,13 @@ fn cWrite(path_c: [*c]const u8, buf: [*c]const u8, size: usize, off: c.off_t, fi
 
     const input = if (size == 0) "" else buf[0..size];
     const written = adapter.write(open_file, @intCast(off), input) catch |err| return toFuseError(err);
+    if (written > size) {
+        std.log.err(
+            "fuse write reply exceeded request: path={s} requested={d} returned={d}",
+            .{ path, size, written },
+        );
+        return -fs_protocol.Errno.EIO;
+    }
     return @intCast(written);
 }
 
@@ -1236,7 +1243,7 @@ fn toFuseError(err: anyerror) c_int {
         error.CrossEndpointRename => -fs_protocol.Errno.EXDEV,
         error.ReadOnlyFilesystem => -fs_protocol.Errno.EROFS,
         error.OperationNotSupported => -fs_protocol.Errno.ENOSYS,
-        error.InvalidResponse, error.ProtocolError => -fs_protocol.Errno.EINVAL,
+        error.InvalidPayload, error.InvalidResponse, error.ProtocolError => -fs_protocol.Errno.EINVAL,
         else => -fs_protocol.Errno.EIO,
     };
 }
@@ -1283,5 +1290,6 @@ test "fs_fuse_adapter: toFuseError maps xattr and lock related errors" {
     try std.testing.expectEqual(-fs_protocol.Errno.ENODATA, toFuseError(error.NoData));
     try std.testing.expectEqual(-fs_protocol.Errno.EAGAIN, toFuseError(error.WouldBlock));
     try std.testing.expectEqual(-fs_protocol.Errno.ERANGE, toFuseError(error.Range));
+    try std.testing.expectEqual(-fs_protocol.Errno.EINVAL, toFuseError(error.InvalidPayload));
     try std.testing.expectEqual(-fs_protocol.Errno.ENOSYS, toFuseError(error.OperationNotSupported));
 }

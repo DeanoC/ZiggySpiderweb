@@ -253,6 +253,12 @@ const FidState = struct {
     node_id: u32,
     is_open: bool = false,
     mode: []const u8 = "r",
+    pending_special_write: ?[]u8 = null,
+
+    fn deinit(self: *FidState, allocator: std.mem.Allocator) void {
+        if (self.pending_special_write) |value| allocator.free(value);
+        self.* = undefined;
+    }
 };
 
 pub const ToolPayloadErrorInfo = struct {
@@ -545,6 +551,11 @@ pub const Session = struct {
             node.deinit(self.allocator);
         }
         self.nodes.deinit(self.allocator);
+        var fid_it = self.fids.iterator();
+        while (fid_it.next()) |entry| {
+            var state = entry.value_ptr.*;
+            state.deinit(self.allocator);
+        }
         self.fids.deinit(self.allocator);
         self.allocator.free(self.agent_id);
         self.allocator.free(self.actor_type);
@@ -1039,12 +1050,136 @@ pub const Session = struct {
         return true;
     }
 
+    fn specialWriteErrorResponse(
+        self: *Session,
+        raw_tag: ?u32,
+        special: SpecialKind,
+        err: anyerror,
+    ) ![]u8 {
+        const tag: u16 = @intCast(raw_tag orelse 0);
+        return switch (special) {
+            .job_status => switch (err) {
+                error.InvalidPayload => unified.buildFsrpcError(
+                    self.allocator,
+                    tag,
+                    "invalid",
+                    "job status payload must be a JSON object with state=queued|running|done|failed and optional error",
+                ),
+                else => err,
+            },
+            .terminal_v2_invoke => switch (err) {
+                error.InvalidPayload => unified.buildFsrpcError(
+                    self.allocator,
+                    tag,
+                    "invalid",
+                    "terminal invoke payload must include op=create|resume|close|write|read|resize|exec or matching fields",
+                ),
+                error.TerminalSessionNotFound => unified.buildFsrpcError(self.allocator, tag, "enoent", "terminal session not found"),
+                error.TerminalSessionClosed => unified.buildFsrpcError(self.allocator, tag, "eperm", "terminal session is closed"),
+                error.UnsupportedPlatform => unified.buildFsrpcError(self.allocator, tag, "unsupported", "pty terminal sessions are currently supported on linux only"),
+                error.TerminalPtyUnavailable => unified.buildFsrpcError(self.allocator, tag, "unavailable", "pty backend unavailable: install util-linux script"),
+                else => err,
+            },
+            .terminal_v2_create => switch (err) {
+                error.InvalidPayload => unified.buildFsrpcError(self.allocator, tag, "invalid", "terminal create payload must be a JSON object with optional session_id/label/cwd"),
+                error.UnsupportedPlatform => unified.buildFsrpcError(self.allocator, tag, "unsupported", "pty terminal sessions are currently supported on linux only"),
+                error.TerminalPtyUnavailable => unified.buildFsrpcError(self.allocator, tag, "unavailable", "pty backend unavailable: install util-linux script"),
+                else => err,
+            },
+            .terminal_v2_resume => switch (err) {
+                error.InvalidPayload => unified.buildFsrpcError(self.allocator, tag, "invalid", "terminal resume payload must include session_id"),
+                error.TerminalSessionNotFound => unified.buildFsrpcError(self.allocator, tag, "enoent", "terminal session not found"),
+                error.TerminalSessionClosed => unified.buildFsrpcError(self.allocator, tag, "eperm", "terminal session is closed"),
+                error.UnsupportedPlatform => unified.buildFsrpcError(self.allocator, tag, "unsupported", "pty terminal sessions are currently supported on linux only"),
+                else => err,
+            },
+            .terminal_v2_close => switch (err) {
+                error.InvalidPayload => unified.buildFsrpcError(self.allocator, tag, "invalid", "terminal close payload must include session_id when no current session exists"),
+                error.TerminalSessionNotFound => unified.buildFsrpcError(self.allocator, tag, "enoent", "terminal session not found"),
+                error.TerminalSessionClosed => unified.buildFsrpcError(self.allocator, tag, "eperm", "terminal session is closed"),
+                error.UnsupportedPlatform => unified.buildFsrpcError(self.allocator, tag, "unsupported", "pty terminal sessions are currently supported on linux only"),
+                else => err,
+            },
+            .terminal_v2_exec => switch (err) {
+                error.InvalidPayload => unified.buildFsrpcError(self.allocator, tag, "invalid", "terminal exec payload must include command or argv (optional session_id/cwd/timeout_ms)"),
+                error.TerminalSessionNotFound => unified.buildFsrpcError(self.allocator, tag, "enoent", "terminal session not found"),
+                error.TerminalSessionClosed => unified.buildFsrpcError(self.allocator, tag, "eperm", "terminal session is closed"),
+                error.UnsupportedPlatform => unified.buildFsrpcError(self.allocator, tag, "unsupported", "pty terminal sessions are currently supported on linux only"),
+                error.TerminalPtyUnavailable => unified.buildFsrpcError(self.allocator, tag, "unavailable", "pty backend unavailable: install util-linux script"),
+                else => err,
+            },
+            .terminal_v2_write => switch (err) {
+                error.InvalidPayload => unified.buildFsrpcError(self.allocator, tag, "invalid", "terminal write payload must include input/command/data_b64 (optional session_id)"),
+                error.TerminalSessionNotFound => unified.buildFsrpcError(self.allocator, tag, "enoent", "terminal session not found"),
+                error.TerminalSessionClosed => unified.buildFsrpcError(self.allocator, tag, "eperm", "terminal session is closed"),
+                error.UnsupportedPlatform => unified.buildFsrpcError(self.allocator, tag, "unsupported", "pty terminal sessions are currently supported on linux only"),
+                else => err,
+            },
+            .terminal_v2_read => switch (err) {
+                error.InvalidPayload => unified.buildFsrpcError(self.allocator, tag, "invalid", "terminal read payload must be object with optional session_id/max_bytes/timeout_ms"),
+                error.TerminalSessionNotFound => unified.buildFsrpcError(self.allocator, tag, "enoent", "terminal session not found"),
+                error.TerminalSessionClosed => unified.buildFsrpcError(self.allocator, tag, "eperm", "terminal session is closed"),
+                error.UnsupportedPlatform => unified.buildFsrpcError(self.allocator, tag, "unsupported", "pty terminal sessions are currently supported on linux only"),
+                else => err,
+            },
+            .terminal_v2_resize => switch (err) {
+                error.InvalidPayload => unified.buildFsrpcError(self.allocator, tag, "invalid", "terminal resize payload must include cols and rows (optional session_id)"),
+                error.TerminalSessionNotFound => unified.buildFsrpcError(self.allocator, tag, "enoent", "terminal session not found"),
+                error.TerminalSessionClosed => unified.buildFsrpcError(self.allocator, tag, "eperm", "terminal session is closed"),
+                error.UnsupportedPlatform => unified.buildFsrpcError(self.allocator, tag, "unsupported", "pty terminal sessions are currently supported on linux only"),
+                else => err,
+            },
+            else => err,
+        };
+    }
+
+    fn executeNodeWrite(self: *Session, node_id: u32, special: SpecialKind, offset: u64, data: []const u8) !WriteOutcome {
+        return switch (special) {
+            .chat_reply => self.handleChatReplyWrite(node_id, data),
+            .job_status => self.handleJobStatusWrite(node_id, offset, data),
+            .job_result => self.handleJobResultWrite(node_id, offset, data),
+            .job_log => self.handleJobLogWrite(node_id, offset, data),
+            .event_wait_config => self.handleEventWaitConfigWrite(node_id, data),
+            .event_signal => self.handleEventSignalWrite(node_id, data),
+            .web_search_invoke, .web_search_search, .search_code_invoke, .search_code_search => self.handleSearchNamespaceWrite(special, node_id, data),
+            .mounts_invoke, .mounts_list, .mounts_mount, .mounts_mkdir, .mounts_unmount, .mounts_bind, .mounts_unbind, .mounts_resolve => self.handleMountsNamespaceWrite(special, node_id, data),
+            .home_invoke, .home_ensure => self.handleHomeNamespaceWrite(special, node_id, data),
+            .workers_invoke, .workers_register, .workers_heartbeat, .workers_detach => self.handleWorkersNamespaceWrite(special, node_id, data),
+            .venom_packages_invoke, .venom_packages_list, .venom_packages_get, .venom_packages_install, .venom_packages_remove => self.handleVenomPackagesNamespaceWrite(special, node_id, data),
+            .agents_invoke => self.handleAgentsInvokeWrite(node_id, data),
+            .agents_list => self.handleAgentsListWrite(node_id, data),
+            .agents_create => self.handleAgentsCreateWrite(node_id, data),
+            .projects_invoke, .projects_list, .projects_get, .projects_up => self.handleWorkspacesNamespaceWrite(special, node_id, data),
+            .git_invoke, .git_sync_checkout, .git_status, .git_diff_range => self.handleGitNamespaceWrite(special, node_id, data),
+            .github_pr_invoke, .github_pr_sync, .github_pr_ingest_event, .github_pr_publish_review => self.handleGitHubPrNamespaceWrite(special, node_id, data),
+            .pr_review_invoke, .pr_review_configure_repo, .pr_review_get_repo, .pr_review_list_repos, .pr_review_intake, .pr_review_start, .pr_review_sync, .pr_review_run_validation, .pr_review_record_validation, .pr_review_draft_review, .pr_review_save_draft, .pr_review_record_review, .pr_review_advance => self.handlePrReviewNamespaceWrite(special, node_id, data),
+            .missions_invoke, .missions_invoke_service, .missions_create, .missions_list, .missions_get, .missions_heartbeat, .missions_checkpoint, .missions_bootstrap_contract, .missions_recover, .missions_request_approval, .missions_approve, .missions_reject, .missions_resume, .missions_block, .missions_complete, .missions_fail, .missions_cancel => self.handleMissionsNamespaceWrite(special, node_id, data),
+            .pairing_refresh => self.handlePairingControlWrite(.refresh, data),
+            .pairing_approve => self.handlePairingControlWrite(.approve, data),
+            .pairing_deny => self.handlePairingControlWrite(.deny, data),
+            .pairing_invites_refresh => self.handlePairingControlWrite(.invites_refresh, data),
+            .pairing_invites_create => self.handlePairingControlWrite(.invites_create, data),
+            .terminal_v2_invoke => self.handleTerminalV2InvokeWrite(node_id, data),
+            .terminal_v2_create => self.handleTerminalV2CreateWrite(node_id, data),
+            .terminal_v2_resume => self.handleTerminalV2ResumeWrite(node_id, data),
+            .terminal_v2_close => self.handleTerminalV2CloseWrite(node_id, data),
+            .terminal_v2_exec => self.handleTerminalV2ExecWrite(node_id, data),
+            .terminal_v2_write => self.handleTerminalV2WriteWrite(node_id, data),
+            .terminal_v2_read => self.handleTerminalV2ReadWrite(node_id, data),
+            .terminal_v2_resize => self.handleTerminalV2ResizeWrite(node_id, data),
+            .none, .chat_input, .agent_venoms_index, .node_venom_events_log, .event_next => blk: {
+                try self.writeFileContent(node_id, offset, data);
+                break :blk .{ .written = data.len };
+            },
+        };
+    }
+
     fn handleWrite(self: *Session, msg: *const unified.ParsedMessage) ![]u8 {
         const fid = msg.fid orelse return unified.buildFsrpcError(self.allocator, msg.tag, "invalid", "fid is required");
         const data = msg.data orelse return unified.buildFsrpcError(self.allocator, msg.tag, "invalid", "write requires data");
         const offset = msg.offset orelse 0;
 
-        const state = self.fids.get(fid) orelse return unified.buildFsrpcError(self.allocator, msg.tag, "enoent", "unknown fid");
+        var state = self.fids.get(fid) orelse return unified.buildFsrpcError(self.allocator, msg.tag, "enoent", "unknown fid");
         const node = self.nodes.get(state.node_id) orelse return unified.buildFsrpcError(self.allocator, msg.tag, "eio", "missing node");
         if (node.kind != .file) return unified.buildFsrpcError(self.allocator, msg.tag, "eisdir", "write requires file fid");
         if (!node.writable) return unified.buildFsrpcError(self.allocator, msg.tag, "eperm", "file is read-only");
@@ -1056,752 +1191,37 @@ pub const Session = struct {
         defer if (job_name) |value| self.allocator.free(value);
         defer if (correlation_id) |value| self.allocator.free(value);
         defer if (chat_reply_content) |value| self.allocator.free(value);
+
         if (isTerminalV2Special(node.special) and !self.canInvokeTerminalNamespace(state.node_id)) {
-            return unified.buildFsrpcError(
-                self.allocator,
-                msg.tag,
-                "eperm",
-                "terminal invoke access denied by permissions",
-            );
+            return unified.buildFsrpcError(self.allocator, msg.tag, "eperm", "terminal invoke access denied by permissions");
         }
+
         if (try self.tryWriteBoundVenomProxyFile(state.node_id, offset, data)) |proxied| {
             written = proxied.written;
             job_name = proxied.job_name;
             correlation_id = proxied.correlation_id;
             chat_reply_content = proxied.chat_reply_content;
-        } else switch (node.special) {
-            .chat_input => {
-                const outcome = try self.handleChatInputWrite(msg, data);
-                written = outcome.written;
-                job_name = outcome.job_name;
-                correlation_id = outcome.correlation_id;
-            },
-            .chat_reply => {
-                const outcome = try self.handleChatReplyWrite(state.node_id, data);
-                written = outcome.written;
-                chat_reply_content = outcome.chat_reply_content;
-            },
-            .job_status => {
-                const outcome = self.handleJobStatusWrite(state.node_id, offset, data) catch |err| switch (err) {
-                    error.InvalidPayload => {
-                        return unified.buildFsrpcError(
-                            self.allocator,
-                            msg.tag,
-                            "invalid",
-                            "job status payload must be a JSON object with state=queued|running|done|failed and optional error",
-                        );
-                    },
-                    else => return err,
-                };
-                written = outcome.written;
-            },
-            .job_result => {
-                const outcome = try self.handleJobResultWrite(state.node_id, offset, data);
-                written = outcome.written;
-            },
-            .job_log => {
-                const outcome = try self.handleJobLogWrite(state.node_id, offset, data);
-                written = outcome.written;
-            },
-            .event_wait_config => {
-                const outcome = self.handleEventWaitConfigWrite(state.node_id, data) catch |err| switch (err) {
-                    error.InvalidPayload => {
-                        return unified.buildFsrpcError(
-                            self.allocator,
-                            msg.tag,
-                            "invalid",
-                            "wait.json payload must include non-empty paths[] and optional timeout_ms",
-                        );
-                    },
-                    else => return err,
-                };
-                written = outcome.written;
-            },
-            .event_signal => {
-                const outcome = self.handleEventSignalWrite(state.node_id, data) catch |err| switch (err) {
-                    error.InvalidPayload => {
-                        return unified.buildFsrpcError(
-                            self.allocator,
-                            msg.tag,
-                            "invalid",
-                            "signal.json payload must be an object with event_type=user|agent|hook and optional parameter/payload",
-                        );
-                    },
-                    else => return err,
-                };
-                written = outcome.written;
-            },
-            .web_search_invoke,
-            .web_search_search,
-            .search_code_invoke,
-            .search_code_search,
-            => {
-                const outcome = self.handleSearchNamespaceWrite(node.special, state.node_id, data) catch |err| switch (err) {
-                    error.InvalidPayload => {
-                        return unified.buildFsrpcError(
-                            self.allocator,
-                            msg.tag,
-                            "invalid",
-                            "search payload must be a JSON object; invoke accepts optional op/tool_name plus arguments/args",
-                        );
-                    },
-                    error.AccessDenied => {
-                        return unified.buildFsrpcError(
-                            self.allocator,
-                            msg.tag,
-                            "eperm",
-                            "search invoke access denied by permissions",
-                        );
-                    },
-                    else => return err,
-                };
-                written = outcome.written;
-            },
-            .mounts_invoke,
-            .mounts_list,
-            .mounts_mount,
-            .mounts_mkdir,
-            .mounts_unmount,
-            .mounts_bind,
-            .mounts_unbind,
-            .mounts_resolve,
-            => {
-                const outcome = self.handleMountsNamespaceWrite(node.special, state.node_id, data) catch |err| switch (err) {
-                    error.InvalidPayload => {
-                        return unified.buildFsrpcError(
-                            self.allocator,
-                            msg.tag,
-                            "invalid",
-                            "mounts payload is invalid for requested operation",
-                        );
-                    },
-                    error.AccessDenied => {
-                        return unified.buildFsrpcError(
-                            self.allocator,
-                            msg.tag,
-                            "eperm",
-                            "mounts/binds operation denied by project policy",
-                        );
-                    },
-                    else => return err,
-                };
-                written = outcome.written;
-            },
-            .home_invoke,
-            .home_ensure,
-            => {
-                const outcome = self.handleHomeNamespaceWrite(node.special, state.node_id, data) catch |err| switch (err) {
-                    error.InvalidPayload => {
-                        return unified.buildFsrpcError(
-                            self.allocator,
-                            msg.tag,
-                            "invalid",
-                            "home payload is invalid for requested operation",
-                        );
-                    },
-                    error.AccessDenied => {
-                        return unified.buildFsrpcError(
-                            self.allocator,
-                            msg.tag,
-                            "eperm",
-                            "home operation denied by project policy",
-                        );
-                    },
-                    else => return err,
-                };
-                written = outcome.written;
-            },
-            .workers_invoke,
-            .workers_register,
-            .workers_heartbeat,
-            .workers_detach,
-            => {
-                const outcome = self.handleWorkersNamespaceWrite(node.special, state.node_id, data) catch |err| switch (err) {
-                    error.InvalidPayload => {
-                        return unified.buildFsrpcError(
-                            self.allocator,
-                            msg.tag,
-                            "invalid",
-                            "workers payload is invalid for requested operation",
-                        );
-                    },
-                    else => return err,
-                };
-                written = outcome.written;
-            },
-            .venom_packages_invoke,
-            .venom_packages_list,
-            .venom_packages_get,
-            .venom_packages_install,
-            .venom_packages_remove,
-            => {
-                const outcome = self.handleVenomPackagesNamespaceWrite(node.special, state.node_id, data) catch |err| switch (err) {
-                    error.InvalidPayload => {
-                        return unified.buildFsrpcError(
-                            self.allocator,
-                            msg.tag,
-                            "invalid",
-                            "venom_packages payload is invalid for requested operation",
-                        );
-                    },
-                    error.AccessDenied => {
-                        return unified.buildFsrpcError(
-                            self.allocator,
-                            msg.tag,
-                            "eperm",
-                            "venom package operation denied by policy",
-                        );
-                    },
-                    error.AlreadyExists => {
-                        return unified.buildFsrpcError(
-                            self.allocator,
-                            msg.tag,
-                            "eexist",
-                            "venom package already installed",
-                        );
-                    },
-                    else => return err,
-                };
-                written = outcome.written;
-            },
-            .agents_invoke => {
-                const outcome = self.handleAgentsInvokeWrite(state.node_id, data) catch |err| switch (err) {
-                    error.InvalidPayload => {
-                        return unified.buildFsrpcError(
-                            self.allocator,
-                            msg.tag,
-                            "invalid",
-                            "agents invoke payload must include op=list|create and optional arguments/args",
-                        );
-                    },
-                    error.AccessDenied => {
-                        return unified.buildFsrpcError(
-                            self.allocator,
-                            msg.tag,
-                            "eperm",
-                            "agent creation requires capability",
-                        );
-                    },
-                    else => return err,
-                };
-                written = outcome.written;
-            },
-            .agents_list => {
-                const outcome = self.handleAgentsListWrite(state.node_id, data) catch |err| switch (err) {
-                    error.InvalidPayload => {
-                        return unified.buildFsrpcError(
-                            self.allocator,
-                            msg.tag,
-                            "invalid",
-                            "agents list payload must be empty or a JSON object",
-                        );
-                    },
-                    else => return err,
-                };
-                written = outcome.written;
-            },
-            .agents_create => {
-                const outcome = self.handleAgentsCreateWrite(state.node_id, data) catch |err| switch (err) {
-                    error.InvalidPayload => {
-                        return unified.buildFsrpcError(
-                            self.allocator,
-                            msg.tag,
-                            "invalid",
-                            "agents create payload requires agent_id (or id) and optional metadata/project fields",
-                        );
-                    },
-                    error.AccessDenied => {
-                        return unified.buildFsrpcError(
-                            self.allocator,
-                            msg.tag,
-                            "eperm",
-                            "agent creation requires capability",
-                        );
-                    },
-                    else => return err,
-                };
-                written = outcome.written;
-            },
-            .projects_invoke,
-            .projects_list,
-            .projects_get,
-            .projects_up,
-            => {
-                const outcome = self.handleWorkspacesNamespaceWrite(node.special, state.node_id, data) catch |err| switch (err) {
-                    error.InvalidPayload => {
-                        return unified.buildFsrpcError(
-                            self.allocator,
-                            msg.tag,
-                            "invalid",
-                            "workspace payload is invalid for requested operation",
-                        );
-                    },
-                    error.AccessDenied => {
-                        return unified.buildFsrpcError(
-                            self.allocator,
-                            msg.tag,
-                            "eperm",
-                            "workspace operation denied by policy",
-                        );
-                    },
-                    else => return err,
-                };
-                written = outcome.written;
-            },
-            .git_invoke,
-            .git_sync_checkout,
-            .git_status,
-            .git_diff_range,
-            => {
-                const outcome = self.handleGitNamespaceWrite(node.special, state.node_id, data) catch |err| switch (err) {
-                    error.InvalidPayload => {
-                        return unified.buildFsrpcError(
-                            self.allocator,
-                            msg.tag,
-                            "invalid",
-                            "git payload is invalid for requested operation",
-                        );
-                    },
-                    else => return err,
-                };
-                written = outcome.written;
-            },
-            .github_pr_invoke,
-            .github_pr_sync,
-            .github_pr_ingest_event,
-            .github_pr_publish_review,
-            => {
-                const outcome = self.handleGitHubPrNamespaceWrite(node.special, state.node_id, data) catch |err| switch (err) {
-                    error.InvalidPayload => {
-                        return unified.buildFsrpcError(
-                            self.allocator,
-                            msg.tag,
-                            "invalid",
-                            "github_pr payload is invalid for requested operation",
-                        );
-                    },
-                    else => return err,
-                };
-                written = outcome.written;
-            },
-            .pr_review_invoke,
-            .pr_review_configure_repo,
-            .pr_review_get_repo,
-            .pr_review_list_repos,
-            .pr_review_intake,
-            .pr_review_start,
-            .pr_review_sync,
-            .pr_review_run_validation,
-            .pr_review_record_validation,
-            .pr_review_draft_review,
-            .pr_review_save_draft,
-            .pr_review_record_review,
-            .pr_review_advance,
-            => {
-                const outcome = self.handlePrReviewNamespaceWrite(node.special, state.node_id, data) catch |err| switch (err) {
-                    error.InvalidPayload => {
-                        return unified.buildFsrpcError(
-                            self.allocator,
-                            msg.tag,
-                            "invalid",
-                            "pr_review payload is invalid for requested operation",
-                        );
-                    },
-                    error.AccessDenied => {
-                        return unified.buildFsrpcError(
-                            self.allocator,
-                            msg.tag,
-                            "eperm",
-                            "pr_review operation denied by policy",
-                        );
-                    },
-                    error.NotFound => {
-                        return unified.buildFsrpcError(
-                            self.allocator,
-                            msg.tag,
-                            "enoent",
-                            "pr_review mission not found",
-                        );
-                    },
-                    else => return err,
-                };
-                written = outcome.written;
-            },
-            .missions_invoke,
-            .missions_invoke_service,
-            .missions_create,
-            .missions_list,
-            .missions_get,
-            .missions_heartbeat,
-            .missions_checkpoint,
-            .missions_recover,
-            .missions_request_approval,
-            .missions_approve,
-            .missions_reject,
-            .missions_resume,
-            .missions_block,
-            .missions_complete,
-            .missions_fail,
-            .missions_cancel,
-            => {
-                const outcome = self.handleMissionsNamespaceWrite(node.special, state.node_id, data) catch |err| switch (err) {
-                    error.InvalidPayload => {
-                        return unified.buildFsrpcError(
-                            self.allocator,
-                            msg.tag,
-                            "invalid",
-                            "missions payload is invalid for requested operation",
-                        );
-                    },
-                    error.AccessDenied => {
-                        return unified.buildFsrpcError(
-                            self.allocator,
-                            msg.tag,
-                            "eperm",
-                            "missions operation requires admin approval privileges",
-                        );
-                    },
-                    error.NotFound => {
-                        return unified.buildFsrpcError(
-                            self.allocator,
-                            msg.tag,
-                            "enoent",
-                            "mission not found",
-                        );
-                    },
-                    else => return err,
-                };
-                written = outcome.written;
-            },
-            .pairing_refresh => {
-                const outcome = try self.handlePairingControlWrite(.refresh, data);
-                written = outcome.written;
-            },
-            .pairing_approve => {
-                const outcome = try self.handlePairingControlWrite(.approve, data);
-                written = outcome.written;
-            },
-            .pairing_deny => {
-                const outcome = try self.handlePairingControlWrite(.deny, data);
-                written = outcome.written;
-            },
-            .pairing_invites_refresh => {
-                const outcome = try self.handlePairingControlWrite(.invites_refresh, data);
-                written = outcome.written;
-            },
-            .pairing_invites_create => {
-                const outcome = try self.handlePairingControlWrite(.invites_create, data);
-                written = outcome.written;
-            },
-            .terminal_v2_invoke => {
-                const outcome = self.handleTerminalV2InvokeWrite(state.node_id, data) catch |err| switch (err) {
-                    error.InvalidPayload => {
-                        return unified.buildFsrpcError(
-                            self.allocator,
-                            msg.tag,
-                            "invalid",
-                            "terminal invoke payload must include op=create|resume|close|write|read|resize|exec or matching fields",
-                        );
-                    },
-                    error.TerminalSessionNotFound => {
-                        return unified.buildFsrpcError(
-                            self.allocator,
-                            msg.tag,
-                            "enoent",
-                            "terminal session not found",
-                        );
-                    },
-                    error.TerminalSessionClosed => {
-                        return unified.buildFsrpcError(
-                            self.allocator,
-                            msg.tag,
-                            "eperm",
-                            "terminal session is closed",
-                        );
-                    },
-                    error.UnsupportedPlatform => {
-                        return unified.buildFsrpcError(
-                            self.allocator,
-                            msg.tag,
-                            "unsupported",
-                            "pty terminal sessions are currently supported on linux only",
-                        );
-                    },
-                    error.TerminalPtyUnavailable => {
-                        return unified.buildFsrpcError(
-                            self.allocator,
-                            msg.tag,
-                            "unavailable",
-                            "pty backend unavailable: install util-linux script",
-                        );
-                    },
-                    else => return err,
-                };
-                written = outcome.written;
-            },
-            .terminal_v2_create => {
-                const outcome = self.handleTerminalV2CreateWrite(state.node_id, data) catch |err| switch (err) {
-                    error.InvalidPayload => {
-                        return unified.buildFsrpcError(
-                            self.allocator,
-                            msg.tag,
-                            "invalid",
-                            "terminal create payload must be a JSON object with optional session_id/label/cwd",
-                        );
-                    },
-                    error.UnsupportedPlatform => {
-                        return unified.buildFsrpcError(
-                            self.allocator,
-                            msg.tag,
-                            "unsupported",
-                            "pty terminal sessions are currently supported on linux only",
-                        );
-                    },
-                    error.TerminalPtyUnavailable => {
-                        return unified.buildFsrpcError(
-                            self.allocator,
-                            msg.tag,
-                            "unavailable",
-                            "pty backend unavailable: install util-linux script",
-                        );
-                    },
-                    else => return err,
-                };
-                written = outcome.written;
-            },
-            .terminal_v2_resume => {
-                const outcome = self.handleTerminalV2ResumeWrite(state.node_id, data) catch |err| switch (err) {
-                    error.InvalidPayload => {
-                        return unified.buildFsrpcError(
-                            self.allocator,
-                            msg.tag,
-                            "invalid",
-                            "terminal resume payload must include session_id",
-                        );
-                    },
-                    error.TerminalSessionNotFound => {
-                        return unified.buildFsrpcError(
-                            self.allocator,
-                            msg.tag,
-                            "enoent",
-                            "terminal session not found",
-                        );
-                    },
-                    error.TerminalSessionClosed => {
-                        return unified.buildFsrpcError(
-                            self.allocator,
-                            msg.tag,
-                            "eperm",
-                            "terminal session is closed",
-                        );
-                    },
-                    error.UnsupportedPlatform => {
-                        return unified.buildFsrpcError(
-                            self.allocator,
-                            msg.tag,
-                            "unsupported",
-                            "pty terminal sessions are currently supported on linux only",
-                        );
-                    },
-                    else => return err,
-                };
-                written = outcome.written;
-            },
-            .terminal_v2_close => {
-                const outcome = self.handleTerminalV2CloseWrite(state.node_id, data) catch |err| switch (err) {
-                    error.InvalidPayload => {
-                        return unified.buildFsrpcError(
-                            self.allocator,
-                            msg.tag,
-                            "invalid",
-                            "terminal close payload must include session_id or use an active session",
-                        );
-                    },
-                    error.TerminalSessionNotFound => {
-                        return unified.buildFsrpcError(
-                            self.allocator,
-                            msg.tag,
-                            "enoent",
-                            "terminal session not found",
-                        );
-                    },
-                    error.UnsupportedPlatform => {
-                        return unified.buildFsrpcError(
-                            self.allocator,
-                            msg.tag,
-                            "unsupported",
-                            "pty terminal sessions are currently supported on linux only",
-                        );
-                    },
-                    else => return err,
-                };
-                written = outcome.written;
-            },
-            .terminal_v2_exec => {
-                const outcome = self.handleTerminalV2ExecWrite(state.node_id, data) catch |err| switch (err) {
-                    error.InvalidPayload => {
-                        return unified.buildFsrpcError(
-                            self.allocator,
-                            msg.tag,
-                            "invalid",
-                            "terminal exec payload must include command or argv (optional session_id/cwd)",
-                        );
-                    },
-                    error.TerminalSessionNotFound => {
-                        return unified.buildFsrpcError(
-                            self.allocator,
-                            msg.tag,
-                            "enoent",
-                            "terminal session not found",
-                        );
-                    },
-                    error.TerminalSessionClosed => {
-                        return unified.buildFsrpcError(
-                            self.allocator,
-                            msg.tag,
-                            "eperm",
-                            "terminal session is closed",
-                        );
-                    },
-                    error.UnsupportedPlatform => {
-                        return unified.buildFsrpcError(
-                            self.allocator,
-                            msg.tag,
-                            "unsupported",
-                            "pty terminal sessions are currently supported on linux only",
-                        );
-                    },
-                    else => return err,
-                };
-                written = outcome.written;
-            },
-            .terminal_v2_write => {
-                const outcome = self.handleTerminalV2WriteWrite(state.node_id, data) catch |err| switch (err) {
-                    error.InvalidPayload => {
-                        return unified.buildFsrpcError(
-                            self.allocator,
-                            msg.tag,
-                            "invalid",
-                            "terminal write payload must include input/command/data_b64 (optional session_id)",
-                        );
-                    },
-                    error.TerminalSessionNotFound => {
-                        return unified.buildFsrpcError(
-                            self.allocator,
-                            msg.tag,
-                            "enoent",
-                            "terminal session not found",
-                        );
-                    },
-                    error.TerminalSessionClosed => {
-                        return unified.buildFsrpcError(
-                            self.allocator,
-                            msg.tag,
-                            "eperm",
-                            "terminal session is closed",
-                        );
-                    },
-                    error.UnsupportedPlatform => {
-                        return unified.buildFsrpcError(
-                            self.allocator,
-                            msg.tag,
-                            "unsupported",
-                            "pty terminal sessions are currently supported on linux only",
-                        );
-                    },
-                    else => return err,
-                };
-                written = outcome.written;
-            },
-            .terminal_v2_read => {
-                const outcome = self.handleTerminalV2ReadWrite(state.node_id, data) catch |err| switch (err) {
-                    error.InvalidPayload => {
-                        return unified.buildFsrpcError(
-                            self.allocator,
-                            msg.tag,
-                            "invalid",
-                            "terminal read payload must be object with optional session_id/max_bytes/timeout_ms",
-                        );
-                    },
-                    error.TerminalSessionNotFound => {
-                        return unified.buildFsrpcError(
-                            self.allocator,
-                            msg.tag,
-                            "enoent",
-                            "terminal session not found",
-                        );
-                    },
-                    error.TerminalSessionClosed => {
-                        return unified.buildFsrpcError(
-                            self.allocator,
-                            msg.tag,
-                            "eperm",
-                            "terminal session is closed",
-                        );
-                    },
-                    error.UnsupportedPlatform => {
-                        return unified.buildFsrpcError(
-                            self.allocator,
-                            msg.tag,
-                            "unsupported",
-                            "pty terminal sessions are currently supported on linux only",
-                        );
-                    },
-                    else => return err,
-                };
-                written = outcome.written;
-            },
-            .terminal_v2_resize => {
-                const outcome = self.handleTerminalV2ResizeWrite(state.node_id, data) catch |err| switch (err) {
-                    error.InvalidPayload => {
-                        return unified.buildFsrpcError(
-                            self.allocator,
-                            msg.tag,
-                            "invalid",
-                            "terminal resize payload must include cols and rows (optional session_id)",
-                        );
-                    },
-                    error.TerminalSessionNotFound => {
-                        return unified.buildFsrpcError(
-                            self.allocator,
-                            msg.tag,
-                            "enoent",
-                            "terminal session not found",
-                        );
-                    },
-                    error.TerminalSessionClosed => {
-                        return unified.buildFsrpcError(
-                            self.allocator,
-                            msg.tag,
-                            "eperm",
-                            "terminal session is closed",
-                        );
-                    },
-                    error.UnsupportedPlatform => {
-                        return unified.buildFsrpcError(
-                            self.allocator,
-                            msg.tag,
-                            "unsupported",
-                            "pty terminal sessions are currently supported on linux only",
-                        );
-                    },
-                    else => return err,
-                };
-                written = outcome.written;
-            },
-            else => {
-                self.writeFileContent(state.node_id, offset, data) catch |err| switch (err) {
-                    error.InvalidOffset => {
-                        return unified.buildFsrpcError(
-                            self.allocator,
-                            msg.tag,
-                            "invalid",
-                            "write offset is out of range",
-                        );
-                    },
-                    else => return err,
-                };
-            },
+        } else if (node.special == .chat_input) {
+            const outcome = try self.handleChatInputWrite(msg, data);
+            written = outcome.written;
+            job_name = outcome.job_name;
+            correlation_id = outcome.correlation_id;
+            chat_reply_content = outcome.chat_reply_content;
+        } else if (specialWriteCommitsOnClose(node.special)) {
+            self.appendPendingSpecialWrite(&state, state.node_id, offset, data) catch |err| switch (err) {
+                error.InvalidOffset => return unified.buildFsrpcError(self.allocator, msg.tag, "invalid", "write offset is out of range"),
+                else => return err,
+            };
+            try self.fids.put(self.allocator, fid, state);
+            written = data.len;
+        } else {
+            const outcome = self.executeNodeWrite(state.node_id, node.special, offset, data) catch |err| {
+                return self.specialWriteErrorResponse(msg.tag, node.special, err);
+            };
+            written = outcome.written;
+            job_name = outcome.job_name;
+            correlation_id = outcome.correlation_id;
+            chat_reply_content = outcome.chat_reply_content;
         }
 
         const payload = if (job_name) |job| blk: {
@@ -1862,7 +1282,21 @@ pub const Session = struct {
 
     fn handleClunk(self: *Session, msg: *const unified.ParsedMessage) ![]u8 {
         const fid = msg.fid orelse return unified.buildFsrpcError(self.allocator, msg.tag, "invalid", "fid is required");
-        _ = self.fids.remove(fid);
+        if (self.fids.fetchRemove(fid)) |entry| {
+            var state = entry.value;
+            defer state.deinit(self.allocator);
+            if (state.pending_special_write) |payload| {
+                const node = self.nodes.get(state.node_id) orelse {
+                    return unified.buildFsrpcError(self.allocator, msg.tag, "eio", "missing node");
+                };
+                if (isTerminalV2Special(node.special) and !self.canInvokeTerminalNamespace(state.node_id)) {
+                    return unified.buildFsrpcError(self.allocator, msg.tag, "eperm", "terminal invoke access denied by permissions");
+                }
+                _ = self.executeNodeWrite(state.node_id, node.special, 0, payload) catch |err| {
+                    return self.specialWriteErrorResponse(msg.tag, node.special, err);
+                };
+            }
+        }
         return unified.buildFsrpcResponse(self.allocator, .r_clunk, msg.tag, "{}");
     }
 
@@ -4822,6 +4256,52 @@ pub const Session = struct {
         if (!self.canInvokeVenomDirectory(venom_dir_id)) return false;
         if (!self.is_admin and std.mem.eql(u8, self.actor_type, "user")) return false;
         return true;
+    }
+
+    fn specialWriteCommitsOnClose(special: SpecialKind) bool {
+        return switch (special) {
+            .none,
+            .chat_input,
+            .chat_reply,
+            .job_status,
+            .job_result,
+            .job_log,
+            .agent_venoms_index,
+            .node_venom_events_log,
+            => false,
+            else => true,
+        };
+    }
+
+    fn appendPendingSpecialWrite(
+        self: *Session,
+        state: *FidState,
+        node_id: u32,
+        offset: u64,
+        data: []const u8,
+    ) !void {
+        if (state.pending_special_write == null) {
+            state.pending_special_write = try self.allocator.dupe(u8, "");
+        }
+        errdefer if (state.pending_special_write) |value| self.allocator.free(value);
+
+        const base_offset = std.math.cast(usize, offset) orelse return error.InvalidOffset;
+        const current = state.pending_special_write.?;
+        const required_len = std.math.add(usize, base_offset, data.len) catch return error.InvalidOffset;
+
+        if (required_len > current.len) {
+            var next = try self.allocator.alloc(u8, required_len);
+            @memset(next, 0);
+            if (current.len > 0) @memcpy(next[0..current.len], current);
+            self.allocator.free(current);
+            state.pending_special_write = next;
+        }
+
+        if (data.len > 0) {
+            @memcpy(state.pending_special_write.?[base_offset .. base_offset + data.len], data);
+        }
+        try self.setFileContent(state.node_id, state.pending_special_write.?);
+        _ = node_id;
     }
 
     fn isTerminalV2Special(special: SpecialKind) bool {
@@ -9539,6 +9019,16 @@ fn protocolWriteFile(
     const write_res = try session.handle(&write);
     defer allocator.free(write_res);
     try std.testing.expect(std.mem.indexOf(u8, write_res, "acheron.r_write") != null);
+
+    var clunk = unified.ParsedMessage{
+        .channel = .acheron,
+        .acheron_type = .t_clunk,
+        .tag = tag_base + 4,
+        .fid = walk_fid,
+    };
+    const clunk_res = try session.handle(&clunk);
+    defer allocator.free(clunk_res);
+    try std.testing.expect(std.mem.indexOf(u8, clunk_res, "acheron.r_clunk") != null);
 }
 
 fn protocolWriteFileExpectError(
@@ -9596,13 +9086,31 @@ fn protocolWriteFileExpectError(
     };
     const write_res = try session.handle(&write);
     errdefer allocator.free(write_res);
-    try std.testing.expect(std.mem.indexOf(u8, write_res, "acheron.error") != null);
+    if (std.mem.indexOf(u8, write_res, "acheron.error") != null) {
+        if (expected_error_code.len > 0) {
+            const pattern = try std.fmt.allocPrint(allocator, "\"code\":\"{s}\"", .{expected_error_code});
+            defer allocator.free(pattern);
+            try std.testing.expect(std.mem.indexOf(u8, write_res, pattern) != null);
+        }
+        return write_res;
+    }
+
+    var clunk = unified.ParsedMessage{
+        .channel = .acheron,
+        .acheron_type = .t_clunk,
+        .tag = tag_base + 4,
+        .fid = walk_fid,
+    };
+    allocator.free(write_res);
+    const clunk_res = try session.handle(&clunk);
+    errdefer allocator.free(clunk_res);
+    try std.testing.expect(std.mem.indexOf(u8, clunk_res, "acheron.error") != null);
     if (expected_error_code.len > 0) {
         const pattern = try std.fmt.allocPrint(allocator, "\"code\":\"{s}\"", .{expected_error_code});
         defer allocator.free(pattern);
-        try std.testing.expect(std.mem.indexOf(u8, write_res, pattern) != null);
+        try std.testing.expect(std.mem.indexOf(u8, clunk_res, pattern) != null);
     }
-    return write_res;
+    return clunk_res;
 }
 
 fn protocolReadFile(
@@ -9659,6 +9167,120 @@ fn protocolReadFile(
     const read_res = try session.handle(&read);
     defer allocator.free(read_res);
     return decodeReadResponseData(allocator, read_res);
+}
+
+test "acheron_session: terminal control writes commit on clunk after chunked appends" {
+    const allocator = std.testing.allocator;
+
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createUnavailable(
+        allocator,
+        "execution_failed",
+        "runtime unavailable",
+    );
+    defer runtime_handle.destroy();
+
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "agent-under-test",
+        .{
+            .actor_type = "agent",
+            .actor_id = "agent-under-test",
+        },
+    );
+    defer session.deinit();
+
+    var attach = unified.ParsedMessage{
+        .channel = .acheron,
+        .acheron_type = .t_attach,
+        .tag = 4000,
+        .fid = 500,
+    };
+    const attach_res = try session.handle(&attach);
+    defer allocator.free(attach_res);
+
+    const path = try allocPathSegments(allocator, &.{ "nodes", "local", "venoms", "terminal", "control", "create.json" });
+    defer freePathSegments(allocator, path);
+    var walk = unified.ParsedMessage{
+        .channel = .acheron,
+        .acheron_type = .t_walk,
+        .tag = 4001,
+        .fid = 500,
+        .newfid = 501,
+        .path = path,
+    };
+    const walk_res = try session.handle(&walk);
+    defer allocator.free(walk_res);
+
+    var open = unified.ParsedMessage{
+        .channel = .acheron,
+        .acheron_type = .t_open,
+        .tag = 4002,
+        .fid = 501,
+        .mode = "w",
+    };
+    const open_res = try session.handle(&open);
+    defer allocator.free(open_res);
+
+    var write_a = unified.ParsedMessage{
+        .channel = .acheron,
+        .acheron_type = .t_write,
+        .tag = 4003,
+        .fid = 501,
+        .offset = 0,
+        .data = "{\"session_id\":\"split",
+    };
+    const write_a_res = try session.handle(&write_a);
+    defer allocator.free(write_a_res);
+    try std.testing.expect(std.mem.indexOf(u8, write_a_res, "\"n\":20") != null);
+
+    var write_b = unified.ParsedMessage{
+        .channel = .acheron,
+        .acheron_type = .t_write,
+        .tag = 4004,
+        .fid = 501,
+        .offset = 20,
+        .data = "-session\",\"label\":\"chunked\"}",
+    };
+    const write_b_res = try session.handle(&write_b);
+    defer allocator.free(write_b_res);
+    try std.testing.expect(std.mem.indexOf(u8, write_b_res, "\"n\":28") != null);
+
+    const before_clunk = try protocolReadFile(
+        &session,
+        allocator,
+        502,
+        503,
+        &.{ "nodes", "local", "venoms", "terminal", "current.json" },
+        4005,
+    );
+    defer allocator.free(before_clunk);
+    try std.testing.expect(std.mem.indexOf(u8, before_clunk, "\"session\":null") != null);
+
+    var clunk = unified.ParsedMessage{
+        .channel = .acheron,
+        .acheron_type = .t_clunk,
+        .tag = 4006,
+        .fid = 501,
+    };
+    const clunk_res = try session.handle(&clunk);
+    defer allocator.free(clunk_res);
+    try std.testing.expect(std.mem.indexOf(u8, clunk_res, "acheron.r_clunk") != null);
+
+    const after_clunk = try protocolReadFile(
+        &session,
+        allocator,
+        504,
+        505,
+        &.{ "nodes", "local", "venoms", "terminal", "current.json" },
+        4007,
+    );
+    defer allocator.free(after_clunk);
+    try std.testing.expect(std.mem.indexOf(u8, after_clunk, "split-session") != null);
 }
 
 fn runTestCommandCapture(
