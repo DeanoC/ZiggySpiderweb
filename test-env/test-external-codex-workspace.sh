@@ -40,6 +40,7 @@ CODEX_CLI_VERSION="${CODEX_CLI_VERSION:-0.111.0}"
 CODEX_AUTH_MODE="${CODEX_AUTH_MODE:-auto}"
 CODEX_API_KEY_ENV="${CODEX_API_KEY_ENV:-OPENAI_API_KEY}"
 CODEX_HOME_DIR="${CODEX_HOME_DIR:-$HOST_HOME_DIR}"
+EXTERNAL_AGENT_ID="${EXTERNAL_AGENT_ID:-codex}"
 CODEX_TIMEOUT_SECONDS="${CODEX_TIMEOUT_SECONDS:-900}"
 CODEX_IDLE_TIMEOUT_SECONDS="${CODEX_IDLE_TIMEOUT_SECONDS:-0}"
 CODEX_JSON_EVENTS="${CODEX_JSON_EVENTS:-1}"
@@ -48,6 +49,8 @@ CODEX_DISABLE_COLLABORATION_MODES="${CODEX_DISABLE_COLLABORATION_MODES:-1}"
 CODEX_DISABLE_APPS="${CODEX_DISABLE_APPS:-1}"
 CODEX_DISABLE_SHELL_SNAPSHOT="${CODEX_DISABLE_SHELL_SNAPSHOT:-1}"
 CODEX_ALLOW_HOST_CODEX_HOME="${CODEX_ALLOW_HOST_CODEX_HOME:-1}"
+CODEX_ENABLE_TERMINAL_BRIDGE="${CODEX_ENABLE_TERMINAL_BRIDGE:-1}"
+CODEX_ENABLE_GIT_BRIDGE="${CODEX_ENABLE_GIT_BRIDGE:-1}"
 CODEX_INSTALL_IF_MISSING="${CODEX_INSTALL_IF_MISSING:-1}"
 SPIDERWEB_INSTALL_SOURCE="${SPIDERWEB_INSTALL_SOURCE:-auto}"
 SPIDERWEB_RELEASE_VERSION="${SPIDERWEB_RELEASE_VERSION:-v0.3.0}"
@@ -129,6 +132,14 @@ CODEX_FAILURE_REASON=""
 CODEX_RUN_STATE="not_started"
 CODEX_LAUNCH_SOURCE=""
 declare -a CODEX_ENV_BASE=()
+declare -a CODEX_ALLOWED_BRIDGE_EXECS=()
+RUN_STARTED_AT_UTC=""
+CODEX_LAUNCH_STARTED_AT_UTC=""
+CODEX_BOOTSTRAP_COMPLETE_AT_UTC=""
+CODEX_BOOTSTRAP_COMPLETE_SOURCE=""
+CODEX_FIRST_WORKSPACE_WRITE_AT_UTC=""
+CODEX_FIRST_WORKSPACE_WRITE_PATH=""
+VALIDATION_STARTED_AT_UTC=""
 
 cleanup() {
     local exit_code=$?
@@ -183,6 +194,7 @@ if [[ -z "$REMOTE_NODE_PORT" ]]; then
 fi
 
 mkdir -p "$OUTPUT_DIR" "$OUTPUT_DIR/logs" "$OUTPUT_DIR/snapshots"
+RUN_STARTED_AT_UTC="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 
 TEST_TMP_DIR="$(mktemp -d)"
 TEMP_HOME="$TEST_TMP_DIR/home"
@@ -202,6 +214,7 @@ CODEX_PTY_LOG="$OUTPUT_DIR/logs/codex.pty.log"
 CODEX_INSTALL_LOG="$OUTPUT_DIR/logs/codex-install.log"
 CODEX_AUTH_LOG="$OUTPUT_DIR/logs/codex-auth.log"
 CODEX_EVENT_SUMMARY="$OUTPUT_DIR/codex_exec_summary.json"
+CODEX_PROGRESS_TIMELINE="$OUTPUT_DIR/codex_progress_timeline.json"
 
 SPIDERWEB_CONFIG_FILE="$TEST_TMP_DIR/spiderweb.json"
 LTM_DIR="$TEST_TMP_DIR/ltm"
@@ -229,6 +242,28 @@ CODEX_XDG_CONFIG_HOME="$CODEX_RUNTIME_ROOT/xdg-config"
 CODEX_XDG_CACHE_HOME="$CODEX_RUNTIME_ROOT/xdg-cache"
 CODEX_XDG_DATA_HOME="$CODEX_RUNTIME_ROOT/xdg-data"
 CODEX_XDG_STATE_HOME="$CODEX_RUNTIME_ROOT/xdg-state"
+CODEX_BRIDGE_DIR="$CODEX_RUNTIME_ROOT/bridge"
+CODEX_BRIDGE_COMMON_SRC="$ASSET_DIR/spiderweb_bridge_common.py"
+CODEX_BRIDGE_SHELL_SRC="$ASSET_DIR/spiderweb_terminal_shell.py"
+CODEX_BRIDGE_GIT_SRC="$ASSET_DIR/spiderweb_git_shim.py"
+CODEX_STDIN_LAUNCHER_SRC="$ASSET_DIR/codex_exec_stdin_launcher.py"
+CODEX_BRIDGE_LSB_RELEASE_SRC="$ASSET_DIR/spiderweb_lsb_release.py"
+CODEX_BRIDGE_GETCONF_SRC="$ASSET_DIR/spiderweb_getconf.py"
+CODEX_BRIDGE_COMMON="$CODEX_BRIDGE_DIR/spiderweb_bridge_common.py"
+CODEX_BRIDGE_SHELL="$CODEX_BRIDGE_DIR/spiderweb-terminal-shell"
+CODEX_BRIDGE_GIT="$CODEX_BRIDGE_DIR/git"
+CODEX_STDIN_LAUNCHER="$CODEX_BRIDGE_DIR/codex-exec-stdin-launcher"
+CODEX_BRIDGE_PYTHON="$CODEX_BRIDGE_DIR/python3"
+CODEX_BRIDGE_LSB_RELEASE="$CODEX_BRIDGE_DIR/lsb_release"
+CODEX_BRIDGE_GETCONF="$CODEX_BRIDGE_DIR/getconf"
+CODEX_EXEC_PATH=""
+AGENT_HOME_TARGET_ROOT="$WORKSPACE_EXPORT_ROOT/.spiderweb/agents/$EXTERNAL_AGENT_ID/home"
+AGENT_HOME_MOUNT_ROOT="$MOUNT_WORKSPACE_PATH/.spiderweb/agents/$EXTERNAL_AGENT_ID/home"
+AGENT_HOME_XDG_CONFIG="$AGENT_HOME_MOUNT_ROOT/.config"
+AGENT_HOME_XDG_CACHE="$AGENT_HOME_MOUNT_ROOT/.cache"
+AGENT_HOME_XDG_DATA="$AGENT_HOME_MOUNT_ROOT/.local/share"
+AGENT_HOME_XDG_STATE="$AGENT_HOME_MOUNT_ROOT/.local/state"
+AGENT_HOME_TMP="$AGENT_HOME_MOUNT_ROOT/tmp"
 
 AUTH_TOKENS_FILE="$LTM_DIR/auth_tokens.json"
 mkdir -p \
@@ -253,12 +288,18 @@ build_usage_report() {
         --mounted-services "$OUTPUT_DIR/snapshots/mounted_services.json"
         --venom-packages "$OUTPUT_DIR/snapshots/venom_packages.json"
         --repo-root "$ROOT_DIR"
+        --codex-event-log "$CODEX_STDOUT_LOG"
         --json-output "$USAGE_JSON"
         --markdown-output "$USAGE_MD"
     )
     if [[ -d "$CODEX_RUNTIME_ROOT" ]]; then
         cmd+=(--allowed-runtime-root "$CODEX_RUNTIME_ROOT")
     fi
+    for bridge_exec in "${CODEX_ALLOWED_BRIDGE_EXECS[@]}"; do
+        if [[ -n "$bridge_exec" ]]; then
+            cmd+=(--allowed-bridge-exec "$bridge_exec")
+        fi
+    done
     if [[ "$CODEX_ALLOW_HOST_CODEX_HOME" == "1" && -n "$CODEX_HOME_DIR" && -d "$CODEX_HOME_DIR/.codex" ]]; then
         cmd+=(--allowed-host-write-prefix "$CODEX_HOME_DIR/.codex")
     fi
@@ -296,9 +337,11 @@ write_codex_runtime_snapshot() {
         --arg requested_auth "$CODEX_AUTH_MODE" \
         --arg selected_auth "${CODEX_SELECTED_AUTH_MODE:-}" \
         --arg effective_home "${CODEX_EFFECTIVE_HOME:-}" \
+        --arg external_agent_id "$EXTERNAL_AGENT_ID" \
         --arg launch_source "${CODEX_LAUNCH_SOURCE:-}" \
         --arg runtime_root "$CODEX_RUNTIME_ROOT" \
         --arg existing_home "$CODEX_HOME_DIR" \
+        --arg mounted_home "$AGENT_HOME_MOUNT_ROOT" \
         --arg timeout_seconds "$CODEX_TIMEOUT_SECONDS" \
         --arg idle_timeout_seconds "$CODEX_IDLE_TIMEOUT_SECONDS" \
         --arg json_events "$CODEX_JSON_EVENTS" \
@@ -314,9 +357,11 @@ write_codex_runtime_snapshot() {
             requested_auth_mode: $requested_auth,
             selected_auth_mode: $selected_auth,
             effective_home: $effective_home,
+            external_agent_id: $external_agent_id,
             launch_source: $launch_source,
             codex_runtime_root: $runtime_root,
             existing_login_home: $existing_home,
+            mounted_agent_home: $mounted_home,
             timeout_seconds: ($timeout_seconds | tonumber),
             idle_timeout_seconds: ($idle_timeout_seconds | tonumber),
             json_events: ($json_events == "1"),
@@ -328,6 +373,108 @@ write_codex_runtime_snapshot() {
             custom_launch_cmd: ($launch_cmd_custom | if . == "" then null else . end)
         }' > "$OUTPUT_DIR/snapshots/codex_runtime.json"
 }
+
+file_mtime_utc() {
+    python3 - "$1" <<'PY'
+from datetime import datetime, timezone
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+if not path.exists():
+    raise SystemExit(1)
+timestamp = path.stat().st_mtime
+if timestamp <= 1:
+    raise SystemExit(2)
+dt = datetime.fromtimestamp(timestamp, tz=timezone.utc)
+print(dt.strftime("%Y-%m-%dT%H:%M:%SZ"))
+PY
+}
+
+workspace_first_write_info() {
+    python3 - "$MOUNT_WORKSPACE_PATH" <<'PY'
+from datetime import datetime, timezone
+from pathlib import Path
+import sys
+
+workspace = Path(sys.argv[1])
+skip = {"TASK.md", "validate_game.py"}
+best = None
+
+if workspace.exists():
+    for entry in workspace.rglob("*"):
+        if entry.name in skip:
+            continue
+        try:
+            stat = entry.stat()
+        except FileNotFoundError:
+            continue
+        rel = entry.relative_to(workspace)
+        candidate = (stat.st_mtime, str(rel))
+        if best is None or candidate < best:
+            best = candidate
+
+if best is None:
+    raise SystemExit(1)
+
+dt = datetime.fromtimestamp(best[0], tz=timezone.utc)
+print(dt.strftime("%Y-%m-%dT%H:%M:%SZ"))
+print(best[1])
+PY
+}
+
+write_codex_progress_timeline() {
+    jq -cn \
+        --arg run_started "${RUN_STARTED_AT_UTC:-}" \
+        --arg codex_launch_started "${CODEX_LAUNCH_STARTED_AT_UTC:-}" \
+        --arg bootstrap_complete "${CODEX_BOOTSTRAP_COMPLETE_AT_UTC:-}" \
+        --arg bootstrap_source "${CODEX_BOOTSTRAP_COMPLETE_SOURCE:-}" \
+        --arg first_workspace_write "${CODEX_FIRST_WORKSPACE_WRITE_AT_UTC:-}" \
+        --arg first_workspace_write_path "${CODEX_FIRST_WORKSPACE_WRITE_PATH:-}" \
+        --arg validation_started "${VALIDATION_STARTED_AT_UTC:-}" \
+        --arg updated_at "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
+        '{
+            run_started_at_utc: ($run_started | if . == "" then null else . end),
+            codex_launch_started_at_utc: ($codex_launch_started | if . == "" then null else . end),
+            bootstrap_complete_at_utc: ($bootstrap_complete | if . == "" then null else . end),
+            bootstrap_complete_source: ($bootstrap_source | if . == "" then null else . end),
+            first_workspace_write_at_utc: ($first_workspace_write | if . == "" then null else . end),
+            first_workspace_write_path: ($first_workspace_write_path | if . == "" then null else . end),
+            validation_started_at_utc: ($validation_started | if . == "" then null else . end),
+            updated_at_utc: $updated_at
+        }' > "$CODEX_PROGRESS_TIMELINE"
+}
+
+observe_codex_progress() {
+    local changed=0
+    local first_write_info
+
+    if [[ -z "$CODEX_BOOTSTRAP_COMPLETE_AT_UTC" && -s "$MOUNT_POINT/services/home/control/ensure.json" ]]; then
+        CODEX_BOOTSTRAP_COMPLETE_AT_UTC="$(file_mtime_utc "$MOUNT_POINT/services/home/control/ensure.json" || true)"
+        if [[ -n "$CODEX_BOOTSTRAP_COMPLETE_AT_UTC" ]]; then
+            CODEX_BOOTSTRAP_COMPLETE_SOURCE="/services/home/control/ensure.json"
+        else
+            CODEX_BOOTSTRAP_COMPLETE_AT_UTC="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+            CODEX_BOOTSTRAP_COMPLETE_SOURCE="/services/home/control/ensure.json (observed)"
+        fi
+        changed=1
+    fi
+
+    if [[ -z "$CODEX_FIRST_WORKSPACE_WRITE_AT_UTC" ]]; then
+        first_write_info="$(workspace_first_write_info 2>/dev/null || true)"
+        if [[ -n "$first_write_info" ]]; then
+            CODEX_FIRST_WORKSPACE_WRITE_AT_UTC="$(sed -n '1p' <<<"$first_write_info")"
+            CODEX_FIRST_WORKSPACE_WRITE_PATH="$(sed -n '2p' <<<"$first_write_info")"
+            changed=1
+        fi
+    fi
+
+    if [[ "$changed" == "1" ]]; then
+        write_codex_progress_timeline
+    fi
+}
+
+write_codex_progress_timeline
 
 handoff_intro() {
     case "$CODEX_RUN_STATE" in
@@ -365,6 +512,9 @@ write_handoff_bundle() {
     fi
     if [[ -f "$CODEX_EVENT_SUMMARY" ]]; then
         cp "$CODEX_EVENT_SUMMARY" "$HANDOFF_DIR/codex_exec_summary.json"
+    fi
+    if [[ -f "$CODEX_PROGRESS_TIMELINE" ]]; then
+        cp "$CODEX_PROGRESS_TIMELINE" "$HANDOFF_DIR/codex_progress_timeline.json"
     fi
 
     local codex_summary_lines=""
@@ -526,7 +676,7 @@ import sys
 from pathlib import Path
 
 workspace = Path(sys.argv[1])
-expected = ["TASK.md", "validate_game.py"]
+expected = [".spiderweb", "TASK.md", "validate_game.py"]
 entries = sorted(item.name for item in workspace.iterdir())
 if entries != expected:
     raise SystemExit(f"expected clean workspace entries {expected}, found {entries}")
@@ -601,22 +751,147 @@ Rules:
 - Treat this directory as the only writable project root.
 - Preserve validate_game.py.
 - Read `/projects/<project_id>/meta/agent_bootstrap_quickref.json` first, then `/projects/<project_id>/meta/agent_bootstrap.json`, and perform the bootstrap steps from inside the mounted workspace before you start building the game.
-- On this client, Spiderweb namespace paths are mounted under the namespace root, so `/services/*` from metadata is available at `../../../services/*` relative to this workspace and at the absolute mount path shown in the rendered prompt.
+- On this client, Spiderweb namespace paths are mounted under the namespace root, but when you use shell commands through the bridged terminal you must use namespace-visible paths like `/meta/*`, `/projects/<project_id>/meta/*`, `/services/*`, `/shared_data/*`, and `./TASK.md` instead of client-only absolute mount paths.
 - Ensure your own durable agent home first, then verify or repair required generic service binds from inside the mounted workspace if needed.
 - Use `agent_bootstrap_quickref.json` plus the mounted service directory itself as the verification source. Read `mounted_services.json` only if the quick reference is missing a detail you genuinely need. Do not read service README/SCHEMA/OPS files unless a required binding is missing and you genuinely need the repair shape.
+- Use the current metadata field names exactly as they exist today:
+  - in `protocol.json`, use `channel`, `version`, `layout`, and `ops`
+  - in `agent_bootstrap_quickref.json`, use `service_root`, `required_services`, `control_writes`, `fallback_meta`, `all_required_services_present`, and `discovery_order`
+  - in `agent_bootstrap.json`, use `service_preference`, `bootstrap_sequence`, `required_reads`, and `fallback_reads`
+- Do not invent alternate field names such as `protocol_version`, `mounted_namespace_root`, `notes`, `control_paths`, `required_service_entries`, or `generic_fallback_roots` unless they are actually present in the file you just read.
+- If `agent_bootstrap_quickref.json` says `all_required_services_present=true` and your write to `/services/home/control/ensure.json` succeeds, treat bootstrap as complete immediately.
+- A successful `ensure_home` command is the success signal. Do not retry the same `/services/home/control/ensure.json` write, do not wrap it in timeout-based verification commands, and do not perform extra verification writes unless the first command fails with a non-zero exit code.
+- After that point, do not spend more turns probing `/services/*`, looping over service directories, or re-checking the same service paths. Move straight into file generation.
+- For home bootstrap, use `control_writes.ensure_home` from `agent_bootstrap_quickref.json`.
+- For bind repair, use `control_writes.repair_bind` from `agent_bootstrap_quickref.json`.
+- For fallback roots, use `service_preference.fallback_roots` from `agent_bootstrap.json`.
 - Read the shared seed files exactly as instructed by the rendered prompt.
 - Keep all project writes in this directory.
 - In this external Codex CLI run, apply_patch is not available. Use shell commands or small local scripts to create and edit files here.
+- Follow this exact execution sequence:
+  1. Read each required metadata/task/seed file exactly once.
+  2. Write `{"agent_id":"codex","project_id":"<project_id>"}` to `/services/home/control/ensure.json`.
+  3. If that command exits successfully, treat bootstrap as complete.
+  4. Generate `game.py`, `game_manifest.json`, `walkthrough.txt`, and `README.md` in one Python file-generation step.
+  5. Run `python3 -m py_compile ./game.py`.
+  6. Run `python3 ./game.py < ./walkthrough.txt`.
+  7. Run `python3 ./validate_game.py --workspace . --shared-data /shared_data --output ./game_validation.json`.
+  8. If a validation step fails, fix only the project files and rerun only the failed step(s).
 - After the required discovery reads and bootstrap actions, start implementing immediately instead of doing extra exploratory reads unless validation fails.
 - Keep discovery simple. Do not build a large custom metadata-inspection script; adapt only the single file you are currently reading if its schema is unexpected.
+- Once the three shared seed files have been read and `ensure_home` has succeeded, do not read any more metadata or service files unless a command actually fails.
+- Do not re-read `protocol.json`, `agent_bootstrap_quickref.json`, `agent_bootstrap.json`, `workspace_status.json`, `TASK.md`, or the shared seed files after the initial required read pass.
+- Do not run extra service checks such as `test -d /services/...`, `head`, `rg`, or ad-hoc Python extraction scripts against the same metadata after the initial required read pass.
+- You do not need to re-read `validate_game.py` before implementation. Use this validator contract summary as authoritative unless a validation run fails:
+  - required files: `game.py`, `game_manifest.json`, `walkthrough.txt`
+  - manifest checks: 10 location names matching `world_seed.json`, 10 item names matching `items_seed.json`, seeded puzzle ids present, `shared_data_inputs` exactly `[/shared_data/world_seed.json, /shared_data/items_seed.json, /shared_data/puzzle_seed.json]`, `victory_text` exact, `entrypoint`=`game.py`, `walkthrough`=`walkthrough.txt`
+  - runtime checks: `python3 -m py_compile ./game.py`, `python3 ./game.py < ./walkthrough.txt`, then `python3 ./validate_game.py --workspace . --shared-data /shared_data --output ./game_validation.json`
 - Prefer writing all deliverables in one shell or Python file-generation step, then iterate only if validation fails.
+- Do not pause for design narration after you already have the seed entries. Move directly from seed reads to the one-pass file-generation command.
+- When writing or replacing game.py, game_manifest.json, walkthrough.txt, or README.md, write the full intended contents in one pass. Do not append fragments to an existing file.
+- If you need to replace game.py after a failed attempt, remove the old file first and then recreate it from scratch so stale trailing content cannot survive a shorter rewrite.
+- Do not run chmod on project files. This mount may not support chmod, and python3 game.py is sufficient for validation.
+- Before running validate_game.py, first run python3 -m py_compile ./game.py and then python3 ./game.py < ./walkthrough.txt. Only move on to the validator once both succeed.
+- When you run validate_game.py through the bridged terminal, use namespace paths, not client-only mount paths: `python3 ./validate_game.py --workspace . --shared-data /shared_data --output ./game_validation.json`.
 - The victory line must be:
   VICTORY: Lantern of Nine Paths recovered
 EOF
 }
 
+seed_agent_runtime_home() {
+    mkdir -p \
+        "$AGENT_HOME_TARGET_ROOT" \
+        "$AGENT_HOME_TARGET_ROOT/.config" \
+        "$AGENT_HOME_TARGET_ROOT/.cache" \
+        "$AGENT_HOME_TARGET_ROOT/.local/share" \
+        "$AGENT_HOME_TARGET_ROOT/.local/state" \
+        "$AGENT_HOME_TARGET_ROOT/tmp"
+}
+
 setup_spiderweb_runtime_root() {
     cp -R "$ROOT_DIR/templates/." "$SPIDERWEB_RUNTIME_ROOT/templates/"
+}
+
+install_bridge_runtime() {
+    mkdir -p "$CODEX_BRIDGE_DIR"
+    cp "$CODEX_BRIDGE_COMMON_SRC" "$CODEX_BRIDGE_COMMON"
+    cp "$CODEX_BRIDGE_SHELL_SRC" "$CODEX_BRIDGE_SHELL"
+    cp "$CODEX_BRIDGE_GIT_SRC" "$CODEX_BRIDGE_GIT"
+    cp "$CODEX_STDIN_LAUNCHER_SRC" "$CODEX_STDIN_LAUNCHER"
+    cp "$CODEX_BRIDGE_LSB_RELEASE_SRC" "$CODEX_BRIDGE_LSB_RELEASE"
+    cp "$CODEX_BRIDGE_GETCONF_SRC" "$CODEX_BRIDGE_GETCONF"
+    ln -sf "$(command -v python3)" "$CODEX_BRIDGE_PYTHON"
+    chmod +x \
+        "$CODEX_BRIDGE_COMMON" \
+        "$CODEX_BRIDGE_SHELL" \
+        "$CODEX_BRIDGE_GIT" \
+        "$CODEX_STDIN_LAUNCHER" \
+        "$CODEX_BRIDGE_LSB_RELEASE" \
+        "$CODEX_BRIDGE_GETCONF"
+    CODEX_EXEC_PATH="$CODEX_BRIDGE_DIR:$INSTALL_DIR:/usr/local/bin:/usr/bin:/bin"
+
+    CODEX_ALLOWED_BRIDGE_EXECS=()
+    CODEX_ALLOWED_BRIDGE_EXECS+=("$CODEX_STDIN_LAUNCHER")
+    CODEX_ALLOWED_BRIDGE_EXECS+=("$CODEX_BRIDGE_PYTHON")
+    CODEX_ALLOWED_BRIDGE_EXECS+=("$CODEX_BRIDGE_LSB_RELEASE")
+    CODEX_ALLOWED_BRIDGE_EXECS+=("$CODEX_BRIDGE_GETCONF")
+    if [[ "$CODEX_ENABLE_TERMINAL_BRIDGE" == "1" ]]; then
+        CODEX_ALLOWED_BRIDGE_EXECS+=("$CODEX_BRIDGE_SHELL")
+    fi
+    if [[ "$CODEX_ENABLE_GIT_BRIDGE" == "1" ]]; then
+        CODEX_ALLOWED_BRIDGE_EXECS+=("$CODEX_BRIDGE_GIT")
+    fi
+}
+
+prepare_mounted_codex_home() {
+    mkdir -p \
+        "$AGENT_HOME_MOUNT_ROOT" \
+        "$AGENT_HOME_XDG_CONFIG" \
+        "$AGENT_HOME_XDG_CACHE" \
+        "$AGENT_HOME_XDG_DATA" \
+        "$AGENT_HOME_XDG_STATE" \
+        "$AGENT_HOME_TMP"
+}
+
+write_mounted_codex_config() {
+    local target_codex_dir="$AGENT_HOME_MOUNT_ROOT/.codex"
+    mkdir -p "$target_codex_dir"
+    cat > "$target_codex_dir/config.toml" <<'EOF'
+check_for_update_on_startup = false
+project_doc_max_bytes = 0
+project_root_markers = []
+allow_login_shell = false
+
+[skills.bundled]
+enabled = false
+EOF
+}
+
+sync_existing_login_into_mounted_home() {
+    if [[ -z "$CODEX_HOME_DIR" || ! -d "$CODEX_HOME_DIR/.codex" ]]; then
+        log_fail "mounted_login requested, but no .codex directory exists in CODEX_HOME_DIR"
+        return 1
+    fi
+    rm -rf "$AGENT_HOME_MOUNT_ROOT/.codex"
+    mkdir -p "$AGENT_HOME_MOUNT_ROOT/.codex"
+
+    local source_codex_dir="$CODEX_HOME_DIR/.codex"
+    local target_codex_dir="$AGENT_HOME_MOUNT_ROOT/.codex"
+    local copied_any=0
+    local candidate
+    for candidate in auth.json version.json; do
+        if [[ -f "$source_codex_dir/$candidate" ]]; then
+            cp "$source_codex_dir/$candidate" "$target_codex_dir/$candidate"
+            copied_any=1
+        fi
+    done
+
+    if [[ "$copied_any" != "1" ]]; then
+        log_fail "mounted_login requested, but no usable Codex auth files were found under $source_codex_dir"
+        return 1
+    fi
+
+    write_mounted_codex_config
 }
 
 resolve_candidate_codex_bin() {
@@ -674,6 +949,13 @@ ensure_codex_cli() {
         return 0
     fi
 
+    if [[ -n "$CODEX_BIN" ]]; then
+        CODEX_RESOLVED_BIN="$CODEX_BIN"
+        CODEX_RESOLVED_VERSION="$(codex_version_of "$CODEX_RESOLVED_BIN")"
+        CODEX_LAUNCH_SOURCE="explicit"
+        return 0
+    fi
+
     local candidate=""
     local candidate_version=""
     candidate="$(resolve_candidate_codex_bin || true)"
@@ -705,13 +987,62 @@ ensure_codex_cli() {
 configure_codex_env() {
     local auth_mode="$1"
     local home_dir="$2"
-    CODEX_ENV_BASE=(env HOME="$home_dir")
-    if [[ "$auth_mode" == "api_key" ]]; then
+    local xdg_config_home="$CODEX_XDG_CONFIG_HOME"
+    local xdg_cache_home="$CODEX_XDG_CACHE_HOME"
+    local xdg_data_home="$CODEX_XDG_DATA_HOME"
+    local xdg_state_home="$CODEX_XDG_STATE_HOME"
+    local tmp_dir="$CODEX_RUNTIME_ROOT/tmp"
+
+    if [[ "$auth_mode" == "api_key" || "$auth_mode" == "mounted_login" ]]; then
+        xdg_config_home="$AGENT_HOME_XDG_CONFIG"
+        xdg_cache_home="$AGENT_HOME_XDG_CACHE"
+        xdg_data_home="$AGENT_HOME_XDG_DATA"
+        xdg_state_home="$AGENT_HOME_XDG_STATE"
+        tmp_dir="$AGENT_HOME_TMP"
+    fi
+
+    mkdir -p "$tmp_dir" "$xdg_config_home" "$xdg_cache_home" "$xdg_data_home" "$xdg_state_home"
+
+    CODEX_ENV_BASE=(
+        env
+        HOME="$home_dir"
+        XDG_CONFIG_HOME="$xdg_config_home"
+        XDG_CACHE_HOME="$xdg_cache_home"
+        XDG_DATA_HOME="$xdg_data_home"
+        XDG_STATE_HOME="$xdg_state_home"
+        TMPDIR="$tmp_dir"
+        PATH="$CODEX_EXEC_PATH"
+        PWD="$MOUNT_WORKSPACE_PATH"
+        GIT_CEILING_DIRECTORIES="$MOUNT_WORKSPACE_PATH"
+        GIT_DISCOVERY_ACROSS_FILESYSTEM=0
+        GIT_CONFIG_NOSYSTEM=1
+        GIT_CONFIG_GLOBAL=/dev/null
+    )
+    if [[ "$CODEX_ENABLE_TERMINAL_BRIDGE" == "1" ]]; then
         CODEX_ENV_BASE+=(
-            XDG_CONFIG_HOME="$CODEX_XDG_CONFIG_HOME"
-            XDG_CACHE_HOME="$CODEX_XDG_CACHE_HOME"
-            XDG_DATA_HOME="$CODEX_XDG_DATA_HOME"
-            XDG_STATE_HOME="$CODEX_XDG_STATE_HOME"
+            SHELL="$CODEX_BRIDGE_SHELL"
+            SPIDERWEB_TERMINAL_CREATE_PATH="$MOUNT_POINT/services/terminal/control/create.json"
+            SPIDERWEB_TERMINAL_EXEC_PATH="$MOUNT_POINT/services/terminal/control/exec.json"
+            SPIDERWEB_TERMINAL_CLOSE_PATH="$MOUNT_POINT/services/terminal/control/close.json"
+            SPIDERWEB_TERMINAL_STATUS_PATH="$MOUNT_POINT/services/terminal/status.json"
+            SPIDERWEB_TERMINAL_RESULT_PATH="$MOUNT_POINT/services/terminal/result.json"
+            SPIDERWEB_TERMINAL_LOCK_PATH="$CODEX_RUNTIME_ROOT/terminal-bridge.lock"
+            SPIDERWEB_TERMINAL_TIMEOUT_MS=120000
+            SPIDERWEB_MOUNT_WORKSPACE_ROOT="$MOUNT_WORKSPACE_PATH"
+            SPIDERWEB_HOST_WORKSPACE_ROOT="$WORKSPACE_EXPORT_ROOT"
+            SPIDERWEB_NAMESPACE_WORKSPACE_ROOT=/nodes/local/fs
+        )
+    fi
+    if [[ "$CODEX_ENABLE_GIT_BRIDGE" == "1" ]]; then
+        CODEX_ENV_BASE+=(
+            SPIDERWEB_GIT_STATUS_PATH="$MOUNT_POINT/services/git/status.json"
+            SPIDERWEB_GIT_RESULT_PATH="$MOUNT_POINT/services/git/result.json"
+            SPIDERWEB_GIT_STATUS_CONTROL_PATH="$MOUNT_POINT/services/git/control/status.json"
+            SPIDERWEB_GIT_DIFF_RANGE_PATH="$MOUNT_POINT/services/git/control/diff_range.json"
+            SPIDERWEB_GIT_LOCK_PATH="$CODEX_RUNTIME_ROOT/git-bridge.lock"
+            SPIDERWEB_GIT_TIMEOUT_MS=30000
+            SPIDERWEB_MOUNT_WORKSPACE_ROOT="$MOUNT_WORKSPACE_PATH"
+            SPIDERWEB_NAMESPACE_WORKSPACE_ROOT=/nodes/local/fs
         )
     fi
 }
@@ -721,6 +1052,10 @@ existing_login_available() {
         return 1
     fi
     env HOME="$CODEX_HOME_DIR" "$CODEX_RESOLVED_BIN" login status >/dev/null 2>&1
+}
+
+mounted_login_available() {
+    existing_login_available && [[ -d "$CODEX_HOME_DIR/.codex" ]]
 }
 
 setup_codex_auth() {
@@ -735,6 +1070,8 @@ setup_codex_auth() {
         auto)
             if [[ -n "$api_key" ]]; then
                 requested_mode="api_key"
+            elif mounted_login_available; then
+                requested_mode="mounted_login"
             elif existing_login_available; then
                 requested_mode="existing_login"
             else
@@ -754,6 +1091,12 @@ setup_codex_auth() {
                 return 1
             fi
             ;;
+        mounted_login)
+            if ! mounted_login_available; then
+                log_fail "CODEX_AUTH_MODE=mounted_login requested, but no working login with a .codex directory was found in CODEX_HOME_DIR"
+                return 1
+            fi
+            ;;
         *)
             log_fail "unsupported CODEX_AUTH_MODE: $requested_mode"
             return 1
@@ -761,18 +1104,25 @@ setup_codex_auth() {
     esac
 
     if [[ "$requested_mode" == "api_key" ]]; then
-        mkdir -p \
-            "$CODEX_ISOLATED_HOME" \
-            "$CODEX_XDG_CONFIG_HOME" \
-            "$CODEX_XDG_CACHE_HOME" \
-            "$CODEX_XDG_DATA_HOME" \
-            "$CODEX_XDG_STATE_HOME"
+        prepare_mounted_codex_home
         CODEX_SELECTED_AUTH_MODE="api_key"
-        CODEX_EFFECTIVE_HOME="$CODEX_ISOLATED_HOME"
+        CODEX_EFFECTIVE_HOME="$AGENT_HOME_MOUNT_ROOT"
         configure_codex_env "$CODEX_SELECTED_AUTH_MODE" "$CODEX_EFFECTIVE_HOME"
 
         if ! printf '%s\n' "$api_key" | "${CODEX_ENV_BASE[@]}" "$CODEX_RESOLVED_BIN" login --with-api-key >"$CODEX_AUTH_LOG" 2>&1; then
             log_fail "failed authenticating Codex with API key"
+            tail -n 120 "$CODEX_AUTH_LOG" || true
+            return 1
+        fi
+    elif [[ "$requested_mode" == "mounted_login" ]]; then
+        prepare_mounted_codex_home
+        sync_existing_login_into_mounted_home
+        CODEX_SELECTED_AUTH_MODE="mounted_login"
+        CODEX_EFFECTIVE_HOME="$AGENT_HOME_MOUNT_ROOT"
+        configure_codex_env "$CODEX_SELECTED_AUTH_MODE" "$CODEX_EFFECTIVE_HOME"
+
+        if ! "${CODEX_ENV_BASE[@]}" "$CODEX_RESOLVED_BIN" login status >"$CODEX_AUTH_LOG" 2>&1; then
+            log_fail "Codex login status failed in mounted login mode"
             tail -n 120 "$CODEX_AUTH_LOG" || true
             return 1
         fi
@@ -793,7 +1143,7 @@ setup_codex_auth() {
 }
 
 default_codex_launch_cmd() {
-    printf '%s' 'cat {prompt_file} | {codex_bin} exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox --ephemeral --color never --add-dir {namespace_meta_dir} --add-dir {project_meta_dir} --add-dir {shared_data_dir} --add-dir {artifact_dir} -C {workspace_root} -o {artifact_dir}/codex_last_message.txt -'
+    printf '%s' '{codex_bin} exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox --ephemeral --color never --add-dir {namespace_meta_dir} --add-dir {project_meta_dir} --add-dir {shared_data_dir} --add-dir {artifact_dir} -C {workspace_root} -o {artifact_dir}/codex_last_message.txt -'
 }
 
 render_codex_launch_command() {
@@ -876,6 +1226,7 @@ monitor_codex_process() {
             last_fingerprint="$current_fingerprint"
             last_progress_ts="$now_ts"
         fi
+        observe_codex_progress
 
         if (( CODEX_TIMEOUT_SECONDS > 0 && now_ts - start_ts >= CODEX_TIMEOUT_SECONDS )); then
             CODEX_FAILURE_REASON="codex_timeout_after_${CODEX_TIMEOUT_SECONDS}s"
@@ -914,6 +1265,8 @@ run_live_codex() {
     cmd="$(render_codex_launch_command)"
     CODEX_RUN_STATE="running"
     CODEX_FAILURE_REASON=""
+    CODEX_LAUNCH_STARTED_AT_UTC="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+    write_codex_progress_timeline
 
     : >"$CODEX_STDOUT_LOG"
     : >"$CODEX_STDERR_LOG"
@@ -923,17 +1276,32 @@ run_live_codex() {
     quoted_cmd="$(shell_quote "$cmd")"
 
     if [[ "$CODEX_USE_PTY" == "1" ]]; then
-        "${CODEX_ENV_BASE[@]}" \
-            PATH="$INSTALL_DIR:$PATH" \
-            setsid \
-            strace -ff -s 4096 -e trace=%file,%process -o "$STRACE_PREFIX" \
-            script -qefc "bash -lc $quoted_cmd" "$CODEX_PTY_LOG" >"$CODEX_STDOUT_LOG" 2>"$CODEX_STDERR_LOG" &
+        local pty_inner_cmd="$cmd"
+        if [[ "$CODEX_ENABLE_TERMINAL_BRIDGE" == "1" ]]; then
+            pty_inner_cmd="export SHELL=$(shell_quote "$CODEX_BRIDGE_SHELL"); $cmd"
+        fi
+        local quoted_pty_inner_cmd
+        quoted_pty_inner_cmd="$(shell_quote "$pty_inner_cmd")"
+        (
+            cd "$MOUNT_WORKSPACE_PATH"
+            "${CODEX_ENV_BASE[@]}" \
+                SHELL=/bin/bash \
+                GIT_DIR= \
+                GIT_WORK_TREE= \
+                setsid \
+                strace -ff -s 4096 -e trace=%file,%process -o "$STRACE_PREFIX" \
+                script -qefc "bash -lc $quoted_pty_inner_cmd" "$CODEX_PTY_LOG" >"$CODEX_STDOUT_LOG" 2>"$CODEX_STDERR_LOG"
+        ) &
     else
-        "${CODEX_ENV_BASE[@]}" \
-            PATH="$INSTALL_DIR:$PATH" \
-            setsid \
-            strace -ff -s 4096 -e trace=%file,%process -o "$STRACE_PREFIX" \
-            bash -lc "$cmd" >"$CODEX_STDOUT_LOG" 2>"$CODEX_STDERR_LOG" &
+        (
+            cd "$MOUNT_WORKSPACE_PATH"
+            "${CODEX_ENV_BASE[@]}" \
+                GIT_DIR= \
+                GIT_WORK_TREE= \
+                setsid \
+                strace -ff -s 4096 -e trace=%file,%process -o "$STRACE_PREFIX" \
+                "$CODEX_STDIN_LAUNCHER" "$PROMPT_FILE" "$cmd" >"$CODEX_STDOUT_LOG" 2>"$CODEX_STDERR_LOG"
+        ) &
     fi
     local runner_pid="$!"
 
@@ -943,6 +1311,7 @@ run_live_codex() {
     wait "$runner_pid"
     CODEX_EXIT_CODE=$?
     set -e
+    observe_codex_progress
     summarize_codex_events
 
     if [[ "$CODEX_EXIT_CODE" -ne 0 ]]; then
@@ -983,6 +1352,7 @@ log_pass "installer completed and produced required binaries"
 setup_spiderweb_runtime_root
 cp "$ASSET_DIR/shared_data/"* "$REMOTE_EXPORT_ROOT/"
 write_workspace_seed_files
+seed_agent_runtime_home
 assert_clean_workspace_layout "$WORKSPACE_EXPORT_ROOT"
 log_pass "seeded a clean local workspace export"
 
@@ -1128,6 +1498,7 @@ assert_clean_workspace_layout "$MOUNT_WORKSPACE_PATH"
 log_pass "preflight discovery files, mount paths, and clean workspace layout are present"
 
 render_prompt
+install_bridge_runtime
 
 if [[ "$CODEX_MODE" == "manual" ]]; then
     write_handoff_bundle "manual_mode_requested"
@@ -1160,6 +1531,8 @@ log_pass "Codex auth prepared using $CODEX_SELECTED_AUTH_MODE"
 
 run_live_codex
 
+VALIDATION_STARTED_AT_UTC="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+write_codex_progress_timeline
 python3 "$MOUNT_WORKSPACE_PATH/validate_game.py" \
     --workspace "$MOUNT_WORKSPACE_PATH" \
     --shared-data "$MOUNT_POINT/shared_data" \

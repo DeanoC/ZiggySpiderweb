@@ -73,6 +73,8 @@ pub fn seedNamespaceAt(self: anytype, terminal_dir: u32, base_path: []const u8) 
         "{\"invoke\":true,\"operations\":[\"terminal_session_create\",\"terminal_session_resume\",\"terminal_session_close\",\"terminal_session_write\",\"terminal_session_read\",\"terminal_session_resize\",\"shell_exec\"],\"discoverable\":true,\"interactive\":true,\"sessionized\":true,\"pty\":true}",
         "Sessionized terminal namespace. Create/resume/close PTY sessions and use write/read/resize for interactive workflows.",
     );
+    const namespace_mode = self.terminalNamespaceMode();
+    const path_model = self.terminalPathModel();
     _ = try self.addFile(
         terminal_dir,
         "OPS.json",
@@ -83,7 +85,15 @@ pub fn seedNamespaceAt(self: anytype, terminal_dir: u32, base_path: []const u8) 
     _ = try self.addFile(
         terminal_dir,
         "RUNTIME.json",
-        "{\"type\":\"runtime_tool\",\"tool\":\"shell_exec\",\"session_model\":\"terminal-v2\"}",
+        blk: {
+            const content = try std.fmt.allocPrint(
+                self.allocator,
+                "{{\"type\":\"runtime_tool\",\"tool\":\"shell_exec\",\"session_model\":\"terminal-v2\",\"namespace_mode\":\"{s}\",\"path_model\":\"{s}\"}}",
+                .{ namespace_mode, path_model },
+            );
+            defer self.allocator.free(content);
+            break :blk content;
+        },
         false,
         .none,
     );
@@ -97,14 +107,30 @@ pub fn seedNamespaceAt(self: anytype, terminal_dir: u32, base_path: []const u8) 
     _ = try self.addFile(
         terminal_dir,
         "STATUS.json",
-        "{\"venom_id\":\"terminal-v2\",\"state\":\"namespace\",\"has_invoke\":true,\"sessionized\":true}",
+        blk: {
+            const content = try std.fmt.allocPrint(
+                self.allocator,
+                "{{\"venom_id\":\"terminal-v2\",\"state\":\"namespace\",\"has_invoke\":true,\"sessionized\":true,\"namespace_mode\":\"{s}\",\"path_model\":\"{s}\"}}",
+                .{ namespace_mode, path_model },
+            );
+            defer self.allocator.free(content);
+            break :blk content;
+        },
         false,
         .none,
     );
     self.terminal_status_id = try self.addFile(
         terminal_dir,
         "status.json",
-        "{\"state\":\"idle\",\"tool\":null,\"session_id\":null,\"updated_at_ms\":0,\"error\":null}",
+        blk: {
+            const content = try std.fmt.allocPrint(
+                self.allocator,
+                "{{\"state\":\"idle\",\"tool\":null,\"session_id\":null,\"updated_at_ms\":0,\"error\":null,\"namespace_mode\":\"{s}\",\"path_model\":\"{s}\"}}",
+                .{ namespace_mode, path_model },
+            );
+            defer self.allocator.free(content);
+            break :blk content;
+        },
         false,
         .none,
     );
@@ -547,7 +573,29 @@ fn execCommand(self: anytype, payload: []const u8) !usize {
         return payload.len;
     }
 
-    return error.InvalidPayload;
+    var ephemeral_session = SessionState{
+        .created_at_ms = std.time.milliTimestamp(),
+        .updated_at_ms = std.time.milliTimestamp(),
+    };
+    defer ephemeral_session.deinit(self.allocator);
+    if (try self.sessionJsonObjectOptionalString(obj, "cwd")) |cwd| {
+        ephemeral_session.cwd = try self.allocator.dupe(u8, cwd);
+    }
+
+    const command_bytes = try buildExecCommandBytes(self, obj);
+    defer self.allocator.free(command_bytes);
+    var exec_outcome = try executeCommand(self, &ephemeral_session, command_bytes);
+    defer exec_outcome.deinit(self.allocator);
+
+    if (exec_outcome.error_message) |message| {
+        try updateStatusAndResult(self, "failed", "shell_exec", null, message, "exec", "null");
+        return payload.len;
+    }
+
+    const exec_result = try buildExecOutputResultJson(self, exec_outcome.output, false, exec_outcome.exit_code);
+    defer self.allocator.free(exec_result);
+    try updateStatusAndResult(self, "done", "shell_exec", null, null, "exec", exec_result);
+    return payload.len;
 }
 
 fn appendBufferedResult(self: anytype, session: *SessionState, payload: []const u8) !void {
@@ -852,8 +900,16 @@ fn buildStatusJson(
 
     return std.fmt.allocPrint(
         self.allocator,
-        "{{\"state\":\"{s}\",\"tool\":\"{s}\",\"session_id\":{s},\"updated_at_ms\":{d},\"error\":{s}}}",
-        .{ escaped_state, escaped_tool, session_json, std.time.milliTimestamp(), error_json },
+        "{{\"state\":\"{s}\",\"tool\":\"{s}\",\"session_id\":{s},\"updated_at_ms\":{d},\"error\":{s},\"namespace_mode\":\"{s}\",\"path_model\":\"{s}\"}}",
+        .{
+            escaped_state,
+            escaped_tool,
+            session_json,
+            std.time.milliTimestamp(),
+            error_json,
+            self.terminalNamespaceMode(),
+            self.terminalPathModel(),
+        },
     );
 }
 
@@ -932,7 +988,7 @@ fn buildSessionsJson(self: anytype) ![]u8 {
         } else try self.allocator.dupe(u8, "null");
         defer self.allocator.free(cwd_json);
         try out.writer(self.allocator).print(
-            "{{\"session_id\":\"{s}\",\"state\":\"{s}\",\"label\":{s},\"cwd\":{s},\"created_at_ms\":{d},\"updated_at_ms\":{d},\"last_exec_at_ms\":{d},\"closed_at_ms\":{d},\"exec_count\":{d}}}",
+            "{{\"session_id\":\"{s}\",\"state\":\"{s}\",\"label\":{s},\"cwd\":{s},\"created_at_ms\":{d},\"updated_at_ms\":{d},\"last_exec_at_ms\":{d},\"closed_at_ms\":{d},\"exec_count\":{d},\"namespace_mode\":\"{s}\",\"path_model\":\"{s}\"}}",
             .{
                 escaped_id,
                 escaped_state,
@@ -943,6 +999,8 @@ fn buildSessionsJson(self: anytype) ![]u8 {
                 session.last_exec_at_ms,
                 session.closed_at_ms,
                 session.exec_count,
+                self.terminalNamespaceMode(),
+                self.terminalPathModel(),
             },
         );
     }
@@ -967,8 +1025,15 @@ fn buildCurrentJson(self: anytype) ![]u8 {
     defer self.allocator.free(cwd_json);
     return std.fmt.allocPrint(
         self.allocator,
-        "{{\"session\":{{\"session_id\":\"{s}\",\"state\":\"{s}\",\"cwd\":{s},\"updated_at_ms\":{d}}}}}",
-        .{ escaped_id, escaped_state, cwd_json, session.updated_at_ms },
+        "{{\"session\":{{\"session_id\":\"{s}\",\"state\":\"{s}\",\"cwd\":{s},\"updated_at_ms\":{d},\"namespace_mode\":\"{s}\",\"path_model\":\"{s}\"}}}}",
+        .{
+            escaped_id,
+            escaped_state,
+            cwd_json,
+            session.updated_at_ms,
+            self.terminalNamespaceMode(),
+            self.terminalPathModel(),
+        },
     );
 }
 

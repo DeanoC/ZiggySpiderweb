@@ -148,6 +148,7 @@ Expected output artifacts:
 - `codex_usage_report.json`
 - `codex_usage_report.md`
 - `bootstrap_provenance.json`
+- `codex_progress_timeline.json`
 - `game_validation.json`
 - `codex_handoff/`
 
@@ -157,6 +158,10 @@ Repeatability artifacts:
 - `repeatability_summary.md`
 - one subdirectory per run, each containing the normal live harness artifacts
 
+Repeatability interruption behavior:
+
+- if you intentionally stop the repeatability runner mid-batch, it now writes partial `repeatability_summary.json` and `repeatability_summary.md` files from whatever artifacts already exist
+- interrupted runs are marked with `interrupted=true` plus an `interrupt_reason`, so you can still see whether the run had already reached bootstrap, validation, or report generation
 Matrix runner artifacts:
 
 - `matrix_summary.json`
@@ -188,6 +193,7 @@ Fallback behavior:
 - the harness should still preserve the namespace-mounted workspace context
 - `codex_handoff/` is the dedicated resume package for manual continuation
 - `codex_exec_summary.json` captures the last observed Codex event, last completed item, and inferred stall stage from the live `--json` event stream
+- `codex_progress_timeline.json` records the observed timing of live-run milestones such as Codex launch, bootstrap completion, first workspace write, and validation start
 - validation and usage reports should still be written in fallback/manual mode
 
 Operator notes:

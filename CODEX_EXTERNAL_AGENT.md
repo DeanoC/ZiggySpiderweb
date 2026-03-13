@@ -6,6 +6,7 @@ The harness entrypoint for this flow is `test-env/test-external-codex-workspace.
 
 The current milestone is agent-driven workspace bootstrap, not Codex-specific harness shaping. The harness creates a generic shared workspace baseline. The mounted external agent must then discover the environment and bootstrap itself from inside the namespace.
 
+The next-phase machine-independence plan is captured in `EXTERNAL_CODEX_MACHINE_INDEPENDENCE_PLAN.md`.
 ## Current Recommendation
 
 Use a Linux host for the documented Codex E2E path.
@@ -169,6 +170,7 @@ That repeatability runner writes:
 - `repeatability_summary.md`
 - one subdirectory per run, each with the usual live harness artifacts
 
+If you stop the repeatability batch intentionally, it still writes partial repeatability summaries from the artifacts that already exist. Interrupted runs are marked with `interrupted=true` and an `interrupt_reason`.
 When you need a ready-to-file upstream repro bundle, use:
 
 ```bash
@@ -243,6 +245,7 @@ bash test-env/test-external-codex-workspace.sh
 Each run should preserve the same high-signal artifacts:
 
 - `codex_exec_summary.json`
+- `codex_progress_timeline.json`
 - `codex_usage_report.json`
 - `codex_usage_report.md`
 - `bootstrap_provenance.json`
@@ -258,6 +261,13 @@ Each run should preserve the same high-signal artifacts:
 - the last completed item type
 - the last agent message, if one was emitted
 - an inferred stall stage such as `after_tool_result` or `after_agent_message`
+
+`codex_progress_timeline.json` is the quick milestone-timing artifact for live runs. It records the observed timing of:
+
+- Codex launch start
+- bootstrap completion
+- first workspace write
+- validation start
 
 The usage report distinguishes:
 

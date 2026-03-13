@@ -52,6 +52,22 @@ def parse_json_file(path: Path):
         return json.load(handle)
 
 
+def parse_jsonl_events(path: Path):
+    if not path.exists():
+        return []
+    events = []
+    with path.open("r", encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                events.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return events
+
+
 def service_name_from_entry(item: dict) -> str | None:
     venom_id = item.get("venom_id")
     if venom_id:
@@ -138,9 +154,43 @@ def relevant_raw_path(syscall: str, line: str) -> str | None:
     return matches[0]
 
 
+def syscall_succeeded(line: str) -> bool:
+    if "= -1 " in line:
+        return False
+    if syscall := SYSCALL_RE.match(line):
+        name = syscall.group("syscall")
+        return f"{name}(" in line and ") = " in line
+    return False
+
+
 def append_unique(items: list[str], value: str):
     if value not in items:
         items.append(value)
+
+
+def namespace_path_to_mount_path(namespace_path: str, mount_root: Path, project_id: str) -> str | None:
+    mapping = {
+        "/meta/": mount_root / "meta",
+        "/shared_data/": mount_root / "shared_data",
+        f"/projects/{project_id}/": mount_root / "projects" / project_id,
+        "/services/": mount_root / "services",
+        "/nodes/local/fs/": mount_root / "nodes" / "local" / "fs",
+    }
+    for prefix, root in mapping.items():
+        if namespace_path.startswith(prefix):
+            suffix = namespace_path.removeprefix(prefix)
+            return str((root / suffix).resolve())
+    if namespace_path == "/meta":
+        return str((mount_root / "meta").resolve())
+    if namespace_path == "/shared_data":
+        return str((mount_root / "shared_data").resolve())
+    if namespace_path == f"/projects/{project_id}":
+        return str((mount_root / "projects" / project_id).resolve())
+    if namespace_path == "/services":
+        return str((mount_root / "services").resolve())
+    if namespace_path == "/nodes/local/fs":
+        return str((mount_root / "nodes" / "local" / "fs").resolve())
+    return None
 
 
 def service_reason(
@@ -253,7 +303,9 @@ def main() -> int:
     parser.add_argument("--mounted-services", required=True)
     parser.add_argument("--venom-packages", required=True)
     parser.add_argument("--repo-root", required=True)
+    parser.add_argument("--codex-event-log")
     parser.add_argument("--allowed-runtime-root", action="append", default=[])
+    parser.add_argument("--allowed-bridge-exec", action="append", default=[])
     parser.add_argument("--allowed-host-write-prefix", action="append", default=[])
     parser.add_argument("--json-output", required=True)
     parser.add_argument("--markdown-output", required=True)
@@ -268,6 +320,14 @@ def main() -> int:
     artifact_root = Path(args.artifact_root).resolve()
     repo_root = Path(args.repo_root).resolve()
     allowed_runtime_roots = [Path(value).resolve() for value in args.allowed_runtime_root]
+    allowed_bridge_execs = set()
+    for value in args.allowed_bridge_exec:
+        candidate = Path(value)
+        allowed_bridge_execs.add(str(candidate))
+        try:
+            allowed_bridge_execs.add(str(candidate.resolve()))
+        except OSError:
+            pass
     allowed_host_write_prefixes = [Path(value).resolve() for value in args.allowed_host_write_prefix]
     mounted_service_entries = parse_json_file(Path(args.mounted_services))
     project_bound_services, namespace_visible_services = extract_service_views(mounted_service_entries)
@@ -286,15 +346,19 @@ def main() -> int:
     terminal_runtime_commands = []
     git_runtime_commands = []
     bootstrap_reads = []
+    fallback_bootstrap_reads = []
     bootstrap_actions = []
     persistent_changes = []
     ephemeral_changes = []
     required_bootstrap_paths = [
         str((mount_root / "meta" / "protocol.json").resolve()),
-        str((mount_root / "projects" / args.project_id / "meta" / "mounted_services.json").resolve()),
-        str((mount_root / "projects" / args.project_id / "meta" / "workspace_status.json").resolve()),
-        str((mount_root / "projects" / args.project_id / "meta" / "venom_packages.json").resolve()),
+        str((mount_root / "projects" / args.project_id / "meta" / "agent_bootstrap_quickref.json").resolve()),
         str((mount_root / "projects" / args.project_id / "meta" / "agent_bootstrap.json").resolve()),
+        str((mount_root / "projects" / args.project_id / "meta" / "workspace_status.json").resolve()),
+    ]
+    fallback_bootstrap_paths = [
+        str((mount_root / "projects" / args.project_id / "meta" / "mounted_services.json").resolve()),
+        str((mount_root / "projects" / args.project_id / "meta" / "venom_packages.json").resolve()),
     ]
 
     for trace_path in sorted(glob.glob(args.strace_prefix + "*")):
@@ -320,9 +384,15 @@ def main() -> int:
 
             if normalized_path in required_bootstrap_paths:
                 append_unique(bootstrap_reads, normalized_path)
+            if normalized_path in fallback_bootstrap_paths:
+                append_unique(fallback_bootstrap_reads, normalized_path)
 
             if syscall == "execve":
+                if not syscall_succeeded(line):
+                    continue
                 append_unique(executed_commands, normalized_path)
+                if normalized_path in allowed_bridge_execs:
+                    continue
                 command_name = Path(normalized_path).name
                 if command_name in {"codex", "node", "nodejs"} or any(token in normalized_path for token in CODEX_RUNTIME_TOKENS):
                     append_unique(codex_runtime_paths, normalized_path)
@@ -336,7 +406,7 @@ def main() -> int:
                 append_unique(host_local_paths, normalized_path)
                 if path_within_root(normalized_path, str(repo_root)):
                     append_unique(search_code_paths, normalized_path)
-                if "/.git" in normalized_path or normalized_path.endswith(".git"):
+                if syscall_succeeded(line) and ("/.git" in normalized_path or normalized_path.endswith(".git")):
                     append_unique(git_like_paths, normalized_path)
                 if any(token in normalized_path for token in HOME_TOKENS):
                     append_unique(home_state_paths, normalized_path)
@@ -386,6 +456,47 @@ def main() -> int:
                     append_unique(allowed_host_writes, normalized_path)
                 else:
                     append_unique(disallowed_writes, normalized_path)
+
+    if args.codex_event_log:
+        required_namespace_reads = {
+            "/meta/protocol.json",
+            f"/projects/{args.project_id}/meta/agent_bootstrap_quickref.json",
+            f"/projects/{args.project_id}/meta/agent_bootstrap.json",
+            f"/projects/{args.project_id}/meta/workspace_status.json",
+        }
+        fallback_namespace_reads = {
+            f"/projects/{args.project_id}/meta/mounted_services.json",
+            f"/projects/{args.project_id}/meta/venom_packages.json",
+        }
+        for event in parse_jsonl_events(Path(args.codex_event_log)):
+            item = event.get("item")
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") != "command_execution":
+                continue
+            command = item.get("command")
+            if not isinstance(command, str):
+                continue
+            for namespace_path in required_namespace_reads:
+                if namespace_path in command:
+                    mount_path = namespace_path_to_mount_path(namespace_path, mount_root, args.project_id)
+                    if mount_path:
+                        append_unique(bootstrap_reads, mount_path)
+            for namespace_path in fallback_namespace_reads:
+                if namespace_path in command:
+                    mount_path = namespace_path_to_mount_path(namespace_path, mount_root, args.project_id)
+                    if mount_path:
+                        append_unique(fallback_bootstrap_reads, mount_path)
+
+            if (
+                "/services/home/control/ensure.json" in command
+                and item.get("status") == "completed"
+                and item.get("exit_code") == 0
+            ):
+                event_item = {"action": "home_ensure", "path": str((mount_root / "services" / "home" / "control" / "ensure.json").resolve())}
+                if event_item not in bootstrap_actions:
+                    bootstrap_actions.append(event_item)
+                append_unique(persistent_changes, "home_ensure")
 
     candidate_gaps = []
     seen_gap_ids = set()
@@ -474,6 +585,8 @@ def main() -> int:
             "required_reads": required_bootstrap_paths,
             "required_reads_seen": bootstrap_reads,
             "required_reads_complete": required_reads_complete,
+            "fallback_reads": fallback_bootstrap_paths,
+            "fallback_reads_seen": fallback_bootstrap_reads,
             "agent_bootstrap_actions_after_mount": bootstrap_actions,
             "persistent_workspace_changes": persistent_changes,
             "ephemeral_agent_changes": ephemeral_changes,
