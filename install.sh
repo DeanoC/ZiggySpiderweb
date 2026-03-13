@@ -525,10 +525,8 @@ copy_release_binaries() {
     local install_dir="$2"
     shift 2
     local binaries=("$@")
-    local staged_dir="$extract_dir/.spiderweb-release-bin"
-
-    rm -rf "$staged_dir"
-    mkdir -p "$staged_dir"
+    local staged_dir
+    staged_dir="$(mktemp -d)"
 
     local bin source_path
     for bin in "${binaries[@]}"; do
@@ -555,6 +553,8 @@ copy_release_binaries() {
             sudo cp "$staged_dir/$bin" "$install_dir/"
         done
     fi
+
+    rm -rf "$staged_dir"
 }
 
 DEPS_MISSING=()

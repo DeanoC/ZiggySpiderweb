@@ -13,8 +13,10 @@ Namespace paths from Spiderweb metadata are mounted under that root on this mach
 - namespace `/meta/...` is client path `__NAMESPACE_META_DIR__/...`
 
 Path usage rule:
-- For shell commands executed from this workspace, use Spiderweb namespace-visible paths such as `/meta/...`, `/projects/__PROJECT_ID__/meta/...`, `/services/...`, `/shared_data/...`, and relative paths like `./TASK.md`.
-- Do not shell against client-only absolute mount paths like `__MOUNT_ROOT__/...` or `__PROJECT_META_DIR__/...`; those are for your understanding of the mount layout, not for bridged terminal commands.
+- First try Spiderweb namespace-visible paths such as `/meta/...`, `/projects/__PROJECT_ID__/meta/...`, `/services/...`, `/shared_data/...`, and relative paths like `./TASK.md`.
+- If those literal namespace-visible paths are not present in your shell, determine `namespace_root` once by walking upward from the current working directory until you find a directory containing `meta`, `projects`, `services`, and `nodes`.
+- After that, use `{namespace_root}/meta/...`, `{namespace_root}/projects/...`, `{namespace_root}/services/...`, and `{namespace_root}/shared_data/...` consistently for the rest of the run.
+- Do not keep probing after you determine `namespace_root`.
 
 Before making assumptions, inspect these exact files in order:
 - /meta/protocol.json
@@ -37,7 +39,7 @@ Execution sequence:
 4. Generate `game.py`, `game_manifest.json`, `walkthrough.txt`, and `README.md` in one Python file-generation step.
 5. Run `python3 -m py_compile ./game.py`.
 6. Run `python3 ./game.py < ./walkthrough.txt`.
-7. Run `python3 ./validate_game.py --workspace . --shared-data /shared_data --output ./game_validation.json`.
+7. Run `python3 ./validate_game.py --workspace . --shared-data <shared-data-path> --output ./game_validation.json`.
 8. If a validation step fails, fix only the project files and rerun only the failed step(s).
 
 Discovery rules:
@@ -70,7 +72,7 @@ Bootstrap contract:
 
 Workspace contract:
 - Keep all project files in the current working directory.
-- Read shared seed data only from `/shared_data`.
+- Read shared seed data from `/shared_data` when that literal path exists; otherwise read it from `{namespace_root}/shared_data`.
 - Prefer the canonical shared workspace interface mounted at `/services/*`. Use fallback namespace paths only when the bootstrap metadata says they are available and needed.
 - Do not depend on repo files, home files, or host-local paths outside the working directory and the listed metadata/shared-data directories.
 - Preserve ./validate_game.py.
@@ -84,13 +86,15 @@ Workspace contract:
 - You do not need to re-read `validate_game.py` before implementation. Use the validator contract summarized here as authoritative unless a validation run fails:
   - required files: `game.py`, `game_manifest.json`, `walkthrough.txt`
   - manifest checks: 10 location names matching `world_seed.json`, 10 item names matching `items_seed.json`, seeded puzzle ids present, `shared_data_inputs` exactly `[/shared_data/world_seed.json, /shared_data/items_seed.json, /shared_data/puzzle_seed.json]`, `victory_text` exact, `entrypoint`=`game.py`, `walkthrough`=`walkthrough.txt`
-  - runtime checks: `python3 -m py_compile ./game.py`, `python3 ./game.py < ./walkthrough.txt`, and then `python3 ./validate_game.py --workspace . --shared-data /shared_data --output ./game_validation.json`
+  - runtime checks: `python3 -m py_compile ./game.py`, `python3 ./game.py < ./walkthrough.txt`, and then `python3 ./validate_game.py --workspace . --shared-data <shared-data-path> --output ./game_validation.json`
 - Prefer creating all four deliverables in one decisive shell or Python write step, then iterate only if validation fails.
 - Do not pause for design narration after you already have the seed entries. Move directly from seed reads to the one-pass file-generation command.
 - When writing or replacing `game.py`, `game_manifest.json`, `walkthrough.txt`, or `README.md`, write the full intended contents in one pass. Do not append fragments to an existing file.
 - If you need to replace `game.py` after a failed attempt, remove the old file first and then recreate it from scratch so stale trailing content cannot survive a shorter rewrite.
 - Do not run `chmod` on project files. This mount may not support chmod, and the game only needs to run via `python3 ./game.py`.
 - Before running the official validator, run `python3 -m py_compile ./game.py` and `python3 ./game.py < ./walkthrough.txt`. Only move on to the validator once both succeed.
+- Set `<shared-data-path>` to `/shared_data` when that literal path exists in the shell. Otherwise set it to `{namespace_root}/shared_data`.
+- Do not try to create root-level symlinks, mounts, or other host filesystem hacks to force `/shared_data` into existence.
 
 Deliverable:
 - Build a Python terminal adventure game in the current working directory.
@@ -133,6 +137,6 @@ Before you finish:
 2. Run:
    python3 ./game.py < ./walkthrough.txt
 3. Run:
-   python3 ./validate_game.py --workspace . --shared-data /shared_data --output ./game_validation.json
+   python3 ./validate_game.py --workspace . --shared-data <shared-data-path> --output ./game_validation.json
 4. If any step fails, fix the game and rerun the failing step(s) before finishing.
 5. In your final note, summarize which mounted paths you used and which bootstrap actions you performed inside the workspace.
