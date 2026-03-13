@@ -6,6 +6,8 @@ The harness entrypoint for this flow is `test-env/test-external-codex-workspace.
 
 The current milestone is agent-driven workspace bootstrap, not Codex-specific harness shaping. The harness creates a generic shared workspace baseline. The mounted external agent must then discover the environment and bootstrap itself from inside the namespace.
 
+The next-phase machine-independence plan is captured in `EXTERNAL_CODEX_MACHINE_INDEPENDENCE_PLAN.md`.
+
 ## Current Recommendation
 
 Use a Linux host for the documented Codex E2E path.
