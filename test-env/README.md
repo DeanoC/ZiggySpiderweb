@@ -162,7 +162,6 @@ Repeatability interruption behavior:
 
 - if you intentionally stop the repeatability runner mid-batch, it now writes partial `repeatability_summary.json` and `repeatability_summary.md` files from whatever artifacts already exist
 - interrupted runs are marked with `interrupted=true` plus an `interrupt_reason`, so you can still see whether the run had already reached bootstrap, validation, or report generation
-
 Matrix runner artifacts:
 
 - `matrix_summary.json`
