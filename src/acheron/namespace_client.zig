@@ -680,6 +680,10 @@ pub const NamespaceClient = struct {
         self.active_session_key = try self.allocator.dupe(u8, session_key);
     }
 
+    fn copySessionKeyForReconnect(self: *NamespaceClient, session_key: []const u8) ![]u8 {
+        return try self.allocator.dupe(u8, session_key);
+    }
+
     fn setActiveSessionBinding(
         self: *NamespaceClient,
         agent_id: []const u8,
@@ -752,16 +756,21 @@ pub const NamespaceClient = struct {
 
     fn recoverWarmupTransport(self: *NamespaceClient, request_type: unified.FsrpcType) anyerror!void {
         const session_key = self.active_session_key orelse return error.InvalidState;
+        const owned_session_key = try self.copySessionKeyForReconnect(session_key);
+        defer self.allocator.free(owned_session_key);
         const had_namespace_attached = self.namespace_attached;
-        try self.reconnectControlSession(session_key);
+        try self.reconnectControlSession(owned_session_key);
         if (!had_namespace_attached) return;
         if (request_type == .t_version or request_type == .t_attach) return;
-        try self.attachNamespaceRoot(session_key);
+        try self.attachNamespaceRoot(owned_session_key);
     }
 
     fn recoverActiveSessionTransport(self: *NamespaceClient, session_key: []const u8) !void {
-        try self.reconnectControlSession(session_key);
-        try self.attachNamespaceRoot(session_key);
+        const owned_session_key = try self.copySessionKeyForReconnect(session_key);
+        defer self.allocator.free(owned_session_key);
+
+        try self.reconnectControlSession(owned_session_key);
+        try self.attachNamespaceRoot(owned_session_key);
         try self.reopenAllTrackedHandles();
     }
 
@@ -1489,6 +1498,22 @@ test "namespace_client: setActiveSessionKey reuses identical session ids safely"
     try client.setActiveSessionKey(before);
     try std.testing.expect(client.active_session_key != null);
     try std.testing.expect(client.active_session_key.?.ptr == before.ptr);
+}
+
+test "namespace_client: reconnect session key copy survives active key replacement" {
+    var client: NamespaceClient = undefined;
+    client.allocator = std.testing.allocator;
+    client.active_session_key = try std.testing.allocator.dupe(u8, "sess-a");
+    defer if (client.active_session_key) |value| std.testing.allocator.free(value);
+
+    const borrowed = client.active_session_key.?;
+    const owned = try client.copySessionKeyForReconnect(borrowed);
+    defer std.testing.allocator.free(owned);
+
+    try client.setActiveSessionKey("sess-b");
+
+    try std.testing.expect(owned.ptr != borrowed.ptr);
+    try std.testing.expectEqualStrings("sess-a", owned);
 }
 
 test "namespace_client: isTransportError recognizes reconnect-worthy failures" {
