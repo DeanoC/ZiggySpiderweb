@@ -3869,19 +3869,29 @@ pub const Session = struct {
         const merged = try self.mergeWorkspaceAgentsContract(managed_block, existing);
         defer self.allocator.free(merged);
 
-        if (self.lookupChild(self.root_id, "AGENTS.md")) |file_id| {
-            try self.setFileContent(file_id, merged);
-        } else {
-            _ = try self.addFile(self.root_id, "AGENTS.md", merged, false, .none);
-        }
+        var workspace_file_id: u32 = 0;
+        var namespace_file_id: u32 = 0;
 
         const local_fs_dir = self.resolveAbsolutePathNoBinds(local_fs_world_prefix);
         if (local_fs_dir) |dir_id| {
             if (self.lookupChild(dir_id, "AGENTS.md")) |file_id| {
-                try self.setFileContent(file_id, merged);
+                workspace_file_id = file_id;
             } else {
-                _ = try self.addFile(dir_id, "AGENTS.md", merged, true, .none);
+                workspace_file_id = try self.addFile(dir_id, "AGENTS.md", merged, true, .none);
             }
+        }
+
+        if (self.lookupChild(self.root_id, "AGENTS.md")) |file_id| {
+            namespace_file_id = file_id;
+        } else {
+            namespace_file_id = try self.addFile(self.root_id, "AGENTS.md", merged, false, .none);
+        }
+
+        if (workspace_file_id != 0) {
+            try self.registerNodeAliasPair(workspace_file_id, namespace_file_id);
+            try self.setFileContent(workspace_file_id, merged);
+        } else {
+            try self.setFileContent(namespace_file_id, merged);
         }
 
         self.writeMissionContractFile(workspace_agents_contract_path, merged) catch {};
@@ -10209,6 +10219,14 @@ test "acheron_session: workspace AGENTS contract is seeded and preserves user no
     defer if (workspace_agents) |value| allocator.free(value);
     try std.testing.expect(workspace_agents != null);
     try std.testing.expectEqualStrings(namespace_agents.?, workspace_agents.?);
+
+    const workspace_agents_id = session.resolveAbsolutePathNoBinds("/nodes/local/fs/AGENTS.md") orelse return error.MissingNode;
+    try session.setFileContent(workspace_agents_id, "# User Override\n");
+
+    const namespace_agents_updated = try session.tryReadInternalPath("/AGENTS.md");
+    defer if (namespace_agents_updated) |value| allocator.free(value);
+    try std.testing.expect(namespace_agents_updated != null);
+    try std.testing.expectEqualStrings("# User Override\n", namespace_agents_updated.?);
 }
 
 test "acheron_session: services terminal exec updates live service status and result" {
