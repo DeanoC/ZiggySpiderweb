@@ -16,12 +16,21 @@ def main() -> int:
     if not command.strip():
         sys.stderr.write("codex stdin launcher: empty command\n")
         return 2
-    shell = os.environ.get("SHELL", "").strip() or "/bin/sh"
+    shell = (
+        os.environ.get("CODEX_STDIN_LAUNCHER_SHELL", "").strip()
+        or os.environ.get("SHELL", "").strip()
+        or "/bin/sh"
+    )
+    child_env = os.environ.copy()
+    target_shell = child_env.get("CODEX_TARGET_SHELL", "").strip()
+    if target_shell:
+        child_env["SHELL"] = target_shell
+
     argv = [shell, "-lc", command]
 
     with open(prompt_file, "rb", buffering=0) as handle:
         os.dup2(handle.fileno(), 0)
-        os.execvpe(argv[0], argv, os.environ.copy())
+        os.execvpe(argv[0], argv, child_env)
     return 0
 
 

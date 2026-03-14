@@ -200,9 +200,11 @@ Operator notes:
 
 - prefer the installer-first Linux path for this harness; use `./install-fs-mount.sh` only when the namespace mount happens on a separate Linux machine
 - the harness is about the standalone node + namespace story, not the older routed `--workspace-url` only flow
+- the namespace root exposed by `spiderweb-fs-mount` is the canonical external-agent entrypoint
 - the clean writable project tree is `/nodes/local/fs`; Spiderweb’s own runtime root is kept separate from that workspace on purpose
-- the harness creates only a generic `dev`-template workspace baseline; after attach, the external agent is responsible for reading `/projects/<project_id>/meta/agent_bootstrap.json` and bootstrapping itself from inside the workspace
-- `agent_bootstrap.json` is the generic contract for discovery order, preferred `/services/*` usage, self-home provisioning, service verification/repair, and persistence semantics
+- the harness creates only a generic `dev`-template workspace baseline; after attach, Spiderweb must surface a real workspace-root `AGENTS.md`, and the external agent is responsible for reading that file first and then following the referenced bootstrap metadata from inside the workspace
+- `AGENTS.md` is the human-facing workspace contract; `agent_bootstrap.json` and `agent_bootstrap_quickref.json` remain the exact machine-readable contract for discovery order, preferred `/services/*` usage, self-home provisioning, service verification/repair, and persistence semantics
+- the expected interactive user flow is: start `codex` in the namespace root, give a short prompt that tells it to read `AGENTS.md`, and let it write outputs under `nodes/local/fs/`
 - shared project binds persist across agent detach/reattach, while worker-private loopback state is expected to be ephemeral
 - `CODEX_AUTH_MODE=api_key` is still the strict fresh-install path, but `existing_login` is temporarily acceptable for reliability because host `~/.codex` writes are allowlisted by default while still reported as a `codex_home` machine-independence gap
 - `CODEX_LAUNCH_CMD` is optional; the harness can build a default launcher around the pinned `codex exec` flow
@@ -219,7 +221,7 @@ Operator notes:
 CODEX_MODE=live \
 CODEX_AUTH_MODE=api_key \
 OPENAI_API_KEY=... \
-CODEX_LAUNCH_CMD='cat {prompt_file} | {codex_bin} exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox --ephemeral --add-dir {namespace_meta_dir} --add-dir {project_meta_dir} --add-dir {shared_data_dir} --add-dir {artifact_dir} -C {workspace_root} -o {artifact_dir}/codex_last_message.txt -' \
+CODEX_LAUNCH_CMD='cat {prompt_file} | {codex_bin} exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox --ephemeral --add-dir {namespace_meta_dir} --add-dir {project_meta_dir} --add-dir {shared_data_dir} --add-dir {artifact_dir} -C {namespace_root} -o {artifact_dir}/codex_last_message.txt -' \
 bash test-env/test-external-codex-workspace.sh
 ```
 

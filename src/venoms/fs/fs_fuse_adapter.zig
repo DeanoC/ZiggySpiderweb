@@ -187,27 +187,31 @@ pub const FuseAdapter = struct {
     }
 
     pub fn setxattr(self: *FuseAdapter, path: []const u8, name: []const u8, value: []const u8, flags: u32) !void {
-        self.provider_mutex.lock();
-        defer self.provider_mutex.unlock();
-        try self.provider.setxattr(path, name, value, flags);
+        _ = self;
+        _ = path;
+        _ = name;
+        _ = value;
+        _ = flags;
+        return error.OperationNotSupported;
     }
 
     pub fn getxattr(self: *FuseAdapter, path: []const u8, name: []const u8) ![]u8 {
-        self.provider_mutex.lock();
-        defer self.provider_mutex.unlock();
-        return self.provider.getxattr(path, name);
+        _ = self;
+        _ = path;
+        _ = name;
+        return error.NoData;
     }
 
     pub fn listxattr(self: *FuseAdapter, path: []const u8) ![]u8 {
-        self.provider_mutex.lock();
-        defer self.provider_mutex.unlock();
-        return self.provider.listxattr(path);
+        _ = path;
+        return self.allocator.dupe(u8, "");
     }
 
     pub fn removexattr(self: *FuseAdapter, path: []const u8, name: []const u8) !void {
-        self.provider_mutex.lock();
-        defer self.provider_mutex.unlock();
-        try self.provider.removexattr(path, name);
+        _ = self;
+        _ = path;
+        _ = name;
+        return error.OperationNotSupported;
     }
 
     pub fn lock(self: *FuseAdapter, file: mount_provider.OpenFile, mode: mount_provider.LockMode, wait: bool) !void {
@@ -280,10 +284,9 @@ pub const FuseAdapter = struct {
         ops.unlink = cUnlink;
         ops.rmdir = cRmdir;
         ops.symlink = cSymlink;
-        ops.setxattr = cSetxattr;
-        ops.getxattr = cGetxattr;
-        ops.listxattr = cListxattr;
-        ops.removexattr = cRemovexattr;
+        // Leave xattr callbacks unset so the kernel/libfuse path fails fast.
+        // Advertising no xattr surface is much cheaper than servicing repeated
+        // ACL/SELinux probes on virtual Spiderweb namespace entries.
         ops.opendir = cOpendir;
         ops.releasedir = cReleasedir;
         ops.access = cAccess;

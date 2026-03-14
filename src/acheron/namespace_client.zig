@@ -6,6 +6,7 @@ const unified = @import("spider-protocol").unified;
 const control_reply_timeout_ms: i32 = 45_000;
 const control_handshake_timeout_ms: i32 = 10_000;
 const session_status_poll_interval_ms: u64 = 250;
+const slow_readdir_warn_ms: u64 = 100;
 const synthetic_statfs_json =
     "{\"bsize\":65536,\"frsize\":65536,\"blocks\":1,\"bfree\":1,\"bavail\":1,\"files\":1048576,\"ffree\":1048575,\"favail\":1048575,\"namemax\":4096}";
 
@@ -303,6 +304,7 @@ pub const NamespaceClient = struct {
     }
 
     fn readdirOnce(self: *NamespaceClient, path: []const u8, cookie: u64, max_entries: u32) ![]u8 {
+        var timer = try std.time.Timer.start();
         const stat = try self.statPath(path);
         if (stat.kind != .dir) return error.NotDirectory;
 
@@ -346,6 +348,15 @@ pub const NamespaceClient = struct {
             "],\"next\":{d},\"eof\":{s},\"dir_gen\":0}}",
             .{ end_index, if (eof) "true" else "false" },
         );
+        const elapsed_ms = timer.read() / std.time.ns_per_ms;
+        if (elapsed_ms >= slow_readdir_warn_ms) {
+            std.log.warn("slow namespace readdir: {d}ms path={s} cookie={d} max_entries={d}", .{
+                elapsed_ms,
+                path,
+                cookie,
+                max_entries,
+            });
+        }
         return out.toOwnedSlice(self.allocator);
     }
 

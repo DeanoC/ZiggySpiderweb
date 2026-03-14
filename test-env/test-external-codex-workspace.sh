@@ -230,7 +230,6 @@ USAGE_JSON="$OUTPUT_DIR/codex_usage_report.json"
 USAGE_MD="$OUTPUT_DIR/codex_usage_report.md"
 BOOTSTRAP_JSON="$OUTPUT_DIR/bootstrap_provenance.json"
 STRACE_PREFIX="$OUTPUT_DIR/logs/codex.strace"
-TASK_FILE="$WORKSPACE_EXPORT_ROOT/TASK.md"
 VALIDATOR_SRC="$ASSET_DIR/validate_text_adventure.py"
 PARSER_SRC="$ASSET_DIR/parse_codex_usage_report.py"
 CODEX_EVENT_SUMMARY_SRC="$ASSET_DIR/summarize_codex_exec_json.py"
@@ -398,7 +397,7 @@ from pathlib import Path
 import sys
 
 workspace = Path(sys.argv[1])
-skip = {"TASK.md", "validate_game.py"}
+skip = {"AGENTS.md", "validate_game.py"}
 best = None
 
 if workspace.exists():
@@ -497,7 +496,9 @@ write_handoff_bundle() {
     local reason="$1"
     mkdir -p "$HANDOFF_DIR"
     cp "$PROMPT_FILE" "$HANDOFF_DIR/PROMPT.txt"
-    cp "$TASK_FILE" "$HANDOFF_DIR/TASK.md"
+    if [[ -f "$OUTPUT_DIR/snapshots/AGENTS.md" ]]; then
+        cp "$OUTPUT_DIR/snapshots/AGENTS.md" "$HANDOFF_DIR/AGENTS.md"
+    fi
     cp "$OUTPUT_DIR/snapshots/protocol.json" "$HANDOFF_DIR/protocol.json"
     cp "$OUTPUT_DIR/snapshots/agent_bootstrap_quickref.json" "$HANDOFF_DIR/agent_bootstrap_quickref.json"
     cp "$OUTPUT_DIR/snapshots/mounted_services.json" "$HANDOFF_DIR/mounted_services.json"
@@ -661,6 +662,7 @@ wait_for_namespace_mount() {
               -f "$MOUNT_POINT/projects/$PROJECT_ID/meta/venom_packages.json" &&
               -f "$MOUNT_POINT/projects/$PROJECT_ID/meta/agent_bootstrap.json" &&
               -d "$MOUNT_WORKSPACE_PATH" &&
+              -f "$MOUNT_WORKSPACE_PATH/AGENTS.md" &&
               -d "$MOUNT_POINT/shared_data" ]]; then
             return 0
         fi
@@ -669,17 +671,31 @@ wait_for_namespace_mount() {
     return 1
 }
 
-assert_clean_workspace_layout() {
+assert_seeded_workspace_layout() {
     local path="$1"
     python3 - "$path" <<'PY'
 import sys
 from pathlib import Path
 
 workspace = Path(sys.argv[1])
-expected = [".spiderweb", "TASK.md", "validate_game.py"]
+expected = [".spiderweb", "AGENTS.md", "validate_game.py"]
 entries = sorted(item.name for item in workspace.iterdir())
 if entries != expected:
     raise SystemExit(f"expected clean workspace entries {expected}, found {entries}")
+PY
+}
+
+assert_attached_workspace_layout() {
+    local path="$1"
+    python3 - "$path" <<'PY'
+import sys
+from pathlib import Path
+
+workspace = Path(sys.argv[1])
+expected = [".spiderweb", "AGENTS.md", "validate_game.py"]
+entries = sorted(item.name for item in workspace.iterdir())
+if entries != expected:
+    raise SystemExit(f"expected attached workspace entries {expected}, found {entries}")
 PY
 }
 
@@ -736,68 +752,78 @@ PY
 write_workspace_seed_files() {
     cp "$VALIDATOR_SRC" "$WORKSPACE_EXPORT_ROOT/validate_game.py"
     chmod +x "$WORKSPACE_EXPORT_ROOT/validate_game.py"
-    cat > "$TASK_FILE" <<'EOF'
-# Spiderweb Text Adventure Task
+}
 
-Build a Python terminal adventure in this workspace.
+write_workspace_agents_file() {
+    python3 - "$WORKSPACE_EXPORT_ROOT/AGENTS.md" "$PROJECT_ID" <<'PY'
+from pathlib import Path
+import sys
 
-Required outputs:
-- game.py
-- game_manifest.json
-- walkthrough.txt
-- README.md
+output_path = Path(sys.argv[1])
+project_id = sys.argv[2]
 
-Rules:
-- Treat this directory as the only writable project root.
-- Preserve validate_game.py.
-- Read `/projects/<project_id>/meta/agent_bootstrap_quickref.json` first, then `/projects/<project_id>/meta/agent_bootstrap.json`, and perform the bootstrap steps from inside the mounted workspace before you start building the game.
-- On this client, first try namespace-visible shell paths like `/meta/*`, `/projects/<project_id>/meta/*`, `/services/*`, `/shared_data/*`, and `./TASK.md`.
-- If those literal namespace-visible paths are not present in your shell, determine `namespace_root` once by walking upward from the current working directory until you find a directory containing `meta`, `projects`, `services`, and `nodes`, then use `{namespace_root}/meta/*`, `{namespace_root}/projects/*`, `{namespace_root}/services/*`, and `{namespace_root}/shared_data/*` consistently for the rest of the run.
-- Ensure your own durable agent home first, then verify or repair required generic service binds from inside the mounted workspace if needed.
-- Use `agent_bootstrap_quickref.json` plus the mounted service directory itself as the verification source. Read `mounted_services.json` only if the quick reference is missing a detail you genuinely need. Do not read service README/SCHEMA/OPS files unless a required binding is missing and you genuinely need the repair shape.
-- Use the current metadata field names exactly as they exist today:
-  - in `protocol.json`, use `channel`, `version`, `layout`, and `ops`
-  - in `agent_bootstrap_quickref.json`, use `service_root`, `required_services`, `control_writes`, `fallback_meta`, `all_required_services_present`, and `discovery_order`
-  - in `agent_bootstrap.json`, use `service_preference`, `bootstrap_sequence`, `required_reads`, and `fallback_reads`
-- Do not invent alternate field names such as `protocol_version`, `mounted_namespace_root`, `notes`, `control_paths`, `required_service_entries`, or `generic_fallback_roots` unless they are actually present in the file you just read.
-- If `agent_bootstrap_quickref.json` says `all_required_services_present=true` and your write to `/services/home/control/ensure.json` succeeds, treat bootstrap as complete immediately.
-- A successful `ensure_home` command is the success signal. Do not retry the same `/services/home/control/ensure.json` write, do not wrap it in timeout-based verification commands, and do not perform extra verification writes unless the first command fails with a non-zero exit code.
-- After that point, do not spend more turns probing `/services/*`, looping over service directories, or re-checking the same service paths. Move straight into file generation.
-- For home bootstrap, use `control_writes.ensure_home` from `agent_bootstrap_quickref.json`.
-- For bind repair, use `control_writes.repair_bind` from `agent_bootstrap_quickref.json`.
-- For fallback roots, use `service_preference.fallback_roots` from `agent_bootstrap.json`.
-- Read the shared seed files exactly as instructed by the rendered prompt.
-- Keep all project writes in this directory.
-- In this external Codex CLI run, apply_patch is not available. Use shell commands or small local scripts to create and edit files here.
-- Follow this exact execution sequence:
-  1. Read each required metadata/task/seed file exactly once.
-  2. Write `{"agent_id":"codex","project_id":"<project_id>"}` to `/services/home/control/ensure.json`.
-  3. If that command exits successfully, treat bootstrap as complete.
-  4. Generate `game.py`, `game_manifest.json`, `walkthrough.txt`, and `README.md` in one Python file-generation step.
-  5. Run `python3 -m py_compile ./game.py`.
-  6. Run `python3 ./game.py < ./walkthrough.txt`.
-  7. Run `python3 ./validate_game.py --workspace . --shared-data <shared-data-path> --output ./game_validation.json`.
-  8. If a validation step fails, fix only the project files and rerun only the failed step(s).
-- After the required discovery reads and bootstrap actions, start implementing immediately instead of doing extra exploratory reads unless validation fails.
-- Keep discovery simple. Do not build a large custom metadata-inspection script; adapt only the single file you are currently reading if its schema is unexpected.
-- Once the three shared seed files have been read and `ensure_home` has succeeded, do not read any more metadata or service files unless a command actually fails.
-- Do not re-read `protocol.json`, `agent_bootstrap_quickref.json`, `agent_bootstrap.json`, `workspace_status.json`, `TASK.md`, or the shared seed files after the initial required read pass.
-- Do not run extra service checks such as `test -d /services/...`, `head`, `rg`, or ad-hoc Python extraction scripts against the same metadata after the initial required read pass.
-- You do not need to re-read `validate_game.py` before implementation. Use this validator contract summary as authoritative unless a validation run fails:
-  - required files: `game.py`, `game_manifest.json`, `walkthrough.txt`
-  - manifest checks: 10 location names matching `world_seed.json`, 10 item names matching `items_seed.json`, seeded puzzle ids present, `shared_data_inputs` exactly `[/shared_data/world_seed.json, /shared_data/items_seed.json, /shared_data/puzzle_seed.json]`, `victory_text` exact, `entrypoint`=`game.py`, `walkthrough`=`walkthrough.txt`
-  - runtime checks: `python3 -m py_compile ./game.py`, `python3 ./game.py < ./walkthrough.txt`, then `python3 ./validate_game.py --workspace . --shared-data /shared_data --output ./game_validation.json`
-- Prefer writing all deliverables in one shell or Python file-generation step, then iterate only if validation fails.
-- Do not pause for design narration after you already have the seed entries. Move directly from seed reads to the one-pass file-generation command.
-- When writing or replacing game.py, game_manifest.json, walkthrough.txt, or README.md, write the full intended contents in one pass. Do not append fragments to an existing file.
-- If you need to replace game.py after a failed attempt, remove the old file first and then recreate it from scratch so stale trailing content cannot survive a shorter rewrite.
-- Do not run chmod on project files. This mount may not support chmod, and python3 game.py is sufficient for validation.
-- Before running validate_game.py, first run python3 -m py_compile ./game.py and then python3 ./game.py < ./walkthrough.txt. Only move on to the validator once both succeed.
-- When you run validate_game.py, set `<shared-data-path>` to `/shared_data` if that literal path exists in the shell; otherwise use `{namespace_root}/shared_data`.
-- Do not create root-level symlinks, mounts, or other host filesystem hacks to force `/shared_data` into existence.
-- The victory line must be:
-  VICTORY: Lantern of Nine Paths recovered
-EOF
+managed = f"""# AGENTS.md
+
+<!-- SPIDERWEB:BEGIN MANAGED -->
+## Spiderweb Workspace Rules
+
+You are working inside a Spiderweb-mounted workspace.
+
+Read order:
+1. Read this `AGENTS.md` first and treat it as mandatory workspace guidance.
+2. Treat the mounted namespace root as `/` for this session. Then read only these required files, in order:
+   - `meta/protocol.json`
+   - `projects/{project_id}/meta/agent_bootstrap_quickref.json`
+   - `projects/{project_id}/meta/agent_bootstrap.json`
+   - `shared_data/world_seed.json`
+   - `shared_data/items_seed.json`
+   - `shared_data/puzzle_seed.json`
+
+Bootstrap rules:
+- Prefer `/services/*` paths over fallback namespace locations.
+- If `/services/home/control/ensure.json` succeeds once, treat home bootstrap as complete.
+- If `agent_bootstrap_quickref.json` says `all_required_services_present=true`, do not keep probing `/services/*` and move directly into implementation.
+- If required services are missing, repair them through `/services/mounts/control/bind.json` using the machine-readable bootstrap metadata.
+- Keep project writes inside `nodes/local/fs/` unless the user explicitly asks otherwise.
+- When creating or fixing a project file, rewrite the whole file in one pass instead of appending partial repair fragments.
+- If `game.py` fails compile or walkthrough validation, delete and recreate `game.py` from scratch before retrying.
+- Preserve existing workspace support files such as `./validate_game.py`.
+- Do not run broad scans such as `find`, `rg --files`, or recursive `ls` across `services/`, `projects/`, or `meta/`. Read only the exact listed files directly.
+
+Namespace facts:
+- Namespace root: `./`
+- Namespace alias: `/AGENTS.md`
+- Project write root: `nodes/local/fs` (namespace alias `/nodes/local/fs`)
+- Shared data root: `shared_data` (namespace alias `/shared_data`)
+- Service root: `services` (namespace alias `/services`)
+- Machine bootstrap metadata:
+  - `projects/{project_id}/meta/agent_bootstrap_quickref.json`
+  - `projects/{project_id}/meta/agent_bootstrap.json`
+- Future Spiderweb-managed artifacts may appear under `nodes/local/fs/.spiderweb/`.
+
+Task source:
+- The concrete task comes from the user prompt, not from `TASK.md`.
+- After the required reads above, begin implementation and validation immediately unless a required service is genuinely missing.
+- If the user asks for the standard text-adventure task, completion means:
+  - write `nodes/local/fs/game.py`, `nodes/local/fs/game_manifest.json`, `nodes/local/fs/walkthrough.txt`, and `nodes/local/fs/README.md`
+  - run `python3 -m py_compile nodes/local/fs/game.py`
+  - run `python3 nodes/local/fs/game.py < nodes/local/fs/walkthrough.txt`
+  - run `python3 nodes/local/fs/validate_game.py --workspace nodes/local/fs --shared-data shared_data --output nodes/local/fs/game_validation.json`
+  - if a validation step fails, fix the project files and rerun only the failed step
+  - do not stop after partial outputs; finish when all required files exist and validation succeeds
+
+Do not:
+- Invent old metadata field names when the current JSON already defines the contract.
+- Create root-level symlink hacks for `/meta`, `/services`, or `/shared_data`.
+<!-- SPIDERWEB:END MANAGED -->
+
+## User Notes
+
+Add any persistent workspace-specific instructions, goals, or missions below this heading.
+"""
+
+output_path.write_text(managed, encoding="utf-8")
+PY
 }
 
 seed_agent_runtime_home() {
@@ -1014,8 +1040,8 @@ configure_codex_env() {
         XDG_STATE_HOME="$xdg_state_home"
         TMPDIR="$tmp_dir"
         PATH="$CODEX_EXEC_PATH"
-        PWD="$MOUNT_WORKSPACE_PATH"
-        GIT_CEILING_DIRECTORIES="$MOUNT_WORKSPACE_PATH"
+        PWD="$MOUNT_POINT"
+        GIT_CEILING_DIRECTORIES="$MOUNT_POINT"
         GIT_DISCOVERY_ACROSS_FILESYSTEM=0
         GIT_CONFIG_NOSYSTEM=1
         GIT_CONFIG_GLOBAL=/dev/null
@@ -1145,7 +1171,7 @@ setup_codex_auth() {
 }
 
 default_codex_launch_cmd() {
-    printf '%s' '{codex_bin} exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox --ephemeral --color never --add-dir {namespace_meta_dir} --add-dir {project_meta_dir} --add-dir {shared_data_dir} --add-dir {artifact_dir} -C {workspace_root} -o {artifact_dir}/codex_last_message.txt -'
+    printf '%s' '{codex_bin} exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox --ephemeral --color never --add-dir {namespace_meta_dir} --add-dir {project_meta_dir} --add-dir {shared_data_dir} --add-dir {artifact_dir} -C {namespace_root} -o {artifact_dir}/codex_last_message.txt -'
 }
 
 render_codex_launch_command() {
@@ -1183,7 +1209,7 @@ workspace = Path(sys.argv[1])
 stdout_log = Path(sys.argv[2])
 stderr_log = Path(sys.argv[3])
 pty_log = Path(sys.argv[4])
-skip_files = {"TASK.md", "validate_game.py"}
+skip_files = {"AGENTS.md", "validate_game.py"}
 
 count = 0
 latest = 0
@@ -1276,18 +1302,22 @@ run_live_codex() {
 
     local quoted_cmd
     quoted_cmd="$(shell_quote "$cmd")"
+    local codex_target_shell=""
+    if [[ "$CODEX_ENABLE_TERMINAL_BRIDGE" == "1" ]]; then
+        codex_target_shell="$CODEX_BRIDGE_SHELL"
+    fi
 
     if [[ "$CODEX_USE_PTY" == "1" ]]; then
-        local pty_inner_cmd="$cmd"
-        if [[ "$CODEX_ENABLE_TERMINAL_BRIDGE" == "1" ]]; then
-            pty_inner_cmd="export SHELL=$(shell_quote "$CODEX_BRIDGE_SHELL"); $cmd"
-        fi
+        local pty_inner_cmd
+        pty_inner_cmd="$(shell_quote "$CODEX_STDIN_LAUNCHER") $(shell_quote "$PROMPT_FILE") $quoted_cmd"
         local quoted_pty_inner_cmd
         quoted_pty_inner_cmd="$(shell_quote "$pty_inner_cmd")"
         (
-            cd "$MOUNT_WORKSPACE_PATH"
+            cd "$MOUNT_POINT"
             "${CODEX_ENV_BASE[@]}" \
                 SHELL=/bin/bash \
+                CODEX_STDIN_LAUNCHER_SHELL=/bin/bash \
+                CODEX_TARGET_SHELL="$codex_target_shell" \
                 GIT_DIR= \
                 GIT_WORK_TREE= \
                 setsid \
@@ -1296,9 +1326,11 @@ run_live_codex() {
         ) &
     else
         (
-            cd "$MOUNT_WORKSPACE_PATH"
+            cd "$MOUNT_POINT"
             "${CODEX_ENV_BASE[@]}" \
                 SHELL=/bin/bash \
+                CODEX_STDIN_LAUNCHER_SHELL=/bin/bash \
+                CODEX_TARGET_SHELL="$codex_target_shell" \
                 GIT_DIR= \
                 GIT_WORK_TREE= \
                 setsid \
@@ -1356,8 +1388,7 @@ setup_spiderweb_runtime_root
 cp "$ASSET_DIR/shared_data/"* "$REMOTE_EXPORT_ROOT/"
 write_workspace_seed_files
 seed_agent_runtime_home
-assert_clean_workspace_layout "$WORKSPACE_EXPORT_ROOT"
-log_pass "seeded a clean local workspace export"
+log_pass "seeded a clean local workspace export root"
 
 cat > "$SPIDERWEB_CONFIG_FILE" <<EOF
 {
@@ -1461,6 +1492,9 @@ PROJECT_UP_RESP="$(control_call project_up "$PROJECT_UP_PAYLOAD")"
 PROJECT_ID="$(json_field "$PROJECT_UP_RESP" '.payload.project_id')"
 PROJECT_TOKEN="$(jq -r '.payload.project_token // empty' <<<"$PROJECT_UP_RESP")"
 printf '%s\n' "$PROJECT_UP_RESP" > "$OUTPUT_DIR/snapshots/project_up.json"
+write_workspace_agents_file
+assert_seeded_workspace_layout "$WORKSPACE_EXPORT_ROOT"
+log_pass "seeded workspace AGENTS contract for project $PROJECT_ID"
 
 if ! wait_for_workspace_mounts; then
     log_fail "workspace mounts did not converge for /nodes/local/fs and /shared_data"
@@ -1492,12 +1526,13 @@ cp "$MOUNT_POINT/projects/$PROJECT_ID/meta/mounted_services.json" "$OUTPUT_DIR/s
 cp "$MOUNT_POINT/projects/$PROJECT_ID/meta/workspace_status.json" "$OUTPUT_DIR/snapshots/workspace_status.json"
 cp "$MOUNT_POINT/projects/$PROJECT_ID/meta/venom_packages.json" "$OUTPUT_DIR/snapshots/venom_packages.json"
 cp "$MOUNT_POINT/projects/$PROJECT_ID/meta/agent_bootstrap.json" "$OUTPUT_DIR/snapshots/agent_bootstrap.json"
+cp "$MOUNT_WORKSPACE_PATH/AGENTS.md" "$OUTPUT_DIR/snapshots/AGENTS.md"
 
 if [[ ! -d "$MOUNT_WORKSPACE_PATH" || ! -d "$MOUNT_POINT/shared_data" ]]; then
     log_fail "mounted namespace is missing /nodes/local/fs or /shared_data"
     exit 1
 fi
-assert_clean_workspace_layout "$MOUNT_WORKSPACE_PATH"
+assert_attached_workspace_layout "$MOUNT_WORKSPACE_PATH"
 log_pass "preflight discovery files, mount paths, and clean workspace layout are present"
 
 render_prompt
