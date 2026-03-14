@@ -15,9 +15,11 @@ Use a Linux host for the documented Codex E2E path.
 - keep Spiderweb’s runtime root separate from the Codex project tree
 - use one clean standalone `spiderweb-fs-node` for `/nodes/local/fs` and one standalone node for `/shared_data`
 - mount the workspace with `spiderweb-fs-mount --namespace-url ...`
-- launch plain Codex from `/nodes/local/fs`, or deliberately fall back to a prepared handoff
+- launch plain Codex from the namespace root, and treat `/nodes/local/fs` as the writable project subtree inside that namespace
 
 Windows `spiderweb-fs-mount` remains useful for separate client validation, but the new external Codex harness is Linux-first.
+
+The canonical interactive entrypoint is the namespace root exposed by `spiderweb-fs-mount`. A short prompt like `Read AGENTS.md and follow it` should be enough to bootstrap the agent, with project files written under `nodes/local/fs/`.
 
 ## Installer-First Linux Flow
 
@@ -293,31 +295,31 @@ When fallback is used:
 
 This is the main difference between `CODEX_MODE=auto` and `CODEX_MODE=live`.
 
-## What A Fresh Codex Should Read First
+## What A Fresh External Agent Should Read First
 
-Once Codex is dropped into the mounted workspace, the minimum discovery order should be:
+Once an external agent is dropped into the mounted workspace, the intended discovery order is:
 
-1. `/meta/protocol.json`
-2. `/projects/<project_id>/meta/mounted_services.json`
-3. `/projects/<project_id>/meta/workspace_status.json`
-4. `/projects/<project_id>/meta/venom_packages.json`
-5. `/projects/<project_id>/meta/agent_bootstrap.json`
-6. `/services/<service>/README.md`
-7. `/services/<service>/OPS.json`
-8. `/services/<service>/SCHEMA.json`
-9. `/services/<service>/CAPS.json`
-10. `/agents/<agent_id>/`
+1. `./AGENTS.md`
+2. `/meta/protocol.json`
+3. `/projects/<project_id>/meta/agent_bootstrap_quickref.json`
+4. `/projects/<project_id>/meta/agent_bootstrap.json`
+5. `/projects/<project_id>/meta/workspace_status.json`
+6. `/projects/<project_id>/meta/venom_packages.json`
+7. `/shared_data/...` or other task-specific mounted inputs from the user prompt
+
+`AGENTS.md` is the human-facing front door. The JSON files remain the exact machine-readable source of truth.
 
 ## Agent-Driven Bootstrap Contract
 
 The attached agent, not the harness, should perform these steps after mount:
 
-1. Read `agent_bootstrap.json`.
-2. Ensure its durable home through `/services/home/control/ensure.json`.
-3. Verify the required generic `/services/*` entries.
-4. If a required service is missing, repair it through `/services/mounts/control/bind.json` using the fallback namespace roots described in `agent_bootstrap.json`.
-5. Optionally register worker-private venoms through `/services/workers/control/register.json` when the task needs them.
-6. Perform the workspace task and validation.
+1. Read `AGENTS.md`.
+2. Follow `AGENTS.md` into `agent_bootstrap_quickref.json` and `agent_bootstrap.json`.
+3. Ensure its durable home through `/services/home/control/ensure.json`.
+4. Verify the required generic `/services/*` entries.
+5. If a required service is missing, repair it through `/services/mounts/control/bind.json` using the fallback namespace roots described in `agent_bootstrap.json`.
+6. Optionally register worker-private venoms through `/services/workers/control/register.json` when the task needs them.
+7. Perform the workspace task from the user prompt and validate it.
 
 Persistence model for this milestone:
 

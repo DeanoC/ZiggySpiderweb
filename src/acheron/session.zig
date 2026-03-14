@@ -139,7 +139,28 @@ const wait_poll_interval_ms: u64 = events_venom.wait_poll_interval_ms;
 const debug_stream_log_max_bytes: usize = 2 * 1024 * 1024;
 const max_signal_events: usize = events_venom.max_signal_events;
 const local_fs_world_prefix = "/nodes/local/fs";
+const workspace_agents_contract_path = "/nodes/local/fs/AGENTS.md";
+const namespace_agents_contract_path = "/AGENTS.md";
+const workspace_agents_managed_begin = "<!-- SPIDERWEB:BEGIN MANAGED -->";
+const workspace_agents_managed_end = "<!-- SPIDERWEB:END MANAGED -->";
 const worker_reap_grace_ms: i64 = 60_000;
+
+const BootstrapRequiredService = struct {
+    id: []const u8,
+    ensure_path: ?[]const u8 = null,
+    invoke_path: ?[]const u8 = null,
+};
+
+const bootstrap_required_services = [_]BootstrapRequiredService{
+    .{ .id = "home", .ensure_path = "/services/home/control/ensure.json", .invoke_path = "/services/home/control/invoke.json" },
+    .{ .id = "mounts", .invoke_path = "/services/mounts/control/bind.json" },
+    .{ .id = "workers", .invoke_path = "/services/workers/control/register.json" },
+    .{ .id = "terminal", .invoke_path = "/services/terminal/control/invoke.json" },
+    .{ .id = "git", .invoke_path = "/services/git/control/invoke.json" },
+    .{ .id = "search_code", .invoke_path = "/services/search_code/control/invoke.json" },
+    .{ .id = "library" },
+    .{ .id = "events" },
+};
 
 const agent_create_capabilities = [_][]const u8{
     "agents.create",
@@ -240,6 +261,7 @@ const Node = struct {
     name: []u8,
     writable: bool,
     content: []u8,
+    last_dynamic_refresh_ms: i64 = 0,
     children: std.StringHashMapUnmanaged(u32) = .{},
     special: SpecialKind = .none,
 
@@ -250,6 +272,9 @@ const Node = struct {
         self.* = undefined;
     }
 };
+
+const dynamic_directory_refresh_ttl_ms: i64 = 5_000;
+const slow_dynamic_directory_refresh_warn_ms: u64 = 100;
 
 const FidState = struct {
     node_id: u32,
@@ -1126,6 +1151,24 @@ pub const Session = struct {
     }
 
     fn refreshDynamicDirectory(self: *Session, dir_id: u32) !void {
+        const now_ms = std.time.milliTimestamp();
+        const previous_refresh_ms = blk: {
+            const node = self.nodes.getPtr(dir_id) orelse return;
+            if (node.kind != .dir) return;
+            if (node.last_dynamic_refresh_ms != 0 and (now_ms - node.last_dynamic_refresh_ms) < dynamic_directory_refresh_ttl_ms) {
+                return;
+            }
+            const previous = node.last_dynamic_refresh_ms;
+            node.last_dynamic_refresh_ms = now_ms;
+            break :blk previous;
+        };
+        errdefer {
+            if (self.nodes.getPtr(dir_id)) |node| {
+                node.last_dynamic_refresh_ms = previous_refresh_ms;
+            }
+        }
+        var timer = try std.time.Timer.start();
+
         try self.reapExpiredWorkerNodes();
         try self.refreshWorkerPresenceStatuses();
         if (dir_id == self.nodes_root_id) {
@@ -1133,6 +1176,13 @@ pub const Session = struct {
         }
         try self.refreshLocalFsDirectory(dir_id);
         try self.refreshBoundVenomProxyDirectory(dir_id);
+
+        const elapsed_ms = timer.read() / std.time.ns_per_ms;
+        if (elapsed_ms >= slow_dynamic_directory_refresh_warn_ms) {
+            const absolute_path = try self.nodeAbsolutePath(dir_id);
+            defer self.allocator.free(absolute_path);
+            std.log.warn("slow dynamic directory refresh: {d}ms path={s}", .{ elapsed_ms, absolute_path });
+        }
     }
 
     fn refreshLocalFsDirectory(self: *Session, dir_id: u32) !void {
@@ -1417,9 +1467,11 @@ pub const Session = struct {
         const state = self.fids.get(fid) orelse return unified.buildFsrpcError(self.allocator, msg.tag, "enoent", "unknown fid");
         const node = self.nodes.get(state.node_id) orelse return unified.buildFsrpcError(self.allocator, msg.tag, "eio", "missing node");
 
-        if (try self.buildBoundVenomProxyStatPayload(state.node_id)) |payload| {
-            defer self.allocator.free(payload);
-            return unified.buildFsrpcResponse(self.allocator, .r_stat, msg.tag, payload);
+        if (node.kind != .dir) {
+            if (try self.buildBoundVenomProxyStatPayload(state.node_id)) |payload| {
+                defer self.allocator.free(payload);
+                return unified.buildFsrpcResponse(self.allocator, .r_stat, msg.tag, payload);
+            }
         }
 
         const escaped_name = try unified.jsonEscape(self.allocator, node.name);
@@ -1772,6 +1824,7 @@ pub const Session = struct {
         try self.seedActiveScopedVenomBindings(active_agent_venoms_dir, project_venoms_dir, policy.project_id);
         try self.refreshScopedVenomIndexes();
         try self.addWorkspaceServiceDiscoveryFiles(meta_root, project_meta_dir, policy.project_id);
+        try self.seedWorkspaceAgentsContract(policy.project_id);
     }
 
     fn addProjectMetaFiles(
@@ -3541,7 +3594,7 @@ pub const Session = struct {
         defer self.allocator.free(escaped_project_id);
         return std.fmt.allocPrint(
             self.allocator,
-            "{{\"version\":\"acheron-namespace-project-contract-v2\",\"project_id\":\"{s}\",\"top_level_roots\":[\"/nodes\",\"/agents\",\"/global\",\"/services\"],\"project_metadata_files\":[\"topology.json\",\"nodes.json\",\"agents.json\",\"sources.json\",\"contracts.json\",\"paths.json\",\"summary.json\",\"agent_bootstrap.json\",\"agent_bootstrap_quickref.json\",\"alerts.json\",\"workspace_status.json\",\"mounts.json\",\"desired_mounts.json\",\"actual_mounts.json\",\"binds.json\",\"mounted_services.json\",\"venom_packages.json\",\"drift.json\",\"reconcile.json\",\"availability.json\",\"health.json\"],\"links\":{{\"nodes_root\":\"/nodes\",\"agents_root\":\"/agents\",\"global_root\":\"/global\",\"services_root\":\"/services\",\"workspace_control\":\"/global/workspaces\",\"workspace_status\":\"/global/workspaces/control/invoke.json\",\"workspace_binds\":\"/projects/{s}/meta/binds.json\",\"workspace_services\":\"/projects/{s}/meta/mounted_services.json\",\"venom_packages\":\"/projects/{s}/meta/venom_packages.json\",\"agent_bootstrap\":\"/projects/{s}/meta/agent_bootstrap.json\",\"agent_bootstrap_quickref\":\"/projects/{s}/meta/agent_bootstrap_quickref.json\"}}}}",
+            "{{\"version\":\"acheron-namespace-project-contract-v2\",\"project_id\":\"{s}\",\"top_level_roots\":[\"/nodes\",\"/agents\",\"/global\",\"/services\"],\"project_metadata_files\":[\"topology.json\",\"nodes.json\",\"agents.json\",\"sources.json\",\"contracts.json\",\"paths.json\",\"summary.json\",\"agent_bootstrap.json\",\"agent_bootstrap_quickref.json\",\"alerts.json\",\"workspace_status.json\",\"mounts.json\",\"desired_mounts.json\",\"actual_mounts.json\",\"binds.json\",\"mounted_services.json\",\"venom_packages.json\",\"drift.json\",\"reconcile.json\",\"availability.json\",\"health.json\"],\"links\":{{\"nodes_root\":\"/nodes\",\"agents_root\":\"/agents\",\"global_root\":\"/global\",\"services_root\":\"/services\",\"workspace_control\":\"/global/workspaces\",\"workspace_status\":\"/global/workspaces/control/invoke.json\",\"workspace_binds\":\"/projects/{s}/meta/binds.json\",\"workspace_services\":\"/projects/{s}/meta/mounted_services.json\",\"venom_packages\":\"/projects/{s}/meta/venom_packages.json\",\"agent_bootstrap\":\"/projects/{s}/meta/agent_bootstrap.json\",\"agent_bootstrap_quickref\":\"/projects/{s}/meta/agent_bootstrap_quickref.json\",\"workspace_agents_contract\":\"/AGENTS.md\",\"workspace_agents_contract_persisted\":\"/nodes/local/fs/AGENTS.md\"}}}}",
             .{ escaped_project_id, escaped_project_id, escaped_project_id, escaped_project_id, escaped_project_id, escaped_project_id },
         );
     }
@@ -3551,7 +3604,7 @@ pub const Session = struct {
         defer self.allocator.free(escaped_project_id);
         return std.fmt.allocPrint(
             self.allocator,
-            "{{\"project_id\":\"{s}\",\"nodes_root\":\"/nodes\",\"agents_root\":\"/agents\",\"services\":{{\"root\":\"/services\",\"mounted_services_meta\":\"/projects/{s}/meta/mounted_services.json\"}},\"packages\":{{\"meta\":\"/projects/{s}/meta/venom_packages.json\"}},\"bootstrap\":{{\"meta\":\"/projects/{s}/meta/agent_bootstrap.json\",\"quickref\":\"/projects/{s}/meta/agent_bootstrap_quickref.json\"}},\"global\":{{\"root\":\"/global\",\"library\":\"/global/library\",\"workspaces\":\"/global/workspaces\",\"chat\":\"/global/chat\",\"jobs\":\"/global/jobs\",\"mounts\":\"/global/mounts\",\"debug\":{s}}}}}",
+            "{{\"project_id\":\"{s}\",\"nodes_root\":\"/nodes\",\"agents_root\":\"/agents\",\"services\":{{\"root\":\"/services\",\"mounted_services_meta\":\"/projects/{s}/meta/mounted_services.json\"}},\"packages\":{{\"meta\":\"/projects/{s}/meta/venom_packages.json\"}},\"bootstrap\":{{\"meta\":\"/projects/{s}/meta/agent_bootstrap.json\",\"quickref\":\"/projects/{s}/meta/agent_bootstrap_quickref.json\",\"workspace_contract\":{{\"namespace_alias\":\"/AGENTS.md\",\"workspace_path\":\"/nodes/local/fs/AGENTS.md\"}}}},\"global\":{{\"root\":\"/global\",\"library\":\"/global/library\",\"workspaces\":\"/global/workspaces\",\"chat\":\"/global/chat\",\"jobs\":\"/global/jobs\",\"mounts\":\"/global/mounts\",\"debug\":{s}}}}}",
             .{
                 escaped_project_id,
                 escaped_project_id,
@@ -3564,21 +3617,6 @@ pub const Session = struct {
     }
 
     fn buildAgentBootstrapQuickrefJson(self: *Session, project_id: []const u8, agent_id: []const u8) ![]u8 {
-        const required_services = [_]struct {
-            id: []const u8,
-            ensure_path: ?[]const u8 = null,
-            invoke_path: ?[]const u8 = null,
-        }{
-            .{ .id = "home", .ensure_path = "/services/home/control/ensure.json", .invoke_path = "/services/home/control/invoke.json" },
-            .{ .id = "mounts", .invoke_path = "/services/mounts/control/bind.json" },
-            .{ .id = "workers", .invoke_path = "/services/workers/control/register.json" },
-            .{ .id = "terminal", .invoke_path = "/services/terminal/control/invoke.json" },
-            .{ .id = "git", .invoke_path = "/services/git/control/invoke.json" },
-            .{ .id = "search_code", .invoke_path = "/services/search_code/control/invoke.json" },
-            .{ .id = "library" },
-            .{ .id = "events" },
-        };
-
         const escaped_project_id = try unified.jsonEscape(self.allocator, project_id);
         defer self.allocator.free(escaped_project_id);
         const escaped_agent_id = try unified.jsonEscape(self.allocator, agent_id);
@@ -3588,10 +3626,15 @@ pub const Session = struct {
         errdefer out.deinit(self.allocator);
 
         try out.writer(self.allocator).print(
-            "{{\"version\":\"spiderweb-agent-bootstrap-quickref-v1\",\"project_id\":\"{s}\",\"agent_id\":\"{s}\",\"workspace_root\":\"/nodes/local/fs\",\"shared_data_root\":\"/shared_data\",\"service_root\":\"/services\",\"discovery_order\":[\"/meta/protocol.json\",\"/projects/{s}/meta/agent_bootstrap_quickref.json\",\"/projects/{s}/meta/agent_bootstrap.json\",\"/projects/{s}/meta/workspace_status.json\",\"./TASK.md\",\"/shared_data/world_seed.json\",\"/shared_data/items_seed.json\",\"/shared_data/puzzle_seed.json\"],\"fallback_meta\":{{\"mounted_services\":\"/projects/{s}/meta/mounted_services.json\",\"venom_packages\":\"/projects/{s}/meta/venom_packages.json\"}},\"required_services\":[",
+            "{{\"version\":\"spiderweb-agent-bootstrap-quickref-v1\",\"project_id\":\"{s}\",\"agent_id\":\"{s}\",\"namespace_root\":\"/\",\"project_write_root\":\"/nodes/local/fs\",\"shared_data_root\":\"/shared_data\",\"service_root\":\"/services\",\"workspace_contract\":{{\"namespace_path\":\"/AGENTS.md\",\"project_copy\":\"/nodes/local/fs/AGENTS.md\",\"managed_root\":\"/nodes/local/fs/.spiderweb\"}},\"paths\":{{\"protocol\":\"meta/protocol.json\",\"project_meta_dir\":\"projects/{s}/meta\",\"quickref\":\"projects/{s}/meta/agent_bootstrap_quickref.json\",\"bootstrap\":\"projects/{s}/meta/agent_bootstrap.json\",\"workspace_status\":\"projects/{s}/meta/workspace_status.json\",\"venom_packages\":\"projects/{s}/meta/venom_packages.json\",\"mounted_services\":\"projects/{s}/meta/mounted_services.json\",\"shared_data_root\":\"shared_data\",\"service_root\":\"services\",\"project_write_root\":\"nodes/local/fs\"}},\"discovery_order\":[\"AGENTS.md\",\"meta/protocol.json\",\"projects/{s}/meta/agent_bootstrap_quickref.json\",\"projects/{s}/meta/agent_bootstrap.json\",\"shared_data/world_seed.json\",\"shared_data/items_seed.json\",\"shared_data/puzzle_seed.json\"],\"fallback_meta\":{{\"mounted_services\":\"projects/{s}/meta/mounted_services.json\",\"venom_packages\":\"projects/{s}/meta/venom_packages.json\"}},\"required_services\":[",
             .{
                 escaped_project_id,
                 escaped_agent_id,
+                escaped_project_id,
+                escaped_project_id,
+                escaped_project_id,
+                escaped_project_id,
+                escaped_project_id,
                 escaped_project_id,
                 escaped_project_id,
                 escaped_project_id,
@@ -3601,7 +3644,7 @@ pub const Session = struct {
         );
 
         var present_count: usize = 0;
-        for (required_services, 0..) |service, idx| {
+        for (bootstrap_required_services, 0..) |service, idx| {
             if (idx != 0) try out.append(self.allocator, ',');
 
             const bind_path = try std.fmt.allocPrint(self.allocator, "/services/{s}", .{service.id});
@@ -3643,8 +3686,8 @@ pub const Session = struct {
         try out.writer(self.allocator).print(
             "],\"all_required_services_present\":{s},\"required_service_count\":{d},\"required_services_present_count\":{d},\"control_writes\":{{\"ensure_home\":\"/services/home/control/ensure.json\",\"repair_bind\":\"/services/mounts/control/bind.json\"}},\"implementation_hint\":{{\"prefer_quickref_over_raw_service_enumeration\":true,\"proceed_directly_when_ready\":true}}}}",
             .{
-                if (present_count == required_services.len) "true" else "false",
-                required_services.len,
+                if (present_count == bootstrap_required_services.len) "true" else "false",
+                bootstrap_required_services.len,
                 present_count,
             },
         );
@@ -3661,10 +3704,16 @@ pub const Session = struct {
         defer self.allocator.free(escaped_target_template);
         return std.fmt.allocPrint(
             self.allocator,
-            "{{\"version\":\"spiderweb-agent-bootstrap-v1\",\"project_id\":\"{s}\",\"agent_id\":\"{s}\",\"workspace_root\":\"/nodes/local/fs\",\"shared_data_root\":\"/shared_data\",\"service_preference\":{{\"preferred_root\":\"/services\",\"fallback_roots\":[\"/global\",\"/nodes/local/venoms\"]}},\"required_reads\":[\"/meta/protocol.json\",\"/projects/{s}/meta/agent_bootstrap_quickref.json\",\"/projects/{s}/meta/agent_bootstrap.json\",\"/projects/{s}/meta/workspace_status.json\",\"/projects/{s}/meta/venom_packages.json\"],\"fallback_reads\":[\"/projects/{s}/meta/mounted_services.json\"],\"bootstrap_sequence\":[{{\"step\":\"ensure_home\",\"service\":\"/services/home\",\"invoke_path\":\"/services/home/control/ensure.json\",\"payload\":{{\"agent_id\":\"{s}\",\"project_id\":\"{s}\"}},\"required\":true}},{{\"step\":\"verify_generic_services\",\"service\":\"/services/mounts\",\"required_services\":[\"home\",\"mounts\",\"workers\",\"terminal\",\"git\",\"search_code\",\"library\",\"events\"],\"repair_invoke_path\":\"/services/mounts/control/bind.json\",\"target_template\":\"{s}\",\"required\":true}},{{\"step\":\"optional_worker_register\",\"service\":\"/services/workers\",\"invoke_path\":\"/services/workers/control/register.json\",\"default_venoms\":[\"memory\",\"sub_brains\"],\"required\":false}}],\"persistence\":{{\"shared_project_binds\":\"persistent\",\"shared_project_mounts\":\"persistent\",\"agent_home\":\"durable_per_agent\",\"worker_loopback\":\"ephemeral\"}},\"detach\":{{\"shared_changes\":\"keep\",\"worker_state\":\"detach_or_ttl_cleanup\"}}}}",
+            "{{\"version\":\"spiderweb-agent-bootstrap-v1\",\"project_id\":\"{s}\",\"agent_id\":\"{s}\",\"namespace_root\":\"/\",\"project_write_root\":\"/nodes/local/fs\",\"shared_data_root\":\"/shared_data\",\"workspace_contract\":{{\"namespace_path\":\"/AGENTS.md\",\"project_copy\":\"/nodes/local/fs/AGENTS.md\",\"task_source\":\"user_prompt\",\"managed_root\":\"/nodes/local/fs/.spiderweb\"}},\"paths\":{{\"protocol\":\"meta/protocol.json\",\"project_meta_dir\":\"projects/{s}/meta\",\"quickref\":\"projects/{s}/meta/agent_bootstrap_quickref.json\",\"bootstrap\":\"projects/{s}/meta/agent_bootstrap.json\",\"workspace_status\":\"projects/{s}/meta/workspace_status.json\",\"venom_packages\":\"projects/{s}/meta/venom_packages.json\",\"mounted_services\":\"projects/{s}/meta/mounted_services.json\",\"shared_data_root\":\"shared_data\",\"service_root\":\"services\",\"project_write_root\":\"nodes/local/fs\"}},\"service_preference\":{{\"preferred_root\":\"/services\",\"fallback_roots\":[\"/global\",\"/nodes/local/venoms\"]}},\"required_reads\":[\"AGENTS.md\",\"meta/protocol.json\",\"projects/{s}/meta/agent_bootstrap_quickref.json\",\"projects/{s}/meta/agent_bootstrap.json\",\"shared_data/world_seed.json\",\"shared_data/items_seed.json\",\"shared_data/puzzle_seed.json\"],\"fallback_reads\":[\"projects/{s}/meta/mounted_services.json\",\"projects/{s}/meta/workspace_status.json\",\"projects/{s}/meta/venom_packages.json\"],\"bootstrap_sequence\":[{{\"step\":\"ensure_home\",\"service\":\"/services/home\",\"invoke_path\":\"/services/home/control/ensure.json\",\"payload\":{{\"agent_id\":\"{s}\",\"project_id\":\"{s}\"}},\"required\":true}},{{\"step\":\"verify_generic_services\",\"service\":\"/services/mounts\",\"required_services\":[\"home\",\"mounts\",\"workers\",\"terminal\",\"git\",\"search_code\",\"library\",\"events\"],\"repair_invoke_path\":\"/services/mounts/control/bind.json\",\"target_template\":\"{s}\",\"required\":true}},{{\"step\":\"optional_worker_register\",\"service\":\"/services/workers\",\"invoke_path\":\"/services/workers/control/register.json\",\"default_venoms\":[\"memory\",\"sub_brains\"],\"required\":false}}],\"persistence\":{{\"shared_project_binds\":\"persistent\",\"shared_project_mounts\":\"persistent\",\"agent_home\":\"durable_per_agent\",\"worker_loopback\":\"ephemeral\"}},\"detach\":{{\"shared_changes\":\"keep\",\"worker_state\":\"detach_or_ttl_cleanup\"}}}}",
             .{
                 escaped_project_id,
                 escaped_agent_id,
+                escaped_project_id,
+                escaped_project_id,
+                escaped_project_id,
+                escaped_project_id,
+                escaped_project_id,
+                escaped_project_id,
                 escaped_project_id,
                 escaped_project_id,
                 escaped_project_id,
@@ -3675,6 +3724,167 @@ pub const Session = struct {
                 escaped_target_template,
             },
         );
+    }
+
+    fn buildWorkspaceAgentsManagedBlock(self: *Session, project_id: []const u8) ![]u8 {
+        var available_services = std.ArrayListUnmanaged(u8){};
+        defer available_services.deinit(self.allocator);
+        var missing_services = std.ArrayListUnmanaged(u8){};
+        defer missing_services.deinit(self.allocator);
+
+        for (bootstrap_required_services) |service| {
+            const bind_path = try std.fmt.allocPrint(self.allocator, "/services/{s}", .{service.id});
+            defer self.allocator.free(bind_path);
+            const target = if (self.hasProjectBindPath(bind_path)) &available_services else &missing_services;
+            if (target.items.len != 0) try target.appendSlice(self.allocator, ", ");
+            try target.appendSlice(self.allocator, service.id);
+        }
+
+        const available_text = if (available_services.items.len != 0)
+            available_services.items
+        else
+            "none";
+        const missing_text = if (missing_services.items.len != 0)
+            missing_services.items
+        else
+            "none";
+        const vision_text = "Project vision is tracked by Spiderweb project metadata and mission sources. Follow future workspace mission files when they are materialized.";
+
+        return std.fmt.allocPrint(
+            self.allocator,
+            \\# Spiderweb Workspace Agent Contract
+            \\
+            \\{s}
+            \\This section is generated by Spiderweb. Follow it first. Workspace-owner notes live below the managed block and are preserved across updates.
+            \\
+            \\## What This Folder Is
+            \\You are in a mounted Spiderweb workspace. The workspace itself is the durable collaboration surface; agents may come and go.
+            \\
+            \\## Project Vision
+            \\{s}
+            \\
+            \\## Required Bootstrap Flow
+            \\1. Read `AGENTS.md` first.
+            \\2. Treat the mounted namespace root as `/` for this session. Then read only these required files, in order:
+            \\   - `meta/protocol.json`
+            \\   - `projects/{s}/meta/agent_bootstrap_quickref.json`
+            \\   - `projects/{s}/meta/agent_bootstrap.json`
+            \\   - `shared_data/world_seed.json`
+            \\   - `shared_data/items_seed.json`
+            \\   - `shared_data/puzzle_seed.json`
+            \\3. Use `/services/*` as the preferred service surface. Only use fallback roots from `agent_bootstrap.json` if a required service is missing.
+            \\4. If `/services/home/control/ensure.json` succeeds and `agent_bootstrap_quickref.json` says `all_required_services_present=true`, treat bootstrap as complete immediately and start implementation. Do not keep exploring or re-probing services after that point.
+            \\5. Keep project writes inside `nodes/local/fs/` unless the user prompt explicitly says otherwise.
+            \\6. When creating or fixing project files, rewrite the whole target file in one pass. Do not append partial repair fragments to an existing file.
+            \\7. If `game.py` fails `py_compile` or the walkthrough run, delete and recreate `game.py` from scratch before retrying.
+            \\8. Do not run broad scans such as `find`, `rg --files`, or recursive `ls` across `services/`, `projects/`, or `meta/`. Read only the exact listed files directly.
+            \\
+            \\## Namespace Paths
+            \\- Namespace root: `.` and `/`
+            \\- Namespace alias for this file: `AGENTS.md` and `/AGENTS.md`
+            \\- Project write root: `nodes/local/fs` and `/nodes/local/fs`
+            \\- Shared data root: `shared_data` and `/shared_data`
+            \\- Service root: `services` and `/services`
+            \\
+            \\## Current Service Surface
+            \\- Present required services: {s}
+            \\- Missing optional/repairable services: {s}
+            \\
+            \\## Task Source
+            \\For this milestone, the concrete task comes from the user prompt after bootstrap. Do not assume there is a `TASK.md`.
+            \\After the required reads above, move directly into implementation and validation unless a required service is genuinely missing.
+            \\If the user asks for the standard text-adventure task, completion means:
+            \\- Write `nodes/local/fs/game.py`, `nodes/local/fs/game_manifest.json`, `nodes/local/fs/walkthrough.txt`, and `nodes/local/fs/README.md`.
+            \\- Run `python3 -m py_compile nodes/local/fs/game.py`.
+            \\- Run `python3 nodes/local/fs/game.py < nodes/local/fs/walkthrough.txt`.
+            \\- Run `python3 nodes/local/fs/validate_game.py --workspace nodes/local/fs --shared-data shared_data --output nodes/local/fs/game_validation.json`.
+            \\- If a validation step fails, fix the project files and rerun only the failed step.
+            \\- Do not stop after creating partial outputs. Finish when all required files exist and validation succeeds.
+            \\
+            \\## Future Missions
+            \\If the workspace later materializes mission files under `.spiderweb/` or exposes `/services/missions`, treat them as workspace-owned guidance in addition to the user prompt.
+            \\
+            \\{s}
+            ,
+            .{
+                workspace_agents_managed_begin,
+                vision_text,
+                project_id,
+                project_id,
+                available_text,
+                missing_text,
+                workspace_agents_managed_end,
+            },
+        );
+    }
+
+    fn mergeWorkspaceAgentsContract(self: *Session, managed_block: []const u8, existing: ?[]const u8) ![]u8 {
+        const placeholder =
+            "## Workspace Owner Notes\n\nAdd custom workspace-specific rules here. Spiderweb preserves everything outside the managed block.\n";
+
+        if (existing) |current| {
+            const begin_index = std.mem.indexOf(u8, current, workspace_agents_managed_begin);
+            const end_index = std.mem.indexOf(u8, current, workspace_agents_managed_end);
+            if (begin_index != null and end_index != null and end_index.? >= begin_index.?) {
+                const suffix_start = end_index.? + workspace_agents_managed_end.len;
+                const prefix = current[0..begin_index.?];
+                const suffix = current[suffix_start..];
+                return std.fmt.allocPrint(self.allocator, "{s}{s}{s}", .{ prefix, managed_block, suffix });
+            }
+            if (std.mem.trim(u8, current, " \t\r\n").len != 0) {
+                return std.fmt.allocPrint(
+                    self.allocator,
+                    "{s}\n\n{s}\n{s}",
+                    .{ managed_block, placeholder, current },
+                );
+            }
+        }
+
+        return std.fmt.allocPrint(self.allocator, "{s}\n\n{s}", .{ managed_block, placeholder });
+    }
+
+    fn readExistingWorkspaceAgentsContract(self: *Session) !?[]u8 {
+        const host_path = self.resolveMissionContractHostPath(workspace_agents_contract_path) catch return null;
+        defer self.allocator.free(host_path);
+
+        const safe_host_path = (try self.resolveLocalFsSafeHostPath(host_path)) orelse return null;
+        defer self.allocator.free(safe_host_path);
+
+        var file = if (std.fs.path.isAbsolute(safe_host_path))
+            std.fs.openFileAbsolute(safe_host_path, .{}) catch return null
+        else
+            std.fs.cwd().openFile(safe_host_path, .{}) catch return null;
+        defer file.close();
+
+        const existing = try file.readToEndAlloc(self.allocator, 1024 * 1024);
+        return existing;
+    }
+
+    fn seedWorkspaceAgentsContract(self: *Session, project_id: []const u8) !void {
+        const managed_block = try self.buildWorkspaceAgentsManagedBlock(project_id);
+        defer self.allocator.free(managed_block);
+
+        const existing = try self.readExistingWorkspaceAgentsContract();
+        defer if (existing) |value| self.allocator.free(value);
+        const merged = try self.mergeWorkspaceAgentsContract(managed_block, existing);
+        defer self.allocator.free(merged);
+
+        if (self.lookupChild(self.root_id, "AGENTS.md")) |file_id| {
+            try self.setFileContent(file_id, merged);
+        } else {
+            _ = try self.addFile(self.root_id, "AGENTS.md", merged, false, .none);
+        }
+
+        const local_fs_dir = self.resolveAbsolutePathNoBinds(local_fs_world_prefix);
+        if (local_fs_dir) |dir_id| {
+            if (self.lookupChild(dir_id, "AGENTS.md")) |file_id| {
+                try self.setFileContent(file_id, merged);
+            } else {
+                _ = try self.addFile(dir_id, "AGENTS.md", merged, true, .none);
+            }
+        }
+
+        self.writeMissionContractFile(workspace_agents_contract_path, merged) catch {};
     }
 
     fn buildProjectSourcesJson(
@@ -9928,6 +10138,77 @@ test "acheron_session: preferred service paths use workspace bindings when avail
     const unbound_github_path = try unbound_session.resolvePreferredServicePath("github_pr", "/control/sync.json");
     defer allocator.free(unbound_github_path);
     try std.testing.expectEqualStrings("/global/github_pr/control/sync.json", unbound_github_path);
+}
+
+test "acheron_session: workspace AGENTS contract is seeded and preserves user notes" {
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    try tmp_dir.dir.makePath("exports");
+    try tmp_dir.dir.writeFile(.{
+        .sub_path = "exports/AGENTS.md",
+        .data = "## Workspace Owner Notes\n\nKeep custom lint rules in mind.\n",
+    });
+
+    const root = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+    const exports_dir = try std.fs.path.join(allocator, &.{ root, "exports" });
+    defer allocator.free(exports_dir);
+
+    var control_plane = control_plane_mod.ControlPlane.init(allocator);
+    defer control_plane.deinit();
+
+    const project_json = try control_plane.createProject(
+        "{\"name\":\"AgentsSeeded\",\"vision\":\"Deliver the mounted workspace contract\"}",
+    );
+    defer allocator.free(project_json);
+
+    var parsed_project = try std.json.parseFromSlice(std.json.Value, allocator, project_json, .{});
+    defer parsed_project.deinit();
+    const project_id = parsed_project.value.object.get("project_id").?.string;
+    const project_token = parsed_project.value.object.get("project_token").?.string;
+
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createUnavailable(
+        allocator,
+        "execution_failed",
+        "runtime unavailable",
+    );
+    defer runtime_handle.destroy();
+
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "codex",
+        .{
+            .project_id = project_id,
+            .project_token = project_token,
+            .local_fs_export_root = exports_dir,
+            .agents_dir = ".does-not-exist",
+            .projects_dir = ".does-not-exist",
+            .control_plane = &control_plane,
+            .actor_type = "agent",
+            .actor_id = "codex",
+        },
+    );
+    defer session.deinit();
+
+    const namespace_agents = try session.tryReadInternalPath("/AGENTS.md");
+    defer if (namespace_agents) |value| allocator.free(value);
+    try std.testing.expect(namespace_agents != null);
+    try std.testing.expect(std.mem.indexOf(u8, namespace_agents.?, workspace_agents_managed_begin) != null);
+    try std.testing.expect(std.mem.indexOf(u8, namespace_agents.?, "Project vision is tracked by Spiderweb project metadata") != null);
+    try std.testing.expect(std.mem.indexOf(u8, namespace_agents.?, "Keep custom lint rules in mind.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, namespace_agents.?, "TASK.md") == null);
+
+    const workspace_agents = try session.tryReadInternalPath("/nodes/local/fs/AGENTS.md");
+    defer if (workspace_agents) |value| allocator.free(value);
+    try std.testing.expect(workspace_agents != null);
+    try std.testing.expectEqualStrings(namespace_agents.?, workspace_agents.?);
 }
 
 test "acheron_session: services terminal exec updates live service status and result" {
