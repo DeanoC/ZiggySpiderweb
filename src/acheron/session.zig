@@ -262,6 +262,7 @@ const Node = struct {
     writable: bool,
     content: []u8,
     last_dynamic_refresh_ms: i64 = 0,
+    dynamic_refresh_in_progress: bool = false,
     children: std.StringHashMapUnmanaged(u32) = .{},
     special: SpecialKind = .none,
 
@@ -273,7 +274,6 @@ const Node = struct {
     }
 };
 
-const dynamic_directory_refresh_ttl_ms: i64 = 5_000;
 const slow_dynamic_directory_refresh_warn_ms: u64 = 100;
 
 const FidState = struct {
@@ -1155,13 +1155,17 @@ pub const Session = struct {
         const previous_refresh_ms = blk: {
             const node = self.nodes.getPtr(dir_id) orelse return;
             if (node.kind != .dir) return;
-            if (node.last_dynamic_refresh_ms != 0 and (now_ms - node.last_dynamic_refresh_ms) < dynamic_directory_refresh_ttl_ms) {
-                return;
-            }
+            if (node.dynamic_refresh_in_progress) return;
             const previous = node.last_dynamic_refresh_ms;
             node.last_dynamic_refresh_ms = now_ms;
+            node.dynamic_refresh_in_progress = true;
             break :blk previous;
         };
+        defer {
+            if (self.nodes.getPtr(dir_id)) |node| {
+                node.dynamic_refresh_in_progress = false;
+            }
+        }
         errdefer {
             if (self.nodes.getPtr(dir_id)) |node| {
                 node.last_dynamic_refresh_ms = previous_refresh_ms;
@@ -3805,7 +3809,7 @@ pub const Session = struct {
             \\If the workspace later materializes mission files under `.spiderweb/` or exposes `/services/missions`, treat them as workspace-owned guidance in addition to the user prompt.
             \\
             \\{s}
-            ,
+        ,
             .{
                 workspace_agents_managed_begin,
                 vision_text,
@@ -10582,6 +10586,120 @@ test "acheron_session: local fs export rejects symlink targets outside export ro
     const leak = try session.tryReadInternalPath("/nodes/local/fs/leak.txt");
     defer if (leak) |value| allocator.free(value);
     try std.testing.expect(leak == null);
+}
+
+test "acheron_session: local fs refresh sees new files immediately" {
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    try tmp_dir.dir.makePath("exports");
+    try tmp_dir.dir.writeFile(.{
+        .sub_path = "exports/first.txt",
+        .data = "one",
+    });
+
+    const root = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+    const exports_dir = try std.fs.path.join(allocator, &.{ root, "exports" });
+    defer allocator.free(exports_dir);
+
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createUnavailable(
+        allocator,
+        "execution_failed",
+        "runtime unavailable",
+    );
+    defer runtime_handle.destroy();
+
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "default",
+        .{
+            .local_fs_export_root = exports_dir,
+            .agents_dir = ".does-not-exist",
+            .projects_dir = ".does-not-exist",
+        },
+    );
+    defer session.deinit();
+
+    const local_fs_dir = session.resolveAbsolutePathNoBinds("/nodes/local/fs") orelse return error.MissingNode;
+
+    try session.refreshDynamicDirectory(local_fs_dir);
+    try std.testing.expect(session.lookupChild(local_fs_dir, "first.txt") != null);
+
+    try tmp_dir.dir.writeFile(.{
+        .sub_path = "exports/second.txt",
+        .data = "two",
+    });
+
+    try session.refreshDynamicDirectory(local_fs_dir);
+    try std.testing.expect(session.lookupChild(local_fs_dir, "second.txt") != null);
+}
+
+test "acheron_session: dynamic refresh skips re-entrant invocation" {
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    try tmp_dir.dir.makePath("exports");
+    try tmp_dir.dir.writeFile(.{
+        .sub_path = "exports/first.txt",
+        .data = "one",
+    });
+
+    const root = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+    const exports_dir = try std.fs.path.join(allocator, &.{ root, "exports" });
+    defer allocator.free(exports_dir);
+
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createUnavailable(
+        allocator,
+        "execution_failed",
+        "runtime unavailable",
+    );
+    defer runtime_handle.destroy();
+
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "default",
+        .{
+            .local_fs_export_root = exports_dir,
+            .agents_dir = ".does-not-exist",
+            .projects_dir = ".does-not-exist",
+        },
+    );
+    defer session.deinit();
+
+    const local_fs_dir = session.resolveAbsolutePathNoBinds("/nodes/local/fs") orelse return error.MissingNode;
+
+    try session.refreshDynamicDirectory(local_fs_dir);
+    try std.testing.expect(session.lookupChild(local_fs_dir, "first.txt") != null);
+
+    const local_fs_node = session.nodes.getPtr(local_fs_dir) orelse return error.MissingNode;
+    local_fs_node.dynamic_refresh_in_progress = true;
+    defer local_fs_node.dynamic_refresh_in_progress = false;
+
+    try tmp_dir.dir.writeFile(.{
+        .sub_path = "exports/second.txt",
+        .data = "two",
+    });
+
+    try session.refreshDynamicDirectory(local_fs_dir);
+    try std.testing.expect(session.lookupChild(local_fs_dir, "second.txt") == null);
+
+    local_fs_node.dynamic_refresh_in_progress = false;
+    try session.refreshDynamicDirectory(local_fs_dir);
+    try std.testing.expect(session.lookupChild(local_fs_dir, "second.txt") != null);
 }
 
 test "session: hostPathMatchesPrefixBoundary handles native separators" {
