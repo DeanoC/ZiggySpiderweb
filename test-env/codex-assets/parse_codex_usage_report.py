@@ -404,7 +404,7 @@ def main() -> int:
 
             if category == "host_local":
                 append_unique(host_local_paths, normalized_path)
-                if path_within_root(normalized_path, str(repo_root)):
+                if path_within_root(normalized_path, str(repo_root)) and normalized_path != str(repo_root):
                     append_unique(search_code_paths, normalized_path)
                 if syscall_succeeded(line) and ("/.git" in normalized_path or normalized_path.endswith(".git")):
                     append_unique(git_like_paths, normalized_path)
@@ -451,7 +451,12 @@ def main() -> int:
                     elif change_scope == "ephemeral":
                         append_unique(ephemeral_changes, action)
 
-            if is_write(syscall, line) and normalized_path not in ALLOWED_SPECIAL_WRITES and category not in {"mounted_workspace", "mounted_remote_node", "artifact_runtime", "allowed_local_runtime"}:
+            if (
+                syscall_succeeded(line)
+                and is_write(syscall, line)
+                and normalized_path not in ALLOWED_SPECIAL_WRITES
+                and category not in {"mounted_workspace", "mounted_remote_node", "artifact_runtime", "allowed_local_runtime"}
+            ):
                 if category == "host_local" and path_within_any_root(normalized_path, allowed_host_write_prefixes):
                     append_unique(allowed_host_writes, normalized_path)
                 else:
