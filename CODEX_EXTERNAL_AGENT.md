@@ -232,13 +232,13 @@ OPENAI_API_KEY=... \
 bash test-env/test-external-codex-workspace.sh
 ```
 
-If you do need to override the launcher, use a template that keeps Codex rooted in `/nodes/local/fs` and adds only the metadata/data directories it needs:
+If you do need to override the launcher, use a template that keeps Codex rooted in the namespace root and adds only the metadata/data directories it needs:
 
 ```bash
 CODEX_MODE=live \
 CODEX_AUTH_MODE=api_key \
 OPENAI_API_KEY=... \
-CODEX_LAUNCH_CMD='cat {prompt_file} | {codex_bin} exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox --ephemeral --add-dir {namespace_meta_dir} --add-dir {project_meta_dir} --add-dir {shared_data_dir} --add-dir {artifact_dir} -C {workspace_root} -o {artifact_dir}/codex_last_message.txt -' \
+CODEX_LAUNCH_CMD='cat {prompt_file} | {codex_bin} exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox --ephemeral --add-dir {namespace_meta_dir} --add-dir {project_meta_dir} --add-dir {shared_data_dir} --add-dir {artifact_dir} -C {namespace_root} -o {artifact_dir}/codex_last_message.txt -' \
 bash test-env/test-external-codex-workspace.sh
 ```
 

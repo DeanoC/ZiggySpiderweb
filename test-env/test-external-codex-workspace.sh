@@ -1040,8 +1040,8 @@ configure_codex_env() {
         XDG_STATE_HOME="$xdg_state_home"
         TMPDIR="$tmp_dir"
         PATH="$CODEX_EXEC_PATH"
-        PWD="$MOUNT_WORKSPACE_PATH"
-        GIT_CEILING_DIRECTORIES="$MOUNT_WORKSPACE_PATH"
+        PWD="$MOUNT_POINT"
+        GIT_CEILING_DIRECTORIES="$MOUNT_POINT"
         GIT_DISCOVERY_ACROSS_FILESYSTEM=0
         GIT_CONFIG_NOSYSTEM=1
         GIT_CONFIG_GLOBAL=/dev/null
@@ -1171,7 +1171,7 @@ setup_codex_auth() {
 }
 
 default_codex_launch_cmd() {
-    printf '%s' '{codex_bin} exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox --ephemeral --color never --add-dir {namespace_meta_dir} --add-dir {project_meta_dir} --add-dir {shared_data_dir} --add-dir {artifact_dir} -C {workspace_root} -o {artifact_dir}/codex_last_message.txt -'
+    printf '%s' '{codex_bin} exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox --ephemeral --color never --add-dir {namespace_meta_dir} --add-dir {project_meta_dir} --add-dir {shared_data_dir} --add-dir {artifact_dir} -C {namespace_root} -o {artifact_dir}/codex_last_message.txt -'
 }
 
 render_codex_launch_command() {
@@ -1313,7 +1313,7 @@ run_live_codex() {
         local quoted_pty_inner_cmd
         quoted_pty_inner_cmd="$(shell_quote "$pty_inner_cmd")"
         (
-            cd "$MOUNT_WORKSPACE_PATH"
+            cd "$MOUNT_POINT"
             "${CODEX_ENV_BASE[@]}" \
                 SHELL=/bin/bash \
                 CODEX_STDIN_LAUNCHER_SHELL=/bin/bash \
@@ -1326,7 +1326,7 @@ run_live_codex() {
         ) &
     else
         (
-            cd "$MOUNT_WORKSPACE_PATH"
+            cd "$MOUNT_POINT"
             "${CODEX_ENV_BASE[@]}" \
                 SHELL=/bin/bash \
                 CODEX_STDIN_LAUNCHER_SHELL=/bin/bash \
