@@ -4,9 +4,6 @@
 [submodule "deps/spider-protocol"]
 	path = deps/spider-protocol
 	url = https://github.com/DeanoC/SpiderProtocol.git
-[submodule "deps/ziggy-piai"]
-	path = deps/ziggy-piai
-	url = https://github.com/DeanoC/ZiggyPiAi.git
 [submodule "deps/ziggy-memory-store"]
 	path = deps/ziggy-memory-store
 	url = https://github.com/DeanoC/ZiggyMemoryStore.git

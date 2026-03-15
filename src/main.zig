@@ -1,6 +1,6 @@
 const std = @import("std");
 
-const server = @import("server_piai.zig");
+const server = @import("server.zig");
 const Config = @import("config.zig");
 
 pub fn main() !void {
