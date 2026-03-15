@@ -415,9 +415,19 @@ pub fn mountpointMustExistBeforeMount(backend: FuseAdapter.MountBackend) bool {
     };
 }
 
+const minimum_macos_fskit_version = std.SemanticVersion{ .major = 15, .minor = 4, .patch = 0 };
+
+fn isMacosFskitSupportedVersion(version: std.SemanticVersion) bool {
+    return version.order(minimum_macos_fskit_version) != .lt;
+}
+
 pub fn isCurrentMacosFskitSupported() bool {
     if (builtin.os.tag != .macos) return false;
-    return builtin.target.os.isAtLeast(.macos, .{ .major = 15, .minor = 4, .patch = 0 }) orelse false;
+
+    // Use the host's runtime version rather than the compile target so local
+    // mount support tracks the actual machine we're running on.
+    const runtime_target = std.zig.system.resolveTargetQuery(.{}) catch return false;
+    return isMacosFskitSupportedVersion(runtime_target.os.version_range.semver.min);
 }
 
 pub fn validateLocalMountRequest(mountpoint: []const u8, backend: FuseAdapter.MountBackend) !void {
@@ -1673,6 +1683,12 @@ test "fs_fuse_adapter: darwin rejects unsupported backend and version" {
         error.UnsupportedMacosVersion,
         validateMountRequestForOs(.macos, "/Volumes/spiderweb-demo", .auto, false),
     );
+}
+
+test "fs_fuse_adapter: darwin fskit support is gated by runtime version" {
+    try std.testing.expect(!isMacosFskitSupportedVersion(.{ .major = 15, .minor = 3, .patch = 9 }));
+    try std.testing.expect(isMacosFskitSupportedVersion(.{ .major = 15, .minor = 4, .patch = 0 }));
+    try std.testing.expect(isMacosFskitSupportedVersion(.{ .major = 15, .minor = 6, .patch = 0 }));
 }
 
 test "fs_fuse_adapter: darwin mount options prefer fskit with generated volume name" {
