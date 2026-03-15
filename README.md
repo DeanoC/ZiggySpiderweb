@@ -6,7 +6,7 @@
 
 Spiderweb is a **workspace host + Acheron-based distributed RPC filesystem** for external agents. It provides the workspace, virtual filesystem, nodes, venoms, and control plane. The agent process itself lives outside Spiderweb and uses the mounted workspace as its contract.
 
-Built in Zig. The Spiderweb server remains Linux-oriented, and the standalone `spiderweb-fs-mount` client builds for Linux and Windows.
+Built in Zig. The Spiderweb workspace host runs on Linux and macOS. The standalone `spiderweb-fs-mount` client has real local mount backends on Linux, Windows, and macOS. On macOS, local mounts require macFUSE 5.x and a mountpoint under `/Volumes/<name>`.
 
 ## Vision
 
@@ -50,6 +50,13 @@ zig build
   --auth-token <admin-or-user-token> \
   mount /mnt/spiderweb-demo
 
+# macOS local mount example (requires macFUSE 5.x)
+./zig-out/bin/spiderweb-fs-mount \
+  --workspace-url ws://127.0.0.1:18790/ \
+  --workspace-id <workspace-id> \
+  --auth-token <admin-or-user-token> \
+  mount /Volumes/spiderweb-demo
+
 # Start an external worker against the mounted folder
 ../SpiderMonkey/zig-out/bin/spider-monkey \
   run \
@@ -60,7 +67,7 @@ zig build
 
 ## Standalone Mount Client
 
-`spiderweb-fs-mount` can now run as a standalone client on machines that do not host Spiderweb locally.
+`spiderweb-fs-mount` can now run as a standalone client on machines that do not host Spiderweb locally. Real local mount backends are currently supported on Linux, Windows, and macOS.
 
 - `--workspace-url <ws-url>` keeps the existing routed `/v2/fs` mount mode.
 - `--namespace-url <ws-url>` connects to the main Spiderweb websocket, attaches an Acheron session root, and mounts the full namespace (`/agents`, `/nodes`, `/global`, optional `/debug`).
@@ -86,8 +93,14 @@ Examples:
 # Existing routed-FS mode
 ./zig-out/bin/spiderweb-fs-mount --workspace-url ws://127.0.0.1:18790/ mount /mnt/spiderweb
 
+# macOS routed-FS mode (requires macFUSE 5.x)
+./zig-out/bin/spiderweb-fs-mount --workspace-url ws://127.0.0.1:18790/ mount /Volumes/spiderweb
+
 # Full namespace mode
 ./zig-out/bin/spiderweb-fs-mount --namespace-url ws://127.0.0.1:18790/ --workspace-id ws-demo mount /mnt/spiderweb
+
+# macOS full namespace mode (requires macFUSE 5.x)
+./zig-out/bin/spiderweb-fs-mount --namespace-url ws://127.0.0.1:18790/ --workspace-id ws-demo mount /Volumes/spiderweb
 
 # Namespace smoke harness (low-level commands, optional real mount when SMOKE_USE_OS_MOUNT=1)
 SPIDERWEB_WORKSPACE_ID=ws-demo ./scripts/acheron-namespace-smoke.sh

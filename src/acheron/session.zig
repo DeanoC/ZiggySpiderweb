@@ -716,14 +716,28 @@ pub const Session = struct {
         return if (self.canUseNamespaceShellExec()) "shared-absolute" else "localfs-only";
     }
 
+    pub fn terminalSupportsInteractiveSessions(self: *const Session) bool {
+        _ = self;
+        return builtin.os.tag == .linux;
+    }
+
     fn canUseNamespaceShellExec(self: *const Session) bool {
-        return builtin.os.tag == .linux and
+        return self.terminalSupportsInteractiveSessions() and
             self.project_id != null and
             self.namespace_mount_url != null and
             self.namespace_session_key != null and
             self.sandbox_mounts_root != null and
             self.sandbox_launcher != null and
             self.sandbox_fs_mount_bin != null;
+    }
+
+    fn buildUnsupportedInteractiveTerminalError(self: *Session, tag: u16) ![]u8 {
+        return unified.buildFsrpcError(
+            self.allocator,
+            tag,
+            "unsupported",
+            "interactive terminal sessions are currently supported on Linux only",
+        );
     }
 
     fn cleanupNamespaceMount(self: *Session) void {
@@ -1284,13 +1298,13 @@ pub const Session = struct {
                 ),
                 error.TerminalSessionNotFound => unified.buildFsrpcError(self.allocator, tag, "enoent", "terminal session not found"),
                 error.TerminalSessionClosed => unified.buildFsrpcError(self.allocator, tag, "eperm", "terminal session is closed"),
-                error.UnsupportedPlatform => unified.buildFsrpcError(self.allocator, tag, "unsupported", "pty terminal sessions are currently supported on linux only"),
+                error.UnsupportedPlatform => self.buildUnsupportedInteractiveTerminalError(tag),
                 error.TerminalPtyUnavailable => unified.buildFsrpcError(self.allocator, tag, "unavailable", "pty backend unavailable: install util-linux script"),
                 else => err,
             },
             .terminal_v2_create => switch (err) {
                 error.InvalidPayload => unified.buildFsrpcError(self.allocator, tag, "invalid", "terminal create payload must be a JSON object with optional session_id/label/cwd"),
-                error.UnsupportedPlatform => unified.buildFsrpcError(self.allocator, tag, "unsupported", "pty terminal sessions are currently supported on linux only"),
+                error.UnsupportedPlatform => self.buildUnsupportedInteractiveTerminalError(tag),
                 error.TerminalPtyUnavailable => unified.buildFsrpcError(self.allocator, tag, "unavailable", "pty backend unavailable: install util-linux script"),
                 else => err,
             },
@@ -1298,21 +1312,21 @@ pub const Session = struct {
                 error.InvalidPayload => unified.buildFsrpcError(self.allocator, tag, "invalid", "terminal resume payload must include session_id"),
                 error.TerminalSessionNotFound => unified.buildFsrpcError(self.allocator, tag, "enoent", "terminal session not found"),
                 error.TerminalSessionClosed => unified.buildFsrpcError(self.allocator, tag, "eperm", "terminal session is closed"),
-                error.UnsupportedPlatform => unified.buildFsrpcError(self.allocator, tag, "unsupported", "pty terminal sessions are currently supported on linux only"),
+                error.UnsupportedPlatform => self.buildUnsupportedInteractiveTerminalError(tag),
                 else => err,
             },
             .terminal_v2_close => switch (err) {
                 error.InvalidPayload => unified.buildFsrpcError(self.allocator, tag, "invalid", "terminal close payload must include session_id when no current session exists"),
                 error.TerminalSessionNotFound => unified.buildFsrpcError(self.allocator, tag, "enoent", "terminal session not found"),
                 error.TerminalSessionClosed => unified.buildFsrpcError(self.allocator, tag, "eperm", "terminal session is closed"),
-                error.UnsupportedPlatform => unified.buildFsrpcError(self.allocator, tag, "unsupported", "pty terminal sessions are currently supported on linux only"),
+                error.UnsupportedPlatform => self.buildUnsupportedInteractiveTerminalError(tag),
                 else => err,
             },
             .terminal_v2_exec => switch (err) {
                 error.InvalidPayload => unified.buildFsrpcError(self.allocator, tag, "invalid", "terminal exec payload must include command or argv (optional session_id/cwd/timeout_ms)"),
                 error.TerminalSessionNotFound => unified.buildFsrpcError(self.allocator, tag, "enoent", "terminal session not found"),
                 error.TerminalSessionClosed => unified.buildFsrpcError(self.allocator, tag, "eperm", "terminal session is closed"),
-                error.UnsupportedPlatform => unified.buildFsrpcError(self.allocator, tag, "unsupported", "pty terminal sessions are currently supported on linux only"),
+                error.UnsupportedPlatform => self.buildUnsupportedInteractiveTerminalError(tag),
                 error.TerminalPtyUnavailable => unified.buildFsrpcError(self.allocator, tag, "unavailable", "pty backend unavailable: install util-linux script"),
                 else => err,
             },
@@ -1320,21 +1334,21 @@ pub const Session = struct {
                 error.InvalidPayload => unified.buildFsrpcError(self.allocator, tag, "invalid", "terminal write payload must include input/command/data_b64 (optional session_id)"),
                 error.TerminalSessionNotFound => unified.buildFsrpcError(self.allocator, tag, "enoent", "terminal session not found"),
                 error.TerminalSessionClosed => unified.buildFsrpcError(self.allocator, tag, "eperm", "terminal session is closed"),
-                error.UnsupportedPlatform => unified.buildFsrpcError(self.allocator, tag, "unsupported", "pty terminal sessions are currently supported on linux only"),
+                error.UnsupportedPlatform => self.buildUnsupportedInteractiveTerminalError(tag),
                 else => err,
             },
             .terminal_v2_read => switch (err) {
                 error.InvalidPayload => unified.buildFsrpcError(self.allocator, tag, "invalid", "terminal read payload must be object with optional session_id/max_bytes/timeout_ms"),
                 error.TerminalSessionNotFound => unified.buildFsrpcError(self.allocator, tag, "enoent", "terminal session not found"),
                 error.TerminalSessionClosed => unified.buildFsrpcError(self.allocator, tag, "eperm", "terminal session is closed"),
-                error.UnsupportedPlatform => unified.buildFsrpcError(self.allocator, tag, "unsupported", "pty terminal sessions are currently supported on linux only"),
+                error.UnsupportedPlatform => self.buildUnsupportedInteractiveTerminalError(tag),
                 else => err,
             },
             .terminal_v2_resize => switch (err) {
                 error.InvalidPayload => unified.buildFsrpcError(self.allocator, tag, "invalid", "terminal resize payload must include cols and rows (optional session_id)"),
                 error.TerminalSessionNotFound => unified.buildFsrpcError(self.allocator, tag, "enoent", "terminal session not found"),
                 error.TerminalSessionClosed => unified.buildFsrpcError(self.allocator, tag, "eperm", "terminal session is closed"),
-                error.UnsupportedPlatform => unified.buildFsrpcError(self.allocator, tag, "unsupported", "pty terminal sessions are currently supported on linux only"),
+                error.UnsupportedPlatform => self.buildUnsupportedInteractiveTerminalError(tag),
                 else => err,
             },
             else => err,
@@ -9918,6 +9932,8 @@ fn protocolReadFile(
 }
 
 test "acheron_session: terminal control writes commit on clunk after chunked appends" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
     const allocator = std.testing.allocator;
 
     const runtime_handle = try runtime_handle_mod.RuntimeHandle.createUnavailable(
@@ -10029,6 +10045,59 @@ test "acheron_session: terminal control writes commit on clunk after chunked app
     );
     defer allocator.free(after_clunk);
     try std.testing.expect(std.mem.indexOf(u8, after_clunk, "split-session") != null);
+}
+
+test "acheron_session: terminal metadata disables interactive sessions off linux" {
+    if (builtin.os.tag == .linux) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createUnavailable(
+        allocator,
+        "execution_failed",
+        "runtime unavailable",
+    );
+    defer runtime_handle.destroy();
+
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "agent-under-test",
+        .{
+            .actor_type = "agent",
+            .actor_id = "agent-under-test",
+        },
+    );
+    defer session.deinit();
+
+    const create_error = try protocolWriteFileExpectError(
+        &session,
+        allocator,
+        4050,
+        4051,
+        &.{ "nodes", "local", "venoms", "terminal", "control", "create.json" },
+        "{}",
+        4052,
+        "unsupported",
+    );
+    defer allocator.free(create_error);
+
+    const status_json = try protocolReadFile(
+        &session,
+        allocator,
+        4053,
+        4054,
+        &.{ "nodes", "local", "venoms", "terminal", "STATUS.json" },
+        4055,
+    );
+    defer allocator.free(status_json);
+    try std.testing.expect(std.mem.indexOf(u8, status_json, "\"interactive\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status_json, "\"sessionized\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status_json, "\"pty\":false") != null);
 }
 
 fn runTestCommandCapture(
@@ -10534,6 +10603,103 @@ test "acheron_session: pr_review run_validation denied when shell_exec is blocke
         741,
         &.{ "nodes", "local", "venoms", "terminal", "current.json" },
         1820,
+    );
+    defer allocator.free(terminal_current);
+    try std.testing.expect(std.mem.indexOf(u8, terminal_current, "\"session\":null") != null);
+}
+
+test "acheron_session: pr_review run_validation succeeds without interactive terminal sessions" {
+    const allocator = std.testing.allocator;
+
+    var mission_store = try mission_store_mod.MissionStore.initWithPath(allocator, null);
+    defer mission_store.deinit();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    try tmp_dir.dir.makePath("exports");
+
+    const root = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+    const exports_dir = try std.fs.path.join(allocator, &.{ root, "exports" });
+    defer allocator.free(exports_dir);
+
+    const runtime_handle = try runtime_handle_mod.RuntimeHandle.createUnavailable(
+        allocator,
+        "execution_failed",
+        "runtime unavailable",
+    );
+    defer runtime_handle.destroy();
+
+    var job_index = chat_job_index.ChatJobIndex.init(allocator, "");
+    defer job_index.deinit();
+
+    var session = try Session.initWithOptions(
+        allocator,
+        runtime_handle,
+        &job_index,
+        "reviewer-host",
+        .{
+            .mission_store = &mission_store,
+            .local_fs_export_root = exports_dir,
+            .actor_type = "agent",
+            .actor_id = "reviewer-host",
+        },
+    );
+    defer session.deinit();
+
+    try protocolWriteFile(
+        &session,
+        allocator,
+        1821,
+        1822,
+        &.{ "agents", "self", "pr_review", "control", "start.json" },
+        "{\"repo_key\":\"DeanoC/Spiderweb\",\"pr_number\":130,\"checkout_path\":\"/nodes/local/fs\",\"default_review_commands\":[\"printf validation-ok\"]}",
+        1823,
+    );
+
+    const start_result = try protocolReadFile(
+        &session,
+        allocator,
+        1824,
+        1825,
+        &.{ "agents", "self", "pr_review", "result.json" },
+        1826,
+    );
+    defer allocator.free(start_result);
+    const mission_id = try extractMissionIdFromResultPayload(allocator, start_result);
+    defer allocator.free(mission_id);
+
+    const validation_payload = try std.fmt.allocPrint(allocator, "{{\"mission_id\":\"{s}\"}}", .{mission_id});
+    defer allocator.free(validation_payload);
+    try protocolWriteFile(
+        &session,
+        allocator,
+        1827,
+        1828,
+        &.{ "agents", "self", "pr_review", "control", "run_validation.json" },
+        validation_payload,
+        1829,
+    );
+
+    const pr_review_result = try protocolReadFile(
+        &session,
+        allocator,
+        1830,
+        1831,
+        &.{ "agents", "self", "pr_review", "result.json" },
+        1832,
+    );
+    defer allocator.free(pr_review_result);
+    try std.testing.expect(std.mem.indexOf(u8, pr_review_result, "\"operation\":\"run_validation\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pr_review_result, "\"ok\":true") != null);
+
+    const terminal_current = try protocolReadFile(
+        &session,
+        allocator,
+        1833,
+        1834,
+        &.{ "nodes", "local", "venoms", "terminal", "current.json" },
+        1835,
     );
     defer allocator.free(terminal_current);
     try std.testing.expect(std.mem.indexOf(u8, terminal_current, "\"session\":null") != null);

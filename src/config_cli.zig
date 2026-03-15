@@ -211,45 +211,89 @@ fn handleConfigCommand(allocator: std.mem.Allocator, args: []const []const u8) !
         const msg = try std.fmt.bufPrint(&buf, "{s}\n", .{config.config_path});
         try stdout_file.writeAll(msg);
     } else if (std.mem.eql(u8, subcommand, "install-service")) {
-        try installSystemdService(allocator);
+        try installService(allocator);
+    } else if (std.mem.eql(u8, subcommand, "uninstall-service")) {
+        try uninstallService(allocator);
+    } else if (std.mem.eql(u8, subcommand, "service-status")) {
+        try printServiceStatus(allocator);
     } else {
         std.log.err("Unknown config command: {s}", .{subcommand});
-        std.log.info("Available: set-server, set-log, path, install-service", .{});
+        std.log.info("Available: set-server, set-log, path, install-service, uninstall-service, service-status", .{});
         return error.UnknownCommand;
     }
 }
 
-fn installSystemdService(allocator: std.mem.Allocator) !void {
-    const home = std.process.getEnvVarOwned(allocator, "HOME") catch {
-        std.log.err("Could not get HOME directory", .{});
-        return error.MissingHome;
+const ServiceManager = enum {
+    systemd_user,
+    launchd_user,
+    unsupported,
+};
+
+const service_name = "spiderweb";
+
+const CommandResult = struct {
+    stdout: []u8,
+    stderr: []u8,
+    term: std.process.Child.Term,
+
+    fn deinit(self: *CommandResult, allocator: std.mem.Allocator) void {
+        allocator.free(self.stdout);
+        allocator.free(self.stderr);
+        self.* = undefined;
+    }
+};
+
+fn installService(allocator: std.mem.Allocator) !void {
+    return switch (detectServiceManager()) {
+        .systemd_user => installSystemdUserService(allocator),
+        .launchd_user => installLaunchdUserService(allocator),
+        .unsupported => error.UnsupportedPlatform,
     };
-    defer allocator.free(home);
+}
 
-    const repo_dir = try std.fs.path.join(allocator, &.{ home, ".local", "share", "ziggy-spiderweb" });
-    defer allocator.free(repo_dir);
-
-    const working_dir = blk: {
-        std.fs.accessAbsolute(repo_dir, .{}) catch break :blk home;
-        break :blk repo_dir;
+fn uninstallService(allocator: std.mem.Allocator) !void {
+    return switch (detectServiceManager()) {
+        .systemd_user => uninstallSystemdUserService(allocator),
+        .launchd_user => uninstallLaunchdUserService(allocator),
+        .unsupported => error.UnsupportedPlatform,
     };
+}
 
-    const service_dir = try std.fs.path.join(allocator, &.{ home, ".config", "systemd", "user" });
-    defer allocator.free(service_dir);
+fn printServiceStatus(allocator: std.mem.Allocator) !void {
+    return switch (detectServiceManager()) {
+        .systemd_user => printSystemdUserServiceStatus(allocator),
+        .launchd_user => printLaunchdUserServiceStatus(allocator),
+        .unsupported => error.UnsupportedPlatform,
+    };
+}
 
-    try std.fs.cwd().makePath(service_dir);
+fn detectServiceManager() ServiceManager {
+    return switch (builtin.os.tag) {
+        .linux => .systemd_user,
+        .macos => .launchd_user,
+        else => .unsupported,
+    };
+}
 
-    const service_path = try std.fs.path.join(allocator, &.{ service_dir, "spiderweb.service" });
+fn installSystemdUserService(allocator: std.mem.Allocator) !void {
+    const exec_path = try resolveServiceExecutablePath(allocator);
+    defer allocator.free(exec_path);
+    const working_dir = try defaultServiceWorkingDirectory(allocator);
+    defer allocator.free(working_dir);
+    const service_path = try systemdUserServicePath(allocator);
     defer allocator.free(service_path);
 
-    const service_content =
+    if (std.fs.path.dirname(service_path)) |dir| try makePathAny(dir);
+
+    const content = try std.fmt.allocPrint(
+        allocator,
         \\[Unit]
         \\Description=Spiderweb Workspace Host
         \\After=network.target
         \\
         \\[Service]
         \\Type=simple
-        \\ExecStart={s}/.local/bin/spiderweb
+        \\ExecStart={s}
         \\WorkingDirectory={s}
         \\Restart=on-failure
         \\RestartSec=5
@@ -257,17 +301,287 @@ fn installSystemdService(allocator: std.mem.Allocator) !void {
         \\[Install]
         \\WantedBy=default.target
         \\
-    ;
+    ,
+        .{ exec_path, working_dir },
+    );
+    defer allocator.free(content);
 
-    var buf: [1024]u8 = undefined;
-    const content = try std.fmt.bufPrint(&buf, service_content, .{ home, working_dir });
-
-    const file = try std.fs.cwd().createFile(service_path, .{});
+    var file = try createFileAny(service_path, .{ .truncate = true });
     defer file.close();
     try file.writeAll(content);
 
-    std.log.info("Systemd service installed to {s}", .{service_path});
-    std.log.info("Enable with: systemctl --user enable --now spiderweb", .{});
+    try runCommandSuccess(allocator, &.{ "systemctl", "--user", "daemon-reload" });
+    try runCommandSuccess(allocator, &.{ "systemctl", "--user", "enable", "--now", service_name });
+
+    std.log.info("Installed and started systemd user service at {s}", .{service_path});
+}
+
+fn uninstallSystemdUserService(allocator: std.mem.Allocator) !void {
+    const service_path = try systemdUserServicePath(allocator);
+    defer allocator.free(service_path);
+
+    if (try runCommandBestEffort(allocator, &.{ "systemctl", "--user", "disable", "--now", service_name })) |result| {
+        var owned_result = result;
+        owned_result.deinit(allocator);
+    }
+    _ = try deleteFileIfExistsAny(service_path);
+    if (try runCommandBestEffort(allocator, &.{ "systemctl", "--user", "daemon-reload" })) |result| {
+        var owned_result = result;
+        owned_result.deinit(allocator);
+    }
+
+    std.log.info("Removed systemd user service definition at {s}", .{service_path});
+}
+
+fn printSystemdUserServiceStatus(allocator: std.mem.Allocator) !void {
+    const service_path = try systemdUserServicePath(allocator);
+    defer allocator.free(service_path);
+    const installed = pathExists(service_path);
+
+    if (!installed) {
+        const out = try std.fmt.allocPrint(
+            allocator,
+            "Service manager: systemd\n  unit:      {s}\n  installed: no\n",
+            .{service_path},
+        );
+        defer allocator.free(out);
+        try std.fs.File.stdout().writeAll(out);
+        return;
+    }
+
+    var enabled = try runCommandBestEffort(allocator, &.{ "systemctl", "--user", "is-enabled", service_name });
+    defer if (enabled) |*value| value.deinit(allocator);
+    var active = try runCommandBestEffort(allocator, &.{ "systemctl", "--user", "is-active", service_name });
+    defer if (active) |*value| value.deinit(allocator);
+
+    const enabled_text = if (enabled) |value|
+        commandResultSummary(value, "unknown")
+    else
+        "unknown";
+    const active_text = if (active) |value|
+        commandResultSummary(value, "unknown")
+    else
+        "unknown";
+
+    const out = try std.fmt.allocPrint(
+        allocator,
+        "Service manager: systemd\n  unit:      {s}\n  installed: yes\n  enabled:   {s}\n  active:    {s}\n",
+        .{ service_path, enabled_text, active_text },
+    );
+    defer allocator.free(out);
+    try std.fs.File.stdout().writeAll(out);
+}
+
+fn installLaunchdUserService(allocator: std.mem.Allocator) !void {
+    const exec_path = try resolveServiceExecutablePath(allocator);
+    defer allocator.free(exec_path);
+    const working_dir = try defaultServiceWorkingDirectory(allocator);
+    defer allocator.free(working_dir);
+    const plist_path = try launchdPlistPath(allocator);
+    defer allocator.free(plist_path);
+
+    if (std.fs.path.dirname(plist_path)) |dir| try makePathAny(dir);
+
+    const content = try std.fmt.allocPrint(
+        allocator,
+        \\<?xml version="1.0" encoding="UTF-8"?>
+        \\<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        \\<plist version="1.0">
+        \\<dict>
+        \\  <key>Label</key>
+        \\  <string>{s}</string>
+        \\  <key>ProgramArguments</key>
+        \\  <array>
+        \\    <string>{s}</string>
+        \\  </array>
+        \\  <key>WorkingDirectory</key>
+        \\  <string>{s}</string>
+        \\  <key>RunAtLoad</key>
+        \\  <true/>
+        \\  <key>KeepAlive</key>
+        \\  <true/>
+        \\</dict>
+        \\</plist>
+        \\
+    ,
+        .{ service_name, exec_path, working_dir },
+    );
+    defer allocator.free(content);
+
+    var file = try createFileAny(plist_path, .{ .truncate = true });
+    defer file.close();
+    try file.writeAll(content);
+
+    const domain_target = try launchdDomainTarget(allocator);
+    defer allocator.free(domain_target);
+    const service_target = try launchdServiceTarget(allocator);
+    defer allocator.free(service_target);
+
+    if (try runCommandBestEffort(allocator, &.{ "launchctl", "bootout", domain_target, plist_path })) |result| {
+        var owned_result = result;
+        owned_result.deinit(allocator);
+    }
+    try runCommandSuccess(allocator, &.{ "launchctl", "bootstrap", domain_target, plist_path });
+    try runCommandSuccess(allocator, &.{ "launchctl", "kickstart", "-k", service_target });
+
+    std.log.info("Installed and started launchd user service at {s}", .{plist_path});
+}
+
+fn uninstallLaunchdUserService(allocator: std.mem.Allocator) !void {
+    const plist_path = try launchdPlistPath(allocator);
+    defer allocator.free(plist_path);
+    const domain_target = try launchdDomainTarget(allocator);
+    defer allocator.free(domain_target);
+    const service_target = try launchdServiceTarget(allocator);
+    defer allocator.free(service_target);
+
+    if (try runCommandBestEffort(allocator, &.{ "launchctl", "bootout", domain_target, plist_path })) |result| {
+        var owned_result = result;
+        owned_result.deinit(allocator);
+    }
+    if (try runCommandBestEffort(allocator, &.{ "launchctl", "bootout", service_target })) |result| {
+        var owned_result = result;
+        owned_result.deinit(allocator);
+    }
+    _ = try deleteFileIfExistsAny(plist_path);
+
+    std.log.info("Removed launchd user service definition at {s}", .{plist_path});
+}
+
+fn printLaunchdUserServiceStatus(allocator: std.mem.Allocator) !void {
+    const plist_path = try launchdPlistPath(allocator);
+    defer allocator.free(plist_path);
+    const installed = pathExists(plist_path);
+    const service_target = try launchdServiceTarget(allocator);
+    defer allocator.free(service_target);
+
+    var printed = if (installed)
+        try runCommandBestEffort(allocator, &.{ "launchctl", "print", service_target })
+    else
+        null;
+    defer if (printed) |*value| value.deinit(allocator);
+
+    const out = try std.fmt.allocPrint(
+        allocator,
+        "Service manager: launchd\n  plist:      {s}\n  installed:  {s}\n  loaded:     {s}\n",
+        .{
+            plist_path,
+            if (installed) "yes" else "no",
+            if (printed != null and commandExitedSuccessfully(printed.?)) "yes" else "no",
+        },
+    );
+    defer allocator.free(out);
+    try std.fs.File.stdout().writeAll(out);
+}
+
+fn resolveServiceExecutablePath(allocator: std.mem.Allocator) ![]u8 {
+    const self_path = try std.fs.selfExePathAlloc(allocator);
+    defer allocator.free(self_path);
+    const self_dir = std.fs.path.dirname(self_path) orelse return error.InvalidExecutablePath;
+
+    const sibling = try std.fs.path.join(allocator, &.{ self_dir, "spiderweb" });
+    if (pathExists(sibling)) return sibling;
+    allocator.free(sibling);
+
+    const home = try requireHomeDir(allocator);
+    defer allocator.free(home);
+    return std.fs.path.join(allocator, &.{ home, ".local", "bin", "spiderweb" });
+}
+
+fn defaultServiceWorkingDirectory(allocator: std.mem.Allocator) ![]u8 {
+    const home = try requireHomeDir(allocator);
+    defer allocator.free(home);
+
+    const repo_dir = try std.fs.path.join(allocator, &.{ home, ".local", "share", "ziggy-spiderweb" });
+    if (pathExists(repo_dir)) return repo_dir;
+    allocator.free(repo_dir);
+
+    return currentShellWorkingDirectory(allocator);
+}
+
+fn requireHomeDir(allocator: std.mem.Allocator) ![]u8 {
+    return std.process.getEnvVarOwned(allocator, "HOME") catch {
+        std.log.err("Could not get HOME directory", .{});
+        return error.MissingHome;
+    };
+}
+
+fn systemdUserServicePath(allocator: std.mem.Allocator) ![]u8 {
+    const home = try requireHomeDir(allocator);
+    defer allocator.free(home);
+    return std.fs.path.join(allocator, &.{ home, ".config", "systemd", "user", "spiderweb.service" });
+}
+
+fn launchdPlistPath(allocator: std.mem.Allocator) ![]u8 {
+    const home = try requireHomeDir(allocator);
+    defer allocator.free(home);
+    return std.fs.path.join(allocator, &.{ home, "Library", "LaunchAgents", "spiderweb.plist" });
+}
+
+fn launchdDomainTarget(allocator: std.mem.Allocator) ![]u8 {
+    return std.fmt.allocPrint(allocator, "gui/{d}", .{std.posix.getuid()});
+}
+
+fn launchdServiceTarget(allocator: std.mem.Allocator) ![]u8 {
+    const domain_target = try launchdDomainTarget(allocator);
+    defer allocator.free(domain_target);
+    return std.fmt.allocPrint(allocator, "{s}/{s}", .{ domain_target, service_name });
+}
+
+fn runCommandCapture(allocator: std.mem.Allocator, argv: []const []const u8) !CommandResult {
+    const result = try std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = argv,
+        .max_output_bytes = 128 * 1024,
+    });
+    return .{
+        .stdout = result.stdout,
+        .stderr = result.stderr,
+        .term = result.term,
+    };
+}
+
+fn runCommandSuccess(allocator: std.mem.Allocator, argv: []const []const u8) !void {
+    var result = try runCommandCapture(allocator, argv);
+    defer result.deinit(allocator);
+    if (commandExitedSuccessfully(result)) return;
+
+    const stderr_text = trimmedCommandText(result.stderr);
+    const stdout_text = trimmedCommandText(result.stdout);
+    if (stderr_text.len > 0) {
+        std.log.err("command failed: {s}", .{stderr_text});
+    } else if (stdout_text.len > 0) {
+        std.log.err("command failed: {s}", .{stdout_text});
+    } else {
+        std.log.err("command failed: {s}", .{argv[0]});
+    }
+    return error.CommandFailed;
+}
+
+fn runCommandBestEffort(allocator: std.mem.Allocator, argv: []const []const u8) !?CommandResult {
+    return runCommandCapture(allocator, argv) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+}
+
+fn commandExitedSuccessfully(result: CommandResult) bool {
+    return switch (result.term) {
+        .Exited => |code| code == 0,
+        else => false,
+    };
+}
+
+fn commandResultSummary(result: CommandResult, fallback: []const u8) []const u8 {
+    const stdout_text = trimmedCommandText(result.stdout);
+    if (stdout_text.len > 0) return stdout_text;
+    const stderr_text = trimmedCommandText(result.stderr);
+    if (stderr_text.len > 0) return stderr_text;
+    return fallback;
+}
+
+fn trimmedCommandText(text: []const u8) []const u8 {
+    return std.mem.trim(u8, text, " \t\r\n");
 }
 
 fn resolveAuthTokensPath(
@@ -278,7 +592,7 @@ fn resolveAuthTokensPath(
 ) ![]u8 {
     const storage_dir = try resolveRuntimeStorageDirectory(allocator, ltm_directory, spider_web_root, config_path);
     defer allocator.free(storage_dir);
-    try std.fs.cwd().makePath(storage_dir);
+    try makePathAny(storage_dir);
     return std.fs.path.join(allocator, &.{ storage_dir, auth_tokens_filename });
 }
 
@@ -320,8 +634,10 @@ fn resolveRuntimeBaseDirectory(
     }
 
     if (try detectServiceWorkingDirectory(allocator)) |service_dir| {
-        errdefer allocator.free(service_dir);
-        if (try currentDirectoryOwnsRuntimeStorage(allocator, ltm_directory)) return currentShellWorkingDirectory(allocator);
+        if (try currentDirectoryOwnsRuntimeStorage(allocator, ltm_directory)) {
+            defer allocator.free(service_dir);
+            return currentShellWorkingDirectory(allocator);
+        }
         return service_dir;
     }
 
@@ -345,7 +661,11 @@ fn currentDirectoryOwnsRuntimeStorage(allocator: std.mem.Allocator, ltm_director
 }
 
 fn pathExists(path: []const u8) bool {
-    std.fs.accessAbsolute(path, .{}) catch return false;
+    if (std.fs.path.isAbsolute(path)) {
+        std.fs.accessAbsolute(path, .{}) catch return false;
+        return true;
+    }
+    std.fs.cwd().access(path, .{}) catch return false;
     return true;
 }
 
@@ -362,6 +682,9 @@ fn detectServiceWorkingDirectory(allocator: std.mem.Allocator) !?[]u8 {
     const home = std.process.getEnvVarOwned(allocator, "HOME") catch null;
     if (home) |home_dir| {
         defer allocator.free(home_dir);
+        const launchd_path = try std.fs.path.join(allocator, &.{ home_dir, "Library", "LaunchAgents", "spiderweb.plist" });
+        defer allocator.free(launchd_path);
+        if (try parseServiceWorkingDirectory(allocator, launchd_path)) |dir| return dir;
         const user_service_path = try std.fs.path.join(allocator, &.{ home_dir, ".config", "systemd", "user", "spiderweb.service" });
         defer allocator.free(user_service_path);
         if (try parseServiceWorkingDirectory(allocator, user_service_path)) |dir| return dir;
@@ -381,6 +704,18 @@ fn parseServiceWorkingDirectory(allocator: std.mem.Allocator, service_path: []co
     };
     defer allocator.free(contents);
 
+    if (std.mem.indexOf(u8, contents, "<plist") != null) {
+        return extractPlistStringValue(allocator, contents, "WorkingDirectory");
+    }
+
+    return parseSystemdWorkingDirectory(allocator, contents, service_path);
+}
+
+fn parseSystemdWorkingDirectory(
+    allocator: std.mem.Allocator,
+    contents: []const u8,
+    service_path: []const u8,
+) !?[]u8 {
     var lines = std.mem.tokenizeAny(u8, contents, "\r\n");
     while (lines.next()) |line_raw| {
         const line = std.mem.trim(u8, line_raw, " \t");
@@ -397,6 +732,24 @@ fn parseServiceWorkingDirectory(allocator: std.mem.Allocator, service_path: []co
     return null;
 }
 
+fn extractPlistStringValue(
+    allocator: std.mem.Allocator,
+    contents: []const u8,
+    key_name: []const u8,
+) !?[]u8 {
+    const key_tag = try std.fmt.allocPrint(allocator, "<key>{s}</key>", .{key_name});
+    defer allocator.free(key_tag);
+
+    const key_idx = std.mem.indexOf(u8, contents, key_tag) orelse return null;
+    const after_key = contents[key_idx + key_tag.len ..];
+    const string_start_rel = std.mem.indexOf(u8, after_key, "<string>") orelse return null;
+    const value_start = string_start_rel + "<string>".len;
+    const value_end_rel = std.mem.indexOf(u8, after_key[value_start..], "</string>") orelse return null;
+    const value = std.mem.trim(u8, after_key[value_start .. value_start + value_end_rel], " \t\r\n");
+    if (value.len == 0) return null;
+    return try allocator.dupe(u8, value);
+}
+
 fn readFileAllocAny(allocator: std.mem.Allocator, path: []const u8, max_bytes: usize) ![]u8 {
     if (std.fs.path.isAbsolute(path)) {
         const file = try std.fs.openFileAbsolute(path, .{ .mode = .read_only });
@@ -404,6 +757,47 @@ fn readFileAllocAny(allocator: std.mem.Allocator, path: []const u8, max_bytes: u
         return file.readToEndAlloc(allocator, max_bytes);
     }
     return std.fs.cwd().readFileAlloc(allocator, path, max_bytes);
+}
+
+fn makePathAny(path: []const u8) !void {
+    if (path.len == 0) return;
+    if (std.fs.path.isAbsolute(path)) {
+        var root_dir = try std.fs.openDirAbsolute("/", .{});
+        defer root_dir.close();
+        const rel_dir = std.mem.trimLeft(u8, path, "/");
+        if (rel_dir.len == 0) return;
+        root_dir.makePath(rel_dir) catch |err| switch (err) {
+            error.PathAlreadyExists => return,
+            else => return err,
+        };
+        return;
+    }
+    std.fs.cwd().makePath(path) catch |err| switch (err) {
+        error.PathAlreadyExists => return,
+        else => return err,
+    };
+}
+
+fn createFileAny(path: []const u8, flags: std.fs.File.CreateFlags) !std.fs.File {
+    if (std.fs.path.isAbsolute(path)) {
+        return std.fs.createFileAbsolute(path, flags);
+    }
+    return std.fs.cwd().createFile(path, flags);
+}
+
+fn deleteFileIfExistsAny(path: []const u8) !bool {
+    if (std.fs.path.isAbsolute(path)) {
+        std.fs.deleteFileAbsolute(path) catch |err| switch (err) {
+            error.FileNotFound => return false,
+            else => return err,
+        };
+        return true;
+    }
+    std.fs.cwd().deleteFile(path) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    return true;
 }
 
 fn makeOpaqueToken(allocator: std.mem.Allocator, prefix: []const u8) ![]u8 {
@@ -468,7 +862,7 @@ fn persistAuthTokens(
     });
     defer allocator.free(bytes);
 
-    var file = try std.fs.cwd().createFile(path, .{
+    var file = try createFileAny(path, .{
         .truncate = true,
         .mode = 0o600,
     });
@@ -506,7 +900,9 @@ fn printUsage() !void {
         \\  spiderweb-config config path         Show config file path
         \\  spiderweb-config config set-server --bind <addr> --port <port>
         \\  spiderweb-config config set-log <debug|info|warn|error>
-        \\  spiderweb-config config install-service     Install systemd service
+        \\  spiderweb-config config install-service
+        \\  spiderweb-config config uninstall-service
+        \\  spiderweb-config config service-status
         \\
         \\Examples:
         \\  spiderweb-config first-run
@@ -515,10 +911,13 @@ fn printUsage() !void {
         \\  spiderweb-config auth status --reveal
         \\  spiderweb-config auth reset --yes
         \\  spiderweb-config config set-server --bind 0.0.0.0 --port 9000
+        \\  spiderweb-config config install-service
+        \\  spiderweb-config config service-status
         \\
         \\Workspace-first flow:
         \\  spiderweb-control workspace_create '{"name":"Demo","vision":"Deliver the demo workspace"}'
         \\  spiderweb-fs-mount --workspace-id <workspace-id> ./workspace
+        \\  note: native local mounts are currently supported on Linux and Windows
         \\  spider-monkey run --workspace-root ./workspace
         \\
     ;
@@ -568,4 +967,34 @@ test "config_cli: parse service working directory from unit file" {
     const parsed = (try parseServiceWorkingDirectory(allocator, service_path)) orelse return error.TestExpectedWorkingDirectory;
     defer allocator.free(parsed);
     try std.testing.expectEqualStrings("/opt/ziggy-spiderweb", parsed);
+}
+
+test "config_cli: parse working directory from launchd plist" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.writeFile(.{
+        .sub_path = "spiderweb.plist",
+        .data =
+        \\<?xml version="1.0" encoding="UTF-8"?>
+        \\<plist version="1.0">
+        \\<dict>
+        \\  <key>Label</key>
+        \\  <string>spiderweb</string>
+        \\  <key>WorkingDirectory</key>
+        \\  <string>/Users/example/Spiderweb</string>
+        \\</dict>
+        \\</plist>
+        ,
+    });
+
+    const root = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+    const plist_path = try std.fs.path.join(allocator, &.{ root, "spiderweb.plist" });
+    defer allocator.free(plist_path);
+
+    const parsed = (try parseServiceWorkingDirectory(allocator, plist_path)) orelse return error.TestExpectedWorkingDirectory;
+    defer allocator.free(parsed);
+    try std.testing.expectEqualStrings("/Users/example/Spiderweb", parsed);
 }

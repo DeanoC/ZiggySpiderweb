@@ -53,11 +53,16 @@ const ExecOutcome = struct {
     }
 };
 
+fn terminalSupportsInteractiveSessions() bool {
+    return builtin.os.tag == .linux;
+}
+
 pub fn seedNamespace(self: anytype, terminal_dir: u32) !void {
     return seedNamespaceAt(self, terminal_dir, "/global/terminal");
 }
 
 pub fn seedNamespaceAt(self: anytype, terminal_dir: u32, base_path: []const u8) !void {
+    const supports_interactive_sessions = terminalSupportsInteractiveSessions();
     const escaped_base_path = try unified.jsonEscape(self.allocator, base_path);
     defer self.allocator.free(escaped_base_path);
     const shape_json = try std.fmt.allocPrint(
@@ -66,34 +71,49 @@ pub fn seedNamespaceAt(self: anytype, terminal_dir: u32, base_path: []const u8) 
         .{escaped_base_path},
     );
     defer self.allocator.free(shape_json);
+    const capabilities_json = if (supports_interactive_sessions)
+        try self.allocator.dupe(
+            u8,
+            "{\"invoke\":true,\"operations\":[\"terminal_session_create\",\"terminal_session_resume\",\"terminal_session_close\",\"terminal_session_write\",\"terminal_session_read\",\"terminal_session_resize\",\"shell_exec\"],\"discoverable\":true,\"interactive\":true,\"sessionized\":true,\"pty\":true}",
+        )
+    else
+        try self.allocator.dupe(
+            u8,
+            "{\"invoke\":true,\"operations\":[\"shell_exec\"],\"discoverable\":true,\"interactive\":false,\"sessionized\":false,\"pty\":false}",
+        );
+    defer self.allocator.free(capabilities_json);
     try self.addDirectoryDescriptors(
         terminal_dir,
         "Terminal",
         shape_json,
-        "{\"invoke\":true,\"operations\":[\"terminal_session_create\",\"terminal_session_resume\",\"terminal_session_close\",\"terminal_session_write\",\"terminal_session_read\",\"terminal_session_resize\",\"shell_exec\"],\"discoverable\":true,\"interactive\":true,\"sessionized\":true,\"pty\":true}",
-        "Sessionized terminal namespace. Create/resume/close PTY sessions and use write/read/resize for interactive workflows.",
+        capabilities_json,
+        if (supports_interactive_sessions)
+            "Sessionized terminal namespace. Create/resume/close PTY sessions and use write/read/resize for interactive workflows."
+        else
+            "Command execution namespace. Use exec for non-interactive workflows; interactive PTY sessions are currently supported on Linux only.",
     );
     const namespace_mode = self.terminalNamespaceMode();
     const path_model = self.terminalPathModel();
     _ = try self.addFile(
         terminal_dir,
         "OPS.json",
-        "{\"model\":\"local_bridge\",\"invoke\":\"control/invoke.json\",\"transport\":\"acheron-local\",\"paths\":{\"create\":\"control/create.json\",\"resume\":\"control/resume.json\",\"close\":\"control/close.json\",\"write\":\"control/write.json\",\"read\":\"control/read.json\",\"resize\":\"control/resize.json\",\"exec\":\"control/exec.json\"},\"operations\":{\"create\":\"create\",\"resume\":\"resume\",\"close\":\"close\",\"write\":\"write\",\"read\":\"read\",\"resize\":\"resize\",\"exec\":\"exec\"}}",
+        if (supports_interactive_sessions)
+            "{\"model\":\"local_bridge\",\"invoke\":\"control/invoke.json\",\"transport\":\"acheron-local\",\"paths\":{\"create\":\"control/create.json\",\"resume\":\"control/resume.json\",\"close\":\"control/close.json\",\"write\":\"control/write.json\",\"read\":\"control/read.json\",\"resize\":\"control/resize.json\",\"exec\":\"control/exec.json\"},\"operations\":{\"create\":\"create\",\"resume\":\"resume\",\"close\":\"close\",\"write\":\"write\",\"read\":\"read\",\"resize\":\"resize\",\"exec\":\"exec\"}}"
+        else
+            "{\"model\":\"local_bridge\",\"invoke\":\"control/invoke.json\",\"transport\":\"acheron-local\",\"paths\":{\"exec\":\"control/exec.json\"},\"operations\":{\"exec\":\"exec\"}}",
         false,
         .none,
     );
+    const runtime_json = try std.fmt.allocPrint(
+        self.allocator,
+        "{{\"type\":\"runtime_tool\",\"tool\":\"shell_exec\",\"session_model\":\"terminal-v2\",\"namespace_mode\":\"{s}\",\"path_model\":\"{s}\"}}",
+        .{ namespace_mode, path_model },
+    );
+    defer self.allocator.free(runtime_json);
     _ = try self.addFile(
         terminal_dir,
         "RUNTIME.json",
-        blk: {
-            const content = try std.fmt.allocPrint(
-                self.allocator,
-                "{{\"type\":\"runtime_tool\",\"tool\":\"shell_exec\",\"session_model\":\"terminal-v2\",\"namespace_mode\":\"{s}\",\"path_model\":\"{s}\"}}",
-                .{ namespace_mode, path_model },
-            );
-            defer self.allocator.free(content);
-            break :blk content;
-        },
+        runtime_json,
         false,
         .none,
     );
@@ -104,33 +124,41 @@ pub fn seedNamespaceAt(self: anytype, terminal_dir: u32, base_path: []const u8) 
         false,
         .none,
     );
+    const status_descriptor_json = try std.fmt.allocPrint(
+        self.allocator,
+        "{{\"venom_id\":\"terminal-v2\",\"state\":\"namespace\",\"has_invoke\":true,\"interactive\":{s},\"sessionized\":{s},\"pty\":{s},\"namespace_mode\":\"{s}\",\"path_model\":\"{s}\"}}",
+        .{
+            if (supports_interactive_sessions) "true" else "false",
+            if (supports_interactive_sessions) "true" else "false",
+            if (supports_interactive_sessions) "true" else "false",
+            namespace_mode,
+            path_model,
+        },
+    );
+    defer self.allocator.free(status_descriptor_json);
     _ = try self.addFile(
         terminal_dir,
         "STATUS.json",
-        blk: {
-            const content = try std.fmt.allocPrint(
-                self.allocator,
-                "{{\"venom_id\":\"terminal-v2\",\"state\":\"namespace\",\"has_invoke\":true,\"sessionized\":true,\"namespace_mode\":\"{s}\",\"path_model\":\"{s}\"}}",
-                .{ namespace_mode, path_model },
-            );
-            defer self.allocator.free(content);
-            break :blk content;
-        },
+        status_descriptor_json,
         false,
         .none,
     );
+    const status_json = try std.fmt.allocPrint(
+        self.allocator,
+        "{{\"state\":\"idle\",\"tool\":null,\"session_id\":null,\"updated_at_ms\":0,\"error\":null,\"interactive\":{s},\"sessionized\":{s},\"pty\":{s},\"namespace_mode\":\"{s}\",\"path_model\":\"{s}\"}}",
+        .{
+            if (supports_interactive_sessions) "true" else "false",
+            if (supports_interactive_sessions) "true" else "false",
+            if (supports_interactive_sessions) "true" else "false",
+            namespace_mode,
+            path_model,
+        },
+    );
+    defer self.allocator.free(status_json);
     self.terminal_status_id = try self.addFile(
         terminal_dir,
         "status.json",
-        blk: {
-            const content = try std.fmt.allocPrint(
-                self.allocator,
-                "{{\"state\":\"idle\",\"tool\":null,\"session_id\":null,\"updated_at_ms\":0,\"error\":null,\"namespace_mode\":\"{s}\",\"path_model\":\"{s}\"}}",
-                .{ namespace_mode, path_model },
-            );
-            defer self.allocator.free(content);
-            break :blk content;
-        },
+        status_json,
         false,
         .none,
     );
@@ -160,7 +188,10 @@ pub fn seedNamespaceAt(self: anytype, terminal_dir: u32, base_path: []const u8) 
     _ = try self.addFile(
         control_dir,
         "README.md",
-        "Use create/resume/close to manage PTY sessions. Use write/read/resize for interactive I/O. exec is a convenience write+read command path. invoke.json accepts op=create|resume|close|write|read|resize|exec envelopes.\n",
+        if (supports_interactive_sessions)
+            "Use create/resume/close to manage PTY sessions. Use write/read/resize for interactive I/O. exec is a convenience write+read command path. invoke.json accepts op=create|resume|close|write|read|resize|exec envelopes.\n"
+        else
+            "Use exec.json for non-interactive shell execution. Interactive PTY session controls (create/resume/close/write/read/resize) are currently supported on Linux only. invoke.json accepts op=exec everywhere and the PTY session ops on Linux.\n",
         false,
         .none,
     );
