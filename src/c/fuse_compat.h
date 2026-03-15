@@ -57,6 +57,9 @@ struct statvfs {
 #endif
 #else
 #include <sys/statvfs.h>
+#ifdef __APPLE__
+#include <sys/mount.h>
+#endif
 #include <sys/uio.h>
 #include <unistd.h>
 #endif
@@ -71,12 +74,20 @@ struct fuse_config;
 struct fuse_pollhandle;
 struct fuse_bufvec;
 struct fuse_dirhandle;
+#ifdef __APPLE__
+struct fuse_darwin_attr;
+#endif
 
 struct libfuse_version {
-    int major;
-    int minor;
-    int hotfix;
-    int padding;
+    uint32_t major;
+    uint32_t minor;
+    uint32_t hotfix;
+#ifdef __APPLE__
+    uint32_t darwin_extensions_enabled : 1;
+    uint32_t padding : 31;
+#else
+    uint32_t padding;
+#endif
 };
 
 #ifdef _WIN32
@@ -220,9 +231,36 @@ enum fuse_fill_dir_flags {
 };
 
 typedef int (*fuse_fill_dir_t)(void *buf, const char *name, const struct stat *stbuf, off_t off, enum fuse_fill_dir_flags flags);
+#ifdef __APPLE__
+typedef int (*fuse_darwin_fill_dir_t)(void *buf, const char *name, const struct fuse_darwin_attr *attr, off_t off, enum fuse_fill_dir_flags flags);
+
+struct fuse_darwin_attr {
+    ino_t ino;
+    mode_t mode;
+    nlink_t nlink;
+    uid_t uid;
+    gid_t gid;
+    dev_t rdev;
+    struct timespec atimespec;
+    struct timespec mtimespec;
+    struct timespec ctimespec;
+    struct timespec btimespec;
+    struct timespec bkuptimespec;
+    off_t size;
+    blkcnt_t blocks;
+    blksize_t blksize;
+    unsigned int flags;
+    uint64_t reserved[8];
+};
+#endif
 
 struct fuse_operations {
+#ifdef __APPLE__
+    int (*getattr)(const char *, struct fuse_darwin_attr *, struct fuse_file_info *fi);
+    int (*setattr)(const char *, struct fuse_darwin_attr *attr, int to_set, struct fuse_file_info *fi);
+#else
     int (*getattr)(const char *, struct stat *, struct fuse_file_info *fi);
+#endif
     int (*readlink)(const char *, char *, size_t);
     int (*mknod)(const char *, mode_t, dev_t);
     int (*mkdir)(const char *, mode_t);
@@ -237,16 +275,29 @@ struct fuse_operations {
     int (*open)(const char *, struct fuse_file_info *);
     int (*read)(const char *, char *, size_t, off_t, struct fuse_file_info *);
     int (*write)(const char *, const char *, size_t, off_t, struct fuse_file_info *);
+#ifdef __APPLE__
+    int (*statfs)(const char *, struct statfs *);
+#else
     int (*statfs)(const char *, struct statvfs *);
+#endif
     int (*flush)(const char *, struct fuse_file_info *);
     int (*release)(const char *, struct fuse_file_info *);
     int (*fsync)(const char *, int, struct fuse_file_info *);
+#ifdef __APPLE__
+    int (*setxattr)(const char *, const char *, const char *, size_t, int, uint32_t);
+    int (*getxattr)(const char *, const char *, char *, size_t, uint32_t);
+#else
     int (*setxattr)(const char *, const char *, const char *, size_t, int);
     int (*getxattr)(const char *, const char *, char *, size_t);
+#endif
     int (*listxattr)(const char *, char *, size_t);
     int (*removexattr)(const char *, const char *);
     int (*opendir)(const char *, struct fuse_file_info *);
+#ifdef __APPLE__
+    int (*readdir)(const char *, void *, fuse_darwin_fill_dir_t, off_t, struct fuse_file_info *, enum fuse_readdir_flags);
+#else
     int (*readdir)(const char *, void *, fuse_fill_dir_t, off_t, struct fuse_file_info *, enum fuse_readdir_flags);
+#endif
     int (*releasedir)(const char *, struct fuse_file_info *);
     int (*fsyncdir)(const char *, int, struct fuse_file_info *);
     void *(*init)(struct fuse_conn_info *conn, struct fuse_config *cfg);
@@ -254,7 +305,11 @@ struct fuse_operations {
     int (*access)(const char *, int);
     int (*create)(const char *, mode_t, struct fuse_file_info *);
     int (*lock)(const char *, struct fuse_file_info *, int cmd, struct flock *);
+#ifdef __APPLE__
+    int (*utimens)(const char *, const struct timespec tv[3], struct fuse_file_info *fi);
+#else
     int (*utimens)(const char *, const struct timespec tv[2], struct fuse_file_info *fi);
+#endif
     int (*bmap)(const char *, size_t blocksize, uint64_t *idx);
     int (*ioctl)(const char *, unsigned int cmd, void *arg, struct fuse_file_info *, unsigned int flags, void *data);
     int (*poll)(const char *, struct fuse_file_info *, struct fuse_pollhandle *ph, unsigned *reventsp);
@@ -264,6 +319,11 @@ struct fuse_operations {
     int (*fallocate)(const char *, int, off_t, off_t, struct fuse_file_info *);
     ssize_t (*copy_file_range)(const char *path_in, struct fuse_file_info *fi_in, off_t offset_in, const char *path_out, struct fuse_file_info *fi_out, off_t offset_out, size_t size, int flags);
     off_t (*lseek)(const char *, off_t off, int whence, struct fuse_file_info *);
+#ifdef __APPLE__
+    int (*chflags)(const char *, struct fuse_file_info *, unsigned int);
+    int (*setvolname)(const char *);
+    void (*monitor)(const char *, uint32_t);
+#endif
 };
 #endif
 
@@ -271,9 +331,18 @@ int fuse_main_real_versioned(int argc, char *argv[],
                              const struct fuse_operations *op, size_t op_size,
                              struct libfuse_version *version, void *user_data);
 
+int spiderweb_call_fuse_main_real_versioned(void *fn,
+                                            int argc,
+                                            char *argv[],
+                                            const struct fuse_operations *op,
+                                            size_t op_size,
+                                            void *user_data);
+
 int32_t spiderweb_fi_get_flags(struct fuse_file_info *fi);
 uint64_t spiderweb_fi_get_fh(struct fuse_file_info *fi);
 void spiderweb_fi_set_fh(struct fuse_file_info *fi, uint64_t fh);
+void spiderweb_fi_set_nonseekable(struct fuse_file_info *fi, int enabled);
+void spiderweb_fi_set_cache_readdir(struct fuse_file_info *fi, int enabled);
 
 #ifdef __cplusplus
 }

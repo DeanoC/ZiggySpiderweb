@@ -526,15 +526,7 @@ pub fn load(self: *Config) !void {
 }
 
 fn validateRuntimeConfig(self: *Config) !void {
-    if (!builtin.is_test and !self.runtime.sandbox_enabled) {
-        if (!builtin.is_test) {
-            std.log.err(
-                "invalid config: runtime.sandbox_enabled=false is unsupported (Acheron runtime requires sandbox mode)",
-                .{},
-            );
-        }
-        return error.InvalidConfig;
-    }
+    if (!runtimeRequiresSandboxValidation(self.runtime)) return;
 
     const mounts_root = try requireAbsoluteRuntimePath("runtime.sandbox_mounts_root", self.runtime.sandbox_mounts_root);
     const rootfs_store_root = try requireAbsoluteRuntimePath("runtime.sandbox_rootfs_store_root", self.runtime.sandbox_rootfs_store_root);
@@ -638,6 +630,10 @@ fn ensureRuntimePathsDoNotOverlap(
         }
         return error.InvalidConfig;
     }
+}
+
+fn runtimeRequiresSandboxValidation(runtime: RuntimeConfig) bool {
+    return builtin.os.tag == .linux and runtime.sandbox_enabled;
 }
 pub fn save(self: Config) !void {
     // Ensure parent directory exists
@@ -858,7 +854,25 @@ test "Config ignores deprecated runtime.sandbox_enabled field and does not persi
     try std.testing.expect(std.mem.indexOf(u8, saved, "\"sandbox_enabled\"") == null);
 }
 
+test "Config validation allows disabled sandbox runtime" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const tmp_root = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_root);
+    const cfg_path = try std.fs.path.join(allocator, &.{ tmp_root, "config.json" });
+
+    var config = try Config.init(allocator, cfg_path);
+    defer config.deinit();
+
+    config.runtime.sandbox_enabled = false;
+    try config.validateRuntimeConfig();
+}
+
 test "Config validation rejects overlapping sandbox roots" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
     const allocator = std.testing.allocator;
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
@@ -879,6 +893,8 @@ test "Config validation rejects overlapping sandbox roots" {
 }
 
 test "Config validation rejects empty rootfs base ref" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
     const allocator = std.testing.allocator;
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();

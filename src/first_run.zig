@@ -1,3 +1,4 @@
+const builtin = @import("builtin");
 const std = @import("std");
 const Config = @import("config.zig");
 
@@ -63,15 +64,20 @@ pub fn runFirstRun(allocator: std.mem.Allocator, args: []const []const u8) !void
     try println("\n  Config: {s}", .{config.config_path});
     try println("  Server: ws://{s}:{d}", .{ config.server.bind, config.server.port });
     try std.fs.File.stdout().writeAll("  Worker model: external filesystem agents\n");
-    try std.fs.File.stdout().writeAll("\nManual v1 flow:\n");
+    try std.fs.File.stdout().writeAll("\nHost flow:\n");
     try std.fs.File.stdout().writeAll("  1. Start Spiderweb: spiderweb\n");
     try std.fs.File.stdout().writeAll("  2. Create a workspace: spiderweb-control workspace_create '{\"name\":\"Demo\",\"vision\":\"Mounted workspace\"}'\n");
-    try std.fs.File.stdout().writeAll("  3. Mount it locally: spiderweb-fs-mount --workspace-url ws://127.0.0.1:18790/ --workspace-id <workspace-id> mount <mountpoint>\n");
-    try std.fs.File.stdout().writeAll("  4. Start Spider Monkey: spider-monkey run --workspace-root <mountpoint>\n");
+    if (builtin.os.tag == .macos) {
+        try std.fs.File.stdout().writeAll("  3. Connect a Linux/Windows mount client or another worker host for mounted workspace access. Native macOS mount support is still pending.\n");
+    } else {
+        try std.fs.File.stdout().writeAll("  3. Mount it locally: spiderweb-fs-mount --workspace-url ws://127.0.0.1:18790/ --workspace-id <workspace-id> mount <mountpoint>\n");
+        try std.fs.File.stdout().writeAll("  4. Start Spider Monkey: spider-monkey run --workspace-root <mountpoint>\n");
+    }
     try std.fs.File.stdout().writeAll("\nUseful commands:\n");
     try std.fs.File.stdout().writeAll("  spiderweb-config auth status\n");
     try std.fs.File.stdout().writeAll("  spiderweb-config config set-server --bind 0.0.0.0 --port 18790\n");
+    try std.fs.File.stdout().writeAll("  spiderweb-config config service-status\n");
     try std.fs.File.stdout().writeAll("  spiderweb-control workspace_list\n");
-    try std.fs.File.stdout().writeAll("\nInstall systemd service:\n");
+    try std.fs.File.stdout().writeAll("\nInstall background service:\n");
     try std.fs.File.stdout().writeAll("  spiderweb-config config install-service\n");
 }

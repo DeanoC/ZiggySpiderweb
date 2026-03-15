@@ -5,6 +5,8 @@ const fs_cache = @import("spiderweb_fs_cache");
 const fs_source_policy = @import("spiderweb_fs_source_policy");
 const acheron_node_protocol_version = "unified-v2-fs";
 const acheron_node_proto_id: i64 = 2;
+const synthetic_statfs_json =
+    "{\"bsize\":65536,\"frsize\":65536,\"blocks\":1,\"bfree\":1,\"bavail\":1,\"files\":1048576,\"ffree\":1048575,\"favail\":1048575,\"namemax\":4096}";
 
 const RouterError = error{
     InvalidPath,
@@ -396,8 +398,13 @@ pub const Router = struct {
     }
 
     pub fn statfs(self: *Router, path: []const u8) ![]u8 {
+        const normalized_path = normalizeRouterPath(path);
         self.drainPendingInvalidations();
-        const node = try self.resolvePath(path, false, .statfs);
+        if (std.mem.eql(u8, normalized_path, "/") or self.isVirtualDirectoryPath(normalized_path)) {
+            return self.allocator.dupe(u8, synthetic_statfs_json);
+        }
+
+        const node = try self.resolvePath(normalized_path, false, .statfs);
         const response = try self.callEndpoint(node.endpoint_index, .STATFS, node.node_id, null, "{}");
         defer response.deinit(self.allocator);
         if (!response.ok) return mapErrno(response.err_no);

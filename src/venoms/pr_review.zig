@@ -2763,25 +2763,39 @@ fn executeRunValidationOp(self: anytype, args_obj: std.json.ObjectMap) ![]u8 {
 
     const create_payload = try self.buildPrReviewTerminalCreateRequestJson(context.checkout_path);
     defer self.allocator.free(create_payload);
-    create_capture = try self.invokePrReviewServiceCapture(
-        store,
-        mission_id,
-        checkpoint_stage,
-        "Opened validation terminal session",
-        terminal_service_path,
-        terminal_create_path,
-        create_payload,
-        contract.artifact_root,
-        "services/validation-create.json",
-        "validation_create",
-    );
-    _ = try captureServiceErrorFromPayload(
-        self,
-        create_capture.?.result_payload,
-        &service_error_code,
-        &service_error_message,
-    );
-    validation_terminal_needs_close = service_error_code == null;
+    {
+        var local_create_capture = try self.invokePrReviewServiceCapture(
+            store,
+            mission_id,
+            checkpoint_stage,
+            "Opened validation terminal session",
+            terminal_service_path,
+            terminal_create_path,
+            create_payload,
+            contract.artifact_root,
+            "services/validation-create.json",
+            "validation_create",
+        );
+        var keep_local_create_capture = false;
+        defer if (!keep_local_create_capture) local_create_capture.deinit(self.allocator);
+
+        _ = try captureServiceErrorFromPayload(
+            self,
+            local_create_capture.result_payload,
+            &service_error_code,
+            &service_error_message,
+        );
+        if (service_error_code) |code| {
+            if (std.mem.eql(u8, code, "unsupported")) {
+                freeOptionalOwnedString(self, &service_error_code);
+                freeOptionalOwnedString(self, &service_error_message);
+            }
+        } else {
+            create_capture = local_create_capture;
+            keep_local_create_capture = true;
+            validation_terminal_needs_close = true;
+        }
+    }
     errdefer if (validation_terminal_needs_close) {
         if (self.allocator.dupe(u8, "{}")) |cleanup_payload| {
             defer self.allocator.free(cleanup_payload);
@@ -2884,7 +2898,7 @@ fn executeRunValidationOp(self: anytype, args_obj: std.json.ObjectMap) ![]u8 {
     const command_paths_slice = try command_paths_json.toOwnedSlice(self.allocator);
     defer self.allocator.free(command_paths_slice);
 
-    if (create_capture != null) {
+    if (validation_terminal_needs_close and create_capture != null) {
         const close_payload = try self.allocator.dupe(u8, "{}");
         defer self.allocator.free(close_payload);
         close_capture = self.invokePrReviewServiceCapture(
