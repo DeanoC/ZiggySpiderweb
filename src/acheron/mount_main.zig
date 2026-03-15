@@ -259,7 +259,6 @@ pub fn main() !void {
             if (err != error.FileNotFound) return err;
             break :blk try adapter.create(path, 0o100644, 2);
         };
-        defer adapter.release(file) catch {};
 
         adapter.truncate(path, 0) catch |err| switch (err) {
             error.OperationNotSupported => {
@@ -270,6 +269,7 @@ pub fn main() !void {
             else => return err,
         };
         _ = try adapter.write(file, 0, content);
+        try adapter.release(file);
         try std.fs.File.stdout().writeAll("ok\n");
         return;
     }
@@ -325,6 +325,7 @@ pub fn main() !void {
         else
             try router.statusJson(force_probe);
         defer allocator.free(status);
+        emitLocalMountStatusDiagnostic(mount_backend);
         const line = try std.fmt.allocPrint(allocator, "{s}\n", .{status});
         defer allocator.free(line);
         try std.fs.File.stdout().writeAll(line);
@@ -333,9 +334,18 @@ pub fn main() !void {
 
     if (std.mem.eql(u8, command, "mount")) {
         if (remaining.items.len < 2) return error.InvalidArguments;
-        if (!(builtin.os.tag == .windows)) {
-            try ensurePathExists(remaining.items[1]);
+        const mountpoint = remaining.items[1];
+        if (fs_fuse_adapter.mountpointMustExistBeforeMount(mount_backend)) {
+            try ensurePathExists(mountpoint);
         }
+        fs_fuse_adapter.validateLocalMountRequest(mountpoint, mount_backend) catch |err| {
+            reportMountCommandError(err, mountpoint, mount_backend);
+            std.process.exit(2);
+        };
+        fs_fuse_adapter.probeLocalMountBackend(mount_backend) catch |err| {
+            reportMountCommandError(err, mountpoint, mount_backend);
+            std.process.exit(2);
+        };
         var sync_ctx: ?*WorkspaceSyncContext = null;
         var sync_thread: ?std.Thread = null;
         var keepalive_ctx: ?*NamespaceKeepaliveContext = null;
@@ -389,7 +399,10 @@ pub fn main() !void {
             keepalive_thread = try std.Thread.spawn(.{}, namespaceKeepaliveThreadMain, .{ctx});
             keepalive_ctx = ctx;
         }
-        try adapter.mountWithBackend(remaining.items[1], mount_backend);
+        adapter.mountWithBackend(mountpoint, mount_backend) catch |err| {
+            reportMountCommandError(err, mountpoint, mount_backend);
+            return err;
+        };
         return;
     }
 
@@ -440,6 +453,7 @@ fn printHelp() !void {
         \\
         \\Usage:
         \\  spiderweb-fs-mount [--workspace-url <ws-url> | --namespace-url <ws-url>] [--workspace-id <id>] [--workspace-token <token>] [--auth-token <token>] [--agent-id <id>] [--session-key <key>] [--mount-backend auto|fuse|winfsp] [--workspace-sync-interval-ms <ms>] [--namespace-keepalive-interval-ms <ms>] [--endpoint <name>=<ws-url>[#export][@/mount]] <command> [args]
+        \\  macOS local mounts require macFUSE 5.x and a mountpoint under /Volumes/<name>.
         \\
         \\Commands:
         \\  getattr <path>
@@ -461,9 +475,11 @@ fn printHelp() !void {
         \\  spiderweb-fs-mount --endpoint a=ws://127.0.0.1:18891/v2/fs status
         \\  spiderweb-fs-mount --workspace-url ws://127.0.0.1:18790/ readdir /
         \\  spiderweb-fs-mount --workspace-url ws://127.0.0.1:18790/ --workspace-id ws-demo --workspace-sync-interval-ms 5000 mount /mnt/spiderweb
+        \\  spiderweb-fs-mount --workspace-url ws://127.0.0.1:18790/ --workspace-id ws-demo mount /Volumes/spiderweb-demo
         \\  spiderweb-fs-mount --workspace-url ws://127.0.0.1:18790/ --workspace-id ws-demo --workspace-token ws-token-... readdir /
         \\  spiderweb-fs-mount --workspace-url ws://127.0.0.1:18790/ --auth-token sw-admin-... readdir /
         \\  spiderweb-fs-mount --namespace-url ws://127.0.0.1:18790/ --workspace-id ws-demo mount /mnt/spiderweb
+        \\  spiderweb-fs-mount --namespace-url ws://127.0.0.1:18790/ --workspace-id ws-demo mount /Volumes/spiderweb-demo
         \\  spiderweb-fs-mount --namespace-url ws://127.0.0.1:18790/ --workspace-id ws-demo --mount-backend winfsp mount X:
         \\  spiderweb-fs-mount --endpoint a=ws://127.0.0.1:18891/v2/fs#work@/a --endpoint b=ws://127.0.0.1:18892/v2/fs#work@/a readdir /a
         \\    (repeat the same mount path to enable failover)
@@ -493,6 +509,59 @@ fn parseMountBackend(raw: []const u8) !fs_fuse_adapter.FuseAdapter.MountBackend 
     if (std.mem.eql(u8, raw, "fuse")) return .fuse;
     if (std.mem.eql(u8, raw, "winfsp")) return .winfsp;
     return error.InvalidArguments;
+}
+
+fn emitLocalMountStatusDiagnostic(backend: fs_fuse_adapter.FuseAdapter.MountBackend) void {
+    if (builtin.os.tag != .macos) return;
+
+    if (!fs_fuse_adapter.isCurrentMacosFskitSupported()) {
+        std.log.warn("local macOS mount backend unavailable: macOS 15.4+ is required for macFUSE FSKit mounts", .{});
+        return;
+    }
+
+    if (fs_fuse_adapter.probeLocalMountBackend(backend)) |_| {
+        std.log.info("local macOS mount backend ready: use mount /Volumes/<name> with macFUSE FSKit", .{});
+    } else |err| switch (err) {
+        error.UnsupportedMountBackend => {
+            std.log.warn("local macOS mount backend unavailable: --mount-backend winfsp is Windows-only; use auto or fuse", .{});
+        },
+        error.MacFuseNotInstalled => {
+            std.log.warn("local macOS mount backend unavailable: install macFUSE 5.x from https://macfuse.github.io/ and mount under /Volumes/<name>", .{});
+        },
+        error.UnsupportedMacosVersion => {
+            std.log.warn("local macOS mount backend unavailable: macOS 15.4+ is required for backend=fskit", .{});
+        },
+        else => {
+            std.log.warn("local macOS mount backend probe failed: {s}", .{@errorName(err)});
+        },
+    }
+}
+
+fn reportMountCommandError(
+    err: anyerror,
+    mountpoint: []const u8,
+    backend: fs_fuse_adapter.FuseAdapter.MountBackend,
+) void {
+    _ = backend;
+    if (builtin.os.tag == .macos) switch (err) {
+        error.UnsupportedMountBackend => {
+            std.log.err("macOS local mounts do not support --mount-backend winfsp; use auto or fuse", .{});
+            return;
+        },
+        error.UnsupportedMacosVersion => {
+            std.log.err("macOS local mounts require macOS 15.4+ for the macFUSE FSKit backend", .{});
+            return;
+        },
+        error.InvalidMacosMountpoint => {
+            std.log.err("macOS local mounts must use a mountpoint under /Volumes/<name>; got {s}", .{mountpoint});
+            return;
+        },
+        error.MacFuseNotInstalled, error.MountLibraryNotFound => {
+            std.log.err("macOS local mounts require macFUSE 5.x. Install it from https://macfuse.github.io/ and retry with /Volumes/<name>", .{});
+            return;
+        },
+        else => {},
+    };
 }
 
 fn buildNamespaceStatusJson(
@@ -1238,6 +1307,74 @@ fn jsonEscape(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
     return out.toOwnedSlice(allocator);
 }
 
+const LiveSmokeConfig = struct {
+    url: []u8,
+    project_id: []u8,
+    auth_token: []u8,
+
+    fn deinit(self: *LiveSmokeConfig, allocator: std.mem.Allocator) void {
+        allocator.free(self.url);
+        allocator.free(self.project_id);
+        allocator.free(self.auth_token);
+        self.* = undefined;
+    }
+};
+
+fn loadLiveSmokeConfig(allocator: std.mem.Allocator) !?LiveSmokeConfig {
+    const url = std.process.getEnvVarOwned(allocator, "SPIDERWEB_LIVE_SMOKE_URL") catch return null;
+    errdefer allocator.free(url);
+    const project_id = std.process.getEnvVarOwned(allocator, "SPIDERWEB_LIVE_SMOKE_PROJECT_ID") catch return null;
+    errdefer allocator.free(project_id);
+    const auth_token = std.process.getEnvVarOwned(allocator, "SPIDERWEB_LIVE_SMOKE_AUTH_TOKEN") catch return null;
+    errdefer allocator.free(auth_token);
+    return .{
+        .url = url,
+        .project_id = project_id,
+        .auth_token = auth_token,
+    };
+}
+
+fn liveSmokeReadFile(
+    allocator: std.mem.Allocator,
+    client: *namespace_client.NamespaceClient,
+    path: []const u8,
+) ![]u8 {
+    const file = try client.open(path, 0);
+    defer client.release(file) catch {};
+
+    var out = std.ArrayListUnmanaged(u8){};
+    defer out.deinit(allocator);
+    var offset: u64 = 0;
+    const chunk_len: u32 = 256 * 1024;
+    while (true) {
+        const chunk = try client.read(file, offset, chunk_len);
+        defer allocator.free(chunk);
+        if (chunk.len == 0) break;
+        try out.appendSlice(allocator, chunk);
+        if (chunk.len < chunk_len) break;
+        offset += chunk.len;
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn liveSmokeWriteFile(client: *namespace_client.NamespaceClient, path: []const u8, content: []const u8) !void {
+    const file = try client.open(path, 2);
+    errdefer client.release(file) catch {};
+    _ = try client.write(file, 0, content);
+    try client.release(file);
+}
+
+fn extractMissionIdFromResultPayload(allocator: std.mem.Allocator, payload_json: []const u8) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload_json, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidResponse;
+    const result_value = parsed.value.object.get("result") orelse return error.InvalidResponse;
+    if (result_value != .object) return error.InvalidResponse;
+    const mission_id_value = result_value.object.get("mission_id") orelse return error.InvalidResponse;
+    if (mission_id_value != .string or mission_id_value.string.len == 0) return error.InvalidResponse;
+    return allocator.dupe(u8, mission_id_value.string);
+}
+
 test "acheron_mount_main: parseEndpointFlag supports explicit mount path" {
     const parsed = try parseEndpointFlag("a=ws://127.0.0.1:18891/v2/fs#work@/src");
     try std.testing.expectEqualStrings("a", parsed.name);
@@ -1278,4 +1415,82 @@ test "acheron_mount_main: connectWorkspaceHasMounts requires non-empty mounts ar
     var parsed_with_mount = try std.json.parseFromSlice(std.json.Value, allocator, "{\"workspace\":{\"mounts\":[{\"mount_path\":\"/m\",\"fs_url\":\"ws://127.0.0.1:18891/v2/fs\"}]}}", .{});
     defer parsed_with_mount.deinit();
     try std.testing.expect(connectWorkspaceHasMounts(parsed_with_mount.value.object.get("workspace")));
+}
+
+test "acheron_mount_main: live mac smoke covers terminal exec and pr review validation" {
+    if (builtin.os.tag != .macos) return;
+
+    const allocator = std.testing.allocator;
+    var live = (try loadLiveSmokeConfig(allocator)) orelse return;
+    defer live.deinit(allocator);
+
+    var client = try namespace_client.NamespaceClient.connect(allocator, live.url, live.auth_token);
+    defer client.deinit();
+
+    var connect_info = try client.controlConnect();
+    defer connect_info.deinit(allocator);
+
+    const session_key = try std.fmt.allocPrint(allocator, "mac-live-smoke-{d}", .{std.time.milliTimestamp()});
+    defer allocator.free(session_key);
+    const agent_id = "mac-live-smoke-agent";
+
+    try client.controlAgentEnsure(agent_id);
+    var attach_info = try client.controlSessionAttach(.{
+        .session_key = session_key,
+        .agent_id = agent_id,
+        .project_id = live.project_id,
+    });
+    defer attach_info.deinit(allocator);
+    try client.attachNamespaceRoot(attach_info.session_key);
+
+    const terminal_status_descriptor = try liveSmokeReadFile(allocator, &client, "/nodes/local/venoms/terminal/STATUS.json");
+    defer allocator.free(terminal_status_descriptor);
+    try std.testing.expect(std.mem.indexOf(u8, terminal_status_descriptor, "\"interactive\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, terminal_status_descriptor, "\"sessionized\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, terminal_status_descriptor, "\"pty\":false") != null);
+
+    try liveSmokeWriteFile(
+        &client,
+        "/nodes/local/venoms/terminal/control/exec.json",
+        "{\"command\":\"printf terminal-ok\"}",
+    );
+
+    const terminal_status = try liveSmokeReadFile(allocator, &client, "/nodes/local/venoms/terminal/status.json");
+    defer allocator.free(terminal_status);
+    try std.testing.expect(std.mem.indexOf(u8, terminal_status, "\"state\":\"done\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, terminal_status, "\"tool\":\"shell_exec\"") != null);
+
+    const terminal_result = try liveSmokeReadFile(allocator, &client, "/nodes/local/venoms/terminal/result.json");
+    defer allocator.free(terminal_result);
+    try std.testing.expect(std.mem.indexOf(u8, terminal_result, "\"operation\":\"exec\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, terminal_result, "\"ok\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, terminal_result, "dGVybWluYWwtb2s=") != null);
+
+    try liveSmokeWriteFile(
+        &client,
+        "/agents/self/pr_review/control/start.json",
+        "{\"repo_key\":\"DeanoC/Spiderweb\",\"pr_number\":130,\"checkout_path\":\"/nodes/local/fs\",\"default_review_commands\":[\"printf validation-ok\"]}",
+    );
+
+    const pr_start_result = try liveSmokeReadFile(allocator, &client, "/agents/self/pr_review/result.json");
+    defer allocator.free(pr_start_result);
+    const mission_id = try extractMissionIdFromResultPayload(allocator, pr_start_result);
+    defer allocator.free(mission_id);
+
+    const validation_payload = try std.fmt.allocPrint(allocator, "{{\"mission_id\":\"{s}\"}}", .{mission_id});
+    defer allocator.free(validation_payload);
+    try liveSmokeWriteFile(
+        &client,
+        "/agents/self/pr_review/control/run_validation.json",
+        validation_payload,
+    );
+
+    const pr_result = try liveSmokeReadFile(allocator, &client, "/agents/self/pr_review/result.json");
+    defer allocator.free(pr_result);
+    try std.testing.expect(std.mem.indexOf(u8, pr_result, "\"operation\":\"run_validation\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pr_result, "\"ok\":true") != null);
+
+    const terminal_current = try liveSmokeReadFile(allocator, &client, "/nodes/local/venoms/terminal/current.json");
+    defer allocator.free(terminal_current);
+    try std.testing.expect(std.mem.indexOf(u8, terminal_current, "\"session\":null") != null);
 }

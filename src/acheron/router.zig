@@ -5,6 +5,8 @@ const fs_cache = @import("spiderweb_fs_cache");
 const fs_source_policy = @import("spiderweb_fs_source_policy");
 const acheron_node_protocol_version = "unified-v2-fs";
 const acheron_node_proto_id: i64 = 2;
+const synthetic_statfs_json =
+    "{\"bsize\":65536,\"frsize\":65536,\"blocks\":1,\"bfree\":1,\"bavail\":1,\"files\":1048576,\"ffree\":1048575,\"favail\":1048575,\"namemax\":4096}";
 
 const RouterError = error{
     InvalidPath,
@@ -396,8 +398,13 @@ pub const Router = struct {
     }
 
     pub fn statfs(self: *Router, path: []const u8) ![]u8 {
+        const normalized_path = normalizeRouterPath(path);
         self.drainPendingInvalidations();
-        const node = try self.resolvePath(path, false, .statfs);
+        if (self.usesSyntheticStatfs(normalized_path)) {
+            return self.allocator.dupe(u8, synthetic_statfs_json);
+        }
+
+        const node = try self.resolvePath(normalized_path, false, .statfs);
         const response = try self.callEndpoint(node.endpoint_index, .STATFS, node.node_id, null, "{}");
         defer response.deinit(self.allocator);
         if (!response.ok) return mapErrno(response.err_no);
@@ -1600,6 +1607,10 @@ pub const Router = struct {
         return false;
     }
 
+    fn usesSyntheticStatfs(self: *const Router, path: []const u8) bool {
+        return self.isVirtualDirectoryPath(path);
+    }
+
     fn buildVirtualDirectoryListing(self: *Router, path: []const u8, cookie: u64, max_entries: u32) ![]u8 {
         const normalized_path = normalizeRouterPath(path);
         var children = std.ArrayListUnmanaged([]const u8){};
@@ -2402,6 +2413,48 @@ test "acheron_router: root path is not virtual when an endpoint is mounted at sl
     });
 
     try std.testing.expect(!router.isVirtualDirectoryPath("/"));
+    try std.testing.expect(!router.usesSyntheticStatfs("/"));
+}
+
+test "acheron_router: root path uses synthetic statfs only when it is virtual" {
+    const allocator = std.testing.allocator;
+
+    var root_router = try Router.init(allocator, &[_]EndpointConfig{});
+    defer root_router.deinit();
+
+    const now = std.time.milliTimestamp();
+    try root_router.endpoints.append(allocator, .{
+        .name = try allocator.dupe(u8, "root-node"),
+        .url = try allocator.dupe(u8, "ws://127.0.0.1:65535/v2/fs"),
+        .export_name = null,
+        .mount_path = try allocator.dupe(u8, "/"),
+        .root_node_id = 42,
+        .export_read_only = false,
+        .caps_case_sensitive = true,
+        .healthy = true,
+        .last_health_check_ms = now,
+        .last_success_ms = now,
+    });
+
+    try std.testing.expect(!root_router.usesSyntheticStatfs("/"));
+
+    var virtual_root_router = try Router.init(allocator, &[_]EndpointConfig{});
+    defer virtual_root_router.deinit();
+
+    try virtual_root_router.endpoints.append(allocator, .{
+        .name = try allocator.dupe(u8, "project-node"),
+        .url = try allocator.dupe(u8, "ws://127.0.0.1:65534/v2/fs"),
+        .export_name = null,
+        .mount_path = try allocator.dupe(u8, "/projects/demo"),
+        .root_node_id = 7,
+        .export_read_only = false,
+        .caps_case_sensitive = true,
+        .healthy = true,
+        .last_health_check_ms = now,
+        .last_success_ms = now,
+    });
+
+    try std.testing.expect(virtual_root_router.usesSyntheticStatfs("/"));
 }
 
 test "acheron_router: resolvePath honors explicit mount_path overlays" {

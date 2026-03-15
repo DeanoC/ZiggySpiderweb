@@ -2,6 +2,8 @@
 
 Deployment and maintenance helpers for the workspace-host version of Spiderweb.
 
+These scripts are Linux-specific. On macOS, use `spiderweb-config config install-service` to install the per-user `launchd` service instead.
+
 ## Quick Install
 
 ```bash

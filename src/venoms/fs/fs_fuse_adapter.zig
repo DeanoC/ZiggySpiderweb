@@ -9,8 +9,18 @@ const c = @cImport({
 
 var active_adapter: ?*FuseAdapter = null;
 
-const FuseStat = if (builtin.os.tag == .windows) c.struct_fuse_stat else c.struct_stat;
-const FuseStatvfs = if (builtin.os.tag == .windows) c.struct_fuse_statvfs else c.struct_statvfs;
+const FuseStat = if (builtin.os.tag == .windows)
+    c.struct_fuse_stat
+else if (builtin.os.tag == .macos)
+    c.struct_fuse_darwin_attr
+else
+    c.struct_stat;
+const FuseStatvfs = if (builtin.os.tag == .windows)
+    c.struct_fuse_statvfs
+else if (builtin.os.tag == .macos)
+    c.struct_statfs
+else
+    c.struct_statvfs;
 
 const FuseMainRealVersionedFn = *const fn (
     c_int,
@@ -248,7 +258,7 @@ pub const FuseAdapter = struct {
     }
 
     pub fn mountWithBackend(self: *FuseAdapter, mountpoint: []const u8, backend: MountBackend) !void {
-        if (mountpoint.len == 0) return error.InvalidMountpoint;
+        try validateLocalMountRequest(mountpoint, backend);
         if (active_adapter != null) return error.AlreadyMounted;
 
         var ops = std.mem.zeroes(c.struct_fuse_operations);
@@ -257,6 +267,11 @@ pub const FuseAdapter = struct {
             ops.readdir = cReaddirWin;
             ops.statfs = cStatfsWin;
             ops.rename = cRenameWin;
+        } else if (builtin.os.tag == .macos) {
+            ops.getattr = cGetattrDarwin;
+            ops.readdir = cReaddirDarwin;
+            ops.statfs = cStatfsDarwin;
+            ops.rename = cRename;
         } else {
             ops.getattr = cGetattr;
             ops.readdir = cReaddir;
@@ -308,10 +323,8 @@ pub const FuseAdapter = struct {
                 try appendArgZ(self.allocator, &argv, "-d");
             }
         } else |_| {}
-        const mount_options = switch (@import("builtin").os.tag) {
-            .windows => "uid=-1,gid=-1,FileInfoTimeout=-1",
-            else => "default_permissions,attr_timeout=1,entry_timeout=1,negative_timeout=0",
-        };
+        const mount_options = try buildMountOptions(self.allocator, mountpoint);
+        defer self.allocator.free(mount_options);
         try appendArgZ(self.allocator, &argv, "-o");
         try appendArgZ(self.allocator, &argv, mount_options);
         try appendArgZ(self.allocator, &argv, mountpoint);
@@ -324,20 +337,33 @@ pub const FuseAdapter = struct {
 
         const argc: c_int = @intCast(argv.items.len);
         const argv_ptr: [*c][*c]u8 = @ptrCast(argv.items.ptr);
-        var fuse_version: c.struct_libfuse_version = .{
-            .major = 0,
-            .minor = 0,
-            .hotfix = 0,
-            .padding = 0,
-        };
-
-        const rc = if (lib.lookup(FuseMainRealVersionedFn, "fuse_main_real_versioned")) |fuse_main_real_versioned|
+        const rc = if (builtin.os.tag == .macos)
+            if (lib.lookup(FuseMainRealVersionedFn, "fuse_main_real_versioned")) |fuse_main_real_versioned|
+                c.spiderweb_call_fuse_main_real_versioned(
+                    @ptrCast(@constCast(fuse_main_real_versioned)),
+                    argc,
+                    argv_ptr,
+                    &ops,
+                    @sizeOf(c.struct_fuse_operations),
+                    null,
+                )
+            else if (lib.lookup(FuseMainRealFn, "fuse_main_real")) |fuse_main_real|
+                fuse_main_real(
+                    argc,
+                    argv_ptr,
+                    &ops,
+                    @sizeOf(c.struct_fuse_operations),
+                    null,
+                )
+            else
+                return error.MissingFuseSymbol
+        else if (lib.lookup(FuseMainRealVersionedFn, "fuse_main_real_versioned")) |fuse_main_real_versioned|
             fuse_main_real_versioned(
                 argc,
                 argv_ptr,
                 &ops,
                 @sizeOf(c.struct_fuse_operations),
-                &fuse_version,
+                null,
                 null,
             )
         else if (lib.lookup(FuseMainRealFn, "fuse_main_real")) |fuse_main_real|
@@ -381,8 +407,134 @@ pub const FuseAdapter = struct {
     }
 };
 
+pub fn mountpointMustExistBeforeMount(backend: FuseAdapter.MountBackend) bool {
+    _ = backend;
+    return switch (builtin.os.tag) {
+        .windows, .macos => false,
+        else => true,
+    };
+}
+
+const minimum_macos_fskit_version = std.SemanticVersion{ .major = 15, .minor = 4, .patch = 0 };
+
+fn isMacosFskitSupportedVersion(version: std.SemanticVersion) bool {
+    return version.order(minimum_macos_fskit_version) != .lt;
+}
+
+pub fn isCurrentMacosFskitSupported() bool {
+    if (builtin.os.tag != .macos) return false;
+
+    // Use the host's runtime version rather than the compile target so local
+    // mount support tracks the actual machine we're running on.
+    const runtime_target = std.zig.system.resolveTargetQuery(.{}) catch return false;
+    return isMacosFskitSupportedVersion(runtime_target.os.version_range.semver.min);
+}
+
+pub fn validateLocalMountRequest(mountpoint: []const u8, backend: FuseAdapter.MountBackend) !void {
+    return validateMountRequestForOs(builtin.os.tag, mountpoint, backend, isCurrentMacosFskitSupported());
+}
+
+pub fn probeLocalMountBackend(backend: FuseAdapter.MountBackend) !void {
+    try validateBackendForOs(builtin.os.tag, backend, isCurrentMacosFskitSupported());
+    var lib = try openMountLibrary(backend);
+    lib.close();
+}
+
+fn buildMountOptions(allocator: std.mem.Allocator, mountpoint: []const u8) ![]u8 {
+    return buildMountOptionsForOs(allocator, builtin.os.tag, mountpoint);
+}
+
+fn buildMountOptionsForOs(allocator: std.mem.Allocator, os_tag: std.Target.Os.Tag, mountpoint: []const u8) ![]u8 {
+    return switch (os_tag) {
+        .windows => allocator.dupe(u8, "uid=-1,gid=-1,FileInfoTimeout=-1"),
+        .macos => blk: {
+            const volume_name = try macosVolumeNameFromMountpoint(allocator, mountpoint);
+            defer allocator.free(volume_name);
+            break :blk try std.fmt.allocPrint(
+                allocator,
+                "backend=fskit,volname={s},fsname=spiderweb#{s}",
+                .{ volume_name, volume_name },
+            );
+        },
+        else => allocator.dupe(u8, "default_permissions,attr_timeout=1,entry_timeout=1,negative_timeout=0"),
+    };
+}
+
+fn macosVolumeNameFromMountpoint(allocator: std.mem.Allocator, mountpoint: []const u8) ![]u8 {
+    const trimmed = std.mem.trimRight(u8, mountpoint, "/");
+    const base = std.fs.path.basename(trimmed);
+    const fallback = if (base.len == 0 or std.mem.eql(u8, base, "Volumes")) "spiderweb" else base;
+
+    var out = std.ArrayListUnmanaged(u8){};
+    defer out.deinit(allocator);
+    for (fallback) |ch| {
+        const normalized = if (std.ascii.isAlphanumeric(ch) or ch == '-' or ch == '_' or ch == '.') ch else '-';
+        try out.append(allocator, normalized);
+    }
+    if (out.items.len == 0) try out.appendSlice(allocator, "spiderweb");
+    return out.toOwnedSlice(allocator);
+}
+
+fn validateMountRequestForOs(
+    os_tag: std.Target.Os.Tag,
+    mountpoint: []const u8,
+    backend: FuseAdapter.MountBackend,
+    macos_supported: bool,
+) !void {
+    if (mountpoint.len == 0) return error.InvalidMountpoint;
+    try validateBackendForOs(os_tag, backend, macos_supported);
+
+    if (os_tag == .macos) {
+        try validateMacosMountpoint(mountpoint);
+    }
+}
+
+fn validateMacosMountpoint(mountpoint: []const u8) !void {
+    const trimmed = std.mem.trimRight(u8, mountpoint, "/");
+    if (!std.fs.path.isAbsolute(trimmed)) return error.InvalidMacosMountpoint;
+
+    const normalized = try std.fs.path.resolvePosix(std.heap.page_allocator, &.{trimmed});
+    defer std.heap.page_allocator.free(normalized);
+
+    if (!std.mem.startsWith(u8, normalized, "/Volumes/")) return error.InvalidMacosMountpoint;
+
+    const volume_name = normalized["/Volumes/".len..];
+    if (volume_name.len == 0) return error.InvalidMacosMountpoint;
+    if (std.mem.indexOfScalar(u8, volume_name, '/') != null) return error.InvalidMacosMountpoint;
+}
+
+fn validateBackendForOs(
+    os_tag: std.Target.Os.Tag,
+    backend: FuseAdapter.MountBackend,
+    macos_supported: bool,
+) !void {
+    switch (os_tag) {
+        .macos => switch (backend) {
+            .auto, .fuse => {
+                if (!macos_supported) return error.UnsupportedMacosVersion;
+            },
+            .winfsp => return error.UnsupportedMountBackend,
+        },
+        .linux => switch (backend) {
+            .auto, .fuse => {},
+            .winfsp => return error.UnsupportedOs,
+        },
+        .windows => {},
+        else => return error.UnsupportedOs,
+    }
+}
+
 fn openMountLibrary(backend: FuseAdapter.MountBackend) !std.DynLib {
-    const candidates: []const []const u8 = switch (builtin.os.tag) {
+    const candidates = try mountLibraryCandidatesForOs(builtin.os.tag, backend);
+    for (candidates) |candidate| {
+        if (std.DynLib.open(candidate)) |lib| return lib else |_| {}
+    }
+    if (builtin.os.tag == .macos) return error.MacFuseNotInstalled;
+    return error.MountLibraryNotFound;
+}
+
+fn mountLibraryCandidatesForOs(os_tag: std.Target.Os.Tag, backend: FuseAdapter.MountBackend) ![]const []const u8 {
+    return switch (os_tag) {
         .linux => switch (backend) {
             .auto, .fuse => &[_][]const u8{
                 "libfuse3.so.4",
@@ -393,7 +545,24 @@ fn openMountLibrary(backend: FuseAdapter.MountBackend) !std.DynLib {
                 "/usr/lib/x86_64-linux-gnu/libfuse3.so.3",
                 "libfuse3.so",
             },
-            .winfsp => return error.UnsupportedOs,
+            .winfsp => error.UnsupportedOs,
+        },
+        .macos => switch (backend) {
+            .auto, .fuse => &[_][]const u8{
+                "/usr/local/lib/libfuse3.dylib",
+                "/usr/local/lib/libfuse3.4.dylib",
+                "/usr/local/lib/libfuse3.3.dylib",
+                "/usr/local/lib/libfuse3.2.dylib",
+                "/usr/local/lib/libfuse3.0.dylib",
+                "/opt/homebrew/lib/libfuse3.dylib",
+                "/opt/homebrew/lib/libfuse3.4.dylib",
+                "/opt/homebrew/lib/libfuse3.3.dylib",
+                "/Library/Frameworks/macfuse.framework/Versions/Current/lib/libfuse3.dylib",
+                "/Library/Frameworks/macfuse.framework/Versions/Current/lib/libfuse3.4.dylib",
+                "/Library/Filesystems/macfuse.fs/Contents/Resources/lib/libfuse3.dylib",
+                "libfuse3.dylib",
+            },
+            .winfsp => error.UnsupportedMountBackend,
         },
         .windows => switch (backend) {
             .auto, .fuse, .winfsp => &[_][]const u8{
@@ -408,12 +577,8 @@ fn openMountLibrary(backend: FuseAdapter.MountBackend) !std.DynLib {
                 "C:\\Program Files (x86)\\WinFsp\\bin\\winfsp.dll",
             },
         },
-        else => return error.UnsupportedOs,
+        else => error.UnsupportedOs,
     };
-    for (candidates) |candidate| {
-        if (std.DynLib.open(candidate)) |lib| return lib else |_| {}
-    }
-    return error.MountLibraryNotFound;
 }
 
 fn appendArgZ(allocator: std.mem.Allocator, argv: *std.ArrayListUnmanaged([*:0]u8), arg: []const u8) !void {
@@ -432,10 +597,16 @@ fn cGetattrWin(path_c: [*c]const u8, st_c: [*c]c.struct_fuse_stat) callconv(.c) 
 
     const path = std.mem.span(path_c);
     fuseTrace("getattr path={s}", .{path});
-    const attr_json = adapter.getattr(path) catch |err| return toFuseError(err);
+    const attr_json = adapter.getattr(path) catch |err| {
+        fuseTrace("getattr error path={s} err={s}", .{ path, @errorName(err) });
+        return toFuseError(err);
+    };
     defer adapter.allocator.free(attr_json);
 
-    parseAndFillStat(adapter.allocator, st_c, attr_json) catch |err| return toFuseError(err);
+    parseAndFillStat(adapter.allocator, st_c, attr_json) catch |err| {
+        fuseTrace("getattr parse error path={s} err={s}", .{ path, @errorName(err) });
+        return toFuseError(err);
+    };
     return 0;
 }
 
@@ -446,10 +617,36 @@ fn cGetattr(path_c: [*c]const u8, st_c: [*c]c.struct_stat, fi: ?*c.struct_fuse_f
 
     const path = std.mem.span(path_c);
     fuseTrace("getattr path={s}", .{path});
-    const attr_json = adapter.getattr(path) catch |err| return toFuseError(err);
+    const attr_json = adapter.getattr(path) catch |err| {
+        fuseTrace("getattr error path={s} err={s}", .{ path, @errorName(err) });
+        return toFuseError(err);
+    };
     defer adapter.allocator.free(attr_json);
 
-    parseAndFillStat(adapter.allocator, st_c, attr_json) catch |err| return toFuseError(err);
+    parseAndFillStat(adapter.allocator, st_c, attr_json) catch |err| {
+        fuseTrace("getattr parse error path={s} err={s}", .{ path, @errorName(err) });
+        return toFuseError(err);
+    };
+    return 0;
+}
+
+fn cGetattrDarwin(path_c: [*c]const u8, st_c: [*c]c.struct_fuse_darwin_attr, fi: ?*c.struct_fuse_file_info) callconv(.c) c_int {
+    _ = fi;
+    const adapter = active_adapter orelse return -fs_protocol.Errno.EIO;
+    if (path_c == null or st_c == null) return -fs_protocol.Errno.EINVAL;
+
+    const path = std.mem.span(path_c);
+    fuseTrace("getattr(darwin) path={s}", .{path});
+    const attr_json = adapter.getattr(path) catch |err| {
+        fuseTrace("getattr(darwin) error path={s} err={s}", .{ path, @errorName(err) });
+        return toFuseError(err);
+    };
+    defer adapter.allocator.free(attr_json);
+
+    parseAndFillStat(adapter.allocator, st_c, attr_json) catch |err| {
+        fuseTrace("getattr(darwin) parse error path={s} err={s}", .{ path, @errorName(err) });
+        return toFuseError(err);
+    };
     return 0;
 }
 
@@ -467,15 +664,33 @@ fn cReaddirWin(
     const path = std.mem.span(path_c);
     fuseTrace("readdir path={s} off={d}", .{ path, off });
 
-    const cookie: u64 = if (off <= 0) 0 else @intCast(off);
-    const listing = adapter.readdir(path, cookie, 16384) catch |err| return toFuseError(err);
+    const cookie: u64 = if (off <= 0)
+        0
+    else
+        @intCast(off);
+    const listing = adapter.readdir(path, cookie, 16384) catch |err| {
+        fuseTrace("readdir provider error={s} path={s} cookie={d}", .{ @errorName(err), path, cookie });
+        return toFuseError(err);
+    };
     defer adapter.allocator.free(listing);
-
-    var parsed = std.json.parseFromSlice(std.json.Value, adapter.allocator, listing, .{}) catch return -fs_protocol.Errno.EIO;
+    var parsed = std.json.parseFromSlice(std.json.Value, adapter.allocator, listing, .{}) catch |err| {
+        fuseTrace("readdir parse error={s}", .{@errorName(err)});
+        return -fs_protocol.Errno.EIO;
+    };
     defer parsed.deinit();
-    if (parsed.value != .object) return -fs_protocol.Errno.EIO;
-    const ents = parsed.value.object.get("ents") orelse return -fs_protocol.Errno.EIO;
-    if (ents != .array) return -fs_protocol.Errno.EIO;
+    if (parsed.value != .object) {
+        fuseTrace("readdir payload was not object", .{});
+        return -fs_protocol.Errno.EIO;
+    }
+    const ents = parsed.value.object.get("ents") orelse {
+        fuseTrace("readdir payload missing ents", .{});
+        return -fs_protocol.Errno.EIO;
+    };
+    if (ents != .array) {
+        fuseTrace("readdir ents was not array", .{});
+        return -fs_protocol.Errno.EIO;
+    }
+    fuseTrace("readdir entries={d}", .{ents.array.items.len});
 
     if (filler == null) return -fs_protocol.Errno.EINVAL;
     var idx: u64 = 0;
@@ -520,15 +735,36 @@ fn cReaddir(
     const path = std.mem.span(path_c);
     fuseTrace("readdir path={s} off={d}", .{ path, off });
 
-    const cookie: u64 = if (off <= 0) 0 else @intCast(off);
-    const listing = adapter.readdir(path, cookie, 16384) catch |err| return toFuseError(err);
+    const cookie: u64 = if (builtin.os.tag == .macos)
+        0
+    else if (off <= 0)
+        0
+    else
+        @intCast(off);
+    const listing = adapter.readdir(path, cookie, 16384) catch |err| {
+        fuseTrace("readdir provider error={s} path={s} cookie={d}", .{ @errorName(err), path, cookie });
+        return toFuseError(err);
+    };
     defer adapter.allocator.free(listing);
-
-    var parsed = std.json.parseFromSlice(std.json.Value, adapter.allocator, listing, .{}) catch return -fs_protocol.Errno.EIO;
+    fuseTrace("readdir payload={s}", .{listing});
+    var parsed = std.json.parseFromSlice(std.json.Value, adapter.allocator, listing, .{}) catch |err| {
+        fuseTrace("readdir parse error={s}", .{@errorName(err)});
+        return -fs_protocol.Errno.EIO;
+    };
     defer parsed.deinit();
-    if (parsed.value != .object) return -fs_protocol.Errno.EIO;
-    const ents = parsed.value.object.get("ents") orelse return -fs_protocol.Errno.EIO;
-    if (ents != .array) return -fs_protocol.Errno.EIO;
+    if (parsed.value != .object) {
+        fuseTrace("readdir payload was not object", .{});
+        return -fs_protocol.Errno.EIO;
+    }
+    const ents = parsed.value.object.get("ents") orelse {
+        fuseTrace("readdir payload missing ents", .{});
+        return -fs_protocol.Errno.EIO;
+    };
+    if (ents != .array) {
+        fuseTrace("readdir ents was not array", .{});
+        return -fs_protocol.Errno.EIO;
+    }
+    fuseTrace("readdir entries={d}", .{ents.array.items.len});
 
     if (filler == null) return -fs_protocol.Errno.EINVAL;
     var idx: u64 = 0;
@@ -551,14 +787,103 @@ fn cReaddir(
                 } else |_| {}
             }
         }
-        if (filler.?(buf, @ptrCast(name_z.ptr), stat_ptr, next_off, c.FUSE_FILL_DIR_DEFAULTS) != 0) break;
+        const filler_rc = filler.?(buf, @ptrCast(name_z.ptr), stat_ptr, next_off, c.FUSE_FILL_DIR_DEFAULTS);
+        fuseTrace("readdir entry name={s} rc={d}", .{ name_val.string, filler_rc });
+        if (filler_rc != 0) break;
         idx += 1;
     }
     return 0;
 }
 
-fn cOpendir(path_c: [*c]const u8, fi: ?*c.struct_fuse_file_info) callconv(.c) c_int {
+fn cReaddirDarwin(
+    path_c: [*c]const u8,
+    buf: ?*anyopaque,
+    filler: c.fuse_darwin_fill_dir_t,
+    off: c.off_t,
+    fi: ?*c.struct_fuse_file_info,
+    flags: c.enum_fuse_readdir_flags,
+) callconv(.c) c_int {
     _ = fi;
+    _ = flags;
+
+    const adapter = active_adapter orelse return -fs_protocol.Errno.EIO;
+    if (path_c == null) return -fs_protocol.Errno.EINVAL;
+    const path = std.mem.span(path_c);
+    fuseTrace("readdir(darwin) path={s} off={d}", .{ path, off });
+
+    // macFUSE/FSKit may start readdir with non-zero offsets for synthetic "."
+    // and ".." entries. Spiderweb's namespace cookies are not POSIX dirent
+    // positions, so Darwin uses a simple non-seekable listing path for now.
+    const cookie: u64 = 0;
+    const listing = adapter.readdir(path, cookie, 16384) catch |err| {
+        fuseTrace("readdir(darwin) provider error={s} path={s} cookie={d}", .{ @errorName(err), path, cookie });
+        return toFuseError(err);
+    };
+    defer adapter.allocator.free(listing);
+    var parsed = std.json.parseFromSlice(std.json.Value, adapter.allocator, listing, .{}) catch |err| {
+        fuseTrace("readdir(darwin) parse error={s}", .{@errorName(err)});
+        return -fs_protocol.Errno.EIO;
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) {
+        fuseTrace("readdir(darwin) payload was not object", .{});
+        return -fs_protocol.Errno.EIO;
+    }
+    const ents = parsed.value.object.get("ents") orelse {
+        fuseTrace("readdir(darwin) payload missing ents", .{});
+        return -fs_protocol.Errno.EIO;
+    };
+    if (ents != .array) {
+        fuseTrace("readdir(darwin) ents was not array", .{});
+        return -fs_protocol.Errno.EIO;
+    }
+
+    if (filler == null) return -fs_protocol.Errno.EINVAL;
+
+    const dot_entries = [_][]const u8{ ".", ".." };
+    for (dot_entries) |name| {
+        const filler_rc = filler.?(buf, @ptrCast(name.ptr), null, 0, c.FUSE_FILL_DIR_DEFAULTS);
+        fuseTrace("readdir(darwin) special name={s} rc={d}", .{ name, filler_rc });
+        if (filler_rc != 0) return 0;
+    }
+
+    var names = std.ArrayListUnmanaged([*:0]u8){};
+    defer {
+        for (names.items) |name_z| freeArgZ(adapter.allocator, name_z);
+        names.deinit(adapter.allocator);
+    }
+    var stats = std.ArrayListUnmanaged(c.struct_fuse_darwin_attr){};
+    defer stats.deinit(adapter.allocator);
+    names.ensureTotalCapacity(adapter.allocator, ents.array.items.len) catch return -fs_protocol.Errno.EIO;
+    stats.ensureTotalCapacity(adapter.allocator, ents.array.items.len) catch return -fs_protocol.Errno.EIO;
+
+    for (ents.array.items) |entry| {
+        if (entry != .object) continue;
+        const name_val = entry.object.get("name") orelse continue;
+        if (name_val != .string) continue;
+        const name_z = adapter.allocator.dupeZ(u8, name_val.string) catch return -fs_protocol.Errno.EIO;
+        names.appendAssumeCapacity(@ptrCast(name_z.ptr));
+        const name_ptr = names.items[names.items.len - 1];
+
+        const next_off: c.off_t = 0;
+        var stat_ptr: [*c]const c.struct_fuse_darwin_attr = null;
+        if (entry.object.get("attr")) |attr_val| {
+            if (attr_val == .object) {
+                if (parseAttrFromObject(attr_val.object)) |attr| {
+                    stats.appendAssumeCapacity(std.mem.zeroes(c.struct_fuse_darwin_attr));
+                    fillStatFromParsedAttr(&stats.items[stats.items.len - 1], attr);
+                    stat_ptr = @ptrCast(&stats.items[stats.items.len - 1]);
+                } else |_| {}
+            }
+        }
+        const filler_rc = filler.?(buf, name_ptr, stat_ptr, next_off, c.FUSE_FILL_DIR_DEFAULTS);
+        fuseTrace("readdir(darwin) entry name={s} rc={d}", .{ name_val.string, filler_rc });
+        if (filler_rc != 0) break;
+    }
+    return 0;
+}
+
+fn cOpendir(path_c: [*c]const u8, fi: ?*c.struct_fuse_file_info) callconv(.c) c_int {
     const adapter = active_adapter orelse return -fs_protocol.Errno.EIO;
     if (path_c == null) return -fs_protocol.Errno.EINVAL;
 
@@ -569,6 +894,10 @@ fn cOpendir(path_c: [*c]const u8, fi: ?*c.struct_fuse_file_info) callconv(.c) c_
 
     const attr = parseAttr(adapter.allocator, attr_json) catch |err| return toFuseError(err);
     if (!attrIsDirectory(attr)) return -fs_protocol.Errno.ENOTDIR;
+    if (builtin.os.tag == .macos and fi != null) {
+        c.spiderweb_fi_set_nonseekable(fi.?, 1);
+        c.spiderweb_fi_set_cache_readdir(fi.?, 0);
+    }
     return 0;
 }
 
@@ -603,9 +932,33 @@ fn cStatfs(path_c: [*c]const u8, stbuf: [*c]c.struct_statvfs) callconv(.c) c_int
     const adapter = active_adapter orelse return -fs_protocol.Errno.EIO;
     if (path_c == null or stbuf == null) return -fs_protocol.Errno.EINVAL;
     const path = std.mem.span(path_c);
-    const statfs_json = adapter.statfs(path) catch |err| return toFuseError(err);
+    fuseTrace("statfs path={s}", .{path});
+    const statfs_json = adapter.statfs(path) catch |err| {
+        fuseTrace("statfs error path={s} err={s}", .{ path, @errorName(err) });
+        return toFuseError(err);
+    };
     defer adapter.allocator.free(statfs_json);
-    parseAndFillStatvfs(adapter.allocator, stbuf, statfs_json) catch |err| return toFuseError(err);
+    parseAndFillStatvfs(adapter.allocator, stbuf, statfs_json) catch |err| {
+        fuseTrace("statfs parse error path={s} err={s}", .{ path, @errorName(err) });
+        return toFuseError(err);
+    };
+    return 0;
+}
+
+fn cStatfsDarwin(path_c: [*c]const u8, stbuf: [*c]c.struct_statfs) callconv(.c) c_int {
+    const adapter = active_adapter orelse return -fs_protocol.Errno.EIO;
+    if (path_c == null or stbuf == null) return -fs_protocol.Errno.EINVAL;
+    const path = std.mem.span(path_c);
+    fuseTrace("statfs(darwin) path={s}", .{path});
+    const statfs_json = adapter.statfs(path) catch |err| {
+        fuseTrace("statfs(darwin) error path={s} err={s}", .{ path, @errorName(err) });
+        return toFuseError(err);
+    };
+    defer adapter.allocator.free(statfs_json);
+    parseAndFillStatvfs(adapter.allocator, stbuf, statfs_json) catch |err| {
+        fuseTrace("statfs(darwin) parse error path={s} err={s}", .{ path, @errorName(err) });
+        return toFuseError(err);
+    };
     return 0;
 }
 
@@ -1027,15 +1380,16 @@ fn parseAndFillStatvfs(allocator: std.mem.Allocator, st: anytype, statfs_json: [
     const Statvfs = @TypeOf(st.*);
     st.* = std.mem.zeroes(Statvfs);
 
-    if (@hasField(c.struct_statvfs, "f_bsize")) st.*.f_bsize = safeStatCast(@TypeOf(st.*.f_bsize), statfs.bsize);
-    if (@hasField(c.struct_statvfs, "f_frsize")) st.*.f_frsize = safeStatCast(@TypeOf(st.*.f_frsize), statfs.frsize);
-    if (@hasField(c.struct_statvfs, "f_blocks")) st.*.f_blocks = safeStatCast(@TypeOf(st.*.f_blocks), statfs.blocks);
-    if (@hasField(c.struct_statvfs, "f_bfree")) st.*.f_bfree = safeStatCast(@TypeOf(st.*.f_bfree), statfs.bfree);
-    if (@hasField(c.struct_statvfs, "f_bavail")) st.*.f_bavail = safeStatCast(@TypeOf(st.*.f_bavail), statfs.bavail);
-    if (@hasField(c.struct_statvfs, "f_files")) st.*.f_files = safeStatCast(@TypeOf(st.*.f_files), statfs.files);
-    if (@hasField(c.struct_statvfs, "f_ffree")) st.*.f_ffree = safeStatCast(@TypeOf(st.*.f_ffree), statfs.ffree);
-    if (@hasField(c.struct_statvfs, "f_favail")) st.*.f_favail = safeStatCast(@TypeOf(st.*.f_favail), statfs.favail);
-    if (@hasField(c.struct_statvfs, "f_namemax")) st.*.f_namemax = safeStatCast(@TypeOf(st.*.f_namemax), statfs.namemax);
+    if (@hasField(Statvfs, "f_bsize")) st.*.f_bsize = safeStatCast(@TypeOf(st.*.f_bsize), statfs.bsize);
+    if (@hasField(Statvfs, "f_frsize")) st.*.f_frsize = safeStatCast(@TypeOf(st.*.f_frsize), statfs.frsize);
+    if (@hasField(Statvfs, "f_iosize")) st.*.f_iosize = safeStatCast(@TypeOf(st.*.f_iosize), statfs.frsize);
+    if (@hasField(Statvfs, "f_blocks")) st.*.f_blocks = safeStatCast(@TypeOf(st.*.f_blocks), statfs.blocks);
+    if (@hasField(Statvfs, "f_bfree")) st.*.f_bfree = safeStatCast(@TypeOf(st.*.f_bfree), statfs.bfree);
+    if (@hasField(Statvfs, "f_bavail")) st.*.f_bavail = safeStatCast(@TypeOf(st.*.f_bavail), statfs.bavail);
+    if (@hasField(Statvfs, "f_files")) st.*.f_files = safeStatCast(@TypeOf(st.*.f_files), statfs.files);
+    if (@hasField(Statvfs, "f_ffree")) st.*.f_ffree = safeStatCast(@TypeOf(st.*.f_ffree), statfs.ffree);
+    if (@hasField(Statvfs, "f_favail")) st.*.f_favail = safeStatCast(@TypeOf(st.*.f_favail), statfs.favail);
+    if (@hasField(Statvfs, "f_namemax")) st.*.f_namemax = safeStatCast(@TypeOf(st.*.f_namemax), statfs.namemax);
 }
 
 fn makeTimespec(comptime T: type, ns_total: i64) T {
@@ -1101,27 +1455,49 @@ fn fillStatFromParsedAttr(st: anytype, attr: ParsedAttr) void {
     st.* = std.mem.zeroes(Stat);
     const effective = effectiveStatAttr(attr);
 
-    if (@hasField(c.struct_stat, "st_ino")) st.*.st_ino = safeStatCast(@TypeOf(st.*.st_ino), effective.id);
-    if (@hasField(c.struct_stat, "st_mode")) st.*.st_mode = safeStatCast(@TypeOf(st.*.st_mode), effective.mode);
-    if (@hasField(c.struct_stat, "st_nlink")) st.*.st_nlink = safeStatCast(@TypeOf(st.*.st_nlink), effective.nlink);
-    if (@hasField(c.struct_stat, "st_uid")) st.*.st_uid = safeStatCast(@TypeOf(st.*.st_uid), effective.uid);
-    if (@hasField(c.struct_stat, "st_gid")) st.*.st_gid = safeStatCast(@TypeOf(st.*.st_gid), effective.gid);
-    if (@hasField(c.struct_stat, "st_size")) st.*.st_size = safeStatCast(@TypeOf(st.*.st_size), effective.size);
+    if (@hasField(Stat, "st_ino")) st.*.st_ino = safeStatCast(@TypeOf(st.*.st_ino), effective.id);
+    if (@hasField(Stat, "ino")) st.*.ino = safeStatCast(@TypeOf(st.*.ino), effective.id);
+    if (@hasField(Stat, "st_mode")) st.*.st_mode = safeStatCast(@TypeOf(st.*.st_mode), effective.mode);
+    if (@hasField(Stat, "mode")) st.*.mode = safeStatCast(@TypeOf(st.*.mode), effective.mode);
+    if (@hasField(Stat, "st_nlink")) st.*.st_nlink = safeStatCast(@TypeOf(st.*.st_nlink), effective.nlink);
+    if (@hasField(Stat, "nlink")) st.*.nlink = safeStatCast(@TypeOf(st.*.nlink), effective.nlink);
+    if (@hasField(Stat, "st_uid")) st.*.st_uid = safeStatCast(@TypeOf(st.*.st_uid), effective.uid);
+    if (@hasField(Stat, "uid")) st.*.uid = safeStatCast(@TypeOf(st.*.uid), effective.uid);
+    if (@hasField(Stat, "st_gid")) st.*.st_gid = safeStatCast(@TypeOf(st.*.st_gid), effective.gid);
+    if (@hasField(Stat, "gid")) st.*.gid = safeStatCast(@TypeOf(st.*.gid), effective.gid);
+    if (@hasField(Stat, "st_size")) st.*.st_size = safeStatCast(@TypeOf(st.*.st_size), effective.size);
+    if (@hasField(Stat, "size")) st.*.size = safeStatCast(@TypeOf(st.*.size), effective.size);
 
-    if (@hasField(c.struct_stat, "st_atim")) {
+    if (@hasField(Stat, "st_atim")) {
         st.*.st_atim = makeTimespec(@TypeOf(st.*.st_atim), attr.atime_ns);
-    } else if (@hasField(c.struct_stat, "st_atimespec")) {
+    } else if (@hasField(Stat, "st_atimespec")) {
         st.*.st_atimespec = makeTimespec(@TypeOf(st.*.st_atimespec), attr.atime_ns);
+    } else if (@hasField(Stat, "atimespec")) {
+        st.*.atimespec = makeTimespec(@TypeOf(st.*.atimespec), attr.atime_ns);
     }
-    if (@hasField(c.struct_stat, "st_mtim")) {
+    if (@hasField(Stat, "st_mtim")) {
         st.*.st_mtim = makeTimespec(@TypeOf(st.*.st_mtim), attr.mtime_ns);
-    } else if (@hasField(c.struct_stat, "st_mtimespec")) {
+    } else if (@hasField(Stat, "st_mtimespec")) {
         st.*.st_mtimespec = makeTimespec(@TypeOf(st.*.st_mtimespec), attr.mtime_ns);
+    } else if (@hasField(Stat, "mtimespec")) {
+        st.*.mtimespec = makeTimespec(@TypeOf(st.*.mtimespec), attr.mtime_ns);
     }
-    if (@hasField(c.struct_stat, "st_ctim")) {
+    if (@hasField(Stat, "st_ctim")) {
         st.*.st_ctim = makeTimespec(@TypeOf(st.*.st_ctim), attr.ctime_ns);
-    } else if (@hasField(c.struct_stat, "st_ctimespec")) {
+    } else if (@hasField(Stat, "st_ctimespec")) {
         st.*.st_ctimespec = makeTimespec(@TypeOf(st.*.st_ctimespec), attr.ctime_ns);
+    } else if (@hasField(Stat, "ctimespec")) {
+        st.*.ctimespec = makeTimespec(@TypeOf(st.*.ctimespec), attr.ctime_ns);
+    }
+    if (@hasField(Stat, "btimespec")) {
+        st.*.btimespec = makeTimespec(@TypeOf(st.*.btimespec), attr.ctime_ns);
+    }
+    if (@hasField(Stat, "blksize")) {
+        st.*.blksize = safeStatCast(@TypeOf(st.*.blksize), 4096);
+    }
+    if (@hasField(Stat, "blocks")) {
+        const blocks = if (effective.size == 0) 0 else (effective.size + 511) / 512;
+        st.*.blocks = safeStatCast(@TypeOf(st.*.blocks), blocks);
     }
 }
 
@@ -1295,4 +1671,66 @@ test "fs_fuse_adapter: toFuseError maps xattr and lock related errors" {
     try std.testing.expectEqual(-fs_protocol.Errno.ERANGE, toFuseError(error.Range));
     try std.testing.expectEqual(-fs_protocol.Errno.EINVAL, toFuseError(error.InvalidPayload));
     try std.testing.expectEqual(-fs_protocol.Errno.ENOSYS, toFuseError(error.OperationNotSupported));
+}
+
+test "fs_fuse_adapter: darwin validates supported mountpoints" {
+    try validateMountRequestForOs(.macos, "/Volumes/spiderweb-demo", .auto, true);
+    try validateMountRequestForOs(.macos, "/Volumes/spiderweb-demo/", .auto, true);
+    try std.testing.expectError(
+        error.InvalidMacosMountpoint,
+        validateMountRequestForOs(.macos, "/tmp/spiderweb-demo", .auto, true),
+    );
+    try std.testing.expectError(
+        error.InvalidMacosMountpoint,
+        validateMountRequestForOs(.macos, "/Volumes", .auto, true),
+    );
+    try std.testing.expectError(
+        error.InvalidMacosMountpoint,
+        validateMountRequestForOs(.macos, "/Volumes/../tmp/spiderweb-demo", .auto, true),
+    );
+    try std.testing.expectError(
+        error.InvalidMacosMountpoint,
+        validateMountRequestForOs(.macos, "/Volumes/spiderweb-demo/nested", .auto, true),
+    );
+}
+
+test "fs_fuse_adapter: darwin rejects unsupported backend and version" {
+    try std.testing.expectError(
+        error.UnsupportedMountBackend,
+        validateMountRequestForOs(.macos, "/Volumes/spiderweb-demo", .winfsp, true),
+    );
+    try std.testing.expectError(
+        error.UnsupportedMacosVersion,
+        validateMountRequestForOs(.macos, "/Volumes/spiderweb-demo", .auto, false),
+    );
+}
+
+test "fs_fuse_adapter: darwin fskit support is gated by runtime version" {
+    try std.testing.expect(!isMacosFskitSupportedVersion(.{ .major = 15, .minor = 3, .patch = 9 }));
+    try std.testing.expect(isMacosFskitSupportedVersion(.{ .major = 15, .minor = 4, .patch = 0 }));
+    try std.testing.expect(isMacosFskitSupportedVersion(.{ .major = 15, .minor = 6, .patch = 0 }));
+}
+
+test "fs_fuse_adapter: darwin mount options prefer fskit with generated volume name" {
+    const allocator = std.testing.allocator;
+    const options = try buildMountOptionsForOs(allocator, .macos, "/Volumes/Spiderweb Demo");
+    defer allocator.free(options);
+
+    try std.testing.expect(std.mem.indexOf(u8, options, "backend=fskit") != null);
+    try std.testing.expect(std.mem.indexOf(u8, options, "volname=Spiderweb-Demo") != null);
+    try std.testing.expect(std.mem.indexOf(u8, options, "fsname=spiderweb#Spiderweb-Demo") != null);
+}
+
+test "fs_fuse_adapter: darwin library candidates use macfuse libfuse3" {
+    const candidates = try mountLibraryCandidatesForOs(.macos, .auto);
+    try std.testing.expect(candidates.len > 0);
+    try std.testing.expectEqualStrings("/usr/local/lib/libfuse3.dylib", candidates[0]);
+    var saw_framework = false;
+    for (candidates) |candidate| {
+        if (std.mem.indexOf(u8, candidate, "macfuse.framework") != null) {
+            saw_framework = true;
+            break;
+        }
+    }
+    try std.testing.expect(saw_framework);
 }

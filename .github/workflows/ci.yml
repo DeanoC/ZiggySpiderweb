@@ -38,6 +38,28 @@ jobs:
           echo "[ci] RUN_SANDBOX_CI_TESTS!=1; skipping sandbox-dependent matrix + mother-e2e suite."
         fi
 
+  macos-host-build-and-test:
+    name: macos-host-build-and-test
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.1
+
+      - name: Zig version
+        run: zig version
+
+      - name: Build host artifacts
+        run: zig build
+
+      - name: Run tests
+        run: zig build test
+
   standalone-client-linux:
     uses: ./.github/workflows/ziggy-shared-ci.yml
     secrets: inherit
