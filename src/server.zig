@@ -8560,7 +8560,7 @@ fn seedUserRememberedTargetForTests(
     try runtime_registry.auth_tokens.setRememberedTarget(.user, agent_id, project_id_value.string);
 }
 
-test "server_piai: workspace template control ops expose dev catalog entries" {
+test "server: workspace template control ops expose dev catalog entries" {
     const allocator = std.testing.allocator;
     var runtime_registry = AgentRuntimeRegistry.init(allocator, .{
         .ltm_directory = "",
@@ -8593,7 +8593,7 @@ test "server_piai: workspace template control ops expose dev catalog entries" {
     try std.testing.expect(std.mem.indexOf(u8, fetched, "\"bind_path\":\"/services/search_code\"") != null);
 }
 
-test "server_piai: workspace bind control ops rewrite workspace payload and response fields" {
+test "server: workspace bind control ops rewrite workspace payload and response fields" {
     const allocator = std.testing.allocator;
     var runtime_registry = AgentRuntimeRegistry.init(allocator, .{
         .ltm_directory = "",
@@ -8667,7 +8667,7 @@ test "server_piai: workspace bind control ops rewrite workspace payload and resp
     try std.testing.expect(std.mem.indexOf(u8, removed, "\"bind_path\":\"/repo\"") == null);
 }
 
-test "server_piai: admin initial binding prefers remembered workspace target" {
+test "server: admin initial binding prefers remembered workspace target" {
     const allocator = std.testing.allocator;
     var runtime_registry = AgentRuntimeRegistry.init(allocator, .{
         .ltm_directory = "",
@@ -8961,7 +8961,7 @@ fn expectWorkspaceScopeSnapshotsEqual(
     }
 }
 
-test "server_piai: base websocket path handles unified control and rejects legacy runtime channels" {
+test "server: base websocket path handles unified control and rejects legacy runtime channels" {
     const allocator = std.testing.allocator;
     var runtime_registry = AgentRuntimeRegistry.init(allocator, .{
         .ltm_directory = "",
@@ -9029,7 +9029,7 @@ test "server_piai: base websocket path handles unified control and rejects legac
     try std.testing.expect(server_ctx.err_name == null);
 }
 
-test "server_piai: workspace namespace stays project-scoped across user session agent switches" {
+test "server: workspace namespace stays project-scoped across user session agent switches" {
     const allocator = std.testing.allocator;
     var runtime_registry = AgentRuntimeRegistry.init(allocator, .{
         .ltm_directory = "",
@@ -9138,7 +9138,7 @@ test "server_piai: workspace namespace stays project-scoped across user session 
     try std.testing.expect(server_ctx.err_name == null);
 }
 
-test "server_piai: control.agent_list and control.agent_get expose registry metadata" {
+test "server: control.agent_list and control.agent_get expose registry metadata" {
     const allocator = std.testing.allocator;
     const nonce = std.crypto.random.int(u64);
     const root = try std.fmt.allocPrint(allocator, ".tmp-agent-registry-{d}", .{nonce});
@@ -9240,7 +9240,7 @@ test "server_piai: control.agent_list and control.agent_get expose registry meta
     try std.testing.expect(std.mem.indexOf(u8, get_reply.payload, "\"name\":\"Bob\"") != null);
 }
 
-test "server_piai: control.agent_ensure creates missing agents and is idempotent" {
+test "server: control.agent_ensure creates missing agents and is idempotent" {
     const allocator = std.testing.allocator;
     const nonce = std.crypto.random.int(u64);
     const root = try std.fmt.allocPrint(allocator, ".tmp-agent-ensure-{d}", .{nonce});
@@ -9332,7 +9332,7 @@ test "server_piai: control.agent_ensure creates missing agents and is idempotent
     try std.testing.expect(std.mem.indexOf(u8, hatch, "HATCH.md") != null);
 }
 
-test "server_piai: operator token gate protects control mutations" {
+test "server: operator token gate protects control mutations" {
     const allocator = std.testing.allocator;
     var runtime_registry = AgentRuntimeRegistry.init(allocator, .{
         .ltm_directory = "",
@@ -9399,7 +9399,7 @@ test "server_piai: operator token gate protects control mutations" {
     try std.testing.expect(server_ctx.err_name == null);
 }
 
-test "server_piai: base websocket rejects legacy acheron runtime session" {
+test "server: base websocket rejects legacy acheron runtime session" {
     const allocator = std.testing.allocator;
     var runtime_registry = AgentRuntimeRegistry.init(allocator, .{
         .ltm_directory = "",
@@ -9431,7 +9431,7 @@ test "server_piai: base websocket rejects legacy acheron runtime session" {
     try std.testing.expect(server_ctx.err_name == null);
 }
 
-test "server_piai: base websocket supports namespace attach after session_attach" {
+test "server: base websocket supports namespace attach after session_attach" {
     const allocator = std.testing.allocator;
     var runtime_registry = AgentRuntimeRegistry.init(allocator, .{
         .ltm_directory = "",
@@ -9528,7 +9528,7 @@ test "server_piai: base websocket supports namespace attach after session_attach
     try std.testing.expect(server_ctx.err_name == null);
 }
 
-test "server_piai: auth matrix gates admin endpoints and handshake tokens" {
+test "server: auth matrix gates admin endpoints and handshake tokens" {
     const allocator = std.testing.allocator;
     var runtime_registry = AgentRuntimeRegistry.init(allocator, .{
         .ltm_directory = "",
@@ -9689,7 +9689,7 @@ test "server_piai: auth matrix gates admin endpoints and handshake tokens" {
     try std.testing.expect(server_ctx.err_name == null);
 }
 
-test "server_piai: user connect advertises provisioning gate when no remembered non-system target exists" {
+test "server: user connect advertises provisioning gate when no remembered non-system target exists" {
     const allocator = std.testing.allocator;
     var runtime_registry = AgentRuntimeRegistry.init(allocator, .{
         .ltm_directory = "",
@@ -9749,7 +9749,7 @@ test "server_piai: user connect advertises provisioning gate when no remembered 
     try std.testing.expect(server_ctx.err_name == null);
 }
 
-test "server_piai: provisioning gate still allows workspace bootstrap control operations" {
+test "server: provisioning gate still allows workspace bootstrap control operations" {
     const allocator = std.testing.allocator;
     var runtime_registry = AgentRuntimeRegistry.init(allocator, .{
         .ltm_directory = "",
@@ -9800,7 +9800,7 @@ test "server_piai: provisioning gate still allows workspace bootstrap control op
     try std.testing.expect(server_ctx.err_name == null);
 }
 
-test "server_piai: user connect requires session_attach even when another project is active" {
+test "server: user connect requires session_attach even when another project is active" {
     const allocator = std.testing.allocator;
     var runtime_registry = AgentRuntimeRegistry.init(allocator, .{
         .ltm_directory = "",
@@ -9874,7 +9874,7 @@ test "server_piai: user connect requires session_attach even when another projec
     try std.testing.expect(server_ctx.err_name == null);
 }
 
-test "server_piai: connect and session_status expose actor identity metadata" {
+test "server: connect and session_status expose actor identity metadata" {
     const allocator = std.testing.allocator;
     var runtime_registry = AgentRuntimeRegistry.init(allocator, .{
         .ltm_directory = "",
@@ -9931,7 +9931,7 @@ test "server_piai: connect and session_status expose actor identity metadata" {
     try std.testing.expect(server_ctx.err_name == null);
 }
 
-test "server_piai: user session_attach forbids actor identity override" {
+test "server: user session_attach forbids actor identity override" {
     const allocator = std.testing.allocator;
     var runtime_registry = AgentRuntimeRegistry.init(allocator, .{
         .ltm_directory = "",
@@ -10005,7 +10005,7 @@ test "server_piai: user session_attach forbids actor identity override" {
     try std.testing.expect(server_ctx.err_name == null);
 }
 
-test "server_piai: control.session_history and control.session_restore survive reconnect" {
+test "server: control.session_history and control.session_restore survive reconnect" {
     const allocator = std.testing.allocator;
     var runtime_registry = AgentRuntimeRegistry.init(allocator, .{
         .ltm_directory = "",
@@ -10112,7 +10112,7 @@ test "server_piai: control.session_history and control.session_restore survive r
     try std.testing.expect(server_ctx.err_name == null);
 }
 
-test "server_piai: control.auth_rotate reports storage_error when token persistence fails" {
+test "server: control.auth_rotate reports storage_error when token persistence fails" {
     const allocator = std.testing.allocator;
     var runtime_registry = AgentRuntimeRegistry.init(allocator, .{
         .ltm_directory = "",
@@ -10174,7 +10174,7 @@ test "server_piai: control.auth_rotate reports storage_error when token persiste
     try std.testing.expect(server_ctx.err_name == null);
 }
 
-test "server_piai: session_attach rejects project changes while jobs are in-flight" {
+test "server: session_attach rejects project changes while jobs are in-flight" {
     const allocator = std.testing.allocator;
     var runtime_registry = AgentRuntimeRegistry.init(allocator, .{
         .ltm_directory = "",
@@ -10245,7 +10245,7 @@ test "server_piai: session_attach rejects project changes while jobs are in-flig
     try std.testing.expect(server_ctx.err_name == null);
 }
 
-test "server_piai: session_attach forbids reserved system agent on non-system workspace" {
+test "server: session_attach forbids reserved system agent on non-system workspace" {
     const allocator = std.testing.allocator;
     var runtime_registry = AgentRuntimeRegistry.init(allocator, .{
         .ltm_directory = "",
@@ -10314,7 +10314,7 @@ test "server_piai: session_attach forbids reserved system agent on non-system wo
     try std.testing.expect(server_ctx.err_name == null);
 }
 
-test "server_piai: debug subscription control operations are unsupported in acheron-native mode" {
+test "server: debug subscription control operations are unsupported in acheron-native mode" {
     const allocator = std.testing.allocator;
     var runtime_registry = AgentRuntimeRegistry.init(allocator, .{
         .ltm_directory = "",
@@ -10367,7 +10367,7 @@ test "server_piai: debug subscription control operations are unsupported in ache
     try std.testing.expect(server_ctx.err_name == null);
 }
 
-test "server_piai: base path rejects legacy runtime connections cleanly across reconnects" {
+test "server: base path rejects legacy runtime connections cleanly across reconnects" {
     const allocator = std.testing.allocator;
     var runtime_registry = AgentRuntimeRegistry.init(allocator, .{
         .ltm_directory = "",
@@ -10415,7 +10415,7 @@ test "server_piai: base path rejects legacy runtime connections cleanly across r
     try std.testing.expect(server_ctx.err_name == null);
 }
 
-test "server_piai: runtime cap does not block repeated base-path reconnects" {
+test "server: runtime cap does not block repeated base-path reconnects" {
     const allocator = std.testing.allocator;
     var runtime_registry = AgentRuntimeRegistry.initWithLimits(
         allocator,
@@ -10487,7 +10487,7 @@ test "server_piai: runtime cap does not block repeated base-path reconnects" {
     try std.testing.expect(server_ctx.err_name == null);
 }
 
-test "server_piai: project runtime switches persona when agent changes" {
+test "server: project runtime switches persona when agent changes" {
     const allocator = std.testing.allocator;
     var runtime_registry = AgentRuntimeRegistry.initWithLimits(
         allocator,
@@ -10522,7 +10522,7 @@ test "server_piai: project runtime switches persona when agent changes" {
     try std.testing.expectEqualStrings(system_agent_id, active_entry.runtime_agent_id);
 }
 
-test "server_piai: getOrCreate replaces unhealthy runtime for same agent" {
+test "server: getOrCreate replaces unhealthy runtime for same agent" {
     const allocator = std.testing.allocator;
     var runtime_registry = AgentRuntimeRegistry.initWithLimits(
         allocator,
@@ -10551,7 +10551,7 @@ test "server_piai: getOrCreate replaces unhealthy runtime for same agent" {
     try std.testing.expectEqual(@as(usize, 1), runtime_registry.by_agent.count());
 }
 
-test "server_piai: ready runtime lookup rejects unhealthy binding" {
+test "server: ready runtime lookup rejects unhealthy binding" {
     const allocator = std.testing.allocator;
     var runtime_registry = AgentRuntimeRegistry.initWithLimits(
         allocator,
@@ -10579,7 +10579,7 @@ test "server_piai: ready runtime lookup rejects unhealthy binding" {
     try std.testing.expectEqual(@as(usize, 0), runtime_registry.by_agent.count());
 }
 
-test "server_piai: unhealthy binding drop marks warmup error" {
+test "server: unhealthy binding drop marks warmup error" {
     const allocator = std.testing.allocator;
     var runtime_registry = AgentRuntimeRegistry.initWithLimits(
         allocator,
@@ -10619,7 +10619,7 @@ test "server_piai: unhealthy binding drop marks warmup error" {
     try std.testing.expect(!runtime_registry.hasRuntimeForBinding(runtime_registry.default_agent_id, project_id));
 }
 
-test "server_piai: websocket rejects unsupported route version" {
+test "server: websocket rejects unsupported route version" {
     const allocator = std.testing.allocator;
     var runtime_registry = AgentRuntimeRegistry.init(allocator, .{
         .ltm_directory = "",
@@ -10657,7 +10657,7 @@ test "server_piai: websocket rejects unsupported route version" {
     try std.testing.expect(server_ctx.err_name == null);
 }
 
-test "server_piai: resolve connection path maps base URL to default agent" {
+test "server: resolve connection path maps base URL to default agent" {
     const resolved_root = resolveAgentIdFromConnectionPath("/", "default") orelse return error.TestExpectedAgent;
     try std.testing.expectEqualStrings("default", resolved_root);
     const resolved_query = resolveAgentIdFromConnectionPath("/?session=main", "default") orelse return error.TestExpectedAgent;
@@ -10666,14 +10666,14 @@ test "server_piai: resolve connection path maps base URL to default agent" {
     try std.testing.expect(resolveAgentIdFromConnectionPath("/v1/agents/default/stream", "default") == null);
 }
 
-test "server_piai: pathMatchesControlTarget only matches control namespace root path" {
+test "server: pathMatchesControlTarget only matches control namespace root path" {
     try std.testing.expect(pathMatchesControlTarget("global/workspaces/control/up.json", "global/workspaces/control/up.json"));
     try std.testing.expect(pathMatchesControlTarget("/global/workspaces/control/up.json", "global/workspaces/control/up.json"));
     try std.testing.expect(pathMatchesControlTarget("/global/workspaces/control/up.json/", "global/workspaces/control/up.json"));
     try std.testing.expect(!pathMatchesControlTarget("workspace/global/workspaces/control/up.json", "global/workspaces/control/up.json"));
 }
 
-test "server_piai: parseHttpRequestPath parses GET line" {
+test "server: parseHttpRequestPath parses GET line" {
     const request =
         "GET /metrics HTTP/1.1\r\n" ++
         "Host: localhost\r\n" ++
@@ -10682,12 +10682,12 @@ test "server_piai: parseHttpRequestPath parses GET line" {
     try std.testing.expectEqualStrings("/metrics", path);
 }
 
-test "server_piai: stripHttpRequestTargetQuery removes query string" {
+test "server: stripHttpRequestTargetQuery removes query string" {
     try std.testing.expectEqualStrings("/metrics", stripHttpRequestTargetQuery("/metrics?format=json"));
     try std.testing.expectEqualStrings("/readyz", stripHttpRequestTargetQuery("/readyz"));
 }
 
-test "server_piai: metrics include retained node service event telemetry" {
+test "server: metrics include retained node service event telemetry" {
     const allocator = std.testing.allocator;
     var runtime_registry = AgentRuntimeRegistry.init(allocator, .{
         .ltm_directory = "",
@@ -10706,7 +10706,7 @@ test "server_piai: metrics include retained node service event telemetry" {
     try std.testing.expect(std.mem.indexOf(u8, metrics_prom, "spiderweb_node_service_events_retained_window_ms") != null);
 }
 
-test "server_piai: extract project payload helpers parse id and token" {
+test "server: extract project payload helpers parse id and token" {
     const allocator = std.testing.allocator;
     const payload = "{\"project_id\":\"proj-7\",\"project_token\":\"proj-token-7\"}";
 
@@ -10724,7 +10724,7 @@ test "server_piai: extract project payload helpers parse id and token" {
     try std.testing.expect(token_missing == null);
 }
 
-test "server_piai: extract node id helper parses valid payload" {
+test "server: extract node id helper parses valid payload" {
     const allocator = std.testing.allocator;
     const payload = "{\"node_id\":\"node-7\",\"venom_delta\":{\"changed\":true}}";
     const node_id = try extractNodeIdFromControlPayload(allocator, payload);
@@ -10736,7 +10736,7 @@ test "server_piai: extract node id helper parses valid payload" {
     try std.testing.expect(missing == null);
 }
 
-test "server_piai: user node service visibility is project mounted-node scoped" {
+test "server: user node service visibility is project mounted-node scoped" {
     const allocator = std.testing.allocator;
     var runtime_registry = AgentRuntimeRegistry.init(allocator, .{
         .ltm_directory = "",
@@ -10792,7 +10792,7 @@ test "server_piai: user node service visibility is project mounted-node scoped" 
     ));
 }
 
-test "server_piai: validateFsNodeHelloPayload enforces optional auth_token" {
+test "server: validateFsNodeHelloPayload enforces optional auth_token" {
     const allocator = std.testing.allocator;
     _ = try validateFsNodeHelloPayload(
         allocator,
@@ -10822,7 +10822,7 @@ test "server_piai: validateFsNodeHelloPayload enforces optional auth_token" {
     );
 }
 
-test "server_piai: node fs route parser extracts node id" {
+test "server: node fs route parser extracts node id" {
     const route = parseNodeFsRoute("/v2/fs/node/node-17") orelse return error.TestExpectedResponse;
     try std.testing.expectEqualStrings("node-17", route);
     const route_q = parseNodeFsRoute("/v2/fs/node/node_17?session=a") orelse return error.TestExpectedResponse;
@@ -10831,7 +10831,7 @@ test "server_piai: node fs route parser extracts node id" {
     try std.testing.expect(parseNodeFsRoute("/v2/fs/node/node:bad") == null);
 }
 
-test "server_piai: rewriteAcheronTag rewrites top-level tag" {
+test "server: rewriteAcheronTag rewrites top-level tag" {
     const allocator = std.testing.allocator;
     const raw = "{\"channel\":\"acheron\",\"type\":\"acheron.t_fs_lookup\",\"tag\":7,\"payload\":{\"name\":\"a\"}}";
     const rewritten = try rewriteAcheronTag(allocator, raw, 99);
@@ -10840,7 +10840,7 @@ test "server_piai: rewriteAcheronTag rewrites top-level tag" {
     try std.testing.expect(std.mem.indexOf(u8, rewritten, "\"type\":\"acheron.t_fs_lookup\"") != null);
 }
 
-test "server_piai: agent id validation allows safe identifiers only" {
+test "server: agent id validation allows safe identifiers only" {
     try std.testing.expect(AgentRuntimeRegistry.isValidAgentId("alpha-1"));
     try std.testing.expect(AgentRuntimeRegistry.isValidAgentId("agent_2"));
     try std.testing.expect(!AgentRuntimeRegistry.isValidAgentId("."));
@@ -10848,7 +10848,7 @@ test "server_piai: agent id validation allows safe identifiers only" {
     try std.testing.expect(!AgentRuntimeRegistry.isValidAgentId(""));
 }
 
-test "server_piai: project id validation rejects traversal-like values" {
+test "server: project id validation rejects traversal-like values" {
     try std.testing.expect(AgentRuntimeRegistry.isValidProjectId("proj-1"));
     try std.testing.expect(AgentRuntimeRegistry.isValidProjectId("proj.alpha_2"));
     try std.testing.expect(!AgentRuntimeRegistry.isValidProjectId(""));
@@ -10857,7 +10857,7 @@ test "server_piai: project id validation rejects traversal-like values" {
     try std.testing.expect(!AgentRuntimeRegistry.isValidProjectId("proj/../../etc"));
 }
 
-test "server_piai: invalid configured default agent falls back to built-in default" {
+test "server: invalid configured default agent falls back to built-in default" {
     const allocator = std.testing.allocator;
     var cfg = Config.RuntimeConfig{};
     cfg.default_agent_id = ".";
@@ -10866,7 +10866,7 @@ test "server_piai: invalid configured default agent falls back to built-in defau
     try std.testing.expectEqualStrings(system_agent_id, registry.default_agent_id);
 }
 
-test "server_piai: parseArchiveTimestamp accepts rotated debug archive names" {
+test "server: parseArchiveTimestamp accepts rotated debug archive names" {
     try std.testing.expectEqual(@as(?u64, 1771674073992), parseArchiveTimestamp("debug-stream-1771674073992.ndjson"));
     try std.testing.expectEqual(@as(?u64, 1771674073992), parseArchiveTimestamp("debug-stream-1771674073992.ndjson.gz"));
     try std.testing.expectEqual(@as(?u64, 1771674073992), parseArchiveTimestamp("debug-stream-1771674073992-1.ndjson"));
@@ -10874,7 +10874,7 @@ test "server_piai: parseArchiveTimestamp accepts rotated debug archive names" {
     try std.testing.expectEqual(@as(?u64, null), parseArchiveTimestamp("debug-stream-abc.ndjson"));
 }
 
-test "server_piai: local fs node registration upserts fs chat and jobs venoms" {
+test "server: local fs node registration upserts fs chat and jobs venoms" {
     const allocator = std.testing.allocator;
 
     var runtime_config = Config.RuntimeConfig{};
