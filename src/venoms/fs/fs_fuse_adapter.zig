@@ -777,11 +777,11 @@ fn cReaddir(
 
         const next_cookie = std.math.add(u64, cookie, idx + 1) catch std.math.maxInt(u64);
         const next_off: c.off_t = std.math.cast(c.off_t, next_cookie) orelse 0;
+        var stat_buf: c.struct_stat = std.mem.zeroes(c.struct_stat);
         var stat_ptr: [*c]const c.struct_stat = null;
         if (entry.object.get("attr")) |attr_val| {
             if (attr_val == .object) {
                 if (parseAttrFromObject(attr_val.object)) |attr| {
-                    var stat_buf: c.struct_stat = std.mem.zeroes(c.struct_stat);
                     fillStatFromParsedAttr(&stat_buf, attr);
                     stat_ptr = @ptrCast(&stat_buf);
                 } else |_| {}
