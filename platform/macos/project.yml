@@ -1,0 +1,70 @@
+name: SpiderwebFSKit
+
+options:
+  deploymentTarget:
+    macOS: "15.4"
+
+settings:
+  base:
+    SWIFT_VERSION: 5.10
+    MACOSX_DEPLOYMENT_TARGET: "15.4"
+    CODE_SIGN_STYLE: Automatic
+    ENABLE_APP_SANDBOX: YES
+
+targets:
+  SpiderwebFSKit:
+    type: application
+    platform: macOS
+    deploymentTarget: "15.4"
+    sources:
+      - path: Sources/Shared
+      - path: Sources/SpiderwebFSKitApp
+    info:
+      path: Config/SpiderwebFSKit-Info.plist
+    entitlements:
+      path: build/generated/SpiderwebFSKit.entitlements
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.deanoc.spiderweb.fskit.app
+        PRODUCT_NAME: SpiderwebFSKit
+        GENERATE_INFOPLIST_FILE: NO
+        LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/../Frameworks"
+    dependencies:
+      - target: SpiderwebFSKitExtension
+        embed: true
+        codeSign: true
+
+  SpiderwebFSKitExtension:
+    type: extensionkit-extension
+    platform: macOS
+    deploymentTarget: "15.4"
+    sources:
+      - path: Sources/Shared
+      - path: Sources/SpiderwebFSKitExtension
+    info:
+      path: Config/SpiderwebFSKitExtension-Info.plist
+      properties:
+        FSSupportedSchemes:
+          - spiderweb
+        EXAppExtensionAttributes:
+          EXExtensionPointIdentifier: com.apple.fskit.fsmodule
+          FSActivateOptionSyntax:
+            shortOptions: "m:n:w:"
+          FSMediaTypes: {}
+          FSPersonalities:
+            SpiderwebPersonality:
+              FSName: Spiderweb
+              FSfileObjectsAreCaseSensitive: true
+          FSRequiresSecurityScopedPathURLResources: false
+          FSShortName: spiderweb
+          FSSupportsBlockResources: false
+          FSSupportsGenericURLResources: true
+          FSSupportsPathURLs: false
+          FSSupportsServerURLs: true
+    entitlements:
+      path: build/generated/SpiderwebFSKitExtension.entitlements
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.deanoc.spiderweb.fskit.app.extension
+        PRODUCT_NAME: SpiderwebFSKitExtension
+        GENERATE_INFOPLIST_FILE: NO

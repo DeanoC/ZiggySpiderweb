@@ -5,10 +5,13 @@ const fs_fuse_adapter = @import("spiderweb_fs_fuse_adapter");
 const hybrid_mount_provider = @import("hybrid_mount_provider.zig");
 const mount_provider = @import("spiderweb_mount_provider");
 const mount_state = @import("mount_state.zig");
+const native_mount_protocol = @import("native_mount_protocol.zig");
+const native_mount_support = @import("native_mount_support.zig");
 const namespace_client = @import("namespace_client.zig");
 
 const control_reply_timeout_ms: i32 = 45_000;
 const control_handshake_timeout_ms: i32 = 10_000;
+const native_mount_timeout_ms: u64 = 30_000;
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -325,7 +328,7 @@ pub fn main() !void {
         else
             try router.statusJson(force_probe);
         defer allocator.free(status);
-        emitLocalMountStatusDiagnostic(mount_backend);
+        emitLocalMountStatusDiagnostic(allocator, mount_backend);
         const line = try std.fmt.allocPrint(allocator, "{s}\n", .{status});
         defer allocator.free(line);
         try std.fs.File.stdout().writeAll(line);
@@ -335,15 +338,36 @@ pub fn main() !void {
     if (std.mem.eql(u8, command, "mount")) {
         if (remaining.items.len < 2) return error.InvalidArguments;
         const mountpoint = remaining.items[1];
-        if (fs_fuse_adapter.mountpointMustExistBeforeMount(mount_backend)) {
+        const effective_backend = try resolveRequestedMountBackend(allocator, mount_backend);
+        if (fs_fuse_adapter.mountpointMustExistBeforeMount(effective_backend)) {
             try ensurePathExists(mountpoint);
         }
-        fs_fuse_adapter.validateLocalMountRequest(mountpoint, mount_backend) catch |err| {
-            reportMountCommandError(err, mountpoint, mount_backend);
+        if (effective_backend == .native) {
+            native_mount_support.validateNativeMountRequest(mountpoint) catch |err| {
+                reportMountCommandError(err, mountpoint, effective_backend);
+                std.process.exit(2);
+            };
+            requestNativeMount(
+                allocator,
+                mountpoint,
+                endpoint_specs.items,
+                namespace_status,
+                workspace_token,
+                resolved_workspace_auth_token,
+                workspace_sync_interval_ms,
+                namespace_keepalive_interval_ms,
+            ) catch |err| {
+                reportMountCommandError(err, mountpoint, effective_backend);
+                return err;
+            };
+            return;
+        }
+        fs_fuse_adapter.validateLocalMountRequest(mountpoint, effective_backend) catch |err| {
+            reportMountCommandError(err, mountpoint, effective_backend);
             std.process.exit(2);
         };
-        fs_fuse_adapter.probeLocalMountBackend(mount_backend) catch |err| {
-            reportMountCommandError(err, mountpoint, mount_backend);
+        fs_fuse_adapter.probeLocalMountBackend(effective_backend) catch |err| {
+            reportMountCommandError(err, mountpoint, effective_backend);
             std.process.exit(2);
         };
         var sync_ctx: ?*WorkspaceSyncContext = null;
@@ -399,8 +423,8 @@ pub fn main() !void {
             keepalive_thread = try std.Thread.spawn(.{}, namespaceKeepaliveThreadMain, .{ctx});
             keepalive_ctx = ctx;
         }
-        adapter.mountWithBackend(mountpoint, mount_backend) catch |err| {
-            reportMountCommandError(err, mountpoint, mount_backend);
+        adapter.mountWithBackend(mountpoint, effective_backend) catch |err| {
+            reportMountCommandError(err, mountpoint, effective_backend);
             return err;
         };
         return;
@@ -452,8 +476,9 @@ fn printHelp() !void {
         \\spiderweb-fs-mount - Distributed filesystem router client
         \\
         \\Usage:
-        \\  spiderweb-fs-mount [--workspace-url <ws-url> | --namespace-url <ws-url>] [--workspace-id <id>] [--workspace-token <token>] [--auth-token <token>] [--agent-id <id>] [--session-key <key>] [--mount-backend auto|fuse|winfsp] [--workspace-sync-interval-ms <ms>] [--namespace-keepalive-interval-ms <ms>] [--endpoint <name>=<ws-url>[#export][@/mount]] <command> [args]
-        \\  macOS local mounts require macFUSE 5.x and a mountpoint under /Volumes/<name>.
+        \\  spiderweb-fs-mount [--workspace-url <ws-url> | --namespace-url <ws-url>] [--workspace-id <id>] [--workspace-token <token>] [--auth-token <token>] [--agent-id <id>] [--session-key <key>] [--mount-backend auto|native|fuse|winfsp] [--workspace-sync-interval-ms <ms>] [--namespace-keepalive-interval-ms <ms>] [--endpoint <name>=<ws-url>[#export][@/mount]] <command> [args]
+        \\  On macOS, auto prefers the native FSKit backend and falls back to macFUSE.
+        \\  macOS mounts use /Volumes/<name>. Native mounts require the SpiderwebFSKit app; fuse mounts require macFUSE 5.x.
         \\
         \\Commands:
         \\  getattr <path>
@@ -475,7 +500,8 @@ fn printHelp() !void {
         \\  spiderweb-fs-mount --endpoint a=ws://127.0.0.1:18891/v2/fs status
         \\  spiderweb-fs-mount --workspace-url ws://127.0.0.1:18790/ readdir /
         \\  spiderweb-fs-mount --workspace-url ws://127.0.0.1:18790/ --workspace-id ws-demo --workspace-sync-interval-ms 5000 mount /mnt/spiderweb
-        \\  spiderweb-fs-mount --workspace-url ws://127.0.0.1:18790/ --workspace-id ws-demo mount /Volumes/spiderweb-demo
+        \\  spiderweb-fs-mount --workspace-url ws://127.0.0.1:18790/ --workspace-id ws-demo --mount-backend native mount /Volumes/spiderweb-demo
+        \\  spiderweb-fs-mount --workspace-url ws://127.0.0.1:18790/ --workspace-id ws-demo --mount-backend fuse mount /Volumes/spiderweb-demo
         \\  spiderweb-fs-mount --workspace-url ws://127.0.0.1:18790/ --workspace-id ws-demo --workspace-token ws-token-... readdir /
         \\  spiderweb-fs-mount --workspace-url ws://127.0.0.1:18790/ --auth-token sw-admin-... readdir /
         \\  spiderweb-fs-mount --namespace-url ws://127.0.0.1:18790/ --workspace-id ws-demo mount /mnt/spiderweb
@@ -506,33 +532,27 @@ const NamespaceStatus = struct {
 
 fn parseMountBackend(raw: []const u8) !fs_fuse_adapter.FuseAdapter.MountBackend {
     if (std.mem.eql(u8, raw, "auto")) return .auto;
+    if (std.mem.eql(u8, raw, "native")) return .native;
     if (std.mem.eql(u8, raw, "fuse")) return .fuse;
     if (std.mem.eql(u8, raw, "winfsp")) return .winfsp;
     return error.InvalidArguments;
 }
 
-fn emitLocalMountStatusDiagnostic(backend: fs_fuse_adapter.FuseAdapter.MountBackend) void {
+fn emitLocalMountStatusDiagnostic(allocator: std.mem.Allocator, backend: fs_fuse_adapter.FuseAdapter.MountBackend) void {
     if (builtin.os.tag != .macos) return;
 
-    if (!fs_fuse_adapter.isCurrentMacosFskitSupported()) {
-        std.log.warn("local macOS mount backend unavailable: macOS 15.4+ is required for macFUSE FSKit mounts", .{});
-        return;
-    }
-
-    if (fs_fuse_adapter.probeLocalMountBackend(backend)) |_| {
-        std.log.info("local macOS mount backend ready: use mount /Volumes/<name> with macFUSE FSKit", .{});
-    } else |err| switch (err) {
-        error.UnsupportedMountBackend => {
-            std.log.warn("local macOS mount backend unavailable: --mount-backend winfsp is Windows-only; use auto or fuse", .{});
+    switch (backend) {
+        .native => {
+            _ = emitNativeStatusDiagnostic(allocator);
         },
-        error.MacFuseNotInstalled => {
-            std.log.warn("local macOS mount backend unavailable: install macFUSE 5.x from https://macfuse.github.io/ and mount under /Volumes/<name>", .{});
+        .fuse => emitFuseStatusDiagnostic(.fuse),
+        .auto => {
+            if (!emitNativeStatusDiagnostic(allocator)) {
+                emitFuseStatusDiagnostic(.fuse);
+            }
         },
-        error.UnsupportedMacosVersion => {
-            std.log.warn("local macOS mount backend unavailable: macOS 15.4+ is required for backend=fskit", .{});
-        },
-        else => {
-            std.log.warn("local macOS mount backend probe failed: {s}", .{@errorName(err)});
+        .winfsp => {
+            std.log.warn("local macOS mount backend unavailable: --mount-backend winfsp is Windows-only; use auto, native, or fuse", .{});
         },
     }
 }
@@ -545,15 +565,43 @@ fn reportMountCommandError(
     _ = backend;
     if (builtin.os.tag == .macos) switch (err) {
         error.UnsupportedMountBackend => {
-            std.log.err("macOS local mounts do not support --mount-backend winfsp; use auto or fuse", .{});
+            std.log.err("macOS local mounts do not support that backend; use auto, native, or fuse", .{});
             return;
         },
         error.UnsupportedMacosVersion => {
-            std.log.err("macOS local mounts require macOS 15.4+ for the macFUSE FSKit backend", .{});
+            std.log.err("macOS native mounts require macOS 15.4+ or newer", .{});
             return;
         },
         error.InvalidMacosMountpoint => {
             std.log.err("macOS local mounts must use a mountpoint under /Volumes/<name>; got {s}", .{mountpoint});
+            return;
+        },
+        error.NativeFsExtensionNotInstalled => {
+            std.log.err("macOS native mounts require the SpiderwebFSKit app. Build it under platform/macos, then run `spiderweb-config config install-fs-extension`.", .{});
+            return;
+        },
+        error.NativeFsExtensionNotReady => {
+            std.log.err("macOS native mounts are scaffolded but not fully wired on this checkout yet. Use `--mount-backend fuse` for now, or finish the FSKit callback bridge and install a runtime-ready SpiderwebFSKit app bundle.", .{});
+            return;
+        },
+        error.NativeFsExtensionSigningRequired => {
+            std.log.err("macOS native mounts require a real Apple development signing identity. Sign into Xcode, select a development team, rebuild SpiderwebFSKit, then reinstall the FS extension so the FSKit and app-group entitlements are preserved.", .{});
+            return;
+        },
+        error.NativeFsExtensionCapabilitiesMissing => {
+            std.log.err("macOS native mounts require SpiderwebFSKit to be signed with preserved FSKit and app-group entitlements. The current signing team/profile is stripping them, so the module stays disabled.", .{});
+            return;
+        },
+        error.NativeFsExtensionApprovalRequired => {
+            std.log.err("macOS native mounts require the SpiderwebFSKit extension to be enabled in System Settings -> General -> Login Items & Extensions -> File System Extensions.", .{});
+            return;
+        },
+        error.NativeFsExtensionDisabled => {
+            std.log.err("macOS sees the SpiderwebFSKit module as disabled. Re-enable it in System Settings -> General -> Login Items & Extensions -> File System Extensions after reinstalling a correctly signed build.", .{});
+            return;
+        },
+        error.NativeMountTimedOut => {
+            std.log.err("macOS native mount request timed out waiting for {s} to appear. Check the SpiderwebFSKit app/extension logs and retry.", .{mountpoint});
             return;
         },
         error.MacFuseNotInstalled, error.MountLibraryNotFound => {
@@ -562,6 +610,135 @@ fn reportMountCommandError(
         },
         else => {},
     };
+}
+
+fn resolveRequestedMountBackend(
+    allocator: std.mem.Allocator,
+    backend: fs_fuse_adapter.FuseAdapter.MountBackend,
+) !fs_fuse_adapter.FuseAdapter.MountBackend {
+    if (builtin.os.tag != .macos) return backend;
+
+    return switch (backend) {
+        .auto => blk: {
+            native_mount_support.probeNativeBackend(allocator) catch break :blk .fuse;
+            break :blk .native;
+        },
+        else => backend,
+    };
+}
+
+fn emitNativeStatusDiagnostic(allocator: std.mem.Allocator) bool {
+    var status = native_mount_support.detectInstallStatus(allocator) catch |err| {
+        std.log.warn("local macOS native mount backend probe failed: {s}", .{@errorName(err)});
+        return false;
+    };
+    defer status.deinit(allocator);
+
+    if (!status.supported_os) {
+        std.log.warn("local macOS native mount backend unavailable: macOS 15.4+ is required for FSKit mounts", .{});
+        return false;
+    }
+    if (status.ready()) {
+        std.log.info("local macOS native mount backend ready: use mount /Volumes/<name> and --mount-backend native (or auto)", .{});
+        return true;
+    }
+
+    if (!status.app_installed) {
+        std.log.warn("local macOS native mount backend unavailable: install SpiderwebFSKit with `spiderweb-config config install-fs-extension`", .{});
+        return false;
+    }
+    if (!status.extension_present or !status.helper_present) {
+        std.log.warn("local macOS native mount backend unavailable: installed SpiderwebFSKit.app is missing the extension or helper payload", .{});
+        return false;
+    }
+    if (!status.runtime_ready) {
+        std.log.warn("local macOS native mount backend scaffold detected, but the runtime-ready manifest is missing; use fuse until the FSKit callback bridge is finished", .{});
+        return false;
+    }
+    if (!status.signing_identity_available) {
+        std.log.warn("local macOS native mount backend needs Xcode signing setup: no valid Apple development code-signing identities were found", .{});
+        return false;
+    }
+    if (!status.app_group_entitled or !status.extension_fskit_entitled) {
+        std.log.warn("local macOS native mount backend is signed, but the current team/profile is stripping app-group or FSKit entitlements; native mounts will stay disabled until those capabilities are preserved", .{});
+        return false;
+    }
+    if (!status.extension_registered) {
+        std.log.warn("local macOS native mount backend needs approval: enable SpiderwebFSKit in System Settings -> General -> Login Items & Extensions -> File System Extensions", .{});
+        return false;
+    }
+    if (!status.module_enabled) {
+        std.log.warn("local macOS native mount backend is installed but still disabled by the OS; enable SpiderwebFSKit in File System Extensions and verify the signed entitlements survived install", .{});
+        return false;
+    }
+    return false;
+}
+
+fn emitFuseStatusDiagnostic(backend: fs_fuse_adapter.FuseAdapter.MountBackend) void {
+    if (!fs_fuse_adapter.isCurrentMacosFskitSupported()) {
+        std.log.warn("local macOS fuse backend unavailable: macOS 15.4+ is required for macFUSE FSKit mounts", .{});
+        return;
+    }
+
+    if (fs_fuse_adapter.probeLocalMountBackend(backend)) |_| {
+        std.log.info("local macOS fuse backend ready: use mount /Volumes/<name> with macFUSE 5.x", .{});
+    } else |err| switch (err) {
+        error.UnsupportedMountBackend => {
+            std.log.warn("local macOS fuse backend unavailable: use auto, native, or fuse", .{});
+        },
+        error.MacFuseNotInstalled => {
+            std.log.warn("local macOS fuse backend unavailable: install macFUSE 5.x from https://macfuse.github.io/ and mount under /Volumes/<name>", .{});
+        },
+        error.UnsupportedMacosVersion => {
+            std.log.warn("local macOS fuse backend unavailable: macOS 15.4+ is required for backend=fskit", .{});
+        },
+        else => {
+            std.log.warn("local macOS fuse backend probe failed: {s}", .{@errorName(err)});
+        },
+    }
+}
+
+fn requestNativeMount(
+    allocator: std.mem.Allocator,
+    mountpoint: []const u8,
+    endpoint_specs: []const fs_router.EndpointConfig,
+    namespace_status: NamespaceStatus,
+    workspace_token: ?[]const u8,
+    auth_token: ?[]const u8,
+    workspace_sync_interval_ms: u64,
+    namespace_keepalive_interval_ms: u64,
+) !void {
+    const native_endpoints = try allocator.alloc(native_mount_protocol.EndpointSpec, endpoint_specs.len);
+    defer allocator.free(native_endpoints);
+    for (endpoint_specs, 0..) |endpoint, idx| {
+        native_endpoints[idx] = .{
+            .name = endpoint.name,
+            .url = endpoint.url,
+            .export_name = endpoint.export_name,
+            .mount_path = endpoint.mount_path orelse "/",
+            .auth_token = endpoint.auth_token orelse auth_token,
+        };
+    }
+
+    const namespace_binding = if (namespace_status.namespace_url) |namespace_url|
+        native_mount_protocol.NamespaceBinding{
+            .namespace_url = namespace_url,
+            .auth_token = auth_token,
+            .project_id = namespace_status.project_id orelse return error.ProjectRequired,
+            .agent_id = namespace_status.agent_id orelse return error.InvalidResponse,
+            .session_key = namespace_status.session_key orelse return error.InvalidResponse,
+            .project_token = workspace_token,
+        }
+    else
+        null;
+
+    try native_mount_support.requestNativeMount(allocator, .{
+        .mountpoint = mountpoint,
+        .workspace_sync_interval_ms = workspace_sync_interval_ms,
+        .namespace_keepalive_interval_ms = namespace_keepalive_interval_ms,
+        .endpoints = native_endpoints,
+        .namespace = namespace_binding,
+    }, native_mount_timeout_ms);
 }
 
 fn buildNamespaceStatusJson(
