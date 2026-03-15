@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const Config = @import("config.zig");
+const native_mount_support = @import("acheron/native_mount_support.zig");
 const first_run = @import("first_run.zig");
 
 const auth_tokens_filename = "auth_tokens.json";
@@ -216,9 +217,15 @@ fn handleConfigCommand(allocator: std.mem.Allocator, args: []const []const u8) !
         try uninstallService(allocator);
     } else if (std.mem.eql(u8, subcommand, "service-status")) {
         try printServiceStatus(allocator);
+    } else if (std.mem.eql(u8, subcommand, "install-fs-extension")) {
+        try installFsExtension(allocator);
+    } else if (std.mem.eql(u8, subcommand, "uninstall-fs-extension")) {
+        try uninstallFsExtension(allocator);
+    } else if (std.mem.eql(u8, subcommand, "fs-extension-status")) {
+        try printFsExtensionStatus(allocator);
     } else {
         std.log.err("Unknown config command: {s}", .{subcommand});
-        std.log.info("Available: set-server, set-log, path, install-service, uninstall-service, service-status", .{});
+        std.log.info("Available: set-server, set-log, path, install-service, uninstall-service, service-status, install-fs-extension, uninstall-fs-extension, fs-extension-status", .{});
         return error.UnknownCommand;
     }
 }
@@ -265,6 +272,92 @@ fn printServiceStatus(allocator: std.mem.Allocator) !void {
         .launchd_user => printLaunchdUserServiceStatus(allocator),
         .unsupported => error.UnsupportedPlatform,
     };
+}
+
+fn installFsExtension(allocator: std.mem.Allocator) !void {
+    if (builtin.os.tag != .macos) return error.UnsupportedPlatform;
+
+    var status = try native_mount_support.detectInstallStatus(allocator);
+    defer status.deinit(allocator);
+
+    if (!status.supported_os) return error.UnsupportedMacosVersion;
+    const source_app_path = status.source_app_path orelse {
+        std.log.err("Could not find a built SpiderwebFSKit.app. Build it from platform/macos first.", .{});
+        return error.NativeFsExtensionNotInstalled;
+    };
+    if (std.fs.path.dirname(status.app_path)) |dir| try makePathAny(dir);
+
+    _ = try deleteTreeIfExistsAny(status.app_path);
+    try runCommandSuccess(allocator, &.{ "ditto", source_app_path, status.app_path });
+
+    if (pathExists(status.extension_path)) {
+        if (try runCommandBestEffort(allocator, &.{ "pluginkit", "-a", status.extension_path })) |result| {
+            var owned = result;
+            owned.deinit(allocator);
+        }
+        if (try runCommandBestEffort(allocator, &.{ "pluginkit", "-e", "use", "-i", native_mount_support.extension_bundle_id })) |result| {
+            var owned = result;
+            owned.deinit(allocator);
+        }
+    }
+    if (try runCommandBestEffort(allocator, &.{ "open", "-a", status.app_path })) |result| {
+        var owned = result;
+        owned.deinit(allocator);
+    }
+    native_mount_support.openSystemSettingsForFsExtension();
+
+    std.log.info("Installed SpiderwebFSKit.app to {s}", .{status.app_path});
+    std.log.info("If macOS prompts for approval, enable the file system extension in System Settings -> General -> Login Items & Extensions.", .{});
+}
+
+fn uninstallFsExtension(allocator: std.mem.Allocator) !void {
+    if (builtin.os.tag != .macos) return error.UnsupportedPlatform;
+
+    var status = try native_mount_support.detectInstallStatus(allocator);
+    defer status.deinit(allocator);
+
+    if (pathExists(status.extension_path)) {
+        if (try runCommandBestEffort(allocator, &.{ "pluginkit", "-r", status.extension_path })) |result| {
+            var owned = result;
+            owned.deinit(allocator);
+        }
+    }
+    _ = try deleteTreeIfExistsAny(status.app_path);
+    _ = try deleteTreeIfExistsAny(status.request_dir);
+
+    std.log.info("Removed SpiderwebFSKit.app from {s}", .{status.app_path});
+}
+
+fn printFsExtensionStatus(allocator: std.mem.Allocator) !void {
+    if (builtin.os.tag != .macos) return error.UnsupportedPlatform;
+
+    var status = try native_mount_support.detectInstallStatus(allocator);
+    defer status.deinit(allocator);
+
+    const out = try std.fmt.allocPrint(
+        allocator,
+        "FS extension manager: native-fskit\n  supported_os:             {s}\n  installed_app:            {s}\n  built_app_source:         {s}\n  extension_bundle:         {s}\n  helper_executable:        {s}\n  runtime_manifest:         {s}\n  extension_present:        {s}\n  helper_present:           {s}\n  runtime_ready:            {s}\n  signing_identity:         {s}\n  app_group_entitlements:   {s}\n  extension_fs_entitlement: {s}\n  registered:               {s}\n  module_enabled:           {s}\n  ready:                    {s}\n  request_dir:              {s}\n",
+        .{
+            if (status.supported_os) "yes" else "no",
+            status.app_path,
+            status.source_app_path orelse "(not found)",
+            status.extension_path,
+            status.helper_path,
+            status.runtime_ready_manifest_path,
+            if (status.extension_present) "yes" else "no",
+            if (status.helper_present) "yes" else "no",
+            if (status.runtime_ready) "yes" else "no",
+            if (status.signing_identity_available) "yes" else "no",
+            if (status.app_group_entitled) "yes" else "no",
+            if (status.extension_fskit_entitled) "yes" else "no",
+            if (status.extension_registered) "yes" else "no",
+            if (status.module_enabled) "yes" else "no",
+            if (status.ready()) "yes" else "no",
+            status.request_dir,
+        },
+    );
+    defer allocator.free(out);
+    try std.fs.File.stdout().writeAll(out);
 }
 
 fn detectServiceManager() ServiceManager {
@@ -800,6 +893,22 @@ fn deleteFileIfExistsAny(path: []const u8) !bool {
     return true;
 }
 
+fn deleteTreeIfExistsAny(path: []const u8) !bool {
+    if (!pathExists(path)) return false;
+
+    if (std.fs.path.isAbsolute(path)) {
+        var root_dir = try std.fs.openDirAbsolute("/", .{});
+        defer root_dir.close();
+        const rel_path = std.mem.trimLeft(u8, path, "/");
+        if (rel_path.len == 0) return false;
+        try root_dir.deleteTree(rel_path);
+        return true;
+    }
+
+    try std.fs.cwd().deleteTree(path);
+    return true;
+}
+
 fn makeOpaqueToken(allocator: std.mem.Allocator, prefix: []const u8) ![]u8 {
     var random_bytes: [24]u8 = undefined;
     std.crypto.random.bytes(&random_bytes);
@@ -903,6 +1012,9 @@ fn printUsage() !void {
         \\  spiderweb-config config install-service
         \\  spiderweb-config config uninstall-service
         \\  spiderweb-config config service-status
+        \\  spiderweb-config config install-fs-extension
+        \\  spiderweb-config config uninstall-fs-extension
+        \\  spiderweb-config config fs-extension-status
         \\
         \\Examples:
         \\  spiderweb-config first-run
@@ -913,11 +1025,13 @@ fn printUsage() !void {
         \\  spiderweb-config config set-server --bind 0.0.0.0 --port 9000
         \\  spiderweb-config config install-service
         \\  spiderweb-config config service-status
+        \\  spiderweb-config config install-fs-extension
+        \\  spiderweb-config config fs-extension-status
         \\
         \\Workspace-first flow:
         \\  spiderweb-control workspace_create '{"name":"Demo","vision":"Deliver the demo workspace"}'
         \\  spiderweb-fs-mount --workspace-id <workspace-id> ./workspace
-        \\  note: native local mounts are currently supported on Linux and Windows
+        \\  note: macOS auto mounts use macFUSE for now; use --mount-backend native when explicitly testing the FSKit path
         \\  spider-monkey run --workspace-root ./workspace
         \\
     ;

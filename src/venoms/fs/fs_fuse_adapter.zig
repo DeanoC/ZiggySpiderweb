@@ -1,6 +1,7 @@
 const builtin = @import("builtin");
 const std = @import("std");
 const mount_provider = @import("spiderweb_mount_provider");
+const mount_session = @import("spiderweb_mount_session");
 const fs_protocol = @import("acheron_fs_router").acheron_protocol;
 
 const c = @cImport({
@@ -41,14 +42,11 @@ const FuseMainRealFn = *const fn (
 
 pub const FuseAdapter = struct {
     allocator: std.mem.Allocator,
-    provider: mount_provider.Provider,
-    handles: std.AutoHashMapUnmanaged(u64, mount_provider.OpenFile) = .{},
-    next_local_handle: u64 = 1,
-    provider_mutex: std.Thread.Mutex = .{},
-    handles_mutex: std.Thread.Mutex = .{},
+    session: mount_session.MountSession,
 
     pub const MountBackend = enum {
         auto,
+        native,
         fuse,
         winfsp,
     };
@@ -56,201 +54,107 @@ pub const FuseAdapter = struct {
     pub fn init(allocator: std.mem.Allocator, provider: mount_provider.Provider) FuseAdapter {
         return .{
             .allocator = allocator,
-            .provider = provider,
+            .session = mount_session.MountSession.init(allocator, provider),
         };
     }
 
     pub fn deinit(self: *FuseAdapter) void {
-        self.handles_mutex.lock();
-        var handles = self.handles;
-        self.handles = .{};
-        self.handles_mutex.unlock();
-        defer handles.deinit(self.allocator);
-
-        var it = handles.valueIterator();
-        while (it.next()) |open_file| {
-            self.provider_mutex.lock();
-            self.provider.release(open_file.*) catch {};
-            self.provider_mutex.unlock();
-        }
-        self.provider.deinit();
+        self.session.deinit();
     }
 
     pub fn getattr(self: *FuseAdapter, path: []const u8) ![]u8 {
-        self.provider_mutex.lock();
-        defer self.provider_mutex.unlock();
-        return self.provider.getattr(path);
+        return self.session.getattr(path);
     }
 
     pub fn readdir(self: *FuseAdapter, path: []const u8, cookie: u64, max_entries: u32) ![]u8 {
-        self.provider_mutex.lock();
-        defer self.provider_mutex.unlock();
-        return self.provider.readdir(path, cookie, max_entries);
+        return self.session.readdir(path, cookie, max_entries);
     }
 
     pub fn statfs(self: *FuseAdapter, path: []const u8) ![]u8 {
-        self.provider_mutex.lock();
-        defer self.provider_mutex.unlock();
-        return self.provider.statfs(path);
+        return self.session.statfs(path);
     }
 
     pub fn open(self: *FuseAdapter, path: []const u8, flags: u32) !mount_provider.OpenFile {
-        self.provider_mutex.lock();
-        defer self.provider_mutex.unlock();
-        return self.provider.open(path, flags);
+        return self.session.open(path, flags);
     }
 
     pub fn openAndStoreHandle(self: *FuseAdapter, path: []const u8, flags: u32) !u64 {
-        self.provider_mutex.lock();
-        errdefer self.provider_mutex.unlock();
-        const open_file = try self.provider.open(path, flags);
-        self.provider_mutex.unlock();
-        errdefer {
-            self.provider_mutex.lock();
-            self.provider.release(open_file) catch {};
-            self.provider_mutex.unlock();
-        }
-
-        self.handles_mutex.lock();
-        defer self.handles_mutex.unlock();
-        const local_id = self.reserveLocalHandleLocked();
-        try self.handles.put(self.allocator, local_id, open_file);
-        return local_id;
+        return self.session.openAndStoreHandle(path, flags);
     }
 
     pub fn read(self: *FuseAdapter, file: mount_provider.OpenFile, off: u64, len: u32) ![]u8 {
-        self.provider_mutex.lock();
-        defer self.provider_mutex.unlock();
-        return self.provider.read(file, off, len);
+        return self.session.read(file, off, len);
     }
 
     pub fn release(self: *FuseAdapter, file: mount_provider.OpenFile) !void {
-        self.provider_mutex.lock();
-        defer self.provider_mutex.unlock();
-        try self.provider.release(file);
+        try self.session.release(file);
     }
 
     pub fn create(self: *FuseAdapter, path: []const u8, mode: u32, flags: u32) !mount_provider.OpenFile {
-        self.provider_mutex.lock();
-        defer self.provider_mutex.unlock();
-        return self.provider.create(path, mode, flags);
+        return self.session.create(path, mode, flags);
     }
 
     pub fn createAndStoreHandle(self: *FuseAdapter, path: []const u8, mode: u32, flags: u32) !u64 {
-        self.provider_mutex.lock();
-        errdefer self.provider_mutex.unlock();
-        const open_file = try self.provider.create(path, mode, flags);
-        self.provider_mutex.unlock();
-        errdefer {
-            self.provider_mutex.lock();
-            self.provider.release(open_file) catch {};
-            self.provider_mutex.unlock();
-        }
-
-        self.handles_mutex.lock();
-        defer self.handles_mutex.unlock();
-        const local_id = self.reserveLocalHandleLocked();
-        try self.handles.put(self.allocator, local_id, open_file);
-        return local_id;
+        return self.session.createAndStoreHandle(path, mode, flags);
     }
 
     pub fn write(self: *FuseAdapter, file: mount_provider.OpenFile, off: u64, data: []const u8) !u32 {
-        self.provider_mutex.lock();
-        defer self.provider_mutex.unlock();
-        return self.provider.write(file, off, data);
+        return self.session.write(file, off, data);
     }
 
     pub fn truncate(self: *FuseAdapter, path: []const u8, size: u64) !void {
-        self.provider_mutex.lock();
-        defer self.provider_mutex.unlock();
-        try self.provider.truncate(path, size);
+        try self.session.truncate(path, size);
     }
 
     pub fn unlink(self: *FuseAdapter, path: []const u8) !void {
-        self.provider_mutex.lock();
-        defer self.provider_mutex.unlock();
-        try self.provider.unlink(path);
+        try self.session.unlink(path);
     }
 
     pub fn mkdir(self: *FuseAdapter, path: []const u8) !void {
-        self.provider_mutex.lock();
-        defer self.provider_mutex.unlock();
-        try self.provider.mkdir(path);
+        try self.session.mkdir(path);
     }
 
     pub fn rmdir(self: *FuseAdapter, path: []const u8) !void {
-        self.provider_mutex.lock();
-        defer self.provider_mutex.unlock();
-        try self.provider.rmdir(path);
+        try self.session.rmdir(path);
     }
 
     pub fn rename(self: *FuseAdapter, old_path: []const u8, new_path: []const u8) !void {
-        self.provider_mutex.lock();
-        defer self.provider_mutex.unlock();
-        try self.provider.rename(old_path, new_path);
+        try self.session.rename(old_path, new_path);
     }
 
     pub fn symlink(self: *FuseAdapter, target: []const u8, link_path: []const u8) !void {
-        self.provider_mutex.lock();
-        defer self.provider_mutex.unlock();
-        try self.provider.symlink(target, link_path);
+        try self.session.symlink(target, link_path);
     }
 
     pub fn setxattr(self: *FuseAdapter, path: []const u8, name: []const u8, value: []const u8, flags: u32) !void {
-        _ = self;
-        _ = path;
-        _ = name;
-        _ = value;
-        _ = flags;
-        return error.OperationNotSupported;
+        try self.session.setxattr(path, name, value, flags);
     }
 
     pub fn getxattr(self: *FuseAdapter, path: []const u8, name: []const u8) ![]u8 {
-        _ = self;
-        _ = path;
-        _ = name;
-        return error.NoData;
+        return self.session.getxattr(path, name);
     }
 
     pub fn listxattr(self: *FuseAdapter, path: []const u8) ![]u8 {
-        _ = path;
-        return self.allocator.dupe(u8, "");
+        return self.session.listxattr(path);
     }
 
     pub fn removexattr(self: *FuseAdapter, path: []const u8, name: []const u8) !void {
-        _ = self;
-        _ = path;
-        _ = name;
-        return error.OperationNotSupported;
+        try self.session.removexattr(path, name);
     }
 
     pub fn lock(self: *FuseAdapter, file: mount_provider.OpenFile, mode: mount_provider.LockMode, wait: bool) !void {
-        self.provider_mutex.lock();
-        defer self.provider_mutex.unlock();
-        try self.provider.lock(file, mode, wait);
+        try self.session.lock(file, mode, wait);
     }
 
     pub fn tryReconcileEndpointsIfIdle(
         self: *FuseAdapter,
         endpoint_configs: []const @import("acheron_fs_router").EndpointConfig,
     ) !bool {
-        if (!self.provider_mutex.tryLock()) return false;
-        defer self.provider_mutex.unlock();
-        self.handles_mutex.lock();
-        const has_handles = self.handles.count() != 0;
-        self.handles_mutex.unlock();
-        if (has_handles) return false;
-        return self.provider.tryReconcileEndpointsIfIdle(endpoint_configs);
+        return self.session.tryReconcileEndpointsIfIdle(endpoint_configs);
     }
 
     pub fn tryKeepAliveIfIdle(self: *FuseAdapter) !bool {
-        if (!self.provider_mutex.tryLock()) return false;
-        defer self.provider_mutex.unlock();
-        self.handles_mutex.lock();
-        const has_handles = self.handles.count() != 0;
-        self.handles_mutex.unlock();
-        if (has_handles) return false;
-        return self.provider.tryKeepAliveIfIdle();
+        return self.session.tryKeepAliveIfIdle();
     }
 
     pub fn mount(self: *FuseAdapter, mountpoint: []const u8) !void {
@@ -379,31 +283,12 @@ pub const FuseAdapter = struct {
         if (rc != 0) return error.FuseMainFailed;
     }
 
-    fn reserveLocalHandleLocked(self: *FuseAdapter) u64 {
-        var local_id = self.next_local_handle;
-        self.next_local_handle +%= 1;
-        if (local_id == 0) {
-            local_id = self.next_local_handle;
-            self.next_local_handle +%= 1;
-        }
-        return local_id;
-    }
-
     fn lookupOpenHandle(self: *FuseAdapter, local_id: u64) ?mount_provider.OpenFile {
-        self.handles_mutex.lock();
-        defer self.handles_mutex.unlock();
-        return self.handles.get(local_id);
+        return self.session.lookupOpenHandle(local_id);
     }
 
     fn releaseStoredHandle(self: *FuseAdapter, local_id: u64) void {
-        self.handles_mutex.lock();
-        const removed = self.handles.fetchRemove(local_id);
-        self.handles_mutex.unlock();
-        if (removed) |entry| {
-            self.provider_mutex.lock();
-            self.provider.release(entry.value) catch {};
-            self.provider_mutex.unlock();
-        }
+        self.session.releaseStoredHandle(local_id);
     }
 };
 
@@ -513,13 +398,16 @@ fn validateBackendForOs(
             .auto, .fuse => {
                 if (!macos_supported) return error.UnsupportedMacosVersion;
             },
-            .winfsp => return error.UnsupportedMountBackend,
+            .native, .winfsp => return error.UnsupportedMountBackend,
         },
         .linux => switch (backend) {
             .auto, .fuse => {},
-            .winfsp => return error.UnsupportedOs,
+            .native, .winfsp => return error.UnsupportedOs,
         },
-        .windows => {},
+        .windows => switch (backend) {
+            .native => return error.UnsupportedMountBackend,
+            else => {},
+        },
         else => return error.UnsupportedOs,
     }
 }
@@ -545,6 +433,7 @@ fn mountLibraryCandidatesForOs(os_tag: std.Target.Os.Tag, backend: FuseAdapter.M
                 "/usr/lib/x86_64-linux-gnu/libfuse3.so.3",
                 "libfuse3.so",
             },
+            .native => error.UnsupportedMountBackend,
             .winfsp => error.UnsupportedOs,
         },
         .macos => switch (backend) {
@@ -562,7 +451,7 @@ fn mountLibraryCandidatesForOs(os_tag: std.Target.Os.Tag, backend: FuseAdapter.M
                 "/Library/Filesystems/macfuse.fs/Contents/Resources/lib/libfuse3.dylib",
                 "libfuse3.dylib",
             },
-            .winfsp => error.UnsupportedMountBackend,
+            .native, .winfsp => error.UnsupportedMountBackend,
         },
         .windows => switch (backend) {
             .auto, .fuse, .winfsp => &[_][]const u8{
@@ -576,6 +465,7 @@ fn mountLibraryCandidatesForOs(os_tag: std.Target.Os.Tag, backend: FuseAdapter.M
                 "C:\\Program Files (x86)\\WinFsp\\bin\\winfsp-x86.dll",
                 "C:\\Program Files (x86)\\WinFsp\\bin\\winfsp.dll",
             },
+            .native => error.UnsupportedMountBackend,
         },
         else => error.UnsupportedOs,
     };

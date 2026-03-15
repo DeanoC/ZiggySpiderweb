@@ -85,6 +85,13 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     spiderweb_mount_provider_mod.addImport("acheron_fs_router", acheron_fs_router_mod);
+    const spiderweb_mount_session_mod = b.createModule(.{
+        .root_source_file = b.path("src/acheron/mount_session.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    spiderweb_mount_session_mod.addImport("acheron_fs_router", acheron_fs_router_mod);
+    spiderweb_mount_session_mod.addImport("spiderweb_mount_provider", spiderweb_mount_provider_mod);
     const spiderweb_fs_fuse_adapter_mod = b.createModule(.{
         .root_source_file = b.path("src/venoms/fs/fs_fuse_adapter.zig"),
         .target = target,
@@ -93,6 +100,7 @@ pub fn build(b: *std.Build) void {
     spiderweb_fs_fuse_adapter_mod.addIncludePath(b.path("src/c"));
     spiderweb_fs_fuse_adapter_mod.addImport("acheron_fs_router", acheron_fs_router_mod);
     spiderweb_fs_fuse_adapter_mod.addImport("spiderweb_mount_provider", spiderweb_mount_provider_mod);
+    spiderweb_fs_fuse_adapter_mod.addImport("spiderweb_mount_session", spiderweb_mount_session_mod);
     const fuse_compat_stub_mod = b.createModule(.{
         .root_source_file = b.path("src/c/fuse_compat_stub.zig"),
         .target = target,
@@ -248,6 +256,24 @@ pub fn build(b: *std.Build) void {
     const fs_mount_step = b.step("fs-mount", "Build standalone spiderweb-fs-mount client");
     fs_mount_step.dependOn(&spiderweb_fs_mount.step);
 
+    const fs_helper_mod = b.createModule(.{
+        .root_source_file = b.path("src/acheron/fs_helper_main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    fs_helper_mod.addImport("spider-protocol", spider_protocol_module);
+    fs_helper_mod.addImport("acheron_fs_router", acheron_fs_router_mod);
+    fs_helper_mod.addImport("spiderweb_mount_provider", spiderweb_mount_provider_mod);
+    fs_helper_mod.addImport("spiderweb_mount_session", spiderweb_mount_session_mod);
+    const spiderweb_fs_helper = b.addExecutable(.{
+        .name = "spiderweb-fs-helper",
+        .root_module = fs_helper_mod,
+    });
+    spiderweb_fs_helper.linkLibC();
+    b.installArtifact(spiderweb_fs_helper);
+    const fs_helper_step = b.step("spiderweb-fs-helper", "Build native macOS filesystem helper");
+    fs_helper_step.dependOn(&spiderweb_fs_helper.step);
+
     // Config CLI executable
     const config_mod = b.createModule(.{
         .root_source_file = b.path("src/config_cli.zig"),
@@ -364,6 +390,13 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_fs_mount_tests.step);
     const fs_mount_test_step = b.step("test-fs-mount", "Run spiderweb-fs-mount client tests");
     fs_mount_test_step.dependOn(&run_fs_mount_tests.step);
+
+    const fs_helper_tests = b.addTest(.{
+        .root_module = fs_helper_mod,
+    });
+    fs_helper_tests.linkLibC();
+    const run_fs_helper_tests = b.addRunArtifact(fs_helper_tests);
+    test_step.dependOn(&run_fs_helper_tests.step);
 }
 
 fn applySqliteLibraryPath(compile: *std.Build.Step.Compile, sqlite_lib_dir: ?[]const u8) void {
