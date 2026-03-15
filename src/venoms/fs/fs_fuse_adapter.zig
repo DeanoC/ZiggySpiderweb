@@ -485,11 +485,22 @@ fn validateMountRequestForOs(
     try validateBackendForOs(os_tag, backend, macos_supported);
 
     if (os_tag == .macos) {
-        const normalized = std.mem.trimRight(u8, mountpoint, "/");
-        if (!std.fs.path.isAbsolute(normalized)) return error.InvalidMacosMountpoint;
-        if (!std.mem.startsWith(u8, normalized, "/Volumes/")) return error.InvalidMacosMountpoint;
-        if (normalized.len <= "/Volumes/".len) return error.InvalidMacosMountpoint;
+        try validateMacosMountpoint(mountpoint);
     }
+}
+
+fn validateMacosMountpoint(mountpoint: []const u8) !void {
+    const trimmed = std.mem.trimRight(u8, mountpoint, "/");
+    if (!std.fs.path.isAbsolute(trimmed)) return error.InvalidMacosMountpoint;
+
+    const normalized = try std.fs.path.resolvePosix(std.heap.page_allocator, &.{trimmed});
+    defer std.heap.page_allocator.free(normalized);
+
+    if (!std.mem.startsWith(u8, normalized, "/Volumes/")) return error.InvalidMacosMountpoint;
+
+    const volume_name = normalized["/Volumes/".len..];
+    if (volume_name.len == 0) return error.InvalidMacosMountpoint;
+    if (std.mem.indexOfScalar(u8, volume_name, '/') != null) return error.InvalidMacosMountpoint;
 }
 
 fn validateBackendForOs(
@@ -1664,6 +1675,7 @@ test "fs_fuse_adapter: toFuseError maps xattr and lock related errors" {
 
 test "fs_fuse_adapter: darwin validates supported mountpoints" {
     try validateMountRequestForOs(.macos, "/Volumes/spiderweb-demo", .auto, true);
+    try validateMountRequestForOs(.macos, "/Volumes/spiderweb-demo/", .auto, true);
     try std.testing.expectError(
         error.InvalidMacosMountpoint,
         validateMountRequestForOs(.macos, "/tmp/spiderweb-demo", .auto, true),
@@ -1671,6 +1683,14 @@ test "fs_fuse_adapter: darwin validates supported mountpoints" {
     try std.testing.expectError(
         error.InvalidMacosMountpoint,
         validateMountRequestForOs(.macos, "/Volumes", .auto, true),
+    );
+    try std.testing.expectError(
+        error.InvalidMacosMountpoint,
+        validateMountRequestForOs(.macos, "/Volumes/../tmp/spiderweb-demo", .auto, true),
+    );
+    try std.testing.expectError(
+        error.InvalidMacosMountpoint,
+        validateMountRequestForOs(.macos, "/Volumes/spiderweb-demo/nested", .auto, true),
     );
 }
 
