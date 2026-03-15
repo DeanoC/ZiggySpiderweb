@@ -547,9 +547,7 @@ fn emitLocalMountStatusDiagnostic(allocator: std.mem.Allocator, backend: fs_fuse
         },
         .fuse => emitFuseStatusDiagnostic(.fuse),
         .auto => {
-            if (!emitNativeStatusDiagnostic(allocator)) {
-                emitFuseStatusDiagnostic(.fuse);
-            }
+            emitFuseStatusDiagnostic(.fuse);
         },
         .winfsp => {
             std.log.warn("local macOS mount backend unavailable: --mount-backend winfsp is Windows-only; use auto, native, or fuse", .{});
@@ -620,8 +618,8 @@ fn resolveRequestedMountBackend(
 
     return switch (backend) {
         .auto => blk: {
-            native_mount_support.probeNativeBackend(allocator) catch break :blk .fuse;
-            break :blk .native;
+            _ = allocator;
+            break :blk .fuse;
         },
         else => backend,
     };
@@ -639,7 +637,7 @@ fn emitNativeStatusDiagnostic(allocator: std.mem.Allocator) bool {
         return false;
     }
     if (status.ready()) {
-        std.log.info("local macOS native mount backend ready: use mount /Volumes/<name> and --mount-backend native (or auto)", .{});
+        std.log.info("local macOS native mount backend ready: use mount /Volumes/<name> and --mount-backend native", .{});
         return true;
     }
 

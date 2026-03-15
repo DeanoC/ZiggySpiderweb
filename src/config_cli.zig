@@ -1031,7 +1031,7 @@ fn printUsage() !void {
         \\Workspace-first flow:
         \\  spiderweb-control workspace_create '{"name":"Demo","vision":"Deliver the demo workspace"}'
         \\  spiderweb-fs-mount --workspace-id <workspace-id> ./workspace
-        \\  note: macOS auto mounts prefer the native FSKit backend and fall back to macFUSE when the extension is unavailable
+        \\  note: macOS auto mounts use macFUSE for now; use --mount-backend native when explicitly testing the FSKit path
         \\  spider-monkey run --workspace-root ./workspace
         \\
     ;

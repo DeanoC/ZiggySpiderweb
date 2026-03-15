@@ -73,7 +73,7 @@ zig build
 `spiderweb-fs-mount` can now run as a standalone client on machines that do not host Spiderweb locally. Real local mount backends are currently supported on Linux, Windows, and macOS.
 
 On macOS:
-- `--mount-backend auto` now understands both `native` and `fuse`.
+- `--mount-backend auto` currently defaults to the macFUSE path so the shipped behavior stays reliable while the native backend is still waiting on Apple signing/capability approval.
 - `native` is the first-party FSKit path under `platform/macos`, with the app/extension bundle routing file operations through `spiderweb-fs-helper`.
 - `fuse` is the reliable fallback today and still requires macFUSE 5.x.
 - `spiderweb-config config install-fs-extension` / `fs-extension-status` manage the native app bundle once it has been built.

@@ -38,4 +38,5 @@ Verification flow on a macOS development machine:
 
 The native backend is intentionally staged. On machines without a paid Apple
 Developer team that preserves those entitlements, `--mount-backend fuse`
-remains the reliable macOS path.
+remains the reliable macOS path, and `--mount-backend auto` intentionally
+sticks to that macFUSE default until the native backend is fully validated.
